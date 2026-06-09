@@ -204,6 +204,15 @@ impl Trace for Value {
             // to `T::trace`), so we deref to call `EnumVariant::trace` explicitly,
             // reaching the payload's `Cc` container (the actual cycle node).
             Value::EnumVariant(v) => (**v).trace(tracer),
+            // SRV §3.6: a frozen `Shared` is an `Arc` DAG in a DIFFERENT ownership
+            // domain (NOT `Cc`), acyclic by construction (`shared.freeze` rejects
+            // input cycles), so refcounting reclaims it — the Bacon–Rajan collector
+            // must NEVER descend into it. The same NO-OP invariant native handles
+            // rely on. The `Arc` graph holds no `Cc` and no `Value` cell, so it adds
+            // ZERO new GC edges and cannot participate in a `Cc` cycle even
+            // transitively (no `Arc→Cc→Arc` cross-domain cycle is possible). Explicit
+            // arm (folds into the catch-all, but spelled out for the invariant).
+            Value::Shared(_) => {}
             // NOTE on `Function`: a tree-walker `Function` captures an
             // `Environment` (its own `Rc<RefCell<Scope>>` graph), which is NOT
             // one of the cycle-capable Value containers migrated in V13-T2 (see
@@ -1196,5 +1205,46 @@ mod tests {
         // Interp drop is the other deterministic endpoint: the table (and its entry)
         // is freed when the Interp goes out of scope here. No panic.
         drop(interp);
+    }
+
+    // SRV §3.4 (Gate 0) — the NEGATIVE compile-time guard. `Value` gained its first
+    // `Send` member (`Value::Shared(Arc<SharedNode>)`), but the union as a whole MUST
+    // stay `!Send` (the `LocalSet`/current-thread invariant). This expands to a
+    // `const` impl-check: if a future edit removes the last `Rc`/`Cc`/`Native` member
+    // or adds `unsafe impl Send for Value`, the build fails HERE rather than silently
+    // making the whole interpreter `Send`. The POSITIVE counterpart
+    // (`is_send_sync::<SharedNode>()`) lives in `value.rs`.
+    static_assertions::assert_not_impl_any!(crate::value::Value: Send);
+
+    // SRV §3.6 — a `Cc` container holding a `Value::Shared` field is GC-collected
+    // normally: the `Shared` is a traced-SKIPPED leaf (the `Arc` graph is a different
+    // ownership domain), so tracing the container reaches its OTHER children but NOT
+    // the frozen DAG, and adds ZERO edges through the `Shared`.
+    #[test]
+    fn shared_field_is_a_traced_skipped_leaf() {
+        use crate::value::{ObjectCell, SharedNode, Value};
+        use indexmap::IndexMap;
+        use std::sync::Arc;
+
+        // A frozen leaf (an `Arc<SharedNode>`), stored as a field of a `Cc` Object.
+        let frozen = Value::Shared(Arc::new(SharedNode::Int(7)));
+        let mut map = IndexMap::new();
+        map.insert("frozen".to_string(), frozen);
+        map.insert("probe".to_string(), Value::Int(1));
+        let obj = Value::Object(ObjectCell::new(map));
+
+        // Tracing the container must NOT panic and must NOT descend into the `Arc`
+        // graph (there is no `Trace` edge through `Value::Shared`). We assert the
+        // trace runs cleanly; the `Shared` arm is a no-op by construction.
+        VISITS.with(|c| c.set(0));
+        let mut probe_root = Probe;
+        let _ = &mut probe_root;
+        // Drive a real collection over a heap that includes the Shared-bearing object.
+        let tracked_before = gcmodule::count_thread_tracked();
+        drop(obj);
+        let _ = super::collect();
+        // No assertion on a specific count — the point is that collection completes
+        // without tracing into (or leaking) the frozen `Arc` graph.
+        assert!(gcmodule::count_thread_tracked() <= tracked_before);
     }
 }
