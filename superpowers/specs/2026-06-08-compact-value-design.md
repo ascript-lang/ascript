@@ -35,7 +35,9 @@ refcount churn**, in independently-shippable stages, while holding the campaign'
 feature configs (`goal.md` Gate 1). VAL changes *how a value is stored*, never *what a program observes*.
 Because the win is measured against the **true** 32-byte starting point (not the mistaken 24), it is *larger*
 than first framed — a 4× collapse (32→8) at the NaN-box ceiling — and Stage 1 must explicitly box/shrink the
-two 24-byte two-field variants (§4) or the enum will not reach 16 bytes.
+two 24-byte two-field variants (§4), the necessary **32→24** step. (The niche-enum reaches **16** only once
+`Str` is ALSO thinned — Task 9 — and **8** only via the NaN-box; see the §3.3 CORRECTION. Boxing the two fat
+variants + `Decimal` lands Stage 1 at **24**, not 16.)
 
 Three things make this the right next step and not premature:
 
@@ -64,7 +66,7 @@ Three things make this the right next step and not premature:
 
 | Source of cost | Today | After VAL |
 |---|---|---|
-| `Value` width | **32 bytes** (24-byte two-field payload — `ClassMethod`/`GeneratorMethod` — + discriminant/pad) | **8 bytes** (NaN-box, §3.2) or **16** (niche fallback, §3.3) |
+| `Value` width | **32 bytes** (24-byte two-field payload — `ClassMethod`/`GeneratorMethod` — + discriminant/pad) | **8 bytes** (NaN-box, §3.2) or **16** (niche fallback WITH thin-`Str`, §3.3; **24** while `Str` stays the 2-word `Rc<str>`) |
 | Widest two-field variants (`ClassMethod(Rc<Class>, Rc<str>)`, `GeneratorMethod(Rc<GeneratorHandle>, &'static str)`) | 24-byte payload each — they set the enum width | **boxed to a 1-word pointer** (Stage 1, §4), removing the floor that pins the enum at 32 |
 | `Int`/`Float`/`Bool`/`Nil` on the value stack | enum move of 32 bytes | a single 8-byte word, no heap, no refcount |
 | Small string (`"id"`, `"GET"`, single chars from NUM's codepoint methods) | `Rc<str>` alloc + refcount bump per clone | **inlined in the value word** (§5, stage 3), zero alloc |
@@ -76,7 +78,10 @@ The first row — 32→8 — cuts the VM value stack (`Fiber.stack`), every fram
 cache density across the entire heap, not just arithmetic. Note the floor: until the two 24-byte two-field
 variants (`ClassMethod`/`GeneratorMethod`) are boxed, *no* layout — niche-enum or NaN-box — can get below 32
 bytes, because Rust sizes the enum to its widest variant. Boxing them is therefore the **first** Stage-1
-deliverable (§4), not an afterthought; it alone takes the niche-enum floor from 32 to 16.
+deliverable (§4), not an afterthought; it takes the niche-enum floor from 32 to **24** (then Decimal-boxing
+holds 24, since the fat `Str` is now the widest payload — **16** arrives only with thin-`Str`, Task 9; see
+the §3.3 CORRECTION). So the "first row — 32→8" above is the NaN-box *ceiling*, reached in stages
+32→24→16→8, not a single Stage-1 jump.
 
 ## 3. The representation
 
@@ -204,24 +209,33 @@ If the full pointer NaN-box is judged not worth the `unsafe`/upstream-dependency
 the pointers:
 
 - Keep `Value` a Rust enum (compiler-generated `Clone`/`Drop` over `Cc`/`Rc` — **no hand-written ownership
-  `unsafe`**), but **collapse every payload to ≤ 8 bytes** so the enum is 16 bytes total (≤ 8 only with
-  thin-`Str`, optional):
+  `unsafe`**), but **collapse every payload toward ≤ 8 bytes** so the enum shrinks stepwise. **CORRECTION
+  (empirically measured during VAL Task 2, scratch-verified at the real variant count):** because the inline
+  scalar variants (`Int`/`Float`) take any bit pattern, Rust cannot niche-elide the discriminant — the layout
+  is `round_up(widest_payload) + 8-byte tag`. So the floor tracks the **widest payload width**, not a niche:
+  with the 2-word fat `Str` it is **24** (16 + 8); thinning `Str` to one word reaches **16** (8 + 8); **8**
+  bytes is reachable ONLY via the NaN-box (§3.2 — a hand-tagged machine word, not a Rust enum). (This corrects
+  the earlier "fat-`Str` → 16" framing below, which was off by one level.) The stages:
   - **The two 24-byte two-field variants move first.** `ClassMethod(Rc<Class>, Rc<str>)` and
     `GeneratorMethod(Rc<GeneratorHandle>, &'static str)` each become a **single boxed payload** — one
     `Rc<ClassMethodData{class, name}>` / `Rc<GeneratorMethodData{handle, name}>` (a 1-word pointer). This is
-    the load-bearing shrink: while these stay 24-byte, the enum *cannot* drop below 32 (Rust sizes to the
-    widest variant), so neither this fallback nor the NaN-box reaches 16/8 without it.
-  - `Decimal` (16 B) and any other oversized payload move **behind a pointer** (`Rc<Decimal>` / a pooled
-    box) — the same heap-kind move NaN-boxing forces, but without touching the pointer encoding.
-  - `Str` stays `Rc<str>` (2 words) only if we accept 16 bytes; to reach 8 we'd box the fat-pointer
-    metadata (a `Rc<StrHeader>`-style thin pointer) — staged, optional.
+    the load-bearing shrink **32 → 24**: while these stay 24-byte, the enum *cannot* drop below 32 (Rust sizes
+    to the widest variant), so neither this fallback nor the NaN-box reaches 24/16/8 without it.
+  - `Decimal` (16 B) and any other oversized inline payload move **behind a pointer** (`Rc<Decimal>` / a
+    pooled box) — the same heap-kind move NaN-boxing forces, but without touching the pointer encoding. (This
+    alone does NOT shrink the enum below 24, because the fat `Str` is now the widest payload — it removes the
+    *other* 16-byte inline payload so that once `Str` is thinned the enum drops straight to 16.)
+  - `Str` stays the 2-word `Rc<str>` only if we accept **24** bytes; to reach **16** we thin `Str` to a
+    single-word pointer (a `Rc<StrHeader>`-style thin pointer / small-string — **Task 9**) — staged, optional.
+    8 bytes needs the NaN-box, not a thinner enum.
   - The scalar variants (`Nil`/`Bool`/`Int`/`Float`) already fit a word; the win is that the *enum* no
-    longer pads to 32.
+    longer pads to 32 (→ 24 after the two boxings, → 16 after thin-`Str`).
 - This uses Rust's **niche optimization** (`NonNull`/`Cc`'s non-null guarantee fills the discriminant niche)
   to keep the tag free where possible — the same mechanism that makes `Option<Cc<T>>` the size of `Cc<T>`.
 
-The fallback yields **16-byte (or 8-byte, with thin-`Str`) values with inline scalars and zero new ownership
-`unsafe`**, at the cost of not collapsing *every* value to a single word (a 16-byte value is still 2× better
+The fallback yields **24-byte (fat-`Str`) → 16-byte (thin-`Str`, Task 9) values with inline scalars and zero
+new ownership `unsafe`** (8 bytes only via the NaN-box, §3.2), at the cost of not collapsing *every* value to
+a single word (a 16-byte value is still 2× better
 than today's 32 and keeps the whole stage-1/2/3 win). It is the *guaranteed-shippable* floor; the NaN-box is the
 *stretch ceiling*. Both are independently differential-tested.
 

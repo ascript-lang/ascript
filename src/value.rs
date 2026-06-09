@@ -1732,27 +1732,32 @@ mod tests {
     fn value_size_is_documented() {
         // VAL Task 2: `Decimal` is now boxed behind `Rc<Decimal>` (one word, was a
         // 16-byte inline payload). This is a necessary, behavior-preserving step
-        // toward the 16-byte niche floor — but the enum stays at **24** because the
-        // `Str(Rc<str>)` variant independently holds the floor there:
+        // toward the 16-byte niche floor — but the enum stays at **24** because
+        // `Str(Rc<str>)` is STILL a 16-byte *fat* pointer (data ptr + length) and is
+        // now the widest payload:
         //
-        //   `Rc<str>` is a 16-byte *fat* pointer (data ptr + length). An enum with
-        //   BOTH a 16-byte fat-pointer variant AND inline 8-byte scalar variants
-        //   (`Int(i64)`/`Float(f64)`) cannot niche-pack to 16: a scalar can take any
-        //   bit pattern, so it collides with the pointer's null niche, forcing an
-        //   explicit discriminant word → 16 (payload) + 8 (tag+pad) = 24. (Verified
-        //   empirically: with a THIN `Str` pointer the very same enum is 16.)
+        //   The inline scalar variants (`Int(i64)`/`Float(f64)`) take ANY bit
+        //   pattern, so Rust cannot niche-elide the discriminant into a pointer
+        //   variant's null niche — it must add an explicit tag word. The layout is
+        //   therefore `round_up(widest_payload) + 8-byte tag`: with the 16-byte fat
+        //   `Str`, that is 16 + 8 = **24**; with a single-word (thin) `Str` it is
+        //   8 + 8 = **16**. (Scratch-verified at the real variant count: fat-`Str`
+        //   enum = 24 even with NO scalar and even with few variants; thin-`Str`
+        //   enum = 16. So the floor is set by the fat-pointer payload WIDTH, not by
+        //   Decimal — which is exactly why boxing Decimal alone cannot reach 16.)
         //
         // Reaching 16 therefore requires thinning `Str` to a single-word pointer —
-        // that is **Stage 3 (Task 9 — small-string / thin-`Str`)**, explicitly
-        // OUTSIDE this unit (Tasks 0–2). The spec foresees exactly this (§3.3): the
-        // niche fallback is "16 bytes ... `Str` stays `Rc<str>` (2 words) only if we
-        // accept 16 bytes; to reach 8 we'd box the fat-pointer metadata ... staged,
-        // optional." Boxing `Decimal` here removes the OTHER 16-byte inline payload
-        // so that once `Str` is thinned the enum drops straight to 16.
+        // that is **Task 9 (small-string / thin-`Str`)**, OUTSIDE this unit
+        // (Tasks 0–2). Boxing `Decimal` here removes the OTHER 16-byte inline payload
+        // so that once `Str` is thinned the enum drops straight to 16. NOTE: the spec
+        // §3.3 / plan Task-2 "fat-`Str` → 16" target is arithmetically wrong (it is
+        // 24); corrected in the spec/plan. 8 bytes is reachable ONLY via the NaN-box
+        // (a hand-tagged machine word, not a Rust enum), which is a separate, gated
+        // stage.
         //
-        // Stage progression: 32 → 24 [Task 1: fat method bindings boxed] → 24
-        // [Task 2: Decimal boxed, now Str-limited] → 16 [Stage 3: thin-`Str`] → 8
-        // [Stage 2: NaN-box].
+        // Size progression: 32 → 24 [Task 1: fat method bindings boxed] → 24
+        // [Task 2: Decimal boxed, now fat-`Str`-limited] → 16 [thin-`Str`] → 8
+        // [NaN-box, gated].
         assert_eq!(std::mem::size_of::<Value>(), 24);
     }
 

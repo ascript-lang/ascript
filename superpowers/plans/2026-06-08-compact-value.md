@@ -21,11 +21,13 @@ bindings, NOT by `Decimal`/`Str`) toward 8, in four independently-shippable, ind
    `GeneratorMethod(Rc<GeneratorHandle>, &'static str)` → `Rc<GeneratorMethodData>`) + move `Decimal` (16 B)
    behind a pointer + inline scalars (`Nil`/`Bool`/`Int`/`Float`) + SMI fast paths in VM arith. This is the
    §3.3 **niche-optimized fallback** — derived `Clone`/`Drop` over `Cc`/`Rc`, **no new ownership `unsafe`**.
-   Ships **regardless** of the Stage-2 verdict (32→16 B; ≤8 only with optional thin-`Str`).
+   Ships **regardless** of the Stage-2 verdict (**32→24 B**; 16 only with optional thin-`Str` at Task 9, ≤8
+   only with the NaN-box — CORRECTED: the original "32→16 B" was arithmetically wrong, see Task 2 + spec §3.3).
 2. **Pointer NaN-box** to 8 B — **GATED** on (a) upstreaming gcmodule `Cc::into_raw`/`from_raw` AND (b) the
    GC-soundness suite green on the tagged layout. Introduces the hand-written tag-dispatched
-   `unsafe` `Clone`/`Drop`/`trace`. **If either gate fails, STOP at Stage 1's 16-byte enum** — an
-   owner-noted, recorded stopping point (`goal-brief.md` Gate 6). An explicit decision task gates this.
+   `unsafe` `Clone`/`Drop`/`trace`. **If either gate fails, STOP at Stage 1's 24-byte enum** (16-byte with
+   thin-`Str`/Task 9) — an owner-noted, recorded stopping point (`goal-brief.md` Gate 6). An explicit decision
+   task gates this.
 3. **Small-string inlining** (≤6 B under NaN-box, or a small-string-optimized `Str` under the fallback).
 4. **Compiler escape-analysis** stack allocation (`src/compile/`) with the **identity-preservation
    soundness obligation** (§3.4 of the spec) and a `--no-escape-analysis` kill switch (a fifth differential
@@ -138,17 +140,23 @@ Stage-2-only `ValueTag` + `Cc::into_raw`/`from_raw` (gated); Stage-4 `--no-escap
 ## Task 2 — Move `Decimal` behind a pointer; shrink the enum to the niche-fallback 16 bytes
 **Files:** `src/value.rs` (+ compiler-flushed arms in `interp.rs`/`vm/run.rs` decimal arith, `fmt.rs`,
 `worker/serialize.rs` `TAG_DECIMAL`, `aso.rs` decimal constant). **Tests:** `value.rs`, decimal tests.
-- [ ] Failing test: `size_of::<Value>() == 16` (the §3.3 niche-fallback floor — now that the two fat
-  variants AND `Decimal` are ≤8-byte payloads and scalars fit a word, Rust's niche optimization over
-  `Cc`/`Rc`'s non-null guarantee fills the discriminant); decimal arithmetic / `type_name=="decimal"` /
-  exact equality / Map-key fold all byte-identical (an extra indirection, zero behavior change).
+- [ ] **CORRECTED TARGET — `size_of::<Value>() == 24`, NOT 16** (verified during implementation; the
+  spec/plan "→16" was arithmetically wrong). Boxing `Decimal` removes one 16-byte inline payload, but
+  `Str(Rc<str>)` is STILL a 2-word fat pointer and is now the widest payload. Because the inline scalars
+  (`Int`/`Float`) prevent niche-elision, the layout is `round_up(widest_payload) + 8-byte tag` = 16 + 8 = 24.
+  Reaching **16** requires thinning `Str` to a single word (**Task 9 — small-string / thin-`Str`**); **8**
+  needs the NaN-box (Stage 2). So the failing test asserts **24** with this explanation inline. Decimal
+  arithmetic / `type_name=="decimal"` / exact equality / Map-key fold are all byte-identical (an extra
+  indirection, zero behavior change) — that is the real Task-2 deliverable. See the §3.3 CORRECTION in the
+  design spec and `value_size_is_documented` in `value.rs`.
 - [ ] Change `Value::Decimal(Decimal)` → `Value::Decimal(Rc<Decimal>)` (or a pooled box). Update the
   `decimal_fast` VM arm `run.rs:~3787`, the `apply_binop` decimal arm in `interp.rs`, `Display`/`Debug`,
   `MapKey` (still folds by value), the worker `TAG_DECIMAL` encode/decode (still the SAME logical tag —
   serialize the decoded decimal, **not** the pointer), and the `.aso` decimal constant (still logical — no
   `ASO_FORMAT_VERSION` bump if the serialized form is unchanged; if the box changes the in-pool layout, read
   `ASO_FORMAT_VERSION` and +1 per `goal-brief.md`).
-- [ ] Update Task 0's size tripwire to 16. Green both configs; clippy. **Four-mode differential green.**
+- [ ] Update Task 0's size tripwire to **24** (the corrected floor; it moves to 16 only at Task 9 thin-`Str`,
+  and 8 at the NaN-box). Green both configs; clippy. **Four-mode differential green.**
   **Review:** confirm decimal exactness preserved (the boxing is invisible), `.aso` round-trip green,
   worker round-trip of a `Decimal` byte-identical. Commit.
 
