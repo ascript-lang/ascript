@@ -30,9 +30,19 @@
 //                     variants were boxed (32→24); the extra indirection on these
 //                     rare bindings must not measurably regress.
 
+// VAL Stage-3 (Task 9, thin-`Str` → 16) ADDS string-heavy + memory-bound
+// workloads (8–11 below). Thin-`Str` makes a `Value::Str` a single 8-byte word
+// (`Rc<Box<str>>`) at the cost of a double-indirection on string ACCESS, so the
+// string workloads honestly surface any access regression, and the memory-bound
+// workload (a big `array<string>` / string-keyed map) is where the 24→16 shrink's
+// cache-density benefit should show. The same-session baseline for Stage 3 is the
+// Stage-1 floor (this branch @ Task-4 commit 1f1451d, size 24), so the A/B isolates
+// the 24→16 step.
+
 import * as time from "std/time"
 import * as decimal from "std/decimal"
 import * as array from "std/array"
+import * as string from "std/string"
 
 // ── 1. int_sum — scalar-heavy i64 accumulation ───────────────────────────────
 fn bench_int_sum() {
@@ -134,10 +144,86 @@ fn bench_method_cold() {
   print(`method_cold total=${total} elapsed_ms=${t1 - t0}`)
 }
 
+// ── 8. string_concat — string-heavy: build many short strings via concat ─────
+//   Each `+` allocates a fresh `AStr` (`Rc::new(Box<str>)`); thin-`Str` adds the
+//   `Box<str>` indirection vs the old fat `Rc<str>`. A direct string-access stress.
+fn bench_string_concat() {
+  let t0 = time.monotonic()
+  let total = 0
+  for (i in 0..2000000) {
+    let s = "node-" + string.upper("k")
+    total = total + len(s)
+  }
+  let t1 = time.monotonic()
+  print(`string_concat total=${total} elapsed_ms=${t1 - t0}`)
+}
+
+// ── 9. string_map — map with STRING keys: insert + read by string key ────────
+//   Exercises `MapKey::Str` fold (`Value::Str` → `MapKey::Str`, an Rc bump) on the
+//   thin encoding, plus string hashing/equality on lookup.
+fn bench_string_map() {
+  let keys = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+  let t0 = time.monotonic()
+  let total = 0
+  for (r in 0..1000000) {
+    let m = {}
+    for (i in 0..len(keys)) {
+      m[keys[i]] = i
+    }
+    for (i in 0..len(keys)) {
+      total = total + m[keys[i]]
+    }
+  }
+  let t1 = time.monotonic()
+  print(`string_map total=${total} elapsed_ms=${t1 - t0}`)
+}
+
+// ── 10. string_index — codepoint / slice access over strings ─────────────────
+//   Decodes the string to bytes/codepoints repeatedly — the hottest READ path for
+//   the thin form (every access traverses Value→Rc→Box<str>→bytes).
+fn bench_string_index() {
+  let s = "the quick brown fox jumps over the lazy dog"
+  let t0 = time.monotonic()
+  let total = 0
+  for (i in 0..2000000) {
+    let cps = string.codepoints(s)
+    total = total + len(cps) + len(string.slice(s, 4, 9))
+  }
+  let t1 = time.monotonic()
+  print(`string_index total=${total} elapsed_ms=${t1 - t0}`)
+}
+
+// ── 11. membound_strings — memory-bound LARGE working set (cache density) ─────
+//   A big `array<string>` plus a big string-keyed map, then a full traversal of
+//   both. The whole working set is large `Vec<Value>` / `IndexMap` storage where a
+//   16-byte `Value` slot is 33% denser than a 24-byte slot — the workload where
+//   24→16 cache density is meant to pay off (vs the CPU-bound loops above).
+fn bench_membound_strings() {
+  let t0 = time.monotonic()
+  let n = 1500000
+  let arr = []
+  for (i in 0..n) {
+    array.push(arr, "item")
+  }
+  // Full linear scan of the dense Value array (string slots).
+  let total = 0
+  for (pass in 0..6) {
+    for (i in 0..len(arr)) {
+      total = total + len(arr[i])
+    }
+  }
+  let t1 = time.monotonic()
+  print(`membound_strings total=${total} elapsed_ms=${t1 - t0}`)
+}
+
 bench_int_sum()
 bench_fib_iter()
 bench_array_walk()
 bench_object_churn()
 bench_float_sum()
+bench_string_concat()
+bench_string_map()
+bench_string_index()
+bench_membound_strings()
 bench_decimal_cold()
 bench_method_cold()

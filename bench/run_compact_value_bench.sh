@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # bench/run_compact_value_bench.sh
 #
-# VAL Stage-1 (compact Value, 32→24 bytes) headline + Gate 12.
+# VAL Stage-3 (Task 9, thin-Str: Value 24→16 bytes) headline + Gate 12.
 #
 # Reports, with the same-session A/B discipline of run_shared_heap_bench.sh:
-#   1. size_of::<Value>()  — 32 (pre-VAL) → 24 (Stage-1 floor; thin-Str→16, NaN-box→8).
+#   1. size_of::<Value>()  — 24 (Stage-1 floor) → 16 (thin-Str/Builtin; NaN-box→8).
 #   2. Wall-clock per workload, in BOTH VM modes (specialized AND
 #      ASCRIPT_NO_SPECIALIZE=1 generic), for the VAL branch AND the same-session
-#      pre-VAL baseline (main @ 612339c) built in an isolated git worktree. All four
-#      series are run INTERLEAVED (round-robin per workload) so machine drift cancels.
+#      STAGE-1 baseline (this branch @ Task-4 commit 1f1451d, size 24) built in an
+#      isolated git worktree. All four series run INTERLEAVED (round-robin per
+#      workload) so machine drift cancels. The baseline is the Stage-1 floor (not
+#      pre-VAL main) so the A/B isolates the 24→16 step alone.
 #   3. Geomean per mode (VAL vs baseline) — a regression in EITHER mode is a VAL bug
 #      (Gate 12: no generic-mode regression; the generic VM skips every IC/adaptive
-#      fast path, so it must benefit from the smaller Value too).
+#      fast path, so it must benefit from the smaller Value too). Includes the NEW
+#      string-heavy (concat / string-keyed map / codepoint-index) and memory-bound
+#      large-working-set workloads — where thin-Str's cache-density benefit (and any
+#      string-access regression from the double indirection) is surfaced honestly.
 #   4. Cold-path check: decimal_cold (boxed Rc<Decimal>, an Rc::new per op) and
 #      method_cold (boxed ClassMethod/GeneratorMethod) must add no measurable
 #      regression on these rare bindings.
@@ -38,10 +43,13 @@ BENCH_FILE="${SCRIPT_DIR}/compact_value_bench.as"
 RESULTS_FILE="${SCRIPT_DIR}/COMPACT_VALUE_RESULTS.md"
 REPS="${BENCH_REPS:-3}"
 
-# Pre-VAL baseline commit (the merge VAL branched from). Built in an isolated
-# worktree with its OWN target/ so it never clobbers the main build.
-BASELINE_COMMIT="612339c"
-BASELINE_WT="${BENCH_BASELINE_WT:-/tmp/ascript-val-baseline}"
+# VAL Stage-3 baseline = the STAGE-1 floor (this branch @ Task-4 commit 1f1451d,
+# size 24) so the A/B isolates the 24→16 step. NB: 1f1451d ALREADY carries the
+# ASCRIPT_NO_SPECIALIZE seam (Task 4 added it), so the perl seam-patch below is a
+# no-op on it (its pattern targets the pre-VAL `Vm::new(...)` form). Built in an
+# isolated worktree with its OWN target/ so it never clobbers the main build.
+BASELINE_COMMIT="${BENCH_BASELINE_COMMIT:-1f1451d}"
+BASELINE_WT="${BENCH_BASELINE_WT:-/tmp/ascript-val-stage3-baseline}"
 
 VAL_BIN="${REPO_ROOT}/target/profiling/ascript"
 BASE_BIN="${BASELINE_WT}/target/profiling/ascript"
@@ -69,9 +77,12 @@ echo "==> Building baseline @ ${BASELINE_COMMIT} (--profile profiling, isolated 
 ( cd "${BASELINE_WT}" && cargo build --profile profiling --quiet )
 echo "    Built: ${BASE_BIN}"
 
-BASE_SIZE="$( ( cd "${BASELINE_WT}" && cargo test --quiet --lib value_size -- --ignored --nocapture 2>/dev/null ) \
-            | grep -o 'size_of::<Value>() = [0-9]*' | grep -o '[0-9]*' | head -1 || echo '32' )"
-[ -z "${BASE_SIZE}" ] && BASE_SIZE="32"
+# Match the VAL-branch detection exactly: target `value_size_print` (the ignored
+# eprintln test) and do NOT pass --quiet (it suppresses --nocapture). The Stage-1
+# baseline (1f1451d) is 24; default to 24 if the grep ever comes up empty.
+BASE_SIZE="$( ( cd "${BASELINE_WT}" && cargo test --lib value_size_print -- --ignored --nocapture 2>&1 ) \
+            | grep -o 'size_of::<Value>() = [0-9]*' | grep -o '[0-9]*' | head -1 || echo '24' )"
+[ -z "${BASE_SIZE}" ] && BASE_SIZE="24"
 echo "    size_of::<Value>() = ${BASE_SIZE} (baseline)"
 echo ""
 
@@ -142,6 +153,12 @@ med = {k: median(v) for k, v in rows.items()}
 
 COLD = {"decimal_cold", "method_cold"}
 HOT = [w for w in order if w not in COLD]
+# VAL Stage-3 subsets: the string-heavy + memory-bound workloads added for thin-Str
+# (reported separately so a string-ACCESS regression is disclosed honestly, not
+# averaged away). SCALAR = the original CPU-bound loops.
+STRING = [w for w in HOT if w in
+          {"string_concat", "string_map", "string_index", "membound_strings"}]
+SCALAR = [w for w in HOT if w not in STRING]
 
 def geomean(vals):
     vals = [v for v in vals if v > 0]
@@ -164,10 +181,19 @@ gen_ratio  = ratio("base_gen",  "val_gen",  HOT)
 def pct(r):
     return (r - 1.0) * 100.0  # +% = VAL faster
 
+str_spec_ratio = ratio("base_spec", "val_spec", STRING)
+str_gen_ratio  = ratio("base_gen",  "val_gen",  STRING)
+scal_spec_ratio = ratio("base_spec", "val_spec", SCALAR)
+scal_gen_ratio  = ratio("base_gen",  "val_gen",  SCALAR)
+
 print("==> Summary")
-print(f"    size_of::<Value>(): {base_size} (pre-VAL) -> {val_size} (VAL Stage-1)")
-print(f"    HOT geomean speedup (baseline/VAL):  specialized {spec_ratio:.3f}x ({pct(spec_ratio):+.1f}%)"
+print(f"    size_of::<Value>(): {base_size} (Stage-1 floor) -> {val_size} (VAL Stage-3 thin-Str)")
+print(f"    ALL-HOT geomean (baseline/VAL):  specialized {spec_ratio:.3f}x ({pct(spec_ratio):+.1f}%)"
       f"   generic {gen_ratio:.3f}x ({pct(gen_ratio):+.1f}%)")
+print(f"    SCALAR geomean:  specialized {scal_spec_ratio:.3f}x ({pct(scal_spec_ratio):+.1f}%)"
+      f"   generic {scal_gen_ratio:.3f}x ({pct(scal_gen_ratio):+.1f}%)")
+print(f"    STRING geomean:  specialized {str_spec_ratio:.3f}x ({pct(str_spec_ratio):+.1f}%)"
+      f"   generic {str_gen_ratio:.3f}x ({pct(str_gen_ratio):+.1f}%)")
 # Gate 12: neither mode may regress. A ratio < 1.0 means VAL slower than baseline.
 gate12 = "PASS" if (spec_ratio >= 0.97 and gen_ratio >= 0.97) else "REVIEW"
 print(f"    Gate 12 (no regression in EITHER mode, >= -3% tolerance): {gate12}")
@@ -180,7 +206,7 @@ for w in ("decimal_cold", "method_cold"):
 
 # ── Markdown ──────────────────────────────────────────────────────────────────
 L = []
-L.append("# Compact Value Representation Benchmark (VAL Stage 1 + Gate 12)")
+L.append("# Compact Value Representation Benchmark (VAL Stage 3 / thin-Str + Gate 12)")
 L.append("")
 L.append(f"**Date:** {ts}")
 L.append(f"**Host:** {cpu}")
@@ -195,17 +221,21 @@ L.append("## 1. Structural fact — `size_of::<Value>()`")
 L.append("")
 L.append(f"| | bytes |")
 L.append(f"|---|---|")
-L.append(f"| pre-VAL baseline (@ `{base_commit}`) | **{base_size}** |")
-L.append(f"| VAL Stage 1 (this branch) | **{val_size}** |")
+L.append(f"| Stage-1 floor baseline (@ `{base_commit}`) | **{base_size}** |")
+L.append(f"| VAL Stage 3 / thin-`Str` (this branch) | **{val_size}** |")
 L.append("")
-L.append("The honest Stage-1 floor is **24**, not 16: the inline scalar variants")
-L.append("(`Int`/`Float`) take any bit pattern, so Rust cannot niche-elide the")
-L.append("discriminant — the layout is `round_up(widest_payload) + 8-byte tag`. With")
-L.append("the fat `Str(Rc<str>)` (16-byte 2-word pointer) still the widest payload,")
-L.append("that is 16 + 8 = 24. Reaching 16 needs thin-`Str` (Task 9); 8 needs the")
-L.append("NaN-box (Stage 2, gated). Boxing the two fat method-binding variants")
-L.append("(`ClassMethod`/`GeneratorMethod`, 24-byte payloads) was the load-bearing")
-L.append("32→24 shrink; boxing `Decimal` removed the other 16-byte inline payload.")
+L.append("Stage 3 thins the two `Rc<str>`-carrying variants (`Str` AND `Builtin`) from")
+L.append("the fat 16-byte `Rc<str>` (data ptr + length) to the single-word `AStr`")
+L.append("(`Rc<Box<str>>`, 8 bytes — the `Box<str>` carries its own length INSIDE the")
+L.append("heap allocation, so the `Rc` is a thin pointer). Both had to be thinned: the")
+L.append("enum floor is `round_up(widest_payload) + 8-byte tag`, so a single remaining")
+L.append("fat `Rc<str>` would have re-pinned it at 24. With the widest payload now 8")
+L.append("bytes and `Decimal` already boxed (Stage 1), the layout is `8 + 8` = **16** —")
+L.append("the VAL Stage-3 floor, reached with **NO new ownership `unsafe`** (the")
+L.append("deferred NaN-box's selling point). 8 bytes needs the NaN-box (deferred —")
+L.append("gcmodule lacks public `Cc::into_raw`/`from_raw`). The tradeoff is a")
+L.append("double-indirection on string ACCESS (`Value → Rc → Box<str> → bytes`),")
+L.append("surfaced by the string workloads below.")
 L.append("")
 L.append("---")
 L.append("")
@@ -224,31 +254,37 @@ for w in order:
     L.append(f"| {w}{tag} | {cell('base_spec', w)} | {cell('val_spec', w)} | "
              f"{cell('base_gen', w)} | {cell('val_gen', w)} |")
 L.append("")
-L.append("## 3. Geomean (HOT workloads) — VAL vs same-session baseline")
+L.append("## 3. Geomean — VAL (16 B) vs same-session Stage-1 baseline (24 B)")
 L.append("")
-L.append("| Mode | baseline geomean (ms) | VAL geomean (ms) | speedup | delta |")
-L.append("|------|-----------------------|------------------|---------|-------|")
-bs = mode_geomean("base_spec", HOT); vs = mode_geomean("val_spec", HOT)
-bg = mode_geomean("base_gen",  HOT); vg = mode_geomean("val_gen",  HOT)
-L.append(f"| **specialized** | {bs:.1f} | {vs:.1f} | {spec_ratio:.3f}× | {pct(spec_ratio):+.1f}% |")
-L.append(f"| **generic (`--no-specialize`)** | {bg:.1f} | {vg:.1f} | {gen_ratio:.3f}× | {pct(gen_ratio):+.1f}% |")
+L.append("Three subsets: **ALL-HOT** (every non-cold workload), **SCALAR** (the original")
+L.append("CPU-bound loops — int/float/array/object, where `Str` is not on the path) and")
+L.append("**STRING** (the thin-`Str` workloads: concat / string-keyed map / codepoint")
+L.append("index / memory-bound `array<string>`). The STRING subset is the one that can")
+L.append("REGRESS from the double-indirection — reported separately, not averaged away.")
 L.append("")
-L.append(f"**Gate 12: {gate12}.** VAL's win is an encoding optimization UNDER the value")
-L.append("API (not a specialization guard), so the generic VM — which skips every")
-L.append("IC/adaptive/global fast path — must benefit from the smaller `Value` too and")
-L.append("must NOT regress. A generic-mode regression would be a VAL bug, not an")
-L.append("acceptable trade.")
+L.append("| Subset / Mode | baseline geomean (ms) | VAL geomean (ms) | speedup | delta |")
+L.append("|---------------|-----------------------|------------------|---------|-------|")
+def grow(label, base_series, val_series, wl, r):
+    b = mode_geomean(base_series, wl); v = mode_geomean(val_series, wl)
+    L.append(f"| {label} | {b:.1f} | {v:.1f} | {r:.3f}× | {pct(r):+.1f}% |")
+grow("ALL-HOT specialized", "base_spec", "val_spec", HOT, spec_ratio)
+grow("ALL-HOT generic",     "base_gen",  "val_gen",  HOT, gen_ratio)
+grow("SCALAR specialized",  "base_spec", "val_spec", SCALAR, scal_spec_ratio)
+grow("SCALAR generic",      "base_gen",  "val_gen",  SCALAR, scal_gen_ratio)
+grow("STRING specialized",  "base_spec", "val_spec", STRING, str_spec_ratio)
+grow("STRING generic",      "base_gen",  "val_gen",  STRING, str_gen_ratio)
 L.append("")
-L.append("**Honest reading:** on this host (a fast Apple-silicon core) these workloads")
-L.append("are CPU-bound, not memory-bandwidth-bound, so the 32→24 shrink lands at the")
-L.append("**noise floor** — both modes' geomeans sit within ±1% of the baseline across")
-L.append("runs (a positive delta on one run, a slightly negative one on the next). No")
-L.append("speedup is claimed; the load-bearing facts are (1) the structural 32→24")
-L.append("shrink and (2) **no regression in EITHER mode** beyond noise (Gate 12). The")
-L.append("cache-density win this shrink buys becomes measurable on memory-bound,")
-L.append("large-`Vec<Value>`/`IndexMap`-traversal workloads and compounds with the")
-L.append("later stages (thin-`Str`→16, NaN-box→8); Stage 1 alone is a correctness +")
-L.append("foundation step, not a throughput headline.")
+L.append(f"**Gate 12: {gate12}.** Thin-`Str` is an encoding change UNDER the value API")
+L.append("(not a specialization guard), so the generic VM — which skips every")
+L.append("IC/adaptive/global fast path — must NOT regress either. A generic-mode")
+L.append("regression would be a VAL bug, not an acceptable trade.")
+L.append("")
+L.append("**Honest reading:** the SCALAR subset is unaffected (those workloads never")
+L.append("touch `Str`), so any SCALAR delta is pure machine noise. The STRING subset is")
+L.append("where the 24→16 shrink trades against the extra string-access indirection:")
+L.append("read the STRING geomean as the NET for string-bound code, and `membound_strings`")
+L.append("(the large-working-set scan) as the cache-density signal specifically. See the")
+L.append("KEEP-or-STOP verdict at the foot of this report for the net call.")
 L.append("")
 L.append("## 4. Cold-path check (Task 1 / Task 2 boxing)")
 L.append("")
