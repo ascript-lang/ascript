@@ -343,6 +343,29 @@ impl CheckTy {
             return Compat3::Yes;
         }
 
+        // Rule 1.5 — type VARIABLE (TYPE §4.2). The cardinal Gate-5 invariant: an
+        // unsolved/unbounded `Var` is the gradual top — `Unknown`, NEVER `No`. A
+        // BOUNDED `Var` as the DESTINATION checks the source against its interface
+        // bound via `conforms` (so a bounded `T` only accepts a conforming value, but
+        // `No` only on a provable concrete failure). Every other `Var` interaction is
+        // `Unknown`. (A solved `Var` is substituted away before any diagnosing
+        // `assignable` — §4.2 — so a `Var` reaching here is genuinely unsolved.)
+        if let Var(_, bound) = dst {
+            return match bound {
+                Some(b) => match b.as_ref() {
+                    Interface(iid) => table.conforms(self, *iid),
+                    // A non-interface bound (shouldn't occur — bounds are
+                    // interface-only) → gradual.
+                    _ => Compat3::Unknown,
+                },
+                None => Compat3::Unknown,
+            };
+        }
+        if matches!(self, Var(_, _)) {
+            // A `Var` SOURCE flowing into any slot is never provably wrong (gradual).
+            return Compat3::Unknown;
+        }
+
         // Rule 2 — Never.
         if matches!(self, Never) {
             return Compat3::Yes; // bottom assignable to anything
@@ -457,6 +480,96 @@ impl CheckTy {
             } else {
                 Compat3::No
             };
+        }
+
+        // Rule 5b — INTERFACE destination (IFACE §6 / TYPE §4.5): structural
+        // conformance. Placed BEFORE the nominal-class rule 6 so a `Class`/`ClassApp`
+        // source into an interface slot routes through `conforms` (not rule 6's
+        // class-vs-non-class fall-through). `No` only on a fully-concrete provable
+        // failure; a non-class / partial source stays `Unknown` (the gradual gate).
+        if let Interface(iid) = dst {
+            return table.conforms(self, *iid);
+        }
+        // A source interface flowing into a non-interface slot is not provably wrong
+        // (a value typed by an interface could be anything that conforms) → gradual.
+        if matches!(self, Interface(_)) {
+            return Compat3::Unknown;
+        }
+
+        // Rule 5c — parameterized user generics: INVARIANT (TYPE §4.6 — a NEW arm,
+        // NOT the covariant built-in rule 8). Same head + arity → each type-arg pair
+        // checked in BOTH directions; `No` only when EVERY pair is concrete-distinct
+        // both ways. Different head / arity (both concrete) → `No`. Any pair involving
+        // a `Var`/`Any` → `Unknown` (the Var-bias). Placed before rule 6 so a
+        // parameterized head never falls into the nominal-class arm.
+        match (self, dst) {
+            (ClassApp(c, sargs), ClassApp(d, dargs)) => {
+                return if c != d || sargs.len() != dargs.len() {
+                    Compat3::No
+                } else {
+                    invariant_args(sargs, dargs, table, depth)
+                };
+            }
+            (EnumApp(c, sargs), EnumApp(d, dargs)) => {
+                return if c != d || sargs.len() != dargs.len() {
+                    Compat3::No
+                } else {
+                    invariant_args(sargs, dargs, table, depth)
+                };
+            }
+            // A parameterized class instance IS an object at runtime (mirrors rule 6).
+            (ClassApp(_, _), Object) => return Compat3::Yes,
+            // A raw class ref vs a parameterized one of the SAME (or related) head is
+            // not provably wrong → gradual; of an unrelated head → provably wrong.
+            (ClassApp(c, _), Class(d)) | (Class(c), ClassApp(d, _)) => {
+                return if c == d || table.is_subclass(*c, *d) || table.is_subclass(*d, *c) {
+                    Compat3::Unknown
+                } else {
+                    Compat3::No
+                };
+            }
+            (EnumApp(c, _), Enum(d)) | (Enum(c), EnumApp(d, _)) => {
+                return if c == d {
+                    Compat3::Unknown
+                } else {
+                    Compat3::No
+                };
+            }
+            // A parameterized head vs a concrete primitive/container → provably wrong.
+            (ClassApp(_, _) | EnumApp(_, _), d) if prim(d) || is_concrete_ctor(d) => {
+                return Compat3::No;
+            }
+            (s, ClassApp(_, _) | EnumApp(_, _)) if prim(s) || is_concrete_ctor(s) => {
+                return Compat3::No;
+            }
+            _ => {}
+        }
+
+        // Rule 5d — parameterized FUNCTION types (TYPE §5.2). `FnSig` vs `FnSig`:
+        // params CONTRAVARIANT, return COVARIANT — a `No` needs ALL components
+        // provable, and the corpus uses the bare `fn` escape, so this almost always
+        // lands on `Unknown`. `FnSig` vs the bare `Fn` (either direction) → `Unknown`.
+        match (self, dst) {
+            (FnSig(sps, sret), FnSig(dps, dret)) => {
+                if sps.len() != dps.len() {
+                    return Compat3::No; // a provable arity clash
+                }
+                let mut acc = Compat3::Yes;
+                for (sp, dp) in sps.iter().zip(dps.iter()) {
+                    // params: contravariant → dst-param assignable to src-param.
+                    acc = meet_compat(acc, dp.assignable_depth(sp, table, depth + 1));
+                }
+                acc = meet_compat(acc, sret.assignable_depth(dret, table, depth + 1));
+                return acc;
+            }
+            (FnSig(_, _), Fn) | (Fn, FnSig(_, _)) => return Compat3::Unknown,
+            (FnSig(_, _), d) if (prim(d) && !matches!(d, Fn)) || is_concrete_ctor(d) => {
+                return Compat3::No;
+            }
+            (s, FnSig(_, _)) if (prim(s) && !matches!(s, Fn)) || is_concrete_ctor(s) => {
+                return Compat3::No;
+            }
+            _ => {}
         }
 
         // Rule 6 — nominal classes.
@@ -721,6 +834,36 @@ fn is_concrete_ctor(t: &CheckTy) -> bool {
             | CheckTy::Future(_)
             | CheckTy::Result(_)
     )
+}
+
+/// INVARIANT type-argument compatibility (TYPE §4.6) for the NEW user generic heads
+/// (`ClassApp`/`EnumApp`). Each pair `(s, d)` is checked in BOTH directions:
+/// - either side an unsolved/unbounded `Var` (or `Any`) → that pair is `Unknown`
+///   (the Var-bias: a pair with a variable NEVER yields `No`);
+/// - both directions `Yes` (mutually assignable, i.e. equal-up-to-gradual) → `Yes`;
+/// - both directions `No` (concrete-distinct both ways) → the WHOLE thing is `No`;
+/// - anything else (e.g. `Dog → Animal` Yes but `Animal → Dog` No) → `Unknown`
+///   (the documented v1 invariance limitation: silent, not blocking).
+fn invariant_args(sargs: &[CheckTy], dargs: &[CheckTy], table: &Table, depth: usize) -> Compat3 {
+    let mut acc = Compat3::Yes;
+    for (s, d) in sargs.iter().zip(dargs.iter()) {
+        // Var-bias / gradual: any side a var or `Any` → this pair is `Unknown`.
+        let involves_gradual = matches!(s, CheckTy::Var(_, _) | CheckTy::Any)
+            || matches!(d, CheckTy::Var(_, _) | CheckTy::Any);
+        let pair = if involves_gradual {
+            Compat3::Unknown
+        } else {
+            let fwd = s.assignable_depth(d, table, depth + 1);
+            let bwd = d.assignable_depth(s, table, depth + 1);
+            match (fwd, bwd) {
+                (Compat3::No, Compat3::No) => return Compat3::No, // concrete-distinct both ways
+                (Compat3::Yes, Compat3::Yes) => Compat3::Yes,
+                _ => Compat3::Unknown,
+            }
+        };
+        acc = meet_compat(acc, pair);
+    }
+    acc
 }
 
 /// Combine two component compatibilities (covariant constructor): `No` dominates,
@@ -1089,6 +1232,133 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::GenericType)
             .unwrap();
         assert_eq!(CheckTy::from_type_node(node, &table), CheckTy::Any);
+    }
+
+    // ------------------ TYPE Task 11: assignable for the new variants ------------
+
+    fn cid(table: &Table, name: &str) -> ClassId {
+        table.class_id(name).unwrap()
+    }
+
+    #[test]
+    fn var_is_gradual_both_directions_never_no() {
+        let tbl = t();
+        let v = CheckTy::Var(param_template_id("T"), None);
+        // Var as source: into anything → Unknown, never No.
+        assert_eq!(v.assignable(&CheckTy::Int, &tbl), Compat3::Unknown);
+        assert_eq!(v.assignable(&CheckTy::String, &tbl), Compat3::Unknown);
+        // Var as destination (unbounded): from anything → Unknown, never No.
+        assert_eq!(CheckTy::Int.assignable(&v, &tbl), Compat3::Unknown);
+        assert_eq!(CheckTy::String.assignable(&v, &tbl), Compat3::Unknown);
+    }
+
+    #[test]
+    fn classapp_invariance() {
+        let table = build_table("class Box<T> { value: T }");
+        let b = cid(&table, "Box");
+        let box_int = CheckTy::ClassApp(b, vec![CheckTy::Int]);
+        let box_str = CheckTy::ClassApp(b, vec![CheckTy::String]);
+        let box_any = CheckTy::ClassApp(b, vec![CheckTy::Any]);
+        // Box<int> ↮ Box<string> → No (concrete-distinct both ways).
+        assert_eq!(box_int.assignable(&box_str, &table), Compat3::No);
+        // Box<int> ↔ Box<any> → gradual (not No).
+        assert_ne!(box_int.assignable(&box_any, &table), Compat3::No);
+        assert_ne!(box_any.assignable(&box_int, &table), Compat3::No);
+        // Box<int> → Box<int> → Yes.
+        assert_eq!(
+            box_int.assignable(&CheckTy::ClassApp(b, vec![CheckTy::Int]), &table),
+            Compat3::Yes
+        );
+    }
+
+    #[test]
+    fn classapp_dog_animal_is_silent_not_blocking() {
+        // Box<Dog> NOT assignable to Box<Animal>, but the checker stays SILENT
+        // (Unknown) — the documented v1 invariance limitation, NOT a blocking No.
+        let table = build_table("class Animal {}\nclass Dog extends Animal {}\nclass Box<T> { value: T }");
+        let b = cid(&table, "Box");
+        let dog = CheckTy::Class(cid(&table, "Dog"));
+        let animal = CheckTy::Class(cid(&table, "Animal"));
+        let box_dog = CheckTy::ClassApp(b, vec![dog]);
+        let box_animal = CheckTy::ClassApp(b, vec![animal]);
+        assert_eq!(box_dog.assignable(&box_animal, &table), Compat3::Unknown);
+    }
+
+    #[test]
+    fn classapp_var_arg_never_no() {
+        // Box<T> (unsolved var arg) vs Box<int> → Unknown (Var-bias), never No.
+        let table = build_table("class Box<T> { value: T }");
+        let b = cid(&table, "Box");
+        let box_t = CheckTy::ClassApp(b, vec![CheckTy::Var(param_template_id("T"), None)]);
+        let box_int = CheckTy::ClassApp(b, vec![CheckTy::Int]);
+        assert_eq!(box_t.assignable(&box_int, &table), Compat3::Unknown);
+        assert_eq!(box_int.assignable(&box_t, &table), Compat3::Unknown);
+    }
+
+    #[test]
+    fn classapp_distinct_heads_no() {
+        let table = build_table("class Box<T> { value: T }\nclass Cell<T> { value: T }");
+        let b = cid(&table, "Box");
+        let c = cid(&table, "Cell");
+        let box_int = CheckTy::ClassApp(b, vec![CheckTy::Int]);
+        let cell_int = CheckTy::ClassApp(c, vec![CheckTy::Int]);
+        assert_eq!(box_int.assignable(&cell_int, &table), Compat3::No);
+    }
+
+    #[test]
+    fn fnsig_vs_bare_fn_is_unknown() {
+        let tbl = t();
+        let sig = CheckTy::FnSig(vec![CheckTy::Int], Box::new(CheckTy::String));
+        assert_eq!(sig.assignable(&CheckTy::Fn, &tbl), Compat3::Unknown);
+        assert_eq!(CheckTy::Fn.assignable(&sig, &tbl), Compat3::Unknown);
+    }
+
+    #[test]
+    fn fnsig_vs_nonfn_concrete_is_no() {
+        let tbl = t();
+        let sig = CheckTy::FnSig(vec![CheckTy::Int], Box::new(CheckTy::String));
+        assert_eq!(sig.assignable(&CheckTy::Int, &tbl), Compat3::No);
+    }
+
+    #[test]
+    fn interface_destination_uses_conforms() {
+        let table = build_table(
+            "interface Shape { fn area(): number }\nclass Circle { fn area(): number { return 1 } }\nclass Empty { fn name(): string { return \"x\" } }",
+        );
+        let iid = table.interface_id("Shape").unwrap();
+        let iface = CheckTy::Interface(iid);
+        let circle = CheckTy::Class(table.class_id("Circle").unwrap());
+        let empty = CheckTy::Class(table.class_id("Empty").unwrap());
+        assert_eq!(circle.assignable(&iface, &table), Compat3::Yes);
+        assert_eq!(empty.assignable(&iface, &table), Compat3::No);
+        // a primitive into an interface slot → Unknown (gradual, not a class).
+        assert_eq!(CheckTy::Int.assignable(&iface, &table), Compat3::Unknown);
+    }
+
+    #[test]
+    fn bounded_var_destination_checks_conforms() {
+        let table = build_table(
+            "interface Shape { fn area(): number }\nclass Circle { fn area(): number { return 1 } }\nclass Empty { fn name(): string { return \"x\" } }",
+        );
+        let iid = table.interface_id("Shape").unwrap();
+        let bounded = CheckTy::Var(
+            param_template_id("T"),
+            Some(Box::new(CheckTy::Interface(iid))),
+        );
+        let circle = CheckTy::Class(table.class_id("Circle").unwrap());
+        let empty = CheckTy::Class(table.class_id("Empty").unwrap());
+        // A conforming class into a bounded `T` slot → Yes; non-conforming → No.
+        assert_eq!(circle.assignable(&bounded, &table), Compat3::Yes);
+        assert_eq!(empty.assignable(&bounded, &table), Compat3::No);
+    }
+
+    #[test]
+    fn num_interplay_int_into_number_and_not_string() {
+        let tbl = t();
+        // T solved to int flows into `: number` (Yes — union membership via rule 9 /
+        // numeric tower) and NOT into `: string` (No).
+        assert_eq!(CheckTy::Int.assignable(&CheckTy::Number, &tbl), Compat3::Yes);
+        assert_eq!(CheckTy::Int.assignable(&CheckTy::String, &tbl), Compat3::No);
     }
 
     #[test]
