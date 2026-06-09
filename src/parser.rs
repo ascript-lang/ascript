@@ -10,6 +10,7 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>, AsError> {
         tokens,
         pos: 0,
         pending_gt: 0,
+        type_param_scope: Vec::new(),
     };
     parser.program()
 }
@@ -23,6 +24,15 @@ struct Parser<'a> {
     /// advancing the cursor. Type-arg closings nest strictly, so a simple counter
     /// suffices (the Rust/Java/C# nested-generics technique).
     pending_gt: usize,
+    /// TYPE §6: the generic type-parameter names currently in scope (the params of
+    /// the enclosing `fn`/`class`/`enum`/`interface` decl). A bare `Ident` in TYPE
+    /// position that matches one of these lowers to `Type::Param` (runtime-erased)
+    /// rather than `Type::Named`. Pushed by `parse_type_params`, popped after the
+    /// decl body parses. A flat `Vec` (not a stack of frames) suffices because
+    /// generic decls do not nest a SECOND generic param list in v1 (a method inside
+    /// a generic class shares the class's params; per-method type params are a
+    /// later additive feature). When that lands, this becomes a frame stack.
+    type_param_scope: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -268,6 +278,9 @@ impl<'a> Parser<'a> {
                 ))
             }
         };
+        // TYPE §6: optional `<T, U: Bound>` generic param list (in scope for the
+        // signature + body); runtime-erased, popped after the body parses.
+        let type_params = self.parse_type_params()?;
         let params = self.param_list()?;
         let ret = if *self.peek() == Tok::Colon {
             self.advance();
@@ -276,6 +289,7 @@ impl<'a> Parser<'a> {
             None
         };
         let body = self.block()?;
+        self.pop_type_params(type_params.len());
         let span = Span::new(start, self.prev_end());
         Ok(Stmt::Fn {
             name,
@@ -303,6 +317,9 @@ impl<'a> Parser<'a> {
                 ))
             }
         };
+        // TYPE §6: optional `<T>` generic param list, in scope for variant payload
+        // field types (`enum Option<T> { Some(value: T), None }`).
+        let type_params = self.parse_type_params()?;
         self.eat(&Tok::LBrace)?;
         let mut variants = Vec::new();
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
@@ -355,6 +372,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.eat(&Tok::RBrace)?;
+        self.pop_type_params(type_params.len());
         let span = Span::new(start, self.prev_end());
         Ok(Stmt::Enum {
             name,
@@ -381,6 +399,13 @@ impl<'a> Parser<'a> {
                 ))
             }
         };
+        // TYPE §6: optional `<T>` generic param list (in scope for the method
+        // requirement signatures). The `Interface` decl node already reserves a
+        // `type_params: Vec<String>` field (IFACE §6.1), so populate it with the
+        // declared names (bounds stay parser-only / static-checker-consumed).
+        let type_param_nodes = self.parse_type_params()?;
+        let type_params: Vec<String> =
+            type_param_nodes.iter().map(|tp| tp.name.clone()).collect();
         // Optional `extends I1, I2, …` composition list (contextual keyword).
         let extends = self.parse_iface_name_list("extends")?;
         self.eat(&Tok::LBrace)?;
@@ -446,10 +471,11 @@ impl<'a> Parser<'a> {
             });
         }
         self.eat(&Tok::RBrace)?;
+        self.pop_type_params(type_param_nodes.len());
         let span = Span::new(start, self.prev_end());
         Ok(Stmt::Interface {
             name,
-            type_params: Vec::new(),
+            type_params,
             extends,
             methods,
             span,
@@ -565,6 +591,9 @@ impl<'a> Parser<'a> {
                 ))
             }
         };
+        // TYPE §6: optional `<T>` generic param list, in scope for field types,
+        // method signatures, and the `extends`/`implements` clauses.
+        let type_params = self.parse_type_params()?;
         let superclass = if matches!(self.peek(), Tok::Ident(s) if s == "extends") {
             // `extends` is a soft keyword here (lexes as Ident)
             self.advance();
@@ -711,6 +740,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.eat(&Tok::RBrace)?;
+        self.pop_type_params(type_params.len());
         let span = Span::new(start, self.prev_end());
         Ok(Stmt::Class {
             name,
@@ -757,6 +787,69 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// TYPE §6: parse an OPTIONAL generic type-parameter list after a decl name —
+    /// `< Ident (: Bound)? (, Ident (: Bound)?)* >`. Returns the declared param
+    /// names (with their optional bound types) AND pushes the names onto
+    /// `type_param_scope` so type references inside the decl lower to `Type::Param`.
+    /// The caller MUST call `pop_type_params(n)` with the returned count after the
+    /// decl body is parsed. When the next token is not `<`, this is a no-op (returns
+    /// an empty list, pushes nothing). The list itself is RUNTIME-ERASED — the
+    /// returned bounds are consumed only by the static checker (TYPE Tasks 8–12);
+    /// the runtime decl nodes do not store them in this unit.
+    fn parse_type_params(
+        &mut self,
+    ) -> Result<Vec<crate::ast::TypeParam>, AsError> {
+        let mut params = Vec::new();
+        if *self.peek() != Tok::Lt {
+            return Ok(params);
+        }
+        self.advance(); // <
+        // An empty `<>` is rejected (a generic decl must declare ≥1 param).
+        loop {
+            let name = match self.advance() {
+                Tok::Ident(n) => n,
+                other => {
+                    return Err(AsError::at(
+                        format!("expected a type-parameter name, found {:?}", other),
+                        self.tokens[self.pos - 1].span,
+                    ))
+                }
+            };
+            // Push the name into scope IMMEDIATELY so a later param's bound can
+            // reference an earlier param (`<T, C: Container<T>>`).
+            self.type_param_scope.push(name.clone());
+            // Optional bound: `: Type` (only interfaces are admitted by the checker,
+            // but the parser accepts any type here — the checker rejects non-iface
+            // bounds in TYPE Tasks 8–12).
+            let bound = if *self.peek() == Tok::Colon {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            params.push(crate::ast::TypeParam { name, bound });
+            if *self.peek() == Tok::Comma {
+                self.advance();
+                // Trailing comma before `>` is tolerated.
+                if *self.peek() == Tok::Gt || *self.peek() == Tok::Shr {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        self.eat_type_gt()?;
+        Ok(params)
+    }
+
+    /// Pop `n` names off `type_param_scope` (the count of params an earlier
+    /// `parse_type_params` pushed). Called after a generic decl's body parses so the
+    /// params go out of scope.
+    fn pop_type_params(&mut self, n: usize) {
+        let new_len = self.type_param_scope.len().saturating_sub(n);
+        self.type_param_scope.truncate(new_len);
+    }
+
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
         let mut t = self.parse_type_atom()?;
         while *self.peek() == Tok::Pipe {
@@ -772,7 +865,38 @@ impl<'a> Parser<'a> {
         let span = self.span();
         let atom = match self.advance() {
             Tok::Nil => Type::Nil,
-            Tok::Fn => Type::Fn,
+            // `fn` is the bare callable type; `fn(A) -> B` is a parameterized
+            // function type (`Type::FnSig`). Disambiguated by a `(` immediately
+            // after `fn` (TYPE §6 — known type position, no expression ambiguity).
+            Tok::Fn => {
+                if *self.peek() == Tok::LParen {
+                    self.advance(); // (
+                    let mut params = Vec::new();
+                    if *self.peek() != Tok::RParen {
+                        loop {
+                            params.push(self.parse_type()?);
+                            if *self.peek() == Tok::Comma {
+                                self.advance();
+                                if *self.peek() == Tok::RParen {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.eat(&Tok::RParen)?;
+                    // `-> Ret` is REQUIRED for a function-type signature. `->` lexes
+                    // as two tokens (`Minus` then `Gt`) — there is no dedicated arrow
+                    // token (`=>` is `FatArrow`); consume the pair.
+                    self.eat(&Tok::Minus)?;
+                    self.eat(&Tok::Gt)?;
+                    let ret = self.parse_type()?;
+                    Type::FnSig(params, Box::new(ret))
+                } else {
+                    Type::Fn
+                }
+            }
             Tok::LBracket => {
                 // tuple type [T1, T2, ...]
                 let mut parts = Vec::new();
@@ -826,6 +950,37 @@ impl<'a> Parser<'a> {
                     let v = self.parse_type()?;
                     self.eat_type_gt()?;
                     Type::Map(Box::new(k), Box::new(v))
+                }
+                // TYPE §6: a bare identifier matching an in-scope generic type
+                // parameter lowers to `Type::Param` (runtime-erased accept-anything).
+                // A type param is NEVER applied to type args (`T<int>` is nonsense),
+                // so this only handles the bare reference.
+                _ if self.type_param_scope.iter().any(|p| p == &name) => Type::Param(name),
+                // TYPE §6: a USER generic application in type position
+                // (`Box<int>`, `Box<Box<int>>`). The head is a user class/enum/
+                // interface name; its type-argument list is PARSED (so the syntax is
+                // accepted and `>>` splits correctly) but DISCARDED for the runtime
+                // contract — generics are erased, so `Box<int>` checks exactly like
+                // the bare `Box` head (`Type::Named`). The static checker (TYPE Tasks
+                // 8–12) is what reads the args.
+                _ if *self.peek() == Tok::Lt => {
+                    self.advance(); // <
+                    // Parse-and-discard the comma-separated type-argument list.
+                    if *self.peek() != Tok::Gt && *self.peek() != Tok::Shr {
+                        loop {
+                            let _ = self.parse_type()?;
+                            if *self.peek() == Tok::Comma {
+                                self.advance();
+                                if *self.peek() == Tok::Gt || *self.peek() == Tok::Shr {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.eat_type_gt()?;
+                    Type::Named(name)
                 }
                 _ => Type::Named(name),
             },
@@ -3154,5 +3309,114 @@ mod tests {
             first_arm_pattern("match s { Point => 1 }"),
             Pattern::Ident(_)
         ));
+    }
+
+    // ---- TYPE Task 4: generics surface (type-param lists, Param, FnSig) ----
+
+    /// Pull the declared return / first-param type text out of a `fn` decl for
+    /// assertions.
+    fn fn_first_param_ty(stmt: &Stmt) -> Option<String> {
+        match stmt {
+            Stmt::Fn { params, .. } => params.first().and_then(|p| p.ty.as_ref().map(|t| t.to_string())),
+            _ => None,
+        }
+    }
+    fn fn_ret_ty(stmt: &Stmt) -> Option<String> {
+        match stmt {
+            Stmt::Fn { ret, .. } => ret.as_ref().map(|t| t.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn parses_generic_fn_type_param_list_and_param_refs() {
+        // The fn RETURN type uses `:` (the real AScript syntax); the `->` arrow is
+        // ONLY for a `fn(A) -> B` function-TYPE annotation.
+        let s = parse_one("fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {}");
+        // In-scope params lower to Type::Param, so `array<A>` renders `array<A>`.
+        assert_eq!(fn_first_param_ty(&s).as_deref(), Some("array<A>"));
+        assert_eq!(fn_ret_ty(&s).as_deref(), Some("array<B>"));
+        match &s {
+            Stmt::Fn { params, .. } => {
+                // Second param `f: fn(A) -> B` lowered to a FnSig.
+                assert_eq!(params[1].ty.as_ref().unwrap().to_string(), "fn(A) -> B");
+            }
+            o => panic!("expected fn decl, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_generic_fn_bound() {
+        // `fn first<T, C: Container<T>>(c: C): T` — the bound parses; `C` and `T`
+        // are in-scope params in the signature (return type via `:`).
+        let s = parse_one("fn first<T, C: Container<T>>(c: C): T { return c.at(0) }");
+        assert_eq!(fn_first_param_ty(&s).as_deref(), Some("C"));
+        assert_eq!(fn_ret_ty(&s).as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn parses_generic_class_enum_interface_decls() {
+        assert!(matches!(
+            parse_one("class Box<T> { value: T\n fn get(): T { return self.value } }"),
+            Stmt::Class { .. }
+        ));
+        assert!(matches!(
+            parse_one("enum Option<T> { Some(value: T), None }"),
+            Stmt::Enum { .. }
+        ));
+        assert!(matches!(
+            parse_one("interface Container<T> { fn len(): int\n fn at(i: int): T }"),
+            Stmt::Interface { .. }
+        ));
+        // A class field typed by the class's own param renders the bare param name.
+        match parse_one("class Box<T> { value: T }") {
+            Stmt::Class { fields, .. } => assert_eq!(fields[0].ty.to_string(), "T"),
+            o => panic!("expected class, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fnsig_type_zero_and_multi_arg() {
+        // Zero-arg
+        let s = parse_one("fn f(cb: fn() -> bool) {}");
+        assert_eq!(fn_first_param_ty(&s).as_deref(), Some("fn() -> bool"));
+        // Multi-arg, nested generic
+        let s = parse_one("fn g(cb: fn(int, string) -> array<int>) {}");
+        assert_eq!(
+            fn_first_param_ty(&s).as_deref(),
+            Some("fn(int, string) -> array<int>")
+        );
+    }
+
+    #[test]
+    fn nested_generic_application_closes_via_shr_split() {
+        // `map<int, array<int>>` — the closing `>>` must split (NUM helper reuse).
+        let s = parse_one("fn h(m: map<int, array<int>>) {}");
+        assert_eq!(fn_first_param_ty(&s).as_deref(), Some("map<int, array<int>>"));
+        // Box<Box<int>> nested user heads.
+        let s = parse_one("fn k(b: Box<Box<int>>) {}");
+        // User generic head discards args at runtime → renders the bare head name.
+        assert_eq!(fn_first_param_ty(&s).as_deref(), Some("Box"));
+    }
+
+    #[test]
+    fn type_param_only_in_scope_inside_its_decl() {
+        // Outside any generic decl, a bare `T` is an ordinary Named type, not a Param.
+        let s = parse_one("fn plain(x: T) {}");
+        match &s {
+            Stmt::Fn { params, .. } => {
+                // Renders identically (`T`), but it is a Named, not a Param.
+                assert!(matches!(params[0].ty, Some(crate::ast::Type::Named(_))));
+            }
+            o => panic!("got {o:?}"),
+        }
+        // Inside a generic decl, the SAME `T` lowers to a Param.
+        let s = parse_one("fn gen<T>(x: T) {}");
+        match &s {
+            Stmt::Fn { params, .. } => {
+                assert!(matches!(params[0].ty, Some(crate::ast::Type::Param(_))));
+            }
+            o => panic!("got {o:?}"),
+        }
     }
 }

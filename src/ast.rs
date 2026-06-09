@@ -183,6 +183,17 @@ pub enum Type {
     FnSig(Vec<Type>, Box<Type>),
 }
 
+/// TYPE §6: one declared generic type parameter — a name with an optional
+/// interface bound (`T` or `C: Container<T>`). Produced by the parsers' type-param
+/// lists. RUNTIME-ERASED: the runtime decl nodes do not store these (generics carry
+/// no runtime obligation); they are consumed only by the static checker (TYPE Tasks
+/// 8–12), which records the names + bounds in its symbol table.
+#[derive(Clone, Debug)]
+pub struct TypeParam {
+    pub name: String,
+    pub bound: Option<Type>,
+}
+
 /// A function parameter: a name with an optional type annotation.
 #[derive(Clone, Debug)]
 pub struct Param {
