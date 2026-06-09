@@ -518,7 +518,14 @@ pub async fn run_file_on_vm_with_packages(
         interp.set_package_resolver(map);
     }
     interp.install_self();
-    let vm = Vm::new(interp.clone());
+    // VAL Task 4 (Gate 12 bench seam): `ASCRIPT_NO_SPECIALIZE=1` runs the CLI on
+    // the GENERIC VM (every IC / adaptive-arith / global fast path skipped),
+    // exactly as `vm_run_source_generic` does in tests. The two modes are asserted
+    // byte-identical by the three-way differential, so this is a pure
+    // measurement/debug seam — it changes speed, never observable behavior. Absent
+    // or any non-"1" value keeps the default specialized VM (byte-identical default).
+    let specialize = std::env::var("ASCRIPT_NO_SPECIALIZE").as_deref() != Ok("1");
+    let vm = Vm::with_specialize(interp.clone(), specialize);
     // Resolve relative imports against the source file's directory.
     if let Some(dir) = path.parent() {
         vm.set_module_dir(dir.to_path_buf());

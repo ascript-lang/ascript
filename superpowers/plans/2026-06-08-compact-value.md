@@ -163,7 +163,7 @@ Stage-2-only `ValueTag` + `Cc::into_raw`/`from_raw` (gated); Stage-4 `--no-escap
 ## Task 3 — Inline-scalar SMI fast path in VM arithmetic + adaptive `ArithKind::Int` operand load/store
 **Files:** `src/vm/run.rs` (arith site `:3778-3819`), `src/vm/adapt.rs`. **Tests:** `vm_differential.rs`,
 `value.rs` boundary test.
-- [ ] Failing tests (BOTH engines, four-mode): the SMI↔boxed spill **boundary** unit test of spec §7.2 —
+- [x] Failing tests (BOTH engines, four-mode): the SMI↔boxed spill **boundary** unit test of spec §7.2 —
   `2^47 − 1`, `2^47`, `−2^47`, `−2^47 − 1`, plus `2^53`, `i64::MAX`, `i64::MIN` — asserting for each:
   round-trip (`decode(encode(n))==n`), arithmetic that carries across the boundary yields the right
   kind+value, comparison across an SMI and a boxed operand of equal/adjacent value, and `MapKey` fold (an
@@ -172,11 +172,14 @@ Stage-2-only `ValueTag` + `Cc::into_raw`/`from_raw` (gated); Stage-4 `--no-escap
   no SMI, no spill — so in Stage 1 this test exercises the inline-`i64` path and the SMI/spill assertions
   become live only at Stage 2 (write the test now; it must pass trivially under the full-`i64` Stage-1 layout
   and again under the NaN-box if Stage 2 lands).
-- [ ] Add the `ArithKind::Int` guarded fast path in the arith site (NUM already added the `ArithKind::Int`
+- [x] Add the `ArithKind::Int` guarded fast path in the arith site (NUM already added the `ArithKind::Int`
   variant + checked-int semantics — Stage 1 makes its operand load/store read the inline scalar word with no
   heap touch, then run the EXACT same checked-int computation NUM defined). Specialized and generic VM
-  byte-identical (incl. which inputs panic). No new opcode.
-- [ ] Green both configs; clippy. **Four-mode differential green** (re-run scalar-heavy goldens).
+  byte-identical (incl. which inputs panic). No new opcode. NOTE: the `ArithKind::Int` arm already landed
+  with NUM and already reads `*x`/`*y` from the inline `Value::Int(i64)` word (delegating to the shared
+  `int_binop`); under the Stage-1 full-`i64` layout this IS the inline-scalar path — VAL only documented it
+  as such (the §7.2 boundary test exercises it now and goes live if the Stage-2 NaN-box lands).
+- [x] Green both configs; clippy. **Four-mode differential green** (re-run scalar-heavy goldens).
   **Review:** confirm the fast path is "guard the kind, then the exact generic op" (`run.rs:3779-3805`
   pattern); confirm a mixed Int/Float site deopts identically in both VM modes; confirm no panic-input
   divergence. Commit.
@@ -184,16 +187,22 @@ Stage-2-only `ValueTag` + `Cc::into_raw`/`from_raw` (gated); Stage-4 `--no-escap
 ## Task 4 — Stage-1 benchmarks (both VM modes) + size report + cold-path check
 **Files:** `bench/` (new harness writing a markdown report sibling to `bench/PROFILING_RESULTS.md`),
 reuse `src/stdlib/bench.rs`. **Tests:** the bench harness runs; no CI perf gate beyond Gate-12 no-regress.
-- [ ] Add `bench/compact_value_bench.as` + a runner; report **`size_of::<Value>()` 32→16**, and wall-clock
+- [x] Add `bench/compact_value_bench.as` + a runner; report **`size_of::<Value>()` 32→24** (the HONEST
+  Stage-1 floor — NOT 16; fat `Str` is still the widest payload), and wall-clock
   on scalar-heavy loops (int sum, array-index walk, Fibonacci/Mandelbrot over NUM ints), allocation/refcount
   churn (a `Cc`/`Rc` clone counter or `dhat`), and a cache-density proxy (large `Vec<Value>` / large
   `IndexMap` traversal) — **each in BOTH specialized AND `--no-specialize` generic mode** side by side
   (Gate 12). Add the **cold-path check**: a `ClassMethod`/`GeneratorMethod` construct+dispatch microbench
   confirming Task 1's boxing adds no measurable regression on those rare bindings.
-- [ ] Honest framing in the report: state the measured geomean PER MODE and flag any regression (the extra
+- [x] Honest framing in the report: state the measured geomean PER MODE and flag any regression (the extra
   `Decimal` indirection, the boxed-method-binding indirection). **No speedup is claimed** — the number is
-  whatever `bench/` reports. **Gate 12: no regression in EITHER mode.**
-- [ ] **Review:** reviewer RE-RUNS the bench in both modes and confirms the report's numbers + the
+  whatever `bench/` reports. **Gate 12: no regression in EITHER mode.** MEASURED (Apple M4, 5-rep
+  interleaved A/B vs same-session baseline @ 612339c, both `--profile profiling`): HOT geomean sits at the
+  NOISE FLOOR (±1% across runs) in BOTH specialized and generic modes → Gate-12 PASS (no regression in
+  either mode); the flagged cold-path is `decimal_cold` ~-10% (boxed `Rc<Decimal>` does an `Rc::new` per
+  op — only on decimal-heavy code), `method_cold` ~±1% (noise). Report: `bench/COMPACT_VALUE_RESULTS.md`.
+  Bench seam: `ASCRIPT_NO_SPECIALIZE=1` env on the CLI `run` path (byte-identical generic mode for the A/B).
+- [x] **Review:** reviewer RE-RUNS the bench in both modes and confirms the report's numbers + the
   no-either-mode-regression floor. Commit. **← Stage 1 is a green merge-able point on its own.**
 
 ---
