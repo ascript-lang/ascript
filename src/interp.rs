@@ -4262,8 +4262,18 @@ impl Interp {
             }
             Value::Generator(g) => match name {
                 // `gen.next` / `gen.close` are bound generator methods.
-                "next" => Ok(Value::GeneratorMethod(g.clone(), "next")),
-                "close" => Ok(Value::GeneratorMethod(g.clone(), "close")),
+                "next" => Ok(Value::GeneratorMethod(Rc::new(
+                    crate::value::GeneratorMethodData {
+                        handle: g.clone(),
+                        name: "next",
+                    },
+                ))),
+                "close" => Ok(Value::GeneratorMethod(Rc::new(
+                    crate::value::GeneratorMethodData {
+                        handle: g.clone(),
+                        name: "close",
+                    },
+                ))),
                 other => Err(AsError::at(
                     format!("generator has no property '{}' (try 'next')", other),
                     span,
@@ -4276,7 +4286,10 @@ impl Interp {
             // owned name; `call_value` dispatches it.
             Value::Class(c) => {
                 if crate::value::find_static_method(c, name).is_some() || name == "from" {
-                    Ok(Value::ClassMethod(c.clone(), name.into()))
+                    Ok(Value::ClassMethod(Rc::new(crate::value::ClassMethodData {
+                        class: c.clone(),
+                        name: name.into(),
+                    })))
                 } else {
                     Err(AsError::at(
                         format!("class {} has no static member '{}'", c.name, name),
@@ -4327,25 +4340,27 @@ impl Interp {
             Value::Class(class) => self.construct(class, args, span).await,
             Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
             Value::NativeMethod(m) => self.call_native_method(m, args, span).await,
-            Value::GeneratorMethod(g, method) => {
-                self.call_generator_method(&g, method, args, span).await
+            Value::GeneratorMethod(gm) => {
+                self.call_generator_method(&gm.handle, gm.name, args, span)
+                    .await
             }
             // ADT: calling a payload-variant CONSTRUCTOR (`Shape.Circle(2.0)`)
             // validates arity + field types and produces a constructed variant.
             // Calling a UNIT variant is an error.
             Value::EnumVariant(ev) => self.construct_variant(&ev, args, span).await,
-            Value::ClassMethod(c, name) => {
+            Value::ClassMethod(cm) => {
+                let (c, name) = (&cm.class, &cm.name);
                 // A user `static fn` (SP1 §3) takes precedence over the built-in
                 // `from` only if it exists; we resolved the name at read time, but
                 // re-resolve here so the carrier is self-contained. A static name
                 // that shadows `from` is impossible — `static fn from` is rejected.
-                if let Some((method, defining)) = crate::value::find_static_method(&c, &name) {
-                    self.call_static_method(method, defining, args, span, &name)
+                if let Some((method, defining)) = crate::value::find_static_method(c, name) {
+                    self.call_static_method(method, defining, args, span, name)
                         .await
-                } else if &*name == "from" {
+                } else if &**name == "from" {
                     let obj = args.first().cloned().unwrap_or(Value::Nil);
                     let strict = matches!(args.get(1), Some(Value::Bool(true)));
-                    self.validate_into(&c, &obj, strict, "", span)
+                    self.validate_into(c, &obj, strict, "", span)
                         .await
                         .map_err(Control::from)
                 } else {
@@ -6308,7 +6323,7 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
                 None => Err(AsError::at("integer overflow in '-'", span).into()),
             },
             Value::Float(n) => Ok(Value::Float(-n)),
-            Value::Decimal(d) => Ok(Value::Decimal(-d)),
+            Value::Decimal(d) => Ok(Value::Decimal(Rc::new(-*d))),
             _ => Err(AsError::at("cannot negate a non-number", span).into()),
         },
         UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
@@ -6596,20 +6611,20 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         let db = coerce_to_decimal(&r, span)?;
         if let (Some(a), Some(b)) = (da, db) {
             let result = match op {
-                BinOp::Add => Value::Decimal(a + b),
-                BinOp::Sub => Value::Decimal(a - b),
-                BinOp::Mul => Value::Decimal(a * b),
+                BinOp::Add => Value::Decimal(Rc::new(a + b)),
+                BinOp::Sub => Value::Decimal(Rc::new(a - b)),
+                BinOp::Mul => Value::Decimal(Rc::new(a * b)),
                 BinOp::Div => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal division by zero", span).into());
                     }
-                    Value::Decimal(a / b)
+                    Value::Decimal(Rc::new(a / b))
                 }
                 BinOp::Mod => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal remainder by zero", span).into());
                     }
-                    Value::Decimal(a % b)
+                    Value::Decimal(Rc::new(a % b))
                 }
                 // Ordering: both operands are already finite Decimals here
                 // (coerce_to_decimal above Tier-2-panics on a non-finite Number).
@@ -6904,7 +6919,7 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
         (Value::Decimal(a), Value::Decimal(b)) => Ok(a == b),
         // NUM §4: Decimal vs Int — the int converts EXACTLY.
         (Value::Decimal(a), Value::Int(i)) | (Value::Int(i), Value::Decimal(a)) => {
-            Ok(*a == rust_decimal::Decimal::from(*i))
+            Ok(**a == rust_decimal::Decimal::from(*i))
         }
         // Decimal vs Float (or vice-versa): coerce the number to decimal.
         (Value::Decimal(a), Value::Float(n)) | (Value::Float(n), Value::Decimal(a)) => {
@@ -6917,7 +6932,7 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
             let b = rust_decimal::Decimal::from_f64(*n).ok_or_else(|| {
                 AsError::at("cannot convert number to decimal for comparison", span)
             })?;
-            Ok(*a == b)
+            Ok(**a == b)
         }
         // All other pairs: generic structural equality.
         _ => Ok(l == r),
@@ -7016,7 +7031,7 @@ pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value 
         SharedNode::Bool(b) => Value::Bool(*b),
         SharedNode::Int(i) => Value::Int(*i),
         SharedNode::Float(f) => Value::Float(*f),
-        SharedNode::Decimal(d) => Value::Decimal(*d),
+        SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
         SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
         // Containers (and the opaque Regex/EnumVariant/Instance frozen nodes) stay
         // shared — re-wrap the SAME `Arc` (a pointer bump, no copy).
@@ -7050,7 +7065,7 @@ pub(crate) fn shared_to_value_shallow(node: &crate::value::SharedNode) -> Option
         SharedNode::Bool(b) => Value::Bool(*b),
         SharedNode::Int(i) => Value::Int(*i),
         SharedNode::Float(f) => Value::Float(*f),
-        SharedNode::Decimal(d) => Value::Decimal(*d),
+        SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
         SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
         SharedNode::Bytes(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
         SharedNode::Array(a) => {

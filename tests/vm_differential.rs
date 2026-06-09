@@ -5482,6 +5482,90 @@ async fn assert_three_way_matches(src: &str) {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  VAL Task 3 — the SMI↔boxed spill-BOUNDARY differential (spec §7.2).
+//
+//  The spill threshold of the §3.2 NaN-box bit budget is the i48 SMI range
+//  `[−2^47, 2^47 − 1]` (= `[-140737488355328, 140737488355327]`). The boundary
+//  values straddle it: `2^47 − 1` / `2^47` (positive edge) and `−2^47` /
+//  `−2^47 − 1` (negative edge), plus the far-out `2^53` and the i64 extremes.
+//  For EACH, on tree-walker == specialized-VM == generic-VM, byte-identical:
+//   - round-trip (the value prints back as itself),
+//   - arithmetic that CARRIES across the boundary (`+1`/`-1` over the edge),
+//   - comparison across an SMI and a boxed operand of adjacent value,
+//   - `MapKey` fold (a Map keyed by both an inline-SMI and a boxed `Int` value).
+//
+//  NOTE (Stage 1): under the niche-fallback layout `Int` is a FULL inline `i64` —
+//  there is NO SMI and NO spill, so this test passes TRIVIALLY today (it exercises
+//  the inline-`i64` path). It becomes the LIVE SMI/spill guard if/when the Stage-2
+//  NaN-box lands and `Int` gains a 48-bit SMI with a boxed-`i64` spill. The
+//  value-layer half (`decode(encode(n))==n` + the fold equality of two equal-valued
+//  `Int`s) lives in `src/value.rs` (`smi_boundary_round_trip_and_mapkey_fold`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn smi_boundary_arith_and_compare_three_way() {
+    // The i48 spill edges + the far values, exercised through real arithmetic that
+    // carries a result across the boundary. (`i64::MIN` is written `-MAX - 1`
+    // because `-9223372036854775808` lexes as unary-minus of an out-of-range
+    // literal — NUM behavior.) Each op runs `int_binop`'s checked-overflow path,
+    // so the specialized fast path's inline-scalar load and the generic
+    // `apply_binop` MUST agree on both value and overflow panics.
+    assert_three_way_matches(
+        "let a = 140737488355327\n\
+         let b = 140737488355328\n\
+         let c = -140737488355328\n\
+         let d = -140737488355329\n\
+         print(a)\n\
+         print(b)\n\
+         print(c)\n\
+         print(d)\n\
+         print(a + 1)\n\
+         print(b - 1)\n\
+         print(c - 1)\n\
+         print(d + 1)\n\
+         print(a < b)\n\
+         print(b > a)\n\
+         print(c > d)\n\
+         print(a == 140737488355327)\n\
+         print(a == b)\n\
+         print(140737488355327 + 1 == b)\n\
+         print(9223372036854775807)\n\
+         print(-9223372036854775807 - 1)\n\
+         print(9223372036854775807 % 2)\n\
+         print(9223372036854775807 / 2)\n",
+    )
+    .await;
+    // The overflow EDGE must panic identically on all three engines (the fast path
+    // delegates to `int_binop`, so the panic message + span are shared).
+    assert_three_way_matches("print(9223372036854775807 + 1)\n").await;
+    assert_three_way_matches("let m = -9223372036854775807 - 1\nprint(m - 1)\n").await;
+}
+
+#[cfg(feature = "data")]
+#[tokio::test]
+async fn smi_boundary_mapkey_fold_three_way() {
+    // The §7.2 Map-key half: a Map keyed by boundary `Int`s on both sides of the
+    // spill threshold. An SMI-encoded and a boxed-`Int` key of equal value MUST
+    // fold to the SAME Map key (today both are the inline `i64`). Looking up by a
+    // freshly-computed equal value (`a` vs the literal, `b` vs `a + 1`) proves the
+    // fold is by VALUE, not by encoding. Requires the `data` feature (`std/map`).
+    assert_three_way_matches(
+        "import * as map from \"std/map\"\n\
+         let a = 140737488355327\n\
+         let b = 140737488355328\n\
+         let c = -140737488355328\n\
+         let m = #{ a: \"smiMax\", b: \"spillPos\", c: \"smiMin\" }\n\
+         print(map.get(m, a))\n\
+         print(map.get(m, 140737488355327))\n\
+         print(map.get(m, a + 1))\n\
+         print(map.get(m, b))\n\
+         print(map.get(m, c))\n\
+         print(map.has(m, 140737488355328))\n",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn srv_shared_freeze_reads_and_mutation_panic_three_way() {
     // SRV §5 (the data half): `shared.freeze` + reads + the mutation panic are pure

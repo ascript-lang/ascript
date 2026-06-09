@@ -819,7 +819,10 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
             let b = r.take(16)?;
             let mut arr = [0u8; 16];
             arr.copy_from_slice(b);
-            Value::Decimal(rust_decimal::Decimal::deserialize(arr))
+            // VAL Task 2: the on-disk form is unchanged (the 16 LOGICAL bytes of
+            // the decimal); only the in-memory wrapping is now `Rc`. No
+            // ASO_FORMAT_VERSION bump — the serialized layout is identical.
+            Value::Decimal(std::rc::Rc::new(rust_decimal::Decimal::deserialize(arr)))
         }
         TAG_ENUM => {
             let name = r.str()?;
@@ -2512,7 +2515,9 @@ run()
         c.add_const(Value::Float(f64::NAN));
         c.add_const(Value::Float(-0.0));
         c.add_const(Value::Float(f64::INFINITY));
-        c.add_const(Value::Decimal(Decimal::from_str("1.50").unwrap()));
+        c.add_const(Value::Decimal(std::rc::Rc::new(
+            Decimal::from_str("1.50").unwrap(),
+        )));
         let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
         assert!(matches!(rt.consts[0], Value::Float(n) if n.is_nan()));
         assert!(matches!(rt.consts[1], Value::Float(n) if n == 0.0 && n.is_sign_negative()));

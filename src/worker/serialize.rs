@@ -645,7 +645,9 @@ fn decode_value(
                 path: "<decimal>".to_string(),
                 hint: None,
             })?;
-            Ok(Value::Decimal(d))
+            // VAL Task 2: same logical `TAG_DECIMAL` wire form (the decimal STRING,
+            // not the pointer); only the in-memory wrap is now `Rc`.
+            Ok(Value::Decimal(std::rc::Rc::new(d)))
         }
         TAG_STR => Ok(Value::Str(r.str()?.into())),
         TAG_BYTES => {
@@ -982,7 +984,7 @@ mod tests {
             Value::Bool(true),
             Value::Float(3.5),
             Value::Str("hi".into()),
-            Value::Decimal(Decimal::from_str("0.1").unwrap()),
+            Value::Decimal(Rc::new(Decimal::from_str("0.1").unwrap())),
         ] {
             assert_eq!(rt(&v), v);
         }

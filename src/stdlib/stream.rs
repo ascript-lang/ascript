@@ -210,7 +210,7 @@ fn require_callable(v: &Value, span: Span, ctx: &str) -> Result<Value, Control> 
         | Value::BoundMethod(_)
         | Value::NativeMethod(_)
         | Value::Class(_)
-        | Value::ClassMethod(_, _) => Ok(v.clone()),
+        | Value::ClassMethod(_) => Ok(v.clone()),
         _ => Err(AsError::at(
             format!(
                 "{} expects a function, got {}",

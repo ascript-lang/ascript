@@ -230,7 +230,10 @@ impl MapKey {
                 }
             }
             Value::Str(s) => Some(MapKey::Str(s.clone())),
-            Value::Decimal(d) => Some(MapKey::Decimal(*d)),
+            // VAL Task 2: `MapKey::Decimal` still folds BY VALUE (the inner
+            // `Decimal`), so exact key equality is preserved — `**d` decodes the
+            // boxed value out of the `Rc` (the box is invisible to keying).
+            Value::Decimal(d) => Some(MapKey::Decimal(**d)),
             _ => None,
         }
     }
@@ -243,7 +246,7 @@ impl MapKey {
             MapKey::Int(i) => Value::Int(*i),
             MapKey::Num(bits) => Value::Float(f64::from_bits(*bits)),
             MapKey::Str(s) => Value::Str(s.clone()),
-            MapKey::Decimal(d) => Value::Decimal(*d),
+            MapKey::Decimal(d) => Value::Decimal(Rc::new(*d)),
         }
     }
 }
@@ -1073,6 +1076,23 @@ const _: fn() = || {
     is_send_sync::<SharedNode>();
 };
 
+/// VAL Task 1 — the boxed payload of `Value::GeneratorMethod`. Carries the
+/// generator handle plus the bound method name (`"next"`/`"close"`). Boxing the
+/// two fields behind one `Rc` collapses a 24-byte two-field variant to a single
+/// word, removing the floor that pinned `Value` at 32 bytes.
+pub struct GeneratorMethodData {
+    pub handle: Rc<crate::coro::GeneratorHandle>,
+    pub name: &'static str,
+}
+
+/// VAL Task 1 — the boxed payload of `Value::ClassMethod`. Carries the class plus
+/// the static/`from` method name. Boxing collapses the other 24-byte two-field
+/// variant to a single word (see `GeneratorMethodData`).
+pub struct ClassMethodData {
+    pub class: Rc<Class>,
+    pub name: Rc<str>,
+}
+
 #[derive(Clone)]
 pub enum Value {
     Nil,
@@ -1084,9 +1104,18 @@ pub enum Value {
     /// literals with a `.` or exponent lex to `Float`. (Formerly `Number(f64)`.)
     Float(f64),
     /// Exact decimal arithmetic (96-bit scaled integer via `rust_decimal`).
-    /// `Copy` — no heap allocation; `Hash + Eq + Ord` via the inner type.
+    /// `Hash + Eq + Ord` via the inner type.
     /// Participates in operator overloading with `Int`/`Float` via coercion.
-    Decimal(Decimal),
+    ///
+    /// VAL Task 2: boxed behind `Rc<Decimal>`. The inner `Decimal` is 16 bytes
+    /// (`Copy`), one of the two 16-byte inline payloads (`Str(Rc<str>)` is the
+    /// other) that block niche-packing to the 16-byte floor. Behind a 1-word `Rc`,
+    /// `Decimal` no longer contributes to the enum width. The boxing is INVISIBLE:
+    /// every op decodes (`**d`) before operating, so a boxed `Decimal` is
+    /// byte-identical to the old inline one (same `type_name`, exact arithmetic,
+    /// Map-key fold). (The enum reaches 16 only once `Str` is ALSO thinned —
+    /// Stage 3 / Task 9; see `value_size_is_documented`.)
+    Decimal(Rc<Decimal>),
     Str(Rc<str>),
     /// A native built-in function, dispatched by name in the interpreter.
     Builtin(Rc<str>),
@@ -1136,13 +1165,20 @@ pub enum Value {
     /// A method bound to a generator handle (e.g. `gen.next`), dispatched by the
     /// async `call_generator_method`. Generators have no `NativeObject`, so they
     /// can't reuse `NativeMethod`; this is the parallel binding for them.
-    GeneratorMethod(Rc<crate::coro::GeneratorHandle>, &'static str),
+    ///
+    /// VAL Task 1: boxed into a single `Rc<GeneratorMethodData>` (one word) — the
+    /// two-field form was a 24-byte payload that pinned the whole enum at 32 bytes.
+    /// These bindings are rare/cold, so the extra indirection is negligible.
+    GeneratorMethod(Rc<GeneratorMethodData>),
     /// A class associated function bound to its class: either the built-in typed
     /// parser `User.from` or a USER static method `User.create` (SP1 §3). The name
     /// is an `Rc<str>` (not `&'static`) so it can carry an arbitrary user static
     /// name; `call_value` resolves it against `static_methods` (chain-walked),
     /// then the built-in `from`.
-    ClassMethod(Rc<Class>, Rc<str>),
+    ///
+    /// VAL Task 1: boxed into a single `Rc<ClassMethodData>` (one word) — see the
+    /// `GeneratorMethod` note above; this was the other 24-byte pinning variant.
+    ClassMethod(Rc<ClassMethodData>),
     /// SRV §3.2 — an immutable, `Arc`-backed frozen value (`shared.freeze`). The
     /// runtime's FIRST and ONLY `Send`-carrying variant (the union as a whole stays
     /// `!Send` — see the `assert_not_impl_any!(Value: Send)` guard in `gc.rs`).
@@ -1150,6 +1186,17 @@ pub enum Value {
     /// panic (SRV §3.8); crosses the worker airlock by `Arc` clone (zero copy).
     Shared(Arc<SharedNode>),
 }
+
+// VAL Task 0 / spec §6 — the `!Send`/`!Sync` lock, module-level (compile-time)
+// next to the `Value` definition so it fails the build, not just a test run, if a
+// future edit (VAL's own NaN-box, SRV's `Arc` leaf, or any variant-adder) ever
+// makes `Value` `Send` or `Sync`. That would break the
+// `#[tokio::main(flavor = "current_thread")]` + `LocalSet` invariant the whole
+// runtime rests on (CLAUDE.md §"The interpreter"). A deliberate future decision to
+// make `Value` `Send` must DELETE this assert, surfacing the choice. (The SRV-era
+// `assert_not_impl_any!(Value: Send)` in `gc.rs` is a test-body sibling — kept; this
+// is the broader compile-time `Send + Sync` guard the VAL spec asks for.)
+static_assertions::assert_not_impl_any!(Value: Send, Sync);
 
 impl Value {
     /// NUM §3.3 (BREAKING): the resolved falsy set is `nil`, `false`, `Int(0)`,
@@ -1164,7 +1211,7 @@ impl Value {
             // `0.0 == -0.0` is `true`, so the `!= 0.0` test covers both signed zeros;
             // NaN is excluded explicitly (`!is_nan()`) → `0.0`/`-0.0`/`NaN` all falsy.
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
-            Value::Decimal(d) => *d != Decimal::ZERO,
+            Value::Decimal(d) => **d != Decimal::ZERO,
             Value::Str(s) => !s.is_empty(),
             _ => true,
         }
@@ -1212,6 +1259,61 @@ impl Value {
                     None
                 }
             }
+            _ => None,
+        }
+    }
+
+    // ── VAL Task 0: thin zero-cost accessor helpers ─────────────────────────
+    // These insulate the rest of the codebase from the physical `Value`
+    // encoding. They are `#[inline]` wrappers over the CURRENT enum so that
+    // later VAL stages (a niche-shrunk enum, then a NaN-box) change ONLY
+    // `value.rs` — call sites read `Value::int(n)` / `v.as_int()` / etc. and
+    // never pattern-match the encoding directly. Mirrors NUM's mechanical
+    // accessor discipline (`as_f64`/`as_int_exact` above).
+
+    /// Construct an `Int` value (NUM's exact-integer subtype).
+    #[inline]
+    pub fn int(n: i64) -> Value {
+        Value::Int(n)
+    }
+
+    /// Construct a `Float` value (NUM's IEEE-754 subtype).
+    #[inline]
+    pub fn float(n: f64) -> Value {
+        Value::Float(n)
+    }
+
+    /// Construct an `Object` value from an insertion-ordered key map.
+    #[inline]
+    pub fn object(map: IndexMap<String, Value>) -> Value {
+        Value::Object(ObjectCell::new(map))
+    }
+
+    /// Extract the `i64` of an `Int` value EXACTLY — `None` for every other kind
+    /// (including `Float`; use `as_int_exact` for the integral-float coercion).
+    #[inline]
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Extract the `f64` of a `Float` value EXACTLY — `None` for every other kind
+    /// (including `Int`; use `as_f64` for the number-widening view).
+    #[inline]
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// View the underlying `ObjectCell` of an `Object` value, `None` otherwise.
+    #[inline]
+    pub fn as_object(&self) -> Option<Cc<ObjectCell>> {
+        match self {
+            Value::Object(o) => Some(o.clone()),
             _ => None,
         }
     }
@@ -1355,10 +1457,12 @@ impl PartialEq for Value {
             (Value::Future(a), Value::Future(b)) => a.ptr_eq(b),
             // Generators compare by identity (same body channel).
             (Value::Generator(a), Value::Generator(b)) => Rc::ptr_eq(a, b),
-            (Value::GeneratorMethod(a, an), Value::GeneratorMethod(b, bn)) => {
-                Rc::ptr_eq(a, b) && an == bn
+            (Value::GeneratorMethod(a), Value::GeneratorMethod(b)) => {
+                Rc::ptr_eq(&a.handle, &b.handle) && a.name == b.name
             }
-            (Value::ClassMethod(a, an), Value::ClassMethod(b, bn)) => Rc::ptr_eq(a, b) && an == bn,
+            (Value::ClassMethod(a), Value::ClassMethod(b)) => {
+                Rc::ptr_eq(&a.class, &b.class) && a.name == b.name
+            }
             // SRV §3.5: a frozen `Shared` compares by `Arc` IDENTITY (like every
             // other container's identity-equality). Two `Shared`s wrapping the SAME
             // `Arc` are equal (idempotent `freeze` returns the same `Arc`); distinct
@@ -1414,8 +1518,8 @@ impl fmt::Debug for Value {
             Value::Super(_) => write!(f, "Super"),
             Value::Future(_) => write!(f, "Future"),
             Value::Generator(_) => write!(f, "Generator"),
-            Value::GeneratorMethod(_, m) => write!(f, "GeneratorMethod({})", m),
-            Value::ClassMethod(c, m) => write!(f, "ClassMethod({}.{})", c.name, m),
+            Value::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
+            Value::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
             Value::Shared(n) => write!(f, "Shared({})", n.kind_name()),
         }
     }
@@ -1595,8 +1699,8 @@ impl Value {
             Value::Super(_) => write!(f, "<super>"),
             Value::Future(_) => write!(f, "<future>"),
             Value::Generator(_) => write!(f, "<generator>"),
-            Value::GeneratorMethod(_, m) => write!(f, "<generator method {}>", m),
-            Value::ClassMethod(c, m) => write!(f, "<class method {}.{}>", c.name, m),
+            Value::GeneratorMethod(g) => write!(f, "<generator method {}>", g.name),
+            Value::ClassMethod(c) => write!(f, "<class method {}.{}>", c.class.name, c.name),
             // SRV §3.5: a frozen `Shared` prints like the value it froze (a frozen
             // object as `{...}`, a frozen array as `[...]`, a scalar bare).
             Value::Shared(n) => n.write_display(f),
@@ -1616,6 +1720,121 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // VAL Task 0 — the MOVING SIZE TRIPWIRE. `Value` is the runtime tagged union
+    // threaded through every fiber stack slot, frame slot, array element, and map
+    // slot; its width is a load-bearing performance fact. This test pins the
+    // measured baseline so a careless edit that widens a variant is caught
+    // immediately, and each VAL stage updates the asserted constant as the enum
+    // shrinks (32 → ≤24 → 16 → 8). The companion `value_size_print` is `ignore`d
+    // (it just surfaces the number when run with `--nocapture`).
+    #[test]
+    fn value_size_is_documented() {
+        // VAL Task 2: `Decimal` is now boxed behind `Rc<Decimal>` (one word, was a
+        // 16-byte inline payload). This is a necessary, behavior-preserving step
+        // toward the 16-byte niche floor — but the enum stays at **24** because
+        // `Str(Rc<str>)` is STILL a 16-byte *fat* pointer (data ptr + length) and is
+        // now the widest payload:
+        //
+        //   The inline scalar variants (`Int(i64)`/`Float(f64)`) take ANY bit
+        //   pattern, so Rust cannot niche-elide the discriminant into a pointer
+        //   variant's null niche — it must add an explicit tag word. The layout is
+        //   therefore `round_up(widest_payload) + 8-byte tag`: with the 16-byte fat
+        //   `Str`, that is 16 + 8 = **24**; with a single-word (thin) `Str` it is
+        //   8 + 8 = **16**. (Scratch-verified at the real variant count: fat-`Str`
+        //   enum = 24 even with NO scalar and even with few variants; thin-`Str`
+        //   enum = 16. So the floor is set by the fat-pointer payload WIDTH, not by
+        //   Decimal — which is exactly why boxing Decimal alone cannot reach 16.)
+        //
+        // Reaching 16 therefore requires thinning `Str` to a single-word pointer —
+        // that is **Task 9 (small-string / thin-`Str`)**, OUTSIDE this unit
+        // (Tasks 0–2). Boxing `Decimal` here removes the OTHER 16-byte inline payload
+        // so that once `Str` is thinned the enum drops straight to 16. NOTE: the spec
+        // §3.3 / plan Task-2 "fat-`Str` → 16" target is arithmetically wrong (it is
+        // 24); corrected in the spec/plan. 8 bytes is reachable ONLY via the NaN-box
+        // (a hand-tagged machine word, not a Rust enum), which is a separate, gated
+        // stage.
+        //
+        // Size progression: 32 → 24 [Task 1: fat method bindings boxed] → 24
+        // [Task 2: Decimal boxed, now fat-`Str`-limited] → 16 [thin-`Str`] → 8
+        // [NaN-box, gated].
+        assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
+
+    #[test]
+    #[ignore]
+    fn value_size_print() {
+        eprintln!("size_of::<Value>() = {}", std::mem::size_of::<Value>());
+    }
+
+    // VAL Task 0 — accessor round-trip: the thin, zero-cost constructor/extractor
+    // helpers (`Value::int`/`float`/`object`, `as_int`/`as_float`/`as_object`)
+    // insulate the rest of the tree from the physical encoding so later VAL stages
+    // change ONLY `value.rs`. Round-trip identity must hold.
+    #[test]
+    fn accessor_round_trip() {
+        assert_eq!(Value::int(5).as_int(), Some(5));
+        assert_eq!(Value::int(-2_000_000).as_int(), Some(-2_000_000));
+        assert_eq!(Value::float(3.5).as_float(), Some(3.5));
+        // Cross-kind: an int is not a float and vice versa (no silent coercion).
+        assert_eq!(Value::int(5).as_float(), None);
+        assert_eq!(Value::float(3.5).as_int(), None);
+        // Object round-trip preserves pointer identity.
+        let obj = Value::object(IndexMap::new());
+        let cell = obj.as_object().expect("object accessor");
+        assert!(matches!(&obj, Value::Object(c) if crate::gc::cc_ptr_eq(c, &cell)));
+    }
+
+    // VAL Task 3 — the SMI↔boxed spill-BOUNDARY round-trip + Map-key fold (spec
+    // §7.2), value-layer half. The boundary values straddle the NaN-box SMI budget
+    // (`i48`, range `[−2^47, 2^47 − 1]`): under the Stage-1 niche-fallback layout
+    // `Int` is a FULL inline `i64` — there is no SMI and no spill, so every value
+    // below round-trips through the inline scalar word TRIVIALLY (this is the
+    // assertion the plan/spec require to pass today; it becomes the LIVE SMI/spill
+    // boundary if/when the Stage-2 NaN-box lands and the encoding gains a 48-bit
+    // SMI). The engine-level (tree-walker == specialized-VM == generic-VM) half of
+    // §7.2 — arithmetic carry, comparison, and Map-key fold across the boundary on
+    // real `.as` programs — lives in `tests/vm_differential.rs`
+    // (`smi_boundary_*`).
+    #[test]
+    fn smi_boundary_round_trip_and_mapkey_fold() {
+        // The exact boundary values from spec §7.2: the i48 spill edges, plus a few
+        // beyond the budget (which spill to a boxed `Int` under the NaN-box; stay a
+        // full inline `i64` under the Stage-1 fallback).
+        let boundary: [i64; 7] = [
+            (1i64 << 47) - 1, // 2^47 − 1  (largest i48 SMI)
+            1i64 << 47,       // 2^47      (first spill, positive)
+            -(1i64 << 47),    // −2^47     (smallest i48 SMI)
+            -(1i64 << 47) - 1, // −2^47 − 1 (first spill, negative)
+            1i64 << 53,       // 2^53      (well beyond)
+            i64::MAX,
+            i64::MIN,
+        ];
+        for &n in &boundary {
+            // Round-trip through the value encoding via the Task-0 accessors:
+            // `decode(encode(n)) == n` (the §7.2 round-trip property). Under the
+            // inline-`i64` Stage-1 layout this is an exact pass-through.
+            assert_eq!(Value::int(n).as_int(), Some(n), "as_int round-trip for {n}");
+            // Round-trip through the Map-key fold: an `Int` value folds to
+            // `MapKey::Int(n)` and recovers the SAME value. (Under a future NaN-box,
+            // an SMI `Int` and a boxed `Int` of equal value MUST fold to the same
+            // key — there is only one logical `Int(n)`, so this property is what
+            // pins that invariant. Today both encodings are the inline `i64`.)
+            let key = MapKey::from_value(&Value::int(n)).expect("int is hashable");
+            // `MapKey` is not `Debug`, so compare with a boolean assert.
+            assert!(key == MapKey::Int(n), "MapKey fold for {n}");
+            assert_eq!(key.to_value().as_int(), Some(n), "MapKey recover for {n}");
+        }
+        // Cross-boundary fold equality: two `Int`s of the same value (regardless of
+        // any future SMI/boxed encoding split) are the SAME Map key. Constructed via
+        // two independent paths to mimic an "SMI vs boxed of equal value" pairing.
+        let lo = (1i64 << 47) - 1;
+        for &n in &[lo, lo + 1, -(1i64 << 47), i64::MAX, i64::MIN] {
+            let a = MapKey::from_value(&Value::int(n)).unwrap();
+            let b = MapKey::from_value(&Value::Int(n)).unwrap();
+            assert!(a == b, "equal-valued Ints must fold to the SAME Map key ({n})");
+        }
+    }
 
     // ADT Task 1 helpers — construct variant values directly at the value layer.
     fn unit_variant(en: &str, name: &str, backing: Value) -> Value {
@@ -1839,16 +2058,16 @@ mod tests {
         // requiring it in assert_eq!/assert_ne!.)
         let num_key = MapKey::from_value(&Value::Float(1.0)).expect("number is hashable");
         let dec_key =
-            MapKey::from_value(&Value::Decimal(Decimal::from(1))).expect("decimal is hashable");
+            MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1)))).expect("decimal is hashable");
         assert!(
             num_key != dec_key,
             "number 1 and decimal 1 must be distinct map keys"
         );
         // Two equal Decimals produce the same key (round-trips through to_value).
-        let a = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
-        let b = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
+        let a = MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1))));
+        let b = MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1))));
         assert!(a == b);
-        assert_eq!(dec_key.to_value(), Value::Decimal(Decimal::from(1)));
+        assert_eq!(dec_key.to_value(), Value::Decimal(Rc::new(Decimal::from(1))));
     }
 
     // ---- IFACE Task 1: Value::Interface descriptor ----
@@ -1888,7 +2107,7 @@ mod tests {
         assert_eq!(crate::interp::type_name(&Value::Float(5.0)), "float");
         // Decimal is its own subtype, unchanged.
         assert_eq!(
-            crate::interp::type_name(&Value::Decimal(Decimal::from(1))),
+            crate::interp::type_name(&Value::Decimal(Rc::new(Decimal::from(1)))),
             "decimal"
         );
     }
@@ -1942,7 +2161,7 @@ mod tests {
         assert!(!Value::Float(0.0).is_truthy());
         assert!(!Value::Float(-0.0).is_truthy());
         assert!(!Value::Float(f64::NAN).is_truthy());
-        assert!(!Value::Decimal(Decimal::ZERO).is_truthy());
+        assert!(!Value::Decimal(Rc::new(Decimal::ZERO)).is_truthy());
         assert!(!Value::Str("".into()).is_truthy());
         // Truthy: any non-zero number, non-empty string, EVERY collection even empty.
         assert!(Value::Bool(true).is_truthy());
@@ -1950,7 +2169,7 @@ mod tests {
         assert!(Value::Int(-1).is_truthy());
         assert!(Value::Float(0.5).is_truthy());
         assert!(Value::Float(f64::INFINITY).is_truthy());
-        assert!(Value::Decimal(Decimal::from(1)).is_truthy());
+        assert!(Value::Decimal(Rc::new(Decimal::from(1))).is_truthy());
         assert!(Value::Str("x".into()).is_truthy());
         assert!(Value::Array(crate::value::ArrayCell::new(vec![])).is_truthy());
         {

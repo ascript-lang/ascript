@@ -24,6 +24,7 @@ use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
 use crate::value::Value;
+use std::rc::Rc; // VAL Task 2: `Value::Decimal` is now `Rc<Decimal>`.
 use rust_decimal::prelude::*;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -48,7 +49,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// - Anything else: None (caller panics with a better message).
 pub(crate) fn coerce_to_decimal(v: &Value, span: Span) -> Result<Option<Decimal>, Control> {
     match v {
-        Value::Decimal(d) => Ok(Some(*d)),
+        Value::Decimal(d) => Ok(Some(**d)),
         // NUM §4: an `Int` converts EXACTLY (no f64 round-trip).
         Value::Int(i) => Ok(Some(Decimal::from(*i))),
         Value::Float(n) => {
@@ -80,11 +81,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "from" => {
             let v = arg(args, 0);
             match &v {
-                Value::Decimal(d) => Ok(Value::Decimal(*d)),
+                Value::Decimal(d) => Ok(Value::Decimal(d.clone())),
                 // NUM §4: an `Int` converts EXACTLY.
-                Value::Int(i) => Ok(Value::Decimal(Decimal::from(*i))),
+                Value::Int(i) => Ok(Value::Decimal(Rc::new(Decimal::from(*i)))),
                 Value::Str(s) => Decimal::from_str(s.as_ref())
-                    .map(Value::Decimal)
+                    .map(|d| Value::Decimal(Rc::new(d)))
                     .map_err(|_| {
                         AsError::at(
                             format!("decimal.from: invalid decimal string {:?}", s.as_ref()),
@@ -102,16 +103,18 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     }
                     // Integer-valued floats → exact integer Decimal (no fractional part).
                     if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
-                        Ok(Value::Decimal(Decimal::from(*n as i64)))
+                        Ok(Value::Decimal(Rc::new(Decimal::from(*n as i64))))
                     } else {
                         // Non-integer: use shortest round-trip via from_f64.
-                        Decimal::from_f64(*n).map(Value::Decimal).ok_or_else(|| {
-                            AsError::at(
-                                "decimal.from: cannot convert number to decimal (out of range)",
-                                span,
-                            )
-                            .into()
-                        })
+                        Decimal::from_f64(*n)
+                            .map(|d| Value::Decimal(Rc::new(d)))
+                            .ok_or_else(|| {
+                                AsError::at(
+                                    "decimal.from: cannot convert number to decimal (out of range)",
+                                    span,
+                                )
+                                .into()
+                            })
                     }
                 }
                 _ => Err(AsError::at(
@@ -129,7 +132,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "parse" => {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
             match Decimal::from_str(s.as_ref()) {
-                Ok(d) => Ok(make_pair(Value::Decimal(d), Value::Nil)),
+                Ok(d) => Ok(make_pair(Value::Decimal(Rc::new(d)), Value::Nil)),
                 Err(e) => Ok(make_pair(
                     Value::Nil,
                     make_error(Value::Str(format!("invalid decimal: {}", e).into())),
@@ -168,34 +171,34 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 }
                 _ => return Err(AsError::at("decimal.round: places must be a number", span).into()),
             };
-            Ok(Value::Decimal(d.round_dp_with_strategy(
+            Ok(Value::Decimal(Rc::new(d.round_dp_with_strategy(
                 places,
                 rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-            )))
+            ))))
         }
 
         // decimal.abs(d) → decimal
         "abs" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("abs"))?;
-            Ok(Value::Decimal(d.abs()))
+            Ok(Value::Decimal(Rc::new(d.abs())))
         }
 
         // decimal.floor(d) → decimal
         "floor" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("floor"))?;
-            Ok(Value::Decimal(d.floor()))
+            Ok(Value::Decimal(Rc::new(d.floor())))
         }
 
         // decimal.ceil(d) → decimal
         "ceil" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("ceil"))?;
-            Ok(Value::Decimal(d.ceil()))
+            Ok(Value::Decimal(Rc::new(d.ceil())))
         }
 
         // decimal.trunc(d) → decimal
         "trunc" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("trunc"))?;
-            Ok(Value::Decimal(d.trunc()))
+            Ok(Value::Decimal(Rc::new(d.trunc())))
         }
 
         _ => Err(AsError::at(format!("std/decimal has no function '{}'", func), span).into()),
@@ -206,7 +209,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 
 pub(crate) fn want_decimal(v: &Value, span: Span, ctx: &str) -> Result<Decimal, Control> {
     match v {
-        Value::Decimal(d) => Ok(*d),
+        Value::Decimal(d) => Ok(**d),
         _ => Err(AsError::at(
             format!(
                 "{} expects a decimal, got {}",
@@ -230,7 +233,7 @@ mod tests {
     }
 
     fn d(s: &str) -> Value {
-        Value::Decimal(Decimal::from_str(s).unwrap())
+        Value::Decimal(Rc::new(Decimal::from_str(s).unwrap()))
     }
 
     // --- construction ---

@@ -101,7 +101,7 @@ impl Freezer {
             Value::Bool(b) => Ok(Arc::new(SharedNode::Bool(*b))),
             Value::Int(i) => Ok(Arc::new(SharedNode::Int(*i))),
             Value::Float(n) => Ok(Arc::new(SharedNode::Float(*n))),
-            Value::Decimal(d) => Ok(Arc::new(SharedNode::Decimal(*d))),
+            Value::Decimal(d) => Ok(Arc::new(SharedNode::Decimal(**d))),
             Value::Str(s) => Ok(Arc::new(SharedNode::Str(Arc::from(&**s)))),
 
             // Freezing an already-frozen sub-value is the identity (shares the Arc).

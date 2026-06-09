@@ -21,11 +21,13 @@ bindings, NOT by `Decimal`/`Str`) toward 8, in four independently-shippable, ind
    `GeneratorMethod(Rc<GeneratorHandle>, &'static str)` → `Rc<GeneratorMethodData>`) + move `Decimal` (16 B)
    behind a pointer + inline scalars (`Nil`/`Bool`/`Int`/`Float`) + SMI fast paths in VM arith. This is the
    §3.3 **niche-optimized fallback** — derived `Clone`/`Drop` over `Cc`/`Rc`, **no new ownership `unsafe`**.
-   Ships **regardless** of the Stage-2 verdict (32→16 B; ≤8 only with optional thin-`Str`).
+   Ships **regardless** of the Stage-2 verdict (**32→24 B**; 16 only with optional thin-`Str` at Task 9, ≤8
+   only with the NaN-box — CORRECTED: the original "32→16 B" was arithmetically wrong, see Task 2 + spec §3.3).
 2. **Pointer NaN-box** to 8 B — **GATED** on (a) upstreaming gcmodule `Cc::into_raw`/`from_raw` AND (b) the
    GC-soundness suite green on the tagged layout. Introduces the hand-written tag-dispatched
-   `unsafe` `Clone`/`Drop`/`trace`. **If either gate fails, STOP at Stage 1's 16-byte enum** — an
-   owner-noted, recorded stopping point (`goal-brief.md` Gate 6). An explicit decision task gates this.
+   `unsafe` `Clone`/`Drop`/`trace`. **If either gate fails, STOP at Stage 1's 24-byte enum** (16-byte with
+   thin-`Str`/Task 9) — an owner-noted, recorded stopping point (`goal-brief.md` Gate 6). An explicit decision
+   task gates this.
 3. **Small-string inlining** (≤6 B under NaN-box, or a small-string-optimized `Str` under the fallback).
 4. **Compiler escape-analysis** stack allocation (`src/compile/`) with the **identity-preservation
    soundness obligation** (§3.4 of the spec) and a `--no-escape-analysis` kill switch (a fifth differential
@@ -138,24 +140,30 @@ Stage-2-only `ValueTag` + `Cc::into_raw`/`from_raw` (gated); Stage-4 `--no-escap
 ## Task 2 — Move `Decimal` behind a pointer; shrink the enum to the niche-fallback 16 bytes
 **Files:** `src/value.rs` (+ compiler-flushed arms in `interp.rs`/`vm/run.rs` decimal arith, `fmt.rs`,
 `worker/serialize.rs` `TAG_DECIMAL`, `aso.rs` decimal constant). **Tests:** `value.rs`, decimal tests.
-- [ ] Failing test: `size_of::<Value>() == 16` (the §3.3 niche-fallback floor — now that the two fat
-  variants AND `Decimal` are ≤8-byte payloads and scalars fit a word, Rust's niche optimization over
-  `Cc`/`Rc`'s non-null guarantee fills the discriminant); decimal arithmetic / `type_name=="decimal"` /
-  exact equality / Map-key fold all byte-identical (an extra indirection, zero behavior change).
+- [ ] **CORRECTED TARGET — `size_of::<Value>() == 24`, NOT 16** (verified during implementation; the
+  spec/plan "→16" was arithmetically wrong). Boxing `Decimal` removes one 16-byte inline payload, but
+  `Str(Rc<str>)` is STILL a 2-word fat pointer and is now the widest payload. Because the inline scalars
+  (`Int`/`Float`) prevent niche-elision, the layout is `round_up(widest_payload) + 8-byte tag` = 16 + 8 = 24.
+  Reaching **16** requires thinning `Str` to a single word (**Task 9 — small-string / thin-`Str`**); **8**
+  needs the NaN-box (Stage 2). So the failing test asserts **24** with this explanation inline. Decimal
+  arithmetic / `type_name=="decimal"` / exact equality / Map-key fold are all byte-identical (an extra
+  indirection, zero behavior change) — that is the real Task-2 deliverable. See the §3.3 CORRECTION in the
+  design spec and `value_size_is_documented` in `value.rs`.
 - [ ] Change `Value::Decimal(Decimal)` → `Value::Decimal(Rc<Decimal>)` (or a pooled box). Update the
   `decimal_fast` VM arm `run.rs:~3787`, the `apply_binop` decimal arm in `interp.rs`, `Display`/`Debug`,
   `MapKey` (still folds by value), the worker `TAG_DECIMAL` encode/decode (still the SAME logical tag —
   serialize the decoded decimal, **not** the pointer), and the `.aso` decimal constant (still logical — no
   `ASO_FORMAT_VERSION` bump if the serialized form is unchanged; if the box changes the in-pool layout, read
   `ASO_FORMAT_VERSION` and +1 per `goal-brief.md`).
-- [ ] Update Task 0's size tripwire to 16. Green both configs; clippy. **Four-mode differential green.**
+- [ ] Update Task 0's size tripwire to **24** (the corrected floor; it moves to 16 only at Task 9 thin-`Str`,
+  and 8 at the NaN-box). Green both configs; clippy. **Four-mode differential green.**
   **Review:** confirm decimal exactness preserved (the boxing is invisible), `.aso` round-trip green,
   worker round-trip of a `Decimal` byte-identical. Commit.
 
 ## Task 3 — Inline-scalar SMI fast path in VM arithmetic + adaptive `ArithKind::Int` operand load/store
 **Files:** `src/vm/run.rs` (arith site `:3778-3819`), `src/vm/adapt.rs`. **Tests:** `vm_differential.rs`,
 `value.rs` boundary test.
-- [ ] Failing tests (BOTH engines, four-mode): the SMI↔boxed spill **boundary** unit test of spec §7.2 —
+- [x] Failing tests (BOTH engines, four-mode): the SMI↔boxed spill **boundary** unit test of spec §7.2 —
   `2^47 − 1`, `2^47`, `−2^47`, `−2^47 − 1`, plus `2^53`, `i64::MAX`, `i64::MIN` — asserting for each:
   round-trip (`decode(encode(n))==n`), arithmetic that carries across the boundary yields the right
   kind+value, comparison across an SMI and a boxed operand of equal/adjacent value, and `MapKey` fold (an
@@ -164,11 +172,14 @@ Stage-2-only `ValueTag` + `Cc::into_raw`/`from_raw` (gated); Stage-4 `--no-escap
   no SMI, no spill — so in Stage 1 this test exercises the inline-`i64` path and the SMI/spill assertions
   become live only at Stage 2 (write the test now; it must pass trivially under the full-`i64` Stage-1 layout
   and again under the NaN-box if Stage 2 lands).
-- [ ] Add the `ArithKind::Int` guarded fast path in the arith site (NUM already added the `ArithKind::Int`
+- [x] Add the `ArithKind::Int` guarded fast path in the arith site (NUM already added the `ArithKind::Int`
   variant + checked-int semantics — Stage 1 makes its operand load/store read the inline scalar word with no
   heap touch, then run the EXACT same checked-int computation NUM defined). Specialized and generic VM
-  byte-identical (incl. which inputs panic). No new opcode.
-- [ ] Green both configs; clippy. **Four-mode differential green** (re-run scalar-heavy goldens).
+  byte-identical (incl. which inputs panic). No new opcode. NOTE: the `ArithKind::Int` arm already landed
+  with NUM and already reads `*x`/`*y` from the inline `Value::Int(i64)` word (delegating to the shared
+  `int_binop`); under the Stage-1 full-`i64` layout this IS the inline-scalar path — VAL only documented it
+  as such (the §7.2 boundary test exercises it now and goes live if the Stage-2 NaN-box lands).
+- [x] Green both configs; clippy. **Four-mode differential green** (re-run scalar-heavy goldens).
   **Review:** confirm the fast path is "guard the kind, then the exact generic op" (`run.rs:3779-3805`
   pattern); confirm a mixed Int/Float site deopts identically in both VM modes; confirm no panic-input
   divergence. Commit.
@@ -176,16 +187,22 @@ Stage-2-only `ValueTag` + `Cc::into_raw`/`from_raw` (gated); Stage-4 `--no-escap
 ## Task 4 — Stage-1 benchmarks (both VM modes) + size report + cold-path check
 **Files:** `bench/` (new harness writing a markdown report sibling to `bench/PROFILING_RESULTS.md`),
 reuse `src/stdlib/bench.rs`. **Tests:** the bench harness runs; no CI perf gate beyond Gate-12 no-regress.
-- [ ] Add `bench/compact_value_bench.as` + a runner; report **`size_of::<Value>()` 32→16**, and wall-clock
+- [x] Add `bench/compact_value_bench.as` + a runner; report **`size_of::<Value>()` 32→24** (the HONEST
+  Stage-1 floor — NOT 16; fat `Str` is still the widest payload), and wall-clock
   on scalar-heavy loops (int sum, array-index walk, Fibonacci/Mandelbrot over NUM ints), allocation/refcount
   churn (a `Cc`/`Rc` clone counter or `dhat`), and a cache-density proxy (large `Vec<Value>` / large
   `IndexMap` traversal) — **each in BOTH specialized AND `--no-specialize` generic mode** side by side
   (Gate 12). Add the **cold-path check**: a `ClassMethod`/`GeneratorMethod` construct+dispatch microbench
   confirming Task 1's boxing adds no measurable regression on those rare bindings.
-- [ ] Honest framing in the report: state the measured geomean PER MODE and flag any regression (the extra
+- [x] Honest framing in the report: state the measured geomean PER MODE and flag any regression (the extra
   `Decimal` indirection, the boxed-method-binding indirection). **No speedup is claimed** — the number is
-  whatever `bench/` reports. **Gate 12: no regression in EITHER mode.**
-- [ ] **Review:** reviewer RE-RUNS the bench in both modes and confirms the report's numbers + the
+  whatever `bench/` reports. **Gate 12: no regression in EITHER mode.** MEASURED (Apple M4, 5-rep
+  interleaved A/B vs same-session baseline @ 612339c, both `--profile profiling`): HOT geomean sits at the
+  NOISE FLOOR (±1% across runs) in BOTH specialized and generic modes → Gate-12 PASS (no regression in
+  either mode); the flagged cold-path is `decimal_cold` ~-10% (boxed `Rc<Decimal>` does an `Rc::new` per
+  op — only on decimal-heavy code), `method_cold` ~±1% (noise). Report: `bench/COMPACT_VALUE_RESULTS.md`.
+  Bench seam: `ASCRIPT_NO_SPECIALIZE=1` env on the CLI `run` path (byte-identical generic mode for the A/B).
+- [x] **Review:** reviewer RE-RUNS the bench in both modes and confirms the report's numbers + the
   no-either-mode-regression floor. Commit. **← Stage 1 is a green merge-able point on its own.**
 
 ---
@@ -200,11 +217,23 @@ as the soundness baseline.
   a small PR exposing the `NonNull<RawCcBox<T,O>>` round-trip; `src/cc.rs:79`). The layout-coupling
   `transmute` over the private `#[repr(C)] RawCcBox` (`src/cc.rs:38-79`) is **REJECTED as fragile** (spec
   §8) — do not take it.
-- [ ] **Record the verdict (owner-noted, never silent — Gate 6):** if (a) `into_raw`/`from_raw` is available
+- [x] **Record the verdict (owner-noted, never silent — Gate 6):** if (a) `into_raw`/`from_raw` is available
   upstream AND (b) the §3.3 GC-soundness design (decode-in-`Value::trace` + correct tag-dispatched
   `Clone`/`Drop`) is judged to pass the V13-T4/T6 gates on the tagged layout → **proceed to Task 6**. Else
-  → **STOP at Stage 1's 16-byte enum**, mark Stage 2 deferred in `roadmap.md` + the design spec with the
+  → **STOP at the niche-fallback floor**, mark Stage 2 deferred in `roadmap.md` + the design spec with the
   reason, and **skip Tasks 6–8** (jump to Stage 3 over the niche-fallback enum, which still benefits).
+  > **VERDICT (2026-06-09): STOP — Stage 2 (NaN-box → 8 B) DEFERRED, owner-noted.** Criterion (a) is NOT
+  > met: **gcmodule 0.3.3 (the pinned dependency) exposes no public `Cc::into_raw`/`from_raw`** — verified by
+  > inspecting `~/.cargo/.../gcmodule-0.3.3/src/cc.rs`: the only `into_raw`/`from_raw` are PRIVATE
+  > `Box::into_raw`/`from_raw` over the internal `RawCcBox`; there is no public `Cc`↔raw-`NonNull` round-trip.
+  > The NaN-box requires tagging/untagging a raw `Cc` pointer, so it cannot be built soundly on this API. The
+  > only supported path (a small upstream PR adding `into_raw`/`from_raw`) is an external, multi-week,
+  > uncertain process **out of this campaign's scope**, and the layout-coupling `transmute` over the private
+  > `#[repr(C)] RawCcBox` is **REJECTED as fragile (spec §8)** — do NOT take it. Per the spec's *designed*
+  > fallback (§3.3: "absent that, the niche fallback is the floor"), VAL stops at the niche-optimized enum and
+  > pursues **Stage 3 (Task 9 — thin-`Str`) to reach the 16-byte floor** (the corrected floor; Stage 1 is 24).
+  > 8 bytes remains a future item IF/when gcmodule gains the raw API (a deferred follow-up, never a silent
+  > drop). Tasks 6–8 are SKIPPED.
 - [ ] **Review:** an independent reviewer confirms the verdict's evidence (the upstream PR state / the
   soundness argument) and signs off on proceed-vs-stop. Commit the recorded decision.
 
@@ -282,6 +311,19 @@ boundary test from Task 3 now exercises the LIVE SMI/spill path), encoding round
 - [ ] Green both configs; clippy. **Four-mode differential green.** **Review:** confirm zero alloc for short
   keys/identifiers (a `dhat` spot-check); confirm shape ICs don't thrash on an inline/heap-`Str` mix (add a
   cache-non-thrash test per spec §6). Commit. **← Stage 3 is a green merge-able point.**
+
+> **OUTCOME (2026-06-10): EVALUATED + REJECTED — reverted (commit e923c6b).** A thin `Str`/`Builtin` via a
+> safe `AStr(Rc<Box<str>>)` newtype (NO new unsafe) DID reach `size_of::<Value>() == 16`, four-mode
+> byte-identical, all gates green. But the Phase-3 bench (string-heavy + a purpose-built memory-bound scan,
+> both VM modes, interleaved same-session A/B vs the Stage-1 24-B baseline) showed it is a **net regression on
+> every path it changes**: STRING −2.2%/−1.5% (spec/gen), and the memory-bound scan (the cache-density bet)
+> **+6.8%** — the extra `Value→Rc→Box<str>→bytes` hop per access costs more than the denser 16-B slot saves.
+> The regression is INHERENT to a *safe* thin `Str` (any single-word safe rep double-indirects); the only
+> no-indirection path below 24 is the NaN-box, which has NO access hop — but that is DEFERRED (Task 5, gcmodule
+> `into_raw`/`from_raw`). Per the task's keep-only-if-not-a-net-regression bias → STOP. **VAL's size floor is
+> Stage 1's 24 bytes.** The thin-`Str` data lives in `bench/COMPACT_VALUE_RESULTS.md §5`; the impl was reverted
+> (kept the bench/verdict). 16 remains achievable but not worth it; 8 needs the NaN-box (future, if gcmodule
+> gains the raw API).
 
 ---
 

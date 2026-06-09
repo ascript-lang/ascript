@@ -68,7 +68,7 @@ fn is_callable(v: &Value) -> bool {
             | Value::Builtin(_)
             | Value::BoundMethod(_)
             | Value::NativeMethod(_)
-            | Value::ClassMethod(_, _)
+            | Value::ClassMethod(_)
     )
 }
 
