@@ -16,7 +16,13 @@
 //! on Windows the server degrades to single-isolate (covered by the `#[cfg(windows)]`
 //! test at the bottom — an `.as` example can't exercise the Windows branch since it
 //! runs identically on every platform, Gate 9).
+//!
+//! `net`-gated: the whole file drives `std/http/server`, which only exists under the
+//! `net` feature (in the default set). Under `--no-default-features` the server module
+//! is absent, so the spawned program can never bind/serve — these tests compile to
+//! nothing there (the server tier is covered by the default-config build).
 
+#![cfg(feature = "net")]
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::io::{Read, Write};
