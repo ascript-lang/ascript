@@ -19,9 +19,18 @@
 //!   output is ever emitted — the program's stdout is a pure function of its text, or the
 //!   differential is meaningless (spec §6). Loops are bound-capped so programs always halt.
 //! - **Edge-biased.** Weighted toward known divergence-prone regions: numeric boundaries
-//!   (`i64::MIN/MAX`, `2^53±1`, `0`, mixed int/float, `/`/`%`/`**`/wrapping ops, bitwise),
-//!   deep nesting, closures/capture-by-value, empty collections, shadowing, `match`
-//!   ranges/guards/Option-C bind-vs-compare.
+//!   (`i64::MIN/MAX`, `2^53±1`, `0`, mixed int/float, `/`/`%`/wrapping ops, bitwise `& | ^`),
+//!   deep nesting, empty collections, shadowing/reassignment, and `match` over int
+//!   literals/ranges/`_`.
+//!
+//! **Coverage TODO (the explicit next FUZZ unit — the differential only fuzzes the surface
+//! it reaches).** Unit 1 covers the pre-NUM *core* surface (above). NOT YET EMITTED, and
+//! tracked as the breadth follow-up (spec §1 names several as edge targets): the `**`
+//! exponent + shift/complement `<< >> ~`; decimals; closures / capture-by-value; `match`
+//! guards + array/object/variant/Option-C bind patterns; classes; enums (incl. ADT payload
+//! variants); interfaces + `instanceof`; object/map/set literals; destructuring/spread/rest;
+//! string templates `${…}`; `?`/`!` propagate/unwrap; async/await/spawn/workers; try/recover.
+//! Adding each is a generator extension whose differential run may surface real engine bugs.
 //!
 //! Crate-gated `#[cfg(any(test, fuzzing))]` (in `lib.rs`) so it compiles into `ascript`
 //! ONLY for `cargo test` (and a `--cfg fuzzing` libFuzzer build) — never in a normal or

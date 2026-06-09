@@ -30,3 +30,8 @@ dist/
 /page-*.png
 /page-*.jpeg
 /hero-*.png
+
+# proptest failure-seed files. The campaign FIXES any differential failure in-branch
+# with a real regression test (Gate 0), so these are transient debugging artifacts,
+# not committed fixtures.
+**/*.proptest-regressions
