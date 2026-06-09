@@ -350,20 +350,17 @@ pub(crate) enum ResourceState {
     /// it. `Value::Native` traces as a no-op (`gc.rs`'s `_ => {}`), so the invariant
     /// holds for `ForeignLib`/`ForeignSymbol`/`ForeignPtr` automatically.
     #[cfg(feature = "ffi")]
-    #[allow(dead_code)] // The field is read by Task 7's `lib.symbol`.
     ForeignLib(std::rc::Rc<libloading::Library>),
     /// FFI campaign §3.4: a resolved symbol + its bound signature. Stores the function
     /// address as a raw pointer (in `FfiSymbol`) and KEEPS THE OWNING `Library` ALIVE
     /// via an `Rc` clone, so the address stays valid for every `sym.call`. Boxed to
     /// keep the enum compact. GC-UNTRACED (raw pointer + opaque handle).
     #[cfg(feature = "ffi")]
-    #[allow(dead_code)] // Constructed by Task 7's `lib.symbol`.
     ForeignSymbol(Box<crate::stdlib::ffi::FfiSymbol>),
     /// FFI campaign §3.4: an opaque C pointer (a `malloc` result, a C "constructor"
     /// handle) carried as a raw `usize` address. NOT auto-freed (the C library owns the
     /// lifetime). GC-UNTRACED.
     #[cfg(feature = "ffi")]
-    #[allow(dead_code)] // Constructed by Task 7's pointer-returning `sym.call`.
     ForeignPtr(usize),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
@@ -4696,6 +4693,36 @@ impl Interp {
                     span,
                 )
                 .await;
+            }
+        }
+        #[cfg(feature = "ffi")]
+        {
+            use crate::value::NativeKind::*;
+            // FFI handle methods. The `ffi` capability already re-checked above via
+            // `governing_cap` (all three FFI kinds → Cap::Ffi), so operating an open
+            // handle is denied after `caps.drop("ffi")`.
+            match m.receiver.kind {
+                ForeignLib if m.method == "symbol" => {
+                    return self.ffi_lib_symbol(m.receiver.id, &args, span);
+                }
+                ForeignSymbol if m.method == "call" => {
+                    return self.ffi_symbol_call(m.receiver.id, &args, span);
+                }
+                ForeignPtr if m.method == "read_cstr" => {
+                    return self.ffi_read_cstr_ptr(m.receiver.id, span);
+                }
+                ForeignLib | ForeignSymbol | ForeignPtr => {
+                    return Err(AsError::at(
+                        format!(
+                            "{} handle has no method '{}'",
+                            m.receiver.kind.type_name(),
+                            m.method
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                _ => {}
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
