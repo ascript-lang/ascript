@@ -20,6 +20,12 @@ use std::collections::HashMap;
 /// (8). Past the cap, `unify` gives up (gradual), never recurses unboundedly.
 const UNIFY_DEPTH_CAP: usize = 8;
 
+/// A concrete type in the NUM numeric tower (`int`/`float` ⊆ `number`). Used by the
+/// numeric-join rescue so an over-constrained type var widens to `number`.
+fn is_numeric(t: &CheckTy) -> bool {
+    matches!(t, CheckTy::Int | CheckTy::Float | CheckTy::Number)
+}
+
 /// The union-find unifier + fresh-var allocator. One `Solver` per instantiation
 /// context (a single generic call/construction).
 #[derive(Debug, Default)]
@@ -137,6 +143,20 @@ impl Solver {
         if depth > UNIFY_DEPTH_CAP {
             return false; // depth-cap give-up (gradual)
         }
+        // Capture any var IDENTITY on each side BEFORE resolving (resolve_shallow
+        // collapses a bound var to its concrete), so an OVER-CONSTRAINED numeric var can
+        // be widened to its join rather than left stale-bound — see the numeric-join
+        // rescue at the concrete give-up below.
+        let a_var = if let Var(v, _) = a {
+            Some(self.binding_chain_end(*v))
+        } else {
+            None
+        };
+        let b_var = if let Var(v, _) = b {
+            Some(self.binding_chain_end(*v))
+        } else {
+            None
+        };
         let a = self.resolve_shallow(a);
         let b = self.resolve_shallow(b);
 
@@ -186,8 +206,49 @@ impl Solver {
             }
             // Two identical concretes unify; distinct concretes do NOT (gradual
             // give-up — a *constraint failure*, not a diagnostic).
-            (x, y) => x == y,
+            (x, y) => {
+                if x == y {
+                    return true;
+                }
+                // Numeric-join rescue (§4.2): a type var constrained to two DISTINCT
+                // concrete numerics (e.g. `int` then `float`, from `max(1, 2.0)`) widens
+                // to `number` — their join — instead of staying stale-bound, which would
+                // otherwise manufacture a FALSE blocking `type-mismatch` on sound,
+                // type-erased code. A NON-numeric conflict (`int` vs `string`) still
+                // gives up, leaving the stale binding so the genuine "T can't be both"
+                // mismatch is still reported. Only fires when a var is actually involved
+                // (two raw concretes with no var stay a plain give-up).
+                if is_numeric(x) && is_numeric(y) {
+                    let mut rescued = false;
+                    if let Some(v) = a_var {
+                        self.bindings.insert(v, CheckTy::Number);
+                        rescued = true;
+                    }
+                    if let Some(v) = b_var {
+                        self.bindings.insert(v, CheckTy::Number);
+                        rescued = true;
+                    }
+                    if rescued {
+                        return true;
+                    }
+                }
+                false
+            }
         }
+    }
+
+    /// Follow a var→var binding chain to its END var (the one bound to a concrete or
+    /// still unbound) — the var whose binding the numeric-join rescue must widen.
+    fn binding_chain_end(&self, mut v: VarId) -> VarId {
+        let mut steps = 0;
+        while let Some(CheckTy::Var(w, _)) = self.bindings.get(&v) {
+            v = *w;
+            steps += 1;
+            if steps > 64 {
+                break; // defensive — never spin
+            }
+        }
+        v
     }
 
     /// Bind `v := t` after the OCCURS-CHECK. If `v` occurs anywhere inside `t` (a
@@ -374,6 +435,45 @@ mod tests {
         let mut s = Solver::new();
         assert!(s.unify(&CheckTy::Any, &CheckTy::Int));
         assert!(s.unify(&CheckTy::String, &CheckTy::Any));
+    }
+
+    #[test]
+    fn numeric_join_widens_over_constrained_var() {
+        // Regression (TYPE Unit-C review B1): a single type var constrained by two
+        // distinct NUMERICS — `int` then `float`, as in `max(1, 2.0)` — widens to
+        // `number` (their join) instead of staying stale-bound to `int`, which would
+        // otherwise manufacture a FALSE blocking `type-mismatch` on sound erased code.
+        let mut s = Solver::new();
+        let v = s.fresh();
+        assert!(s.unify(&tv(v), &CheckTy::Int)); // arg0 → v := int
+        assert!(s.unify(&tv(v), &CheckTy::Float)); // arg1 → widen v to number (NOT give-up)
+        assert_eq!(s.substitute(&tv(v)), CheckTy::Number);
+        // Order-independent: float then int also widens to number.
+        let mut s2 = Solver::new();
+        let w = s2.fresh();
+        assert!(s2.unify(&tv(w), &CheckTy::Float));
+        assert!(s2.unify(&tv(w), &CheckTy::Int));
+        assert_eq!(s2.substitute(&tv(w)), CheckTy::Number);
+    }
+
+    #[test]
+    fn non_numeric_conflict_does_not_widen() {
+        // The numeric-join rescue must NOT swallow a genuine "T can't be both" conflict:
+        // a var constrained to `int` then `string` gives up (leaving the binding) so the
+        // downstream `assignable` still reports the real mismatch.
+        let mut s = Solver::new();
+        let v = s.fresh();
+        assert!(s.unify(&tv(v), &CheckTy::Int));
+        assert!(!s.unify(&tv(v), &CheckTy::String)); // give-up, NOT widened
+        assert_eq!(s.substitute(&tv(v)), CheckTy::Int);
+    }
+
+    #[test]
+    fn two_raw_numerics_without_a_var_do_not_unify() {
+        // The rescue only fires when a VAR is involved; two raw concrete numerics with
+        // no var stay a plain give-up (no spurious success, nothing to widen).
+        let mut s = Solver::new();
+        assert!(!s.unify(&CheckTy::Int, &CheckTy::Float));
     }
 
     #[test]

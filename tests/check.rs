@@ -417,6 +417,48 @@ fn empty_array_generic_call_is_silent() {
     );
 }
 
+#[test]
+fn same_typed_params_mixed_numerics_is_silent() {
+    // Regression (TYPE Unit-C review B1): a generic with two same-typed params called
+    // with mixed numeric subtypes (`max(1, 2.0)`) must be SILENT — the type var widens
+    // to `number` (the join), not stale-bound to `int` (which manufactured a false
+    // blocking `type-mismatch` on code that runs fine, since T is erased).
+    let p = write_tmp(
+        "gen_mixed_num.as",
+        "fn max<T>(a: T, b: T): T { return a }\nlet r = max(1, 2.0)\nlet s = max(2.0, 1)\nprint(r)\nprint(s)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("type-"),
+        "same-T mixed-numeric generic call must be gradual-silent; got: {combined}"
+    );
+}
+
+#[test]
+fn same_typed_params_incompatible_types_still_caught() {
+    // The numeric-join rescue must NOT swallow a genuine conflict: `pair(1, "s")` binds
+    // T to two non-numeric-incompatible concretes — still a blocking `type-mismatch`.
+    let p = write_tmp(
+        "gen_conflict.as",
+        "fn pair<T>(a: T, b: T): T { return a }\nlet x = pair(1, \"s\")\nprint(x)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("type-mismatch"),
+        "a genuine same-T conflict (int vs string) must still be caught; got: {combined}"
+    );
+}
+
 // --- CFG-T3: ascript.toml [lint] config -----------------------------------
 //
 // Discovery walks UP from each checked file's parent directory looking for

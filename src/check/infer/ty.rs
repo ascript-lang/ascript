@@ -805,8 +805,16 @@ pub const TEMPLATE_VAR_BASE: VarId = 0x8000_0000;
 
 /// A STABLE template-`Var` id for a type-parameter NAME (TYPE §4.2). FNV-1a over the
 /// name, folded into the high (template) half of the id space. The same name always
-/// maps to the same id (so a signature's repeated `T` is one variable); a collision
-/// across two distinct names would merely unify them → gradual, never a false `No`.
+/// maps to the same id (so a signature's repeated `T` is one variable).
+///
+/// A hash COLLISION across two DISTINCT param names in one signature (`<T, U>`) would
+/// fuse them into one variable. That is NOT necessarily gradual: like the same-`T`
+/// over-constraint (see the unifier's numeric-join rescue), two non-numeric concrete
+/// args could then surface a spurious mismatch. It is, however, practically
+/// unreachable — a 31-bit FNV-1a collision between two short type-parameter names does
+/// not occur in real code — so it is left as a documented, accepted residual rather
+/// than paid for with a per-decl interning table. (The numeric case is already
+/// rescued by the unifier; only a non-numeric collision could mislead.)
 pub fn param_template_id(name: &str) -> VarId {
     let mut h: u32 = 0x811c_9dc5;
     for b in name.bytes() {
