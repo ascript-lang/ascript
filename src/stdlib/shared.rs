@@ -78,8 +78,23 @@ struct Freezer {
 }
 
 impl Freezer {
-    /// Deep-freeze `v` into a `SharedValue`, threading `path` for error messages.
+    /// Deep-freeze `v` into a `SharedValue`, threading `path` for error messages. A
+    /// hostile, iteratively-built value (e.g. `for … { x = [x] }`, which evades the
+    /// interpreter's `EXPR_NEST_LIMIT`) recurses one native frame per level here, so we
+    /// grow the stack like the rest of the runtime (SP9 `stack::grow` → `stacker::
+    /// maybe_grow`): a pathologically deep freeze becomes a clean result instead of a
+    /// SIGABRT. The guard is a no-op when the stack is healthy; the inner recursive calls
+    /// re-enter through this wrapper, so the check fires at every level.
     fn walk(&mut self, v: &Value, path: &mut String, span: Span) -> Result<SharedValue, Control> {
+        crate::vm::stack::grow(|| self.walk_inner(v, path, span))
+    }
+
+    fn walk_inner(
+        &mut self,
+        v: &Value,
+        path: &mut String,
+        span: Span,
+    ) -> Result<SharedValue, Control> {
         match v {
             // Scalars freeze directly — no identity, no recursion.
             Value::Nil => Ok(Arc::new(SharedNode::Nil)),
@@ -358,6 +373,37 @@ mod tests {
             },
             _ => panic!("expected Shared"),
         }
+    }
+
+    #[test]
+    fn freeze_moderately_deep_value_succeeds() {
+        // Guards the recursive `walk` against a gross regression on nested input. The
+        // deep-robustness fix proper — `walk`'s `stack::grow` wrapper, which grows the
+        // freeze recursion per level so a PATHOLOGICALLY deep (~100k) value freezes to a
+        // clean result instead of a SIGABRT — is verified end-to-end via the binary on
+        // the 512 MB worker stack (a `while { x=[x] }` program). It can't be unit-tested
+        // precisely here: any depth that would overflow the small debug test-thread stack
+        // WITHOUT the fix also overflows on the deep value's DROP (a separate, pre-existing
+        // deep-drop limitation with no per-level stacker). So this test uses a depth that
+        // exercises the recursion cleanly on the test stack.
+        let mut v = Value::Int(0);
+        for _ in 0..2_000 {
+            v = Value::Array(ArrayCell::new(vec![v]));
+        }
+        let frozen = freeze(&v, s());
+        assert!(frozen.is_ok(), "moderately-deep freeze must succeed");
+        // Confirm it descended the whole way: 2000 nested Shared arrays, innermost Int 0.
+        let mut node = match frozen.unwrap() {
+            Value::Shared(n) => n,
+            _ => panic!("expected Shared"),
+        };
+        let mut depth = 0;
+        while let SharedNode::Array(elems) = &*node {
+            node = elems[0].clone();
+            depth += 1;
+        }
+        assert_eq!(depth, 2_000, "freeze must descend every level");
+        assert!(matches!(&*node, SharedNode::Int(0)));
     }
 
     #[test]
