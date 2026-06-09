@@ -130,6 +130,27 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   `enum-variant-binding-shadow` (Warning) — write unit variants QUALIFIED (`Shape.Point`) in
   exhaustiveness-relevant matches. Examples: `examples/enums_adt.as`, `examples/advanced/{json_adt,
   state_machine,typed_errors}.as`.
+- **Structural interfaces (IFACE — runtime half).** `interface Name [extends A, B] { fn m(params): T }`
+  declares a named method SET (signatures, NO bodies; `async`/`fn*`/`static`/`worker` modifiers rejected).
+  `interface` is a RESERVED keyword (`Tok::Interface`/`InterfaceKw`); `extends` (interface composition,
+  transitive-union method set) and `implements` (on a class) are CONTEXTUAL. An interface name resolves to
+  `Value::Interface(Rc<InterfaceDef>)` — an immutable, acyclic, no-op-`Trace` descriptor (the weight class of
+  `Value::Class`, never a receiver). `v instanceof I` is a STRUCTURAL conformance check (`Interp::conforms`,
+  the single SoT both engines reach via the shared `apply_binop` `InstanceOf` arm — branch on RHS:
+  `Value::Class` → unchanged nominal `is_instance_of`, `Value::Interface` → `conforms`, else the Tier-2
+  `instanceof requires a class **or interface** on the right-hand side`). v1 conformance = **name + arity**
+  (`arity_compatible` over `min_required`/`declared_max`); only `Value::Instance` can conform. `extends` is
+  flattened **lazily** (forward-referenceable module-globals) with a runtime cycle guard; verdict memoized
+  per `(class, iface)` pointer pair on `Interp`/`Vm` (pure memo, active in `--no-specialize`, holds no `Rc`).
+  `implements` is documentation only — stored on `Stmt::Class.implements` for the checker, NOT on the runtime
+  `Class` (conformance stays structural). An interface-typed annotation is a runtime CONTRACT via the
+  env-aware `check_type_env` (a `Named` resolving to an interface runs `conforms`; class/unresolved
+  unchanged). Interfaces ride the worker **code-shipping** closure (`TopDef::Interface`, transitive `extends`
+  deps), never the value serializer (an interface VALUE is non-sendable → field-path panic). `.aso` serializes
+  the UNFLATTENED descriptor (own methods + `extends` names) + the class `implements` list. **Static interface
+  type-checking (`CheckTy::Interface`, `assignable`, `implements-violation`) is TYPE-era — NOT shipped yet.**
+  Examples: `examples/interfaces.as`, `examples/advanced/interface_dispatch.as`; docs at
+  `docs/content/language/classes-enums.md#interfaces`.
 - **`std/log`** — leveled (`debug/info/warn/error`) structured logging, `Interp`-stateful, routed via
   `self.call_log`; stderr (Live) or capture buffer (tests). Serializes via `json::to_json_lossy` (never
   panics). Object args merge as fields; a thunk first-arg defers message work past the level filter; default
@@ -296,8 +317,10 @@ lines). Token-depth counting keeps `${…}` braces from skewing depth.
 ### Values (`src/value.rs`)
 `Value` is the runtime tagged union — roughly 16 user-facing kinds: `Nil`, `Bool`, `Int(i64)`,
 `Float(f64)`, `Decimal`, `Str(Rc<str>)`, `Builtin`/`Function`, `Array`, `Object` (insertion-ordered
-`IndexMap`), `Map`, `Set`, `Bytes`, `Regex`, `Native`, `Enum`, `Class`/`Instance`, plus M17's `Future`
-(identity-equal, backed by `SharedFuture`) and `Generator` (identity-equal, consumer-driven). A separate
+`IndexMap`), `Map`, `Set`, `Bytes`, `Regex`, `Native`, `Enum`, `Class`/`Instance`, IFACE's
+`Interface(Rc<InterfaceDef>)` (identity-equal, immutable, no-op `Trace` — a conformance descriptor, never a
+receiver), plus M17's `Future` (identity-equal, backed by `SharedFuture`) and `Generator` (identity-equal,
+consumer-driven). A separate
 hashable `MapKey` canonicalizes numbers (−0.0→+0.0, NaN unified; an integral in-range `Float` folds to the
 equal `Int` key) for `Map` keys.
 

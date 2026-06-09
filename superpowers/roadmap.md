@@ -372,6 +372,38 @@ redesign + a blocking `non-exhaustive-match` Error), corpus migrated not trimmed
    exhaustiveness). Generic enums (`enum Box<T>`) deferred to TYPE; the representation admits it
    additively.
 
+## IFACE — structural interfaces ✅ RUNTIME HALF COMPLETE (2026-06)
+
+`specs/2026-06-08-interfaces-design.md`, `plans/2026-06-08-interfaces.md`. Adds **structural interfaces**
+(the Go model): an `interface` names a method SET; a value **conforms** if it structurally has those
+methods. CORE, both engines byte-identical, **non-breaking** (`interface` is a new reserved keyword; the
+nominal `instanceof` over classes is preserved bit-for-bit; the RHS error gains "or interface"). The
+**RUNTIME half ships now**; the **STATIC half (`CheckTy::Interface`, `assignable`, narrowing,
+`implements-violation`) is TYPE-era** and NOT yet shipped.
+
+1. **Value + predicate** — `Value::Interface(Rc<InterfaceDef>)` (immutable, acyclic, no-op `Trace`;
+   weight class of `Value::Class`, never a receiver). `Interp::conforms` is the single SoT both engines
+   reach via the shared `apply_binop` `InstanceOf` arm (RHS branch: `Class` → unchanged nominal
+   `is_instance_of`, `Interface` → `conforms`). v1 conformance = **name + arity** (`arity_compatible` over
+   `min_required`/`declared_max`); only `Value::Instance` conforms. `extends` flattened **lazily** (forward-
+   referenceable module-globals) with a runtime cycle guard; verdict memoized per `(class, iface)` pointer
+   on `Interp`/`Vm` (pure memo, active in `--no-specialize`). Env-aware `check_type_env` routes an
+   interface-typed annotation through `conforms` as a runtime contract.
+2. **Both parsers + tree-sitter** — `interface_decl` (method-requirement list, `extends` composition,
+   modifiers rejected) + a class `implements` clause; `Stmt::Interface` + `Stmt::Class.implements`;
+   `interface`/`implements` highlights; `parser.c` regenerated.
+3. **Serialization + workers** — `.aso` Interface constant (UNFLATTENED own methods + `extends` names) +
+   class `implements` list, `ASO_FORMAT_VERSION` = 25; worker **code-shipping** `TopDef::Interface`
+   (transitive `extends` deps) — interfaces ride the closure, never the value serializer (an interface
+   VALUE is non-sendable → field-path panic).
+4. **Tooling + corpus** — CST formatter (interface decls + `implements` clause, idempotent); LSP semantic
+   tokens (`interface`/`implements`/`extends` keywords, interface names as types); REPL cross-line
+   interface sessions; examples `examples/interfaces.as` + `examples/advanced/interface_dispatch.as`, four-
+   mode byte-identical, fmt-canonical, Gate-5-clean (zero `type-*`/`non-exhaustive`/`enum-variant`). Docs:
+   `docs/content/language/classes-enums.md#interfaces` + `type-contracts.md`. Default method bodies,
+   interface fields, and generic interfaces (`interface Iterator<T>`) deferred (the representation reserves
+   them); static conformance checking deferred to TYPE.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred
