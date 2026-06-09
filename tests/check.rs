@@ -560,6 +560,55 @@ mod toml_config {
             combined(&out)
         );
     }
+
+    // TYPE Task 2 — the annotated-slot blocking default is OPT-OUT via ascript.toml.
+    // An annotated `type-mismatch` defaults to a BLOCKING `Severity::Error` (Task 1).
+    // A project `[lint] warn = ["type-mismatch"]` DOWNGRADES it back to a warning (the
+    // explicit opt-out); with NO override the default stays blocking. This composes
+    // entirely through `config.effective(code, default)`: the emit severity is the
+    // `default` argument, so a `warn` override returns `Some(Warning)` and no override
+    // passes the `Error` through — NO code change beyond Task 1 was needed here.
+
+    #[test]
+    fn type_default_blocks_annotated_mismatch() {
+        // No ascript.toml → the annotated `type-mismatch` stays a blocking Error and
+        // the run exits non-zero (the soundness default).
+        let dir = project("type_default_blocks");
+        let f = write(&dir, "a.as", "let x: number = \"s\"\nprint(x)\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "annotated type-mismatch must block by default (exit non-zero); out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn toml_warn_downgrades_blocking_type_mismatch() {
+        // `[lint] warn = ["type-mismatch"]` downgrades the blocking annotated Error
+        // back to a Warning → the run exits 0 (the explicit opt-out).
+        let dir = project("type_warn_downgrade");
+        let f = write(&dir, "a.as", "let x: number = \"s\"\nprint(x)\n");
+        write(&dir, "ascript.toml", "[lint]\nwarn = [\"type-mismatch\"]\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            out.status.success(),
+            "[lint] warn = [type-mismatch] must downgrade the blocking Error to a Warning (exit 0); out: {}",
+            combined(&out)
+        );
+        // The diagnostic is still reported (as a warning), just non-blocking.
+        let json = Command::new(bin())
+            .arg("check")
+            .arg("--json")
+            .arg(&f)
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&json.stdout);
+        assert!(
+            s.contains("\"code\":\"type-mismatch\"") && s.contains("\"severity\":\"warning\""),
+            "downgraded type-mismatch must still report as a warning; out: {s}"
+        );
+    }
 }
 
 // The checker must NOT false-positive on idiomatic code: every example program

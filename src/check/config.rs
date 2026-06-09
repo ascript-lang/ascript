@@ -92,6 +92,18 @@ impl LintConfig {
     /// - explicit `Some(sev)` override → that severity
     /// - explicit suppression (`None`) → `None` (drop the diagnostic)
     /// - no override → the default severity
+    ///
+    /// **TYPE soundness opt-out (the blocking default is opt-out, not opt-in).**
+    /// The `default` argument is the rule's *emitted* severity, which since TYPE is
+    /// `Severity::Error` for a `type-mismatch`/`type-error` against a syntactically
+    /// **annotated** slot (an explicit `let x: T`, a typed param, a declared return,
+    /// a typed field default) and `Severity::Warning` everywhere else (an inferred
+    /// slot, `possibly-nil`). This method composes that with the project config with
+    /// no special-casing: a `[lint] warn = ["type-mismatch"]` (`self.warn(...)`)
+    /// override returns `Some(Warning)` — **downgrading the blocking annotated error
+    /// back to an advisory warning** (the explicit, documented opt-out for teams
+    /// mid-migration) — while *no* override passes the blocking `Error` through
+    /// (the soundness default stays blocking; backward-compat is not a constraint).
     pub fn effective(&self, code: &str, default: Severity) -> Option<Severity> {
         match self.overrides.get(code) {
             Some(Some(sev)) => Some(*sev),
@@ -127,6 +139,37 @@ mod tests {
         assert_eq!(
             cfg.effective("relaxed", Severity::Error),
             Some(Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn type_blocking_default_is_opt_out_via_warn() {
+        // TYPE Task 2: the annotated-slot `type-mismatch` is emitted at the BLOCKING
+        // `Severity::Error` default (the `default` argument). With NO override it
+        // passes through as a blocking Error (the soundness default).
+        let cfg = LintConfig::default();
+        assert_eq!(
+            cfg.effective("type-mismatch", Severity::Error),
+            Some(Severity::Error),
+            "default (no override) keeps the annotated type-mismatch blocking",
+        );
+
+        // `[lint] warn = ["type-mismatch"]` (→ `warn(...)`) DOWNGRADES the blocking
+        // Error back to a Warning — the explicit opt-out, composed purely through
+        // `effective` (no special-casing).
+        let mut warned = LintConfig::default();
+        warned.warn("type-mismatch");
+        assert_eq!(
+            warned.effective("type-mismatch", Severity::Error),
+            Some(Severity::Warning),
+            "warn override downgrades the blocking annotated Error to a Warning",
+        );
+
+        // An advisory (`possibly-nil`/inferred) `type-mismatch` defaults to Warning
+        // and is unaffected by the absence of an override.
+        assert_eq!(
+            cfg.effective("possibly-nil", Severity::Warning),
+            Some(Severity::Warning),
         );
     }
 }
