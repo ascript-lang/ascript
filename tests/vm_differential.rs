@@ -7349,6 +7349,67 @@ async fn build_and_run_aso_from_src(src: &str, tag: &str) -> String {
     build_and_run_aso(&src_path).await
 }
 
+/// Build inline `src` to `.aso`, run it, and return `(run_succeeded, stdout, stderr)`
+/// WITHOUT asserting success — for interface ERROR-path programs whose `.aso` run must
+/// FAIL the same way the other three engines do (a runtime panic; the build itself
+/// still succeeds because cyclic/bad-`extends`/contract faults are runtime, not
+/// compile-time). Mirrors [`build_and_run_aso`] otherwise.
+async fn build_and_run_aso_status(src: &str, tag: &str) -> (bool, String, String) {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ascript_iface_err_{tag}_{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create temp dir: {e}"));
+    let src_name = format!("{tag}.as");
+    std::fs::write(dir.join(&src_name), src).unwrap_or_else(|e| panic!("write temp .as: {e}"));
+    let build_out = std::process::Command::new(bin)
+        .arg("build")
+        .arg(&src_name)
+        .current_dir(&dir)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn ascript build: {e}"));
+    // The build MUST succeed — these faults are runtime, not compile-time. (If a future
+    // change makes them compile errors, this assert flags the behavior change loudly.)
+    assert!(
+        build_out.status.success(),
+        "ascript build {tag} should succeed (runtime fault, not compile error)\n  stderr: {}",
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+    let run_out = std::process::Command::new(bin)
+        .arg("run")
+        .arg(format!("{tag}.aso"))
+        .current_dir(&dir)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn ascript run .aso: {e}"));
+    (
+        run_out.status.success(),
+        String::from_utf8_lossy(&run_out.stdout).into_owned(),
+        String::from_utf8_lossy(&run_out.stderr).into_owned(),
+    )
+}
+
+/// Strip ANSI SGR escape sequences (`\x1b[…m`) so a rendered CLI diagnostic can be
+/// substring-matched against the raw `AsError.message`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Consume up to and including the final 'm' of the SGR sequence.
+            for e in chars.by_ref() {
+                if e == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// IFACE Task 9: interface programs must be byte-identical across the FULL four-mode
 /// matrix (tree-walker == specialized VM == generic VM == `.aso`). Unit A's iface
 /// tests only ran the first three because `.aso` REJECTED interface programs; now that
@@ -7400,6 +7461,55 @@ async fn iface_programs_four_mode_byte_identical() {
         assert_eq!(
             tw, aso,
             ".aso output diverged from tree-walker for iface `{tag}`\n  tw: {tw:?}\n  aso: {aso:?}"
+        );
+    }
+}
+
+/// IFACE review follow-up: interface ERROR paths (cyclic `extends`, `extends` a class /
+/// unknown name, a non-conforming interface-typed contract) must FAIL byte-identically
+/// across ALL FOUR modes — the three in-process engines (identical `AsError.message`)
+/// AND the `.aso`-compiled binary (non-zero exit whose rendered stderr carries the same
+/// message). The faults fire in the shared `flatten_interface_inner`/`check_type_env`,
+/// so `.aso` is identical by construction; this locks that so a future regression in
+/// `.aso` panic parity can't slip past the gates.
+#[tokio::test]
+async fn iface_error_paths_four_mode_byte_identical() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "cycle",
+            "interface A extends B {}\ninterface B extends A {}\nclass C {}\nprint(C() instanceof A)",
+        ),
+        (
+            "badclass",
+            "class K {}\ninterface I extends K {}\nclass C { fn m() {} }\nprint(C() instanceof I)",
+        ),
+        (
+            "unknown",
+            "interface I extends Nope {}\nclass C {}\nprint(C() instanceof I)",
+        ),
+        (
+            "contract",
+            "interface R { fn read(b): int }\nclass NoRead { fn write(b) { return 0 } }\nfn slurp(r: R) { return 0 }\nprint(slurp(NoRead()))",
+        ),
+    ];
+    for (tag, src) in cases {
+        // Modes 1–3: all three in-process engines error with an IDENTICAL message.
+        let tw = ascript::run_source(src).await.expect_err("tree-walker should error");
+        let vm = ascript::vm_run_source(src).await.expect_err("specialized vm should error");
+        let gen = ascript::vm_run_source_generic(src)
+            .await
+            .expect_err("generic vm should error");
+        assert_eq!(tw.message, vm.message, "specialized VM message diverged for `{tag}`");
+        assert_eq!(tw.message, gen.message, "generic VM message diverged for `{tag}`");
+        // Mode 4: .aso-compiled — build succeeds, run FAILS non-zero, and the rendered
+        // stderr (ANSI-stripped) carries the same panic message.
+        let (ok, _out, err) = build_and_run_aso_status(src, tag).await;
+        assert!(!ok, ".aso run for iface error `{tag}` should exit non-zero");
+        let err = strip_ansi(&err);
+        assert!(
+            err.contains(&tw.message),
+            ".aso stderr for `{tag}` must carry the same panic message\n  expected substring: {:?}\n  stderr: {err}",
+            tw.message
         );
     }
 }
