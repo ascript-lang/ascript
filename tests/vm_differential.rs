@@ -3546,6 +3546,17 @@ async fn vm_class_basic_method_and_fields() {
 }
 
 #[tokio::test]
+async fn vm_class_semicolon_member_separators() {
+    // `;` is an optional separator between class members. The CST parser used to
+    // reject it (the legacy tree-walker accepted it) — a legacy-vs-CST divergence
+    // where the tree-walker RAN a program the VM refused to compile. All four modes
+    // must now agree: typed fields, defaulted fields, and methods, separated by `;`
+    // (incl. doubled separators).
+    let src = "class Cfg { x: number = 1; y: number = 2;; fn sum() { return self.x + self.y } }\nlet c = Cfg()\nprint(c.sum())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
 async fn vm_class_field_read_via_member() {
     // Read a field directly off the instance (not through a method).
     let src = "class Point {\n  x: number\n  y: number\n  fn init(x, y) { self.x = x\n self.y = y }\n}\nlet p = Point(10, 20)\nprint(p.x)\nprint(p.y)";
