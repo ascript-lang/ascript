@@ -1073,6 +1073,23 @@ const _: fn() = || {
     is_send_sync::<SharedNode>();
 };
 
+/// VAL Task 1 — the boxed payload of `Value::GeneratorMethod`. Carries the
+/// generator handle plus the bound method name (`"next"`/`"close"`). Boxing the
+/// two fields behind one `Rc` collapses a 24-byte two-field variant to a single
+/// word, removing the floor that pinned `Value` at 32 bytes.
+pub struct GeneratorMethodData {
+    pub handle: Rc<crate::coro::GeneratorHandle>,
+    pub name: &'static str,
+}
+
+/// VAL Task 1 — the boxed payload of `Value::ClassMethod`. Carries the class plus
+/// the static/`from` method name. Boxing collapses the other 24-byte two-field
+/// variant to a single word (see `GeneratorMethodData`).
+pub struct ClassMethodData {
+    pub class: Rc<Class>,
+    pub name: Rc<str>,
+}
+
 #[derive(Clone)]
 pub enum Value {
     Nil,
@@ -1136,13 +1153,20 @@ pub enum Value {
     /// A method bound to a generator handle (e.g. `gen.next`), dispatched by the
     /// async `call_generator_method`. Generators have no `NativeObject`, so they
     /// can't reuse `NativeMethod`; this is the parallel binding for them.
-    GeneratorMethod(Rc<crate::coro::GeneratorHandle>, &'static str),
+    ///
+    /// VAL Task 1: boxed into a single `Rc<GeneratorMethodData>` (one word) — the
+    /// two-field form was a 24-byte payload that pinned the whole enum at 32 bytes.
+    /// These bindings are rare/cold, so the extra indirection is negligible.
+    GeneratorMethod(Rc<GeneratorMethodData>),
     /// A class associated function bound to its class: either the built-in typed
     /// parser `User.from` or a USER static method `User.create` (SP1 §3). The name
     /// is an `Rc<str>` (not `&'static`) so it can carry an arbitrary user static
     /// name; `call_value` resolves it against `static_methods` (chain-walked),
     /// then the built-in `from`.
-    ClassMethod(Rc<Class>, Rc<str>),
+    ///
+    /// VAL Task 1: boxed into a single `Rc<ClassMethodData>` (one word) — see the
+    /// `GeneratorMethod` note above; this was the other 24-byte pinning variant.
+    ClassMethod(Rc<ClassMethodData>),
     /// SRV §3.2 — an immutable, `Arc`-backed frozen value (`shared.freeze`). The
     /// runtime's FIRST and ONLY `Send`-carrying variant (the union as a whole stays
     /// `!Send` — see the `assert_not_impl_any!(Value: Send)` guard in `gc.rs`).
@@ -1421,10 +1445,12 @@ impl PartialEq for Value {
             (Value::Future(a), Value::Future(b)) => a.ptr_eq(b),
             // Generators compare by identity (same body channel).
             (Value::Generator(a), Value::Generator(b)) => Rc::ptr_eq(a, b),
-            (Value::GeneratorMethod(a, an), Value::GeneratorMethod(b, bn)) => {
-                Rc::ptr_eq(a, b) && an == bn
+            (Value::GeneratorMethod(a), Value::GeneratorMethod(b)) => {
+                Rc::ptr_eq(&a.handle, &b.handle) && a.name == b.name
             }
-            (Value::ClassMethod(a, an), Value::ClassMethod(b, bn)) => Rc::ptr_eq(a, b) && an == bn,
+            (Value::ClassMethod(a), Value::ClassMethod(b)) => {
+                Rc::ptr_eq(&a.class, &b.class) && a.name == b.name
+            }
             // SRV §3.5: a frozen `Shared` compares by `Arc` IDENTITY (like every
             // other container's identity-equality). Two `Shared`s wrapping the SAME
             // `Arc` are equal (idempotent `freeze` returns the same `Arc`); distinct
@@ -1480,8 +1506,8 @@ impl fmt::Debug for Value {
             Value::Super(_) => write!(f, "Super"),
             Value::Future(_) => write!(f, "Future"),
             Value::Generator(_) => write!(f, "Generator"),
-            Value::GeneratorMethod(_, m) => write!(f, "GeneratorMethod({})", m),
-            Value::ClassMethod(c, m) => write!(f, "ClassMethod({}.{})", c.name, m),
+            Value::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
+            Value::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
             Value::Shared(n) => write!(f, "Shared({})", n.kind_name()),
         }
     }
@@ -1661,8 +1687,8 @@ impl Value {
             Value::Super(_) => write!(f, "<super>"),
             Value::Future(_) => write!(f, "<future>"),
             Value::Generator(_) => write!(f, "<generator>"),
-            Value::GeneratorMethod(_, m) => write!(f, "<generator method {}>", m),
-            Value::ClassMethod(c, m) => write!(f, "<class method {}.{}>", c.name, m),
+            Value::GeneratorMethod(g) => write!(f, "<generator method {}>", g.name),
+            Value::ClassMethod(c) => write!(f, "<class method {}.{}>", c.class.name, c.name),
             // SRV §3.5: a frozen `Shared` prints like the value it froze (a frozen
             // object as `{...}`, a frozen array as `[...]`, a scalar bare).
             Value::Shared(n) => n.write_display(f),
@@ -1692,12 +1718,16 @@ mod tests {
     // (it just surfaces the number when run with `--nocapture`).
     #[test]
     fn value_size_is_documented() {
-        // VAL Task 0 baseline (measured): 32 bytes — set by the two 24-byte
-        // two-field method-binding variants (`ClassMethod(Rc<Class>, Rc<str>)`,
-        // `GeneratorMethod(Rc<GeneratorHandle>, &'static str)`) rounded with the
-        // discriminant to 32. Each VAL stage updates this constant as the enum
-        // shrinks (32 → ≤24 → 16 → 8).
-        assert_eq!(std::mem::size_of::<Value>(), 32);
+        // VAL Task 1: the two fat two-field method-binding variants are boxed to a
+        // single word, so the floor drops to ≤24 — now set by the next-widest
+        // 16-byte payloads (`Decimal` (16, still inline) / `Str(Rc<str>)` (2 words))
+        // plus the discriminant. Task 2 boxes `Decimal` to reach the 16-byte niche
+        // floor. Each VAL stage updates this constant (32 → ≤24 → 16 → 8).
+        assert!(
+            std::mem::size_of::<Value>() <= 24,
+            "size_of::<Value>() = {}",
+            std::mem::size_of::<Value>()
+        );
     }
 
     #[test]

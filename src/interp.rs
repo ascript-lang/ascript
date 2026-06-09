@@ -4262,8 +4262,18 @@ impl Interp {
             }
             Value::Generator(g) => match name {
                 // `gen.next` / `gen.close` are bound generator methods.
-                "next" => Ok(Value::GeneratorMethod(g.clone(), "next")),
-                "close" => Ok(Value::GeneratorMethod(g.clone(), "close")),
+                "next" => Ok(Value::GeneratorMethod(Rc::new(
+                    crate::value::GeneratorMethodData {
+                        handle: g.clone(),
+                        name: "next",
+                    },
+                ))),
+                "close" => Ok(Value::GeneratorMethod(Rc::new(
+                    crate::value::GeneratorMethodData {
+                        handle: g.clone(),
+                        name: "close",
+                    },
+                ))),
                 other => Err(AsError::at(
                     format!("generator has no property '{}' (try 'next')", other),
                     span,
@@ -4276,7 +4286,10 @@ impl Interp {
             // owned name; `call_value` dispatches it.
             Value::Class(c) => {
                 if crate::value::find_static_method(c, name).is_some() || name == "from" {
-                    Ok(Value::ClassMethod(c.clone(), name.into()))
+                    Ok(Value::ClassMethod(Rc::new(crate::value::ClassMethodData {
+                        class: c.clone(),
+                        name: name.into(),
+                    })))
                 } else {
                     Err(AsError::at(
                         format!("class {} has no static member '{}'", c.name, name),
@@ -4327,25 +4340,27 @@ impl Interp {
             Value::Class(class) => self.construct(class, args, span).await,
             Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
             Value::NativeMethod(m) => self.call_native_method(m, args, span).await,
-            Value::GeneratorMethod(g, method) => {
-                self.call_generator_method(&g, method, args, span).await
+            Value::GeneratorMethod(gm) => {
+                self.call_generator_method(&gm.handle, gm.name, args, span)
+                    .await
             }
             // ADT: calling a payload-variant CONSTRUCTOR (`Shape.Circle(2.0)`)
             // validates arity + field types and produces a constructed variant.
             // Calling a UNIT variant is an error.
             Value::EnumVariant(ev) => self.construct_variant(&ev, args, span).await,
-            Value::ClassMethod(c, name) => {
+            Value::ClassMethod(cm) => {
+                let (c, name) = (&cm.class, &cm.name);
                 // A user `static fn` (SP1 §3) takes precedence over the built-in
                 // `from` only if it exists; we resolved the name at read time, but
                 // re-resolve here so the carrier is self-contained. A static name
                 // that shadows `from` is impossible — `static fn from` is rejected.
-                if let Some((method, defining)) = crate::value::find_static_method(&c, &name) {
-                    self.call_static_method(method, defining, args, span, &name)
+                if let Some((method, defining)) = crate::value::find_static_method(c, name) {
+                    self.call_static_method(method, defining, args, span, name)
                         .await
-                } else if &*name == "from" {
+                } else if &**name == "from" {
                     let obj = args.first().cloned().unwrap_or(Value::Nil);
                     let strict = matches!(args.get(1), Some(Value::Bool(true)));
-                    self.validate_into(&c, &obj, strict, "", span)
+                    self.validate_into(c, &obj, strict, "", span)
                         .await
                         .map_err(Control::from)
                 } else {
