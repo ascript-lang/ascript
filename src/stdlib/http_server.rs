@@ -1206,24 +1206,38 @@ impl Interp {
         // we don't accumulate join handles forever.
         let mut inflight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         loop {
-            // On the bounded path, stop accepting once the SHARED budget is exhausted.
-            // Reading 0 here means either this loop or a sibling has already claimed
-            // the global total; make sure every sibling wakes, then drain + return.
-            // (`usize::MAX` = unbounded effectively never reaches 0.)
-            if bounded && budget.load(Ordering::SeqCst) == 0 {
-                stop.notify_waiters();
-                break;
-            }
-            // Accept the next connection. On the bounded path we race `accept()`
-            // against the shared `stop` so a sibling reaching the global budget wakes
-            // THIS loop out of a blocking `accept()` (otherwise it would hang). On the
-            // unbounded path `stop` is never fired, so we await `accept()` directly
-            // (byte-identical to the old loop).
+            // Accept the next connection. On the bounded path we race `accept()` against
+            // the shared `stop` so a sibling reaching the global budget wakes THIS loop
+            // out of a blocking `accept()` (otherwise it would hang). On the unbounded
+            // path `stop` is never fired, so we await `accept()` directly (byte-identical
+            // to the old loop).
             let accepted = if bounded {
+                // LOST-WAKEUP FIX: `Notify::notify_waiters` only wakes ALREADY-registered
+                // waiters (it stores no permit). So we REGISTER the `stop` waiter FIRST,
+                // then re-check the budget. A sibling that drove the budget to 0 and fired
+                // `notify_waiters` BEFORE we registered is caught by this budget re-check
+                // (it set budget=0 before notifying); one that fires AFTER is delivered to
+                // our already-registered `notified`. Either way an idle isolate can no
+                // longer miss the shutdown and park in `accept()` forever (which would hang
+                // its thread → `serve` never returns). Reading 0 here means this loop or a
+                // sibling claimed the global total — wake every sibling, then drain+return.
+                let notified = stop.notified();
+                tokio::pin!(notified);
+                // `Notified` registers its waiter on first POLL, not on creation — so we
+                // `enable()` it to register NOW, BEFORE the budget re-check. Without this
+                // the register-before-check is a no-op (the select would register only
+                // after the check, re-opening the lost-wakeup window). With it: a sibling
+                // that fired `notify_waiters` after this `enable()` reaches our registered
+                // waiter; one that fired before set budget=0 first, caught by the re-check.
+                notified.as_mut().enable();
+                if budget.load(Ordering::SeqCst) == 0 {
+                    stop.notify_waiters();
+                    break;
+                }
                 tokio::select! {
                     biased;
                     r = listener.accept() => Some(r),
-                    _ = stop.notified() => None,
+                    _ = &mut notified => None,
                 }
             } else {
                 Some(listener.accept().await)

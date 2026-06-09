@@ -334,6 +334,66 @@ fn multi_isolate_max_requests_is_exact_total() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn multi_isolate_concurrent_at_exhaustion_stops_cleanly() {
+    // Integration guard for the SRV Unit-B review BLOCKER B1 (the `Notify::notify_waiters`
+    // lost-wakeup, fixed in `accept_loop` by `enable()`-ing the stop waiter BEFORE the
+    // budget re-check). The bug could leave an idle isolate parked in `accept()` forever
+    // after a sibling claimed the last budget unit → a hung thread → `serve` never returns
+    // → process hang. This drives the high-concurrency exhaustion path (many isolates
+    // contending the budget at shutdown) and asserts the server STOPS CLEANLY across
+    // several rounds. HONEST CAVEAT: the specific lost-wakeup is a microscopic timing
+    // window (an isolate descheduled between the budget check and the select's waiter
+    // registration), so this is a best-effort trigger, not a deterministic catch — the
+    // fix's correctness rests on the tokio `Notify` register-before-check reasoning; this
+    // test guards against a gross regression in the multi-isolate shutdown coordination.
+    for attempt in 0..5 {
+        let port = reserve_port();
+        let workers = 8usize;
+        let k = 5usize;
+        let src = server_program(workers, Some(k));
+        let mut child = spawn_server(&format!("concur{attempt}"), &src, port);
+
+        // FIRST wait for the server to be ready (all N isolates booted their `setup` +
+        // bound) via the retrying probe — firing before that would get connection-refused
+        // (0 budget consumed) and the server would correctly wait forever for requests
+        // that never arrive (a test artifact, not the bug under test). This probe consumes
+        // ONE budget unit.
+        assert!(
+            http_get(port, "/who").is_some(),
+            "[attempt {attempt}] server should become ready"
+        );
+
+        // Now fire MORE than the remaining budget CONCURRENTLY so several isolates are
+        // simultaneously parked in accept() when the budget hits 0 — the exact scenario
+        // the sequential test can't reach. At most K total are served; the invariant under
+        // test is that the process EXITS CLEANLY (no lost-wakeup hang).
+        let mut handles = Vec::new();
+        for _ in 0..(k + workers) {
+            handles.push(std::thread::spawn(move || {
+                http_get_quick(port, "/who").map(|b| b.starts_with("hi:")).unwrap_or(false)
+            }));
+        }
+        let served = 1 + handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .filter(|&b| b)
+            .count();
+        assert!(
+            served <= k,
+            "[attempt {attempt}] never more than maxRequests={k} served, got {served}"
+        );
+
+        let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+        assert!(
+            matches!(status, Some(s) if s.success()),
+            "[attempt {attempt}] server must STOP CLEANLY after concurrent exhaustion (no \
+             lost-wakeup hang); status={status:?}"
+        );
+    }
+}
+
 /// A single quick GET (short connect budget) used to probe that the server has stopped.
 fn http_get_quick(port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect_timeout(
