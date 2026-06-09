@@ -404,6 +404,36 @@ nominal `instanceof` over classes is preserved bit-for-bit; the RHS error gains 
    interface fields, and generic interfaces (`interface Iterator<T>`) deferred (the representation reserves
    them); static conformance checking deferred to TYPE.
 
+## TYPE — Sound gradual types & generics (STATIC-ONLY) ✅ MERGED
+
+Spec `superpowers/specs/2026-06-08-sound-types-generics-design.md`, plan `…/plans/2026-06-08-sound-types-generics.md`
+(17 tasks). **Diagnostically breaking, behaviourally inert:** no engine/`.aso` change, `ASO_FORMAT_VERSION`
+stays 25, `vm_differential` untouched and green in both configs — generics are runtime-**erased** (a `T`-slot
+checks as accept-anything). Two deliverables:
+
+1. **Soundness flip** — a provable `Compat3::No` on a *syntactically annotated* slot is now a blocking
+   `Severity::Error` (was advisory Warning). Realized as a `sev` arg on `emit` threaded via a `blocking` flag
+   through `check_against` for the two `walk_let`/`walk_return` sites + passed `Error` directly at the two
+   INLINE sites (`check_call_args`, `check_field_default`). `possibly-nil`, `type-error`, and inferred-context
+   mismatches stay Warning. Downgradable: `ascript.toml [lint] type-mismatch = "warn"`.
+2. **Generics** — `CheckTy::{Var,FnSig,ClassApp,EnumApp,Interface}`, occurs-checked union-find (`unify.rs`),
+   argument-driven inference (freshen→unify→substitute→check) + explicit type args, a genuinely-INVARIANT
+   `ClassApp`/`EnumApp`/parameterized-interface `assignable` arm (rule 8 left covariant), and interface bounds
+   via the structural `conforms` predicate. The cardinal invariant: an unsolved/unbounded `Var` → `Unknown`,
+   NEVER `No`. Surface syntax (`fn map<A,B>`, `class Box<T>`, `enum Option<T>`, `fn(A)->B`, bounded
+   `<C: Container<T>>`, expression-level `Box<int>(5)`) lands in BOTH parsers + tree-sitter (regen + GLR
+   conflict for the expression-level type-arg case), the formatter, and the AST — all erased at runtime.
+
+**Tooling + corpus (Tasks 13–17):** the CST formatter now PRESERVES decl-level type-param lists (the Unit-B
+`fn id<T>` → `fn id` drop is fixed) AND expression-level explicit type args, idempotent + round-tripping; the
+Gate-5 tripwire (`tests/check.rs` `corpus::`) asserts ZERO `type-*`/exhaustiveness diagnostics over `examples/**`
+in BOTH configs plus a property battery (incl. the B1 mixed-numeric `max(1, 2.0)` combinator — the numeric-join
+rescue's standing guard); runnable `examples/generics.as` + `examples/advanced/generic_result.as` (four-mode
+byte-identical, fmt-canonical, Gate-5-clean); LSP hover/inlay surface INSTANTIATED generics (`Box<int>`,
+`array<int>`) and the blocking `type-mismatch` Error flows through. Docs: `docs/content/language/type-contracts.md`
+(Sound typing + Generics sections), README types blurb. **v1 limitation (documented, not a bug):** user
+parameterized types are INVARIANT — write a generic `fn<T>` rather than relying on `Box<Dog>` ↦ `Box<Animal>`.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

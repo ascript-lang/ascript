@@ -152,11 +152,15 @@ value, a value flowing through `any`, an `import`ed/stdlib result, or any expres
 checker can't determine is treated as `any` and never produces a warning. Idiomatic untyped AScript
 stays completely quiet — only *provably* wrong code is flagged.
 
-It emits three diagnostics, all default-**Warning** and all configurable like every other lint
-(`// ascript-ignore[type-mismatch]`, `--deny`/`--warn`/`--allow`, the `ascript.toml [lint]` table):
+It emits three diagnostics, all configurable like every other lint
+(`// ascript-ignore[type-mismatch]`, `--deny`/`--warn`/`--allow`, the `ascript.toml [lint]` table).
+Their **default severity follows the soundness model** below: `type-mismatch` on a *syntactically
+annotated* slot is a blocking **Error**, while `type-error` and `possibly-nil` (and any mismatch in
+an *inferred* context) stay advisory **Warning**.
 
 - **`type-mismatch`** — a value provably the wrong type for an **annotated slot**: a typed `let`/
   `const` initializer, a typed parameter at a call, a typed `return`, or a typed class-field default.
+  Because the slot is annotated, this defaults to a **blocking Error** (see *Sound typing* below).
 
   ```ascript
   let count: number = "ten"          // type-mismatch: expected `number`, found `string`
@@ -236,3 +240,87 @@ cross-module no).
 > exact old cases for one release (so an existing `ascript.toml` naming them keeps working) and the
 > new pass suppresses its own duplicate `type-mismatch` at the same span; prefer `type-mismatch`
 > going forward. In a later release the legacy rules become accepted-but-no-op config aliases.
+
+## Sound typing: blocking for annotated, gradual for inferred
+
+The checker is still **static-only** — it runs no code and never changes runtime behaviour — but its
+*severity* now reflects a simple soundness contract:
+
+- **You annotated it → it blocks.** A provable `type-mismatch` against a *syntactically annotated*
+  slot (a typed `let`/`const`, a typed parameter at a call, a typed `return`, or a typed field
+  default) is an **Error**: `ascript check` exits non-zero and your editor flags it red. If you wrote
+  the type down, a value that provably violates it is a bug, not a hint.
+- **It was inferred / `any` / unprovable → it stays advisory.** `possibly-nil`, `type-error`, and a
+  mismatch in an *inferred* context default to **Warning**. Anything the checker cannot prove stays
+  completely silent (the gradual escape) — untyped AScript never trips the gate.
+
+The runtime is **unchanged**: generics and annotations are *erased*, the bytecode (`.aso`) format is
+unchanged, and both engines still produce byte-identical output. This is a *diagnostic* tightening,
+not a behavioural one — a program that built before still runs the same; it only fails the type gate
+if it was annotated-and-provably-wrong.
+
+**Opting out.** The block is a default, not a mandate. Downgrade it per-project in `ascript.toml`:
+
+```toml
+[lint]
+type-mismatch = "warn"   # back to advisory; or "allow" to silence entirely
+```
+
+…or inline at the one site: `// ascript-ignore[type-mismatch]`.
+
+## Generics
+
+Functions, classes, enums, and interfaces can take **type parameters** — placeholders inferred at
+each call/construction site and **erased at runtime**. The checker uses them statically (to relate a
+result back to its inputs and to enforce bounds); it never affects execution.
+
+```ascript
+// A generic function — `<A, B>` are inferred from the arguments. `fn(A) -> B` is
+// a function-type annotation for the callback.
+fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {
+  let out = []
+  for (x in xs) { array.push(out, f(x)) }
+  return out
+}
+
+let doubled = map([1, 2, 3], (x) => x * 2)   // inferred: array<int>
+
+// A generic class — the type arg is inferred from the constructor.
+class Box<T> {
+  value: T
+  fn get(): T { return self.value }
+}
+let b = Box(5)            // b : Box<int>   (hover/inlay show the instantiation)
+let s = Box<string>("x")  // explicit type argument
+
+// A generic enum (the optional-payload ADT shape).
+enum Option<T> { Some(value: T), None }
+```
+
+**Bounds.** A type parameter can require a structural interface — `<C: Container<T>>` accepts any `C`
+that conforms to `Container<T>` (structural; no explicit `implements` needed). A type argument that
+provably fails the bound is a blocking `type-mismatch`.
+
+```ascript
+interface Container<T> { fn at(i: number): T }
+fn first<T, C: Container<T>>(c: C): T { return c.at(0) }
+```
+
+**Soundness is the same rule as above.** A generic parameter slot is *annotated*, so a provable
+mismatch against a *solved* type argument blocks:
+
+```ascript
+fn id<T>(x: T): T { return x }
+let r = id<string>(5)     // type-mismatch (Error): argument 1 expects `string`, found `int`
+```
+
+…while anything the solver can't pin down stays **gradual**: an unsolved type parameter degrades to
+`any` (never a false positive), so an empty-array `map([], f)` or an `any`-typed argument is silent.
+
+> [!NOTE] **v1 limitation — invariance.** Parameterized types are **invariant**: `Box<int>` and
+> `Box<string>` are unrelated, and `Box<Dog>` is *not* accepted where `Box<Animal>` is expected (the
+> checker stays silent rather than guessing — it never wrongly blocks, but it also won't prove the
+> safe-looking upcast). When you need to operate over the element generically, write a **generic
+> function** (`fn handle<T>(b: Box<T>)`) rather than relying on subtyping between instantiations.
+> (Built-in containers like `array<T>` keep their existing covariant rule; only user `class`/`enum`/
+> parameterized-interface applications are invariant.)

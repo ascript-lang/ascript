@@ -145,11 +145,17 @@ legacy tree-walker is retained as a differential oracle and a debugging escape h
 
 `ascript check` statically checks `.as` files (syntax errors + lints) and reports
 **all** diagnostics with an exit code suited to CI: `0` clean, `1` on a lint failure,
-`2` on a usage error (e.g. an unknown rule). It includes an **advisory gradual type
-checker** (`type-mismatch` / `type-error` / `possibly-nil`, all default-Warning)
-that predicts likely runtime contract violations — annotation mismatches, provably
-ill-typed operations, and unguarded `T?` dereferences — while staying silent on
-idiomatic untyped code (only *provably* wrong code is flagged).
+`2` on a usage error (e.g. an unknown rule). It includes a **static, gradual type
+checker** (`type-mismatch` / `type-error` / `possibly-nil`) that predicts likely
+runtime contract violations — annotation mismatches, provably ill-typed operations,
+and unguarded `T?` dereferences — while staying silent on idiomatic untyped code
+(only *provably* wrong code is flagged). It is **sound-for-annotated**: a provable
+`type-mismatch` against a *syntactically annotated* slot is a blocking **Error**
+(fails CI), while inferred-context diagnostics stay advisory **Warning**. The
+checker also understands **generics** (`fn map<A, B>`, `class Box<T>`, `enum
+Option<T>`, bounded `<C: Container<T>>`) — type parameters are inferred per call and
+**erased at runtime** (no `.aso`/engine change). Any default is downgradable in
+`ascript.toml` (`type-mismatch = "warn"`).
 
 Per-rule severity is configurable via repeatable CLI flags and/or an `ascript.toml`:
 
