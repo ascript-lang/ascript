@@ -571,6 +571,21 @@ pub struct Interp {
     /// `iface_verdict_cache` against pointer reuse (see its doc). Pure-memo invalidation, so
     /// it never changes observable behavior — only whether a verdict is recomputed.
     iface_cache_gen: std::cell::Cell<u64>,
+    /// FFI §4.3: the per-isolate capability set (default = ALL granted, so the
+    /// central dispatch gate is a no-op short-circuit and every existing program
+    /// is byte-identical). `RefCell` only because the irreversible `caps.drop`
+    /// mutates it; the dispatch gate reads a `Copy` [`crate::stdlib::caps::CapBits`]
+    /// **snapshot**, NEVER holding this borrow across an `.await`
+    /// (`await_holding_refcell_ref` stays satisfied).
+    caps: RefCell<crate::stdlib::caps::CapSet>,
+    /// FFI §4.5a: whether `caps.drop`/`caps.dropAll` are permitted on THIS isolate.
+    /// `true` on the top-level program isolate and a dedicated `run_in_worker`
+    /// isolate (where a drop is durable, single-tenant). A **pooled** `worker fn`
+    /// REUSES one `Interp` across requests, so a drop there would leak forward into
+    /// unrelated work — the pooled-request install clears this flag (Task 8) and
+    /// `caps.drop` is then refused with a loud recoverable panic (§4.5a). A `Cell`
+    /// (never held across `.await`).
+    caps_drop_allowed: Cell<bool>,
     worker_source: RefCell<Option<Rc<str>>>,
     /// Workers Spec A (.aso path): the raw `.aso` bytes of the entry program, retained
     /// so a `worker fn` dispatch can re-parse them into a top-level
@@ -852,9 +867,95 @@ impl Interp {
             package_resolver: RefCell::new(None),
             iface_verdict_cache: RefCell::new(HashMap::new()),
             iface_cache_gen: std::cell::Cell::new(0),
+            // FFI §4.3: default = ALL granted → byte-identical for every existing
+            // program (the gate short-circuits until something is dropped).
+            caps: RefCell::new(crate::stdlib::caps::CapSet::all_granted()),
+            // Top-level / dedicated isolate → drops are durable. A pooled worker
+            // clears this (Task 8) so a leaking drop is refused.
+            caps_drop_allowed: Cell::new(true),
             worker_source: RefCell::new(None),
             worker_aso_bytes: RefCell::new(None),
         }
+    }
+
+    /// FFI §4.5: install the initial capability set (CLI/manifest-composed, Task 5,
+    /// or a dedicated worker's reduced set, Task 8). Called ONCE after construction
+    /// and BEFORE running any program code. Replaces the default all-granted set.
+    pub fn set_caps(&self, caps: crate::stdlib::caps::CapSet) {
+        *self.caps.borrow_mut() = caps;
+    }
+
+    /// A clone of the current capability set (for tests / worker spawn plumbing).
+    pub fn caps(&self) -> crate::stdlib::caps::CapSet {
+        self.caps.borrow().clone()
+    }
+
+    /// A `Copy` snapshot of the grant bitset — what the dispatch gate reads. The
+    /// borrow is released immediately (the returned value is `Copy`), so it is
+    /// never held across an `.await`.
+    pub(crate) fn caps_bits(&self) -> crate::stdlib::caps::CapBits {
+        self.caps.borrow().bits_snapshot()
+    }
+
+    /// FFI §4.5a: set whether `caps.drop` is permitted on this isolate. Cleared by
+    /// a pooled `worker fn` request install (Task 8); left `true` on the top-level
+    /// program and a dedicated isolate.
+    // Used by the pooled-worker request install (Task 8); the field already gates
+    // `caps.drop` (Task 4). Allowed-dead until Task 8 wires the pooled install.
+    #[allow(dead_code)]
+    pub fn set_caps_drop_allowed(&self, allowed: bool) {
+        self.caps_drop_allowed.set(allowed);
+    }
+
+    /// Whether `caps.drop`/`caps.dropAll` may mutate this isolate's `caps` (§4.5a).
+    /// Consumed by `std/caps` `drop`/`dropAll` routing (Task 4).
+    #[allow(dead_code)]
+    pub(crate) fn caps_drop_allowed(&self) -> bool {
+        self.caps_drop_allowed.get()
+    }
+
+    /// Irreversibly **deny** `cap` on this isolate (`caps.drop`). Subtractive only —
+    /// there is no inverse. The caller (Task 4 `caps.call`) has already verified
+    /// [`caps_drop_allowed`](Interp::caps_drop_allowed).
+    #[allow(dead_code)]
+    pub(crate) fn caps_deny(&self, cap: crate::stdlib::caps::Cap) {
+        self.caps.borrow_mut().deny(cap);
+    }
+
+    /// Irreversibly deny ALL five dangerous capabilities (`caps.dropAll`).
+    #[allow(dead_code)]
+    pub(crate) fn caps_deny_all(&self) {
+        self.caps.borrow_mut().deny_all_dangerous();
+    }
+
+    /// FFI §4.3: the ONE capability gate. Given a required [`Cap`] (from
+    /// [`crate::stdlib::required_cap`]) raise the recoverable Tier-2 denial panic
+    /// `capability '<name>' denied` if it is not granted. Reads a `Copy` bitset
+    /// **snapshot** (never holds the `caps` borrow), so it is await-safe.
+    ///
+    /// **Gate-12:** the caller short-circuits when ALL caps are granted; this
+    /// helper is only reached when *something* has been dropped, so the single
+    /// bitset test here is off the hot path.
+    pub(crate) fn require_cap(
+        &self,
+        cap: crate::stdlib::caps::Cap,
+        _module: &str,
+        _func: &str,
+        _args: &[Value],
+        span: Span,
+    ) -> Result<(), Control> {
+        // `Copy` snapshot — borrow released before this line returns.
+        let bits = self.caps_bits();
+        if bits.has(cap) {
+            return Ok(());
+        }
+        // Recoverable Tier-2 panic (catchable by `recover`): a host sandboxing a
+        // plugin observes the denial rather than crashing. Names the capability so
+        // the violation is unambiguous.
+        Err(Control::Panic(AsError::at(
+            format!("capability '{}' denied", cap.name()),
+            span,
+        )))
     }
 
     /// Workers Spec A: record the entry program's full source so a `worker fn`
@@ -7131,6 +7232,110 @@ mod tests {
     use super::*;
     use crate::lexer::lex;
     use crate::parser::parse;
+
+    /// FFI §4.3: `require_cap` raises the recoverable Tier-2 denial panic when the
+    /// cap is NOT granted, and passes when it is. Pure (no feature gate) — works in
+    /// every config.
+    #[test]
+    fn require_cap_denies_when_dropped_and_allows_when_granted() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = Interp::new();
+        // Default = all granted → require passes.
+        assert!(interp
+            .require_cap(Cap::Ffi, "ffi", "open", &[], Span::new(0, 0))
+            .is_ok());
+        // Drop ffi → require raises the named denial panic, recoverable.
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Ffi);
+        interp.set_caps(cs);
+        match interp.require_cap(Cap::Ffi, "ffi", "open", &[], Span::new(0, 0)) {
+            Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'ffi' denied"),
+            other => panic!("expected denial panic, got {other:?}"),
+        }
+        // A still-granted cap (net) still passes.
+        assert!(interp
+            .require_cap(Cap::Net, "net", "lookup", &[], Span::new(0, 0))
+            .is_ok());
+    }
+
+    /// FFI §4.3 Gate-12: the default all-granted snapshot reports `all_granted()`
+    /// (the single-flag short-circuit the gate uses to stay zero-cost).
+    #[test]
+    fn default_caps_are_all_granted_snapshot() {
+        let interp = Interp::new();
+        assert!(interp.caps_bits().all_granted());
+    }
+
+    /// FFI §4.3 end-to-end through the REAL dispatch site `call_stdlib`: with `env`
+    /// dropped, a routed `env.get` call raises `capability 'env' denied` BEFORE the
+    /// module body runs. This is the funnel both engines share, so byte-identity is
+    /// by construction. DNS-egress (`net.lookup`) is the same dispatch-site
+    /// mechanism (Task 9 e2e). A still-granted, ungated module is unaffected.
+    #[cfg(feature = "sys")]
+    #[tokio::test]
+    async fn dropped_cap_denies_at_dispatch_site() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Env);
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // `env` denied → the gate raises the recoverable denial panic.
+                let denied = interp
+                    .call_stdlib("env", "get", &[Value::Str("PATH".into())], Span::new(0, 0))
+                    .await;
+                match denied {
+                    Err(Control::Panic(e)) => {
+                        assert_eq!(e.message, "capability 'env' denied")
+                    }
+                    other => panic!("expected env denial, got {other:?}"),
+                }
+                // A still-granted, ungated module (math) routes normally.
+                let ok = interp
+                    .call_stdlib("math", "abs", &[Value::Int(-3)], Span::new(0, 0))
+                    .await
+                    .unwrap();
+                assert_eq!(ok, Value::Int(3));
+            })
+            .await;
+    }
+
+    /// FFI §4.3 [SECURITY]: DNS (`net.lookup`) is captured by the dispatch-site gate
+    /// by construction — it routes through the `"net"` module string even though it
+    /// is NOT a connect/bind site, so dropping `net` denies it. (Full end-to-end
+    /// resolved-vs-denied value test is Task 9; this asserts the gate fires.)
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn dropped_net_denies_dns_lookup() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Net);
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let denied = interp
+                    .call_stdlib(
+                        "net",
+                        "lookup",
+                        &[Value::Str("example.com".into())],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                match denied {
+                    Err(Control::Panic(e)) => {
+                        assert_eq!(e.message, "capability 'net' denied")
+                    }
+                    other => panic!("expected net denial for DNS lookup, got {other:?}"),
+                }
+            })
+            .await;
+    }
 
     /// SP12 soft hook: with NO `telemetry.init` (and regardless of the feature),
     /// the SP11-facing `Interp::telemetry_*` hook is inert — `telemetry_active()`

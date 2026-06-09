@@ -272,6 +272,50 @@ pub fn is_known_std_module(path: &str) -> bool {
     STD_MODULES.contains(&path)
 }
 
+/// FFI §4.1/§4.3: the **complete, central** map from a dispatch-site `(module,
+/// func)` to the [`Cap`](caps::Cap) it requires, or `None` for a module that
+/// touches no dangerous resource. This is the single enumeration the capability
+/// gate consults; because it is keyed at the `call_stdlib` dispatch ROOT, every
+/// OS-touching path — including **DNS** (`net.lookup`/`lookupOne`, which route
+/// through `"net"` but are NOT a connect/bind site), stdin reads (`io`), and
+/// host-topology leaks (`os.networkInterfaces`/`localIp`/`hostname`) — is captured
+/// **by construction**: there is no per-function path that can slip the gate.
+///
+/// Feature-independent (pure data): the mapping exists in every build so a
+/// `--no-default-features` binary still denies `fs`/`net`/`process`/`ffi`/`env`.
+///
+/// `os` is the ONE module whose verdict depends on `func` (§4.3a): the
+/// topology/identity calls leak the network even without acquiring a socket and
+/// are gated by `Net`; the rest of `os` is ambient self-introspection (`pid`,
+/// `platform`, `arch`, `cpuCount`, `tempDir`, `uptime`, `disks`, `memory`, …) and
+/// is ungated.
+pub fn required_cap(module: &str, func: &str) -> Option<caps::Cap> {
+    use caps::Cap;
+    match module {
+        // Filesystem — every fs func reads/writes/lists the host filesystem.
+        "fs" => Some(Cap::Fs),
+        // `io` reads process STDIN (a real input channel) → gated as a host-fd read.
+        "io" => Some(Cap::Fs),
+        // Environment variables.
+        "env" => Some(Cap::Env),
+        // Subprocess spawning.
+        "process" => Some(Cap::Process),
+        // FFI: a denied `ffi` blocks `ffi.open`, transitively blocking all native calls.
+        "ffi" => Some(Cap::Ffi),
+        // All network modules — sockets, HTTP, DNS, UDP, WebSocket, servers.
+        // `"net"` covers `net.lookup`/`lookupOne` (DNS) by construction.
+        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server" => Some(Cap::Net),
+        // `os` is per-func: topology/identity leak network info → `Net`; the rest
+        // is ambient self-introspection and ungated.
+        "os" => match func {
+            "networkInterfaces" | "localIp" | "hostname" => Some(Cap::Net),
+            _ => None,
+        },
+        // Everything else is pure / non-resource-acquiring (math, json, string, …).
+        _ => None,
+    }
+}
+
 impl Interp {
     /// Dispatch a qualified stdlib builtin (`module` = "math", `func` = "abs").
     pub(crate) async fn call_stdlib(
@@ -360,6 +404,21 @@ impl Interp {
                     let type_arg = type_arg.clone();
                     return self.typed_decode_rows(parsed, &type_arg, span).await;
                 }
+            }
+        }
+        // FFI §4.3 — THE central capability gate. ONE chokepoint at the dispatch
+        // root, keyed by module string (and `func` for `os`), so every OS-touching
+        // call (fs, net incl. DNS `net.lookup`, process, env, io, os-topology) is
+        // gated by construction — there is no per-function path that can slip it.
+        //
+        // Gate-12 short-circuit: when ALL caps are granted (the default — every
+        // existing program), this is a SINGLE `Copy` bitset flag check that returns
+        // immediately, with no per-call `required_cap` lookup. The gate is therefore
+        // zero-cost on the hot path and the default run is byte-identical.
+        let cap_bits = self.caps_bits(); // Copy snapshot — no borrow held across the await below.
+        if !cap_bits.all_granted() {
+            if let Some(cap) = required_cap(module, func) {
+                self.require_cap(cap, module, func, args, span)?;
             }
         }
         match module {
@@ -810,5 +869,82 @@ pub(crate) fn clamp_index(i: f64, len: usize) -> usize {
         len
     } else {
         i as usize
+    }
+}
+
+#[cfg(test)]
+mod cap_gate_tests {
+    use super::*;
+    use crate::stdlib::caps::Cap;
+
+    #[test]
+    fn required_cap_complete_enumeration() {
+        // fs / io → Fs
+        assert_eq!(required_cap("fs", "readFile"), Some(Cap::Fs));
+        assert_eq!(required_cap("fs", "writeFile"), Some(Cap::Fs));
+        assert_eq!(required_cap("io", "readAll"), Some(Cap::Fs));
+        assert_eq!(required_cap("io", "readLine"), Some(Cap::Fs));
+        // env → Env
+        assert_eq!(required_cap("env", "get"), Some(Cap::Env));
+        // process → Process
+        assert_eq!(required_cap("process", "spawn"), Some(Cap::Process));
+        // ffi → Ffi
+        assert_eq!(required_cap("ffi", "open"), Some(Cap::Ffi));
+        // all net modules → Net (incl. DNS via the "net" module string)
+        for m in ["net", "net_tcp", "net_http", "net_udp", "net_ws", "http_server"] {
+            assert_eq!(required_cap(m, "anything"), Some(Cap::Net), "module {m}");
+        }
+        // DNS specifically: net.lookup / lookupOne route through "net" → Net.
+        assert_eq!(required_cap("net", "lookup"), Some(Cap::Net));
+        assert_eq!(required_cap("net", "lookupOne"), Some(Cap::Net));
+        // os per-func split (§4.3a): topology/identity → Net; ambient → None.
+        assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
+        assert_eq!(required_cap("os", "localIp"), Some(Cap::Net));
+        assert_eq!(required_cap("os", "hostname"), Some(Cap::Net));
+        assert_eq!(required_cap("os", "pid"), None);
+        assert_eq!(required_cap("os", "platform"), None);
+        assert_eq!(required_cap("os", "cpuCount"), None);
+        assert_eq!(required_cap("os", "tempDir"), None);
+        assert_eq!(required_cap("os", "uptime"), None);
+        assert_eq!(required_cap("os", "disks"), None);
+        // pure / non-resource modules → None.
+        assert_eq!(required_cap("math", "abs"), None);
+        assert_eq!(required_cap("json", "parse"), None);
+        assert_eq!(required_cap("string", "upper"), None);
+        assert_eq!(required_cap("array", "map"), None);
+        // caps itself is NOT gated (querying/dropping is always allowed).
+        assert_eq!(required_cap("caps", "drop"), None);
+    }
+
+    /// Drift guard: every resource-acquiring module string the dispatch match
+    /// routes MUST have an explicit `required_cap` mapping (a `None` is a
+    /// deliberate decision, not an omission). Adding a new `std/*` resource module
+    /// without an entry here will trip this test. The list mirrors the gated
+    /// modules in `call_stdlib`'s `match module`.
+    #[test]
+    fn every_resource_module_is_mapped() {
+        // Modules that MUST require a capability (whole-module).
+        let gated: &[(&str, Cap)] = &[
+            ("fs", Cap::Fs),
+            ("io", Cap::Fs),
+            ("env", Cap::Env),
+            ("process", Cap::Process),
+            ("ffi", Cap::Ffi),
+            ("net", Cap::Net),
+            ("net_tcp", Cap::Net),
+            ("net_http", Cap::Net),
+            ("net_udp", Cap::Net),
+            ("net_ws", Cap::Net),
+            ("http_server", Cap::Net),
+        ];
+        for (m, want) in gated {
+            assert_eq!(
+                required_cap(m, "x"),
+                Some(*want),
+                "resource module {m} must map to {want:?}"
+            );
+        }
+        // os is per-func: at least its topology funcs must be Net.
+        assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
     }
 }
