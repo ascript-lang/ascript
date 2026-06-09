@@ -1,6 +1,6 @@
 # AScript Multi-isolate Server Tier & Shared Read-only Heap — Design (SRV)
 
-- **Status:** Draft for review
+- **Status:** Implemented (branch `feat/server-tier`)
 - **Date:** 2026-06-08
 - **Code:** SRV (Serious Language campaign — see `goal.md`)
 - **Depends on:** the shipped worker subsystem (`src/worker/` — Workers Spec A

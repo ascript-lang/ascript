@@ -271,6 +271,42 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   default (`determinism_mode()==None` → byte-identical). `ffi-nondeterminism` lint (default Warning, 0 FP on
   `examples/**`) flags `ffi.*` inside a workflow body. Examples: `examples/{ffi_libm,caps_sandbox}.as` +
   `examples/advanced/ffi_struct.as`; docs `docs/content/stdlib/{ffi,caps}.md`.
+- **SRV — server tier: shared read-only heap + multi-isolate serve** (spec
+  `specs/2026-06-08-server-tier-shared-heap-design.md`). **NO grammar change, NO `.aso` bump** (`freeze` is a
+  runtime call; the `TAG_SHARED` serializer tag is worker-wire only — `tests/srv_negative_space.rs` enforces
+  both, incl. `ASO_FORMAT_VERSION` unchanged at 25). (a) **`std/shared` — the first `Send` value.**
+  `shared.freeze(v)` deep-converts a value into an immutable, `Arc`-backed `Value::Shared(Arc<SharedNode>)` —
+  AScript's ONLY `Send`-carrying `Value` variant (the union as a whole STAYS `!Send`; guarded by
+  `static_assertions::assert_not_impl_any!(Value: Send)` + a positive `assert_send_sync::<SharedNode>`). The
+  variant + `SharedNode` + read-only dispatch are **CORE** (build under `--no-default-features`); only the
+  `shared.*` fns are behind the `shared` feature (in `default`). `SharedNode` carries NUM's `Int`/`Float` and
+  ADT's payload `EnumVariant`. The freeze walk (`src/stdlib/shared.rs`) uses **two identity tables**, both keyed
+  by `gc::cc_addr`/`Rc::as_ptr`: `in_progress: HashSet` (on-stack cycle → REJECT, checked FIRST) and
+  `completed: HashMap` (finished-node DIAMOND → reuse the `Arc`) — so a frozen graph is an acyclic `Arc` DAG
+  with preserved sharing. **GC:** `Value::trace`'s `Shared` arm is a **no-op** (a different ownership domain,
+  acyclic by construction — refcounting reclaims it; never trace into it). **Reads** (`index_get`/`read_member`
+  + a `call_shared` call-site hook mirroring the `std/schema` hook) make a frozen value read exactly like its
+  underlying kind (scalar materialized, sub-container → a `Shared` view, zero-copy iteration); the VM read fast
+  paths **deopt** a `Shared` receiver to the generic reader (specialized == generic). **Mutation** reuses the
+  shipped `frozen_kind` `cannot mutate a frozen {kind}` panic (no bespoke string); a frozen-INSTANCE
+  user-method call gets a DISTINCT diagnostic (`method '<name>' is not available on a frozen instance …`). (b)
+  **Multi-isolate serve.** `server.serve({ workers: N, setup, args })` (`workers` absent/1 = today's
+  single-isolate path, unchanged) spreads the accept loop across N shared-nothing isolates that each bind the
+  same port via **`SO_REUSEPORT`** (kernel-balanced; `socket2` is now a DIRECT `net`-gated dep). The single
+  `&self` loop is refactored into `accept_loop(listener, id, …)` (takes the listener BY VALUE); each isolate
+  runs `setup(...args)` at boot to build its OWN handle + open its OWN per-isolate `Native` resources (never
+  cross the airlock). Global `maxRequests` is a shared `Arc<AtomicUsize>` budget + a coordinated `Notify` stop
+  (only the TOTAL is asserted, never the per-isolate split — OS scheduling). **Windows** has no `SO_REUSEPORT`
+  → single-isolate fallback + a one-time `warn`. **Airlock crossing is an `Arc` bump, not a copy:** path-a
+  (accept-loop boot) captures the raw `Arc<SharedNode>`s directly in the `Send` `make_loop` closure; path-b
+  (pooled per-request) uses a `TAG_SHARED` wire tag + a `Writer.shared`/`WorkerRequest.shared`
+  `Vec<Arc<SharedNode>>` side-vector. The shared-heap DATA examples (`examples/shared_config.as`,
+  `examples/advanced/shared_routing_table.as`) are four-mode byte-identical; the server example
+  (`examples/advanced/server_multicore.as`) binds a port + blocks, so it is EXCLUDED from the run-to-completion
+  corpus (`EXAMPLE_SKIPS` `LongRunningServer`) and covered by `tests/server_multicore.rs`. Bench:
+  `bench/shared_heap_bench.as` + `run_shared_heap_bench.sh` (the zero-copy-vs-deep-clone headline + Gate-12
+  no-tax). Docs: `docs/content/stdlib/shared.md` + the "Multi-core servers" section in
+  `docs/content/language/workers.md`.
 
 ## Commands
 

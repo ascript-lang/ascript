@@ -464,6 +464,39 @@ co-designed subsystems:
    `examples/{ffi_libm,caps_sandbox}.as` + `examples/advanced/ffi_struct.as`; docs
    `docs/content/stdlib/{ffi,caps}.md` (+ NAV).
 
+### SRV — Server tier: shared read-only heap + multi-isolate serve ✅
+
+Spec `superpowers/specs/2026-06-08-server-tier-shared-heap-design.md`, plan
+`…/plans/2026-06-08-server-tier-shared-heap.md` (13 tasks). The capability + performance leaf of the
+serious-language campaign — a *serious server tier*. **NO grammar change, NO `.aso` bump** (`ASO_FORMAT_VERSION`
+stays 25; `freeze` is a runtime call, the `TAG_SHARED` tag is worker-wire only) — enforced by
+`tests/srv_negative_space.rs`. Two co-designed parts:
+
+1. **`std/shared` — the shared read-only heap (the first `Send` value).** `shared.freeze(v)` deep-converts a
+   value into an immutable, `Arc`-backed `Value::Shared(Arc<SharedNode>)` — AScript's ONLY `Send`-carrying
+   `Value` variant (the union stays `!Send`, guarded by `assert_not_impl_any!(Value: Send)` + a positive
+   `assert_send_sync::<SharedNode>`). A frozen value reads exactly like its underlying kind (scalar / descend /
+   index / read-only method / zero-copy iterate); mutation reuses the shipped `frozen_kind` `cannot mutate a
+   frozen {kind}` panic (a frozen-instance user-method call gets a distinct diagnostic). Freeze uses two
+   identity tables (`in_progress` cycle → reject, `completed` diamond → reuse one `Arc`), so a frozen graph is
+   an acyclic `Arc` DAG with preserved sharing — OUTSIDE the cycle GC (the `Value::trace` `Shared` arm is a
+   no-op). The variant + read-only dispatch are CORE (`--no-default-features`); only `shared.*` is feature-gated.
+   Crosses the airlock as an `Arc` bump, not a copy. **Headline (`bench/shared_heap_bench.as`): handing a large
+   table to a worker is flat O(1) (one atomic increment) on the shared path vs O(N) deep-clone — the speedup
+   grows with table size (7×→70×+ from 10k→100k entries).** Gate 12: the `Shared` read arm is a predictably-
+   not-taken tag check after the existing fast paths, so the non-shared hot path has no per-read tax.
+2. **Multi-isolate HTTP serving.** `server.serve({ workers: N, setup, args })` spreads the accept loop across N
+   shared-nothing isolates that each bind the same port via `SO_REUSEPORT` (kernel-balanced; `socket2` a direct
+   `net`-gated dep). The `&self` loop is refactored into `accept_loop(listener, id, …)`; each isolate runs
+   `setup(...args)` at boot to build its OWN handle + open its OWN per-isolate `Native` resources (never cross
+   the airlock); a frozen shared config crosses as a pointer bump. Global `maxRequests` is a shared
+   `Arc<AtomicUsize>` budget + a `Notify` stop (only the TOTAL is asserted). Windows (no `SO_REUSEPORT`) →
+   single-isolate fallback + a one-time `warn`. The data examples (`shared_config.as`,
+   `advanced/shared_routing_table.as`) are four-mode byte-identical; the server example
+   (`advanced/server_multicore.as`) binds a port + blocks so it is corpus-excluded (`LongRunningServer`) and
+   covered by `tests/server_multicore.rs`. Docs `docs/content/stdlib/shared.md` + the "Multi-core servers"
+   section in `docs/content/language/workers.md` (+ NAV).
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred
