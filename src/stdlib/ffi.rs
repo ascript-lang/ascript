@@ -665,6 +665,11 @@ fn invoke_symbol(
             for (idx, bytes) in &out_params {
                 if let Some((_, cell)) = ptr_bytes_args.iter().find(|(i, _)| i == idx) {
                     let mut buf = cell.borrow_mut();
+                    // Best-effort PREFIX copy: the live buffer and the recorded one are the
+                    // same size for a deterministic program (same struct layout), so this
+                    // normally copies the whole buffer. On a length mismatch we copy the
+                    // common prefix and leave the tail as-is rather than panic — a graceful
+                    // degradation, never a wrong value for the bytes that DO match.
                     let n = buf.len().min(bytes.len());
                     buf[..n].copy_from_slice(&bytes[..n]);
                 }
@@ -672,7 +677,11 @@ fn invoke_symbol(
             drop(bytes_guards);
             return Ok(ffi_ret_to_value(interp, ret));
         }
-        // else: stream exhausted → fall through to a real call + Record append.
+        // Stream exhausted (the recorded prefix is consumed) → fall through to a real
+        // call. NOTE the deliberate asymmetry vs the clock/RNG seams (which flip to Record
+        // on exhaustion): the mode STAYS Replay here, so the Record block below is skipped
+        // — a post-prefix FFI call re-invokes C live and is NOT appended. After the
+        // recorded prefix a resumed workflow is simply back in live execution.
     }
 
     // --- The trampoline. SAFETY: the CIF was built from `sym.argtypes -> sym.ret`; we
