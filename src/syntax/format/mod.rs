@@ -731,6 +731,22 @@ impl Printer<'_> {
                 if let Some(callee) = kids.iter().copied().find(|c| is_expr_kind(c.kind())) {
                     self.expr(callee);
                 }
+                // TYPE §6 (Task 13): an expression-level explicit type-argument list
+                // (`Box<string>(…)`) rides as a `TypeArgs` child of the `CallExpr`.
+                // Re-emit it so the call round-trips; dropping it was lossy (the form
+                // is erased at RUNTIME, but the formatter must preserve source).
+                if let Some(targs) = kids.iter().copied().find(|c| c.kind() == TypeArgs) {
+                    let ts: Vec<&ResolvedNode> =
+                        targs.children().filter(|c| is_type_kind(c.kind())).collect();
+                    self.out.text("<");
+                    for (i, t) in ts.iter().enumerate() {
+                        if i > 0 {
+                            self.out.text(", ");
+                        }
+                        self.type_ann(t);
+                    }
+                    self.out.text(">");
+                }
                 if let Some(args) = kids.iter().copied().find(|c| c.kind() == ArgList) {
                     self.arg_list(args);
                 }
