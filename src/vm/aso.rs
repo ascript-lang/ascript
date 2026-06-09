@@ -1918,6 +1918,51 @@ mod tests {
         );
     }
 
+    /// FUZZ Task 1 — the PERMANENT P0 regression guard, driven through the PUBLIC
+    /// [`Chunk::from_bytes`] entry point (not the internal `read_chunk`), directly
+    /// mirroring the worker serializer's `decode_huge_length_does_not_allocate`
+    /// (`src/worker/serialize.rs`). A full, valid `.aso` header (magic + version)
+    /// is followed by a zero-length code field and then a const-pool count claiming
+    /// `u32::MAX` over an otherwise-empty buffer. Pre-clamp, `read_chunk`'s
+    /// `c.consts.reserve(u32::MAX)` pre-allocated tens of GB (≈4.3e9 ×
+    /// `size_of::<Value>`) → the allocator returns null → Rust aborts BEFORE any
+    /// per-element read. The `remaining()` clamp bounds the reservation; the
+    /// per-element loop then reports the short read as a clean `Truncated`.
+    /// Removing the clamp re-aborts THIS test — it is the regression guard that
+    /// proves the P0 fix can never silently regress.
+    #[test]
+    fn reader_huge_length_does_not_allocate() {
+        let mut w = Writer::new();
+        w.buf.extend_from_slice(&ASO_MAGIC);
+        w.u32(ASO_FORMAT_VERSION);
+        // code: a zero-length byte field (len-prefixed).
+        w.len(0);
+        // const-pool count = u32::MAX over an empty remainder.
+        w.len(u32::MAX as usize);
+        let bytes = w.buf;
+        // Must return a clean Err (Truncated) WITHOUT a multi-GB allocation/abort.
+        let result = Chunk::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(AsoError::Truncated)),
+            "a u32::MAX const-pool length over an empty buffer must decode to a clean \
+             Truncated error, never an abort — got {result:?}"
+        );
+
+        // The same bomb on the proto/class/interface/import/type/span/upvalue/cell
+        // length fields must ALSO clamp: a valid (but empty) const pool followed by a
+        // bomb proto count.
+        let mut w2 = Writer::new();
+        w2.buf.extend_from_slice(&ASO_MAGIC);
+        w2.u32(ASO_FORMAT_VERSION);
+        w2.len(0); // code
+        w2.len(0); // consts (empty, valid)
+        w2.len(u32::MAX as usize); // protos: bomb
+        assert!(
+            matches!(Chunk::from_bytes(&w2.buf), Err(AsoError::Truncated)),
+            "a u32::MAX proto count must also clamp to a clean Truncated error"
+        );
+    }
+
     /// The clamp must not change behavior for a well-formed stream: a genuine large
     /// (but in-bounds) count still decodes fully. Guards against the clamp truncating
     /// valid data.
