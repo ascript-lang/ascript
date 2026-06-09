@@ -194,7 +194,13 @@ impl Freezer {
 
             Value::EnumVariant(ev) => {
                 // The payload value must also freeze. A variant's identity is its
-                // (enum, name); the payload is the cycle-capable part.
+                // (enum, name); the payload is the cycle-capable part. We deliberately
+                // do NOT enter/finish the variant itself in the visited map: any cycle
+                // back to a variant must route through its payload container (Array /
+                // Object), which IS identity-tracked, so cycles are still caught and
+                // cannot hang. The only cost is that a variant reached by two distinct
+                // paths is re-walked rather than Arc-shared (a freeze-time micro-cost,
+                // never a soundness issue).
                 let len = path.len();
                 path.push_str(".value");
                 let value: SharedValue = match &ev.payload {
