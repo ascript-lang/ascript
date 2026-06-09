@@ -116,6 +116,17 @@ pub fn collect() -> usize {
     reclaimed
 }
 
+/// The number of GC-tracked objects currently live on this thread's heap — a thin
+/// wrapper over `gcmodule::count_thread_tracked()`. FUZZ test seam (spec §2.4 GC
+/// property): build a cyclic graph, drop the roots, [`collect`], and assert this
+/// returns to the pre-build baseline (no leak) — the exact before/drop/after delta the
+/// inline `gc.rs` no-leak tests use, exposed so `tests/property.rs` can generalize it
+/// over random graph shapes without reaching into the private `gcmodule` dependency.
+#[inline]
+pub fn tracked_count() -> usize {
+    gcmodule::count_thread_tracked()
+}
+
 /// Cheap allocation-pressure check, called at coarse-grained safe points during
 /// long-running execution (e.g. between accepted `http.serve` connections). Runs a
 /// collection ONLY when the live tracked-object count has grown past the last

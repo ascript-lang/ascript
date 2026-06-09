@@ -101,6 +101,13 @@ struct Gen<'a, 'b> {
     in_loop: bool,
     /// True while emitting inside a function body (so `return` is legal).
     in_fn: bool,
+    /// PROTECTED loop-counter names (the `while (cN < K)` counters). They are declared
+    /// `mutable` so the generator's own guaranteed-progress `cN = cN + 1` is legal, but they
+    /// are NEVER offered to `assign_stmt` as a target — otherwise a body statement could
+    /// reassign the counter to a huge value (`w1 = 1000000 -% 2^53`), making the loop run
+    /// ~quadrillions of iterations (a generator-induced near-hang, NOT an engine bug). This
+    /// is the loop-termination invariant (spec §6 / Task 4: bound loop counts).
+    protected: Vec<String>,
 }
 
 impl<'a, 'b> Gen<'a, 'b> {
@@ -113,6 +120,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             counter: 0,
             in_loop: false,
             in_fn: false,
+            protected: Vec::new(),
         }
     }
 
@@ -158,11 +166,13 @@ impl<'a, 'b> Gen<'a, 'b> {
             .flat_map(|s| s.vars.iter().map(|(n, _)| n.clone()))
             .collect()
     }
-    /// In-scope MUTABLE variable names (assignment targets).
+    /// In-scope MUTABLE variable names that are legal ASSIGNMENT targets — excludes the
+    /// protected loop counters (see `protected`), so a generated loop ALWAYS terminates.
     fn mut_vars(&self) -> Vec<String> {
         self.scopes
             .iter()
             .flat_map(|s| s.vars.iter().filter(|(_, m)| *m).map(|(n, _)| n.clone()))
+            .filter(|n| !self.protected.contains(n))
             .collect()
     }
 
@@ -307,7 +317,13 @@ impl<'a, 'b> Gen<'a, 'b> {
         let _ = writeln!(self.out, "while ({ctr} < {iters}) {{");
         let prev = self.in_loop;
         self.in_loop = true;
+        // Protect the counter from being reassigned anywhere in the body (the loop-
+        // termination invariant): a body `{ctr} = <huge>` would otherwise blow the iteration
+        // count to quadrillions. The generator's own `{ctr} = {ctr} + 1` below is emitted
+        // directly (not via `assign_stmt`), so it is unaffected by the protection.
+        self.protected.push(ctr.clone());
         self.block_no_close(depth + 1);
+        self.protected.pop();
         self.in_loop = prev;
         // Guaranteed-progress increment.
         self.indent(depth + 1);
@@ -393,7 +409,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             return self.leaf_expr();
         }
         match self.choice(12) {
-            0 | 1 | 2 => self.int_expr(depth),
+            0..=2 => self.int_expr(depth),
             3 | 4 => self.float_expr(depth),
             5 => self.bool_expr(depth),
             6 => self.string_expr(depth),
@@ -677,6 +693,55 @@ mod tests {
         let a = gen_program_from_bytes(&bytes);
         let b = gen_program_from_bytes(&bytes);
         assert_eq!(a.source, b.source, "same seed must yield identical source");
+    }
+
+    /// LOOP-TERMINATION INVARIANT (regression guard, FUZZ self-found bug): a `while` loop
+    /// counter is PROTECTED inside its OWN BODY — it must never appear as an assignment
+    /// target there except the generator's own `cN = cN + 1` progress step. A body
+    /// reassignment like `w1 = (1000000 -% 9007199254740992)` would set the counter to
+    /// ~-9e15 and the loop would run ~quadrillions of iterations (a generator-induced
+    /// near-hang the three-way differential flagged as a multi-minute non-termination).
+    ///
+    /// We brace-scan each `while (cN < K) {` to its matching close and assert no
+    /// `cN = <other>` occurs INSIDE that span (a reassignment AFTER the loop ends is
+    /// harmless and allowed). The increment `cN = cN + 1` is the only permitted form.
+    #[test]
+    fn while_counters_are_never_reassigned_inside_their_body() {
+        for seed in 0u64..300 {
+            let prog = gen_program_from_bytes(&seed_bytes(seed));
+            let lines: Vec<&str> = prog.source.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim();
+                let Some(rest) = t.strip_prefix("while (") else {
+                    continue;
+                };
+                let ctr = rest.split(' ').next().unwrap_or("");
+                if ctr.is_empty() {
+                    continue;
+                }
+                let legal = format!("{ctr} = {ctr} + 1");
+                let illegal_prefix = format!("{ctr} = ");
+                // Brace-scan from the `while (...) {` line to its matching close.
+                let mut depth = 0i32;
+                let mut started = false;
+                for l in &lines[i..] {
+                    depth += l.matches('{').count() as i32;
+                    depth -= l.matches('}').count() as i32;
+                    started |= l.contains('{');
+                    let lt = l.trim();
+                    if lt.starts_with(&illegal_prefix) && lt != legal {
+                        panic!(
+                            "seed {seed}: while-counter `{ctr}` reassigned INSIDE its body \
+                             (non-terminating risk): `{lt}`\n--- src ---\n{}",
+                            prog.source
+                        );
+                    }
+                    if started && depth <= 0 {
+                        break; // matched the closing brace of this while
+                    }
+                }
+            }
+        }
     }
 
     /// Expand a u64 seed into a longer, varied byte buffer so the generator has enough

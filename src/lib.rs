@@ -8,10 +8,14 @@ pub mod env;
 pub mod error;
 pub mod fmt;
 // FUZZ: the grammar-aware source generator (the differential-fuzzing core asset).
-// Crate-gated so it compiles into `ascript` ONLY for `cargo test` (the `test` cfg) and a
-// `--cfg fuzzing` libFuzzer build — never in a normal/`--no-default-features` build, and
-// `arbitrary` (a dev-dependency) never enters the production graph (plan Task 4, spec §3.1).
-#[cfg(any(test, fuzzing))]
+// Feature-gated (`fuzzgen`, NON-default) + `cfg(test)` for the crate's own unit tests +
+// `--cfg fuzzing` for a libFuzzer build — so it compiles into `ascript` ONLY in those
+// dev/test contexts and NEVER in a normal/`--no-default-features` production build, and
+// `arbitrary` (an optional dep behind `fuzzgen`) never enters the production graph. The
+// `fuzzgen` feature is what an INTEGRATION test (`tests/property.rs`) reaches (it links the
+// crate's normal build, which does not see `cfg(test)`); the crate's self-dev-dependency
+// enables it (plan Task 4, spec §3.1).
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
 pub mod fuzzgen;
 pub mod gc;
 pub mod interp;
@@ -361,6 +365,66 @@ pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> 
 #[doc(hidden)]
 pub async fn vm_run_source_generic(src: &str) -> Result<(String, Option<i32>), AsError> {
     vm_run_source_with(src, false).await
+}
+
+/// FUZZ `.aso` round-trip seam (`#[doc(hidden)]` test API, not a stable surface):
+/// compile `src` to a [`Chunk`], serialize it to `.aso` bytes ([`vm::Chunk::to_bytes`]),
+/// deserialize + verify them back ([`vm::Chunk::from_bytes_verified`]), then run the
+/// reconstituted chunk on the (specializing) VM capturing output — exactly the
+/// `compile → serialize → deserialize → run` pipeline `ascript build` + a fresh
+/// `ascript run file.aso` exercise, but in-memory so output is captured. The FUZZ
+/// `.aso`-round-trip property asserts this is byte-identical to the direct
+/// [`vm_run_source`] of the same `src` (the `.aso` path must equal the in-memory VM).
+/// A serialize/verify error surfaces as an [`AsError`] so the property can compare it
+/// against the direct run's outcome.
+#[doc(hidden)]
+pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // Serialize → bytes → deserialize+verify (the real `.aso` round-trip).
+    let bytes = chunk
+        .to_bytes()
+        .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes)
+        .map_err(|e| AsError::new(format!("cannot load .aso round-trip: {e}")))?;
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+    });
+    let closure = Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::with_specialize(interp.clone(), true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
 }
 
 /// Compile a `.as` source file to a verified bytecode [`Chunk`] and write it to

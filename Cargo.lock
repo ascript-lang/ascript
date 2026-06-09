@@ -182,6 +182,7 @@ dependencies = [
  "arbitrary",
  "argon2",
  "ariadne",
+ "ascript",
  "async-recursion",
  "base64",
  "bcrypt",

@@ -24,6 +24,11 @@ path = "src/main.rs"
 
 [dependencies]
 rust_decimal = { version = "1", features = ["maths"] }
+# FUZZ: the unstructured-bytes source for the grammar-aware generator (`src/fuzzgen/`).
+# OPTIONAL + behind the non-default `fuzzgen` feature, so it enters the production graph
+# of NEITHER a plain `cargo build` NOR `--no-default-features` (verified `cargo tree`).
+# `cargo test` pulls it in via the crate's self-dev-dependency with `features=["fuzzgen"]`.
+arbitrary = { version = "1", features = ["derive"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 async-recursion = "1"
 # Probe-and-grow native stack (SP9 §1): `stacker::maybe_grow` allocates a fresh
@@ -135,16 +140,24 @@ ungrammar = "1"
 [dev-dependencies]
 tree-sitter = "0.25"
 tempfile = "3"
-# FUZZ (differential fuzzing & property testing). Dev-only: neither enters the
-# production graph (the `src/fuzzgen/` generator is `#[cfg(any(test, fuzzing))]`-gated
-# and `arbitrary` is dev-dep-only), so a plain `cargo build` / `--no-default-features`
-# build is unaffected. `arbitrary` is the shared unstructured-bytes source so the SAME
-# generator can later feed a libFuzzer target (nightly-gated unit) by `#[path]`-include.
+# FUZZ (differential fuzzing & property testing). Dev-only.
 proptest = "1"
-arbitrary = { version = "1", features = ["derive"] }
+# Needed only by `tests/property.rs` to construct `ObjectCell`/`MapCell`/`SetCell`
+# (which take an `IndexMap`/`IndexSet`) directly when generating sendable value graphs.
+indexmap = "2"
+# Self-dev-dependency enabling the `fuzzgen` feature so the INTEGRATION test
+# `tests/property.rs` links a lib build with `ascript::fuzzgen` present (an integration
+# test links the crate's NORMAL build, which does NOT see `cfg(test)`; a feature is the
+# only gate it can reach). This is dev-only — production `cargo build` never enables it,
+# so neither `arbitrary` nor the generator enters the release binary.
+ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
 default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared"]
+# FUZZ: the grammar-aware source generator (`src/fuzzgen/`). NON-default — enabled only by
+# the crate's self-dev-dependency for `tests/property.rs` (and by a `--cfg fuzzing` libFuzzer
+# build). Pulls `arbitrary`. Never in `default`, so production is byte-identical.
+fuzzgen = ["dep:arbitrary"]
 # SRV §3/§4: std/shared — the shared, immutable, zero-copy read-only heap. The
 # `Value::Shared` VARIANT + `SharedNode` + the read-only dispatch are CORE (unconditional,
 # build under --no-default-features); only the `shared.freeze`/`shared.isShared` stdlib
