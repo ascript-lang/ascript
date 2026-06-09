@@ -312,6 +312,19 @@ boundary test from Task 3 now exercises the LIVE SMI/spill path), encoding round
   keys/identifiers (a `dhat` spot-check); confirm shape ICs don't thrash on an inline/heap-`Str` mix (add a
   cache-non-thrash test per spec §6). Commit. **← Stage 3 is a green merge-able point.**
 
+> **OUTCOME (2026-06-10): EVALUATED + REJECTED — reverted (commit e923c6b).** A thin `Str`/`Builtin` via a
+> safe `AStr(Rc<Box<str>>)` newtype (NO new unsafe) DID reach `size_of::<Value>() == 16`, four-mode
+> byte-identical, all gates green. But the Phase-3 bench (string-heavy + a purpose-built memory-bound scan,
+> both VM modes, interleaved same-session A/B vs the Stage-1 24-B baseline) showed it is a **net regression on
+> every path it changes**: STRING −2.2%/−1.5% (spec/gen), and the memory-bound scan (the cache-density bet)
+> **+6.8%** — the extra `Value→Rc→Box<str>→bytes` hop per access costs more than the denser 16-B slot saves.
+> The regression is INHERENT to a *safe* thin `Str` (any single-word safe rep double-indirects); the only
+> no-indirection path below 24 is the NaN-box, which has NO access hop — but that is DEFERRED (Task 5, gcmodule
+> `into_raw`/`from_raw`). Per the task's keep-only-if-not-a-net-regression bias → STOP. **VAL's size floor is
+> Stage 1's 24 bytes.** The thin-`Str` data lives in `bench/COMPACT_VALUE_RESULTS.md §5`; the impl was reverted
+> (kept the bench/verdict). 16 remains achievable but not worth it; 8 needs the NaN-box (future, if gcmodule
+> gains the raw API).
+
 ---
 
 ## Stage 4 — Escape-analysis stack allocation (compiler)
