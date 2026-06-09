@@ -842,6 +842,19 @@ pub(crate) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Nil)
 }
 
+/// Type name for a "got X" mismatch message. A frozen `Value::Shared` reports its
+/// UNDERLYING kind via `type_name` (so a frozen array reads as "array"), which makes
+/// a bare "expects an array, got array" message self-contradictory. Prefix "frozen "
+/// so the rejection reads truthfully: a frozen (read-only) value can't stand in for a
+/// mutable one in a free-function like `array.push(frozen, …)` — the method form
+/// `x.push(…)` already reports the canonical "cannot mutate a frozen array".
+pub(crate) fn got_type_name(v: &Value) -> String {
+    match v {
+        Value::Shared(_) => format!("frozen {}", crate::interp::type_name(v)),
+        _ => crate::interp::type_name(v).to_string(),
+    }
+}
+
 pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Control> {
     match v.as_f64() {
         Some(n) => Ok(n),
@@ -880,11 +893,7 @@ pub(crate) fn want_array(
     match v {
         Value::Array(a) => Ok(a.clone()),
         _ => Err(AsError::at(
-            format!(
-                "{} expects an array, got {}",
-                ctx,
-                crate::interp::type_name(v)
-            ),
+            format!("{} expects an array, got {}", ctx, got_type_name(v)),
             span,
         )
         .into()),
@@ -901,11 +910,7 @@ pub(crate) fn want_object(
     match v {
         Value::Object(o) => Ok(o.clone()),
         _ => Err(AsError::at(
-            format!(
-                "{} expects an object, got {}",
-                ctx,
-                crate::interp::type_name(v)
-            ),
+            format!("{} expects an object, got {}", ctx, got_type_name(v)),
             span,
         )
         .into()),
@@ -920,7 +925,7 @@ pub(crate) fn want_bytes(
     match v {
         Value::Bytes(b) => Ok(b.clone()),
         _ => Err(AsError::at(
-            format!("{} expects bytes, got {}", ctx, crate::interp::type_name(v)),
+            format!("{} expects bytes, got {}", ctx, got_type_name(v)),
             span,
         )
         .into()),
@@ -1095,5 +1100,48 @@ mod cap_gate_tests {
                 "std module '{key}' is in BOTH required_cap and KNOWN_UNGATED — pick one."
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "shared"))]
+mod want_helpers_tests {
+    use super::*;
+    use crate::span::Span;
+
+    // SRV review MINOR: a frozen value passed to a mutating free-function (e.g.
+    // `array.push(frozen, x)`) must reject with a TRUTHFUL "got frozen array", not the
+    // self-contradictory "got array" (`type_name` of a frozen array is "array"). The
+    // method form `x.push(…)` already reports the canonical "cannot mutate a frozen
+    // array"; this keeps the free-function rejection from lying about the type.
+    // `Control`/`Value` aren't `Debug`, so avoid `.unwrap()`/`.unwrap_err()` (they'd
+    // require the other variant to be `Debug`) — match explicitly instead.
+    fn mismatch_msg(v: &Value, ctx: &str) -> String {
+        let sp = Span::new(0, 0);
+        match want_array(v, sp, ctx) {
+            Ok(_) => panic!("want_array unexpectedly accepted the value"),
+            Err(crate::interp::Control::Panic(e)) => e.message,
+            Err(_) => panic!("expected a Panic control"),
+        }
+    }
+
+    #[test]
+    fn want_array_reports_frozen_in_got_position() {
+        let sp = Span::new(0, 0);
+        let live = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(1)]));
+        let frozen = match crate::stdlib::shared::freeze(&live, sp) {
+            Ok(v) => v,
+            Err(_) => panic!("freeze failed"),
+        };
+        // Frozen array → truthful "got frozen array" (not the self-contradictory
+        // "got array" that `type_name` alone would produce).
+        assert_eq!(
+            mismatch_msg(&frozen, "array.push"),
+            "array.push expects an array, got frozen array"
+        );
+        // A LIVE non-array still reports its plain kind (no spurious "frozen").
+        assert_eq!(
+            mismatch_msg(&Value::Int(3), "array.push"),
+            "array.push expects an array, got int"
+        );
     }
 }
