@@ -7392,6 +7392,64 @@ mod tests {
             .await;
     }
 
+    /// BLOCKER 2: `sqlite`/`postgres`/`redis` open OS resources (a DB file / a TCP
+    /// socket) but were ABSENT from `required_cap`, so `--sandbox` left them reachable.
+    /// With the matching cap dropped, the dispatch-site gate now denies them BEFORE
+    /// any connect attempt — a clean recoverable Tier-2 panic naming the capability.
+    #[cfg(any(feature = "sql", feature = "postgres", feature = "redis"))]
+    #[tokio::test]
+    async fn dropped_cap_denies_database_modules() {
+        use crate::stdlib::caps::CapSet;
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        // `--sandbox` equivalent: drop every dangerous capability.
+        let mut cs = CapSet::all_granted();
+        cs.deny_all_dangerous();
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // sqlite.open → Fs denied (would otherwise open/create a DB file).
+                #[cfg(feature = "sql")]
+                match interp
+                    .call_stdlib("sqlite", "open", &[Value::Str(":memory:".into())], Span::new(0, 0))
+                    .await
+                {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'fs' denied"),
+                    other => panic!("expected sqlite fs denial, got {other:?}"),
+                }
+                // postgres.connect → Net denied (would otherwise open a TCP socket).
+                #[cfg(feature = "postgres")]
+                match interp
+                    .call_stdlib(
+                        "postgres",
+                        "connect",
+                        &[Value::Str("postgres://localhost/db".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'net' denied"),
+                    other => panic!("expected postgres net denial, got {other:?}"),
+                }
+                // redis.connect → Net denied (TCP egress).
+                #[cfg(feature = "redis")]
+                match interp
+                    .call_stdlib(
+                        "redis",
+                        "connect",
+                        &[Value::Str("redis://localhost".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'net' denied"),
+                    other => panic!("expected redis net denial, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
     /// FFI §4.4 Gate-12: with NO carve-out configured (`net_scope`/`fs_scope` are
     /// `None` — the default and the all-deny/all-grant cases), the stage-2 checks
     /// short-circuit to `Ok` with NO host comparison / NO path canonicalization.

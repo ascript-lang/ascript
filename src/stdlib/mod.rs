@@ -328,6 +328,15 @@ pub fn required_cap(module: &str, func: &str) -> Option<caps::Cap> {
         // All network modules — sockets, HTTP, DNS, UDP, WebSocket, servers.
         // `"net"` covers `net.lookup`/`lookupOne` (DNS) by construction.
         "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server" => Some(Cap::Net),
+        // Database modules open OS resources (BLOCKER 2). `sqlite` opens/creates a DB
+        // file → `Fs`; `postgres`/`redis` open TCP sockets → `Net`. Feature-gated the
+        // SAME way the dispatch match arms are so `--no-default-features` still builds.
+        #[cfg(feature = "sql")]
+        "sqlite" => Some(Cap::Fs),
+        #[cfg(feature = "postgres")]
+        "postgres" => Some(Cap::Net),
+        #[cfg(feature = "redis")]
+        "redis" => Some(Cap::Net),
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
@@ -932,6 +941,14 @@ mod cap_gate_tests {
         // DNS specifically: net.lookup / lookupOne route through "net" → Net.
         assert_eq!(required_cap("net", "lookup"), Some(Cap::Net));
         assert_eq!(required_cap("net", "lookupOne"), Some(Cap::Net));
+        // BLOCKER 2: database modules open OS resources and MUST be gated.
+        // sqlite opens/creates a DB file → Fs; postgres/redis open TCP sockets → Net.
+        #[cfg(feature = "sql")]
+        assert_eq!(required_cap("sqlite", "open"), Some(Cap::Fs));
+        #[cfg(feature = "postgres")]
+        assert_eq!(required_cap("postgres", "connect"), Some(Cap::Net));
+        #[cfg(feature = "redis")]
+        assert_eq!(required_cap("redis", "connect"), Some(Cap::Net));
         // os per-func split (§4.3a): topology/identity → Net; ambient → None.
         assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
         assert_eq!(required_cap("os", "localIp"), Some(Cap::Net));
@@ -971,6 +988,14 @@ mod cap_gate_tests {
             ("net_udp", Cap::Net),
             ("net_ws", Cap::Net),
             ("http_server", Cap::Net),
+            // BLOCKER 2: database modules open OS resources — gate the SAME way the
+            // dispatch match feature-gates them, so `--no-default-features` builds.
+            #[cfg(feature = "sql")]
+            ("sqlite", Cap::Fs),
+            #[cfg(feature = "postgres")]
+            ("postgres", Cap::Net),
+            #[cfg(feature = "redis")]
+            ("redis", Cap::Net),
         ];
         for (m, want) in gated {
             assert_eq!(
