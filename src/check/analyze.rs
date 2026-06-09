@@ -82,6 +82,25 @@ pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
     // `possibly-nil` diagnostics through this same machinery.
     diagnostics.extend(crate::check::infer::check(&tree, &resolved, src));
 
+    // TYPE: when the inference pass emits a BLOCKING `type-mismatch` (an annotated
+    // param or field-default slot, `Severity::Error`) at a span, it supersedes the
+    // legacy advisory `contract-mismatch`/`field-default-type` Warning at that same
+    // span (the inference pass keeps its blocking emit there rather than de-dupping
+    // it away). Drop the legacy advisory so the user sees the single sound Error,
+    // not a duplicate Warning. (Advisory inference `type-mismatch`es still de-dup on
+    // the inference side; this only fires for the blocking Error case.)
+    let blocking_type_spans: std::collections::HashSet<usize> = diagnostics
+        .iter()
+        .filter(|d| d.code == "type-mismatch" && d.severity == Severity::Error)
+        .map(|d| d.range.start)
+        .collect();
+    if !blocking_type_spans.is_empty() {
+        diagnostics.retain(|d| {
+            !(matches!(d.code.as_str(), "contract-mismatch" | "field-default-type")
+                && blocking_type_spans.contains(&d.range.start))
+        });
+    }
+
     // Apply inline `ascript-ignore` suppressions before sorting.
     let supp = suppressions(src);
     let line_starts = line_start_offsets(src);

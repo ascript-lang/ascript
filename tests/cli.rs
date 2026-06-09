@@ -2154,9 +2154,11 @@ fn check_super_misuse_lint_and_allow_suppression() {
 
 #[test]
 fn check_field_default_type_lint_and_allow_suppression() {
-    // The `field-default-type` static lint flags a class field whose literal
-    // default contradicts its declared type (a guaranteed runtime panic at
-    // construction). Configurable: `--allow field-default-type` suppresses it.
+    // A class field whose literal default contradicts its declared type is a
+    // guaranteed runtime panic at construction. Since TYPE this is a BLOCKING
+    // `type-mismatch` Error (the typed field default is an annotated slot — the
+    // legacy `field-default-type` advisory is SUBSUMED by the sound checker).
+    // Configurable: `--allow type-mismatch` suppresses it.
     let bin = env!("CARGO_BIN_EXE_ascript");
     let file = std::env::temp_dir().join(format!(
         "ascript_field_default_type_{}.as",
@@ -2164,7 +2166,7 @@ fn check_field_default_type_lint_and_allow_suppression() {
     ));
     std::fs::write(&file, "class P { n: number = \"x\" }\n").unwrap();
 
-    // Default: the diagnostic appears (JSON output for a robust assertion).
+    // Default: the diagnostic appears as a blocking `type-mismatch` Error.
     let out = Command::new(bin)
         .arg("check")
         .arg("--json")
@@ -2173,27 +2175,36 @@ fn check_field_default_type_lint_and_allow_suppression() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("\"code\":\"field-default-type\""),
-        "expected a field-default-type diagnostic, got:\n{stdout}"
+        stdout.contains("\"code\":\"type-mismatch\""),
+        "expected a blocking type-mismatch diagnostic, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("field 'n' default is string"),
+        stdout.contains("\"severity\":\"error\""),
+        "the annotated field-default mismatch must be a blocking Error, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("field 'n' default is"),
         "expected the descriptive message, got:\n{stdout}"
     );
+    // The legacy advisory is subsumed (dropped at this span).
+    assert!(
+        !stdout.contains("\"code\":\"field-default-type\""),
+        "the legacy field-default-type advisory should be subsumed, got:\n{stdout}"
+    );
 
-    // `--allow field-default-type` suppresses it.
+    // `--allow type-mismatch` suppresses it.
     let allowed = Command::new(bin)
         .arg("check")
         .arg("--json")
         .arg("--allow")
-        .arg("field-default-type")
+        .arg("type-mismatch")
         .arg(&file)
         .output()
         .unwrap();
     let allowed_out = String::from_utf8_lossy(&allowed.stdout);
     assert!(
-        !allowed_out.contains("\"code\":\"field-default-type\""),
-        "--allow field-default-type should suppress the diagnostic, got:\n{allowed_out}"
+        !allowed_out.contains("\"code\":\"type-mismatch\""),
+        "--allow type-mismatch should suppress the diagnostic, got:\n{allowed_out}"
     );
 
     let _ = std::fs::remove_file(&file);

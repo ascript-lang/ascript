@@ -129,7 +129,16 @@ impl<'a> Pass<'a> {
         if self.suppress_emit > 0 {
             return; // synthesizing during return inference — the real walk reports.
         }
-        if code == "type-mismatch" && self.legacy_spans.contains(&range.start) {
+        // De-dup an *advisory* `type-mismatch` against the legacy
+        // `contract-mismatch`/`field-default-type` Warning at the same span (the
+        // one-release overlap). A BLOCKING `type-mismatch` (TYPE: an annotated
+        // param or field-default slot) is the soundness contract and MUST surface —
+        // it supersedes the legacy advisory, which `analyze` then drops at this span
+        // (so the user sees the Error, not a duplicate Warning).
+        if code == "type-mismatch"
+            && severity == Severity::Warning
+            && self.legacy_spans.contains(&range.start)
+        {
             return; // de-dup against the legacy rule at this span
         }
         self.out.push(AsDiagnostic {
@@ -221,7 +230,8 @@ impl<'a> Pass<'a> {
         let bound_ty = match (&ann, &init) {
             (Some(ty_node), Some(init_expr)) => {
                 let expected = CheckTy::from_type_node(ty_node, self.table);
-                self.check_against(init_expr, &expected, env);
+                // Annotated destination slot (`let x: T = v`) → BLOCKING (TYPE §3.1).
+                self.check_against(init_expr, &expected, env, true);
                 expected
             }
             (Some(ty_node), None) => CheckTy::from_type_node(ty_node, self.table),
@@ -256,7 +266,8 @@ impl<'a> Pass<'a> {
         let expr = first_expr_child(stmt);
         let expected = self.expected_return.last().cloned().flatten();
         match (expr, expected) {
-            (Some(e), Some(exp)) => self.check_against(&e, &exp, env),
+            // Declared return type (`fn f(): T { return v }`) → BLOCKING (TYPE §3.1).
+            (Some(e), Some(exp)) => self.check_against(&e, &exp, env, true),
             (Some(e), None) => {
                 self.synth(&e, env);
             }
@@ -578,7 +589,9 @@ impl<'a> Pass<'a> {
                 actual.display(self.table),
                 expected.display(self.table)
             );
-            self.emit("type-mismatch", code_range(field), msg);
+            // `expected` is the field's declared type node (`from_type_node` above)
+            // → BLOCKING annotated slot (TYPE §3.1).
+            self.emit_with("type-mismatch", Severity::Error, code_range(field), msg);
         }
     }
 
@@ -586,7 +599,18 @@ impl<'a> Pass<'a> {
 
     /// Check `expr` against `expected`; on a provable `No`, emit `type-mismatch`.
     /// `Unknown`/`Yes` are silent (gradual discipline).
-    fn check_against(&mut self, expr: &ResolvedNode, expected: &CheckTy, env: &mut Env) {
+    ///
+    /// `blocking` decides the severity (TYPE §3.1): a mismatch against a
+    /// *syntactically-annotated* destination slot (an explicit `let x: T`, a
+    /// declared return) is a BLOCKING `Severity::Error`; an inferred/uncertain
+    /// context passes `false` and stays an advisory `Severity::Warning`.
+    fn check_against(
+        &mut self,
+        expr: &ResolvedNode,
+        expected: &CheckTy,
+        env: &mut Env,
+        blocking: bool,
+    ) {
         let actual = self.synth(expr, env);
         if let Compat3::No = actual.assignable(expected, self.table) {
             let msg = format!(
@@ -594,7 +618,12 @@ impl<'a> Pass<'a> {
                 expected.display(self.table),
                 actual.display(self.table)
             );
-            self.emit("type-mismatch", code_range(expr), msg);
+            let sev = if blocking {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            self.emit_with("type-mismatch", sev, code_range(expr), msg);
         }
     }
 
@@ -1097,7 +1126,9 @@ impl<'a> Pass<'a> {
                     expected.display(self.table),
                     actual.display(self.table)
                 );
-                self.emit("type-mismatch", code_range(arg), msg);
+                // `ptype_node` is always lowered from an annotated param type
+                // (`from_type_node` above) → BLOCKING annotated slot (TYPE §3.1).
+                self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
             }
         }
     }
@@ -2241,23 +2272,35 @@ mod tests {
     }
 
     #[test]
-    fn literal_arg_mismatch_dedup_with_legacy() {
+    fn literal_arg_mismatch_blocking_supersedes_legacy() {
+        // TYPE: an annotated-param mismatch is now a BLOCKING `type-mismatch` Error
+        // that SUPERSEDES the legacy advisory `contract-mismatch` at the same span
+        // (the legacy Warning is dropped in `analyze`, so the user sees one sound
+        // Error, not a duplicate).
         let src = "fn f(n: number) { return n }\nf(\"x\")\n";
-        assert!(has(src, "contract-mismatch"));
-        // de-dup: type-mismatch suppressed at the legacy span.
-        assert_eq!(
-            count(src, "type-mismatch"),
-            0,
-            "{:?}",
-            analyze(src).diagnostics
-        );
+        assert_eq!(count(src, "type-mismatch"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(count(src, "contract-mismatch"), 0, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "type-mismatch")
+            .unwrap();
+        assert_eq!(d.severity, crate::check::diagnostic::Severity::Error);
     }
 
     #[test]
-    fn field_default_subsumed_dedup() {
+    fn field_default_subsumed_blocking_supersedes_legacy() {
+        // TYPE: a typed field-default mismatch is now a BLOCKING `type-mismatch`
+        // Error that supersedes the legacy `field-default-type` advisory.
         let src = "class P { n: number = \"x\" }\n";
-        assert!(has(src, "field-default-type"));
-        assert_eq!(count(src, "type-mismatch"), 0);
+        assert_eq!(count(src, "type-mismatch"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(count(src, "field-default-type"), 0, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "type-mismatch")
+            .unwrap();
+        assert_eq!(d.severity, crate::check::diagnostic::Severity::Error);
     }
 
     #[test]

@@ -925,3 +925,123 @@ mod adt_exhaustiveness {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// TYPE Task 1 — the soundness blocking-severity chokepoint.
+//
+// A `type-mismatch`/`type-error` against a *syntactically-annotated* slot is a
+// BLOCKING `Severity::Error` (it fails the gate); an inferred/uncertain misuse
+// (and `possibly-nil`) stays an advisory `Severity::Warning`. There are EXACTLY
+// FOUR annotated sites: `let x: T = v`, `fn f(): T { return v }`, an annotated
+// param at a call site, and a typed class-field default.
+// ---------------------------------------------------------------------------
+mod sound_blocking_severity {
+    use ascript::check::{analyze, Severity};
+
+    fn diags(src: &str) -> Vec<ascript::check::AsDiagnostic> {
+        analyze(src).diagnostics
+    }
+    fn find<'a>(
+        ds: &'a [ascript::check::AsDiagnostic],
+        code: &str,
+    ) -> Option<&'a ascript::check::AsDiagnostic> {
+        ds.iter().find(|d| d.code == code)
+    }
+
+    #[test]
+    fn annotated_let_mismatch_is_error() {
+        // `let x: number = "s"` — the destination slot is annotated → BLOCKING.
+        let ds = diags("let x: number = \"s\"\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "annotated `let` mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_param_mismatch_is_error() {
+        // `fn f(p: string) {} f(1)` — the call passes `int` to an annotated `string`
+        // param → BLOCKING on arg 1.
+        let ds = diags("fn f(p: string) {}\nf(1)\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "annotated param mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_return_mismatch_is_error() {
+        // `fn f(): number { return "x" }` — the declared return is annotated → BLOCKING.
+        let ds = diags("fn f(): number { return \"x\" }\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "annotated return mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn typed_field_default_mismatch_is_error() {
+        // `class C { n: number = "x" }` — the field's declared type is annotated → BLOCKING.
+        let ds = diags("class C { n: number = \"x\" }\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "typed field default mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn inferred_misuse_stays_advisory_warning() {
+        // No annotation on `x`; the later arithmetic misuse is over an *inferred*
+        // string slot → stays advisory `Warning` (the programmer never promised a
+        // type). This is the paired counterpart of `annotated_let_mismatch_is_error`.
+        let ds = diags("let x = \"s\"\nlet y = x - 1\n");
+        let d = find(&ds, "type-error")
+            .unwrap_or_else(|| panic!("expected type-error on inferred misuse, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Warning,
+            "inferred-slot misuse must stay advisory (Warning): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn paired_annotated_error_vs_inferred_warning() {
+        // The SAME provable `No` is Error over an annotated slot and Warning over an
+        // inferred slot — asserted side by side.
+        let annotated = diags("let x: number = \"s\"\n");
+        let ad = find(&annotated, "type-mismatch")
+            .unwrap_or_else(|| panic!("annotated: expected type-mismatch, got {annotated:?}"));
+        assert_eq!(ad.severity, Severity::Error, "annotated → Error: {annotated:?}");
+
+        let inferred = diags("let x = \"s\"\nlet y = x - 1\n");
+        let id = find(&inferred, "type-error")
+            .unwrap_or_else(|| panic!("inferred: expected type-error, got {inferred:?}"));
+        assert_eq!(id.severity, Severity::Warning, "inferred → Warning: {inferred:?}");
+    }
+
+    #[test]
+    fn possibly_nil_stays_advisory_warning() {
+        // `possibly-nil` flags a *latent* runtime panic, not an annotated-slot type
+        // clash — it stays advisory even though `x` is annotated `T?`.
+        let ds = diags("fn f(x: number?): number { return x + 1 }\n");
+        if let Some(d) = find(&ds, "possibly-nil") {
+            assert_eq!(
+                d.severity,
+                Severity::Warning,
+                "possibly-nil must stay advisory (Warning): {ds:?}"
+            );
+        }
+    }
+}
