@@ -294,6 +294,7 @@ impl Printer<'_> {
         if let Some(name) = first_ident_text(node) {
             self.out.text(&name);
         }
+        self.type_params(node);
         self.params(node);
         if let Some(rt) = node.children().find(|c| c.kind() == RetType) {
             self.out.text(": ");
@@ -327,6 +328,7 @@ impl Printer<'_> {
         if let Some(name) = idents.first() {
             self.out.text(name);
         }
+        self.type_params(node);
         // Emit `extends SuperClass` if present.
         // `extends` is a soft keyword parsed as Ident; idents = [ClassName, "extends", SuperName].
         if let Some(p) = idents.iter().position(|s| s == "extends") {
@@ -391,6 +393,7 @@ impl Printer<'_> {
         if let Some(name) = first_ident_text(node) {
             self.out.text(&name);
         }
+        self.type_params(node);
         if let Some(ext) = node.children().find(|c| c.kind() == ExtendsList) {
             let names = iface_clause_names(ext);
             if !names.is_empty() {
@@ -613,6 +616,7 @@ impl Printer<'_> {
         if let Some(name) = first_ident_text(node) {
             self.out.text(&name);
         }
+        self.type_params(node);
         self.out.text(" {");
         self.out.newline();
         self.out.indent();
@@ -1052,6 +1056,40 @@ impl Printer<'_> {
         }
         self.out.text(",");
         self.out.newline();
+    }
+
+    /// TYPE §6 (Task 13): render a decl-level type-parameter list `<T, U>` (or with
+    /// bounds, `<T, C: Container<T>>`) from the `TypeParams` child of a fn/class/enum/
+    /// interface declaration. A no-op when the decl has no `TypeParams`. The list is
+    /// retained in the CST (`TypeParams` → `TypeParam` → optional `TypeBound`), so this
+    /// is purely a re-emit; dropping it (the carried-over bug) was lossy + non-idempotent.
+    fn type_params(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        let Some(list) = node.children().find(|c| c.kind() == TypeParams) else {
+            return;
+        };
+        let params: Vec<&ResolvedNode> =
+            list.children().filter(|c| c.kind() == TypeParam).collect();
+        if params.is_empty() {
+            return;
+        }
+        self.out.text("<");
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            if let Some(name) = first_ident_text(p) {
+                self.out.text(&name);
+            }
+            // Optional bound `: Type` (a `TypeBound` child holding the bound type).
+            if let Some(bound) = p.children().find(|c| c.kind() == TypeBound) {
+                if let Some(ty) = bound.children().find(|c| is_type_kind(c.kind())) {
+                    self.out.text(": ");
+                    self.type_ann(ty);
+                }
+            }
+        }
+        self.out.text(">");
     }
 
     fn type_ann(&mut self, node: &ResolvedNode) {
