@@ -1278,6 +1278,94 @@ fn lsp_worker_is_keyword_token() {
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
+/// IFACE Task 11: semantic tokens for interfaces — the `interface` reserved
+/// keyword and the contextual `implements`/`extends` introducers are KEYWORD
+/// tokens (legend index 0); the interface NAME at the declaration site is a
+/// CLASS-typed token (legend index 5 — interface names color as types). Asserts
+/// over the decoded token stream (absolute line/char rebuilt from the deltas).
+#[test]
+fn lsp_interface_semantic_tokens() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://iface_tokens.as";
+    // line 0: `interface Reader { fn read(b: bytes): int }`
+    // line 1: `class File implements Reader { fn read(b: bytes): int { return 0 } }`
+    let text = "interface Reader { fn read(b: bytes): int }\n\
+class File implements Reader { fn read(b: bytes): int { return 0 } }\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let st_resp = client.read_response(2, overall);
+    let raw = st_resp["result"]["data"]
+        .as_array()
+        .expect("semanticTokens data array");
+    let nums: Vec<u32> = raw.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+    assert!(
+        nums.len().is_multiple_of(5) && !nums.is_empty(),
+        "token stream: {nums:?}"
+    );
+
+    // Decode the delta-encoded stream into absolute (line, char, len, type) tuples.
+    let mut toks = Vec::new();
+    let (mut line, mut ch) = (0u32, 0u32);
+    for g in nums.chunks(5) {
+        if g[0] != 0 {
+            line += g[0];
+            ch = g[1];
+        } else {
+            ch += g[1];
+        }
+        toks.push((line, ch, g[2], g[3]));
+    }
+    const KEYWORD: u32 = 0;
+    const CLASS: u32 = 5;
+
+    // `interface` keyword at line 0, char 0, len 9.
+    assert!(
+        toks.contains(&(0, 0, 9, KEYWORD)),
+        "`interface` must be a KEYWORD token; got: {toks:?}"
+    );
+    // `Reader` (the interface NAME) at line 0, char 10, len 6 -> CLASS-typed.
+    assert!(
+        toks.iter().any(|&(l, c, len, ty)| l == 0 && c == 10 && len == 6 && ty == CLASS),
+        "interface name `Reader` must be a CLASS-typed token; got: {toks:?}"
+    );
+    // `implements` (line 1, char 11, len 10) -> KEYWORD (contextual).
+    assert!(
+        toks.iter().any(|&(l, c, len, ty)| l == 1 && c == 11 && len == 10 && ty == KEYWORD),
+        "`implements` must be a KEYWORD token; got: {toks:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
 /// Task 12 Step 1b: `worker` is offered as a completion keyword at a top-level
 /// position.
 #[test]

@@ -1,0 +1,10 @@
+# exit: none
+upper: Hello -> HELLO -> hello
+reverse: abc -> cba -> abc
+true
+no codec named 'half'
+no codec named 'zip'
+conforming codecs: 2
+false
+true
+interface dispatch ok

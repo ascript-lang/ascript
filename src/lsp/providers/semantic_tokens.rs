@@ -115,6 +115,26 @@ fn contextual_keyword_spans(model: &SemanticModel) -> std::collections::HashSet<
         let r = tok.text_range();
         out.insert((usize::from(r.start()), usize::from(r.end())));
     }
+    // IFACE: the `extends`/`implements` introducer in an `ExtendsList` (interface
+    // composition) or `ImplementsClause` (class conformance) is a CONTEXTUAL keyword
+    // — the CST keeps it as an `Ident`, so style it like `worker`/`static`. It is the
+    // FIRST `Ident` token of the clause node (the remaining idents are interface
+    // NAMES and stay classified as types via the resolver).
+    for clause in model.tree.descendants().filter(|n| {
+        matches!(
+            n.kind(),
+            SyntaxKind::ExtendsList | SyntaxKind::ImplementsClause
+        )
+    }) {
+        if let Some(intro) = clause
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == SyntaxKind::Ident)
+        {
+            let r = intro.text_range();
+            out.insert((usize::from(r.start()), usize::from(r.end())));
+        }
+    }
     out
 }
 
@@ -305,6 +325,8 @@ fn is_keyword_kind(k: SyntaxKind) -> bool {
             | YieldKw
             | StaticKw
             | WorkerKw
+            // IFACE: `interface` is a reserved keyword (CST `InterfaceKw`).
+            | InterfaceKw
     )
 }
 
