@@ -112,6 +112,14 @@ libloading = { version = "0.8", optional = true }
 # toolchains (`-print-multi-os-directory` / CFI assembler errors). The system libffi
 # is present on macOS (homebrew/system) and Linux (libffi-dev).
 libffi = { version = "3", optional = true, features = ["system"] }
+# VAL Task 0 / spec §6 — compile-time `!Send`/`!Sync` lock on `Value`
+# (`assert_not_impl_any!(Value: Send, Sync)`, module-level in `value.rs`). Promoted
+# from a dev-dependency to a normal dependency so the guard is active in the
+# production lib build, not only under `cargo test`: a future edit that makes
+# `Value` `Send`/`Sync` (breaking the `LocalSet`/current-thread invariant) fails
+# the build. The macro expands to a zero-size `const` check — no runtime cost, no
+# codegen.
+static_assertions = "1"
 
 [build-dependencies]
 cc = "1"
@@ -120,13 +128,6 @@ ungrammar = "1"
 [dev-dependencies]
 tree-sitter = "0.25"
 tempfile = "3"
-# SRV §3.4: the NEGATIVE compile-time guard `assert_not_impl_any!(Value: Send)`.
-# `Value` gains its FIRST `Send` member (`Value::Shared(Arc<SharedNode>)`) but the
-# union as a whole MUST stay `!Send` (the `LocalSet`/current-thread invariant). The
-# assertion fails to compile if a future edit ever removes the last `Rc`/`Cc`/`Native`
-# member or adds a stray `unsafe impl Send for Value`. Compile-time only → a
-# dev-dependency, never a production dep.
-static_assertions = "1"
 
 [features]
 default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared"]

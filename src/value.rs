@@ -1151,6 +1151,17 @@ pub enum Value {
     Shared(Arc<SharedNode>),
 }
 
+// VAL Task 0 / spec §6 — the `!Send`/`!Sync` lock, module-level (compile-time)
+// next to the `Value` definition so it fails the build, not just a test run, if a
+// future edit (VAL's own NaN-box, SRV's `Arc` leaf, or any variant-adder) ever
+// makes `Value` `Send` or `Sync`. That would break the
+// `#[tokio::main(flavor = "current_thread")]` + `LocalSet` invariant the whole
+// runtime rests on (CLAUDE.md §"The interpreter"). A deliberate future decision to
+// make `Value` `Send` must DELETE this assert, surfacing the choice. (The SRV-era
+// `assert_not_impl_any!(Value: Send)` in `gc.rs` is a test-body sibling — kept; this
+// is the broader compile-time `Send + Sync` guard the VAL spec asks for.)
+static_assertions::assert_not_impl_any!(Value: Send, Sync);
+
 impl Value {
     /// NUM §3.3 (BREAKING): the resolved falsy set is `nil`, `false`, `Int(0)`,
     /// a `Float` that is `0.0`/`-0.0`/`NaN`, a `Decimal` equal to zero, and the
@@ -1212,6 +1223,61 @@ impl Value {
                     None
                 }
             }
+            _ => None,
+        }
+    }
+
+    // ── VAL Task 0: thin zero-cost accessor helpers ─────────────────────────
+    // These insulate the rest of the codebase from the physical `Value`
+    // encoding. They are `#[inline]` wrappers over the CURRENT enum so that
+    // later VAL stages (a niche-shrunk enum, then a NaN-box) change ONLY
+    // `value.rs` — call sites read `Value::int(n)` / `v.as_int()` / etc. and
+    // never pattern-match the encoding directly. Mirrors NUM's mechanical
+    // accessor discipline (`as_f64`/`as_int_exact` above).
+
+    /// Construct an `Int` value (NUM's exact-integer subtype).
+    #[inline]
+    pub fn int(n: i64) -> Value {
+        Value::Int(n)
+    }
+
+    /// Construct a `Float` value (NUM's IEEE-754 subtype).
+    #[inline]
+    pub fn float(n: f64) -> Value {
+        Value::Float(n)
+    }
+
+    /// Construct an `Object` value from an insertion-ordered key map.
+    #[inline]
+    pub fn object(map: IndexMap<String, Value>) -> Value {
+        Value::Object(ObjectCell::new(map))
+    }
+
+    /// Extract the `i64` of an `Int` value EXACTLY — `None` for every other kind
+    /// (including `Float`; use `as_int_exact` for the integral-float coercion).
+    #[inline]
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Extract the `f64` of a `Float` value EXACTLY — `None` for every other kind
+    /// (including `Int`; use `as_f64` for the number-widening view).
+    #[inline]
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// View the underlying `ObjectCell` of an `Object` value, `None` otherwise.
+    #[inline]
+    pub fn as_object(&self) -> Option<Cc<ObjectCell>> {
+        match self {
+            Value::Object(o) => Some(o.clone()),
             _ => None,
         }
     }
@@ -1616,6 +1682,47 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // VAL Task 0 — the MOVING SIZE TRIPWIRE. `Value` is the runtime tagged union
+    // threaded through every fiber stack slot, frame slot, array element, and map
+    // slot; its width is a load-bearing performance fact. This test pins the
+    // measured baseline so a careless edit that widens a variant is caught
+    // immediately, and each VAL stage updates the asserted constant as the enum
+    // shrinks (32 → ≤24 → 16 → 8). The companion `value_size_print` is `ignore`d
+    // (it just surfaces the number when run with `--nocapture`).
+    #[test]
+    fn value_size_is_documented() {
+        // VAL Task 0 baseline (measured): 32 bytes — set by the two 24-byte
+        // two-field method-binding variants (`ClassMethod(Rc<Class>, Rc<str>)`,
+        // `GeneratorMethod(Rc<GeneratorHandle>, &'static str)`) rounded with the
+        // discriminant to 32. Each VAL stage updates this constant as the enum
+        // shrinks (32 → ≤24 → 16 → 8).
+        assert_eq!(std::mem::size_of::<Value>(), 32);
+    }
+
+    #[test]
+    #[ignore]
+    fn value_size_print() {
+        eprintln!("size_of::<Value>() = {}", std::mem::size_of::<Value>());
+    }
+
+    // VAL Task 0 — accessor round-trip: the thin, zero-cost constructor/extractor
+    // helpers (`Value::int`/`float`/`object`, `as_int`/`as_float`/`as_object`)
+    // insulate the rest of the tree from the physical encoding so later VAL stages
+    // change ONLY `value.rs`. Round-trip identity must hold.
+    #[test]
+    fn accessor_round_trip() {
+        assert_eq!(Value::int(5).as_int(), Some(5));
+        assert_eq!(Value::int(-2_000_000).as_int(), Some(-2_000_000));
+        assert_eq!(Value::float(3.5).as_float(), Some(3.5));
+        // Cross-kind: an int is not a float and vice versa (no silent coercion).
+        assert_eq!(Value::int(5).as_float(), None);
+        assert_eq!(Value::float(3.5).as_int(), None);
+        // Object round-trip preserves pointer identity.
+        let obj = Value::object(IndexMap::new());
+        let cell = obj.as_object().expect("object accessor");
+        assert!(matches!(&obj, Value::Object(c) if crate::gc::cc_ptr_eq(c, &cell)));
+    }
 
     // ADT Task 1 helpers — construct variant values directly at the value layer.
     fn unit_variant(en: &str, name: &str, backing: Value) -> Value {
