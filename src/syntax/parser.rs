@@ -1080,43 +1080,212 @@ fn primary(p: &mut Parser) -> CompletedMarker {
 /// is left to comparison. Precondition: cursor at `Lt`. Pure (no events, no token
 /// mutation).
 fn looks_like_explicit_type_args(p: &Parser) -> bool {
-    use SyntaxKind::*;
-    let mut depth = 0i32;
-    let mut i = p.pos;
-    while i < p.nontrivia.len() {
-        let k = p.tokens[p.nontrivia[i]].kind;
-        match k {
-            Lt => depth += 1,
-            Gt => {
-                depth -= 1;
-                if depth == 0 {
-                    // Closed: a type-arg call iff the next token is `(`.
-                    return p.nontrivia.get(i + 1).map(|&ti| p.tokens[ti].kind) == Some(LParen);
-                }
+    // Precondition: cursor at `Lt`. Run a pure, non-mutating scan that mirrors the
+    // legacy parser's speculative `parse_type` EXACTLY (so the two front-ends agree
+    // token-for-token — a divergence here is a four-mode-byte-identity landmine). An
+    // earlier token-balancer was wrong on two shapes: `a < b() > (c)` (a `(` inside the
+    // angle span that is NOT a `fn(...)` type — must reject to comparison) and
+    // `f<fn(int) -> string>(x)` (the `->` arrow's `>` is NOT a list close — must accept
+    // the FnSig type arg). A faithful grammar scan handles both. Accept iff the list
+    // `< Type (, Type)* >` closes cleanly with a single `>` whose NEXT token is `(`.
+    let mut s = TypeArgScan {
+        p,
+        i: p.pos,
+        half: false,
+    };
+    if s.kind() != Some(SyntaxKind::Lt) {
+        return false;
+    }
+    s.bump(); // <
+    if s.at_close() {
+        return false; // empty `<>` is not a type-arg list
+    }
+    loop {
+        if !s.scan_type() {
+            return false;
+        }
+        if s.kind() == Some(SyntaxKind::Comma) {
+            s.bump();
+            if s.at_close() {
+                return false; // trailing comma before `>` is invalid
             }
-            Shr => {
-                // `>>` closes two levels.
-                depth -= 2;
-                if depth <= 0 {
-                    // A `>>` that over-closes (depth < 0) is not a clean type-arg
-                    // list close; only depth == 0 with a following `(` qualifies.
-                    if depth == 0 {
-                        return p.nontrivia.get(i + 1).map(|&ti| p.tokens[ti].kind)
-                            == Some(LParen);
+        } else {
+            break;
+        }
+    }
+    if !s.eat_close() {
+        return false;
+    }
+    // `half` true here means the list closed on the FIRST `>` of a `>>`, leaving a
+    // dangling `>` — an over-close that the legacy `eat_type_gt`+`peek==(` check also
+    // rejects (the leftover `>`, not `(`, follows). So a clean call needs `half==false`
+    // and the very next token `(`.
+    !s.half && s.kind() == Some(SyntaxKind::LParen)
+}
+
+/// Pure, non-mutating token scanner over `Parser::nontrivia` used solely by
+/// [`looks_like_explicit_type_args`] to decide type-args-vs-comparison the SAME way the
+/// legacy parser's speculative `parse_type` does. `half` models a `>>` whose first `>`
+/// has been consumed as a close (the second is still pending) — the in-place `>>`-split
+/// the real parser performs, done virtually here so the lookahead mutates nothing.
+struct TypeArgScan<'a> {
+    p: &'a Parser,
+    i: usize,
+    half: bool,
+}
+
+impl TypeArgScan<'_> {
+    fn kind(&self) -> Option<SyntaxKind> {
+        self.p.nontrivia.get(self.i).map(|&ti| self.p.tokens[ti].kind)
+    }
+    fn at_close(&self) -> bool {
+        matches!(self.kind(), Some(SyntaxKind::Gt) | Some(SyntaxKind::Shr))
+    }
+    /// Advance one non-trivia token. Never called while `half` (we only ever read a
+    /// half-`Shr` position via `kind()` comparisons or `eat_close`).
+    fn bump(&mut self) {
+        debug_assert!(!self.half, "bump() while mid-`>>` would skip a `>`");
+        self.i += 1;
+    }
+    /// Consume exactly one closing `>` (from a `Gt`, or one half of a `Shr`).
+    fn eat_close(&mut self) -> bool {
+        match self.kind() {
+            Some(SyntaxKind::Gt) => {
+                self.i += 1;
+                true
+            }
+            Some(SyntaxKind::Shr) if self.half => {
+                self.i += 1;
+                self.half = false;
+                true
+            }
+            Some(SyntaxKind::Shr) => {
+                self.half = true; // first `>` of the `>>` consumed; stay on the token
+                true
+            }
+            _ => false,
+        }
+    }
+    /// `Type := Optional ('|' Optional)*` (matches legacy `parse_type`).
+    fn scan_type(&mut self) -> bool {
+        if !self.scan_optional() {
+            return false;
+        }
+        while self.kind() == Some(SyntaxKind::Pipe) {
+            self.bump();
+            if !self.scan_optional() {
+                return false;
+            }
+        }
+        true
+    }
+    /// `Optional := Primary '?'?`.
+    fn scan_optional(&mut self) -> bool {
+        if !self.scan_primary() {
+            return false;
+        }
+        if self.kind() == Some(SyntaxKind::Question) {
+            self.bump();
+        }
+        true
+    }
+    /// `Primary` mirrors legacy `parse_type_atom`: `fn(...) -> T` | bare `fn` | `[..]`
+    /// tuple | `nil` | builtin/user/param ident with an optional `< .. >` generic app.
+    fn scan_primary(&mut self) -> bool {
+        use SyntaxKind::*;
+        match self.kind() {
+            Some(FnKw) => {
+                self.bump(); // fn
+                if self.kind() != Some(LParen) {
+                    return true; // bare `fn` type
+                }
+                self.bump(); // (
+                if self.kind() != Some(RParen) {
+                    loop {
+                        if !self.scan_type() {
+                            return false;
+                        }
+                        if self.kind() == Some(Comma) {
+                            self.bump();
+                            if self.kind() == Some(RParen) {
+                                break; // tolerated trailing comma
+                            }
+                        } else {
+                            break;
+                        }
                     }
+                }
+                if self.kind() != Some(RParen) {
                     return false;
                 }
+                self.bump(); // )
+                // `-> Ret` — the arrow lexes as `Minus` then a PLAIN `Gt` (never `Shr`).
+                if self.kind() != Some(Minus) {
+                    return false;
+                }
+                self.bump();
+                if self.kind() != Some(Gt) {
+                    return false;
+                }
+                self.bump();
+                self.scan_type() // return type
             }
-            // Tokens that MAY appear inside a type-argument list (type atoms, the
-            // generic/tuple/union/optional/fn-type punctuation). Anything else at
-            // depth ≥ 1 means this is not a type-arg list — bail to comparison.
-            Ident | NilKw | FnKw | Comma | LBracket | RBracket | Question | Pipe
-            | LParen | RParen | Minus => {}
-            _ => return false,
+            Some(LBracket) => {
+                self.bump(); // [
+                if self.kind() != Some(RBracket) {
+                    loop {
+                        if !self.scan_type() {
+                            return false;
+                        }
+                        if self.kind() == Some(Comma) {
+                            self.bump();
+                            if self.kind() == Some(RBracket) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if self.kind() != Some(RBracket) {
+                    return false;
+                }
+                self.bump(); // ]
+                true
+            }
+            Some(NilKw) => {
+                self.bump();
+                true
+            }
+            // Any ident (builtin, `array`/`map`/`Result`/`future`, user, type-param),
+            // with an OPTIONAL `< Type (, Type)* >` generic application.
+            Some(Ident) => {
+                self.bump(); // name
+                if self.kind() == Some(Lt) {
+                    self.bump(); // <
+                    if self.at_close() {
+                        return false; // empty `<>`
+                    }
+                    loop {
+                        if !self.scan_type() {
+                            return false;
+                        }
+                        if self.kind() == Some(Comma) {
+                            self.bump();
+                            if self.at_close() {
+                                return false;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    return self.eat_close();
+                }
+                true
+            }
+            _ => false,
         }
-        i += 1;
     }
-    false
 }
 
 /// TYPE §6: consume an expression-level explicit type-argument list `< Type

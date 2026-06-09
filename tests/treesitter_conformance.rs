@@ -416,6 +416,8 @@ fn treesitter_disambiguates_explicit_type_args_vs_comparison() {
         "let xs = map<string, number>(items, f)",
         "Box<Box<int>>(5)",
         "foo<int>(1)",
+        // FnSig type argument — the `->` arrow's `>` must NOT close the angle list.
+        "f<fn(int) -> string>(5)",
     ] {
         let tree = parser.parse(src.as_bytes(), None).expect("parse");
         assert!(
@@ -439,6 +441,9 @@ fn treesitter_disambiguates_explicit_type_args_vs_comparison() {
         "f(a < b, c > d)",
         "let _ = x < y ? a : b",
         "let _ = a < b > c",
+        // A `(` inside the angle span that is NOT a `fn(...)` type → comparison, not a
+        // generic call (`b()` is not a type).
+        "let _ = a < b() > (c)",
     ] {
         let tree = parser.parse(src.as_bytes(), None).expect("parse");
         assert!(
