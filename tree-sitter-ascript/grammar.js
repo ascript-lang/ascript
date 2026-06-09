@@ -108,6 +108,25 @@ module.exports = grammar({
     // vs `variant_pattern`. GLR keeps both alive until the first field disambiguates.
     [$.variant_pattern, $._primary_expression],
     [$.variant_pattern, $._postfix_expression],
+    // ----- TYPE §6 (Task 5/7): explicit type-arg call vs comparison ---------
+    // `callee < T > (args)` is a generic-instantiation call (`call_expression`
+    // with `type_arguments`), but `a < b > (c)` is a comparison chain
+    // (`binary_expression`). At the `<` after a postfix expression the parser
+    // cannot yet tell whether it opens a `type_arguments` list or is the `<`
+    // comparison operator — only the trailing `(arguments)` after the matching `>`
+    // decides. Declaring the conflict keeps BOTH derivations live (GLR) until that
+    // `(` (call) or its absence (comparison) resolves them, mirroring the legacy/
+    // CST parsers' speculative-parse-with-trailing-`(` rule. NUM declared no
+    // expression-position `<` conflict; this is TYPE's own. At
+    // `_postfix_expression •  <` the parser must keep alive BOTH reducing the
+    // postfix to an `_expression` (so `<` is the comparison operator) and shifting
+    // into a `call_expression`'s `type_arguments` (so `<` opens the type-arg list).
+    [$._expression, $.call_expression],
+    // TYPE §6: a `function_type` return that is a union (`fn() -> A | B`) is
+    // ambiguous between extending the union and closing the function type — keep
+    // both live (GLR) so the return binds the union (matching the legacy parser's
+    // `parse_type`, where `->` is followed by a full `parse_type` incl. unions).
+    [$._type, $.union_type],
   ],
 
   rules: {
@@ -221,10 +240,30 @@ module.exports = grammar({
       'fn',
       optional('*'),  // `fn*` / `async fn*` — a generator (§7, M17)
       field('name', $.identifier),
+      // TYPE §6: optional `<T, U: Bound>` generic param list.
+      optional(field('type_parameters', $.type_parameters)),
       field('parameters', $.parameter_list),
       optional(seq(':', field('return_type', $._type))),
       field('body', $.block),
     ),
+
+    // TYPE §6: a generic type-parameter LIST on a decl (`<T, U: Bound>`). The `>>`
+    // closing of a NESTED bound generic (`<C: Box<Box<int>>>`) is handled by
+    // tree-sitter's context-aware lexer (it prefers two `>` over a `>>` token in
+    // this parse state), exactly as the built-in `array<…>` types already rely on.
+    type_parameters: $ => seq(
+      '<',
+      commaSep1($.type_parameter),
+      optional(','),
+      '>',
+    ),
+    type_parameter: $ => seq(
+      field('name', $.identifier),
+      optional(field('bound', $.type_bound)),
+    ),
+    // A type-parameter bound (`: Container<T>`) — interface-constrained (the static
+    // checker admits only interfaces; the grammar accepts any type here).
+    type_bound: $ => seq(':', $._type),
 
     parameter_list: $ => seq(
       '(',
@@ -251,6 +290,8 @@ module.exports = grammar({
       optional($.worker_keyword),  // `worker class` — dedicated-isolate actor (Spec B)
       'class',
       field('name', $.identifier),
+      // TYPE §6: optional `<T>` generic param list (before `extends`).
+      optional(field('type_parameters', $.type_parameters)),
       optional(seq('extends', field('superclass', $.identifier))),
       // IFACE: optional `implements I1, I2` clause (after `extends`, before body).
       optional($.implements_clause),
@@ -289,6 +330,8 @@ module.exports = grammar({
     enum_declaration: $ => seq(
       'enum',
       field('name', $.identifier),
+      // TYPE §6: optional `<T>` generic param list (`enum Option<T> { … }`).
+      optional(field('type_parameters', $.type_parameters)),
       '{',
       commaSep($.enum_variant),
       optional(','),
@@ -316,6 +359,8 @@ module.exports = grammar({
     interface_declaration: $ => seq(
       'interface',
       field('name', $.identifier),
+      // TYPE §6: optional `<T>` generic param list (`interface Container<T> { … }`).
+      optional(field('type_parameters', $.type_parameters)),
       optional(seq('extends', commaSep1(field('parent', $.identifier)))),
       field('body', $.interface_body),
     ),
@@ -619,10 +664,40 @@ module.exports = grammar({
       $._primary_expression,
     ),
 
-    call_expression: $ => prec(PREC.postfix, seq(
-      field('function', $._postfix_expression),
-      field('arguments', $.arguments),
-    )),
+    // A plain call `f(args)` and a generic-instantiation call
+    // `f<T>(args)` (TYPE §6). The latter is its OWN alternative (not an `optional`
+    // type-arg slot) so the bare-call path keeps the simple high-precedence shape
+    // and the generic path carries the `<…>` only when a trailing `(arguments)`
+    // confirms it.
+    call_expression: $ => choice(
+      prec(PREC.postfix, seq(
+        field('function', $._postfix_expression),
+        field('arguments', $.arguments),
+      )),
+      // TYPE §6 (Task 5/7): expression-level EXPLICIT type arguments
+      // (`Box<int>(5)`, `map<string, number>(xs, f)`). Lexically ambiguous with the
+      // comparison chain `(fn < arg) > (…)`; the GLR conflict declared above
+      // (`[call_expression, binary_expression]`) keeps both interpretations alive,
+      // and the trailing `(arguments)` immediately after `>` is what selects the
+      // type-argument reading. The args are runtime-erased (the compiler/interpreter
+      // ignore a `type_arguments` on a call). A `<` NOT followed by `… > (` loses
+      // this derivation and reduces to comparison instead. No `prec` on this arm —
+      // the `<` shift must compete FAIRLY with the comparison reduce (a precedence
+      // here would force one reading and defeat the GLR split).
+      seq(
+        field('function', $._postfix_expression),
+        field('type_arguments', $.type_arguments),
+        field('arguments', $.arguments),
+      ),
+    ),
+    // The `<T, U>` of an explicit-type-arg call. Reuses the same `>>`-splitting
+    // lexer behavior as the built-in `array<…>` types.
+    type_arguments: $ => seq(
+      '<',
+      commaSep1($._type),
+      optional(','),
+      '>',
+    ),
     arguments: $ => seq('(', commaSep(choice($.named_argument, $._expression, $.spread_element)), optional(','), ')'),
 
     // ADT §3.2: a named call argument `name: expr` (enum-variant construction —
@@ -751,7 +826,12 @@ module.exports = grammar({
       $.result_type,
       $.future_type,
       $.tuple_type,
-      $.identifier, // class / enum name
+      // TYPE §6: a user generic application (`Box<int>`, `Map<string, int>`) and a
+      // parameterized function type (`fn(A) -> B`). Both before the bare
+      // `identifier` so a `Foo<…>` head prefers the generic form.
+      $.generic_type,
+      $.function_type,
+      $.identifier, // class / enum name OR an in-scope type-parameter reference
     ),
     primitive_type: _ => choice(
       'number', 'string', 'bool', 'nil', 'any', 'fn', 'object', 'error',
@@ -761,6 +841,28 @@ module.exports = grammar({
     result_type: $ => seq('Result', '<', $._type, '>'),
     future_type: $ => seq('future', '<', $._type, '>'),
     tuple_type: $ => seq('[', commaSep1($._type), optional(','), ']'),
+    // TYPE §6: a USER generic application in TYPE position — `Box<int>`,
+    // `Map<string, int>`, nested `Box<Box<int>>` (the `>>` close is handled by
+    // tree-sitter's context-aware lexer, like the built-in `array<…>` already are).
+    // The args are runtime-erased; the head is a class/enum/interface name.
+    generic_type: $ => seq(
+      field('name', $.identifier),
+      '<',
+      commaSep1($._type),
+      optional(','),
+      '>',
+    ),
+    // TYPE §6: a parameterized function type `fn(A) -> B`. The `->` lexes as
+    // `'-' '>'` (no dedicated arrow token); a literal `'->'` matches the longest
+    // run, so the grammar uses it directly.
+    function_type: $ => prec(1, seq(
+      'fn',
+      '(',
+      optional(seq(commaSep1($._type), optional(','))),
+      ')',
+      '->',
+      $._type,
+    )),
     // T? — nullable suffix (sugar for `T | nil`). Reachable only inside `_type`.
     // The inner `choice` is the non-recursive subset of `_type_atom` (avoids
     // left-recursion / `T??`); KEEP IN SYNC with `_type_atom` if a new type atom

@@ -144,8 +144,15 @@ fn is_expr(kind: SyntaxKind) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::check::analyze;
+
+    /// Does the RULE emit `code` directly? Since TYPE, the end-to-end `analyze`
+    /// pipeline DROPS a `contract-mismatch` advisory at a span where the inference
+    /// pass emits a blocking `type-mismatch` Error (subsumption). These unit tests
+    /// exercise the rule's own detection, so they invoke it directly.
     fn has(src: &str, code: &str) -> bool {
-        analyze(src).diagnostics.iter().any(|d| d.code == code)
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(src));
+        let resolved = crate::syntax::resolve::resolve(&tree);
+        super::check(&tree, &resolved, src).iter().any(|d| d.code == code)
     }
 
     #[test]

@@ -184,17 +184,29 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   native fns ignore surplus args → only too-few is flagged). Cross-module span provenance via
   `AsError.span_source`. Cross-file LSP (`src/lsp/workspace.rs`, `Send+Sync`, interpreter-free
   `WorkspaceIndex`) powers go-to-def / workspace symbols / find-references / rename.
-- **SP10 — advisory static gradual type checker** (`src/check/infer/`, static-only, NEVER runs code). One
-  inference pass wired into `analyze_with_config` after `rules::ALL`. Emits three default-Warning codes:
-  `type-mismatch` (value provably wrong for an ANNOTATED slot — subsumes `contract-mismatch`+
+- **SP10 / TYPE — static gradual type checker, sound-for-annotated + generics** (`src/check/infer/`,
+  static-only, NEVER runs code). One inference pass wired into `analyze_with_config` after `rules::ALL`.
+  Emits `type-mismatch` (value provably wrong for an ANNOTATED slot — subsumes `contract-mismatch`+
   `field-default-type`), `type-error` (arithmetic on a provable non-number), `possibly-nil` (provable `T?`
-  deref without a guard). Files: `ty.rs` (the `CheckTy` lattice + `Compat3{Yes,No,Unknown}` — **only `No`
-  ever emits**, everything uncertain is silent: the gradual escape that keeps the untyped corpus at ZERO
-  false positives), `table.rs`, `env.rs`, `pass.rs` (bidirectional `synth`/`check_against`, in-file return
-  inference, nil-guard/`match`/`instanceof` narrowing). **Invariants:** (1) `examples/**` emits 0 `type-*`
-  diagnostics in BOTH feature configs (a new corpus `type-*` is a bug in `assignable`/`synth` — default to
-  `Unknown`, never relax the gate); (2) it runs no code, so `vm_differential` is unchanged. LSP:
-  `infer::hover_type_at` powers hover types.
+  deref without a guard). **Severity is the soundness model (TYPE):** a `type-mismatch` on a *syntactically
+  annotated* slot is a **blocking `Severity::Error`** (the single chokepoint = a `sev` arg on `emit`, threaded
+  via a `blocking` flag through `check_against` for `walk_let`/`walk_return` + passed `Error` directly at the
+  two INLINE sites `check_call_args`/`check_field_default`); `possibly-nil`, `type-error`, and inferred-context
+  mismatches stay **Warning**. `ascript.toml [lint] type-mismatch = "warn"` downgrades the block.
+  **Generics (TYPE, runtime-ERASED):** `CheckTy::{Var,FnSig,ClassApp,EnumApp,Interface}` + occurs-checked
+  union-find (`unify.rs`) + argument-driven inference (freshen→unify→substitute→check) + a genuinely-INVARIANT
+  `ClassApp`/`EnumApp`/parameterized-interface `assignable` arm (rule 8 left covariant) + interface bounds via
+  the structural `conforms` predicate. Generics surface in all front-ends but are ERASED: a `T`-slot checks as
+  accept-anything at runtime → **no `.aso` bump (`ASO_FORMAT_VERSION` unchanged), `vm_differential` untouched,
+  all four modes byte-identical**. Files: `ty.rs` (the `CheckTy` lattice + `Compat3{Yes,No,Unknown}` — **only
+  `No` ever emits**, an unsolved/unbounded `Var` → **`Unknown`, NEVER `No`** — the gradual escape that keeps the
+  untyped corpus at ZERO false positives), `unify.rs`, `table.rs` (`type_params`/bounds/`InterfaceInfo`/
+  `field_order` for positional construction inference), `env.rs`, `pass.rs` (bidirectional `synth`/`check_against`,
+  generic call/construction inference + arrow callback-return inference, in-file return inference, narrowing).
+  **Invariants:** (1) `examples/**` emits 0 `type-*`/exhaustiveness diagnostics in BOTH feature configs — the
+  Gate-5 tripwire (`tests/check.rs` `corpus::`); a new corpus diagnostic is a bug in `assignable`/`synth`/`unify`
+  (default to `Unknown`, never relax the gate); (2) it runs no code → `vm_differential` and `.aso` unchanged.
+  LSP: `infer::hover_type_at` powers hover + inlay, surfacing INSTANTIATED generics (`Box<int>`, `array<int>`).
 - **SP6 — package manager** (`pkg` feature, default-on). An entirely CLI-side module set
   `src/pkg/{manifest,cache,hash,fetch,lock,resolve,commands}.rs` keeps TOML/IO out of the core. `ascript.toml`
   gains `[package]`+`[dependencies]` (value shape selects source kind: `{git,tag|rev}`/`{url}`/`{path}`/

@@ -162,6 +162,10 @@ fn type_to_json_schema(ty: &Type, resolve_named: &dyn Fn(&str) -> Option<J>) -> 
             Some(schema) => (schema, true),
             None => (json!({"type": "object"}), true),
         },
+        // TYPE: generics are runtime-erased. A `Type::Param("T")` accepts anything
+        // (= `any` → an open `{}`); a `Type::FnSig` is a callable (mirrors `Fn`).
+        Type::Param(_) => (json!({}), true),
+        Type::FnSig(_, _) => (json!({"type": "string"}), true),
     }
 }
 

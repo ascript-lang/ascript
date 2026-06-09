@@ -364,3 +364,110 @@ fn interpreter_parser_accepts_all_examples() {
         "interpreter parser rejected: {failures:?}"
     );
 }
+
+#[test]
+fn treesitter_parses_generics_surface() {
+    // TYPE §6: type-param lists, `fn(A)->B`, user generic application, and bounds
+    // all parse with no error nodes.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        "fn id<T>(x: T): T { return x }",
+        "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> { return [] }",
+        "fn first<T, C: Container<T>>(c: C): T { return c.at(0) }",
+        "class Box<T> { value: T\n fn get(): T { return self.value } }",
+        "class Pair<A, B> { a: A\n b: B }",
+        "enum Option<T> { Some(value: T), None }",
+        // NOTE: a SECOND named-payload variant trips a PRE-EXISTING
+        // variant-pattern-vs-call GLR limitation in the grammar (independent of
+        // generics — `enum E { Ok(value:int), Err(error:int) }` errors on the OLD
+        // grammar too), so the two-named-payload `Result2<T,E>` form is exercised by
+        // the legacy/CST front-ends (frontend_conformance) rather than here.
+        "enum Tagged<T> { Wrap(value: T), Empty }",
+        "interface Container<T> { fn len(): int\n fn at(i: int): T }",
+        "let f: fn(int) -> string = g",
+        "let z: fn() -> bool = g",
+        "let b: Box<int> = make()",
+        "fn h(m: map<int, array<int>>) {}",
+        "let bb: Box<Box<int>> = make()",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on generics snippet: {src}"
+        );
+    }
+}
+
+#[test]
+fn treesitter_disambiguates_explicit_type_args_vs_comparison() {
+    // TYPE §6 (Task 5/7) — the NEW expression-level `<` ambiguity. The paired
+    // battery: type-arg CALLS parse with `type_arguments`; comparison chains parse
+    // as comparisons (no `type_arguments`). The trailing `(` after `>` decides.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+
+    // TYPE-ARG-CALL readings — every one parses cleanly AND carries a
+    // `type_arguments` node.
+    for src in [
+        "let b = Box<int>(5)",
+        "let xs = map<string, number>(items, f)",
+        "Box<Box<int>>(5)",
+        "foo<int>(1)",
+        // FnSig type argument — the `->` arrow's `>` must NOT close the angle list.
+        "f<fn(int) -> string>(5)",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on type-arg-call: {src}"
+        );
+        assert!(
+            tree_contains_kind(&tree, "type_arguments"),
+            "expected a type_arguments node in {src:?}"
+        );
+    }
+
+    // COMPARISON readings — every one parses cleanly AND has NO `type_arguments`
+    // (the `<`/`>` stay comparison operators).
+    for src in [
+        "let _ = a < b",
+        "let _ = a > b",
+        "let _ = a << b",
+        "let _ = a >> b",
+        "let _ = a < b && c > d",
+        "f(a < b, c > d)",
+        "let _ = x < y ? a : b",
+        "let _ = a < b > c",
+        // A `(` inside the angle span that is NOT a `fn(...)` type → comparison, not a
+        // generic call (`b()` is not a type).
+        "let _ = a < b() > (c)",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on comparison: {src}"
+        );
+        assert!(
+            !tree_contains_kind(&tree, "type_arguments"),
+            "comparison {src:?} wrongly parsed a type_arguments node"
+        );
+    }
+}
+
+/// Whether any node in `tree` has the given kind.
+fn tree_contains_kind(tree: &tree_sitter::Tree, kind: &str) -> bool {
+    let mut cursor = tree.walk();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind {
+            return true;
+        }
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}

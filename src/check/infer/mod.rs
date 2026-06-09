@@ -13,6 +13,7 @@ pub mod env;
 pub mod pass;
 pub mod table;
 pub mod ty;
+pub mod unify;
 
 use crate::check::diagnostic::AsDiagnostic;
 use crate::syntax::cst::ResolvedNode;

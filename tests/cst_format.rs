@@ -262,6 +262,48 @@ return 0\n  }\n}\n";
 }
 
 #[test]
+fn formats_generic_type_param_lists() {
+    // TYPE Task 13 (CST formatter): decl-level type-parameter lists `<T, U>` on
+    // `fn`/`class`/`enum`/`interface` declarations must SURVIVE formatting (the
+    // Unit-B carried-over bug dropped them — `fn id<T>(x: T)` became `fn id(x: T)`,
+    // a lossy, non-idempotent rewrite). Bounds (`C: Container<T>`) render too. The
+    // `fn(A) -> B` function-type and `Box<int>` generic application already round-
+    // trip; this test pins them alongside the new decl-list rendering AND the
+    // expression-level explicit type-arg form (`Box<string>("hi")`), which also
+    // dropped its type args before. Idempotent + reparses cleanly.
+    let src = "fn map<A,B>(xs:array<A>,f:fn(A)->B):array<B>{return []}\n\
+class Box<T>{value:T\nfn get():T{return self.value}}\n\
+enum Option<T>{Some(value:T),None}\n\
+interface Container<T>{fn at(i:number):T}\n\
+fn first<T,C:Container<T>>(c:C):T{return c.at(0)}\n\
+let b:Box<int> = Box(5)\n\
+let c = Box<string>(\"hi\")\n";
+    let want = "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {\n  \
+return []\n}\n\
+class Box<T> {\n  \
+value: T\n  \
+fn get(): T {\n    \
+return self.value\n  }\n}\n\
+enum Option<T> {\n  \
+Some(value: T),\n  \
+None,\n}\n\
+interface Container<T> {\n  \
+fn at(i: number): T\n}\n\
+fn first<T, C: Container<T>>(c: C): T {\n  \
+return c.at(0)\n}\n\
+let b: Box<int> = Box(5)\n\
+let c = Box<string>(\"hi\")\n";
+    let once = ascript::syntax::format_tree(src);
+    assert_eq!(once, want, "unexpected generics format");
+    let twice = ascript::syntax::format_tree(&once);
+    assert_eq!(once, twice, "generics format not idempotent");
+    assert!(
+        ascript::syntax::parser::parse(&once).errors.is_empty(),
+        "formatted generics output does not reparse: {once:?}"
+    );
+}
+
+#[test]
 fn formatted_corpus_reparses_without_errors() {
     let mut failures = Vec::new();
     for path in corpus() {

@@ -7047,6 +7047,19 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         Type::Future(_) => matches!(value, Value::Future(_)),
         // `T?` ≡ `T | nil`.
         Type::Optional(inner) => check_type(value, inner) || matches!(value, Value::Nil),
+        // TYPE §5.4: generics are RUNTIME-ERASED. A generic type PARAMETER (`T`)
+        // carries no runtime obligation — it accepts every value, exactly like
+        // `any`. The static checker enforces `T`'s consistency; the runtime does
+        // not. (This is the ONLY behavioral surface generics expose at runtime, and
+        // it is intentionally a no-op.)
+        Type::Param(_) => true,
+        // A parameterized function type (`fn(A) -> B`) is checked as a plain
+        // callable at runtime — the param/return signature is erased (advisory,
+        // static-only), so this is identical to `Type::Fn`.
+        Type::FnSig(_, _) => matches!(
+            value,
+            Value::Function(_) | Value::Closure(_) | Value::Builtin(_)
+        ),
     }
 }
 

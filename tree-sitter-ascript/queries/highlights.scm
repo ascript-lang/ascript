@@ -50,6 +50,11 @@
 (array_type "array" @type.builtin)
 (map_type "map" @type.builtin)
 (result_type "Result" @type.builtin)
+; A user generic application head (`Box<int>`).
+(generic_type name: (identifier) @type)
+; TYPE §6: generic type parameters (`<T, U: Bound>`) and a `T` reference.
+(type_parameter name: (identifier) @type.parameter)
+(type_bound (identifier) @type)
 ; Capitalized identifiers in type position read as class/enum names.
 ((identifier) @type
   (#match? @type "^[A-Z]"))

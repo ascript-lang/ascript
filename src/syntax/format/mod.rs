@@ -294,6 +294,7 @@ impl Printer<'_> {
         if let Some(name) = first_ident_text(node) {
             self.out.text(&name);
         }
+        self.type_params(node);
         self.params(node);
         if let Some(rt) = node.children().find(|c| c.kind() == RetType) {
             self.out.text(": ");
@@ -327,6 +328,7 @@ impl Printer<'_> {
         if let Some(name) = idents.first() {
             self.out.text(name);
         }
+        self.type_params(node);
         // Emit `extends SuperClass` if present.
         // `extends` is a soft keyword parsed as Ident; idents = [ClassName, "extends", SuperName].
         if let Some(p) = idents.iter().position(|s| s == "extends") {
@@ -391,6 +393,7 @@ impl Printer<'_> {
         if let Some(name) = first_ident_text(node) {
             self.out.text(&name);
         }
+        self.type_params(node);
         if let Some(ext) = node.children().find(|c| c.kind() == ExtendsList) {
             let names = iface_clause_names(ext);
             if !names.is_empty() {
@@ -613,6 +616,7 @@ impl Printer<'_> {
         if let Some(name) = first_ident_text(node) {
             self.out.text(&name);
         }
+        self.type_params(node);
         self.out.text(" {");
         self.out.newline();
         self.out.indent();
@@ -726,6 +730,22 @@ impl Printer<'_> {
                 let kids: Vec<&ResolvedNode> = node.children().collect();
                 if let Some(callee) = kids.iter().copied().find(|c| is_expr_kind(c.kind())) {
                     self.expr(callee);
+                }
+                // TYPE §6 (Task 13): an expression-level explicit type-argument list
+                // (`Box<string>(…)`) rides as a `TypeArgs` child of the `CallExpr`.
+                // Re-emit it so the call round-trips; dropping it was lossy (the form
+                // is erased at RUNTIME, but the formatter must preserve source).
+                if let Some(targs) = kids.iter().copied().find(|c| c.kind() == TypeArgs) {
+                    let ts: Vec<&ResolvedNode> =
+                        targs.children().filter(|c| is_type_kind(c.kind())).collect();
+                    self.out.text("<");
+                    for (i, t) in ts.iter().enumerate() {
+                        if i > 0 {
+                            self.out.text(", ");
+                        }
+                        self.type_ann(t);
+                    }
+                    self.out.text(">");
                 }
                 if let Some(args) = kids.iter().copied().find(|c| c.kind() == ArgList) {
                     self.arg_list(args);
@@ -1054,6 +1074,40 @@ impl Printer<'_> {
         self.out.newline();
     }
 
+    /// TYPE §6 (Task 13): render a decl-level type-parameter list `<T, U>` (or with
+    /// bounds, `<T, C: Container<T>>`) from the `TypeParams` child of a fn/class/enum/
+    /// interface declaration. A no-op when the decl has no `TypeParams`. The list is
+    /// retained in the CST (`TypeParams` → `TypeParam` → optional `TypeBound`), so this
+    /// is purely a re-emit; dropping it (the carried-over bug) was lossy + non-idempotent.
+    fn type_params(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        let Some(list) = node.children().find(|c| c.kind() == TypeParams) else {
+            return;
+        };
+        let params: Vec<&ResolvedNode> =
+            list.children().filter(|c| c.kind() == TypeParam).collect();
+        if params.is_empty() {
+            return;
+        }
+        self.out.text("<");
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            if let Some(name) = first_ident_text(p) {
+                self.out.text(&name);
+            }
+            // Optional bound `: Type` (a `TypeBound` child holding the bound type).
+            if let Some(bound) = p.children().find(|c| c.kind() == TypeBound) {
+                if let Some(ty) = bound.children().find(|c| is_type_kind(c.kind())) {
+                    self.out.text(": ");
+                    self.type_ann(ty);
+                }
+            }
+        }
+        self.out.text(">");
+    }
+
     fn type_ann(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         match node.kind() {
@@ -1074,6 +1128,27 @@ impl Printer<'_> {
                     }
                 }
                 self.out.text(">");
+            }
+            // TYPE §6: a generic type-param reference renders as its bare name.
+            ParamType => self.out.text(node_first_ident_or_text(node).trim()),
+            // TYPE §6: `fn(A) -> B` — params are the type children except the LAST,
+            // which is the return type. Canonical `fn(A, B) -> R` spacing.
+            FnType => {
+                let ts: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_type_kind(c.kind())).collect();
+                self.out.text("fn(");
+                // Last type child is the return; the rest are params.
+                let param_count = ts.len().saturating_sub(1);
+                for (i, t) in ts.iter().take(param_count).enumerate() {
+                    if i > 0 {
+                        self.out.text(", ");
+                    }
+                    self.type_ann(t);
+                }
+                self.out.text(") -> ");
+                if let Some(ret) = ts.last() {
+                    self.type_ann(ret);
+                }
             }
             OptionalType => {
                 if let Some(inner) = node.children().find(|c| is_type_kind(c.kind())) {
@@ -1179,6 +1254,9 @@ fn is_type_kind(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         NamedType | GenericType | OptionalType | UnionType | TupleType
+            // TYPE §6: a generic type-param reference and a `fn(A)->B` function type.
+            | ParamType
+            | FnType
     )
 }
 

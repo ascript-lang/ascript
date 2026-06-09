@@ -353,6 +353,155 @@ fn forward_reference_to_interface_is_not_undefined() {
     );
 }
 
+// --- TYPE Task 12: generic inference end-to-end (CLI gate) ----------------
+
+#[test]
+fn generic_mismatch_fails_the_gate() {
+    // A generic fn call whose inferred return is provably wrong for an ANNOTATED slot
+    // is a BLOCKING error → non-zero exit.
+    let p = write_tmp(
+        "gen_bad.as",
+        "fn id<T>(x: T): T { return x }\nlet s: string = id(5)\nprint(s)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a provable generic mismatch must fail the gate; got: {combined}"
+    );
+    assert!(
+        combined.contains("type-mismatch"),
+        "expected a type-mismatch; got: {combined}"
+    );
+}
+
+#[test]
+fn clean_generic_code_passes_the_gate() {
+    // Inference + an explicit type arg + a method-return instantiation, all clean.
+    let p = write_tmp(
+        "gen_ok.as",
+        "class Box<T> { value: T\n fn init(v: T) { self.value = v }\n fn get(): T { return self.value } }\nlet b = Box<int>(5)\nlet n: int = b.get()\nprint(n)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "clean generic code must pass the gate; got: {combined}"
+    );
+}
+
+#[test]
+fn empty_array_generic_call_is_silent() {
+    // The pinned invariant: map([], f) leaves the element type gradual → no diagnostic.
+    let p = write_tmp(
+        "gen_empty.as",
+        "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {\n  let out: array<B> = []\n  return out\n}\nlet r = map([], (x) => x)\nprint(len(r))\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("type-"),
+        "empty-array generic must be gradual-silent; got: {combined}"
+    );
+}
+
+#[test]
+fn same_typed_params_mixed_numerics_is_silent() {
+    // Regression (TYPE Unit-C review B1): a generic with two same-typed params called
+    // with mixed numeric subtypes (`max(1, 2.0)`) must be SILENT — the type var widens
+    // to `number` (the join), not stale-bound to `int` (which manufactured a false
+    // blocking `type-mismatch` on code that runs fine, since T is erased).
+    let p = write_tmp(
+        "gen_mixed_num.as",
+        "fn max<T>(a: T, b: T): T { return a }\nlet r = max(1, 2.0)\nlet s = max(2.0, 1)\nprint(r)\nprint(s)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("type-"),
+        "same-T mixed-numeric generic call must be gradual-silent; got: {combined}"
+    );
+}
+
+#[test]
+fn generic_subclass_field_construction_is_gradual_silent() {
+    // Regression (TYPE Unit-D review): a no-`init` GENERIC subclass with inherited
+    // fields auto-derives its positional constructor over the base-FIRST merged field
+    // schema, so arg 0 binds to the first BASE field at runtime. The checker's own-only
+    // field order would misalign arg 0 to the first OWN field and manufacture a FALSE
+    // blocking `type-mismatch`. `Sub(1, "x")` below RUNS fine and must check clean.
+    let p = write_tmp(
+        "gen_subclass.as",
+        "class Base { a: number }\nclass Sub<T> extends Base { b: string }\nlet s = Sub(1, \"x\")\nprint(s.a)\nprint(s.b)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("type-"),
+        "a generic subclass construction (base-first merged fields) must be gradual-silent; got: {combined}"
+    );
+}
+
+#[test]
+fn baseless_generic_construction_still_precise() {
+    // The subclass gradual-drop must NOT weaken base-less generic inference: an explicit
+    // type arg conflicting with the constructor value is still a blocking error.
+    let p = write_tmp(
+        "gen_baseless.as",
+        "class Box<T> { v: T }\nlet b: Box<string> = Box(5)\nprint(b)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("type-mismatch"),
+        "a base-less Box<string> = Box(5) conflict must still be caught; got: {combined}"
+    );
+}
+
+#[test]
+fn same_typed_params_incompatible_types_still_caught() {
+    // The numeric-join rescue must NOT swallow a genuine conflict: `pair(1, "s")` binds
+    // T to two non-numeric-incompatible concretes — still a blocking `type-mismatch`.
+    let p = write_tmp(
+        "gen_conflict.as",
+        "fn pair<T>(a: T, b: T): T { return a }\nlet x = pair(1, \"s\")\nprint(x)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("type-mismatch"),
+        "a genuine same-T conflict (int vs string) must still be caught; got: {combined}"
+    );
+}
+
 // --- CFG-T3: ascript.toml [lint] config -----------------------------------
 //
 // Discovery walks UP from each checked file's parent directory looking for
@@ -560,6 +709,55 @@ mod toml_config {
             combined(&out)
         );
     }
+
+    // TYPE Task 2 — the annotated-slot blocking default is OPT-OUT via ascript.toml.
+    // An annotated `type-mismatch` defaults to a BLOCKING `Severity::Error` (Task 1).
+    // A project `[lint] warn = ["type-mismatch"]` DOWNGRADES it back to a warning (the
+    // explicit opt-out); with NO override the default stays blocking. This composes
+    // entirely through `config.effective(code, default)`: the emit severity is the
+    // `default` argument, so a `warn` override returns `Some(Warning)` and no override
+    // passes the `Error` through — NO code change beyond Task 1 was needed here.
+
+    #[test]
+    fn type_default_blocks_annotated_mismatch() {
+        // No ascript.toml → the annotated `type-mismatch` stays a blocking Error and
+        // the run exits non-zero (the soundness default).
+        let dir = project("type_default_blocks");
+        let f = write(&dir, "a.as", "let x: number = \"s\"\nprint(x)\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "annotated type-mismatch must block by default (exit non-zero); out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn toml_warn_downgrades_blocking_type_mismatch() {
+        // `[lint] warn = ["type-mismatch"]` downgrades the blocking annotated Error
+        // back to a Warning → the run exits 0 (the explicit opt-out).
+        let dir = project("type_warn_downgrade");
+        let f = write(&dir, "a.as", "let x: number = \"s\"\nprint(x)\n");
+        write(&dir, "ascript.toml", "[lint]\nwarn = [\"type-mismatch\"]\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            out.status.success(),
+            "[lint] warn = [type-mismatch] must downgrade the blocking Error to a Warning (exit 0); out: {}",
+            combined(&out)
+        );
+        // The diagnostic is still reported (as a warning), just non-blocking.
+        let json = Command::new(bin())
+            .arg("check")
+            .arg("--json")
+            .arg(&f)
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&json.stdout);
+        assert!(
+            s.contains("\"code\":\"type-mismatch\"") && s.contains("\"severity\":\"warning\""),
+            "downgraded type-mismatch must still report as a warning; out: {s}"
+        );
+    }
 }
 
 // The checker must NOT false-positive on idiomatic code: every example program
@@ -619,16 +817,28 @@ mod corpus {
     //
     // The test runs in WHICHEVER feature config `cargo test` is invoked with, so it
     // gates BOTH `cargo test` (default) and `cargo test --no-default-features`.
+    // The full Gate-5 diagnostic set: the three SP10 advisory codes PLUS the
+    // static-exhaustiveness / ADT codes (`non-exhaustive-match`,
+    // `enum-variant-binding-shadow`). This mirrors the CI grep
+    // (`type-mismatch|type-error|possibly-nil|non-exhaustive|enum-variant`) so the
+    // test and the shell gate cannot drift.
+    const GATE5_CODES: &[&str] = &[
+        "type-mismatch",
+        "type-error",
+        "possibly-nil",
+        "non-exhaustive-match",
+        "enum-variant-binding-shadow",
+    ];
+
     #[test]
     fn type_checker_emits_no_type_diagnostics_on_the_corpus() {
-        let type_codes = ["type-mismatch", "type-error", "possibly-nil"];
         let mut offenders = Vec::new();
         for path in corpus() {
             let src = fs::read_to_string(&path).unwrap();
             let hits: Vec<_> = ascript::check::analyze(&src)
                 .diagnostics
                 .into_iter()
-                .filter(|d| type_codes.contains(&d.code.as_str()))
+                .filter(|d| GATE5_CODES.contains(&d.code.as_str()))
                 .map(|d| format!("{}@{}: {}", d.code, d.range.start, d.message))
                 .collect();
             if !hits.is_empty() {
@@ -637,8 +847,54 @@ mod corpus {
         }
         assert!(
             offenders.is_empty(),
-            "SP10 type checker emitted type-* diagnostics on the untyped corpus (fix the root cause in assignable/synth/narrowing — default to Unknown/silent — NEVER relax this gate):\n{}",
+            "SP10 type checker emitted Gate-5 diagnostics on the corpus (fix the root cause in assignable/synth/unify/narrowing — default to Unknown/silent — NEVER relax this gate):\n{}",
             offenders.join("\n")
+        );
+    }
+
+    // TYPE Task 14 — the zero-false-positive PROPERTY battery. Untyped, `any`-typed,
+    // and partially-typed programs flowing through generics must emit NO blocking
+    // diagnostic. The cardinal invariant is "an unsolved/unbounded `Var` → Unknown,
+    // never No": these are the exact shapes that would trip if unification or the
+    // invariant `assignable` arm ever manufactured a `No`. The B1 mixed-numeric
+    // combinator (`max(1, 2.0)` over `<T>(a: T, b: T)`) is included as the standing
+    // proof of the numeric-join rescue. Runs in whichever feature config invokes
+    // `cargo test`, so it gates BOTH configs.
+    #[test]
+    fn generics_property_battery_emits_no_blocking_diagnostic() {
+        let programs: &[&str] = &[
+            // Identity over an untyped value.
+            "fn id<T>(x: T): T { return x }\nprint(id(5))\nprint(id(\"s\"))\n",
+            // Same-typed params with MIXED numerics (the B1 false-positive shape).
+            "fn pick<T>(a: T, b: T): T { return a }\nprint(pick(1, 2.0))\n",
+            "fn maxOf<T>(a: T, b: T): T { if (a > b) { return a }\n  return b }\nprint(maxOf(1, 2.0))\n",
+            // Empty-array generic call: `A` stays unsolved → array<any> → silent.
+            "fn mapAll<A, B>(xs: array<A>, f: fn(A) -> B): array<B> { return [] }\nprint(mapAll([], fn(x) { return x }))\n",
+            // `any`-typed argument flowing into a generic param.
+            "fn wrap<T>(x: T): array<T> { return [x] }\nfn use2(v: any) { return wrap(v) }\nprint(use2(3))\n",
+            // A generic class round-trip with inferred + explicit type args.
+            "class Box<T> { value: T\n  fn get(): T { return self.value } }\nlet a = Box(5)\nprint(a.get())\n",
+            // A generic enum payload.
+            "enum Opt<T> { Some(value: T), None }\nlet o = Opt.Some(3)\nprint(o)\n",
+            // Partially-typed: a `number`-annotated arg into a `<T>` slot.
+            "fn echo<T>(x: T): T { return x }\nfn caller(n: number) { return echo(n) }\nprint(caller(7))\n",
+        ];
+        let mut offenders = Vec::new();
+        for src in programs {
+            let blocking: Vec<_> = ascript::check::analyze(src)
+                .diagnostics
+                .into_iter()
+                .filter(|d| GATE5_CODES.contains(&d.code.as_str()))
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect();
+            if !blocking.is_empty() {
+                offenders.push(format!("{src:?}\n  {}", blocking.join("\n  ")));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "generics emitted a blocking diagnostic on a gradual program (the Var→Unknown invariant is broken):\n{}",
+            offenders.join("\n\n")
         );
     }
 }
@@ -922,6 +1178,126 @@ mod adt_exhaustiveness {
         let src = std::fs::read_to_string("examples/enums_adt.as").unwrap();
         for code in ["non-exhaustive-match", "enum-variant-binding-shadow", "type-mismatch", "type-error"] {
             assert!(!has(&src, code), "examples/enums_adt.as emitted {code}: {:?}", diags(&src));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TYPE Task 1 — the soundness blocking-severity chokepoint.
+//
+// A `type-mismatch`/`type-error` against a *syntactically-annotated* slot is a
+// BLOCKING `Severity::Error` (it fails the gate); an inferred/uncertain misuse
+// (and `possibly-nil`) stays an advisory `Severity::Warning`. There are EXACTLY
+// FOUR annotated sites: `let x: T = v`, `fn f(): T { return v }`, an annotated
+// param at a call site, and a typed class-field default.
+// ---------------------------------------------------------------------------
+mod sound_blocking_severity {
+    use ascript::check::{analyze, Severity};
+
+    fn diags(src: &str) -> Vec<ascript::check::AsDiagnostic> {
+        analyze(src).diagnostics
+    }
+    fn find<'a>(
+        ds: &'a [ascript::check::AsDiagnostic],
+        code: &str,
+    ) -> Option<&'a ascript::check::AsDiagnostic> {
+        ds.iter().find(|d| d.code == code)
+    }
+
+    #[test]
+    fn annotated_let_mismatch_is_error() {
+        // `let x: number = "s"` — the destination slot is annotated → BLOCKING.
+        let ds = diags("let x: number = \"s\"\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "annotated `let` mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_param_mismatch_is_error() {
+        // `fn f(p: string) {} f(1)` — the call passes `int` to an annotated `string`
+        // param → BLOCKING on arg 1.
+        let ds = diags("fn f(p: string) {}\nf(1)\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "annotated param mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_return_mismatch_is_error() {
+        // `fn f(): number { return "x" }` — the declared return is annotated → BLOCKING.
+        let ds = diags("fn f(): number { return \"x\" }\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "annotated return mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn typed_field_default_mismatch_is_error() {
+        // `class C { n: number = "x" }` — the field's declared type is annotated → BLOCKING.
+        let ds = diags("class C { n: number = \"x\" }\n");
+        let d = find(&ds, "type-mismatch")
+            .unwrap_or_else(|| panic!("expected type-mismatch, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Error,
+            "typed field default mismatch must block (Error): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn inferred_misuse_stays_advisory_warning() {
+        // No annotation on `x`; the later arithmetic misuse is over an *inferred*
+        // string slot → stays advisory `Warning` (the programmer never promised a
+        // type). This is the paired counterpart of `annotated_let_mismatch_is_error`.
+        let ds = diags("let x = \"s\"\nlet y = x - 1\n");
+        let d = find(&ds, "type-error")
+            .unwrap_or_else(|| panic!("expected type-error on inferred misuse, got {ds:?}"));
+        assert_eq!(
+            d.severity,
+            Severity::Warning,
+            "inferred-slot misuse must stay advisory (Warning): {ds:?}"
+        );
+    }
+
+    #[test]
+    fn paired_annotated_error_vs_inferred_warning() {
+        // The SAME provable `No` is Error over an annotated slot and Warning over an
+        // inferred slot — asserted side by side.
+        let annotated = diags("let x: number = \"s\"\n");
+        let ad = find(&annotated, "type-mismatch")
+            .unwrap_or_else(|| panic!("annotated: expected type-mismatch, got {annotated:?}"));
+        assert_eq!(ad.severity, Severity::Error, "annotated → Error: {annotated:?}");
+
+        let inferred = diags("let x = \"s\"\nlet y = x - 1\n");
+        let id = find(&inferred, "type-error")
+            .unwrap_or_else(|| panic!("inferred: expected type-error, got {inferred:?}"));
+        assert_eq!(id.severity, Severity::Warning, "inferred → Warning: {inferred:?}");
+    }
+
+    #[test]
+    fn possibly_nil_stays_advisory_warning() {
+        // `possibly-nil` flags a *latent* runtime panic, not an annotated-slot type
+        // clash — it stays advisory even though `x` is annotated `T?`.
+        let ds = diags("fn f(x: number?): number { return x + 1 }\n");
+        if let Some(d) = find(&ds, "possibly-nil") {
+            assert_eq!(
+                d.severity,
+                Severity::Warning,
+                "possibly-nil must stay advisory (Warning): {ds:?}"
+            );
         }
     }
 }

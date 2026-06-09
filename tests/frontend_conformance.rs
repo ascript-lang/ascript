@@ -646,3 +646,57 @@ fn both_frontends_reject_interface_modifiers_on_requirement() {
     both_reject("interface R { worker fn read(b) }");
     both_reject("interface R { fn* read(b) }");
 }
+
+// ---- TYPE Task 6: generics surface — BOTH front-ends agree ----
+
+#[test]
+fn both_frontends_accept_generic_decls() {
+    // Type-param lists on every decl kind.
+    both_accept("fn id<T>(x: T): T { return x }");
+    both_accept("fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> { return [] }");
+    both_accept("fn first<T, C: Container<T>>(c: C): T { return c.at(0) }");
+    both_accept("class Box<T> { value: T\n fn get(): T { return self.value } }");
+    both_accept("class Pair<A, B> { a: A\n b: B }");
+    both_accept("enum Option<T> { Some(value: T), None }");
+    both_accept("enum Result2<T, E> { Ok(value: T), Err(error: E) }");
+    both_accept("interface Container<T> { fn len(): int\n fn at(i: int): T }");
+    both_accept("export fn id<T>(x: T): T { return x }");
+}
+
+#[test]
+fn both_frontends_accept_fnsig_and_generic_application_types() {
+    // `fn(A) -> B` function types in param/return/field/let position.
+    both_accept("fn apply<A, B>(f: fn(A) -> B, x: A): B { return f(x) }");
+    both_accept("fn z(cb: fn() -> bool) {}");
+    both_accept("fn multi(cb: fn(int, string) -> array<int>) {}");
+    // User generic application in TYPE position (args parsed-then-erased).
+    both_accept("let b: Box<int> = make()");
+    both_accept("let m: Map<string, int> = make()");
+    // Nested generic application closes via the `>>`-split.
+    both_accept("fn h(m: map<int, array<int>>) {}");
+    both_accept("let bb: Box<Box<int>> = make()");
+}
+
+#[test]
+fn both_frontends_accept_explicit_type_arg_calls() {
+    // The NEW expression-level disambiguation — these are generic-instantiation
+    // CALLS (the trailing `(` after `>` selects the type-arg reading).
+    both_accept("let b = Box<int>(5)");
+    both_accept("let xs = map<string, number>(items, f)");
+    both_accept("Box<Box<int>>(5)");
+    both_accept("foo<int>(1)");
+}
+
+#[test]
+fn both_frontends_keep_comparison_when_not_a_type_arg_call() {
+    // The paired COMPARISON battery — none of these flip to a type-arg call (no `>`
+    // immediately followed by `(`), so both front-ends keep them as comparisons.
+    both_accept("let _ = a < b");
+    both_accept("let _ = a > b");
+    both_accept("let _ = a << b");
+    both_accept("let _ = a >> b");
+    both_accept("let _ = a < b && c > d");
+    both_accept("f(a < b, c > d)");
+    both_accept("let _ = x < y ? a : b");
+    both_accept("let _ = a < b > c");
+}

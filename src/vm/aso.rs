@@ -1050,6 +1050,15 @@ fn write_type(w: &mut Writer, t: &Type) {
             w.u8(TY_OPTIONAL);
             write_type(w, inner);
         }
+        // TYPE: generics are RUNTIME-ERASED, so they need NO new `.aso` tag (no
+        // format bump). A `Type::Param("T")` is, at runtime, accept-anything =
+        // `Any` (see `check_type`), so it serializes AS `TY_ANY`; a parameterized
+        // `Type::FnSig(...)` is checked as a plain callable, so it serializes AS
+        // `TY_FN`. The runtime contract is byte-identical to the erased form, which
+        // is exactly the point — the signature is static-only and never reaches
+        // the VM.
+        Type::Param(_) => w.u8(TY_ANY),
+        Type::FnSig(_, _) => w.u8(TY_FN),
     }
 }
 

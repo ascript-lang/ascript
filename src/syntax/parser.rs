@@ -43,6 +43,12 @@ struct Parser {
     /// `try_arrow` is reached only at the top of `assignment()` and so never fires
     /// on a guard operand that precedes the arm's `=>`.
     suppress_arrow: bool,
+    /// TYPE §6: the generic type-parameter names currently in scope (the params of
+    /// the enclosing `fn`/`class`/`enum`/`interface` decl). A bare `Ident` in TYPE
+    /// position matching one of these is tagged `ParamType` (→ `ast::Type::Param`),
+    /// mirroring the legacy parser's `type_param_scope`. Pushed by `type_params`,
+    /// popped after the decl body. Flat `Vec` (no nesting in v1).
+    type_param_scope: Vec<String>,
 }
 
 /// A pending open node. `complete` sets its kind; if dropped uncompleted it
@@ -73,6 +79,7 @@ impl Parser {
             errors: Vec::new(),
             lex_errors,
             suppress_arrow: false,
+            type_param_scope: Vec::new(),
         }
     }
 
@@ -207,6 +214,24 @@ impl Parser {
             Some(&ti) => self.tokens[ti].kind == SyntaxKind::Ident && self.tokens[ti].text == kw,
             None => false,
         }
+    }
+
+    /// The text of the current non-trivia token (empty past the end).
+    fn current_text(&self) -> &str {
+        match self.nontrivia.get(self.pos) {
+            Some(&ti) => self.tokens[ti].text.as_str(),
+            None => "",
+        }
+    }
+
+    /// TYPE §6: true if the current token is an `Ident` naming an in-scope generic
+    /// type parameter.
+    fn at_type_param(&self) -> bool {
+        self.at(SyntaxKind::Ident)
+            && self
+                .type_param_scope
+                .iter()
+                .any(|p| p == self.current_text())
     }
 
     fn error(&mut self, message: impl Into<String>) {
@@ -679,6 +704,9 @@ fn fn_decl(p: &mut Parser) {
     } else {
         p.error("expected function name");
     }
+    // TYPE §6: optional `<T, U: Bound>` generic param list (in scope for the
+    // signature + body); runtime-erased, popped after the body parses.
+    let np = type_params(p);
     if p.at(LParen) {
         param_list(p);
     } else {
@@ -692,7 +720,14 @@ fn fn_decl(p: &mut Parser) {
     } else {
         p.error("expected '{' for function body");
     }
+    pop_type_params(p, np);
     p.complete(m, FnDecl);
+}
+
+/// Pop `n` names off the CST parser's `type_param_scope` (TYPE §6).
+fn pop_type_params(p: &mut Parser, n: usize) {
+    let new_len = p.type_param_scope.len().saturating_sub(n);
+    p.type_param_scope.truncate(new_len);
 }
 
 fn ret_type(p: &mut Parser) {
@@ -1035,10 +1070,270 @@ fn primary(p: &mut Parser) -> CompletedMarker {
     postfix(p, cm)
 }
 
+/// TYPE §6 (Task 5/6): a non-mutating LOOKAHEAD deciding whether a `<` after a
+/// postfix callee opens an expression-level explicit type-argument list of a
+/// generic-instantiation call (`Box<int>(5)`) rather than a comparison (`a < b`).
+/// Mirrors the legacy parser's speculative rule: balance `<`/`>` (a `>>` closes
+/// TWO levels) over a TYPE-LIKE token run and accept ONLY if, when the angle depth
+/// returns to 0, the next token is `(`. Any token that cannot appear in a type-arg
+/// list (an operator, a literal, `=`, …) at depth ≥ 1 fails the lookahead → the `<`
+/// is left to comparison. Precondition: cursor at `Lt`. Pure (no events, no token
+/// mutation).
+fn looks_like_explicit_type_args(p: &Parser) -> bool {
+    // Precondition: cursor at `Lt`. Run a pure, non-mutating scan that mirrors the
+    // legacy parser's speculative `parse_type` EXACTLY (so the two front-ends agree
+    // token-for-token — a divergence here is a four-mode-byte-identity landmine). An
+    // earlier token-balancer was wrong on two shapes: `a < b() > (c)` (a `(` inside the
+    // angle span that is NOT a `fn(...)` type — must reject to comparison) and
+    // `f<fn(int) -> string>(x)` (the `->` arrow's `>` is NOT a list close — must accept
+    // the FnSig type arg). A faithful grammar scan handles both. Accept iff the list
+    // `< Type (, Type)* >` closes cleanly with a single `>` whose NEXT token is `(`.
+    let mut s = TypeArgScan {
+        p,
+        i: p.pos,
+        half: false,
+    };
+    if s.kind() != Some(SyntaxKind::Lt) {
+        return false;
+    }
+    s.bump(); // <
+    if s.at_close() {
+        return false; // empty `<>` is not a type-arg list
+    }
+    loop {
+        if !s.scan_type() {
+            return false;
+        }
+        if s.kind() == Some(SyntaxKind::Comma) {
+            s.bump();
+            if s.at_close() {
+                return false; // trailing comma before `>` is invalid
+            }
+        } else {
+            break;
+        }
+    }
+    if !s.eat_close() {
+        return false;
+    }
+    // `half` true here means the list closed on the FIRST `>` of a `>>`, leaving a
+    // dangling `>` — an over-close that the legacy `eat_type_gt`+`peek==(` check also
+    // rejects (the leftover `>`, not `(`, follows). So a clean call needs `half==false`
+    // and the very next token `(`.
+    !s.half && s.kind() == Some(SyntaxKind::LParen)
+}
+
+/// Pure, non-mutating token scanner over `Parser::nontrivia` used solely by
+/// [`looks_like_explicit_type_args`] to decide type-args-vs-comparison the SAME way the
+/// legacy parser's speculative `parse_type` does. `half` models a `>>` whose first `>`
+/// has been consumed as a close (the second is still pending) — the in-place `>>`-split
+/// the real parser performs, done virtually here so the lookahead mutates nothing.
+struct TypeArgScan<'a> {
+    p: &'a Parser,
+    i: usize,
+    half: bool,
+}
+
+impl TypeArgScan<'_> {
+    fn kind(&self) -> Option<SyntaxKind> {
+        self.p.nontrivia.get(self.i).map(|&ti| self.p.tokens[ti].kind)
+    }
+    fn at_close(&self) -> bool {
+        matches!(self.kind(), Some(SyntaxKind::Gt) | Some(SyntaxKind::Shr))
+    }
+    /// Advance one non-trivia token. Never called while `half` (we only ever read a
+    /// half-`Shr` position via `kind()` comparisons or `eat_close`).
+    fn bump(&mut self) {
+        debug_assert!(!self.half, "bump() while mid-`>>` would skip a `>`");
+        self.i += 1;
+    }
+    /// Consume exactly one closing `>` (from a `Gt`, or one half of a `Shr`).
+    fn eat_close(&mut self) -> bool {
+        match self.kind() {
+            Some(SyntaxKind::Gt) => {
+                self.i += 1;
+                true
+            }
+            Some(SyntaxKind::Shr) if self.half => {
+                self.i += 1;
+                self.half = false;
+                true
+            }
+            Some(SyntaxKind::Shr) => {
+                self.half = true; // first `>` of the `>>` consumed; stay on the token
+                true
+            }
+            _ => false,
+        }
+    }
+    /// `Type := Optional ('|' Optional)*` (matches legacy `parse_type`).
+    fn scan_type(&mut self) -> bool {
+        if !self.scan_optional() {
+            return false;
+        }
+        while self.kind() == Some(SyntaxKind::Pipe) {
+            self.bump();
+            if !self.scan_optional() {
+                return false;
+            }
+        }
+        true
+    }
+    /// `Optional := Primary '?'?`.
+    fn scan_optional(&mut self) -> bool {
+        if !self.scan_primary() {
+            return false;
+        }
+        if self.kind() == Some(SyntaxKind::Question) {
+            self.bump();
+        }
+        true
+    }
+    /// `Primary` mirrors legacy `parse_type_atom`: `fn(...) -> T` | bare `fn` | `[..]`
+    /// tuple | `nil` | builtin/user/param ident with an optional `< .. >` generic app.
+    fn scan_primary(&mut self) -> bool {
+        use SyntaxKind::*;
+        match self.kind() {
+            Some(FnKw) => {
+                self.bump(); // fn
+                if self.kind() != Some(LParen) {
+                    return true; // bare `fn` type
+                }
+                self.bump(); // (
+                if self.kind() != Some(RParen) {
+                    loop {
+                        if !self.scan_type() {
+                            return false;
+                        }
+                        if self.kind() == Some(Comma) {
+                            self.bump();
+                            if self.kind() == Some(RParen) {
+                                break; // tolerated trailing comma
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if self.kind() != Some(RParen) {
+                    return false;
+                }
+                self.bump(); // )
+                // `-> Ret` — the arrow lexes as `Minus` then a PLAIN `Gt` (never `Shr`).
+                if self.kind() != Some(Minus) {
+                    return false;
+                }
+                self.bump();
+                if self.kind() != Some(Gt) {
+                    return false;
+                }
+                self.bump();
+                self.scan_type() // return type
+            }
+            Some(LBracket) => {
+                self.bump(); // [
+                if self.kind() != Some(RBracket) {
+                    loop {
+                        if !self.scan_type() {
+                            return false;
+                        }
+                        if self.kind() == Some(Comma) {
+                            self.bump();
+                            if self.kind() == Some(RBracket) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if self.kind() != Some(RBracket) {
+                    return false;
+                }
+                self.bump(); // ]
+                true
+            }
+            Some(NilKw) => {
+                self.bump();
+                true
+            }
+            // Any ident (builtin, `array`/`map`/`Result`/`future`, user, type-param),
+            // with an OPTIONAL `< Type (, Type)* >` generic application.
+            Some(Ident) => {
+                self.bump(); // name
+                if self.kind() == Some(Lt) {
+                    self.bump(); // <
+                    if self.at_close() {
+                        return false; // empty `<>`
+                    }
+                    loop {
+                        if !self.scan_type() {
+                            return false;
+                        }
+                        if self.kind() == Some(Comma) {
+                            self.bump();
+                            if self.at_close() {
+                                return false;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    return self.eat_close();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// TYPE §6: consume an expression-level explicit type-argument list `< Type
+/// (, Type)* >` (the `<` at the cursor), emitting a `TypeArgs` node. The closing
+/// `>` reuses the NUM `>>`-split. Only called after `looks_like_explicit_type_args`
+/// has confirmed the shape, so it does not need to backtrack.
+fn explicit_type_args(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // <
+    while !p.at(Gt) && !p.at(Shr) && !p.at_end() {
+        type_ann(p);
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    p.split_shr_for_type();
+    if p.at(Gt) {
+        p.bump();
+    } else {
+        p.error("expected '>' to close type arguments");
+    }
+    p.complete(m, TypeArgs);
+}
+
 fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
     use SyntaxKind::*;
     loop {
         match p.current() {
+            // TYPE §6 (Task 5/6): expression-level explicit type args before a call
+            // (`Box<int>(5)`). A LOOKAHEAD decides type-args-vs-comparison; on a
+            // match we consume the `< … >` (erased `TypeArgs`) AND the following
+            // `(...)` arg list into a SINGLE `CallExpr` (the type args ride as a
+            // discarded child — the compiler ignores a `TypeArgs` in a call, keeping
+            // the erased shape). On no match, `Lt` is not a postfix operator → break
+            // to comparison.
+            Lt if looks_like_explicit_type_args(p) => {
+                let m = p.precede(&cm);
+                explicit_type_args(p);
+                if p.at(LParen) {
+                    arg_list(p);
+                } else {
+                    p.error("expected '(' after explicit type arguments");
+                }
+                cm = p.complete(m, CallExpr);
+            }
             LParen => {
                 let m = p.precede(&cm);
                 arg_list(p);
@@ -1302,8 +1597,101 @@ fn type_optional(p: &mut Parser) -> CompletedMarker {
     cm
 }
 
+/// TYPE §6: parse an OPTIONAL generic type-parameter list after a decl name —
+/// `< Ident (: Bound)? (, …)* >`. Pushes each declared name onto
+/// `type_param_scope` (so signature/body type refs lower to `Param`) and returns
+/// the count to pop after the decl body. A no-op (returns 0) when not at `<`. Tags
+/// the list `TypeParams`, each entry `TypeParam`, each bound `TypeBound`.
+fn type_params(p: &mut Parser) -> usize {
+    use SyntaxKind::*;
+    if !p.at(Lt) {
+        return 0;
+    }
+    let m = p.start();
+    p.bump(); // <
+    let mut count = 0;
+    loop {
+        let pm = p.start();
+        if p.at(Ident) {
+            // Record the param name in scope BEFORE the bound (so a later param's
+            // bound can reference an earlier param: `<T, C: Container<T>>`).
+            p.type_param_scope.push(p.current_text().to_string());
+            count += 1;
+            p.bump(); // param name
+        } else {
+            p.error("expected a type-parameter name");
+        }
+        // Optional bound `: Type`.
+        if p.at(Colon) {
+            let bm = p.start();
+            p.bump(); // :
+            type_ann(p);
+            p.complete(bm, TypeBound);
+        }
+        p.complete(pm, TypeParam);
+        if p.at(Comma) {
+            p.bump();
+            // Tolerate a trailing comma before the close.
+            if p.at(Gt) || p.at(Shr) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    p.split_shr_for_type();
+    if p.at(Gt) {
+        p.bump();
+    } else {
+        p.error("expected '>' to close type parameters");
+    }
+    p.complete(m, TypeParams);
+    count
+}
+
 fn type_primary(p: &mut Parser) -> CompletedMarker {
     use SyntaxKind::*;
+    // TYPE §6: a `fn(A) -> B` parameterized function type. A `fn` immediately
+    // followed by `(` is a function-type signature (`FnType`); a bare `fn` (no `(`)
+    // stays the plain `Fn` type, handled by the `FnKw` arm below.
+    if p.at(FnKw) && p.nth_at(1, LParen) {
+        let m = p.start();
+        p.bump(); // fn
+        p.bump(); // (
+        while !p.at(RParen) && !p.at_end() {
+            type_ann(p);
+            if p.at(Comma) {
+                p.bump();
+            } else {
+                break;
+            }
+        }
+        if p.at(RParen) {
+            p.bump();
+        } else {
+            p.error("expected ')' to close function-type parameters");
+        }
+        // `-> Ret` (the arrow lexes as `Minus` then `Gt`).
+        if p.at(Minus) {
+            p.bump();
+        } else {
+            p.error("expected '->' in function type");
+        }
+        if p.at(Gt) {
+            p.bump();
+        } else {
+            p.error("expected '>' after '-' in function type");
+        }
+        type_ann(p);
+        return p.complete(m, FnType);
+    }
+    // TYPE §6: a bare reference to an in-scope generic type parameter (`T`) is
+    // tagged `ParamType` (→ `ast::Type::Param`) rather than `NamedType`.
+    if p.at_type_param() {
+        let m = p.start();
+        p.bump(); // param name
+        return p.complete(m, ParamType);
+    }
     match p.current() {
         Ident => {
             let m = p.start();
@@ -1400,6 +1788,8 @@ fn class_decl(p: &mut Parser) {
     } else {
         p.error("expected class name");
     }
+    // TYPE §6: optional `<T>` generic param list (in scope for field/method types).
+    let np = type_params(p);
     if p.at_kw("extends") {
         p.bump(); // extends
         if p.at(Ident) {
@@ -1439,6 +1829,7 @@ fn class_decl(p: &mut Parser) {
     } else {
         p.error("expected '}' to close class");
     }
+    pop_type_params(p, np);
     p.complete(m, ClassDecl);
 }
 
@@ -1455,6 +1846,8 @@ fn interface_decl(p: &mut Parser) {
     } else {
         p.error("expected interface name");
     }
+    // TYPE §6: optional `<T>` generic param list (in scope for the requirements).
+    let np = type_params(p);
     if p.at_kw("extends") {
         let em = p.start();
         p.bump(); // extends
@@ -1498,6 +1891,7 @@ fn interface_decl(p: &mut Parser) {
     } else {
         p.error("expected '}' to close interface");
     }
+    pop_type_params(p, np);
     p.complete(m, InterfaceDecl);
 }
 
@@ -1635,6 +2029,8 @@ fn enum_decl(p: &mut Parser) {
     } else {
         p.error("expected enum name");
     }
+    // TYPE §6: optional `<T>` generic param list (in scope for variant payloads).
+    let np = type_params(p);
     if p.at(LBrace) {
         p.bump();
     } else {
@@ -1685,6 +2081,7 @@ fn enum_decl(p: &mut Parser) {
     } else {
         p.error("expected '}' to close enum");
     }
+    pop_type_params(p, np);
     p.complete(m, EnumDecl);
 }
 

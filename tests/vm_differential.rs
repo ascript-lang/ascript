@@ -7514,6 +7514,38 @@ async fn iface_error_paths_four_mode_byte_identical() {
     }
 }
 
+/// TYPE Unit-B review regression: the expression-level `<` disambiguation
+/// (type-args-vs-comparison) must produce IDENTICAL parses on the legacy and CST
+/// front-ends, so the engines execute identically. A token-balancer earlier diverged
+/// on `a < b() > (c)` (a `(` inside the angle span — must be comparison) and
+/// `f<fn(int) -> string>(x)` (the `->` arrow's `>` is not a list close — must be a
+/// generic call). These behavioral cases lock both decisions across all engines.
+#[tokio::test]
+async fn type_arg_disambiguation_byte_identical() {
+    // Generic CALLS (the `>` is immediately followed by `(`): erased, run identically.
+    let ok_cases = [
+        "fn f<T>(x: T) { return x }\nprint(f<int>(5))",
+        "class Box<T> { v: T\n  fn get() { return self.v } }\nprint(Box<int>(7).get())",
+        // FnSig type argument — the `->` must NOT close the angle list (B2).
+        "fn f<T>(x: T) { return x }\nprint(f<fn(int) -> string>(5))",
+        // Nested generic closes via the `>>`-split, then the `(`.
+        "fn f<T>(x: T) { return x }\nprint(f<Box<int>>(9))\nclass Box<T> { v: T }",
+        // Comparison/bitwise are UNAFFECTED (no `>` immediately before `(`).
+        "let a = 3\nlet b = 5\nprint(a < b)\nprint(b > a)\nprint(a << 1)\nprint(b >> 1)\nprint(a < b && b > a)",
+        // A `<`/`>` pair around a parenthesised arg that is NOT a generic head.
+        "fn lt(x, y) { return x < y }\nfn gt(x, y) { return x > y }\nprint(lt(1, 2))\nprint(gt(1, 2))",
+    ];
+    for src in ok_cases {
+        assert_opt_call_ok_three_way(src).await;
+    }
+    // B1: `a < b() > (c)` is a comparison chain — `bool > number` panics IDENTICALLY on
+    // all three engines (a parse divergence would instead surface as a VM parse error).
+    assert_opt_call_error_three_way(
+        "fn b() { return 2 }\nlet a = 1\nlet c = 3\nprint(a < b() > (c))",
+    )
+    .await;
+}
+
 /// Workers §11.3: every worker example must produce IDENTICAL, order-deterministic
 /// output across all four modes: tree-walker, specialized VM, generic VM, and
 /// .aso-compiled. Worker programs are byte-identical by construction (gather +

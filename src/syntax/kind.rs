@@ -109,6 +109,19 @@ pub enum SyntaxKind {
     TupleType,
     TypeArgs,
     RetType,
+    // TYPE §6: generics surface syntax
+    /// A generic type-parameter LIST on a decl: `<T, U: Bound>`.
+    TypeParams,
+    /// One declared type parameter inside a `TypeParams` list (`T` or `C: Bound`).
+    TypeParam,
+    /// A type-parameter's optional interface bound (`: Container<T>`).
+    TypeBound,
+    /// A parameterized function type: `fn(A) -> B`.
+    FnType,
+    /// A reference to an in-scope generic type parameter in TYPE position (`T`).
+    /// Lowered to `ast::Type::Param`. (Structurally a name; tagged distinctly so the
+    /// `cst_type` lowering can map it to `Param` without re-deriving scope.)
+    ParamType,
 
     // --- trivia ---
     Whitespace,

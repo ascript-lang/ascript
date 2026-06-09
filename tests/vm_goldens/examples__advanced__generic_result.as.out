@@ -1,0 +1,8 @@
+# exit: none
+value=42
+fallback
+8
+-1
+-1
+ready
+items: 3

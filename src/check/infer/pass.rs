@@ -129,7 +129,16 @@ impl<'a> Pass<'a> {
         if self.suppress_emit > 0 {
             return; // synthesizing during return inference — the real walk reports.
         }
-        if code == "type-mismatch" && self.legacy_spans.contains(&range.start) {
+        // De-dup an *advisory* `type-mismatch` against the legacy
+        // `contract-mismatch`/`field-default-type` Warning at the same span (the
+        // one-release overlap). A BLOCKING `type-mismatch` (TYPE: an annotated
+        // param or field-default slot) is the soundness contract and MUST surface —
+        // it supersedes the legacy advisory, which `analyze` then drops at this span
+        // (so the user sees the Error, not a duplicate Warning).
+        if code == "type-mismatch"
+            && severity == Severity::Warning
+            && self.legacy_spans.contains(&range.start)
+        {
             return; // de-dup against the legacy rule at this span
         }
         self.out.push(AsDiagnostic {
@@ -221,7 +230,8 @@ impl<'a> Pass<'a> {
         let bound_ty = match (&ann, &init) {
             (Some(ty_node), Some(init_expr)) => {
                 let expected = CheckTy::from_type_node(ty_node, self.table);
-                self.check_against(init_expr, &expected, env);
+                // Annotated destination slot (`let x: T = v`) → BLOCKING (TYPE §3.1).
+                self.check_against(init_expr, &expected, env, true);
                 expected
             }
             (Some(ty_node), None) => CheckTy::from_type_node(ty_node, self.table),
@@ -256,7 +266,8 @@ impl<'a> Pass<'a> {
         let expr = first_expr_child(stmt);
         let expected = self.expected_return.last().cloned().flatten();
         match (expr, expected) {
-            (Some(e), Some(exp)) => self.check_against(&e, &exp, env),
+            // Declared return type (`fn f(): T { return v }`) → BLOCKING (TYPE §3.1).
+            (Some(e), Some(exp)) => self.check_against(&e, &exp, env, true),
             (Some(e), None) => {
                 self.synth(&e, env);
             }
@@ -578,7 +589,9 @@ impl<'a> Pass<'a> {
                 actual.display(self.table),
                 expected.display(self.table)
             );
-            self.emit("type-mismatch", code_range(field), msg);
+            // `expected` is the field's declared type node (`from_type_node` above)
+            // → BLOCKING annotated slot (TYPE §3.1).
+            self.emit_with("type-mismatch", Severity::Error, code_range(field), msg);
         }
     }
 
@@ -586,7 +599,18 @@ impl<'a> Pass<'a> {
 
     /// Check `expr` against `expected`; on a provable `No`, emit `type-mismatch`.
     /// `Unknown`/`Yes` are silent (gradual discipline).
-    fn check_against(&mut self, expr: &ResolvedNode, expected: &CheckTy, env: &mut Env) {
+    ///
+    /// `blocking` decides the severity (TYPE §3.1): a mismatch against a
+    /// *syntactically-annotated* destination slot (an explicit `let x: T`, a
+    /// declared return) is a BLOCKING `Severity::Error`; an inferred/uncertain
+    /// context passes `false` and stays an advisory `Severity::Warning`.
+    fn check_against(
+        &mut self,
+        expr: &ResolvedNode,
+        expected: &CheckTy,
+        env: &mut Env,
+        blocking: bool,
+    ) {
         let actual = self.synth(expr, env);
         if let Compat3::No = actual.assignable(expected, self.table) {
             let msg = format!(
@@ -594,7 +618,12 @@ impl<'a> Pass<'a> {
                 expected.display(self.table),
                 actual.display(self.table)
             );
-            self.emit("type-mismatch", code_range(expr), msg);
+            let sev = if blocking {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            self.emit_with("type-mismatch", sev, code_range(expr), msg);
         }
     }
 
@@ -879,10 +908,23 @@ impl<'a> Pass<'a> {
             if callee.kind() == NameRef {
                 let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
                 if let Some(cid) = self.callee_class_id(callee, &name) {
+                    // TYPE §4: a GENERIC class construction (`Box(5)` / `Box<int>(5)`)
+                    // infers (or takes explicit) type args → a `ClassApp`. A non-generic
+                    // class stays `Class(cid)` (the existing path).
+                    if !self.table.class_type_params(cid).is_empty() {
+                        return self.synth_generic_construction(cid, expr, arg_list, env);
+                    }
                     self.synth_arg_list(arg_list, env);
                     return CheckTy::Class(cid);
                 }
                 if let Some(fn_decl) = self.resolve_in_file_fn(callee, &name) {
+                    // TYPE §4: a GENERIC fn call (`id(5)` / `map<…>(…)`) freshens →
+                    // unifies args → substitutes → checks against the SOLVED params,
+                    // and returns the substituted return type. A non-generic fn uses
+                    // the existing arg-check + declared/inferred return path.
+                    if decl_has_type_params(&fn_decl) {
+                        return self.synth_generic_fn_call(&fn_decl, expr, arg_list, &name, env);
+                    }
                     self.check_call_args(&fn_decl, arg_list, &name, env);
                     return self.fn_return_type(&fn_decl);
                 }
@@ -941,6 +983,17 @@ impl<'a> Pass<'a> {
                 self.synth_arg_list(arg_list, env);
                 let ret = self.table.method_return(cid, &method).unwrap_or(CheckTy::Any);
                 return Some(CheckTy::Future(Box::new(ret)));
+            }
+        }
+
+        // Pattern (3) — TYPE §4: a method call on a PARAMETERIZED receiver
+        // (`b.get()` where `b : Box<int>`). Synthesize the method's declared return
+        // and substitute the receiver's type args (`T → int`). A non-generic / unknown
+        // method falls through to the gradual `Any` path.
+        if let CheckTy::ClassApp(cid, args) = &recv_ty {
+            if let Some(ret) = self.table.method_return(*cid, &method) {
+                self.synth_arg_list(arg_list, env);
+                return Some(self.instantiate_class_member(*cid, args, &ret));
             }
         }
 
@@ -1097,9 +1150,340 @@ impl<'a> Pass<'a> {
                     expected.display(self.table),
                     actual.display(self.table)
                 );
-                self.emit("type-mismatch", code_range(arg), msg);
+                // `ptype_node` is always lowered from an annotated param type
+                // (`from_type_node` above) → BLOCKING annotated slot (TYPE §3.1).
+                self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
             }
         }
+    }
+
+    /// TYPE §4.3: infer a GENERIC in-file fn call. Freshen the decl's params + return
+    /// (template `Var`s → fresh vars), unify each arg's synth against its freshened
+    /// param (and any EXPLICIT type args against the decl's template→fresh mapping),
+    /// substitute the solution, then check each arg against its SOLVED param type
+    /// (blocking — a generic param is always annotated). Returns the substituted
+    /// return type (an unsolved leaf → `Any`, gradual). A spread arg makes positions
+    /// unknowable → synth + gradual `Any`.
+    fn synth_generic_fn_call(
+        &mut self,
+        fn_decl: &ResolvedNode,
+        call_expr: &ResolvedNode,
+        arg_list: Option<&ResolvedNode>,
+        name: &str,
+        env: &mut Env,
+    ) -> CheckTy {
+        use crate::check::infer::unify::Solver;
+        // Lower the declared params + return with template vars in place.
+        let param_nodes = param_type_nodes(fn_decl);
+        let template_params: Vec<Option<CheckTy>> = param_nodes
+            .iter()
+            .map(|n| n.as_ref().map(|node| CheckTy::from_type_node(node, self.table)))
+            .collect();
+        let template_ret = declared_return(fn_decl, self.table);
+
+        // Spread → positions unknowable; synth + gradual.
+        let has_spread = arg_list
+            .map(|al| al.children().any(|c| c.kind() == SyntaxKind::SpreadElem))
+            .unwrap_or(false);
+        if has_spread {
+            self.synth_arg_list(arg_list, env);
+            return template_ret
+                .map(|r| widen_unsolved(&r))
+                .unwrap_or(CheckTy::Any);
+        }
+
+        let args: Vec<ResolvedNode> = arg_list
+            .into_iter()
+            .flat_map(|al| al.children())
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        // Synthesize each arg up-front (sub-diagnostics flow regardless of generics).
+        let arg_tys: Vec<CheckTy> = args.iter().map(|a| self.synth(a, env)).collect();
+
+        // Freshen the signature (params + return SHARE one template→fresh mapping so a
+        // repeated `T` is one variable).
+        let mut solver = Solver::new();
+        let mut mapping = std::collections::HashMap::new();
+        let fresh_params: Vec<Option<CheckTy>> = template_params
+            .iter()
+            .map(|p| p.as_ref().map(|t| solver.freshen(t, &mut mapping)))
+            .collect();
+        let fresh_ret = template_ret
+            .as_ref()
+            .map(|r| solver.freshen(r, &mut mapping));
+
+        // EXPLICIT type args (`map<string, number>(…)`): bind each decl type-param's
+        // fresh var to the supplied type (in declaration order). A later inferred
+        // constraint that conflicts surfaces as a normal blocking mismatch on the arg.
+        let explicit = explicit_type_args(call_expr, self.table);
+        if !explicit.is_empty() {
+            let tparams = decl_type_param_names(fn_decl);
+            for (i, ty) in explicit.iter().enumerate() {
+                if let Some(pname) = tparams.get(i) {
+                    let tmpl = crate::check::infer::ty::param_template_id(pname);
+                    if let Some(&fresh) = mapping.get(&tmpl) {
+                        solver.unify(&CheckTy::Var(fresh, None), ty);
+                    }
+                }
+            }
+        }
+
+        // Unify each arg against its freshened param (gradual give-up on a clash).
+        for (aty, fp) in arg_tys.iter().zip(fresh_params.iter()) {
+            if let Some(fp) = fp {
+                solver.unify(&aty.widen(), fp);
+            }
+        }
+
+        // TYPE §4 (callback inference): when a param is a `fn(In) -> Out` and the arg
+        // is an ARROW, bind the arrow's params to the SOLVED input types and synth its
+        // body, then unify the body type into `Out`. This is what lets `map(xs, s =>
+        // len(s))` solve `B = number` so the result is `array<number>` (and the LSP
+        // hover shows it). Purely additive to the solver — it can only SOLVE more
+        // vars, never manufacture a `No` (the arrow is never type-checked here), so it
+        // is Gate-5-safe.
+        for (i, fp) in fresh_params.iter().enumerate() {
+            let (Some(CheckTy::FnSig(ins, out)), Some(arg)) = (fp.as_ref(), args.get(i)) else {
+                continue;
+            };
+            if arg.kind() != SyntaxKind::ArrowExpr {
+                continue;
+            }
+            // Solve the input types now so the arrow's param env is as concrete as
+            // possible; an unsolved input stays a Var (→ Any in the body env).
+            let solved_ins: Vec<CheckTy> = ins.iter().map(|t| solver.substitute(t)).collect();
+            if let Some(body_ty) = self.infer_arrow_body(arg, &solved_ins, env) {
+                solver.unify(&body_ty.widen(), out);
+            }
+        }
+
+        // Check each arg against its SOLVED param type (blocking — annotated slot).
+        for (i, (arg, aty)) in args.iter().zip(arg_tys.iter()).enumerate() {
+            let Some(Some(fp)) = fresh_params.get(i) else {
+                continue;
+            };
+            let solved = solver.substitute(fp);
+            if let Compat3::No = aty.assignable(&solved, self.table) {
+                let msg = format!(
+                    "argument {} of `{name}` expects `{}`, found `{}`",
+                    i + 1,
+                    solved.display(self.table),
+                    aty.display(self.table)
+                );
+                self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
+            }
+        }
+
+        // Bound enforcement: after solving, check each bounded type-param's solution
+        // against its interface bound (a provable No → blocking, annotated origin).
+        self.enforce_generic_bounds(
+            &decl_type_params_with_bounds(fn_decl, self.table),
+            &mapping,
+            &solver,
+            call_expr,
+        );
+
+        // Return the substituted return type (unsolved → Any). Wrap for async/worker.
+        let ret = fresh_ret
+            .map(|r| solver.substitute(&r))
+            .unwrap_or(CheckTy::Any);
+        let ret = widen_unsolved(&ret);
+        if is_async(fn_decl) || is_worker(fn_decl) {
+            CheckTy::Future(Box::new(ret))
+        } else if is_generator(fn_decl) {
+            CheckTy::Any
+        } else {
+            ret
+        }
+    }
+
+    /// TYPE §4: infer a GENERIC class CONSTRUCTION (`Box(5)` / `Box<int>(5)`). Use the
+    /// explicit type args if supplied, else infer the class's type params from the
+    /// `init` arguments (against `init`'s freshened param types). Returns
+    /// `ClassApp(cid, solved_args)` — an unsolved arg → `Any` (gradual).
+    fn synth_generic_construction(
+        &mut self,
+        cid: usize,
+        call_expr: &ResolvedNode,
+        arg_list: Option<&ResolvedNode>,
+        env: &mut Env,
+    ) -> CheckTy {
+        use crate::check::infer::unify::Solver;
+        let tparams = self.table.class_type_params(cid).to_vec();
+        let tparam_names: Vec<String> = tparams.iter().map(|(n, _)| n.clone()).collect();
+
+        // Synthesize the args (sub-diagnostics flow).
+        let args: Vec<ResolvedNode> = arg_list
+            .into_iter()
+            .flat_map(|al| al.children())
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        let arg_tys: Vec<CheckTy> = args.iter().map(|a| self.synth(a, env)).collect();
+
+        let mut solver = Solver::new();
+        // Map each class type-param name → a fresh var.
+        let mut mapping: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for name in &tparam_names {
+            let tmpl = crate::check::infer::ty::param_template_id(name);
+            let fresh = solver.fresh();
+            mapping.insert(tmpl, fresh);
+        }
+
+        // EXPLICIT type args bind directly.
+        let explicit = explicit_type_args(call_expr, self.table);
+        for (i, ty) in explicit.iter().enumerate() {
+            if let Some(name) = tparam_names.get(i) {
+                let tmpl = crate::check::infer::ty::param_template_id(name);
+                if let Some(&fresh) = mapping.get(&tmpl) {
+                    solver.unify(&CheckTy::Var(fresh, None), ty);
+                }
+            }
+        }
+
+        // Infer from the `init` params (if any) when no spread.
+        let has_spread = arg_list
+            .map(|al| al.children().any(|c| c.kind() == SyntaxKind::SpreadElem))
+            .unwrap_or(false);
+        let mut fresh_init_params: Vec<CheckTy> = Vec::new();
+        if !has_spread {
+            // Positional construction binds arg `i` to the `i`th init parameter when
+            // an `init` exists, else to the `i`th DECLARED FIELD (`Box(5)` → field
+            // `value: T`). Either source lets us infer the class's type args.
+            let positional = self
+                .class_init_param_types(cid)
+                .unwrap_or_else(|| self.class_field_param_types(cid));
+            for (aty, ptmpl) in arg_tys.iter().zip(positional.iter()) {
+                // Freshen the param/field's template var(s) through the SAME mapping.
+                let fp = solver.freshen(ptmpl, &mut mapping);
+                solver.unify(&aty.widen(), &fp);
+                fresh_init_params.push(fp);
+            }
+        }
+
+        // Check each init arg against its SOLVED param type — this surfaces an
+        // EXPLICIT type arg that conflicts with the constructor argument (e.g.
+        // `Box<string>(5)`: the explicit `string` bound `T`, but `5` is `int`). A
+        // generic init param is always annotated → blocking (TYPE §3.1). An init param
+        // that stayed an unsolved `Var` → `Any` → gradual.
+        for (i, (arg, aty)) in args.iter().zip(arg_tys.iter()).enumerate() {
+            let Some(fp) = fresh_init_params.get(i) else {
+                continue;
+            };
+            let solved = solver.substitute(fp);
+            if let Compat3::No = aty.assignable(&solved, self.table) {
+                let cname = self
+                    .table
+                    .class(cid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                let msg = format!(
+                    "argument {} of `{cname}` expects `{}`, found `{}`",
+                    i + 1,
+                    solved.display(self.table),
+                    aty.display(self.table)
+                );
+                self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
+            }
+        }
+
+        // Build the solved type-arg vector (declaration order).
+        let solved_args: Vec<CheckTy> = tparam_names
+            .iter()
+            .map(|name| {
+                let tmpl = crate::check::infer::ty::param_template_id(name);
+                match mapping.get(&tmpl) {
+                    Some(&fresh) => solver.substitute(&CheckTy::Var(fresh, None)),
+                    None => CheckTy::Any,
+                }
+            })
+            .collect();
+        CheckTy::ClassApp(cid, solved_args)
+    }
+
+    /// Enforce interface bounds after solving: for each `(template_id, Some(bound))`,
+    /// substitute the bound's fresh var and `conforms`-check it; a provable `No` is a
+    /// blocking `type-mismatch` (the bound is on a declared generic — annotated).
+    fn enforce_generic_bounds(
+        &mut self,
+        bounds: &[(u32, Option<CheckTy>)],
+        mapping: &std::collections::HashMap<u32, u32>,
+        solver: &crate::check::infer::unify::Solver,
+        anchor: &ResolvedNode,
+    ) {
+        for (tmpl, bound) in bounds {
+            let Some(CheckTy::Interface(iid)) = bound else {
+                continue;
+            };
+            let Some(&fresh) = mapping.get(tmpl) else {
+                continue;
+            };
+            let solved = solver.substitute(&CheckTy::Var(fresh, None));
+            if let Compat3::No = self.table.conforms(&solved, *iid) {
+                let iname = self
+                    .table
+                    .interface_info(*iid)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_default();
+                let msg = format!(
+                    "type argument `{}` does not conform to bound `{iname}`",
+                    solved.display(self.table)
+                );
+                self.emit_with("type-mismatch", Severity::Error, code_range(anchor), msg);
+            }
+        }
+    }
+
+    /// Substitute a class's type arguments into a member type lowered with that
+    /// class's template `Var`s (TYPE §4): map each class type-param `template_id` →
+    /// the corresponding solved arg, then substitute. A leftover var → `Any`.
+    fn instantiate_class_member(&self, cid: usize, args: &[CheckTy], member: &CheckTy) -> CheckTy {
+        let tparams = self.table.class_type_params(cid);
+        if tparams.is_empty() {
+            return member.clone();
+        }
+        let mut map: std::collections::HashMap<u32, CheckTy> = std::collections::HashMap::new();
+        for ((name, _), arg) in tparams.iter().zip(args.iter()) {
+            map.insert(crate::check::infer::ty::param_template_id(name), arg.clone());
+        }
+        widen_unsolved(&subst_templates(member, &map))
+    }
+
+    /// The `init` method's parameter types of a class (lowered with template vars in
+    /// place), if it declares one. `None` when the class has no `init` / no params.
+    fn class_init_param_types(&self, cid: usize) -> Option<Vec<CheckTy>> {
+        let sig = self.table.method_sig(cid, "init")?;
+        if sig.params.is_empty() {
+            return None;
+        }
+        Some(sig.params.clone())
+    }
+
+    /// The class's declared field types in DECLARATION order (the positional-
+    /// construction targets when there is no `init`). Returns the template-lowered
+    /// types so the unifier can solve the class's type args from `Box(5)`.
+    ///
+    /// IMPORTANT (Gate-5 soundness): `field_order` is OWN-fields-only, but a no-`init`
+    /// class with a SUPERCLASS auto-derives its positional constructor over the
+    /// base-FIRST `merged_field_schema` (`interp.rs`/`value.rs`) — so arg 0 binds to the
+    /// first BASE field at runtime, NOT the first own field. Using the own-only order
+    /// here misaligns the positional check and would manufacture a FALSE blocking
+    /// `type-mismatch` (e.g. `class Sub<T> extends Base { b: string }`; `Sub(1, "x")`
+    /// runs fine but arg 0 `1` would be checked against own-field `b: string`). Rather
+    /// than reconstruct the merged base-first order (and risk field-shadowing subtleties)
+    /// we DROP to gradual for any class with a superclass: return no positional targets,
+    /// so construction args are not field-checked and the type args stay unsolved →
+    /// `Any` (never a false `No`). Base-less generic classes (the common `Box<T>` shape)
+    /// keep precise field inference.
+    fn class_field_param_types(&self, cid: usize) -> Vec<CheckTy> {
+        let Some(c) = self.table.class(cid) else {
+            return Vec::new();
+        };
+        if c.parent.is_some() {
+            return Vec::new(); // has a superclass → gradual (see doc above)
+        }
+        c.field_order.iter().map(|(_, t)| t.clone()).collect()
     }
 
     fn synth_array(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
@@ -1507,6 +1891,13 @@ impl<'a> Pass<'a> {
         let field = member_name(expr);
         match (&recv_ty, field) {
             (CheckTy::Class(cid), Some(f)) => self.table.field_type(*cid, &f).unwrap_or(CheckTy::Any),
+            // TYPE §4: a field access on a parameterized receiver (`b.value` where
+            // `b : Box<int>`) — look up the field's template type and substitute the
+            // class's type args (`T → int`).
+            (CheckTy::ClassApp(cid, args), Some(f)) => {
+                let tmpl = self.table.field_type(*cid, &f).unwrap_or(CheckTy::Any);
+                self.instantiate_class_member(*cid, args, &tmpl)
+            }
             (CheckTy::Enum(eid), Some(f)) => {
                 if let Some(ei) = self.table.enum_info(*eid) {
                     if ei.variants.iter().any(|v| v == &f) {
@@ -1655,6 +2046,77 @@ impl<'a> Pass<'a> {
     /// Infer a function's return type: the `join` of all its `return` expression
     /// synths, plus `Nil` if it can fall off the end (no return value reached on
     /// some path). Synthesis runs with emission SUPPRESSED (the real walk reports).
+    /// Synthesize the RESULT type of an `ArrowExpr` argument given the solved input
+    /// types for its parameters (TYPE §4 callback inference). Binds each arrow param
+    /// (by position) to its input type in a child env, then synthesizes an expression
+    /// body directly or infers a block body's joined return type. Emits nothing
+    /// (`suppress_emit`) — this is speculative inference feeding the unifier, not a
+    /// checking site. Returns `None` when the arrow has no recoverable body.
+    fn infer_arrow_body(
+        &mut self,
+        arrow: &ResolvedNode,
+        input_tys: &[CheckTy],
+        env: &Env,
+    ) -> Option<CheckTy> {
+        use SyntaxKind::*;
+        // Work in a child narrowing scope so the param bindings we install for the
+        // arrow body do not leak into the caller's env.
+        let mut child = Env::new();
+        for (k, v) in env.iter_base() {
+            child.define(k.clone(), v.clone());
+        }
+        if let Some(params) = arrow.children().find(|c| c.kind() == ParamList) {
+            for (i, p) in params.children().filter(|c| c.kind() == Param).enumerate() {
+                // Key each arrow param by its RESOLVED binding (slot/global), mirroring
+                // `bind_params`, so a use of the param inside the body resolves to it.
+                if let Some(b) = self
+                    .resolved
+                    .bindings
+                    .iter()
+                    .find(|b| b.decl_range == p.text_range())
+                {
+                    let key = if b.is_global {
+                        BindingKey::Global(b.name.clone())
+                    } else {
+                        BindingKey::Local(b.slot)
+                    };
+                    let ty = input_tys.get(i).cloned().unwrap_or(CheckTy::Any);
+                    child.define(key, ty);
+                }
+            }
+        }
+        self.suppress_emit += 1;
+        let result = if let Some(block) = arrow.children().find(|c| c.kind() == Block) {
+            // Block body: join every `return <expr>` value (a bare side-effect arrow
+            // has no value return → Any, the maximally-silent leaf).
+            let mut returns: Vec<ResolvedNode> = Vec::new();
+            collect_returns(block, &mut returns);
+            let mut acc = CheckTy::Never;
+            let mut saw = false;
+            for ret in &returns {
+                if let Some(e) = first_expr_child(ret) {
+                    let t = self.synth(&e, &mut child);
+                    acc = acc.join(&t.widen(), self.table);
+                    saw = true;
+                }
+            }
+            if saw {
+                Some(acc.widen())
+            } else {
+                None
+            }
+        } else {
+            // Expression body: the body is the last expression-kind child.
+            let body = arrow
+                .children()
+                .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+                .last();
+            body.map(|e| self.synth(e, &mut child).widen())
+        };
+        self.suppress_emit -= 1;
+        result
+    }
+
     fn infer_return(&mut self, fn_decl: &ResolvedNode) -> CheckTy {
         let Some(body) = fn_decl.children().find(|c| c.kind() == SyntaxKind::Block) else {
             return CheckTy::Any;
@@ -2085,6 +2547,116 @@ fn param_type_nodes(fn_decl: &ResolvedNode) -> Vec<Option<ResolvedNode>> {
         .collect()
 }
 
+/// TYPE §4: does this decl carry a `<…>` type-parameter list (i.e. is it generic)?
+fn decl_has_type_params(decl: &ResolvedNode) -> bool {
+    decl.children().any(|c| c.kind() == SyntaxKind::TypeParams)
+}
+
+/// The declared type-parameter NAMES of a decl, in order (`<A, B>` → `["A","B"]`).
+fn decl_type_param_names(decl: &ResolvedNode) -> Vec<String> {
+    use SyntaxKind::*;
+    let Some(list) = decl.children().find(|c| c.kind() == TypeParams) else {
+        return Vec::new();
+    };
+    list.children()
+        .filter(|c| c.kind() == TypeParam)
+        .filter_map(crate::syntax::resolve::ident_text)
+        .collect()
+}
+
+/// The decl's type parameters as `(template_id, optional bound CheckTy)` pairs — the
+/// shape `enforce_generic_bounds` consumes.
+fn decl_type_params_with_bounds(
+    decl: &ResolvedNode,
+    table: &Table,
+) -> Vec<(u32, Option<CheckTy>)> {
+    use SyntaxKind::*;
+    let Some(list) = decl.children().find(|c| c.kind() == TypeParams) else {
+        return Vec::new();
+    };
+    list.children()
+        .filter(|c| c.kind() == TypeParam)
+        .filter_map(|tp| {
+            let name = crate::syntax::resolve::ident_text(tp)?;
+            let bound = tp
+                .children()
+                .find(|c| c.kind() == TypeBound)
+                .and_then(|b| b.children().find(|c| is_type_kind(c.kind())))
+                .map(|ty| CheckTy::from_type_node(ty, table));
+            Some((crate::check::infer::ty::param_template_id(&name), bound))
+        })
+        .collect()
+}
+
+/// The EXPLICIT type arguments at a call/construction site (`Box<int>(5)` /
+/// `map<string, number>(…)`): the `TypeArgs` child of the `CallExpr`, lowered. Empty
+/// when the call has no explicit type args (the common inferred case).
+fn explicit_type_args(call_expr: &ResolvedNode, table: &Table) -> Vec<CheckTy> {
+    use SyntaxKind::*;
+    call_expr
+        .children()
+        .find(|c| c.kind() == TypeArgs)
+        .map(|ta| {
+            ta.children()
+                .filter(|c| is_type_kind(c.kind()))
+                .map(|c| CheckTy::from_type_node(c, table))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Substitute TEMPLATE `Var`s in `ty` by id via `map` (a class/enum type-param
+/// instantiation). A template var not in the map is left as-is (later widened to
+/// `Any`). Non-template vars are untouched.
+fn subst_templates(ty: &CheckTy, map: &std::collections::HashMap<u32, CheckTy>) -> CheckTy {
+    use CheckTy::*;
+    match ty {
+        Var(id, _) => match map.get(id) {
+            Some(t) => t.clone(),
+            None => ty.clone(),
+        },
+        Array(x) => Array(Box::new(subst_templates(x, map))),
+        Future(x) => Future(Box::new(subst_templates(x, map))),
+        Result(x) => Result(Box::new(subst_templates(x, map))),
+        Map(k, v) => Map(
+            Box::new(subst_templates(k, map)),
+            Box::new(subst_templates(v, map)),
+        ),
+        Tuple(ms) => Tuple(ms.iter().map(|m| subst_templates(m, map)).collect()),
+        Union(ms) => Union(ms.iter().map(|m| subst_templates(m, map)).collect()),
+        FnSig(ps, r) => FnSig(
+            ps.iter().map(|p| subst_templates(p, map)).collect(),
+            Box::new(subst_templates(r, map)),
+        ),
+        ClassApp(id, args) => ClassApp(*id, args.iter().map(|a| subst_templates(a, map)).collect()),
+        EnumApp(id, args) => EnumApp(*id, args.iter().map(|a| subst_templates(a, map)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Widen any leftover (unsolved) `Var` in a substituted type to `Any` (defensive —
+/// `substitute` already maps unsolved vars to `Any`, but a freshly-lowered type that
+/// never went through a solver can still carry a template `Var`).
+fn widen_unsolved(t: &CheckTy) -> CheckTy {
+    use CheckTy::*;
+    match t {
+        Var(_, _) => Any,
+        Array(x) => Array(Box::new(widen_unsolved(x))),
+        Future(x) => Future(Box::new(widen_unsolved(x))),
+        Result(x) => Result(Box::new(widen_unsolved(x))),
+        Map(k, v) => Map(Box::new(widen_unsolved(k)), Box::new(widen_unsolved(v))),
+        Tuple(ms) => Tuple(ms.iter().map(widen_unsolved).collect()),
+        Union(ms) => Union(ms.iter().map(widen_unsolved).collect()),
+        FnSig(ps, r) => FnSig(
+            ps.iter().map(widen_unsolved).collect(),
+            Box::new(widen_unsolved(r)),
+        ),
+        ClassApp(id, args) => ClassApp(*id, args.iter().map(widen_unsolved).collect()),
+        EnumApp(id, args) => EnumApp(*id, args.iter().map(widen_unsolved).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Is this fn/method declared `async` (carries an `AsyncKw` token)?
 fn is_async(decl: &ResolvedNode) -> bool {
     decl.children_with_tokens()
@@ -2201,8 +2773,11 @@ fn is_provably_non_number(t: &CheckTy) -> bool {
         Any | Never | Number | Int | Float => false,
         Union(ms) => ms.iter().all(is_provably_non_number),
         String | Bool | Nil | Bytes | Object | Regex | Error | Fn | Array(_) | Map(_, _)
-        | Tuple(_) | Result(_) | Future(_) | Class(_) | Enum(_) => true,
-        EnumVariant(_, _) | Literal(_) => false,
+        | Tuple(_) | Result(_) | Future(_) | Class(_) | Enum(_) | FnSig(_, _)
+        | ClassApp(_, _) | EnumApp(_, _) | Interface(_) => true,
+        // `Var` is gradual (widened to `Any` above) but listed defensively; narrowing
+        // artifacts never reach here post-widen.
+        Var(_, _) | EnumVariant(_, _) | Literal(_) => false,
     }
 }
 
@@ -2241,23 +2816,35 @@ mod tests {
     }
 
     #[test]
-    fn literal_arg_mismatch_dedup_with_legacy() {
+    fn literal_arg_mismatch_blocking_supersedes_legacy() {
+        // TYPE: an annotated-param mismatch is now a BLOCKING `type-mismatch` Error
+        // that SUPERSEDES the legacy advisory `contract-mismatch` at the same span
+        // (the legacy Warning is dropped in `analyze`, so the user sees one sound
+        // Error, not a duplicate).
         let src = "fn f(n: number) { return n }\nf(\"x\")\n";
-        assert!(has(src, "contract-mismatch"));
-        // de-dup: type-mismatch suppressed at the legacy span.
-        assert_eq!(
-            count(src, "type-mismatch"),
-            0,
-            "{:?}",
-            analyze(src).diagnostics
-        );
+        assert_eq!(count(src, "type-mismatch"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(count(src, "contract-mismatch"), 0, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "type-mismatch")
+            .unwrap();
+        assert_eq!(d.severity, crate::check::diagnostic::Severity::Error);
     }
 
     #[test]
-    fn field_default_subsumed_dedup() {
+    fn field_default_subsumed_blocking_supersedes_legacy() {
+        // TYPE: a typed field-default mismatch is now a BLOCKING `type-mismatch`
+        // Error that supersedes the legacy `field-default-type` advisory.
         let src = "class P { n: number = \"x\" }\n";
-        assert!(has(src, "field-default-type"));
-        assert_eq!(count(src, "type-mismatch"), 0);
+        assert_eq!(count(src, "type-mismatch"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(count(src, "field-default-type"), 0, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "type-mismatch")
+            .unwrap();
+        assert_eq!(d.severity, crate::check::diagnostic::Severity::Error);
     }
 
     #[test]
@@ -2636,4 +3223,101 @@ mod tests {
             analyze(src).diagnostics
         );
     }
+
+    // --------------------- TYPE Task 12: generic inference wiring ---------------
+
+    fn sev(src: &str, code: &str) -> Option<crate::check::diagnostic::Severity> {
+        analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == code)
+            .map(|d| d.severity)
+    }
+
+    #[test]
+    fn generic_id_infers_return_into_annotated_slot() {
+        // `id(5)` solves T=int → returns int → flows into `: number` cleanly, but a
+        // string slot is a blocking mismatch.
+        let ok = "fn id<T>(x: T): T { return x }\nlet n: number = id(5)\nn\n";
+        assert!(!has(ok, "type-mismatch"), "{:?}", analyze(ok).diagnostics);
+        let bad = "fn id<T>(x: T): T { return x }\nlet s: string = id(5)\ns\n";
+        assert!(has(bad, "type-mismatch"), "{:?}", analyze(bad).diagnostics);
+        assert_eq!(
+            sev(bad, "type-mismatch"),
+            Some(crate::check::diagnostic::Severity::Error)
+        );
+    }
+
+    #[test]
+    fn generic_box_construction_and_method_return() {
+        // Box(5) infers T=int; b.get() : int → into `: int` ok, into `: string` blocks.
+        let src_ok = "class Box<T> { value: T\n fn init(v: T) { self.value = v }\n fn get(): T { return self.value } }\nlet b = Box(5)\nlet n: int = b.get()\nn\n";
+        assert!(!has(src_ok, "type-mismatch"), "{:?}", analyze(src_ok).diagnostics);
+        let src_bad = "class Box<T> { value: T\n fn init(v: T) { self.value = v }\n fn get(): T { return self.value } }\nlet b = Box(5)\nlet s: string = b.get()\ns\n";
+        assert!(has(src_bad, "type-mismatch"), "{:?}", analyze(src_bad).diagnostics);
+    }
+
+    #[test]
+    fn generic_box_field_access_instantiates() {
+        // b.value where b : Box<int> synthesizes int.
+        let bad = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b = Box(5)\nlet s: string = b.value\ns\n";
+        assert!(has(bad, "type-mismatch"), "{:?}", analyze(bad).diagnostics);
+    }
+
+    #[test]
+    fn empty_array_map_is_gradual_silent() {
+        // THE pinned invariant: map([], f) leaves A unsolved → array<any> → ZERO diags.
+        let src = "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {\n  let out: array<B> = []\n  return out\n}\nlet r = map([], (x) => x)\nr\n";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn explicit_type_args_conflict_blocks() {
+        // map<string, number>([1,2], …) — the int-array conflicts with the string A.
+        let src = "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {\n  let out: array<B> = []\n  return out\n}\nlet r = map<string, number>([1, 2], (x) => x)\nr\n";
+        assert!(has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn explicit_box_type_arg_used() {
+        // Box<int>(5) ok; Box<string>(5) — the explicit string conflicts with int arg.
+        let ok = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b = Box<int>(5)\nb\n";
+        assert!(!has(ok, "type-mismatch"), "{:?}", analyze(ok).diagnostics);
+        let bad = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b = Box<string>(5)\nb\n";
+        assert!(has(bad, "type-mismatch"), "{:?}", analyze(bad).diagnostics);
+    }
+
+    #[test]
+    fn generic_call_on_untyped_data_is_silent() {
+        // Passing `any` data through a generic stays Unknown — no blocking.
+        let src = "fn id<T>(x: T): T { return x }\nfn use(d) { let s: string = id(d)\n return s }\nuse(1)\n";
+        assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn generic_over_unknown_type_name_is_gradual() {
+        // Box<Widget> where Widget is unknown → Widget lowers to Any → gradual.
+        let src = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b: Box<Widget> = Box(5)\nb\n";
+        assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn bounded_generic_nonconforming_blocks() {
+        // first<T, C: Container<T>>(c: C) called with a value provably lacking the
+        // interface methods → blocking conformance mismatch.
+        let src = "interface Container<T> { fn len(): int\n fn at(i: int): T }\nfn first<T, C: Container<T>>(c: C): T { return c.at(0) }\nclass Bad { fn nope(): int { return 0 } }\nlet x = first(Bad())\nx\n";
+        assert!(has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn bounded_generic_conforming_is_silent() {
+        // A conforming class passes the bound cleanly.
+        let src = "interface Container<T> { fn len(): int\n fn at(i: int): T }\nfn first<T, C: Container<T>>(c: C): T { return c.at(0) }\nclass Good { fn len(): int { return 0 }\n fn at(i: int): int { return i } }\nlet x = first(Good())\nx\n";
+        assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
 }
+

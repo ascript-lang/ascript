@@ -70,9 +70,15 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
 mod tests {
     use crate::check::analyze;
 
+    /// Count the `field-default-type` diagnostics the RULE emits directly. Since
+    /// TYPE, the end-to-end `analyze` pipeline DROPS a `field-default-type` advisory
+    /// at a span where the inference pass emits a blocking `type-mismatch` Error
+    /// (subsumption — the user sees the sound Error, not a duplicate Warning). These
+    /// unit tests exercise the rule's own detection, so they invoke it directly.
     fn count(src: &str, code: &str) -> usize {
-        analyze(src)
-            .diagnostics
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(src));
+        let resolved = crate::syntax::resolve::resolve(&tree);
+        super::check(&tree, &resolved, src)
             .iter()
             .filter(|d| d.code == code)
             .count()
@@ -158,8 +164,9 @@ mod tests {
     #[test]
     fn message_names_field_kind_and_type() {
         let src = "class P { n: number = \"x\" }";
-        let d = analyze(src)
-            .diagnostics
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(src));
+        let resolved = crate::syntax::resolve::resolve(&tree);
+        let d = super::check(&tree, &resolved, src)
             .into_iter()
             .find(|d| d.code == "field-default-type")
             .unwrap();
@@ -167,5 +174,18 @@ mod tests {
             d.message,
             "field 'n' default is string, which violates its declared type number"
         );
+    }
+
+    #[test]
+    fn typed_field_default_surfaces_as_blocking_type_mismatch() {
+        // End-to-end: through `analyze` the user sees a single BLOCKING
+        // `type-mismatch` Error (the legacy `field-default-type` advisory is dropped
+        // at this span — TYPE subsumption).
+        let src = "class P { n: number = \"x\" }";
+        let ds = analyze(src).diagnostics;
+        assert_eq!(ds.iter().filter(|d| d.code == "field-default-type").count(), 0, "{ds:?}");
+        let tm: Vec<_> = ds.iter().filter(|d| d.code == "type-mismatch").collect();
+        assert_eq!(tm.len(), 1, "{ds:?}");
+        assert_eq!(tm[0].severity, crate::check::diagnostic::Severity::Error);
     }
 }

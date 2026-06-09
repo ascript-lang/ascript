@@ -262,11 +262,15 @@ pub(crate) fn lit_name(lit: LitKind) -> &'static str {
 }
 
 /// Is `kind` a type-annotation CST node?
+///
+/// Includes the TYPE §6 generics nodes (`ParamType` — a generic type-parameter
+/// reference; `FnType` — a parameterized `fn(A) -> B`) so child-type filters pick
+/// them up. The legacy literal-compat rules treat both as `Unknown` (silent).
 pub(crate) fn is_type_kind(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
         kind,
-        NamedType | GenericType | OptionalType | UnionType | TupleType
+        NamedType | GenericType | OptionalType | UnionType | TupleType | ParamType | FnType
     )
 }
 

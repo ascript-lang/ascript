@@ -89,6 +89,24 @@ mod tests {
         assert!(matches!(&lsp.code, Some(NumberOrString::String(c)) if c == "syntax-error"));
     }
 
+    #[test]
+    fn blocking_generic_type_mismatch_flows_to_lsp_as_error() {
+        // TYPE Task 16: a generic call with an EXPLICIT type arg that conflicts with
+        // the argument (`id<string>(5)`) is a BLOCKING `type-mismatch`. It must reach
+        // the LSP as an ERROR-severity diagnostic carrying the `type-mismatch` code
+        // (the Task-1 severity flip surfaced in the editor).
+        let src = "fn id<T>(x: T): T { return x }\nlet r = id<string>(5)\n";
+        let analysis = crate::check::analyze(src);
+        let hit = analysis
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "type-mismatch")
+            .expect("a type-mismatch diagnostic");
+        let lsp = byte_diagnostic_to_lsp(src, hit);
+        assert_eq!(lsp.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(matches!(&lsp.code, Some(NumberOrString::String(c)) if c == "type-mismatch"));
+    }
+
     /// Phase 0 GATE: the LSP must not reference the legacy interpreter front-end.
     /// This guards the unification — any re-introduction of the legacy
     /// ast/lexer/parser/token paths anywhere under `src/lsp/` fails the build.
