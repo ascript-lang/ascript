@@ -123,6 +123,10 @@ impl Interp {
 
     async fn tcp_connect(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let addr = want_addr(args, span, "net/tcp.connect")?;
+        // FFI §4.4 stage-2 (net carve-out): re-check the resolved host at connect
+        // time. Gate-12: no carve-out → immediate `Ok` with no comparison.
+        let host = want_string(&arg(args, 0), span, "net/tcp.connect host")?;
+        self.check_net_host(&host, span)?;
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
                 let handle = self.register_resource(
@@ -141,6 +145,10 @@ impl Interp {
 
     async fn tcp_listen(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let addr = want_addr(args, span, "net/tcp.listen")?;
+        // FFI §4.4 stage-2 (net carve-out): re-check the bind host. Gate-12:
+        // no carve-out → immediate `Ok` with no comparison.
+        let host = want_string(&arg(args, 0), span, "net/tcp.listen host")?;
+        self.check_net_host(&host, span)?;
         match TcpListener::bind(&addr).await {
             Ok(listener) => {
                 // Expose the bound port (the OS-assigned one when binding port 0) so

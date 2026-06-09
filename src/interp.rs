@@ -944,18 +944,76 @@ impl Interp {
         _args: &[Value],
         span: Span,
     ) -> Result<(), Control> {
-        // `Copy` snapshot — borrow released before this line returns.
-        let bits = self.caps_bits();
-        if bits.has(cap) {
-            return Ok(());
+        use crate::stdlib::caps::CapDecision;
+        // Short, await-free borrow to read the dispatch decision (consults the
+        // optional fs/net carve-out scope). The borrow is dropped before return.
+        let decision = self.caps.borrow().dispatch_decision(cap);
+        match decision {
+            // Granted-outright, OR a granular carve-out is configured (the
+            // connect/bind / fs-path STAGE 2 enforces the allow-list). Defer passes
+            // the dispatch gate here; the resolved host/path isn't known yet.
+            CapDecision::Allow | CapDecision::Defer => Ok(()),
+            // Recoverable Tier-2 panic (catchable by `recover`): a host sandboxing a
+            // plugin observes the denial rather than crashing. Names the capability.
+            CapDecision::Deny => Err(Control::Panic(AsError::at(
+                format!("capability '{}' denied", cap.name()),
+                span,
+            ))),
         }
-        // Recoverable Tier-2 panic (catchable by `recover`): a host sandboxing a
-        // plugin observes the denial rather than crashing. Names the capability so
-        // the violation is unambiguous.
-        Err(Control::Panic(AsError::at(
-            format!("capability '{}' denied", cap.name()),
-            span,
-        )))
+    }
+
+    /// FFI §4.4 STAGE 2 (net): enforce a `net` carve-out against a resolved `host`
+    /// at connect/bind time. **Gate-12 fast path:** when no `net` carve-out is
+    /// configured (`net_scope` is `None` — the default and the all-deny/all-grant
+    /// cases) this returns `Ok(())` immediately with **no host comparison** — the
+    /// dispatch-site bitset test was already conclusive. The allow-list is consulted
+    /// ONLY when a carve-out exists.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))] // only the net entries call it
+    pub(crate) fn check_net_host(&self, host: &str, span: Span) -> Result<(), Control> {
+        // Borrow is await-free and dropped before return.
+        let allowed = {
+            let caps = self.caps.borrow();
+            match &caps.net_scope {
+                None => return Ok(()), // Gate-12: no carve-out → no host comparison.
+                Some(scope) => scope.allows_host(host),
+            }
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Control::Panic(AsError::at(
+                format!("capability 'net' denied for host '{host}'"),
+                span,
+            )))
+        }
+    }
+
+    /// FFI §4.4 STAGE 2 (fs): enforce an `fs` carve-out against a resolved `path`
+    /// (a write iff `is_write`) at the path-resolving entry. **Gate-12 fast path:**
+    /// when no `fs` carve-out is configured (`fs_scope` is `None`) this returns
+    /// `Ok(())` immediately with **no path canonicalization**. Canonicalization is
+    /// paid for ONLY by programs that configure a carve-out.
+    pub(crate) fn check_fs_path(
+        &self,
+        path: &std::path::Path,
+        is_write: bool,
+        span: Span,
+    ) -> Result<(), Control> {
+        let allowed = {
+            let caps = self.caps.borrow();
+            match &caps.fs_scope {
+                None => return Ok(()), // Gate-12: no carve-out → no canonicalization.
+                Some(scope) => scope.allows_path(path, is_write),
+            }
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Control::Panic(AsError::at(
+                format!("capability 'fs' denied for path '{}'", path.display()),
+                span,
+            )))
+        }
     }
 
     /// Workers Spec A: record the entry program's full source so a `worker fn`
@@ -7335,6 +7393,172 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// FFI §4.4 Gate-12: with NO carve-out configured (`net_scope`/`fs_scope` are
+    /// `None` — the default and the all-deny/all-grant cases), the stage-2 checks
+    /// short-circuit to `Ok` with NO host comparison / NO path canonicalization.
+    /// Proven by feeding a host/path that WOULD be denied under a carve-out and
+    /// asserting it passes — the only way it can pass is if no comparison ran.
+    #[test]
+    fn stage2_checks_shortcircuit_when_no_carveout() {
+        let interp = Interp::new();
+        // No net carve-out → even a public address passes (no host comparison).
+        assert!(interp.check_net_host("8.8.8.8", Span::new(0, 0)).is_ok());
+        assert!(interp.check_net_host("example.com", Span::new(0, 0)).is_ok());
+        // No fs carve-out → even a write to /etc passes (no canonicalization).
+        assert!(interp
+            .check_fs_path(std::path::Path::new("/etc/passwd"), true, Span::new(0, 0))
+            .is_ok());
+    }
+
+    /// FFI §4.4 stage-2 enforcement (net): with a carve-out configured, the host
+    /// is checked — loopback/allow-listed pass, public is denied with a host-named
+    /// panic.
+    #[test]
+    fn stage2_net_carveout_enforces_allowlist() {
+        use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+        let interp = Interp::new();
+        let mut cs = CapSet::all_granted();
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::External,
+            allow: vec!["api.internal".into()],
+        });
+        interp.set_caps(cs);
+        // Loopback allowed.
+        assert!(interp.check_net_host("127.0.0.1", Span::new(0, 0)).is_ok());
+        // Allow-listed host allowed.
+        assert!(interp.check_net_host("api.internal", Span::new(0, 0)).is_ok());
+        // Public denied with a host-named message.
+        match interp.check_net_host("8.8.8.8", Span::new(0, 0)) {
+            Err(Control::Panic(e)) => {
+                assert!(e.message.contains("net") && e.message.contains("8.8.8.8"), "{}", e.message)
+            }
+            other => panic!("expected net host denial, got {other:?}"),
+        }
+    }
+
+    /// FFI §4.4: a `net` carve-out makes the dispatch gate DEFER (not deny-outright)
+    /// so the stage-2 host check runs — verified end-to-end through `call_stdlib`
+    /// for `net.lookup`: a public host is denied, loopback resolves.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn net_carveout_defers_then_stage2_denies_public_lookup() {
+        use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::All,
+            allow: vec!["localhost".into()],
+        });
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Public host: dispatch defers, stage-2 denies (host-named).
+                let denied = interp
+                    .call_stdlib(
+                        "net",
+                        "lookup",
+                        &[Value::Str("example.com".into())],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                match denied {
+                    Err(Control::Panic(e)) => assert!(
+                        e.message.contains("example.com"),
+                        "{}",
+                        e.message
+                    ),
+                    other => panic!("expected stage-2 denial, got {other:?}"),
+                }
+                // localhost is allow-listed → resolves to a [ips, nil] pair.
+                let ok = interp
+                    .call_stdlib(
+                        "net",
+                        "lookup",
+                        &[Value::Str("localhost".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                    .unwrap();
+                if let Value::Array(a) = ok {
+                    assert_eq!(a.borrow()[1], Value::Nil, "lookup should succeed, err=nil");
+                } else {
+                    panic!("expected [ips, err] pair");
+                }
+            })
+            .await;
+    }
+
+    /// FFI §4.4 fs carve-out end-to-end through `call_stdlib`: `deny="write",
+    /// allow=[<tmp/cache>]` permits a read and a write under the allowed subtree but
+    /// blocks a write elsewhere (the dispatch-site classifies arg 0 + read/write).
+    #[cfg(feature = "sys")]
+    #[tokio::test]
+    async fn fs_carveout_blocks_write_outside_allow() {
+        use crate::stdlib::caps::{CapSet, FsDeny, FsScope};
+        let dir = std::env::temp_dir().join("ascript_caps_e2e");
+        std::fs::create_dir_all(&dir).ok();
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.set_fs_scope(FsScope {
+            deny: FsDeny::Write,
+            allow: vec![dir.to_string_lossy().to_string()],
+        });
+        interp.set_caps(cs);
+        let allowed = dir.join("ok.txt");
+        let outside = std::env::temp_dir().join("ascript_caps_outside.txt");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Write under the allowed subtree → passes the gate (returns a pair).
+                let w_ok = interp
+                    .call_stdlib(
+                        "fs",
+                        "write",
+                        &[
+                            Value::Str(allowed.to_string_lossy().to_string().into()),
+                            Value::Str("hi".into()),
+                        ],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                assert!(w_ok.is_ok(), "write under allow should pass the gate");
+                // Write OUTSIDE the allowed subtree → denied with a path-named panic.
+                let w_deny = interp
+                    .call_stdlib(
+                        "fs",
+                        "write",
+                        &[
+                            Value::Str(outside.to_string_lossy().to_string().into()),
+                            Value::Str("nope".into()),
+                        ],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                match w_deny {
+                    Err(Control::Panic(e)) => {
+                        assert!(e.message.contains("fs") && e.message.contains("denied"), "{}", e.message)
+                    }
+                    other => panic!("expected fs write denial, got {other:?}"),
+                }
+                // A READ outside the subtree is still allowed (write-deny mode).
+                let r_ok = interp
+                    .call_stdlib(
+                        "fs",
+                        "exists",
+                        &[Value::Str(outside.to_string_lossy().to_string().into())],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                assert!(r_ok.is_ok(), "read should be allowed in write-deny mode");
+            })
+            .await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&outside).ok();
     }
 
     /// SP12 soft hook: with NO `telemetry.init` (and regardless of the feature),

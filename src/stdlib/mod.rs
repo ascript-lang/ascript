@@ -272,6 +272,27 @@ pub fn is_known_std_module(path: &str) -> bool {
     STD_MODULES.contains(&path)
 }
 
+/// FFI §4.4: for a path-bearing `fs` function, return `(path, is_write)` — the
+/// path it operates on (arg 0) and whether the operation MUTATES the filesystem.
+/// `None` for the pure path-string helpers (`join`/`dirname`/… do not touch the
+/// filesystem) or a non-string arg 0 (a type error the fn itself reports). Used by
+/// the fs stage-2 carve-out check; never reached unless an `fs` carve-out is
+/// configured (Gate-12).
+fn fs_path_arg<'a>(func: &str, args: &'a [Value]) -> Option<(&'a str, bool)> {
+    let is_write = match func {
+        // Filesystem-mutating operations.
+        "write" | "append" | "mkdir" | "remove" => true,
+        // Filesystem-reading operations.
+        "read" | "readBytes" | "exists" | "stat" | "readDir" | "walk" | "grep" => false,
+        // Pure path-string ops (join/dirname/basename/extname/isAbsolute) — no fs access.
+        _ => return None,
+    };
+    match args.first() {
+        Some(Value::Str(s)) => Some((s.as_ref(), is_write)),
+        _ => None,
+    }
+}
+
 /// FFI §4.1/§4.3: the **complete, central** map from a dispatch-site `(module,
 /// func)` to the [`Cap`](caps::Cap) it requires, or `None` for a module that
 /// touches no dangerous resource. This is the single enumeration the capability
@@ -419,6 +440,17 @@ impl Interp {
         if !cap_bits.all_granted() {
             if let Some(cap) = required_cap(module, func) {
                 self.require_cap(cap, module, func, args, span)?;
+            }
+            // FFI §4.4 stage-2 (fs carve-out): a configured `fs` carve-out makes the
+            // dispatch gate DEFER above; the resolved path is re-checked here, at the
+            // fs dispatch (the path-bearing fs funcs take the path as arg 0). Gate-12:
+            // `check_fs_path` returns immediately when no `fs` carve-out is configured,
+            // so this is a cheap classify + (usually) a no-op. The net stage-2 lives
+            // deeper (at connect/bind / DNS) where the resolved host is known.
+            if module == "fs" {
+                if let Some((path, is_write)) = fs_path_arg(func, args) {
+                    self.check_fs_path(std::path::Path::new(path), is_write, span)?;
+                }
             }
         }
         match module {
