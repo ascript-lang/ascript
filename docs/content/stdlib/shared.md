@@ -112,6 +112,31 @@ value. The **mutating** methods do not (they raise the frozen panic above).
 > `method '<name>' is not available on a frozen instance (methods are not shared
 > across isolates; freeze exposes fields only)`.
 
+### Serializing a frozen value
+
+Because a frozen value **reads** exactly like its underlying kind, it also
+**serializes** exactly like it — the headline *"freeze the config/routing table once,
+then emit it on every request"* path. `json.stringify`, `json.parse`-round-trip,
+`msgpack`/`cbor` encode, YAML/TOML, and `std/log`'s structured fields all accept a
+frozen container transparently:
+
+```ascript
+import * as shared from "std/shared"
+import * as json from "std/json"
+
+let cfg = shared.freeze({ region: "us", limits: [10, 100] })
+
+json.stringify(cfg)[0]                       // {"region":"us","limits":[10,100]}
+json.stringify({ snapshot: cfg, ok: true })[0]  // a frozen child in a LIVE object
+                                             //   serializes — no "contagion"
+```
+
+A frozen value serializes **identically to its live equivalent**: a frozen
+container (object / array / map / set) emits its data; a frozen **instance** (or enum
+variant / regex) follows the same rule a *live* one does — `json.stringify` of a class
+instance is a `[nil, err]` Tier-1 pair (instances are not JSON values) whether or not
+it is frozen, while `std/log` renders it the same way for both.
+
 ---
 
 ## The cross-isolate pattern

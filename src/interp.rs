@@ -7024,6 +7024,65 @@ pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value 
     }
 }
 
+/// Materialize ONE level of a frozen `SharedNode` into a LIVE `Value` whose children
+/// are `Value::Shared` views (an `Arc` bump per child, never a deep copy). The std
+/// serializers (json / msgpack / cbor / log's `to_json_lossy`) walk `Value`, so a raw
+/// `Value::Shared` otherwise hits their catch-all and a frozen container fails to
+/// serialize (and poisons any live container that holds it). With this, a serializer
+/// detects `Value::Shared`, materializes one level, and recurses — re-materializing
+/// each deeper level on demand (frozen graphs are acyclic by construction, so this
+/// terminates without a `seen` guard).
+///
+/// Returns `None` for the node kinds that have no live-container analogue we can
+/// faithfully rebuild — `Instance` (needs its `Class`), `EnumVariant`, `Regex` — so
+/// the caller can fall back to its OWN live-value semantics for those (e.g. json's
+/// `from_ascript` errors on a live instance, while `to_json_lossy` renders its
+/// fields). This keeps a frozen value serializing byte-identically to its live kind.
+///
+/// Gated on `data` (json/yaml/toml + the log `to_json_lossy`); `binary` (msgpack/cbor)
+/// depends on `data`, so this matches the union of all callers — no dead code under
+/// `--no-default-features`.
+#[cfg(feature = "data")]
+pub(crate) fn shared_to_value_shallow(node: &crate::value::SharedNode) -> Option<Value> {
+    use crate::value::{ArrayCell, MapCell, ObjectCell, SetCell, SharedNode};
+    Some(match node {
+        SharedNode::Nil => Value::Nil,
+        SharedNode::Bool(b) => Value::Bool(*b),
+        SharedNode::Int(i) => Value::Int(*i),
+        SharedNode::Float(f) => Value::Float(*f),
+        SharedNode::Decimal(d) => Value::Decimal(*d),
+        SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
+        SharedNode::Bytes(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
+        SharedNode::Array(a) => {
+            Value::Array(ArrayCell::new(a.iter().map(shared_child_to_value).collect()))
+        }
+        SharedNode::Object(o) => {
+            let mut m = indexmap::IndexMap::with_capacity(o.len());
+            for (k, v) in o.iter() {
+                m.insert(k.to_string(), shared_child_to_value(v));
+            }
+            Value::Object(ObjectCell::new(m))
+        }
+        SharedNode::Map(mp) => {
+            let mut m = indexmap::IndexMap::with_capacity(mp.len());
+            for (k, v) in mp.iter() {
+                m.insert(k.to_map_key(), shared_child_to_value(v));
+            }
+            Value::Map(MapCell::new(m))
+        }
+        SharedNode::Set(s) => {
+            let mut set = indexmap::IndexSet::with_capacity(s.len());
+            for k in s.iter() {
+                set.insert(k.to_map_key());
+            }
+            Value::Set(SetCell::new(set))
+        }
+        SharedNode::Instance { .. }
+        | SharedNode::EnumVariant { .. }
+        | SharedNode::Regex { .. } => return None,
+    })
+}
+
 /// Index-read into a frozen `Shared` node (SRV §3.5). Returns a scalar `Value` or a
 /// `Value::Shared` sub-view; an out-of-range/missing key is `nil` (matching the live
 /// Array/Object/Map semantics).

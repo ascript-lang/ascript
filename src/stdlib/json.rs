@@ -173,6 +173,17 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             seen.pop();
             Ok(serde_json::Value::Array(out))
         }
+        // SRV §3: a frozen value serializes exactly like its underlying kind. A
+        // frozen container materializes one level (children stay `Value::Shared`) and
+        // recurses; a frozen instance/enum-variant/regex falls through to the same
+        // catch-all a LIVE instance/regex hits (kept consistent via `kind_name`).
+        Value::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
+            Some(live) => from_ascript(&live, seen),
+            None => Err(format!(
+                "cannot serialize a value of type {} to JSON",
+                node.kind_name()
+            )),
+        },
         other => Err(format!(
             "cannot serialize a value of type {} to JSON",
             crate::interp::type_name(other)
@@ -273,6 +284,26 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         Value::Function(_) | Value::Closure(_) | Value::Builtin(_) => {
             J::String("<function>".into())
         }
+        // SRV §3: a frozen value renders exactly like its live kind. Frozen containers
+        // materialize one level + recurse; a frozen instance renders its fields (as a
+        // live instance does above); a frozen enum-variant/regex falls to the same
+        // lossy `<kind>` string a live one would.
+        Value::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
+            Some(live) => to_json_lossy(&live, seen),
+            None => match &**node {
+                crate::value::SharedNode::Instance { fields, .. } => {
+                    let mut m = serde_json::Map::new();
+                    for (k, v) in fields.iter() {
+                        m.insert(
+                            k.to_string(),
+                            to_json_lossy(&crate::interp::shared_child_to_value(v), seen),
+                        );
+                    }
+                    J::Object(m)
+                }
+                _ => J::String(format!("<{}>", node.kind_name())),
+            },
+        },
         other => J::String(format!("<{}>", crate::interp::type_name(other))),
     }
 }
@@ -299,6 +330,62 @@ mod tests {
         assert!(parsed
             .to_string()
             .starts_with("[{a: 1, b: [true, nil, \"x\"]}, nil]"));
+    }
+
+    // SRV regression (holistic-review MAJOR): a frozen `Value::Shared` must serialize
+    // byte-identically to its live equivalent — and a frozen CHILD must not poison a
+    // live container that holds it. Before the fix, `from_ascript` hit its catch-all
+    // ("cannot serialize a value of type object to JSON") for any frozen value.
+    #[cfg(feature = "shared")]
+    #[test]
+    fn frozen_value_serializes_like_live() {
+        use crate::stdlib::shared;
+        let src = "{\"region\":\"us\",\"ports\":[80,443],\"meta\":{\"a\":1,\"b\":[true,null]}}";
+        let parsed = call("parse", &[s(src)], sp()).unwrap();
+        let live = match parsed {
+            Value::Array(a) => a.borrow()[0].clone(),
+            _ => unreachable!("parse returns [value, err]"),
+        };
+        let frozen = shared::freeze(&live, sp()).unwrap();
+
+        // 1. from_ascript: frozen object/array/nested produces the SAME json as live.
+        let live_j = from_ascript(&live, &mut Vec::new()).unwrap();
+        let frozen_j = from_ascript(&frozen, &mut Vec::new()).unwrap();
+        assert_eq!(live_j, frozen_j);
+
+        // 2. to_json_lossy (the std/log path): frozen renders identically to live.
+        assert_eq!(
+            to_json_lossy(&live, &mut Vec::new()),
+            to_json_lossy(&frozen, &mut Vec::new())
+        );
+
+        // 3. Contagion guard: a frozen child inside a LIVE object still serializes.
+        let mut m = indexmap::IndexMap::new();
+        m.insert("cfg".to_string(), frozen.clone());
+        let mixed = Value::Object(crate::value::ObjectCell::new(m));
+        assert_eq!(
+            from_ascript(&mixed, &mut Vec::new()).unwrap(),
+            serde_json::json!({ "cfg": live_j }),
+        );
+
+        // 4. Frozen scalar + frozen array serialize directly.
+        let fi = shared::freeze(&Value::Int(42), sp()).unwrap();
+        assert_eq!(
+            from_ascript(&fi, &mut Vec::new()).unwrap(),
+            serde_json::json!(42)
+        );
+
+        // 5. Map + Set freeze through their canonical key/element forms.
+        let mp = call("parse", &[s("{\"k\":[1,2,3]}")], sp()).unwrap();
+        let mv = match mp {
+            Value::Array(a) => a.borrow()[0].clone(),
+            _ => unreachable!(),
+        };
+        let fm = shared::freeze(&mv, sp()).unwrap();
+        assert_eq!(
+            from_ascript(&fm, &mut Vec::new()).unwrap(),
+            serde_json::json!({ "k": [1, 2, 3] })
+        );
     }
 
     #[test]

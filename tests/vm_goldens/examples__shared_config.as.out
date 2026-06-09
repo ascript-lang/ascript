@@ -9,3 +9,5 @@ true
 true
 cannot mutate a frozen object
 cannot mutate a frozen array
+{"region":"us-east-1","flags":{"beta":true,"canary":false},"limits":[10,100,1000]}
+{"snapshot":{"region":"us-east-1","flags":{"beta":true,"canary":false},"limits":[10,100,1000]},"ok":true}

@@ -8,6 +8,7 @@
 //
 //   ascript run examples/shared_config.as
 import * as shared from "std/shared"
+import * as json from "std/json"
 
 fn main() {
   // Build the config once and freeze it. The result is an immutable DAG.
@@ -36,6 +37,12 @@ fn main() {
   print(e1.message) // cannot mutate a frozen object
   let [__, e2] = recover(() => cfg.limits.push(9999))
   print(e2.message) // cannot mutate a frozen array
+
+  // A frozen value serializes exactly like its underlying kind — the headline
+  // "freeze the config once, emit it on every request" path. And a frozen value
+  // nested inside a LIVE object does NOT poison the enclosing serialization.
+  print(json.stringify(cfg)[0]) // {"region":"us-east-1","flags":{...},"limits":[...]}
+  print(json.stringify({snapshot: cfg, ok: true})[0]) // frozen child, live parent
 }
 
 main()

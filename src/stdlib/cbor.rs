@@ -89,6 +89,16 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
             seen.pop();
             Ok(Cb::Map(pairs))
         }
+        // SRV §3: a frozen value encodes like its underlying kind. Frozen containers
+        // materialize one level + recurse; instance/enum-variant/regex error like a
+        // live one (no live arm exists for them either).
+        Value::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
+            Some(live) => to_cbor(&live, seen),
+            None => Err(format!(
+                "cannot serialize a value of type {} to CBOR",
+                node.kind_name()
+            )),
+        },
         other => Err(format!(
             "cannot serialize a value of type {} to CBOR",
             crate::interp::type_name(other)
@@ -283,5 +293,33 @@ mod tests {
                 other => panic!("expected object, got {:?}", other),
             }
         }
+    }
+
+    // SRV regression (holistic-review MAJOR): a frozen container must encode like its
+    // live equivalent (before the fix, `to_cbor` errored on any `Value::Shared`).
+    #[cfg(feature = "shared")]
+    #[test]
+    fn frozen_container_encodes_like_live() {
+        use crate::stdlib::shared;
+        let mut m = indexmap::IndexMap::new();
+        m.insert("a".to_string(), Value::Int(1));
+        m.insert(
+            "xs".to_string(),
+            Value::Array(crate::value::ArrayCell::new(vec![
+                Value::Int(2),
+                Value::Int(3),
+            ])),
+        );
+        let live = Value::Object(crate::value::ObjectCell::new(m));
+        let frozen = shared::freeze(&live, sp()).unwrap();
+        // Encoding is deterministic: the frozen object must encode to the SAME bytes
+        // as the live one (Value::Object `==` is identity, so compare the bytes).
+        let bytes_of = |v: Value| match call("encode", &[v], sp()).unwrap() {
+            Value::Bytes(b) => b.borrow().clone(),
+            _ => panic!("encode did not return bytes"),
+        };
+        assert_eq!(bytes_of(live.clone()), bytes_of(frozen));
+        assert!(matches!(roundtrip(live), Value::Object(_)));
+        assert!(call("encode", &[shared::freeze(&Value::Int(7), sp()).unwrap()], sp()).is_ok());
     }
 }
