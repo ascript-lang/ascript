@@ -157,6 +157,24 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
                 _ => Some(Type::Named(name)),
             }
         }
+        // TYPE §6: a generic type-PARAMETER reference (`T`) lowers to the
+        // runtime-erased `Type::Param` (accept-anything in `check_type`). The legacy
+        // parser produces the same node for an in-scope param, so the two front-ends
+        // agree (both engines check a `T`-typed slot identically — as `any`).
+        K::ParamType => {
+            let name = cst_first_ident(node)?;
+            Some(Type::Param(name))
+        }
+        // TYPE §6: a parameterized function type `fn(A) -> B` → `Type::FnSig`. The
+        // params are the leading type children; the return is the LAST type child
+        // (after the `-> `). Runtime-erased: checked as a plain callable.
+        K::FnType => {
+            let mut tys: Vec<Type> = node.children().filter_map(cst_type).collect();
+            // A well-formed `fn(P*) -> R` has ≥1 type child (the return). The last is
+            // the return; the rest are params.
+            let ret = tys.pop()?;
+            Some(Type::FnSig(tys, Box::new(ret)))
+        }
         K::OptionalType => {
             let inner = node.children().find_map(cst_type)?;
             Some(Type::Optional(Box::new(inner)))
@@ -727,6 +745,9 @@ fn is_type_node(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         NamedType | GenericType | OptionalType | UnionType | TupleType
+            // TYPE §6: a generic type-param reference and a `fn(A)->B` function type.
+            | ParamType
+            | FnType
     )
 }
 

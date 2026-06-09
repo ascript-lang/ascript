@@ -1075,6 +1075,27 @@ impl Printer<'_> {
                 }
                 self.out.text(">");
             }
+            // TYPE §6: a generic type-param reference renders as its bare name.
+            ParamType => self.out.text(node_first_ident_or_text(node).trim()),
+            // TYPE §6: `fn(A) -> B` — params are the type children except the LAST,
+            // which is the return type. Canonical `fn(A, B) -> R` spacing.
+            FnType => {
+                let ts: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_type_kind(c.kind())).collect();
+                self.out.text("fn(");
+                // Last type child is the return; the rest are params.
+                let param_count = ts.len().saturating_sub(1);
+                for (i, t) in ts.iter().take(param_count).enumerate() {
+                    if i > 0 {
+                        self.out.text(", ");
+                    }
+                    self.type_ann(t);
+                }
+                self.out.text(") -> ");
+                if let Some(ret) = ts.last() {
+                    self.type_ann(ret);
+                }
+            }
             OptionalType => {
                 if let Some(inner) = node.children().find(|c| is_type_kind(c.kind())) {
                     self.type_ann(inner);
@@ -1179,6 +1200,9 @@ fn is_type_kind(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         NamedType | GenericType | OptionalType | UnionType | TupleType
+            // TYPE §6: a generic type-param reference and a `fn(A)->B` function type.
+            | ParamType
+            | FnType
     )
 }
 
