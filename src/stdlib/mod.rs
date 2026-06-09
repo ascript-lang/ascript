@@ -10,6 +10,7 @@ pub mod array;
 pub mod assert_mod;
 pub mod bench;
 pub mod bytes;
+pub mod caps;
 #[cfg(feature = "binary")]
 pub mod cbor;
 pub mod cli;
