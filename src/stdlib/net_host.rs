@@ -12,6 +12,7 @@ use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
+use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -115,7 +116,7 @@ impl Interp {
         for sa in addrs {
             let ip = sa.ip().to_string();
             if seen.insert(ip.clone()) {
-                ips.push(Value::Str(crate::value::AStr::from(ip.as_str())));
+                ips.push(Value::Str(Rc::from(ip.as_str())));
             }
         }
         let arr = Value::Array(crate::value::ArrayCell::new(ips));

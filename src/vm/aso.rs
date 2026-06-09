@@ -814,7 +814,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
         TAG_BOOL => Value::Bool(r.u8()? != 0),
         TAG_INT => Value::Int(r.u64()? as i64),
         TAG_NUMBER => Value::Float(r.f64()?),
-        TAG_STR => Value::Str(crate::value::AStr::from(r.str()?.as_str())),
+        TAG_STR => Value::Str(Rc::from(r.str()?.as_str())),
         TAG_DECIMAL => {
             let b = r.take(16)?;
             let mut arr = [0u8; 16];
@@ -2565,8 +2565,8 @@ run()
         // pass the literal-only check and round-trip byte-stably.
         let mut c = Chunk::new();
         let keys = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Str("a".into()),
-            Value::Str("b".into()),
+            Value::Str(std::rc::Rc::from("a")),
+            Value::Str(std::rc::Rc::from("b")),
         ]));
         c.add_const(keys);
         assert_eq!(c.check_consts_literal_only(), Ok(()));

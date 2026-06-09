@@ -909,11 +909,8 @@ impl Vm {
                     // The u8 mutability flag follows the u16 name const (1 = `let`,
                     // 0 = immutable `const`/`fn`/`class`/`enum`/`import`).
                     let mutable = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) != 0;
-                    let name: Rc<str> = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        // VAL Task 9: `Value::Str` is the thin `AStr`; module globals are
-                        // keyed by the string IDENTIFIER (`Rc<str>`), so decode + re-intern
-                        // at this boundary (not a hot per-element path).
-                        Value::Str(s) => Rc::from(s.as_str()),
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -1364,7 +1361,7 @@ impl Vm {
                             .borrow()
                             .iter()
                             .map(|v| match v {
-                                Value::Str(s) => Some(Rc::from(s.as_str())),
+                                Value::Str(s) => Some(s.clone()),
                                 _ => None,
                             })
                             .collect(),
@@ -1502,7 +1499,7 @@ impl Vm {
                             .borrow()
                             .iter()
                             .map(|v| match v {
-                                Value::Str(s) => Some(Rc::from(s.as_str())),
+                                Value::Str(s) => Some(s.clone()),
                                 _ => None,
                             })
                             .collect(),
@@ -1795,13 +1792,11 @@ impl Vm {
                     // the first-seen position (IndexMap semantics), byte-identical
                     // to the tree-walker's `ExprKind::Object`.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    // VAL Task 9: keys decode to `String` directly (the map is `String`-
-                    // keyed anyway) — `Value::Str` is now the thin `AStr`.
-                    let mut pairs: Vec<(String, Value)> = vec![(String::new(), Value::Nil); n];
+                    let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
                     for slot in pairs.iter_mut().rev() {
                         let value = fiber.pop();
                         let key = match fiber.pop() {
-                            Value::Str(s) => s.to_string(),
+                            Value::Str(s) => s,
                             other => {
                                 return Err(self.panic_at(
                                     fiber,
@@ -1814,7 +1809,7 @@ impl Vm {
                     }
                     let mut map = indexmap::IndexMap::with_capacity(n);
                     for (k, v) in pairs {
-                        map.insert(k, v);
+                        map.insert(k.to_string(), v);
                     }
                     // Assign the object's hidden-class shape from its final ordered
                     // keys (V11-T2). Pure metadata — does not change behavior.
@@ -2529,7 +2524,7 @@ impl Vm {
                                 .borrow()
                                 .iter()
                                 .filter_map(|v| match v {
-                                    Value::Str(s) => Some(Rc::from(s.as_str())),
+                                    Value::Str(s) => Some(s.clone()),
                                     _ => None,
                                 })
                                 .collect(),
@@ -5059,7 +5054,7 @@ mod tests {
     fn neg_non_number_panics_with_span() {
         // Push a Str const, then NEG -> "cannot negate" panic with a real span.
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Str(crate::value::AStr::from("nope")));
+        let k = c.add_const(Value::Str(Rc::from("nope")));
         c.emit_u16(Op::Const, k, s());
         // give NEG a distinct, non-empty span so we can assert it is carried.
         let neg_span = Span::new(5, 9);
@@ -5083,7 +5078,7 @@ mod tests {
     #[test]
     fn add_non_numbers_panics() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Str(crate::value::AStr::from("a")));
+        let a = c.add_const(Value::Str(Rc::from("a")));
         let b = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
@@ -5235,7 +5230,7 @@ mod tests {
     #[test]
     fn range_op_non_number_bounds_panics() {
         let mut c = Chunk::new();
-        let ks = c.add_const(Value::Str(crate::value::AStr::from("x")));
+        let ks = c.add_const(Value::Str(Rc::from("x")));
         let k5 = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, ks, s());
         c.emit_u16(Op::Const, k5, s());
@@ -5256,8 +5251,8 @@ mod tests {
     #[test]
     fn string_concat_through_add() {
         let mut c = Chunk::new();
-        let ka = c.add_const(Value::Str(crate::value::AStr::from("foo")));
-        let kb = c.add_const(Value::Str(crate::value::AStr::from("bar")));
+        let ka = c.add_const(Value::Str(Rc::from("foo")));
+        let kb = c.add_const(Value::Str(Rc::from("bar")));
         c.emit_u16(Op::Const, ka, s());
         c.emit_u16(Op::Const, kb, s());
         c.emit(Op::Add, s());
@@ -5303,7 +5298,7 @@ mod tests {
         // GET_GLOBAL print; CONST 42; CALL 1; RETURN (CALL leaves print's nil
         // result, which RETURN pops).
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str(crate::value::AStr::from("print")));
+        let name = c.add_const(Value::Str(Rc::from("print")));
         c.emit_u16(Op::GetGlobal, name, s());
         let k = c.add_const(Value::Float(42.0));
         c.emit_u16(Op::Const, k, s());
@@ -5317,7 +5312,7 @@ mod tests {
     #[test]
     fn get_global_undefined_panics() {
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str(crate::value::AStr::from("not_a_builtin")));
+        let name = c.add_const(Value::Str(Rc::from("not_a_builtin")));
         let gg_span = Span::new(3, 16);
         c.emit_u16(Op::GetGlobal, name, gg_span);
         c.emit(Op::Return, s());
@@ -5475,7 +5470,7 @@ mod tests {
         // CONST "a"; CONST 1; CONST "b"; CONST 2; NEW_OBJECT 2 → {a:1, b:2}.
         let mut c = Chunk::new();
         for (k, v) in [("a", 1.0), ("b", 2.0)] {
-            let ki = c.add_const(Value::Str(crate::value::AStr::from(k)));
+            let ki = c.add_const(Value::Str(Rc::from(k)));
             c.emit_u16(Op::Const, ki, s());
             let vi = c.add_const(Value::Float(v));
             c.emit_u16(Op::Const, vi, s());
@@ -5532,12 +5527,12 @@ mod tests {
     fn get_index_object_missing_key_is_nil() {
         // {a:1}["b"] → nil (missing object key is nil, not a panic).
         let mut c = Chunk::new();
-        let ka = c.add_const(Value::Str(crate::value::AStr::from("a")));
+        let ka = c.add_const(Value::Str(Rc::from("a")));
         c.emit_u16(Op::Const, ka, s());
         let v1 = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, v1, s());
         c.emit_u16(Op::NewObject, 1, s());
-        let kb = c.add_const(Value::Str(crate::value::AStr::from("b")));
+        let kb = c.add_const(Value::Str(Rc::from("b")));
         c.emit_u16(Op::Const, kb, s());
         c.emit(Op::GetIndex, s());
         c.emit(Op::Return, s());
@@ -5551,12 +5546,12 @@ mod tests {
     fn get_prop_object_field() {
         // {a:1}.a → 1 via GET_PROP "a".
         let mut c = Chunk::new();
-        let ka = c.add_const(Value::Str(crate::value::AStr::from("a")));
+        let ka = c.add_const(Value::Str(Rc::from("a")));
         c.emit_u16(Op::Const, ka, s());
         let v1 = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, v1, s());
         c.emit_u16(Op::NewObject, 1, s());
-        let name = c.add_const(Value::Str(crate::value::AStr::from("a")));
+        let name = c.add_const(Value::Str(Rc::from("a")));
         c.emit_u16(Op::GetProp, name, s());
         c.emit(Op::Return, s());
         assert_eq!(expect_number(c), 1.0);
@@ -5567,7 +5562,7 @@ mod tests {
         // nil?.a → nil (short-circuit, no read_member call).
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
-        let name = c.add_const(Value::Str(crate::value::AStr::from("a")));
+        let name = c.add_const(Value::Str(Rc::from("a")));
         c.emit_u16(Op::GetPropOpt, name, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
@@ -5581,7 +5576,7 @@ mod tests {
         // nil.a → "cannot read property 'a' of nil" (NOT short-circuited).
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
-        let name = c.add_const(Value::Str(crate::value::AStr::from("a")));
+        let name = c.add_const(Value::Str(Rc::from("a")));
         c.emit_u16(Op::GetProp, name, s());
         c.emit(Op::Return, s());
         match run_chunk(c) {
@@ -5861,7 +5856,7 @@ mod tests {
         let out = with_vm(|vm| async move {
             let r = vm
                 .call_value(
-                    Value::Builtin(crate::value::AStr::from("print")),
+                    Value::Builtin(Rc::from("print")),
                     vec![Value::Float(7.0)],
                     s(),
                 )
@@ -5909,7 +5904,7 @@ mod tests {
         let mut c = Chunk::new();
         let pair = c.add_const(crate::interp::make_pair(
             Value::Nil,
-            Value::Str(crate::value::AStr::from("boom")),
+            Value::Str(Rc::from("boom")),
         ));
         c.emit_u16(Op::Const, pair, s());
         c.emit(Op::Propagate, s());
@@ -5922,7 +5917,7 @@ mod tests {
                 let b = a.borrow();
                 assert_eq!(b.len(), 2);
                 assert_eq!(b[0], Value::Nil);
-                assert_eq!(b[1], Value::Str(crate::value::AStr::from("boom")));
+                assert_eq!(b[1], Value::Str(Rc::from("boom")));
             }
             other => panic!("expected Done([nil, \"boom\"]), got {other:?}"),
         }
@@ -6344,7 +6339,7 @@ mod tests {
     fn get_global_cached_returns_same_builtin() {
         // Manually populate + read the global cache for a GET_GLOBAL site.
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str(crate::value::AStr::from("print")));
+        let name = c.add_const(Value::Str(Rc::from("print")));
         c.emit_u16(Op::GetGlobal, name, s());
         c.emit(Op::Return, s());
         let version = 0u64;

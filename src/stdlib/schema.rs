@@ -150,7 +150,7 @@ fn err_obj(path: &str, message: String) -> Value {
 pub(crate) fn schema_kind(schema: &Value) -> Option<Rc<str>> {
     match schema {
         Value::Object(o) => match o.borrow().get("__kind") {
-            Some(Value::Str(s)) => Some(Rc::from(s.as_str())),
+            Some(Value::Str(s)) => Some(s.clone()),
             _ => None,
         },
         _ => None,

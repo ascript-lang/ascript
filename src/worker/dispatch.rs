@@ -141,11 +141,7 @@ fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
                     .last()
                     .unwrap_or(0);
                 let def = classify_binding(top, prev, stmt_start, ip);
-                // VAL Task 9: the `Value::Str` payload is now the thin `AStr`; this
-                // cold worker code-shipping path keys its def map by `Rc<str>` (a
-                // string IDENTIFIER, not a runtime string value), so decode to `&str`
-                // and re-intern. Not hot.
-                defs.entry(Rc::from(name.as_str())).or_insert(def);
+                defs.entry(name.clone()).or_insert(def);
             }
         }
 
@@ -320,7 +316,7 @@ fn collect_get_global_names(chunk: &Chunk, out: &mut Vec<Rc<str>>) {
         if op == Op::GetGlobal {
             let idx = chunk.read_u16(ip + 1) as usize;
             if let Some(Value::Str(name)) = chunk.consts.get(idx) {
-                out.push(Rc::from(name.as_str()));
+                out.push(name.clone());
             }
         }
         ip += 1 + width;
@@ -348,7 +344,7 @@ fn collect_range_refs(top: &Chunk, start: usize, end: usize, out: &mut Vec<Rc<st
             Op::GetGlobal => {
                 let idx = top.read_u16(ip + 1) as usize;
                 if let Some(Value::Str(name)) = top.consts.get(idx) {
-                    out.push(Rc::from(name.as_str()));
+                    out.push(name.clone());
                 }
             }
             Op::Closure => {
@@ -634,7 +630,7 @@ fn decode_class_group(
 
 fn class_name_from_const(top: &Chunk, operand: u16) -> Result<Rc<str>, Control> {
     match top.consts.get(operand as usize) {
-        Some(Value::Str(s)) => Ok(Rc::from(s.as_str())),
+        Some(Value::Str(s)) => Ok(s.clone()),
         _ => Err(panic_build("superclass GET_GLOBAL has no name constant")),
     }
 }
@@ -764,7 +760,7 @@ fn emit_class_recursive(
     for m in &members {
         match m {
             GroupMember::SuperGlobal(sup) => {
-                let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(sup.clone())));
+                let name_idx = frag.add_const(Value::Str(sup.clone()));
                 frag.emit_u16(Op::GetGlobal, name_idx, span);
             }
             GroupMember::Closure(proto) => {
@@ -777,7 +773,7 @@ fn emit_class_recursive(
     }
     let cp_idx = frag.add_class_proto(cp);
     frag.emit_u16(Op::Class, cp_idx, span);
-    let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(class_name)));
+    let name_idx = frag.add_const(Value::Str(Rc::from(class_name)));
     frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
     Ok(())
 }
@@ -828,18 +824,18 @@ fn emit_dep_closure(
         match defs.get(name.as_ref()) {
             Some(TopDef::Const(v)) => {
                 emit_const_load(frag, v.clone(), span);
-                let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(name.clone())));
+                let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Fn(proto)) => {
                 let proto_idx = frag.add_proto(proto.clone());
                 frag.emit_u16(Op::Closure, proto_idx, span);
-                let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(name.clone())));
+                let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::ComputedConst { start, end }) => {
                 copy_code_range(frag, top, *start, *end, span);
-                let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(name.clone())));
+                let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Interface(proto)) => {
@@ -859,7 +855,7 @@ fn emit_dep_closure(
 fn emit_interface_def(frag: &mut Chunk, proto: Rc<InterfaceProto>, name: &Rc<str>, span: Span) {
     let idx = frag.add_interface_proto(proto);
     frag.emit_u16(Op::DefineInterface, idx, span);
-    let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(name.clone())));
+    let name_idx = frag.add_const(Value::Str(name.clone()));
     frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
 }
 
@@ -1215,13 +1211,13 @@ fn materialize_slice(
         match defs.get(name.as_ref()) {
             Some(TopDef::Const(v)) => {
                 emit_const_load(&mut frag, v.clone(), span);
-                let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(name.clone())));
+                let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Fn(proto)) => {
                 let proto_idx = frag.add_proto(proto.clone());
                 frag.emit_u16(Op::Closure, proto_idx, span);
-                let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(name.clone())));
+                let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::ComputedConst { start, end }) => {
@@ -1229,7 +1225,7 @@ fn materialize_slice(
                 // bind the result with DEFINE_GLOBAL. The range excludes the trailing
                 // DEFINE_GLOBAL, so emit it here.
                 copy_code_range(&mut frag, top, *start, *end, span);
-                let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(name.clone())));
+                let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Interface(proto)) => {
@@ -1244,7 +1240,7 @@ fn materialize_slice(
     if emit_entry {
         let proto_idx = frag.add_proto(entry_proto.clone());
         frag.emit_u16(Op::Closure, proto_idx, span);
-        let name_idx = frag.add_const(Value::Str(crate::value::AStr::from(entry_name)));
+        let name_idx = frag.add_const(Value::Str(Rc::from(entry_name)));
         frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
     }
 
@@ -1284,7 +1280,7 @@ fn source_order_define_names(top: &Chunk) -> Vec<Rc<str>> {
         if op == Op::DefineGlobal {
             let idx = top.read_u16(ip + 1) as usize;
             if let Some(Value::Str(name)) = top.consts.get(idx) {
-                names.push(Rc::from(name.as_str()));
+                names.push(name.clone());
             }
         }
         ip += 1 + width;
