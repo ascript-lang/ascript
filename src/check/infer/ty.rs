@@ -15,6 +15,12 @@ use crate::syntax::kind::SyntaxKind;
 pub type ClassId = usize;
 /// An enum declaration index into the [`Table`].
 pub type EnumId = usize;
+/// An interface declaration index into the [`Table`] (IFACE §6 — reserved name).
+pub type InterfaceId = usize;
+/// A unique generic type-variable id, allocated within a single instantiation
+/// context by the unifier (TYPE §4.2). Two `Var`s with the same id are the same
+/// variable; distinct ids are distinct variables.
+pub type VarId = u32;
 
 /// Width cap on a normalized union: a union with more members collapses to `Any`.
 const UNION_WIDTH_CAP: usize = 8;
@@ -76,6 +82,28 @@ pub enum CheckTy {
     EnumVariant(EnumId, std::rc::Rc<str>),
     /// INTERNAL refinement from flow: a literal value.
     Literal(LitVal),
+    /// A generic type VARIABLE (TYPE §4.2). `id` identifies it within an
+    /// instantiation context; the optional boxed `CheckTy` is its interface
+    /// `bound` (`None` ⇒ unbounded ⇒ gradual top). **The cardinal Gate-5 rule:**
+    /// an unsolved/unbounded `Var` is `Unknown`-yielding (never `No`) — it is the
+    /// gradual escape (`Any`) generalized. After unification a solved `Var` is
+    /// substituted by its solution everywhere before any diagnosing `assignable`.
+    Var(VarId, Option<Box<CheckTy>>),
+    /// A PARAMETERIZED function type (`fn(A) -> B`): the param types + return type
+    /// (TYPE §5.1). A strict extension of the bare [`CheckTy::Fn`] — a bare `fn`
+    /// stays `Fn` and is `Unknown`-compatible with any `FnSig` (gradual).
+    FnSig(Vec<CheckTy>, Box<CheckTy>),
+    /// A NOMINAL-by-id but PARAMETERIZED class instantiation (`Box<int>`): the head
+    /// [`ClassId`] plus its solved type arguments (TYPE §5.1). [`CheckTy::Class`]
+    /// remains the zero-arg form. INVARIANT in `assignable` (§4.6).
+    ClassApp(ClassId, Vec<CheckTy>),
+    /// A NOMINAL-by-id but PARAMETERIZED enum instantiation (`Option<int>`): the head
+    /// [`EnumId`] plus its solved type arguments (TYPE §5.1). INVARIANT (§4.6).
+    EnumApp(EnumId, Vec<CheckTy>),
+    /// A structural INTERFACE (IFACE §6), identified by table id. Conformance is
+    /// structural (a value conforms if it has the required methods with assignable
+    /// signatures) — see `Table::conforms`. Carries no args here in v1.
+    Interface(InterfaceId),
 }
 
 /// The three-valued result of [`CheckTy::assignable`]. **Only `No` diagnoses.**
@@ -121,11 +149,38 @@ impl CheckTy {
                             CheckTy::Class(id)
                         } else if let Some(id) = table.enum_id(other) {
                             CheckTy::Enum(id)
+                        } else if let Some(id) = table.interface_id(other) {
+                            // IFACE: an interface-typed slot (`p: Reader`) → `Interface`.
+                            CheckTy::Interface(id)
                         } else {
                             CheckTy::Any // unknown name → gradual default
                         }
                     }
                 }
+            }
+            // TYPE §6: a reference to an in-scope generic type parameter (`T`), tagged
+            // distinctly by the CST parser. Lower to a `Var` whose id is a stable hash
+            // of the param NAME — so the same param name in a signature lowers to the
+            // same template `Var` (the unifier freshens these to per-call fresh vars,
+            // §4.3). Unbounded ⇒ gradual top (`None`).
+            ParamType => {
+                let name = node.text().to_string();
+                CheckTy::Var(param_template_id(name.trim()), None)
+            }
+            // TYPE §6: a parameterized `fn(A) -> B`. Children (in order): the param
+            // type nodes, then the return type node (the LAST type-kind child).
+            FnType => {
+                let types: Vec<CheckTy> = node
+                    .children()
+                    .filter(|c| crate::check::rules::is_type_kind(c.kind()))
+                    .map(|c| Self::from_type_node_depth(c, table, depth + 1))
+                    .collect();
+                if types.is_empty() {
+                    return CheckTy::Fn; // malformed — degrade to the bare fn type
+                }
+                let mut it = types;
+                let ret = it.pop().unwrap();
+                CheckTy::FnSig(it, Box::new(ret))
             }
             GenericType => {
                 let head = node
@@ -157,7 +212,26 @@ impl CheckTy {
                     Some("future") if args.len() == 1 => {
                         CheckTy::Future(Box::new(args.into_iter().next().unwrap()))
                     }
-                    _ => CheckTy::Any, // any other generic head → gradual default
+                    // TYPE §6: a user CLASS/ENUM/INTERFACE head with type args → a
+                    // parameterized application (`Box<int>`/`Option<T>`/`Container<T>`).
+                    // Today such heads fell to `Any` — a strict, gradual-preserving
+                    // upgrade (the args are still gradual leaves until inference solves
+                    // them). An unknown head stays `Any`.
+                    Some(other) => {
+                        if let Some(id) = table.class_id(other) {
+                            CheckTy::ClassApp(id, args)
+                        } else if let Some(id) = table.enum_id(other) {
+                            CheckTy::EnumApp(id, args)
+                        } else if let Some(id) = table.interface_id(other) {
+                            // A parameterized interface keeps its id (v1 conformance is
+                            // by id); the args are dropped (no use-site interface args
+                            // in v1, §5.1).
+                            CheckTy::Interface(id)
+                        } else {
+                            CheckTy::Any
+                        }
+                    }
+                    None => CheckTy::Any,
                 }
             }
             OptionalType => {
@@ -199,6 +273,9 @@ impl CheckTy {
             CheckTy::Literal(LitVal::Nil) => CheckTy::Nil,
             CheckTy::EnumVariant(e, _) => CheckTy::Enum(*e),
             CheckTy::Never => CheckTy::Any,
+            // A leftover (unsubstituted) `Var` widens to `Any` — the gradual leaf
+            // (TYPE §4.2: an unsolved type variable behaves like `Any`).
+            CheckTy::Var(_, _) => CheckTy::Any,
             other => other.clone(),
         }
     }
@@ -562,10 +639,75 @@ impl CheckTy {
                 .map(|e| e.name.clone())
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| "enum".into()),
-            // widened away above
-            EnumVariant(_, _) | Literal(_) => unreachable!("widened above"),
+            // TYPE §6: parameterized heads render `Head<arg, …>`.
+            ClassApp(id, args) => {
+                let head = table
+                    .class(id)
+                    .map(|c| c.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "object".into());
+                render_app(&head, &args, table)
+            }
+            EnumApp(id, args) => {
+                let head = table
+                    .enum_info(id)
+                    .map(|e| e.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "enum".into());
+                render_app(&head, &args, table)
+            }
+            Interface(id) => table
+                .interface_info(id)
+                .map(|i| i.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "interface".into()),
+            // A parameterized fn type: `fn(p, …) -> ret`.
+            FnSig(params, ret) => {
+                let ps: Vec<_> = params.iter().map(|p| p.display(table)).collect();
+                format!("fn({}) -> {}", ps.join(", "), ret.display(table))
+            }
+            // widened away above (`Var` → `Any`, narrowing artifacts → base)
+            Var(_, _) | EnumVariant(_, _) | Literal(_) => unreachable!("widened above"),
         }
     }
+}
+
+/// Render a parameterized application `Head<arg, …>` for `display`. A zero-arg
+/// application (a raw class/enum ref) renders as the bare head.
+fn render_app(head: &str, args: &[CheckTy], table: &Table) -> String {
+    if args.is_empty() {
+        return head.to_string();
+    }
+    let inner: Vec<_> = args.iter().map(|a| a.display(table)).collect();
+    format!("{head}<{}>", inner.join(", "))
+}
+
+/// The high half of the `VarId` space, reserved for "template" vars — the
+/// declaration-context `Var`s `from_type_node` produces for a type-param reference
+/// (hashed from the param name). The unifier allocates "fresh" vars from the LOW
+/// half (a monotonic counter) and freshening rewrites every template var to a fresh
+/// one, so the two spaces never collide. A `Var` id `>= TEMPLATE_VAR_BASE` is a
+/// template; below it is a fresh (solvable) var.
+pub const TEMPLATE_VAR_BASE: VarId = 0x8000_0000;
+
+/// A STABLE template-`Var` id for a type-parameter NAME (TYPE §4.2). FNV-1a over the
+/// name, folded into the high (template) half of the id space. The same name always
+/// maps to the same id (so a signature's repeated `T` is one variable); a collision
+/// across two distinct names would merely unify them → gradual, never a false `No`.
+pub fn param_template_id(name: &str) -> VarId {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in name.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    // Keep it in the template half (set the top bit), but never 0 within that half.
+    TEMPLATE_VAR_BASE | (h & 0x7fff_ffff)
+}
+
+/// True if `id` is a TEMPLATE var (a declaration-context type-param reference), as
+/// opposed to a fresh, solvable unification var.
+pub fn is_template_var(id: VarId) -> bool {
+    id >= TEMPLATE_VAR_BASE
 }
 
 /// True for a concrete container constructor (used in the "concrete vs concrete"
@@ -619,6 +761,11 @@ fn discriminant_order(t: &CheckTy) -> u32 {
         Enum(_) => 20,
         EnumVariant(_, _) => 21,
         Literal(_) => 22,
+        Var(_, _) => 23,
+        FnSig(_, _) => 24,
+        ClassApp(_, _) => 25,
+        EnumApp(_, _) => 26,
+        Interface(_) => 27,
     }
 }
 
@@ -628,6 +775,8 @@ fn secondary_key(t: &CheckTy) -> usize {
     match t {
         Class(id) | Enum(id) => *id,
         EnumVariant(id, _) => *id,
+        ClassApp(id, _) | EnumApp(id, _) | Interface(id) => *id,
+        Var(id, _) => *id as usize,
         _ => 0,
     }
 }
@@ -644,8 +793,10 @@ pub fn normalize(t: CheckTy) -> CheckTy {
     while let Some(m) = stack.pop() {
         match m {
             CheckTy::Union(inner) => stack.extend(inner),
-            // `Any` swallows a union (gradual top).
-            CheckTy::Any => return CheckTy::Any,
+            // `Any` swallows a union (gradual top); a leftover `Var` widens to `Any`
+            // (TYPE §4.2: an unsolved type variable is the gradual top) and so does
+            // too.
+            CheckTy::Any | CheckTy::Var(_, _) => return CheckTy::Any,
             CheckTy::Never => {} // bottom drops out of a union
             CheckTy::Literal(_) | CheckTy::EnumVariant(_, _) => flat.push(m.widen()),
             other => flat.push(other),
@@ -830,6 +981,114 @@ mod tests {
             b = CheckTy::Array(Box::new(b));
         }
         assert_eq!(assign(a, b), Compat3::Unknown);
+    }
+
+    // ---- TYPE Task 8: new variant display / widen / from_type_node lowering ----
+
+    fn build_table(src: &str) -> Table {
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(src));
+        let resolved = crate::syntax::resolve::resolve(&tree);
+        Table::build(&tree, &resolved)
+    }
+
+    /// Find the first type-annotation node of `kind` in a built tree and lower it.
+    fn lower_first(src: &str, kind: SyntaxKind) -> CheckTy {
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(src));
+        let resolved = crate::syntax::resolve::resolve(&tree);
+        let table = Table::build(&tree, &resolved);
+        let node = tree
+            .descendants()
+            .find(|n| n.kind() == kind)
+            .expect("a node of the requested kind");
+        CheckTy::from_type_node(node, &table)
+    }
+
+    #[test]
+    fn var_widens_to_any() {
+        let v = CheckTy::Var(param_template_id("T"), None);
+        assert_eq!(v.widen(), CheckTy::Any);
+        // displayed (which widens first) → "any"
+        assert_eq!(v.display(&t()), "any");
+    }
+
+    #[test]
+    fn param_template_id_is_stable_and_distinct() {
+        assert_eq!(param_template_id("T"), param_template_id("T"));
+        assert_ne!(param_template_id("T"), param_template_id("U"));
+        assert!(is_template_var(param_template_id("T")));
+        assert!(!is_template_var(0));
+        assert!(!is_template_var(5));
+    }
+
+    #[test]
+    fn fnsig_displays() {
+        let sig = CheckTy::FnSig(vec![CheckTy::Int], Box::new(CheckTy::String));
+        assert_eq!(sig.display(&t()), "fn(int) -> string");
+    }
+
+    #[test]
+    fn classapp_displays() {
+        let table = build_table("class Box<T> { value: number }");
+        let cid = table.class_id("Box").unwrap();
+        let app = CheckTy::ClassApp(cid, vec![CheckTy::Int]);
+        assert_eq!(app.display(&table), "Box<int>");
+    }
+
+    #[test]
+    fn from_type_node_param_lowers_to_var() {
+        // `T` in a generic-class field type is a ParamType → Var.
+        let ty = lower_first("class Box<T> { value: T }", SyntaxKind::ParamType);
+        assert!(matches!(ty, CheckTy::Var(_, None)));
+    }
+
+    #[test]
+    fn from_type_node_fn_type_lowers_to_fnsig() {
+        let ty = lower_first(
+            "fn higher(f: fn(int) -> string) {}",
+            SyntaxKind::FnType,
+        );
+        match ty {
+            CheckTy::FnSig(params, ret) => {
+                assert_eq!(params, vec![CheckTy::Int]);
+                assert_eq!(*ret, CheckTy::String);
+            }
+            other => panic!("expected FnSig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_type_node_user_generic_head_lowers_to_classapp() {
+        // `Box<int>` (a user class head) → ClassApp (was Any before TYPE).
+        let table = build_table("class Box<T> { value: T }\nlet b: Box<int> = x");
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(
+            "class Box<T> { value: T }\nlet b: Box<int> = x",
+        ));
+        let node = tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::GenericType)
+            .unwrap();
+        let ty = CheckTy::from_type_node(node, &table);
+        match ty {
+            CheckTy::ClassApp(id, args) => {
+                assert_eq!(id, table.class_id("Box").unwrap());
+                assert_eq!(args, vec![CheckTy::Int]);
+            }
+            other => panic!("expected ClassApp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_type_node_unknown_generic_head_stays_any() {
+        // `Widget<int>` — unknown head → Any (gradual-preserving).
+        let table = build_table("let b: Widget<int> = x");
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(
+            "let b: Widget<int> = x",
+        ));
+        let node = tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::GenericType)
+            .unwrap();
+        assert_eq!(CheckTy::from_type_node(node, &table), CheckTy::Any);
     }
 
     #[test]

@@ -2232,8 +2232,11 @@ fn is_provably_non_number(t: &CheckTy) -> bool {
         Any | Never | Number | Int | Float => false,
         Union(ms) => ms.iter().all(is_provably_non_number),
         String | Bool | Nil | Bytes | Object | Regex | Error | Fn | Array(_) | Map(_, _)
-        | Tuple(_) | Result(_) | Future(_) | Class(_) | Enum(_) => true,
-        EnumVariant(_, _) | Literal(_) => false,
+        | Tuple(_) | Result(_) | Future(_) | Class(_) | Enum(_) | FnSig(_, _)
+        | ClassApp(_, _) | EnumApp(_, _) | Interface(_) => true,
+        // `Var` is gradual (widened to `Any` above) but listed defensively; narrowing
+        // artifacts never reach here post-widen.
+        Var(_, _) | EnumVariant(_, _) | Literal(_) => false,
     }
 }
 

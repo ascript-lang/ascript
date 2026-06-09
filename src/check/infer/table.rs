@@ -7,7 +7,7 @@
 //! terminates), and field / method-return types are lowered to [`CheckTy`]. Each
 //! enum gets an [`EnumId`] and its variant names.
 
-use crate::check::infer::ty::{CheckTy, ClassId, EnumId};
+use crate::check::infer::ty::{CheckTy, ClassId, EnumId, InterfaceId};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::ResolveResult;
@@ -52,13 +52,46 @@ impl EnumInfo {
     }
 }
 
-/// The class/enum symbol table, built once per `analyze` call.
+/// A structural-interface entry (IFACE §6 — reserved name). `methods` maps each
+/// required method NAME to its lowered signature: the (declared-or-`Any`) parameter
+/// types and the (declared-or-`Any`) return type. Conformance is structural over
+/// this set (see [`Table::conforms`]).
+#[derive(Debug, Clone, Default)]
+pub struct InterfaceInfo {
+    pub name: String,
+    /// Required method name → (param types, return type).
+    pub methods: HashMap<String, MethodSig>,
+    /// Parent interface ids from `extends A, B` (their requirements are inherited).
+    pub extends: Vec<InterfaceId>,
+    /// Declared type-parameter names + optional bounds (TYPE §4 — `interface C<T>`).
+    pub type_params: Vec<(String, Option<CheckTy>)>,
+}
+
+/// A lowered method signature (IFACE §6 / TYPE): ordered parameter types + return.
+#[derive(Debug, Clone)]
+pub struct MethodSig {
+    pub params: Vec<CheckTy>,
+    pub ret: CheckTy,
+}
+
+impl Default for MethodSig {
+    fn default() -> Self {
+        MethodSig {
+            params: Vec::new(),
+            ret: CheckTy::Any,
+        }
+    }
+}
+
+/// The class/enum/interface symbol table, built once per `analyze` call.
 #[derive(Debug, Clone, Default)]
 pub struct Table {
     classes: Vec<ClassInfo>,
     enums: Vec<EnumInfo>,
+    interfaces: Vec<InterfaceInfo>,
     class_by_name: HashMap<String, ClassId>,
     enum_by_name: HashMap<String, EnumId>,
+    interface_by_name: HashMap<String, InterfaceId>,
 }
 
 impl Table {
@@ -176,6 +209,17 @@ impl Table {
     /// The [`EnumId`] for an enum name, if known.
     pub fn enum_id(&self, name: &str) -> Option<EnumId> {
         self.enum_by_name.get(name).copied()
+    }
+
+    /// The [`InterfaceId`] for an interface name, if known (IFACE §6). Populated in
+    /// TYPE Task 9; until then the table holds none.
+    pub fn interface_id(&self, name: &str) -> Option<InterfaceId> {
+        self.interface_by_name.get(name).copied()
+    }
+
+    /// Interface info by id (IFACE §6).
+    pub fn interface_info(&self, id: InterfaceId) -> Option<&InterfaceInfo> {
+        self.interfaces.get(id)
     }
 
     /// Class info by id.
