@@ -908,10 +908,23 @@ impl<'a> Pass<'a> {
             if callee.kind() == NameRef {
                 let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
                 if let Some(cid) = self.callee_class_id(callee, &name) {
+                    // TYPE §4: a GENERIC class construction (`Box(5)` / `Box<int>(5)`)
+                    // infers (or takes explicit) type args → a `ClassApp`. A non-generic
+                    // class stays `Class(cid)` (the existing path).
+                    if !self.table.class_type_params(cid).is_empty() {
+                        return self.synth_generic_construction(cid, expr, arg_list, env);
+                    }
                     self.synth_arg_list(arg_list, env);
                     return CheckTy::Class(cid);
                 }
                 if let Some(fn_decl) = self.resolve_in_file_fn(callee, &name) {
+                    // TYPE §4: a GENERIC fn call (`id(5)` / `map<…>(…)`) freshens →
+                    // unifies args → substitutes → checks against the SOLVED params,
+                    // and returns the substituted return type. A non-generic fn uses
+                    // the existing arg-check + declared/inferred return path.
+                    if decl_has_type_params(&fn_decl) {
+                        return self.synth_generic_fn_call(&fn_decl, expr, arg_list, &name, env);
+                    }
                     self.check_call_args(&fn_decl, arg_list, &name, env);
                     return self.fn_return_type(&fn_decl);
                 }
@@ -970,6 +983,17 @@ impl<'a> Pass<'a> {
                 self.synth_arg_list(arg_list, env);
                 let ret = self.table.method_return(cid, &method).unwrap_or(CheckTy::Any);
                 return Some(CheckTy::Future(Box::new(ret)));
+            }
+        }
+
+        // Pattern (3) — TYPE §4: a method call on a PARAMETERIZED receiver
+        // (`b.get()` where `b : Box<int>`). Synthesize the method's declared return
+        // and substitute the receiver's type args (`T → int`). A non-generic / unknown
+        // method falls through to the gradual `Any` path.
+        if let CheckTy::ClassApp(cid, args) = &recv_ty {
+            if let Some(ret) = self.table.method_return(*cid, &method) {
+                self.synth_arg_list(arg_list, env);
+                return Some(self.instantiate_class_member(*cid, args, &ret));
             }
         }
 
@@ -1131,6 +1155,283 @@ impl<'a> Pass<'a> {
                 self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
             }
         }
+    }
+
+    /// TYPE §4.3: infer a GENERIC in-file fn call. Freshen the decl's params + return
+    /// (template `Var`s → fresh vars), unify each arg's synth against its freshened
+    /// param (and any EXPLICIT type args against the decl's template→fresh mapping),
+    /// substitute the solution, then check each arg against its SOLVED param type
+    /// (blocking — a generic param is always annotated). Returns the substituted
+    /// return type (an unsolved leaf → `Any`, gradual). A spread arg makes positions
+    /// unknowable → synth + gradual `Any`.
+    fn synth_generic_fn_call(
+        &mut self,
+        fn_decl: &ResolvedNode,
+        call_expr: &ResolvedNode,
+        arg_list: Option<&ResolvedNode>,
+        name: &str,
+        env: &mut Env,
+    ) -> CheckTy {
+        use crate::check::infer::unify::Solver;
+        // Lower the declared params + return with template vars in place.
+        let param_nodes = param_type_nodes(fn_decl);
+        let template_params: Vec<Option<CheckTy>> = param_nodes
+            .iter()
+            .map(|n| n.as_ref().map(|node| CheckTy::from_type_node(node, self.table)))
+            .collect();
+        let template_ret = declared_return(fn_decl, self.table);
+
+        // Spread → positions unknowable; synth + gradual.
+        let has_spread = arg_list
+            .map(|al| al.children().any(|c| c.kind() == SyntaxKind::SpreadElem))
+            .unwrap_or(false);
+        if has_spread {
+            self.synth_arg_list(arg_list, env);
+            return template_ret
+                .map(|r| widen_unsolved(&r))
+                .unwrap_or(CheckTy::Any);
+        }
+
+        let args: Vec<ResolvedNode> = arg_list
+            .into_iter()
+            .flat_map(|al| al.children())
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        // Synthesize each arg up-front (sub-diagnostics flow regardless of generics).
+        let arg_tys: Vec<CheckTy> = args.iter().map(|a| self.synth(a, env)).collect();
+
+        // Freshen the signature (params + return SHARE one template→fresh mapping so a
+        // repeated `T` is one variable).
+        let mut solver = Solver::new();
+        let mut mapping = std::collections::HashMap::new();
+        let fresh_params: Vec<Option<CheckTy>> = template_params
+            .iter()
+            .map(|p| p.as_ref().map(|t| solver.freshen(t, &mut mapping)))
+            .collect();
+        let fresh_ret = template_ret
+            .as_ref()
+            .map(|r| solver.freshen(r, &mut mapping));
+
+        // EXPLICIT type args (`map<string, number>(…)`): bind each decl type-param's
+        // fresh var to the supplied type (in declaration order). A later inferred
+        // constraint that conflicts surfaces as a normal blocking mismatch on the arg.
+        let explicit = explicit_type_args(call_expr, self.table);
+        if !explicit.is_empty() {
+            let tparams = decl_type_param_names(fn_decl);
+            for (i, ty) in explicit.iter().enumerate() {
+                if let Some(pname) = tparams.get(i) {
+                    let tmpl = crate::check::infer::ty::param_template_id(pname);
+                    if let Some(&fresh) = mapping.get(&tmpl) {
+                        solver.unify(&CheckTy::Var(fresh, None), ty);
+                    }
+                }
+            }
+        }
+
+        // Unify each arg against its freshened param (gradual give-up on a clash).
+        for (aty, fp) in arg_tys.iter().zip(fresh_params.iter()) {
+            if let Some(fp) = fp {
+                solver.unify(&aty.widen(), fp);
+            }
+        }
+
+        // Check each arg against its SOLVED param type (blocking — annotated slot).
+        for (i, (arg, aty)) in args.iter().zip(arg_tys.iter()).enumerate() {
+            let Some(Some(fp)) = fresh_params.get(i) else {
+                continue;
+            };
+            let solved = solver.substitute(fp);
+            if let Compat3::No = aty.assignable(&solved, self.table) {
+                let msg = format!(
+                    "argument {} of `{name}` expects `{}`, found `{}`",
+                    i + 1,
+                    solved.display(self.table),
+                    aty.display(self.table)
+                );
+                self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
+            }
+        }
+
+        // Bound enforcement: after solving, check each bounded type-param's solution
+        // against its interface bound (a provable No → blocking, annotated origin).
+        self.enforce_generic_bounds(
+            &decl_type_params_with_bounds(fn_decl, self.table),
+            &mapping,
+            &solver,
+            call_expr,
+        );
+
+        // Return the substituted return type (unsolved → Any). Wrap for async/worker.
+        let ret = fresh_ret
+            .map(|r| solver.substitute(&r))
+            .unwrap_or(CheckTy::Any);
+        let ret = widen_unsolved(&ret);
+        if is_async(fn_decl) || is_worker(fn_decl) {
+            CheckTy::Future(Box::new(ret))
+        } else if is_generator(fn_decl) {
+            CheckTy::Any
+        } else {
+            ret
+        }
+    }
+
+    /// TYPE §4: infer a GENERIC class CONSTRUCTION (`Box(5)` / `Box<int>(5)`). Use the
+    /// explicit type args if supplied, else infer the class's type params from the
+    /// `init` arguments (against `init`'s freshened param types). Returns
+    /// `ClassApp(cid, solved_args)` — an unsolved arg → `Any` (gradual).
+    fn synth_generic_construction(
+        &mut self,
+        cid: usize,
+        call_expr: &ResolvedNode,
+        arg_list: Option<&ResolvedNode>,
+        env: &mut Env,
+    ) -> CheckTy {
+        use crate::check::infer::unify::Solver;
+        let tparams = self.table.class_type_params(cid).to_vec();
+        let tparam_names: Vec<String> = tparams.iter().map(|(n, _)| n.clone()).collect();
+
+        // Synthesize the args (sub-diagnostics flow).
+        let args: Vec<ResolvedNode> = arg_list
+            .into_iter()
+            .flat_map(|al| al.children())
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        let arg_tys: Vec<CheckTy> = args.iter().map(|a| self.synth(a, env)).collect();
+
+        let mut solver = Solver::new();
+        // Map each class type-param name → a fresh var.
+        let mut mapping: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for name in &tparam_names {
+            let tmpl = crate::check::infer::ty::param_template_id(name);
+            let fresh = solver.fresh();
+            mapping.insert(tmpl, fresh);
+        }
+
+        // EXPLICIT type args bind directly.
+        let explicit = explicit_type_args(call_expr, self.table);
+        for (i, ty) in explicit.iter().enumerate() {
+            if let Some(name) = tparam_names.get(i) {
+                let tmpl = crate::check::infer::ty::param_template_id(name);
+                if let Some(&fresh) = mapping.get(&tmpl) {
+                    solver.unify(&CheckTy::Var(fresh, None), ty);
+                }
+            }
+        }
+
+        // Infer from the `init` params (if any) when no spread.
+        let has_spread = arg_list
+            .map(|al| al.children().any(|c| c.kind() == SyntaxKind::SpreadElem))
+            .unwrap_or(false);
+        let mut fresh_init_params: Vec<CheckTy> = Vec::new();
+        if !has_spread {
+            if let Some(init_params) = self.class_init_param_types(cid) {
+                for (aty, ptmpl) in arg_tys.iter().zip(init_params.iter()) {
+                    // Freshen the init param's template var(s) through the SAME mapping.
+                    let fp = solver.freshen(ptmpl, &mut mapping);
+                    solver.unify(&aty.widen(), &fp);
+                    fresh_init_params.push(fp);
+                }
+            }
+        }
+
+        // Check each init arg against its SOLVED param type — this surfaces an
+        // EXPLICIT type arg that conflicts with the constructor argument (e.g.
+        // `Box<string>(5)`: the explicit `string` bound `T`, but `5` is `int`). A
+        // generic init param is always annotated → blocking (TYPE §3.1). An init param
+        // that stayed an unsolved `Var` → `Any` → gradual.
+        for (i, (arg, aty)) in args.iter().zip(arg_tys.iter()).enumerate() {
+            let Some(fp) = fresh_init_params.get(i) else {
+                continue;
+            };
+            let solved = solver.substitute(fp);
+            if let Compat3::No = aty.assignable(&solved, self.table) {
+                let cname = self
+                    .table
+                    .class(cid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                let msg = format!(
+                    "argument {} of `{cname}` expects `{}`, found `{}`",
+                    i + 1,
+                    solved.display(self.table),
+                    aty.display(self.table)
+                );
+                self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
+            }
+        }
+
+        // Build the solved type-arg vector (declaration order).
+        let solved_args: Vec<CheckTy> = tparam_names
+            .iter()
+            .map(|name| {
+                let tmpl = crate::check::infer::ty::param_template_id(name);
+                match mapping.get(&tmpl) {
+                    Some(&fresh) => solver.substitute(&CheckTy::Var(fresh, None)),
+                    None => CheckTy::Any,
+                }
+            })
+            .collect();
+        CheckTy::ClassApp(cid, solved_args)
+    }
+
+    /// Enforce interface bounds after solving: for each `(template_id, Some(bound))`,
+    /// substitute the bound's fresh var and `conforms`-check it; a provable `No` is a
+    /// blocking `type-mismatch` (the bound is on a declared generic — annotated).
+    fn enforce_generic_bounds(
+        &mut self,
+        bounds: &[(u32, Option<CheckTy>)],
+        mapping: &std::collections::HashMap<u32, u32>,
+        solver: &crate::check::infer::unify::Solver,
+        anchor: &ResolvedNode,
+    ) {
+        for (tmpl, bound) in bounds {
+            let Some(CheckTy::Interface(iid)) = bound else {
+                continue;
+            };
+            let Some(&fresh) = mapping.get(tmpl) else {
+                continue;
+            };
+            let solved = solver.substitute(&CheckTy::Var(fresh, None));
+            if let Compat3::No = self.table.conforms(&solved, *iid) {
+                let iname = self
+                    .table
+                    .interface_info(*iid)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_default();
+                let msg = format!(
+                    "type argument `{}` does not conform to bound `{iname}`",
+                    solved.display(self.table)
+                );
+                self.emit_with("type-mismatch", Severity::Error, code_range(anchor), msg);
+            }
+        }
+    }
+
+    /// Substitute a class's type arguments into a member type lowered with that
+    /// class's template `Var`s (TYPE §4): map each class type-param `template_id` →
+    /// the corresponding solved arg, then substitute. A leftover var → `Any`.
+    fn instantiate_class_member(&self, cid: usize, args: &[CheckTy], member: &CheckTy) -> CheckTy {
+        let tparams = self.table.class_type_params(cid);
+        if tparams.is_empty() {
+            return member.clone();
+        }
+        let mut map: std::collections::HashMap<u32, CheckTy> = std::collections::HashMap::new();
+        for ((name, _), arg) in tparams.iter().zip(args.iter()) {
+            map.insert(crate::check::infer::ty::param_template_id(name), arg.clone());
+        }
+        widen_unsolved(&subst_templates(member, &map))
+    }
+
+    /// The `init` method's parameter types of a class (lowered with template vars in
+    /// place), if it declares one. `None` when the class has no `init` / no params.
+    fn class_init_param_types(&self, cid: usize) -> Option<Vec<CheckTy>> {
+        let sig = self.table.method_sig(cid, "init")?;
+        if sig.params.is_empty() {
+            return None;
+        }
+        Some(sig.params.clone())
     }
 
     fn synth_array(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
@@ -1538,6 +1839,13 @@ impl<'a> Pass<'a> {
         let field = member_name(expr);
         match (&recv_ty, field) {
             (CheckTy::Class(cid), Some(f)) => self.table.field_type(*cid, &f).unwrap_or(CheckTy::Any),
+            // TYPE §4: a field access on a parameterized receiver (`b.value` where
+            // `b : Box<int>`) — look up the field's template type and substitute the
+            // class's type args (`T → int`).
+            (CheckTy::ClassApp(cid, args), Some(f)) => {
+                let tmpl = self.table.field_type(*cid, &f).unwrap_or(CheckTy::Any);
+                self.instantiate_class_member(*cid, args, &tmpl)
+            }
             (CheckTy::Enum(eid), Some(f)) => {
                 if let Some(ei) = self.table.enum_info(*eid) {
                     if ei.variants.iter().any(|v| v == &f) {
@@ -2116,6 +2424,116 @@ fn param_type_nodes(fn_decl: &ResolvedNode) -> Vec<Option<ResolvedNode>> {
         .collect()
 }
 
+/// TYPE §4: does this decl carry a `<…>` type-parameter list (i.e. is it generic)?
+fn decl_has_type_params(decl: &ResolvedNode) -> bool {
+    decl.children().any(|c| c.kind() == SyntaxKind::TypeParams)
+}
+
+/// The declared type-parameter NAMES of a decl, in order (`<A, B>` → `["A","B"]`).
+fn decl_type_param_names(decl: &ResolvedNode) -> Vec<String> {
+    use SyntaxKind::*;
+    let Some(list) = decl.children().find(|c| c.kind() == TypeParams) else {
+        return Vec::new();
+    };
+    list.children()
+        .filter(|c| c.kind() == TypeParam)
+        .filter_map(crate::syntax::resolve::ident_text)
+        .collect()
+}
+
+/// The decl's type parameters as `(template_id, optional bound CheckTy)` pairs — the
+/// shape `enforce_generic_bounds` consumes.
+fn decl_type_params_with_bounds(
+    decl: &ResolvedNode,
+    table: &Table,
+) -> Vec<(u32, Option<CheckTy>)> {
+    use SyntaxKind::*;
+    let Some(list) = decl.children().find(|c| c.kind() == TypeParams) else {
+        return Vec::new();
+    };
+    list.children()
+        .filter(|c| c.kind() == TypeParam)
+        .filter_map(|tp| {
+            let name = crate::syntax::resolve::ident_text(tp)?;
+            let bound = tp
+                .children()
+                .find(|c| c.kind() == TypeBound)
+                .and_then(|b| b.children().find(|c| is_type_kind(c.kind())))
+                .map(|ty| CheckTy::from_type_node(ty, table));
+            Some((crate::check::infer::ty::param_template_id(&name), bound))
+        })
+        .collect()
+}
+
+/// The EXPLICIT type arguments at a call/construction site (`Box<int>(5)` /
+/// `map<string, number>(…)`): the `TypeArgs` child of the `CallExpr`, lowered. Empty
+/// when the call has no explicit type args (the common inferred case).
+fn explicit_type_args(call_expr: &ResolvedNode, table: &Table) -> Vec<CheckTy> {
+    use SyntaxKind::*;
+    call_expr
+        .children()
+        .find(|c| c.kind() == TypeArgs)
+        .map(|ta| {
+            ta.children()
+                .filter(|c| is_type_kind(c.kind()))
+                .map(|c| CheckTy::from_type_node(c, table))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Substitute TEMPLATE `Var`s in `ty` by id via `map` (a class/enum type-param
+/// instantiation). A template var not in the map is left as-is (later widened to
+/// `Any`). Non-template vars are untouched.
+fn subst_templates(ty: &CheckTy, map: &std::collections::HashMap<u32, CheckTy>) -> CheckTy {
+    use CheckTy::*;
+    match ty {
+        Var(id, _) => match map.get(id) {
+            Some(t) => t.clone(),
+            None => ty.clone(),
+        },
+        Array(x) => Array(Box::new(subst_templates(x, map))),
+        Future(x) => Future(Box::new(subst_templates(x, map))),
+        Result(x) => Result(Box::new(subst_templates(x, map))),
+        Map(k, v) => Map(
+            Box::new(subst_templates(k, map)),
+            Box::new(subst_templates(v, map)),
+        ),
+        Tuple(ms) => Tuple(ms.iter().map(|m| subst_templates(m, map)).collect()),
+        Union(ms) => Union(ms.iter().map(|m| subst_templates(m, map)).collect()),
+        FnSig(ps, r) => FnSig(
+            ps.iter().map(|p| subst_templates(p, map)).collect(),
+            Box::new(subst_templates(r, map)),
+        ),
+        ClassApp(id, args) => ClassApp(*id, args.iter().map(|a| subst_templates(a, map)).collect()),
+        EnumApp(id, args) => EnumApp(*id, args.iter().map(|a| subst_templates(a, map)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Widen any leftover (unsolved) `Var` in a substituted type to `Any` (defensive —
+/// `substitute` already maps unsolved vars to `Any`, but a freshly-lowered type that
+/// never went through a solver can still carry a template `Var`).
+fn widen_unsolved(t: &CheckTy) -> CheckTy {
+    use CheckTy::*;
+    match t {
+        Var(_, _) => Any,
+        Array(x) => Array(Box::new(widen_unsolved(x))),
+        Future(x) => Future(Box::new(widen_unsolved(x))),
+        Result(x) => Result(Box::new(widen_unsolved(x))),
+        Map(k, v) => Map(Box::new(widen_unsolved(k)), Box::new(widen_unsolved(v))),
+        Tuple(ms) => Tuple(ms.iter().map(widen_unsolved).collect()),
+        Union(ms) => Union(ms.iter().map(widen_unsolved).collect()),
+        FnSig(ps, r) => FnSig(
+            ps.iter().map(widen_unsolved).collect(),
+            Box::new(widen_unsolved(r)),
+        ),
+        ClassApp(id, args) => ClassApp(*id, args.iter().map(widen_unsolved).collect()),
+        EnumApp(id, args) => EnumApp(*id, args.iter().map(widen_unsolved).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Is this fn/method declared `async` (carries an `AsyncKw` token)?
 fn is_async(decl: &ResolvedNode) -> bool {
     decl.children_with_tokens()
@@ -2682,4 +3100,101 @@ mod tests {
             analyze(src).diagnostics
         );
     }
+
+    // --------------------- TYPE Task 12: generic inference wiring ---------------
+
+    fn sev(src: &str, code: &str) -> Option<crate::check::diagnostic::Severity> {
+        analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == code)
+            .map(|d| d.severity)
+    }
+
+    #[test]
+    fn generic_id_infers_return_into_annotated_slot() {
+        // `id(5)` solves T=int → returns int → flows into `: number` cleanly, but a
+        // string slot is a blocking mismatch.
+        let ok = "fn id<T>(x: T): T { return x }\nlet n: number = id(5)\nn\n";
+        assert!(!has(ok, "type-mismatch"), "{:?}", analyze(ok).diagnostics);
+        let bad = "fn id<T>(x: T): T { return x }\nlet s: string = id(5)\ns\n";
+        assert!(has(bad, "type-mismatch"), "{:?}", analyze(bad).diagnostics);
+        assert_eq!(
+            sev(bad, "type-mismatch"),
+            Some(crate::check::diagnostic::Severity::Error)
+        );
+    }
+
+    #[test]
+    fn generic_box_construction_and_method_return() {
+        // Box(5) infers T=int; b.get() : int → into `: int` ok, into `: string` blocks.
+        let src_ok = "class Box<T> { value: T\n fn init(v: T) { self.value = v }\n fn get(): T { return self.value } }\nlet b = Box(5)\nlet n: int = b.get()\nn\n";
+        assert!(!has(src_ok, "type-mismatch"), "{:?}", analyze(src_ok).diagnostics);
+        let src_bad = "class Box<T> { value: T\n fn init(v: T) { self.value = v }\n fn get(): T { return self.value } }\nlet b = Box(5)\nlet s: string = b.get()\ns\n";
+        assert!(has(src_bad, "type-mismatch"), "{:?}", analyze(src_bad).diagnostics);
+    }
+
+    #[test]
+    fn generic_box_field_access_instantiates() {
+        // b.value where b : Box<int> synthesizes int.
+        let bad = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b = Box(5)\nlet s: string = b.value\ns\n";
+        assert!(has(bad, "type-mismatch"), "{:?}", analyze(bad).diagnostics);
+    }
+
+    #[test]
+    fn empty_array_map_is_gradual_silent() {
+        // THE pinned invariant: map([], f) leaves A unsolved → array<any> → ZERO diags.
+        let src = "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {\n  let out: array<B> = []\n  return out\n}\nlet r = map([], (x) => x)\nr\n";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn explicit_type_args_conflict_blocks() {
+        // map<string, number>([1,2], …) — the int-array conflicts with the string A.
+        let src = "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {\n  let out: array<B> = []\n  return out\n}\nlet r = map<string, number>([1, 2], (x) => x)\nr\n";
+        assert!(has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn explicit_box_type_arg_used() {
+        // Box<int>(5) ok; Box<string>(5) — the explicit string conflicts with int arg.
+        let ok = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b = Box<int>(5)\nb\n";
+        assert!(!has(ok, "type-mismatch"), "{:?}", analyze(ok).diagnostics);
+        let bad = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b = Box<string>(5)\nb\n";
+        assert!(has(bad, "type-mismatch"), "{:?}", analyze(bad).diagnostics);
+    }
+
+    #[test]
+    fn generic_call_on_untyped_data_is_silent() {
+        // Passing `any` data through a generic stays Unknown — no blocking.
+        let src = "fn id<T>(x: T): T { return x }\nfn use(d) { let s: string = id(d)\n return s }\nuse(1)\n";
+        assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn generic_over_unknown_type_name_is_gradual() {
+        // Box<Widget> where Widget is unknown → Widget lowers to Any → gradual.
+        let src = "class Box<T> { value: T\n fn init(v: T) { self.value = v } }\nlet b: Box<Widget> = Box(5)\nb\n";
+        assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn bounded_generic_nonconforming_blocks() {
+        // first<T, C: Container<T>>(c: C) called with a value provably lacking the
+        // interface methods → blocking conformance mismatch.
+        let src = "interface Container<T> { fn len(): int\n fn at(i: int): T }\nfn first<T, C: Container<T>>(c: C): T { return c.at(0) }\nclass Bad { fn nope(): int { return 0 } }\nlet x = first(Bad())\nx\n";
+        assert!(has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn bounded_generic_conforming_is_silent() {
+        // A conforming class passes the bound cleanly.
+        let src = "interface Container<T> { fn len(): int\n fn at(i: int): T }\nfn first<T, C: Container<T>>(c: C): T { return c.at(0) }\nclass Good { fn len(): int { return 0 }\n fn at(i: int): int { return i } }\nlet x = first(Good())\nx\n";
+        assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
 }
+

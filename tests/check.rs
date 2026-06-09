@@ -353,6 +353,70 @@ fn forward_reference_to_interface_is_not_undefined() {
     );
 }
 
+// --- TYPE Task 12: generic inference end-to-end (CLI gate) ----------------
+
+#[test]
+fn generic_mismatch_fails_the_gate() {
+    // A generic fn call whose inferred return is provably wrong for an ANNOTATED slot
+    // is a BLOCKING error → non-zero exit.
+    let p = write_tmp(
+        "gen_bad.as",
+        "fn id<T>(x: T): T { return x }\nlet s: string = id(5)\nprint(s)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a provable generic mismatch must fail the gate; got: {combined}"
+    );
+    assert!(
+        combined.contains("type-mismatch"),
+        "expected a type-mismatch; got: {combined}"
+    );
+}
+
+#[test]
+fn clean_generic_code_passes_the_gate() {
+    // Inference + an explicit type arg + a method-return instantiation, all clean.
+    let p = write_tmp(
+        "gen_ok.as",
+        "class Box<T> { value: T\n fn init(v: T) { self.value = v }\n fn get(): T { return self.value } }\nlet b = Box<int>(5)\nlet n: int = b.get()\nprint(n)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "clean generic code must pass the gate; got: {combined}"
+    );
+}
+
+#[test]
+fn empty_array_generic_call_is_silent() {
+    // The pinned invariant: map([], f) leaves the element type gradual → no diagnostic.
+    let p = write_tmp(
+        "gen_empty.as",
+        "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> {\n  let out: array<B> = []\n  return out\n}\nlet r = map([], (x) => x)\nprint(len(r))\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("type-"),
+        "empty-array generic must be gradual-silent; got: {combined}"
+    );
+}
+
 // --- CFG-T3: ascript.toml [lint] config -----------------------------------
 //
 // Discovery walks UP from each checked file's parent directory looking for
