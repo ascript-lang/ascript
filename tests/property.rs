@@ -183,6 +183,51 @@ fn three_way_differential_fixed_seed_battery() {
     }
 }
 
+/// HIGH-VOLUME stress differential (FUZZ Unit 2). `#[ignore]` by default (it runs many
+/// thousands of programs through four engine modes — too slow for the default `cargo test`),
+/// but it is the breadth net used when broadening the generator: run with
+/// `cargo test --test property stress_differential_many_seeds -- --ignored --nocapture`.
+/// Any divergence prints the seed + the minimized-able program. The seed→program mapping is
+/// fixed so any finding is replayable verbatim through the fixed-seed battery.
+#[test]
+#[ignore]
+fn stress_differential_many_seeds() {
+    let n: u64 = std::env::var("FUZZ_STRESS_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+    let batch = 250u64;
+    let mut diverged = 0u64;
+    let mut start = 0u64;
+    while start < n {
+        let end = (start + batch).min(n);
+        let progs: Vec<String> = (start..end)
+            .map(|seed| {
+                let bytes = seed_bytes(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1), 768);
+                fuzzgen::gen_program_from_bytes(&bytes).source
+            })
+            .collect();
+        let results = run_all_engines_batch(progs.clone());
+        for (i, ((tw, vm, gen, aso), src)) in results.iter().zip(progs.iter()).enumerate() {
+            let seed = start + i as u64;
+            if tw != vm {
+                diverged += 1;
+                eprintln!("DIVERGENCE seed {seed} specialized-VM\ntw {tw:?}\nvm {vm:?}\n--- src ---\n{src}\n");
+            }
+            if tw != gen {
+                diverged += 1;
+                eprintln!("DIVERGENCE seed {seed} generic-VM\ntw {tw:?}\ngen {gen:?}\n--- src ---\n{src}\n");
+            }
+            if tw != aso {
+                diverged += 1;
+                eprintln!("DIVERGENCE seed {seed} .aso\ntw {tw:?}\naso {aso:?}\n--- src ---\n{src}\n");
+            }
+        }
+        start = end;
+    }
+    assert_eq!(diverged, 0, "{diverged} three-way divergences over {n} seeds (see stderr)");
+}
+
 // ===========================================================================
 // Task 7 — the planted-bug SABOTEUR self-test (spec §7)
 // ===========================================================================

@@ -23,14 +23,28 @@
 //!   deep nesting, empty collections, shadowing/reassignment, and `match` over int
 //!   literals/ranges/`_`.
 //!
-//! **Coverage TODO (the explicit next FUZZ unit — the differential only fuzzes the surface
-//! it reaches).** Unit 1 covers the pre-NUM *core* surface (above). NOT YET EMITTED, and
-//! tracked as the breadth follow-up (spec §1 names several as edge targets): the `**`
-//! exponent + shift/complement `<< >> ~`; decimals; closures / capture-by-value; `match`
-//! guards + array/object/variant/Option-C bind patterns; classes; enums (incl. ADT payload
-//! variants); interfaces + `instanceof`; object/map/set literals; destructuring/spread/rest;
-//! string templates `${…}`; `?`/`!` propagate/unwrap; async/await/spawn/workers; try/recover.
-//! Adding each is a generator extension whose differential run may surface real engine bugs.
+//! **Coverage (broadened by FUZZ Unit 2 — the differential only fuzzes the surface it
+//! reaches).** Unit 1 covered the pre-NUM *core* surface (above). Unit 2 ADDED, each behind
+//! a hard three-way stress run (see `tests/property.rs::stress_differential_many_seeds`):
+//!   - **Arithmetic completeness:** `**` exponent (overflow-trap), bitwise/shift/complement
+//!     `& | ^ << >> ~` (int-only, bounded shift amount), and exact **decimals** (`decimal.from`
+//!     arithmetic, mixed with int).
+//!   - **Composite literals + ops:** object literals `{k: v}` (member/index read, `len`), map
+//!     literals `#{k: v}` (`map.get`/`len`, numeric-key MapKey canonicalization), array indexing,
+//!     `set.from` size, and `for…of` iteration.
+//!   - **Classes / enums / ADT / rich `match`** (Unit 2 cont'd, see `class_decl`/`enum_decl`/
+//!     `match` extensions): typed fields/defaults/`init`/methods, `instanceof`, inheritance/`super`;
+//!     unit + positional + named ADT variants, constructors, `.value`; value/range/wildcard/array/
+//!     object/variant patterns, `...rest`, guards, Option-C bind-vs-compare.
+//!   - **Closures + capture:** arrow closures, capture-by-value vs by-reference, per-iteration
+//!     loop-var freshness, nested/curried closures.
+//!   - **String templates `${…}`** (incl. nested) and **`?`/`!` propagate/unwrap** over the
+//!     `[value, err]` tier-1 model.
+//!
+//! STILL NOT EMITTED (the next breadth follow-up; the differential cannot fuzz what it never
+//! generates): interfaces + structural-`instanceof`; destructuring/spread/rest in let/params;
+//! async/await/spawn/workers (deferred — nondeterministic scheduling, see spec §6); try/recover
+//! (the `recover(fn(){…})` carry-forward bug); generators `fn*`/`yield`.
 //!
 //! Crate-gated `#[cfg(any(test, fuzzing))]` (in `lib.rs`) so it compiles into `ascript`
 //! ONLY for `cargo test` (and a `--cfg fuzzing` libFuzzer build) — never in a normal or
@@ -188,6 +202,19 @@ impl<'a, 'b> Gen<'a, 'b> {
     // ---- program / statements ----
 
     fn program(&mut self) {
+        // Stdlib imports the broadened generator relies on (decimal arithmetic, array/map/
+        // set construction + access). Always emitted so any later production can reference
+        // them; an unused import is a lint Warning, never a runtime error, so this keeps the
+        // generated source valid + deterministic regardless of which productions fire.
+        for (alias, module) in [
+            ("decimal", "std/decimal"),
+            ("array", "std/array"),
+            ("map", "std/map"),
+            ("set", "std/set"),
+        ] {
+            let _ = writeln!(self.out, "import * as {alias} from \"{module}\"");
+            let _ = alias;
+        }
         // A handful of top-level functions first (so later code can call them).
         let n_fns = self.choice(3); // 0..3
         for _ in 0..n_fns {
@@ -417,7 +444,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         if depth >= MAX_DEPTH {
             return self.leaf_expr();
         }
-        match self.choice(12) {
+        match self.choice(14) {
             0..=2 => self.int_expr(depth),
             3 | 4 => self.float_expr(depth),
             5 => self.bool_expr(depth),
@@ -426,8 +453,55 @@ impl<'a, 'b> Gen<'a, 'b> {
             8 => self.call_expr(depth),
             9 => self.array_expr(depth),
             10 => self.leaf_expr(),
+            11 => self.decimal_expr(depth),
+            12 => self.composite_expr(depth),
             _ => self.int_expr(depth),
         }
+    }
+
+    /// A decimal-typed expression: exact arithmetic over `decimal.from("…")` constructors
+    /// (NUM: `Value::Decimal`, exact, opt-in). Mixes with `int` operands (decimal op int is
+    /// legal and stays decimal). Avoids `/ 0` by biasing the divisor non-zero. Decimals
+    /// print deterministically (exact textual scale), so output stays a pure function of
+    /// source. Exercises the `Op::Add`/`Sub`/`Mul`/`Div` decimal arms + MapKey::Decimal.
+    fn decimal_expr(&mut self, depth: u32) -> String {
+        let a = self.decimal_atom();
+        if depth >= MAX_DEPTH || self.flag() {
+            return a;
+        }
+        let op = match self.choice(4) {
+            0 => "+",
+            1 => "-",
+            2 => "*",
+            _ => "/",
+        };
+        if op == "/" {
+            // Non-zero decimal divisor by construction.
+            let nz = 1 + self.choice(8);
+            format!("({a} / decimal.from(\"{nz}\"))")
+        } else if self.flag() {
+            // Mix with an int operand (decimal op int → decimal).
+            let n = self.choice(20);
+            format!("({a} {op} {n})")
+        } else {
+            let b = self.decimal_atom();
+            format!("({a} {op} {b})")
+        }
+    }
+
+    /// A decimal atom: `decimal.from("<literal>")` over a small fixed set of exact values.
+    fn decimal_atom(&mut self) -> String {
+        let lit = match self.choice(8) {
+            0 => "0",
+            1 => "1",
+            2 => "-1",
+            3 => "2.5",
+            4 => "0.1",
+            5 => "100",
+            6 => "3.14",
+            _ => "10",
+        };
+        format!("decimal.from(\"{lit}\")")
     }
 
     /// A leaf expression: an in-scope variable or a fresh literal.
@@ -450,15 +524,40 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// Wrapping operators (`+% -% *%`) are preferred for the unbounded-magnitude cases so
     /// the program does not panic on overflow (a panic is FINE for the differential — it
     /// compares panic messages — but wrapping keeps more programs run-to-completion).
+    ///
+    /// FUZZ Unit 2 — arithmetic completeness: this now also emits `**` exponent (NUM:
+    /// traps on i64 overflow; right-associative), the int-only bitwise/shift family
+    /// (`& | ^ << >> ~`, Go precedence), exercising the adaptive-arithmetic opcodes plus
+    /// the `Op::Pow`/`Op::Shl`/`Op::Shr`/`Op::BitNot` paths. Shift amounts are bounded to a
+    /// small valid window and exponents to a small base/power so most programs run to
+    /// completion (an out-of-range shift / overflow is still a clean Tier-2 panic the
+    /// differential compares, just rarer).
     fn int_expr(&mut self, depth: u32) -> String {
         if depth >= MAX_DEPTH || self.flag() {
             return self.int_atom();
+        }
+        // Unary complement `~x` (int-only) — a leaf-ish prefix form.
+        if self.choice(12) == 0 {
+            let a = self.int_atom();
+            return format!("(~{a})");
+        }
+        // Exponent `a ** b` — keep the base small and the power in 0..6 so the result
+        // rarely overflows i64 (overflow is a clean trap, just kept rare for completion%).
+        if self.choice(12) == 0 {
+            let base = match self.choice(4) {
+                0 => "2",
+                1 => "3",
+                2 => "(-2)",
+                _ => "1",
+            };
+            let pow = self.choice(7); // 0..6
+            return format!("({base} ** {pow})");
         }
         let a = self.int_atom();
         let b = self.int_atom();
         // Avoid `/ 0` and `% 0` panics being the ONLY thing tested: bias divisor away from
         // a literal zero by adding 1 inside a paren when the op is `/` or `%`.
-        let op = match self.choice(10) {
+        let op = match self.choice(13) {
             0 => "+%",
             1 => "-%",
             2 => "*%",
@@ -467,13 +566,22 @@ impl<'a, 'b> Gen<'a, 'b> {
             5 => "&",
             6 => "|",
             7 => "^",
-            8 => "/",
+            8 => "<<",
+            9 => ">>",
+            10 => "*",
+            11 => "/",
             _ => "%",
         };
         if op == "/" || op == "%" {
             // `(b - b + small)` is non-zero by construction → no spurious div-by-zero.
             let nz = 1 + self.choice(7);
             format!("({a} {op} {nz})")
+        } else if op == "<<" || op == ">>" {
+            // Bound the shift amount to a valid `0..=15` so the shift never trips the
+            // `shift amount out of range` trap on most programs (still occasionally a
+            // legal small value). The shift COUNT must be a small non-negative literal.
+            let amt = self.choice(16); // 0..15
+            format!("({a} {op} {amt})")
         } else {
             format!("({a} {op} {b})")
         }
@@ -644,6 +752,68 @@ impl<'a, 'b> Gen<'a, 'b> {
         let n = self.choice(4); // 0..3 elements (0 = empty-collection edge)
         let elems: Vec<String> = (0..n).map(|_| self.int_atom()).collect();
         format!("len([{}])", elems.join(", "))
+    }
+
+    /// FUZZ Unit 2 — composite literals + ops. An int-valued expression read OUT of an
+    /// object / map / array / set: object-literal `{k: v}` member + index read, map-literal
+    /// `#{k: v}` `map.get`, array indexing, and `set.from([...])` size. Exercises the shape
+    /// inline caches (object member/index reads), `MapKey` canonicalization (−0.0/NaN/
+    /// integral-float-folds-to-int via numeric keys), and the `len`/`set.size`/`map.get`
+    /// native paths. The observable is always a deterministic scalar `int` so output stays
+    /// a pure function of source (never an unordered map/set print).
+    fn composite_expr(&mut self, _depth: u32) -> String {
+        match self.choice(7) {
+            // Object literal: member read of a known key.
+            0 => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                format!("({{a: {a}, b: {b}}}).a")
+            }
+            // Object literal: index read with a string key.
+            1 => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                format!("({{a: {a}, b: {b}}})[\"b\"]")
+            }
+            // Object literal: `len` (key count).
+            2 => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                format!("len({{a: {a}, b: {b}}})")
+            }
+            // Map literal: `map.get` of a present key. Numeric keys exercise MapKey
+            // canonicalization (the integral-float-folds-to-int + −0.0/NaN unification).
+            3 => {
+                let v = self.int_atom();
+                let key = match self.choice(4) {
+                    0 => "1",
+                    1 => "0",
+                    2 => "true",
+                    _ => "\"k\"",
+                };
+                format!("map.get(#{{{key}: {v}}}, {key})")
+            }
+            // Map literal: `len`.
+            4 => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                format!("len(#{{1: {a}, 2: {b}}})")
+            }
+            // Array indexing of a non-empty array literal.
+            5 => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                let c = self.int_atom();
+                let idx = self.choice(3); // 0..2, always in bounds
+                format!("[{a}, {b}, {c}][{idx}]")
+            }
+            // Set construction + size (dedup edge: `set.from` over a literal array).
+            _ => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                format!("set.size(set.from([{a}, {b}, {a}]))")
+            }
+        }
     }
 }
 
