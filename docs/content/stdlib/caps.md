@@ -15,18 +15,26 @@ A small, fixed, closed set — one per dangerous resource class:
 
 | Capability | Governs |
 |---|---|
-| `fs` | filesystem read/write/metadata/listing; `io` stdin reads; `os` file ops |
-| `net` | sockets, HTTP, **DNS** (`net.lookup`), WebSocket, UDP, servers, net-topology |
+| `fs` | filesystem read/write/metadata/listing; `io` stdin reads; `os` file ops; `sqlite` DB files; **`workflow` event-log persistence** |
+| `net` | sockets, HTTP, **DNS** (`net.lookup`), WebSocket, UDP, servers, net-topology; `postgres`/`redis`; **`ai` (LLM API calls)**; **`telemetry` (OTLP/Sentry/PostHog exporters)** |
 | `process` | spawning subprocesses |
 | `ffi` | `ffi.open` (and therefore all native calls) |
 | `env` | reading/writing environment variables |
 
 The gate is applied **once, centrally**, at the single stdlib dispatch site, keyed by
 module string — so DNS (`net.lookup`, which is *not* a connect site), stdin reads
-(`io`), and host-topology leaks (`os.networkInterfaces`/`localIp`/`hostname`) are all
-captured **by construction**. There is no per-function path that can slip the gate. A
-denied capability is a **recoverable Tier-2 panic** (`capability 'net' denied`), so a
-host can sandbox a plugin and *observe* the denial rather than crash.
+(`io`), host-topology leaks (`os.networkInterfaces`/`localIp`/`hostname`), the database
+modules, and the `ai`/`telemetry` network exporters are all captured **by construction**.
+There is no per-function path that can slip the gate (a completeness test forces every
+stdlib module to be classified gated-or-pure). A denied capability is a **recoverable
+Tier-2 panic** (`capability 'net' denied`), so a host can sandbox a plugin and *observe*
+the denial rather than crash.
+
+> **`ffi` is the all-bets-off capability.** Native code loaded via `ffi.open` runs
+> outside every other capability check — a plugin granted `ffi` can `dlsym("connect")`
+> (network), `dlsym("open")` (filesystem), or spawn a process, regardless of whether
+> `net`/`fs`/`process` were dropped. So **deny `ffi` for any isolate you also want to
+> deny `net`/`fs`/`process`** — granting `ffi` is equivalent to granting everything.
 
 ## Three scopes, all subtractive
 

@@ -721,16 +721,25 @@ impl NativeKind {
             | NativeKind::Lru
             | NativeKind::Events
             | NativeKind::WorkerActor => None,
+            // Telemetry spans/instruments BUFFER in memory; the only network egress is the
+            // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
+            // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a
+            // telemetry handle acquires no OS resource → ungated (over-gating a no-op span
+            // would break defensive telemetry use).
             #[cfg(feature = "telemetry")]
             NativeKind::TelemetrySpan
             | NativeKind::TelemetryInstrument
             | NativeKind::TelemetryNoop => None,
+            // An OPEN AI stream reads completions FROM THE NETWORK on each `.next()`
+            // (`exec_chat_stream`), so operating one after `caps.drop("net")` must be
+            // denied — the per-handle re-check that makes the drop HOLD (mirrors
+            // TcpStream/HttpBody). `AiProvider`/`AiModel`/`AiTool` are pure config / tool
+            // definitions with no network-doing handle methods (the network is the
+            // module-level `ai.generate`/`ai.stream`, gated at the dispatch root).
             #[cfg(feature = "ai")]
-            NativeKind::AiProvider
-            | NativeKind::AiModel
-            | NativeKind::AiStream
-            | NativeKind::AiTextStream
-            | NativeKind::AiTool => None,
+            NativeKind::AiStream | NativeKind::AiTextStream => Some(Cap::Net),
+            #[cfg(feature = "ai")]
+            NativeKind::AiProvider | NativeKind::AiModel | NativeKind::AiTool => None,
         }
     }
 }

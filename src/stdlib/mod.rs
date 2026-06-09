@@ -342,6 +342,21 @@ pub fn required_cap(module: &str, func: &str) -> Option<caps::Cap> {
         "postgres" => Some(Cap::Net),
         #[cfg(feature = "redis")]
         "redis" => Some(Cap::Net),
+        // `ai` + `telemetry` each carry their OWN reqwest network stack (LLM API calls /
+        // OTLP-HTTP/Sentry/PostHog exporters) — NOT routed through `net_http`, so they
+        // need their own gate or a `--deny net`/`--sandbox`/`run_in_worker({deny net})`
+        // isolate could still exfiltrate over the network. Whole-module `Net` gate, the
+        // same posture as `net.lookup`. Feature-gated like the dispatch arms.
+        #[cfg(feature = "ai")]
+        "ai" => Some(Cap::Net),
+        #[cfg(feature = "telemetry")]
+        "telemetry" => Some(Cap::Net),
+        // `workflow.run`/`resume` PERSIST an append-only event log to a user-specified
+        // `{log}` FILE PATH (`write_log` → `std::fs::File::create`), so a durable workflow
+        // writes the host filesystem → `Fs`. (Found by the completeness sweep below; same
+        // ungated-OS-module class as ai/telemetry.)
+        #[cfg(feature = "workflow")]
+        "workflow" => Some(Cap::Fs),
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
@@ -1003,6 +1018,15 @@ mod cap_gate_tests {
             ("postgres", Cap::Net),
             #[cfg(feature = "redis")]
             ("redis", Cap::Net),
+            // ai/telemetry carry their own reqwest network stacks; workflow persists an
+            // event-log FILE — all OS-acquiring, all were ungated (holistic-review BLOCKER
+            // 1 + completeness sweep).
+            #[cfg(feature = "ai")]
+            ("ai", Cap::Net),
+            #[cfg(feature = "telemetry")]
+            ("telemetry", Cap::Net),
+            #[cfg(feature = "workflow")]
+            ("workflow", Cap::Fs),
         ];
         for (m, want) in gated {
             assert_eq!(
@@ -1013,5 +1037,56 @@ mod cap_gate_tests {
         }
         // os is per-func: at least its topology funcs must be Net.
         assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
+    }
+
+    /// COMPLETENESS guard (holistic-review BLOCKER 2): the prior test only checks modules
+    /// someone REMEMBERED to list — it cannot catch a NEW OS-touching module added with no
+    /// `required_cap` entry (exactly how ai/telemetry/workflow shipped ungated). This test
+    /// closes the loop: EVERY module in `STD_MODULES` must be classified as either GATED
+    /// (a `required_cap` entry) or EXPLICITLY ungated (in `KNOWN_UNGATED`, pure/in-memory
+    /// or process-owned stdio). A module in NEITHER trips this — forcing a deliberate
+    /// capability decision for anything new. Run only in the full default build where
+    /// every feature-gated module is actually present + dispatchable.
+    #[test]
+    #[cfg(all(
+        feature = "ai",
+        feature = "telemetry",
+        feature = "workflow",
+        feature = "sql",
+        feature = "postgres",
+        feature = "redis",
+        feature = "ffi",
+        feature = "net"
+    ))]
+    fn every_std_module_is_classified_gated_or_explicitly_ungated() {
+        // Pure / in-memory / process-owned-stdio modules that acquire NO new OS resource.
+        // (`tui` is the controlling terminal's stdout/stdin — like `print` — not a new fd;
+        // revisit if raw-tty input ever becomes a gated input channel. `log` writes
+        // stderr / a capture buffer, never an arbitrary file. `cli` reads start-time argv.)
+        const KNOWN_UNGATED: &[&str] = &[
+            "assert", "bench", "cli", "color", "decimal", "math", "string", "array",
+            "object", "map", "schema", "set", "lru", "events", "template", "bytes", "caps",
+            "convert", "task", "time", "sync", "stream", "date", "intl", "json", "log",
+            "encoding", "crypto", "compress", "regex", "url", "uuid", "csv", "toml", "yaml",
+            "msgpack", "cbor", "tui",
+        ];
+        for full in STD_MODULES {
+            let key = full.strip_prefix("std/").unwrap().replace('/', "_");
+            if key == "os" {
+                continue; // per-func (topology→Net, ambient→None); covered above.
+            }
+            let gated = required_cap(&key, "__probe__").is_some();
+            let ungated = KNOWN_UNGATED.contains(&key.as_str());
+            assert!(
+                gated || ungated,
+                "std module '{key}' is UNCLASSIFIED: add it to `required_cap` if it touches \
+                 the OS, or to `KNOWN_UNGATED` if it is pure. (A silently-ungated OS module \
+                 is a capability bypass — this is exactly how ai/telemetry/workflow slipped.)"
+            );
+            assert!(
+                !(gated && ungated),
+                "std module '{key}' is in BOTH required_cap and KNOWN_UNGATED — pick one."
+            );
+        }
     }
 }

@@ -331,6 +331,61 @@ fn audit_ffi_open_denied() {
     assert_denied("audit_ffi_open_sbx.as", imp, "ffi.open(\"libm.so.6\")", "ffi", &["--sandbox"]);
 }
 
+// Holistic-review BLOCKER: `ai`/`telemetry` carry their OWN reqwest network stacks (not
+// routed through `net_http`) and `workflow` persists an event-log FILE — all were ungated
+// network/fs egress that defeated --deny net / --deny fs / --sandbox. Now gated; audited.
+
+#[cfg(feature = "telemetry")]
+#[test]
+fn audit_telemetry_network_denied_by_net() {
+    let imp = "import * as telemetry from \"std/telemetry\"";
+    // telemetry.flush exports over the network → gated by Net (was an exfil channel).
+    assert_denied("audit_telemetry_flush.as", imp, "telemetry.flush()", "net", &["--deny", "net"]);
+    assert_denied("audit_telemetry_flush_sbx.as", imp, "telemetry.flush()", "net", &["--sandbox"]);
+}
+
+#[cfg(feature = "ai")]
+#[test]
+fn audit_ai_network_denied_by_net() {
+    let imp = "import * as ai from \"std/ai\"";
+    // ai.generate makes an LLM API call → gated by Net.
+    assert_denied(
+        "audit_ai_generate.as",
+        imp,
+        "ai.generate({model: \"openai:gpt-4o-mini\", prompt: \"hi\"})",
+        "net",
+        &["--deny", "net"],
+    );
+    assert_denied(
+        "audit_ai_generate_sbx.as",
+        imp,
+        "ai.generate({model: \"openai:gpt-4o-mini\", prompt: \"hi\"})",
+        "net",
+        &["--sandbox"],
+    );
+}
+
+#[cfg(feature = "workflow")]
+#[test]
+fn audit_workflow_log_write_denied_by_fs() {
+    // workflow.run persists an append-only event log to a user `{log}` file path → Fs.
+    let imp = "import { run } from \"std/workflow\"\nfn wf(ctx, input) { return 1 }";
+    assert_denied(
+        "audit_workflow_run.as",
+        imp,
+        "run(wf, {id: 1}, {log: \"/tmp/ascript_audit_wf.log\"})",
+        "fs",
+        &["--deny", "fs"],
+    );
+    assert_denied(
+        "audit_workflow_run_sbx.as",
+        imp,
+        "run(wf, {id: 1}, {log: \"/tmp/ascript_audit_wf.log\"})",
+        "fs",
+        &["--sandbox"],
+    );
+}
+
 // ───────────────────────────── the positive half: a granted cap works ─────────
 
 #[test]
