@@ -404,10 +404,105 @@ impl CapBits {
     }
 }
 
-// The `std/caps` module routing (exports / call) is added in Task 4 below.
-// A placeholder keeps the module a clean unit until then.
-#[allow(dead_code)]
-pub(crate) fn _placeholder(_: &Value) {}
+// ─────────────────────────── `std/caps` module routing ───────────────────────
+// CORE (no feature gate): the capability query/drop surface exists in every build.
+// `import * as caps from "std/caps"` then `caps.has(...)` / `caps.drop(...)`.
+
+use crate::error::AsError;
+use crate::interp::{Control, Interp};
+use crate::span::Span;
+
+/// `std/caps` exports — flat names so `import * as caps` binds `caps.has` etc.
+/// All four register in `std_arity.rs` (the drift-guard cross-checks exports).
+pub fn exports() -> Vec<(&'static str, Value)> {
+    vec![
+        ("has", super::bi("caps.has")),
+        ("list", super::bi("caps.list")),
+        ("drop", super::bi("caps.drop")),
+        ("dropAll", super::bi("caps.dropAll")),
+    ]
+}
+
+impl Interp {
+    /// `std/caps` dispatch (`&self` — `drop`/`dropAll` mutate `Interp.caps`).
+    /// Note: the `caps` module is NOT gated by `required_cap` (querying/dropping
+    /// authority is always permitted — you can only ever NARROW).
+    pub(crate) async fn call_caps(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        match func {
+            // caps.has(name) -> bool. Unknown name → Tier-2 panic (programmer error).
+            "has" => {
+                let name = super::want_string(&super::arg(args, 0), span, "caps.has")?;
+                let cap = parse_cap_name(&name, span)?;
+                // Granted iff the bit is set OR a carve-out is configured (a
+                // carve-out means "partially granted", so `has` reports true).
+                let caps = self.caps();
+                let granted = caps.has(cap)
+                    || matches!(cap, Cap::Fs if caps.fs_scope.is_some())
+                    || matches!(cap, Cap::Net if caps.net_scope.is_some());
+                Ok(Value::Bool(granted))
+            }
+            // caps.list() -> array<string> — currently outright-granted caps.
+            "list" => {
+                let names = self.caps().granted_names();
+                let arr: Vec<Value> = names.into_iter().map(|n| Value::Str(n.into())).collect();
+                Ok(Value::Array(crate::value::ArrayCell::new(arr)))
+            }
+            // caps.drop(name) -> nil — IRREVERSIBLE subtraction. Refused in a pooled
+            // worker fn (§4.5a). Unknown name → Tier-2 panic.
+            "drop" => {
+                let name = super::want_string(&super::arg(args, 0), span, "caps.drop")?;
+                let cap = parse_cap_name(&name, span)?;
+                self.guard_drop_allowed("caps.drop", span)?;
+                self.caps_deny(cap);
+                Ok(Value::Nil)
+            }
+            // caps.dropAll() -> nil — drop all five. Same refusal rule.
+            "dropAll" => {
+                self.guard_drop_allowed("caps.dropAll", span)?;
+                self.caps_deny_all();
+                Ok(Value::Nil)
+            }
+            _ => Err(AsError::at(format!("std/caps has no function '{func}'"), span).into()),
+        }
+    }
+
+    /// §4.5a: a `caps.drop`/`dropAll` is REFUSED (loud recoverable Tier-2 panic)
+    /// when the isolate forbids dropping — i.e. a POOLED `worker fn`, whose shared
+    /// `Interp` is reused across requests, so a drop would leak forward / require a
+    /// re-grant. Durable only on the top-level program and a dedicated isolate.
+    fn guard_drop_allowed(&self, op: &str, span: Span) -> Result<(), Control> {
+        if self.caps_drop_allowed() {
+            Ok(())
+        } else {
+            Err(Control::Panic(AsError::at(
+                format!(
+                    "{op} is not allowed inside a pooled worker fn (a shared isolate \
+                     is reused across requests; drop capabilities in a dedicated \
+                     isolate via run_in_worker or at the top level instead)"
+                ),
+                span,
+            )))
+        }
+    }
+}
+
+/// Parse a capability name arg, raising a Tier-2 panic on an unknown name
+/// (programmer error — not Tier-1 data). Shared by `has`/`drop`.
+fn parse_cap_name(name: &str, span: Span) -> Result<Cap, Control> {
+    cap_name(name).ok_or_else(|| {
+        Control::Panic(AsError::at(
+            format!(
+                "unknown capability '{name}' (expected one of: fs, net, process, ffi, env)"
+            ),
+            span,
+        ))
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -595,6 +690,144 @@ mod tests {
         let mut ffi = CapSet::all_granted();
         ffi.deny(Cap::Ffi);
         assert_eq!(ffi.dispatch_decision(Cap::Ffi), CapDecision::Deny);
+    }
+
+    // ─────────────────────── `std/caps` module routing (Task 4) ──────────────
+    use crate::interp::{Control, Interp};
+    use crate::span::Span;
+
+    fn span() -> Span {
+        Span::new(0, 0)
+    }
+
+    #[tokio::test]
+    async fn caps_has_reports_grant_and_drop() {
+        let interp = Interp::new();
+        // Default: everything granted.
+        let r = interp
+            .call_caps("has", &[Value::Str("net".into())], span())
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Bool(true));
+        // Drop net → has("net") becomes false.
+        interp
+            .call_caps("drop", &[Value::Str("net".into())], span())
+            .await
+            .unwrap();
+        let r = interp
+            .call_caps("has", &[Value::Str("net".into())], span())
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Bool(false));
+        // Other caps untouched.
+        let r = interp
+            .call_caps("has", &[Value::Str("fs".into())], span())
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn caps_list_reflects_grants() {
+        let interp = Interp::new();
+        interp
+            .call_caps("drop", &[Value::Str("ffi".into())], span())
+            .await
+            .unwrap();
+        let list = interp.call_caps("list", &[], span()).await.unwrap();
+        if let Value::Array(a) = list {
+            let names: Vec<String> = a
+                .borrow()
+                .iter()
+                .map(|v| match v {
+                    Value::Str(s) => s.to_string(),
+                    _ => panic!("expected strings"),
+                })
+                .collect();
+            assert_eq!(names, vec!["fs", "net", "process", "env"]); // ffi dropped
+        } else {
+            panic!("caps.list should return an array");
+        }
+    }
+
+    #[tokio::test]
+    async fn caps_drop_is_irreversible_no_regrant_api() {
+        let interp = Interp::new();
+        interp
+            .call_caps("drop", &[Value::Str("process".into())], span())
+            .await
+            .unwrap();
+        // Stays false — there is NO grant function to call (caps.call has no "grant"
+        // arm; the only mutators are drop/dropAll). Dropping again is idempotent.
+        interp
+            .call_caps("drop", &[Value::Str("process".into())], span())
+            .await
+            .unwrap();
+        let r = interp
+            .call_caps("has", &[Value::Str("process".into())], span())
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Bool(false));
+        // A bogus func name (e.g. "grant") errors — no re-grant path exists.
+        let no_grant = interp.call_caps("grant", &[Value::Str("process".into())], span()).await;
+        assert!(no_grant.is_err(), "there must be no caps.grant");
+    }
+
+    #[tokio::test]
+    async fn caps_drop_all_clears_everything() {
+        let interp = Interp::new();
+        interp.call_caps("dropAll", &[], span()).await.unwrap();
+        let list = interp.call_caps("list", &[], span()).await.unwrap();
+        if let Value::Array(a) = list {
+            assert!(a.borrow().is_empty(), "dropAll should leave no grants");
+        } else {
+            panic!("list should be an array");
+        }
+    }
+
+    #[tokio::test]
+    async fn caps_unknown_name_is_tier2_panic() {
+        let interp = Interp::new();
+        match interp.call_caps("has", &[Value::Str("bogus".into())], span()).await {
+            Err(Control::Panic(e)) => assert!(e.message.contains("unknown capability"), "{}", e.message),
+            other => panic!("expected unknown-cap panic, got {other:?}"),
+        }
+        match interp.call_caps("drop", &[Value::Str("nope".into())], span()).await {
+            Err(Control::Panic(e)) => assert!(e.message.contains("unknown capability"), "{}", e.message),
+            other => panic!("expected unknown-cap panic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn caps_drop_refused_in_pooled_worker() {
+        let interp = Interp::new();
+        // Simulate a pooled worker isolate: drops are refused.
+        interp.set_caps_drop_allowed(false);
+        match interp.call_caps("drop", &[Value::Str("net".into())], span()).await {
+            Err(Control::Panic(e)) => {
+                assert!(e.message.contains("pooled worker"), "{}", e.message)
+            }
+            other => panic!("expected pooled-drop refusal, got {other:?}"),
+        }
+        // The refusal must NOT have mutated caps: net is still granted.
+        let r = interp
+            .call_caps("has", &[Value::Str("net".into())], span())
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Bool(true), "a refused drop must not mutate caps");
+        // dropAll is likewise refused.
+        assert!(interp.call_caps("dropAll", &[], span()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn caps_drop_durable_on_top_level_isolate() {
+        let interp = Interp::new();
+        assert!(interp.caps_drop_allowed(), "top-level isolate allows drops");
+        interp
+            .call_caps("drop", &[Value::Str("env".into())], span())
+            .await
+            .unwrap();
+        assert!(!interp.caps().has(Cap::Env), "drop mutated Interp.caps");
     }
 
     #[test]

@@ -58,6 +58,12 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/math", "trailing_zeros") => 1,
         ("std/math", "rotl") => 2,
         ("std/math", "rotr") => 2,
+        // std/caps — the capability surface (FFI §5.2). `list`/`dropAll` take no
+        // args; `has`/`drop` take exactly one (the capability name).
+        ("std/caps", "has") => 1,
+        ("std/caps", "list") => 0,
+        ("std/caps", "drop") => 1,
+        ("std/caps", "dropAll") => 0,
         // std/task — pipe requires exactly 2 args (generator + event bus).
         ("std/task", "pipe") => 2,
         // std/string — NUM code-point helpers (fixed required arity).
@@ -116,6 +122,10 @@ mod tests {
             ("std/math", "trailing_zeros"),
             ("std/math", "rotl"),
             ("std/math", "rotr"),
+            ("std/caps", "has"),
+            ("std/caps", "list"),
+            ("std/caps", "drop"),
+            ("std/caps", "dropAll"),
             ("std/task", "pipe"),
             ("std/string", "codepoints"),
             ("std/string", "from_codepoints"),

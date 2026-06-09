@@ -908,22 +908,19 @@ impl Interp {
     }
 
     /// Whether `caps.drop`/`caps.dropAll` may mutate this isolate's `caps` (§4.5a).
-    /// Consumed by `std/caps` `drop`/`dropAll` routing (Task 4).
-    #[allow(dead_code)]
+    /// Consumed by `std/caps` `drop`/`dropAll` routing.
     pub(crate) fn caps_drop_allowed(&self) -> bool {
         self.caps_drop_allowed.get()
     }
 
     /// Irreversibly **deny** `cap` on this isolate (`caps.drop`). Subtractive only —
-    /// there is no inverse. The caller (Task 4 `caps.call`) has already verified
+    /// there is no inverse. The caller (`call_caps`) has already verified
     /// [`caps_drop_allowed`](Interp::caps_drop_allowed).
-    #[allow(dead_code)]
     pub(crate) fn caps_deny(&self, cap: crate::stdlib::caps::Cap) {
         self.caps.borrow_mut().deny(cap);
     }
 
     /// Irreversibly deny ALL five dangerous capabilities (`caps.dropAll`).
-    #[allow(dead_code)]
     pub(crate) fn caps_deny_all(&self) {
         self.caps.borrow_mut().deny_all_dangerous();
     }
