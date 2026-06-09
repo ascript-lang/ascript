@@ -588,6 +588,23 @@ pub enum NativeKind {
     // down). Not feature-gated — `worker` is core syntax. Readable field: the
     // declared class `name`.
     WorkerActor,
+    // FFI campaign §3.4: an open shared library (`ffi.open` → `dlopen`). Backs a
+    // `ResourceState::ForeignLib(libloading::Library)`; its `Drop` `dlclose`s
+    // deterministically. Method: `.symbol`. GC-UNTRACED (a `Library` is an opaque OS
+    // handle the collector cannot reason about — reclaimed only by `Drop`). The
+    // variant name stays un-gated (kept in every exhaustive `NativeKind` match) even
+    // when the `ffi` feature is off, so matches compile in both configs; only the
+    // backing `ResourceState` body references `libloading`.
+    ForeignLib,
+    // FFI campaign §3.4: a `dlsym`'d symbol + its bound signature (argtypes/rettype +
+    // the libffi CIF). Method: `.call`. Stores the resolved function address as a raw
+    // `*mut c_void` and KEEPS THE OWNING `Library` ALIVE (a borrowed `Symbol<'lib>`
+    // cannot be `'static`). GC-UNTRACED.
+    ForeignSymbol,
+    // FFI campaign §3.4: an opaque C pointer returned by a call (a `malloc` result, a
+    // C "constructor" handle). Carries the raw `usize` address; passed back as a
+    // `ffi.ptr`. NOT auto-freed (ownership is the C library's contract). GC-UNTRACED.
+    ForeignPtr,
 }
 
 impl NativeKind {
@@ -638,6 +655,9 @@ impl NativeKind {
             #[cfg(feature = "ai")]
             NativeKind::AiTool => "aiTool",
             NativeKind::WorkerActor => "workerActor",
+            NativeKind::ForeignLib => "foreignLib",
+            NativeKind::ForeignSymbol => "foreignSymbol",
+            NativeKind::ForeignPtr => "foreignPtr",
         }
     }
 
@@ -681,6 +701,14 @@ impl NativeKind {
             }
             // An open DB file handle (sqlite): operating it is filesystem I/O.
             NativeKind::SqliteConnection | NativeKind::SqliteStatement => Some(Cap::Fs),
+            // FFI §4 (BLOCKER 3): operating an OPEN foreign handle — `lib.symbol`,
+            // `sym.call`, reading a `ForeignPtr` — is a native-call effect governed by
+            // `ffi`. So `caps.drop("ffi")` HOLDS for libs/symbols opened before the
+            // drop: a `lib.symbol`/`sym.call` after the drop is denied here, not just
+            // the initial `ffi.open` at the dispatch gate.
+            NativeKind::ForeignLib | NativeKind::ForeignSymbol | NativeKind::ForeignPtr => {
+                Some(Cap::Ffi)
+            }
             // Pure in-memory natives — no OS effect at method time → ungated.
             NativeKind::Terminal
             | NativeKind::Channel

@@ -501,6 +501,35 @@ mod tests {
         closure_inner.trace(&mut noop); // no panic, traces upvalue cells
     }
 
+    /// FFI Gate 4 (load-bearing): the three FFI native handles
+    /// (`ForeignLib`/`ForeignSymbol`/`ForeignPtr`) contribute ZERO traced edges — the
+    /// GC must NEVER trace into a `Library` / raw foreign pointer (it is opaque memory
+    /// the collector cannot reason about; reclamation is the deterministic `Drop` of the
+    /// `ResourceState`). `Value::Native` traces as a no-op (`_ => {}`), so a
+    /// `Value::Native(ForeignPtr)` adds no Probe visits regardless of the kind.
+    #[test]
+    fn ffi_native_handles_add_zero_traced_edges() {
+        let mut noop: Box<dyn FnMut(*const ())> = Box::new(|_p| {});
+        VISITS.with(|c| c.set(0));
+        for kind in [
+            crate::value::NativeKind::ForeignLib,
+            crate::value::NativeKind::ForeignSymbol,
+            crate::value::NativeKind::ForeignPtr,
+        ] {
+            let handle = Value::Native(Rc::new(crate::value::NativeObject {
+                id: 0,
+                kind,
+                fields: IndexMap::new(),
+            }));
+            handle.trace(&mut noop);
+        }
+        assert_eq!(
+            VISITS.with(|c| c.get()),
+            0,
+            "an FFI native handle must contribute zero traced edges (GC leaf-opaque)"
+        );
+    }
+
     /// V13-T3: collection actually RUNS and reclaims a reference cycle. Build a
     /// self-referential array (`let a = []; a.push(a)`) directly over the `Cc`
     /// value model, drop the external handle, then force a collection via the

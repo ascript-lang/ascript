@@ -21,6 +21,8 @@ pub mod convert;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 pub mod events;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "datetime")]
@@ -197,6 +199,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/cbor" => cbor::exports(),
         #[cfg(feature = "tui")]
         "std/tui" => tui::exports(),
+        #[cfg(feature = "ffi")]
+        "std/ffi" => ffi::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -266,6 +270,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/msgpack",
     "std/cbor",
     "std/tui",
+    "std/ffi",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -569,6 +574,8 @@ impl Interp {
             "cbor" => cbor::call(func, args, span),
             #[cfg(feature = "tui")]
             "tui" => self.call_tui(func, args, span),
+            #[cfg(feature = "ffi")]
+            "ffi" => self.call_ffi(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

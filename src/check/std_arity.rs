@@ -64,6 +64,10 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/caps", "list") => 0,
         ("std/caps", "drop") => 1,
         ("std/caps", "dropAll") => 0,
+        // std/ffi — Task 6 lands `open` (1 required arg); the full surface
+        // (struct/cstr/read_cstr/alloc/get/set + the symbol/call handle methods)
+        // is registered in Task 7.
+        ("std/ffi", "open") => 1,
         // std/task — pipe requires exactly 2 args (generator + event bus).
         ("std/task", "pipe") => 2,
         // std/string — NUM code-point helpers (fixed required arity).
@@ -126,6 +130,7 @@ mod tests {
             ("std/caps", "list"),
             ("std/caps", "drop"),
             ("std/caps", "dropAll"),
+            ("std/ffi", "open"),
             ("std/task", "pipe"),
             ("std/string", "codepoints"),
             ("std/string", "from_codepoints"),

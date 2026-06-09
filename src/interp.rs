@@ -339,6 +339,32 @@ pub(crate) enum ResourceState {
     /// handle — NOT script `Value`s. The GC must NEVER trace into it. `Value::Native`
     /// already traces as a no-op (`gc.rs`'s `_ => {}` arm), so the invariant holds.
     WorkerActor(Box<crate::worker::actor::WorkerActorHandle>),
+    /// FFI campaign §3.4: an open shared library (`ffi.open` → `dlopen`). The
+    /// `libloading::Library` `dlclose`s on `Drop` (deterministic reclaim, matching the
+    /// native-resource discipline). Wrapped in an `Rc` so a `ForeignSymbol` can keep
+    /// the owning `Library` alive past the lib handle's own drop (a borrowed
+    /// `Symbol<'lib>` cannot be `'static`; the raw-address-plus-kept-alive-`Library`
+    /// pairing gives both `'static` storage and lifetime correctness — §3.4).
+    ///
+    /// GC INVARIANT: a `Library` is an opaque OS handle; the GC must NEVER trace into
+    /// it. `Value::Native` traces as a no-op (`gc.rs`'s `_ => {}`), so the invariant
+    /// holds for `ForeignLib`/`ForeignSymbol`/`ForeignPtr` automatically.
+    #[cfg(feature = "ffi")]
+    #[allow(dead_code)] // The field is read by Task 7's `lib.symbol`.
+    ForeignLib(std::rc::Rc<libloading::Library>),
+    /// FFI campaign §3.4: a resolved symbol + its bound signature. Stores the function
+    /// address as a raw pointer (in `FfiSymbol`) and KEEPS THE OWNING `Library` ALIVE
+    /// via an `Rc` clone, so the address stays valid for every `sym.call`. Boxed to
+    /// keep the enum compact. GC-UNTRACED (raw pointer + opaque handle).
+    #[cfg(feature = "ffi")]
+    #[allow(dead_code)] // Constructed by Task 7's `lib.symbol`.
+    ForeignSymbol(Box<crate::stdlib::ffi::FfiSymbol>),
+    /// FFI campaign §3.4: an opaque C pointer (a `malloc` result, a C "constructor"
+    /// handle) carried as a raw `usize` address. NOT auto-freed (the C library owns the
+    /// lifetime). GC-UNTRACED.
+    #[cfg(feature = "ffi")]
+    #[allow(dead_code)] // Constructed by Task 7's pointer-returning `sym.call`.
+    ForeignPtr(usize),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
