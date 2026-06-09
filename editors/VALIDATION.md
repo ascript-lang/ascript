@@ -277,7 +277,7 @@ gaps:
 - **Zed / Neovim grammar repo URL + commit SHA** — RESOLVED. The standalone
   `ascript-lang/tree-sitter-ascript` grammar is published and `editors/zed/extension.toml`
   (`[grammars.ascript].commit`) and `editors/nvim/lua/ascript/treesitter.lua` (`GRAMMAR_REV`) are
-  both pinned to the published commit (currently `118c62e7`). Re-pin both whenever the grammar
+  both pinned to the published commit (currently `7227fb7f`). Re-pin both whenever the grammar
   changes — `scripts/sync-grammar.sh` mirrors the subtree and prints the new SHA. The bundled
   `*.scm` query files are full copies of the complete query set (verified), not interim stubs.
 - **VS Code icon** — the extension ships without an icon and uses VS Code's default file icon
