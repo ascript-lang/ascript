@@ -73,6 +73,8 @@ pub mod redis;
 #[cfg(feature = "data")]
 pub mod regex;
 pub mod schema;
+#[cfg(feature = "shared")]
+pub mod shared;
 pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
@@ -124,6 +126,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/object" => object::exports(),
         "std/map" => map::exports(),
         "std/schema" => schema::exports(),
+        #[cfg(feature = "shared")]
+        "std/shared" => shared::exports(),
         "std/set" => set::exports(),
         "std/lru" => lru::exports(),
         "std/events" => events::exports(),
@@ -227,6 +231,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/object",
     "std/map",
     "std/schema",
+    "std/shared",
     "std/set",
     "std/lru",
     "std/events",
@@ -498,6 +503,8 @@ impl Interp {
             "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
             "schema" => self.call_schema(func, args, span).await,
+            #[cfg(feature = "shared")]
+            "shared" => shared::call(func, args, span),
             "set" => set::call(func, args, span),
             "lru" => self.call_lru_new(func, args, span),
             "events" => self.call_events_new(func, args, span),
@@ -1065,7 +1072,7 @@ mod cap_gate_tests {
         // stderr / a capture buffer, never an arbitrary file. `cli` reads start-time argv.)
         const KNOWN_UNGATED: &[&str] = &[
             "assert", "bench", "cli", "color", "decimal", "math", "string", "array",
-            "object", "map", "schema", "set", "lru", "events", "template", "bytes", "caps",
+            "object", "map", "schema", "shared", "set", "lru", "events", "template", "bytes", "caps",
             "convert", "task", "time", "sync", "stream", "date", "intl", "json", "log",
             "encoding", "crypto", "compress", "regex", "url", "uuid", "csv", "toml", "yaml",
             "msgpack", "cbor", "tui",

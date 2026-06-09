@@ -123,7 +123,14 @@ tempfile = "3"
 static_assertions = "1"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared"]
+# SRV §3/§4: std/shared — the shared, immutable, zero-copy read-only heap. The
+# `Value::Shared` VARIANT + `SharedNode` + the read-only dispatch are CORE (unconditional,
+# build under --no-default-features); only the `shared.freeze`/`shared.isShared` stdlib
+# functions live here, behind this feature (mirroring how `Value` kinds are core but
+# their stdlib lives in a feature module). Pure / in-memory — no OS, no extra deps.
+# Default-on (batteries).
+shared = []
 # SP6 package manager / dependency story. Decentralized-first (git/url/path deps;
 # bare-version requirements need a future registry). CLI-only and feature-gated,
 # exactly like `src/lint_config_toml.rs` keeps TOML/IO out of the interpreter
