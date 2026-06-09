@@ -93,6 +93,8 @@ use crate::span::Span;
 use crate::value::{NativeKind, NativeMethod, Value};
 use indexmap::IndexMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -885,6 +887,61 @@ impl Interp {
             None => return Ok(err_pair("server.serve: server is closed".into())),
         };
 
+        // Seed the SHARED accept budget + stop signal that `accept_loop` runs against.
+        // For the single-isolate path these are private to this one loop: the budget
+        // is `maxRequests` (or `usize::MAX` = unbounded), and the stop `Notify` is
+        // never fired by anyone but this loop reaching budget 0. The multi-isolate
+        // path (SRV Part A, Task 8) clones the SAME `Arc<AtomicUsize>` budget +
+        // `Arc<Notify>` into every isolate's `accept_loop`, which is exactly why the
+        // body is factored out here. Single-isolate behavior is byte-for-byte the same
+        // as the prior inline loop (budget reproduces `served`/`maxRequests`).
+        let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
+        let stop = Arc::new(tokio::sync::Notify::new());
+        // `bounded` mirrors the old `max_requests.is_some()` — when set, the loop
+        // retains + drains in-flight handler tasks and observes the shared stop.
+        let bounded = max_requests.is_some();
+
+        self.accept_loop(
+            listener,
+            id,
+            max_body,
+            timeout_ms,
+            max_concurrent,
+            budget,
+            stop,
+            bounded,
+            span,
+        )
+        .await
+    }
+
+    /// The per-listener accept + dispatch loop, factored out of `http_server_serve`
+    /// so the single-isolate path AND each multi-isolate REUSEPORT isolate (SRV
+    /// Part A) run the SAME body on their own listener (`listener` by value), their
+    /// own per-isolate handle `id`, sharing one `budget`/`stop` across the group.
+    ///
+    /// `budget` is the remaining global request count (`usize::MAX` = unbounded);
+    /// each accepted connection does a saturating `fetch_sub` and, when the budget
+    /// is exhausted, fires `stop` so sibling isolates blocked on `accept()` also
+    /// halt. `bounded` (true iff `maxRequests` was set) toggles the deterministic
+    /// drain: when set, in-flight handler tasks are retained and awaited before
+    /// returning, and the loop also wakes on `stop` so a sibling reaching the global
+    /// budget stops this loop too. When unset (`serve` with no `maxRequests`), this
+    /// is an unbounded server: tasks are detached and the loop runs forever (the old
+    /// behavior exactly — `stop` is never fired and `accept()` is awaited directly).
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_loop(
+        &self,
+        listener: TcpListener,
+        id: u64,
+        max_body: usize,
+        timeout_ms: u64,
+        max_concurrent: usize,
+        budget: Arc<AtomicUsize>,
+        stop: Arc<tokio::sync::Notify>,
+        bounded: bool,
+        span: Span,
+    ) -> Result<Value, Control> {
         // Bounds the number of connections handled at once. Each spawned handler
         // task holds an `OwnedSemaphorePermit` for its lifetime; the permit is
         // released (returned to the semaphore) when the task finishes. This caps
@@ -893,25 +950,70 @@ impl Interp {
         // the resulting `OwnedSemaphorePermit` is `'static` and can move into the
         // spawned handler task. Arc is fine in this `!Send` single-threaded runtime —
         // the permit never crosses a thread (every task stays on the LocalSet).
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        // In-flight handler tasks, retained ONLY when `maxRequests` is set so the
-        // shutdown path can DRAIN them (await completion) before returning —
+        let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        // In-flight handler tasks, retained ONLY when bounded (`maxRequests` set) so
+        // the shutdown path can DRAIN them (await completion) before returning —
         // otherwise an accepted-but-not-yet-finished slow handler's response could be
         // lost. Without `maxRequests` (an unbounded `serve`) tasks are detached; the
         // semaphore alone bounds concurrency and finished tasks free themselves, so
         // we don't accumulate join handles forever.
         let mut inflight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let mut served = 0usize;
         loop {
-            if let Some(max) = max_requests {
-                if served >= max {
+            // On the bounded path, stop accepting once the SHARED budget is exhausted.
+            // Reading 0 here means either this loop or a sibling has already claimed
+            // the global total; make sure every sibling wakes, then drain + return.
+            // (`usize::MAX` = unbounded effectively never reaches 0.)
+            if bounded && budget.load(Ordering::SeqCst) == 0 {
+                stop.notify_waiters();
+                break;
+            }
+            // Accept the next connection. On the bounded path we race `accept()`
+            // against the shared `stop` so a sibling reaching the global budget wakes
+            // THIS loop out of a blocking `accept()` (otherwise it would hang). On the
+            // unbounded path `stop` is never fired, so we await `accept()` directly
+            // (byte-identical to the old loop).
+            let accepted = if bounded {
+                tokio::select! {
+                    biased;
+                    r = listener.accept() => Some(r),
+                    _ = stop.notified() => None,
+                }
+            } else {
+                Some(listener.accept().await)
+            };
+            let (stream, _peer) = match accepted {
+                Some(Ok(pair)) => pair,
+                Some(Err(e)) => {
+                    return Ok(err_pair(format!("server.serve accept failed: {}", e)))
+                }
+                // Woken by `stop` (a sibling hit the global budget) — drain + return.
+                None => break,
+            };
+            // We have a connection in hand — now CLAIM one unit of the shared budget.
+            // The claim is the source of truth for "exactly `maxRequests` total" (a
+            // saturating `fetch_update`: an exhausted budget stays at 0, never wraps).
+            // A claimed unit is ALWAYS served — we never race `stop` after claiming —
+            // so the group serves exactly the budget total. If the claim fails (a
+            // sibling took the last unit between our accept and here), we drop this
+            // connection (it closes cleanly, the client sees a reset) and stop. This
+            // is the documented OS-scheduling nondeterminism: the TOTAL is exact, the
+            // per-isolate split is not (§4.1/§5). On the single-isolate path there are
+            // no siblings, so the claim never fails before the budget is spent and the
+            // behavior reproduces the old `served >= max` exactly.
+            if bounded {
+                let claimed = budget
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                        cur.checked_sub(1)
+                    })
+                    .is_ok();
+                if !claimed {
+                    // A sibling claimed the last unit first; release this connection
+                    // and stop. (`stream` drops here → the socket closes.)
+                    drop(stream);
+                    stop.notify_waiters();
                     break;
                 }
             }
-            let (stream, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => return Ok(err_pair(format!("server.serve accept failed: {}", e))),
-            };
             // Acquire a permit BEFORE spawning so we never spawn more than
             // `max_concurrent` handler tasks at once. (Bounded by the semaphore; the
             // accept loop parks here when the cap is reached, applying backpressure.)
@@ -932,9 +1034,13 @@ impl Interp {
                 vm.handle_connection(id, stream, max_body, timeout_ms, span)
                     .await;
             });
-            served += 1;
-            if max_requests.is_some() {
+            if bounded {
                 inflight.push(handle);
+                // If that claim drove the budget to 0, signal every sibling to stop
+                // (and stop ourselves on the next iteration's budget==0 check).
+                if budget.load(Ordering::SeqCst) == 0 {
+                    stop.notify_waiters();
+                }
             }
             // (Unbounded serve: the handle is dropped — the task is detached and runs
             // to completion on the LocalSet; the semaphore bounds concurrency.)
@@ -1842,6 +1948,53 @@ await s.serve({{ maxRequests: 1 }})
             "in-flight slow handler must be drained before serve returns"
         );
         assert_eq!(body, "drained-ok");
+    }
+
+    #[tokio::test]
+    async fn max_requests_serves_exactly_n_then_returns() {
+        // SRV Task 7 parity: the refactored `accept_loop` must reproduce the old
+        // `served >= max` semantics EXACTLY — `maxRequests: 3` serves exactly three
+        // sequential requests then `serve` returns. The 4th connection (sent after
+        // serve has returned) must FAIL to get an HTTP response (the listener is gone).
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/n", (req) => "ok")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 3 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/n");
+        let (served, fourth_failed) = with_server(&src, move || async move {
+            let mut served = 0usize;
+            // Three sequential requests — each must succeed.
+            for _ in 0..3 {
+                let (status, body) = client_request("GET", &url, None).await;
+                if status == "HTTP/1.1 200 OK" && body == "ok" {
+                    served += 1;
+                }
+            }
+            // A 4th connection after serve has returned: the listener is closed, so a
+            // connect/request attempt must NOT yield a 200 (it errors or is refused).
+            let fourth = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                client_request("GET", &url, None),
+            )
+            .await;
+            let fourth_failed = match fourth {
+                Err(_) => true, // timed out — nothing listening
+                Ok((status, _)) => status != "HTTP/1.1 200 OK",
+            };
+            (served, fourth_failed)
+        })
+        .await;
+        assert_eq!(served, 3, "exactly maxRequests=3 connections must be served");
+        assert!(
+            fourth_failed,
+            "the 4th connection must fail — serve returned after exactly 3"
+        );
     }
 
     #[tokio::test]
