@@ -1236,6 +1236,28 @@ impl<'a> Pass<'a> {
             }
         }
 
+        // TYPE §4 (callback inference): when a param is a `fn(In) -> Out` and the arg
+        // is an ARROW, bind the arrow's params to the SOLVED input types and synth its
+        // body, then unify the body type into `Out`. This is what lets `map(xs, s =>
+        // len(s))` solve `B = number` so the result is `array<number>` (and the LSP
+        // hover shows it). Purely additive to the solver — it can only SOLVE more
+        // vars, never manufacture a `No` (the arrow is never type-checked here), so it
+        // is Gate-5-safe.
+        for (i, fp) in fresh_params.iter().enumerate() {
+            let (Some(CheckTy::FnSig(ins, out)), Some(arg)) = (fp.as_ref(), args.get(i)) else {
+                continue;
+            };
+            if arg.kind() != SyntaxKind::ArrowExpr {
+                continue;
+            }
+            // Solve the input types now so the arrow's param env is as concrete as
+            // possible; an unsolved input stays a Var (→ Any in the body env).
+            let solved_ins: Vec<CheckTy> = ins.iter().map(|t| solver.substitute(t)).collect();
+            if let Some(body_ty) = self.infer_arrow_body(arg, &solved_ins, env) {
+                solver.unify(&body_ty.widen(), out);
+            }
+        }
+
         // Check each arg against its SOLVED param type (blocking — annotated slot).
         for (i, (arg, aty)) in args.iter().zip(arg_tys.iter()).enumerate() {
             let Some(Some(fp)) = fresh_params.get(i) else {
@@ -1326,13 +1348,17 @@ impl<'a> Pass<'a> {
             .unwrap_or(false);
         let mut fresh_init_params: Vec<CheckTy> = Vec::new();
         if !has_spread {
-            if let Some(init_params) = self.class_init_param_types(cid) {
-                for (aty, ptmpl) in arg_tys.iter().zip(init_params.iter()) {
-                    // Freshen the init param's template var(s) through the SAME mapping.
-                    let fp = solver.freshen(ptmpl, &mut mapping);
-                    solver.unify(&aty.widen(), &fp);
-                    fresh_init_params.push(fp);
-                }
+            // Positional construction binds arg `i` to the `i`th init parameter when
+            // an `init` exists, else to the `i`th DECLARED FIELD (`Box(5)` → field
+            // `value: T`). Either source lets us infer the class's type args.
+            let positional = self
+                .class_init_param_types(cid)
+                .unwrap_or_else(|| self.class_field_param_types(cid));
+            for (aty, ptmpl) in arg_tys.iter().zip(positional.iter()) {
+                // Freshen the param/field's template var(s) through the SAME mapping.
+                let fp = solver.freshen(ptmpl, &mut mapping);
+                solver.unify(&aty.widen(), &fp);
+                fresh_init_params.push(fp);
             }
         }
 
@@ -1432,6 +1458,16 @@ impl<'a> Pass<'a> {
             return None;
         }
         Some(sig.params.clone())
+    }
+
+    /// The class's declared field types in DECLARATION order (the positional-
+    /// construction targets when there is no `init`). Returns the template-lowered
+    /// types so the unifier can solve the class's type args from `Box(5)`.
+    fn class_field_param_types(&self, cid: usize) -> Vec<CheckTy> {
+        self.table
+            .class(cid)
+            .map(|c| c.field_order.iter().map(|(_, t)| t.clone()).collect())
+            .unwrap_or_default()
     }
 
     fn synth_array(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
@@ -1994,6 +2030,77 @@ impl<'a> Pass<'a> {
     /// Infer a function's return type: the `join` of all its `return` expression
     /// synths, plus `Nil` if it can fall off the end (no return value reached on
     /// some path). Synthesis runs with emission SUPPRESSED (the real walk reports).
+    /// Synthesize the RESULT type of an `ArrowExpr` argument given the solved input
+    /// types for its parameters (TYPE §4 callback inference). Binds each arrow param
+    /// (by position) to its input type in a child env, then synthesizes an expression
+    /// body directly or infers a block body's joined return type. Emits nothing
+    /// (`suppress_emit`) — this is speculative inference feeding the unifier, not a
+    /// checking site. Returns `None` when the arrow has no recoverable body.
+    fn infer_arrow_body(
+        &mut self,
+        arrow: &ResolvedNode,
+        input_tys: &[CheckTy],
+        env: &Env,
+    ) -> Option<CheckTy> {
+        use SyntaxKind::*;
+        // Work in a child narrowing scope so the param bindings we install for the
+        // arrow body do not leak into the caller's env.
+        let mut child = Env::new();
+        for (k, v) in env.iter_base() {
+            child.define(k.clone(), v.clone());
+        }
+        if let Some(params) = arrow.children().find(|c| c.kind() == ParamList) {
+            for (i, p) in params.children().filter(|c| c.kind() == Param).enumerate() {
+                // Key each arrow param by its RESOLVED binding (slot/global), mirroring
+                // `bind_params`, so a use of the param inside the body resolves to it.
+                if let Some(b) = self
+                    .resolved
+                    .bindings
+                    .iter()
+                    .find(|b| b.decl_range == p.text_range())
+                {
+                    let key = if b.is_global {
+                        BindingKey::Global(b.name.clone())
+                    } else {
+                        BindingKey::Local(b.slot)
+                    };
+                    let ty = input_tys.get(i).cloned().unwrap_or(CheckTy::Any);
+                    child.define(key, ty);
+                }
+            }
+        }
+        self.suppress_emit += 1;
+        let result = if let Some(block) = arrow.children().find(|c| c.kind() == Block) {
+            // Block body: join every `return <expr>` value (a bare side-effect arrow
+            // has no value return → Any, the maximally-silent leaf).
+            let mut returns: Vec<ResolvedNode> = Vec::new();
+            collect_returns(block, &mut returns);
+            let mut acc = CheckTy::Never;
+            let mut saw = false;
+            for ret in &returns {
+                if let Some(e) = first_expr_child(ret) {
+                    let t = self.synth(&e, &mut child);
+                    acc = acc.join(&t.widen(), self.table);
+                    saw = true;
+                }
+            }
+            if saw {
+                Some(acc.widen())
+            } else {
+                None
+            }
+        } else {
+            // Expression body: the body is the last expression-kind child.
+            let body = arrow
+                .children()
+                .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+                .last();
+            body.map(|e| self.synth(e, &mut child).widen())
+        };
+        self.suppress_emit -= 1;
+        result
+    }
+
     fn infer_return(&mut self, fn_decl: &ResolvedNode) -> CheckTy {
         let Some(body) = fn_decl.children().find(|c| c.kind() == SyntaxKind::Block) else {
             return CheckTy::Any;

@@ -230,6 +230,28 @@ mod tests {
     }
 
     #[test]
+    fn type_hint_surfaces_instantiated_generic() {
+        // TYPE Task 16: the inlay type hint on an un-annotated binding of a generic
+        // construction surfaces the SOLVED type args (`: Box<int>`), so the editor
+        // shows the instantiated generic inline.
+        let src = "class Box<T> {\n  value: T\n}\nlet b = Box(5)\n";
+        let m = model(src);
+        let hints = inlay_hints(&m, full_range(&m));
+        let labels: Vec<String> = hints
+            .iter()
+            .filter(|h| h.kind == Some(InlayHintKind::TYPE))
+            .filter_map(|h| match &h.label {
+                InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|s| s.contains("Box<int>")),
+            "expected a `Box<int>` type hint, got {labels:?}"
+        );
+    }
+
+    #[test]
     fn no_type_hint_when_annotated() {
         let m = model("let n: number = 1\n");
         let hints = inlay_hints(&m, full_range(&m));

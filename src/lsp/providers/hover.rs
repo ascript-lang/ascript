@@ -117,4 +117,34 @@ mod tests {
         let m = model("let x = 1\n");
         assert!(hover(&m, 3).is_none()); // the space
     }
+
+    #[test]
+    fn hover_on_generic_construction_shows_instantiated_type() {
+        // TYPE Task 16: hovering a binding of a generic class construction surfaces
+        // the INSTANTIATED type (`Box<int>`, not `Box<T>` / `Box<any>`). The type arg
+        // is inferred from the positional field argument `5`.
+        let src = "class Box<T> {\n  value: T\n  fn get(): T { return self.value }\n}\nlet b = Box(5)\nprint(b.get())\n";
+        let m = model(src);
+        let off = src.find("let b").unwrap() + 4; // the binding name `b`
+        let h = hover(&m, off).expect("hover on b");
+        let HoverContents::Markup(mk) = h.contents else {
+            panic!()
+        };
+        assert!(mk.value.contains("Box<int>"), "got {}", mk.value);
+    }
+
+    #[test]
+    fn hover_on_generic_fn_call_shows_instantiated_return() {
+        // TYPE Task 16: hovering a binding of a generic fn call surfaces the SOLVED
+        // return type. `map<A, B>([1, 2, 3], (x) => x * 2)` solves `A = int`,
+        // `B = int` (callback inference), so the result hovers as `array<int>`.
+        let src = "fn map<A, B>(xs: array<A>, f: fn(A) -> B): array<B> { return [] }\nlet r = map([1, 2, 3], (x) => x * 2)\nprint(r)\n";
+        let m = model(src);
+        let off = src.find("let r").unwrap() + 4;
+        let h = hover(&m, off).expect("hover on r");
+        let HoverContents::Markup(mk) = h.contents else {
+            panic!()
+        };
+        assert!(mk.value.contains("array<int>"), "got {}", mk.value);
+    }
 }

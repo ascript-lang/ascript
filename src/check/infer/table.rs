@@ -19,6 +19,10 @@ pub struct ClassInfo {
     pub name: String,
     pub parent: Option<ClassId>,
     pub fields: HashMap<String, CheckTy>,
+    /// Field types in DECLARATION order (the `fields` map is unordered). Used for
+    /// positional construction (`Box(5)` binds arg 0 to the first field), which
+    /// TYPE §4 needs to infer a generic class's type args when there is no `init`.
+    pub field_order: Vec<(String, CheckTy)>,
     pub methods: HashMap<String, CheckTy>,
     /// Full method signatures (params + return) — used by structural `conforms`.
     pub method_sigs: HashMap<String, MethodSig>,
@@ -208,6 +212,7 @@ impl Table {
             let parent = superclass_name(node).and_then(|n| t.class_by_name.get(&n).copied());
 
             let mut fields: HashMap<String, CheckTy> = HashMap::new();
+            let mut field_order: Vec<(String, CheckTy)> = Vec::new();
             let mut methods: HashMap<String, CheckTy> = HashMap::new();
             let mut method_sigs: HashMap<String, MethodSig> = HashMap::new();
             for member in node.children() {
@@ -215,7 +220,8 @@ impl Table {
                     FieldDecl => {
                         if let Some(name) = crate::syntax::resolve::ident_text(member) {
                             let ty = field_type(member, &t);
-                            fields.insert(name, ty);
+                            fields.insert(name.clone(), ty.clone());
+                            field_order.push((name, ty));
                         }
                     }
                     MethodDecl => {
@@ -238,6 +244,7 @@ impl Table {
             }
             t.classes[id].parent = parent;
             t.classes[id].fields = fields;
+            t.classes[id].field_order = field_order;
             t.classes[id].methods = methods;
             t.classes[id].method_sigs = method_sigs;
             // TYPE §4: record the class's declared type parameters + bounds.
