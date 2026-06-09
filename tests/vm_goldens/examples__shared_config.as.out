@@ -1,0 +1,11 @@
+# exit: none
+us-east-1
+true
+10
+3
+true
+1110
+true
+true
+cannot mutate a frozen object
+cannot mutate a frozen array

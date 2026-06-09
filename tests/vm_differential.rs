@@ -988,6 +988,18 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/ws_server.as",
         SkipReason::LongRunningServer,
     ),
+    // SRV multi-core server: `server.serve({ workers: 0, setup })` runs N REUSEPORT
+    // accept loops forever, awaiting a client in a separate process. It does not
+    // terminate on its own and hangs even the tree-walker — the same headless-
+    // impossible situation as http_server.as. The shared-heap DATA examples
+    // (shared_config.as, shared_routing_table.as) ARE four-mode byte-identical and
+    // run in the gate; only this port-binding server example is excluded. The
+    // REUSEPORT/Windows-fallback behavior it demonstrates is covered by the
+    // tests/server_multicore.rs integration test.
+    (
+        "examples/advanced/server_multicore.as",
+        SkipReason::LongRunningServer,
+    ),
 ];
 
 /// Enumerate EVERY `examples/*.as` and `examples/advanced/*.as` file, paths
@@ -7604,6 +7616,11 @@ async fn worker_examples_all_modes_byte_identical() {
     // the `.aso` mode — the gap that let a real four-mode divergence through.
     let worker_examples: Vec<String> = all_corpus_examples()
         .into_iter()
+        // A worker example on the corpus SKIP list (e.g. a forever-blocking REUSEPORT
+        // server like `server_multicore.as`, which uses `worker fn boot` but never
+        // terminates) cannot be run to completion here — honor the same skip the
+        // whole-corpus gate uses, so a worker-using server doesn't hang this test.
+        .filter(|p| skip_reason(p).is_none())
         .filter(|p| {
             let path = std::path::Path::new(root).join(p);
             let src = std::fs::read_to_string(&path).unwrap_or_default();
