@@ -588,6 +588,23 @@ pub enum NativeKind {
     // down). Not feature-gated — `worker` is core syntax. Readable field: the
     // declared class `name`.
     WorkerActor,
+    // FFI campaign §3.4: an open shared library (`ffi.open` → `dlopen`). Backs a
+    // `ResourceState::ForeignLib(libloading::Library)`; its `Drop` `dlclose`s
+    // deterministically. Method: `.symbol`. GC-UNTRACED (a `Library` is an opaque OS
+    // handle the collector cannot reason about — reclaimed only by `Drop`). The
+    // variant name stays un-gated (kept in every exhaustive `NativeKind` match) even
+    // when the `ffi` feature is off, so matches compile in both configs; only the
+    // backing `ResourceState` body references `libloading`.
+    ForeignLib,
+    // FFI campaign §3.4: a `dlsym`'d symbol + its bound signature (argtypes/rettype +
+    // the libffi CIF). Method: `.call`. Stores the resolved function address as a raw
+    // `*mut c_void` and KEEPS THE OWNING `Library` ALIVE (a borrowed `Symbol<'lib>`
+    // cannot be `'static`). GC-UNTRACED.
+    ForeignSymbol,
+    // FFI campaign §3.4: an opaque C pointer returned by a call (a `malloc` result, a
+    // C "constructor" handle). Carries the raw `usize` address; passed back as a
+    // `ffi.ptr`. NOT auto-freed (ownership is the C library's contract). GC-UNTRACED.
+    ForeignPtr,
 }
 
 impl NativeKind {
@@ -638,6 +655,91 @@ impl NativeKind {
             #[cfg(feature = "ai")]
             NativeKind::AiTool => "aiTool",
             NativeKind::WorkerActor => "workerActor",
+            NativeKind::ForeignLib => "foreignLib",
+            NativeKind::ForeignSymbol => "foreignSymbol",
+            NativeKind::ForeignPtr => "foreignPtr",
+        }
+    }
+
+    /// FFI §4 (BLOCKER 3): the capability that governs OPERATING an already-open
+    /// handle of this kind, or `None` for a pure in-memory native that touches no OS
+    /// resource. Consulted at the top of `Interp::call_native_method` so that
+    /// dropping a capability HOLDS for handles opened before the drop (e.g.
+    /// `socket.read()` / `listener.accept()` are denied after `caps.drop("net")`).
+    ///
+    /// - `Net`: every networking handle (TCP, UDP, HTTP body/server/response/SSE,
+    ///   WebSocket, HTTP cancel/next) plus the network DB connections (postgres/redis).
+    /// - `Process`: a child process and its stdio reader/writer.
+    /// - `Fs`: a sqlite connection/statement (an open DB FILE handle).
+    /// - `None`: pure in-memory natives (channel, semaphore, timers, rate limiter,
+    ///   stream, lru, events, telemetry, ai-config, worker actor, terminal) — they
+    ///   acquire no OS effect at method time, so gating them would over-deny.
+    pub fn governing_cap(self) -> Option<crate::stdlib::caps::Cap> {
+        use crate::stdlib::caps::Cap;
+        match self {
+            // Networking handles — operating them is live network I/O.
+            NativeKind::TcpListener
+            | NativeKind::TcpStream
+            | NativeKind::HttpResponse
+            | NativeKind::HttpBody
+            | NativeKind::SseStream
+            | NativeKind::HttpServer
+            | NativeKind::WsConnection
+            | NativeKind::WsListener
+            | NativeKind::UdpSocket => Some(Cap::Net),
+            NativeKind::PostgresConnection | NativeKind::RedisConnection => Some(Cap::Net),
+            // A cancel token (`http.cancelToken()`) is a pure in-memory `Notify` —
+            // cancelling acquires no network, so gating it would over-deny a cleanup
+            // (you typically cancel an in-flight request even after dropping `net`).
+            // The HTTP-next middleware advancer drives already-accepted server work;
+            // the accept itself (HttpServer) is gated. Both stay ungated to avoid
+            // over-deny on the default path's request-lifecycle handles.
+            NativeKind::CancelHandle | NativeKind::HttpNext => None,
+            // A child process + its stdio: operating them is subprocess control.
+            NativeKind::ChildProcess | NativeKind::Reader | NativeKind::Writer => {
+                Some(Cap::Process)
+            }
+            // An open DB file handle (sqlite): operating it is filesystem I/O.
+            NativeKind::SqliteConnection | NativeKind::SqliteStatement => Some(Cap::Fs),
+            // FFI §4 (BLOCKER 3): operating an OPEN foreign handle — `lib.symbol`,
+            // `sym.call`, reading a `ForeignPtr` — is a native-call effect governed by
+            // `ffi`. So `caps.drop("ffi")` HOLDS for libs/symbols opened before the
+            // drop: a `lib.symbol`/`sym.call` after the drop is denied here, not just
+            // the initial `ffi.open` at the dispatch gate.
+            NativeKind::ForeignLib | NativeKind::ForeignSymbol | NativeKind::ForeignPtr => {
+                Some(Cap::Ffi)
+            }
+            // Pure in-memory natives — no OS effect at method time → ungated.
+            NativeKind::Terminal
+            | NativeKind::Channel
+            | NativeKind::Semaphore
+            | NativeKind::Interval
+            | NativeKind::DebounceWrapper
+            | NativeKind::ThrottleWrapper
+            | NativeKind::RateLimiter
+            | NativeKind::Stream
+            | NativeKind::Lru
+            | NativeKind::Events
+            | NativeKind::WorkerActor => None,
+            // Telemetry spans/instruments BUFFER in memory; the only network egress is the
+            // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
+            // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a
+            // telemetry handle acquires no OS resource → ungated (over-gating a no-op span
+            // would break defensive telemetry use).
+            #[cfg(feature = "telemetry")]
+            NativeKind::TelemetrySpan
+            | NativeKind::TelemetryInstrument
+            | NativeKind::TelemetryNoop => None,
+            // An OPEN AI stream reads completions FROM THE NETWORK on each `.next()`
+            // (`exec_chat_stream`), so operating one after `caps.drop("net")` must be
+            // denied — the per-handle re-check that makes the drop HOLD (mirrors
+            // TcpStream/HttpBody). `AiProvider`/`AiModel`/`AiTool` are pure config / tool
+            // definitions with no network-doing handle methods (the network is the
+            // module-level `ai.generate`/`ai.stream`, gated at the dispatch root).
+            #[cfg(feature = "ai")]
+            NativeKind::AiStream | NativeKind::AiTextStream => Some(Cap::Net),
+            #[cfg(feature = "ai")]
+            NativeKind::AiProvider | NativeKind::AiModel | NativeKind::AiTool => None,
         }
     }
 }

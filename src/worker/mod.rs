@@ -32,8 +32,9 @@ impl Drop for InflightGuard {
 
 pub use dispatch::{
     build_class_slice, build_class_slice_for_interp, build_code_slice,
-    build_code_slice_for_static_method, build_code_slice_for_static_method_from_source,
-    build_code_slice_from_source, build_stream_slice_for_interp,
+    build_code_slice_for_interp, build_code_slice_for_static_method,
+    build_code_slice_for_static_method_from_source, build_code_slice_from_source,
+    build_stream_slice_for_interp,
 };
 pub use pool::pool_is_initialized;
 
@@ -118,6 +119,10 @@ pub fn dispatch_worker(
         class_name: slice.class_name.as_deref().map(|s| s.to_string()),
         entry_name: slice.entry_name.to_string(),
         args: encoded,
+        // FFI §4.5a: ship the dispatching isolate's caps as the pooled worker's
+        // read-only floor (a `Send` side-channel field, not a `Value`). The isolate
+        // installs it fresh per request + refuses a drop there.
+        caps: Box::new(interp.caps()),
         reply: reply_tx,
         abort: abort_rx,
     };
@@ -134,6 +139,7 @@ pub fn dispatch_worker(
                 req.slice_bytes.as_deref(),
                 &req.entry_name,
                 &req.args,
+                *req.caps,
                 span,
             );
         }
@@ -233,11 +239,17 @@ fn run_slice_inline(
     slice_bytes: Option<&[u8]>,
     entry_name: &str,
     encoded_args: &[u8],
+    caps: crate::stdlib::caps::CapSet,
     span: Span,
 ) -> Result<Value, Control> {
     // Build a fresh, shared-nothing Interp/Vm on THIS thread.
     let iso_interp = Rc::new(Interp::new());
     iso_interp.install_self();
+    // FFI §4.5a: this caller-thread fallback is the pooled-worker equivalent — install
+    // the caller's caps floor and refuse a drop, so a `worker fn` is gated identically
+    // whether it runs on a pool isolate or degrades to inline (byte-identical authority).
+    iso_interp.set_caps(caps);
+    iso_interp.set_caps_drop_allowed(false);
     let vm = crate::vm::Vm::new(iso_interp.clone());
 
     // Decode the args against the fresh interp (cycles / class reconstruction resolve
@@ -280,6 +292,150 @@ fn run_slice_inline(
         cell.resolve(r);
     });
     fut.set_abort(handle.abort_handle());
+    Ok(Value::Future(fut))
+}
+
+/// FFI §4.5a — THE KEYSTONE: dispatch a worker onto a DEDICATED (single-tenant)
+/// isolate carrying a REDUCED `CapSet`. This is the `run_in_worker({caps})` path.
+///
+/// Unlike the pooled path (`dispatch_worker`), this spawns a FRESH isolate for this
+/// one job via [`isolate::spawn_isolate`]: the `Send` `CapSet` is captured DIRECTLY in
+/// the `Send + 'static` `make_loop` closure (it never rides the byte channel and never
+/// touches the structured-clone value serializer — it is not a `Value`). The closure
+/// installs `caps` into the brand-new `Interp` **before** running the entry, runs the
+/// one job, and the isolate is torn down on `IsolateHandle` drop. Because the `Interp`
+/// is NEVER reused, an in-plugin `caps.drop` is durable AND cannot leak — there is no
+/// "next request" on that `Interp`. The plugin keeps `caps_drop_allowed = true` (the
+/// `Interp::new` default), so it CAN drop further (one-way), but never re-grant.
+///
+/// The reply crosses back as `Send` bytes over a `std::mpsc` back-channel; the caller
+/// bridges it onto a `Value::Future` decoded against the CALLER's interp (so the
+/// returned plain data — `int`/`Bytes`/`Object` — reconstructs in the caller's heap).
+pub fn dispatch_worker_dedicated(
+    interp: &Interp,
+    slice: WorkerCodeSlice,
+    args: Vec<Value>,
+    caps: crate::stdlib::caps::CapSet,
+    span: Span,
+) -> Result<Value, Control> {
+    // Sendability gate + encode (args wrapped as one array for one decode), exactly as
+    // the pooled path: an FFI handle / closure / future arg is rejected with a field
+    // path here, before any isolate spawn.
+    for arg in &args {
+        serialize::check_sendable(arg)
+            .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
+    }
+    let args_array = Value::Array(crate::value::ArrayCell::new(args));
+    let encoded = serialize::encode(&args_array)
+        .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
+
+    let slice_bytes: Vec<u8> = slice.entry_aso.to_vec();
+    let entry_name: String = slice.entry_name.to_string();
+
+    // `Send` back-channel for the one reply (the dedicated isolate is single-shot here).
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel::<isolate::WorkerReply>();
+
+    // Spawn the dedicated isolate. The CapSet + slice + entry + reply sender are all
+    // `Send` and captured directly in the `Send + 'static` closure.
+    let handle = isolate::spawn_isolate(move |vm, mut rx| async move {
+        let iso_interp = vm.interp().clone();
+        // KEYSTONE: install the reduced caps into the fresh, single-tenant Interp
+        // BEFORE running any plugin code. `caps_drop_allowed` stays true (the default):
+        // a dedicated isolate is single-tenant, so an in-plugin drop is terminal.
+        iso_interp.set_caps(caps);
+
+        // Load the slice's globals once.
+        if let Err(msg) = isolate::load_slice(&vm, Some(&slice_bytes)).await {
+            let _ = reply_tx.send(isolate::WorkerReply::Panic(msg));
+            return;
+        }
+        // Wait for the single args message.
+        let Some(args_bytes) = rx.recv().await else {
+            return; // handle dropped before we got args (cancelled).
+        };
+        let arg_values = match isolate::decode_args(&args_bytes, &iso_interp) {
+            Ok(vs) => vs,
+            Err(msg) => {
+                let _ = reply_tx.send(isolate::WorkerReply::Panic(msg));
+                return;
+            }
+        };
+        let entry = match vm.user_global(&entry_name) {
+            Some(v) => v,
+            None => {
+                let _ = reply_tx.send(isolate::WorkerReply::Panic(format!(
+                    "worker entry '{entry_name}' is not defined in the shipped code slice"
+                )));
+                return;
+            }
+        };
+        let reply = match vm.call_value(entry, arg_values, crate::span::Span::new(0, 0)).await {
+            Ok(v) => match serialize::encode(&v) {
+                Ok(bytes) => isolate::WorkerReply::Ok(bytes),
+                Err(e) => isolate::WorkerReply::Panic(e.message()),
+            },
+            Err(Control::Panic(e)) => isolate::WorkerReply::Panic(e.message),
+            Err(Control::Propagate(_)) => match serialize::encode(&Value::Nil) {
+                Ok(bytes) => isolate::WorkerReply::Ok(bytes),
+                Err(e) => isolate::WorkerReply::Panic(e.message()),
+            },
+            Err(Control::Exit(_)) => {
+                isolate::WorkerReply::Panic("exit() is not allowed inside a worker".to_string())
+            }
+        };
+        let _ = reply_tx.send(reply);
+        // The isolate loop ends when `rx` closes (handle dropped); we've sent our reply.
+    })
+    .map_err(|e| {
+        Control::Panic(crate::error::AsError::at(
+            format!("could not spawn a dedicated worker isolate: {e}"),
+            span,
+        ))
+    })?;
+
+    // Ship the args, then bridge the reply onto a Value::Future. The isolate handle is
+    // moved into the bridge task so it stays alive until the reply arrives (and is then
+    // dropped → the isolate's thread joins → no zombie).
+    if handle.tx.send(encoded).is_err() {
+        return Err(Control::Panic(crate::error::AsError::at(
+            "dedicated worker isolate terminated before receiving its input".to_string(),
+            span,
+        )));
+    }
+
+    let interp_rc = interp.rc();
+    let fut = crate::task::SharedFuture::new();
+    let cell = fut.cell();
+    let bridge = tokio::task::spawn_local(async move {
+        // Hold the handle alive across the blocking reply wait. The recv runs on a
+        // blocking helper so the current-thread runtime is not stalled; on success the
+        // result is decoded against the caller's interp.
+        let _handle = handle;
+        let reply = tokio::task::spawn_blocking(move || {
+            reply_rx
+                .recv_timeout(std::time::Duration::from_secs(300))
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        let result = match reply {
+            Some(isolate::WorkerReply::Ok(bytes)) => {
+                serialize::decode(&bytes, &interp_rc).map_err(|e| Control::Panic(e.into()))
+            }
+            Some(isolate::WorkerReply::Panic(msg)) => {
+                Err(Control::Panic(crate::error::AsError::at(msg, span)))
+            }
+            Some(isolate::WorkerReply::Cancelled) | None => {
+                Err(Control::Panic(crate::error::AsError::at(
+                    "dedicated worker isolate terminated unexpectedly".to_string(),
+                    span,
+                )))
+            }
+        };
+        cell.resolve(result);
+    });
+    fut.set_abort(bridge.abort_handle());
     Ok(Value::Future(fut))
 }
 

@@ -221,6 +221,11 @@ impl Interp {
 
     async fn ws_connect(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let url = want_string(&arg(args, 0), span, "net/ws.connect url")?;
+        // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the resolved host
+        // BEFORE the handshake. Gate-12: no carve-out → immediate `Ok`.
+        if let Some(host) = crate::stdlib::caps::host_of_url(&url) {
+            self.check_net_host(&host, span)?;
+        }
         // opts.headers / opts.auth → handshake request headers (Tier-2 on misuse,
         // consistent with the std/net/http client). nil/absent opts → no headers.
         let headers = ws_connect_headers(&arg(args, 1), span)?;
@@ -268,6 +273,9 @@ impl Interp {
                 AsError::at("net/ws.listen port must be an integer 0..=65535", span).into(),
             );
         }
+        // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the bind host.
+        // Gate-12: no carve-out → immediate `Ok` with no comparison.
+        self.check_net_host(&host, span)?;
         let addr = format!("{}:{}", host, port as u16);
         match TcpListener::bind(&addr).await {
             Ok(listener) => {

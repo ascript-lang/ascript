@@ -94,6 +94,18 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp"],
 # OpenAI-compat swarm + native Anthropic/Gemini + Bedrock SigV4 + Vertex). Optional,
 # off-by-default `ai` feature (network + heavy provider deps → opt-in like telemetry).
 genai = { version = "0.6", optional = true, features = ["bedrock-sigv4"] }
+# FFI (FFI campaign §3): native library loading + the C-ABI trampoline. `libloading`
+# is the cross-platform `dlopen`/`dlsym`/`LoadLibrary` loader; `libffi` is the
+# portable C calling-convention trampoline (`ffi_prep_cif` + `ffi_call`). Optional,
+# default-ON `ffi` feature (batteries-included — `import "std/ffi"` works out of the
+# box; safety is the capability gate + the per-isolate sandbox, NOT compiling it out).
+# cfg's out cleanly under --no-default-features (no `libloading`/`libffi` linked).
+libloading = { version = "0.8", optional = true }
+# `system` links the platform's libffi (via pkg-config) instead of building the
+# vendored C copy — the vendored build's `configure` trips on newer macOS/clang
+# toolchains (`-print-multi-os-directory` / CFI assembler errors). The system libffi
+# is present on macOS (homebrew/system) and Linux (libffi-dev).
+libffi = { version = "3", optional = true, features = ["system"] }
 
 [build-dependencies]
 cc = "1"
@@ -104,7 +116,7 @@ tree-sitter = "0.25"
 tempfile = "3"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi"]
 # SP6 package manager / dependency story. Decentralized-first (git/url/path deps;
 # bare-version requirements need a future registry). CLI-only and feature-gated,
 # exactly like `src/lint_config_toml.rs` keeps TOML/IO out of the interpreter
@@ -178,6 +190,15 @@ telemetry = ["data", "net"]
 # the un-gated STD_MODULES list. Emits OTel GenAI spans through SP12's soft hook
 # with NO Cargo dependency on telemetry (works whether telemetry is on or off).
 ai = ["data", "net", "dep:genai"]
+# FFI campaign §3: std/ffi — call into arbitrary C libraries via libloading
+# (dlopen/dlsym) + libffi (the C-ABI trampoline). Default-ON (batteries — §3.6:
+# availability is the feature; AUTHORITY is the `ffi` capability gate, which is
+# strictly more granular than a compile-time switch). Sized C ints marshal OVER
+# `int` (no new Value kind); the three handles (ForeignLib/Symbol/Ptr) are native
+# resources with deterministic Drop, GC-untraced. cfg's out cleanly under
+# --no-default-features (where `import "std/ffi"` is an unknown-module error; the
+# `std/caps` capability surface stays CORE — capabilities exist in a bare build).
+ffi = ["dep:libloading", "dep:libffi"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"

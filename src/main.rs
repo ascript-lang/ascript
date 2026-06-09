@@ -26,6 +26,24 @@ enum Command {
         /// mismatch. For CI / sandboxes.
         #[arg(long = "locked")]
         locked: bool,
+        /// FFI §4.2: deny one or more capabilities (opt-out). Repeatable and/or
+        /// comma-separated, e.g. `--deny ffi,process`. Valid names: fs, net,
+        /// process, ffi, env. Composes (union of denials) with the manifest
+        /// `[capabilities]` table; denial is monotone (CLI cannot re-grant).
+        #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
+        deny: Vec<String>,
+        /// FFI §4.2: deny ALL five dangerous capabilities (fs, net, process, ffi,
+        /// env). Sugar for `--deny fs,net,process,ffi,env`.
+        #[arg(long = "sandbox")]
+        sandbox: bool,
+        /// FFI §4.4: a granular net carve-out: `--deny-net=external` (allow
+        /// loopback/private, block public) or `--deny-net=all`.
+        #[arg(long = "deny-net", value_name = "MODE")]
+        deny_net: Option<String>,
+        /// FFI §4.4: a granular fs carve-out: `--deny-fs=write` (reads allowed,
+        /// writes denied) or `--deny-fs=all`.
+        #[arg(long = "deny-fs", value_name = "MODE")]
+        deny_fs: Option<String>,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -87,6 +105,13 @@ enum Command {
         /// (no network), failing on drift / missing lock / integrity mismatch.
         #[arg(long = "locked")]
         locked: bool,
+        /// FFI §4.2: deny one or more capabilities for the test run (opt-out).
+        /// Comma-separated / repeatable. Composes with the manifest.
+        #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
+        deny: Vec<String>,
+        /// FFI §4.2: deny ALL five dangerous capabilities for the test run.
+        #[arg(long = "sandbox")]
+        sandbox: bool,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
@@ -136,6 +161,107 @@ enum Command {
 // only touched pages are committed, so a shallow program pays nothing. The runtime
 // stays single-threaded (`current_thread` + `LocalSet`), matching spec §7 and the
 // interpreter's `?Send` (Rc-friendly) futures.
+/// FFI §4.2/§4.5: compose the initial [`CapSet`](ascript::stdlib::caps::CapSet)
+/// from the CLI flags AND the nearest `ascript.toml` `[capabilities]` table.
+///
+/// Composition is **most-restrictive-wins** (denial is monotone): the manifest's
+/// denials are applied first (the manifest floor), then the CLI's are unioned on
+/// top. The CLI can therefore only ever ADD denials, never re-grant what the
+/// manifest denied — exactly the spec's "CLI overrides manifest" within a monotone
+/// model (CLI overriding means tightening further, never loosening).
+///
+/// Returns `Ok(None)` when nothing is denied (all granted → the byte-identical
+/// default). A bad cap name / deny-mode (CLI or manifest) is a clean `Err`.
+fn compose_caps(
+    _path: &std::path::Path,
+    deny: &[String],
+    sandbox: bool,
+    deny_net: Option<&str>,
+    deny_fs: Option<&str>,
+) -> Result<Option<ascript::stdlib::caps::CapSet>, String> {
+    use ascript::stdlib::caps::{Cap, CapSet, FsDeny, FsScope, NetDeny, NetScope};
+
+    // Start from the manifest floor (under the `pkg` feature), else all-granted.
+    #[cfg(feature = "pkg")]
+    let (mut set, had_manifest) = match pkg::manifest::Manifest::load_nearest(_path)? {
+        Some((_, manifest)) => (manifest.capset()?, manifest.capabilities.is_some()),
+        None => (CapSet::all_granted(), false),
+    };
+    #[cfg(not(feature = "pkg"))]
+    let (mut set, had_manifest) = (CapSet::all_granted(), false);
+
+    let mut had_cli = false;
+
+    if sandbox {
+        set.deny_all_dangerous();
+        had_cli = true;
+    }
+    // `--deny a,b` (value_delimiter splits commas; the flag is also repeatable).
+    for name in deny {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match ascript::stdlib::caps::cap_name(name) {
+            Some(cap) => {
+                set.deny(cap);
+                had_cli = true;
+            }
+            None => {
+                return Err(format!(
+                    "--deny: unknown capability '{name}' (expected one of: fs, net, process, ffi, env)"
+                ))
+            }
+        }
+    }
+    // Granular net carve-out (CLI). A CLI carve-out tightens the net scope.
+    if let Some(mode) = deny_net {
+        let deny = match mode {
+            "external" => NetDeny::External,
+            "all" => NetDeny::All,
+            other => {
+                return Err(format!(
+                    "--deny-net: expected 'external' or 'all', got '{other}'"
+                ))
+            }
+        };
+        set.set_net_scope(NetScope { deny, allow: Vec::new() });
+        had_cli = true;
+    }
+    // Granular fs carve-out (CLI).
+    if let Some(mode) = deny_fs {
+        let deny = match mode {
+            "write" => FsDeny::Write,
+            "all" => FsDeny::All,
+            other => {
+                return Err(format!(
+                    "--deny-fs: expected 'write' or 'all', got '{other}'"
+                ))
+            }
+        };
+        set.set_fs_scope(FsScope { deny, allow: Vec::new() });
+        had_cli = true;
+    }
+    // Re-apply whole-cap CLI denials of fs/net AFTER scopes so `--deny net`
+    // overrides a manifest carve-out (monotone: deny wins).
+    for name in deny {
+        if let Some(cap) = ascript::stdlib::caps::cap_name(name.trim()) {
+            if matches!(cap, Cap::Fs | Cap::Net) {
+                set.deny(cap);
+            }
+        }
+    }
+    if sandbox {
+        set.deny_all_dangerous();
+    }
+
+    if had_cli || had_manifest {
+        Ok(Some(set))
+    } else {
+        Ok(None) // nothing denied → keep the byte-identical default
+    }
+}
+
 fn main() -> ExitCode {
     let worker = std::thread::Builder::new()
         .name("ascript-main".to_string())
@@ -213,6 +339,10 @@ async fn real_main() -> ExitCode {
         Command::Run {
             tree_walker,
             locked,
+            deny,
+            sandbox,
+            deny_net,
+            deny_fs,
             file,
             args,
         } => {
@@ -220,6 +350,16 @@ async fn real_main() -> ExitCode {
             #[cfg(not(feature = "pkg"))]
             let _ = locked;
             let path = std::path::Path::new(&file);
+            // FFI §4.2/§4.5: compose the initial CapSet from CLI flags + the
+            // manifest `[capabilities]` table (most-restrictive-wins; denial is
+            // monotone). `None` → all granted (byte-identical default).
+            let caps = match compose_caps(path, &deny, sandbox, deny_net.as_deref(), deny_fs.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            };
             // A `.aso` file is compiled bytecode → run it on the VM (no compile step).
             // A `.as` file is compiled to bytecode and run on the VM as well (this is
             // the production path post-cutover). The tree-walker is kept as the
@@ -249,26 +389,16 @@ async fn real_main() -> ExitCode {
                     }
                 }
             };
+            // `packages` is only computed under the `pkg` feature; pass `None`
+            // otherwise. `caps` threads through every run path.
+            #[cfg(not(feature = "pkg"))]
+            let packages: Option<ascript::interp::PackageMap> = None;
             let result = if is_aso {
-                ascript::run_aso_file(path, &args).await
+                ascript::run_aso_file(path, &args, caps).await
             } else if use_tree_walker {
-                #[cfg(feature = "pkg")]
-                {
-                    ascript::run_file_with_packages(path, &args, packages).await
-                }
-                #[cfg(not(feature = "pkg"))]
-                {
-                    ascript::run_file(path, &args).await
-                }
+                ascript::run_file_with_packages(path, &args, packages, caps).await
             } else {
-                #[cfg(feature = "pkg")]
-                {
-                    ascript::run_file_on_vm_with_packages(path, &args, packages).await
-                }
-                #[cfg(not(feature = "pkg"))]
-                {
-                    ascript::run_file_on_vm(path, &args).await
-                }
+                ascript::run_file_on_vm_with_packages(path, &args, packages, caps).await
             };
             match result {
                 // Output already streamed live (OutputSink::Live).
@@ -481,7 +611,25 @@ async fn real_main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        Command::Test { files, locked } => {
+        Command::Test {
+            files,
+            locked,
+            deny,
+            sandbox,
+        } => {
+            // FFI §4.2/§4.5: compose caps from CLI + the test files' nearest
+            // manifest (no granular CLI carve-outs on `test`).
+            let cap_path = files
+                .first()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let caps = match compose_caps(&cap_path, &deny, sandbox, None, None) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            };
             // SP6: ensure the lock is satisfied for the test files' nearest
             // manifest (resolve+fetch-on-miss, or `--locked` offline) and inject
             // the resolved package map so a bare `import "pkg"` in a test works.
@@ -499,12 +647,12 @@ async fn real_main() -> ExitCode {
                     }
                     None => None,
                 };
-                ascript::run_tests_with_packages(&files, packages).await
+                ascript::run_tests_with_packages(&files, packages, caps).await
             };
             #[cfg(not(feature = "pkg"))]
             let test_result = {
                 let _ = locked;
-                ascript::run_tests(&files).await
+                ascript::run_tests_with_packages(&files, None, caps).await
             };
             match test_result {
             Ok(summary) => {

@@ -65,6 +65,12 @@ impl Pool {
     /// just not parallel). Once at least one isolate is live, jobs always queue onto an
     /// existing isolate (its mpsc gives FIFO backpressure), so a transient spawn
     /// failure never strands work.
+    ///
+    /// The `Err`-variant carries the whole `WorkerRequest` BY DESIGN (the graceful-
+    /// degradation handoff hands the request back so the caller runs it inline), so the
+    /// `large_err` lint is allowed here — boxing it would just add an alloc on the rare
+    /// degradation path for no benefit.
+    #[allow(clippy::result_large_err)]
     fn dispatch(&mut self, req: WorkerRequest) -> Result<Rc<Cell<usize>>, WorkerRequest> {
         // 1. An idle isolate?
         if let Some(slot) = self.slots.iter().find(|s| s.inflight.get() == 0) {
@@ -110,6 +116,8 @@ impl Pool {
 /// isolate's shared in-flight counter so the caller's bridge task can decrement it on
 /// reply. On `Err(req)` no isolate was available and none could be spawned — the
 /// caller must run the worker inline (graceful degradation under resource pressure).
+/// The `Err`-variant carries the whole request by design (see [`Pool::dispatch`]).
+#[allow(clippy::result_large_err)]
 pub fn dispatch(req: WorkerRequest) -> Result<Rc<Cell<usize>>, WorkerRequest> {
     POOL.with(|cell| {
         let mut guard = cell.borrow_mut();

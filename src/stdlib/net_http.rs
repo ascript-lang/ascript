@@ -552,6 +552,21 @@ async fn backoff_sleep(cfg: &RetryConfig, attempt: u32) {
 /// (timeout/redirect/decompress/tls/cookies/proxy/httpVersion). Only called when
 /// `has_advanced_client_opts` is true; plain requests reuse the pooled default.
 fn build_client(opts: &Value, span: Span) -> Result<reqwest::Client, Control> {
+    build_client_inner(opts, span, false)
+}
+
+/// BLOCKER 1: build a per-request client with redirects FORCED off, used when a
+/// `net` carve-out is active so a redirect cannot escape the host allow-list (we
+/// only validate the initial request host). All other opts are still honored.
+fn build_client_no_redirect(opts: &Value, span: Span) -> Result<reqwest::Client, Control> {
+    build_client_inner(opts, span, true)
+}
+
+fn build_client_inner(
+    opts: &Value,
+    span: Span,
+    force_no_redirect: bool,
+) -> Result<reqwest::Client, Control> {
     let mut b = reqwest::Client::builder();
 
     // timeout { connect, read, total } in ms. reqwest has no separate per-read
@@ -582,7 +597,12 @@ fn build_client(opts: &Value, span: Span) -> Result<reqwest::Client, Control> {
     }
 
     // redirect { follow, max } | "none". Default: follow, max 10.
-    if let Some(r) = opt_field(opts, "redirect") {
+    // BLOCKER 1: when a `net` carve-out is active, redirects are FORCED off so a
+    // redirect to a disallowed host can't escape the allow-list (the initial host is
+    // the only one validated). This overrides any `opts.redirect` request.
+    if force_no_redirect {
+        b = b.redirect(reqwest::redirect::Policy::none());
+    } else if let Some(r) = opt_field(opts, "redirect") {
         let policy = match &r {
             Value::Str(s) if s.as_ref() == "none" => reqwest::redirect::Policy::none(),
             Value::Object(o) => {
@@ -913,10 +933,23 @@ impl Interp {
                 )
             }
         };
+        // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the resolved target
+        // host against the allow-list BEFORE issuing the request. Gate-12: no carve-out
+        // → `check_net_host` returns immediately with no comparison. A URL with no
+        // parseable authority is left for reqwest to reject as a Tier-1 error.
+        let net_carved = self.net_carveout_active();
+        if let Some(host) = crate::stdlib::caps::host_of_url(&url) {
+            self.check_net_host(&host, span)?;
+        }
         // Fast path: plain requests reuse the pooled default client. Any advanced
         // client-level opt (timeout/redirect/tls/cookies/proxy/decompress/httpVersion)
-        // builds a dedicated per-request client.
-        let client = if has_advanced_client_opts(opts) {
+        // builds a dedicated per-request client. When a `net` carve-out is active a
+        // redirect could escape the allow-list (we validate only the initial host),
+        // so we force a dedicated client with redirects DISABLED — a redirect to a
+        // disallowed host must NOT bypass the allow-list (BLOCKER 1).
+        let client = if net_carved {
+            build_client_no_redirect(opts, span)?
+        } else if has_advanced_client_opts(opts) {
             build_client(opts, span)?
         } else {
             default_client()
@@ -1685,6 +1718,11 @@ impl Interp {
     /// `Value::Native(SseStream)` whose `next()` parses the event stream. A
     /// connect-time failure is the usual Tier-1 `[nil, err]`.
     async fn call_sse(&self, url: String, opts: &Value, span: Span) -> Result<Value, Control> {
+        // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the host before the
+        // SSE GET (an auto-reconnecting long-lived stream). Gate-12: no carve-out → no-op.
+        if let Some(host) = crate::stdlib::caps::host_of_url(&url) {
+            self.check_net_host(&host, span)?;
+        }
         // Replayable headers + auth — captured so reconnect re-issues an identical GET.
         let headers = sse_headers(opts, span)?;
         let auth = sse_auth(opts, span)?;

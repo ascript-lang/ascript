@@ -34,6 +34,8 @@ const NAV = [
     ['stdlib/db', 'Databases (SQLite, Postgres & Redis)'],
     ['stdlib/time', 'Time & locale'],
     ['stdlib/net', 'Networking & HTTP'],
+    ['stdlib/ffi', 'FFI (C interop)'],
+    ['stdlib/caps', 'Capabilities & sandboxing'],
     ['stdlib/async', 'Async & concurrency'],
     ['stdlib/stream', 'Lazy streams'],
     ['stdlib/utilities', 'Utilities (LRU, events, templates)'],

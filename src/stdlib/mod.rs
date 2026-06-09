@@ -10,6 +10,7 @@ pub mod array;
 pub mod assert_mod;
 pub mod bench;
 pub mod bytes;
+pub mod caps;
 #[cfg(feature = "binary")]
 pub mod cbor;
 pub mod cli;
@@ -20,6 +21,8 @@ pub mod convert;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 pub mod events;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "datetime")]
@@ -126,6 +129,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/events" => events::exports(),
         "std/template" => template::exports(),
         "std/bytes" => bytes::exports(),
+        "std/caps" => caps::exports(),
         "std/convert" => convert::exports(),
         "std/task" => task_mod::exports(),
         "std/time" => time::exports(),
@@ -195,6 +199,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/cbor" => cbor::exports(),
         #[cfg(feature = "tui")]
         "std/tui" => tui::exports(),
+        #[cfg(feature = "ffi")]
+        "std/ffi" => ffi::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -226,6 +232,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/events",
     "std/template",
     "std/bytes",
+    "std/caps",
     "std/convert",
     "std/task",
     "std/time",
@@ -263,12 +270,102 @@ pub const STD_MODULES: &[&str] = &[
     "std/msgpack",
     "std/cbor",
     "std/tui",
+    "std/ffi",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
 /// (see [`STD_MODULES`]).
 pub fn is_known_std_module(path: &str) -> bool {
     STD_MODULES.contains(&path)
+}
+
+/// FFI §4.4: for a path-bearing `fs` function, return `(path, is_write)` — the
+/// path it operates on (arg 0) and whether the operation MUTATES the filesystem.
+/// `None` for the pure path-string helpers (`join`/`dirname`/… do not touch the
+/// filesystem) or a non-string arg 0 (a type error the fn itself reports). Used by
+/// the fs stage-2 carve-out check; never reached unless an `fs` carve-out is
+/// configured (Gate-12).
+fn fs_path_arg<'a>(func: &str, args: &'a [Value]) -> Option<(&'a str, bool)> {
+    let is_write = match func {
+        // Filesystem-mutating operations.
+        "write" | "append" | "mkdir" | "remove" => true,
+        // Filesystem-reading operations.
+        "read" | "readBytes" | "exists" | "stat" | "readDir" | "walk" | "grep" => false,
+        // Pure path-string ops (join/dirname/basename/extname/isAbsolute) — no fs access.
+        _ => return None,
+    };
+    match args.first() {
+        Some(Value::Str(s)) => Some((s.as_ref(), is_write)),
+        _ => None,
+    }
+}
+
+/// FFI §4.1/§4.3: the **complete, central** map from a dispatch-site `(module,
+/// func)` to the [`Cap`](caps::Cap) it requires, or `None` for a module that
+/// touches no dangerous resource. This is the single enumeration the capability
+/// gate consults; because it is keyed at the `call_stdlib` dispatch ROOT, every
+/// OS-touching path — including **DNS** (`net.lookup`/`lookupOne`, which route
+/// through `"net"` but are NOT a connect/bind site), stdin reads (`io`), and
+/// host-topology leaks (`os.networkInterfaces`/`localIp`/`hostname`) — is captured
+/// **by construction**: there is no per-function path that can slip the gate.
+///
+/// Feature-independent (pure data): the mapping exists in every build so a
+/// `--no-default-features` binary still denies `fs`/`net`/`process`/`ffi`/`env`.
+///
+/// `os` is the ONE module whose verdict depends on `func` (§4.3a): the
+/// topology/identity calls leak the network even without acquiring a socket and
+/// are gated by `Net`; the rest of `os` is ambient self-introspection (`pid`,
+/// `platform`, `arch`, `cpuCount`, `tempDir`, `uptime`, `disks`, `memory`, …) and
+/// is ungated.
+pub fn required_cap(module: &str, func: &str) -> Option<caps::Cap> {
+    use caps::Cap;
+    match module {
+        // Filesystem — every fs func reads/writes/lists the host filesystem.
+        "fs" => Some(Cap::Fs),
+        // `io` reads process STDIN (a real input channel) → gated as a host-fd read.
+        "io" => Some(Cap::Fs),
+        // Environment variables.
+        "env" => Some(Cap::Env),
+        // Subprocess spawning.
+        "process" => Some(Cap::Process),
+        // FFI: a denied `ffi` blocks `ffi.open`, transitively blocking all native calls.
+        "ffi" => Some(Cap::Ffi),
+        // All network modules — sockets, HTTP, DNS, UDP, WebSocket, servers.
+        // `"net"` covers `net.lookup`/`lookupOne` (DNS) by construction.
+        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server" => Some(Cap::Net),
+        // Database modules open OS resources (BLOCKER 2). `sqlite` opens/creates a DB
+        // file → `Fs`; `postgres`/`redis` open TCP sockets → `Net`. Feature-gated the
+        // SAME way the dispatch match arms are so `--no-default-features` still builds.
+        #[cfg(feature = "sql")]
+        "sqlite" => Some(Cap::Fs),
+        #[cfg(feature = "postgres")]
+        "postgres" => Some(Cap::Net),
+        #[cfg(feature = "redis")]
+        "redis" => Some(Cap::Net),
+        // `ai` + `telemetry` each carry their OWN reqwest network stack (LLM API calls /
+        // OTLP-HTTP/Sentry/PostHog exporters) — NOT routed through `net_http`, so they
+        // need their own gate or a `--deny net`/`--sandbox`/`run_in_worker({deny net})`
+        // isolate could still exfiltrate over the network. Whole-module `Net` gate, the
+        // same posture as `net.lookup`. Feature-gated like the dispatch arms.
+        #[cfg(feature = "ai")]
+        "ai" => Some(Cap::Net),
+        #[cfg(feature = "telemetry")]
+        "telemetry" => Some(Cap::Net),
+        // `workflow.run`/`resume` PERSIST an append-only event log to a user-specified
+        // `{log}` FILE PATH (`write_log` → `std::fs::File::create`), so a durable workflow
+        // writes the host filesystem → `Fs`. (Found by the completeness sweep below; same
+        // ungated-OS-module class as ai/telemetry.)
+        #[cfg(feature = "workflow")]
+        "workflow" => Some(Cap::Fs),
+        // `os` is per-func: topology/identity leak network info → `Net`; the rest
+        // is ambient self-introspection and ungated.
+        "os" => match func {
+            "networkInterfaces" | "localIp" | "hostname" => Some(Cap::Net),
+            _ => None,
+        },
+        // Everything else is pure / non-resource-acquiring (math, json, string, …).
+        _ => None,
+    }
 }
 
 impl Interp {
@@ -361,6 +458,32 @@ impl Interp {
                 }
             }
         }
+        // FFI §4.3 — THE central capability gate. ONE chokepoint at the dispatch
+        // root, keyed by module string (and `func` for `os`), so every OS-touching
+        // call (fs, net incl. DNS `net.lookup`, process, env, io, os-topology) is
+        // gated by construction — there is no per-function path that can slip it.
+        //
+        // Gate-12 short-circuit: when ALL caps are granted (the default — every
+        // existing program), this is a SINGLE `Copy` bitset flag check that returns
+        // immediately, with no per-call `required_cap` lookup. The gate is therefore
+        // zero-cost on the hot path and the default run is byte-identical.
+        let cap_bits = self.caps_bits(); // Copy snapshot — no borrow held across the await below.
+        if !cap_bits.all_granted() {
+            if let Some(cap) = required_cap(module, func) {
+                self.require_cap(cap, module, func, args, span)?;
+            }
+            // FFI §4.4 stage-2 (fs carve-out): a configured `fs` carve-out makes the
+            // dispatch gate DEFER above; the resolved path is re-checked here, at the
+            // fs dispatch (the path-bearing fs funcs take the path as arg 0). Gate-12:
+            // `check_fs_path` returns immediately when no `fs` carve-out is configured,
+            // so this is a cheap classify + (usually) a no-op. The net stage-2 lives
+            // deeper (at connect/bind / DNS) where the resolved host is known.
+            if module == "fs" {
+                if let Some((path, is_write)) = fs_path_arg(func, args) {
+                    self.check_fs_path(std::path::Path::new(path), is_write, span)?;
+                }
+            }
+        }
         match module {
             #[cfg(feature = "ai")]
             "ai" => self.call_ai(func, args, span).await,
@@ -380,6 +503,7 @@ impl Interp {
             "events" => self.call_events_new(func, args, span),
             "template" => template::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
+            "caps" => self.call_caps(func, args, span).await,
             "convert" => convert::call(func, args, span),
             "task" => self.call_task(func, args, span).await,
             "time" => self.call_time(func, args, span).await,
@@ -465,6 +589,8 @@ impl Interp {
             "cbor" => cbor::call(func, args, span),
             #[cfg(feature = "tui")]
             "tui" => self.call_tui(func, args, span),
+            #[cfg(feature = "ffi")]
+            "ffi" => self.call_ffi(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -809,5 +935,158 @@ pub(crate) fn clamp_index(i: f64, len: usize) -> usize {
         len
     } else {
         i as usize
+    }
+}
+
+#[cfg(test)]
+mod cap_gate_tests {
+    use super::*;
+    use crate::stdlib::caps::Cap;
+
+    #[test]
+    fn required_cap_complete_enumeration() {
+        // fs / io → Fs
+        assert_eq!(required_cap("fs", "readFile"), Some(Cap::Fs));
+        assert_eq!(required_cap("fs", "writeFile"), Some(Cap::Fs));
+        assert_eq!(required_cap("io", "readAll"), Some(Cap::Fs));
+        assert_eq!(required_cap("io", "readLine"), Some(Cap::Fs));
+        // env → Env
+        assert_eq!(required_cap("env", "get"), Some(Cap::Env));
+        // process → Process
+        assert_eq!(required_cap("process", "spawn"), Some(Cap::Process));
+        // ffi → Ffi
+        assert_eq!(required_cap("ffi", "open"), Some(Cap::Ffi));
+        // all net modules → Net (incl. DNS via the "net" module string)
+        for m in ["net", "net_tcp", "net_http", "net_udp", "net_ws", "http_server"] {
+            assert_eq!(required_cap(m, "anything"), Some(Cap::Net), "module {m}");
+        }
+        // DNS specifically: net.lookup / lookupOne route through "net" → Net.
+        assert_eq!(required_cap("net", "lookup"), Some(Cap::Net));
+        assert_eq!(required_cap("net", "lookupOne"), Some(Cap::Net));
+        // BLOCKER 2: database modules open OS resources and MUST be gated.
+        // sqlite opens/creates a DB file → Fs; postgres/redis open TCP sockets → Net.
+        #[cfg(feature = "sql")]
+        assert_eq!(required_cap("sqlite", "open"), Some(Cap::Fs));
+        #[cfg(feature = "postgres")]
+        assert_eq!(required_cap("postgres", "connect"), Some(Cap::Net));
+        #[cfg(feature = "redis")]
+        assert_eq!(required_cap("redis", "connect"), Some(Cap::Net));
+        // os per-func split (§4.3a): topology/identity → Net; ambient → None.
+        assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
+        assert_eq!(required_cap("os", "localIp"), Some(Cap::Net));
+        assert_eq!(required_cap("os", "hostname"), Some(Cap::Net));
+        assert_eq!(required_cap("os", "pid"), None);
+        assert_eq!(required_cap("os", "platform"), None);
+        assert_eq!(required_cap("os", "cpuCount"), None);
+        assert_eq!(required_cap("os", "tempDir"), None);
+        assert_eq!(required_cap("os", "uptime"), None);
+        assert_eq!(required_cap("os", "disks"), None);
+        // pure / non-resource modules → None.
+        assert_eq!(required_cap("math", "abs"), None);
+        assert_eq!(required_cap("json", "parse"), None);
+        assert_eq!(required_cap("string", "upper"), None);
+        assert_eq!(required_cap("array", "map"), None);
+        // caps itself is NOT gated (querying/dropping is always allowed).
+        assert_eq!(required_cap("caps", "drop"), None);
+    }
+
+    /// Drift guard: every resource-acquiring module string the dispatch match
+    /// routes MUST have an explicit `required_cap` mapping (a `None` is a
+    /// deliberate decision, not an omission). Adding a new `std/*` resource module
+    /// without an entry here will trip this test. The list mirrors the gated
+    /// modules in `call_stdlib`'s `match module`.
+    #[test]
+    fn every_resource_module_is_mapped() {
+        // Modules that MUST require a capability (whole-module).
+        let gated: &[(&str, Cap)] = &[
+            ("fs", Cap::Fs),
+            ("io", Cap::Fs),
+            ("env", Cap::Env),
+            ("process", Cap::Process),
+            ("ffi", Cap::Ffi),
+            ("net", Cap::Net),
+            ("net_tcp", Cap::Net),
+            ("net_http", Cap::Net),
+            ("net_udp", Cap::Net),
+            ("net_ws", Cap::Net),
+            ("http_server", Cap::Net),
+            // BLOCKER 2: database modules open OS resources — gate the SAME way the
+            // dispatch match feature-gates them, so `--no-default-features` builds.
+            #[cfg(feature = "sql")]
+            ("sqlite", Cap::Fs),
+            #[cfg(feature = "postgres")]
+            ("postgres", Cap::Net),
+            #[cfg(feature = "redis")]
+            ("redis", Cap::Net),
+            // ai/telemetry carry their own reqwest network stacks; workflow persists an
+            // event-log FILE — all OS-acquiring, all were ungated (holistic-review BLOCKER
+            // 1 + completeness sweep).
+            #[cfg(feature = "ai")]
+            ("ai", Cap::Net),
+            #[cfg(feature = "telemetry")]
+            ("telemetry", Cap::Net),
+            #[cfg(feature = "workflow")]
+            ("workflow", Cap::Fs),
+        ];
+        for (m, want) in gated {
+            assert_eq!(
+                required_cap(m, "x"),
+                Some(*want),
+                "resource module {m} must map to {want:?}"
+            );
+        }
+        // os is per-func: at least its topology funcs must be Net.
+        assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
+    }
+
+    /// COMPLETENESS guard (holistic-review BLOCKER 2): the prior test only checks modules
+    /// someone REMEMBERED to list — it cannot catch a NEW OS-touching module added with no
+    /// `required_cap` entry (exactly how ai/telemetry/workflow shipped ungated). This test
+    /// closes the loop: EVERY module in `STD_MODULES` must be classified as either GATED
+    /// (a `required_cap` entry) or EXPLICITLY ungated (in `KNOWN_UNGATED`, pure/in-memory
+    /// or process-owned stdio). A module in NEITHER trips this — forcing a deliberate
+    /// capability decision for anything new. Run only in the full default build where
+    /// every feature-gated module is actually present + dispatchable.
+    #[test]
+    #[cfg(all(
+        feature = "ai",
+        feature = "telemetry",
+        feature = "workflow",
+        feature = "sql",
+        feature = "postgres",
+        feature = "redis",
+        feature = "ffi",
+        feature = "net"
+    ))]
+    fn every_std_module_is_classified_gated_or_explicitly_ungated() {
+        // Pure / in-memory / process-owned-stdio modules that acquire NO new OS resource.
+        // (`tui` is the controlling terminal's stdout/stdin — like `print` — not a new fd;
+        // revisit if raw-tty input ever becomes a gated input channel. `log` writes
+        // stderr / a capture buffer, never an arbitrary file. `cli` reads start-time argv.)
+        const KNOWN_UNGATED: &[&str] = &[
+            "assert", "bench", "cli", "color", "decimal", "math", "string", "array",
+            "object", "map", "schema", "set", "lru", "events", "template", "bytes", "caps",
+            "convert", "task", "time", "sync", "stream", "date", "intl", "json", "log",
+            "encoding", "crypto", "compress", "regex", "url", "uuid", "csv", "toml", "yaml",
+            "msgpack", "cbor", "tui",
+        ];
+        for full in STD_MODULES {
+            let key = full.strip_prefix("std/").unwrap().replace('/', "_");
+            if key == "os" {
+                continue; // per-func (topology→Net, ambient→None); covered above.
+            }
+            let gated = required_cap(&key, "__probe__").is_some();
+            let ungated = KNOWN_UNGATED.contains(&key.as_str());
+            assert!(
+                gated || ungated,
+                "std module '{key}' is UNCLASSIFIED: add it to `required_cap` if it touches \
+                 the OS, or to `KNOWN_UNGATED` if it is pure. (A silently-ungated OS module \
+                 is a capability bypass — this is exactly how ai/telemetry/workflow slipped.)"
+            );
+            assert!(
+                !(gated && ungated),
+                "std module '{key}' is in BOTH required_cap and KNOWN_UNGATED — pick one."
+            );
+        }
     }
 }

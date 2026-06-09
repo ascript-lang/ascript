@@ -27,6 +27,32 @@ pub struct Manifest {
     /// order (alphabetical, since `preserve_order` is off); MVS is
     /// order-independent and the lockfile sorts by name, so order is immaterial.
     pub dependencies: IndexMap<String, DepSource>,
+    /// `[capabilities]` — FFI §4.2 opt-out capability denials (a NEW owned table,
+    /// beside `[package]`/`[dependencies]`). `None` when the table is absent (the
+    /// default: all granted). Composed into a `CapSet` via [`Manifest::capset`].
+    pub capabilities: Option<CapabilitiesConfig>,
+}
+
+/// The parsed `[capabilities]` table (FFI §4.2). Pure DATA — the composition into
+/// a runtime `CapSet` happens in [`Manifest::capset`], keeping the TOML shape and
+/// the runtime type loosely coupled.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapabilitiesConfig {
+    /// `deny = ["ffi", "process"]` — whole-capability denials.
+    pub deny: Vec<String>,
+    /// `net = { deny = "external", allow = [...] }` — a granular net carve-out.
+    pub net: Option<ScopeConfig>,
+    /// `fs = { deny = "write", allow = [...] }` — a granular fs carve-out.
+    pub fs: Option<ScopeConfig>,
+}
+
+/// A granular `{ deny = "<mode>", allow = [...] }` carve-out, as written in TOML.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeConfig {
+    /// The deny mode string: for net `"external"`/`"all"`, for fs `"write"`/`"all"`.
+    pub deny: String,
+    /// The allow-list (hosts for net, path prefixes for fs).
+    pub allow: Vec<String>,
 }
 
 /// The `[package]` identity table.
@@ -178,10 +204,87 @@ impl Manifest {
             }
         }
 
+        let capabilities = match table.get("capabilities") {
+            None => None,
+            Some(toml::Value::Table(t)) => Some(parse_capabilities(ctx, t)?),
+            Some(_) => {
+                return Err(format!(
+                    "ascript.toml: {ctx}: `capabilities` must be a table (`[capabilities]`)"
+                ))
+            }
+        };
+
         Ok(Manifest {
             package,
             dependencies,
+            capabilities,
         })
+    }
+
+    /// Compose the manifest's `[capabilities]` into a runtime [`CapSet`]
+    /// (FFI §4.2/§4.5). `None` capabilities → the default all-granted set. An
+    /// unknown cap name or deny-mode string is a clean `Err` (never a panic — a
+    /// hostile manifest is rejected, not crashed).
+    pub fn capset(&self) -> Result<ascript::stdlib::caps::CapSet, String> {
+        use ascript::stdlib::caps::{Cap, CapSet, FsDeny, FsScope, NetDeny, NetScope};
+        let mut set = CapSet::all_granted();
+        let Some(caps) = &self.capabilities else {
+            return Ok(set);
+        };
+        // Whole-capability denials.
+        for name in &caps.deny {
+            match ascript::stdlib::caps::cap_name(name) {
+                Some(cap) => set.deny(cap),
+                None => {
+                    return Err(format!(
+                        "ascript.toml: [capabilities].deny: unknown capability '{name}' \
+                         (expected one of: fs, net, process, ffi, env)"
+                    ))
+                }
+            }
+        }
+        // Granular net carve-out.
+        if let Some(sc) = &caps.net {
+            let deny = match sc.deny.as_str() {
+                "external" => NetDeny::External,
+                "all" => NetDeny::All,
+                other => {
+                    return Err(format!(
+                        "ascript.toml: [capabilities].net.deny: expected \"external\" or \"all\", got '{other}'"
+                    ))
+                }
+            };
+            set.set_net_scope(NetScope {
+                deny,
+                allow: sc.allow.clone(),
+            });
+        }
+        // Granular fs carve-out.
+        if let Some(sc) = &caps.fs {
+            let deny = match sc.deny.as_str() {
+                "write" => FsDeny::Write,
+                "all" => FsDeny::All,
+                other => {
+                    return Err(format!(
+                        "ascript.toml: [capabilities].fs.deny: expected \"write\" or \"all\", got '{other}'"
+                    ))
+                }
+            };
+            set.set_fs_scope(FsScope {
+                deny,
+                allow: sc.allow.clone(),
+            });
+        }
+        // A whole-cap deny of fs/net overrides any carve-out (deny is monotone):
+        // re-apply after scopes so `deny = ["net"]` + a net carve-out → fully denied.
+        for name in &caps.deny {
+            if let Some(cap) = ascript::stdlib::caps::cap_name(name) {
+                if matches!(cap, Cap::Fs | Cap::Net) {
+                    set.deny(cap);
+                }
+            }
+        }
+        Ok(set)
     }
 
     /// Load the nearest `ascript.toml` at or above `file`'s directory, returning
@@ -235,6 +338,64 @@ fn parse_package(ctx: &str, t: &toml::Table) -> Result<PackageMeta, String> {
         description: str_field("description")?,
         license: str_field("license")?,
     })
+}
+
+/// Parse the `[capabilities]` table (FFI §4.2). Reads `deny = [..]` plus optional
+/// granular `net`/`fs` carve-out sub-tables. Unknown KEYS are ignored (forward
+/// compatibility), but a malformed VALUE (wrong type) is a clean error.
+fn parse_capabilities(ctx: &str, t: &toml::Table) -> Result<CapabilitiesConfig, String> {
+    let mut cfg = CapabilitiesConfig::default();
+    if let Some(v) = t.get("deny") {
+        cfg.deny = parse_string_array(ctx, "capabilities.deny", v)?;
+    }
+    if let Some(v) = t.get("net") {
+        cfg.net = Some(parse_scope(ctx, "capabilities.net", v)?);
+    }
+    if let Some(v) = t.get("fs") {
+        cfg.fs = Some(parse_scope(ctx, "capabilities.fs", v)?);
+    }
+    Ok(cfg)
+}
+
+/// Parse a `{ deny = "<mode>", allow = [..] }` carve-out sub-table.
+fn parse_scope(ctx: &str, key: &str, val: &toml::Value) -> Result<ScopeConfig, String> {
+    let toml::Value::Table(t) = val else {
+        return Err(format!(
+            "ascript.toml: {ctx}: `{key}` must be a table ({{ deny = \"…\", allow = [..] }})"
+        ));
+    };
+    let deny = match t.get("deny") {
+        Some(toml::Value::String(s)) => s.clone(),
+        Some(_) => return Err(format!("ascript.toml: {ctx}: `{key}.deny` must be a string")),
+        None => return Err(format!("ascript.toml: {ctx}: `{key}` requires a `deny` mode")),
+    };
+    let allow = match t.get("allow") {
+        None => Vec::new(),
+        Some(v) => parse_string_array(ctx, &format!("{key}.allow"), v)?,
+    };
+    Ok(ScopeConfig { deny, allow })
+}
+
+/// Parse a `key = ["a", "b"]` array-of-strings, erroring on a non-array or a
+/// non-string element.
+fn parse_string_array(ctx: &str, key: &str, val: &toml::Value) -> Result<Vec<String>, String> {
+    let toml::Value::Array(arr) = val else {
+        return Err(format!(
+            "ascript.toml: {ctx}: `{key}` must be an array of strings"
+        ));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for el in arr {
+        match el {
+            toml::Value::String(s) => out.push(s.clone()),
+            _ => {
+                return Err(format!(
+                    "ascript.toml: {ctx}: `{key}` must contain only strings"
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn parse_dep_source(ctx: &str, name: &str, val: &toml::Value) -> Result<DepSource, String> {
@@ -426,6 +587,80 @@ alpha = { path = "../a" }
         let m = Manifest::parse("ascript.toml", "").unwrap();
         assert!(m.package.is_none());
         assert!(m.dependencies.is_empty());
+    }
+
+    #[test]
+    fn capabilities_table_parses_into_capset() {
+        use ascript::stdlib::caps::Cap;
+        let src = r#"
+[capabilities]
+deny = ["ffi", "process"]
+"#;
+        let m = Manifest::parse("ascript.toml", src).unwrap();
+        let cfg = m.capabilities.as_ref().unwrap();
+        assert_eq!(cfg.deny, vec!["ffi", "process"]);
+        let cs = m.capset().unwrap();
+        assert!(!cs.has(Cap::Ffi));
+        assert!(!cs.has(Cap::Process));
+        assert!(cs.has(Cap::Fs) && cs.has(Cap::Net) && cs.has(Cap::Env));
+    }
+
+    #[test]
+    fn capabilities_granular_net_and_fs_parse() {
+        use ascript::stdlib::caps::{Cap, NetDeny};
+        let src = r#"
+[capabilities]
+net = { deny = "external", allow = ["api.internal"] }
+fs  = { deny = "write", allow = ["./cache"] }
+"#;
+        let m = Manifest::parse("ascript.toml", src).unwrap();
+        let cs = m.capset().unwrap();
+        // The carve-out clears the outright bit but configures the scope.
+        assert!(!cs.has(Cap::Net));
+        let net = cs.net_scope.as_ref().unwrap();
+        assert_eq!(net.deny, NetDeny::External);
+        assert_eq!(net.allow, vec!["api.internal".to_string()]);
+        let fs = cs.fs_scope.as_ref().unwrap();
+        assert_eq!(fs.allow, vec!["./cache".to_string()]);
+    }
+
+    #[test]
+    fn capabilities_unknown_cap_name_is_clean_error() {
+        let src = "[capabilities]\ndeny = [\"bogus\"]\n";
+        let m = Manifest::parse("ascript.toml", src).unwrap();
+        let e = m.capset().unwrap_err();
+        assert!(e.contains("unknown capability") && e.contains("bogus"), "{e}");
+    }
+
+    #[test]
+    fn capabilities_bad_deny_mode_is_clean_error() {
+        let src = "[capabilities]\nnet = { deny = \"weird\" }\n";
+        let m = Manifest::parse("ascript.toml", src).unwrap();
+        let e = m.capset().unwrap_err();
+        assert!(e.contains("external") && e.contains("weird"), "{e}");
+    }
+
+    #[test]
+    fn capabilities_absent_is_all_granted() {
+        use ascript::stdlib::caps::Cap;
+        let m = Manifest::parse("ascript.toml", "[dependencies]\n").unwrap();
+        assert!(m.capabilities.is_none());
+        let cs = m.capset().unwrap();
+        for cap in Cap::ALL {
+            assert!(cs.has(cap));
+        }
+    }
+
+    #[test]
+    fn capabilities_non_table_is_error() {
+        let e = Manifest::parse("ascript.toml", "capabilities = 5\n").unwrap_err();
+        assert!(e.contains("capabilities") && e.contains("must be a table"), "{e}");
+    }
+
+    #[test]
+    fn capabilities_deny_must_be_string_array() {
+        let e = Manifest::parse("ascript.toml", "[capabilities]\ndeny = \"ffi\"\n").unwrap_err();
+        assert!(e.contains("must be an array of strings"), "{e}");
     }
 
     #[test]

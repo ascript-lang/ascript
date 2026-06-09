@@ -778,6 +778,9 @@ impl Interp {
                         AsError::at("server.bind port must be an integer 0..=65535", span).into(),
                     );
                 }
+                // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the bind host.
+                // Gate-12: no carve-out → immediate `Ok` with no comparison.
+                self.check_net_host(&host, span)?;
                 let addr = format!("{}:{}", host, port as u16);
                 match TcpListener::bind(&addr).await {
                     Ok(listener) => {

@@ -131,7 +131,7 @@ pub enum SpanStatus {
 /// Shared with the checker (`undefined-variable`) so they cannot drift.
 pub const BUILTIN_NAMES: &[&str] = &[
     "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit", "int",
-    "float",
+    "float", "run_in_worker",
 ];
 
 pub fn global_env() -> Environment {
@@ -339,6 +339,29 @@ pub(crate) enum ResourceState {
     /// handle — NOT script `Value`s. The GC must NEVER trace into it. `Value::Native`
     /// already traces as a no-op (`gc.rs`'s `_ => {}` arm), so the invariant holds.
     WorkerActor(Box<crate::worker::actor::WorkerActorHandle>),
+    /// FFI campaign §3.4: an open shared library (`ffi.open` → `dlopen`). The
+    /// `libloading::Library` `dlclose`s on `Drop` (deterministic reclaim, matching the
+    /// native-resource discipline). Wrapped in an `Rc` so a `ForeignSymbol` can keep
+    /// the owning `Library` alive past the lib handle's own drop (a borrowed
+    /// `Symbol<'lib>` cannot be `'static`; the raw-address-plus-kept-alive-`Library`
+    /// pairing gives both `'static` storage and lifetime correctness — §3.4).
+    ///
+    /// GC INVARIANT: a `Library` is an opaque OS handle; the GC must NEVER trace into
+    /// it. `Value::Native` traces as a no-op (`gc.rs`'s `_ => {}`), so the invariant
+    /// holds for `ForeignLib`/`ForeignSymbol`/`ForeignPtr` automatically.
+    #[cfg(feature = "ffi")]
+    ForeignLib(std::rc::Rc<libloading::Library>),
+    /// FFI campaign §3.4: a resolved symbol + its bound signature. Stores the function
+    /// address as a raw pointer (in `FfiSymbol`) and KEEPS THE OWNING `Library` ALIVE
+    /// via an `Rc` clone, so the address stays valid for every `sym.call`. Boxed to
+    /// keep the enum compact. GC-UNTRACED (raw pointer + opaque handle).
+    #[cfg(feature = "ffi")]
+    ForeignSymbol(Box<crate::stdlib::ffi::FfiSymbol>),
+    /// FFI campaign §3.4: an opaque C pointer (a `malloc` result, a C "constructor"
+    /// handle) carried as a raw `usize` address. NOT auto-freed (the C library owns the
+    /// lifetime). GC-UNTRACED.
+    #[cfg(feature = "ffi")]
+    ForeignPtr(usize),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -571,6 +594,21 @@ pub struct Interp {
     /// `iface_verdict_cache` against pointer reuse (see its doc). Pure-memo invalidation, so
     /// it never changes observable behavior — only whether a verdict is recomputed.
     iface_cache_gen: std::cell::Cell<u64>,
+    /// FFI §4.3: the per-isolate capability set (default = ALL granted, so the
+    /// central dispatch gate is a no-op short-circuit and every existing program
+    /// is byte-identical). `RefCell` only because the irreversible `caps.drop`
+    /// mutates it; the dispatch gate reads a `Copy` [`crate::stdlib::caps::CapBits`]
+    /// **snapshot**, NEVER holding this borrow across an `.await`
+    /// (`await_holding_refcell_ref` stays satisfied).
+    caps: RefCell<crate::stdlib::caps::CapSet>,
+    /// FFI §4.5a: whether `caps.drop`/`caps.dropAll` are permitted on THIS isolate.
+    /// `true` on the top-level program isolate and a dedicated `run_in_worker`
+    /// isolate (where a drop is durable, single-tenant). A **pooled** `worker fn`
+    /// REUSES one `Interp` across requests, so a drop there would leak forward into
+    /// unrelated work — the pooled-request install clears this flag (Task 8) and
+    /// `caps.drop` is then refused with a loud recoverable panic (§4.5a). A `Cell`
+    /// (never held across `.await`).
+    caps_drop_allowed: Cell<bool>,
     worker_source: RefCell<Option<Rc<str>>>,
     /// Workers Spec A (.aso path): the raw `.aso` bytes of the entry program, retained
     /// so a `worker fn` dispatch can re-parse them into a top-level
@@ -852,8 +890,158 @@ impl Interp {
             package_resolver: RefCell::new(None),
             iface_verdict_cache: RefCell::new(HashMap::new()),
             iface_cache_gen: std::cell::Cell::new(0),
+            // FFI §4.3: default = ALL granted → byte-identical for every existing
+            // program (the gate short-circuits until something is dropped).
+            caps: RefCell::new(crate::stdlib::caps::CapSet::all_granted()),
+            // Top-level / dedicated isolate → drops are durable. A pooled worker
+            // clears this (Task 8) so a leaking drop is refused.
+            caps_drop_allowed: Cell::new(true),
             worker_source: RefCell::new(None),
             worker_aso_bytes: RefCell::new(None),
+        }
+    }
+
+    /// FFI §4.5: install the initial capability set (CLI/manifest-composed, Task 5,
+    /// or a dedicated worker's reduced set, Task 8). Called ONCE after construction
+    /// and BEFORE running any program code. Replaces the default all-granted set.
+    pub fn set_caps(&self, caps: crate::stdlib::caps::CapSet) {
+        *self.caps.borrow_mut() = caps;
+    }
+
+    /// A clone of the current capability set (for tests / worker spawn plumbing).
+    pub fn caps(&self) -> crate::stdlib::caps::CapSet {
+        self.caps.borrow().clone()
+    }
+
+    /// A `Copy` snapshot of the grant bitset — what the dispatch gate reads. The
+    /// borrow is released immediately (the returned value is `Copy`), so it is
+    /// never held across an `.await`.
+    pub(crate) fn caps_bits(&self) -> crate::stdlib::caps::CapBits {
+        self.caps.borrow().bits_snapshot()
+    }
+
+    /// FFI §4.5a: set whether `caps.drop` is permitted on this isolate. Cleared by
+    /// a pooled `worker fn` request install (Task 8); left `true` on the top-level
+    /// program and a dedicated isolate.
+    // Used by the pooled-worker request install (Task 8); the field already gates
+    // `caps.drop` (Task 4). Allowed-dead until Task 8 wires the pooled install.
+    #[allow(dead_code)]
+    pub fn set_caps_drop_allowed(&self, allowed: bool) {
+        self.caps_drop_allowed.set(allowed);
+    }
+
+    /// Whether `caps.drop`/`caps.dropAll` may mutate this isolate's `caps` (§4.5a).
+    /// Consumed by `std/caps` `drop`/`dropAll` routing.
+    pub(crate) fn caps_drop_allowed(&self) -> bool {
+        self.caps_drop_allowed.get()
+    }
+
+    /// Irreversibly **deny** `cap` on this isolate (`caps.drop`). Subtractive only —
+    /// there is no inverse. The caller (`call_caps`) has already verified
+    /// [`caps_drop_allowed`](Interp::caps_drop_allowed).
+    pub(crate) fn caps_deny(&self, cap: crate::stdlib::caps::Cap) {
+        self.caps.borrow_mut().deny(cap);
+    }
+
+    /// Irreversibly deny ALL five dangerous capabilities (`caps.dropAll`).
+    pub(crate) fn caps_deny_all(&self) {
+        self.caps.borrow_mut().deny_all_dangerous();
+    }
+
+    /// FFI §4.3: the ONE capability gate. Given a required [`Cap`] (from
+    /// [`crate::stdlib::required_cap`]) raise the recoverable Tier-2 denial panic
+    /// `capability '<name>' denied` if it is not granted. Reads a `Copy` bitset
+    /// **snapshot** (never holds the `caps` borrow), so it is await-safe.
+    ///
+    /// **Gate-12:** the caller short-circuits when ALL caps are granted; this
+    /// helper is only reached when *something* has been dropped, so the single
+    /// bitset test here is off the hot path.
+    pub(crate) fn require_cap(
+        &self,
+        cap: crate::stdlib::caps::Cap,
+        _module: &str,
+        _func: &str,
+        _args: &[Value],
+        span: Span,
+    ) -> Result<(), Control> {
+        use crate::stdlib::caps::CapDecision;
+        // Short, await-free borrow to read the dispatch decision (consults the
+        // optional fs/net carve-out scope). The borrow is dropped before return.
+        let decision = self.caps.borrow().dispatch_decision(cap);
+        match decision {
+            // Granted-outright, OR a granular carve-out is configured (the
+            // connect/bind / fs-path STAGE 2 enforces the allow-list). Defer passes
+            // the dispatch gate here; the resolved host/path isn't known yet.
+            CapDecision::Allow | CapDecision::Defer => Ok(()),
+            // Recoverable Tier-2 panic (catchable by `recover`): a host sandboxing a
+            // plugin observes the denial rather than crashing. Names the capability.
+            CapDecision::Deny => Err(Control::Panic(AsError::at(
+                format!("capability '{}' denied", cap.name()),
+                span,
+            ))),
+        }
+    }
+
+    /// FFI §4.4 STAGE 2 (net): enforce a `net` carve-out against a resolved `host`
+    /// at connect/bind time. **Gate-12 fast path:** when no `net` carve-out is
+    /// configured (`net_scope` is `None` — the default and the all-deny/all-grant
+    /// cases) this returns `Ok(())` immediately with **no host comparison** — the
+    /// dispatch-site bitset test was already conclusive. The allow-list is consulted
+    /// ONLY when a carve-out exists.
+    /// FFI §4.4 (BLOCKER 1): is a `net` carve-out configured on this isolate? Used by
+    /// the HTTP path to decide whether redirects must be disabled (a redirect could
+    /// escape the host allow-list, which we only validate for the initial host).
+    /// Gate-12: a single `Option::is_some` on the `Copy`-cheap borrow — no comparison.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) fn net_carveout_active(&self) -> bool {
+        self.caps.borrow().net_scope.is_some()
+    }
+
+    #[cfg_attr(not(feature = "net"), allow(dead_code))] // only the net entries call it
+    pub(crate) fn check_net_host(&self, host: &str, span: Span) -> Result<(), Control> {
+        // Borrow is await-free and dropped before return.
+        let allowed = {
+            let caps = self.caps.borrow();
+            match &caps.net_scope {
+                None => return Ok(()), // Gate-12: no carve-out → no host comparison.
+                Some(scope) => scope.allows_host(host),
+            }
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Control::Panic(AsError::at(
+                format!("capability 'net' denied for host '{host}'"),
+                span,
+            )))
+        }
+    }
+
+    /// FFI §4.4 STAGE 2 (fs): enforce an `fs` carve-out against a resolved `path`
+    /// (a write iff `is_write`) at the path-resolving entry. **Gate-12 fast path:**
+    /// when no `fs` carve-out is configured (`fs_scope` is `None`) this returns
+    /// `Ok(())` immediately with **no path canonicalization**. Canonicalization is
+    /// paid for ONLY by programs that configure a carve-out.
+    pub(crate) fn check_fs_path(
+        &self,
+        path: &std::path::Path,
+        is_write: bool,
+        span: Span,
+    ) -> Result<(), Control> {
+        let allowed = {
+            let caps = self.caps.borrow();
+            match &caps.fs_scope {
+                None => return Ok(()), // Gate-12: no carve-out → no canonicalization.
+                Some(scope) => scope.allows_path(path, is_write),
+            }
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Control::Panic(AsError::at(
+                format!("capability 'fs' denied for path '{}'", path.display()),
+                span,
+            )))
         }
     }
 
@@ -1069,6 +1257,43 @@ impl Interp {
     ) -> Option<R> {
         let mut guard = self.determinism.borrow_mut();
         guard.as_mut().map(f)
+    }
+
+    /// FFI Task 10 (§7): the current determinism mode, or `None` when INERT (the
+    /// default — the FFI path is then byte-identical to Unit B). A `Copy` snapshot read
+    /// through a short borrow that is dropped before return (await-safe). `ffi.rs`'s
+    /// `sym.call` consults this to decide Record / Replay / pass-through.
+    #[cfg(feature = "ffi")] // only the FFI seam consults these
+    pub(crate) fn determinism_mode(&self) -> Option<crate::det::Mode> {
+        self.determinism.borrow().as_ref().map(|ctx| ctx.mode)
+    }
+
+    /// FFI Task 10 (§7A): in Record mode, append an `FfiCall` event (the marshalled
+    /// return + post-call `Bytes` out-param snapshots). A no-op when not deterministic.
+    #[cfg(feature = "ffi")]
+    pub(crate) fn record_ffi_call(
+        &self,
+        ret: crate::det::FfiRet,
+        out_params: Vec<(usize, Vec<u8>)>,
+    ) {
+        if let Some(ctx) = self.determinism.borrow_mut().as_mut() {
+            ctx.record_ffi_call(ret, out_params);
+        }
+    }
+
+    /// FFI Task 10 (§7A): in Replay mode, return the recorded `FfiCall` outcome (the
+    /// marshalled return plus the out-param byte snapshots) WITHOUT re-invoking C, or
+    /// `None` to fall through to a real call (stream exhausted / kind mismatch). The
+    /// borrow is short and await-free.
+    #[cfg(feature = "ffi")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn replay_ffi_call(
+        &self,
+    ) -> Option<(crate::det::FfiRet, Vec<(usize, Vec<u8>)>)> {
+        self.determinism
+            .borrow_mut()
+            .as_mut()
+            .and_then(|ctx| ctx.replay_ffi_call())
     }
 
     /// Acquire a SNAPSHOT-RESTORE depth guard for a VM re-entrant `Vm::run`
@@ -4386,6 +4611,19 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         let _ = &args;
+        // FFI §4 (BLOCKER 3): re-check the capability governing this handle BEFORE
+        // operating it, so a `caps.drop` HOLDS for handles opened before the drop
+        // (e.g. `socket.read()`/`listener.accept()` denied after `drop("net")`).
+        // Gate-12: a single `Copy` bitset compare on the default all-granted path —
+        // zero per-op cost, byte-identical. The denial uses the same recoverable
+        // Tier-2 panic the central gate raises (naming the capability). A handle whose
+        // kind maps to NO cap (a pure in-memory native) stays ungated.
+        let cap_bits = self.caps_bits(); // Copy snapshot — no borrow across the awaits below.
+        if !cap_bits.all_granted() {
+            if let Some(cap) = m.receiver.kind.governing_cap() {
+                self.require_cap(cap, m.receiver.kind.type_name(), &m.method, &args, span)?;
+            }
+        }
         #[cfg(feature = "sql")]
         {
             use crate::value::NativeKind::*;
@@ -4492,6 +4730,36 @@ impl Interp {
                     span,
                 )
                 .await;
+            }
+        }
+        #[cfg(feature = "ffi")]
+        {
+            use crate::value::NativeKind::*;
+            // FFI handle methods. The `ffi` capability already re-checked above via
+            // `governing_cap` (all three FFI kinds → Cap::Ffi), so operating an open
+            // handle is denied after `caps.drop("ffi")`.
+            match m.receiver.kind {
+                ForeignLib if m.method == "symbol" => {
+                    return self.ffi_lib_symbol(m.receiver.id, &args, span);
+                }
+                ForeignSymbol if m.method == "call" => {
+                    return self.ffi_symbol_call(m.receiver.id, &args, span);
+                }
+                ForeignPtr if m.method == "read_cstr" => {
+                    return self.ffi_read_cstr_ptr(m.receiver.id, span);
+                }
+                ForeignLib | ForeignSymbol | ForeignPtr => {
+                    return Err(AsError::at(
+                        format!(
+                            "{} handle has no method '{}'",
+                            m.receiver.kind.type_name(),
+                            m.method
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                _ => {}
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
@@ -5478,6 +5746,133 @@ impl Interp {
         self.run_body(spec, args, &call_env, span, &what).await
     }
 
+    /// FFI §4.5a — `run_in_worker(fn, input, opts?)`: dispatch a `worker fn` and, when
+    /// `opts.caps` is present, run it on a fresh DEDICATED (single-tenant) isolate
+    /// carrying the reduced `CapSet`. Without `opts.caps` it falls through to the
+    /// ordinary pooled `worker fn` dispatch (the caller's caps floor rides as usual).
+    ///
+    /// The keystone: a cap-reduced job NEVER touches the shared pool (whose reused
+    /// `Interp` cannot hold a durable drop, §4.5a) — it gets its own heap + `Interp`, so
+    /// the reduced set is a real, memory-isolated sandbox and an in-plugin `caps.drop`
+    /// is terminal. Byte-identical across engines (the slice build + dispatch are the
+    /// SAME mechanism `worker fn` uses; only the isolate lifecycle + caps differ).
+    async fn call_run_in_worker(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let callee = args.first().cloned().unwrap_or(Value::Nil);
+        // The single payload arg (an array/object/scalar — structured-clone-sendable).
+        let input = args.get(1).cloned().unwrap_or(Value::Nil);
+        let opts = args.get(2).cloned().unwrap_or(Value::Nil);
+
+        // The callee must be a NAMED `worker fn` (we ship its slice by name).
+        let entry_name = worker_fn_dispatch_name(&callee).ok_or_else(|| {
+            Control::Panic(AsError::at(
+                "run_in_worker expects a named `worker fn` as its first argument".to_string(),
+                span,
+            ))
+        })?;
+
+        // Parse `opts.caps` into a reduced CapSet (None → no caps option → pooled path).
+        let reduced = self.caps_from_run_opts(&opts, span)?;
+
+        // The args list shipped to the worker is the single `input` payload.
+        let worker_args = vec![input];
+
+        // Inline-nesting (called from inside an isolate) is not a sandbox spawn — run the
+        // entry locally like any nested worker fn (the enclosing slice already ships it).
+        // A nested call CANNOT honor a `caps` reduction (an inline run shares the
+        // enclosing isolate's `Interp`, so there is no separate cap boundary to install).
+        // Silently ignoring an explicit `{caps}` would be a security footgun, so REFUSE
+        // it loudly — the author must spawn the cap-reduced worker from the top level.
+        if crate::worker::pool::in_isolate() {
+            if reduced.is_some() {
+                return Err(AsError::at(
+                    "run_in_worker with a `caps` option is not supported from inside a \
+                     worker (a nested inline run shares the enclosing isolate's \
+                     capabilities); spawn the cap-reduced worker from the top level"
+                        .to_string(),
+                    span,
+                )
+                .into());
+            }
+            return crate::worker::dispatch_worker_inline(self, &entry_name, worker_args, span);
+        }
+
+        // Use the `.aso`-aware slice builder: `run_in_worker` is the SAME shared method
+        // on both engines (no VM-specific override like a bare `worker fn` call has), so
+        // it must build the slice from retained source OR the stored `.aso` bytes to stay
+        // four-mode byte-identical (it previously failed under `ascript run x.aso`).
+        let slice = crate::worker::build_code_slice_for_interp(self, &entry_name)?;
+        match reduced {
+            // Cap-reduced → DEDICATED single-tenant isolate carrying the reduced CapSet.
+            Some(caps) => {
+                crate::worker::dispatch_worker_dedicated(self, slice, worker_args, caps, span)
+            }
+            // No caps option → ordinary pooled dispatch (caller's floor rides as usual).
+            None => crate::worker::dispatch_worker(self, slice, worker_args, span),
+        }
+    }
+
+    /// Parse a `run_in_worker` `opts.caps` value into a reduced [`CapSet`], or `None`
+    /// when no `caps` option is present (→ the pooled path). The `caps` shape mirrors
+    /// the manifest/CLI: `{ deny: ["ffi", ...], net: {deny, allow}, fs: {deny, allow} }`.
+    /// An unknown cap name / malformed shape is a Tier-2 panic (programmer error).
+    fn caps_from_run_opts(
+        &self,
+        opts: &Value,
+        span: Span,
+    ) -> Result<Option<crate::stdlib::caps::CapSet>, Control> {
+        let opts_obj = match opts {
+            Value::Object(o) => o,
+            Value::Nil => return Ok(None),
+            _ => return Ok(None),
+        };
+        let caps_val = match opts_obj.borrow().get("caps") {
+            Some(v) => v.clone(),
+            None => return Ok(None),
+        };
+        let caps_obj = match &caps_val {
+            Value::Object(o) => o.clone(),
+            _ => {
+                return Err(AsError::at(
+                    "run_in_worker: opts.caps must be an object (e.g. { deny: [\"ffi\"] })"
+                        .to_string(),
+                    span,
+                )
+                .into())
+            }
+        };
+        // Start from the CALLER's current caps (denial is monotone — a worker can only
+        // ever be MORE restricted than its dispatcher), then subtract opts.caps.deny.
+        let mut set = self.caps();
+        if let Some(Value::Array(deny)) = caps_obj.borrow().get("deny") {
+            for name in deny.borrow().iter() {
+                let name = match name {
+                    Value::Str(s) => s.to_string(),
+                    _ => {
+                        return Err(AsError::at(
+                            "run_in_worker: opts.caps.deny must be an array of capability names"
+                                .to_string(),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                match crate::stdlib::caps::cap_name(&name) {
+                    Some(cap) => set.deny(cap),
+                    None => {
+                        return Err(AsError::at(
+                            format!("run_in_worker: unknown capability '{name}' in opts.caps.deny"),
+                            span,
+                        )
+                        .into())
+                    }
+                }
+            }
+        }
+        // A bare `{}` caps object (no deny) still routes to the dedicated path — the
+        // author explicitly asked for an isolate (the reduced set just equals the floor).
+        Ok(Some(set))
+    }
+
     #[async_recursion(?Send)]
     async fn call_builtin(&self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
@@ -5527,6 +5922,7 @@ impl Interp {
                     Err(Control::Exit(code)) => Err(Control::Exit(code)),
                 }
             }
+            "run_in_worker" => self.call_run_in_worker(args, span).await,
             "exit" => {
                 // exit(code?) — default 0; code must be an integer in 0..=255.
                 let code: i32 = match args.first() {
@@ -6638,6 +7034,20 @@ pub(crate) fn error_message(err: &Value) -> String {
     }
 }
 
+/// FFI §4.5a: the dispatch name of a NAMED `worker fn` value, or `None` if `v` is not
+/// a named worker fn. Handles both engine representations — a tree-walker
+/// `Value::Function` and a VM `Value::Closure` (whose `proto` carries the name +
+/// `is_worker`). `run_in_worker`'s first arg must resolve through this.
+fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
+    match v {
+        Value::Function(f) if f.is_worker => f.name.as_ref().map(|n| n.to_string()),
+        Value::Closure(c) if c.proto.is_worker => {
+            c.proto.chunk.name.as_ref().map(|n| n.to_string())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
@@ -7131,6 +7541,548 @@ mod tests {
     use super::*;
     use crate::lexer::lex;
     use crate::parser::parse;
+
+    /// FFI §4.3: `require_cap` raises the recoverable Tier-2 denial panic when the
+    /// cap is NOT granted, and passes when it is. Pure (no feature gate) — works in
+    /// every config.
+    #[test]
+    fn require_cap_denies_when_dropped_and_allows_when_granted() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = Interp::new();
+        // Default = all granted → require passes.
+        assert!(interp
+            .require_cap(Cap::Ffi, "ffi", "open", &[], Span::new(0, 0))
+            .is_ok());
+        // Drop ffi → require raises the named denial panic, recoverable.
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Ffi);
+        interp.set_caps(cs);
+        match interp.require_cap(Cap::Ffi, "ffi", "open", &[], Span::new(0, 0)) {
+            Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'ffi' denied"),
+            other => panic!("expected denial panic, got {other:?}"),
+        }
+        // A still-granted cap (net) still passes.
+        assert!(interp
+            .require_cap(Cap::Net, "net", "lookup", &[], Span::new(0, 0))
+            .is_ok());
+    }
+
+    /// FFI §4.3 Gate-12: the default all-granted snapshot reports `all_granted()`
+    /// (the single-flag short-circuit the gate uses to stay zero-cost).
+    #[test]
+    fn default_caps_are_all_granted_snapshot() {
+        let interp = Interp::new();
+        assert!(interp.caps_bits().all_granted());
+    }
+
+    /// FFI §4.3 end-to-end through the REAL dispatch site `call_stdlib`: with `env`
+    /// dropped, a routed `env.get` call raises `capability 'env' denied` BEFORE the
+    /// module body runs. This is the funnel both engines share, so byte-identity is
+    /// by construction. DNS-egress (`net.lookup`) is the same dispatch-site
+    /// mechanism (Task 9 e2e). A still-granted, ungated module is unaffected.
+    #[cfg(feature = "sys")]
+    #[tokio::test]
+    async fn dropped_cap_denies_at_dispatch_site() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Env);
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // `env` denied → the gate raises the recoverable denial panic.
+                let denied = interp
+                    .call_stdlib("env", "get", &[Value::Str("PATH".into())], Span::new(0, 0))
+                    .await;
+                match denied {
+                    Err(Control::Panic(e)) => {
+                        assert_eq!(e.message, "capability 'env' denied")
+                    }
+                    other => panic!("expected env denial, got {other:?}"),
+                }
+                // A still-granted, ungated module (math) routes normally.
+                let ok = interp
+                    .call_stdlib("math", "abs", &[Value::Int(-3)], Span::new(0, 0))
+                    .await
+                    .unwrap();
+                assert_eq!(ok, Value::Int(3));
+            })
+            .await;
+    }
+
+    /// FFI §4.3 [SECURITY]: DNS (`net.lookup`) is captured by the dispatch-site gate
+    /// by construction — it routes through the `"net"` module string even though it
+    /// is NOT a connect/bind site, so dropping `net` denies it. (Full end-to-end
+    /// resolved-vs-denied value test is Task 9; this asserts the gate fires.)
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn dropped_net_denies_dns_lookup() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Net);
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let denied = interp
+                    .call_stdlib(
+                        "net",
+                        "lookup",
+                        &[Value::Str("example.com".into())],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                match denied {
+                    Err(Control::Panic(e)) => {
+                        assert_eq!(e.message, "capability 'net' denied")
+                    }
+                    other => panic!("expected net denial for DNS lookup, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// BLOCKER 2: `sqlite`/`postgres`/`redis` open OS resources (a DB file / a TCP
+    /// socket) but were ABSENT from `required_cap`, so `--sandbox` left them reachable.
+    /// With the matching cap dropped, the dispatch-site gate now denies them BEFORE
+    /// any connect attempt — a clean recoverable Tier-2 panic naming the capability.
+    #[cfg(any(feature = "sql", feature = "postgres", feature = "redis"))]
+    #[tokio::test]
+    async fn dropped_cap_denies_database_modules() {
+        use crate::stdlib::caps::CapSet;
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        // `--sandbox` equivalent: drop every dangerous capability.
+        let mut cs = CapSet::all_granted();
+        cs.deny_all_dangerous();
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // sqlite.open → Fs denied (would otherwise open/create a DB file).
+                #[cfg(feature = "sql")]
+                match interp
+                    .call_stdlib("sqlite", "open", &[Value::Str(":memory:".into())], Span::new(0, 0))
+                    .await
+                {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'fs' denied"),
+                    other => panic!("expected sqlite fs denial, got {other:?}"),
+                }
+                // postgres.connect → Net denied (would otherwise open a TCP socket).
+                #[cfg(feature = "postgres")]
+                match interp
+                    .call_stdlib(
+                        "postgres",
+                        "connect",
+                        &[Value::Str("postgres://localhost/db".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'net' denied"),
+                    other => panic!("expected postgres net denial, got {other:?}"),
+                }
+                // redis.connect → Net denied (TCP egress).
+                #[cfg(feature = "redis")]
+                match interp
+                    .call_stdlib(
+                        "redis",
+                        "connect",
+                        &[Value::Str("redis://localhost".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'net' denied"),
+                    other => panic!("expected redis net denial, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// FFI §4.4 Gate-12: with NO carve-out configured (`net_scope`/`fs_scope` are
+    /// `None` — the default and the all-deny/all-grant cases), the stage-2 checks
+    /// short-circuit to `Ok` with NO host comparison / NO path canonicalization.
+    /// Proven by feeding a host/path that WOULD be denied under a carve-out and
+    /// asserting it passes — the only way it can pass is if no comparison ran.
+    #[test]
+    fn stage2_checks_shortcircuit_when_no_carveout() {
+        let interp = Interp::new();
+        // No net carve-out → even a public address passes (no host comparison).
+        assert!(interp.check_net_host("8.8.8.8", Span::new(0, 0)).is_ok());
+        assert!(interp.check_net_host("example.com", Span::new(0, 0)).is_ok());
+        // No fs carve-out → even a write to /etc passes (no canonicalization).
+        assert!(interp
+            .check_fs_path(std::path::Path::new("/etc/passwd"), true, Span::new(0, 0))
+            .is_ok());
+    }
+
+    /// FFI §4.4 stage-2 enforcement (net): with a carve-out configured, the host
+    /// is checked — loopback/allow-listed pass, public is denied with a host-named
+    /// panic.
+    #[test]
+    fn stage2_net_carveout_enforces_allowlist() {
+        use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+        let interp = Interp::new();
+        let mut cs = CapSet::all_granted();
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::External,
+            allow: vec!["api.internal".into()],
+        });
+        interp.set_caps(cs);
+        // Loopback allowed.
+        assert!(interp.check_net_host("127.0.0.1", Span::new(0, 0)).is_ok());
+        // Allow-listed host allowed.
+        assert!(interp.check_net_host("api.internal", Span::new(0, 0)).is_ok());
+        // Public denied with a host-named message.
+        match interp.check_net_host("8.8.8.8", Span::new(0, 0)) {
+            Err(Control::Panic(e)) => {
+                assert!(e.message.contains("net") && e.message.contains("8.8.8.8"), "{}", e.message)
+            }
+            other => panic!("expected net host denial, got {other:?}"),
+        }
+    }
+
+    /// FFI §4.4: a `net` carve-out makes the dispatch gate DEFER (not deny-outright)
+    /// so the stage-2 host check runs — verified end-to-end through `call_stdlib`
+    /// for `net.lookup`: a public host is denied, loopback resolves.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn net_carveout_defers_then_stage2_denies_public_lookup() {
+        use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::All,
+            allow: vec!["localhost".into()],
+        });
+        interp.set_caps(cs);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Public host: dispatch defers, stage-2 denies (host-named).
+                let denied = interp
+                    .call_stdlib(
+                        "net",
+                        "lookup",
+                        &[Value::Str("example.com".into())],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                match denied {
+                    Err(Control::Panic(e)) => assert!(
+                        e.message.contains("example.com"),
+                        "{}",
+                        e.message
+                    ),
+                    other => panic!("expected stage-2 denial, got {other:?}"),
+                }
+                // localhost is allow-listed → resolves to a [ips, nil] pair.
+                let ok = interp
+                    .call_stdlib(
+                        "net",
+                        "lookup",
+                        &[Value::Str("localhost".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                    .unwrap();
+                if let Value::Array(a) = ok {
+                    assert_eq!(a.borrow()[1], Value::Nil, "lookup should succeed, err=nil");
+                } else {
+                    panic!("expected [ips, err] pair");
+                }
+            })
+            .await;
+    }
+
+    /// BLOCKER 1: the net carve-out host allow-list was enforced ONLY at
+    /// `tcp.connect`/`tcp.listen` + DNS — NOT at HTTP / UDP / WS / server. Under a
+    /// `net = {deny:"all", allow:["localhost"]}` carve-out, an http/udp/ws/server
+    /// op to a DISALLOWED host must be denied at the request/bind entry (host-named
+    /// stage-2 panic) BEFORE any socket is opened. Hermetic: the gate fires before
+    /// any real connect, so no network is needed.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn net_carveout_enforced_for_http_udp_ws_server() {
+        use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+        // deny=all, allow only loopback literal 127.0.0.1 (NOT "localhost", so a
+        // 127.0.0.1 bind passes but any public host / hostname is denied).
+        let make = || {
+            let interp = std::rc::Rc::new(Interp::new());
+            interp.install_self();
+            let mut cs = CapSet::all_granted();
+            cs.set_net_scope(NetScope {
+                deny: NetDeny::All,
+                allow: vec!["127.0.0.1".into()],
+            });
+            interp.set_caps(cs);
+            interp
+        };
+        let denied = |msg: &str, host: &str| {
+            assert!(
+                msg.contains("net") && msg.contains(host),
+                "expected host-named net denial for {host}, got: {msg}"
+            );
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // HTTP GET to a public host → denied (TCP egress to 8.8.8.8).
+                let i = make();
+                match i
+                    .call_stdlib(
+                        "net_http",
+                        "get",
+                        &[Value::Str("http://8.8.8.8/".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "8.8.8.8"),
+                    other => panic!("expected http net denial, got {other:?}"),
+                }
+
+                // UDP send-to a disallowed destination → denied.
+                let i = make();
+                // Bind is on the allowed loopback (passes), so this exercises send-to.
+                let bind = i
+                    .call_stdlib(
+                        "net_udp",
+                        "bind",
+                        &[Value::Str("127.0.0.1:0".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                    .unwrap();
+                let sock = if let Value::Array(a) = &bind {
+                    a.borrow()[0].clone()
+                } else {
+                    panic!("bind should return a pair");
+                };
+                // Call `send(data, "8.8.8.8:53")` on the socket handle.
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &sock {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a native udp socket"),
+                    },
+                    method: "send".into(),
+                });
+                match i
+                    .call_native_method(
+                        m,
+                        vec![
+                            Value::Str("x".into()),
+                            Value::Str("8.8.8.8:53".into()),
+                        ],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "8.8.8.8"),
+                    other => panic!("expected udp send net denial, got {other:?}"),
+                }
+
+                // WebSocket connect to a public host → denied.
+                let i = make();
+                match i
+                    .call_stdlib(
+                        "net_ws",
+                        "connect",
+                        &[Value::Str("ws://8.8.8.8:9000/".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "8.8.8.8"),
+                    other => panic!("expected ws net denial, got {other:?}"),
+                }
+
+                // HTTP server bind to a disallowed host (a non-loopback) → denied.
+                let i = make();
+                let server = i
+                    .call_stdlib("http_server", "create", &[], Span::new(0, 0))
+                    .await
+                    .unwrap();
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &server {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a server handle"),
+                    },
+                    method: "bind".into(),
+                });
+                match i
+                    .call_native_method(
+                        m,
+                        vec![Value::Str("0.0.0.0".into()), Value::Int(0)],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "0.0.0.0"),
+                    other => panic!("expected server bind net denial, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// BLOCKER 3: operating an ALREADY-OPEN native handle must re-check the governing
+    /// capability — `call_native_method` had ZERO cap checks, so a socket opened while
+    /// `net` was granted kept working (and `accept()` even acquired NEW connections)
+    /// after `caps.drop("net")`. Here: open a TCP listener (net granted), drop net,
+    /// then `accept()` must be denied — "the drop holds".
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn open_handle_rechecks_dropped_cap() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Open a listener while net is granted (hermetic loopback bind).
+                let pair = interp
+                    .call_stdlib(
+                        "net_tcp",
+                        "listen",
+                        &[Value::Str("127.0.0.1".into()), Value::Int(0)],
+                        Span::new(0, 0),
+                    )
+                    .await
+                    .unwrap();
+                let listener = if let Value::Array(a) = &pair {
+                    assert_eq!(a.borrow()[1], Value::Nil, "listen should succeed");
+                    a.borrow()[0].clone()
+                } else {
+                    panic!("listen should return a pair");
+                };
+                // Drop net AFTER the handle is open.
+                let mut cs = CapSet::all_granted();
+                cs.deny(Cap::Net);
+                interp.set_caps(cs);
+                // accept() on the open listener must now be denied — the per-handle
+                // re-check fires before any new connection is acquired.
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &listener {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a native listener"),
+                    },
+                    method: "accept".into(),
+                });
+                match interp.call_native_method(m, vec![], Span::new(0, 0)).await {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'net' denied"),
+                    other => panic!("expected net denial on accept after drop, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// BLOCKER 3: a handle whose `NativeKind` maps to NO capability (a pure in-memory
+    /// native — e.g. an `events` emitter) stays UNGATED even after every cap is
+    /// dropped, so dropping caps never breaks pure-compute handles (no over-deny).
+    #[tokio::test]
+    async fn ungated_handle_unaffected_by_drops() {
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // An events emitter is an in-memory handle (no OS resource).
+                let emitter = interp
+                    .call_stdlib("events", "new", &[], Span::new(0, 0))
+                    .await
+                    .unwrap();
+                // Drop ALL caps.
+                interp.caps_deny_all();
+                // listenerCount() still works — the handle has no governing cap.
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &emitter {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a native emitter"),
+                    },
+                    method: "listenerCount".into(),
+                });
+                let r = interp
+                    .call_native_method(m, vec![Value::Str("x".into())], Span::new(0, 0))
+                    .await;
+                assert!(r.is_ok(), "ungated handle must stay usable after dropAll: {r:?}");
+            })
+            .await;
+    }
+
+    /// FFI §4.4 fs carve-out end-to-end through `call_stdlib`: `deny="write",
+    /// allow=[<tmp/cache>]` permits a read and a write under the allowed subtree but
+    /// blocks a write elsewhere (the dispatch-site classifies arg 0 + read/write).
+    #[cfg(feature = "sys")]
+    #[tokio::test]
+    async fn fs_carveout_blocks_write_outside_allow() {
+        use crate::stdlib::caps::{CapSet, FsDeny, FsScope};
+        let dir = std::env::temp_dir().join("ascript_caps_e2e");
+        std::fs::create_dir_all(&dir).ok();
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let mut cs = CapSet::all_granted();
+        cs.set_fs_scope(FsScope {
+            deny: FsDeny::Write,
+            allow: vec![dir.to_string_lossy().to_string()],
+        });
+        interp.set_caps(cs);
+        let allowed = dir.join("ok.txt");
+        let outside = std::env::temp_dir().join("ascript_caps_outside.txt");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Write under the allowed subtree → passes the gate (returns a pair).
+                let w_ok = interp
+                    .call_stdlib(
+                        "fs",
+                        "write",
+                        &[
+                            Value::Str(allowed.to_string_lossy().to_string().into()),
+                            Value::Str("hi".into()),
+                        ],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                assert!(w_ok.is_ok(), "write under allow should pass the gate");
+                // Write OUTSIDE the allowed subtree → denied with a path-named panic.
+                let w_deny = interp
+                    .call_stdlib(
+                        "fs",
+                        "write",
+                        &[
+                            Value::Str(outside.to_string_lossy().to_string().into()),
+                            Value::Str("nope".into()),
+                        ],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                match w_deny {
+                    Err(Control::Panic(e)) => {
+                        assert!(e.message.contains("fs") && e.message.contains("denied"), "{}", e.message)
+                    }
+                    other => panic!("expected fs write denial, got {other:?}"),
+                }
+                // A READ outside the subtree is still allowed (write-deny mode).
+                let r_ok = interp
+                    .call_stdlib(
+                        "fs",
+                        "exists",
+                        &[Value::Str(outside.to_string_lossy().to_string().into())],
+                        Span::new(0, 0),
+                    )
+                    .await;
+                assert!(r_ok.is_ok(), "read should be allowed in write-deny mode");
+            })
+            .await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&outside).ok();
+    }
 
     /// SP12 soft hook: with NO `telemetry.init` (and regardless of the feature),
     /// the SP11-facing `Interp::telemetry_*` hook is inert — `telemetry_active()`

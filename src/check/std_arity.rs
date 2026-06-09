@@ -58,6 +58,26 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/math", "trailing_zeros") => 1,
         ("std/math", "rotl") => 2,
         ("std/math", "rotr") => 2,
+        // std/caps — the capability surface (FFI §5.2). `list`/`dropAll` take no
+        // args; `has`/`drop` take exactly one (the capability name).
+        ("std/caps", "has") => 1,
+        ("std/caps", "list") => 0,
+        ("std/caps", "drop") => 1,
+        ("std/caps", "dropAll") => 0,
+        // std/ffi — the FFI surface (FFI §5.1). `open`/`cstr`/`read_cstr`/`struct`/
+        // `alloc` take one required arg; `get` takes (layout, buf, name); `set` takes
+        // (layout, buf, name, value). The handle METHODS `symbol` (name + argtypes +
+        // rettype) and `call` (args array) bind on a `ForeignLib`/`ForeignSymbol`
+        // handle — NOT module exports, so the drift guard skips them (below).
+        ("std/ffi", "open") => 1,
+        ("std/ffi", "struct") => 1,
+        ("std/ffi", "cstr") => 1,
+        ("std/ffi", "read_cstr") => 1,
+        ("std/ffi", "alloc") => 1,
+        ("std/ffi", "get") => 3,
+        ("std/ffi", "set") => 4,
+        ("std/ffi", "symbol") => 3,
+        ("std/ffi", "call") => 1,
         // std/task — pipe requires exactly 2 args (generator + event bus).
         ("std/task", "pipe") => 2,
         // std/string — NUM code-point helpers (fixed required arity).
@@ -116,17 +136,38 @@ mod tests {
             ("std/math", "trailing_zeros"),
             ("std/math", "rotl"),
             ("std/math", "rotr"),
+            ("std/caps", "has"),
+            ("std/caps", "list"),
+            ("std/caps", "drop"),
+            ("std/caps", "dropAll"),
+            ("std/ffi", "open"),
+            ("std/ffi", "struct"),
+            ("std/ffi", "cstr"),
+            ("std/ffi", "read_cstr"),
+            ("std/ffi", "alloc"),
+            ("std/ffi", "get"),
+            ("std/ffi", "set"),
+            ("std/ffi", "symbol"),
+            ("std/ffi", "call"),
             ("std/task", "pipe"),
             ("std/string", "codepoints"),
             ("std/string", "from_codepoints"),
             ("std/string", "code_at"),
         ];
+        // FFI handle METHODS (resolved on a `ForeignLib`/`ForeignSymbol` handle, not
+        // module-level exports). Keyed in `required_args` so `call-arity` can reach
+        // `lib.symbol(...)` / `sym.call(...)` (Gate-5), but NOT in `std_module_exports`,
+        // so the export cross-check skips them.
+        let handle_methods: &[(&str, &str)] = &[("std/ffi", "symbol"), ("std/ffi", "call")];
         for (module, name) in keys {
             // The entry must actually be in the table.
             assert!(
                 required_args(module, name).is_some(),
                 "{module}::{name} is in the drift-guard list but not in required_args"
             );
+            if handle_methods.contains(&(module, name)) {
+                continue; // a handle method — no module export to cross-check.
+            }
             // And it must be a real export (only checkable for built modules).
             if let Some(exports) = crate::stdlib::std_module_exports(module) {
                 assert!(

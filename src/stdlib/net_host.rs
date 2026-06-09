@@ -89,7 +89,20 @@ impl Interp {
 
     /// Resolve `host` to a de-duplicated list of IP strings. Returns Tier-1
     /// `[array<string>, nil]` on success or `[nil, err]` on failure.
-    async fn net_lookup(&self, host: String, _span: Span) -> Result<Value, Control> {
+    async fn net_lookup(&self, host: String, span: Span) -> Result<Value, Control> {
+        // FFI §4.4 stage-2 (net carve-out): re-check the resolved host against the
+        // allow-list. Gate-12: when no `net` carve-out is configured this returns
+        // immediately with no host comparison. The bare host (a single trailing
+        // `:port` stripped — IPv6 literals carry multiple colons and are left whole)
+        // is what an allow-list names.
+        let bare = if host.starts_with('[') {
+            host.split(']').next().unwrap_or(&host).trim_start_matches('[')
+        } else if host.chars().filter(|&c| c == ':').count() == 1 {
+            host.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host)
+        } else {
+            &host
+        };
+        self.check_net_host(bare, span)?;
         let addr = to_addr(&host);
         let addrs = match tokio::net::lookup_host(&addr).await {
             Ok(a) => a,

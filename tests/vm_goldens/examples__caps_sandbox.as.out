@@ -1,0 +1,4 @@
+# exit: none
+host has ffi: true
+plugin: ffi denied — capability 'ffi' denied
+host still has ffi: true

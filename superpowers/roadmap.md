@@ -434,6 +434,36 @@ byte-identical, fmt-canonical, Gate-5-clean); LSP hover/inlay surface INSTANTIAT
 (Sound typing + Generics sections), README types blurb. **v1 limitation (documented, not a bug):** user
 parameterized types are INVARIANT — write a generic `fn<T>` rather than relying on `Box<Dog>` ↦ `Box<Animal>`.
 
+## FFI — foreign function interface & opt-out capabilities ✅ MERGED
+
+Spec `superpowers/specs/2026-06-08-ffi-capabilities-design.md`, plan `…/plans/2026-06-08-ffi-capabilities.md`
+(11 tasks). The system-access tier of the serious-language campaign. **No `.aso` bump, no grammar change** —
+pure stdlib + an `Interp` field + CLI/manifest; `vm_differential` green in BOTH configs (the feature lives at
+the shared `Value`/`Interp`/stdlib layer, so all four modes are byte-identical by construction). Two
+co-designed subsystems:
+
+1. **Opt-out capabilities (`std/caps`, CORE).** Default-all-granted (every existing program byte-identical),
+   subtracted at three scopes (CLI `--deny`/`--sandbox`/`--deny-net`/`--deny-fs`, `ascript.toml
+   [capabilities]`, irreversible in-code `caps.drop` — NO `grant`). Five caps (`fs`/`net`/`process`/`ffi`/
+   `env`) on a `CapSet` bitset (`Interp.caps`), gated at ONE central `Interp::call_stdlib` chokepoint keyed by
+   `required_cap(module, func)` — so DNS (`net.lookup`), `io` stdin, and `os`-topology are gated by
+   construction (no per-connect bypass). Gate-12 hot path: a `Copy` `all_granted()` flag short-circuits to
+   zero-cost when nothing is dropped. KEYSTONE: capabilities are PER-ISOLATE → `run_in_worker({caps})` spawns
+   a DEDICATED, memory-isolated sandbox; `caps.drop` is REFUSED in a POOLED `worker fn` (shared-`Interp`
+   reuse, §4.5a). Granular `fs`-path/`net`-host carve-outs. Three security-bypass fixes landed (net carve-out
+   for http/udp/ws, sqlite/postgres/redis gating, per-handle re-check after drop) — each has an explicit
+   `tests/cap_audit.rs` Gate-10 assertion so a regression fails CI.
+2. **FFI (`std/ffi`, default-on `ffi` feature).** `ffi.open`/`lib.symbol`/`sym.call` over `libloading`+`libffi`;
+   sized C ints (`i8…u64`/`size`) marshal OVER `int` (no new `Value` kind, NUM §10); `struct`/`cstr`/`read_cstr`
+   over `Bytes`; three `NativeKind` Foreign handles (GC-untraced, non-sendable). Fixed a LATENT trampoline UB:
+   a sub-register int return must be read at register width (`cif.call::<i64>` then narrow) — libffi writes a
+   full `ffi_arg`, so `call::<i32>` smashed the stack. **SP9 FFI seam** (`det.rs` `DetEvent::FfiCall`/`FfiRet`):
+   Record captures the marshalled return + post-call `Bytes` out-param contents, Replay restores them WITHOUT
+   re-invoking C; a pointer-return / `ForeignPtr` out-param is a LOUD Tier-2 refusal. INERT by default →
+   byte-identical. `ffi-nondeterminism` lint (Warning, 0 FP on `examples/**`). Examples
+   `examples/{ffi_libm,caps_sandbox}.as` + `examples/advanced/ffi_struct.as`; docs
+   `docs/content/stdlib/{ffi,caps}.md` (+ NAV).
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

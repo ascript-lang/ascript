@@ -85,22 +85,28 @@ where
 /// (only the script's own args — NOT the binary name or the file path).
 /// Pass `&[]` if the caller provides no trailing args.
 pub async fn run_file(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_with_packages(path, script_args, None).await
+    run_file_with_packages(path, script_args, None, None).await
 }
 
 /// Like [`run_file`] (tree-walker) but installs a CLI-resolved package map (SP6)
 /// before running, so a bare `import "pkg"` resolves through it. `None` = no
-/// package resolver (every bare specifier is "unknown package").
+/// package resolver (every bare specifier is "unknown package"). `caps` (FFI §4.5)
+/// is the CLI/manifest-composed initial capability set; `None` = all granted.
 pub async fn run_file_with_packages(
     path: &Path,
     script_args: &[String],
     packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<i32, AsError> {
     // CLI `run` streams `print` output live to stdout (so it appears immediately
     // and survives a later panic). Under `Live` there is no captured string, so
     // the success contract is `()` — the caller does not re-print anything.
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
+    // FFI §4.5: install the composed capability set before running any code.
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
     if let Some(map) = packages {
         interp.set_package_resolver(map);
     }
@@ -123,16 +129,21 @@ pub async fn run_file_with_packages(
 /// Load each file as a module (running its `test(...)` registrations) on a
 /// single `Interp`, then run all registered tests and return a summary.
 pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
-    run_tests_with_packages(files, None).await
+    run_tests_with_packages(files, None, None).await
 }
 
 /// Like [`run_tests`] but installs a CLI-resolved package map (SP6) so a bare
-/// `import "pkg"` in a test file resolves through it. `None` = no resolver.
+/// `import "pkg"` in a test file resolves through it. `None` = no resolver. `caps`
+/// (FFI §4.5) is the CLI/manifest-composed capability set; `None` = all granted.
 pub async fn run_tests_with_packages(
     files: &[String],
     packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<TestSummary, AsError> {
     let interp = Rc::new(Interp::new());
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
     if let Some(map) = packages {
         interp.set_package_resolver(map);
     }
@@ -386,7 +397,11 @@ pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf,
 /// or verify failure becomes a clear [`AsError`]), then runs its top-level on the
 /// VM — NO compile step. Relative file imports resolve against the `.aso`'s parent
 /// directory. Returns the process exit code, mirroring [`run_file`].
-pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
+pub async fn run_aso_file(
+    path: &Path,
+    script_args: &[String],
+    caps: Option<crate::stdlib::caps::CapSet>,
+) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
@@ -398,6 +413,10 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
+    // FFI §4.5: install the composed capability set before running any code.
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
     // Workers Spec A (.aso path): retain the raw bytes so `dispatch_worker_closure` can
     // re-parse them into the top-level chunk and build a worker code slice without source.
     interp.set_worker_aso_bytes(Rc::from(bytes.into_boxed_slice()));
@@ -455,16 +474,19 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
 /// build source), the source is attached to a Tier-2 panic here so its diagnostic
 /// renders against the file the user just ran.
 pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_on_vm_with_packages(path, script_args, None).await
+    run_file_on_vm_with_packages(path, script_args, None, None).await
 }
 
 /// Like [`run_file_on_vm`] (VM) but installs a CLI-resolved package map (SP6)
 /// before running, so a bare `import "pkg"` resolves through it. `None` = no
-/// package resolver (every bare specifier is "unknown package").
+/// package resolver (every bare specifier is "unknown package"). `caps` (FFI §4.5)
+/// is the CLI/manifest-composed initial capability set; `None` = all granted
+/// (byte-identical default).
 pub async fn run_file_on_vm_with_packages(
     path: &Path,
     script_args: &[String],
     packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -485,6 +507,11 @@ pub async fn run_file_on_vm_with_packages(
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
+    // FFI §4.5: install the CLI/manifest-composed capability set (most-restrictive
+    // -wins) BEFORE running any code. `None` → the default all-granted set is kept.
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
     // Workers Spec A: retain the source so a `worker fn` call can build its slice.
     interp.set_worker_source(&src);
     if let Some(map) = packages {

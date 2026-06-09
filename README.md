@@ -86,6 +86,13 @@ cargo build --release      # → target/release/ascript
 The default build includes the full standard library. Trim it with Cargo features (e.g.
 `--no-default-features --features "data,sys,net"`) for a smaller binary.
 
+> **One native prerequisite:** the default build enables `std/ffi`, which links against the
+> system **libffi**. Install it first — macOS: `brew install libffi` (the system one also works);
+> Debian/Ubuntu: `apt install libffi-dev pkg-config`; Fedora: `dnf install libffi-devel`. If you
+> don't need the foreign-function interface, build without it:
+> `cargo build --release --no-default-features --features "data,datetime,sys,net,crypto,…"`
+> (any feature set that omits `ffi`).
+
 ## Usage
 
 ```bash
@@ -227,6 +234,8 @@ ascript run hello.as
 | Lazy streams | `std/stream` (lazy pull engine: `range` · `from` sources; `map` · `filter` · `take` · `drop` · `flatMap` · `enumerate` · `zip` combinators; `collect` · `reduce` · `count` · `find` · `first` · `forEach` terminals) |
 | Test assertions | `std/assert` (deep `eq`/`ne`, `isTrue`/`isFalse`/`isNil`/`notNil`, `gt`/`gte`/`lt`/`lte`, `contains`, `approxEq`, `throws`, `snapshot`) |
 | Benchmarking | `std/bench` (`measure` · `compare`) |
+| FFI (C interop) | `std/ffi` (call any C library via `libloading`+`libffi`: `open` · `symbol` · `call`; sized C ints marshalled over `int`; `struct`/`cstr`/`read_cstr`; default-on `ffi` feature) |
+| Capabilities | `std/caps` (opt-OUT, default-all-granted; deny `fs`/`net`/`process`/`ffi`/`env` at CLI `--deny`/`--sandbox`, `ascript.toml [capabilities]`, or irreversible in-code `caps.drop`; per-isolate → sandbox an untrusted plugin via `run_in_worker({caps})`; **core**, always present) |
 
 ## Documentation
 

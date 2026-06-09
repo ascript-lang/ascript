@@ -246,6 +246,31 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   `docs/content/language/workers.md`. (Carry-forward bug, OUT of workers scope: `recover(fn(){...})` — an
   anonymous-fn-expression call arg — fails with "function declaration has no resolver binding"; use the arrow
   form `recover(() => ...)`.)
+- **FFI + opt-out capabilities** (`src/stdlib/{ffi,caps}.rs`; spec
+  `specs/2026-06-08-ffi-capabilities-design.md`). **`std/caps` is CORE** (no feature; works under
+  `--no-default-features`); **`std/ffi` is the default-on `ffi` feature** (`libloading`+`libffi`). NO `.aso`
+  bump, NO grammar change — pure stdlib + an `Interp` field + CLI/manifest. (a) **Capabilities — opt-OUT,
+  default-all-granted** (so every existing program is byte-identical). Five caps (`fs`/`net`/`process`/`ffi`/
+  `env`) on a `CapSet` bitset (`Interp.caps`), subtracted at three scopes (CLI `--deny`/`--sandbox`/
+  `--deny-net`/`--deny-fs`, `ascript.toml [capabilities]`, in-code IRREVERSIBLE `caps.drop` — there is NO
+  `grant`). The gate is **ONE central chokepoint** in `Interp::call_stdlib` immediately before
+  `match module`, keyed by `required_cap(module, func)` — so DNS (`net.lookup`, NOT a connect site), `io`
+  stdin, and `os`-topology are gated **by construction**; a per-handle re-check in `call_native_method`
+  (`NativeKind::governing_cap`) holds a drop for already-open handles. Gate-12 hot path: a single `Copy`
+  bitset `all_granted()` flag short-circuits when nothing is dropped (zero-cost default). The KEYSTONE:
+  `run_in_worker(fn, input, {caps:{deny}})` spawns a DEDICATED isolate with a reduced `CapSet` (a real
+  memory-isolated sandbox); `caps.drop` is REFUSED in a POOLED `worker fn` (shared-`Interp` reuse leak,
+  §4.5a). Audit: `tests/cap_audit.rs` (Gate 10 — every OS path denied). (b) **FFI** — `ffi.open`/`lib.symbol`/
+  `sym.call` over libffi; sized C ints (`i8…u64`/`size`) marshal **over `int`** (no new `Value` kind, NUM
+  §10); three `NativeKind` Foreign handles (GC-untraced, non-sendable). **libffi return-width rule**
+  (load-bearing): a sub-register-width int return MUST be read at register width (`cif.call::<i64>` then
+  narrow) — libffi writes a full `ffi_arg`, so `call::<i32>` overflows the 4-byte slot (a stack smash). (c)
+  **SP9 FFI seam** (`src/det.rs` `DetEvent::FfiCall`/`FfiRet`): inside Record/Replay, a `sym.call` records the
+  marshalled return + post-call `Bytes` out-param contents and replays them WITHOUT re-invoking C; a
+  pointer-return / `ForeignPtr` out-param is a LOUD Tier-2 refusal (never a silent wrong replay). INERT by
+  default (`determinism_mode()==None` → byte-identical). `ffi-nondeterminism` lint (default Warning, 0 FP on
+  `examples/**`) flags `ffi.*` inside a workflow body. Examples: `examples/{ffi_libm,caps_sandbox}.as` +
+  `examples/advanced/ffi_struct.as`; docs `docs/content/stdlib/{ffi,caps}.md`.
 
 ## Commands
 
@@ -321,10 +346,11 @@ lines). Token-depth counting keeps `${…}` braces from skewing depth.
   carrying a `[nil, err]` pair. `AsError` converts into `Control::Panic`.
 - `global_env()` installs builtins; programs run in a `.child()` so they can shadow builtins (`let len = 5`).
 - **Native resource handles:** OS resources (TCP, child processes, HTTP bodies/servers, SSE, WebSocket,
-  terminals) are NOT embedded in `Value`. They live in `Interp.resources`
-  (`RefCell<HashMap<u64, ResourceState>>`), referenced from script by a `Value::Native` id — keeps `Value`
-  cheap and lets the runtime reclaim fds deterministically. Adding a stateful native API = a `ResourceState`
-  variant + accessors; never hold a `resources` borrow across `.await`.
+  terminals, **FFI `ForeignLib`/`ForeignSymbol`/`ForeignPtr`**) are NOT embedded in `Value`. They live in
+  `Interp.resources` (`RefCell<HashMap<u64, ResourceState>>`), referenced from script by a `Value::Native` id
+  — keeps `Value` cheap and lets the runtime reclaim fds deterministically (a `ForeignLib` `dlclose`s on
+  drop). Adding a stateful native API = a `ResourceState` variant + accessors; never hold a `resources`
+  borrow across `.await`. All three FFI handles stay **GC-untraced** (a raw foreign pointer is opaque memory).
 
 ### Values (`src/value.rs`)
 `Value` is the runtime tagged union — roughly 16 user-facing kinds: `Nil`, `Bool`, `Int(i64)`,

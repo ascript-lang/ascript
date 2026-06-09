@@ -77,6 +77,9 @@ impl Interp {
             span,
             "net/udp.bind addr",
         )?;
+        // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the bind host.
+        // Gate-12: no carve-out → immediate `Ok` with no comparison.
+        self.check_net_host(crate::stdlib::caps::host_of_addr(&addr), span)?;
         match UdpSocket::bind(&*addr).await {
             Ok(sock) => {
                 let handle = self.register_resource(
@@ -105,6 +108,9 @@ impl Interp {
                 let data = data_to_bytes(args.first().unwrap_or(&Value::Nil), span, "socket.send")?;
                 let addr =
                     want_string(args.get(1).unwrap_or(&Value::Nil), span, "socket.send addr")?;
+                // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the
+                // DESTINATION host before sending. Gate-12: no carve-out → no-op.
+                self.check_net_host(crate::stdlib::caps::host_of_addr(&addr), span)?;
                 let sock = match self.take_resource(id) {
                     Some(ResourceState::UdpSocket(s)) => s,
                     other => {

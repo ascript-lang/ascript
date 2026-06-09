@@ -8,6 +8,7 @@ pub mod call_arity;
 pub mod contract;
 pub mod dead_recover;
 pub mod duplicate_member;
+pub mod ffi_nondeterminism;
 pub mod field_default_type;
 pub mod ignored_result;
 pub mod invalid_propagate;
@@ -46,6 +47,7 @@ pub static ALL: &[Rule] = &[
     super_misuse::check,
     field_default_type::check,
     workflow_determinism::check,
+    ffi_nondeterminism::check,
     worker_capture::check,
 ];
 
