@@ -230,7 +230,10 @@ impl MapKey {
                 }
             }
             Value::Str(s) => Some(MapKey::Str(s.clone())),
-            Value::Decimal(d) => Some(MapKey::Decimal(*d)),
+            // VAL Task 2: `MapKey::Decimal` still folds BY VALUE (the inner
+            // `Decimal`), so exact key equality is preserved — `**d` decodes the
+            // boxed value out of the `Rc` (the box is invisible to keying).
+            Value::Decimal(d) => Some(MapKey::Decimal(**d)),
             _ => None,
         }
     }
@@ -243,7 +246,7 @@ impl MapKey {
             MapKey::Int(i) => Value::Int(*i),
             MapKey::Num(bits) => Value::Float(f64::from_bits(*bits)),
             MapKey::Str(s) => Value::Str(s.clone()),
-            MapKey::Decimal(d) => Value::Decimal(*d),
+            MapKey::Decimal(d) => Value::Decimal(Rc::new(*d)),
         }
     }
 }
@@ -1101,9 +1104,18 @@ pub enum Value {
     /// literals with a `.` or exponent lex to `Float`. (Formerly `Number(f64)`.)
     Float(f64),
     /// Exact decimal arithmetic (96-bit scaled integer via `rust_decimal`).
-    /// `Copy` — no heap allocation; `Hash + Eq + Ord` via the inner type.
+    /// `Hash + Eq + Ord` via the inner type.
     /// Participates in operator overloading with `Int`/`Float` via coercion.
-    Decimal(Decimal),
+    ///
+    /// VAL Task 2: boxed behind `Rc<Decimal>`. The inner `Decimal` is 16 bytes
+    /// (`Copy`), one of the two 16-byte inline payloads (`Str(Rc<str>)` is the
+    /// other) that block niche-packing to the 16-byte floor. Behind a 1-word `Rc`,
+    /// `Decimal` no longer contributes to the enum width. The boxing is INVISIBLE:
+    /// every op decodes (`**d`) before operating, so a boxed `Decimal` is
+    /// byte-identical to the old inline one (same `type_name`, exact arithmetic,
+    /// Map-key fold). (The enum reaches 16 only once `Str` is ALSO thinned —
+    /// Stage 3 / Task 9; see `value_size_is_documented`.)
+    Decimal(Rc<Decimal>),
     Str(Rc<str>),
     /// A native built-in function, dispatched by name in the interpreter.
     Builtin(Rc<str>),
@@ -1199,7 +1211,7 @@ impl Value {
             // `0.0 == -0.0` is `true`, so the `!= 0.0` test covers both signed zeros;
             // NaN is excluded explicitly (`!is_nan()`) → `0.0`/`-0.0`/`NaN` all falsy.
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
-            Value::Decimal(d) => *d != Decimal::ZERO,
+            Value::Decimal(d) => **d != Decimal::ZERO,
             Value::Str(s) => !s.is_empty(),
             _ => true,
         }
@@ -1718,16 +1730,30 @@ mod tests {
     // (it just surfaces the number when run with `--nocapture`).
     #[test]
     fn value_size_is_documented() {
-        // VAL Task 1: the two fat two-field method-binding variants are boxed to a
-        // single word, so the floor drops to ≤24 — now set by the next-widest
-        // 16-byte payloads (`Decimal` (16, still inline) / `Str(Rc<str>)` (2 words))
-        // plus the discriminant. Task 2 boxes `Decimal` to reach the 16-byte niche
-        // floor. Each VAL stage updates this constant (32 → ≤24 → 16 → 8).
-        assert!(
-            std::mem::size_of::<Value>() <= 24,
-            "size_of::<Value>() = {}",
-            std::mem::size_of::<Value>()
-        );
+        // VAL Task 2: `Decimal` is now boxed behind `Rc<Decimal>` (one word, was a
+        // 16-byte inline payload). This is a necessary, behavior-preserving step
+        // toward the 16-byte niche floor — but the enum stays at **24** because the
+        // `Str(Rc<str>)` variant independently holds the floor there:
+        //
+        //   `Rc<str>` is a 16-byte *fat* pointer (data ptr + length). An enum with
+        //   BOTH a 16-byte fat-pointer variant AND inline 8-byte scalar variants
+        //   (`Int(i64)`/`Float(f64)`) cannot niche-pack to 16: a scalar can take any
+        //   bit pattern, so it collides with the pointer's null niche, forcing an
+        //   explicit discriminant word → 16 (payload) + 8 (tag+pad) = 24. (Verified
+        //   empirically: with a THIN `Str` pointer the very same enum is 16.)
+        //
+        // Reaching 16 therefore requires thinning `Str` to a single-word pointer —
+        // that is **Stage 3 (Task 9 — small-string / thin-`Str`)**, explicitly
+        // OUTSIDE this unit (Tasks 0–2). The spec foresees exactly this (§3.3): the
+        // niche fallback is "16 bytes ... `Str` stays `Rc<str>` (2 words) only if we
+        // accept 16 bytes; to reach 8 we'd box the fat-pointer metadata ... staged,
+        // optional." Boxing `Decimal` here removes the OTHER 16-byte inline payload
+        // so that once `Str` is thinned the enum drops straight to 16.
+        //
+        // Stage progression: 32 → 24 [Task 1: fat method bindings boxed] → 24
+        // [Task 2: Decimal boxed, now Str-limited] → 16 [Stage 3: thin-`Str`] → 8
+        // [Stage 2: NaN-box].
+        assert_eq!(std::mem::size_of::<Value>(), 24);
     }
 
     #[test]
@@ -1976,16 +2002,16 @@ mod tests {
         // requiring it in assert_eq!/assert_ne!.)
         let num_key = MapKey::from_value(&Value::Float(1.0)).expect("number is hashable");
         let dec_key =
-            MapKey::from_value(&Value::Decimal(Decimal::from(1))).expect("decimal is hashable");
+            MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1)))).expect("decimal is hashable");
         assert!(
             num_key != dec_key,
             "number 1 and decimal 1 must be distinct map keys"
         );
         // Two equal Decimals produce the same key (round-trips through to_value).
-        let a = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
-        let b = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
+        let a = MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1))));
+        let b = MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1))));
         assert!(a == b);
-        assert_eq!(dec_key.to_value(), Value::Decimal(Decimal::from(1)));
+        assert_eq!(dec_key.to_value(), Value::Decimal(Rc::new(Decimal::from(1))));
     }
 
     // ---- IFACE Task 1: Value::Interface descriptor ----
@@ -2025,7 +2051,7 @@ mod tests {
         assert_eq!(crate::interp::type_name(&Value::Float(5.0)), "float");
         // Decimal is its own subtype, unchanged.
         assert_eq!(
-            crate::interp::type_name(&Value::Decimal(Decimal::from(1))),
+            crate::interp::type_name(&Value::Decimal(Rc::new(Decimal::from(1)))),
             "decimal"
         );
     }
@@ -2079,7 +2105,7 @@ mod tests {
         assert!(!Value::Float(0.0).is_truthy());
         assert!(!Value::Float(-0.0).is_truthy());
         assert!(!Value::Float(f64::NAN).is_truthy());
-        assert!(!Value::Decimal(Decimal::ZERO).is_truthy());
+        assert!(!Value::Decimal(Rc::new(Decimal::ZERO)).is_truthy());
         assert!(!Value::Str("".into()).is_truthy());
         // Truthy: any non-zero number, non-empty string, EVERY collection even empty.
         assert!(Value::Bool(true).is_truthy());
@@ -2087,7 +2113,7 @@ mod tests {
         assert!(Value::Int(-1).is_truthy());
         assert!(Value::Float(0.5).is_truthy());
         assert!(Value::Float(f64::INFINITY).is_truthy());
-        assert!(Value::Decimal(Decimal::from(1)).is_truthy());
+        assert!(Value::Decimal(Rc::new(Decimal::from(1))).is_truthy());
         assert!(Value::Str("x".into()).is_truthy());
         assert!(Value::Array(crate::value::ArrayCell::new(vec![])).is_truthy());
         {

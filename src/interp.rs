@@ -6323,7 +6323,7 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
                 None => Err(AsError::at("integer overflow in '-'", span).into()),
             },
             Value::Float(n) => Ok(Value::Float(-n)),
-            Value::Decimal(d) => Ok(Value::Decimal(-d)),
+            Value::Decimal(d) => Ok(Value::Decimal(Rc::new(-*d))),
             _ => Err(AsError::at("cannot negate a non-number", span).into()),
         },
         UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
@@ -6611,20 +6611,20 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         let db = coerce_to_decimal(&r, span)?;
         if let (Some(a), Some(b)) = (da, db) {
             let result = match op {
-                BinOp::Add => Value::Decimal(a + b),
-                BinOp::Sub => Value::Decimal(a - b),
-                BinOp::Mul => Value::Decimal(a * b),
+                BinOp::Add => Value::Decimal(Rc::new(a + b)),
+                BinOp::Sub => Value::Decimal(Rc::new(a - b)),
+                BinOp::Mul => Value::Decimal(Rc::new(a * b)),
                 BinOp::Div => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal division by zero", span).into());
                     }
-                    Value::Decimal(a / b)
+                    Value::Decimal(Rc::new(a / b))
                 }
                 BinOp::Mod => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal remainder by zero", span).into());
                     }
-                    Value::Decimal(a % b)
+                    Value::Decimal(Rc::new(a % b))
                 }
                 // Ordering: both operands are already finite Decimals here
                 // (coerce_to_decimal above Tier-2-panics on a non-finite Number).
@@ -6919,7 +6919,7 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
         (Value::Decimal(a), Value::Decimal(b)) => Ok(a == b),
         // NUM §4: Decimal vs Int — the int converts EXACTLY.
         (Value::Decimal(a), Value::Int(i)) | (Value::Int(i), Value::Decimal(a)) => {
-            Ok(*a == rust_decimal::Decimal::from(*i))
+            Ok(**a == rust_decimal::Decimal::from(*i))
         }
         // Decimal vs Float (or vice-versa): coerce the number to decimal.
         (Value::Decimal(a), Value::Float(n)) | (Value::Float(n), Value::Decimal(a)) => {
@@ -6932,7 +6932,7 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
             let b = rust_decimal::Decimal::from_f64(*n).ok_or_else(|| {
                 AsError::at("cannot convert number to decimal for comparison", span)
             })?;
-            Ok(*a == b)
+            Ok(**a == b)
         }
         // All other pairs: generic structural equality.
         _ => Ok(l == r),
@@ -7031,7 +7031,7 @@ pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value 
         SharedNode::Bool(b) => Value::Bool(*b),
         SharedNode::Int(i) => Value::Int(*i),
         SharedNode::Float(f) => Value::Float(*f),
-        SharedNode::Decimal(d) => Value::Decimal(*d),
+        SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
         SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
         // Containers (and the opaque Regex/EnumVariant/Instance frozen nodes) stay
         // shared — re-wrap the SAME `Arc` (a pointer bump, no copy).
@@ -7065,7 +7065,7 @@ pub(crate) fn shared_to_value_shallow(node: &crate::value::SharedNode) -> Option
         SharedNode::Bool(b) => Value::Bool(*b),
         SharedNode::Int(i) => Value::Int(*i),
         SharedNode::Float(f) => Value::Float(*f),
-        SharedNode::Decimal(d) => Value::Decimal(*d),
+        SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
         SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
         SharedNode::Bytes(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
         SharedNode::Array(a) => {

@@ -4315,7 +4315,7 @@ impl Vm {
                     // SAME rust_decimal op as apply_binop's decimal arm. Both
                     // operands are real Decimals (always finite), Add/Sub/Mul only
                     // — no coercion, no div-by-zero.
-                    return Ok(decimal_fast(op, *x, *y));
+                    return Ok(decimal_fast(op, **x, **y));
                 }
                 (ArithKind::ConcatStr, Value::Str(x), Value::Str(y))
                     if matches!(op, BinOp::Add) =>
@@ -4872,9 +4872,9 @@ fn number_fast(op: BinOp, a: f64, b: f64) -> Value {
 #[inline]
 fn decimal_fast(op: BinOp, a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
     match op {
-        BinOp::Add => Value::Decimal(a + b),
-        BinOp::Sub => Value::Decimal(a - b),
-        BinOp::Mul => Value::Decimal(a * b),
+        BinOp::Add => Value::Decimal(Rc::new(a + b)),
+        BinOp::Sub => Value::Decimal(Rc::new(a - b)),
+        BinOp::Mul => Value::Decimal(Rc::new(a * b)),
         _ => unreachable!("decimal_fast called with non-specializable op {op:?}"),
     }
 }
@@ -5093,7 +5093,9 @@ mod tests {
     /// it.
     fn dec(s: &str) -> Value {
         use std::str::FromStr;
-        Value::Decimal(rust_decimal::Decimal::from_str(s).expect("valid decimal literal"))
+        Value::Decimal(Rc::new(
+            rust_decimal::Decimal::from_str(s).expect("valid decimal literal"),
+        ))
     }
 
     /// Push two decimal consts and apply `op`, returning the run outcome.
@@ -6244,9 +6246,9 @@ mod tests {
         let b = Decimal::new(25, 1); // 2.5
         for _ in 0..WARMUP_THRESHOLD {
             let v = vm
-                .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(a), Value::Decimal(b))
+                .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(Rc::new(a)), Value::Decimal(Rc::new(b)))
                 .expect("ok");
-            assert_eq!(v, Value::Decimal(a + b));
+            assert_eq!(v, Value::Decimal(Rc::new(a + b)));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
         assert_eq!(
@@ -6257,10 +6259,10 @@ mod tests {
         );
         // Specialized decimal add equals the generic apply_binop result bit-exact.
         let v = vm
-            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(a), Value::Decimal(b))
+            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(Rc::new(a)), Value::Decimal(Rc::new(b)))
             .expect("ok");
         let generic =
-            crate::interp::apply_binop(BinOp::Add, Value::Decimal(a), Value::Decimal(b), s())
+            crate::interp::apply_binop(BinOp::Add, Value::Decimal(Rc::new(a)), Value::Decimal(Rc::new(b)), s())
                 .expect("ok");
         assert_eq!(v, generic);
     }
