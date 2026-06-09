@@ -486,6 +486,14 @@ fn invoke_symbol(
     // Keep any borrowed `Bytes` buffers alive for the call duration (their address is
     // what we pass for a `ffi.ptr`).
     let mut bytes_guards: Vec<Rc<std::cell::RefCell<Vec<u8>>>> = Vec::new();
+    // FFI Task 10 (§7A): every `ffi.ptr`-typed arg that is a `Bytes` — its arg index +
+    // the buffer cell — so a determinism RECORD can snapshot its POST-call contents and
+    // a REPLAY can write the recorded contents back. Populated by `marshal_ptr`.
+    let mut ptr_bytes_args: Vec<(usize, Rc<std::cell::RefCell<Vec<u8>>>)> = Vec::new();
+    // FFI Task 10 (§7B): true if any `ffi.ptr`-typed arg is a `ForeignPtr` — an opaque
+    // foreign address the recorder cannot snapshot/rebind, so the call is NOT replayable
+    // inside a determinism context (a loud refusal, never a silent wrong replay).
+    let mut has_foreign_ptr_arg = false;
 
     // Pre-size so pushes never reallocate (a realloc would invalidate earlier `Arg`
     // pointers). Worst case every arg lands in one Vec, so reserve `len` in each.
@@ -582,6 +590,14 @@ fn invoke_symbol(
             }
             FfiType::Ptr => {
                 let p = marshal_ptr(interp, val, i, span, &mut bytes_guards)?;
+                // FFI Task 10: track ptr args for the determinism out-param seam.
+                match val {
+                    Value::Bytes(b) => ptr_bytes_args.push((i, b.clone())),
+                    Value::Native(nk) if nk.kind == NativeKind::ForeignPtr => {
+                        has_foreign_ptr_arg = true;
+                    }
+                    _ => {}
+                }
                 store_ptr.push(p);
                 slots.push(Slot::Ptr(store_ptr.len() - 1));
             }
@@ -616,30 +632,88 @@ fn invoke_symbol(
 
     let code = CodePtr(sym.addr);
 
+    // ─── FFI Task 10 (§7): the SP9 determinism seam. INERT by default — when no
+    // determinism context is active (`determinism_mode()` is `None`), this whole block
+    // is skipped and the path below is byte-identical to Unit B. ───
+    let det_mode = interp.determinism_mode();
+    if det_mode.is_some() {
+        // §7B — a pointer RETURN or a `ForeignPtr` OUT-PARAM cannot be meaningfully
+        // recorded/replayed (an opaque foreign address is meaningless across runs).
+        // REFUSE loudly (Tier-2), never silently replay a wrong value.
+        if sym.ret == FfiType::Ptr {
+            return Err(AsError::at(
+                "ffi: pointer-returning call is not replayable in a workflow".to_string(),
+                span,
+            )
+            .into());
+        }
+        if has_foreign_ptr_arg {
+            return Err(AsError::at(
+                "ffi: call with a foreign-pointer out-param is not replayable in a workflow"
+                    .to_string(),
+                span,
+            )
+            .into());
+        }
+    }
+
+    if det_mode == Some(crate::det::Mode::Replay) {
+        // §7A — REPLAY: return the recorded marshalled return + write the recorded
+        // POST-call out-param bytes back into the live `Bytes`, WITHOUT re-invoking C.
+        // A stream miss (exhausted / kind mismatch) falls through to a real call below.
+        if let Some((ret, out_params)) = interp.replay_ffi_call() {
+            for (idx, bytes) in &out_params {
+                if let Some((_, cell)) = ptr_bytes_args.iter().find(|(i, _)| i == idx) {
+                    let mut buf = cell.borrow_mut();
+                    let n = buf.len().min(bytes.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                }
+            }
+            drop(bytes_guards);
+            return Ok(ffi_ret_to_value(interp, ret));
+        }
+        // else: stream exhausted → fall through to a real call + Record append.
+    }
+
     // --- The trampoline. SAFETY: the CIF was built from `sym.argtypes -> sym.ret`; we
     // validated `call_args.len() == argtypes.len()` and marshalled each argument into a
     // store of the exact C type the CIF declares, so the `Arg` pointers and the CIF
     // agree. `sym.addr` is a valid function address kept alive by `sym._lib`. The
     // return type `R` of `cif.call::<R>` matches `sym.ret`'s C type below. There is no
-    // remaining script-reachable way to mismatch — every path is validated above. ---
+    // remaining script-reachable way to mismatch — every path is validated above.
+    //
+    // libffi RETURN-WIDTH RULE (load-bearing): per the libffi contract, an INTEGER
+    // return narrower than the register width (`ffi_arg` = `c_ulong`, i.e. `u64` on
+    // LP64) is written by `ffi_call` as a FULL `ffi_arg`. So `cif.call::<R>` MUST be
+    // instantiated at a register-width `R` for every `iN`/`uN` ≤ register width, else
+    // libffi writes 8 bytes into a `size_of::<R>()` (e.g. 4-byte) return slot —
+    // a stack buffer overflow (UB; observed as a SIGSEGV in surrounding code). We
+    // therefore call sub-register int returns as `i64`/`u64`/`usize` and narrow with a
+    // documented cast. Floats and pointer/void are register-width already. ---
     let out = unsafe {
         match sym.ret {
-            FfiType::I8 => Value::Int(sym.cif.call::<i8>(code, &ffi_args) as i64),
-            FfiType::I16 => Value::Int(sym.cif.call::<i16>(code, &ffi_args) as i64),
-            FfiType::I32 => Value::Int(sym.cif.call::<i32>(code, &ffi_args) as i64),
+            // Signed sub-register ints: call at i64 register width, then narrow to the
+            // declared width's value (sign-correct via the intermediate cast).
+            FfiType::I8 => Value::Int(sym.cif.call::<i64>(code, &ffi_args) as i8 as i64),
+            FfiType::I16 => Value::Int(sym.cif.call::<i64>(code, &ffi_args) as i16 as i64),
+            FfiType::I32 => Value::Int(sym.cif.call::<i64>(code, &ffi_args) as i32 as i64),
             FfiType::I64 => Value::Int(sym.cif.call::<i64>(code, &ffi_args)),
-            FfiType::U8 => Value::Int(sym.cif.call::<u8>(code, &ffi_args) as i64),
-            FfiType::U16 => Value::Int(sym.cif.call::<u16>(code, &ffi_args) as i64),
-            FfiType::U32 => Value::Int(sym.cif.call::<u32>(code, &ffi_args) as i64),
+            // Unsigned sub-register ints: call at u64 register width, mask to the
+            // declared width (zero-extended), then carry over `int`.
+            FfiType::U8 => Value::Int((sym.cif.call::<u64>(code, &ffi_args) as u8) as i64),
+            FfiType::U16 => Value::Int((sym.cif.call::<u64>(code, &ffi_args) as u16) as i64),
+            FfiType::U32 => Value::Int((sym.cif.call::<u64>(code, &ffi_args) as u32) as i64),
             // §3.3 output asymmetry: a u64/size whose top bit is set comes back as the
             // two's-complement bit pattern (a negative `int`); bit-identical round-trip.
+            // u64/usize are register-width — no narrowing.
             FfiType::U64 => Value::Int(sym.cif.call::<u64>(code, &ffi_args) as i64),
             FfiType::Size => Value::Int(sym.cif.call::<usize>(code, &ffi_args) as i64),
             FfiType::F32 => Value::Float(sym.cif.call::<f32>(code, &ffi_args) as f64),
             FfiType::F64 => Value::Float(sym.cif.call::<f64>(code, &ffi_args)),
             FfiType::Ptr => {
                 let p: *mut c_void = sym.cif.call::<*mut c_void>(code, &ffi_args);
-                // A returned pointer becomes an opaque ForeignPtr handle.
+                // A returned pointer becomes an opaque ForeignPtr handle. (Unreachable
+                // under a determinism context — §7B refused a Ptr return above.)
                 interp.register_resource(
                     NativeKind::ForeignPtr,
                     indexmap::IndexMap::new(),
@@ -652,9 +726,45 @@ fn invoke_symbol(
             }
         }
     };
+
+    // §7A — RECORD: after the real call, snapshot the POST-call contents of every
+    // `Bytes` out-param + the marshalled return, and append the `FfiCall` event. Done
+    // only in Record mode (and only when a context is active); a no-op otherwise.
+    if det_mode == Some(crate::det::Mode::Record) {
+        let ret = value_to_ffi_ret(&out);
+        let out_params: Vec<(usize, Vec<u8>)> = ptr_bytes_args
+            .iter()
+            .map(|(i, cell)| (*i, cell.borrow().clone()))
+            .collect();
+        interp.record_ffi_call(ret, out_params);
+    }
+
     // Keep `bytes_guards` alive until here (their addresses were live for the call).
     drop(bytes_guards);
     Ok(out)
+}
+
+/// FFI Task 10: project a marshalled return `Value` into the recordable [`FfiRet`].
+/// Only the small primitives the marshaller produces are possible here (a `Ptr`
+/// return is refused before recording, §7B), so the catch-all is `Void`.
+fn value_to_ffi_ret(v: &Value) -> crate::det::FfiRet {
+    use crate::det::FfiRet;
+    match v {
+        Value::Int(n) => FfiRet::Int(*n),
+        Value::Float(f) => FfiRet::Float(*f),
+        _ => FfiRet::Void,
+    }
+}
+
+/// FFI Task 10: reconstruct the marshalled return `Value` from a recorded [`FfiRet`]
+/// on Replay (byte-identical to what the real call produced at Record).
+fn ffi_ret_to_value(_interp: &Interp, ret: crate::det::FfiRet) -> Value {
+    use crate::det::FfiRet;
+    match ret {
+        FfiRet::Int(n) => Value::Int(n),
+        FfiRet::Float(f) => Value::Float(f),
+        FfiRet::Void => Value::Nil,
+    }
 }
 
 /// Marshal a `ffi.ptr` argument: a `Bytes` passes its buffer address; a `ForeignPtr`
@@ -1457,5 +1567,177 @@ mod tests {
         assert!(want_int_in_range(&Value::Int(-1), 0, u8::MAX as i64, "u8", 0, span()).is_err());
         assert!(want_int(&Value::Int(-1), "u64", 0, span()).is_ok());
         let _ = interp; // keep an interp to mirror the other tests' shape
+    }
+
+    // ───────────────────────── FFI Task 10 — SP9 determinism seam ─────────────
+    // These need `install_determinism`/`take_determinism`, gated behind the
+    // `workflow` feature (the only entry that installs a context today). The seam
+    // itself is feature-independent (it lives in `invoke_symbol`).
+    #[cfg(feature = "workflow")]
+    mod determinism {
+        use super::*;
+        use crate::det::{DeterminismContext, FfiRet};
+
+        fn arr(vals: Vec<Value>) -> Value {
+            Value::Array(crate::value::ArrayCell::new(vals))
+        }
+
+        /// INERT by default: with NO determinism context, `sym.call` runs normally and
+        /// records NOTHING — byte-identical to Unit B.
+        #[tokio::test]
+        async fn inert_by_default_no_recording() {
+            let interp = Interp::new();
+            let abs = open_symbol(&interp, libc_name(), "abs", vec![FfiType::I32], FfiType::I32);
+            let r = interp
+                .ffi_symbol_call(abs, &[arr(vec![Value::Int(-7)])], span())
+                .unwrap();
+            assert_eq!(r, Value::Int(7));
+            // No context installed → determinism_mode is None (the byte-identical path).
+            assert!(interp.determinism_mode().is_none());
+        }
+
+        /// A value-returning call records its marshalled return; Replay returns the
+        /// recorded value WITHOUT re-invoking C (we prove "no re-invoke" by replaying
+        /// against a DIFFERENT input that would yield a different real result).
+        #[tokio::test]
+        async fn record_then_replay_value_return() {
+            // Record: abs(-9) = 9, recorded.
+            let interp = Interp::new();
+            interp.install_determinism(DeterminismContext::record(1, 0.0));
+            let abs = open_symbol(&interp, libc_name(), "abs", vec![FfiType::I32], FfiType::I32);
+            let rec = interp
+                .ffi_symbol_call(abs, &[arr(vec![Value::Int(-9)])], span())
+                .unwrap();
+            assert_eq!(rec, Value::Int(9));
+            let events = interp.take_determinism().unwrap().events;
+            assert_eq!(events.len(), 1, "one FfiCall recorded");
+
+            // Replay: call abs with a DIFFERENT arg (+9999). The recorded return (9) must
+            // come back, proving C was NOT re-invoked (a real call would give 9999).
+            let interp2 = Interp::new();
+            interp2.install_determinism(DeterminismContext::replay(1, 0.0, events));
+            let abs2 = open_symbol(&interp2, libc_name(), "abs", vec![FfiType::I32], FfiType::I32);
+            let replayed = interp2
+                .ffi_symbol_call(abs2, &[arr(vec![Value::Int(9999)])], span())
+                .unwrap();
+            assert_eq!(replayed, Value::Int(9), "replay returns the RECORDED value");
+        }
+
+        /// [SECURITY — out-param fidelity §7A]: a C call that writes a `ffi.ptr` `Bytes`
+        /// out-param (here libc `memset`, return declared `void`) records the POST-call
+        /// buffer; on Replay the recorded bytes are written back into the live `Bytes`
+        /// WITHOUT re-invoking C (proven by replaying with a buffer of stale zeroes).
+        #[tokio::test]
+        async fn out_param_buffer_replays_faithfully() {
+            // memset(void* s, int c, size_t n) — declare the return as void (the C
+            // `void*` return is simply discarded by the CIF). Writes `c` into `n` bytes.
+            let interp = Interp::new();
+            interp.install_determinism(DeterminismContext::record(2, 0.0));
+            let memset = open_symbol(
+                &interp,
+                libc_name(),
+                "memset",
+                vec![FfiType::Ptr, FfiType::I32, FfiType::Size],
+                FfiType::Void,
+            );
+            // A 4-byte buffer; memset it to 'A' (65).
+            let buf = Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
+            let _ = interp
+                .ffi_symbol_call(
+                    memset,
+                    &[arr(vec![buf.clone(), Value::Int(65), Value::Int(4)])],
+                    span(),
+                )
+                .unwrap();
+            if let Value::Bytes(b) = &buf {
+                assert_eq!(&*b.borrow(), &[65u8, 65, 65, 65], "memset wrote AAAA");
+            }
+            let events = interp.take_determinism().unwrap().events;
+
+            // Replay: a FRESH zeroed buffer; the recorded post-call bytes (AAAA) must be
+            // written back WITHOUT re-running memset. We replay with `c=0` so a real call
+            // would zero it — proving the replay used the RECORDED bytes, not C.
+            let interp2 = Interp::new();
+            interp2.install_determinism(DeterminismContext::replay(2, 0.0, events));
+            let memset2 = open_symbol(
+                &interp2,
+                libc_name(),
+                "memset",
+                vec![FfiType::Ptr, FfiType::I32, FfiType::Size],
+                FfiType::Void,
+            );
+            let buf2 = Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
+            let _ = interp2
+                .ffi_symbol_call(
+                    memset2,
+                    &[arr(vec![buf2.clone(), Value::Int(0), Value::Int(4)])],
+                    span(),
+                )
+                .unwrap();
+            if let Value::Bytes(b) = &buf2 {
+                assert_eq!(
+                    &*b.borrow(),
+                    &[65u8, 65, 65, 65],
+                    "replay wrote the RECORDED post-call bytes, not stale zeroes"
+                );
+            }
+        }
+
+        /// [SECURITY — loud refusal §7B]: a `ForeignPtr` OUT-PARAM inside a determinism
+        /// context is a Tier-2 panic, never a silent wrong replay.
+        #[tokio::test]
+        async fn foreign_ptr_out_param_is_refused() {
+            let interp = Interp::new();
+            // First get a ForeignPtr via malloc (outside determinism so the ptr return
+            // is allowed), then enter a determinism context and pass it as a ptr arg.
+            let malloc = open_symbol(&interp, libc_name(), "malloc", vec![FfiType::Size], FfiType::Ptr);
+            let p = interp
+                .ffi_symbol_call(malloc, &[arr(vec![Value::Int(8)])], span())
+                .unwrap();
+            assert!(matches!(&p, Value::Native(n) if n.kind == NativeKind::ForeignPtr));
+
+            interp.install_determinism(DeterminismContext::record(3, 0.0));
+            // strlen(ptr) — pass the ForeignPtr as the ffi.ptr out-param.
+            let strlen = open_symbol(&interp, libc_name(), "strlen", vec![FfiType::Ptr], FfiType::Size);
+            let err = interp
+                .ffi_symbol_call(strlen, &[arr(vec![p])], span())
+                .unwrap_err();
+            match err {
+                Control::Panic(e) => assert!(
+                    e.message.contains("foreign-pointer out-param is not replayable"),
+                    "msg: {}",
+                    e.message
+                ),
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        }
+
+        /// [SECURITY — loud refusal §7B]: a POINTER-RETURNING call inside a determinism
+        /// context is a Tier-2 panic (a foreign pointer is meaningless across runs).
+        #[tokio::test]
+        async fn pointer_return_is_refused() {
+            let interp = Interp::new();
+            interp.install_determinism(DeterminismContext::record(4, 0.0));
+            let malloc = open_symbol(&interp, libc_name(), "malloc", vec![FfiType::Size], FfiType::Ptr);
+            let err = interp
+                .ffi_symbol_call(malloc, &[arr(vec![Value::Int(8)])], span())
+                .unwrap_err();
+            match err {
+                Control::Panic(e) => assert!(
+                    e.message.contains("pointer-returning call is not replayable"),
+                    "msg: {}",
+                    e.message
+                ),
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        }
+
+        /// The recorded `FfiRet` projects each marshalled return faithfully.
+        #[test]
+        fn ffi_ret_projection() {
+            assert_eq!(value_to_ffi_ret(&Value::Int(42)), FfiRet::Int(42));
+            assert_eq!(value_to_ffi_ret(&Value::Float(2.5)), FfiRet::Float(2.5));
+            assert_eq!(value_to_ffi_ret(&Value::Nil), FfiRet::Void);
+        }
     }
 }

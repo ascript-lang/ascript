@@ -184,6 +184,34 @@ fn event_to_json(seq: usize, ev: &DetEvent) -> serde_json::Value {
             "value": value,
             "panic": panic,
         }),
+        // FFI Task 10 (§7A): a recorded foreign `sym.call`. `ret` is the marshalled
+        // return (a tagged primitive); `outParams` snapshots every `Bytes` out-param's
+        // post-call contents (`[index, byteArray]` pairs).
+        DetEvent::FfiCall { ret, out_params } => {
+            let (ret_kind, ret_value) = ffi_ret_to_json(ret);
+            json!({
+                "seq": seq,
+                "kind": "FfiCall",
+                "retKind": ret_kind,
+                "retValue": ret_value,
+                "outParams": out_params
+                    .iter()
+                    .map(|(i, b)| json!([i, b]))
+                    .collect::<Vec<_>>(),
+            })
+        }
+    }
+}
+
+/// FFI Task 10: encode an [`FfiRet`] as `(kind, value)` for the JSON log. The value
+/// is always a JSON number (an int as i64, a float as f64, void as null).
+fn ffi_ret_to_json(ret: &crate::det::FfiRet) -> (&'static str, serde_json::Value) {
+    use crate::det::FfiRet;
+    use serde_json::json;
+    match ret {
+        FfiRet::Int(n) => ("int", json!(n)),
+        FfiRet::Float(f) => ("float", json!(f)),
+        FfiRet::Void => ("void", serde_json::Value::Null),
     }
 }
 
@@ -285,10 +313,44 @@ fn log_to_events(text: &str) -> Vec<DetEvent> {
                     .map(|s| s.to_string());
                 events.push(DetEvent::GeneratorYield { value, panic });
             }
+            // FFI Task 10 (§7A): a recorded foreign call — the marshalled return + the
+            // post-call `Bytes` out-param snapshots.
+            "FfiCall" => {
+                let ret = ffi_ret_from_json(&rec);
+                let out_params = rec
+                    .get("outParams")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|pair| {
+                                let p = pair.as_array()?;
+                                let idx = p.first()?.as_u64()? as usize;
+                                let bytes = json_bytes(p.get(1));
+                                Some((idx, bytes))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                events.push(DetEvent::FfiCall { ret, out_params });
+            }
             _ => {}
         }
     }
     events
+}
+
+/// FFI Task 10: decode an [`FfiRet`] from a `FfiCall` JSON log record (`retKind` +
+/// `retValue`). A malformed/missing record decodes to `Void` (best-effort — the
+/// runtime replay path tolerates it; a real recorded call always writes a valid tag).
+fn ffi_ret_from_json(rec: &serde_json::Value) -> crate::det::FfiRet {
+    use crate::det::FfiRet;
+    match rec.get("retKind").and_then(|v| v.as_str()) {
+        Some("int") => FfiRet::Int(rec.get("retValue").and_then(|v| v.as_i64()).unwrap_or(0)),
+        Some("float") => {
+            FfiRet::Float(rec.get("retValue").and_then(|v| v.as_f64()).unwrap_or(0.0))
+        }
+        _ => FfiRet::Void,
+    }
 }
 
 /// Read `{log: "path", durability?: "fsync"|"buffered"}` from a workflow options

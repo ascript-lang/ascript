@@ -1259,6 +1259,43 @@ impl Interp {
         guard.as_mut().map(f)
     }
 
+    /// FFI Task 10 (§7): the current determinism mode, or `None` when INERT (the
+    /// default — the FFI path is then byte-identical to Unit B). A `Copy` snapshot read
+    /// through a short borrow that is dropped before return (await-safe). `ffi.rs`'s
+    /// `sym.call` consults this to decide Record / Replay / pass-through.
+    #[cfg(feature = "ffi")] // only the FFI seam consults these
+    pub(crate) fn determinism_mode(&self) -> Option<crate::det::Mode> {
+        self.determinism.borrow().as_ref().map(|ctx| ctx.mode)
+    }
+
+    /// FFI Task 10 (§7A): in Record mode, append an `FfiCall` event (the marshalled
+    /// return + post-call `Bytes` out-param snapshots). A no-op when not deterministic.
+    #[cfg(feature = "ffi")]
+    pub(crate) fn record_ffi_call(
+        &self,
+        ret: crate::det::FfiRet,
+        out_params: Vec<(usize, Vec<u8>)>,
+    ) {
+        if let Some(ctx) = self.determinism.borrow_mut().as_mut() {
+            ctx.record_ffi_call(ret, out_params);
+        }
+    }
+
+    /// FFI Task 10 (§7A): in Replay mode, return the recorded `FfiCall` outcome (the
+    /// marshalled return plus the out-param byte snapshots) WITHOUT re-invoking C, or
+    /// `None` to fall through to a real call (stream exhausted / kind mismatch). The
+    /// borrow is short and await-free.
+    #[cfg(feature = "ffi")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn replay_ffi_call(
+        &self,
+    ) -> Option<(crate::det::FfiRet, Vec<(usize, Vec<u8>)>)> {
+        self.determinism
+            .borrow_mut()
+            .as_mut()
+            .and_then(|ctx| ctx.replay_ffi_call())
+    }
+
     /// Acquire a SNAPSHOT-RESTORE depth guard for a VM re-entrant `Vm::run`
     /// boundary (SP3 §B). On drop it restores the counter to its pre-entry value,
     /// absorbing frames abandoned by a panic unwind so `recover` resumes at the

@@ -76,6 +76,19 @@ pub enum DetEvent {
         result: Vec<u8>,
         panic: Option<String>,
     },
+    /// FFI Task 10 (§7): one `sym.call` foreign call crossed the determinism boundary.
+    /// `ret` is the marshalled return value (a small primitive — int/float/void; a
+    /// POINTER return is refused before this is recorded, §7B). `out_params` is the
+    /// post-call snapshot of every `ffi.ptr`-typed **`Bytes`** out-param: `(arg_index,
+    /// bytes)`. On Replay the recorded `ret` is returned WITHOUT re-invoking C and each
+    /// out-param's bytes are written back into the live `Bytes` (§7A) — so a replayed
+    /// workflow is deterministic without re-running native code, AND out-params are
+    /// faithful (not stale pre-call bytes). A `ForeignPtr` out-param is non-recordable
+    /// and is refused (§7B), so `out_params` only ever holds `Bytes` snapshots.
+    FfiCall {
+        ret: FfiRet,
+        out_params: Vec<(usize, Vec<u8>)>,
+    },
     /// Workers Spec B (Task 12): one `worker fn*` resume crossed the isolate boundary.
     /// `value` is the structured-clone-encoded yielded value bytes, or `None` when the
     /// producer finished (the resume returned done). On Replay the recorded outcome is
@@ -85,6 +98,22 @@ pub enum DetEvent {
         value: Option<Vec<u8>>,
         panic: Option<String>,
     },
+}
+
+/// FFI Task 10 (§7): the marshalled RETURN of a recorded foreign call. A pointer
+/// return (`ForeignPtr`) is meaningless across runs and is REFUSED before recording
+/// (§7B), so the recordable returns are exactly the small primitives the marshaller
+/// produces: an integer (every `iN`/`uN`/`size` result, carried as the i64 bit
+/// pattern), a float (`f32`/`f64`), or void (`nil`). Plain Rust types keep `det.rs`
+/// free of `Value`/serde (it builds under `--no-default-features`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FfiRet {
+    /// An `iN`/`uN`/`size` return — the i64 the marshaller produced.
+    Int(i64),
+    /// An `f32`/`f64` return.
+    Float(f64),
+    /// A `void` return (`nil`).
+    Void,
 }
 
 /// The outcome of one recorded cross-isolate boundary interaction, as it crosses
@@ -389,6 +418,31 @@ impl DeterminismContext {
         }
     }
 
+    /// FFI Task 10 (§7A): record one foreign-call boundary. Record-mode ONLY (the
+    /// caller checks `mode` first and invokes the C side for real before calling this).
+    /// Appends a [`DetEvent::FfiCall`] carrying the marshalled return + the post-call
+    /// snapshot of every `Bytes` out-param.
+    pub fn record_ffi_call(&mut self, ret: FfiRet, out_params: Vec<(usize, Vec<u8>)>) {
+        self.events.push(DetEvent::FfiCall { ret, out_params });
+    }
+
+    /// FFI Task 10 (§7A): replay one foreign-call boundary. Returns the recorded
+    /// `(ret, out_params)` WITHOUT re-invoking the C side, or `None` when the stream is
+    /// exhausted (the caller then falls through to a real call + a Record append,
+    /// mirroring the clock/RNG/actor seams). A recorded event of a different kind →
+    /// `None` (cursor unmoved), detecting a divergent replay at the earliest point. The
+    /// caller writes each out-param's recorded bytes back into the live `Bytes`.
+    #[allow(clippy::type_complexity)]
+    pub fn replay_ffi_call(&mut self) -> Option<(FfiRet, Vec<(usize, Vec<u8>)>)> {
+        match self.peek_event() {
+            Some(DetEvent::FfiCall { ret, out_params }) => {
+                self.cursor += 1;
+                Some((ret, out_params))
+            }
+            _ => None,
+        }
+    }
+
     /// Peek the event at `cursor` WITHOUT advancing (the boundary replay helpers only
     /// advance the cursor when the event kind matches, so a mismatch leaves the cursor
     /// in place for the fall-through path to re-record).
@@ -577,6 +631,36 @@ mod tests {
         let mut fresh = SeededRng::new(5);
         assert_eq!(r1, fresh.next_f64());
         assert_eq!(r1, r0);
+    }
+
+    /// FFI Task 10 (§7A): a recorded foreign call replays its return AND its post-call
+    /// `Bytes` out-param contents without re-invoking C.
+    #[test]
+    fn record_then_replay_ffi_call_with_out_param() {
+        let mut rec = DeterminismContext::record(11, 0.0);
+        // A C call that returns status int 0 and wrote [1,2,3,4] into out-param arg 1.
+        rec.record_ffi_call(FfiRet::Int(0), vec![(1, vec![1, 2, 3, 4])]);
+        let events = rec.events.clone();
+
+        let mut rep = DeterminismContext::replay(11, 0.0, events);
+        let (ret, outs) = rep.replay_ffi_call().expect("recorded ffi call");
+        assert_eq!(ret, FfiRet::Int(0));
+        assert_eq!(outs, vec![(1usize, vec![1u8, 2, 3, 4])]);
+        // Exhausted → None (caller falls through to a real call).
+        assert_eq!(rep.replay_ffi_call(), None);
+    }
+
+    /// A wrong-kind recorded event makes `replay_ffi_call` return None without
+    /// consuming it (cursor unmoved) — the same divergence discipline as the actor /
+    /// generator seams.
+    #[test]
+    fn replay_ffi_call_wrong_kind_falls_through() {
+        let mut rec = DeterminismContext::record(1, 0.0);
+        rec.record_actor_call("m", &BoundaryOutcome::Bytes(vec![9]));
+        let events = rec.events.clone();
+        let mut rep = DeterminismContext::replay(1, 0.0, events);
+        assert_eq!(rep.replay_ffi_call(), None);
+        assert_eq!(rep.cursor, 0, "cursor unmoved on a kind mismatch");
     }
 
     /// A method-name mismatch during replay is detected immediately: `replay_actor_call`

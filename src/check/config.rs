@@ -54,6 +54,9 @@ pub const RULE_CODES: &[&str] = &[
     "type-mismatch",
     "type-error",
     "possibly-nil",
+    // FFI §7 — a foreign call inside a workflow/durable context is an opaque effect
+    // seam; steer it into an `activity` (default Warning, like `workflow-determinism`).
+    "ffi-nondeterminism",
 ];
 
 /// Per-code severity overrides plus global warning promotion.
