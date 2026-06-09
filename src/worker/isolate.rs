@@ -48,6 +48,16 @@ pub struct WorkerRequest {
     pub entry_name: String,
     /// Structured-clone-encoded positional args (see `serialize::encode`).
     pub args: Vec<u8>,
+    /// FFI §4.5a — the dispatching isolate's `CapSet` (a `Send` side-channel field, NOT
+    /// a `Value`, so it never touches the structured-clone serializer). The pooled
+    /// isolate installs this FRESH at the top of each request (so request B is
+    /// unaffected by request A — no forward leak) and clears `caps_drop_allowed` (a
+    /// pooled `caps.drop` is refused — a durable drop on a reused `Interp` would leak /
+    /// re-grant, §4.5a). This carries the CALLER'S FLOOR — a pooled worker never drops,
+    /// so writing it grants nothing it had-and-lost (the monotone argument). Boxed to
+    /// keep `WorkerRequest` compact (the `CapSet`'s `Option<FsScope>`/`Option<NetScope>`
+    /// carry heap `Vec`s; `dispatch` returns the request by value in its `Err` path).
+    pub caps: Box<crate::stdlib::caps::CapSet>,
     /// Where the isolate sends the reply (result bytes or a panic message).
     pub reply: oneshot::Sender<WorkerReply>,
     /// Cancel signal: the caller drops the paired sender on `Value::Future` drop;
@@ -248,9 +258,21 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
             class_name: _,
             entry_name,
             args,
+            caps,
             reply,
             abort,
         } = req;
+
+        // FFI §4.5a (the pooled-isolate soundness keystone). This `Interp` is REUSED
+        // across many requests, so we install the caller's floor FRESH at the top of
+        // each request (request B is unaffected by request A's state) and REFUSE a
+        // `caps.drop` here (a durable drop on a shared `Interp` would leak forward / be
+        // a re-grant). Writing the caller-supplied floor every time grants nothing the
+        // pooled worker ever had-and-lost — it never drops — so the monotone invariant
+        // holds. Durable, irreversible `caps.drop` is available only on the top-level
+        // program isolate and a DEDICATED `run_in_worker({caps})` isolate.
+        interp.set_caps(*caps);
+        interp.set_caps_drop_allowed(false);
 
         // Ensure the slice's globals are defined on this isolate's Vm (once per fn_id).
         if !loaded.contains(&fn_id) {
@@ -422,5 +444,78 @@ mod tests {
             loop_ended.load(Ordering::SeqCst),
             "dropping the handle must end the run-loop and join the thread (no zombie)"
         );
+    }
+
+    /// FFI §4.5a keystone: a DEDICATED isolate installs a REDUCED `CapSet` (captured
+    /// directly in the `Send` `make_loop` closure — never riding the value serializer)
+    /// into its brand-new `Interp` BEFORE running the job, and `caps.drop` stays
+    /// DURABLE there (single-tenant → terminal). We spawn an isolate, install a CapSet
+    /// denying `ffi`, then in-isolate verify `ffi` is denied AND a further drop is
+    /// allowed (and holds) — reporting the booleans back over a `Send` channel.
+    #[test]
+    fn dedicated_isolate_installs_reduced_caps_and_allows_durable_drop() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let (tx, rx) = std_mpsc::channel::<(bool, bool, bool)>();
+
+        // The reduced CapSet (deny ffi) — a plain `Send` value captured in the closure.
+        let mut reduced = CapSet::all_granted();
+        reduced.deny(Cap::Ffi);
+
+        let handle = spawn_isolate(move |vm, mut inbound| async move {
+            let interp = vm.interp().clone();
+            // Install the reduced caps BEFORE any job (the dedicated-spawn keystone).
+            interp.set_caps(reduced);
+            // ffi must be denied; net must still be granted; a drop must be ALLOWED
+            // (dedicated isolates keep `caps_drop_allowed = true`).
+            let ffi_granted = interp.caps().has(Cap::Ffi);
+            let net_granted = interp.caps().has(Cap::Net);
+            let drop_allowed = interp.caps_drop_allowed();
+            // Prove the drop is durable: drop net, confirm it stays denied.
+            interp.caps_deny(Cap::Net);
+            let net_after_drop = interp.caps().has(Cap::Net);
+            let _ = tx.send((ffi_granted, net_granted && !net_after_drop, drop_allowed));
+            // Keep the loop alive until the handle drops.
+            while inbound.recv().await.is_some() {}
+        })
+        .expect("dedicated isolate should spawn");
+
+        let (ffi_granted, net_drop_durable, drop_allowed) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("isolate should report within 5s");
+        assert!(!ffi_granted, "the reduced CapSet must deny ffi in the dedicated isolate");
+        assert!(net_drop_durable, "a net drop in a dedicated isolate must be durable");
+        assert!(drop_allowed, "a dedicated isolate keeps caps.drop allowed (durable)");
+        drop(handle);
+    }
+
+    /// FFI §4.5a soundness: a POOLED request installs the caller's caps FRESH and
+    /// REFUSES a drop (the shared `Interp` is reused, so a durable drop would leak /
+    /// re-grant). We simulate the `isolate_loop` per-request install on one reused
+    /// `Interp`: request A drops nothing (refused), request B re-installs the floor and
+    /// still has every cap — proving no forward leak across the reused isolate.
+    #[tokio::test]
+    async fn pooled_request_install_refuses_drop_and_no_leak() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = crate::interp::Interp::new();
+
+        // Request A: install the caller's floor (all granted) + refuse drops (the
+        // `isolate_loop` per-request step). A `caps.drop` here must be refused.
+        interp.set_caps(CapSet::all_granted());
+        interp.set_caps_drop_allowed(false);
+        assert!(!interp.caps_drop_allowed(), "pooled request refuses drops");
+        let refused = interp
+            .call_caps("drop", &[crate::value::Value::Str("net".into())], crate::span::Span::new(0, 0))
+            .await;
+        assert!(refused.is_err(), "a pooled caps.drop must be refused");
+        assert!(interp.caps().has(Cap::Net), "the refused drop must not mutate caps");
+
+        // Request B: re-install the caller's floor FRESH — request B is unaffected by A
+        // and still has every cap (no forward leak; the re-install is the caller's
+        // authority, not a restoration of a dropped one).
+        interp.set_caps(CapSet::all_granted());
+        interp.set_caps_drop_allowed(false);
+        for cap in Cap::ALL {
+            assert!(interp.caps().has(cap), "request B has the full caller floor (no leak)");
+        }
     }
 }

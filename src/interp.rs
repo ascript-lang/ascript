@@ -131,7 +131,7 @@ pub enum SpanStatus {
 /// Shared with the checker (`undefined-variable`) so they cannot drift.
 pub const BUILTIN_NAMES: &[&str] = &[
     "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit", "int",
-    "float",
+    "float", "run_in_worker",
 ];
 
 pub fn global_env() -> Environment {
@@ -5709,6 +5709,115 @@ impl Interp {
         self.run_body(spec, args, &call_env, span, &what).await
     }
 
+    /// FFI §4.5a — `run_in_worker(fn, input, opts?)`: dispatch a `worker fn` and, when
+    /// `opts.caps` is present, run it on a fresh DEDICATED (single-tenant) isolate
+    /// carrying the reduced `CapSet`. Without `opts.caps` it falls through to the
+    /// ordinary pooled `worker fn` dispatch (the caller's caps floor rides as usual).
+    ///
+    /// The keystone: a cap-reduced job NEVER touches the shared pool (whose reused
+    /// `Interp` cannot hold a durable drop, §4.5a) — it gets its own heap + `Interp`, so
+    /// the reduced set is a real, memory-isolated sandbox and an in-plugin `caps.drop`
+    /// is terminal. Byte-identical across engines (the slice build + dispatch are the
+    /// SAME mechanism `worker fn` uses; only the isolate lifecycle + caps differ).
+    async fn call_run_in_worker(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let callee = args.first().cloned().unwrap_or(Value::Nil);
+        // The single payload arg (an array/object/scalar — structured-clone-sendable).
+        let input = args.get(1).cloned().unwrap_or(Value::Nil);
+        let opts = args.get(2).cloned().unwrap_or(Value::Nil);
+
+        // The callee must be a NAMED `worker fn` (we ship its slice by name).
+        let entry_name = worker_fn_dispatch_name(&callee).ok_or_else(|| {
+            Control::Panic(AsError::at(
+                "run_in_worker expects a named `worker fn` as its first argument".to_string(),
+                span,
+            ))
+        })?;
+
+        // Parse `opts.caps` into a reduced CapSet (None → no caps option → pooled path).
+        let reduced = self.caps_from_run_opts(&opts, span)?;
+
+        // The args list shipped to the worker is the single `input` payload.
+        let worker_args = vec![input];
+
+        // Inline-nesting (called from inside an isolate) is not a sandbox spawn — run the
+        // entry locally like any nested worker fn (the enclosing slice already ships it).
+        if crate::worker::pool::in_isolate() {
+            return crate::worker::dispatch_worker_inline(self, &entry_name, worker_args, span);
+        }
+
+        let slice = crate::worker::build_code_slice_from_source(self, &entry_name, None)?;
+        match reduced {
+            // Cap-reduced → DEDICATED single-tenant isolate carrying the reduced CapSet.
+            Some(caps) => {
+                crate::worker::dispatch_worker_dedicated(self, slice, worker_args, caps, span)
+            }
+            // No caps option → ordinary pooled dispatch (caller's floor rides as usual).
+            None => crate::worker::dispatch_worker(self, slice, worker_args, span),
+        }
+    }
+
+    /// Parse a `run_in_worker` `opts.caps` value into a reduced [`CapSet`], or `None`
+    /// when no `caps` option is present (→ the pooled path). The `caps` shape mirrors
+    /// the manifest/CLI: `{ deny: ["ffi", ...], net: {deny, allow}, fs: {deny, allow} }`.
+    /// An unknown cap name / malformed shape is a Tier-2 panic (programmer error).
+    fn caps_from_run_opts(
+        &self,
+        opts: &Value,
+        span: Span,
+    ) -> Result<Option<crate::stdlib::caps::CapSet>, Control> {
+        let opts_obj = match opts {
+            Value::Object(o) => o,
+            Value::Nil => return Ok(None),
+            _ => return Ok(None),
+        };
+        let caps_val = match opts_obj.borrow().get("caps") {
+            Some(v) => v.clone(),
+            None => return Ok(None),
+        };
+        let caps_obj = match &caps_val {
+            Value::Object(o) => o.clone(),
+            _ => {
+                return Err(AsError::at(
+                    "run_in_worker: opts.caps must be an object (e.g. { deny: [\"ffi\"] })"
+                        .to_string(),
+                    span,
+                )
+                .into())
+            }
+        };
+        // Start from the CALLER's current caps (denial is monotone — a worker can only
+        // ever be MORE restricted than its dispatcher), then subtract opts.caps.deny.
+        let mut set = self.caps();
+        if let Some(Value::Array(deny)) = caps_obj.borrow().get("deny") {
+            for name in deny.borrow().iter() {
+                let name = match name {
+                    Value::Str(s) => s.to_string(),
+                    _ => {
+                        return Err(AsError::at(
+                            "run_in_worker: opts.caps.deny must be an array of capability names"
+                                .to_string(),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                match crate::stdlib::caps::cap_name(&name) {
+                    Some(cap) => set.deny(cap),
+                    None => {
+                        return Err(AsError::at(
+                            format!("run_in_worker: unknown capability '{name}' in opts.caps.deny"),
+                            span,
+                        )
+                        .into())
+                    }
+                }
+            }
+        }
+        // A bare `{}` caps object (no deny) still routes to the dedicated path — the
+        // author explicitly asked for an isolate (the reduced set just equals the floor).
+        Ok(Some(set))
+    }
+
     #[async_recursion(?Send)]
     async fn call_builtin(&self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
@@ -5758,6 +5867,7 @@ impl Interp {
                     Err(Control::Exit(code)) => Err(Control::Exit(code)),
                 }
             }
+            "run_in_worker" => self.call_run_in_worker(args, span).await,
             "exit" => {
                 // exit(code?) — default 0; code must be an integer in 0..=255.
                 let code: i32 = match args.first() {
@@ -6866,6 +6976,20 @@ pub(crate) fn error_message(err: &Value) -> String {
             .map(|m| m.to_string())
             .unwrap_or_else(|| err.to_string()),
         other => other.to_string(),
+    }
+}
+
+/// FFI §4.5a: the dispatch name of a NAMED `worker fn` value, or `None` if `v` is not
+/// a named worker fn. Handles both engine representations — a tree-walker
+/// `Value::Function` and a VM `Value::Closure` (whose `proto` carries the name +
+/// `is_worker`). `run_in_worker`'s first arg must resolve through this.
+fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
+    match v {
+        Value::Function(f) if f.is_worker => f.name.as_ref().map(|n| n.to_string()),
+        Value::Closure(c) if c.proto.is_worker => {
+            c.proto.chunk.name.as_ref().map(|n| n.to_string())
+        }
+        _ => None,
     }
 }
 
