@@ -774,16 +774,28 @@ mod corpus {
     //
     // The test runs in WHICHEVER feature config `cargo test` is invoked with, so it
     // gates BOTH `cargo test` (default) and `cargo test --no-default-features`.
+    // The full Gate-5 diagnostic set: the three SP10 advisory codes PLUS the
+    // static-exhaustiveness / ADT codes (`non-exhaustive-match`,
+    // `enum-variant-binding-shadow`). This mirrors the CI grep
+    // (`type-mismatch|type-error|possibly-nil|non-exhaustive|enum-variant`) so the
+    // test and the shell gate cannot drift.
+    const GATE5_CODES: &[&str] = &[
+        "type-mismatch",
+        "type-error",
+        "possibly-nil",
+        "non-exhaustive-match",
+        "enum-variant-binding-shadow",
+    ];
+
     #[test]
     fn type_checker_emits_no_type_diagnostics_on_the_corpus() {
-        let type_codes = ["type-mismatch", "type-error", "possibly-nil"];
         let mut offenders = Vec::new();
         for path in corpus() {
             let src = fs::read_to_string(&path).unwrap();
             let hits: Vec<_> = ascript::check::analyze(&src)
                 .diagnostics
                 .into_iter()
-                .filter(|d| type_codes.contains(&d.code.as_str()))
+                .filter(|d| GATE5_CODES.contains(&d.code.as_str()))
                 .map(|d| format!("{}@{}: {}", d.code, d.range.start, d.message))
                 .collect();
             if !hits.is_empty() {
@@ -792,8 +804,54 @@ mod corpus {
         }
         assert!(
             offenders.is_empty(),
-            "SP10 type checker emitted type-* diagnostics on the untyped corpus (fix the root cause in assignable/synth/narrowing — default to Unknown/silent — NEVER relax this gate):\n{}",
+            "SP10 type checker emitted Gate-5 diagnostics on the corpus (fix the root cause in assignable/synth/unify/narrowing — default to Unknown/silent — NEVER relax this gate):\n{}",
             offenders.join("\n")
+        );
+    }
+
+    // TYPE Task 14 — the zero-false-positive PROPERTY battery. Untyped, `any`-typed,
+    // and partially-typed programs flowing through generics must emit NO blocking
+    // diagnostic. The cardinal invariant is "an unsolved/unbounded `Var` → Unknown,
+    // never No": these are the exact shapes that would trip if unification or the
+    // invariant `assignable` arm ever manufactured a `No`. The B1 mixed-numeric
+    // combinator (`max(1, 2.0)` over `<T>(a: T, b: T)`) is included as the standing
+    // proof of the numeric-join rescue. Runs in whichever feature config invokes
+    // `cargo test`, so it gates BOTH configs.
+    #[test]
+    fn generics_property_battery_emits_no_blocking_diagnostic() {
+        let programs: &[&str] = &[
+            // Identity over an untyped value.
+            "fn id<T>(x: T): T { return x }\nprint(id(5))\nprint(id(\"s\"))\n",
+            // Same-typed params with MIXED numerics (the B1 false-positive shape).
+            "fn pick<T>(a: T, b: T): T { return a }\nprint(pick(1, 2.0))\n",
+            "fn maxOf<T>(a: T, b: T): T { if (a > b) { return a }\n  return b }\nprint(maxOf(1, 2.0))\n",
+            // Empty-array generic call: `A` stays unsolved → array<any> → silent.
+            "fn mapAll<A, B>(xs: array<A>, f: fn(A) -> B): array<B> { return [] }\nprint(mapAll([], fn(x) { return x }))\n",
+            // `any`-typed argument flowing into a generic param.
+            "fn wrap<T>(x: T): array<T> { return [x] }\nfn use2(v: any) { return wrap(v) }\nprint(use2(3))\n",
+            // A generic class round-trip with inferred + explicit type args.
+            "class Box<T> { value: T\n  fn get(): T { return self.value } }\nlet a = Box(5)\nprint(a.get())\n",
+            // A generic enum payload.
+            "enum Opt<T> { Some(value: T), None }\nlet o = Opt.Some(3)\nprint(o)\n",
+            // Partially-typed: a `number`-annotated arg into a `<T>` slot.
+            "fn echo<T>(x: T): T { return x }\nfn caller(n: number) { return echo(n) }\nprint(caller(7))\n",
+        ];
+        let mut offenders = Vec::new();
+        for src in programs {
+            let blocking: Vec<_> = ascript::check::analyze(src)
+                .diagnostics
+                .into_iter()
+                .filter(|d| GATE5_CODES.contains(&d.code.as_str()))
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect();
+            if !blocking.is_empty() {
+                offenders.push(format!("{src:?}\n  {}", blocking.join("\n  ")));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "generics emitted a blocking diagnostic on a gradual program (the Var→Unknown invariant is broken):\n{}",
+            offenders.join("\n\n")
         );
     }
 }
