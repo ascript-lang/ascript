@@ -32,10 +32,10 @@
 //!   - **Composite literals + ops:** object literals `{k: v}` (member/index read, `len`), map
 //!     literals `#{k: v}` (`map.get`/`len`, numeric-key MapKey canonicalization), array indexing,
 //!     `set.from` size, and `for…of` iteration.
-//!   - **Classes / enums / ADT / rich `match`** (Unit 2 cont'd, see `class_decl`/`enum_decl`/
-//!     `match` extensions): typed fields/defaults/`init`/methods, `instanceof`, inheritance/`super`;
-//!     unit + positional + named ADT variants, constructors, `.value`; value/range/wildcard/array/
-//!     object/variant patterns, `...rest`, guards, Option-C bind-vs-compare.
+//!   - **Classes / enums / ADT / rich `match`** (see `class_decl`/`enum_decl`/`class_expr`/
+//!     `enum_expr`): typed fields/defaults/`init`/methods, `instanceof`, inheritance/`super`;
+//!     unit + positional + named ADT variants, constructors, exhaustive `match` over each with
+//!     positional/named/unit + wildcard patterns + Option-C fresh-binds.
 //!   - **Closures + capture:** arrow closures, capture-by-value vs by-reference, per-iteration
 //!     loop-var freshness, nested/curried closures.
 //!   - **String templates `${…}`** (incl. nested) and **`?`/`!` propagate/unwrap** over the
@@ -111,6 +111,36 @@ struct FnSig {
     arity: usize,
 }
 
+/// A declared class: its name, the number of positional `init` params (so construction
+/// matches), and an int method name. `init` always assigns the required field from its single
+/// param; the other field carries a default, so every field is readable after construction.
+#[derive(Clone)]
+struct ClassSig {
+    name: String,
+    /// `init` arity (0 or 1 — we keep construction trivial + deterministic).
+    init_arity: usize,
+    /// A method name returning an int (callable on an instance).
+    method: String,
+}
+
+/// A declared ADT enum + its variants (so constructions + exhaustive matches are valid).
+#[derive(Clone)]
+struct EnumSig {
+    name: String,
+    variants: Vec<VariantSig>,
+}
+
+/// One enum variant: unit, positional-payload, or named-payload.
+#[derive(Clone)]
+enum VariantSig {
+    /// `Name` — a payload-less unit variant.
+    Unit(String),
+    /// `Name(int, int)` — positional `int` payload of the given arity (1 or 2).
+    Positional(String, usize),
+    /// `Name(a: int, b: int)` — named `int` payload with these field names.
+    Named(String, Vec<String>),
+}
+
 struct Gen<'a, 'b> {
     u: &'a mut Unstructured<'b>,
     out: String,
@@ -118,6 +148,10 @@ struct Gen<'a, 'b> {
     scopes: Vec<Scope>,
     /// Top-level functions declared so far (callable from anywhere below).
     fns: Vec<FnSig>,
+    /// Top-level classes declared so far (constructible / `instanceof`-checkable below).
+    classes: Vec<ClassSig>,
+    /// Top-level enums declared so far (constructible + matchable below).
+    enums: Vec<EnumSig>,
     /// Monotonic counter for fresh identifier names (guarantees no accidental clash).
     counter: u32,
     /// True while emitting inside a loop body (so `break`/`continue` are legal).
@@ -140,6 +174,8 @@ impl<'a, 'b> Gen<'a, 'b> {
             out: String::new(),
             scopes: vec![Scope { vars: Vec::new() }],
             fns: Vec::new(),
+            classes: Vec::new(),
+            enums: Vec::new(),
             counter: 0,
             in_loop: false,
             in_fn: false,
@@ -215,6 +251,16 @@ impl<'a, 'b> Gen<'a, 'b> {
             let _ = writeln!(self.out, "import * as {alias} from \"{module}\"");
             let _ = alias;
         }
+        // A handful of top-level classes + enums (so later code can construct/match them).
+        // Declared BEFORE the fns/statements so every construction + match is in scope.
+        let n_classes = self.choice(3); // 0..2
+        for _ in 0..n_classes {
+            self.class_decl();
+        }
+        let n_enums = self.choice(3); // 0..2
+        for _ in 0..n_enums {
+            self.enum_decl();
+        }
         // A handful of top-level functions first (so later code can call them).
         let n_fns = self.choice(3); // 0..3
         for _ in 0..n_fns {
@@ -263,6 +309,114 @@ impl<'a, 'b> Gen<'a, 'b> {
         // Register AFTER the body so a fn cannot (yet) call itself — keeps recursion
         // bounded by construction (no unbounded self-recursion in generated programs).
         self.fns.push(FnSig { name, arity });
+    }
+
+    /// FUZZ Unit 2 — emit a top-level class declaration. The class has one required int
+    /// field (assigned in `init` from the single param), one defaulted int field, and one
+    /// method returning an int over `self`. Roughly half the time it `extends` an
+    /// already-declared class with `super.init`/`super.<method>` so inheritance + `super` +
+    /// the method-resolution-order are exercised. All field types are `number` and every
+    /// observable read is an int, so output stays deterministic.
+    fn class_decl(&mut self) {
+        let name = self.fresh("C");
+        let field_a = self.fresh("fa");
+        let field_b = self.fresh("fb");
+        let method = self.fresh("m");
+        let def_b = self.int_literal();
+
+        // Optionally inherit from a previously-declared class.
+        let parent = if !self.classes.is_empty() && self.flag() {
+            let idx = self.choice(self.classes.len() as u32) as usize;
+            Some(self.classes[idx].clone())
+        } else {
+            None
+        };
+
+        match &parent {
+            Some(p) => {
+                let _ = writeln!(self.out, "class {name} extends {} {{", p.name);
+            }
+            None => {
+                let _ = writeln!(self.out, "class {name} {{");
+            }
+        }
+        let _ = writeln!(self.out, "    {field_a}: number");
+        let _ = writeln!(self.out, "    {field_b}: number = {def_b}");
+        // init: assign the required field; chain to super.init when inheriting.
+        self.out.push_str("    fn init(x) {\n");
+        if let Some(p) = &parent {
+            if p.init_arity == 1 {
+                self.out.push_str("        super.init(x)\n");
+            } else {
+                self.out.push_str("        super.init()\n");
+            }
+        }
+        let _ = writeln!(self.out, "        self.{field_a} = x");
+        self.out.push_str("    }\n");
+        // method: an int over self (and super's method when inheriting).
+        let _ = writeln!(self.out, "    fn {method}() {{");
+        match &parent {
+            Some(p) => {
+                let _ = writeln!(
+                    self.out,
+                    "        return self.{field_a} + self.{field_b} + super.{}()",
+                    p.method
+                );
+            }
+            None => {
+                let _ = writeln!(self.out, "        return self.{field_a} + self.{field_b}");
+            }
+        }
+        self.out.push_str("    }\n");
+        self.out.push_str("}\n");
+
+        self.classes.push(ClassSig {
+            name,
+            init_arity: 1,
+            method,
+        });
+    }
+
+    /// FUZZ Unit 2 — emit a top-level ADT enum declaration with a mix of unit, positional-
+    /// payload, and named-payload variants (every payload field is `int`). Registered so the
+    /// generator can construct each variant + write an EXHAUSTIVE `match` over it.
+    fn enum_decl(&mut self) {
+        let name = self.fresh("E");
+        let n_variants = 2 + self.choice(3); // 2..4 variants
+        let mut variants = Vec::new();
+        let _ = writeln!(self.out, "enum {name} {{");
+        for _ in 0..n_variants {
+            let vname = self.fresh("V");
+            let v = match self.choice(3) {
+                0 => VariantSig::Unit(vname.clone()),
+                1 => {
+                    let arity = 1 + self.choice(2) as usize; // 1..2 positional fields
+                    VariantSig::Positional(vname.clone(), arity)
+                }
+                _ => {
+                    let n = 1 + self.choice(2) as usize; // 1..2 named fields
+                    let fields: Vec<String> = (0..n).map(|_| self.fresh("nf")).collect();
+                    VariantSig::Named(vname.clone(), fields)
+                }
+            };
+            match &v {
+                VariantSig::Unit(n) => {
+                    let _ = writeln!(self.out, "    {n},");
+                }
+                VariantSig::Positional(n, arity) => {
+                    let tys = vec!["int"; *arity].join(", ");
+                    let _ = writeln!(self.out, "    {n}({tys}),");
+                }
+                VariantSig::Named(n, fields) => {
+                    let decls: Vec<String> =
+                        fields.iter().map(|f| format!("{f}: int")).collect();
+                    let _ = writeln!(self.out, "    {n}({}),", decls.join(", "));
+                }
+            }
+            variants.push(v);
+        }
+        self.out.push_str("}\n");
+        self.enums.push(EnumSig { name, variants });
     }
 
     /// Emit one statement at the given nesting `depth`.
@@ -444,7 +598,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         if depth >= MAX_DEPTH {
             return self.leaf_expr();
         }
-        match self.choice(14) {
+        match self.choice(16) {
             0..=2 => self.int_expr(depth),
             3 | 4 => self.float_expr(depth),
             5 => self.bool_expr(depth),
@@ -455,7 +609,106 @@ impl<'a, 'b> Gen<'a, 'b> {
             10 => self.leaf_expr(),
             11 => self.decimal_expr(depth),
             12 => self.composite_expr(depth),
+            13 if !self.classes.is_empty() => self.class_expr(depth),
+            14 if !self.enums.is_empty() => self.enum_expr(depth),
             _ => self.int_expr(depth),
+        }
+    }
+
+    /// FUZZ Unit 2 — an int-valued expression over a declared class: construct an instance
+    /// and either call its int method, read an int field, or `instanceof`-test it (→ a `0`/`1`
+    /// int via a ternary). Construction + method dispatch exercise the field/method inline
+    /// caches + shapes; `instanceof` exercises the nominal `is_instance_of` path. Deterministic.
+    fn class_expr(&mut self, depth: u32) -> String {
+        let idx = self.choice(self.classes.len() as u32) as usize;
+        let c = self.classes[idx].clone();
+        let arg = self.int_atom();
+        let ctor = if c.init_arity == 1 {
+            format!("{}({arg})", c.name)
+        } else {
+            format!("{}()", c.name)
+        };
+        match self.choice(3) {
+            // call the int method
+            0 => format!("({ctor}).{}()", c.method),
+            // instanceof → 0/1 (ternary keeps it int-typed + deterministic)
+            1 => format!("(({ctor}) instanceof {} ? 1 : 0)", c.name),
+            // bind then read the method (a deeper member-cache warm via a let in a block-expr
+            // is not available as an expr; just call the method again with a different arg)
+            _ => {
+                let arg2 = self.int_atom();
+                let ctor2 = if c.init_arity == 1 {
+                    format!("{}({arg2})", c.name)
+                } else {
+                    format!("{}()", c.name)
+                };
+                let _ = depth;
+                format!("(({ctor}).{}() + ({ctor2}).{}())", c.method, c.method)
+            }
+        }
+    }
+
+    /// FUZZ Unit 2 — an int-valued expression over a declared enum: construct a variant and
+    /// reduce it to an int via an EXHAUSTIVE `match` (value/positional/named/unit patterns +
+    /// a wildcard). Construction validates payload arity/types (`validate_into`); the match
+    /// exercises structural `==` + payload binding. Deterministic int observable.
+    fn enum_expr(&mut self, _depth: u32) -> String {
+        let idx = self.choice(self.enums.len() as u32) as usize;
+        let e = self.enums[idx].clone();
+        let ctor = self.enum_variant_ctor(&e);
+        // Build an exhaustive match over the enum that maps each variant to an int.
+        let mut arms = String::new();
+        for v in &e.variants {
+            match v {
+                VariantSig::Unit(n) => {
+                    let lit = self.int_literal();
+                    arms.push_str(&format!("{}.{n} => {lit}, ", e.name));
+                }
+                VariantSig::Positional(n, arity) => {
+                    // Fresh bind names guarantee Option-C BINDS (never accidentally compares
+                    // against an in-scope var) and never trips the bind-shadow warning.
+                    let binds: Vec<String> = (0..*arity).map(|_| self.fresh("g")).collect();
+                    let body = binds.join(" + ");
+                    arms.push_str(&format!("{n}({}) => ({body}), ", binds.join(", ")));
+                }
+                VariantSig::Named(n, fields) => {
+                    // Bind each named field (renamed to a fresh local); sum them.
+                    let renamed: Vec<String> = fields.iter().map(|_| self.fresh("g")).collect();
+                    let binds: Vec<String> = fields
+                        .iter()
+                        .zip(&renamed)
+                        .map(|(f, r)| format!("{f}: {r}"))
+                        .collect();
+                    arms.push_str(&format!(
+                        "{n}({}) => ({}), ",
+                        binds.join(", "),
+                        renamed.join(" + ")
+                    ));
+                }
+            }
+        }
+        // Trailing wildcard keeps it exhaustive even if the constructed variant set narrows.
+        arms.push_str("_ => 0");
+        format!("(match ({ctor}) {{ {arms} }})")
+    }
+
+    /// Construct a random variant of `e`, returning the constructor expression. Positional
+    /// payloads pass positional int args; named payloads pass `field: int` named args.
+    fn enum_variant_ctor(&mut self, e: &EnumSig) -> String {
+        let vi = self.choice(e.variants.len() as u32) as usize;
+        match &e.variants[vi] {
+            VariantSig::Unit(n) => format!("{}.{n}", e.name),
+            VariantSig::Positional(n, arity) => {
+                let args: Vec<String> = (0..*arity).map(|_| self.int_atom()).collect();
+                format!("{}.{n}({})", e.name, args.join(", "))
+            }
+            VariantSig::Named(n, fields) => {
+                let args: Vec<String> = fields
+                    .iter()
+                    .map(|f| format!("{f}: {}", self.int_atom()))
+                    .collect();
+                format!("{}.{n}({})", e.name, args.join(", "))
+            }
         }
     }
 
