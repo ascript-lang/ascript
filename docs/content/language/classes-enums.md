@@ -264,10 +264,106 @@ print(Animal() instanceof Dog) // false — but not the other way around
 
 - A **non-instance** left operand — a number, string, `nil`, an object, an enum value — is always
   `false`, never an error: `print(5 instanceof Animal)` prints `false`.
-- The **right operand must be a class**. Anything else (`x instanceof 5`, `x instanceof nil`) is a
-  Tier-2 panic: `instanceof requires a class on the right-hand side`.
+- The **right operand must be a class or an [interface](#interfaces)**. Anything else
+  (`x instanceof 5`, `x instanceof nil`) is a Tier-2 panic:
+  `instanceof requires a class or interface on the right-hand side`.
 - It binds at the relational tier (same as `< <= > >=`), looser than `+`/`-` and tighter than `&&`,
   so `a instanceof B && c` parses as `(a instanceof B) && c`.
+
+## Interfaces
+
+An **interface** is a named **set of method requirements** — a behavioral contract. A value
+**conforms** to an interface if it structurally has those methods. Conformance is **structural**: a
+class needs no declaration to satisfy an interface, conformance is retroactive (a class from another
+module conforms automatically), and one value may conform to arbitrarily many interfaces at once. No
+inheritance required.
+
+```ascript
+interface Reader {
+  fn read(b): int
+}
+
+interface Writer {
+  fn write(b): int
+}
+
+// File never names Reader, but it conforms — it has a matching `read`.
+class File {
+  fn read(b): int { return len(b) }
+}
+
+const f = File()
+print(f instanceof Reader)   // true  — structural conformance
+print(5 instanceof Reader)   // false — a number has no `read` method
+```
+
+A method **requirement** is `fn name(params): ret` with **no body**. Parameters and the return may be
+typed (the types are documentation at runtime in v1; the static checker tightens them in a later
+milestone). Requirements are separated by newlines or `;`. Generator/async/static/worker modifiers on
+a requirement are rejected.
+
+### `instanceof` against an interface
+
+`v instanceof Reader` is a **structural conformance check**: `true` iff `v` is a class instance whose
+class exposes every method the interface requires (by name and call-shape in v1). Only class instances
+can conform — a bare object, an enum, `nil`, or a number is always `false`.
+
+### Optional `implements` — asserted intent
+
+A class may **assert** conformance with `implements`. It is documentation plus (in a later milestone)
+a declaration-site checker guarantee; at runtime it stores no tag and changes nothing — `instanceof`
+runs the same structural check whether or not `implements` is present.
+
+```ascript
+class Socket implements Reader, Writer {
+  fn read(b): int { return len(b) }
+  fn write(b): int { return len(b) }
+}
+
+print(Socket() instanceof Reader)   // true — exactly as if `implements` were absent
+```
+
+A class with a matching method set conforms **whether or not** it says `implements` — that is the
+whole point of structural typing.
+
+### Composition via `extends`
+
+An interface may **extend** others to require the **union** of their method sets. Interface `extends`
+is composition (distinct from a class's single-superclass `extends`, though the keyword is the same):
+
+```ascript
+interface ReadWriter extends Reader, Writer {}
+
+const s = Socket()
+print(s instanceof ReadWriter)   // true — Socket has both read and write
+```
+
+### Interface-typed annotations are runtime contracts
+
+An interface name is valid anywhere a type is — a parameter, return, field, or `let` annotation. At
+runtime it is a **contract**: a non-conforming value is rejected with the same Tier-2 panic a class
+annotation gives.
+
+```ascript
+fn copy(src: Reader, dst: Writer): int {
+  const n = src.read([1, 2, 3])
+  return dst.write([1, 2, 3, n])
+}
+```
+
+> [!NOTE] **Runtime now, static later.** The runtime conformance check is **permissive and
+> structural** — it checks method name + call-shape (arity), not parameter or return *types*. Full
+> *static* interface type-checking (proving a `Reader`-typed argument conforms at compile time, and a
+> blocking `implements-violation` diagnostic when an `implements` clause is not satisfied) lands with
+> the type-system milestone. This is the same gradual seam the language already has: runtime contracts
+> are structural-and-permissive, the checker is strict-on-annotations.
+
+> [!NOTE] **Deferred to a later milestone.** Default method *bodies*, required *fields* on an
+> interface, and *generic* interfaces (`interface Iterator<T>`) are not in this version. An interface
+> v1 is a behavioral method set only.
+
+See the runnable examples [`examples/interfaces.as`](https://github.com/ascript-lang/ascript/blob/main/examples/interfaces.as)
+and [`examples/advanced/interface_dispatch.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/interface_dispatch.as).
 
 ## Enums
 

@@ -549,6 +549,28 @@ pub struct Interp {
     /// this is how it produces an identical `.aso` slice that the isolate's VM runs.
     /// `None` until [`Interp::set_worker_source`] is called by the run entry point; a
     /// `worker fn` call with no source set raises a clear recoverable panic.
+    /// IFACE §5.3: the per-isolate `instanceof Interface` verdict cache. Memoizes the
+    /// structural `conforms` result keyed by `(Rc::as_ptr(class) as usize,
+    /// Rc::as_ptr(iface) as usize)`. Stores `usize` keys + `(generation, bool)` ONLY — no
+    /// `Value`, no `Rc`, no `Cc` — so it holds nothing alive and the GC never traces it; a
+    /// pure memo (same answer hot or cold), active in BOTH specialized and generic VM modes.
+    ///
+    /// **Pointer-reuse soundness (the generation guard).** Class/interface descriptors are
+    /// NOT load-time-immortal: a `class`/`interface` declared inside a fn body or loop mints
+    /// a fresh `Rc` per execution that can drop to refcount 0 when its scope dies, after
+    /// which the allocator may hand the SAME address to a later, DIFFERENT descriptor. A raw
+    /// pointer key would then alias a stale verdict. So each entry records the
+    /// `iface_cache_gen` it was computed under, and `iface_cache_gen` is bumped on every
+    /// runtime class/interface DEFINITION (tree-walker `exec` + VM `Op::Class`/
+    /// `Op::DefineInterface`). A reused address necessarily carries an older generation than
+    /// the define that created the new descriptor, so its entry is treated as a miss and
+    /// recomputed. In the common case (all descriptors defined at load, before any
+    /// `instanceof`) the generation stabilizes early and every verdict stays cached.
+    iface_verdict_cache: RefCell<HashMap<(usize, usize), (u64, bool)>>,
+    /// Monotonic generation bumped on every runtime class/interface definition; guards
+    /// `iface_verdict_cache` against pointer reuse (see its doc). Pure-memo invalidation, so
+    /// it never changes observable behavior — only whether a verdict is recomputed.
+    iface_cache_gen: std::cell::Cell<u64>,
     worker_source: RefCell<Option<Rc<str>>>,
     /// Workers Spec A (.aso path): the raw `.aso` bytes of the entry program, retained
     /// so a `worker fn` dispatch can re-parse them into a top-level
@@ -828,6 +850,8 @@ impl Interp {
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
             package_resolver: RefCell::new(None),
+            iface_verdict_cache: RefCell::new(HashMap::new()),
+            iface_cache_gen: std::cell::Cell::new(0),
             worker_source: RefCell::new(None),
             worker_aso_bytes: RefCell::new(None),
         }
@@ -2482,7 +2506,9 @@ impl Interp {
                     Some(value) => {
                         let v = self.eval_expr(value, env).await?;
                         if let Some(ty) = ty {
-                            if !check_type(&v, ty) {
+                            // IFACE: env-aware so a `let x: Reader = …` interface
+                            // annotation resolves the name to its descriptor.
+                            if !self.check_type_env(&v, ty, env)? {
                                 return Err(contract_panic(ty, &v, value.span));
                             }
                         }
@@ -2892,6 +2918,38 @@ impl Interp {
                     is_worker: *is_worker,
                 }));
                 env.define(name, class, false).map_err(AsError::new)?;
+                // Invalidate any verdict cached against a now-reusable class pointer.
+                self.bump_iface_cache_gen();
+                Ok(Flow::Normal)
+            }
+            Stmt::Interface {
+                name,
+                extends,
+                methods,
+                ..
+            } => {
+                // IFACE §4: build the descriptor holding own_methods + extends NAMES
+                // only (no flatten — interfaces forward-reference as late-bound
+                // module-globals; flatten happens lazily on first conformance check).
+                let mut own_methods = indexmap::IndexMap::new();
+                for m in methods {
+                    let arity = m.params.iter().filter(|p| !p.rest).count();
+                    let has_rest = m.params.iter().any(|p| p.rest);
+                    own_methods.insert(
+                        m.name.clone(),
+                        crate::value::MethodReq { arity, has_rest },
+                    );
+                }
+                let def = Value::Interface(std::rc::Rc::new(crate::value::InterfaceDef {
+                    name: name.clone(),
+                    own_methods,
+                    extends: extends.clone(),
+                    def_env: env.clone(),
+                    flat: std::cell::RefCell::new(None),
+                }));
+                env.define(name, def, false).map_err(AsError::new)?;
+                // Invalidate any verdict cached against a now-reusable interface pointer.
+                self.bump_iface_cache_gen();
                 Ok(Flow::Normal)
             }
             Stmt::Export(inner) => {
@@ -3048,6 +3106,15 @@ impl Interp {
 
                 let l = self.eval_expr(lhs, env).await?;
                 let r = self.eval_expr(rhs, env).await?;
+
+                // IFACE §5.2: `instanceof` routes through the shared `&self`
+                // `eval_instanceof` (class → nominal `is_instance_of`; interface →
+                // structural `conforms`) — the SAME path the VM takes via
+                // `eval_binop_adaptive`. (Not through `apply_binop`, so its InstanceOf
+                // arm is unreachable.)
+                if let BinOp::InstanceOf = op {
+                    return self.eval_instanceof(l, r, expr.span);
+                }
 
                 // All non-short-circuit operators (string concat / decimal / range
                 // / cross-type equality / numeric) share ONE dispatch with the VM.
@@ -4556,7 +4623,9 @@ impl Interp {
         let BodySpec { params, ret, body } = spec;
         // Arity + parameter contracts + rest collection. Shared verbatim with the
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
-        let bound = check_call_args(params, args, span, what)?;
+        // IFACE: thread the callee frame env so a `Type::Named` param contract resolves
+        // env-aware (interface → structural conforms; class → nominal).
+        let bound = check_call_args(params, args, span, what, Some(self), Some(call_env))?;
         let defaults = bound.defaults.clone();
         // Bind the SUPPLIED params (and the rest array) — but NOT the omitted
         // defaulted positions, whose `bound.values` entries are placeholders. They
@@ -4580,7 +4649,8 @@ impl Interp {
                 .expect("default range only covers defaulted params");
             let dv = self.eval_expr(def, call_env).await?;
             if let Some(ty) = &p.ty {
-                if !check_type(&dv, ty) {
+                // IFACE: env-aware so a defaulted interface/class-typed param resolves.
+                if !self.check_type_env(&dv, ty, call_env)? {
                     return Err(contract_panic(ty, &dv, span));
                 }
             }
@@ -4604,7 +4674,9 @@ impl Interp {
             Err(Control::Exit(code)) => return Err(Control::Exit(code)),
         };
         if let Some(ty) = ret {
-            if !check_type(&result, ty) {
+            // IFACE: env-aware return-type contract (interface/class names resolve via
+            // the callee frame's env chain → def env → module globals).
+            if !self.check_type_env(&result, ty, call_env)? {
                 return Err(contract_panic(ty, &result, span));
             }
         }
@@ -4770,7 +4842,9 @@ impl Interp {
                 // Eval into a local first (never hold the instance borrow across
                 // `.await`).
                 let dv = self.eval_expr(def, &def_class.def_env).await?;
-                if !check_type(&dv, &schema.ty) {
+                // IFACE: env-aware against the declaring class's def env (where an
+                // interface-typed field annotation resolves).
+                if !self.check_type_env(&dv, &schema.ty, &def_class.def_env)? {
                     return Err(contract_panic(&schema.ty, &dv, span));
                 }
                 instance.borrow_mut().fields.insert(fname.clone(), dv);
@@ -4860,7 +4934,13 @@ impl Interp {
             val = self
                 .coerce_field(&fs.ty, val, &def_class.def_env, strict, &field_path, span)
                 .await?;
-            if !check_type(&val, &fs.ty) {
+            // IFACE: env-aware against the declaring class's def env (so an
+            // interface-typed field validates structurally). `validate_into` returns
+            // `AsError`, so map the `conforms` cycle/bad-extends `Control` back.
+            let ok = self
+                .check_type_env(&val, &fs.ty, &def_class.def_env)
+                .map_err(|c| control_to_aserror(c, span))?;
+            if !ok {
                 return Err(AsError::at(
                     format!(
                         "type contract violated at {}: expected {}, got {}",
@@ -4897,6 +4977,251 @@ impl Interp {
                 frozen: std::cell::Cell::new(false),
             },
         ))))
+    }
+
+    /// IFACE §5.2: the `instanceof` dispatch — the SINGLE source of truth both engines
+    /// call (the tree-walker from `eval_expr`'s `BinOp::InstanceOf` arm; the VM from
+    /// `eval_binop_adaptive`'s `InstanceOf` delegation). Branches on the RHS: a
+    /// `Value::Class(c)` runs `is_instance_of` (the UNCHANGED nominal `Rc::as_ptr` walk
+    /// — bit-for-bit identical to pre-IFACE); a `Value::Interface(i)` runs the
+    /// structural `conforms` (lazy flatten + verdict cache); anything else is a Tier-2
+    /// panic with the single "class or interface" message. Because BOTH engines route
+    /// InstanceOf through here (and NOT through `apply_binop`, whose InstanceOf arm is
+    /// now unreachable), the result + panic text are byte-identical across all four
+    /// modes by construction.
+    pub(crate) fn eval_instanceof(
+        &self,
+        l: Value,
+        r: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match &r {
+            Value::Class(cls) => Ok(Value::Bool(crate::value::is_instance_of(&l, cls))),
+            Value::Interface(iface) => Ok(Value::Bool(self.conforms(&l, iface)?)),
+            _ => Err(AsError::at(
+                "instanceof requires a class or interface on the right-hand side",
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// IFACE §8 (G1): the env-aware runtime contract check. The free
+    /// `check_type(value, ty)` is environment-free — its `Type::Named` arm matches a
+    /// class by NAME-STRING up the value's own chain and can never see an
+    /// `InterfaceDef`. This `&self` path resolves a `Type::Named` through the in-scope
+    /// `env` (the same `env.get(name)` ladder `coerce_field`/`validate_into` use): a
+    /// resolved `Value::Interface(i)` runs the structural `conforms`; a resolved
+    /// `Value::Class(c)` runs nominal `is_instance_of` (by class identity); an
+    /// unresolved name (or a non-class/non-interface binding) falls back to today's
+    /// PERMISSIVE name-string match (the free `check_type` — the gradual escape).
+    /// Composite arms (`Array`/`Optional`/`Union`/`Map`) recurse through this method so
+    /// a nested `array<Reader>` resolves element-wise; every non-`Named` leaf delegates
+    /// to the retained-unchanged free `check_type` (no behavior change for primitives).
+    ///
+    /// Returns `Ok(bool)`; the `conforms` lazy-flatten cycle / bad-extends panic rides
+    /// the `Err(Control)`.
+    pub(crate) fn check_type_env(
+        &self,
+        value: &Value,
+        ty: &crate::ast::Type,
+        env: &Environment,
+    ) -> Result<bool, Control> {
+        use crate::ast::Type;
+        match ty {
+            Type::Named(name) => match env.get(name) {
+                Some(Value::Interface(iface)) => self.conforms(value, &iface),
+                Some(Value::Class(cls)) => {
+                    Ok(crate::value::is_instance_of(value, &cls))
+                }
+                // Unresolved / non-class-non-interface name → today's permissive
+                // name-string match (gradual: a forward annotation stays silent).
+                _ => Ok(check_type(value, ty)),
+            },
+            Type::Optional(inner) => Ok(*value == Value::Nil
+                || self.check_type_env(value, inner, env)?),
+            Type::Union(a, b) => {
+                Ok(self.check_type_env(value, a, env)? || self.check_type_env(value, b, env)?)
+            }
+            Type::Array(elem) => match value {
+                Value::Array(arr) => {
+                    let items: Vec<Value> = arr.borrow().clone();
+                    for it in &items {
+                        if !self.check_type_env(it, elem, env)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            Type::Map(k, v) => match value {
+                Value::Map(m) => {
+                    let entries: Vec<(crate::value::MapKey, Value)> =
+                        m.borrow().iter().map(|(mk, mv)| (mk.clone(), mv.clone())).collect();
+                    for (mk, mv) in &entries {
+                        if !check_type(&mk.to_value(), k)
+                            || !self.check_type_env(mv, v, env)?
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            // Every other leaf (primitives, Result/Tuple/Future/Fn/Object/…) has no
+            // name to resolve → delegate to the unchanged free `check_type`.
+            _ => Ok(check_type(value, ty)),
+        }
+    }
+
+    /// IFACE §5.1: the structural conformance predicate — the runtime source of truth
+    /// both engines call (the tree-walker via the `instanceof` eval site, the VM via the
+    /// same path through `eval_binop_adaptive`). `true` iff `v` is a `Value::Instance`
+    /// whose class exposes every method `iface` requires (by name + arity, v1). Only a
+    /// class instance can conform; every other LHS (number, bare object, enum, nil, …)
+    /// is `Ok(false)`. The `Result` carries the lazy-`flatten` cycle / bad-`extends`
+    /// Tier-2 panic. Consults the per-isolate verdict cache (§5.3) above the flatten.
+    pub(crate) fn conforms(
+        &self,
+        v: &Value,
+        iface: &Rc<crate::value::InterfaceDef>,
+    ) -> Result<bool, Control> {
+        let Value::Instance(inst) = v else {
+            // Only class instances can conform in v1 (objects/enums/natives → false).
+            return Ok(false);
+        };
+        let class = inst.borrow().class.clone();
+        // Verdict cache: pure memo keyed by (class ptr, iface ptr). Same answer hot or
+        // cold — active in all modes. The borrow is short-lived (no await inside).
+        let key = (
+            Rc::as_ptr(&class) as usize,
+            Rc::as_ptr(iface) as usize,
+        );
+        let gen = self.iface_cache_gen.get();
+        // A hit is trusted ONLY when its stored generation still matches: a pointer reused
+        // by a later, different descriptor carries an older generation (the define that
+        // created it bumped the counter) and is treated as a miss. See the field doc.
+        if let Some(&(entry_gen, verdict)) = self.iface_verdict_cache.borrow().get(&key) {
+            if entry_gen == gen {
+                return Ok(verdict);
+            }
+        }
+        let methods = self.flatten_interface(iface)?;
+        // VM classes keep an EMPTY `Class.methods` (their compiled methods live in the
+        // VM's per-class side table keyed by `Rc::as_ptr`), so for a VM-registered class
+        // the method-presence/arity check routes through the VM; a tree-walker class
+        // uses the shared `find_method`. Cached out of the borrow so we never hold a VM
+        // borrow across the loop.
+        let vm = self.vm();
+        let mut verdict = true;
+        for (name, req) in methods.iter() {
+            // Prefer the VM side table when the class is VM-registered.
+            let satisfied = vm
+                .as_ref()
+                .and_then(|vm| vm.class_method_satisfies(&class, name, req))
+                .unwrap_or_else(|| match crate::value::find_method(&class, name) {
+                    Some((method, _)) => arity_compatible(&method, req),
+                    None => false,
+                });
+            if !satisfied {
+                verdict = false;
+                break;
+            }
+        }
+        self.iface_verdict_cache
+            .borrow_mut()
+            .insert(key, (gen, verdict));
+        Ok(verdict)
+    }
+
+    /// Bump the `instanceof Interface` verdict-cache generation. Called at every runtime
+    /// class/interface DEFINITION so a freed-then-reallocated descriptor at a reused
+    /// address can never read a stale verdict (see the `iface_verdict_cache` field doc).
+    /// Pure-memo invalidation — never changes observable behavior.
+    pub(crate) fn bump_iface_cache_gen(&self) {
+        self.iface_cache_gen
+            .set(self.iface_cache_gen.get().wrapping_add(1));
+    }
+
+    /// IFACE §4: lazily flatten an interface's transitive required method set (own +
+    /// every transitively-extended interface's, own-wins on name collision). Memoized
+    /// into `iface.flat`; subsequent calls reuse it. Resolves each `extends` NAME
+    /// through the interface's `def_env` (late-bound module-globals → forward references
+    /// resolve). A cyclic `extends` is caught by a visited-pointer set → a recoverable
+    /// Tier-2 panic; an `extends` name resolving to a non-interface / nothing is its own
+    /// recoverable Tier-2 panic.
+    pub(crate) fn flatten_interface(
+        &self,
+        iface: &Rc<crate::value::InterfaceDef>,
+    ) -> Result<Rc<indexmap::IndexMap<String, crate::value::MethodReq>>, Control> {
+        let mut visited: Vec<(*const crate::value::InterfaceDef, String)> = Vec::new();
+        self.flatten_interface_inner(iface, &mut visited)
+    }
+
+    fn flatten_interface_inner(
+        &self,
+        iface: &Rc<crate::value::InterfaceDef>,
+        // (identity pointer, name) — the pointer drives cycle detection; the name builds
+        // the chain message WITHOUT an `unsafe` deref of a raw pointer.
+        visited: &mut Vec<(*const crate::value::InterfaceDef, String)>,
+    ) -> Result<Rc<indexmap::IndexMap<String, crate::value::MethodReq>>, Control> {
+        // Memo hit: return the cached flattened set (borrow dropped immediately).
+        if let Some(flat) = iface.flat.borrow().as_ref() {
+            return Ok(flat.clone());
+        }
+        // Cycle guard: re-entering an interface already on the resolution stack is a
+        // recoverable Tier-2 panic naming the chain.
+        let ptr = Rc::as_ptr(iface);
+        if visited.iter().any(|(p, _)| *p == ptr) {
+            let mut chain: Vec<String> = visited.iter().map(|(_, n)| n.clone()).collect();
+            chain.push(iface.name.clone());
+            return Err(AsError::new(format!(
+                "cyclic interface extends: {}",
+                chain.join(" -> ")
+            ))
+            .into());
+        }
+        visited.push((ptr, iface.name.clone()));
+        // Resolve each `extends` name, recursively union (base-first, own-wins).
+        let mut flat: indexmap::IndexMap<String, crate::value::MethodReq> = indexmap::IndexMap::new();
+        for ext_name in &iface.extends {
+            match iface.def_env.get(ext_name) {
+                Some(Value::Interface(parent)) => {
+                    let parent_flat = self.flatten_interface_inner(&parent, visited)?;
+                    for (k, v) in parent_flat.iter() {
+                        flat.insert(k.clone(), v.clone());
+                    }
+                }
+                Some(other) => {
+                    visited.pop();
+                    return Err(AsError::new(format!(
+                        "interface '{}' extends '{}' which is a {}, not an interface",
+                        iface.name,
+                        ext_name,
+                        type_name(&other)
+                    ))
+                    .into());
+                }
+                None => {
+                    visited.pop();
+                    return Err(AsError::new(format!(
+                        "interface '{}' extends unknown name '{}'",
+                        iface.name, ext_name
+                    ))
+                    .into());
+                }
+            }
+        }
+        // Own requirements win over any inherited with the same name.
+        for (k, v) in iface.own_methods.iter() {
+            flat.insert(k.clone(), v.clone());
+        }
+        visited.pop();
+        let rc = Rc::new(flat);
+        *iface.flat.borrow_mut() = Some(rc.clone());
+        Ok(rc)
     }
 
     /// Recursively coerce a raw value to match a declared field type: a raw
@@ -5476,7 +5801,9 @@ impl Interp {
                 check_not_frozen(obj, value_span)?;
                 let class = inst.borrow().class.clone();
                 if let Some(schema) = lookup_field_schema(&class, name) {
-                    if !check_type(&value, &schema.ty) {
+                    // IFACE: env-aware against the class's def env so an interface-typed
+                    // field assignment validates structurally.
+                    if !self.check_type_env(&value, &schema.ty, &class.def_env)? {
                         return Err(contract_panic(&schema.ty, &value, value_span));
                     }
                 }
@@ -5782,18 +6109,13 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         return materialize_range(&l, &r, false, span);
     }
 
-    // `x instanceof C` (SP2 §1): bool. The rhs MUST be a class; a non-class rhs is
-    // a Tier-2 panic anchored at the (whole-expression) span — byte-identical to the
-    // VM's `Op::InstanceOf`. A non-instance lhs is `false`, never an error.
+    // IFACE §5.2: `instanceof` is intercepted by BOTH engines BEFORE `apply_binop`
+    // (the tree-walker in `eval_expr`, the VM in `eval_binop_adaptive`) and routed
+    // through the shared `&self` `Interp::eval_instanceof` — which needs the engine
+    // state (`conforms`/verdict cache) `apply_binop` (a free fn) cannot reach. So this
+    // arm is unreachable; keeping it documents the contract and traps a stray caller.
     if let BinOp::InstanceOf = op {
-        let Value::Class(cls) = &r else {
-            return Err(AsError::at(
-                "instanceof requires a class on the right-hand side",
-                span,
-            )
-            .into());
-        };
-        return Ok(Value::Bool(crate::value::is_instance_of(&l, cls)));
+        unreachable!("instanceof is routed through Interp::eval_instanceof, not apply_binop");
     }
 
     // String concatenation: `+` joins two strings.
@@ -6337,6 +6659,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
+        Value::Interface(_) => "interface",
         Value::Instance(_) => "instance",
         Value::BoundMethod(_) | Value::Super(_) => "function",
         Value::Future(_) => "future",
@@ -6451,6 +6774,15 @@ pub(crate) fn check_call_args(
     args: Vec<Value>,
     span: Span,
     what: &str,
+    // IFACE: the engine's env-aware contract resolution context. BOTH engines pass
+    // `Some` (tree-walker: its `Environment` chains to the def env / module globals;
+    // VM: `Some(&self.interp, &self.class_env())`, the shared module env where
+    // `Op::DefineInterface`/`Op::Class` register descriptors) so an interface/class
+    // `Type::Named` resolves and enforces conformance. The `Option` is retained for
+    // env-less internal callers; `None` falls to the env-free `check_type` (the exact
+    // pre-IFACE behavior, byte-identical for non-interface code).
+    interp: Option<&Interp>,
+    env: Option<&Environment>,
 ) -> Result<BoundArgs, Control> {
     let has_rest = params.last().is_some_and(|p| p.rest);
     // Count of POSITIONAL params (excludes a trailing `...rest`).
@@ -6517,7 +6849,16 @@ pub(crate) fn check_call_args(
     for p in &params[..supplied] {
         let a = it.next().unwrap();
         if let Some(ty) = &p.ty {
-            if !check_type(&a, ty) {
+            // IFACE: when the engine supplies its resolution env (BOTH engines do), a
+            // `Type::Named` resolves env-aware (interface → structural `conforms`,
+            // class → nominal); an env-less internal caller falls to the env-free
+            // `check_type`, the exact pre-IFACE behavior — byte-identical for
+            // non-interface code.
+            let ok = match (interp, env) {
+                (Some(itp), Some(e)) => itp.check_type_env(&a, ty, e)?,
+                _ => check_type(&a, ty),
+            };
+            if !ok {
                 return Err(contract_panic(ty, &a, span));
             }
         }
@@ -6549,7 +6890,11 @@ pub(crate) fn check_call_args(
         let mut rest_vals = Vec::new();
         for a in it {
             if let Some(t) = elem_ty {
-                if !check_type(&a, t) {
+                let ok = match (interp, env) {
+                    (Some(itp), Some(e)) => itp.check_type_env(&a, t, e)?,
+                    _ => check_type(&a, t),
+                };
+                if !ok {
                     return Err(contract_panic(t, &a, span));
                 }
             }
@@ -6614,8 +6959,10 @@ pub(crate) fn auto_init_bindings(
         })
         .collect();
     // Reuse the function-call arity + per-arg contract logic verbatim so messages
-    // and spans are byte-identical to a hand-written `init(x, y)`.
-    let bound = check_call_args(&params, args, span, class_name)?;
+    // and spans are byte-identical to a hand-written `init(x, y)`. This free fn has no
+    // engine/env (constructor field contracts resolve names via validate_into / the
+    // env-aware field-set path), so pass `None` — env-free `check_type` for any Named.
+    let bound = check_call_args(&params, args, span, class_name, None, None)?;
     // Take only the supplied positional args (contract-checked by
     // `check_call_args`); pair each with its field name. Omitted defaulted fields
     // keep the default the caller already applied.
@@ -6701,6 +7048,49 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         // `T?` ≡ `T | nil`.
         Type::Optional(inner) => check_type(value, inner) || matches!(value, Value::Nil),
     }
+}
+
+/// IFACE §5.1: whether a concrete `method` can satisfy an interface requirement of
+/// the given call-shape (`req`). The method conforms iff it can be CALLED with the
+/// requirement's argument count:
+///   `min_required <= req.arity <= declared_max`
+/// where `min_required` counts params that are neither defaulted nor the rest param,
+/// `declared_max` is the total params minus the rest param (or `∞` if the method has a
+/// rest param). Additionally, a requirement that itself declares a rest param
+/// (`req.has_rest`) requires the method to ALSO be variadic. Arity-only by design
+/// (runtime-permissive; TYPE adds the static type tightening).
+pub(crate) fn arity_compatible(
+    method: &crate::value::Method,
+    req: &crate::value::MethodReq,
+) -> bool {
+    arity_compatible_params(&method.params, req)
+}
+
+/// The param-slice core of [`arity_compatible`], shared by the tree-walker (a
+/// `value::Method`) and the VM (a compiled `FnProto`'s params) so the two engines'
+/// conformance verdicts cannot drift.
+pub(crate) fn arity_compatible_params(
+    params: &[crate::ast::Param],
+    req: &crate::value::MethodReq,
+) -> bool {
+    let has_rest = params.iter().any(|p| p.rest);
+    // A rest requirement needs a variadic method (only place `req.has_rest` matters).
+    if req.has_rest && !has_rest {
+        return false;
+    }
+    let min_required = params
+        .iter()
+        .filter(|p| !p.rest && p.default.is_none())
+        .count();
+    if req.arity < min_required {
+        return false;
+    }
+    if has_rest {
+        // Unbounded max — a rest param absorbs surplus args.
+        return true;
+    }
+    let declared_max = params.iter().filter(|p| !p.rest).count();
+    req.arity <= declared_max
 }
 
 /// Build a contract-violation panic.
@@ -10568,5 +10958,435 @@ print(n?.m())
         // `<<`/`&` bind at the multiplicative tier (tighter than `+ -`):
         // `1 + 1 << 2` is `1 + (1<<2)` = 1 + 4 = 5.
         assert_eq!(eval_num("1 + 1 << 2").await, Value::Int(5));
+    }
+
+    // ---- IFACE Task 2: conforms predicate + lazy flatten + cycle guard + cache ----
+    use crate::value::{InterfaceDef, MethodReq};
+    use indexmap::IndexMap;
+
+    /// A param with the given name; `defaulted` adds a default expr (so it's optional),
+    /// `rest` marks it variadic.
+    fn iface_param(name: &str, defaulted: bool, rest: bool) -> crate::ast::Param {
+        crate::ast::Param {
+            name: name.to_string(),
+            ty: None,
+            name_span: Span::new(0, 0),
+            rest,
+            default: if defaulted {
+                Some(crate::ast::Expr {
+                    kind: crate::ast::ExprKind::Nil,
+                    span: Span::new(0, 0),
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    /// A no-body instance method with the given params.
+    fn iface_method(params: Vec<crate::ast::Param>) -> std::rc::Rc<crate::value::Method> {
+        std::rc::Rc::new(crate::value::Method {
+            params,
+            ret: None,
+            body: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+        })
+    }
+
+    /// Build a class with the given methods and optional superclass.
+    fn iface_class(
+        env: &Environment,
+        name: &str,
+        methods: Vec<(&str, std::rc::Rc<crate::value::Method>)>,
+        superclass: Option<std::rc::Rc<crate::value::Class>>,
+    ) -> std::rc::Rc<crate::value::Class> {
+        let mut method_map = IndexMap::new();
+        for (n, m) in methods {
+            method_map.insert(n.to_string(), m);
+        }
+        let class = std::rc::Rc::new(crate::value::Class {
+            name: name.to_string(),
+            superclass,
+            fields: IndexMap::new(),
+            methods: method_map,
+            static_methods: IndexMap::new(),
+            def_env: env.clone(),
+            is_worker: false,
+        });
+        // Bind the class as a module-global so it stays ALIVE for the whole test (in a
+        // real run classes are load-time-immortal — §5.3 — so the verdict cache's
+        // pointer keys never alias a freed-then-reallocated class; we mirror that here
+        // to keep the test deterministic).
+        env.define(name, Value::Class(class.clone()), false).ok();
+        class
+    }
+
+    /// A bare instance of a class (no fields).
+    fn iface_instance(class: std::rc::Rc<crate::value::Class>) -> Value {
+        Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
+            crate::value::Instance {
+                class,
+                fields: IndexMap::new(),
+                shape_id: std::cell::Cell::new(0),
+                frozen: std::cell::Cell::new(false),
+            },
+        )))
+    }
+
+    /// An interface binding `name` with `own` requirements (name → arity, no rest) and
+    /// `extends` names, defined in `env`, and ALSO bound in `env` so extends resolve.
+    fn iface_def(
+        env: &Environment,
+        name: &str,
+        own: Vec<(&str, usize)>,
+        extends: Vec<&str>,
+    ) -> std::rc::Rc<InterfaceDef> {
+        let mut own_methods = IndexMap::new();
+        for (n, arity) in own {
+            own_methods.insert(
+                n.to_string(),
+                MethodReq {
+                    arity,
+                    has_rest: false,
+                },
+            );
+        }
+        let def = std::rc::Rc::new(InterfaceDef {
+            name: name.to_string(),
+            own_methods,
+            extends: extends.into_iter().map(|s| s.to_string()).collect(),
+            def_env: env.clone(),
+            flat: std::cell::RefCell::new(None),
+        });
+        env.define(name, Value::Interface(def.clone()), false)
+            .unwrap();
+        def
+    }
+
+    #[test]
+    fn conforms_basic_presence_and_arity() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        // interface Reader { fn read(b) -> int }   (arity 1)
+        let reader = iface_def(&env, "Reader", vec![("read", 1)], vec![]);
+        // class File { fn read(b) {} }  → conforms
+        let file = iface_class(&env, "File", vec![("read", iface_method(vec![iface_param("b", false, false)]))], None);
+        assert!(interp.conforms(&iface_instance(file), &reader).unwrap());
+        // class NoRead { fn write(b) {} } → does NOT conform (missing read)
+        let noread = iface_class(&env, "NoRead", vec![("write", iface_method(vec![iface_param("b", false, false)]))], None);
+        assert!(!interp.conforms(&iface_instance(noread), &reader).unwrap());
+        // Non-instance LHS → false (never an error).
+        assert!(!interp.conforms(&Value::Int(5), &reader).unwrap());
+        assert!(!interp.conforms(&Value::Nil, &reader).unwrap());
+        assert!(!interp.conforms(&Value::Object(crate::value::ObjectCell::new(IndexMap::new())), &reader).unwrap());
+    }
+
+    #[test]
+    fn iface_verdict_cache_generation_guard_drops_stale_pointer_entries() {
+        // Regression (IFACE review): the verdict cache keys on raw `Rc::as_ptr` values.
+        // A class/interface declared inside a fn/loop is NOT load-time-immortal — it can
+        // be freed and the allocator can hand the SAME address to a later, DIFFERENT
+        // descriptor, which would otherwise read a stale verdict. The generation guard
+        // (bumped on every runtime class/interface DEFINITION) must make a pre-bump entry
+        // a cache MISS so it is recomputed, never trusted. Deterministic (no reliance on
+        // the allocator actually reusing an address): we assert the gen-stamp mechanics.
+        let interp = Interp::new();
+        let env = global_env().child();
+        let reader = iface_def(&env, "Reader", vec![("read", 1)], vec![]);
+        let file = iface_class(
+            &env,
+            "File",
+            vec![("read", iface_method(vec![iface_param("b", false, false)]))],
+            None,
+        );
+        let inst = iface_instance(file.clone());
+        // First check caches the verdict stamped with the current generation.
+        assert!(interp.conforms(&inst, &reader).unwrap());
+        let key = (
+            std::rc::Rc::as_ptr(&file) as usize,
+            std::rc::Rc::as_ptr(&reader) as usize,
+        );
+        let gen0 = interp.iface_cache_gen.get();
+        assert_eq!(
+            interp.iface_verdict_cache.borrow().get(&key),
+            Some(&(gen0, true)),
+            "verdict must be cached stamped with the current generation"
+        );
+        // A runtime define (what a nested `class`/`interface` triggers) bumps the gen,
+        // making the entry recorded under gen0 stale.
+        interp.bump_iface_cache_gen();
+        let gen1 = interp.iface_cache_gen.get();
+        assert_ne!(gen0, gen1, "a definition must bump the generation");
+        // Reading now must MISS on the stale-gen entry, recompute, and re-stamp gen1.
+        // The re-stamp is the observable proof the stale entry was NOT trusted: a broken
+        // guard (gen-blind hit) would leave the entry at gen0.
+        assert!(interp.conforms(&inst, &reader).unwrap());
+        assert_eq!(
+            interp.iface_verdict_cache.borrow().get(&key),
+            Some(&(gen1, true)),
+            "a stale-generation entry must be recomputed and re-stamped, not trusted"
+        );
+    }
+
+    #[test]
+    fn conforms_inherited_method_satisfies() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        let reader = iface_def(&env, "Reader", vec![("read", 1)], vec![]);
+        let base = iface_class(&env, "Base", vec![("read", iface_method(vec![iface_param("b", false, false)]))], None);
+        let sub = iface_class(&env, "Sub", vec![], Some(base));
+        assert!(interp.conforms(&iface_instance(sub), &reader).unwrap());
+    }
+
+    #[test]
+    fn conforms_arity_table() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        // requirement read(b) arity 1 ; read(b,o) arity 2
+        let req1 = iface_def(&env, "R1", vec![("read", 1)], vec![]);
+        let req2 = iface_def(&env, "R2", vec![("read", 2)], vec![]);
+        // Build one instance per class and keep them ALIVE for the whole test. In a real
+        // run a runtime define bumps `iface_cache_gen` so a reused pointer can't read a
+        // stale verdict (see `iface_verdict_cache_generation_guard_*`); but these helpers
+        // construct descriptors directly WITHOUT going through `exec`/`Op` (no gen bump),
+        // so here we must not free a class between checks or its address could be reused
+        // within a single generation and collide.
+        // fn read(b, opts=nil) → min 1 max 2 : satisfies BOTH arity 1 and arity 2
+        let i_default = iface_instance(iface_class(&env, "D", vec![("read", iface_method(vec![iface_param("b", false, false), iface_param("opts", true, false)]))], None));
+        assert!(interp.conforms(&i_default, &req1).unwrap());
+        assert!(interp.conforms(&i_default, &req2).unwrap());
+        // fn read(b) → min 1 max 1 : satisfies arity 1, NOT arity 2
+        let i_one = iface_instance(iface_class(&env, "O", vec![("read", iface_method(vec![iface_param("b", false, false)]))], None));
+        assert!(interp.conforms(&i_one, &req1).unwrap());
+        assert!(!interp.conforms(&i_one, &req2).unwrap());
+        // fn read(...xs) → min 0 max ∞ : satisfies any arity
+        let i_rest = iface_instance(iface_class(&env, "V", vec![("read", iface_method(vec![iface_param("xs", false, true)]))], None));
+        assert!(interp.conforms(&i_rest, &req1).unwrap());
+        assert!(interp.conforms(&i_rest, &req2).unwrap());
+    }
+
+    #[test]
+    fn conforms_req_has_rest_needs_variadic_method() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        // A requirement that itself declares a rest param.
+        let mut own = IndexMap::new();
+        own.insert("read".to_string(), MethodReq { arity: 0, has_rest: true });
+        let req = std::rc::Rc::new(InterfaceDef {
+            name: "VReader".to_string(),
+            own_methods: own,
+            extends: vec![],
+            def_env: env.clone(),
+            flat: std::cell::RefCell::new(None),
+        });
+        // a non-variadic method does NOT satisfy a variadic requirement
+        let fixed = iface_class(&env, "Fixed", vec![("read", iface_method(vec![iface_param("b", false, false)]))], None);
+        assert!(!interp.conforms(&iface_instance(fixed), &req).unwrap());
+        // a variadic method does
+        let var = iface_class(&env, "Var", vec![("read", iface_method(vec![iface_param("xs", false, true)]))], None);
+        assert!(interp.conforms(&iface_instance(var), &req).unwrap());
+    }
+
+    #[test]
+    fn conforms_composition_and_forward_ref() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        // ReadWriter extends Reader, Writer — declared BEFORE Reader/Writer (forward ref)
+        let rw = iface_def(&env, "ReadWriter", vec![], vec!["Reader", "Writer"]);
+        let _reader = iface_def(&env, "Reader", vec![("read", 1)], vec![]);
+        let _writer = iface_def(&env, "Writer", vec![("write", 1)], vec![]);
+        // a class with both methods conforms; missing one does not
+        let both = iface_class(&env, "Both", vec![
+            ("read", iface_method(vec![iface_param("b", false, false)])),
+            ("write", iface_method(vec![iface_param("b", false, false)])),
+        ], None);
+        assert!(interp.conforms(&iface_instance(both), &rw).unwrap());
+        let only_read = iface_class(&env, "OnlyRead", vec![("read", iface_method(vec![iface_param("b", false, false)]))], None);
+        assert!(!interp.conforms(&iface_instance(only_read), &rw).unwrap());
+    }
+
+    #[test]
+    fn conforms_transitive_extends_of_extends() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        // C extends B ; B extends A ; A { fn a() }
+        let _a = iface_def(&env, "A", vec![("a", 0)], vec![]);
+        let _b = iface_def(&env, "B", vec![("b", 0)], vec!["A"]);
+        let c = iface_def(&env, "C", vec![("c", 0)], vec!["B"]);
+        let full = iface_class(&env, "Full", vec![
+            ("a", iface_method(vec![])),
+            ("b", iface_method(vec![])),
+            ("c", iface_method(vec![])),
+        ], None);
+        assert!(interp.conforms(&iface_instance(full), &c).unwrap());
+        let missing_a = iface_class(&env, "MissingA", vec![
+            ("b", iface_method(vec![])),
+            ("c", iface_method(vec![])),
+        ], None);
+        assert!(!interp.conforms(&iface_instance(missing_a), &c).unwrap());
+    }
+
+    #[test]
+    fn conforms_cyclic_extends_is_recoverable_panic() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        // A extends B ; B extends A
+        let a = iface_def(&env, "A", vec![], vec!["B"]);
+        let _b = iface_def(&env, "B", vec![], vec!["A"]);
+        let inst = iface_instance(iface_class(&env, "X", vec![], None));
+        let err = interp.conforms(&inst, &a).unwrap_err();
+        let msg = panic_of(err).message;
+        assert!(msg.contains("cyclic interface extends"), "got: {msg}");
+    }
+
+    #[test]
+    fn conforms_bad_extends_is_recoverable_panic() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        // extends a name that resolves to a class, not an interface
+        // (iface_class already binds "NotIface" as a module-global Value::Class).
+        let _cls = iface_class(&env, "NotIface", vec![], None);
+        let a = iface_def(&env, "A", vec![], vec!["NotIface"]);
+        let inst = iface_instance(iface_class(&env, "X", vec![], None));
+        let err = interp.conforms(&inst, &a).unwrap_err();
+        assert!(panic_of(err).message.contains("not an interface"));
+        // extends an unknown name
+        let env2 = global_env().child();
+        let b = iface_def(&env2, "B", vec![], vec!["Nope"]);
+        let inst2 = iface_instance(iface_class(&env2, "Y", vec![], None));
+        let err2 = interp.conforms(&inst2, &b).unwrap_err();
+        assert!(panic_of(err2).message.contains("unknown name"));
+    }
+
+    // ---- IFACE Task 5: tree-walker exec + instanceof dispatch + contract path ----
+
+    #[tokio::test]
+    async fn iface_decl_binds_printable_interface_global() {
+        let out = run("interface R { fn read(b): int }\nprint(R)").await;
+        assert_eq!(out, "<interface R>\n");
+    }
+
+    #[tokio::test]
+    async fn iface_instanceof_structural() {
+        let src = "
+interface R { fn read(b): int }
+class File { fn read(b) { return 0 } }
+class NoRead { fn write(b) { return 0 } }
+print(File() instanceof R)
+print(NoRead() instanceof R)
+print(5 instanceof R)
+";
+        assert_eq!(run(src).await, "true\nfalse\nfalse\n");
+    }
+
+    #[tokio::test]
+    async fn iface_instanceof_bad_rhs_message() {
+        // `x instanceof <a number value>` → the new "class or interface" message.
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let stmts = parse(&lex("let n = 5\nlet x = 3\nx instanceof n").unwrap()).unwrap();
+        let env = global_env().child();
+        let local = tokio::task::LocalSet::new();
+        let res = local
+            .run_until(async { interp.exec(&stmts, &env).await })
+            .await;
+        let msg = panic_of(res.unwrap_err()).message;
+        assert!(
+            msg.contains("instanceof requires a class or interface on the right-hand side"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn iface_class_instanceof_still_nominal() {
+        // The class `instanceof` path is unchanged (subclass walk).
+        let src = "
+class A {}
+class B extends A {}
+print(B() instanceof A)
+print(A() instanceof B)
+";
+        assert_eq!(run(src).await, "true\nfalse\n");
+    }
+
+    #[tokio::test]
+    async fn iface_param_contract_accepts_conforming_rejects_non() {
+        // A conforming arg is accepted; a non-conforming one panics with a contract.
+        let ok = run("
+interface R { fn read(b): int }
+class File { fn read(b) { return 7 } }
+fn slurp(r: R) { return r.read(0) }
+print(slurp(File()))
+").await;
+        assert_eq!(ok, "7\n");
+
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let bad_src = "
+interface R { fn read(b): int }
+class NoRead { fn write(b) { return 0 } }
+fn slurp(r: R) { return 0 }
+slurp(NoRead())
+";
+        let stmts = parse(&lex(bad_src).unwrap()).unwrap();
+        let env = global_env().child();
+        let local = tokio::task::LocalSet::new();
+        let res = local.run_until(async { interp.exec(&stmts, &env).await }).await;
+        assert!(matches!(res, Err(Control::Panic(_))), "non-conforming arg should panic");
+    }
+
+    #[tokio::test]
+    async fn iface_named_resolving_to_class_still_nominal_contract() {
+        // A `Named` annotation that resolves to a CLASS keeps nominal-by-identity.
+        let ok = run("
+class C { fn m() { return 1 } }
+fn f(c: C) { return c.m() }
+print(f(C()))
+").await;
+        assert_eq!(ok, "1\n");
+    }
+
+    #[tokio::test]
+    async fn iface_unresolved_name_preserves_prior_behavior() {
+        // An annotation naming nothing falls through to the env-FREE `check_type`
+        // (byte-identical to pre-IFACE): a non-instance value is still rejected — we
+        // must NOT change this. (The env-aware path only ADDS interface/class
+        // resolution; the unresolved leaf is unchanged.)
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let stmts = parse(&lex("fn f(x: Unknown) { return x }\nf(42)").unwrap()).unwrap();
+        let env = global_env().child();
+        let local = tokio::task::LocalSet::new();
+        let res = local.run_until(async { interp.exec(&stmts, &env).await }).await;
+        assert!(matches!(res, Err(Control::Panic(_))), "unknown-name contract unchanged");
+    }
+
+    #[tokio::test]
+    async fn iface_nested_array_contract_resolves_elementwise() {
+        let ok = run("
+interface R { fn read(b): int }
+class File { fn read(b) { return 0 } }
+fn many(rs: array<R>) { return len(rs) }
+print(many([File(), File()]))
+").await;
+        assert_eq!(ok, "2\n");
+    }
+
+    #[test]
+    fn conforms_verdict_cache_warm_equals_cold() {
+        let interp = Interp::new();
+        let env = global_env().child();
+        let reader = iface_def(&env, "Reader", vec![("read", 1)], vec![]);
+        let file = iface_class(&env, "File", vec![("read", iface_method(vec![iface_param("b", false, false)]))], None);
+        let inst = iface_instance(file);
+        // cold (first) call
+        let cold = interp.conforms(&inst, &reader).unwrap();
+        // warm (cached) calls give the SAME answer, repeatedly
+        for _ in 0..5 {
+            assert_eq!(interp.conforms(&inst, &reader).unwrap(), cold);
+        }
+        assert!(cold);
     }
 }

@@ -146,6 +146,7 @@ module.exports = grammar({
         $.function_declaration,
         $.class_declaration,
         $.enum_declaration,
+        $.interface_declaration,
       ),
     ),
 
@@ -156,6 +157,7 @@ module.exports = grammar({
       $.function_declaration,
       $.class_declaration,
       $.enum_declaration,
+      $.interface_declaration,
       $.if_statement,
       $.while_statement,
       $.for_statement,
@@ -250,7 +252,15 @@ module.exports = grammar({
       'class',
       field('name', $.identifier),
       optional(seq('extends', field('superclass', $.identifier))),
+      // IFACE: optional `implements I1, I2` clause (after `extends`, before body).
+      optional($.implements_clause),
       field('body', $.class_body),
+    ),
+    // `implements A, B` — a class asserts structural conformance to these interfaces.
+    // `implements` is a contextual (soft) keyword, like class `extends`.
+    implements_clause: $ => seq(
+      'implements',
+      commaSep1(field('interface', $.identifier)),
     ),
     // `;` is an optional run before the first member and after each member,
     // mirroring the hand-written parser's `skip_semicolons` in class bodies
@@ -297,6 +307,34 @@ module.exports = grammar({
     variant_field: $ => seq(
       optional(seq(field('field', $.identifier), ':')),
       field('type', $._type),
+    ),
+
+    // ----- Interfaces (IFACE) ---------------------------------------------
+    // A structural interface: a named set of method requirements. `interface`
+    // is a reserved keyword. The optional `extends I1, I2` composes (unions)
+    // the requirements of other interfaces (distinct from class `extends`).
+    interface_declaration: $ => seq(
+      'interface',
+      field('name', $.identifier),
+      optional(seq('extends', commaSep1(field('parent', $.identifier)))),
+      field('body', $.interface_body),
+    ),
+    // `;` is an optional separator between requirements, mirroring the class
+    // body's `skip_semicolons` rule (leading/doubled/only-`;` bodies accepted).
+    interface_body: $ => seq(
+      '{',
+      repeat(';'),
+      repeat(seq($.method_requirement, repeat(';'))),
+      '}',
+    ),
+    // A method requirement is a plain instance-method SIGNATURE (no body).
+    // Modifiers (`static`/`worker`/`async`/`fn*`) are rejected by both
+    // hand-written front-ends; the grammar models the bare `fn name(...) -> T`.
+    method_requirement: $ => seq(
+      'fn',
+      field('name', $.identifier),
+      field('parameters', $.parameter_list),
+      optional(seq(':', field('return_type', $._type))),
     ),
 
     // ----- Control flow ----------------------------------------------------

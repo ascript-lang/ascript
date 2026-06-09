@@ -56,7 +56,14 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
             b.is_global
                 || matches!(
                     b.kind,
-                    BindingKind::Fn | BindingKind::Class | BindingKind::Enum
+                    // Hoisted/late-bound decls: a reference resolves to the binding even
+                    // before its textual declaration. An interface name late-binds via its
+                    // `def_env` exactly like a class/enum, so exempt it explicitly rather
+                    // than relying on `is_global` (which a nested interface lacks).
+                    BindingKind::Fn
+                        | BindingKind::Class
+                        | BindingKind::Enum
+                        | BindingKind::Interface
                 )
         })
         .map(|b| b.name.as_str())

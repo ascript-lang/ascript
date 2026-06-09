@@ -153,6 +153,11 @@ fn unsendable_kind(v: &Value) -> Option<(&'static str, Option<&'static str>)> {
         Value::Generator(_) => Some(("generator", None)),
 
         Value::Class(_) => Some(("class", None)),
+        // IFACE (C5): an interface descriptor is code, non-sendable as a VALUE. This
+        // arm makes `check_sendable` reject it with a field path, so `encode_value`'s
+        // catch-all `unreachable!` is never reached. (Interfaces cross isolates via
+        // code-shipping, Task 8 — not the value serializer.)
+        Value::Interface(_) => Some(("interface", None)),
         Value::Enum(_) => Some(("enum", None)),
         Value::Super(_) => Some(("super", None)),
     }
@@ -1207,6 +1212,38 @@ mod tests {
         assert!(err
             .message()
             .contains("cannot be sent to a worker at [1].cb"));
+    }
+
+    #[test]
+    fn rejects_interface_value_with_field_path() {
+        // IFACE (C5): an interface descriptor is CODE — a non-sendable VALUE. The
+        // serializer must reject it with a field path so `encode_value`'s catch-all
+        // `unreachable!` is never reached. (Interfaces cross isolates via code-shipping,
+        // Task 8 — not the value channel.)
+        let iface = Value::Interface(Rc::new(crate::value::InterfaceDef {
+            name: "Reader".to_string(),
+            own_methods: IndexMap::new(),
+            extends: Vec::new(),
+            def_env: crate::interp::global_env(),
+            flat: std::cell::RefCell::new(None),
+        }));
+        // Directly:
+        let err = check_sendable(&iface).unwrap_err();
+        assert_eq!(err.kind, "interface");
+        // Nested under a field path:
+        let v = arr(vec![num(1.0), obj(&[("r", iface)])]);
+        let err = check_sendable(&v).unwrap_err();
+        assert_eq!(err.kind, "interface");
+        assert_eq!(err.path, "[1].r");
+        // `encode` also rejects before writing any bytes (the unreachable! stays dead).
+        let iface2 = Value::Interface(Rc::new(crate::value::InterfaceDef {
+            name: "Reader".to_string(),
+            own_methods: IndexMap::new(),
+            extends: Vec::new(),
+            def_env: crate::interp::global_env(),
+            flat: std::cell::RefCell::new(None),
+        }));
+        assert!(encode(&iface2).is_err());
     }
 
     #[test]

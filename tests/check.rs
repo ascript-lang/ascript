@@ -320,6 +320,39 @@ fn repeatable_deny_applies_to_all() {
     );
 }
 
+#[test]
+fn forward_reference_to_interface_is_not_undefined() {
+    // IFACE: an interface name late-binds via its def_env (lazy `extends`/conformance
+    // resolution), so a reference BEFORE the textual `interface` declaration — including
+    // from inside an earlier fn body — must NOT trip `undefined-variable`, exactly like a
+    // forward-referenced class/enum/fn. (Holistic-review hardening: the exemption is now
+    // explicit on BindingKind::Interface, not implicit via is_global.)
+    let p = write_tmp(
+        "fwd_iface.as",
+        "fn make() {\n  let f = F()\n  return f instanceof Greeter\n}\ninterface Greeter { fn hello() }\nclass F { fn hello() { return \"hi\" } }\nprint(make())\n",
+    );
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--deny")
+        .arg("undefined-variable")
+        .arg(&p)
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "a forward-referenced interface must not be undefined-variable; got: {combined}"
+    );
+    assert!(
+        !combined.contains("undefined"),
+        "no undefined diagnostic expected; got: {combined}"
+    );
+}
+
 // --- CFG-T3: ascript.toml [lint] config -----------------------------------
 //
 // Discovery walks UP from each checked file's parent directory looking for

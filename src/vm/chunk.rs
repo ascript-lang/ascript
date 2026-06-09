@@ -116,6 +116,20 @@ pub struct ClassProto {
     pub has_super: bool,
 }
 
+/// IFACE: a compiled interface definition referenced by an `Op::DefineInterface`
+/// operand. Carries only DATA (name + own method requirements + `extends` names) —
+/// the transitive flatten is lazy at runtime, and `def_env` is supplied by the VM
+/// (its shared class/module env) at `DefineInterface` time, so siblings/forward refs
+/// resolve. Whether the binding is a module-global or a frame-local is decided by
+/// the surrounding DEFINE_GLOBAL/SET_LOCAL the compiler emits.
+#[derive(Debug, Clone)]
+pub struct InterfaceProto {
+    pub name: String,
+    /// `(method name, arity, has_rest)` in declaration order.
+    pub methods: Vec<(String, usize, bool)>,
+    pub extends: Vec<String>,
+}
+
 impl std::fmt::Debug for ClassProto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClassProto")
@@ -249,6 +263,9 @@ pub struct Chunk {
     pub protos: Vec<Rc<FnProto>>,
     /// Compiled class definitions referenced by `CLASS` operands (V9).
     pub class_protos: Vec<Rc<ClassProto>>,
+    /// IFACE: compiled interface definitions referenced by `DEFINE_INTERFACE` operands.
+    /// (NOT serialized to `.aso` until Task 9; empty for non-interface programs.)
+    pub interface_protos: Vec<Rc<InterfaceProto>>,
     /// `(code offset, span)` pairs, one per instruction, sorted ascending by
     /// offset (emission is monotonic).
     pub spans: Vec<(usize, Span)>,
@@ -563,6 +580,18 @@ impl Chunk {
             u16::MAX
         });
         self.class_protos.push(p);
+        idx
+    }
+
+    /// IFACE: append an interface definition, returning its `DEFINE_INTERFACE` operand
+    /// index. Overflow reuses the `ClassProtos` sticky limit (same `u16` cap class).
+    pub fn add_interface_proto(&mut self, p: Rc<InterfaceProto>) -> u16 {
+        let idx = self.interface_protos.len();
+        let idx = u16::try_from(idx).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::ClassProtos(self.cur_span()));
+            u16::MAX
+        });
+        self.interface_protos.push(p);
         idx
     }
 

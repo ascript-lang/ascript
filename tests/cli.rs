@@ -420,6 +420,38 @@ fn repl_vm_persists_fn_and_class_across_lines() {
 }
 
 #[test]
+fn repl_persists_interface_across_lines_for_instanceof() {
+    // IFACE Task 11 (REPL regression): an `interface` defined on one line binds the
+    // descriptor on the persistent session scope; a LATER line's `instanceof` against
+    // it sees the binding. The brace-delimited body relies on the existing
+    // delimiter-depth `is_incomplete` buffering for multi-line entry — here we keep it
+    // on one line. Asserted on BOTH engines (byte-identity).
+    let session = "interface R { fn read(b): int }\n\
+class F { fn read(b): int { return 0 } }\n\
+F() instanceof R\n";
+    let (vm_out, _) = run_repl_session(session, false);
+    assert!(
+        vm_out.contains("true"),
+        "VM: interface must persist across lines for instanceof; stdout: {vm_out}"
+    );
+    let (tw_out, _) = run_repl_session(session, true);
+    assert!(
+        tw_out.contains("true"),
+        "tree-walker: interface must persist across lines for instanceof; stdout: {tw_out}"
+    );
+
+    // A multi-line interface body (exercises delimiter-depth buffering), then used.
+    let multiline = "interface W {\n  fn write(b): int\n}\n\
+class G { fn write(b): int { return 1 } }\n\
+G() instanceof W\n";
+    let (ml_out, _) = run_repl_session(multiline, false);
+    assert!(
+        ml_out.contains("true"),
+        "multi-line interface body must buffer + persist; stdout: {ml_out}"
+    );
+}
+
+#[test]
 fn repl_vm_trailing_expr_prints_value_statements_print_nothing() {
     // A bare trailing expression prints its value.
     let (out, _) = run_repl_session("3 + 4\n", false);

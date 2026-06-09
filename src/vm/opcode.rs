@@ -306,6 +306,13 @@ pub enum Op {
     // ---- classes / enums --------------------------------------------------
     /// `CLASS(u16)` — push a new class named by `consts[idx]`.
     Class,
+    /// IFACE: `DEFINE_INTERFACE(u16)` — build the `InterfaceDef` from
+    /// `interface_protos[idx]` (with `def_env` = the VM's shared class/module env, into
+    /// which it also self-registers for sibling/forward-ref `extends`), and PUSH the
+    /// resulting `Value::Interface`. The compiler emits the matching bind op
+    /// (`DEFINE_GLOBAL` for a top-level interface, `SET_LOCAL` for a nested one) right
+    /// after — exactly mirroring `Op::Class`.
+    DefineInterface,
     /// `METHOD(u16)` — attach TOS (a closure) as method `consts[idx]` on the
     /// class below it.
     Method,
@@ -691,6 +698,7 @@ impl Op {
             x if x == GetPropOpt as u8 => GetPropOpt,
 
             x if x == Class as u8 => Class,
+            x if x == DefineInterface as u8 => DefineInterface,
             x if x == Method as u8 => Method,
             x if x == GetSuper as u8 => GetSuper,
             x if x == InstanceOf as u8 => InstanceOf,
@@ -765,7 +773,8 @@ impl Op {
             // u16-operand ops.
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
-            | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
+            | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | DefineInterface
+            | Method | GetSuper
             | InstanceOfType | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
             | MatchHasKey | CallMethodSpread | DefineExport | CheckParam | CheckLocal
             | MatchVariant | VariantElem | VariantField | MatchVariantArity
@@ -936,6 +945,7 @@ mod tests {
         Op::SetProp,
         Op::GetPropOpt,
         Op::Class,
+        Op::DefineInterface,
         Op::Method,
         Op::GetSuper,
         Op::InstanceOf,

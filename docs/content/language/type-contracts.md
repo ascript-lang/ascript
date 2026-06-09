@@ -54,6 +54,7 @@ scale("3")   // panic: type contract violated: expected number, got string ("3")
 | `[T1, T2, …]` | a fixed-length tuple, matched positionally |
 | `T1 \| T2` | a union — satisfied if either side matches |
 | `ClassName` | an instance of that class or any subclass |
+| `InterfaceName` | any value that [structurally conforms](classes-enums#interfaces) to the interface |
 | `EnumName` | any variant of that enum |
 | `future<T>` | a `future` value (the result of calling an `async fn`) |
 | `T?` | `T` **or** nil — the nullable suffix, sugar for `T \| nil` |
@@ -103,7 +104,7 @@ fn lookup(id: number): Result<object> {
 }
 ```
 
-## Class and enum types
+## Class, interface, and enum types
 
 A class name is a valid contract type that accepts instances of that class and its subclasses. An
 enum name accepts any variant of that enum. See [Classes, enums, match](classes-enums).
@@ -115,6 +116,24 @@ class Circle extends Shape {}
 fn area(s: Shape): number { /* … */ return 0 }
 area(Circle())   // ok — Circle is a Shape
 ```
+
+An **[interface](classes-enums#interfaces)** name is also a contract type — it accepts any value that
+**structurally conforms** (has the interface's required methods). Unlike a class annotation (which is
+nominal — the value must be an instance of that class or a subclass), an interface annotation is
+**structural**, so an unrelated class with a matching method set is accepted:
+
+```ascript
+interface Reader { fn read(b): int }
+
+fn slurp(r: Reader): int { return r.read([1, 2, 3]) }
+
+class File { fn read(b): int { return len(b) } }
+slurp(File())   // ok — File conforms to Reader structurally, no `implements` needed
+```
+
+A non-conforming value passed where an interface is annotated is the same boundary Tier-2 panic a
+class annotation produces. (The runtime check is structural and permissive — it matches method
+**name + call-shape**; full static signature checking is a later milestone.)
 
 > [!NOTE] Because contracts run at the boundary, they double as living, machine-checked
 > documentation: the annotation can never silently drift out of sync with the code's actual

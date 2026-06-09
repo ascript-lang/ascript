@@ -40,10 +40,12 @@ fn is_attachable(kind: SyntaxKind) -> bool {
             | ContinueStmt
             | EnumDecl
             | ClassDecl
+            | InterfaceDecl
             | ImportStmt
             | ExportStmt
             | FieldDecl
             | MethodDecl
+            | MethodReq
             | EnumVariant
     )
 }

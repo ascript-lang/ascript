@@ -21,6 +21,9 @@ pub enum BindingKind {
     Param,
     Fn,
     Class,
+    /// IFACE: a structural interface declaration — an immutable module-global (or
+    /// frame-local) binding, treated like `Class`/`Enum` for resolution.
+    Interface,
     Enum,
     Import,
     PatternBind,

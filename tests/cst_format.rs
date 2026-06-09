@@ -226,6 +226,42 @@ Shape.Point => 0.0,\n  }\n}\n";
 }
 
 #[test]
+fn formats_interface_decls_and_implements_clause() {
+    // IFACE Task 10 (CST formatter): an `interface` declaration renders its method
+    // REQUIREMENTS one-per-line (signature, NO body), the `extends` composition list
+    // comma-joined, and an empty body collapses to `{\n}`. A class renders its
+    // `implements A, B` clause in canonical order (after `extends`, before the body).
+    // Idempotent + reparses.
+    let src = "interface Reader{fn read(b:bytes):int}\n\
+interface Writer{fn write(b:bytes):int;fn flush():int}\n\
+interface ReadWriter extends Reader,Writer{}\n\
+class File implements Reader{fn read(b:bytes):int{return 0}}\n\
+class Socket extends Base implements Reader,Writer{fn read(b:bytes):int{return 0}\nfn write(b:bytes):int{return 0}}\n";
+    let want = "interface Reader {\n  \
+fn read(b: bytes): int\n}\n\
+interface Writer {\n  \
+fn write(b: bytes): int\n  \
+fn flush(): int\n}\n\
+interface ReadWriter extends Reader, Writer {\n}\n\
+class File implements Reader {\n  \
+fn read(b: bytes): int {\n    \
+return 0\n  }\n}\n\
+class Socket extends Base implements Reader, Writer {\n  \
+fn read(b: bytes): int {\n    \
+return 0\n  }\n  \
+fn write(b: bytes): int {\n    \
+return 0\n  }\n}\n";
+    let once = ascript::syntax::format_tree(src);
+    assert_eq!(once, want, "unexpected interface/implements format");
+    let twice = ascript::syntax::format_tree(&once);
+    assert_eq!(once, twice, "interface format not idempotent");
+    assert!(
+        ascript::syntax::parser::parse(&once).errors.is_empty(),
+        "formatted interface output does not reparse: {once:?}"
+    );
+}
+
+#[test]
 fn formatted_corpus_reparses_without_errors() {
     let mut failures = Vec::new();
     for path in corpus() {

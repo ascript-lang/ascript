@@ -1,7 +1,7 @@
 SourceFile = Stmt*
 Stmt =
     LetStmt | ExprStmt | Block | IfStmt | WhileStmt | ReturnStmt | FnDecl
-  | ForStmt | BreakStmt | ContinueStmt | EnumDecl | ClassDecl
+  | ForStmt | BreakStmt | ContinueStmt | EnumDecl | ClassDecl | InterfaceDecl
   | ImportStmt | ExportStmt
 LetStmt = ('let' | 'const') 'ident' ('=' Expr)?
 ExprStmt = Expr
@@ -54,9 +54,13 @@ RetType = ':' Type
 EnumDecl = 'enum' 'ident' '{' EnumVariant* '}'
 EnumVariant = 'ident' ('=' Expr)? ('(' VariantField* ')')?
 VariantField = ('ident' ':')? Type
-ClassDecl = 'class' 'ident' ('extends' 'ident')? '{' (FieldDecl | MethodDecl)* '}'
+ClassDecl = 'class' 'ident' ('extends' 'ident')? ImplementsClause? '{' (FieldDecl | MethodDecl)* '}'
 FieldDecl = 'ident' '?'? ':' Type ('=' Expr)?
 MethodDecl = 'static'? 'async'? 'fn' '*'? 'ident' ParamList RetType? Block
+InterfaceDecl = 'interface' 'ident' ExtendsList? '{' MethodReq* '}'
+MethodReq = 'fn' 'ident' ParamList RetType?
+ExtendsList = 'extends' 'ident'*
+ImplementsClause = 'implements' 'ident'*
 ImportStmt = 'import' (ImportList | '*' 'as' 'ident') 'from' 'string'
 ImportList = '{' 'ident'* '}'
 ExportStmt = 'export' Stmt

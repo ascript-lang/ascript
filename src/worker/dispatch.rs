@@ -59,7 +59,7 @@
 use crate::interp::Control;
 use crate::span::Span;
 use crate::value::Value;
-use crate::vm::chunk::{Chunk, FnProto};
+use crate::vm::chunk::{Chunk, FnProto, InterfaceProto};
 use crate::vm::opcode::Op;
 use crate::worker::WorkerCodeSlice;
 use std::collections::{HashMap, HashSet};
@@ -87,6 +87,12 @@ enum TopDef {
     /// superclass chain), the SAME machinery the actor class-slice uses. A worker fn
     /// that constructs/returns a class instance pulls the class definition in here.
     Class,
+    /// IFACE: a top-level `interface` — ships as its [`InterfaceProto`] (re-emitted as
+    /// `Op::DefineInterface` + `DEFINE_GLOBAL` in the fragment, rebuilding a fresh
+    /// descriptor `Rc` on the isolate, §5.3 per-isolate immortality). The proto carries
+    /// only DATA (name + own method requirements + `extends` names); its transitive
+    /// dependency edge is its `extends` parents (collected in [`collect_def_refs`]).
+    Interface(Rc<InterfaceProto>),
 }
 
 /// Scan a program's top-level [`Chunk`] code stream and build a map from each
@@ -283,6 +289,14 @@ fn classify_binding(
         // A run ending in `CLASS` is a `class` declaration — shipped via the class
         // machinery, not from this map's range.
         Some((Op::Class, _)) => TopDef::Class,
+        // IFACE: a run ending in `DEFINE_INTERFACE` is an `interface` declaration —
+        // ship its proto, re-emitted as DEFINE_INTERFACE + DEFINE_GLOBAL.
+        Some((Op::DefineInterface, operand)) if stmt_start == define_ip.saturating_sub(3) => {
+            if let Some(p) = top.interface_protos.get(operand as usize) {
+                return TopDef::Interface(p.clone());
+            }
+            TopDef::ComputedConst { start: stmt_start, end: define_ip }
+        }
         // Anything else is a computed-initializer binding: ship its instruction range.
         _ => TopDef::ComputedConst { start: stmt_start, end: define_ip },
     }
@@ -367,6 +381,15 @@ fn collect_def_refs(top: &Chunk, def: &TopDef, name: &str, out: &mut Vec<Rc<str>
                         }
                     }
                 }
+            }
+        }
+        TopDef::Interface(proto) => {
+            // IFACE: an interface's transitive top-level dependency edge is its
+            // `extends` parents (the lazy-flatten dependency, §4) — so shipping
+            // `ReadWriter` pulls in `Reader` + `Writer`. Method *signatures* carry no
+            // executable bodies, so there are no `GET_GLOBAL`s to walk.
+            for parent in &proto.extends {
+                out.push(Rc::from(parent.as_str()));
             }
         }
         TopDef::Const(_) => {}
@@ -815,10 +838,25 @@ fn emit_dep_closure(
                 let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
+            Some(TopDef::Interface(proto)) => {
+                emit_interface_def(frag, proto.clone(), &name, span);
+            }
             Some(TopDef::Class) | None => {}
         }
     }
     Ok(())
+}
+
+/// IFACE: re-emit an interface descriptor into a worker fragment — add its proto to
+/// the fragment's `interface_protos`, emit `Op::DefineInterface` (which rebuilds a
+/// fresh `InterfaceDef` `Rc` on the isolate, §5.3), then bind it as a module-global
+/// (`DEFINE_GLOBAL`). The `extends` names reload as module-globals (already shipped
+/// transitively via [`collect_def_refs`]); the lazy flatten resolves them on first use.
+fn emit_interface_def(frag: &mut Chunk, proto: Rc<InterfaceProto>, name: &Rc<str>, span: Span) {
+    let idx = frag.add_interface_proto(proto);
+    frag.emit_u16(Op::DefineInterface, idx, span);
+    let name_idx = frag.add_const(Value::Str(name.clone()));
+    frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
 }
 
 /// Emit every `class` in the dependency-closure `included` set into `frag`, in
@@ -1190,6 +1228,9 @@ fn materialize_slice(
                 let name_idx = frag.add_const(Value::Str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
+            Some(TopDef::Interface(proto)) => {
+                emit_interface_def(&mut frag, proto.clone(), &name, span);
+            }
             // Classes were emitted in step 2; anything else is left late-bound.
             Some(TopDef::Class) | None => {}
         }
@@ -1559,6 +1600,84 @@ mod tests {
         assert!(names.contains("Circle"), "missing Circle: {names:?}");
         assert!(names.contains("Shape"), "missing superclass Shape: {names:?}");
         assert!(!names.contains("Unused"), "shipped unrelated class: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn slice_ships_referenced_interface() {
+        // IFACE (Task 8): a worker fn doing `x instanceof Reader` ships Reader's
+        // descriptor (and the class it constructs), but NOT an unrelated interface.
+        let src = "
+            interface Reader { fn read(b): int }
+            interface Unused { fn frob() }
+            class File {
+                fn read(b) { return 0 }
+            }
+            worker fn g(n) {
+                let f = File()
+                return f instanceof Reader
+            }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let names = slice.dep_names();
+        assert!(names.contains("Reader"), "missing Reader descriptor: {names:?}");
+        assert!(names.contains("File"), "missing File class: {names:?}");
+        assert!(!names.contains("Unused"), "shipped unrelated interface: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn slice_ships_transitive_extends_interfaces() {
+        // IFACE (Task 8): a worker fn using a composed interface pulls in its
+        // `extends` parents transitively (the lazy-flatten dependency edge, §4).
+        let src = "
+            interface Reader { fn read(b): int }
+            interface Writer { fn write(b): int }
+            interface ReadWriter extends Reader, Writer {}
+            class Conn {
+                fn read(b) { return 1 }
+                fn write(b) { return 1 }
+            }
+            worker fn g(n) {
+                let c = Conn()
+                return c instanceof ReadWriter
+            }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let names = slice.dep_names();
+        assert!(names.contains("ReadWriter"), "missing ReadWriter: {names:?}");
+        assert!(names.contains("Reader"), "missing transitive Reader: {names:?}");
+        assert!(names.contains("Writer"), "missing transitive Writer: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn slice_interface_instanceof_runs_in_fresh_isolate() {
+        // IFACE (Task 8): the shipped interface descriptor is rebuilt on a fresh
+        // isolate and `instanceof Interface` evaluates correctly across the boundary
+        // (a conforming class -> true; a transitively-composed interface conforms too).
+        let src = "
+            interface Reader { fn read(b): int }
+            interface Writer { fn write(b): int }
+            interface ReadWriter extends Reader, Writer {}
+            class Conn {
+                fn read(b) { return 1 }
+                fn write(b) { return 1 }
+            }
+            worker fn g(n) {
+                let c = Conn()
+                return [c instanceof Reader, c instanceof ReadWriter]
+            }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(0.0)])
+            .await
+            .expect("runs");
+        match out {
+            Value::Array(arr) => {
+                let a = arr.borrow();
+                assert_eq!(a[0], Value::Bool(true), "Reader conformance across isolate");
+                assert_eq!(a[1], Value::Bool(true), "ReadWriter conformance across isolate");
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -332,11 +332,27 @@ pub enum Stmt {
     Class {
         name: String,
         superclass: Option<String>,
+        /// IFACE: the interface names this class asserts conformance to
+        /// (`class C extends Super implements A, B`). Empty when no clause. The
+        /// RUNTIME ignores it (conformance is structural); the checker proves it
+        /// (`implements-violation`, TYPE-era). Contextual `implements` keyword.
+        implements: Vec<String>,
         fields: Vec<FieldDecl>,
         methods: Vec<MethodDecl>,
         /// `worker class C { … }` — Spec B: a stateful actor class whose instances
         /// are spawned into a dedicated isolate. The runtime side is wired in Task 5.
         is_worker: bool,
+        span: Span,
+        name_span: Span,
+    },
+    /// IFACE §3: a structural interface declaration — a named method SET (no bodies).
+    /// Binds a `Value::Interface` module-global. `extends` composes other interfaces
+    /// (transitive union, lazy). `type_params` reserves generics (empty in v1, §6.1).
+    Interface {
+        name: String,
+        type_params: Vec<String>,
+        extends: Vec<String>,
+        methods: Vec<MethodReqNode>,
         span: Span,
         name_span: Span,
     },
@@ -360,6 +376,19 @@ pub struct FieldDecl {
     /// Lazily-evaluated default (in the class def env) when the field is absent.
     pub default: Option<Expr>,
     pub span: Span,
+    pub name_span: Span,
+}
+
+/// IFACE §3: one method REQUIREMENT in an `interface` body — a signature with NO
+/// body. `async`/`fn*`/`static`/`worker` modifiers are rejected at parse time in v1.
+#[derive(Clone, Debug)]
+pub struct MethodReqNode {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
+    /// Span of the whole requirement (for LSP symbol range).
+    pub span: Span,
+    /// Span of just the method name (for LSP selection range / go-to-def).
     pub name_span: Span,
 }
 

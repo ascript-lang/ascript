@@ -1165,6 +1165,8 @@ impl Vm {
                                 args,
                                 call_span,
                                 what,
+                                Some(&self.interp),
+                                Some(&self.class_env()),
                             )?;
                             // Build a NOT-STARTED one-frame Fiber for the closure and
                             // place the bound params into its slots (cell slot → cell,
@@ -1268,6 +1270,8 @@ impl Vm {
                                 args,
                                 call_span,
                                 what,
+                                Some(&self.interp),
+                                Some(&self.class_env()),
                             )?;
                             // The args/rest array are gone from the stack; the new
                             // frame's window starts where the callee value was.
@@ -3251,7 +3255,49 @@ impl Vm {
                     self.class_methods.borrow_mut().insert(key, method_map);
                     self.class_static_methods.borrow_mut().insert(key, static_map);
                     self.class_defaults.borrow_mut().insert(key, default_map);
+                    // Invalidate any verdict cached against a now-reusable class pointer
+                    // (the Interp cache is shared by both engines). See its field doc.
+                    self.interp.bump_iface_cache_gen();
                     fiber.push(Value::Class(class));
+                }
+
+                Op::DefineInterface => {
+                    // IFACE: build the `InterfaceDef` from the proto and self-bind it.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let ip = fiber.frame().closure.proto.chunk.interface_protos[idx].clone();
+                    // `def_env` is the VM's shared class/module env (mirroring the
+                    // tree-walker, where every top-level decl's def_env is the module
+                    // env), so lazy `flatten` resolves sibling/forward-ref `extends`.
+                    let def_env = self.class_env();
+                    let mut own_methods: indexmap::IndexMap<String, crate::value::MethodReq> =
+                        indexmap::IndexMap::new();
+                    for (mname, arity, has_rest) in &ip.methods {
+                        own_methods.insert(
+                            mname.clone(),
+                            crate::value::MethodReq {
+                                arity: *arity,
+                                has_rest: *has_rest,
+                            },
+                        );
+                    }
+                    let iface = Value::Interface(Rc::new(crate::value::InterfaceDef {
+                        name: ip.name.clone(),
+                        own_methods,
+                        extends: ip.extends.clone(),
+                        def_env: def_env.clone(),
+                        flat: std::cell::RefCell::new(None),
+                    }));
+                    // Register into the shared class/module env so a SIBLING interface's
+                    // `extends` resolves it (late-bound). define-or-assign like classes.
+                    if def_env.define(&ip.name, iface.clone(), false).is_err() {
+                        let _ = def_env.assign(&ip.name, iface.clone());
+                    }
+                    // Push the descriptor; the compiler emitted the matching bind op
+                    // (DEFINE_GLOBAL for a top-level interface, SET_LOCAL for a nested
+                    // one) immediately after — exactly like Op::Class.
+                    // Invalidate any verdict cached against a now-reusable interface pointer.
+                    self.interp.bump_iface_cache_gen();
+                    fiber.push(iface);
                 }
 
                 Op::GetSuper => {
@@ -3433,7 +3479,7 @@ impl Vm {
                 if closure.proto.is_generator {
                     let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
                     let bound =
-                        crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                        crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
                     let mut gfiber = Fiber::new(closure);
                     gfiber.frame_mut().ret_span = span;
                     gfiber.frame_mut().argc = bound.supplied;
@@ -3456,7 +3502,7 @@ impl Vm {
                 // Arity + per-param contracts + rest collection, shared verbatim
                 // with the tree-walker and the `Op::Call` arm.
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
                 // Build a one-frame Fiber whose sole frame is the closure, then
                 // place the bound params into its slots (cell slot → cell, plain
                 // slot → stack). `Fiber::new` already reserved `slot_count` Nil
@@ -3530,6 +3576,31 @@ impl Vm {
     fn is_vm_class(&self, class: &Rc<crate::value::Class>) -> bool {
         let key = Rc::as_ptr(class) as usize;
         self.class_methods.borrow().contains_key(&key)
+    }
+
+    /// IFACE: whether `class` (walking its superclass chain) exposes an INSTANCE method
+    /// `name` whose call-shape satisfies `req` — consulting the VM's compiled-method
+    /// side table (VM classes keep an EMPTY `Class.methods`; their methods live keyed by
+    /// `Rc::as_ptr` here). Returns `Some(true/false)` when `class` is a VM class,
+    /// `None` when it is not VM-registered (so `conforms` falls back to the shared
+    /// tree-walker `find_method`). Mirrors `arity_compatible` over the compiled proto's
+    /// params.
+    pub(crate) fn class_method_satisfies(
+        &self,
+        class: &Rc<crate::value::Class>,
+        name: &str,
+        req: &crate::value::MethodReq,
+    ) -> Option<bool> {
+        if !self.is_vm_class(class) {
+            return None;
+        }
+        match self.find_compiled_method(class, name) {
+            Some((closure, _)) => {
+                let params = &closure.proto.params;
+                Some(crate::interp::arity_compatible_params(params, req))
+            }
+            None => Some(false),
+        }
     }
 
     /// The compiled method closure for `(class identity, name)` looked up ON the
@@ -3846,7 +3917,7 @@ impl Vm {
             if !closure.proto.is_async && !closure.proto.is_generator {
                 let what = closure.proto.chunk.name.as_deref().unwrap_or("method");
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
                 let slot_base = fiber.stack.len();
                 let slot_count = closure.proto.chunk.slot_count as usize;
                 let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
@@ -4166,6 +4237,16 @@ impl Vm {
         use crate::vm::adapt::{ArithCache, ArithKind};
 
         let chunk = &fiber.frame().closure.proto.chunk;
+        // IFACE §5.2: `instanceof` routes through the shared `&self`
+        // `Interp::eval_instanceof` (class → nominal `is_instance_of`; interface →
+        // structural `conforms`) — the SAME path the tree-walker takes. It needs the
+        // engine state (verdict cache) the free `apply_binop` cannot reach, so it is
+        // intercepted here ahead of BOTH the kill-switch and the arithmetic fast path
+        // (a pure memo, active in specialized AND generic modes → byte-identical).
+        if let BinOp::InstanceOf = op {
+            let span = chunk.span_at(fault_ip);
+            return self.interp.eval_instanceof(a, b, span);
+        }
         // KILL SWITCH (V11-T5): with specialization OFF, never observe/specialize/
         // deopt — go straight through the shared generic `apply_binop`. The result
         // and every panic message are identical to the specialized fast path (which
@@ -4482,7 +4563,7 @@ impl Vm {
         // Bind the user args (arity + per-param contracts + rest) against the
         // method's declared params (which EXCLUDE self) — shared with every call
         // path. The bound values land in slots 1.. (self is slot 0).
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
         // A generator method (`fn*` / `async fn*`) is NOT run inline: it binds `self`
         // and args into a NOT-STARTED fiber and wraps it in a VM-backed
         // `GeneratorHandle`, returning a `Value::Generator` immediately — exactly like
@@ -4585,7 +4666,7 @@ impl Vm {
             return Ok(Value::Future(fut));
         }
         let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
         // `static fn*` / `static async fn*`: build a NOT-STARTED fiber, bind args
         // into slots 0.., wrap in a VM `GeneratorHandle`. No receiver/self slot.
         if closure.proto.is_generator {

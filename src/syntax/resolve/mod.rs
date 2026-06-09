@@ -350,7 +350,7 @@ impl Resolver {
             let decl: &ResolvedNode = if child.kind() == ExportStmt {
                 match child
                     .children()
-                    .find(|c| matches!(c.kind(), FnDecl | ClassDecl | EnumDecl))
+                    .find(|c| matches!(c.kind(), FnDecl | ClassDecl | EnumDecl | InterfaceDecl))
                 {
                     Some(d) => d,
                     None => continue,
@@ -361,6 +361,7 @@ impl Resolver {
             let (name, kind) = match decl.kind() {
                 FnDecl => (fn_name(decl), BindingKind::Fn),
                 ClassDecl => (ident_text(decl), BindingKind::Class),
+                InterfaceDecl => (ident_text(decl), BindingKind::Interface),
                 EnumDecl => (ident_text(decl), BindingKind::Enum),
                 _ => continue,
             };
@@ -494,7 +495,7 @@ impl Resolver {
                     self.register_global(name, false);
                 }
             }
-            ClassDecl | EnumDecl => {
+            ClassDecl | EnumDecl | InterfaceDecl => {
                 if let Some(name) = ident_text(node) {
                     self.register_global(name, false);
                 }
@@ -692,6 +693,18 @@ impl Resolver {
                     }
                 }
                 self.resolve_class(node);
+            }
+            InterfaceDecl => {
+                // IFACE: a NESTED interface declares a frame-local binding (a top-level
+                // one is a module-global, hoisted by `collect_module_globals`). The body
+                // holds only method SIGNATURES (no executable expressions) and `extends`
+                // NAMES that resolve lazily at runtime via the VM's class/module env, so
+                // nothing inside needs resolving here.
+                if let Some(name) = ident_text(node) {
+                    if !self.declared_in_current_scope(&name) {
+                        self.declare_binding(&name, BindingKind::Interface, node.text_range());
+                    }
+                }
             }
             ImportStmt => {
                 self.declare_import_bindings(node);

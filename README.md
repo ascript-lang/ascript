@@ -43,7 +43,7 @@ print(`${user.name} — ${user.role}`)
 
 The guiding model is **a focused core with a Go-class standard library.** The core stays
 approachable — a small set of value kinds, gradual type contracts, no hidden control flow — but it is
-genuinely multi-paradigm: object-oriented (classes, inheritance, `instanceof`), functional (closures,
+genuinely multi-paradigm: object-oriented (classes, inheritance, structural interfaces, `instanceof`), functional (closures,
 pattern matching, generators, destructuring, ranges, lazy streams), and concurrent (`async`/`await`,
 structured concurrency, channels, durable workflows, shared-nothing workers for multi-core parallelism).
 It runs on a register-light **bytecode VM** with
@@ -63,7 +63,8 @@ here means a core you can hold in your head and no hidden control flow — not a
 - **Ranges** — `a..b` (exclusive) and `a..=b` (inclusive) are sequences whose direction follows the bounds (`10..1` counts down). A signed `step` (`1..10 step 2`, `10..1 step -2`) sets the stride; omit it and the direction is inferred. A range as a value materializes to `array<number>`; `for`-range stays lazy; stepped ranges also work in `match` patterns (strided membership). See [the docs](docs/content/language/syntax.md#ranges).
 - **Destructuring** — pull fields out of an object or instance by key with `let {a, b as local, "k" as v} = obj`; missing keys bind `nil`.
 - **Default parameters** — `fn f(a, b = 10)` (also arrows, methods, `init`, `async fn`, `fn*`): evaluated at call time, left-to-right, can reference earlier params, typed defaults are contract-checked; an explicit `nil` suppresses the default. A required param may not follow a defaulted one.
-- **`instanceof`** — `x instanceof C` tests class membership up the superclass chain (a comparison-tier operator); a non-instance left side is `false`, never a panic.
+- **`instanceof`** — `x instanceof C` tests class membership up the superclass chain (a comparison-tier operator); a non-instance left side is `false`, never a panic. The right-hand side may also be a **structural interface**, in which case it is a structural conformance check.
+- **Structural interfaces** — an `interface` names a **method set**; a value conforms if it structurally has those methods (Go-style, retroactive, no inheritance required). `class C implements I` asserts intent; `x instanceof I` is a structural conformance check; an interface name is a valid contract type; `interface RW extends Reader, Writer` composes method sets. The runtime check is structural-and-permissive (name + call-shape); full static interface type-checking is a later milestone. See [the docs](docs/content/language/classes-enums.md#interfaces).
 - **Map literals** — `#{ keyExpr: value, … }` builds a `map` directly (no `std/map` import); the key is an expression, keys may be any hashable value, `#{}` is empty, repeated keys are later-wins.
 - **Records** — a class that declares fields but writes no `init` auto-derives a **positional constructor** over its fields in declaration order (base-class fields first); a defaulted field becomes an optional trailing parameter, each arg is contract-checked. Field defaults may be any expression, including ranges (`xs: array<number> = 1..=3`).
 - **`object.freeze` / `object.isFrozen`** — shallow, one-way runtime freeze of a container or instance (returns it for chaining); any later in-place mutation panics. `deepClone` of a frozen value is unfrozen.

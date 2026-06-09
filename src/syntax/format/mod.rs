@@ -219,6 +219,7 @@ impl Printer<'_> {
                 self.out.newline();
             }
             EnumDecl => self.enum_decl(node),
+            InterfaceDecl => self.interface_decl(node),
             ImportStmt => {
                 self.out.text(&normalize_import(node));
                 self.out.newline();
@@ -334,6 +335,15 @@ impl Printer<'_> {
                 self.out.text(sup);
             }
         }
+        // IFACE: canonical order is `extends Super implements A, B` (after extends,
+        // before the body). The names live inside the `ImplementsClause` child.
+        if let Some(im) = node.children().find(|c| c.kind() == ImplementsClause) {
+            let names = iface_clause_names(im);
+            if !names.is_empty() {
+                self.out.text(" implements ");
+                self.out.text(&names.join(", "));
+            }
+        }
         self.out.text(" {");
         self.out.newline();
         self.out.indent();
@@ -369,6 +379,68 @@ impl Printer<'_> {
 
         self.out.dedent();
         self.out.text("}");
+        self.out.newline();
+    }
+
+    /// IFACE §3: render `interface Name [extends A, B] { fn m(...)[: T] }`. The
+    /// `extends` composition list is comma-joined; method requirements render one
+    /// per line (a signature with NO body). An empty body collapses to `{\n}`.
+    fn interface_decl(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("interface ");
+        if let Some(name) = first_ident_text(node) {
+            self.out.text(&name);
+        }
+        if let Some(ext) = node.children().find(|c| c.kind() == ExtendsList) {
+            let names = iface_clause_names(ext);
+            if !names.is_empty() {
+                self.out.text(" extends ");
+                self.out.text(&names.join(", "));
+            }
+        }
+        self.out.text(" {");
+        self.out.newline();
+        self.out.indent();
+
+        let reqs: Vec<&ResolvedNode> =
+            node.children().filter(|c| c.kind() == MethodReq).collect();
+        for (i, m) in reqs.iter().enumerate() {
+            if i > 0 {
+                let blank = self
+                    .comments
+                    .leading
+                    .get(&m.text_range())
+                    .and_then(|l| l.first())
+                    .map(|c| c.blank_before)
+                    .unwrap_or(false);
+                if blank {
+                    self.out.blank();
+                }
+            }
+            self.emit_leading(m);
+            self.method_req(m);
+            self.emit_trailing(m);
+        }
+
+        self.out.dedent();
+        self.out.text("}");
+        self.out.newline();
+    }
+
+    /// IFACE §3: one interface method requirement — `fn name(params)[: ret]`, no body.
+    fn method_req(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("fn ");
+        if let Some(name) = first_ident_text(node) {
+            self.out.text(&name);
+        }
+        self.params(node);
+        if let Some(rt) = node.children().find(|c| c.kind() == RetType) {
+            self.out.text(": ");
+            if let Some(ty) = rt.children().find(|c| is_type_kind(c.kind())) {
+                self.type_ann(ty);
+            }
+        }
         self.out.newline();
     }
 
@@ -1080,6 +1152,18 @@ fn first_ident_text(node: &ResolvedNode) -> Option<String> {
         .filter_map(|el| el.into_token())
         .find(|t| t.kind() == SyntaxKind::Ident)
         .map(|t| t.text().to_string())
+}
+
+/// IFACE: the interface NAMES in an `ExtendsList`/`ImplementsClause`. The clause's
+/// first ident token is the contextual introducer (`extends`/`implements`, lexed as
+/// `Ident`); the remaining idents are the comma-separated interface names.
+fn iface_clause_names(node: &ResolvedNode) -> Vec<String> {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .skip(1) // the introducing `extends`/`implements` keyword
+        .map(|t| t.text().to_string())
+        .collect()
 }
 
 fn is_pattern_kind(kind: SyntaxKind) -> bool {
