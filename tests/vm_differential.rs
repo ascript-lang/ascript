@@ -7553,23 +7553,25 @@ async fn type_arg_disambiguation_byte_identical() {
 #[tokio::test]
 async fn worker_examples_all_modes_byte_identical() {
     let root = env!("CARGO_MANIFEST_DIR");
+    // Select by USAGE, not filename: ANY example that dispatches a worker — a pooled
+    // `worker fn`, a `worker class`, or the dedicated `run_in_worker({caps})` path — must
+    // be four-mode byte-identical (incl. `ascript run x.aso`). Matching the source (not a
+    // `workers_*` filename) ensures a differently-named worker example (e.g.
+    // `caps_sandbox.as`, which exercises the dedicated `.aso`-sensitive path) can't slip
+    // the `.aso` mode — the gap that let a real four-mode divergence through.
     let worker_examples: Vec<String> = all_corpus_examples()
         .into_iter()
         .filter(|p| {
-            p.contains("workers_")
-                // file stem starts with "workers_" (guards against a hypothetical
-                // "no_workers_foo.as" path component that contains the substring but
-                // isn't actually a worker example).
-                && std::path::Path::new(p)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("workers_"))
-                    .unwrap_or(false)
+            let path = std::path::Path::new(root).join(p);
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            src.contains("worker fn")
+                || src.contains("worker class")
+                || src.contains("run_in_worker")
         })
         .collect();
     assert!(
         !worker_examples.is_empty(),
-        "no worker examples found — expected workers_*.as files in examples/ or examples/advanced/"
+        "no worker examples found — expected worker-using .as files in examples/ or examples/advanced/"
     );
     for rel in &worker_examples {
         let path = std::path::Path::new(root).join(rel);

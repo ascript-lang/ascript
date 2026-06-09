@@ -1385,6 +1385,25 @@ pub fn build_class_slice_for_interp(
     build_class_slice(&top, class_name)
 }
 
+/// Build a plain `worker fn` slice for `entry_name`, resolving the top-level chunk
+/// from either retained source (run-from-source) or the stored `.aso` bytes
+/// (`ascript run x.aso`) via [`resolve_worker_top_chunk`]. Mirrors
+/// [`build_code_slice_from_source`] but adds the `.aso`-mode fallback — required by
+/// the DEDICATED-isolate `run_in_worker({caps})` path, which (unlike a bare
+/// `worker fn` call) is the SAME shared method on both engines and so must work in
+/// the 4th execution mode (`ascript run x.aso`) too, not just run-from-source.
+pub fn build_code_slice_for_interp(
+    interp: &crate::interp::Interp,
+    entry_name: &str,
+) -> Result<WorkerCodeSlice, Control> {
+    let top = resolve_worker_top_chunk(
+        interp,
+        &format!("worker fn '{entry_name}'"),
+        "worker fns",
+    )?;
+    build_code_slice(&top, entry_name, None)
+}
+
 /// Build the `worker fn*` stream slice for `entry_name`, resolving the top-level
 /// chunk from either retained source or the stored `.aso` bytes. Mirrors
 /// [`build_code_slice_from_source`] but adds the `.aso`-mode fallback (Plan A

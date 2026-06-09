@@ -5796,7 +5796,11 @@ impl Interp {
             return crate::worker::dispatch_worker_inline(self, &entry_name, worker_args, span);
         }
 
-        let slice = crate::worker::build_code_slice_from_source(self, &entry_name, None)?;
+        // Use the `.aso`-aware slice builder: `run_in_worker` is the SAME shared method
+        // on both engines (no VM-specific override like a bare `worker fn` call has), so
+        // it must build the slice from retained source OR the stored `.aso` bytes to stay
+        // four-mode byte-identical (it previously failed under `ascript run x.aso`).
+        let slice = crate::worker::build_code_slice_for_interp(self, &entry_name)?;
         match reduced {
             // Cap-reduced → DEDICATED single-tenant isolate carrying the reduced CapSet.
             Some(caps) => {
