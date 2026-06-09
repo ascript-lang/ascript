@@ -11,6 +11,13 @@ readme = "README.md"
 name = "ascript"
 path = "src/lib.rs"
 
+# FUZZ: declare the `fuzzing` cfg (set by cargo-fuzz / a libFuzzer build) so the
+# `#[cfg(any(test, fuzzing))] mod fuzzgen` gate does not trip `unexpected_cfgs` on a
+# normal build. It is never set by `cargo build`/`cargo test` here — only the `test`
+# arm of the gate is active in-tree.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [[bin]]
 name = "ascript"
 path = "src/main.rs"
@@ -128,6 +135,13 @@ ungrammar = "1"
 [dev-dependencies]
 tree-sitter = "0.25"
 tempfile = "3"
+# FUZZ (differential fuzzing & property testing). Dev-only: neither enters the
+# production graph (the `src/fuzzgen/` generator is `#[cfg(any(test, fuzzing))]`-gated
+# and `arbitrary` is dev-dep-only), so a plain `cargo build` / `--no-default-features`
+# build is unaffected. `arbitrary` is the shared unstructured-bytes source so the SAME
+# generator can later feed a libFuzzer target (nightly-gated unit) by `#[path]`-include.
+proptest = "1"
+arbitrary = { version = "1", features = ["derive"] }
 
 [features]
 default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared"]

@@ -7,6 +7,12 @@ pub mod diagnostics;
 pub mod env;
 pub mod error;
 pub mod fmt;
+// FUZZ: the grammar-aware source generator (the differential-fuzzing core asset).
+// Crate-gated so it compiles into `ascript` ONLY for `cargo test` (the `test` cfg) and a
+// `--cfg fuzzing` libFuzzer build — never in a normal/`--no-default-features` build, and
+// `arbitrary` (a dev-dependency) never enters the production graph (plan Task 4, spec §3.1).
+#[cfg(any(test, fuzzing))]
+pub mod fuzzgen;
 pub mod gc;
 pub mod interp;
 pub(crate) mod lex_literals;
