@@ -2206,6 +2206,15 @@ fn check_field_default_type_lint_and_allow_suppression() {
         !allowed_out.contains("\"code\":\"type-mismatch\""),
         "--allow type-mismatch should suppress the diagnostic, got:\n{allowed_out}"
     );
+    // INTENTIONAL (review-locked): `type-mismatch` subsumes the legacy advisory, so
+    // `--allow type-mismatch` silences the WHOLE mistake class — the legacy
+    // `field-default-type` Warning must NOT resurface (subsumption runs before the
+    // allow filter; see analyze.rs). A future reordering that resurfaced it would be a
+    // DX regression this assertion catches.
+    assert!(
+        !allowed_out.contains("\"code\":\"field-default-type\""),
+        "--allow type-mismatch must not resurface the subsumed legacy advisory, got:\n{allowed_out}"
+    );
 
     let _ = std::fs::remove_file(&file);
 }

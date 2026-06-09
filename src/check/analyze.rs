@@ -89,6 +89,16 @@ pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
     // it away). Drop the legacy advisory so the user sees the single sound Error,
     // not a duplicate Warning. (Advisory inference `type-mismatch`es still de-dup on
     // the inference side; this only fires for the blocking Error case.)
+    //
+    // ORDERING IS INTENTIONAL: subsumption runs BEFORE inline-ignore + the config
+    // remap below. `type-mismatch` is the canonical diagnostic for these mistakes
+    // (it SUBSUMES the legacy `contract-mismatch`/`field-default-type`, which are on a
+    // one-release retirement path). So `--allow type-mismatch` (or an inline ignore /
+    // a `[lint]` drop) silences the WHOLE mistake class — the legacy advisory does NOT
+    // resurface. That is the better DX: a user who opted out of `type-mismatch` would
+    // be confused to still get a differently-named warning about the very same line.
+    // `--warn type-mismatch` instead keeps a single downgraded Warning. Locked by
+    // `tests/cli.rs::check_field_default_type_lint_and_allow_suppression`.
     let blocking_type_spans: std::collections::HashSet<usize> = diagnostics
         .iter()
         .filter(|d| d.code == "type-mismatch" && d.severity == Severity::Error)

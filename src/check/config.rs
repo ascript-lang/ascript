@@ -47,7 +47,10 @@ pub const RULE_CODES: &[&str] = &[
     "duplicate-member",
     "super-misuse",
     "field-default-type",
-    // SP10 — the advisory gradual type checker (all default Warning).
+    // SP10/TYPE — the gradual type checker. `type-error`/`possibly-nil` default
+    // Warning (advisory); `type-mismatch` defaults to a BLOCKING Error when the slot is
+    // explicitly annotated (sound-for-annotated) and Warning otherwise — the emit site
+    // chooses the severity, `effective` only overrides it (see `effective` + analyze.rs).
     "type-mismatch",
     "type-error",
     "possibly-nil",
