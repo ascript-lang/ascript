@@ -7984,3 +7984,41 @@ async fn vm_match_value_pattern_decimal_matches_treewalker() {
         assert_four_way_run(src).await;
     }
 }
+
+#[tokio::test]
+async fn vm_propagate_then_map_literal_or_later_ternary_matches_treewalker() {
+    // FUZZ Unit 2 bug #3 (CST `ternary_ahead` scanner): a postfix propagate `?` was
+    // MISPARSED as a ternary when a `:` followed it at apparent depth 0 — either inside a
+    // `#{ key: value }` MAP LITERAL (whose `#{` opener `HashLBrace` was not counted toward
+    // bracket depth) or in a LATER statement's real ternary (the scan didn't stop at a
+    // statement-introducing keyword). The legacy oracle's trial-parse handles both; the CST
+    // heuristic now counts `HashLBrace` and stops at a depth-0 statement keyword. These
+    // programs parse + run on the legacy front-end but used to be REJECTED by the CST/VM
+    // front-end with `expected ':' in ternary` / `expected expression`.
+    let cases = [
+        // Propagate `?` then a `#{ k: v }` map literal on the next line, then a real ternary.
+        "import * as map from \"std/map\"\n\
+         fn rok(x) { return [x, nil] }\n\
+         fn f(p) {\n\
+           let pv = rok(p)?\n\
+           print(len(#{1: pv}))\n\
+           return 1\n\
+         }\n\
+         print(f(2))\n\
+         print((false ? 1 : 0))",
+        // Propagate `?` directly followed (next line) by a `return r ? a : b` real ternary.
+        "fn g(v) { return [v, nil] }\n\
+         fn h(p) {\n\
+           let r = g(p)?\n\
+           return r ? 100 : 200\n\
+         }\n\
+         print(h(1))",
+        // A genuine multi-line ternary at top level must STILL parse as a ternary (no regress).
+        "let x = true ?\n  1 :\n  2\nprint(x)",
+        // A ternary whose then-branch is a map literal stays a ternary (HashLBrace inside it).
+        "let x = 5\nprint(x > 0 ? #{1: 10} : #{2: 20})",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
+    }
+}

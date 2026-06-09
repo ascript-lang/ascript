@@ -911,7 +911,12 @@ fn ternary_ahead(p: &Parser) -> bool {
     let mut i = p.pos + 1; // scan AFTER the `?`
     while i < p.nontrivia.len() {
         match p.tokens[p.nontrivia[i]].kind {
-            LParen | LBracket | LBrace => depth += 1,
+            // `#{` (HashLBrace) opens a MAP LITERAL — its inner `key: value` colon is NOT a
+            // ternary colon, so it MUST raise the bracket depth like any other opener.
+            // Omitting it made a `?` propagate followed by a `#{ k: v }` map literal (and a
+            // later real ternary's `:`) misparse as a ternary — the map-literal colon was seen
+            // at depth 0. It is closed by a plain `}` (RBrace), already handled below.
+            LParen | LBracket | LBrace | HashLBrace => depth += 1,
             RParen | RBracket => depth -= 1,
             RBrace => {
                 if depth == 0 {
@@ -920,6 +925,20 @@ fn ternary_ahead(p: &Parser) -> bool {
                 depth -= 1;
             }
             Semicolon if depth == 0 => return false,
+            // A STATEMENT-INTRODUCING keyword at depth 0 means the `?` ended its own statement
+            // (it was a postfix propagate, not a ternary) — the legacy oracle's trial-parse
+            // `assignment()` stops at such a keyword, so a following `:` (a LATER statement's
+            // ternary colon) is NOT this `?`'s colon. Without this, `let r = g(p)?` followed by
+            // `return r ? 100 : 200` scanned into the LATER ternary's `:` and misparsed the
+            // propagate as a ternary. These keywords can never continue a ternary then-branch
+            // at depth 0. (NOTE: `match` is an EXPRESSION keyword, so it is deliberately
+            // EXCLUDED — `cond ? match x {…} : y` stays a valid ternary.)
+            LetKw | ConstKw | ReturnKw | IfKw | WhileKw | ForKw | BreakKw | ContinueKw | FnKw
+            | ClassKw | EnumKw | ImportKw
+                if depth == 0 =>
+            {
+                return false;
+            }
             Colon if depth == 0 => return true,
             _ => {}
         }

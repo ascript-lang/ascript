@@ -41,20 +41,24 @@
 //!     accumulator observed from outside), PER-ITERATION loop-var freshness (a closure-per-
 //!     iteration bag), and nested/curried/IIFE arrows.
 //!   - **String templates `${…}`** (incl. nested, `template_expr`).
+//!   - **`?`/`!` propagate/unwrap** over the tier-1 `[value, err]` model (always-ok `rok`/
+//!     `rerr` helpers so the happy path runs to completion; see `unwrap_expr`/`propagate_stmt`).
 //!
-//! BUGS FOUND + FIXED in-branch via this broadened differential (Gate 0): (1) a compiler
-//! `loop_refresh_slots` frame-leak — a closure in an INNER loop capturing a mutated OUTER-loop
-//! variable read `nil` on the VM (the inner loop fresh-celled an unrelated slot shared with a
-//! nested closure param); (2) the tree-walker `match` value pattern used Rust structural
-//! `PartialEq` instead of the `==`-operator equality, so a `Decimal` subject did NOT match an
-//! int/float literal pattern (the VM, compiling to `Op::Eq`, did). Both have permanent
-//! regression guards in `tests/vm_differential.rs`.
+//! BUGS FOUND + FIXED in-branch via this broadened differential (Gate 0), each with a permanent
+//! four-mode regression guard in `tests/vm_differential.rs`: (1) a compiler `loop_refresh_slots`
+//! frame-leak — a closure in an INNER loop capturing a mutated OUTER-loop variable read `nil`
+//! on the VM (the inner loop fresh-celled an unrelated slot shared with a nested closure param);
+//! (2) the tree-walker `match` value pattern used Rust structural `PartialEq` instead of the
+//! `==`-operator equality, so a `Decimal` subject did NOT match an int/float literal pattern
+//! (the VM, compiling to `Op::Eq`, did); (3) the CST `ternary_ahead` scanner misparsed a
+//! postfix propagate `?` as a ternary when a `:` followed at apparent depth 0 — inside a `#{…}`
+//! map literal (`HashLBrace` was uncounted) or in a LATER statement's real ternary (the scan
+//! didn't stop at a statement keyword).
 //!
 //! STILL NOT EMITTED (the next breadth follow-up; the differential cannot fuzz what it never
-//! generates): `?`/`!` propagate/unwrap; interfaces + structural-`instanceof`; destructuring/
-//! spread/rest in let/params; async/await/spawn/workers (deferred — nondeterministic
-//! scheduling, see spec §6); try/recover (the `recover(fn(){…})` carry-forward bug);
-//! generators `fn*`/`yield`.
+//! generates): interfaces + structural-`instanceof`; destructuring/spread/rest in let/params;
+//! async/await/spawn/workers (deferred — nondeterministic scheduling, see spec §6); try/recover
+//! (the `recover(fn(){…})` carry-forward bug); generators `fn*`/`yield`.
 //!
 //! Crate-gated `#[cfg(any(test, fuzzing))]` (in `lib.rs`) so it compiles into `ascript`
 //! ONLY for `cargo test` (and a `--cfg fuzzing` libFuzzer build) — never in a normal or
@@ -261,6 +265,15 @@ impl<'a, 'b> Gen<'a, 'b> {
             let _ = writeln!(self.out, "import * as {alias} from \"{module}\"");
             let _ = alias;
         }
+        // FUZZ Unit 2 — propagate/unwrap helpers. Two top-level result-returning fns (the
+        // tier-1 `[value, err]` model): `rok(x)` is ALWAYS-ok (`[x, nil]`) and `rerr(x)`
+        // returns ok only when `x >= 0` (`[x, nil]` else `[nil, "neg"]`). The generator uses
+        // `rok(...)!` (always succeeds → deterministic int) and `rok(...)?`/`rerr(...)?`
+        // inside generated fn bodies (the `?` early-returns the `[nil, err]` pair). Both
+        // engines share the `?`/`!` lowering, so any divergence is a real propagate/unwrap bug.
+        self.out.push_str("fn rok(x) {\n    return [x, nil]\n}\n");
+        self.out
+            .push_str("fn rerr(x) {\n    if (x >= 0) {\n        return [x, nil]\n    }\n    return [nil, \"neg\"]\n}\n");
         // A handful of top-level classes + enums (so later code can construct/match them).
         // Declared BEFORE the fns/statements so every construction + match is in scope.
         let n_classes = self.choice(3); // 0..2
@@ -449,11 +462,24 @@ impl<'a, 'b> Gen<'a, 'b> {
             6 => self.for_stmt(depth),
             7 => self.print_stmt(depth),
             8 => self.match_stmt(depth),
-            9 if self.in_fn => self.print_stmt(depth), // keep returns rare/at fn tail only
+            9 if self.in_fn => self.propagate_stmt(depth), // `?` inside a fn body
             10 => self.closure_capture_stmt(depth),
             11 => self.loop_closure_stmt(depth),
             _ => self.print_stmt(depth),
         }
+    }
+
+    /// FUZZ Unit 2 — a propagate `?` statement, legal ONLY inside a fn body (the `?` early-
+    /// returns the `[nil, err]` pair). Uses the ALWAYS-ok `rok(...)` helper so the propagate
+    /// branch is never actually taken (the fn's normal control flow + return are unchanged) —
+    /// this exercises the `ExprKind::Try` lowering on the happy path deterministically. Binds
+    /// the unwrapped int to a fresh local usable downstream.
+    fn propagate_stmt(&mut self, depth: u32) {
+        let name = self.fresh("pv");
+        let x = self.int_atom();
+        self.indent(depth);
+        let _ = writeln!(self.out, "let {name} = rok({x})?");
+        self.declare(&name, true);
     }
 
     /// FUZZ Unit 2 — closures + capture (KNOWN high-divergence: the resolver splits
@@ -683,7 +709,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         if depth >= MAX_DEPTH {
             return self.leaf_expr();
         }
-        match self.choice(18) {
+        match self.choice(19) {
             0..=2 => self.int_expr(depth),
             3 | 4 => self.float_expr(depth),
             5 => self.bool_expr(depth),
@@ -698,6 +724,7 @@ impl<'a, 'b> Gen<'a, 'b> {
             14 if !self.enums.is_empty() => self.enum_expr(depth),
             15 => self.closure_expr(depth),
             16 => self.template_expr(depth),
+            17 => self.unwrap_expr(depth),
             _ => self.int_expr(depth),
         }
     }
@@ -747,6 +774,22 @@ impl<'a, 'b> Gen<'a, 'b> {
             format!("`out ${{`in ${{{a}}}`}} {b}`")
         } else {
             format!("`v=${{{a}}} w=${{{b}}} s=${{{a} + {b}}}`")
+        }
+    }
+
+    /// FUZZ Unit 2 — an int-valued force-unwrap `!` expression over the tier-1 `[value, err]`
+    /// model. Uses the ALWAYS-ok `rok(x)` helper so the unwrap NEVER panics (keeps the
+    /// program run-to-completion); occasionally `rerr(x)` with a guaranteed-non-negative `x`
+    /// so it is also always-ok. Both engines share the `Unwrap` lowering, so a divergence is
+    /// a real propagate/unwrap bug. Deterministic int.
+    fn unwrap_expr(&mut self, _depth: u32) -> String {
+        let x = self.int_atom();
+        if self.flag() {
+            format!("rok({x})!")
+        } else {
+            // `rerr` with a known non-negative arg (a literal in 0..50) stays ok.
+            let n = self.choice(50);
+            format!("rerr({n})!")
         }
     }
 
