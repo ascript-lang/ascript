@@ -409,7 +409,7 @@ impl GeneratorHandle {
         if !started.get() {
             started.set(true);
         }
-        let encoded_input = crate::worker::serialize::encode(&to_inject)
+        let (encoded_input, encoded_shared) = crate::worker::serialize::encode(&to_inject)
             .map_err(|e| Control::Panic(crate::error::AsError::new(e.message())))?;
 
         // Take the driver OUT (no borrow held across the await). `None` here means a
@@ -419,7 +419,7 @@ impl GeneratorHandle {
             None => return Ok(None),
         };
 
-        let outcome = driver.resume(encoded_input).await;
+        let outcome = driver.resume(encoded_input, encoded_shared).await;
 
         // SP9 determinism (Task 12) — RECORD: event-source the boundary outcome (the
         // yielded bytes / done / panic) so a later Replay reproduces it without re-driving
@@ -427,7 +427,10 @@ impl GeneratorHandle {
         interp.with_determinism_mut(|ctx| {
             if ctx.mode == crate::det::Mode::Record {
                 let ev = match &outcome {
-                    Ok(Some(bytes)) => crate::det::BoundaryOutcome::Bytes(bytes.clone()),
+                    // The det log is byte-only; a yielded `Value::Shared`'s `Arc`
+                    // side-vector is not event-sourced (a frozen graph is not
+                    // replayable bytes — accepted limitation, like the actor path).
+                    Ok(Some((bytes, _shared))) => crate::det::BoundaryOutcome::Bytes(bytes.clone()),
                     Ok(None) => crate::det::BoundaryOutcome::Done,
                     Err(msg) => crate::det::BoundaryOutcome::Panic(msg.clone()),
                 };
@@ -436,10 +439,10 @@ impl GeneratorHandle {
         });
 
         match outcome {
-            Ok(Some(bytes)) => {
+            Ok(Some((bytes, shared))) => {
                 // Still producing: put the driver back for the next demand credit.
                 *driver_cell.borrow_mut() = Some(driver);
-                let v = crate::worker::serialize::decode(&bytes, &interp)
+                let v = crate::worker::serialize::decode_with_shared(&bytes, &shared, &interp)
                     .map_err(|e| Control::Panic(crate::error::AsError::new(e.message())))?;
                 Ok(Some(v))
             }

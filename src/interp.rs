@@ -2133,7 +2133,7 @@ impl Interp {
         let slice = crate::worker::build_class_slice_for_interp(self, &class.name)?;
         // Encode the init args as one array (preserving cross-arg sharing).
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
-        let encoded = crate::worker::serialize::encode(&args_array)
+        let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
         // Spawn the dedicated actor isolate + its mailbox.
@@ -2151,6 +2151,7 @@ impl Interp {
             class_name: class.name.clone(),
             slice_bytes: slice.entry_aso.to_vec(),
             args: encoded,
+            shared: encoded_shared,
             reply: init_reply_tx,
         };
         if tx.send(init_msg).is_err() {
@@ -2182,7 +2183,7 @@ impl Interp {
         let native_for_task = native.clone();
         let bridge = tokio::task::spawn_local(async move {
             let result = match init_reply_rx.await {
-                Ok(crate::worker::actor::ActorReply::Ok(_)) => Ok(native_for_task),
+                Ok(crate::worker::actor::ActorReply::Ok(..)) => Ok(native_for_task),
                 Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
                     Err(Control::Panic(AsError::at(msg, span)))
                 }
@@ -2222,7 +2223,7 @@ impl Interp {
                 .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
         }
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
-        let encoded = crate::worker::serialize::encode(&args_array)
+        let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
         // SP9 determinism (Spec B Task 12) — REPLAY: if a determinism context is active
@@ -2264,6 +2265,7 @@ impl Interp {
         let call_msg = crate::worker::actor::ActorMsg::Call {
             method: method.to_string(),
             args: encoded,
+            shared: encoded_shared,
             reply: reply_tx,
         };
         if tx.send(call_msg).is_err() {
@@ -2286,7 +2288,11 @@ impl Interp {
             // a SHORT sync borrow AFTER the `.await`, never held across it.
             if let Ok(ref r) = reply {
                 let outcome = match r {
-                    crate::worker::actor::ActorReply::Ok(bytes) => {
+                    // SRV: the determinism log is byte-only; an actor returning a
+                    // `Value::Shared` records its bytes (the `Arc` side-vector is not
+                    // event-sourced — a frozen graph is not replayable bytes, an
+                    // accepted determinism limitation for shared results).
+                    crate::worker::actor::ActorReply::Ok(bytes, _shared) => {
                         crate::det::BoundaryOutcome::Bytes(bytes.clone())
                     }
                     crate::worker::actor::ActorReply::Panic(msg) => {
@@ -2300,8 +2306,8 @@ impl Interp {
                 });
             }
             let result = match reply {
-                Ok(crate::worker::actor::ActorReply::Ok(bytes)) => {
-                    crate::worker::serialize::decode(&bytes, &interp_rc)
+                Ok(crate::worker::actor::ActorReply::Ok(bytes, shared)) => {
+                    crate::worker::serialize::decode_with_shared(&bytes, &shared, &interp_rc)
                         .map_err(|e| Control::Panic(e.into()))
                 }
                 Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
@@ -2380,7 +2386,7 @@ impl Interp {
         let slice = crate::worker::build_stream_slice_for_interp(self, entry_name)?;
         // Encode the call args as one array (preserving cross-arg sharing).
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
-        let encoded = crate::worker::serialize::encode(&args_array)
+        let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
         // Spawn the dedicated isolate + build the producer (awaits the Init ack).
@@ -2388,6 +2394,7 @@ impl Interp {
             entry_name.to_string(),
             slice.entry_aso.to_vec(),
             encoded,
+            encoded_shared,
         )
         .await
         .map_err(|msg| Control::Panic(AsError::at(msg, span)))?;

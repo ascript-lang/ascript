@@ -165,3 +165,55 @@ fn exports_destructured_names() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n");
 }
+
+// Gated on the `shared` feature: the built binary ships `std/shared` only when the
+// feature is on (it folds into `default`). Under `--no-default-features` the import is
+// an unknown-module error, so the test is skipped there.
+#[cfg(feature = "shared")]
+#[test]
+fn srv_frozen_value_crosses_worker_airlock_zero_copy() {
+    // SRV Task 6: a `shared.freeze`d value crosses the worker airlock by an Arc bump
+    // (the TAG_SHARED side-vector path), is read inside the worker, and is byte-identical
+    // on BOTH engines. Exercises dispatch_worker → WorkerRequest.shared → decode_args.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let d = temp_dir("srv_worker_shared");
+    let src = "import { freeze } from \"std/shared\"\n\
+               import { gather } from \"std/task\"\n\
+               let table = freeze({ \"a\": 1, \"b\": 2, \"c\": 3 })\n\
+               worker fn lookup(t, key) { return t[key] }\n\
+               async fn main() {\n\
+                 let r = await gather([lookup(table, \"a\"), lookup(table, \"b\"), lookup(table, \"c\")])\n\
+                 print(r)\n\
+               }\n\
+               await main()\n";
+    fs::write(d.join("w.as"), src).unwrap();
+    // VM (default engine)
+    let vm = std::process::Command::new(bin)
+        .arg("run")
+        .arg(d.join("w.as"))
+        .output()
+        .unwrap();
+    assert!(
+        vm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&vm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&vm.stdout), "[1, 2, 3]\n");
+    // Tree-walker oracle — byte-identical.
+    let tw = std::process::Command::new(bin)
+        .arg("run")
+        .arg("--tree-walker")
+        .arg(d.join("w.as"))
+        .output()
+        .unwrap();
+    assert!(
+        tw.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&tw.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&tw.stdout),
+        String::from_utf8_lossy(&vm.stdout),
+        "tree-walker must match the VM for a frozen value across the airlock"
+    );
+}

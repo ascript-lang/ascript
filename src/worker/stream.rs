@@ -60,6 +60,8 @@ pub enum StreamMsg {
         slice_bytes: Vec<u8>,
         /// Structured-clone-encoded ARRAY of the positional generator-call args.
         args: Vec<u8>,
+        /// SRV §3.7(b) frozen-`Arc` side-vector for `Value::Shared` args.
+        shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
         reply: oneshot::Sender<StreamReply>,
     },
     /// One demand credit. `input` is the structured-clone-encoded value `.next(v)`
@@ -67,6 +69,8 @@ pub enum StreamMsg {
     /// FIRST resume the producer ignores it (local-generator first-`next` semantics).
     Resume {
         input: Vec<u8>,
+        /// SRV §3.7(b) frozen-`Arc` side-vector for a `Value::Shared` injected value.
+        shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
         reply: oneshot::Sender<StreamReply>,
     },
 }
@@ -75,8 +79,9 @@ pub enum StreamMsg {
 pub enum StreamReply {
     /// `Init` succeeded (the producer generator is built and ready).
     Ack,
-    /// A `yield`ed value, structured-clone-encoded.
-    Yielded(Vec<u8>),
+    /// A `yield`ed value, structured-clone-encoded + the SRV §3.7(b) frozen-`Arc`
+    /// side-vector (a producer may `yield` a `shared.freeze`d value).
+    Yielded(Vec<u8>, Vec<std::sync::Arc<crate::value::SharedNode>>),
     /// The generator finished (its body returned / closed). No more values.
     Done,
     /// An uncaught Tier-2 panic raised inside the producer body (or a sendability
@@ -117,6 +122,7 @@ impl StreamDriver {
         entry_name: String,
         slice_bytes: Vec<u8>,
         encoded_args: Vec<u8>,
+        encoded_shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
     ) -> Result<StreamDriver, String> {
         // A typed `Send` demand channel; the dedicated `IsolateHandle`'s own byte
         // channel is unused (the stream protocol is typed, not raw bytes) — we keep the
@@ -131,6 +137,7 @@ impl StreamDriver {
             entry_name,
             slice_bytes,
             args: encoded_args,
+            shared: encoded_shared,
             reply: ack_tx,
         };
         if tx.send(init).is_err() {
@@ -158,10 +165,16 @@ impl StreamDriver {
     /// AWAIT DISCIPLINE: no `RefCell` borrow is held — the `Send` sender is owned by the
     /// driver and the reply rides a `oneshot`. The caller ([`crate::coro`]) takes the
     /// driver OUT of its `RefCell<Option<..>>` before calling this (take-out-across-await).
-    pub async fn resume(&self, encoded_input: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
+    #[allow(clippy::type_complexity)]
+    pub async fn resume(
+        &self,
+        encoded_input: Vec<u8>,
+        encoded_shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
+    ) -> Result<Option<(Vec<u8>, Vec<std::sync::Arc<crate::value::SharedNode>>)>, String> {
         let (reply_tx, reply_rx) = oneshot::channel::<StreamReply>();
         let msg = StreamMsg::Resume {
             input: encoded_input,
+            shared: encoded_shared,
             reply: reply_tx,
         };
         if self.tx.send(msg).is_err() {
@@ -170,7 +183,7 @@ impl StreamDriver {
             return Ok(None);
         }
         match reply_rx.await {
-            Ok(StreamReply::Yielded(bytes)) => Ok(Some(bytes)),
+            Ok(StreamReply::Yielded(bytes, shared)) => Ok(Some((bytes, shared))),
             Ok(StreamReply::Done) => Ok(None),
             Ok(StreamReply::Panic(msg)) => Err(msg),
             Ok(StreamReply::Ack) => {
@@ -198,9 +211,10 @@ async fn stream_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Stre
                 entry_name,
                 slice_bytes,
                 args,
+                shared,
                 reply,
             } => {
-                match build_producer(&vm, &interp, &entry_name, &slice_bytes, &args).await {
+                match build_producer(&vm, &interp, &entry_name, &slice_bytes, &args, &shared).await {
                     Ok(gen) => {
                         producer = Some(gen);
                         let _ = reply.send(StreamReply::Ack);
@@ -210,7 +224,11 @@ async fn stream_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Stre
                     }
                 }
             }
-            StreamMsg::Resume { input, reply } => {
+            StreamMsg::Resume {
+                input,
+                shared,
+                reply,
+            } => {
                 let Some(gen) = producer.clone() else {
                     let _ = reply.send(StreamReply::Panic(
                         "streaming generator received a demand credit before initialization"
@@ -218,7 +236,7 @@ async fn stream_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Stre
                     ));
                     continue;
                 };
-                let r = resume_producer(&interp, &gen, &input).await;
+                let r = resume_producer(&interp, &gen, &input, &shared).await;
                 let _ = reply.send(r);
             }
         }
@@ -234,12 +252,13 @@ async fn build_producer(
     entry_name: &str,
     slice_bytes: &[u8],
     args: &[u8],
+    shared: &[std::sync::Arc<crate::value::SharedNode>],
 ) -> Result<Value, String> {
     crate::worker::isolate::load_slice(vm, Some(slice_bytes)).await?;
     let entry = vm.user_global(entry_name).ok_or_else(|| {
         format!("streaming generator entry '{entry_name}' was not defined by its code slice")
     })?;
-    let arg_values = crate::worker::isolate::decode_args(args, interp)?;
+    let arg_values = crate::worker::isolate::decode_args_with_shared(args, shared, interp)?;
     // Calling a `worker fn*` on the isolate's Vm builds a LOCAL `Value::Generator` (the
     // proto's is_worker flag is irrelevant on the isolate — the entry runs as a plain
     // generator there; the cross-thread streaming is the CALLER-side driver). It does
@@ -271,8 +290,9 @@ async fn resume_producer(
     interp: &crate::interp::Interp,
     gen: &Value,
     input: &[u8],
+    shared: &[std::sync::Arc<crate::value::SharedNode>],
 ) -> StreamReply {
-    let injected = match crate::worker::serialize::decode(input, interp) {
+    let injected = match crate::worker::serialize::decode_with_shared(input, shared, interp) {
         Ok(v) => v,
         Err(e) => return StreamReply::Panic(e.message()),
     };
@@ -281,7 +301,7 @@ async fn resume_producer(
     };
     match handle.resume(injected).await {
         Ok(Some(v)) => match crate::worker::serialize::encode(&v) {
-            Ok(bytes) => StreamReply::Yielded(bytes),
+            Ok((bytes, shared)) => StreamReply::Yielded(bytes, shared),
             // A non-sendable yielded value (e.g. a raw native resource) is a sendability
             // panic with a field path — it cannot cross the boundary.
             Err(e) => StreamReply::Panic(e.message()),
