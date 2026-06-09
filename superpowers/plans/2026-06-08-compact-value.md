@@ -217,11 +217,23 @@ as the soundness baseline.
   a small PR exposing the `NonNull<RawCcBox<T,O>>` round-trip; `src/cc.rs:79`). The layout-coupling
   `transmute` over the private `#[repr(C)] RawCcBox` (`src/cc.rs:38-79`) is **REJECTED as fragile** (spec
   §8) — do not take it.
-- [ ] **Record the verdict (owner-noted, never silent — Gate 6):** if (a) `into_raw`/`from_raw` is available
+- [x] **Record the verdict (owner-noted, never silent — Gate 6):** if (a) `into_raw`/`from_raw` is available
   upstream AND (b) the §3.3 GC-soundness design (decode-in-`Value::trace` + correct tag-dispatched
   `Clone`/`Drop`) is judged to pass the V13-T4/T6 gates on the tagged layout → **proceed to Task 6**. Else
-  → **STOP at Stage 1's 16-byte enum**, mark Stage 2 deferred in `roadmap.md` + the design spec with the
+  → **STOP at the niche-fallback floor**, mark Stage 2 deferred in `roadmap.md` + the design spec with the
   reason, and **skip Tasks 6–8** (jump to Stage 3 over the niche-fallback enum, which still benefits).
+  > **VERDICT (2026-06-09): STOP — Stage 2 (NaN-box → 8 B) DEFERRED, owner-noted.** Criterion (a) is NOT
+  > met: **gcmodule 0.3.3 (the pinned dependency) exposes no public `Cc::into_raw`/`from_raw`** — verified by
+  > inspecting `~/.cargo/.../gcmodule-0.3.3/src/cc.rs`: the only `into_raw`/`from_raw` are PRIVATE
+  > `Box::into_raw`/`from_raw` over the internal `RawCcBox`; there is no public `Cc`↔raw-`NonNull` round-trip.
+  > The NaN-box requires tagging/untagging a raw `Cc` pointer, so it cannot be built soundly on this API. The
+  > only supported path (a small upstream PR adding `into_raw`/`from_raw`) is an external, multi-week,
+  > uncertain process **out of this campaign's scope**, and the layout-coupling `transmute` over the private
+  > `#[repr(C)] RawCcBox` is **REJECTED as fragile (spec §8)** — do NOT take it. Per the spec's *designed*
+  > fallback (§3.3: "absent that, the niche fallback is the floor"), VAL stops at the niche-optimized enum and
+  > pursues **Stage 3 (Task 9 — thin-`Str`) to reach the 16-byte floor** (the corrected floor; Stage 1 is 24).
+  > 8 bytes remains a future item IF/when gcmodule gains the raw API (a deferred follow-up, never a silent
+  > drop). Tasks 6–8 are SKIPPED.
 - [ ] **Review:** an independent reviewer confirms the verdict's evidence (the upstream PR state / the
   soundness argument) and signs off on proceed-vs-stop. Commit the recorded decision.
 

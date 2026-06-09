@@ -497,8 +497,15 @@ shippable and gated.
 
 **Out of scope / deferred (recorded per `goal.md` Gate 6):**
 - **Full NaN-box pointer layer if its gate fails (§3.3).** Stage 2 is *gated*; if `Cc::into_raw`/`from_raw`
-  isn't available upstream or the GC-soundness suite fails on the tagged layout, VAL stops at the 16-byte
-  niche fallback — an owner-noted stopping point, not a silent drop.
+  isn't available upstream or the GC-soundness suite fails on the tagged layout, VAL stops at the niche
+  fallback — an owner-noted stopping point, not a silent drop.
+  > **GATE VERDICT (2026-06-09, plan Task 5): STOP — Stage 2 (NaN-box → 8 B) DEFERRED.** gcmodule 0.3.3 (the
+  > pinned dependency) exposes **no public `Cc::into_raw`/`from_raw`** (verified against the crate source: only
+  > private `Box::into_raw`/`from_raw` over the internal `RawCcBox`). The supported fix (a small upstream PR)
+  > is external/multi-week/out-of-campaign-scope, and the private-`RawCcBox` `transmute` is rejected as
+  > fragile (§8). So VAL stops at the **niche-optimized enum** and pursues Stage 3 (thin-`Str`, Task 9) to the
+  > **16-byte** floor (Stage 1 lands at 24 — see the §3.3 size CORRECTION; 8 B needs the NaN-box). 8 B is a
+  > future follow-up IF gcmodule gains the raw API. Tasks 6–8 are skipped.
 - **A bump/region allocator or a GC rework.** The cycle-collector rework (if collection pauses ever dominate
   under server load) is an explicitly sanctioned *future* deferral (`goal.md`), not in VAL.
 - **The JIT.** Gated on NUM + VAL by design (`goal.md`); VAL is its prerequisite, not its scope.
