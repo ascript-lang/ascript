@@ -1785,6 +1785,57 @@ mod tests {
         assert!(matches!(&obj, Value::Object(c) if crate::gc::cc_ptr_eq(c, &cell)));
     }
 
+    // VAL Task 3 — the SMI↔boxed spill-BOUNDARY round-trip + Map-key fold (spec
+    // §7.2), value-layer half. The boundary values straddle the NaN-box SMI budget
+    // (`i48`, range `[−2^47, 2^47 − 1]`): under the Stage-1 niche-fallback layout
+    // `Int` is a FULL inline `i64` — there is no SMI and no spill, so every value
+    // below round-trips through the inline scalar word TRIVIALLY (this is the
+    // assertion the plan/spec require to pass today; it becomes the LIVE SMI/spill
+    // boundary if/when the Stage-2 NaN-box lands and the encoding gains a 48-bit
+    // SMI). The engine-level (tree-walker == specialized-VM == generic-VM) half of
+    // §7.2 — arithmetic carry, comparison, and Map-key fold across the boundary on
+    // real `.as` programs — lives in `tests/vm_differential.rs`
+    // (`smi_boundary_*`).
+    #[test]
+    fn smi_boundary_round_trip_and_mapkey_fold() {
+        // The exact boundary values from spec §7.2: the i48 spill edges, plus a few
+        // beyond the budget (which spill to a boxed `Int` under the NaN-box; stay a
+        // full inline `i64` under the Stage-1 fallback).
+        let boundary: [i64; 7] = [
+            (1i64 << 47) - 1, // 2^47 − 1  (largest i48 SMI)
+            1i64 << 47,       // 2^47      (first spill, positive)
+            -(1i64 << 47),    // −2^47     (smallest i48 SMI)
+            -(1i64 << 47) - 1, // −2^47 − 1 (first spill, negative)
+            1i64 << 53,       // 2^53      (well beyond)
+            i64::MAX,
+            i64::MIN,
+        ];
+        for &n in &boundary {
+            // Round-trip through the value encoding via the Task-0 accessors:
+            // `decode(encode(n)) == n` (the §7.2 round-trip property). Under the
+            // inline-`i64` Stage-1 layout this is an exact pass-through.
+            assert_eq!(Value::int(n).as_int(), Some(n), "as_int round-trip for {n}");
+            // Round-trip through the Map-key fold: an `Int` value folds to
+            // `MapKey::Int(n)` and recovers the SAME value. (Under a future NaN-box,
+            // an SMI `Int` and a boxed `Int` of equal value MUST fold to the same
+            // key — there is only one logical `Int(n)`, so this property is what
+            // pins that invariant. Today both encodings are the inline `i64`.)
+            let key = MapKey::from_value(&Value::int(n)).expect("int is hashable");
+            // `MapKey` is not `Debug`, so compare with a boolean assert.
+            assert!(key == MapKey::Int(n), "MapKey fold for {n}");
+            assert_eq!(key.to_value().as_int(), Some(n), "MapKey recover for {n}");
+        }
+        // Cross-boundary fold equality: two `Int`s of the same value (regardless of
+        // any future SMI/boxed encoding split) are the SAME Map key. Constructed via
+        // two independent paths to mimic an "SMI vs boxed of equal value" pairing.
+        let lo = (1i64 << 47) - 1;
+        for &n in &[lo, lo + 1, -(1i64 << 47), i64::MAX, i64::MIN] {
+            let a = MapKey::from_value(&Value::int(n)).unwrap();
+            let b = MapKey::from_value(&Value::Int(n)).unwrap();
+            assert!(a == b, "equal-valued Ints must fold to the SAME Map key ({n})");
+        }
+    }
+
     // ADT Task 1 helpers — construct variant values directly at the value layer.
     fn unit_variant(en: &str, name: &str, backing: Value) -> Value {
         Value::EnumVariant(Rc::new(EnumVariant {

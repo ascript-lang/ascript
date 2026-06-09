@@ -4302,6 +4302,15 @@ impl Vm {
                     // apply_binop's int arm — delegated to the shared `int_binop`
                     // so the two paths cannot drift (NUM §7). The span is needed
                     // for the panic message.
+                    //
+                    // VAL Task 3 (inline-scalar SMI fast path, spec §7.2): `*x`/`*y`
+                    // read the operand's INLINE SCALAR WORD with no heap touch and no
+                    // refcount op — under the Stage-1 niche layout `Value::Int(i64)`
+                    // carries the full i64 inline, so this IS the SMI/inline-scalar
+                    // load. (Under a future Stage-2 NaN-box the matched `i64` would be
+                    // the decoded i48 SMI, or the boxed-`i64` spill — the §7.2
+                    // boundary differential pins both encodings byte-identical to this
+                    // generic-delegating computation.)
                     let span = chunk.span_at(fault_ip);
                     return crate::interp::int_binop(op, *x, *y, span);
                 }
