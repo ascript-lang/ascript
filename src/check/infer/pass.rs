@@ -1463,11 +1463,27 @@ impl<'a> Pass<'a> {
     /// The class's declared field types in DECLARATION order (the positional-
     /// construction targets when there is no `init`). Returns the template-lowered
     /// types so the unifier can solve the class's type args from `Box(5)`.
+    ///
+    /// IMPORTANT (Gate-5 soundness): `field_order` is OWN-fields-only, but a no-`init`
+    /// class with a SUPERCLASS auto-derives its positional constructor over the
+    /// base-FIRST `merged_field_schema` (`interp.rs`/`value.rs`) — so arg 0 binds to the
+    /// first BASE field at runtime, NOT the first own field. Using the own-only order
+    /// here misaligns the positional check and would manufacture a FALSE blocking
+    /// `type-mismatch` (e.g. `class Sub<T> extends Base { b: string }`; `Sub(1, "x")`
+    /// runs fine but arg 0 `1` would be checked against own-field `b: string`). Rather
+    /// than reconstruct the merged base-first order (and risk field-shadowing subtleties)
+    /// we DROP to gradual for any class with a superclass: return no positional targets,
+    /// so construction args are not field-checked and the type args stay unsolved →
+    /// `Any` (never a false `No`). Base-less generic classes (the common `Box<T>` shape)
+    /// keep precise field inference.
     fn class_field_param_types(&self, cid: usize) -> Vec<CheckTy> {
-        self.table
-            .class(cid)
-            .map(|c| c.field_order.iter().map(|(_, t)| t.clone()).collect())
-            .unwrap_or_default()
+        let Some(c) = self.table.class(cid) else {
+            return Vec::new();
+        };
+        if c.parent.is_some() {
+            return Vec::new(); // has a superclass → gradual (see doc above)
+        }
+        c.field_order.iter().map(|(_, t)| t.clone()).collect()
     }
 
     fn synth_array(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {

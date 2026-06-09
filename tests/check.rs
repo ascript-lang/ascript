@@ -440,6 +440,49 @@ fn same_typed_params_mixed_numerics_is_silent() {
 }
 
 #[test]
+fn generic_subclass_field_construction_is_gradual_silent() {
+    // Regression (TYPE Unit-D review): a no-`init` GENERIC subclass with inherited
+    // fields auto-derives its positional constructor over the base-FIRST merged field
+    // schema, so arg 0 binds to the first BASE field at runtime. The checker's own-only
+    // field order would misalign arg 0 to the first OWN field and manufacture a FALSE
+    // blocking `type-mismatch`. `Sub(1, "x")` below RUNS fine and must check clean.
+    let p = write_tmp(
+        "gen_subclass.as",
+        "class Base { a: number }\nclass Sub<T> extends Base { b: string }\nlet s = Sub(1, \"x\")\nprint(s.a)\nprint(s.b)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && !combined.contains("type-"),
+        "a generic subclass construction (base-first merged fields) must be gradual-silent; got: {combined}"
+    );
+}
+
+#[test]
+fn baseless_generic_construction_still_precise() {
+    // The subclass gradual-drop must NOT weaken base-less generic inference: an explicit
+    // type arg conflicting with the constructor value is still a blocking error.
+    let p = write_tmp(
+        "gen_baseless.as",
+        "class Box<T> { v: T }\nlet b: Box<string> = Box(5)\nprint(b)\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("type-mismatch"),
+        "a base-less Box<string> = Box(5) conflict must still be caught; got: {combined}"
+    );
+}
+
+#[test]
 fn same_typed_params_incompatible_types_still_caught() {
     // The numeric-join rescue must NOT swallow a genuine conflict: `pair(1, "s")` binds
     // T to two non-numeric-incompatible concretes — still a blocking `type-mismatch`.
