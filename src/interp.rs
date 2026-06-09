@@ -7076,6 +7076,10 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Generator(_) => "generator",
         Value::GeneratorMethod(..) => "function",
         Value::ClassMethod(..) => "function",
+        // SRV §3.5: a frozen `Shared` reports its UNDERLYING kind (a frozen routing
+        // object is an `"object"`, a frozen array an `"array"`) — user code +
+        // `instanceof` see it as the data it froze, not as a distinct "shared" type.
+        Value::Shared(n) => n.kind_name(),
     }
 }
 

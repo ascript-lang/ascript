@@ -127,6 +127,9 @@ fn unsendable_kind(v: &Value) -> Option<(&'static str, Option<&'static str>)> {
         | Value::Set(_)
         | Value::EnumVariant(_)
         | Value::Instance(_) => None,
+        // SRV §3.7: a frozen `Shared` is THE sendable-by-pointer value — it crosses
+        // by an `Arc` clone (zero copy), never a structured-clone walk. Sendable leaf.
+        Value::Shared(_) => None,
         #[cfg(feature = "data")]
         Value::Regex(_) => None,
 
