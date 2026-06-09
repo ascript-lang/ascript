@@ -901,7 +901,7 @@ pub type SharedValue = Arc<SharedNode>;
 /// `Int`, all NaNs unify, −0.0→+0.0), but uses `Arc<str>` for the string case so
 /// the whole frozen graph stays `Send + Sync` (a `MapKey`'s `Rc<str>` is `!Send`).
 /// Converts to/from `MapKey` at the freeze / read boundary.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SharedKey {
     Nil,
     Bool(bool),
@@ -1052,7 +1052,7 @@ impl SharedNode {
     /// mutable container kinds report a name (so `cannot mutate a frozen {kind}`
     /// applies), mirroring `frozen_kind` for the `!Send` `object.freeze` story.
     /// Scalars/regex/enum-variant are not mutable containers → `None`.
-    fn mutable_container_kind(&self) -> Option<&'static str> {
+    pub(crate) fn mutable_container_kind(&self) -> Option<&'static str> {
         match self {
             SharedNode::Array(_) => Some("array"),
             SharedNode::Object(_) => Some("object"),
