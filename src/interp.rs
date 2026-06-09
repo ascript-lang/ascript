@@ -965,6 +965,15 @@ impl Interp {
     /// cases) this returns `Ok(())` immediately with **no host comparison** — the
     /// dispatch-site bitset test was already conclusive. The allow-list is consulted
     /// ONLY when a carve-out exists.
+    /// FFI §4.4 (BLOCKER 1): is a `net` carve-out configured on this isolate? Used by
+    /// the HTTP path to decide whether redirects must be disabled (a redirect could
+    /// escape the host allow-list, which we only validate for the initial host).
+    /// Gate-12: a single `Option::is_some` on the `Copy`-cheap borrow — no comparison.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) fn net_carveout_active(&self) -> bool {
+        self.caps.borrow().net_scope.is_some()
+    }
+
     #[cfg_attr(not(feature = "net"), allow(dead_code))] // only the net entries call it
     pub(crate) fn check_net_host(&self, host: &str, span: Span) -> Result<(), Control> {
         // Borrow is await-free and dropped before return.
@@ -7542,6 +7551,136 @@ mod tests {
                     assert_eq!(a.borrow()[1], Value::Nil, "lookup should succeed, err=nil");
                 } else {
                     panic!("expected [ips, err] pair");
+                }
+            })
+            .await;
+    }
+
+    /// BLOCKER 1: the net carve-out host allow-list was enforced ONLY at
+    /// `tcp.connect`/`tcp.listen` + DNS — NOT at HTTP / UDP / WS / server. Under a
+    /// `net = {deny:"all", allow:["localhost"]}` carve-out, an http/udp/ws/server
+    /// op to a DISALLOWED host must be denied at the request/bind entry (host-named
+    /// stage-2 panic) BEFORE any socket is opened. Hermetic: the gate fires before
+    /// any real connect, so no network is needed.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn net_carveout_enforced_for_http_udp_ws_server() {
+        use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+        // deny=all, allow only loopback literal 127.0.0.1 (NOT "localhost", so a
+        // 127.0.0.1 bind passes but any public host / hostname is denied).
+        let make = || {
+            let interp = std::rc::Rc::new(Interp::new());
+            interp.install_self();
+            let mut cs = CapSet::all_granted();
+            cs.set_net_scope(NetScope {
+                deny: NetDeny::All,
+                allow: vec!["127.0.0.1".into()],
+            });
+            interp.set_caps(cs);
+            interp
+        };
+        let denied = |msg: &str, host: &str| {
+            assert!(
+                msg.contains("net") && msg.contains(host),
+                "expected host-named net denial for {host}, got: {msg}"
+            );
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // HTTP GET to a public host → denied (TCP egress to 8.8.8.8).
+                let i = make();
+                match i
+                    .call_stdlib(
+                        "net_http",
+                        "get",
+                        &[Value::Str("http://8.8.8.8/".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "8.8.8.8"),
+                    other => panic!("expected http net denial, got {other:?}"),
+                }
+
+                // UDP send-to a disallowed destination → denied.
+                let i = make();
+                // Bind is on the allowed loopback (passes), so this exercises send-to.
+                let bind = i
+                    .call_stdlib(
+                        "net_udp",
+                        "bind",
+                        &[Value::Str("127.0.0.1:0".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                    .unwrap();
+                let sock = if let Value::Array(a) = &bind {
+                    a.borrow()[0].clone()
+                } else {
+                    panic!("bind should return a pair");
+                };
+                // Call `send(data, "8.8.8.8:53")` on the socket handle.
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &sock {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a native udp socket"),
+                    },
+                    method: "send".into(),
+                });
+                match i
+                    .call_native_method(
+                        m,
+                        vec![
+                            Value::Str("x".into()),
+                            Value::Str("8.8.8.8:53".into()),
+                        ],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "8.8.8.8"),
+                    other => panic!("expected udp send net denial, got {other:?}"),
+                }
+
+                // WebSocket connect to a public host → denied.
+                let i = make();
+                match i
+                    .call_stdlib(
+                        "net_ws",
+                        "connect",
+                        &[Value::Str("ws://8.8.8.8:9000/".into())],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "8.8.8.8"),
+                    other => panic!("expected ws net denial, got {other:?}"),
+                }
+
+                // HTTP server bind to a disallowed host (a non-loopback) → denied.
+                let i = make();
+                let server = i
+                    .call_stdlib("http_server", "create", &[], Span::new(0, 0))
+                    .await
+                    .unwrap();
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &server {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a server handle"),
+                    },
+                    method: "bind".into(),
+                });
+                match i
+                    .call_native_method(
+                        m,
+                        vec![Value::Str("0.0.0.0".into()), Value::Int(0)],
+                        Span::new(0, 0),
+                    )
+                    .await
+                {
+                    Err(Control::Panic(e)) => denied(&e.message, "0.0.0.0"),
+                    other => panic!("expected server bind net denial, got {other:?}"),
                 }
             })
             .await;

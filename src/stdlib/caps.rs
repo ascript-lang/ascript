@@ -224,6 +224,45 @@ fn host_is_loopback_or_private(host: &str) -> bool {
     false
 }
 
+/// Extract the bare host (no port, no IPv6 brackets) from a `"host:port"`-style
+/// address string — the form an allow-list names (§4.4). Mirrors the DNS path's
+/// stripping (`net_host.rs`): an IPv6 literal carries multiple colons and keeps its
+/// brackets stripped; a single trailing `:port` is removed; a bare host is returned
+/// whole. Used by the net stage-2 host check across HTTP/UDP/WS/server (BLOCKER 1).
+pub fn host_of_addr(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        // `[::1]:8080` → `::1`. Take up to the closing bracket.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    if addr.chars().filter(|&c| c == ':').count() == 1 {
+        // Exactly one colon → `host:port`; strip the port.
+        return addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    }
+    // No port, or a bare IPv6 literal (multiple colons, no brackets) → whole.
+    addr
+}
+
+/// Extract the bare host from a URL string (`http://host:port/path`,
+/// `ws://host/...`). Returns `None` for a URL with no parseable authority (a
+/// relative URL or a malformed string — the caller treats that as "no host to
+/// check", letting the underlying connect surface its own Tier-1 error). Used by
+/// the HTTP and WebSocket net stage-2 checks (BLOCKER 1).
+pub fn host_of_url(url: &str) -> Option<String> {
+    // Find the authority component after `scheme://`.
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
+    // Authority ends at the first `/`, `?`, or `#`.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Strip any `userinfo@` prefix.
+    let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    if hostport.is_empty() {
+        return None;
+    }
+    Some(host_of_addr(hostport).to_string())
+}
+
 /// The per-`Interp` capability set: a five-bit grant bitset plus the two optional
 /// granular carve-outs for `fs`/`net` (§4.3/§4.4).
 ///
@@ -828,6 +867,34 @@ mod tests {
             .await
             .unwrap();
         assert!(!interp.caps().has(Cap::Env), "drop mutated Interp.caps");
+    }
+
+    #[test]
+    fn host_of_addr_strips_port_and_brackets() {
+        assert_eq!(host_of_addr("example.com:8080"), "example.com");
+        assert_eq!(host_of_addr("127.0.0.1:0"), "127.0.0.1");
+        assert_eq!(host_of_addr("example.com"), "example.com");
+        // IPv6 with brackets + port → bare address.
+        assert_eq!(host_of_addr("[::1]:8080"), "::1");
+        assert_eq!(host_of_addr("[fe80::1]:443"), "fe80::1");
+        // Bare IPv6 (multiple colons, no brackets) → whole.
+        assert_eq!(host_of_addr("::1"), "::1");
+    }
+
+    #[test]
+    fn host_of_url_extracts_host() {
+        assert_eq!(host_of_url("http://example.com/x").as_deref(), Some("example.com"));
+        assert_eq!(host_of_url("https://8.8.8.8:443/").as_deref(), Some("8.8.8.8"));
+        assert_eq!(host_of_url("ws://127.0.0.1:9000/sock").as_deref(), Some("127.0.0.1"));
+        // userinfo stripped.
+        assert_eq!(host_of_url("http://user:pass@host.test/").as_deref(), Some("host.test"));
+        // IPv6 literal.
+        assert_eq!(host_of_url("http://[::1]:8080/").as_deref(), Some("::1"));
+        // query/fragment-only path still resolves the authority.
+        assert_eq!(host_of_url("https://api.internal?q=1").as_deref(), Some("api.internal"));
+        // No authority → None (caller lets the connect surface its own error).
+        assert_eq!(host_of_url("not-a-url"), None);
+        assert_eq!(host_of_url("/relative/path"), None);
     }
 
     #[test]
