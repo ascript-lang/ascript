@@ -51,6 +51,7 @@ const STD_MODULE_PATHS: &[&str] = &[
     "std/array",
     "std/object",
     "std/map",
+    "std/shared",
     "std/math",
     "std/convert",
     "std/json",
@@ -486,6 +487,20 @@ mod tests {
     fn completions_in_import_path_single_quote() {
         let it = items("import { x } from 'std/ma");
         assert!(labels(&it).contains(&"std/math"));
+    }
+
+    #[test]
+    fn completions_offer_shared_module_path() {
+        // SRV Task 10: `std/shared` is an importable module — completion must offer
+        // it (it was missing from STD_MODULE_PATHS otherwise, an orphan like the docs
+        // NAV gotcha). Hover/completion never breaks on a frozen value because a
+        // `Value::Shared` is typed gradually (`Any`) by the checker.
+        let it = items("import * as shared from \"std/sh");
+        assert!(
+            labels(&it).contains(&"std/shared"),
+            "import ctx should offer std/shared: {:?}",
+            labels(&it)
+        );
     }
 
     #[test]

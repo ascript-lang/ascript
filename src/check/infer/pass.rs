@@ -3319,5 +3319,73 @@ mod tests {
         let src = "interface Container<T> { fn len(): int\n fn at(i: int): T }\nfn first<T, C: Container<T>>(c: C): T { return c.at(0) }\nclass Good { fn len(): int { return 0 }\n fn at(i: int): int { return i } }\nlet x = first(Good())\nx\n";
         assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
     }
+
+    // ----- SRV Task 10: shared.freeze / Value::Shared — conservative (gradual gate) -----
+    // A frozen value reads like its underlying kind. The checker handles it CONSERVATIVELY:
+    // `shared.freeze(x)` synthesizes the gradual `Any` (a stdlib member-call on an imported
+    // namespace), so reading/indexing/iterating/mutating a frozen value emits ZERO `type-*`/
+    // `possibly-nil`. The gradual gate (Gate 5) means uncertain → silent; a frozen read is
+    // never a PROVABLE mismatch, so it never diagnoses.
+
+    #[test]
+    fn shared_freeze_field_and_index_reads_are_silent() {
+        let src = "import * as shared from \"std/shared\"\n\
+                   let cfg = shared.freeze({ region: \"us\", flags: { beta: true }, limits: [10, 100] })\n\
+                   print(cfg.region)\n\
+                   print(cfg.flags.beta)\n\
+                   print(cfg.limits[0])\n";
+        let cs = codes(src);
+        assert!(
+            !cs.iter().any(|c| c.starts_with("type-") || c == "possibly-nil"),
+            "frozen reads must not diagnose: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn shared_freeze_arithmetic_on_frozen_scalar_is_silent() {
+        // Arithmetic on a frozen scalar field is gradual (`Any`), never `type-error`.
+        let src = "import * as shared from \"std/shared\"\n\
+                   let cfg = shared.freeze({ limits: [10, 100] })\n\
+                   let total = cfg.limits[0] + cfg.limits[1]\n\
+                   print(total)\n";
+        assert!(
+            !has(src, "type-error") && !has(src, "type-mismatch"),
+            "frozen-scalar arithmetic must not diagnose: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn shared_freeze_iteration_and_method_reads_are_silent() {
+        let src = "import * as shared from \"std/shared\"\n\
+                   let cfg = shared.freeze({ limits: [10, 100] })\n\
+                   print(cfg.limits.len())\n\
+                   print(cfg.has(\"limits\"))\n\
+                   for (l of cfg.limits) { print(l) }\n";
+        let cs = codes(src);
+        assert!(
+            !cs.iter().any(|c| c.starts_with("type-") || c == "possibly-nil"),
+            "frozen method/iteration reads must not diagnose: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn shared_freeze_into_annotated_slot_is_gradual_not_wrong_no() {
+        // A frozen value assigned into an ANNOTATED slot must NEVER be a wrong `No`
+        // (the gradual escape): freeze synthesizes `Any`, which is consistent with any
+        // annotated type. This is the cardinal Gate-5 rule for the shared heap.
+        let src = "import * as shared from \"std/shared\"\n\
+                   let cfg: object = shared.freeze({ region: \"us\" })\n\
+                   let arr: array<int> = shared.freeze([1, 2, 3])\n\
+                   print(cfg.region)\n\
+                   print(arr[0])\n";
+        assert!(
+            !has(src, "type-mismatch"),
+            "freeze into an annotated slot must stay gradual: {:?}",
+            analyze(src).diagnostics
+        );
+    }
 }
 
