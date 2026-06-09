@@ -7881,3 +7881,106 @@ async fn iface_instanceof_bad_rhs_three_way() {
         assert_opt_call_error_three_way(src).await;
     }
 }
+
+// ===========================================================================
+// FUZZ Unit 2 — regression guards for two engine bugs the broadened
+// grammar-aware generator (`ascript::fuzzgen`) surfaced via the three-way
+// differential. Each is a FULL four-mode byte-identical assertion
+// (tree-walker == specialized-VM == generic-VM == `.aso`).
+// ===========================================================================
+
+/// Four-mode OK assertion: all of tree-walker, specialized-VM, generic-VM, and the
+/// `.aso` round-trip produce byte-identical stdout + exit code.
+async fn assert_four_way_run(src: &str) {
+    let tw = ascript::run_source_exit(src).await.expect("tree-walker ok");
+    let vm = ascript::vm_run_source(src).await.expect("specialized vm ok");
+    let gen = ascript::vm_run_source_generic(src).await.expect("generic vm ok");
+    let aso = ascript::aso_roundtrip_run_source(src).await.expect("aso ok");
+    assert_eq!(tw, vm, "specialized-VM diverged from tree-walker for `{src}`");
+    assert_eq!(tw, gen, "generic-VM diverged from tree-walker for `{src}`");
+    assert_eq!(tw, aso, ".aso round-trip diverged from tree-walker for `{src}`");
+}
+
+#[tokio::test]
+async fn vm_nested_loop_closure_capture_matches_treewalker() {
+    // FUZZ Unit 2 bug #1 (compiler `loop_refresh_slots` frame-leak): a closure created in
+    // an INNER loop that captures a by-REFERENCE (mutated) variable declared in the OUTER
+    // loop body. The inner loop's per-iteration FRESH_CELL list wrongly included the
+    // closure PARAMETER's binding (a different frame, same slot index), so the inner loop
+    // clobbered the captured outer cell to `nil` each iteration → the VM read `nil` for the
+    // captured variable while the tree-walker read the real value. The minimal repro:
+    let cases = [
+        // The smoking-gun: the closure returns the captured outer-loop variable; the VM used
+        // to read `nil` here, then panic on `nil + 1`.
+        "let w27 = 0\n\
+         while (w27 < 2) {\n\
+           let w28 = 5\n\
+           while (w28 < 7) {\n\
+             let v = ((x) => w28)(3)\n\
+             print(v)\n\
+             w28 = w28 + 1\n\
+           }\n\
+           w27 = w27 + 1\n\
+         }",
+        // The closure both takes a param `x` AND captures the mutated outer `w28`.
+        "let w27 = 0\n\
+         while (w27 < 2) {\n\
+           let w28 = 5\n\
+           while (w28 < 7) {\n\
+             let v = ((x) => x + w28)(3)\n\
+             print(v)\n\
+             w28 = w28 + 1\n\
+           }\n\
+           w27 = w27 + 1\n\
+         }",
+        // Same shape with a `for`-range inner loop and a block-bodied arrow.
+        "let outer = 0\n\
+         while (outer < 2) {\n\
+           let acc = 10\n\
+           for (i in 0..3) {\n\
+             let g = ((p) => { let t = p * 2; return t + acc })(i)\n\
+             print(g)\n\
+             acc = acc + 1\n\
+           }\n\
+           outer = outer + 1\n\
+         }",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_value_pattern_decimal_matches_treewalker() {
+    // FUZZ Unit 2 bug #2 (tree-walker `Pattern::Value` used Rust structural `PartialEq`
+    // instead of the `==` operator's NUM cross-kind equality): a `match` value pattern over
+    // a Decimal subject. `decimal(-1) == -1` is `true` (NUM coercion), and the VM compiles a
+    // value pattern to `Op::Eq` (the same coercing equality), so the VM matched the int
+    // pattern; the tree-walker's bare `v == subject` treated `Decimal(-1)` as DISTINCT from
+    // `Int(-1)` and fell through. Fixed by routing the tree-walker through the shared
+    // `decimal_cross_eq`. A value pattern is now an `==` test for ALL numeric kinds.
+    let cases = [
+        // The minimal repro: a decimal subject vs an int literal pattern.
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"-1\") - 0\n\
+         print(match (k) { (-1) => \"int-pat\", _ => \"fell\" })",
+        // Decimal vs a positive int pattern.
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"5\")\n\
+         print(match (k) { 5 => \"five\", _ => \"other\" })",
+        // Decimal vs a float pattern (also coerces).
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"2.5\")\n\
+         print(match (k) { 2.5 => \"two-half\", _ => \"other\" })",
+        // The inverse case stays a NON-match (decimal 1 vs pattern 2).
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"1\")\n\
+         print(match (k) { 2 => \"two\", _ => \"not-two\" })",
+        // A float subject still matches an int pattern (unchanged baseline; integral fold).
+        "let k = 1.0\n\
+         print(match (k) { 1 => \"int-pat\", _ => \"fell\" })",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
+    }
+}

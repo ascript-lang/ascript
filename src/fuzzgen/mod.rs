@@ -36,15 +36,25 @@
 //!     `enum_expr`): typed fields/defaults/`init`/methods, `instanceof`, inheritance/`super`;
 //!     unit + positional + named ADT variants, constructors, exhaustive `match` over each with
 //!     positional/named/unit + wildcard patterns + Option-C fresh-binds.
-//!   - **Closures + capture:** arrow closures, capture-by-value vs by-reference, per-iteration
-//!     loop-var freshness, nested/curried closures.
-//!   - **String templates `${…}`** (incl. nested) and **`?`/`!` propagate/unwrap** over the
-//!     `[value, err]` tier-1 model.
+//!   - **Closures + capture** (see `closure_capture_stmt`/`loop_closure_stmt`/`closure_expr`):
+//!     arrow closures, BY-VALUE vs BY-REFERENCE capture (an immutable read vs a mutated
+//!     accumulator observed from outside), PER-ITERATION loop-var freshness (a closure-per-
+//!     iteration bag), and nested/curried/IIFE arrows.
+//!   - **String templates `${…}`** (incl. nested, `template_expr`).
+//!
+//! BUGS FOUND + FIXED in-branch via this broadened differential (Gate 0): (1) a compiler
+//! `loop_refresh_slots` frame-leak — a closure in an INNER loop capturing a mutated OUTER-loop
+//! variable read `nil` on the VM (the inner loop fresh-celled an unrelated slot shared with a
+//! nested closure param); (2) the tree-walker `match` value pattern used Rust structural
+//! `PartialEq` instead of the `==`-operator equality, so a `Decimal` subject did NOT match an
+//! int/float literal pattern (the VM, compiling to `Op::Eq`, did). Both have permanent
+//! regression guards in `tests/vm_differential.rs`.
 //!
 //! STILL NOT EMITTED (the next breadth follow-up; the differential cannot fuzz what it never
-//! generates): interfaces + structural-`instanceof`; destructuring/spread/rest in let/params;
-//! async/await/spawn/workers (deferred — nondeterministic scheduling, see spec §6); try/recover
-//! (the `recover(fn(){…})` carry-forward bug); generators `fn*`/`yield`.
+//! generates): `?`/`!` propagate/unwrap; interfaces + structural-`instanceof`; destructuring/
+//! spread/rest in let/params; async/await/spawn/workers (deferred — nondeterministic
+//! scheduling, see spec §6); try/recover (the `recover(fn(){…})` carry-forward bug);
+//! generators `fn*`/`yield`.
 //!
 //! Crate-gated `#[cfg(any(test, fuzzing))]` (in `lib.rs`) so it compiles into `ascript`
 //! ONLY for `cargo test` (and a `--cfg fuzzing` libFuzzer build) — never in a normal or
@@ -429,7 +439,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
         // Weighted choice over statement kinds. Assignment/break/continue/return are
         // gated on legality; we re-roll to a safe default when illegal.
-        let pick = self.choice(10);
+        let pick = self.choice(13);
         match pick {
             0 | 1 => self.let_stmt(depth),
             2 => self.const_stmt(depth),
@@ -440,7 +450,82 @@ impl<'a, 'b> Gen<'a, 'b> {
             7 => self.print_stmt(depth),
             8 => self.match_stmt(depth),
             9 if self.in_fn => self.print_stmt(depth), // keep returns rare/at fn tail only
+            10 => self.closure_capture_stmt(depth),
+            11 => self.loop_closure_stmt(depth),
             _ => self.print_stmt(depth),
+        }
+    }
+
+    /// FUZZ Unit 2 — closures + capture (KNOWN high-divergence: the resolver splits
+    /// `captured && mutated` → a shared by-reference cell vs `captured && !mutated` → a
+    /// by-value copy; `Op::Closure` copies the by-value slots into a fresh private cell).
+    /// This emits BOTH shapes deterministically:
+    ///   - a BY-VALUE capture of an immutable outer binding (read-only use), and
+    ///   - a BY-REFERENCE capture: a mutable accumulator the closure increments, called
+    ///     twice, with the accumulator ALSO read afterward (so the shared-cell write is
+    ///     observable from the outside — the exact thing a wrong by-value/by-ref split would
+    ///     break). All observables are ints → deterministic.
+    fn closure_capture_stmt(&mut self, depth: u32) {
+        let cap = self.fresh("cap"); // immutable outer (by-value capture)
+        let acc = self.fresh("acc"); // mutable outer (by-reference capture)
+        let f = self.fresh("clo");
+        let g = self.fresh("clo");
+        let cv = self.int_literal();
+        self.indent(depth);
+        let _ = writeln!(self.out, "const {cap} = {cv}");
+        self.declare(&cap, false);
+        self.indent(depth);
+        let _ = writeln!(self.out, "let {acc} = 0");
+        self.declare(&acc, true);
+        // by-value capture closure: reads cap.
+        self.indent(depth);
+        let _ = writeln!(self.out, "let {f} = (x) => x + {cap}");
+        self.declare(&f, true);
+        // by-reference capture closure: mutates acc and returns it.
+        self.indent(depth);
+        let _ = writeln!(
+            self.out,
+            "let {g} = (n) => {{ {acc} = {acc} + n; return {acc} }}"
+        );
+        self.declare(&g, true);
+        // Observe both: the by-value application and the shared-cell mutation (twice + read).
+        let a0 = self.int_atom();
+        self.indent(depth);
+        let _ = writeln!(self.out, "print({f}({a0}))");
+        let n0 = self.int_atom();
+        let n1 = self.int_atom();
+        self.indent(depth);
+        let _ = writeln!(self.out, "print({g}({n0}))");
+        self.indent(depth);
+        let _ = writeln!(self.out, "print({g}({n1}))");
+        self.indent(depth);
+        let _ = writeln!(self.out, "print({acc})");
+    }
+
+    /// FUZZ Unit 2 — PER-ITERATION loop-var freshness (the subtlest capture case): collect a
+    /// closure per loop iteration that captures the immutable loop variable, then call each.
+    /// Because the loop var is captured-and-NOT-mutated, each closure must see its OWN
+    /// iteration's value (a by-value copy into a fresh private cell per iteration). A wrong
+    /// capture would make all closures observe the final value. The loop bound is small +
+    /// fixed and each closure returns `loopvar * k` (an int) → deterministic, ordered output.
+    fn loop_closure_stmt(&mut self, depth: u32) {
+        let bag = self.fresh("bag");
+        let iv = self.fresh("i");
+        let k = 2 + self.choice(3); // 2..4 iterations
+        let mult = 1 + self.choice(5);
+        self.indent(depth);
+        let _ = writeln!(self.out, "let {bag} = []");
+        self.declare(&bag, true);
+        self.indent(depth);
+        let _ = writeln!(self.out, "for ({iv} in 0..{k}) {{");
+        self.indent(depth + 1);
+        let _ = writeln!(self.out, "array.push({bag}, () => {iv} * {mult})");
+        self.indent(depth);
+        self.out.push_str("}\n");
+        // Call each captured closure in order → must reflect the per-iteration loop value.
+        for idx in 0..k {
+            self.indent(depth);
+            let _ = writeln!(self.out, "print({bag}[{idx}]())");
         }
     }
 
@@ -598,7 +683,7 @@ impl<'a, 'b> Gen<'a, 'b> {
         if depth >= MAX_DEPTH {
             return self.leaf_expr();
         }
-        match self.choice(16) {
+        match self.choice(18) {
             0..=2 => self.int_expr(depth),
             3 | 4 => self.float_expr(depth),
             5 => self.bool_expr(depth),
@@ -611,7 +696,57 @@ impl<'a, 'b> Gen<'a, 'b> {
             12 => self.composite_expr(depth),
             13 if !self.classes.is_empty() => self.class_expr(depth),
             14 if !self.enums.is_empty() => self.enum_expr(depth),
+            15 => self.closure_expr(depth),
+            16 => self.template_expr(depth),
             _ => self.int_expr(depth),
+        }
+    }
+
+    /// FUZZ Unit 2 — an int-valued IIFE-style closure expression: an immediately-applied
+    /// arrow, optionally CURRIED (an arrow returning an arrow), optionally capturing an
+    /// in-scope int var (by-value, since the captured var is only read). Exercises arrow
+    /// closure compilation, upvalue capture-by-value, and call dispatch inline at expression
+    /// position. Always reduces to an int → deterministic.
+    fn closure_expr(&mut self, _depth: u32) -> String {
+        let a = self.int_atom();
+        let b = self.int_atom();
+        // Optional captured operand (an in-scope var or a literal).
+        let cap = self.leaf_or_int();
+        match self.choice(3) {
+            // simple applied arrow
+            0 => format!("((x) => x + {cap})({a})"),
+            // curried arrow (a => b => a + b), applied twice
+            1 => format!("((p) => (q) => p + q)({a})({b})"),
+            // arrow with a block body that does a local let + return
+            _ => format!("((x) => {{ let t = x * 2; return t + {cap} }})({a})"),
+        }
+    }
+
+    /// An in-scope int-ish variable, or an int literal (used as a captured closure operand).
+    fn leaf_or_int(&mut self) -> String {
+        let vars = self.all_vars();
+        if !vars.is_empty() && self.flag() {
+            let idx = self.choice(vars.len() as u32) as usize;
+            vars[idx].clone()
+        } else {
+            self.int_literal()
+        }
+    }
+
+    /// FUZZ Unit 2 — a string template `${…}` expression (incl. NESTED templates). Exercises
+    /// the template-interpolation path (the `template_interpolation_*` tests' surface) +
+    /// nested-template parsing. Interpolates only int/bool/string sub-expressions (no map/set/
+    /// float — those print deterministically too, but ints keep the observable simple). The
+    /// result is a string; `len(...)` of it is NOT used (the string itself prints
+    /// deterministically since every interpolated value prints deterministically).
+    fn template_expr(&mut self, depth: u32) -> String {
+        let a = self.int_atom();
+        let b = self.int_atom();
+        if depth < MAX_DEPTH && self.flag() {
+            // Nested template: `${`inner ${a}`}`.
+            format!("`out ${{`in ${{{a}}}`}} {b}`")
+        } else {
+            format!("`v=${{{a}}} w=${{{b}}} s=${{{a} + {b}}}`")
         }
     }
 

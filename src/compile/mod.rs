@@ -1015,23 +1015,48 @@ impl Compiler {
                 slots.push(v);
             }
         }
+        // FRAME-FILTER (closure-capture bug fix): `self.resolved.bindings` holds EVERY
+        // binding across ALL frames, and slot indices are reused across frames (a closure
+        // param and an outer-frame local can both be slot 0). A binding declared inside a
+        // NESTED callable (`ArrowExpr`/`FnDecl`) that itself sits inside this loop body lives
+        // in a DIFFERENT frame — its slot index is meaningless here. Including it would emit a
+        // spurious `FRESH_CELL` for an UNRELATED current-frame cell slot, clobbering a captured
+        // outer variable to nil each iteration. So collect the ranges of nested callable bodies
+        // within the loop body and skip any binding declared inside one of them.
+        let nested_frame_ranges: Vec<TextRange> = body
+            .syntax()
+            .descendants()
+            .filter(|n| {
+                matches!(n.kind(), SyntaxKind::ArrowExpr | SyntaxKind::FnDecl)
+            })
+            .map(|n| n.text_range())
+            .collect();
         for b in &self.resolved.bindings {
             // Only cell slots in THIS frame; only bindings declared inside the
             // body. `contains_range` is inclusive, which is exactly what we want
             // (the body node fully contains its descendant declarations).
-            if self.cur_cells.contains(&b.slot)
+            if !(self.cur_cells.contains(&b.slot)
                 && body_range.contains_range(b.decl_range)
-                && b.decl_range != body_range
+                && b.decl_range != body_range)
             {
-                // SP3 §A4: this `try_from` can never fall through to a silent skip.
-                // `b.slot` is a slot INDEX within this frame, and the frame's
-                // `slot_count` was already validated to fit `u16` (compile_source
-                // :741 / function frame :2378 / field default :2262) BEFORE any
-                // fresh-cell emit — so `b.slot < slot_count <= u16::MAX` always
-                // holds and the `Ok` arm is always taken. No capacity truncation.
-                if let Ok(slot) = u16::try_from(b.slot) {
-                    slots.push(slot);
-                }
+                continue;
+            }
+            // Skip a binding that belongs to a nested callable frame (its slot index
+            // is that frame's, not ours).
+            if nested_frame_ranges
+                .iter()
+                .any(|r| r.contains_range(b.decl_range))
+            {
+                continue;
+            }
+            // SP3 §A4: this `try_from` can never fall through to a silent skip.
+            // `b.slot` is a slot INDEX within this frame, and the frame's
+            // `slot_count` was already validated to fit `u16` (compile_source
+            // :741 / function frame :2378 / field default :2262) BEFORE any
+            // fresh-cell emit — so `b.slot < slot_count <= u16::MAX` always
+            // holds and the `Ok` arm is always taken. No capacity truncation.
+            if let Ok(slot) = u16::try_from(b.slot) {
+                slots.push(slot);
             }
         }
         slots.sort_unstable();
