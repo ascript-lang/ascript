@@ -2138,9 +2138,89 @@ impl<'a> Parser<'a> {
         self.postfix()
     }
 
+    /// TYPE §6 (Task 5): speculatively consume an expression-level explicit
+    /// type-argument list `< Type (, Type)* >` IFF the closing `>` is immediately
+    /// followed by `(` (a generic-instantiation call). Returns `true` and leaves the
+    /// cursor on the `(` when it matched; returns `false` and FULLY REWINDS (both the
+    /// cursor and `pending_gt`) otherwise. The parsed type args are DISCARDED
+    /// (generics are runtime-erased). Precondition: the current token is `Tok::Lt`.
+    ///
+    /// The trailing-`(` requirement is the sole discriminator (matching the spec's
+    /// rule and TypeScript): a `>` followed by anything but `(` rewinds to a
+    /// comparison, so every ordinary `a < b`, `a < b > c`, `f(a < b, c > d)` chain
+    /// is preserved. (The single token-identical case `IDENT < IDENT > ( … )` —
+    /// shared by `Box<int>(5)` and a hypothetical `(a<b)>(c)` — resolves to the
+    /// generic call; the example corpus contains no such comparison, so there is no
+    /// regression.)
+    fn try_explicit_type_args(&mut self) -> bool {
+        debug_assert_eq!(*self.peek(), Tok::Lt);
+        let saved_pos = self.pos;
+        let saved_pending = self.pending_gt;
+        // Parse `< Type (, Type)* >` with the NUM `>>`-split (`eat_type_gt`). Any
+        // error → rewind. We do NOT propagate the error (speculation must not abort
+        // the enclosing parse).
+        self.advance(); // <
+        let ok = self.speculate_type_arg_list();
+        if ok && *self.peek() == Tok::LParen {
+            // Committed: the `(` confirms a call. Leave the cursor on `(`.
+            return true;
+        }
+        // Rewind everything.
+        self.pos = saved_pos;
+        self.pending_gt = saved_pending;
+        false
+    }
+
+    /// Helper for `try_explicit_type_args`: parse the body of a `< … >` type-arg
+    /// list (the `<` already consumed), returning `true` if it closed cleanly. Never
+    /// returns an `Err` — a malformed arg is reported as `false` so the caller can
+    /// rewind to a comparison. An empty `<>` is NOT a valid type-arg list.
+    fn speculate_type_arg_list(&mut self) -> bool {
+        // An immediate close (`<>`) is not a type-arg list.
+        if *self.peek() == Tok::Gt || *self.peek() == Tok::Shr {
+            return false;
+        }
+        loop {
+            if self.parse_type().is_err() {
+                return false;
+            }
+            if *self.peek() == Tok::Comma {
+                self.advance();
+                // A trailing comma before `>` is not valid in a type-arg list.
+                if *self.peek() == Tok::Gt || *self.peek() == Tok::Shr {
+                    return false;
+                }
+            } else {
+                break;
+            }
+        }
+        // Close the list (handles a split `>>`).
+        self.eat_type_gt().is_ok()
+    }
+
     fn postfix(&mut self) -> Result<Expr, AsError> {
         let mut expr = self.primary()?;
         loop {
+            // TYPE §6 (Task 5): expression-level EXPLICIT type arguments
+            // (`Box<int>(5)`, `map<string, number>(xs, f)`). At a `<` after a primary
+            // callee, this is lexically ambiguous with the comparison chain
+            // `(callee < arg) > ...`. Resolve it the TypeScript/Rust-turbofish-free
+            // way: SPECULATIVELY parse `< Type (, Type)* >` and accept the type-arg
+            // reading ONLY if the closing `>` is IMMEDIATELY followed by `(` (the call
+            // shape). On ANY failure — a non-type token, an unbalanced `>`, or a `>`
+            // not followed by `(` — REWIND completely (cursor + `pending_gt`) and
+            // leave the `<` for `comparison()` to consume as `BinOp::Lt`. The type
+            // arguments are RUNTIME-ERASED: a match consumes and DISCARDS them,
+            // producing the exact same callee `Box(5)` would, so the AST (and both
+            // engines) stay byte-identical to the erased form. Comparison/bitwise code
+            // is untouched: every chain whose `>` is NOT immediately followed by `(`
+            // (`a < b`, `a < b > c`, `f(a < b, c > d)`, `a << b`, `a >> b`) rewinds.
+            // Checked BEFORE the match to avoid a borrow conflict with `self.peek()`.
+            if *self.peek() == Tok::Lt && self.try_explicit_type_args() {
+                // Type args consumed (and discarded); the cursor is now on `(`. Loop
+                // again so the `LParen` arm parses the call against the SAME callee.
+                continue;
+            }
             match self.peek() {
                 Tok::LParen => {
                     self.advance();
@@ -3397,6 +3477,82 @@ mod tests {
         let s = parse_one("fn k(b: Box<Box<int>>) {}");
         // User generic head discards args at runtime → renders the bare head name.
         assert_eq!(fn_first_param_ty(&s).as_deref(), Some("Box"));
+    }
+
+    // ---- TYPE Task 5: expression-level explicit type args (the disambiguation) ----
+
+    /// Parse a single expression statement and return its `ExprKind`-ish structure.
+    fn parse_expr(src: &str) -> Expr {
+        let toks = lex(src).unwrap();
+        match parse(&toks).unwrap().into_iter().next().unwrap() {
+            Stmt::Expr(e) => e,
+            o => panic!("expected an expression statement, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_type_args_parse_as_a_call() {
+        // `Box<int>(5)` → a Call (type args erased: same shape as `Box(5)`).
+        let e = parse_expr("Box<int>(5)");
+        match &e.kind {
+            ExprKind::Call { callee, args } => {
+                assert!(matches!(callee.kind, ExprKind::Ident(ref n) if n == "Box"));
+                assert_eq!(args.len(), 1);
+            }
+            o => panic!("expected a Call, got {o:?}"),
+        }
+        // `map<string, number>(xs, f)` → a Call with two args (type args erased).
+        let e = parse_expr("map<string, number>(xs, f)");
+        match &e.kind {
+            ExprKind::Call { callee, args } => {
+                assert!(matches!(callee.kind, ExprKind::Ident(ref n) if n == "map"));
+                assert_eq!(args.len(), 2);
+            }
+            o => panic!("expected a Call, got {o:?}"),
+        }
+        // Nested: `Box<Box<int>>(5)` — the `>>` splits inside the speculative parse.
+        let e = parse_expr("Box<Box<int>>(5)");
+        assert!(matches!(e.kind, ExprKind::Call { .. }));
+    }
+
+    #[test]
+    fn comparison_chains_are_not_type_arg_calls() {
+        // None of these have a `>` immediately followed by `(`, so they stay
+        // comparison/binary — the trailing-`(` rule never fires.
+        for src in [
+            "a < b",
+            "a > b",
+            "a << b",
+            "a >> b",
+            "a < b && c > d",
+            "f(a < b, c > d)",
+            "x < y ? a : b",
+            "a < b > c",
+        ] {
+            let e = parse_expr(src);
+            // The top node must NOT be a bare Call whose callee is `a`/`x` with the
+            // operands swallowed — i.e. a comparison/ternary/logical stays intact.
+            assert!(
+                !matches!(&e.kind, ExprKind::Call { callee, .. }
+                    if matches!(callee.kind, ExprKind::Ident(ref n) if n == "a" || n == "x")),
+                "regressed comparison into a generic call: {src:?} → {:?}",
+                e.kind
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_a_lt_b_stays_binary() {
+        let e = parse_expr("a < b");
+        assert!(matches!(
+            e.kind,
+            ExprKind::Binary { op: BinOp::Lt, .. }
+        ));
+        let e = parse_expr("a >> b");
+        assert!(matches!(
+            e.kind,
+            ExprKind::Binary { op: BinOp::Shr, .. }
+        ));
     }
 
     #[test]
