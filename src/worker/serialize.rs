@@ -1215,6 +1215,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_interface_value_with_field_path() {
+        // IFACE (C5): an interface descriptor is CODE — a non-sendable VALUE. The
+        // serializer must reject it with a field path so `encode_value`'s catch-all
+        // `unreachable!` is never reached. (Interfaces cross isolates via code-shipping,
+        // Task 8 — not the value channel.)
+        let iface = Value::Interface(Rc::new(crate::value::InterfaceDef {
+            name: "Reader".to_string(),
+            own_methods: IndexMap::new(),
+            extends: Vec::new(),
+            def_env: crate::interp::global_env(),
+            flat: std::cell::RefCell::new(None),
+        }));
+        // Directly:
+        let err = check_sendable(&iface).unwrap_err();
+        assert_eq!(err.kind, "interface");
+        // Nested under a field path:
+        let v = arr(vec![num(1.0), obj(&[("r", iface)])]);
+        let err = check_sendable(&v).unwrap_err();
+        assert_eq!(err.kind, "interface");
+        assert_eq!(err.path, "[1].r");
+        // `encode` also rejects before writing any bytes (the unreachable! stays dead).
+        let iface2 = Value::Interface(Rc::new(crate::value::InterfaceDef {
+            name: "Reader".to_string(),
+            own_methods: IndexMap::new(),
+            extends: Vec::new(),
+            def_env: crate::interp::global_env(),
+            flat: std::cell::RefCell::new(None),
+        }));
+        assert!(encode(&iface2).is_err());
+    }
+
+    #[test]
     fn rejects_future_and_native() {
         let fut = Value::Future(crate::task::SharedFuture::resolved(Ok(num(1.0))));
         assert_eq!(check_sendable(&fut).unwrap_err().kind, "future");

@@ -7333,6 +7333,77 @@ async fn build_and_run_aso(source_path: &std::path::Path) -> String {
     String::from_utf8_lossy(&run_out.stdout).into_owned()
 }
 
+/// IFACE Task 9: build inline `src` text to a `.aso` and run it via the real
+/// `ascript` binary, returning stdout. Mirrors [`build_and_run_aso`] but for an
+/// in-test source string (writes it to a unique temp `.as` first). Used to add
+/// `.aso` as the fourth mode for interface programs.
+async fn build_and_run_aso_from_src(src: &str, tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ascript_iface_aso_{tag}_{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create temp dir: {e}"));
+    let src_path = dir.join(format!("{tag}.as"));
+    std::fs::write(&src_path, src).unwrap_or_else(|e| panic!("write temp .as: {e}"));
+    build_and_run_aso(&src_path).await
+}
+
+/// IFACE Task 9: interface programs must be byte-identical across the FULL four-mode
+/// matrix (tree-walker == specialized VM == generic VM == `.aso`). Unit A's iface
+/// tests only ran the first three because `.aso` REJECTED interface programs; now that
+/// `.aso` serializes interface descriptors (v25), `.aso` joins the identity. Each case
+/// is a complete `print`-driven program so stdout is the comparison surface.
+#[tokio::test]
+async fn iface_programs_four_mode_byte_identical() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "instanceof",
+            "interface R { fn read(b): int }\nclass File { fn read(b) { return 0 } }\nclass NoRead { fn write(b) { return 0 } }\nprint(File() instanceof R)\nprint(NoRead() instanceof R)\nprint(5 instanceof R)",
+        ),
+        (
+            "inherited",
+            "interface R { fn read(b): int }\nclass Base { fn read(b) { return 1 } }\nclass Sub extends Base {}\nprint(Sub() instanceof R)",
+        ),
+        (
+            "compose",
+            "interface Reader { fn read(b): int }\ninterface Writer { fn write(b): int }\ninterface RW extends Reader, Writer {}\nclass Sock { fn read(b) { return 1 } fn write(b) { return 2 } }\nclass OnlyR { fn read(b) { return 1 } }\nprint(Sock() instanceof RW)\nprint(OnlyR() instanceof RW)",
+        ),
+        (
+            "contract",
+            "interface R { fn read(b): int }\nclass File { fn read(b) { return 7 } }\nfn slurp(r: R) { return r.read(0) }\nprint(slurp(File()))",
+        ),
+        (
+            "printiface",
+            "interface R { fn read(b): int }\nprint(R)",
+        ),
+        (
+            "arity",
+            "interface R1 { fn read(b): int }\ninterface R2 { fn read(b, o): int }\nclass D { fn read(b, opts) { return 0 } }\nprint(D() instanceof R1)\nprint(D() instanceof R2)",
+        ),
+        (
+            "implements",
+            "interface R { fn read(b): int }\nclass File implements R { fn read(b) { return 9 } }\nprint(File() instanceof R)\nprint(File().read(0))",
+        ),
+    ];
+    for (tag, src) in cases {
+        // Modes 1–3: tree-walker, specialized VM, generic VM (captured stdout).
+        let tw = ascript::run_source(src).await.expect("tree-walker ok");
+        let (vm, _) = ascript::vm_run_source(src).await.expect("specialized vm ok");
+        let (gen, _) = ascript::vm_run_source_generic(src)
+            .await
+            .expect("generic vm ok");
+        assert_eq!(tw, vm, "specialized VM diverged for `{tag}`");
+        assert_eq!(tw, gen, "generic VM diverged for `{tag}`");
+        // Mode 4: .aso-compiled (the new mode this task wires in).
+        let aso = build_and_run_aso_from_src(src, tag).await;
+        assert_eq!(
+            tw, aso,
+            ".aso output diverged from tree-walker for iface `{tag}`\n  tw: {tw:?}\n  aso: {aso:?}"
+        );
+    }
+}
+
 /// Workers §11.3: every worker example must produce IDENTICAL, order-deterministic
 /// output across all four modes: tree-walker, specialized VM, generic VM, and
 /// .aso-compiled. Worker programs are byte-identical by construction (gather +
