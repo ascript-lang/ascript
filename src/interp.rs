@@ -5741,7 +5741,21 @@ impl Interp {
 
         // Inline-nesting (called from inside an isolate) is not a sandbox spawn — run the
         // entry locally like any nested worker fn (the enclosing slice already ships it).
+        // A nested call CANNOT honor a `caps` reduction (an inline run shares the
+        // enclosing isolate's `Interp`, so there is no separate cap boundary to install).
+        // Silently ignoring an explicit `{caps}` would be a security footgun, so REFUSE
+        // it loudly — the author must spawn the cap-reduced worker from the top level.
         if crate::worker::pool::in_isolate() {
+            if reduced.is_some() {
+                return Err(AsError::at(
+                    "run_in_worker with a `caps` option is not supported from inside a \
+                     worker (a nested inline run shares the enclosing isolate's \
+                     capabilities); spawn the cap-reduced worker from the top level"
+                        .to_string(),
+                    span,
+                )
+                .into());
+            }
             return crate::worker::dispatch_worker_inline(self, &entry_name, worker_args, span);
         }
 

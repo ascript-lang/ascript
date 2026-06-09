@@ -86,6 +86,13 @@ cargo build --release      # → target/release/ascript
 The default build includes the full standard library. Trim it with Cargo features (e.g.
 `--no-default-features --features "data,sys,net"`) for a smaller binary.
 
+> **One native prerequisite:** the default build enables `std/ffi`, which links against the
+> system **libffi**. Install it first — macOS: `brew install libffi` (the system one also works);
+> Debian/Ubuntu: `apt install libffi-dev pkg-config`; Fedora: `dnf install libffi-devel`. If you
+> don't need the foreign-function interface, build without it:
+> `cargo build --release --no-default-features --features "data,datetime,sys,net,crypto,…"`
+> (any feature set that omits `ffi`).
+
 ## Usage
 
 ```bash

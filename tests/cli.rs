@@ -16,6 +16,42 @@ fn runs_a_program_file_and_prints_result() {
 }
 
 #[test]
+fn nested_run_in_worker_with_caps_is_refused() {
+    // FFI Unit-B review (NB#2): a `run_in_worker({caps})` called from INSIDE a worker
+    // cannot honor the cap reduction (an inline nested run shares the enclosing isolate's
+    // Interp, so there is no separate cap boundary). Silently ignoring an explicit
+    // `{caps}` would be a security footgun — it must be REFUSED loudly.
+    // The refusal is a LOUD Tier-2 panic (a programmer error — an unsupported API
+    // combination), so the program FAILS with the message rather than silently degrading.
+    let file = std::env::temp_dir().join("ascript_nested_caps_refusal.as");
+    std::fs::write(
+        &file,
+        "import * as task from \"std/task\"\n\
+         worker fn inner(x) { return x * 2 }\n\
+         worker fn outer(x) {\n  \
+           return run_in_worker(inner, x, {caps: {deny: [\"ffi\"]}})\n\
+         }\n\
+         fn main() {\n  let rs = await task.gather([outer(5)])\n  print(rs[0])\n}\n\
+         await main()\n",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success() && combined.contains("not supported"),
+        "nested run_in_worker with caps must FAIL loudly (not silently ignore the caps); \
+         exit={:?} output: {combined}",
+        output.status.code()
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn runs_factorial_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin)
