@@ -2114,3 +2114,64 @@ fn lsp_worker_gen_fn_symbol_and_token() {
     client.close_stdin();
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
+
+/// DX D4 §5.2: a typo'd name produces an `undefined-variable` diagnostic AND a
+/// "did you mean" `codeAction` quickfix that replaces the typo with the closest
+/// in-scope name. The end-to-end path: didOpen → codeAction → a QUICKFIX action
+/// whose WorkspaceEdit rewrites `lenght` → `length`.
+#[test]
+fn lsp_did_you_mean_quickfix() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://typo.as";
+    // `length` is defined; `lenght` on line 1 is a one-edit typo of it.
+    let text = "let length = 5\nprint(lenght)\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text } }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Request code actions over the whole file.
+    let whole_range = json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 2, "character": 0 }
+    });
+    client.request(
+        30,
+        "textDocument/codeAction",
+        json!({ "textDocument": { "uri": uri }, "range": whole_range,
+                "context": { "diagnostics": [] } }),
+    );
+    let resp = client.read_response(30, overall);
+    let actions = resp["result"].as_array().expect("codeAction array");
+
+    // Find a quickfix whose edit replaces with `length`.
+    let found = actions.iter().any(|a| {
+        let is_quickfix = a["kind"].as_str() == Some("quickfix");
+        let replaces_with_length = a["edit"]["changes"][uri]
+            .as_array()
+            .map(|edits| edits.iter().any(|e| e["newText"].as_str() == Some("length")))
+            .unwrap_or(false);
+        is_quickfix && replaces_with_length
+    });
+    assert!(
+        found,
+        "expected a did-you-mean quickfix replacing `lenght` with `length`; got: {actions:#?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}

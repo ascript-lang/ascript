@@ -1301,3 +1301,71 @@ mod sound_blocking_severity {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// DX D4 §5.2 — "did you mean" suggestions on unresolved names + std imports.
+// ---------------------------------------------------------------------------
+mod did_you_mean {
+    use ascript::check::analyze;
+
+    fn message(src: &str, code: &str) -> String {
+        analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == code)
+            .map(|d| d.message)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn typo_of_builtin_suggests_it() {
+        // `prnt` → builtin `print` (distance 1).
+        let m = message("prnt([1])\n", "undefined-variable");
+        assert!(m.contains("did you mean `print`?"), "got: {m}");
+    }
+
+    #[test]
+    fn typo_of_local_binding_suggests_it() {
+        let m = message("let length = 5\nprint(lenght)\n", "undefined-variable");
+        assert!(m.contains("did you mean `length`?"), "got: {m}");
+    }
+
+    #[test]
+    fn name_beyond_distance_gets_no_suggestion() {
+        // `zzzzzz` is far from every binding/builtin — no nonsense suggestion.
+        let m = message("print(zzzzzz)\n", "undefined-variable");
+        assert!(m.contains("is not defined"), "got: {m}");
+        assert!(!m.contains("did you mean"), "should not suggest: {m}");
+    }
+
+    #[test]
+    fn typo_std_module_suggests_closest() {
+        let m = message(
+            "import { abs } from \"std/maths\"\nprint(1)\n",
+            "unresolved-import",
+        );
+        assert!(m.contains("did you mean `std/math`?"), "got: {m}");
+    }
+
+    #[test]
+    fn far_std_module_gets_no_suggestion() {
+        let m = message(
+            "import * as x from \"std/doesnotexist\"\nprint(1)\n",
+            "unresolved-import",
+        );
+        assert!(!m.contains("did you mean"), "should not suggest: {m}");
+    }
+
+    #[test]
+    fn suggestion_carries_a_fix_for_lsp() {
+        // The unresolved-name suggestion carries a Fix the LSP turns into a quickfix.
+        let fix = analyze("let length = 5\nprint(lenght)\n")
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "undefined-variable")
+            .and_then(|d| d.fix)
+            .expect("a did-you-mean fix");
+        assert_eq!(fix.edits.len(), 1);
+        assert_eq!(fix.edits[0].replacement, "length");
+    }
+}

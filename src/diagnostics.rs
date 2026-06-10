@@ -32,6 +32,18 @@ pub fn report(err: &AsError) {
     }
 }
 
+/// Render MULTIPLE errors together (DX D4 §5.1 multi-error reporting). Each error
+/// becomes its OWN ariadne report (matching [`report`]'s styling), printed in the
+/// order given — so a file with several parse errors shows them all at once
+/// instead of bailing on the first. Callers batch only recoverable, parse-time
+/// diagnostics here; a single fatal runtime panic (a Tier-2 abort) still goes
+/// through [`report`] as one report. An empty slice prints nothing.
+pub fn report_all(errors: &[AsError]) {
+    for err in errors {
+        report(err);
+    }
+}
+
 /// Convert a char offset into a byte offset within `text`.
 fn char_to_byte(text: &str, char_off: usize) -> usize {
     text.char_indices()

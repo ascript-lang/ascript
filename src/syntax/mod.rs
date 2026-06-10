@@ -106,6 +106,65 @@ pub fn first_syntax_error_in(parsed: &parser::Parse) -> Option<SyntaxError> {
     }
 }
 
+/// ALL syntax errors (grammar + lexical) recorded on an already-built
+/// [`parser::Parse`], each as a byte-ranged [`SyntaxError`], sorted by `start`
+/// (source order). Where [`first_syntax_error_in`] yields only the EARLIEST,
+/// this batches them for multi-error reporting (DX D4 §5.1): a file with several
+/// parse errors renders them all at once instead of "fix one, recompile, find the
+/// next". Borrow-only — the caller can still move the `Parse` into `build_tree`.
+pub fn all_syntax_errors_in(parsed: &parser::Parse) -> Vec<SyntaxError> {
+    let mut out: Vec<SyntaxError> = Vec::new();
+    // Grammar errors are indexed by NON-TRIVIA token position; map each to a byte
+    // range exactly as `first_syntax_error_in` does for the first one.
+    for e in &parsed.errors {
+        let mut byte = 0usize;
+        let mut non_trivia = 0usize;
+        let mut mapped: Option<SyntaxError> = None;
+        for t in &parsed.tokens {
+            let len = t.text.len();
+            if !t.kind.is_trivia() {
+                if non_trivia == e.token_index {
+                    mapped = Some(SyntaxError {
+                        message: e.message.clone(),
+                        start: byte,
+                        end: byte + len.max(1),
+                    });
+                    break;
+                }
+                non_trivia += 1;
+            }
+            byte += len;
+        }
+        out.push(mapped.unwrap_or_else(|| {
+            // token_index past the end → point at the final byte (EOF).
+            let end: usize = parsed.tokens.iter().map(|t| t.text.len()).sum();
+            SyntaxError {
+                message: e.message.clone(),
+                start: end.saturating_sub(1),
+                end,
+            }
+        }));
+    }
+    // Lexical errors are indexed by FULL-token position.
+    for le in &parsed.lex_errors {
+        let start: usize = parsed.tokens.iter().take(le.token).map(|t| t.text.len()).sum();
+        let end = start
+            + parsed
+                .tokens
+                .get(le.token)
+                .map(|t| t.text.len())
+                .unwrap_or(0);
+        out.push(SyntaxError {
+            message: le.message.clone(),
+            start,
+            end,
+        });
+    }
+    // Stable source order (DX D4 §5.1 determinism): by start, then end.
+    out.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+    out
+}
+
 /// Parse + resolve in one step (convenience for tests/tools).
 pub fn resolve_source(src: &str) -> resolve::types::ResolveResult {
     resolve::resolve(&parse_to_tree(src))
