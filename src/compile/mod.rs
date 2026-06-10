@@ -2682,6 +2682,7 @@ impl Compiler {
             params: Vec::new(),
             ret: None,
             local_names,
+            debug_name: None,
         }))
     }
 
@@ -2888,6 +2889,10 @@ impl Compiler {
         }
 
         let local_names = self.collect_local_names(fn_node);
+        // DBG: the declared name for debugger frame labels. The fn's Ident token is its
+        // name for `fn f(){}` and methods (`greet`); anonymous arrows / fn-expressions
+        // have no Ident token → `None` (the snapshot then falls back to "fn@L<line>").
+        let debug_name = fn_name_token_text(fn_node).map(Rc::from);
         Ok(Rc::new(FnProto {
             chunk: body_chunk,
             arity,
@@ -2899,6 +2904,7 @@ impl Compiler {
             params: proto_params,
             ret: ret_type,
             local_names,
+            debug_name,
         }))
     }
 

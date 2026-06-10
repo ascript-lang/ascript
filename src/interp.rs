@@ -9231,6 +9231,7 @@ print(y)
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Value::Closure(crate::vm::value_ext::Closure::new(proto));
         assert!(

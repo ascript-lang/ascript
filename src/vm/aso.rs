@@ -943,6 +943,7 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
         params,
         ret,
         local_names: Vec::new(),
+        debug_name: None,
     })
 }
 
@@ -2003,6 +2004,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -2138,6 +2140,7 @@ run()
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto).unwrap();
@@ -2159,6 +2162,7 @@ run()
                 params: Vec::new(),
                 ret: None,
                 local_names: Vec::new(),
+                debug_name: None,
             }
         };
         let mut w2 = Writer::new();
@@ -2183,6 +2187,7 @@ run()
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto_with).unwrap();
@@ -2203,6 +2208,7 @@ run()
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         };
         let mut w2 = Writer::new();
         write_proto(&mut w2, &proto_none).unwrap();

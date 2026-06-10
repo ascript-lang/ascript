@@ -388,6 +388,7 @@ pub(crate) async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Resul
         params: Vec::new(),
         ret: None,
         local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);

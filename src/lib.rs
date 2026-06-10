@@ -322,6 +322,7 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         params: Vec::new(),
         ret: None,
         local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
 
@@ -408,6 +409,7 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
         params: Vec::new(),
         ret: None,
         local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -510,6 +512,7 @@ pub async fn run_aso_file(
         params: Vec::new(),
         ret: None,
         local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -615,6 +618,7 @@ pub async fn run_file_on_vm_with_packages(
         params: Vec::new(),
         ret: None,
         local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -664,6 +668,7 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
         params: Vec::new(),
         ret: None,
         local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
 

@@ -96,14 +96,33 @@ pub enum DebugCommand {
     StepOut,
 }
 
+/// A Send-safe snapshot of one call frame at a debugger stop. PLAIN OWNED DATA only —
+/// no `Value`/`Rc`/`Cc` crosses the channel (the worker-airlock discipline). Built on
+/// the VM thread (where `Value` access is fine) and rendered to `String`/`u32` before
+/// sending, so the whole snapshot is `Send` (compile-time-proved by an `_assert_send`
+/// test). Never add an `Rc`/`Value`/`Cc` field — that would break the airlock.
+#[derive(Clone, Debug)]
+pub struct FrameSnapshot {
+    /// Human label for the frame: the function name, "<script>" for the bottom/module
+    /// frame, or "fn@L<line>" when no name is recorded.
+    pub function: String,
+    /// 0-based source line of this frame's active instruction (the DAP layer adds +1).
+    pub line: u32,
+    /// 0-based source column.
+    pub column: u32,
+    /// Locals in slot order: (name, rendered value). Name is the source name when known
+    /// (`FnProto.local_names`) else "slot_N". Value is `format!("{}", v)` (owned String).
+    pub locals: Vec<(String, String)>,
+}
+
 /// An event sent from the VM thread to the DAP server thread when execution stops or
 /// produces output (plain data only). This unit ships the `Stopped` snapshot fields
-/// the trap handler builds; richer frame/variable snapshots arrive with a later unit's
-/// airlock.
+/// the trap handler builds, INCLUDING the Send-safe per-frame [`FrameSnapshot`] vector
+/// (rendered to owned `String`/`u32` on the VM thread before crossing the channel).
 #[derive(Clone, Debug)]
 pub enum DebugEvent {
     /// The VM parked at a breakpoint / step. Carries the minimal plain-data location
-    /// the controller needs; the full frame snapshot is built by a later unit.
+    /// the controller needs plus the full Send-safe frame/variable snapshot.
     Stopped {
         /// The proto identity the break is in (`Rc::as_ptr as usize`).
         proto_id: usize,
@@ -111,6 +130,9 @@ pub enum DebugEvent {
         offset: usize,
         /// The call-stack depth at the stop (`fiber.frames.len()`).
         depth: usize,
+        /// The Send-safe frame/variable snapshot, innermost frame first. Plain owned
+        /// `String`/`u32` only — no `Value`/`Rc`/`Cc` crosses the channel.
+        frames: Vec<FrameSnapshot>,
     },
 }
 
@@ -226,6 +248,14 @@ pub struct CoverageTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_snapshot_is_send() {
+        // Compile-time proof the airlock snapshot type stays Send (all String/u32).
+        fn _assert_send<T: Send>() {}
+        _assert_send::<FrameSnapshot>();
+        _assert_send::<DebugEvent>();
+    }
 
     #[test]
     fn empty_instrumentation_is_fully_inert() {

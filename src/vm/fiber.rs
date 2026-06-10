@@ -242,6 +242,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         Closure::new(proto)
     }
@@ -261,6 +262,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         Closure::new(proto)
     }

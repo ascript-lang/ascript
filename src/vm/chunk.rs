@@ -524,6 +524,13 @@ pub struct FnProto {
     /// (Task 6), and an empty table simply means "no names" (the `slot_N` fallback).
     /// Not serialized this task — reconstructed at attach time / serialized in Task 6.
     pub local_names: Vec<(u32, Rc<str>)>,
+    /// DBG (debug-info): the function's declared name for debugger frame labels
+    /// (`fn f()` → "f", a method → its bare name). `None` for anonymous arrow /
+    /// fn-expression protos and the bottom/script proto. PURE debug metadata — NEVER
+    /// read by the VM run loop; consulted only by an attached debugger to label a
+    /// frame (without it the snapshot falls back to "<script>" / "fn@L<line>").
+    /// Not serialized this task — reconstructed/serialized in Task 6 (`.aso` unchanged).
+    pub debug_name: Option<Rc<str>>,
 }
 
 impl Chunk {
@@ -1162,6 +1169,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         assert_eq!(c.add_proto(p.clone()), 0);
         assert_eq!(c.add_proto(p), 1);

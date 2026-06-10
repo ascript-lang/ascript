@@ -521,6 +521,7 @@ impl Vm {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut module_fiber = Fiber::new(closure);
@@ -3476,10 +3477,18 @@ impl Vm {
                         continue;
                     };
 
-                    // Park: ship a `Stopped` event and block on the command channel
-                    // for a resume. No Value/Cc/RefCell borrow is held across the
-                    // blocking recv (Gate 4) — `debug_stop` scopes every borrow.
-                    self.debug_stop(proto_id, fault_ip, depth);
+                    // Build the Send-safe frame/variable snapshot while `&fiber` is
+                    // live (Value access stays on the VM thread) and BEFORE the
+                    // blocking recv — owned Strings only, no borrow held across the
+                    // wait (Gate 4). Innermost frame first; the innermost frame's
+                    // active instruction is the trapped `fault_ip`.
+                    let frames = self.build_frame_snapshots(fiber, fault_ip);
+
+                    // Park: ship a `Stopped` event (carrying `frames`) and block on
+                    // the command channel for a resume. No Value/Cc/RefCell borrow is
+                    // held across the blocking recv (Gate 4) — `debug_stop` scopes
+                    // every borrow.
+                    self.debug_stop(proto_id, fault_ip, depth, frames);
 
                     // Un-patch this breakpoint and re-point `ip` to the break offset so
                     // the next loop iteration reads + executes the recovered original
@@ -3516,9 +3525,16 @@ impl Vm {
     /// the wait. The `Instrumentation` box is TAKEN out of the cell across the blocking
     /// recv (a re-entrant native call the resumed program triggers could otherwise
     /// re-borrow the cell), then put back.
-    fn debug_stop(&self, proto_id: usize, offset: usize, depth: usize) {
+    fn debug_stop(
+        &self,
+        proto_id: usize,
+        offset: usize,
+        depth: usize,
+        frames: Vec<crate::vm::instrument::FrameSnapshot>,
+    ) {
         use crate::vm::instrument::{DebugCommand, DebugEvent, StepMode};
-        // Ship the Stopped event (scoped borrow, dropped immediately).
+        // Ship the Stopped event (scoped borrow, dropped immediately). `frames` is
+        // already plain owned Send-safe data (built at the trap before this call).
         {
             let inst = self.instrument.borrow();
             let Some(hook) = inst.as_ref().and_then(|i| i.breakpoints.as_ref()) else {
@@ -3532,6 +3548,7 @@ impl Vm {
                     proto_id,
                     offset,
                     depth,
+                    frames,
                 })
                 .is_err()
             {
@@ -3560,6 +3577,68 @@ impl Vm {
         }
         // Restore the payload (the program continues with the debugger still armed).
         *self.instrument.borrow_mut() = taken;
+    }
+
+    /// DBG: build the Send-safe per-frame snapshot at a debugger stop. Walks the fiber's
+    /// call stack INNERMOST-first (`frames.iter().rev()`), rendering each frame's
+    /// location and locals to PLAIN OWNED `String`/`u32` — no `Value`/`Rc`/`Cc` escapes
+    /// (the worker-airlock discipline). Called ONLY from the `Op::Break` trap (reached
+    /// solely via a patched breakpoint byte), so the hot dispatch loop is untouched
+    /// (Gate 12). Fully synchronous — no `.await`; every Value access stays on the VM
+    /// thread and no `RefCell`/`Cc` borrow outlives its `format!`.
+    fn build_frame_snapshots(
+        &self,
+        fiber: &Fiber,
+        fault_ip: usize,
+    ) -> Vec<crate::vm::instrument::FrameSnapshot> {
+        use crate::vm::instrument::FrameSnapshot;
+        let n = fiber.frames.len();
+        let mut out = Vec::with_capacity(n);
+        // Innermost frame first; `idx` is the original (bottom = 0) frame index so we
+        // can detect the bottom/script frame and pick the right active instruction.
+        for (rev_i, frame) in fiber.frames.iter().rev().enumerate() {
+            let idx = n - 1 - rev_i;
+            let proto = &frame.closure.proto;
+            // Active instruction offset: the innermost (first visited) frame uses the
+            // trapped `fault_ip`; caller frames use their saved return address
+            // `frame.ip` — close enough to the call site for v1 (the displacement is at
+            // most one instruction past the call).
+            let offset = if rev_i == 0 { fault_ip } else { frame.ip };
+            let (line, column) = proto.chunk.line_col_at(offset).unwrap_or((0, 0));
+
+            // Frame label: declared name; else "<script>" for the bottom/module frame;
+            // else "fn@L<line>" (1-based line) for an anonymous proto.
+            let function = match &proto.debug_name {
+                Some(name) => name.to_string(),
+                None if idx == 0 => "<script>".to_string(),
+                None => format!("fn@L{}", line + 1),
+            };
+
+            // Locals: render each named slot to an owned String. Read a cell slot's live
+            // value through its `Cc<RefCell<Value>>`; else the plain stack slot at
+            // `slot_base + slot`. Defensive: skip an out-of-range stack index. The
+            // `format!` produces the owned String; no borrow outlives it (airlock).
+            let mut locals = Vec::with_capacity(proto.local_names.len());
+            for (slot, name) in &proto.local_names {
+                let slot_idx = *slot as usize;
+                let rendered = match frame.cells.get(slot_idx).and_then(|c| c.as_ref()) {
+                    Some(cell) => format!("{}", cell.borrow()),
+                    None => match fiber.stack.get(frame.slot_base + slot_idx) {
+                        Some(v) => format!("{v}"),
+                        None => continue,
+                    },
+                };
+                locals.push((name.to_string(), rendered));
+            }
+
+            out.push(FrameSnapshot {
+                function,
+                line,
+                column,
+                locals,
+            });
+        }
+        out
     }
 
     /// Call ANY value, the single primitive both engines re-enter through.
@@ -5079,6 +5158,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5437,6 +5517,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5489,6 +5570,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5648,6 +5730,7 @@ mod tests {
                 params: Vec::new(),
                 ret: None,
                 local_names: Vec::new(),
+                debug_name: None,
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
 
@@ -5846,6 +5929,7 @@ mod tests {
                 params: Vec::new(),
                 ret: None,
                 local_names: Vec::new(),
+                debug_name: None,
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
             let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
@@ -5880,6 +5964,127 @@ mod tests {
         });
         assert!(ok, "a detached controller must not deadlock the program");
         assert_eq!(out, "5.0\n", "output still correct after the auto-resume");
+    }
+
+    // ---- DBG Task 4: the Send-safe frame/variable snapshot ----------------
+
+    #[test]
+    fn stopped_event_carries_frame_variable_snapshot() {
+        // Compile a real program with a named function holding locals, set a breakpoint
+        // INSIDE that function, run, and assert the `Stopped` event ships the Send-safe
+        // frame/variable snapshot: innermost frame is `add` with locals `a`/`b` bound,
+        // and the bottom frame is `<script>`. Watchdog-guarded so a regression hangs the
+        // test (fails loudly) rather than the host.
+        use crate::vm::instrument::{
+            DebugCommand, DebugEvent, DebuggerHook, FrameSnapshot, Instrumentation,
+        };
+
+        let src = "fn add(a, b) {\n  let s = a + b\n  return s\n}\nprint(add(2, 3))\n";
+        let frames: Vec<FrameSnapshot> = with_watchdog(10, move || {
+            let mut top_chunk = crate::compile::compile_source(src).expect("compiles");
+
+            // The `add` function is the top chunk's single nested proto. Bind the module
+            // source onto its chunk so `line_col_at` yields real line numbers, and pick
+            // the FIRST executable instruction of its body as the breakpoint site (params
+            // `a`/`b` are bound at frame entry, before any body op runs).
+            let src_info = Rc::new(crate::error::SourceInfo {
+                path: "<test>".into(),
+                text: src.into(),
+            });
+            {
+                let add = Rc::get_mut(&mut top_chunk.protos[0])
+                    .expect("uniquely own the nested proto");
+                add.chunk.set_module_source(&src_info);
+                assert_eq!(
+                    add.debug_name.as_deref(),
+                    Some("add"),
+                    "the nested fn proto carries its declared name"
+                );
+            }
+            // First executable op of the body (offset 0 of the add chunk).
+            let bp_off = 0usize;
+            let proto_id = Rc::as_ptr(&top_chunk.protos[0]) as *const () as usize;
+
+            let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+            {
+                let add = Rc::get_mut(&mut top_chunk.protos[0]).expect("own nested proto");
+                hook.set_breakpoint(proto_id, bp_off, &mut add.chunk.code);
+            }
+
+            // Controller: capture the FIRST Stopped event's frames, then auto-continue
+            // every stop so the program runs to completion (no deadlock).
+            let (snap_tx, snap_rx) = std::sync::mpsc::channel::<Vec<FrameSnapshot>>();
+            let controller = std::thread::spawn(move || {
+                let mut first = true;
+                while let Ok(evt) = evt_rx.recv() {
+                    if first {
+                        let DebugEvent::Stopped { frames, .. } = evt;
+                        let _ = snap_tx.send(frames);
+                        first = false;
+                    }
+                    if cmd_tx.send(DebugCommand::Continue).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Run the TOP-LEVEL chunk: it defines `add` as a module global and calls it,
+            // so the breakpoint inside `add` traps when the call runs.
+            let top_proto = Rc::new(FnProto {
+                chunk: top_chunk,
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                owning_class: None,
+                params: Vec::new(),
+                ret: None,
+                local_names: Vec::new(),
+                debug_name: None,
+            });
+            let closure = Closure::new(top_proto);
+            let mut fiber = Fiber::new(closure);
+            let inst = Instrumentation {
+                breakpoints: Some(hook),
+                profiler: None,
+                coverage: None,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            let outcome = local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(interp.clone(), inst);
+                vm.run(&mut fiber).await
+            });
+            assert!(
+                matches!(outcome, Ok(RunOutcome::Done(_))),
+                "program ran to completion"
+            );
+            controller.join().expect("controller thread");
+            snap_rx.recv().expect("a Stopped snapshot was captured")
+        });
+
+        // Two frames: the innermost is `add`, the bottom is the script.
+        assert!(!frames.is_empty(), "snapshot has at least one frame");
+        assert_eq!(frames.len(), 2, "add called from the script: two frames");
+
+        let inner = &frames[0];
+        assert_eq!(inner.function, "add", "innermost frame is the `add` function");
+        let names: Vec<&str> = inner.locals.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"a") && names.contains(&"b"),
+            "params a, b are present in the innermost locals: {names:?}"
+        );
+        // Params are bound to the call args 2 and 3 at frame entry.
+        let a = inner.locals.iter().find(|(n, _)| n == "a").map(|(_, v)| v.as_str());
+        let b = inner.locals.iter().find(|(n, _)| n == "b").map(|(_, v)| v.as_str());
+        assert_eq!(a, Some("2"), "a is bound to the first call arg");
+        assert_eq!(b, Some("3"), "b is bound to the second call arg");
+
+        let bottom = frames.last().expect("a bottom frame");
+        assert_eq!(bottom.function, "<script>", "the bottom frame is the script");
     }
 
     #[test]
@@ -6297,6 +6502,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -6619,6 +6825,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -6645,6 +6852,7 @@ mod tests {
             params: Vec::new(),
             ret: None,
             local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
