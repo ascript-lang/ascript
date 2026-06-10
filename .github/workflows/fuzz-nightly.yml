@@ -1,0 +1,151 @@
+name: Fuzz (nightly deep campaign)
+
+# The DEEP fuzzing campaign — the half of FUZZ that the per-PR `fuzz-smoke` job (ci.yml)
+# does NOT do. It runs each libFuzzer target for minutes–hours, persists the grown corpus
+# (cache, keyed on ASO_FORMAT_VERSION) + any crash reproducer (artifact), and — for the
+# `aso_roundtrip` target — IS the sustained-clean run that GATES BIN.
+#
+# THE BIN GATE (spec §4.1 / native-binary plan Task 0 — the literal handshake):
+#   BIN (`ascript build --native`) may NOT land until the `aso_roundtrip` target meets ALL of:
+#     (1) >= 7 CONSECUTIVE nightly runs of >= 4h each with ZERO crashes (no panic / OOM /
+#         OOB / timeout-as-hang), AND the streak counts only runs SINCE the most recent
+#         change to any `read_*` fn in `src/vm/aso.rs` or to `src/vm/verify.rs` (a reader/
+#         verifier edit RESETS the counter — it can reintroduce the bug class this gate
+#         catches), AND
+#     (2) the accumulated corpus reaches >= 90% line coverage of the `read_*` family in
+#         `src/vm/aso.rs` (below the floor "no crash" is uninformative).
+#   A single green per-PR smoke run does NOT satisfy this. The streak is tracked manually
+#   (link the run records in the BIN PR's Task 0); this workflow PRODUCES the evidence.
+#
+# SETUP: no secret required for the fuzz runs themselves. Issue-on-crash uses the default
+# GITHUB_TOKEN (Contents/Issues: write — granted below). Free on public repos.
+
+on:
+  schedule:
+    # 02:00 UTC nightly. aso_roundtrip runs 4h; total job well under the 6h GH limit.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      aso_seconds:
+        description: "aso_roundtrip run duration (s) — the BIN-gating target (default 4h)"
+        default: "14400"
+      others_seconds:
+        description: "per-target duration (s) for the non-gating targets"
+        default: "1800"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # 6h hard cap (GH max); aso 4h + 3×30m others + install leaves headroom.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        # aso_roundtrip is the BIN-gating target (4h, + a runnable-accept verifier-gap pass);
+        # the rest are deep-but-shorter coverage runs.
+        target: [aso_roundtrip, worker_serialize, differential, parser]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked || cargo install cargo-fuzz
+
+      # Persist the grown corpus across nights (coverage accumulates). Keyed on
+      # ASO_FORMAT_VERSION so an .aso layout bump starts a fresh corpus (and resets the
+      # BIN streak, by policy). The key is per-target.
+      - name: Compute corpus cache key
+        id: key
+        run: |
+          VER=$(grep -oE 'ASO_FORMAT_VERSION: u32 = [0-9]+' src/vm/aso.rs | grep -oE '[0-9]+' || echo 0)
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Restore grown corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzzcorpus-${{ matrix.target }}-v${{ steps.key.outputs.ver }}-${{ github.run_id }}
+          restore-keys: |
+            fuzzcorpus-${{ matrix.target }}-v${{ steps.key.outputs.ver }}-
+
+      - name: Deep run — ${{ matrix.target }}
+        env:
+          # Route all `${{ }}` values through env (quoted on use) — never interpolate a
+          # workflow_dispatch input straight into the shell (injection-safe; the matrix
+          # target is a trusted fixed set but env-passed for the same hygiene).
+          TARGET: ${{ matrix.target }}
+          ASO_SECONDS: ${{ github.event.inputs.aso_seconds || '14400' }}
+          OTHERS_SECONDS: ${{ github.event.inputs.others_seconds || '1800' }}
+        run: |
+          case "$TARGET" in
+            aso_roundtrip) SECS="$ASO_SECONDS" ;;
+            *)             SECS="$OTHERS_SECONDS" ;;
+          esac
+          # Guard: SECS must be a plain integer (defends the shell against a hostile input).
+          case "$SECS" in (*[!0-9]*|"") echo "bad duration: $SECS" >&2; exit 1 ;; esac
+          echo "::group::cargo fuzz run $TARGET (${SECS}s)"
+          # rss 4GB, per-input timeout 25s (a hang is a crash). The committed seeds + the
+          # cached grown corpus are the starting set.
+          cargo +nightly fuzz run "$TARGET" -- \
+            -max_total_time="$SECS" -rss_limit_mb=4096 -timeout=25
+          echo "::endgroup::"
+
+      - name: Verifier-gap pass (aso_roundtrip only — runnable-accept)
+        if: matrix.target == 'aso_roundtrip'
+        env:
+          ASCRIPT_FUZZ_RUNNABLE: "1"
+        run: |
+          # A SEPARATE, shorter pass that RUNS verifier-accepted chunks on the VM to catch a
+          # verify.rs gap. Generous timeout: a valid-but-slow program is a §9 bound, not a bug;
+          # only a HOST panic is a finding.
+          cargo +nightly fuzz run aso_roundtrip -- \
+            -max_total_time=900 -rss_limit_mb=4096 -timeout=120
+
+      - name: Upload crash reproducer (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+      - name: Open/append a tracking issue (on crash)
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          # Pass via env (read with process.env) rather than interpolating `${{ }}` into
+          # the JS source — the injection-safe pattern (target is trusted, but kept clean).
+          TARGET: ${{ matrix.target }}
+        with:
+          script: |
+            const target = process.env.TARGET;
+            const title = `nightly fuzz crash: ${target}`;
+            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `The nightly **${target}** fuzz campaign crashed (panic / OOM / OOB / hang).\n\n` +
+              `- Run: ${url}\n- The minimized reproducer is uploaded as artifact \`fuzz-crash-${target}-${context.runId}\`.\n\n` +
+              `Per CONTRIBUTING "Fuzzing", minimize it, add it to \`fuzz/corpus/${target}/\` as a \`bad_*\` seed, ` +
+              `and add a normal-suite regression test before fixing. NOTE: a crash on \`aso_roundtrip\` resets the BIN sustained-clean streak.`;
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: "open", labels: "fuzz-crash",
+            });
+            const hit = existing.data.find(i => i.title === title);
+            if (hit) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: hit.number, body });
+            } else {
+              await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ["fuzz-crash"] });
+            }

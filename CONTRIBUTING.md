@@ -74,6 +74,40 @@ That's it — the next change to `tree-sitter-ascript/**` on `main` auto-publish
 Until the secret exists, the workflow no-ops and you use `scripts/sync-grammar.sh` manually.
 GitHub Actions is free and unlimited on public repositories, so this costs nothing.
 
+## Fuzzing & property tests
+
+AScript is fuzzed two ways:
+
+- **In-tree property tests** (`tests/property.rs`, `proptest` + the `src/fuzzgen` grammar-aware
+  generator) run as part of the normal `cargo test` — deterministic and seeded. They guard the
+  three-way differential, the `.aso`/worker-clone round-trips, and the GC. **No special toolchain.**
+- **libFuzzer targets** live in `fuzz/` — an **isolated cargo workspace member** (its own
+  `[workspace]`) so `libfuzzer-sys`/`cargo-fuzz` **never enter the root `ascript` build graph**
+  (verify with `cargo tree -e normal` — neither `libfuzzer-sys` nor a non-optional `arbitrary`
+  should appear). Four targets: `aso_roundtrip` (the `.aso` reader+verifier), `worker_serialize`
+  (the structured-clone airlock), `differential` (three-engine divergence), `parser`. Run one:
+
+  ```bash
+  cargo install cargo-fuzz                    # one-time (needs the nightly toolchain)
+  cargo +nightly fuzz run aso_roundtrip       # ctrl-C to stop; grows fuzz/corpus/aso_roundtrip/
+  ```
+
+  Only the hand-curated `ex_*`/`bad_*` seeds under `fuzz/corpus/<target>/` are committed; the
+  nightly-grown corpus is gitignored (CI-cached). Regenerate the `.aso` example seeds after an
+  `ASO_FORMAT_VERSION` bump: `./fuzz/regenerate_aso_corpus.sh` (the in-suite
+  `aso_seed_corpus_is_present_and_current` test tripwires a stale corpus).
+
+- **CI:** `ci.yml`'s `fuzz-smoke` job builds every target and replays the committed corpus per PR;
+  `fuzz-nightly.yml` runs the deep, time-boxed campaign (the `aso_roundtrip` run is **4 h**).
+- **When a fuzz run crashes:** minimize the reproducer (`cargo +nightly fuzz tmin <target> <file>`),
+  add it to `fuzz/corpus/<target>/` as a `bad_*` seed, add a **normal-suite regression test** (e.g.
+  in `tests/property.rs`) that pins the now-clean behavior, *then* fix the bug — the regression guard
+  is permanent (Gate 0).
+- **The BIN gate:** `ascript build --native` (BIN) may not land until the `aso_roundtrip` target has
+  **≥ 7 consecutive nightly ≥ 4 h crash-free runs** (the streak resets on any `src/vm/aso.rs`
+  `read_*` / `src/vm/verify.rs` edit) **and** the corpus reaches ≥ 90 % line coverage of the
+  `read_*` family. See `.github/workflows/fuzz-nightly.yml` and the native-binary plan's Task 0.
+
 ## Conventions
 
 - Commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` for AI-assisted work.

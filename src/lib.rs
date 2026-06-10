@@ -866,6 +866,60 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
     }
 }
 
+/// FUZZ Task 5 — the `.aso` **runnable-accept** seam (`#[doc(hidden)]` test API, not a stable
+/// surface). Decode + verify arbitrary `bytes` via [`vm::Chunk::from_bytes_verified`]; if (and
+/// only if) the verifier ACCEPTS them, run the reconstituted chunk on the VM to completion.
+///
+/// This is the in-process body of the `aso_roundtrip` libFuzzer target's bounded runnable-accept
+/// (spec §2.2): a *verified* chunk that crashes the VM host is a `verify.rs` gap (a security
+/// finding). Rejected bytes (`Err`) return immediately. The program's output / value / a
+/// script-level `Control::Panic` are all discarded — only HOST liveness matters, so a Rust-level
+/// `panic!`/abort inside `run` propagates out (the fuzzer records it; libFuzzer's `-timeout`/
+/// `-rss_limit_mb` bound a hang / runaway allocation, the halting-problem bound §9). The caller
+/// is responsible for wrapping this on [`run_on_worker_stack`] (the 512 MB stack) and for any
+/// time budget.
+///
+/// Gated to the SAME `cfg` as [`fuzzgen`] (test / the non-default `fuzzgen` feature the `fuzz/`
+/// crate enables / a `--cfg fuzzing` libFuzzer build) so this fuzz-support seam is NEVER compiled
+/// into the pure production binary.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn aso_runnable_accept(bytes: &[u8]) {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::Vm;
+
+    let chunk = match crate::vm::chunk::Chunk::from_bytes_verified(bytes) {
+        Ok(c) => c,
+        // A clean rejection (bad magic/version/truncation or a verify failure) — nothing to run.
+        Err(_) => return,
+    };
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = crate::vm::Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    // Discard the outcome: a clean `RunOutcome`/`Control` (including a script-level Tier-2
+    // `Panic`) is fine — only a HOST panic, which propagates past this `.await`, is the finding.
+    let _ = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+}
+
 /// Compile a `.as` source file to a verified bytecode [`Chunk`] and write it to
 /// `out` as a `.aso` file (VM plan V12-T4 — `ascript build`).
 ///

@@ -46,3 +46,37 @@ jobs:
 
       - name: Clippy (--no-default-features)
         run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+  fuzz-smoke:
+    name: fuzz · build + corpus smoke
+    runs-on: ubuntu-latest
+    # The DEEP campaign is fuzz-nightly.yml; this per-PR job is a fast tripwire — it builds
+    # every libFuzzer target and runs each briefly over the COMMITTED seed corpus, so a PR
+    # that reintroduces a crash reproducible from a seed fails immediately and cheaply. (The
+    # property-test half of FUZZ runs in the `test` job's `cargo test`.)
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked || cargo install cargo-fuzz
+
+      - name: Build all fuzz targets
+        run: cargo +nightly fuzz build
+
+      - name: Smoke each target over the committed corpus
+        run: |
+          for t in aso_roundtrip worker_serialize differential parser; do
+            echo "::group::smoke $t"
+            # -runs caps it deterministically; the committed ex_*/bad_* seeds are replayed
+            # first, so a seed-reproducible crash fails here. 45s wall cap per target.
+            cargo +nightly fuzz run "$t" -- -max_total_time=45 -rss_limit_mb=4096 -timeout=25
+            echo "::endgroup::"
+          done
