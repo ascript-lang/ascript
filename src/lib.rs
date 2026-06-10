@@ -976,14 +976,44 @@ pub async fn run_aso_file(
     script_args: &[String],
     caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<i32, AsError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let module_dir = path.parent().map(|d| d.to_path_buf());
+    run_verified_aso(&bytes, script_args, caps, module_dir, &path.display().to_string()).await
+}
+
+/// BIN §2.4 — run an embedded (bundled) `.aso` payload. The startup shim
+/// ([`try_run_embedded`]) calls this with the payload sliced out of `current_exe()` and the
+/// program's argv (minus argv[0]). It runs through the SAME verified path as
+/// [`run_aso_file`] (`from_bytes_verified` → `Vm`); relative imports resolve against the
+/// executable's directory. Caps default to all-granted (a bundled program is a normal
+/// launch — there is no CLI surface to deny on once embedded).
+pub async fn run_embedded_aso(payload: &[u8], args: &[String]) -> Result<i32, AsError> {
+    let module_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    run_verified_aso(payload, args, None, module_dir, "the embedded program").await
+}
+
+/// The shared verified-run body behind [`run_aso_file`] and [`run_embedded_aso`] (BIN Task
+/// 2): `Chunk::from_bytes_verified` (the single trust boundary) → `Interp` setup →
+/// `set_worker_aso_bytes` → `Vm` → `LocalSet` run → telemetry flush → GC → the
+/// `RunOutcome`/`Control` exit-code map. `what` labels the load-error; `module_dir` resolves
+/// relative imports. Borrow discipline mirrors the original (no `RefCell`/resource borrow
+/// held across `.await` — Gate 4).
+async fn run_verified_aso(
+    payload: &[u8],
+    script_args: &[String],
+    caps: Option<crate::stdlib::caps::CapSet>,
+    module_dir: Option<std::path::PathBuf>,
+    what: &str,
+) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
 
-    let bytes = std::fs::read(path)
-        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
-    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes)
-        .map_err(|e| AsError::new(format!("cannot load {}: {}", path.display(), e)))?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(payload)
+        .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
@@ -993,12 +1023,12 @@ pub async fn run_aso_file(
     }
     // Workers Spec A (.aso path): retain the raw bytes so `dispatch_worker_closure` can
     // re-parse them into the top-level chunk and build a worker code slice without source.
-    interp.set_worker_aso_bytes(Rc::from(bytes.into_boxed_slice()));
+    interp.set_worker_aso_bytes(Rc::from(payload));
     interp.install_self();
     let vm = Vm::new(interp.clone());
-    // Resolve relative imports against the .aso's directory.
-    if let Some(dir) = path.parent() {
-        vm.set_module_dir(dir.to_path_buf());
+    // Resolve relative imports against the .aso's (or the executable's) directory.
+    if let Some(dir) = module_dir {
+        vm.set_module_dir(dir);
     }
 
     let proto = Rc::new(FnProto {
