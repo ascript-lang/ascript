@@ -969,7 +969,7 @@ fn parallel_single_file_degrades_to_serial() {
 /// correct result under `--parallel` (the file behaves like a normal top-level program in
 /// its test isolate — its workers take the pool path, no pool-reservation deadlock).
 #[test]
-fn parallel_test_file_with_nested_worker_runs_inline() {
+fn parallel_test_file_with_nested_worker_takes_pool_path() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let dir = std::env::temp_dir().join(format!("ascript_par_nested_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1001,7 +1001,7 @@ fn parallel_test_file_with_nested_worker_runs_inline() {
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "nested-worker test must pass (ran inline, no deadlock); output: {s}"
+        "nested-worker test must pass (ran via the pool path, no deadlock); output: {s}"
     );
     assert!(s.contains("2 passed"), "expected 2 passed; got: {s}");
 }

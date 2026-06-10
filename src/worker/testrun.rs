@@ -27,9 +27,14 @@
 //!
 //! ## Nested workers
 //!
-//! A test file that itself dispatches `worker fn`s runs them INLINE in its test isolate
-//! (the workers nested-inline rule — `pool::in_isolate()` is TRUE inside any isolate,
-//! including this one), so there is no deadlock and no pool reservation.
+//! A test file is a FULL top-level program (it has its own source), so it must behave
+//! exactly like one run standalone — including its own `worker fn`/`worker class`/`worker
+//! fn*` dispatch. We therefore force `IN_ISOLATE = false` for the file run (via
+//! `isolate::with_isolate_flag(false, …)`, see `run_one_file`): the file's workers take
+//! the NORMAL pool / code-slice path (recompile-from-source), NOT the inline-nesting path —
+//! which would be wrong here, since inline-nesting assumes the entry is already a VM global
+//! from an *enclosing* worker slice, and a test isolate has no such enclosing slice. No
+//! deadlock (nested workers run on the per-isolate-thread pool), correct result.
 
 use super::isolate;
 use crate::interp::{Control, PackageMap, TestSummary};
@@ -124,6 +129,16 @@ pub async fn run_test_file_in_isolate(
 
     // Hold the handle alive (its Drop joins the thread) while we block for the reply on
     // a blocking helper, so the current-thread runtime is not stalled.
+    //
+    // CAVEAT (documented, not a hard cap): the 600 s bound only catches an isolate that
+    // STOPS replying. It does NOT forcibly kill a *non-cooperative* isolate (a test file
+    // spinning in `while (true)`): when the timeout fires we return an `Err`, but
+    // `_handle` then drops → `IsolateHandle::Drop` does a `thread.join()` on the still-
+    // running thread, which cannot be bounded, so `ascript test` would still block. This
+    // is no worse than the serial runner (it also hangs on an infinite-loop test), and the
+    // SP3 recursion-depth guard catches runaway *recursion*; a runaway *loop* is the
+    // user's bug. The timeout exists to surface a wedged-but-not-spinning isolate cleanly,
+    // not to enforce a wall-clock test budget.
     let _handle = handle;
     let reply = tokio::task::spawn_blocking(move || {
         reply_rx
