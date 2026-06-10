@@ -221,9 +221,11 @@ Beyond navigation, the server also offers editing assistance:
   layout as `ascript fmt`;
 - **code actions** — quickfixes for individual diagnostics, **organize imports**, and a **fix-all**
   action that applies every available fix in the file at once;
-- **completion** is **scope-aware**: it offers keywords, builtins, and the in-scope user bindings;
-  on member access it completes the members of a class or enum and the exports of an imported module
-  namespace; in an `import … from "…"` string it offers std module paths; it includes
+- **completion** is **frame-precise**: it offers keywords, builtins, module-globals, and exactly the
+  local/parameter/closure bindings live at the cursor's frame (not sibling scopes); on member access it
+  completes the fields and methods of the receiver's inferred class, the members of a class or enum, and
+  the exports of an imported module namespace; in an `import … from "…"` string it offers std module
+  paths; it includes
   **control-flow snippets** and **auto-import** items that add the matching `import` statement for a
   known stdlib export, with `completionItem/resolve` filling in detail and documentation lazily.
 
@@ -244,3 +246,19 @@ See [editor setup](tooling/editor-setup) for VS Code, Zed, and Neovim configurat
 > [!NOTE] The language server is **static-analysis only** — it lexes, parses, and resolves your
 > source to produce diagnostics and navigation; it never runs the interpreter, so the whole layer
 > stays `Send + Sync` and free of runtime state.
+
+## `ascript doc`
+
+Generate API documentation from your `///` and `//!` doc-comments — a self-contained HTML site
+(default) or Markdown — with no external toolchain.
+
+```text
+ascript doc                       # document the current project (HTML → target/doc/)
+ascript doc lib.as --format md    # Markdown to stdout
+ascript doc --check               # CI gate: exit non-zero if any public symbol is undocumented
+```
+
+`///` documents the item below it (`fn`/`class`/`enum`/field/method); `//!` documents the module.
+Bodies are Markdown. By default only the exported public API is documented (`--private` includes
+the rest). See the [doc-generation reference](tooling/doc-generation) for the full convention,
+formats, and the `--check` documentation gate.
