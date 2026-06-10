@@ -98,6 +98,7 @@ The default build includes the full standard library. Trim it with Cargo feature
 ```bash
 ascript run program.as     # run a program (compiles to bytecode, runs on the VM)
 ascript build program.as   # compile to bytecode → program.aso
+ascript build --native program.as -o app   # → a self-contained native executable
 ascript run program.aso    # run compiled bytecode (no compile step)
 ascript repl               # interactive REPL
 ascript fmt file.as        # format in place
