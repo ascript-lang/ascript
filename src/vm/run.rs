@@ -164,6 +164,20 @@ pub struct Vm {
     /// zero-cost-when-off pattern of `specialize` and the SP9 determinism cell. See
     /// [`crate::vm::instrument`].
     instrument: RefCell<Option<Box<crate::vm::instrument::Instrumentation>>>,
+    /// DBG: the flattened proto tree of the program under inspection, for resolving a
+    /// source (file, line) to a `(proto_id, offset)` to patch. Populated ONLY when a
+    /// debugger arms breakpoints (empty otherwise → zero cost, NEVER read on the hot
+    /// path; the dispatch loop never touches it). Each entry is an `Rc<FnProto>` clone
+    /// (the entry body + every nested fn, recursively) so a `(file, line)` can target
+    /// any proto, not just the current frame.
+    debug_protos: RefCell<Vec<Rc<crate::vm::chunk::FnProto>>>,
+}
+
+/// DBG: the final path component of a `/`- or `\`-separated path (the file name),
+/// used by the v1 multi-module breakpoint source-matching heuristic. A path with no
+/// separator returns itself.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 impl Vm {
@@ -202,6 +216,7 @@ impl Vm {
             struct_gen: std::cell::Cell::new(0),
             last_fault_source: RefCell::new(None),
             instrument: RefCell::new(None),
+            debug_protos: RefCell::new(Vec::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -232,6 +247,118 @@ impl Vm {
     /// only via the patched-byte `Op::Break` trap) — exposed for the driver / tests.
     pub fn is_instrumented(&self) -> bool {
         self.instrument.borrow().is_some()
+    }
+
+    /// **DBG.** Register the program's proto tree for source-line breakpoint resolution.
+    /// Walks `entry` and recursively each `chunk.protos`, storing every `Rc<FnProto>`
+    /// flat in `debug_protos`. A debugger/launcher calls this once before `run` under
+    /// instrumentation (so a parked VM can resolve a `(file, line)` to ANY proto, not
+    /// just the current frame). Idempotent-ish: replaces the table each call.
+    ///
+    /// Zero-cost when off: `debug_protos` is read ONLY inside `debug_stop` (reached only
+    /// via a patched `Op::Break`), never on the dispatch hot path.
+    pub fn register_debug_protos(&self, entry: &Rc<crate::vm::chunk::FnProto>) {
+        fn walk(proto: &Rc<crate::vm::chunk::FnProto>, out: &mut Vec<Rc<crate::vm::chunk::FnProto>>) {
+            out.push(proto.clone());
+            for nested in &proto.chunk.protos {
+                walk(nested, out);
+            }
+        }
+        let mut table = self.debug_protos.borrow_mut();
+        table.clear();
+        walk(entry, &mut table);
+    }
+
+    /// **DBG.** Resolve a source `(source, line_1based)` to a `(proto_id, offset)` to
+    /// patch with a breakpoint, by consulting the registered `debug_protos` tree.
+    /// Returns `None` when no proto has any instruction on or after the line (unbound).
+    ///
+    /// # v1 matching rules (single-module happy path + nested fns)
+    ///
+    /// - **Source match.** A proto's `chunk.source` carries the module path. If exactly
+    ///   one distinct source path is present across all protos, accept it for ANY
+    ///   requested `source` (the single-module case — the editor's path and the compiler's
+    ///   recorded path need not be byte-equal). Otherwise compare on the file NAME (the
+    ///   final path component), so `/abs/foo.as` matches a requested `foo.as`. A proto with
+    ///   no bound source is skipped.
+    /// - **Proto selection.** Convert to 0-based (`line0`). The right proto is the MOST
+    ///   SPECIFIC one whose own `build_line_starts()` has an instruction EXACTLY on
+    ///   `line0` (a real instruction starts on that line). Among several such, prefer the
+    ///   DEEPEST (last-registered ⇒ most-nested) proto — a nested fn body wins over the
+    ///   enclosing body. If NO proto has an exact-line instruction, fall back to the
+    ///   FIRST candidate's `first_offset_for_line` (next-line binding — DAP allows a
+    ///   breakpoint to bind to a later line).
+    fn resolve_line_breakpoint(
+        &self,
+        source: &str,
+        line_1based: u32,
+    ) -> Option<(usize, usize)> {
+        let line0 = line_1based.saturating_sub(1);
+        let protos = self.debug_protos.borrow();
+
+        // Collect the distinct bound source paths to decide the matching mode.
+        let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in protos.iter() {
+            if let Some(src) = p.chunk.source.borrow().as_ref() {
+                paths.insert(src.path.clone());
+            }
+        }
+        let single_source = paths.len() == 1;
+        let want_file = file_name_of(source);
+
+        // A proto is a candidate when its bound source matches the requested `source`
+        // per the v1 rules above.
+        let is_candidate = |p: &Rc<crate::vm::chunk::FnProto>| -> bool {
+            match p.chunk.source.borrow().as_ref() {
+                None => false,
+                Some(src) => {
+                    if single_source {
+                        true
+                    } else {
+                        file_name_of(&src.path) == want_file
+                    }
+                }
+            }
+        };
+
+        // First pass: a proto whose own line table has an EXACT instruction on `line0`.
+        // `debug_protos` is registered parent-before-child (pre-order walk), so a LATER
+        // index is a more-nested proto — iterate in reverse to prefer the deepest match.
+        for p in protos.iter().rev() {
+            if !is_candidate(p) {
+                continue;
+            }
+            let starts = p.chunk.build_line_starts();
+            if let Some((_, off)) = starts.iter().find(|(l, _)| *l == line0) {
+                let proto_id = Rc::as_ptr(p) as *const () as usize;
+                return Some((proto_id, *off as usize));
+            }
+        }
+
+        // Fallback: next-line binding on the FIRST candidate that has an instruction
+        // at/after `line0` (DAP permits binding to a later line). Iterate in registration
+        // (pre-)order so the outermost/entry-style proto is preferred for the fallback.
+        for p in protos.iter() {
+            if !is_candidate(p) {
+                continue;
+            }
+            if let Some(off) = p.chunk.first_offset_for_line(line0) {
+                let proto_id = Rc::as_ptr(p) as *const () as usize;
+                return Some((proto_id, off as usize));
+            }
+        }
+        None
+    }
+
+    /// **DBG.** Find the chunk of a registered proto by its `Rc::as_ptr` identity, so a
+    /// parked VM can patch/restore a breakpoint byte through the shared `&Chunk`. Returns
+    /// `None` if the id is not in `debug_protos` (a stale/foreign id).
+    fn debug_proto_for(&self, proto_id: usize) -> Option<Rc<crate::vm::chunk::FnProto>> {
+        self.debug_protos
+            .borrow()
+            .iter()
+            .find(|p| Rc::as_ptr(p) as *const () as usize == proto_id)
+            .cloned()
     }
 
     /// Set the directory used to resolve relative FILE imports from the ENTRY
@@ -3558,25 +3685,154 @@ impl Vm {
         // Take the payload OUT across the blocking recv (Gate 4 — hold no cell borrow
         // while blocked). Nothing from the script heap (Value/Cc/fiber) is touched.
         let mut taken = self.instrument.borrow_mut().take();
-        let cmd = taken
-            .as_mut()
-            .and_then(|i| i.breakpoints.as_mut())
-            .and_then(|hook| hook.commands.recv().ok());
-        // Record the resulting step mode (a disconnected channel / no command resumes
-        // free-running). Stepping itself (transient breakpoints) is a Task-6 follow-up;
-        // v1 records the mode so the DAP server can drive it later.
-        let mode = match cmd {
-            Some(DebugCommand::Continue) | None => StepMode::Run,
-            Some(DebugCommand::Next) => StepMode::Over,
-            Some(DebugCommand::StepIn) => StepMode::Into,
-            Some(DebugCommand::StepOut) => StepMode::Out,
+
+        // The command loop: breakpoint-management commands (SetBreakpoints /
+        // ClearBreakpoints) are applied IN PLACE and the loop waits for the NEXT command
+        // (they are not a resume); a resume command (Continue/Next/StepIn/StepOut) records
+        // the step mode and RETURNS. Each iteration blocks on `recv` holding NO RefCell/Cc
+        // borrow (Gate 4): we resolve/patch synchronously between recvs.
+        let mode = loop {
+            // Block on the channel with no borrow held. `recv` returns `Err` if the
+            // controller hung up → resume free-running.
+            let cmd = match taken
+                .as_mut()
+                .and_then(|i| i.breakpoints.as_mut())
+                .map(|hook| hook.commands.recv())
+            {
+                Some(Ok(cmd)) => cmd,
+                // No hook, or the controller disconnected — resume free-running.
+                _ => break StepMode::Run,
+            };
+
+            match cmd {
+                DebugCommand::Continue => break StepMode::Run,
+                DebugCommand::Next => break StepMode::Over,
+                DebugCommand::StepIn => break StepMode::Into,
+                DebugCommand::StepOut => break StepMode::Out,
+                DebugCommand::SetBreakpoints { source, lines } => {
+                    let results = self.apply_set_breakpoints(taken.as_mut(), &source, &lines);
+                    // Ship the verdict; ignore a disconnected controller (it will be
+                    // caught on the next recv). No borrow held across the send.
+                    if let Some(hook) = taken.as_ref().and_then(|i| i.breakpoints.as_ref()) {
+                        let _ = hook
+                            .events
+                            .send(DebugEvent::BreakpointsVerified { results });
+                    }
+                    // Not a resume — wait for the next command.
+                }
+                DebugCommand::ClearBreakpoints => {
+                    self.apply_clear_breakpoints(taken.as_mut());
+                    // Not a resume — wait for the next command.
+                }
+            }
         };
+
         if let Some(hook) = taken.as_mut().and_then(|i| i.breakpoints.as_mut()) {
             hook.step_mode = mode;
             hook.step_depth = depth;
         }
         // Restore the payload (the program continues with the debugger still armed).
         *self.instrument.borrow_mut() = taken;
+    }
+
+    /// DBG: apply a `SetBreakpoints { source, lines }` against the live proto tree while
+    /// parked. DAP setBreakpoints is declarative/replace-all PER SOURCE: first clear this
+    /// source's existing breakpoints (restoring their bytes), then for each requested line
+    /// resolve to a `(proto_id, offset)` and patch `Op::Break` through the shared `&Chunk`.
+    /// Returns one [`BreakpointBinding`] per requested line (verdict + bound offset).
+    ///
+    /// Gate 4: fully synchronous — no `.await`, no `recv`. It briefly borrows
+    /// `debug_protos` to resolve/look up chunks, dropping the borrow before each
+    /// `patch_byte` is irrelevant (no await between), and operates on the hook in the
+    /// already-TAKEN instrumentation box (`inst`), never re-borrowing `self.instrument`.
+    fn apply_set_breakpoints(
+        &self,
+        inst: Option<&mut Box<crate::vm::instrument::Instrumentation>>,
+        source: &str,
+        lines: &[u32],
+    ) -> Vec<crate::vm::instrument::BreakpointBinding> {
+        use crate::vm::instrument::BreakpointBinding;
+        let Some(hook) = inst.and_then(|i| i.breakpoints.as_mut()) else {
+            return Vec::new();
+        };
+
+        // (1) Clear this source's existing breakpoints (replace-all per source). Determine
+        // which registered protos belong to `source`, then restore + forget any live
+        // breakpoint on them.
+        let source_proto_ids: std::collections::HashSet<usize> = {
+            let protos = self.debug_protos.borrow();
+            let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for p in protos.iter() {
+                if let Some(src) = p.chunk.source.borrow().as_ref() {
+                    paths.insert(src.path.clone());
+                }
+            }
+            let single_source = paths.len() == 1;
+            let want_file = file_name_of(source);
+            protos
+                .iter()
+                .filter(|p| match p.chunk.source.borrow().as_ref() {
+                    None => false,
+                    Some(src) => single_source || file_name_of(&src.path) == want_file,
+                })
+                .map(|p| Rc::as_ptr(p) as *const () as usize)
+                .collect()
+        };
+        for (pid, off) in hook.breakpoints_in(&source_proto_ids) {
+            if let Some(original) = hook.forget_breakpoint(pid, off) {
+                if let Some(proto) = self.debug_proto_for(pid) {
+                    proto.chunk.patch_byte(off, original);
+                }
+            }
+        }
+
+        // (2) Resolve + set each requested line. Resolution borrows `debug_protos`
+        // internally and drops the borrow before we patch (all synchronous, no await).
+        let mut results = Vec::with_capacity(lines.len());
+        for &line in lines {
+            match self.resolve_line_breakpoint(source, line) {
+                Some((proto_id, off)) => {
+                    if let Some(proto) = self.debug_proto_for(proto_id) {
+                        hook.set_breakpoint_shared(proto_id, off, &proto.chunk);
+                        results.push(BreakpointBinding {
+                            line,
+                            verified: true,
+                            offset: Some(off as u32),
+                        });
+                    } else {
+                        // Resolved to a proto not in the tree (should not happen) — unbound.
+                        results.push(BreakpointBinding {
+                            line,
+                            verified: false,
+                            offset: None,
+                        });
+                    }
+                }
+                None => results.push(BreakpointBinding {
+                    line,
+                    verified: false,
+                    offset: None,
+                }),
+            }
+        }
+        results
+    }
+
+    /// DBG: apply a `ClearBreakpoints` while parked — restore EVERY patched byte (drain
+    /// the side table; for each `(proto_id, offset) → original`, find the chunk in
+    /// `debug_protos` and write the original byte back). Synchronous, no await/recv.
+    fn apply_clear_breakpoints(
+        &self,
+        inst: Option<&mut Box<crate::vm::instrument::Instrumentation>>,
+    ) {
+        let Some(hook) = inst.and_then(|i| i.breakpoints.as_mut()) else {
+            return;
+        };
+        for ((pid, off), original) in hook.drain_breakpoints() {
+            if let Some(proto) = self.debug_proto_for(pid) {
+                proto.chunk.patch_byte(off, original);
+            }
+        }
     }
 
     /// DBG: build the Send-safe per-frame snapshot at a debugger stop. Walks the fiber's
@@ -6018,9 +6274,10 @@ mod tests {
                 let mut first = true;
                 while let Ok(evt) = evt_rx.recv() {
                     if first {
-                        let DebugEvent::Stopped { frames, .. } = evt;
-                        let _ = snap_tx.send(frames);
-                        first = false;
+                        if let DebugEvent::Stopped { frames, .. } = evt {
+                            let _ = snap_tx.send(frames);
+                            first = false;
+                        }
                     }
                     if cmd_tx.send(DebugCommand::Continue).is_err() {
                         break;
@@ -6085,6 +6342,308 @@ mod tests {
 
         let bottom = frames.last().expect("a bottom frame");
         assert_eq!(bottom.function, "<script>", "the bottom frame is the script");
+    }
+
+    // ---- DBG Task 5a: parked breakpoint-management protocol ---------------
+
+    /// DBG Task-5a test scaffold: compile `src`, bind its module source onto the whole
+    /// chunk tree, build the entry `FnProto`, and register the proto tree on a freshly
+    /// built instrumented `Vm` (so `resolve_line_breakpoint` can see every proto).
+    /// Returns the entry proto, the bound `SourceInfo`, and the `Vm`. The caller installs
+    /// a `DebuggerHook` and drives the channel from a controller thread.
+    fn compile_and_register(
+        src: &str,
+        vm: &Rc<Vm>,
+    ) -> (Rc<FnProto>, Rc<crate::error::SourceInfo>) {
+        let top_chunk = crate::compile::compile_source(src).expect("compiles");
+        let src_info = Rc::new(crate::error::SourceInfo {
+            path: "prog.as".into(),
+            text: src.into(),
+        });
+        // Bind the source onto the entry chunk AND recursively every nested proto, so
+        // `build_line_starts`/`first_offset_for_line` work for the whole tree.
+        top_chunk.set_module_source(&src_info);
+        let entry = Rc::new(FnProto {
+            chunk: top_chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        vm.register_debug_protos(&entry);
+        (entry, src_info)
+    }
+
+    #[test]
+    fn resolve_line_breakpoint_maps_line_into_a_nested_fn() {
+        // A program with a named function. The `let x = 1` line lives INSIDE `f`, so its
+        // resolved (proto_id, offset) must point into `f`'s proto, not the entry proto.
+        let src = "fn f() {\n  let x = 1\n  return x\n}\nprint(f())\n";
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::with_instrument(
+                interp,
+                crate::vm::instrument::Instrumentation::empty(),
+            );
+            let (entry, _src) = compile_and_register(src, &vm);
+
+            // Line 2 (1-based) is `let x = 1`, inside `f`. The nested fn proto is the
+            // entry's single nested proto.
+            let f_proto = &entry.chunk.protos[0];
+            let f_id = Rc::as_ptr(f_proto) as *const () as usize;
+
+            let resolved = vm
+                .resolve_line_breakpoint("prog.as", 2)
+                .expect("line 2 resolves to a breakpoint");
+            assert_eq!(
+                resolved.0, f_id,
+                "the `let x` line binds INSIDE f (not the entry proto)"
+            );
+            // The resolved offset must be a real instruction offset inside f's chunk.
+            let f_line_starts = f_proto.chunk.build_line_starts();
+            assert!(
+                f_line_starts.iter().any(|(_, off)| *off as usize == resolved.1),
+                "resolved offset {} is a real line-start offset in f: {:?}",
+                resolved.1,
+                f_line_starts
+            );
+        });
+    }
+
+    #[test]
+    fn parked_set_breakpoints_binds_and_re_stops_at_the_new_breakpoint() {
+        // Break-on-entry (offset 0 of the entry chunk). When parked, the controller sends
+        // SetBreakpoints for a line INSIDE `f`, expects a BreakpointsVerified{verified}
+        // reply with the resolved offset, then Continue — and the program must STOP AGAIN
+        // at exactly that resolved offset before completing with correct output.
+        use crate::vm::instrument::{
+            BreakpointBinding, DebugCommand, DebugEvent, DebuggerHook, Instrumentation,
+        };
+
+        let src = "fn f() {\n  let x = 1\n  return x\n}\nprint(f())\n";
+        let (ok, out, second_offset, verified) = with_watchdog(10, move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(
+                    interp.clone(),
+                    Instrumentation::empty(),
+                );
+                let (entry, _src) = compile_and_register(src, &vm);
+
+                // The breakpoint line inside f (line 2, 1-based) — pre-resolve the expected
+                // offset so the controller can assert the second stop lands there.
+                let expected = vm
+                    .resolve_line_breakpoint("prog.as", 2)
+                    .expect("line 2 resolves");
+
+                // Patch a break-on-entry (offset 0 of the ENTRY chunk) via the hook, while
+                // the controller drives set/continue. Install the hook into the VM's
+                // instrumentation.
+                let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+                let entry_id = Rc::as_ptr(&entry) as *const () as usize;
+                hook.set_breakpoint_shared(entry_id, 0, &entry.chunk);
+                *vm.instrument.borrow_mut() =
+                    Some(Box::new(Instrumentation {
+                        breakpoints: Some(hook),
+                        profiler: None,
+                        coverage: None,
+                    }));
+
+                // Controller thread: on the FIRST Stopped, send SetBreakpoints{line 2},
+                // read the BreakpointsVerified reply, then Continue. Capture the SECOND
+                // Stopped's offset (the newly-set breakpoint), then Continue to finish.
+                let (out_tx, out_rx) =
+                    std::sync::mpsc::channel::<(usize, Vec<BreakpointBinding>)>();
+                let controller = std::thread::spawn(move || {
+                    let mut stops = 0usize;
+                    let mut second_off: Option<usize> = None;
+                    let mut verified: Vec<BreakpointBinding> = Vec::new();
+                    while let Ok(evt) = evt_rx.recv() {
+                        match evt {
+                            DebugEvent::Stopped { offset, .. } => {
+                                stops += 1;
+                                if stops == 1 {
+                                    // Set a breakpoint inside f, then continue.
+                                    if cmd_tx
+                                        .send(DebugCommand::SetBreakpoints {
+                                            source: "prog.as".into(),
+                                            lines: vec![2],
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    // The verified reply arrives as the next event.
+                                } else {
+                                    // Second stop: record the offset, then continue.
+                                    second_off = Some(offset);
+                                }
+                                if stops >= 2 {
+                                    let _ = out_tx.send((
+                                        second_off.unwrap_or(usize::MAX),
+                                        verified.clone(),
+                                    ));
+                                }
+                                let _ = cmd_tx.send(DebugCommand::Continue);
+                            }
+                            DebugEvent::BreakpointsVerified { results } => {
+                                verified = results;
+                            }
+                        }
+                    }
+                });
+
+                let closure = Closure::new(entry);
+                let mut fiber = Fiber::new(closure);
+                let outcome = vm.run(&mut fiber).await;
+                let ok = matches!(outcome, Ok(RunOutcome::Done(_)));
+                let out = interp.output();
+                // Drop the VM's hook (drops the event Sender) so the controller ends.
+                *vm.instrument.borrow_mut() = None;
+                controller.join().expect("controller thread");
+                let (second_off, verified) =
+                    out_rx.recv().expect("the second stop was reported");
+                (ok, out, second_off, (verified, expected))
+            })
+        });
+
+        let (verified, expected) = verified;
+        assert!(ok, "program ran to completion");
+        assert_eq!(out, "1\n", "program output is correct and unchanged");
+        // The set-breakpoints reply verified the requested line and reported its offset.
+        assert_eq!(verified.len(), 1, "one line requested → one binding");
+        assert!(verified[0].verified, "the line inside f was bound");
+        assert_eq!(verified[0].line, 2);
+        assert_eq!(
+            verified[0].offset,
+            Some(expected.1 as u32),
+            "binding reports the resolved offset"
+        );
+        // The program stopped AGAIN at exactly the newly-set breakpoint offset.
+        assert_eq!(
+            second_offset, expected.1,
+            "the second stop landed at the newly-set breakpoint inside f"
+        );
+    }
+
+    #[test]
+    fn parked_clear_breakpoints_restores_the_original_byte() {
+        // Set a breakpoint inside f via SetBreakpoints while parked at entry, then send
+        // ClearBreakpoints and assert the patched byte is restored to the original opcode
+        // and the program runs free to completion (no second stop).
+        use crate::vm::instrument::{
+            DebugCommand, DebugEvent, DebuggerHook, Instrumentation,
+        };
+
+        let src = "fn f() {\n  let x = 1\n  return x\n}\nprint(f())\n";
+        let (ok, out, stops, byte_after_clear, expected_original) =
+            with_watchdog(10, move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                let local = LocalSet::new();
+                local.block_on(&rt, async move {
+                    let interp = Rc::new(Interp::new());
+                    interp.install_self();
+                    let vm =
+                        Vm::with_instrument(interp.clone(), Instrumentation::empty());
+                    let (entry, _src) = compile_and_register(src, &vm);
+
+                    // The offset we will set + then clear inside f, and the original byte
+                    // there (read BEFORE any patching).
+                    let expected = vm
+                        .resolve_line_breakpoint("prog.as", 2)
+                        .expect("line 2 resolves");
+                    let f_proto = vm
+                        .debug_proto_for(expected.0)
+                        .expect("resolved proto is registered");
+                    let original_byte = f_proto.chunk.code[expected.1];
+
+                    let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+                    let entry_id = Rc::as_ptr(&entry) as *const () as usize;
+                    hook.set_breakpoint_shared(entry_id, 0, &entry.chunk);
+                    *vm.instrument.borrow_mut() = Some(Box::new(Instrumentation {
+                        breakpoints: Some(hook),
+                        profiler: None,
+                        coverage: None,
+                    }));
+
+                    // Controller: on the first stop, SetBreakpoints{line 2} → read reply →
+                    // ClearBreakpoints → Continue. The clear restores the byte BEFORE the
+                    // call to f reaches it, so the program must NOT stop a second time.
+                    let controller = std::thread::spawn(move || {
+                        let mut stops = 0usize;
+                        while let Ok(evt) = evt_rx.recv() {
+                            match evt {
+                                DebugEvent::Stopped { .. } => {
+                                    stops += 1;
+                                    if stops == 1 {
+                                        let _ = cmd_tx.send(DebugCommand::SetBreakpoints {
+                                            source: "prog.as".into(),
+                                            lines: vec![2],
+                                        });
+                                        // wait for verified, handled below
+                                    } else {
+                                        let _ = cmd_tx.send(DebugCommand::Continue);
+                                    }
+                                }
+                                DebugEvent::BreakpointsVerified { .. } => {
+                                    // Now clear all breakpoints, then resume.
+                                    let _ = cmd_tx.send(DebugCommand::ClearBreakpoints);
+                                    let _ = cmd_tx.send(DebugCommand::Continue);
+                                }
+                            }
+                        }
+                        stops
+                    });
+
+                    let closure = Closure::new(entry);
+                    let mut fiber = Fiber::new(closure);
+                    let outcome = vm.run(&mut fiber).await;
+                    let ok = matches!(outcome, Ok(RunOutcome::Done(_)));
+                    let out = interp.output();
+                    // After the run, the byte at the cleared offset must be the original.
+                    let byte_after = f_proto.chunk.code[expected.1];
+                    *vm.instrument.borrow_mut() = None;
+                    let stops = controller.join().expect("controller thread");
+                    (ok, out, stops, byte_after, original_byte)
+                })
+            });
+
+        assert!(ok, "program ran free to completion");
+        assert_eq!(out, "1\n", "program output unchanged");
+        assert_eq!(
+            stops, 1,
+            "only the entry break fired; the cleared breakpoint never trapped"
+        );
+        assert_eq!(
+            byte_after_clear, expected_original,
+            "ClearBreakpoints restored the exact original opcode byte"
+        );
+        assert_ne!(
+            byte_after_clear,
+            Op::Break as u8,
+            "the byte is not left patched after clear"
+        );
+    }
+
+    #[test]
+    fn debug_command_and_event_types_are_send() {
+        // Mirror the instrument.rs airlock proof at the run.rs layer too.
+        fn _assert_send<T: Send>() {}
+        _assert_send::<crate::vm::instrument::DebugCommand>();
+        _assert_send::<crate::vm::instrument::DebugEvent>();
+        _assert_send::<crate::vm::instrument::BreakpointBinding>();
     }
 
     #[test]

@@ -94,6 +94,27 @@ pub enum DebugCommand {
     StepIn,
     /// Step out.
     StepOut,
+    /// Set the breakpoints for a source file to EXACTLY this line set (DAP setBreakpoints
+    /// is declarative/replace-all per source). Lines are 1-based as the editor sends them;
+    /// the VM maps each to the first bytecode offset on that line. Plain data — resolution
+    /// happens on the VM thread.
+    SetBreakpoints { source: String, lines: Vec<u32> },
+    /// Clear ALL breakpoints (restore every patched byte).
+    ClearBreakpoints,
+}
+
+/// One requested breakpoint line and the VM's verdict on it: whether a real instruction
+/// could be bound and the bytecode offset it bound to (for the DAP `breakpoint` reply).
+/// Plain owned data only — no `Rc`/`Value`/`Cc` (the worker-airlock discipline).
+#[derive(Clone, Debug)]
+pub struct BreakpointBinding {
+    /// The 1-based source line the editor requested.
+    pub line: u32,
+    /// Whether a breakpoint was actually set (a real instruction was found at/after the
+    /// line in a candidate proto). `false` means unbound (no executable line).
+    pub verified: bool,
+    /// The bytecode offset the breakpoint bound to, when `verified`. `None` if unbound.
+    pub offset: Option<u32>,
 }
 
 /// A Send-safe snapshot of one call frame at a debugger stop. PLAIN OWNED DATA only —
@@ -134,6 +155,9 @@ pub enum DebugEvent {
         /// `String`/`u32` only — no `Value`/`Rc`/`Cc` crosses the channel.
         frames: Vec<FrameSnapshot>,
     },
+    /// Reply to [`DebugCommand::SetBreakpoints`]: per requested line, whether a
+    /// breakpoint was bound and where. Plain owned data only.
+    BreakpointsVerified { results: Vec<BreakpointBinding> },
 }
 
 /// The DBG debugger hook: the breakpoint side table + stepping state + the `Send`
@@ -197,6 +221,56 @@ impl DebuggerHook {
         original
     }
 
+    /// Set a breakpoint at `(proto_id, offset)` while the chunk is reachable only through
+    /// a *shared* `&Chunk` (the runtime case — the parked VM patches a live proto). Saves
+    /// the original byte into the side table (idempotent, mirroring [`set_breakpoint`])
+    /// and writes [`Op::Break`](crate::vm::opcode::Op::Break) through
+    /// [`Chunk::patch_byte`](crate::vm::chunk::Chunk::patch_byte), which is sound because
+    /// `Code` is `UnsafeCell`-backed (single-threaded, no live `&` into the buffer at the
+    /// debug-stop site). Returns the original byte that was displaced.
+    ///
+    /// Like [`set_breakpoint`], patching is in place — it never moves an offset, so the
+    /// inline-cache side maps and the `spans`/`line_starts` tables stay valid.
+    pub fn set_breakpoint_shared(
+        &mut self,
+        proto_id: usize,
+        offset: usize,
+        chunk: &crate::vm::chunk::Chunk,
+    ) -> u8 {
+        let key = (proto_id, offset);
+        // If already patched, the saved byte is authoritative — never re-save the
+        // Op::Break byte over the real original.
+        let original = *self.breakpoints.entry(key).or_insert_with(|| chunk.code[offset]);
+        chunk.patch_byte(offset, crate::vm::opcode::Op::Break as u8);
+        original
+    }
+
+    /// Drain the side table, yielding each `((proto_id, offset), original_byte)` so the
+    /// caller can restore every patched byte through its `&Chunk`. Leaves the hook with
+    /// no breakpoints (used by `ClearBreakpoints`).
+    pub fn drain_breakpoints(&mut self) -> Vec<(ProtoOffset, u8)> {
+        self.breakpoints.drain().collect()
+    }
+
+    /// The `(proto_id, offset)` keys of the breakpoints currently bound to `source_protos`
+    /// — i.e. whose `proto_id` appears in the given set. Used by `SetBreakpoints` to clear
+    /// just one source's existing breakpoints before re-binding the requested line set
+    /// (DAP setBreakpoints is replace-all *per source*).
+    pub fn breakpoints_in(&self, proto_ids: &std::collections::HashSet<usize>) -> Vec<ProtoOffset> {
+        self.breakpoints
+            .keys()
+            .filter(|(pid, _)| proto_ids.contains(pid))
+            .copied()
+            .collect()
+    }
+
+    /// Remove a single side-table entry and return its saved original byte (the caller
+    /// restores it through the chunk). No-op (`None`) if absent. Does NOT touch the code
+    /// (the caller patches), unlike [`clear_breakpoint`].
+    pub fn forget_breakpoint(&mut self, proto_id: usize, offset: usize) -> Option<u8> {
+        self.breakpoints.remove(&(proto_id, offset))
+    }
+
     /// Clear a breakpoint at `(proto_id, offset)`, restoring the exact original byte.
     /// No-op (returns `None`) if no breakpoint was set there.
     pub fn clear_breakpoint(
@@ -255,6 +329,8 @@ mod tests {
         fn _assert_send<T: Send>() {}
         _assert_send::<FrameSnapshot>();
         _assert_send::<DebugEvent>();
+        _assert_send::<DebugCommand>();
+        _assert_send::<BreakpointBinding>();
     }
 
     #[test]
