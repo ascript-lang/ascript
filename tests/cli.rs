@@ -2910,3 +2910,271 @@ fn manifest_capabilities_table_denies_and_composes_with_cli() {
     assert_eq!(out, "false\nfalse\ntrue\n", "manifest+CLI denials union");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── DX D1: `ascript doc` golden + smoke tests ──────────────────────────────
+
+/// A pinned Markdown golden over a documented module: signatures + `///` bodies +
+/// member rendering. `ascript doc --format md <file>` streams Markdown to stdout.
+#[test]
+fn doc_markdown_golden() {
+    let file = std::env::temp_dir().join("ascript_doc_golden.as");
+    std::fs::write(
+        &file,
+        "//! A tiny calculator.\n\
+         \n\
+         /// Adds two numbers.\n\
+         export fn add(a: number, b: number): number { return a + b }\n\
+         \n\
+         /// A 2D point.\n\
+         export class Point {\n  \
+           /// the x coordinate\n  \
+           x: number = 0\n  \
+           fn init(x) { self.x = x }\n\
+         }\n\
+         \n\
+         /// The shapes.\n\
+         export enum Shape { Circle(r: float), Square }\n\
+         \n\
+         fn hidden() { return 1 }\n",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("md")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "doc failed: {:?}", output);
+    let md = String::from_utf8_lossy(&output.stdout);
+
+    // Module heading + module doc.
+    assert!(md.contains("# ascript_doc_golden"), "module heading: {md}");
+    assert!(md.contains("A tiny calculator."), "module doc: {md}");
+    // Function signature + doc.
+    assert!(md.contains("## fn `add`"), "fn heading: {md}");
+    assert!(
+        md.contains("fn add(a: number, b: number): number"),
+        "fn sig: {md}"
+    );
+    assert!(md.contains("Adds two numbers."), "fn doc: {md}");
+    // Class + field + method.
+    assert!(md.contains("## class `Point`"), "class heading: {md}");
+    assert!(md.contains("`x: number = 0`"), "field sig: {md}");
+    assert!(md.contains("the x coordinate"), "field doc: {md}");
+    assert!(md.contains("#### method `init`"), "method heading: {md}");
+    // Enum variants.
+    assert!(md.contains("## enum `Shape`"), "enum heading: {md}");
+    assert!(md.contains("Circle(r: float)"), "variant sig: {md}");
+    // Private `hidden` is NOT in the public output.
+    assert!(!md.contains("hidden"), "private fn must be excluded: {md}");
+
+    std::fs::remove_file(&file).ok();
+}
+
+/// `--private` includes non-exported declarations.
+#[test]
+fn doc_private_flag_includes_unexported() {
+    let file = std::env::temp_dir().join("ascript_doc_private.as");
+    std::fs::write(
+        &file,
+        "export fn pub_one() {}\nfn priv_one() {}\n",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("md")
+        .arg("--private")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let md = String::from_utf8_lossy(&out.stdout);
+    assert!(md.contains("priv_one"), "--private must include unexported: {md}");
+    std::fs::remove_file(&file).ok();
+}
+
+/// `--format html` writes a self-contained tree: `index.html`, `style.css`, one
+/// page per module. Check the index structure links the module page.
+#[test]
+fn doc_html_index_structure() {
+    let file = std::env::temp_dir().join("ascript_doc_html.as");
+    std::fs::write(
+        &file,
+        "//! HTML module.\n/// A function.\nexport fn f() {}\n",
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join("ascript_doc_html_out");
+    std::fs::remove_dir_all(&dir).ok();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let status = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("html")
+        .arg("--out")
+        .arg(&dir)
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "doc html failed: {:?}", status);
+
+    let index = std::fs::read_to_string(dir.join("index.html")).unwrap();
+    assert!(index.contains("<title>API documentation</title>"), "index title");
+    assert!(
+        index.contains("href=\"ascript_doc_html.html\""),
+        "index links module page: {index}"
+    );
+    assert!(
+        index.contains("<link rel=\"stylesheet\" href=\"style.css\">"),
+        "self-contained stylesheet link"
+    );
+    // The stylesheet exists (self-contained tree).
+    assert!(dir.join("style.css").exists(), "style.css written");
+    // The module page exists with the item.
+    let page = std::fs::read_to_string(dir.join("ascript_doc_html.html")).unwrap();
+    assert!(page.contains("fn f()"), "module page has the fn: {page}");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&file).ok();
+}
+
+/// `--check` exits non-zero on a deliberately-undocumented public symbol and zero
+/// when all public symbols are documented.
+#[test]
+fn doc_check_exits_nonzero_on_undocumented() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    // Undocumented public `bad` → non-zero, reports it.
+    let undoc = std::env::temp_dir().join("ascript_doc_check_undoc.as");
+    std::fs::write(&undoc, "/// ok\nexport fn good() {}\nexport fn bad() {}\n").unwrap();
+    let out = Command::new(bin).arg("doc").arg("--check").arg(&undoc).output().unwrap();
+    assert!(!out.status.success(), "must fail on undocumented symbol");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(combined.contains("bad"), "reports the undocumented symbol: {combined}");
+
+    // Fully documented → zero.
+    let doc = std::env::temp_dir().join("ascript_doc_check_ok.as");
+    std::fs::write(&doc, "/// a\nexport fn a() {}\n/// b\nexport fn b() {}\n").unwrap();
+    let out = Command::new(bin).arg("doc").arg("--check").arg(&doc).output().unwrap();
+    assert!(out.status.success(), "must pass when all documented: {:?}", out);
+
+    std::fs::remove_file(&undoc).ok();
+    std::fs::remove_file(&doc).ok();
+}
+
+/// Review finding 1: two `.as` files with the same STEM in different directories
+/// must produce two DISTINCT output files (no silent overwrite), and the HTML
+/// index must link both with distinct hrefs.
+#[test]
+fn doc_same_stem_files_do_not_collide() {
+    let base = std::env::temp_dir().join(format!("ascript_doc_collide_{}", std::process::id()));
+    std::fs::remove_dir_all(&base).ok();
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    std::fs::create_dir_all(base.join("b")).unwrap();
+    std::fs::write(base.join("a/util.as"), "/// From A.\nexport fn fa() {}\n").unwrap();
+    std::fs::write(base.join("b/util.as"), "/// From B.\nexport fn fb() {}\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let outdir = base.join("out");
+
+    // HTML: two distinct module pages + distinct index links.
+    let status = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("html")
+        .arg("--out")
+        .arg(&outdir)
+        .arg(&base)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "doc html failed: {:?}", status);
+    let index = std::fs::read_to_string(outdir.join("index.html")).unwrap();
+    // Both modules present in the index, with DISTINCT hrefs (slug a_util / b_util).
+    assert!(index.contains("a_util.html"), "a/util page linked: {index}");
+    assert!(index.contains("b_util.html"), "b/util page linked: {index}");
+    // Both module pages exist on disk (neither overwrote the other).
+    assert!(outdir.join("a_util.html").exists(), "a_util.html written");
+    assert!(outdir.join("b_util.html").exists(), "b_util.html written");
+    let a_page = std::fs::read_to_string(outdir.join("a_util.html")).unwrap();
+    let b_page = std::fs::read_to_string(outdir.join("b_util.html")).unwrap();
+    assert!(a_page.contains("From A."), "a page has its own doc: {a_page}");
+    assert!(b_page.contains("From B."), "b page has its own doc: {b_page}");
+
+    // Markdown: two distinct .md files.
+    let mddir = base.join("md");
+    let status = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("md")
+        .arg("--out")
+        .arg(&mddir)
+        .arg(&base)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "doc md failed: {:?}", status);
+    assert!(mddir.join("a_util.md").exists(), "a_util.md written");
+    assert!(mddir.join("b_util.md").exists(), "b_util.md written");
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Review finding 2 (e2e): an HTML doc body's Markdown (fence, inline code, link,
+/// bold) renders as real HTML, not literal characters.
+#[test]
+fn doc_html_renders_markdown_body() {
+    let file = std::env::temp_dir().join(format!("ascript_doc_md_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "/// Uses `len(x)`, is **important**, see [guide](https://ex.com).\n///\n/// ```ascript\n/// let y = 2\n/// ```\nexport fn f() {}\n",
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("ascript_doc_md_out_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let status = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("html")
+        .arg("--out")
+        .arg(&dir)
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "doc failed: {:?}", status);
+    let page_name = format!(
+        "{}.html",
+        file.file_stem().unwrap().to_string_lossy()
+    );
+    let page = std::fs::read_to_string(dir.join(&page_name)).unwrap();
+    assert!(page.contains("<code>len(x)</code>"), "inline code: {page}");
+    assert!(page.contains("<strong>important</strong>"), "bold: {page}");
+    assert!(page.contains("<a href=\"https://ex.com\""), "link: {page}");
+    assert!(page.contains("<pre><code>let y = 2"), "fence: {page}");
+    assert!(!page.contains("**important**"), "no literal bold markers: {page}");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&file).ok();
+}
+
+/// Review finding 6 (e2e): a bare `///` with empty body does NOT satisfy `--check`.
+#[test]
+fn doc_check_rejects_empty_doc_body() {
+    let file = std::env::temp_dir().join(format!("ascript_doc_empty_{}.as", std::process::id()));
+    std::fs::write(&file, "///\nexport fn a() {}\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("doc").arg("--check").arg(&file).output().unwrap();
+    assert!(!out.status.success(), "empty /// must NOT pass --check");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(combined.contains("a"), "reports the undocumented symbol: {combined}");
+    std::fs::remove_file(&file).ok();
+}

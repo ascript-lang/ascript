@@ -215,6 +215,21 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
 fn decl_doc(name: &str, model: &SemanticModel) -> Option<String> {
     let syms = crate::lsp::providers::symbols::document_symbols(model);
     let sym = syms.iter().find(|s| s.name == name)?;
+    let base = decl_doc_label(name, sym, model)?;
+    // DX D1 Task 4: prepend the user's `///` doc body (the shared extractor —
+    // one source of truth with `ascript doc`), if the decl has one.
+    Some(match user_doc_body(name, model) {
+        Some(body) => format!("{base}\n\n{body}"),
+        None => base,
+    })
+}
+
+/// The kind-label portion of a declaration's hover (the pre-DX behavior).
+fn decl_doc_label(
+    name: &str,
+    sym: &tower_lsp::lsp_types::DocumentSymbol,
+    model: &SemanticModel,
+) -> Option<String> {
     let kind = match sym.kind {
         SymbolKind::FUNCTION => {
             // Detect `worker fn` by walking the CST for a FnDecl with this name
@@ -240,6 +255,42 @@ fn decl_doc(name: &str, model: &SemanticModel) -> Option<String> {
         _ => "symbol",
     };
     Some(format!("```\n{kind} {name}\n```"))
+}
+
+/// DX D1 Task 4: the user's `///` doc body for the top-level declaration named
+/// `name` (the shared `syntax::doc_comment` extractor — one source of truth with
+/// `ascript doc`), or `None` if the decl has no doc-comment.
+fn user_doc_body(name: &str, model: &SemanticModel) -> Option<String> {
+    for child in model.tree.children() {
+        let decl = if child.kind() == SyntaxKind::ExportStmt {
+            match child.children().next() {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            child
+        };
+        if !is_documentable_decl(decl.kind()) {
+            continue;
+        }
+        if crate::syntax::resolve::ident_text(decl).as_deref() != Some(name) {
+            continue;
+        }
+        // Pass the EXPORT wrapper if present (its leading trivia carries the doc);
+        // `doc_comment_run` climbs to the wrapper internally either way.
+        let doc = crate::syntax::doc_comment::doc_comment_run(decl)?;
+        if doc.body.trim().is_empty() {
+            return None;
+        }
+        return Some(doc.body);
+    }
+    None
+}
+
+/// True if `kind` is a top-level declaration whose `///` doc is surfaced on hover.
+fn is_documentable_decl(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(kind, FnDecl | ClassDecl | EnumDecl | LetStmt)
 }
 
 /// Return `true` if the top-level `FnDecl` named `name` in `model` carries a
@@ -410,6 +461,33 @@ mod tests {
             doc.contains("worker"),
             "hover on a worker fn must mention 'worker'; got: {doc}"
         );
+    }
+
+    /// DX D1 Task 4: hovering a documented decl shows the user's `///` doc body.
+    #[test]
+    fn doc_at_shows_user_doc_comment() {
+        let src = "/// Greets warmly.\nfn greet() {}\ngreet()\n";
+        let m = model(src);
+        // Hover on `greet` in the declaration.
+        let off = src.find("greet").unwrap();
+        let doc = doc_at(&m, off).expect("hover on greet");
+        assert!(
+            doc.contains("Greets warmly."),
+            "hover must include the user's /// doc; got: {doc}"
+        );
+        // The kind label is still present (the doc is appended, not replacing it).
+        assert!(doc.contains("fn greet"), "kind label retained: {doc}");
+    }
+
+    /// A class with a multi-line `///` doc surfaces the full body.
+    #[test]
+    fn doc_at_class_doc_multiline() {
+        let src = "/// A widget.\n/// Holds state.\nclass Widget {}\nWidget()\n";
+        let m = model(src);
+        let off = src.find("Widget").unwrap();
+        let doc = doc_at(&m, off).expect("hover on Widget");
+        assert!(doc.contains("A widget."), "summary line: {doc}");
+        assert!(doc.contains("Holds state."), "second line: {doc}");
     }
 
     /// A plain (non-worker) class hover must NOT contain "worker".

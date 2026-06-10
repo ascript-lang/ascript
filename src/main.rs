@@ -131,6 +131,30 @@ enum Command {
         #[arg(long = "fix-dry-run")]
         fix_dry_run: bool,
     },
+    /// Generate API documentation from `///` doc-comments (DX D1).
+    #[cfg(feature = "doc")]
+    Doc {
+        /// Files or directories to document (default: the current directory,
+        /// discovered like `check`). Resolves imports to document a whole project.
+        paths: Vec<String>,
+        /// Output directory (default `target/doc/`). Used for `--format html`.
+        #[arg(long = "out", value_name = "DIR")]
+        out: Option<String>,
+        /// Output format: `html` (default; a self-contained `target/doc/` tree) or
+        /// `md` (Markdown to stdout / `--out`).
+        #[arg(long = "format", value_name = "FORMAT", default_value = "html")]
+        format: String,
+        /// Include non-exported declarations (default: public API only).
+        #[arg(long = "private")]
+        private: bool,
+        /// Open the generated `index.html` after writing (best-effort, `sys`-gated).
+        #[arg(long = "open")]
+        open: bool,
+        /// Doc-lint: write nothing; exit non-zero if a public declaration lacks a
+        /// doc-comment (a CI gate), reporting the undocumented symbols.
+        #[arg(long = "check")]
+        check: bool,
+    },
     /// Run .as test files
     Test {
         files: Vec<String>,
@@ -804,6 +828,15 @@ async fn real_main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        #[cfg(feature = "doc")]
+        Command::Doc {
+            paths,
+            out,
+            format,
+            private,
+            open,
+            check,
+        } => run_doc(paths, out, format, private, open, check),
         Command::Test {
             files,
             locked,
@@ -902,6 +935,253 @@ async fn real_main() -> ExitCode {
         #[cfg(feature = "pkg")]
         Command::Verify => pkg_command_exit(pkg::commands::cmd_verify()),
     }
+}
+
+/// DX D1: `ascript doc` — discover `.as` files, build the doc model (static CST
+/// walk, never the interpreter), and emit Markdown / HTML, or `--check` for
+/// undocumented public symbols.
+#[cfg(feature = "doc")]
+fn run_doc(
+    paths: Vec<String>,
+    out: Option<String>,
+    format: String,
+    private: bool,
+    open: bool,
+    check: bool,
+) -> ExitCode {
+    use ascript::doc;
+    use ascript::lsp::workspace::{discover_as_files, WorkspaceIndex};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    // 1. Discover the source files (files passed directly, or recurse a directory).
+    let roots: Vec<PathBuf> = if paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        paths.iter().map(PathBuf::from).collect()
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    for root in &roots {
+        if root.is_dir() {
+            files.extend(discover_as_files(root));
+        } else if root.extension().and_then(|e| e.to_str()) == Some("as") {
+            files.push(root.clone());
+        } else {
+            eprintln!("warning: skipping non-.as path '{}'", root.display());
+        }
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        eprintln!("error: no .as files found");
+        return ExitCode::from(1);
+    }
+
+    // 2. Read sources + build a workspace index for the exported-name sets.
+    let mut sources: Vec<(PathBuf, String)> = Vec::new();
+    for path in &files {
+        match std::fs::read_to_string(path) {
+            Ok(text) => sources.push((path.clone(), text)),
+            Err(e) => {
+                eprintln!("{}: {}", path.display(), e);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let index = WorkspaceIndex::build_from_files(&sources);
+
+    // The index canonicalizes paths lexically; resolve each source path the same
+    // way to look up its exports.
+    let exports_for = |path: &Path| -> HashSet<String> {
+        let canon = lexical_canon(path);
+        index
+            .files
+            .get(&canon)
+            .map(|fi| fi.exports.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    // 3. Build the doc model per file. Each module's display NAME is its path
+    // RELATIVE to the common root of the whole input set (finding 1) — so two
+    // same-stem files in different directories (`a/util.as`, `b/util.as`) become
+    // `a/util` / `b/util` and get distinct output files + distinct index links
+    // (the slug helper, shared by both md + html).
+    let common_root = common_root(&files);
+    let mut modules: Vec<doc::DocModule> = Vec::new();
+    for (path, text) in &sources {
+        let exports = exports_for(path);
+        let name = doc::relative_module_name(path, &common_root);
+        modules.push(doc::extract_module(path, &name, text, &exports, private));
+    }
+    // Drop empty modules (no documentable items) so the index stays focused, unless
+    // a module carries a `//!` module doc.
+    modules.retain(|m| !m.items.is_empty() || m.module_doc.is_some());
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // 4. `--check`: report undocumented public symbols, exit non-zero on any.
+    if check {
+        let mut missing = 0usize;
+        for m in &modules {
+            for sym in doc::undocumented_public(m) {
+                println!("{}: undocumented public {}", m.path.display(), sym);
+                missing += 1;
+            }
+        }
+        if missing > 0 {
+            eprintln!("error: {missing} undocumented public symbol(s)");
+            return ExitCode::from(1);
+        }
+        println!("all public symbols are documented");
+        return ExitCode::SUCCESS;
+    }
+
+    // 5. Emit.
+    match format.as_str() {
+        "md" => {
+            let out_dir = out.as_deref().map(PathBuf::from);
+            if let Some(dir) = &out_dir {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    eprintln!("error: {}: {e}", dir.display());
+                    return ExitCode::from(1);
+                }
+                for m in &modules {
+                    let md = doc::markdown::render_module(m);
+                    // Key the output file by the SHARED slug (same SoT as html +
+                    // the index link), so same-stem modules never collide.
+                    let file = dir.join(format!("{}.md", m.slug));
+                    if let Err(e) = std::fs::write(&file, md) {
+                        eprintln!("error: {}: {e}", file.display());
+                        return ExitCode::from(1);
+                    }
+                }
+                println!("wrote {} module(s) to {}", modules.len(), dir.display());
+            } else {
+                // No --out: stream Markdown to stdout (concatenated).
+                for m in &modules {
+                    print!("{}", doc::markdown::render_module(m));
+                    println!();
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        "html" => {
+            // DEFERRED (review finding 3, owner-noted): SYMBOL cross-linking — a use
+            // of a documented symbol linking to its def page across modules (via the
+            // workspace index's `ResolvedTarget` cross-file targets, plan Task 3) — is
+            // NOT yet implemented. Today only index↔module navigation links exist. This
+            // is a documented DX follow-up, not a silent drop (CLAUDE.md no-silent-
+            // deferral rule); fully resolving every symbol reference to its page is the
+            // larger remaining piece.
+            let dir = out
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/doc"));
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("error: {}: {e}", dir.display());
+                return ExitCode::from(1);
+            }
+            // The shared stylesheet.
+            if let Err(e) = std::fs::write(dir.join("style.css"), doc::html::STYLE_CSS) {
+                eprintln!("error: writing style.css: {e}");
+                return ExitCode::from(1);
+            }
+            // The index.
+            if let Err(e) = std::fs::write(dir.join("index.html"), doc::html::render_index(&modules))
+            {
+                eprintln!("error: writing index.html: {e}");
+                return ExitCode::from(1);
+            }
+            // Per-module pages.
+            for m in &modules {
+                let file = dir.join(doc::html::module_filename(m));
+                if let Err(e) = std::fs::write(&file, doc::html::render_module(m)) {
+                    eprintln!("error: {}: {e}", file.display());
+                    return ExitCode::from(1);
+                }
+            }
+            let index_path = dir.join("index.html");
+            println!(
+                "wrote {} module(s) to {}",
+                modules.len(),
+                dir.display()
+            );
+            if open {
+                open_in_browser(&index_path);
+            }
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("error: unknown --format '{other}' (expected 'html' or 'md')");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Lexically canonicalize a path (resolve `.`/`..`) WITHOUT touching the
+/// filesystem, mirroring the workspace index's keying so `Doc` can look a source
+/// file up by its indexed key.
+#[cfg(feature = "doc")]
+fn lexical_canon(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        use std::path::Component::*;
+        match comp {
+            CurDir => {}
+            ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The longest common DIRECTORY prefix of the input files — used to derive each
+/// module's root-relative display name (finding 1). With a single file, the root
+/// is its parent directory (so the name is the bare stem). Empty input → the
+/// current dir.
+#[cfg(feature = "doc")]
+fn common_root(files: &[std::path::PathBuf]) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    // Each file's parent directory; the common root is the shared prefix of those.
+    let dirs: Vec<&Path> = files.iter().filter_map(|f| f.parent()).collect();
+    let Some((first, rest)) = dirs.split_first() else {
+        return PathBuf::from(".");
+    };
+    let mut prefix: Vec<_> = first.components().collect();
+    for dir in rest {
+        let comps: Vec<_> = dir.components().collect();
+        let keep = prefix
+            .iter()
+            .zip(comps.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(keep);
+    }
+    prefix.iter().collect()
+}
+
+/// Best-effort open of the generated index in the default browser (`sys`-gated;
+/// a no-op with a hint otherwise).
+#[cfg(all(feature = "doc", feature = "sys"))]
+fn open_in_browser(path: &std::path::Path) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener).arg(path).spawn();
+}
+
+/// `--open` fallback when `sys` is not compiled in.
+#[cfg(all(feature = "doc", not(feature = "sys")))]
+fn open_in_browser(path: &std::path::Path) {
+    eprintln!(
+        "note: --open requires the 'sys' feature; the docs are at {}",
+        path.display()
+    );
 }
 
 /// Map a package-command `Result<(), String>` to an exit code (clear error to

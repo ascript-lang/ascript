@@ -1504,6 +1504,59 @@ fn lsp_adt_variant_hover_and_completion() {
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
+/// DX D1 Task 4: hovering a declaration that carries a `///` doc-comment shows the
+/// USER'S doc body (via the shared `syntax::doc_comment` extractor), not just the
+/// kind label. One source of truth feeds both `ascript doc` and the LSP hover.
+#[test]
+fn lsp_hover_shows_user_doc_comment() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://documented.as";
+    // line 0: /// Greets the world warmly.
+    // line 1: fn greet() { print("hi") }
+    // line 2: greet()
+    let text = "/// Greets the world warmly.\nfn greet() { print(\"hi\") }\ngreet()\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Hover on `greet` in the declaration (line 1, char 3).
+    client.request(
+        2,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 3 }
+        }),
+    );
+    let hover_resp = client.read_response(2, overall);
+    let content = hover_resp["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        content.contains("Greets the world warmly."),
+        "hover must show the user's /// doc body; got: {content:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
 /// Task 12 Step 1c: hovering the name of a `worker fn` declaration (or a call
 /// to it) mentions "worker" and "future" in the hover response, reflecting that
 /// calls return `future<T>`.
