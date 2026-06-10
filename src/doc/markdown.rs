@@ -84,7 +84,7 @@ mod tests {
     fn renders_function_with_signature_and_doc() {
         let src = "/// Adds two numbers.\nexport fn add(a: number, b: number): number { return a + b }\n";
         let exp: HashSet<String> = ["add".to_string()].into_iter().collect();
-        let m = extract_module(Path::new("calc.as"), src, &exp, false);
+        let m = extract_module(Path::new("calc.as"), "calc", src, &exp, false);
         let md = render_module(&m);
         assert!(md.contains("# calc"));
         assert!(md.contains("## fn `add`"));
@@ -96,7 +96,7 @@ mod tests {
     fn renders_enum_variants() {
         let src = "/// A shape.\nexport enum Shape {\n  /// a circle\n  Circle(r: float),\n  Point,\n}\n";
         let exp: HashSet<String> = ["Shape".to_string()].into_iter().collect();
-        let m = extract_module(Path::new("shape.as"), src, &exp, false);
+        let m = extract_module(Path::new("shape.as"), "shape", src, &exp, false);
         let md = render_module(&m);
         assert!(md.contains("### Variants"));
         assert!(md.contains("Circle(r: float)"));

@@ -3,10 +3,13 @@
 //!
 //! Entirely STATIC: like the LSP and the checker, this NEVER instantiates the
 //! interpreter / runs code. It parses each file with the CST front-end
-//! (`syntax::parse_to_tree`), reuses the LSP workspace machinery for the
-//! exported-vs-private decision and path discovery (`lsp::workspace`), and reads
-//! each declaration's `///` doc via the shared extractor
-//! (`syntax::doc_comment::doc_comment_run`) — there is NO second parse.
+//! (`syntax::parse_to_tree`) and reads each declaration's `///` doc via the shared
+//! extractor (`syntax::doc_comment::doc_comment_run`). The extractor itself does
+//! NO re-tokenize / no second lex — it reinterprets the existing CST trivia. (The
+//! CLI driver `run_doc` does build a `WorkspaceIndex` for the exported-name sets,
+//! which parses each file, and `extract_module` re-parses it for the model; that
+//! is fine for a static tool — the "no second parse" invariant is specifically
+//! about the trivia extractor not re-lexing, not about the whole CLI pipeline.)
 //!
 //! The doc MODEL ([`DocModule`]/[`DocItem`]) captures the public-API decl kinds
 //! (spec §3.2): functions (incl. `async`/`worker`/`static`/`fn*` modifiers),
@@ -29,8 +32,15 @@ use std::path::{Path, PathBuf};
 pub struct DocModule {
     /// The source file path.
     pub path: PathBuf,
-    /// A display name for the module (the file stem).
+    /// A display name for the module — the path RELATIVE to the input set's common
+    /// root, sans extension (e.g. `a/util` for `…/a/util.as`). Disambiguates two
+    /// same-stem files in different directories so neither the index link nor the
+    /// output file collides (review finding 1).
     pub name: String,
+    /// A filesystem-safe slug for the module, derived from `name` (e.g.
+    /// `a_util`). The SINGLE source of truth for both the Markdown (`<slug>.md`)
+    /// and HTML (`<slug>.html`) output filenames + the index link.
+    pub slug: String,
     /// The `//!` module doc, if any.
     pub module_doc: Option<DocComment>,
     /// The documented top-level items, in source order.
@@ -91,11 +101,15 @@ pub struct DocMember {
 }
 
 /// Build a [`DocModule`] from a source file's text. STATIC: parses with the CST
-/// front-end only. `exports` is the set of exported top-level names (from the
-/// workspace `FileIndex.exports`); when `include_private` is false, only exported
-/// items are kept.
+/// front-end only. `name` is the module's display name (the caller passes the path
+/// RELATIVE to the input set's common root, sans extension — see [`module_name`] /
+/// [`relative_module_name`] — so two same-stem files in different directories stay
+/// distinct). `exports` is the set of exported top-level names (from the workspace
+/// `FileIndex.exports`); when `include_private` is false, only exported items are
+/// kept.
 pub fn extract_module(
     path: &Path,
+    name: &str,
     text: &str,
     exports: &std::collections::HashSet<String>,
     include_private: bool,
@@ -125,18 +139,68 @@ pub fn extract_module(
 
     DocModule {
         path: path.to_path_buf(),
-        name: module_name(path),
+        name: name.to_string(),
+        slug: slugify(name),
         module_doc,
         items,
     }
 }
 
-/// The display name for a module (the file stem, or the full path string if none).
-fn module_name(path: &Path) -> String {
+/// The fallback display name for a single module when no common-root context is
+/// available (the file stem, or the full path string if none). Tests/single-file
+/// callers use this; the CLI uses [`relative_module_name`] over the input set.
+pub fn module_name(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// A module's display name RELATIVE to `root` (sans `.as` extension), with path
+/// separators normalized to `/`. Falls back to [`module_name`] (the stem) if
+/// `path` is not under `root`. This is what disambiguates two same-stem files in
+/// different directories (`a/util`, `b/util`).
+pub fn relative_module_name(path: &Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    // Drop the `.as` extension; keep the directory components.
+    let mut parts: Vec<String> = Vec::new();
+    for comp in rel.components() {
+        if let std::path::Component::Normal(os) = comp {
+            parts.push(os.to_string_lossy().to_string());
+        }
+    }
+    if parts.is_empty() {
+        return module_name(path);
+    }
+    // Strip a trailing `.as` from the last component.
+    if let Some(last) = parts.last_mut() {
+        if let Some(stem) = last.strip_suffix(".as") {
+            *last = stem.to_string();
+        }
+    }
+    parts.join("/")
+}
+
+/// Turn a module display name (possibly with `/` separators) into a filesystem-
+/// safe slug — the SINGLE source of truth for both the `.md`/`.html` output
+/// filenames and the index link (so md and html never diverge, and same-stem
+/// modules get distinct files). Non-alphanumeric (besides `-`/`_`) → `_`.
+pub fn slugify(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "module".to_string()
+    } else {
+        s
+    }
 }
 
 /// Extract a [`DocItem`] from a top-level declaration node, or `None` if it is not
@@ -464,13 +528,21 @@ fn normalize_ws(s: &str) -> String {
 /// Public symbols in `module` that lack a `///` doc (for `ascript doc --check`).
 /// A class/enum is checked at the top level; its members are NOT required to be
 /// documented in v1 (the public-API gate is the exported top-level declaration).
+/// A bare `///` with an EMPTY body counts as UNDOCUMENTED (a stray `///` must not
+/// satisfy the CI gate) — aligned with the LSP hover's same empty-body guard.
 pub fn undocumented_public(module: &DocModule) -> Vec<String> {
     module
         .items
         .iter()
-        .filter(|i| i.exported && i.doc.is_none())
+        .filter(|i| i.exported && !has_doc_body(&i.doc))
         .map(|i| format!("{} {}", i.kind.label(), i.name))
         .collect()
+}
+
+/// True if `doc` is present AND its body is non-empty after trimming (an empty
+/// `///` does not count as documented).
+fn has_doc_body(doc: &Option<DocComment>) -> bool {
+    doc.as_ref().map(|d| !d.body.trim().is_empty()).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -483,7 +555,8 @@ mod tests {
     }
 
     fn extract(text: &str, exp: &[&str], private: bool) -> DocModule {
-        extract_module(Path::new("m.as"), text, &exports(exp), private)
+        let path = Path::new("m.as");
+        extract_module(path, &module_name(path), text, &exports(exp), private)
     }
 
     #[test]
@@ -601,5 +674,46 @@ mod tests {
         let src = "/// doc\nexport fn boom() { print(\"SHOULD NOT RUN\") }\n";
         let m = extract(src, &["boom"], false);
         assert_eq!(m.items.len(), 1);
+    }
+
+    /// Review finding 6: a bare `///` with an empty body must count as
+    /// UNDOCUMENTED for `--check` (a stray `///` cannot satisfy the CI gate).
+    #[test]
+    fn empty_doc_body_is_undocumented() {
+        let src = "///\nexport fn a() {}\n";
+        let m = extract(src, &["a"], false);
+        // The doc is present (a `///` line) but its body is empty.
+        assert!(m.items[0].doc.is_some(), "the empty /// is still parsed");
+        let missing = undocumented_public(&m);
+        assert_eq!(
+            missing,
+            vec!["fn a".to_string()],
+            "empty-body /// must count as undocumented"
+        );
+    }
+
+    /// Review finding 1: the slug helper disambiguates same-stem files in
+    /// different directories, and is a pure function of the root-relative name.
+    #[test]
+    fn relative_module_name_disambiguates_same_stem() {
+        let root = Path::new("/proj");
+        let a = relative_module_name(Path::new("/proj/a/util.as"), root);
+        let b = relative_module_name(Path::new("/proj/b/util.as"), root);
+        assert_eq!(a, "a/util");
+        assert_eq!(b, "b/util");
+        // And their slugs are distinct + filesystem-safe.
+        assert_eq!(slugify(&a), "a_util");
+        assert_eq!(slugify(&b), "b_util");
+        assert_ne!(slugify(&a), slugify(&b));
+    }
+
+    /// The slug is the single source of truth carried on the model.
+    #[test]
+    fn module_slug_set_from_name() {
+        let path = Path::new("/proj/a/util.as");
+        let name = relative_module_name(path, Path::new("/proj"));
+        let m = extract_module(path, &name, "/// d\nexport fn f() {}\n", &exports(&["f"]), false);
+        assert_eq!(m.name, "a/util");
+        assert_eq!(m.slug, "a_util");
     }
 }

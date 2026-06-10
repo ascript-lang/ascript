@@ -126,6 +126,14 @@ enum TrivItem {
 fn collect_outer_run(start: &ResolvedNode) -> Vec<String> {
     let anchor = export_anchor(start);
 
+    // v1 behavior note (review finding 4): a `///` on the SAME line as a preceding
+    // statement (`fn a() {} /// x` then, with no blank line, `export fn b()`) is
+    // attached to `b` as its leading trivia by the CST, so `x` becomes b's doc. This
+    // is spec-literal-conformant (the §2 attachment rule is defined purely on the
+    // trivia stream — a single `Newline` does not break a run) but can surprise. A
+    // fix would detect a same-line preceding sibling statement; deferred as it is an
+    // uncommon authoring pattern and the trivia-stream rule is the spec's SoT.
+
     // Build the leading-trivia item stream up to (and excluding) the first
     // non-trivia token, collapsing newline-runs into a single `Blank` boundary when
     // ≥ 2 in a row.

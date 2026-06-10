@@ -1001,11 +1001,17 @@ fn run_doc(
             .unwrap_or_default()
     };
 
-    // 3. Build the doc model per file.
+    // 3. Build the doc model per file. Each module's display NAME is its path
+    // RELATIVE to the common root of the whole input set (finding 1) — so two
+    // same-stem files in different directories (`a/util.as`, `b/util.as`) become
+    // `a/util` / `b/util` and get distinct output files + distinct index links
+    // (the slug helper, shared by both md + html).
+    let common_root = common_root(&files);
     let mut modules: Vec<doc::DocModule> = Vec::new();
     for (path, text) in &sources {
         let exports = exports_for(path);
-        modules.push(doc::extract_module(path, text, &exports, private));
+        let name = doc::relative_module_name(path, &common_root);
+        modules.push(doc::extract_module(path, &name, text, &exports, private));
     }
     // Drop empty modules (no documentable items) so the index stays focused, unless
     // a module carries a `//!` module doc.
@@ -1040,7 +1046,9 @@ fn run_doc(
                 }
                 for m in &modules {
                     let md = doc::markdown::render_module(m);
-                    let file = dir.join(format!("{}.md", m.name));
+                    // Key the output file by the SHARED slug (same SoT as html +
+                    // the index link), so same-stem modules never collide.
+                    let file = dir.join(format!("{}.md", m.slug));
                     if let Err(e) = std::fs::write(&file, md) {
                         eprintln!("error: {}: {e}", file.display());
                         return ExitCode::from(1);
@@ -1057,6 +1065,13 @@ fn run_doc(
             ExitCode::SUCCESS
         }
         "html" => {
+            // DEFERRED (review finding 3, owner-noted): SYMBOL cross-linking — a use
+            // of a documented symbol linking to its def page across modules (via the
+            // workspace index's `ResolvedTarget` cross-file targets, plan Task 3) — is
+            // NOT yet implemented. Today only index↔module navigation links exist. This
+            // is a documented DX follow-up, not a silent drop (CLAUDE.md no-silent-
+            // deferral rule); fully resolving every symbol reference to its page is the
+            // larger remaining piece.
             let dir = out
                 .as_deref()
                 .map(PathBuf::from)
@@ -1119,6 +1134,31 @@ fn lexical_canon(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
     out
+}
+
+/// The longest common DIRECTORY prefix of the input files — used to derive each
+/// module's root-relative display name (finding 1). With a single file, the root
+/// is its parent directory (so the name is the bare stem). Empty input → the
+/// current dir.
+#[cfg(feature = "doc")]
+fn common_root(files: &[std::path::PathBuf]) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    // Each file's parent directory; the common root is the shared prefix of those.
+    let dirs: Vec<&Path> = files.iter().filter_map(|f| f.parent()).collect();
+    let Some((first, rest)) = dirs.split_first() else {
+        return PathBuf::from(".");
+    };
+    let mut prefix: Vec<_> = first.components().collect();
+    for dir in rest {
+        let comps: Vec<_> = dir.components().collect();
+        let keep = prefix
+            .iter()
+            .zip(comps.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(keep);
+    }
+    prefix.iter().collect()
 }
 
 /// Best-effort open of the generated index in the default browser (`sys`-gated;

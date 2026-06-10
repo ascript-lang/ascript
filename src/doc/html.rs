@@ -42,16 +42,189 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// A page filename for a module (its name + `.html`).
-pub fn module_filename(module: &DocModule) -> String {
-    format!("{}.html", sanitize(&module.name))
+/// Render a `///` Markdown body to HTML (review finding 2 / spec §2: the body is
+/// Markdown — code fences, inline code, links, and emphasis must work, not render
+/// literally). A small hand-rolled renderer mirroring `docs/assets/app.js`
+/// `renderMarkdown`/`renderInline` — NO new crate dependency. Block grammar:
+/// fenced ```` ``` ```` code → `<pre><code>` (HTML-escaped contents), blank-line-
+/// separated paragraphs → `<p>` (inline-rendered). Inline: `` `code` `` →
+/// `<code>`, `[text](url)` → `<a>`, `**bold**` → `<strong>`, `*italic*` → `<em>`.
+/// ALL text + code-fence contents are HTML-escaped BEFORE insertion (no XSS — a
+/// `<script>` in a body stays inert).
+pub fn render_markdown(md: &str) -> String {
+    let normalized = md.replace('\r', "");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut html = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // Fenced code block: ``` or ```lang … ```.
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            let _lang = rest.trim();
+            i += 1;
+            let mut buf: Vec<&str> = Vec::new();
+            while i < lines.len() && !lines[i].trim_start().starts_with("```") {
+                buf.push(lines[i]);
+                i += 1;
+            }
+            // Skip the closing fence (if present).
+            if i < lines.len() {
+                i += 1;
+            }
+            html.push_str(&format!("<pre><code>{}</code></pre>\n", esc(&buf.join("\n"))));
+            continue;
+        }
+        // Blank line: paragraph separator.
+        if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        // A paragraph runs until a blank line or a fence.
+        let mut para: Vec<&str> = Vec::new();
+        while i < lines.len()
+            && !lines[i].trim().is_empty()
+            && !lines[i].trim_start().starts_with("```")
+        {
+            para.push(lines[i]);
+            i += 1;
+        }
+        html.push_str(&format!("<p>{}</p>\n", render_inline(&para.join(" "))));
+    }
+    html
 }
 
-/// Sanitize a module name into a filesystem-safe slug.
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect()
+/// Render inline Markdown to HTML: inline code (contents protected + escaped),
+/// links, bold, italic. Order matters — protect inline-code spans first so their
+/// contents are not re-processed, escape the surrounding text, then apply the
+/// link/emphasis transforms (whose markup is HTML we intentionally emit), and
+/// finally restore the escaped code spans.
+fn render_inline(s: &str) -> String {
+    // 1. Extract inline-code spans, replacing each with a private-use placeholder.
+    let mut codes: Vec<String> = Vec::new();
+    let mut protected = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            let mut code = String::new();
+            let mut closed = false;
+            for d in chars.by_ref() {
+                if d == '`' {
+                    closed = true;
+                    break;
+                }
+                code.push(d);
+            }
+            if closed {
+                protected.push('\u{E000}');
+                protected.push_str(&codes.len().to_string());
+                protected.push('\u{E000}');
+                codes.push(code);
+            } else {
+                // An unterminated backtick — keep it literally.
+                protected.push('`');
+                protected.push_str(&code);
+            }
+        } else {
+            protected.push(c);
+        }
+    }
+    // 2. Escape all remaining text (the placeholders survive — they are PUA chars).
+    let mut out = esc(&protected);
+    // 3. Links [text](url) — escape both parts; mark external links.
+    out = replace_links(&out);
+    // 4. Bold then italic.
+    out = replace_delimited(&out, "**", "strong");
+    out = replace_delimited(&out, "*", "em");
+    // 5. Restore inline-code spans (their contents escaped).
+    for (idx, code) in codes.iter().enumerate() {
+        let placeholder = format!("\u{E000}{idx}\u{E000}");
+        out = out.replace(&placeholder, &format!("<code>{}</code>", esc(code)));
+    }
+    out
+}
+
+/// Replace `[text](url)` with `<a href="url">text</a>`. Operates on already-escaped
+/// text, so the `[`/`]`/`(`/`)` literals are intact; the url is attribute-escaped.
+fn replace_links(s: &str) -> String {
+    let mut out = String::new();
+    let bytes: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '[' {
+            // Find the matching `]` then `(` … `)`.
+            if let Some(close) = find_from(&bytes, i + 1, ']') {
+                if close + 1 < bytes.len() && bytes[close + 1] == '(' {
+                    if let Some(paren) = find_from(&bytes, close + 2, ')') {
+                        let text: String = bytes[i + 1..close].iter().collect();
+                        let url: String = bytes[close + 2..paren].iter().collect();
+                        let external = url.starts_with("http://") || url.starts_with("https://");
+                        let ext_attr = if external {
+                            " target=\"_blank\" rel=\"noopener\""
+                        } else {
+                            ""
+                        };
+                        out.push_str(&format!(
+                            "<a href=\"{}\"{}>{}</a>",
+                            attr_esc(&url),
+                            ext_attr,
+                            text
+                        ));
+                        i = paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Index of the first `target` at or after `start`, if any.
+fn find_from(chars: &[char], start: usize, target: char) -> Option<usize> {
+    (start..chars.len()).find(|&j| chars[j] == target)
+}
+
+/// Replace `<delim>inner<delim>` spans with `<tag>inner</tag>` (non-nesting, the
+/// shortest match). `delim` is `**` (bold) or `*` (italic). Already-escaped input,
+/// so the delimiters are literal asterisks (`*` is not escaped by `esc`).
+fn replace_delimited(s: &str, delim: &str, tag: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find(delim) {
+        let after = &rest[start + delim.len()..];
+        if let Some(end) = after.find(delim) {
+            let inner = &after[..end];
+            // A `*` italic must not swallow `**` bold boundaries: require non-empty,
+            // non-asterisk-bounded inner for the single-`*` case.
+            if delim == "*" && (inner.is_empty() || inner.starts_with('*') || inner.ends_with('*'))
+            {
+                out.push_str(&rest[..start + delim.len()]);
+                rest = after;
+                continue;
+            }
+            out.push_str(&rest[..start]);
+            out.push_str(&format!("<{tag}>{inner}</{tag}>"));
+            rest = &after[end + delim.len()..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Attribute-escape a URL (escape `"` and the angle/amp chars).
+fn attr_esc(s: &str) -> String {
+    esc(s)
+}
+
+/// A page filename for a module — its `slug` (the SINGLE source of truth shared
+/// with the Markdown emitter and the index link, derived from the root-relative
+/// name, so two same-stem files in different dirs get distinct files — finding 1).
+pub fn module_filename(module: &DocModule) -> String {
+    format!("{}.html", module.slug)
 }
 
 /// The shared HTML document shell.
@@ -92,7 +265,7 @@ pub fn render_module(module: &DocModule) -> String {
     body.push_str(&format!("<h1>{}</h1>\n", esc(&module.name)));
 
     if let Some(doc) = &module.module_doc {
-        body.push_str(&format!("<p>{}</p>\n", esc(&doc.body)));
+        body.push_str(&render_markdown(&doc.body));
     }
 
     if module.items.is_empty() {
@@ -123,7 +296,7 @@ fn render_item(body: &mut String, item: &DocItem, level: usize) {
     body.push_str(&format!("<pre><code>{}</code></pre>\n", esc(&item.signature)));
 
     if let Some(doc) = &item.doc {
-        body.push_str(&format!("<p>{}</p>\n", esc(&doc.body)));
+        body.push_str(&render_markdown(&doc.body));
     }
 
     if !item.members.is_empty() {
@@ -167,7 +340,7 @@ mod tests {
     fn mods() -> Vec<DocModule> {
         let src = "//! A calculator.\n/// Adds two numbers.\nexport fn add(a, b) { return a + b }\n";
         let exp: HashSet<String> = ["add".to_string()].into_iter().collect();
-        vec![extract_module(Path::new("calc.as"), src, &exp, false)]
+        vec![extract_module(Path::new("calc.as"), "calc", src, &exp, false)]
     }
 
     #[test]
@@ -194,9 +367,49 @@ mod tests {
     fn html_is_escaped() {
         let src = "/// less &lt; than\nexport fn f(): array<number> { return [] }\n";
         let exp: HashSet<String> = ["f".to_string()].into_iter().collect();
-        let m = extract_module(Path::new("e.as"), src, &exp, false);
+        let m = extract_module(Path::new("e.as"), "e", src, &exp, false);
         let html = render_module(&m);
         // `array<number>` in the signature must be escaped, not raw `<number>`.
         assert!(html.contains("array&lt;number&gt;"), "signature escaped");
+    }
+
+    /// Review finding 2: an HTML doc body with a fence + inline code + a link +
+    /// bold renders as `<pre>`/`<code>`/`<a>`/`<strong>`, NOT literal characters;
+    /// and a `<script>` in a body is still escaped (no XSS).
+    #[test]
+    fn html_renders_markdown_body() {
+        let src = "/// Uses `len(x)` and **bold** text.\n/// See [the guide](https://example.com/g).\n///\n/// ```ascript\n/// let x = 1\n/// ```\nexport fn f() {}\n";
+        let exp: HashSet<String> = ["f".to_string()].into_iter().collect();
+        let m = extract_module(Path::new("md.as"), "md", src, &exp, false);
+        let html = render_module(&m);
+        assert!(html.contains("<code>len(x)</code>"), "inline code: {html}");
+        assert!(html.contains("<strong>bold</strong>"), "bold: {html}");
+        assert!(
+            html.contains("<a href=\"https://example.com/g\""),
+            "link: {html}"
+        );
+        assert!(html.contains("<pre><code>let x = 1"), "fence → pre/code: {html}");
+        // The literal markdown markers must NOT survive as text.
+        assert!(!html.contains("**bold**"), "bold markers consumed: {html}");
+        assert!(!html.contains("```"), "fence markers consumed: {html}");
+    }
+
+    /// XSS guard: a `<script>` in a doc body is escaped, never emitted raw.
+    #[test]
+    fn html_escapes_script_in_doc_body() {
+        let src = "/// danger <script>alert(1)</script> here\nexport fn f() {}\n";
+        let exp: HashSet<String> = ["f".to_string()].into_iter().collect();
+        let m = extract_module(Path::new("x.as"), "x", src, &exp, false);
+        let html = render_module(&m);
+        assert!(!html.contains("<script>"), "no raw script tag: {html}");
+        assert!(html.contains("&lt;script&gt;"), "script escaped: {html}");
+    }
+
+    /// The render_markdown helper escapes code-fence contents too.
+    #[test]
+    fn fence_contents_escaped() {
+        let html = render_markdown("```\n<b>not bold</b>\n```");
+        assert!(html.contains("&lt;b&gt;"), "fence content escaped: {html}");
+        assert!(!html.contains("<b>not bold"), "no raw tag: {html}");
     }
 }
