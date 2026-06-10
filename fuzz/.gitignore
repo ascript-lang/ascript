@@ -1,0 +1,23 @@
+# FUZZ (plan Task 2) — cargo-fuzz build + runtime artifacts. The CURATED seed corpus
+# under `corpus/aso_roundtrip/` is COMMITTED (it is the libFuzzer starting corpus and the
+# permanent regression seed set); only the GROWN/generated artifacts below are ignored.
+/target
+/artifacts
+/coverage
+
+# libFuzzer crash/leak/timeout reproducers (uploaded as CI artifacts, then minimized and
+# committed into the corpus + a normal-suite regression test per CONTRIBUTING).
+crash-*
+leak-*
+timeout-*
+oom-*
+
+# The nightly/smoke-run GROWN corpus (hash-named libFuzzer outputs) is cached in CI (keyed on
+# ASO_FORMAT_VERSION), NOT committed — a single fuzz run can add hundreds of hash-named entries.
+# Ignore the whole corpus dir, then RE-INCLUDE only the hand-curated seeds (Task 5): the real
+# `ex_*.aso` example seeds (built by `build_file` over `examples/**`) and the `bad_*` known-bad
+# regression seeds. The leading `corpus/aso_roundtrip/*` ignore also shadows the ROOT `.gitignore`'s
+# blanket `*.aso` rule, so the two negations below are what actually track the curated seeds.
+corpus/aso_roundtrip/*
+!corpus/aso_roundtrip/ex_*.aso
+!corpus/aso_roundtrip/bad_*

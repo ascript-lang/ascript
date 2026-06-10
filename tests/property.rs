@@ -690,3 +690,169 @@ fn frontend_agreement_fixed_battery() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// FUZZ Task 5 — the `.aso` reader PLANTED-BUG guard (spec §7).
+//
+// This is the in-suite proof that the `fuzz/fuzz_targets/aso_roundtrip.rs` libFuzzer target's
+// invariant holds and its "panic ⇒ crash" detection actually fires — WITHOUT needing the
+// cargo-fuzz CLI. It drives the SAME public reader entry points the fuzz target hits
+// (`Chunk::from_bytes` in `src/vm/aso.rs`, `Chunk::from_bytes_verified` in `src/vm/verify.rs`)
+// over a curated known-bad byte set, asserting each is a clean `Err` and NEVER a panic / OOM /
+// unbounded allocation. It extends the existing reader self-tests in `aso.rs`
+// (`reader_huge_length_does_not_allocate` `:2016`, `bad_magic_detected` `:2700`,
+// `truncated_detected` `:2782`, `version_mismatch_detected` `:2361`) by pinning the EXACT seed
+// set the committed corpus ships, so the corpus and the suite never drift.
+// ---------------------------------------------------------------------------------------
+
+use ascript::vm::chunk::Chunk;
+
+/// The `.aso` magic + the current `ASO_FORMAT_VERSION` header prefix, mirroring the writer.
+fn aso_header() -> Vec<u8> {
+    let mut h = b"ASO\x00".to_vec();
+    h.extend_from_slice(&ascript::vm::aso::ASO_FORMAT_VERSION.to_le_bytes());
+    h
+}
+
+/// The curated KNOWN-BAD byte set — each must classify as a clean `Err`, never a panic/OOM.
+/// These mirror, by construction, the `bad_*` seeds committed under
+/// `fuzz/corpus/aso_roundtrip/` (see `name`), so the corpus and this guard stay in lockstep.
+fn known_bad_aso_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    let h = aso_header();
+    let u32max = u32::MAX.to_le_bytes();
+    let zero = 0u32.to_le_bytes();
+    vec![
+        // Far too short to even read the 4-byte magic.
+        ("bad_empty", Vec::new()),
+        ("bad_short_magic", vec![0x00, 0x01]),
+        // Valid length, wrong magic bytes.
+        ("bad_magic", {
+            let mut b = b"XSO\x00".to_vec();
+            b.extend_from_slice(&ascript::vm::aso::ASO_FORMAT_VERSION.to_le_bytes());
+            b.push(0x00);
+            b
+        }),
+        // Stale + future version (the version-reject path, before any deep read).
+        ("bad_version_stale", {
+            let mut b = b"ASO\x00".to_vec();
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.push(0x00);
+            b
+        }),
+        ("bad_version_future", {
+            let mut b = b"ASO\x00".to_vec();
+            b.extend_from_slice(&u32max);
+            b.push(0x00);
+            b
+        }),
+        // Truncated right after the header (debug flag missing or body missing).
+        ("bad_truncated_after_header", h.clone()),
+        // The P0 BOMB: an oversized const-pool length prefix over an empty body. Pre-clamp this
+        // pre-allocated tens of GB and aborted; the `remaining()` clamp makes it a clean error.
+        ("bad_bomb_const_len", {
+            let mut b = h.clone();
+            b.push(0x00); // debug flag = 0
+            b.extend_from_slice(&zero); // code length = 0
+            b.extend_from_slice(&u32max); // const-pool count = u32::MAX (bomb)
+            b
+        }),
+        // The same bomb on the proto count after a valid (empty) const pool.
+        ("bad_bomb_proto_len", {
+            let mut b = h.clone();
+            b.push(0x00); // debug flag = 0
+            b.extend_from_slice(&zero); // code length = 0
+            b.extend_from_slice(&zero); // const count = 0 (valid, empty)
+            b.extend_from_slice(&u32max); // proto count = u32::MAX (bomb)
+            b
+        }),
+        // Debug-present flag set but the source block is truncated.
+        ("bad_truncated_debug", {
+            let mut b = h.clone();
+            b.push(0x01); // debug present, then nothing
+            b
+        }),
+        // A header followed by one stray byte (truncated-or-trailing).
+        ("bad_trailing_only_header_plus_byte", {
+            let mut b = h.clone();
+            b.extend_from_slice(&[0x00, 0xAB]);
+            b
+        }),
+    ]
+}
+
+/// PLANTED-BUG GUARD (spec §7): every curated known-bad `.aso` input is a CLEAN `Err`, never a
+/// panic / abort / unbounded allocation — proving the `aso_roundtrip` fuzz target's invariant
+/// (and that its crash-detection can fire). Drives BOTH public reader entry points.
+#[test]
+fn aso_planted_bug_known_bad_bytes_are_clean_err() {
+    for (name, bytes) in known_bad_aso_inputs() {
+        // `Chunk::from_bytes` (decode only) — must be `Err`, never a panic/OOM/abort.
+        let decode = Chunk::from_bytes(&bytes);
+        assert!(
+            decode.is_err(),
+            "planted-bug case `{name}` must be a clean Err from `from_bytes`, got Ok"
+        );
+        // `Chunk::from_bytes_verified` (decode + verify, the `run_aso_file` path) — same.
+        let verified = Chunk::from_bytes_verified(&bytes);
+        assert!(
+            verified.is_err(),
+            "planted-bug case `{name}` must be a clean Err from `from_bytes_verified`, got Ok"
+        );
+    }
+}
+
+/// The committed seed corpus under `fuzz/corpus/aso_roundtrip/` is the libFuzzer starting set
+/// AND a permanent regression guard. Assert (a) the `bad_*` seeds are present and byte-identical
+/// to the planted-bug set above (so the corpus and suite never drift), and (b) every committed
+/// `ex_*.aso` seed is a CURRENT-version, fully-decodable real chunk (a stale-version seed would
+/// silently collapse the reader coverage floor, spec §4.2). This is the in-session proof the
+/// corpus exists and is well-formed; the cargo-fuzz campaign is the CI-side extension.
+#[test]
+fn aso_seed_corpus_is_present_and_current() {
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/aso_roundtrip");
+    assert!(
+        corpus.is_dir(),
+        "seed corpus dir missing: {} — run ./fuzz/regenerate_aso_corpus.sh",
+        corpus.display()
+    );
+
+    let mut ex_seeds = 0usize;
+    let mut bad_seeds = 0usize;
+    for entry in std::fs::read_dir(&corpus).expect("read corpus dir") {
+        let path = entry.expect("dir entry").path();
+        let fname = path.file_name().unwrap().to_string_lossy().to_string();
+        let bytes = std::fs::read(&path).expect("read seed");
+
+        if fname.starts_with("ex_") {
+            ex_seeds += 1;
+            // A real example seed MUST decode AND verify on the current build (current version,
+            // valid structure) — otherwise the deep `read_*` arms go unfuzzed.
+            Chunk::from_bytes(&bytes).unwrap_or_else(|e| {
+                panic!("committed seed `{fname}` failed to decode ({e}) — stale ASO_FORMAT_VERSION? Re-run ./fuzz/regenerate_aso_corpus.sh")
+            });
+            assert!(
+                Chunk::from_bytes_verified(&bytes).is_ok(),
+                "committed seed `{fname}` decoded but failed verification"
+            );
+        } else if fname.starts_with("bad_") {
+            bad_seeds += 1;
+            // A known-bad seed must NOT decode (it is a rejection seed).
+            assert!(
+                Chunk::from_bytes(&bytes).is_err(),
+                "known-bad seed `{fname}` unexpectedly decoded Ok"
+            );
+        }
+    }
+
+    assert!(
+        ex_seeds >= 50,
+        "expected many real example seeds (built from examples/**), found only {ex_seeds} — \
+         run ./fuzz/regenerate_aso_corpus.sh"
+    );
+    // Every `bad_*` planted-bug case is committed as a seed.
+    assert_eq!(
+        bad_seeds,
+        known_bad_aso_inputs().len(),
+        "the committed `bad_*` seed count must equal the planted-bug set"
+    );
+}

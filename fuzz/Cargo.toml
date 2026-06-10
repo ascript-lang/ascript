@@ -1,0 +1,47 @@
+[package]
+name = "ascript-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# FUZZ (plan Task 2) — ISOLATED workspace member. Its own empty `[workspace]` table
+# (mirroring `tree-sitter-ascript/Cargo.toml`) keeps `libfuzzer-sys`/`arbitrary`/
+# cargo-fuzz OUT of the root `ascript` build graph: a plain `cargo build` and
+# `cargo build --no-default-features` at the repo root pull in NONE of these. This
+# crate is only ever built by `cargo +nightly fuzz` (or a direct
+# `cargo +nightly build --manifest-path fuzz/Cargo.toml`), never absorbed by the root.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# `arbitrary` (with derive) is a NORMAL dep of THIS isolated crate only — the
+# differential/parser targets (landing in later tasks) `#[path]`-include the shared
+# `src/fuzzgen/` generator, which is `arbitrary`-driven. It never reaches the root graph.
+arbitrary = { version = "1", features = ["derive"] }
+
+# The `aso_roundtrip` target only needs the CORE `.aso` reader + verifier + VM run path,
+# all of which build under `--no-default-features`. We enable ONLY the `fuzzgen` feature:
+# cargo-fuzz builds with `--cfg fuzzing`, which activates `pub mod fuzzgen` in the lib (so the
+# generator the differential/parser targets `#[path]`-include is available + the `arbitrary`
+# dep it `use`s is linked). `fuzzgen` is NON-default, so this never perturbs the root graph.
+[dependencies.ascript]
+path = ".."
+default-features = false
+features = ["fuzzgen"]
+
+# libFuzzer targets must be built with debug assertions + overflow checks so a fuzzer
+# trips them as findings, and with some optimization so campaigns run at speed.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "aso_roundtrip"
+path = "fuzz_targets/aso_roundtrip.rs"
+test = false
+doc = false
+bench = false
