@@ -1003,9 +1003,10 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
 /// caret rendering. The error-tolerant CST parser records every error and recovers
 /// into a best-effort tree, so the run path can show them ALL at once (via
 /// [`diagnostics::report_all`]) instead of bailing on the first the compiler hits.
-/// An empty `Vec` means the parse was clean (run proceeds normally). The byte
-/// offsets are used directly as the span (matching the single-error compile path,
-/// which the renderer maps through `char_to_byte`).
+/// An empty `Vec` means the parse was clean (run proceeds normally). `SyntaxError`
+/// offsets are BYTE offsets (summed `t.text.len()` in `all_syntax_errors_in`), so
+/// they are converted to CHAR offsets here — AScript `Span`s are CHAR offsets (the
+/// renderer feeds them straight to char-mode ariadne).
 pub fn collect_parse_errors(path: &Path) -> Vec<AsError> {
     let Ok(src) = std::fs::read_to_string(path) else {
         return Vec::new(); // a read error is handled by the runner's own report
@@ -1018,10 +1019,25 @@ pub fn collect_parse_errors(path: &Path) -> Vec<AsError> {
     crate::syntax::all_syntax_errors_in(&parsed)
         .into_iter()
         .map(|e| {
-            AsError::at(e.message, crate::span::Span::new(e.start, e.end))
-                .with_source(src_info.clone())
+            let span = crate::span::Span::new(
+                byte_to_char_offset(&src, e.start),
+                byte_to_char_offset(&src, e.end),
+            );
+            AsError::at(e.message, span).with_source(src_info.clone())
         })
         .collect()
+}
+
+/// Convert a BYTE offset into a CHAR offset within `src` (clamping a mid-codepoint
+/// byte down to the largest char boundary `<= byte`). A small CORE copy of the
+/// LSP's `byte_to_char` (which is feature-gated), used where a byte-native syntax
+/// error must be rendered as a char `Span`.
+fn byte_to_char_offset(src: &str, byte: usize) -> usize {
+    let mut b = byte.min(src.len());
+    while b > 0 && !src.is_char_boundary(b) {
+        b -= 1;
+    }
+    src[..b].chars().count()
 }
 
 /// Like [`run_file_on_vm`] (VM) but installs a CLI-resolved package map (SP6)

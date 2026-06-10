@@ -520,7 +520,15 @@ publish steps.
   **architectural** non-goals (impossible under the approach-A async engine — documented in spec §7 and
   `superpowers/specs/adr/2026-05-30-async-generators.md`, not code TODOs): durable/serializable continuations,
   robust unbounded deep recursion, and deterministic/replayable task scheduling.
-- **Accepted SP1 trade-offs** (recorded so they aren't mistaken for bugs): (1) a 1-column caret-span offset
-  between the CST and legacy front-ends in diagnostics (message always correct, only the caret column can be
-  off by one); (2) a perf trade (~2.9× → ~2.5× geomean) from routing top-level vars through `GET_GLOBAL` for
-  tree-walker-parity late-binding (still ≥2×, meets the gate).
+- **Accepted SP1 trade-offs** (recorded so they aren't mistaken for bugs): (1) ~~a 1-column caret-span offset
+  between the CST and legacy front-ends~~ — **RESOLVED** (DX diag-polish): the offset was the visible tip of a
+  span-UNIT inconsistency — the CST front-end built `Span`s from cstree BYTE `text_range()` offsets while the
+  whole `Span`/AsError/DBG/ariadne(char-mode) machinery (and the legacy oracle) assumes CHAR offsets. ASCII hid
+  it (byte==char); any multibyte char before a span desynced them (dropped/blanked caret frames on the VM,
+  parse errors, check lints, and DBG line/col). Fixed by converting at the CST→`Span` boundary
+  (`src/compile/mod.rs`: a thread-local byte→char map installed per `compile_source`, zero-cost for ASCII;
+  `collect_parse_errors`/`diagnostics::report`/`check::render` made char-canonical). The field-default reparse
+  subsystem + `Param.name_span` stay byte (internal, never rendered → the `*_bytes` helpers). No `.aso` bump
+  (offsets are `usize` regardless of unit); four-mode byte-identity unchanged. The LEGACY front-end is
+  untouched (it was already CHAR-correct). (2) a perf trade (~2.9× → ~2.5× geomean) from routing top-level vars
+  through `GET_GLOBAL` for tree-walker-parity late-binding (still ≥2×, meets the gate).

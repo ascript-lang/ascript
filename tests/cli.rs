@@ -3835,3 +3835,166 @@ mod coverage_cli {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// DX diag polish: multibyte-UTF-8 caret correctness.
+//
+// AScript `Span`s are CHAR offsets (the documented invariant + ariadne's
+// char-mode default). For pure-ASCII source byte==char so the bug is invisible,
+// but ANY multibyte char before a span desynchronizes the byte-native CST
+// front-end from the char-mode renderers: the VM run-time panic frame VANISHES,
+// the tree-walker frame shifts a column, parse-error and lint carets blank out.
+// These tests pin the FIXED behavior.
+// ---------------------------------------------------------------------------
+
+/// A VM run-time panic over source containing a multibyte char (`π`, 2 bytes)
+/// BEFORE the failing span must render a FULL ariadne caret frame, byte-identical
+/// to the tree-walker. (Pre-fix: the VM frame vanished entirely because the byte
+/// span overran the char-mode source and ariadne dropped the report.)
+#[test]
+fn multibyte_runtime_panic_renders_caret_frame_both_engines() {
+    // `let π = 0` then `1 / π` → integer division by zero. π is 2 UTF-8 bytes, so
+    // every span after it is byte!=char.
+    let src = "let \u{3c0} = 0\nprint(1 / \u{3c0})\n";
+    let file = std::env::temp_dir().join(format!("ascript_mb_panic_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    let render = |tw: bool| -> String {
+        let mut cmd = Command::new(bin);
+        cmd.arg("run");
+        if tw {
+            cmd.arg("--tree-walker");
+        }
+        let out = cmd.arg(&file).output().unwrap();
+        assert!(!out.status.success(), "should panic (tw={tw})");
+        strip_ansi(&String::from_utf8_lossy(&out.stderr))
+            .lines()
+            .filter(|l| !l.contains(".as:"))
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let vm = render(false);
+    let tw = render(true);
+    let _ = std::fs::remove_file(&file);
+
+    // A real caret frame is present on the VM path (the regression that lost it).
+    assert!(
+        vm.contains('┬') || vm.contains('─'),
+        "VM panic must render a caret/underline row, got:\n{vm}"
+    );
+    // The underlined source line is the SECOND line and is NOT blank — it shows the
+    // `1 / π)` expression text.
+    assert!(
+        vm.contains("1 / \u{3c0}"),
+        "the rendered source row must contain `1 / \u{3c0}`, got:\n{vm}"
+    );
+    // Byte-identical carets across engines (the core fix).
+    assert_eq!(
+        vm, tw,
+        "VM and tree-walker rendered different carets:\n--- vm ---\n{vm}\n--- tw ---\n{tw}"
+    );
+}
+
+/// A parse error AFTER a multibyte char must still render a caret frame (not a bare
+/// `Error:` line) via BOTH `ascript run` and `ascript check`.
+#[test]
+fn multibyte_parse_error_renders_caret_frame() {
+    // `let y = π +` is an incomplete expression (`+` has no RHS) → "expected
+    // expression". π on the first line pushes every later byte offset past char.
+    let src = "let \u{3c0} = 3\nlet y = \u{3c0} +\n";
+    let file = std::env::temp_dir().join(format!("ascript_mb_parse_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    for sub in ["run", "check"] {
+        let out = Command::new(bin).arg(sub).arg(&file).output().unwrap();
+        let err = strip_ansi(&String::from_utf8_lossy(&out.stderr))
+            + &strip_ansi(&String::from_utf8_lossy(&out.stdout));
+        assert!(
+            err.contains('╭') && (err.contains('┬') || err.contains('─')),
+            "`{sub}` over multibyte source must render a caret frame, got:\n{err}"
+        );
+    }
+    let _ = std::fs::remove_file(&file);
+}
+
+/// A lint (unused-binding) over source where a multibyte char PRECEDES the flagged
+/// identifier on the same line must underline the IDENTIFIER, not a column shifted
+/// by the multibyte byte-count, and the source row must not be blank.
+#[test]
+fn multibyte_check_lint_underlines_correctly() {
+    // A `check` lint (unused-binding) over source with a multibyte char PRECEDING the
+    // flagged statement on the same line must render IDENTICALLY (caret rows + 1-based
+    // char column) to the same source with the multibyte char swapped for an ASCII one
+    // — i.e. no byte/char skew. The pre-fix bug produced a BLANK source row and a
+    // column shifted by the multibyte byte count.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    // `<X> = 3; let unused = 5` — same shape, `<X>` is either `π` (2 bytes) or `p`.
+    let render = |marker: &str| -> String {
+        let src = format!("let {marker} = 3; let unused = 5\nprint({marker})\n");
+        let file =
+            std::env::temp_dir().join(format!("ascript_mb_lint_{}_{marker}.as", std::process::id()));
+        std::fs::write(&file, &src).unwrap();
+        let out = Command::new(bin).arg("check").arg(&file).output().unwrap();
+        let r = strip_ansi(&String::from_utf8_lossy(&out.stdout))
+            + &strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_file(&file);
+        // Drop the location-gutter line (path differs) but KEEP its `:line:col` suffix
+        // by re-extracting it below; here keep the source + caret rows.
+        r.lines()
+            .filter(|l| !l.contains(".as:"))
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mb = render("\u{3c0}");
+    let ascii = render("p");
+
+    // The lint fired and the source row is NOT blank (the regression blanked it).
+    assert!(
+        mb.contains("unused-binding") && mb.contains("let \u{3c0} = 3; let unused = 5"),
+        "multibyte lint must render the real source row, got:\n{mb}"
+    );
+    // The caret geometry is byte-identical to the ASCII variant (the skew fix): both
+    // underline the SAME statement at the SAME column.
+    let caret = |s: &str| -> String {
+        s.lines()
+            .filter(|l| l.contains('┬') || l.contains('╰'))
+            .map(|l| l.replace('\u{3c0}', "p")) // normalize the marker char itself
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        caret(&mb),
+        caret(&ascii),
+        "multibyte and ASCII carets must be identical:\n-- mb --\n{mb}\n-- ascii --\n{ascii}"
+    );
+
+    // And the reported 1-based char column matches the ASCII baseline (col 11).
+    let col_of = |marker: &str| -> String {
+        let src = format!("let {marker} = 3; let unused = 5\nprint({marker})\n");
+        let file = std::env::temp_dir()
+            .join(format!("ascript_mb_lintc_{}_{marker}.as", std::process::id()));
+        std::fs::write(&file, &src).unwrap();
+        let out = Command::new(bin).arg("check").arg(&file).output().unwrap();
+        let r = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+        let _ = std::fs::remove_file(&file);
+        // Extract the `:1:NN` column from the gutter line.
+        r.lines()
+            .find_map(|l| l.split(".as:1:").nth(1).map(|s| {
+                s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+            }))
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        col_of("\u{3c0}"),
+        col_of("p"),
+        "multibyte and ASCII lint columns must match"
+    );
+    assert_eq!(col_of("\u{3c0}"), "11", "lint column must be char col 11 (1-based)");
+}
+

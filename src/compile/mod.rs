@@ -48,9 +48,126 @@ impl CompileError {
     }
 }
 
-/// The span of a CST node, as byte offsets into the original source.
+// DX diag polish: the CST front-end reads cstree `text_range()` offsets, which are
+// BYTE offsets into the source. AScript `Span`s are CHAR offsets (`src/span.rs`) —
+// the documented invariant the legacy front-end (the permanent oracle) already
+// upholds, the unit ariadne's char-mode renderer expects, and the unit the DBG line
+// index counts. For pure-ASCII source byte == char, but any multibyte char before a
+// span desyncs the two. `compile_source` installs a [`ByteToChar`] map for the
+// current source so the span helpers convert byte→char at the cstree boundary.
+//
+// IMPORTANT: the field-default RE-PARSE subsystem (`cst_default_expr` / `cst_param` /
+// `reparse_default_*`) is a SEPARATE, internally byte-consistent mechanism (it
+// left-pads source with ASCII spaces "up to the node's start BYTE offset" so the
+// legacy lexer reproduces offsets) — those helpers must keep BYTE offsets and so use
+// the `*_bytes` variants below, never the char-converting ones.
+thread_local! {
+    static BYTE_TO_CHAR: std::cell::RefCell<Option<ByteToChar>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A precomputed byte-offset → char-offset map over one source string. `prefix[b]`
+/// is the number of `char`s before byte offset `b` (a non-char-boundary byte clamps
+/// to the largest boundary `<= b`). Built once per `compile_source`; O(1) lookup.
+struct ByteToChar {
+    /// `prefix[b]` = char count of `src[..b']` where `b'` is the largest char
+    /// boundary `<= b`. Length is `src.len() + 1`.
+    prefix: Vec<u32>,
+}
+
+impl ByteToChar {
+    fn new(src: &str) -> Self {
+        // `prefix[b]` = the number of chars strictly before byte `b` (a continuation
+        // byte clamps DOWN to the char it sits inside). Build it by walking each
+        // char's byte-range and writing its char index to every byte in `[bs, next)`;
+        // the boundary byte `bs` carries the char count BEFORE this char (== `i`).
+        let mut prefix = vec![0u32; src.len() + 1];
+        let mut next_byte = 0usize;
+        let mut i = 0u32;
+        for (b, ch) in src.char_indices() {
+            // The char's first byte and any continuation bytes [b, b+len) all clamp to
+            // char index `i` (chars strictly before this char). `next_byte` tracks the
+            // start of the NEXT char so the tail fill below is exact.
+            for slot in prefix.iter_mut().take(b + ch.len_utf8()).skip(b) {
+                *slot = i;
+            }
+            next_byte = b + ch.len_utf8();
+            i += 1;
+        }
+        // `prefix[src.len()]` = total char count (chars before the one-past-the-end
+        // byte). Any bytes from the last char's end through `src.len()` map to it.
+        for slot in prefix.iter_mut().skip(next_byte) {
+            *slot = i;
+        }
+        ByteToChar { prefix }
+    }
+
+    fn char_of(&self, byte: usize) -> usize {
+        self.prefix
+            .get(byte)
+            .copied()
+            .unwrap_or_else(|| self.prefix.last().copied().unwrap_or(0)) as usize
+    }
+}
+
+/// Install the byte→char map for `src` for the duration of the returned guard. A
+/// pure-ASCII source installs nothing (the map stays `None` → identity, zero-cost);
+/// only a source with a multibyte char pays for the precompute.
+/// Saves the PREVIOUS map on install and restores it on drop (rather than blindly
+/// clearing to `None`), so the guard is robustly nestable — should `compile_source`
+/// ever be called re-entrantly on one thread, the inner scope cannot wipe the outer
+/// source's map.
+struct SpanRemapGuard {
+    prev: Option<ByteToChar>,
+}
+
+impl SpanRemapGuard {
+    fn install(src: &str) -> Self {
+        let map = if src.is_ascii() {
+            None
+        } else {
+            Some(ByteToChar::new(src))
+        };
+        let prev = BYTE_TO_CHAR.with(|cell| cell.replace(map));
+        SpanRemapGuard { prev }
+    }
+}
+
+impl Drop for SpanRemapGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        BYTE_TO_CHAR.with(|cell| *cell.borrow_mut() = prev);
+    }
+}
+
+/// Convert a cstree BYTE offset into a CHAR offset using the installed map. With no
+/// map installed (pure-ASCII source, or a non-`compile_source` caller) this is the
+/// identity — byte == char for ASCII, and the unit tests/`.aso` paths that build
+/// chunks directly never carry multibyte spans.
+fn byte_to_char(byte: usize) -> usize {
+    BYTE_TO_CHAR.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|m| m.char_of(byte))
+            .unwrap_or(byte)
+    })
+}
+
+/// The span of a CST node, as CHAR offsets into the original source.
 fn node_span(node: &impl AstNode) -> Span {
     range_span(node.syntax())
+}
+
+/// BYTE-offset span of a CST node — for the field-default reparse subsystem ONLY
+/// (see the module note above). NOT for anything that reaches a diagnostic.
+fn node_span_bytes(node: &impl AstNode) -> Span {
+    range_span_bytes(node.syntax())
+}
+
+/// BYTE-offset span of a raw CST node — field-default reparse subsystem ONLY.
+fn range_span_bytes(node: &crate::syntax::cst::ResolvedNode) -> Span {
+    let range = node.text_range();
+    Span::new(usize::from(range.start()), usize::from(range.end()))
 }
 
 /// Whether `expr` is the bare name `super` — the implicit super reference used as
@@ -65,10 +182,14 @@ fn is_super_receiver(expr: &Expr) -> bool {
     matches!(expr, Expr::NameRef(n) if n.ident_token().map(|t| t.text().to_string()).as_deref() == Some("super"))
 }
 
-/// The span of a raw CST node, as byte offsets into the original source.
+/// The span of a raw CST node, as CHAR offsets into the original source (converted
+/// from the cstree BYTE `text_range()` via the installed [`ByteToChar`] map).
 fn range_span(node: &crate::syntax::cst::ResolvedNode) -> Span {
     let range = node.text_range();
-    Span::new(usize::from(range.start()), usize::from(range.end()))
+    Span::new(
+        byte_to_char(usize::from(range.start())),
+        byte_to_char(usize::from(range.end())),
+    )
 }
 
 /// The span of an AST node starting at its first *non-trivia* token. A CST node's
@@ -85,7 +206,7 @@ fn node_code_span(node: &impl AstNode) -> Span {
         .descendants_with_tokens()
         .filter_map(|el| el.into_token().cloned())
         .find(|t| !t.kind().is_trivia())
-        .map(|t| usize::from(t.text_range().start()))
+        .map(|t| byte_to_char(usize::from(t.text_range().start())))
         .unwrap_or(full.start);
     Span::new(start, full.end)
 }
@@ -237,7 +358,12 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
 ///    engines.
 fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     use crate::ast::{ArrayElem, BinOp, CallArg, ExprKind, ObjEntry, UnOp};
-    let span = node_span(expr);
+    // BYTE offsets: this lowered `ast::Expr` is the runtime field-default METADATA
+    // that must stay layout-identical to the `reparse_default_*` path, which anchors
+    // spans against a byte-padded source. It is NOT a diagnostic span (the default's
+    // bytecode is compiled separately via `self.compile_expr` over the CST, which
+    // records CHAR spans). See the module note on the reparse subsystem.
+    let span = node_span_bytes(expr);
     let kind = match expr {
         Expr::Literal(lit) => match literal_const_value(lit)? {
             Value::Int(i) => ExprKind::Int(i),
@@ -399,7 +525,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                     })?;
                     entries.push(ObjEntry::Spread(cst_default_expr(&operand)?));
                 } else if let Some(field) = ObjectField::cast(child.clone()) {
-                    let fspan = node_span(&field);
+                    let fspan = node_span_bytes(&field);
                     let key = object_field_key(&field).ok_or_else(|| {
                         CompileError::new("object-default field has no key", fspan)
                     })?;
@@ -417,7 +543,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
         Expr::MapExpr(map) => {
             let mut entries = Vec::new();
             for entry in map.map_entrys() {
-                let espan = node_span(&entry);
+                let espan = node_span_bytes(&entry);
                 let key = entry
                     .key()
                     .ok_or_else(|| CompileError::new("map-default entry has no key", espan))?;
@@ -705,6 +831,9 @@ fn cst_param(node: &crate::syntax::cst::ResolvedNode) -> crate::ast::Param {
         .filter_map(|el| el.into_token())
         .any(|t| t.kind() == K::DotDotDot);
     let name = cst_first_ident(node).unwrap_or_default();
+    // BYTE offsets: `Param.name_span` is runtime contract METADATA, kept byte-anchored
+    // for consistency with the field-default reparse subsystem (it is not a diagnostic
+    // span — call-site contract panics carry the CALL span, not this one).
     let name_span = node
         .children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -713,7 +842,7 @@ fn cst_param(node: &crate::syntax::cst::ResolvedNode) -> crate::ast::Param {
             let r = t.text_range();
             Span::new(usize::from(r.start()), usize::from(r.end()))
         })
-        .unwrap_or_else(|| range_span(node));
+        .unwrap_or_else(|| range_span_bytes(node));
     // The type child (if any) is the annotation after the `:`.
     let ty = node
         .children()
@@ -785,13 +914,24 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     // Parse ONCE: read the recorded syntax errors off the `Parse` (borrow-only),
     // reject up front if any, then move that SAME `Parse` into the tree builder —
     // never parse the source a second time (mirrors `check::analyze`).
+    // Install the byte→char map for the whole compile so every span helper that
+    // reads a cstree BYTE `text_range()` records a CHAR-offset `Span` (the `Span`
+    // invariant). Dropped on return. `src.chars().count()` is the source's CHAR
+    // length — the right value wherever a span uses "end of source".
+    let _span_remap = SpanRemapGuard::install(src);
+    let char_len = src.chars().count();
     let parsed = parse(src);
     if let Some(err) = first_syntax_error_in(&parsed) {
-        return Err(CompileError::new(err.message, Span::new(err.start, err.end)));
+        // `SyntaxError.start`/`end` are BYTE offsets (summed `t.text.len()` in
+        // `all_syntax_errors_in`); convert to CHAR for the diagnostic span.
+        return Err(CompileError::new(
+            err.message,
+            Span::new(byte_to_char(err.start), byte_to_char(err.end)),
+        ));
     }
     let root = build_tree(parsed);
     let file = SourceFile::cast(root.clone())
-        .ok_or_else(|| CompileError::new("expected a source file", Span::new(0, src.len())))?;
+        .ok_or_else(|| CompileError::new("expected a source file", Span::new(0, char_len)))?;
 
     // Run the resolver so the compiler can classify identifier uses (e.g. a bare
     // builtin callee in a `print(...)` call resolves to `Resolution::Global`).
@@ -807,7 +947,7 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     chunk.slot_count = u16::try_from(slot_count).map_err(|_| {
         CompileError::new(
             "too many local slots in top-level frame (max 65535)",
-            Span::new(0, src.len()),
+            Span::new(0, char_len),
         )
     })?;
     // The top frame's cell slots (captured top-level bindings, e.g. a forward- or
@@ -864,10 +1004,10 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     if trailing_expr_node.is_none() {
         compiler
             .chunk
-            .emit(Op::Nil, Span::new(src.len(), src.len()));
+            .emit(Op::Nil, Span::new(char_len, char_len));
         compiler
             .chunk
-            .emit(Op::Return, Span::new(src.len(), src.len()));
+            .emit(Op::Return, Span::new(char_len, char_len));
     }
 
     // SP3 §A: a bytecode-capacity overflow (const pool / proto / class-proto /
@@ -1972,7 +2112,10 @@ impl Compiler {
                         .ident_token()
                         .map(|t| {
                             let r = t.text_range();
-                            Span::new(usize::from(r.start()), usize::from(r.end()))
+                            Span::new(
+                                byte_to_char(usize::from(r.start())),
+                                byte_to_char(usize::from(r.end())),
+                            )
                         })
                         .unwrap_or_else(|| range_span(method.syntax()));
                     return Err(CompileError::new(
@@ -1991,7 +2134,10 @@ impl Compiler {
                         .ident_token()
                         .map(|t| {
                             let r = t.text_range();
-                            Span::new(usize::from(r.start()), usize::from(r.end()))
+                            Span::new(
+                                byte_to_char(usize::from(r.start())),
+                                byte_to_char(usize::from(r.end())),
+                            )
                         })
                         .unwrap_or_else(|| range_span(method.syntax()));
                     return Err(CompileError::new("'from' is reserved on classes", name_span));
@@ -5743,6 +5889,26 @@ mod tests {
     use super::*;
     use crate::vm::disasm::disasm;
 
+    /// The byte→char map underpinning the multibyte span fix. `π` is 2 UTF-8 bytes.
+    #[test]
+    fn byte_to_char_map_is_correct() {
+        // "aπb": a@0(1B), π@1(2B), b@3(1B). chars: a=0, π=1, b=2.
+        let m = ByteToChar::new("a\u{3c0}b");
+        assert_eq!(m.char_of(0), 0); // 'a'
+        assert_eq!(m.char_of(1), 1); // 'π' start
+        assert_eq!(m.char_of(2), 1); // 'π' continuation byte clamps DOWN to char 1
+        assert_eq!(m.char_of(3), 2); // 'b'
+        assert_eq!(m.char_of(4), 3); // one-past-the-end (src.len()) == total chars
+        assert_eq!(m.char_of(999), 3); // out of range clamps to total
+
+        // The exact reproduction case: `let π = 0\nprint(1 / π)\n`. Byte 17 is the `1`
+        // of the division, which is CHAR 16 (the leading `π` is 1 char / 2 bytes).
+        let src = "let \u{3c0} = 0\nprint(1 / \u{3c0})\n";
+        let m = ByteToChar::new(src);
+        let byte_1 = src.find("1").unwrap();
+        assert_eq!(m.char_of(byte_1), 16, "the `1` operand is char column 16");
+    }
+
     /// DBG: `Op::Break` is the runtime breakpoint trap — it must NEVER be emitted by
     /// the compiler (it only ever appears because a debugger patched a byte). Scan a
     /// feature-rich compiled chunk (and every nested proto) for the BREAK opcode byte.
@@ -6072,6 +6238,74 @@ mod tests {
         assert_eq!(
             msg("let a = 99999999999999999999"),
             "integer literal out of range for int (i64)"
+        );
+    }
+
+    /// DX diag polish: the compiler must record CHAR-offset spans (the documented
+    /// `Span` invariant), so a multibyte char before a span does NOT desync the DBG
+    /// line/col index (which counts chars) or the char-mode diagnostic renderers.
+    ///
+    /// `π` is 2 UTF-8 bytes; were the spans byte-based, slicing the source by CHAR
+    /// with a recorded span would land off-by-one (the bug). Here we compile source
+    /// with a leading multibyte char and assert that CHAR-slicing the trailing `yy`
+    /// reference's span reproduces the identifier text, and that `line_col_at` maps
+    /// that instruction to the correct CHAR (line, col).
+    #[test]
+    fn spans_are_char_offsets_for_multibyte_source() {
+        let src = "let \u{3c0} = 1\nlet yy = \u{3c0} + 1\nyy\n";
+        let chunk = compile_source(src).expect("compiles");
+        // Bind the module source so the DBG line index has text to map against.
+        let info = std::rc::Rc::new(crate::error::SourceInfo {
+            path: "<test>".into(),
+            text: src.into(),
+        });
+        chunk.set_module_source(&info);
+
+        let char_len = src.chars().count();
+        let chars: Vec<char> = src.chars().collect();
+        // (1) No recorded span may overrun the source CHAR length — a byte span after
+        //     the 2-byte `π` would (the original bug: byte 26..29 over a 28-char src).
+        for (_off, span) in &chunk.spans {
+            assert!(
+                span.end <= char_len,
+                "span {span:?} exceeds the source CHAR length {char_len} (byte-offset leak)"
+            );
+        }
+
+        // (2) CHAR-alignment & DBG mapping: for EVERY recorded span, the chunk's DBG
+        //     `line_col_at` (its own char-counting LineIndex over the bound source) must
+        //     agree with a manual CHAR-based (line, col) of the span's START. Were the
+        //     spans byte-based, any span after the 2-byte `π` would disagree (the byte
+        //     start would land on the wrong char line/col). This is the exact property
+        //     a debugger relies on (`stackTrace` ip→line).
+        let manual_line_col = |char_off: usize| -> (u32, u32) {
+            let mut line = 0u32;
+            let mut col = 0u32;
+            for &c in chars.iter().take(char_off) {
+                if c == '\n' {
+                    line += 1;
+                    col = 0;
+                } else {
+                    col += 1;
+                }
+            }
+            (line, col)
+        };
+        for (off, sp) in &chunk.spans {
+            let got = chunk.line_col_at(*off).expect("line/col");
+            let want = manual_line_col(sp.start);
+            assert_eq!(
+                got, want,
+                "DBG line_col_at disagreed with the char-based (line,col) of span {sp:?}"
+            );
+        }
+
+        // (3) Sanity: the source's sole `π` reference on line 2 (0-based line 1) is
+        //     reachable at the right CHAR offset — char 19 (`let π = 1\nlet yy = ` is
+        //     19 chars). A byte offset would be 20 (the leading `π` is 2 bytes).
+        assert_eq!(
+            chars[19], '\u{3c0}',
+            "char 19 must be the line-2 `\u{3c0}` (confirms char, not byte, indexing)"
         );
     }
 

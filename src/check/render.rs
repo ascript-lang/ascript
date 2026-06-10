@@ -12,17 +12,36 @@ pub fn human(path: &str, src: &str, diags: &[AsDiagnostic]) -> String {
             Severity::Warning => ReportKind::Warning,
             Severity::Info | Severity::Hint => ReportKind::Advice,
         };
+        // The check core's `ByteSpan` carries genuine BYTE offsets; ariadne 0.6
+        // renders in char-mode (`IndexType::Char` default), so convert byte→char
+        // before building the range — otherwise a multibyte char before the span
+        // blanks/shifts the caret.
+        let start = byte_to_char(src, d.range.start);
+        let end = byte_to_char(src, d.range.end);
         let mut out: Vec<u8> = Vec::new();
-        let report = Report::build(kind, (path, d.range.start..d.range.end))
+        let report = Report::build(kind, (path, start..end))
             .with_code(&d.code)
             .with_message(&d.message)
-            .with_label(Label::new((path, d.range.start..d.range.end)).with_message(&d.message))
+            .with_label(Label::new((path, start..end)).with_message(&d.message))
             .finish();
         // Writing to an in-memory buffer cannot fail in practice.
         let _ = report.write((path, Source::from(src)), &mut out);
         buf.extend_from_slice(&out);
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Convert a BYTE offset into a CHAR offset within `src` (clamping a mid-codepoint
+/// byte down to the largest char boundary `<= byte`). The check core speaks BYTE
+/// offsets; the human renderer feeds char-mode ariadne, so it converts here. Mirrors
+/// `crate::lsp::convert::byte_to_char` (kept local so this CORE renderer builds under
+/// `--no-default-features`, where the LSP module is absent).
+fn byte_to_char(src: &str, byte: usize) -> usize {
+    let mut b = byte.min(src.len());
+    while b > 0 && !src.is_char_boundary(b) {
+        b -= 1;
+    }
+    src[..b].chars().count()
 }
 
 /// Render diagnostics as a JSON array (hand-rolled, serde-free).
