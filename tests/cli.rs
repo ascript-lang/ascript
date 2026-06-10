@@ -3660,3 +3660,149 @@ test("snap", () => { assert.snapshot("user", {name: "ada", age: 99}) })
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// DX D2 Task 6 — `ascript test --coverage` (VM line coverage on the Op::Break seam).
+mod coverage_cli {
+    use std::process::Command;
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ascript_covcli_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn stdout(out: &std::process::Output) -> String {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    // A program with a never-taken branch: line `return "nonpos"` is uncovered.
+    const SRC: &str = "import * as assert from \"std/assert\"\n\
+        \n\
+        fn classify(n) {\n\
+        \x20 if (n > 0) {\n\
+        \x20   return \"pos\"\n\
+        \x20 }\n\
+        \x20 return \"nonpos\"\n\
+        }\n\
+        \n\
+        test(\"pos\", () => {\n\
+        \x20 print(classify(5))\n\
+        \x20 assert.eq(classify(5), \"pos\")\n\
+        })\n";
+
+    #[test]
+    fn coverage_text_reports_covered_and_uncovered() {
+        let dir = fresh_dir("text");
+        let file = dir.join("cov.as");
+        std::fs::write(&file, SRC).unwrap();
+
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin)
+            .arg("test")
+            .arg("--coverage")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "passing tests succeed: {:?}", out);
+        let s = stdout(&out);
+        // The tally survives.
+        assert!(s.contains("1 passed"), "tally present: {s}");
+        // The coverage report names the file and a TOTAL.
+        assert!(s.contains("cov.as:"), "per-file line: {s}");
+        assert!(s.contains("TOTAL:"), "total line: {s}");
+        // Line 7 (`return \"nonpos\"`) is the never-taken branch — must be uncovered.
+        assert!(s.contains("uncovered:"), "lists uncovered lines: {s}");
+        assert!(s.contains('7'), "the dead branch line is listed: {s}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_lcov_format() {
+        let dir = fresh_dir("lcov");
+        let file = dir.join("cov.as");
+        std::fs::write(&file, SRC).unwrap();
+
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin)
+            .arg("test")
+            .arg("--coverage=lcov")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{:?}", out);
+        let s = stdout(&out);
+        assert!(s.contains("SF:"), "LCOV source record: {s}");
+        assert!(s.contains("DA:"), "LCOV line records: {s}");
+        assert!(s.contains("LF:"), "LCOV lines-found: {s}");
+        assert!(s.contains("LH:"), "LCOV lines-hit: {s}");
+        assert!(s.contains("end_of_record"), "LCOV terminator: {s}");
+        // The dead branch line 7 records DA:7,0 (instrumented, not hit).
+        assert!(s.contains("DA:7,0"), "dead branch is DA:<line>,0: {s}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_observation_only_program_output_identical() {
+        // A --coverage run's PROGRAM/test output is byte-identical to a plain `ascript
+        // test` run — the coverage trap re-dispatches the SAME op, so the program result
+        // and the test tally are unchanged (the coverage report is the only extra text,
+        // appended after the tally). Under `ascript test`, `print` inside a test body is
+        // CAPTURED (not streamed), so the program-output portion is the tally itself; the
+        // coverage run reproduces it verbatim as its prefix.
+        let dir = fresh_dir("obs");
+        let file = dir.join("cov.as");
+        std::fs::write(&file, SRC).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+
+        let plain = Command::new(bin).arg("test").arg(&file).output().unwrap();
+        let cov = Command::new(bin)
+            .arg("test")
+            .arg("--coverage")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(plain.status.success() && cov.status.success());
+        let ps = stdout(&plain);
+        let cs = stdout(&cov);
+        // The coverage run reproduces the plain run's output VERBATIM as its prefix, then
+        // appends the coverage report. The observable program/test result is unchanged.
+        assert!(
+            cs.starts_with(&ps),
+            "coverage stdout starts with the plain stdout unchanged\nplain:\n{ps}\ncov:\n{cs}"
+        );
+        // And the appended text is exactly the coverage report (nothing else changed).
+        let appended = &cs[ps.len()..];
+        assert!(
+            appended.starts_with("coverage:"),
+            "the only added output is the coverage report: {appended:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_unknown_format_is_a_clean_error() {
+        let dir = fresh_dir("bad");
+        let file = dir.join("cov.as");
+        std::fs::write(&file, SRC).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin)
+            .arg("test")
+            .arg("--coverage=bogus")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "an unknown format fails cleanly");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("unknown coverage format"), "clear error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

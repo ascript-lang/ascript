@@ -475,12 +475,176 @@ impl ProfilerHook {
     }
 }
 
-/// The DX line-coverage table (DX §6.3). A typed placeholder — DX owns the
-/// implementation; defined here so the shared `Instrumentation` lands once.
-#[derive(Default)]
+/// The DX line-coverage table (DX §6.3).
+///
+/// # The patch-based, hot-loop-untouched design
+///
+/// Coverage adds NO per-instruction check. At arm time, for each proto, the FIRST
+/// bytecode offset of every source line is patched to [`Op::Break`](crate::vm::opcode::Op::Break)
+/// (reusing DBG's software-breakpoint trap). The cold `Op::Break` arm in the run loop
+/// consults [`trap`](CoverageTable::trap) FIRST: if `(proto_id, fault_ip)` is a coverage
+/// trap it marks the line covered, restores the original byte, re-points `ip`, and
+/// re-dispatches — so each line traps AT MOST ONCE then runs free (zero steady-state cost
+/// and byte-identical program output). If it is NOT a coverage trap the arm falls through
+/// to the debugger logic unchanged.
+///
+/// # Plain owned data (worker-airlock safe)
+///
+/// Every field is plain owned data (`HashMap`/`HashSet`/`String`/integers) — NO
+/// `Rc`/`Value`/`Cc`. The whole table can cross the worker airlock for a parallel-run
+/// merge ([`merge`](CoverageTable::merge)).
+///
+/// v1 records covered/not-covered (a line is either hit or it isn't), not hit COUNTS —
+/// because each line un-patches after its first trap, a per-line count would always be 1.
+/// The LCOV `DA` count is therefore `1` for a covered line, `0` otherwise (documented).
+#[derive(Default, Clone)]
 pub struct CoverageTable {
-    /// Reserved for per-line hit counts (DX). Empty placeholder.
-    _reserved: (),
+    /// The patch side table: `(proto_id, offset)` → `(original_byte, line)`. Built at
+    /// arm time; consulted by the `Op::Break` trap to recognize a coverage trap, recover
+    /// the displaced opcode, and learn which source line the offset belongs to. Lines are
+    /// 0-based (matching `build_line_starts`); the reporter adds +1 for 1-based display.
+    traps: HashMap<ProtoOffset, (u8, u32)>,
+    /// `proto_id` → the source file path the proto belongs to (from `chunk.source`).
+    proto_path: HashMap<usize, String>,
+    /// The instrumented universe: per `proto_id`, every line that COULD be covered (so
+    /// the report can list UNCOVERED lines too, not just hit ones).
+    instrumented: HashMap<usize, std::collections::HashSet<u32>>,
+    /// The covered set: `(proto_id, line0)` that actually trapped (= executed); `line0`
+    /// is the 0-based source line. v1 is covered/not, not a count.
+    covered: std::collections::HashSet<(usize, u32)>,
+}
+
+impl CoverageTable {
+    /// A fresh, unarmed table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one patch site at arm time: `(proto_id, offset)` displaced `original`
+    /// (the real opcode byte) and belongs to 0-based source `line`. Also folds `line`
+    /// into the proto's instrumented universe.
+    pub fn record_trap(&mut self, proto_id: usize, offset: usize, original: u8, line: u32) {
+        self.traps.insert((proto_id, offset), (original, line));
+        self.instrumented.entry(proto_id).or_default().insert(line);
+    }
+
+    /// Bind a `proto_id` to its source file path (from `chunk.source.path`).
+    pub fn record_path(&mut self, proto_id: usize, path: String) {
+        self.proto_path.insert(proto_id, path);
+    }
+
+    /// Whether `(proto_id, offset)` is a coverage trap. The `Op::Break` arm checks this
+    /// FIRST so a coverage trap is recovered as coverage (not handed to the debugger).
+    pub fn trap(&self, proto_id: usize, offset: usize) -> Option<(u8, u32)> {
+        self.traps.get(&(proto_id, offset)).copied()
+    }
+
+    /// Mark `(proto_id, line)` covered (the trap fired ⇒ the line executed).
+    pub fn mark_covered(&mut self, proto_id: usize, line: u32) {
+        self.covered.insert((proto_id, line));
+    }
+
+    /// The number of live patch sites (test/diagnostic use).
+    pub fn trap_count(&self) -> usize {
+        self.traps.len()
+    }
+
+    /// Whether nothing has been armed (no patch sites). An empty table is inert.
+    pub fn is_empty(&self) -> bool {
+        self.traps.is_empty()
+    }
+
+    /// Merge `other` into `self`: union the trap side table, paths, instrumented universe,
+    /// and the covered set. Used to fold per-isolate tables after a `--parallel` run.
+    /// Order-independent (set/map unions), so the merged result is identical regardless of
+    /// which isolate finished first.
+    pub fn merge(&mut self, other: &CoverageTable) {
+        for (k, v) in &other.traps {
+            self.traps.entry(*k).or_insert(*v);
+        }
+        for (k, v) in &other.proto_path {
+            self.proto_path.entry(*k).or_insert_with(|| v.clone());
+        }
+        for (pid, lines) in &other.instrumented {
+            let entry = self.instrumented.entry(*pid).or_default();
+            for l in lines {
+                entry.insert(*l);
+            }
+        }
+        for c in &other.covered {
+            self.covered.insert(*c);
+        }
+    }
+
+    /// A by-file, by-line covered/total view, folded across all protos that map to the
+    /// same source path. Returns a `Vec<FileCoverage>` sorted by path (stable output).
+    /// Each file's `lines` is a sorted `(line_1based, covered)` list — the reporter emits
+    /// text/lcov/html from this.
+    pub fn by_file(&self) -> Vec<FileCoverage> {
+        use std::collections::BTreeMap;
+        // path → (line_1based → covered). A line is covered if ANY proto on that path
+        // covered it (a line can host instructions in several protos — e.g. a closure
+        // literal on the same line as its enclosing statement).
+        let mut files: BTreeMap<String, BTreeMap<u32, bool>> = BTreeMap::new();
+        for (pid, lines) in &self.instrumented {
+            let Some(path) = self.proto_path.get(pid) else {
+                continue; // a proto with no bound source — skip cleanly (never panic).
+            };
+            let file = files.entry(path.clone()).or_default();
+            for &line0 in lines {
+                let covered = self.covered.contains(&(*pid, line0));
+                let entry = file.entry(line0 + 1).or_insert(false);
+                *entry = *entry || covered;
+            }
+        }
+        files
+            .into_iter()
+            .map(|(path, lines)| FileCoverage {
+                path,
+                lines: lines.into_iter().collect(),
+            })
+            .collect()
+    }
+}
+
+/// A by-file coverage view (one entry per source file), produced by
+/// [`CoverageTable::by_file`]. Plain owned data.
+#[derive(Clone, Debug)]
+pub struct FileCoverage {
+    /// The source file path.
+    pub path: String,
+    /// `(line_1based, covered)` for every INSTRUMENTED line on this file, sorted by line.
+    pub lines: Vec<(u32, bool)>,
+}
+
+impl FileCoverage {
+    /// The number of covered lines.
+    pub fn covered(&self) -> usize {
+        self.lines.iter().filter(|(_, c)| *c).count()
+    }
+
+    /// The total number of instrumented lines.
+    pub fn total(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// The coverage percentage (0.0 when there are no instrumented lines).
+    pub fn percent(&self) -> f64 {
+        if self.lines.is_empty() {
+            0.0
+        } else {
+            100.0 * self.covered() as f64 / self.total() as f64
+        }
+    }
+
+    /// The sorted list of UNCOVERED 1-based line numbers.
+    pub fn uncovered_lines(&self) -> Vec<u32> {
+        self.lines
+            .iter()
+            .filter(|(_, c)| !*c)
+            .map(|(l, _)| *l)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -593,5 +757,103 @@ mod tests {
         let mut code = vec![Op::Nil as u8];
         assert_eq!(hook.clear_breakpoint(0, 0, &mut code), None);
         assert_eq!(code[0], Op::Nil as u8);
+    }
+
+    // ---- DX D2 Task 6 — CoverageTable -------------------------------------
+
+    #[test]
+    fn coverage_table_is_plain_send() {
+        // Plain owned data only — it crosses the worker airlock for a parallel merge.
+        fn _assert_send<T: Send>() {}
+        _assert_send::<CoverageTable>();
+        _assert_send::<FileCoverage>();
+    }
+
+    #[test]
+    fn coverage_records_and_recognizes_traps() {
+        let mut t = CoverageTable::new();
+        assert!(t.is_empty());
+        // proto 7, offset 3 displaced opcode 0x42, source line 5 (0-based).
+        t.record_trap(7, 3, 0x42, 5);
+        t.record_path(7, "m.as".to_string());
+        assert_eq!(t.trap_count(), 1);
+        assert!(!t.is_empty());
+        // The trap is recognized at exactly (proto, offset).
+        assert_eq!(t.trap(7, 3), Some((0x42, 5)));
+        assert_eq!(t.trap(7, 4), None, "a non-trap offset is not recognized");
+        assert_eq!(t.trap(8, 3), None, "a different proto is not recognized");
+    }
+
+    #[test]
+    fn coverage_by_file_covered_and_uncovered() {
+        let mut t = CoverageTable::new();
+        t.record_path(1, "f.as".to_string());
+        // lines 0,1,2 (0-based) instrumented; cover 0 and 2.
+        t.record_trap(1, 0, 1, 0);
+        t.record_trap(1, 2, 1, 1);
+        t.record_trap(1, 4, 1, 2);
+        t.mark_covered(1, 0);
+        t.mark_covered(1, 2);
+        let files = t.by_file();
+        assert_eq!(files.len(), 1);
+        let f = &files[0];
+        assert_eq!(f.path, "f.as");
+        assert_eq!(f.covered(), 2);
+        assert_eq!(f.total(), 3);
+        // 1-based: lines 1 and 3 covered, line 2 uncovered.
+        assert_eq!(f.uncovered_lines(), vec![2]);
+    }
+
+    #[test]
+    fn coverage_merge_is_order_independent_union() {
+        // Two per-isolate tables for the SAME file (different protos), merged either way.
+        let mut a = CoverageTable::new();
+        a.record_path(1, "g.as".to_string());
+        a.record_trap(1, 0, 1, 0); // line 1 (1-based)
+        a.mark_covered(1, 0);
+        let mut b = CoverageTable::new();
+        b.record_path(2, "g.as".to_string());
+        b.record_trap(2, 0, 1, 1); // line 2 (1-based)
+        // b's line 2 NOT covered.
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+
+        let fab = ab.by_file();
+        let fba = ba.by_file();
+        // Both orders produce the same file view: line 1 covered, line 2 not.
+        assert_eq!(fab.len(), 1);
+        assert_eq!(fba.len(), 1);
+        assert_eq!(fab[0].covered(), 1);
+        assert_eq!(fab[0].total(), 2);
+        assert_eq!(fab[0].uncovered_lines(), vec![2]);
+        assert_eq!(fba[0].covered(), fab[0].covered());
+        assert_eq!(fba[0].total(), fab[0].total());
+        assert_eq!(fba[0].uncovered_lines(), fab[0].uncovered_lines());
+    }
+
+    #[test]
+    fn coverage_by_file_skips_proto_without_path() {
+        // A proto with instrumented lines but no recorded path is skipped (never panics).
+        let mut t = CoverageTable::new();
+        t.record_trap(9, 0, 1, 0); // no record_path for proto 9
+        assert!(t.by_file().is_empty());
+    }
+
+    #[test]
+    fn coverage_line_covered_if_any_proto_covers_it() {
+        // Two protos host an instruction on the SAME 1-based line; one covers it.
+        let mut t = CoverageTable::new();
+        t.record_path(1, "h.as".to_string());
+        t.record_path(2, "h.as".to_string());
+        t.record_trap(1, 0, 1, 0); // proto1, line0 -> 1-based 1
+        t.record_trap(2, 0, 1, 0); // proto2, line0 -> 1-based 1
+        t.mark_covered(2, 0); // only proto2 executed it
+        let files = t.by_file();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].covered(), 1, "line counts as covered (proto2 hit it)");
+        assert_eq!(files[0].total(), 1);
     }
 }
