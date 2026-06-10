@@ -933,6 +933,23 @@ pub fn build_file(
     out: Option<&Path>,
     with_debug: bool,
 ) -> Result<std::path::PathBuf, AsError> {
+    let bytes = compile_verified_aso_bytes(file, with_debug)?;
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => file.with_extension("aso"),
+    };
+    std::fs::write(&out_path, &bytes)
+        .map_err(|e| AsError::new(format!("cannot write {}: {}", out_path.display(), e)))?;
+    Ok(out_path)
+}
+
+/// The shared compile → verify → serialize front half of [`build_file`] and
+/// [`build_native`] (BIN §2.2 step 1): read the source, [`compile::compile_source`], bind the
+/// module source for debug info, [`vm::verify::verify`] (so a produced `.aso` is always
+/// loadable), then `to_bytes_with_debug`. Returns the verified `.aso` byte vector. The native
+/// bundle embeds these EXACT bytes, so the embedded payload is byte-identical to a `build`
+/// artifact (four-mode parity stays free; no `.aso` format change).
+fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, AsError> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
     let src_info = Rc::new(SourceInfo {
@@ -954,15 +971,109 @@ pub fn build_file(
         ))
         .with_source(src_info)
     })?;
-    let bytes = chunk
+    chunk
         .to_bytes_with_debug(with_debug)
-        .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))?;
+        .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
+}
+
+/// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
+/// executable that bundles the whole runtime + the compiled program. This is **bundling, not
+/// AOT**: the output is a copy of the running runtime (`current_exe()`) with the *verified*
+/// `.aso` payload + a trailing [`bundle`] footer appended; at startup the runtime reads its
+/// own footer and runs the payload through the SAME `from_bytes_verified` path as
+/// `run file.aso`.
+///
+/// `--target` is parsed-but-rejected in v1 (host-only). The default output is the source stem
+/// with NO extension (`.exe` on Windows). On Unix the output is `chmod +x`; on macOS it is
+/// ad-hoc signed (mandatory on arm64 — appending invalidated the stub's signature).
+pub fn build_native(
+    file: &Path,
+    out: Option<&Path>,
+    target: Option<&str>,
+) -> Result<std::path::PathBuf, AsError> {
+    // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
+    // naming the requested triple, never a silent ignore or a generic clap failure.
+    if let Some(t) = target {
+        return Err(AsError::new(format!(
+            "cross-compilation is not yet supported (BIN v1 bundles for the host platform \
+             only). Build on a `{t}` host, or omit `--target` to bundle for this host."
+        )));
+    }
+
+    // Step 1: the payload is the SAME verified `.aso` byte vector a `build` produces.
+    let payload = compile_verified_aso_bytes(file, true)?;
+
+    // Step 2: the stub is a byte-for-byte copy of the running runtime.
+    let exe = std::env::current_exe()
+        .map_err(|e| AsError::new(format!("cannot locate the running executable: {e}")))?;
+    let stub = std::fs::read(&exe)
+        .map_err(|e| AsError::new(format!("cannot read the runtime {}: {}", exe.display(), e)))?;
+
+    // Step 3: choose the output path (source stem; `.exe` on Windows; NEVER `.aso`).
     let out_path = match out {
         Some(p) => p.to_path_buf(),
-        None => file.with_extension("aso"),
+        None => {
+            let stem = file
+                .file_stem()
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| std::ffi::OsString::from("app"));
+            let mut p = std::path::PathBuf::from(stem);
+            if cfg!(windows) {
+                p.set_extension("exe");
+            }
+            p
+        }
     };
-    std::fs::write(&out_path, &bytes)
+
+    // Step 4: write the stub, make it executable, and (macOS) ad-hoc sign the CLEAN Mach-O
+    // so its signature `codeLimit` covers only the stub. The payload+footer are appended in
+    // step 5 AFTER the signature — the macOS loader validates `[0, codeLimit)` and ignores
+    // the trailing overlay, so an arm64 bundle execs WITHOUT re-signing the overlay (the
+    // alternative — append then re-sign — relocates the overlay and breaks the footer).
+    std::fs::write(&out_path, &stub)
         .map_err(|e| AsError::new(format!("cannot write {}: {}", out_path.display(), e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&out_path)
+            .map_err(|e| AsError::new(format!("cannot stat {}: {}", out_path.display(), e)))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&out_path, perms).map_err(|e| {
+            AsError::new(format!("cannot chmod +x {}: {}", out_path.display(), e))
+        })?;
+    }
+    crate::bundle::adhoc_sign_macos(&out_path).map_err(AsError::new)?;
+
+    // Step 5: append `payload || footer` AFTER the (now-signed) stub. `payload_offset` is the
+    // on-disk size of the signed stub — signing rewrites `__LINKEDIT`, so it may differ from
+    // `stub.len()`; read it back rather than assuming.
+    let payload_offset = std::fs::metadata(&out_path)
+        .map_err(|e| AsError::new(format!("cannot stat {}: {}", out_path.display(), e)))?
+        .len();
+    let footer = crate::bundle::write_footer(
+        payload_offset,
+        payload.len() as u64,
+        crate::vm::aso::ASO_FORMAT_VERSION,
+    );
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&out_path)
+            .map_err(|e| AsError::new(format!("cannot open {} to append: {}", out_path.display(), e)))?;
+        f.write_all(&payload)
+            .and_then(|()| f.write_all(&footer))
+            .map_err(|e| AsError::new(format!("cannot append payload to {}: {}", out_path.display(), e)))?;
+    }
+
+    let total = payload_offset + payload.len() as u64 + crate::bundle::FOOTER_SIZE as u64;
+    println!(
+        "bundled {} -> {} ({} bytes)",
+        file.display(),
+        out_path.display(),
+        total
+    );
     Ok(out_path)
 }
 

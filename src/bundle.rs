@@ -113,18 +113,30 @@ pub fn read_bundle_footer(exe_bytes: &[u8]) -> Option<(usize, usize)> {
     if exe_len < FOOTER_SIZE {
         return None;
     }
-    let footer = BundleFooter::from_bytes(&exe_bytes[exe_len - FOOTER_SIZE..])?;
+    validate_footer(&exe_bytes[exe_len - FOOTER_SIZE..], exe_len as u64)
+}
+
+/// Validate a `FOOTER_SIZE`-byte footer tail against the TOTAL image length `exe_len`,
+/// returning the bounds-checked `(payload_offset, payload_len)` or `None`. This is the core
+/// of [`read_bundle_footer`]; the startup shim ([`crate::try_run_embedded`]) uses it directly
+/// so it can validate from just the file length + a small tail read, WITHOUT loading the
+/// whole (tens-of-MB) executable on every launch (Task 7 startup budget). NEVER panics.
+pub fn validate_footer(footer_tail: &[u8], exe_len: u64) -> Option<(usize, usize)> {
+    if exe_len < FOOTER_SIZE as u64 {
+        return None;
+    }
+    let footer = BundleFooter::from_bytes(footer_tail)?;
     if footer.payload_offset < MIN_STUB_SIZE {
         return None;
     }
     // The region available for `stub || payload` is everything before the footer.
-    let region = (exe_len - FOOTER_SIZE) as u64;
+    let region = exe_len - FOOTER_SIZE as u64;
     // checked_add: a crafted huge offset/len must not wrap into a passing range.
     let end = footer.payload_offset.checked_add(footer.payload_len)?;
     if end > region {
         return None;
     }
-    // Both fit in usize (end <= region <= exe_len, which is a usize).
+    // Both fit in usize on a 64-bit host (end <= region < exe_len).
     Some((footer.payload_offset as usize, footer.payload_len as usize))
 }
 
