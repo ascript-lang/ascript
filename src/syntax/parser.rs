@@ -843,7 +843,18 @@ fn expr_bp(p: &mut Parser, min_bp: u8) {
 }
 
 /// True if the current token can begin an expression (for optional operands
-/// like `yield`).
+/// like `yield`, and for the ternary then-branch lookahead in `ternary_ahead`).
+///
+/// This mirrors the legacy oracle's `starts_expression` (the single source of
+/// truth — its `assignment()`/`primary()` define what begins an expression):
+/// the prefix operators (`-`/`!`/`~`/`await`/`yield`), the primary starters
+/// (literals, `ident`, `(`, `[`, `{`, `#{`, templates), PLUS the two
+/// expression-introducing KEYWORDS `match` (`match x {…}`) and `async`
+/// (`async () => …` arrow). `fn` is deliberately EXCLUDED — AScript has no
+/// anonymous `fn` expression (the only closure is the arrow), so the oracle's
+/// `assignment()` REJECTS a leading `fn`; treating `fn` as a non-starter keeps a
+/// `?` before it a postfix propagate, matching the oracle. `if`/`for`/`while`
+/// etc. are statements, never expressions, so they are non-starters too.
 fn can_start_expr(p: &Parser) -> bool {
     use SyntaxKind::*;
     matches!(
@@ -865,6 +876,41 @@ fn can_start_expr(p: &Parser) -> bool {
             | TemplateStart
             | AwaitKw
             | YieldKw
+            | MatchKw
+            | AsyncKw
+    )
+}
+
+/// True if the token at `nontrivia` index `i` can begin an expression — the
+/// index-addressed twin of `can_start_expr` (which reads `p.current()`), used by
+/// the ternary-vs-propagate lookahead to inspect the token immediately after a
+/// `?` without moving the cursor.
+fn token_can_start_expr(p: &Parser, i: usize) -> bool {
+    use SyntaxKind::*;
+    let Some(&tok_idx) = p.nontrivia.get(i) else {
+        return false;
+    };
+    matches!(
+        p.tokens[tok_idx].kind,
+        Number
+            | Str
+            | TrueKw
+            | FalseKw
+            | NilKw
+            | Ident
+            | LParen
+            | LBracket
+            | LBrace
+            | HashLBrace
+            | Minus
+            | Bang
+            | Tilde
+            | TemplateStr
+            | TemplateStart
+            | AwaitKw
+            | YieldKw
+            | MatchKw
+            | AsyncKw
     )
 }
 
@@ -907,11 +953,29 @@ fn unary(p: &mut Parser) -> CompletedMarker {
 /// 0 before the statement ends), false if it is a postfix propagate `?`.
 fn ternary_ahead(p: &Parser) -> bool {
     use SyntaxKind::*;
+    // A ternary's then-branch begins IMMEDIATELY after the `?` with an
+    // expression. So if the token right after the `?` cannot begin an expression,
+    // this `?` is a postfix PROPAGATE — regardless of any later `:`. The legacy
+    // oracle gets this for free by SPECULATIVELY parsing the then-branch (it fails
+    // and the `?` falls through to propagate); the token-scan below cannot
+    // speculate, so this explicit guard supplies the same decision. Without it
+    // `g(5)? > 0 ? a : b` (next token `>`, an infix op) and `c ? g(5)? : 0` (the
+    // inner `?` followed by the OUTER ternary's `:`) both wrongly scanned to a
+    // later `:` and misparsed a propagate as a ternary — see
+    // `tests/frontend_conformance.rs` and `vm_propagate_*` regression guards.
+    if !token_can_start_expr(p, p.pos + 1) {
+        return false;
+    }
     let mut depth = 0i32;
     let mut i = p.pos + 1; // scan AFTER the `?`
     while i < p.nontrivia.len() {
         match p.tokens[p.nontrivia[i]].kind {
-            LParen | LBracket | LBrace => depth += 1,
+            // `#{` (HashLBrace) opens a MAP LITERAL — its inner `key: value` colon is NOT a
+            // ternary colon, so it MUST raise the bracket depth like any other opener.
+            // Omitting it made a `?` propagate followed by a `#{ k: v }` map literal (and a
+            // later real ternary's `:`) misparse as a ternary — the map-literal colon was seen
+            // at depth 0. It is closed by a plain `}` (RBrace), already handled below.
+            LParen | LBracket | LBrace | HashLBrace => depth += 1,
             RParen | RBracket => depth -= 1,
             RBrace => {
                 if depth == 0 {
@@ -920,6 +984,20 @@ fn ternary_ahead(p: &Parser) -> bool {
                 depth -= 1;
             }
             Semicolon if depth == 0 => return false,
+            // A STATEMENT-INTRODUCING keyword at depth 0 means the `?` ended its own statement
+            // (it was a postfix propagate, not a ternary) — the legacy oracle's trial-parse
+            // `assignment()` stops at such a keyword, so a following `:` (a LATER statement's
+            // ternary colon) is NOT this `?`'s colon. Without this, `let r = g(p)?` followed by
+            // `return r ? 100 : 200` scanned into the LATER ternary's `:` and misparsed the
+            // propagate as a ternary. These keywords can never continue a ternary then-branch
+            // at depth 0. (NOTE: `match` is an EXPRESSION keyword, so it is deliberately
+            // EXCLUDED — `cond ? match x {…} : y` stays a valid ternary.)
+            LetKw | ConstKw | ReturnKw | IfKw | WhileKw | ForKw | BreakKw | ContinueKw | FnKw
+            | ClassKw | EnumKw | ImportKw
+                if depth == 0 =>
+            {
+                return false;
+            }
             Colon if depth == 0 => return true,
             _ => {}
         }

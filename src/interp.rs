@@ -3645,7 +3645,16 @@ impl Interp {
             }
             Pattern::Value(e) => {
                 let v = self.eval_expr(e, env).await?;
-                Ok(v == *subject)
+                // A value pattern compares the subject against the pattern value with the
+                // SAME equality the `==` operator uses (Option-C: a value pattern is an
+                // `==` test). For pure structural kinds this is the plain `==`, but for the
+                // numeric tower it must apply NUM's cross-kind coercion — in particular
+                // `Decimal(-1)` equals `Int(-1)` (as `decimal(-1) == -1` is `true`). Using
+                // bare Rust `PartialEq` (`v == *subject`) here would treat a Decimal subject
+                // as DISTINCT from an int/float pattern, diverging from both the `==`
+                // operator AND the VM (which compiles a value pattern to `Op::Eq`). Route
+                // through the shared `decimal_cross_eq` so all four modes agree.
+                Ok(decimal_cross_eq(&v, subject, e.span)?)
             }
             Pattern::Range {
                 start,

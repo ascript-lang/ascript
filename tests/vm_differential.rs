@@ -594,6 +594,56 @@ async fn vm_short_circuit_does_not_evaluate_rhs() {
     }
 }
 
+// ----- FUZZ Unit-2: `?`-propagate vs ternary disambiguation (four-mode) ---------
+//
+// Two CST-parser disambiguation bugs surfaced by the FUZZ Unit-2 review: the CST
+// token-scan in `ternary_ahead` (src/syntax/parser.rs) once fused a postfix
+// PROPAGATE `?` into a later ternary's `:`, rejecting valid programs the
+// tree-walker oracle accepts. The fix adds a "next token can begin an expression"
+// guard (a ternary then-branch starts IMMEDIATELY after the `?` with an
+// expression). These run the two original repros all THREE engines (the `.aso`
+// path runs the SAME serialized Chunk, covered at the CLI level) and assert
+// byte-identical output against the tree-walker oracle.
+
+#[tokio::test]
+async fn vm_propagate_then_compare_then_ternary_matches_treewalker() {
+    // Repro A: `g(5)? > 0 ? "pos" : "neg"`. The FIRST `?` is propagate (the next
+    // token `>` cannot begin an expression); the `:` belongs to the trailing
+    // ternary. Tree-walker prints "pos"; the CST/VM once rejected with
+    // "expected expression".
+    assert_three_way_matches(
+        "fn g(v) { return [v, nil] }\n\
+         fn a() { return g(5)? > 0 ? \"pos\" : \"neg\" }\n\
+         print(a())",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_propagate_inside_ternary_branch_matches_treewalker() {
+    // Repro B: `c ? g(5)? : 0`. The INNER `?` is propagate — the token after it is
+    // the OUTER ternary's `:` (not an expression start). Tree-walker(b(true))
+    // prints 5; the CST/VM once rejected with "expected expression".
+    assert_three_way_matches(
+        "fn g(v) { return [v, nil] }\n\
+         fn b(c) { return c ? g(5)? : 0 }\n\
+         print(b(true))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_ternary_keyword_then_branch_matches_treewalker() {
+    // The guard must NOT regress a legitimate ternary whose then-branch begins
+    // with an expression-introducing keyword (`match` / `async`-arrow): the next
+    // token DOES begin an expression, so the `?` stays a ternary.
+    assert_three_way_matches(
+        "fn pick(x) { return x > 0 ? match x { 1 => \"one\", _ => \"many\" } : \"none\" }\n\
+         print(pick(1))\nprint(pick(5))\nprint(pick(0))",
+    )
+    .await;
+}
+
 // ----- V10-T1: destructuring `let` (array + object + rest) ---------------------
 //
 // `let [a, b, ...r] = arr` and `let {a, b as local, "k" as v, ...rest} = obj`.
@@ -7879,5 +7929,185 @@ async fn iface_instanceof_bad_rhs_three_way() {
     ];
     for src in cases {
         assert_opt_call_error_three_way(src).await;
+    }
+}
+
+// ===========================================================================
+// FUZZ Unit 2 — regression guards for two engine bugs the broadened
+// grammar-aware generator (`ascript::fuzzgen`) surfaced via the three-way
+// differential. Each is a FULL four-mode byte-identical assertion
+// (tree-walker == specialized-VM == generic-VM == `.aso`).
+// ===========================================================================
+
+/// Four-mode OK assertion: all of tree-walker, specialized-VM, generic-VM, and the
+/// `.aso` round-trip produce byte-identical stdout + exit code.
+async fn assert_four_way_run(src: &str) {
+    let tw = ascript::run_source_exit(src).await.expect("tree-walker ok");
+    let vm = ascript::vm_run_source(src).await.expect("specialized vm ok");
+    let gen = ascript::vm_run_source_generic(src).await.expect("generic vm ok");
+    let aso = ascript::aso_roundtrip_run_source(src).await.expect("aso ok");
+    assert_eq!(tw, vm, "specialized-VM diverged from tree-walker for `{src}`");
+    assert_eq!(tw, gen, "generic-VM diverged from tree-walker for `{src}`");
+    assert_eq!(tw, aso, ".aso round-trip diverged from tree-walker for `{src}`");
+}
+
+#[tokio::test]
+async fn vm_nested_loop_closure_capture_matches_treewalker() {
+    // FUZZ Unit 2 bug #1 (compiler `loop_refresh_slots` frame-leak): a closure created in
+    // an INNER loop that captures a by-REFERENCE (mutated) variable declared in the OUTER
+    // loop body. The inner loop's per-iteration FRESH_CELL list wrongly included the
+    // closure PARAMETER's binding (a different frame, same slot index), so the inner loop
+    // clobbered the captured outer cell to `nil` each iteration → the VM read `nil` for the
+    // captured variable while the tree-walker read the real value. The minimal repro:
+    let cases = [
+        // The smoking-gun: the closure returns the captured outer-loop variable; the VM used
+        // to read `nil` here, then panic on `nil + 1`.
+        "let w27 = 0\n\
+         while (w27 < 2) {\n\
+           let w28 = 5\n\
+           while (w28 < 7) {\n\
+             let v = ((x) => w28)(3)\n\
+             print(v)\n\
+             w28 = w28 + 1\n\
+           }\n\
+           w27 = w27 + 1\n\
+         }",
+        // The closure both takes a param `x` AND captures the mutated outer `w28`.
+        "let w27 = 0\n\
+         while (w27 < 2) {\n\
+           let w28 = 5\n\
+           while (w28 < 7) {\n\
+             let v = ((x) => x + w28)(3)\n\
+             print(v)\n\
+             w28 = w28 + 1\n\
+           }\n\
+           w27 = w27 + 1\n\
+         }",
+        // Same shape with a `for`-range inner loop and a block-bodied arrow.
+        "let outer = 0\n\
+         while (outer < 2) {\n\
+           let acc = 10\n\
+           for (i in 0..3) {\n\
+             let g = ((p) => { let t = p * 2; return t + acc })(i)\n\
+             print(g)\n\
+             acc = acc + 1\n\
+           }\n\
+           outer = outer + 1\n\
+         }",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_loop_nested_method_closure_capture_matches_treewalker() {
+    // FUZZ Unit 2 bug #1 — SIBLING case caught by the Unit-2 review: the original
+    // `loop_refresh_slots` frame-filter excluded only `ArrowExpr`/`FnDecl` nested frames,
+    // but a `MethodDecl` (a class method declared INSIDE a loop body) opens a fresh frame
+    // via the SAME `resolve_function` path. Its param/local bindings start at slot 0 and
+    // collided with an outer-loop cell slot, so the inner loop's FRESH_CELL list clobbered
+    // the captured outer-loop variable to `nil` on the VM (the tree-walker read the real
+    // value). Fixed by adding `MethodDecl` (and `FieldDecl`) to the nested-frame exclusion.
+    let cases = [
+        // Method PARAM `x` (slot 0) collides with the captured outer-loop cell `w28`.
+        "let w27 = 0\n\
+         while (w27 < 2) {\n\
+           let w28 = 5\n\
+           while (w28 < 7) {\n\
+             class C { fn m(x) { return w28 } }\n\
+             let c = C()\n\
+             print(c.m(3))\n\
+             w28 = w28 + 1\n\
+           }\n\
+           w27 = w27 + 1\n\
+         }",
+        // Method LOCAL `y` collides; method reads the captured outer cell.
+        "let outer = 0\n\
+         while (outer < 2) {\n\
+           let acc = 10\n\
+           for (i in 0..3) {\n\
+             class M { fn build(p) { let y = p * 2\n return y + acc } }\n\
+             print(M().build(i))\n\
+             acc = acc + 1\n\
+           }\n\
+           outer = outer + 1\n\
+         }",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_value_pattern_decimal_matches_treewalker() {
+    // FUZZ Unit 2 bug #2 (tree-walker `Pattern::Value` used Rust structural `PartialEq`
+    // instead of the `==` operator's NUM cross-kind equality): a `match` value pattern over
+    // a Decimal subject. `decimal(-1) == -1` is `true` (NUM coercion), and the VM compiles a
+    // value pattern to `Op::Eq` (the same coercing equality), so the VM matched the int
+    // pattern; the tree-walker's bare `v == subject` treated `Decimal(-1)` as DISTINCT from
+    // `Int(-1)` and fell through. Fixed by routing the tree-walker through the shared
+    // `decimal_cross_eq`. A value pattern is now an `==` test for ALL numeric kinds.
+    let cases = [
+        // The minimal repro: a decimal subject vs an int literal pattern.
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"-1\") - 0\n\
+         print(match (k) { (-1) => \"int-pat\", _ => \"fell\" })",
+        // Decimal vs a positive int pattern.
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"5\")\n\
+         print(match (k) { 5 => \"five\", _ => \"other\" })",
+        // Decimal vs a float pattern (also coerces).
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"2.5\")\n\
+         print(match (k) { 2.5 => \"two-half\", _ => \"other\" })",
+        // The inverse case stays a NON-match (decimal 1 vs pattern 2).
+        "import * as decimal from \"std/decimal\"\n\
+         let k = decimal.from(\"1\")\n\
+         print(match (k) { 2 => \"two\", _ => \"not-two\" })",
+        // A float subject still matches an int pattern (unchanged baseline; integral fold).
+        "let k = 1.0\n\
+         print(match (k) { 1 => \"int-pat\", _ => \"fell\" })",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_propagate_then_map_literal_or_later_ternary_matches_treewalker() {
+    // FUZZ Unit 2 bug #3 (CST `ternary_ahead` scanner): a postfix propagate `?` was
+    // MISPARSED as a ternary when a `:` followed it at apparent depth 0 — either inside a
+    // `#{ key: value }` MAP LITERAL (whose `#{` opener `HashLBrace` was not counted toward
+    // bracket depth) or in a LATER statement's real ternary (the scan didn't stop at a
+    // statement-introducing keyword). The legacy oracle's trial-parse handles both; the CST
+    // heuristic now counts `HashLBrace` and stops at a depth-0 statement keyword. These
+    // programs parse + run on the legacy front-end but used to be REJECTED by the CST/VM
+    // front-end with `expected ':' in ternary` / `expected expression`.
+    let cases = [
+        // Propagate `?` then a `#{ k: v }` map literal on the next line, then a real ternary.
+        "import * as map from \"std/map\"\n\
+         fn rok(x) { return [x, nil] }\n\
+         fn f(p) {\n\
+           let pv = rok(p)?\n\
+           print(len(#{1: pv}))\n\
+           return 1\n\
+         }\n\
+         print(f(2))\n\
+         print((false ? 1 : 0))",
+        // Propagate `?` directly followed (next line) by a `return r ? a : b` real ternary.
+        "fn g(v) { return [v, nil] }\n\
+         fn h(p) {\n\
+           let r = g(p)?\n\
+           return r ? 100 : 200\n\
+         }\n\
+         print(h(1))",
+        // A genuine multi-line ternary at top level must STILL parse as a ternary (no regress).
+        "let x = true ?\n  1 :\n  2\nprint(x)",
+        // A ternary whose then-branch is a map literal stays a ternary (HashLBrace inside it).
+        "let x = 5\nprint(x > 0 ? #{1: 10} : #{2: 20})",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
     }
 }
