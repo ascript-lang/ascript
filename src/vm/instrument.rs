@@ -162,8 +162,10 @@ pub enum DebugEvent {
     /// server so it can be re-emitted as an `output` event on the protocol stdout.
     /// Plain owned `String` — keeps program output OFF the protocol stdout (which the
     /// DAP framing owns), so the editor sees it as DAP output while the channel stays
-    /// the single transport. Sent by the debuggee thread (DBG Task 5b).
-    Output { text: String },
+    /// the single transport. `stderr` selects the DAP `output` category (`true` →
+    /// `"stderr"`, e.g. an uncaught panic; `false` → `"stdout"`). Sent by the debuggee
+    /// thread (DBG Task 5b).
+    Output { text: String, stderr: bool },
     /// The debuggee program finished. Carries the process exit code (0 = normal,
     /// non-zero = an `exit(n)` or an uncaught Tier-2 panic). Sent by the debuggee
     /// thread after `vm.run` returns, just before it drops the hook (DBG Task 5b).

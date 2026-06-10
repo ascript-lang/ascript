@@ -27,10 +27,18 @@ struct AdapterState {
     /// `stopped` uses `reason: "entry"`, subsequent ones `reason: "breakpoint"`.
     entry_reported: bool,
     /// Breakpoints buffered from a `setBreakpoints` that arrived BEFORE the VM parked
-    /// at entry (so they could not be applied yet). Keyed by source path → lines.
-    /// Applied at the entry stop. (v1: the standard flow sets them while parked, so
-    /// this is a fallback for out-of-order clients.)
-    pending_breakpoints: Vec<(String, Vec<u32>)>,
+    /// at entry (so they could not be applied yet). `(source, lines, ids)` — the ids
+    /// are the stable per-breakpoint ids already handed to the editor, carried so the
+    /// `BreakpointsVerified` reply can be correlated back to them. Applied at the entry
+    /// stop, in arrival order.
+    pending_breakpoints: Vec<(String, Vec<u32>, Vec<i64>)>,
+    /// FIFO of breakpoint-id lists awaiting a `BreakpointsVerified` reply, pushed at the
+    /// moment a `SetBreakpoints` command is SENT to the VM (parked-apply or entry-apply).
+    /// The VM processes commands in order, so the pump pops the front to correlate the
+    /// next verified reply to the ids it must update via a `breakpoint` event (F1).
+    pending_verify: std::collections::VecDeque<Vec<i64>>,
+    /// Monotonic breakpoint-id allocator (stable ids the editor uses to update markers).
+    bp_id: i64,
 }
 
 impl AdapterState {
@@ -40,6 +48,8 @@ impl AdapterState {
             frames: Vec::new(),
             entry_reported: false,
             pending_breakpoints: Vec::new(),
+            pending_verify: std::collections::VecDeque::new(),
+            bp_id: 0,
         }
     }
 
@@ -47,6 +57,12 @@ impl AdapterState {
     fn next_seq(&mut self) -> i64 {
         self.seq += 1;
         self.seq
+    }
+
+    /// Allocate the next stable breakpoint id.
+    fn next_bp_id(&mut self) -> i64 {
+        self.bp_id += 1;
+        self.bp_id
     }
 }
 
@@ -79,13 +95,16 @@ fn pump_events(
                         st.entry_reported = true;
                         "entry"
                     };
-                    // If the client buffered breakpoints before we parked, apply them
-                    // now (the entry stop is the first chance). The verified replies
-                    // arrive as BreakpointsVerified events but the client already got
-                    // an optimistic response, so we just push the commands.
+                    // If the client buffered breakpoints before we parked, apply them now
+                    // (the entry stop is the first chance). Each was answered with a
+                    // pending (`verified:false`) response carrying stable ids; push the
+                    // command AND the id list onto `pending_verify` so the authoritative
+                    // `BreakpointsVerified` reply correlates back and emits a `breakpoint`
+                    // event with the real verdict (F1).
                     let pending = std::mem::take(&mut st.pending_breakpoints);
-                    for (source, lines) in pending {
+                    for (source, lines, ids) in pending {
                         let _ = cmd_tx.send(DebugCommand::SetBreakpoints { source, lines });
+                        st.pending_verify.push_back(ids);
                     }
                     (st.next_seq(), reason)
                 };
@@ -102,23 +121,50 @@ fn pump_events(
                     ),
                 );
             }
-            DebugEvent::BreakpointsVerified { .. } => {
-                // The synchronous setBreakpoints handler consumes the verified reply
-                // directly off `evt_rx`? No — `evt_rx` is owned by THIS pump thread.
-                // The handler instead pushes the command and responds optimistically;
-                // we surface the confirmed bindings as a `breakpoint` event so the
-                // editor updates the marker. (Unreachable in the common flow because
-                // the handler drains this synchronously; kept for the parked-apply
-                // path triggered from the pump above.)
+            DebugEvent::BreakpointsVerified { results } => {
+                // The VM's AUTHORITATIVE per-line verdict. `evt_rx` is owned by THIS pump
+                // thread, so the synchronous `setBreakpoints` handler could not read it;
+                // instead it responded with `verified:false` (pending) + assigned a stable
+                // id per requested breakpoint, pushing the id list onto `pending_verify`
+                // (FIFO — the VM applies `SetBreakpoints` commands in order). We pop the
+                // matching id list and emit a DAP `breakpoint` event per line carrying the
+                // REAL verdict, so the editor flips the marker to verified (or leaves an
+                // unbindable line unverified). This is the DAP-sanctioned late-verification
+                // path (no fabricated verdicts).
+                let ids = {
+                    let mut st = state.lock().expect("state mutex");
+                    st.pending_verify.pop_front()
+                };
+                let Some(ids) = ids else { continue };
+                for (i, binding) in results.iter().enumerate() {
+                    let Some(&id) = ids.get(i) else { break };
+                    let seq = state.lock().expect("state mutex").next_seq();
+                    send(
+                        &stdout,
+                        &event(
+                            seq,
+                            "breakpoint",
+                            json!({
+                                "reason": "changed",
+                                "breakpoint": {
+                                    "id": id,
+                                    "verified": binding.verified,
+                                    "line": binding.line,
+                                },
+                            }),
+                        ),
+                    );
+                }
             }
-            DebugEvent::Output { text } => {
+            DebugEvent::Output { text, stderr } => {
                 let seq = state.lock().expect("state mutex").next_seq();
+                let category = if stderr { "stderr" } else { "stdout" };
                 send(
                     &stdout,
                     &event(
                         seq,
                         "output",
-                        json!({ "category": "stdout", "output": text }),
+                        json!({ "category": category, "output": text }),
                     ),
                 );
             }
@@ -140,7 +186,11 @@ fn pump_events(
 /// `run --inspect <file>` form (the program is pre-set; a `launch` request that omits
 /// a path uses it). `program: None` is `ascript dap` (the program comes from the
 /// `launch` request's `program` argument). Returns the process exit code.
-pub fn run_server(program: Option<PathBuf>, script_args: Vec<String>) -> std::io::Result<i32> {
+pub fn run_server(
+    program: Option<PathBuf>,
+    script_args: Vec<String>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+) -> std::io::Result<i32> {
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
@@ -154,9 +204,16 @@ pub fn run_server(program: Option<PathBuf>, script_args: Vec<String>) -> std::io
     let exit_code = 0i32;
 
     loop {
-        let req = match read_message(&mut reader)? {
-            Some(r) => r,
-            None => break, // stdin EOF → client closed the session.
+        let req = match read_message(&mut reader) {
+            Ok(Some(r)) => r,
+            Ok(None) => break, // stdin EOF → client closed the session.
+            // A malformed frame (bad Content-Length / non-JSON body) must NOT bypass
+            // teardown via `?` — fall through to the clean shutdown so the parked
+            // debuggee is resumed and both threads are joined (F4).
+            Err(e) => {
+                eprintln!("dap: malformed message ({e}); shutting down");
+                break;
+            }
         };
 
         match req.command.as_str() {
@@ -218,7 +275,14 @@ pub fn run_server(program: Option<PathBuf>, script_args: Vec<String>) -> std::io
                     continue;
                 };
 
-                let handle = launch::spawn_debuggee(path, args);
+                // Send the launch RESPONSE before spawning, so it is guaranteed to
+                // precede the entry `stopped` event the pump will emit once the debuggee
+                // parks (the debuggee must compile + build a runtime first, but ordering
+                // should not rely on that latency) (F5).
+                let rseq = state.lock().expect("state").next_seq();
+                send(&stdout, &response(rseq, req.seq, &req.command, true, json!({})));
+
+                let handle = launch::spawn_debuggee(path, args, caps.clone());
                 cmd_tx = Some(handle.cmd_tx.clone());
                 debuggee_join = Some(handle.join);
                 let evt_rx = handle.evt_rx;
@@ -231,8 +295,6 @@ pub fn run_server(program: Option<PathBuf>, script_args: Vec<String>) -> std::io
                         .spawn(move || pump_events(evt_rx, pump_state, pump_stdout, pump_cmd))
                         .expect("spawn pump thread"),
                 );
-                let rseq = state.lock().expect("state").next_seq();
-                send(&stdout, &response(rseq, req.seq, &req.command, true, json!({})));
             }
 
             "setBreakpoints" => {
@@ -254,42 +316,39 @@ pub fn run_server(program: Option<PathBuf>, script_args: Vec<String>) -> std::io
                     })
                     .unwrap_or_default();
 
-                // If the VM is parked (it is, after the entry stop), send the command
-                // and wait for the BreakpointsVerified reply so we can respond with the
-                // real verdicts. The pump thread owns `evt_rx`, so we cannot read it
-                // here; instead we respond optimistically `verified:true` for each line
-                // and let the pump surface the authoritative bindings. To give the
-                // happy-path test a real `verified:true`, the bindings ARE authoritative
-                // when applied while parked, and the VM's resolver binds any executable
-                // line — so optimistic `verified:true` matches the parked outcome.
-                //
-                // We DO apply them: send the command to the VM. The verified event is
-                // consumed by the pump (a no-op there) — the editor already has its
-                // response.
-                let parked = state.lock().expect("state").entry_reported;
-                if parked {
-                    if let Some(tx) = &cmd_tx {
-                        let _ = tx.send(DebugCommand::SetBreakpoints {
-                            source: source.clone(),
-                            lines: lines.clone(),
-                        });
+                // DAP setBreakpoints is replace-all per source. We CANNOT verify
+                // synchronously (the pump thread owns `evt_rx`), so we respond with the
+                // DAP-sanctioned PENDING state — each breakpoint gets a stable `id` and
+                // `verified:false` — then the VM's authoritative `BreakpointsVerified`
+                // reply is correlated by id (FIFO via `pending_verify`) and surfaced as a
+                // `breakpoint` event that flips the marker to its REAL verdict (F1). No
+                // fabricated verdicts: an unbindable line stays unverified.
+                let (ids, rseq) = {
+                    let mut st = state.lock().expect("state");
+                    let ids: Vec<i64> = lines.iter().map(|_| st.next_bp_id()).collect();
+                    if st.entry_reported {
+                        // Parked: apply immediately + queue the ids for the reply.
+                        if let Some(tx) = &cmd_tx {
+                            let _ = tx.send(DebugCommand::SetBreakpoints {
+                                source: source.clone(),
+                                lines: lines.clone(),
+                            });
+                            st.pending_verify.push_back(ids.clone());
+                        }
+                    } else {
+                        // Not parked yet — buffer for application at the entry stop
+                        // (carrying the ids so the eventual reply correlates).
+                        st.pending_breakpoints
+                            .push((source.clone(), lines.clone(), ids.clone()));
                     }
-                } else {
-                    // Not parked yet — buffer for application at the entry stop.
-                    state
-                        .lock()
-                        .expect("state")
-                        .pending_breakpoints
-                        .push((source.clone(), lines.clone()));
-                }
+                    (ids, st.next_seq())
+                };
 
-                let verified: Vec<Json> = lines
+                let breakpoints: Vec<Json> = lines
                     .iter()
-                    .map(|&line| {
-                        json!({ "verified": parked, "line": line })
-                    })
+                    .zip(ids.iter())
+                    .map(|(&line, &id)| json!({ "id": id, "verified": false, "line": line }))
                     .collect();
-                let rseq = state.lock().expect("state").next_seq();
                 send(
                     &stdout,
                     &response(
@@ -297,7 +356,7 @@ pub fn run_server(program: Option<PathBuf>, script_args: Vec<String>) -> std::io
                         req.seq,
                         "setBreakpoints",
                         true,
-                        json!({ "breakpoints": verified }),
+                        json!({ "breakpoints": breakpoints }),
                     ),
                 );
             }

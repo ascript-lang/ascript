@@ -39,8 +39,19 @@ struct DapClient {
 impl DapClient {
     /// Spawn `ascript run --inspect <program>` (the pre-set-program form).
     fn spawn_inspect(program: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ascript"))
-            .arg("run")
+        Self::spawn_inspect_with_flags(program, &[])
+    }
+
+    /// Spawn `ascript run [flags] --inspect <program>` — `flags` are extra `run` flags
+    /// placed BEFORE `--inspect` (e.g. `--sandbox`, `--deny fs`) so capability handling
+    /// is exercised under the debugger (review F2).
+    fn spawn_inspect_with_flags(program: &std::path::Path, flags: &[&str]) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ascript"));
+        cmd.arg("run");
+        for f in flags {
+            cmd.arg(f);
+        }
+        let mut child = cmd
             .arg("--inspect")
             .arg(program)
             .stdin(Stdio::piped())
@@ -269,7 +280,9 @@ fn dap_happy_path_breakpoint_inspect_continue() {
         "first stop is break-on-entry: {stopped}"
     );
 
-    // setBreakpoints on the `let s` line (line 2, 1-based) → verified.
+    // setBreakpoints on the `let s` line (line 2, 1-based). The response is the
+    // DAP-sanctioned PENDING state (`verified:false` + a stable `id`); the VM's REAL
+    // verdict arrives next as a `breakpoint` event (F1 — no fabricated verdicts).
     let sb = c.request(
         "setBreakpoints",
         json!({
@@ -280,8 +293,16 @@ fn dap_happy_path_breakpoint_inspect_continue() {
     let sb_resp = c.read_response(sb, deadline);
     let bps = sb_resp["body"]["breakpoints"].as_array().expect("breakpoints array");
     assert_eq!(bps.len(), 1, "one requested → one binding: {sb_resp}");
-    assert_eq!(bps[0]["verified"], json!(true), "line bound: {sb_resp}");
+    assert_eq!(bps[0]["verified"], json!(false), "pending until the VM verifies: {sb_resp}");
     assert_eq!(bps[0]["line"], json!(2));
+    let bp_id = bps[0]["id"].as_i64().expect("breakpoint id");
+    // The authoritative verdict: a `breakpoint` event flips the marker to verified.
+    let bp_evt = c.read_event("breakpoint", deadline);
+    assert_eq!(bp_evt["body"]["breakpoint"]["id"], json!(bp_id), "verdict for our id: {bp_evt}");
+    assert_eq!(
+        bp_evt["body"]["breakpoint"]["verified"], json!(true),
+        "an executable line binds: {bp_evt}"
+    );
 
     // configurationDone → resume from entry → stop at the breakpoint (inside add).
     let cd = c.request("configurationDone", json!({}));
@@ -330,6 +351,89 @@ fn dap_happy_path_breakpoint_inspect_continue() {
     assert!(
         output.contains("5"),
         "program output `5` arrived as an output event, got: {output:?}"
+    );
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+}
+
+/// Test 1b (review F1 regression) — an UNBINDABLE breakpoint (a line past EOF) must
+/// report `verified:false` via the authoritative `breakpoint` event. The pre-fix code
+/// fabricated `verified:true` for ANY line when parked, including lines that never bind
+/// or fire. This guards against that false-positive.
+#[test]
+fn dap_unbindable_breakpoint_reports_unverified() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let program = temp_program("unbindable", PROGRAM); // 5 lines
+    let mut c = DapClient::spawn_inspect(&program);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline); // entry
+
+    // A breakpoint on line 99 (well past the 5-line program) cannot bind.
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": program.to_string_lossy() },
+            "breakpoints": [ { "line": 99 } ],
+        }),
+    );
+    let sb_resp = c.read_response(sb, deadline);
+    let bps = sb_resp["body"]["breakpoints"].as_array().expect("breakpoints array");
+    assert_eq!(bps[0]["verified"], json!(false), "pending in the response: {sb_resp}");
+    let bp_id = bps[0]["id"].as_i64().expect("breakpoint id");
+
+    // The authoritative verdict must stay FALSE — the line never binds (no fabrication).
+    let bp_evt = c.read_event("breakpoint", deadline);
+    assert_eq!(bp_evt["body"]["breakpoint"]["id"], json!(bp_id));
+    assert_eq!(
+        bp_evt["body"]["breakpoint"]["verified"], json!(false),
+        "an unbindable line must NOT be reported verified: {bp_evt}"
+    );
+
+    // configurationDone resumes; with no bound breakpoint the program runs to completion.
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("5"), "program still completes: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+}
+
+/// Test 1c (review F2 / Gate-0 regression) — `--inspect` must honor the CLI capability
+/// flags. Under `--sandbox` a gated `fs.read` is DENIED with the recoverable
+/// `capability 'fs' denied` panic exactly as a normal `--sandbox` run, proving the
+/// composed CapSet is threaded into the debuggee (the pre-fix `--inspect` returned
+/// before `compose_caps` and ran all-granted). The denial rides DAP `output` events.
+#[cfg(feature = "sys")]
+#[test]
+fn dap_inspect_honors_sandbox_capabilities() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // recover() keeps the denial recoverable so the program completes and prints it.
+    let src = "import * as fs from \"std/fs\"\n\
+               let r = recover(() => fs.read(\"/etc/hosts\"))\n\
+               if (r[1] != nil) { print(r[1].message) } else { print(\"read ok\") }\n";
+    let program = temp_program("sandbox", src);
+    let mut c = DapClient::spawn_inspect_with_flags(&program, &["--sandbox"]);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline); // entry
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(
+        output.contains("capability 'fs' denied"),
+        "under --inspect --sandbox, fs.read must be denied (not all-granted); got: {output:?}"
     );
 
     c.close_stdin();

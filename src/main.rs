@@ -364,31 +364,6 @@ async fn real_main() -> ExitCode {
             file,
             args,
         } => {
-            // DBG: `--inspect` routes the program to the DAP server (break-on-entry,
-            // editor-driven) instead of running it normally. The `dap` feature owns
-            // this; without it, report a clean rebuild hint rather than silently
-            // running.
-            if inspect {
-                #[cfg(feature = "dap")]
-                {
-                    let program = std::path::PathBuf::from(&file);
-                    return match ascript::dap::run_server(Some(program), args) {
-                        Ok(code) => ExitCode::from(code as u8),
-                        Err(e) => {
-                            eprintln!("dap error: {e}");
-                            ExitCode::from(1)
-                        }
-                    };
-                }
-                #[cfg(not(feature = "dap"))]
-                {
-                    let _ = &args;
-                    eprintln!(
-                        "error: `--inspect` requires the `dap` feature; rebuild with it enabled (it is on by default)"
-                    );
-                    return ExitCode::from(1);
-                }
-            }
             // `--locked` only affects dependency resolution, which is `pkg`-gated.
             #[cfg(not(feature = "pkg"))]
             let _ = locked;
@@ -403,6 +378,32 @@ async fn real_main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // DBG: `--inspect` routes the program to the DAP server (break-on-entry,
+            // editor-driven) instead of running it normally. Computed AFTER `compose_caps`
+            // so the SAME capability set is enforced under the debugger (review F2 /
+            // Gate-0 — no privilege escalation vs a normal run). The `dap` feature owns
+            // this; without it, report a clean rebuild hint rather than silently running.
+            if inspect {
+                #[cfg(feature = "dap")]
+                {
+                    let program = std::path::PathBuf::from(&file);
+                    return match ascript::dap::run_server(Some(program), args, caps) {
+                        Ok(code) => ExitCode::from(code as u8),
+                        Err(e) => {
+                            eprintln!("dap error: {e}");
+                            ExitCode::from(1)
+                        }
+                    };
+                }
+                #[cfg(not(feature = "dap"))]
+                {
+                    let _ = (&args, &caps);
+                    eprintln!(
+                        "error: `--inspect` requires the `dap` feature; rebuild with it enabled (it is on by default)"
+                    );
+                    return ExitCode::from(1);
+                }
+            }
             // A `.aso` file is compiled bytecode → run it on the VM (no compile step).
             // A `.as` file is compiled to bytecode and run on the VM as well (this is
             // the production path post-cutover). The tree-walker is kept as the
@@ -723,8 +724,11 @@ async fn real_main() -> ExitCode {
         #[cfg(feature = "dap")]
         Command::Dap { .. } => {
             // The DAP server is fully synchronous (it spawns the debuggee on its own
-            // thread + runtime); the program comes from the `launch` request.
-            match ascript::dap::run_server(None, Vec::new()) {
+            // thread + runtime); the program comes from the `launch` request. Caps are
+            // `None` (all-granted) here — `ascript dap` takes no CLI sandbox flags; a
+            // sandboxed debug session uses `ascript run --inspect --sandbox <file>`,
+            // which threads its composed CapSet through (review F2).
+            match ascript::dap::run_server(None, Vec::new(), None) {
                 Ok(code) => ExitCode::from(code as u8),
                 Err(e) => {
                     eprintln!("dap error: {e}");

@@ -31,7 +31,11 @@ pub struct DebuggeeHandle {
 /// On a compile error (or unreadable file) we still ship a single `Output` line with the
 /// error text and a non-zero `Terminated` so the editor session ends cleanly — there is
 /// no proto tree to stop in.
-pub fn spawn_debuggee(program: PathBuf, script_args: Vec<String>) -> DebuggeeHandle {
+pub fn spawn_debuggee(
+    program: PathBuf,
+    script_args: Vec<String>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+) -> DebuggeeHandle {
     let (hook, cmd_tx, evt_rx) = DebuggerHook::new();
     let join = std::thread::Builder::new()
         .name("ascript-debuggee".to_string())
@@ -42,7 +46,7 @@ pub fn spawn_debuggee(program: PathBuf, script_args: Vec<String>) -> DebuggeeHan
                 .build()
                 .expect("debuggee tokio runtime");
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, run_program(program, script_args, hook));
+            local.block_on(&rt, run_program(program, script_args, caps, hook));
         })
         .expect("spawn debuggee thread");
     DebuggeeHandle {
@@ -54,7 +58,12 @@ pub fn spawn_debuggee(program: PathBuf, script_args: Vec<String>) -> DebuggeeHan
 
 /// The async body that runs on the debuggee thread. Owns the `hook` so its event
 /// `Sender` lives exactly as long as the run (dropped at the end → pump sees EOF).
-async fn run_program(program: PathBuf, script_args: Vec<String>, mut hook: DebuggerHook) {
+async fn run_program(
+    program: PathBuf,
+    script_args: Vec<String>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    mut hook: DebuggerHook,
+) {
     use crate::error::SourceInfo;
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -67,6 +76,7 @@ async fn run_program(program: PathBuf, script_args: Vec<String>, mut hook: Debug
         Err(e) => {
             let _ = hook.events.send(DebugEvent::Output {
                 text: format!("cannot read {}: {}\n", program.display(), e),
+                stderr: true,
             });
             let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
             return;
@@ -81,6 +91,7 @@ async fn run_program(program: PathBuf, script_args: Vec<String>, mut hook: Debug
         Err(e) => {
             let _ = hook.events.send(DebugEvent::Output {
                 text: format!("compile error: {}\n", e.message),
+                stderr: true,
             });
             let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
             return;
@@ -92,6 +103,13 @@ async fn run_program(program: PathBuf, script_args: Vec<String>, mut hook: Debug
     // stdout which the framing owns). `Interp::new()` uses the Capture sink.
     let interp = Rc::new(crate::interp::Interp::new());
     interp.set_cli_args(&script_args);
+    // FFI §4.5 / Gate-0 (review F2): install the CLI/manifest-composed capability set
+    // BEFORE running any code, so a debugged program is sandboxed EXACTLY like the same
+    // program run normally (`--deny`/`--sandbox`/`--deny-net`/`--deny-fs` are honored
+    // under `--inspect`). `None` keeps the default all-granted set.
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
     interp.set_worker_source(&src);
     interp.install_self();
 
@@ -151,13 +169,22 @@ async fn run_program(program: PathBuf, script_args: Vec<String>, mut hook: Debug
     };
 
     if let Some(hook) = hook {
-        // Ship the captured program output as a single `output` chunk.
+        // v1 trade-off (DOCUMENTED): the debuggee uses a Capture sink, so program
+        // output is shipped as ONE `Output` chunk at termination — it is byte-identical
+        // in CONTENT to a normal Live run (the Gate-9 observation test), but it does NOT
+        // stream while paused at a breakpoint and is not interleaved with `stopped`
+        // events. Incremental streaming (a channel-backed Live sink) is a follow-up.
         let out = interp.output();
         if !out.is_empty() {
-            let _ = hook.events.send(DebugEvent::Output { text: out });
+            let _ = hook.events.send(DebugEvent::Output {
+                text: out,
+                stderr: false,
+            });
         }
+        // An uncaught Tier-2 panic goes to the stderr category (its message, sans the
+        // ariadne caret a CLI run would render).
         if let Some(text) = panic_text {
-            let _ = hook.events.send(DebugEvent::Output { text });
+            let _ = hook.events.send(DebugEvent::Output { text, stderr: true });
         }
         let _ = hook.events.send(DebugEvent::Terminated { exit_code });
         // `hook` drops here → its event Sender drops → pump thread sees the channel
