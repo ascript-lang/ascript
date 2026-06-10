@@ -62,10 +62,17 @@ fn is_call_site(
         return false;
     }
     let tree = crate::syntax::tree_builder::build_tree(parsed);
-    // The NameRef whose range is exactly the reference span.
+    // The NameRef whose bare `Ident` TOKEN range is exactly the reference span.
+    // `UseSite.range` (what `references_at` returns) is the use TOKEN range, NOT the
+    // NameRef NODE range — a NameRef node can carry leading whitespace trivia (DX
+    // D3-T12), so we match the Ident token, mirroring `collect_uses`.
     let Some(name_ref) = tree.descendants().find(|n| {
         n.kind() == SyntaxKind::NameRef
-            && crate::check::diagnostic::ByteSpan::from(n.text_range()) == span
+            && n.children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .find(|t| t.kind() == SyntaxKind::Ident)
+                .map(|t| crate::check::diagnostic::ByteSpan::from(t.text_range()) == span)
+                .unwrap_or(false)
     }) else {
         return false;
     };
