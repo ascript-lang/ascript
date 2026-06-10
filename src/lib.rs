@@ -2,6 +2,10 @@ pub mod ast;
 pub mod check;
 pub mod compile;
 pub mod coro;
+// DBG Task 5b: the Debug Adapter Protocol (DAP) server over stdio. Feature-gated
+// (`dap`, default-on) so `--no-default-features` builds none of it.
+#[cfg(feature = "dap")]
+pub mod dap;
 pub mod det;
 pub mod diagnostics;
 pub mod env;

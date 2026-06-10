@@ -158,6 +158,16 @@ pub enum DebugEvent {
     /// Reply to [`DebugCommand::SetBreakpoints`]: per requested line, whether a
     /// breakpoint was bound and where. Plain owned data only.
     BreakpointsVerified { results: Vec<BreakpointBinding> },
+    /// Program output (the debuggee's captured `print` stream), shipped to the DAP
+    /// server so it can be re-emitted as an `output` event on the protocol stdout.
+    /// Plain owned `String` — keeps program output OFF the protocol stdout (which the
+    /// DAP framing owns), so the editor sees it as DAP output while the channel stays
+    /// the single transport. Sent by the debuggee thread (DBG Task 5b).
+    Output { text: String },
+    /// The debuggee program finished. Carries the process exit code (0 = normal,
+    /// non-zero = an `exit(n)` or an uncaught Tier-2 panic). Sent by the debuggee
+    /// thread after `vm.run` returns, just before it drops the hook (DBG Task 5b).
+    Terminated { exit_code: i32 },
 }
 
 /// The DBG debugger hook: the breakpoint side table + stepping state + the `Send`

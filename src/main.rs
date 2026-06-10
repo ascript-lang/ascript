@@ -44,6 +44,13 @@ enum Command {
         /// writes denied) or `--deny-fs=all`.
         #[arg(long = "deny-fs", value_name = "MODE")]
         deny_fs: Option<String>,
+        /// DBG: run under the debugger — start a Debug Adapter Protocol (DAP) server
+        /// over stdio for this program instead of running it normally. An editor's
+        /// DAP client drives breakpoints/stepping/inspection. Requires the `dap`
+        /// feature (default-on); a `--no-default-features` build reports a rebuild
+        /// hint. The program stops at entry; output rides DAP `output` events.
+        #[arg(long = "inspect")]
+        inspect: bool,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -118,6 +125,16 @@ enum Command {
     Lsp {
         /// Accepted for compatibility with LSP clients that pass `--stdio` (e.g. some
         /// VS Code client configs). stdio is the only transport, so this is a no-op.
+        #[arg(long = "stdio")]
+        stdio: bool,
+    },
+    /// Run the Debug Adapter Protocol (DAP) server over stdio. An editor's DAP client
+    /// connects and drives launch/breakpoints/stepping. The program to debug comes
+    /// from the `launch` request (or use `run --inspect <file>` to pre-set it).
+    #[cfg(feature = "dap")]
+    Dap {
+        /// Accepted for compatibility with DAP clients that pass `--stdio`. stdio is
+        /// the only transport, so this is a no-op.
         #[arg(long = "stdio")]
         stdio: bool,
     },
@@ -343,9 +360,35 @@ async fn real_main() -> ExitCode {
             sandbox,
             deny_net,
             deny_fs,
+            inspect,
             file,
             args,
         } => {
+            // DBG: `--inspect` routes the program to the DAP server (break-on-entry,
+            // editor-driven) instead of running it normally. The `dap` feature owns
+            // this; without it, report a clean rebuild hint rather than silently
+            // running.
+            if inspect {
+                #[cfg(feature = "dap")]
+                {
+                    let program = std::path::PathBuf::from(&file);
+                    return match ascript::dap::run_server(Some(program), args) {
+                        Ok(code) => ExitCode::from(code as u8),
+                        Err(e) => {
+                            eprintln!("dap error: {e}");
+                            ExitCode::from(1)
+                        }
+                    };
+                }
+                #[cfg(not(feature = "dap"))]
+                {
+                    let _ = &args;
+                    eprintln!(
+                        "error: `--inspect` requires the `dap` feature; rebuild with it enabled (it is on by default)"
+                    );
+                    return ExitCode::from(1);
+                }
+            }
             // `--locked` only affects dependency resolution, which is `pkg`-gated.
             #[cfg(not(feature = "pkg"))]
             let _ = locked;
@@ -676,6 +719,18 @@ async fn real_main() -> ExitCode {
         Command::Lsp { .. } => {
             ascript::lsp::run_server().await;
             ExitCode::SUCCESS
+        }
+        #[cfg(feature = "dap")]
+        Command::Dap { .. } => {
+            // The DAP server is fully synchronous (it spawns the debuggee on its own
+            // thread + runtime); the program comes from the `launch` request.
+            match ascript::dap::run_server(None, Vec::new()) {
+                Ok(code) => ExitCode::from(code as u8),
+                Err(e) => {
+                    eprintln!("dap error: {e}");
+                    ExitCode::from(1)
+                }
+            }
         }
         #[cfg(feature = "pkg")]
         Command::Add { spec } => pkg_command_exit(pkg::commands::cmd_add(&spec)),

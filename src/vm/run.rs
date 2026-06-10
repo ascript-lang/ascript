@@ -249,6 +249,31 @@ impl Vm {
         self.instrument.borrow().is_some()
     }
 
+    /// **DBG Task 5b.** Install a [`DebuggerHook`](crate::vm::instrument::DebuggerHook)
+    /// as the sole armed sub-feature, replacing any existing instrumentation payload.
+    /// The DAP launcher uses this after patching break-on-entry on the hook. Behaves
+    /// exactly like setting `instrument = Some(Instrumentation{ breakpoints: Some(hook),
+    /// .. })` — kept as a method so the field stays private.
+    pub fn install_debugger_hook(&self, hook: crate::vm::instrument::DebuggerHook) {
+        *self.instrument.borrow_mut() = Some(Box::new(crate::vm::instrument::Instrumentation {
+            breakpoints: Some(hook),
+            profiler: None,
+            coverage: None,
+        }));
+    }
+
+    /// **DBG Task 5b.** Reclaim the armed
+    /// [`DebuggerHook`](crate::vm::instrument::DebuggerHook) (if any), leaving the VM
+    /// with no instrumentation. The DAP launcher calls this after `run` returns to ship
+    /// the terminal `Output`/`Terminated` events and then drop the hook (closing the
+    /// event channel). `None` if no debugger was armed.
+    pub fn take_debugger_hook(&self) -> Option<crate::vm::instrument::DebuggerHook> {
+        self.instrument
+            .borrow_mut()
+            .take()
+            .and_then(|mut i| i.breakpoints.take())
+    }
+
     /// **DBG.** Register the program's proto tree for source-line breakpoint resolution.
     /// Walks `entry` and recursively each `chunk.protos`, storing every `Rc<FnProto>`
     /// flat in `debug_protos`. A debugger/launcher calls this once before `run` under
@@ -6501,6 +6526,7 @@ mod tests {
                             DebugEvent::BreakpointsVerified { results } => {
                                 verified = results;
                             }
+                            _ => {}
                         }
                     }
                 });
@@ -6602,6 +6628,7 @@ mod tests {
                                     let _ = cmd_tx.send(DebugCommand::ClearBreakpoints);
                                     let _ = cmd_tx.send(DebugCommand::Continue);
                                 }
+                                _ => {}
                             }
                         }
                         stops
