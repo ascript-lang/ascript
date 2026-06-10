@@ -858,8 +858,27 @@ impl Drop for InflightGuard {
 pub struct TestSummary {
     pub passed: usize,
     pub failed: usize,
+    /// DX D2 Task 10: tests SKIPPED by `--filter` (name didn't match). Not counted as
+    /// passed or failed — reported separately as "N filtered".
+    pub filtered: usize,
     /// `(test name, failure message)` for each failed test.
     pub failures: Vec<(String, String)>,
+}
+
+impl TestSummary {
+    /// DX D2 — print the one-line tally (`ok. P passed; F failed[; K filtered]`). The
+    /// `filtered` clause is OMITTED when zero so a run with no `--filter` is byte-identical
+    /// to the historical output. Shared by the one-shot dispatch and the `--watch` re-runs.
+    pub fn print_tally(&self) {
+        if self.filtered > 0 {
+            println!(
+                "ok. {} passed; {} failed; {} filtered",
+                self.passed, self.failed, self.filtered
+            );
+        } else {
+            println!("ok. {} passed; {} failed", self.passed, self.failed);
+        }
+    }
 }
 
 impl TestSummary {
@@ -882,6 +901,9 @@ impl TestSummary {
         let mut map = indexmap::IndexMap::new();
         map.insert("passed".to_string(), Value::Int(self.passed as i64));
         map.insert("failed".to_string(), Value::Int(self.failed as i64));
+        // DX D2 Task 10: carry the filtered count across the airlock so a parallel isolate's
+        // `--filter` skips aggregate correctly.
+        map.insert("filtered".to_string(), Value::Int(self.filtered as i64));
         map.insert(
             "failures".to_string(),
             Value::Array(crate::value::ArrayCell::new(failures)),
@@ -903,6 +925,13 @@ impl TestSummary {
         let failed = match map.get("failed")? {
             Value::Int(n) if *n >= 0 => *n as usize,
             _ => return None,
+        };
+        // DX D2 Task 10: `filtered` is tolerated-absent (default 0) for forward/back
+        // compatibility of the airlock shape.
+        let filtered = match map.get("filtered") {
+            Some(Value::Int(n)) if *n >= 0 => *n as usize,
+            Some(_) => return None,
+            None => 0,
         };
         let failures_val = map.get("failures")?;
         let arr = match failures_val {
@@ -926,6 +955,7 @@ impl TestSummary {
         Some(TestSummary {
             passed,
             failed,
+            filtered,
             failures,
         })
     }
@@ -2644,11 +2674,29 @@ impl Interp {
     /// Returns `Err(Control::Exit)` if a test calls `exit()` — that unwinds the
     /// test runner rather than being counted as a pass or fail.
     pub async fn run_registered_tests(&self) -> Result<TestSummary, Control> {
+        self.run_registered_tests_filtered(None).await
+    }
+
+    /// DX D2 Task 10 — run the registered tests, optionally PRUNING by a `--filter` on the
+    /// test NAME (substring or `/regex/`). A test whose name doesn't match the filter is
+    /// SKIPPED — counted in `filtered`, never run, never pass/fail. The filter is applied
+    /// identically inside every isolate, so the result is independent of `--parallel` (§7).
+    pub async fn run_registered_tests_filtered(
+        &self,
+        filter: Option<&crate::test_filter::TestFilter>,
+    ) -> Result<TestSummary, Control> {
         let mut summary = TestSummary::default();
         // Clone out the registrations first so the table borrow is not held across
         // each `call_value` await.
         let tests = self.tests.borrow().clone();
         for (name, func) in tests {
+            // Name-gate BEFORE running the body — a skipped test executes nothing.
+            if let Some(f) = filter {
+                if !f.matches(&name) {
+                    summary.filtered += 1;
+                    continue;
+                }
+            }
             match self.call_value(func, Vec::new(), Span::new(0, 0)).await {
                 Ok(_) | Err(Control::Propagate(_)) => summary.passed += 1,
                 Err(Control::Panic(e)) => {
@@ -13146,6 +13194,7 @@ print(many([File(), File()]))
         let summary = TestSummary {
             passed: 3,
             failed: 2,
+            filtered: 1,
             failures: vec![
                 ("alpha".to_string(), "expected 1 got 2".to_string()),
                 ("beta".to_string(), "boom".to_string()),
@@ -13156,6 +13205,7 @@ print(many([File(), File()]))
         let back = TestSummary::from_value(&v).expect("decodes");
         assert_eq!(back.passed, 3);
         assert_eq!(back.failed, 2);
+        assert_eq!(back.filtered, 1);
         assert_eq!(
             back.failures,
             vec![
