@@ -257,12 +257,25 @@ impl WorkspaceIndex {
         d: &SymbolDef,
     ) -> Option<GlobalBindingId> {
         if d.kind == DefKind::Import {
-            // An import binding's identity IS the definer's Global identity.
-            if let Some((m, _)) = self.definition_at(canon, d.name_range.start) {
-                let def_id = self.interner.get(&m)?;
-                return Some(GlobalBindingId::Global(def_id, d.name.clone()));
+            // An import binding's identity IS the definer's Global identity. Resolve
+            // it through the import EDGE, not `definition_at`: the import-clause name
+            // is NOT emitted as a `UseSite` (it is not a `NameRef`), so `definition_at`
+            // would return `None` and the identity would wrongly fall back to THIS
+            // (the importer's) FileId — making references/rename from a cursor ON the
+            // import clause find nothing / produce a corrupt partial rename.
+            if let Some(file) = self.files.get(canon) {
+                for e in &file.imports {
+                    if e.names.iter().any(|n| n == &d.name) {
+                        if let Some(module) = &e.resolved {
+                            if let Some(def_id) = self.interner.get(module) {
+                                return Some(GlobalBindingId::Global(def_id, d.name.clone()));
+                            }
+                        }
+                    }
+                }
             }
-            // An unresolved/std import: fall back to a this-file Global.
+            // An unresolved/std import (or a not-yet-indexed target): fall back to a
+            // this-file Global so the import clause is at least self-consistent.
             return Some(GlobalBindingId::Global(this_id, d.name.clone()));
         }
         // A top-level decl is a module-global → Global(thisFile, name).

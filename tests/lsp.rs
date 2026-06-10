@@ -2455,6 +2455,40 @@ mod identity_unification {
         WorkspaceIndex::build_from_files(&owned)
     }
 
+    /// A cursor ON an import-clause name (`f` in `import { f } from "./a"`) resolves
+    /// to the DEFINER's identity (via the import edge), so references/rename from the
+    /// clause find the def + every cross-file use — not an empty/importer-local set
+    /// that would otherwise produce a corrupt partial rename. (Holistic-review BLOCKER:
+    /// `def_identity` previously routed imports through `definition_at`, which can't
+    /// see the clause name since it is not a `UseSite`.)
+    #[test]
+    fn import_clause_cursor_resolves_to_definer_identity() {
+        let a_src = "export fn f() { return 1 }\n";
+        let b_src = "import { f } from \"./a\"\nprint(f(1))\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+        let clause_off = b_src.find("{ f }").unwrap() + 2; // the `f` inside `{ f }`
+        let refs = index.references_at(&b, clause_off, true);
+        assert!(
+            refs.iter().any(|(p, _)| *p == a),
+            "refs from the import clause must include a.as's def: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|(p, _)| *p == b),
+            "refs from the import clause must include b.as's use: {refs:?}"
+        );
+        // Rename from the clause edits BOTH files (def + clause + use), not just the
+        // clause token.
+        let edits = index
+            .rename_edits(&b, clause_off, "g")
+            .expect("import-clause rename is allowed");
+        assert!(
+            edits.iter().any(|(p, _)| *p == a) && edits.iter().any(|(p, _)| *p == b),
+            "rename from the import clause must edit both files: {edits:?}"
+        );
+    }
+
     /// Shadowed-local cross-file rename/refs: A exports `x`; B imports `x` AND has
     /// its OWN `let x`. Refs of A's export must include B's IMPORTED uses but NOT
     /// B's local `x` uses.
