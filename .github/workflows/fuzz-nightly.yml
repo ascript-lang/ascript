@@ -98,10 +98,17 @@ jobs:
           # Guard: SECS must be a plain integer (defends the shell against a hostile input).
           case "$SECS" in (*[!0-9]*|"") echo "bad duration: $SECS" >&2; exit 1 ;; esac
           echo "::group::cargo fuzz run $TARGET (${SECS}s)"
+          # Keep LeakSanitizer ON for the DECODE-ONLY `aso_roundtrip` (a leak there is a real
+          # `.aso` reader bug — BIN's gating target). Disable it for the targets that RUN the
+          # managed runtime: their intentional process-lifetime state (interned strings,
+          # lazy_static/once_cell globals, tokio/gcmodule internals, thread-locals) is
+          # indistinguishable from a leak to LSan; a genuine unbounded leak still trips
+          # `-rss_limit_mb`.
+          leak=1; [ "$TARGET" = aso_roundtrip ] || leak=0
           # rss 4GB, per-input timeout 25s (a hang is a crash). The committed seeds + the
           # cached grown corpus are the starting set.
           cargo +nightly fuzz run "$TARGET" -- \
-            -max_total_time="$SECS" -rss_limit_mb=4096 -timeout=25
+            -max_total_time="$SECS" -rss_limit_mb=4096 -timeout=25 -detect_leaks=$leak
           echo "::endgroup::"
 
       - name: Verifier-gap pass (aso_roundtrip only — runnable-accept)
@@ -111,9 +118,10 @@ jobs:
         run: |
           # A SEPARATE, shorter pass that RUNS verifier-accepted chunks on the VM to catch a
           # verify.rs gap. Generous timeout: a valid-but-slow program is a §9 bound, not a bug;
-          # only a HOST panic is a finding.
+          # only a HOST panic is a finding. Leak detection OFF — this pass RUNS the managed
+          # runtime (process-lifetime state is not a leak); a genuine leak trips `-rss_limit_mb`.
           cargo +nightly fuzz run aso_roundtrip -- \
-            -max_total_time=900 -rss_limit_mb=4096 -timeout=120
+            -max_total_time=900 -rss_limit_mb=4096 -timeout=120 -detect_leaks=0
 
       - name: Reader coverage report (aso_roundtrip only — the BIN coverage floor)
         if: matrix.target == 'aso_roundtrip'
