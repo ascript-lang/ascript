@@ -13,10 +13,13 @@ pub fn report(err: &AsError) {
     let caret_source = err.span_source.as_ref().or(err.source.as_ref());
     match (caret_source, err.span) {
         (Some(src), Some(span)) => {
-            // Spans are CHAR offsets; ariadne wants byte ranges. Convert.
+            // Spans are CHAR offsets and ariadne 0.6 renders in its default
+            // `IndexType::Char` mode, so the range is passed straight through — NO
+            // char→byte conversion (the legacy and CST front-ends both produce CHAR
+            // spans; converting here would desync the caret on multibyte source).
             let text = &src.text;
-            let start = char_to_byte(text, span.start);
-            let end = char_to_byte(text, span.end);
+            let start = span.start;
+            let end = span.end;
             let path = src.path.as_str();
             let _ = Report::build(ReportKind::Error, (path, start..end))
                 .with_message(&err.message)
@@ -42,12 +45,4 @@ pub fn report_all(errors: &[AsError]) {
     for err in errors {
         report(err);
     }
-}
-
-/// Convert a char offset into a byte offset within `text`.
-fn char_to_byte(text: &str, char_off: usize) -> usize {
-    text.char_indices()
-        .nth(char_off)
-        .map(|(b, _)| b)
-        .unwrap_or(text.len())
 }
