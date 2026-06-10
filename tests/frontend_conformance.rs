@@ -206,6 +206,18 @@ fn interpreter_parses_each_grammar_construct() {
         "let chain = a ? b : c ? d : e",
         "let neg = cond ? -1 : 1",
         "let mix = (x > 0 ? \"pos\" : \"neg\")",
+        // Propagate-`?` followed by an infix op then a REAL ternary: the first `?`
+        // is postfix propagate (next token `>` cannot begin an expression), the
+        // later `:` belongs to the trailing ternary. (FUZZ Unit-2 repro A — the CST
+        // token-scan once fused these into one ternary and rejected the program.)
+        "fn a() { return g(5)? > 0 ? \"pos\" : \"neg\" }",
+        // Propagate-`?` INSIDE a ternary then-branch: the inner `?` is propagate
+        // (next token is the OUTER ternary's `:`, not an expression start).
+        "fn b(c) { return c ? g(5)? : 0 }",
+        // A ternary whose then-branch is an expression-introducing keyword — these
+        // MUST still parse as ternaries (the next-token guard accepts `match`/`async`).
+        "let tm = c ? match x { 1 => 2, _ => 3 } : y",
+        "let ta = c ? async () => 5 : z",
         "o.method(1)",
         "fn m() { return self.x }",
         // --- arrow functions: single / multi / async ---

@@ -594,6 +594,56 @@ async fn vm_short_circuit_does_not_evaluate_rhs() {
     }
 }
 
+// ----- FUZZ Unit-2: `?`-propagate vs ternary disambiguation (four-mode) ---------
+//
+// Two CST-parser disambiguation bugs surfaced by the FUZZ Unit-2 review: the CST
+// token-scan in `ternary_ahead` (src/syntax/parser.rs) once fused a postfix
+// PROPAGATE `?` into a later ternary's `:`, rejecting valid programs the
+// tree-walker oracle accepts. The fix adds a "next token can begin an expression"
+// guard (a ternary then-branch starts IMMEDIATELY after the `?` with an
+// expression). These run the two original repros all THREE engines (the `.aso`
+// path runs the SAME serialized Chunk, covered at the CLI level) and assert
+// byte-identical output against the tree-walker oracle.
+
+#[tokio::test]
+async fn vm_propagate_then_compare_then_ternary_matches_treewalker() {
+    // Repro A: `g(5)? > 0 ? "pos" : "neg"`. The FIRST `?` is propagate (the next
+    // token `>` cannot begin an expression); the `:` belongs to the trailing
+    // ternary. Tree-walker prints "pos"; the CST/VM once rejected with
+    // "expected expression".
+    assert_three_way_matches(
+        "fn g(v) { return [v, nil] }\n\
+         fn a() { return g(5)? > 0 ? \"pos\" : \"neg\" }\n\
+         print(a())",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_propagate_inside_ternary_branch_matches_treewalker() {
+    // Repro B: `c ? g(5)? : 0`. The INNER `?` is propagate — the token after it is
+    // the OUTER ternary's `:` (not an expression start). Tree-walker(b(true))
+    // prints 5; the CST/VM once rejected with "expected expression".
+    assert_three_way_matches(
+        "fn g(v) { return [v, nil] }\n\
+         fn b(c) { return c ? g(5)? : 0 }\n\
+         print(b(true))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_ternary_keyword_then_branch_matches_treewalker() {
+    // The guard must NOT regress a legitimate ternary whose then-branch begins
+    // with an expression-introducing keyword (`match` / `async`-arrow): the next
+    // token DOES begin an expression, so the `?` stays a ternary.
+    assert_three_way_matches(
+        "fn pick(x) { return x > 0 ? match x { 1 => \"one\", _ => \"many\" } : \"none\" }\n\
+         print(pick(1))\nprint(pick(5))\nprint(pick(0))",
+    )
+    .await;
+}
+
 // ----- V10-T1: destructuring `let` (array + object + rest) ---------------------
 //
 // `let [a, b, ...r] = arr` and `let {a, b as local, "k" as v, ...rest} = obj`.

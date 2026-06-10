@@ -482,10 +482,39 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// this exercises the `ExprKind::Try` lowering on the happy path deterministically. Binds
     /// the unwrapped int to a fresh local usable downstream.
     fn propagate_stmt(&mut self, depth: u32) {
+        // Three shapes, all happy-path deterministic (`rok(..)?` never early-returns):
+        //   0: the plain `let v = rok(x)?` binding.
+        //   1: propagate-then-infix-then-ternary — `rok(x)? > k ? a : b` (repro A). The
+        //      `?` MUST stay a postfix propagate (the next token `>` cannot begin an
+        //      expression); the later `:` belongs to the trailing ternary. A naive
+        //      `ternary_ahead` token-scan once fused these and rejected the program.
+        //   2: propagate INSIDE a ternary then-branch — `c ? rok(x)? : k` (repro B). The
+        //      inner `?` is propagate (the next token is the OUTER ternary's `:`).
+        // Both 1 and 2 are the FUZZ Unit-2 disambiguation class; emitting them keeps the
+        // four-mode differential standing guard over it.
         let name = self.fresh("pv");
         let x = self.int_atom();
-        self.indent(depth);
-        let _ = writeln!(self.out, "let {name} = rok({x})?");
+        match self.choice(3) {
+            1 => {
+                let k = self.int_literal();
+                let a = self.int_literal();
+                let b = self.int_literal();
+                self.indent(depth);
+                let _ = writeln!(self.out, "let {name} = rok({x})? > {k} ? {a} : {b}");
+            }
+            2 => {
+                // `c` is a deterministic int condition (truthy unless 0); both branches
+                // are ints so the result type is stable.
+                let c = self.int_literal();
+                let k = self.int_literal();
+                self.indent(depth);
+                let _ = writeln!(self.out, "let {name} = {c} ? rok({x})? : {k}");
+            }
+            _ => {
+                self.indent(depth);
+                let _ = writeln!(self.out, "let {name} = rok({x})?");
+            }
+        }
         self.declare(&name, true);
     }
 
