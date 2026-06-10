@@ -32,15 +32,18 @@ pub(crate) fn in_isolate() -> bool {
     IN_ISOLATE.with(|c| c.get())
 }
 
-/// Run `f` (producing a future) with the `IN_ISOLATE` flag forced TRUE for the
-/// duration of the future, restoring the prior value afterward. SRV Part A uses this
-/// for the single-isolate `serve` fallback (Windows / non-REUSEPORT): a `setup`
-/// `worker fn` must run INLINE on the current interp's VM (so it builds the server
-/// handle in THIS resource table) rather than dispatching to the pool. The flag is
-/// thread-local and the runtime is single-threaded, so set-run-restore is sound; the
-/// guard restores even if the future is dropped mid-flight.
-#[cfg(feature = "net")]
-pub(crate) async fn with_inline_dispatch<F, Fut, T>(f: F) -> T
+/// Run `f` (producing a future) with the `IN_ISOLATE` flag forced to `value` for the
+/// duration of the future, restoring the prior value afterward (even if the future is
+/// dropped mid-flight). The flag is thread-local and the runtime is single-threaded, so
+/// set-run-restore is sound.
+///
+/// Used to override the per-thread isolate flag for a scoped sub-run:
+///   - SRV forces it TRUE (a `setup` `worker fn` must run INLINE on the current VM).
+///   - DX D2's test-file isolate forces it FALSE so the file it hosts behaves like a
+///     normal top-level program — its own `worker fn`s dispatch to a (per-isolate-thread)
+///     pool with the full code-slice path, instead of the inline-nesting path that
+///     assumes the entry is already a VM global from an enclosing slice.
+pub(crate) async fn with_isolate_flag<F, Fut, T>(value: bool, f: F) -> T
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
@@ -51,9 +54,20 @@ where
             IN_ISOLATE.with(|c| c.set(self.0));
         }
     }
-    let prev = IN_ISOLATE.with(|c| c.replace(true));
+    let prev = IN_ISOLATE.with(|c| c.replace(value));
     let _restore = Restore(prev);
     f().await
+}
+
+/// Run `f` with the `IN_ISOLATE` flag forced TRUE (SRV single-isolate `serve` fallback).
+/// Thin wrapper over [`with_isolate_flag`].
+#[cfg(feature = "net")]
+pub(crate) async fn with_inline_dispatch<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    with_isolate_flag(true, f).await
 }
 
 /// One unit of work shipped to an isolate. Every field is `Send` (bytes / plain

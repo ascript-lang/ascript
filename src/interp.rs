@@ -845,6 +845,75 @@ pub struct TestSummary {
     pub failures: Vec<(String, String)>,
 }
 
+impl TestSummary {
+    /// DX D2 Task 5 — the airlock shape. Encode this summary as a `Value::Object`
+    /// of EXISTING sendable kinds so a worker isolate can ship it back across the
+    /// structured-clone airlock (`serialize::encode`) and the parent decode it.
+    /// Shape: `{passed: number, failed: number, failures: array<{name, message}>}`.
+    /// No new sendable `Value` kind — an ordinary `Object` of numbers/strings/arrays.
+    pub fn to_value(&self) -> Value {
+        let failures: Vec<Value> = self
+            .failures
+            .iter()
+            .map(|(name, message)| {
+                let mut f = indexmap::IndexMap::new();
+                f.insert("name".to_string(), Value::Str(Rc::from(name.as_str())));
+                f.insert("message".to_string(), Value::Str(Rc::from(message.as_str())));
+                Value::object(f)
+            })
+            .collect();
+        let mut map = indexmap::IndexMap::new();
+        map.insert("passed".to_string(), Value::Int(self.passed as i64));
+        map.insert("failed".to_string(), Value::Int(self.failed as i64));
+        map.insert(
+            "failures".to_string(),
+            Value::Array(crate::value::ArrayCell::new(failures)),
+        );
+        Value::object(map)
+    }
+
+    /// DX D2 Task 5 — reconstruct a `TestSummary` from the `Value::Object` produced
+    /// by [`TestSummary::to_value`] after it crosses the airlock (lossless round-trip).
+    /// Returns `None` on a malformed shape (a defensive guard: a corrupt isolate
+    /// result is a clean error at the call site, never a panic).
+    pub fn from_value(v: &Value) -> Option<TestSummary> {
+        let obj = v.as_object()?;
+        let map = obj.borrow();
+        let passed = match map.get("passed")? {
+            Value::Int(n) if *n >= 0 => *n as usize,
+            _ => return None,
+        };
+        let failed = match map.get("failed")? {
+            Value::Int(n) if *n >= 0 => *n as usize,
+            _ => return None,
+        };
+        let failures_val = map.get("failures")?;
+        let arr = match failures_val {
+            Value::Array(a) => a.borrow(),
+            _ => return None,
+        };
+        let mut failures = Vec::with_capacity(arr.len());
+        for entry in arr.iter() {
+            let fobj = entry.as_object()?;
+            let fmap = fobj.borrow();
+            let name = match fmap.get("name")? {
+                Value::Str(s) => s.to_string(),
+                _ => return None,
+            };
+            let message = match fmap.get("message")? {
+                Value::Str(s) => s.to_string(),
+                _ => return None,
+            };
+            failures.push((name, message));
+        }
+        Some(TestSummary {
+            passed,
+            failed,
+            failures,
+        })
+    }
+}
+
 impl Interp {
     pub fn new() -> Self {
         Self::with_sink(OutputSink::Capture(RefCell::new(String::new())))
@@ -13015,5 +13084,55 @@ print(many([File(), File()]))
             }
             _ => panic!(),
         }
+    }
+
+    /// DX D2 Task 5 — the `TestSummary ↔ Value::Object` airlock conversion is
+    /// lossless: passed/failed counts and every `(name, message)` failure survive the
+    /// round-trip in order, AND through the worker structured-clone encode/decode
+    /// (which crosses ONLY existing sendable `Value` kinds — no new kind).
+    #[test]
+    fn test_summary_value_roundtrip_is_lossless() {
+        let summary = TestSummary {
+            passed: 3,
+            failed: 2,
+            failures: vec![
+                ("alpha".to_string(), "expected 1 got 2".to_string()),
+                ("beta".to_string(), "boom".to_string()),
+            ],
+        };
+        // Direct Value round-trip.
+        let v = summary.to_value();
+        let back = TestSummary::from_value(&v).expect("decodes");
+        assert_eq!(back.passed, 3);
+        assert_eq!(back.failed, 2);
+        assert_eq!(
+            back.failures,
+            vec![
+                ("alpha".to_string(), "expected 1 got 2".to_string()),
+                ("beta".to_string(), "boom".to_string()),
+            ]
+        );
+
+        // Through the worker airlock (encode → decode): the shape is sendable.
+        crate::worker::serialize::check_sendable(&v).expect("summary object is sendable");
+        let (bytes, shared) = crate::worker::serialize::encode(&v).expect("encodes");
+        let interp = Interp::new();
+        let decoded =
+            crate::worker::serialize::decode_with_shared(&bytes, &shared, &interp).expect("decodes");
+        let back2 = TestSummary::from_value(&decoded).expect("decodes from airlock object");
+        assert_eq!(back2.passed, 3);
+        assert_eq!(back2.failed, 2);
+        assert_eq!(back2.failures, summary.failures);
+    }
+
+    /// A malformed isolate result (wrong shape) yields `None`, never a panic — the
+    /// defensive guard that keeps a corrupt worker reply a clean error.
+    #[test]
+    fn test_summary_from_value_rejects_malformed() {
+        assert!(TestSummary::from_value(&Value::Int(5)).is_none());
+        let mut m = indexmap::IndexMap::new();
+        m.insert("passed".to_string(), Value::Int(1));
+        // missing `failed` and `failures`
+        assert!(TestSummary::from_value(&Value::object(m)).is_none());
     }
 }
