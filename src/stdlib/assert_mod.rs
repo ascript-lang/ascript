@@ -21,6 +21,116 @@ use crate::stdlib::object::deep_equal;
 use crate::value::Value;
 use rust_decimal::prelude::ToPrimitive;
 
+// ── structural diff (spec §6.5) ──────────────────────────────────────────────
+
+/// Maximum recursion depth for the structural diff. Beyond this depth the diff
+/// stops descending and reports the differing node flatly. This is a hard guard
+/// against pathologically deep (and, together with the visited set, cyclic)
+/// structures — the diff NEVER stack-overflows or loops, it degrades to a flat
+/// `expected ... got ...` line for the over-deep node.
+const DIFF_MAX_DEPTH: usize = 64;
+
+/// Produce a human-readable, path-qualified structural diff between two values
+/// whose semantics mirror `object::deep_equal` EXACTLY: if `deep_equal(a, b)`
+/// is `true` the returned string is empty; otherwise it lists, recursively, the
+/// per-Object-key add/remove/change and per-Array-index change (and length
+/// differences) that make them unequal.
+///
+/// Path syntax: `.key` for object keys, `[i]` for array indices, e.g.
+/// `.users[0].name: "a" → "b"`. Lines:
+///   - `<path>: <old> → <new>`   a CHANGE (both present, unequal)
+///   - `+ <path>: <new>`         an ADD (present in `b`, absent in `a`)
+///   - `- <path>: <old>`         a REMOVE (present in `a`, absent in `b`)
+///
+/// Cycle/over-depth safe: a visited-pair set (mirroring `deep_equal`'s `seen`)
+/// short-circuits a back-edge as "equal" (matching `deep_equal`), and a depth
+/// bound degrades to a flat node-level change line.
+pub(crate) fn structural_diff(a: &Value, b: &Value) -> String {
+    let mut out = String::new();
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    diff_inner(a, b, &mut String::new(), 0, &mut seen, &mut out);
+    out
+}
+
+/// Emit a single diff line for a CHANGE at `path` (root path renders as `(root)`).
+fn diff_change_line(path: &str, old: &Value, new: &Value, out: &mut String) {
+    let p = if path.is_empty() { "(root)" } else { path };
+    out.push_str(&format!("{}: {} → {}\n", p, old, new));
+}
+
+fn diff_inner(
+    a: &Value,
+    b: &Value,
+    path: &mut String,
+    depth: usize,
+    seen: &mut std::collections::HashSet<(usize, usize)>,
+    out: &mut String,
+) {
+    // Equal per deep_equal ⟺ no diff. Checked first so number/MapKey/etc.
+    // canonicalization is honoured exactly (e.g. 1 == 1.0 if deep_equal says so).
+    if deep_equal(a, b) {
+        return;
+    }
+    // Depth guard: degrade to a flat node-level change beyond the bound.
+    if depth >= DIFF_MAX_DEPTH {
+        diff_change_line(path, a, b, out);
+        return;
+    }
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => {
+            // Cycle guard mirroring deep_equal: a revisited pair is "equal".
+            if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
+                return;
+            }
+            let (x, y) = (x.borrow(), y.borrow());
+            let n = x.len().min(y.len());
+            for i in 0..n {
+                let base = path.len();
+                path.push_str(&format!("[{}]", i));
+                diff_inner(&x[i], &y[i], path, depth + 1, seen, out);
+                path.truncate(base);
+            }
+            // Length difference: extra removed / added indices.
+            for i in n..x.len() {
+                out.push_str(&format!("- {}[{}]: {}\n", path, i, x[i]));
+            }
+            for i in n..y.len() {
+                out.push_str(&format!("+ {}[{}]: {}\n", path, i, y[i]));
+            }
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
+                return;
+            }
+            let (x, y) = (x.borrow(), y.borrow());
+            // Removed / changed keys, in `a`'s insertion order.
+            for (k, va) in x.iter() {
+                match y.get(k) {
+                    Some(vb) => {
+                        let base = path.len();
+                        path.push('.');
+                        path.push_str(k);
+                        diff_inner(va, vb, path, depth + 1, seen, out);
+                        path.truncate(base);
+                    }
+                    None => out.push_str(&format!("- {}.{}: {}\n", path, k, va)),
+                }
+            }
+            // Added keys, in `b`'s insertion order.
+            for (k, vb) in y.iter() {
+                if !x.contains_key(k) {
+                    out.push_str(&format!("+ {}.{}: {}\n", path, k, vb));
+                }
+            }
+        }
+        // Scalars, Maps, Sets, Instances, mismatched kinds, etc.: report flat.
+        // (Maps/Sets/Instances are deep-equality containers but a keyed/ordered
+        // diff over MapKey/Set is not in the §6.5 surface — a node-level change
+        // line is the readable, deterministic choice.)
+        _ => diff_change_line(path, a, b, out),
+    }
+}
+
 // ── snapshot_impl (sys-gated; testable pure helper) ──────────────────────────
 
 /// Core snapshot logic, parameterized by `dir` (base dir for `__snapshots__/`),
@@ -59,10 +169,39 @@ pub(crate) fn snapshot_impl(
         let stored = std::fs::read_to_string(&snap_file)
             .map_err(|e| format!("assert.snapshot: could not read snapshot file: {}", e))?;
         if stored != serialized {
-            return Err(format!(
-                "assert.snapshot '{}' mismatch:\n--- stored ---\n{}\n--- new ---\n{}",
-                name, stored, serialized
-            ));
+            // Try a structural diff over the two JSON payloads (parse → Value →
+            // structural_diff). Both were produced by serde_json::to_string_pretty
+            // over json::from_ascript output, so they normally re-parse cleanly;
+            // if either fails to parse, fall back to the raw text dump.
+            let structural = match (
+                serde_json::from_str::<serde_json::Value>(&stored),
+                serde_json::from_str::<serde_json::Value>(serialized),
+            ) {
+                (Ok(sj), Ok(nj)) => {
+                    let sv = crate::stdlib::json::to_ascript(&sj);
+                    let nv = crate::stdlib::json::to_ascript(&nj);
+                    let d = structural_diff(&sv, &nv);
+                    if d.trim().is_empty() {
+                        None
+                    } else {
+                        Some(d)
+                    }
+                }
+                _ => None,
+            };
+            return Err(match structural {
+                Some(d) => format!(
+                    "assert.snapshot '{}' mismatch:\ndiff (stored → new):\n{}\n--- stored ---\n{}\n--- new ---\n{}",
+                    name,
+                    d.trim_end(),
+                    stored,
+                    serialized
+                ),
+                None => format!(
+                    "assert.snapshot '{}' mismatch:\n--- stored ---\n{}\n--- new ---\n{}",
+                    name, stored, serialized
+                ),
+            });
         }
         Ok(())
     } else {
@@ -80,6 +219,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     #[allow(unused_mut)]
     let mut v = vec![
         ("eq", bi("assert.eq")),
+        ("deepEq", bi("assert.deepEq")),
         ("ne", bi("assert.ne")),
         ("isTrue", bi("assert.isTrue")),
         ("isFalse", bi("assert.isFalse")),
@@ -92,12 +232,30 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("contains", bi("assert.contains")),
         ("approxEq", bi("assert.approxEq")),
         ("throws", bi("assert.throws")),
+        ("throwsWith", bi("assert.throwsWith")),
     ];
+    // assert.matches requires `data` (Value::Regex + the regex crate).
+    #[cfg(feature = "data")]
+    v.push(("matches", bi("assert.matches")));
     // assert.snapshot requires both `sys` (filesystem I/O) and `data` (JSON
     // serialization via serde_json).
     #[cfg(all(feature = "sys", feature = "data"))]
     v.push(("snapshot", bi("assert.snapshot")));
     v
+}
+
+/// Build the `assert.eq`/`assert.deepEq` failure message. When the structural
+/// diff is non-empty (containers differ) it is appended for readability;
+/// otherwise (scalar-vs-scalar or differing kinds) the flat `a != b` line is
+/// enough.
+fn eq_fail_message(a: &Value, b: &Value) -> String {
+    let base = format!("assert.eq failed: {} != {}", a, b);
+    let diff = structural_diff(a, b);
+    if diff.trim().is_empty() {
+        base
+    } else {
+        format!("{}\ndiff (expected → actual):\n{}", base, diff.trim_end())
+    }
 }
 
 /// Helper: format a panic error with an optional user message prefix.
@@ -124,9 +282,80 @@ impl Interp {
                 let b = arg(args, 1);
                 let msg = opt_str(args, 2);
                 if !deep_equal(&a, &b) {
+                    return Err(fail(eq_fail_message(&a, &b), msg.as_deref(), span));
+                }
+                Ok(Value::Nil)
+            }
+            // ── assert.deepEq(a, b, msg?) — alias for assert.eq ──────────────
+            //
+            // `assert.eq` is ALREADY structural (deep_equal). `deepEq` is a
+            // named alias that makes the deep-equality intent explicit; it
+            // shares the exact impl + the structural-diff failure message.
+            "deepEq" => {
+                let a = arg(args, 0);
+                let b = arg(args, 1);
+                let msg = opt_str(args, 2);
+                if !deep_equal(&a, &b) {
+                    return Err(fail(eq_fail_message(&a, &b), msg.as_deref(), span));
+                }
+                Ok(Value::Nil)
+            }
+            // ── assert.matches(value, regex) ─────────────────────────────────
+            //
+            // Assert a string `value` matches a regex (a `Value::Regex` or a
+            // pattern string, compiled on the fly — same convention as
+            // `regex.test`). A non-string value or non-match fails clearly.
+            //
+            // Gated on `data`: `Value::Regex` and the `regex` crate only exist
+            // with it. Under `--no-default-features` `matches` is absent from the
+            // exports and falls through to the catch-all "has no function" panic.
+            #[cfg(feature = "data")]
+            "matches" => {
+                let value = arg(args, 0);
+                let s = match &value {
+                    Value::Str(s) => s.to_string(),
+                    _ => {
+                        return Err(AsError::at(
+                            format!(
+                                "assert.matches: value must be a string, got {}",
+                                crate::interp::type_name(&value)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                let pat_val = arg(args, 1);
+                let (re, pat_src) = match &pat_val {
+                    Value::Regex(r) => (r.re.clone(), r.source.clone()),
+                    Value::Str(p) => match regex::Regex::new(p) {
+                        Ok(re) => (re, p.to_string()),
+                        Err(e) => {
+                            return Err(AsError::at(
+                                format!("assert.matches: invalid regex pattern: {}", e),
+                                span,
+                            )
+                            .into())
+                        }
+                    },
+                    _ => {
+                        return Err(AsError::at(
+                            format!(
+                                "assert.matches: pattern must be a regex or string, got {}",
+                                crate::interp::type_name(&pat_val)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                if !re.is_match(&s) {
                     return Err(fail(
-                        format!("assert.eq failed: {} != {}", a, b),
-                        msg.as_deref(),
+                        format!(
+                            "assert.matches failed: {:?} does not match /{}/",
+                            s, pat_src
+                        ),
+                        None,
                         span,
                     ));
                 }
@@ -356,6 +585,56 @@ impl Interp {
                         )
                         .into())
                     }
+                }
+            }
+            // ── assert.throwsWith(fn, substr) -> errValue ────────────────────
+            //
+            // Like assert.throws, but ALSO asserts the recovered error message
+            // CONTAINS `substr`. A throw with a non-matching message fails
+            // (showing the actual message); NO throw fails. Mirrors the async
+            // shape of assert.throws exactly.
+            "throwsWith" => {
+                let callee = arg(args, 0);
+                let needle = match arg(args, 1) {
+                    Value::Str(s) => s.to_string(),
+                    v => {
+                        return Err(AsError::at(
+                            format!(
+                                "assert.throwsWith: substr must be a string, got {}",
+                                crate::interp::type_name(&v)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                let call_result = self.call_value(callee, vec![], span).await;
+                let result: Result<Value, Control> = match call_result {
+                    Ok(Value::Future(f)) => f.get().await,
+                    other => other,
+                };
+                match result {
+                    Err(Control::Panic(e)) => {
+                        let actual = e.message.clone();
+                        if actual.contains(&needle) {
+                            Ok(make_error(Value::Str(actual.into())))
+                        } else {
+                            Err(AsError::at(
+                                format!(
+                                    "assert.throwsWith failed: expected error message to contain {:?}, but got {:?}",
+                                    needle, actual
+                                ),
+                                span,
+                            )
+                            .into())
+                        }
+                    }
+                    Err(other) => Err(other),
+                    Ok(_) => Err(AsError::at(
+                        "assert.throwsWith failed: expected fn to throw, but it returned normally",
+                        span,
+                    )
+                    .into()),
                 }
             }
             // ── assert.snapshot(name, value) ─────────────────────────────────
@@ -953,6 +1232,243 @@ A.eq(1, 1)
         assert!(!msg.is_empty(), "expected a non-empty error message");
     }
 
+    // ── structural diff (unit) ──────────────────────────────────────────────
+
+    #[test]
+    fn diff_equal_is_empty() {
+        use super::structural_diff;
+        use crate::value::{ArrayCell, ObjectCell, Value};
+        // Scalars.
+        assert_eq!(structural_diff(&Value::Int(1), &Value::Int(1)), "");
+        // 1 vs 1.0 — deep_equal-equal → empty diff (no spurious change).
+        assert_eq!(structural_diff(&Value::Int(1), &Value::Float(1.0)), "");
+        // Deep arrays.
+        let a = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2)]));
+        let b = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(structural_diff(&a, &b), "");
+        // Objects (insertion order).
+        let mut o1 = indexmap::IndexMap::new();
+        o1.insert("a".to_string(), Value::Int(1));
+        let mut o2 = indexmap::IndexMap::new();
+        o2.insert("a".to_string(), Value::Int(1));
+        assert_eq!(
+            structural_diff(&Value::Object(ObjectCell::new(o1)), &Value::Object(ObjectCell::new(o2))),
+            ""
+        );
+    }
+
+    #[test]
+    fn diff_object_add_remove_change() {
+        use super::structural_diff;
+        use crate::value::{ObjectCell, Value};
+        let mut a = indexmap::IndexMap::new();
+        a.insert("keep".to_string(), Value::Int(1));
+        a.insert("change".to_string(), Value::Int(2));
+        a.insert("gone".to_string(), Value::Int(3));
+        let mut b = indexmap::IndexMap::new();
+        b.insert("keep".to_string(), Value::Int(1));
+        b.insert("change".to_string(), Value::Int(9));
+        b.insert("extra".to_string(), Value::Int(4));
+        let d = structural_diff(&Value::Object(ObjectCell::new(a)), &Value::Object(ObjectCell::new(b)));
+        assert!(d.contains(".change: 2 → 9"), "change: {d}");
+        assert!(d.contains("- .gone: 3"), "remove: {d}");
+        assert!(d.contains("+ .extra: 4"), "add: {d}");
+        assert!(!d.contains("keep"), "unchanged key should not appear: {d}");
+    }
+
+    #[test]
+    fn diff_array_index_change_and_length() {
+        use super::structural_diff;
+        use crate::value::{ArrayCell, Value};
+        // index change
+        let a = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2)]));
+        let b = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(7)]));
+        let d = structural_diff(&a, &b);
+        assert!(d.contains("[1]: 2 → 7"), "index change: {d}");
+        // length difference (extra in a → removed)
+        let a2 = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
+        let b2 = Value::Array(ArrayCell::new(vec![Value::Int(1)]));
+        let d2 = structural_diff(&a2, &b2);
+        assert!(d2.contains("- [1]: 2"), "removed idx 1: {d2}");
+        assert!(d2.contains("- [2]: 3"), "removed idx 2: {d2}");
+        // length difference (extra in b → added)
+        let d3 = structural_diff(&b2, &a2);
+        assert!(d3.contains("+ [1]: 2"), "added idx 1: {d3}");
+        assert!(d3.contains("+ [2]: 3"), "added idx 2: {d3}");
+    }
+
+    #[test]
+    fn diff_nested_path_qualified() {
+        use super::structural_diff;
+        use crate::value::{ArrayCell, ObjectCell, Value};
+        // { users: [ { name: "a" } ] } vs { users: [ { name: "b" } ] }
+        let mk = |name: &str| {
+            let mut inner = indexmap::IndexMap::new();
+            inner.insert("name".to_string(), Value::Str(name.into()));
+            let arr = Value::Array(ArrayCell::new(vec![Value::Object(ObjectCell::new(inner))]));
+            let mut top = indexmap::IndexMap::new();
+            top.insert("users".to_string(), arr);
+            Value::Object(ObjectCell::new(top))
+        };
+        let d = structural_diff(&mk("a"), &mk("b"));
+        // Value::Display renders strings without quotes, so the change line is
+        // `.users[0].name: a → b`.
+        assert!(
+            d.contains(".users[0].name: a → b"),
+            "path-qualified nested: {d}"
+        );
+    }
+
+    #[test]
+    fn diff_cyclic_does_not_overflow() {
+        use super::structural_diff;
+        use crate::value::{ArrayCell, Value};
+        // Build a self-referential array a = [a], and an equal-shaped b = [b].
+        let a = ArrayCell::new(vec![]);
+        a.borrow_mut().push(Value::Array(a.clone()));
+        let b = ArrayCell::new(vec![]);
+        b.borrow_mut().push(Value::Array(b.clone()));
+        // deep_equal treats these as equal (back-edge short-circuit) → empty diff,
+        // and crucially this must NOT stack-overflow / loop.
+        let d = structural_diff(&Value::Array(a), &Value::Array(b));
+        assert_eq!(d, "");
+    }
+
+    // ── assert.deepEq ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn deep_eq_pass() {
+        run(r#"
+import * as assert from "std/assert"
+assert.deepEq([1, {a: 2}], [1, {a: 2}])
+"#)
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deep_eq_fail_shows_diff() {
+        let src = r#"
+import * as assert from "std/assert"
+let r = recover(() => assert.deepEq({a: 1, b: 2}, {a: 1, b: 3}))
+print(r[1].message)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("assert.eq failed"), "header: {out}");
+        assert!(out.contains(".b: 2 → 3"), "diff line: {out}");
+    }
+
+    #[tokio::test]
+    async fn eq_fail_includes_structural_diff() {
+        let src = r#"
+import * as assert from "std/assert"
+let r = recover(() => assert.eq([1, 2, 3], [1, 9, 3]))
+print(r[1].message)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("[1]: 2 → 9"), "expected diff line in: {out}");
+    }
+
+    // ── assert.matches (data-gated: Value::Regex) ───────────────────────────
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn matches_pattern_string_pass() {
+        run(r#"
+import * as assert from "std/assert"
+assert.matches("hello123", "[a-z]+[0-9]+")
+"#)
+        .await;
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn matches_compiled_regex_pass() {
+        run(r#"
+import * as assert from "std/assert"
+import * as regex from "std/regex"
+let re = regex.compile("^\\d+$")[0]
+assert.matches("42", re)
+"#)
+        .await;
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn matches_fail_shows_value_and_pattern() {
+        let src = r#"
+import * as assert from "std/assert"
+let r = recover(() => assert.matches("abc", "[0-9]+"))
+print(r[1].message)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("abc"), "value: {out}");
+        assert!(out.contains("[0-9]+"), "pattern: {out}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn matches_non_string_value_fails() {
+        let src = r#"
+import * as assert from "std/assert"
+let r = recover(() => assert.matches(42, "[0-9]+"))
+print(r[1].message)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("must be a string"), "diagnostic: {out}");
+    }
+
+    // ── assert.throwsWith ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn throws_with_matching_substr_passes() {
+        let out = run(r#"
+import * as A from "std/assert"
+let e = A.throwsWith(() => assert(false, "boom happened"), "boom")
+print(e.message)
+"#)
+        .await;
+        assert!(out.contains("boom"), "returns error: {out}");
+    }
+
+    #[tokio::test]
+    async fn throws_with_non_matching_substr_fails() {
+        let src = r#"
+import * as A from "std/assert"
+let r = recover(() => A.throwsWith(() => assert(false, "boom happened"), "kaboom"))
+print(r[1].message)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("expected error message to contain"), "diag: {out}");
+        assert!(out.contains("boom happened"), "shows actual: {out}");
+    }
+
+    #[tokio::test]
+    async fn throws_with_no_throw_fails() {
+        let src = r#"
+import * as A from "std/assert"
+let r = recover(() => A.throwsWith(() => 1, "x"))
+print(r[1] != nil)
+"#;
+        assert_eq!(run(src).await, "true\n");
+    }
+
+    #[tokio::test]
+    async fn throws_with_drives_async_fn() {
+        // Mirror throws_drives_async_fn: trigger a panic via out-of-bounds index
+        // inside the async fn (the `assert(false, ...)` carry-forward arg bug is
+        // unrelated). The default index-OOB message contains "index".
+        let out = run(r#"
+import * as assert from "std/assert"
+async fn boom() {
+    let _ = [][0]
+}
+let e = await assert.throwsWith(boom, "index")
+print(e.message)
+"#)
+        .await;
+        assert!(!out.trim().is_empty(), "async path: {out}");
+    }
+
     // ── assert.snapshot ───────────────────────────────────────────────────────
     // These tests operate on the snapshot_impl helper directly to avoid any
     // global cwd/env-var pollution between parallel tests.
@@ -1003,6 +1519,20 @@ A.eq(1, 1)
                 msg.contains("different_value"),
                 "error should show new: {msg}"
             );
+        }
+
+        #[test]
+        fn mismatch_shows_structural_diff_for_json() {
+            // When both stored + new parse as JSON objects, the mismatch message
+            // carries a structural diff (per-key change), in addition to the raw
+            // dump fallback.
+            let dir = tmp_dir("structural_diff");
+            snapshot_impl(&dir, "obj", "{\n  \"a\": 1,\n  \"b\": 2\n}", false).unwrap();
+            let r = snapshot_impl(&dir, "obj", "{\n  \"a\": 1,\n  \"b\": 3\n}", false);
+            assert!(r.is_err());
+            let msg = r.unwrap_err();
+            assert!(msg.contains("diff (stored → new)"), "has diff header: {msg}");
+            assert!(msg.contains(".b: 2 → 3"), "structural change line: {msg}");
         }
 
         #[test]

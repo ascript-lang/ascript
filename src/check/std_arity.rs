@@ -87,6 +87,12 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/string", "codepoints") => 1,
         ("std/string", "from_codepoints") => 1,
         ("std/string", "code_at") => 2,
+        // std/assert — fixed-arity assertions (DX D2-T9). `eq`/`ne` take an
+        // optional trailing message → 2 required; `deepEq`/`matches`/`throwsWith`
+        // are 2 required.
+        ("std/assert", "deepEq") => 2,
+        ("std/assert", "matches") => 2,
+        ("std/assert", "throwsWith") => 2,
         _ => return None,
     };
     Some(n)
@@ -156,6 +162,13 @@ mod tests {
             ("std/string", "codepoints"),
             ("std/string", "from_codepoints"),
             ("std/string", "code_at"),
+            ("std/assert", "deepEq"),
+            // `matches` is a `data`-gated export — keyed in the curated table
+            // unconditionally (data is pure), but only export-cross-checkable
+            // when `data` is built. See the cfg-conditional push below.
+            #[cfg(feature = "data")]
+            ("std/assert", "matches"),
+            ("std/assert", "throwsWith"),
         ];
         // FFI handle METHODS (resolved on a `ForeignLib`/`ForeignSymbol` handle, not
         // module-level exports). Keyed in `required_args` so `call-arity` can reach
