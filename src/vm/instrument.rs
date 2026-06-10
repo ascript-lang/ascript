@@ -104,6 +104,18 @@ pub enum DebugCommand {
     SetBreakpoints { source: String, lines: Vec<u32> },
     /// Clear ALL breakpoints (restore every patched byte).
     ClearBreakpoints,
+    /// Evaluate `expr` in the PAUSED frame `frame_id` (the DAP `evaluate` request — Watch
+    /// panel / Debug Console / hover). `frame_id` is the index into the innermost-first
+    /// frame snapshot order (the same id the DAP `stackTrace` reply assigns). The VM bridges
+    /// the live frame locals + module globals into an `Environment` and runs the parsed
+    /// expression on the tree-walker (`Interp::eval_expr`), then ships an
+    /// [`DebugEvent::EvaluateResult`] back — plain owned data only (the rendered value is a
+    /// `String`; NO `Value`/`Rc`/`Cc` crosses the channel).
+    ///
+    /// Side-effects in the expression DO run (like the V8/Chrome debug console). This is the
+    /// SHARED evaluator that conditional breakpoints / logpoints will reuse at
+    /// breakpoint-check time (a documented follow-up — they build on `eval_in_paused_frame`).
+    Evaluate { expr: String, frame_id: usize },
 }
 
 /// One requested breakpoint line and the VM's verdict on it: whether a real instruction
@@ -173,6 +185,13 @@ pub enum DebugEvent {
     /// non-zero = an `exit(n)` or an uncaught Tier-2 panic). Sent by the debuggee
     /// thread after `vm.run` returns, just before it drops the hook (DBG Task 5b).
     Terminated { exit_code: i32 },
+    /// Reply to [`DebugCommand::Evaluate`]: the rendered result of evaluating an
+    /// expression in a paused frame. `ok` is `false` for a parse error, a thrown
+    /// (Tier-2) panic, or a `?`-propagation; `display` then carries the error text (or
+    /// `<parse error: …>`). On success `display` is the value rendered via `Value`'s
+    /// `Display`. PLAIN OWNED DATA only — the value is rendered to a `String` on the VM
+    /// thread; NO `Value`/`Rc`/`Cc` crosses the channel (the worker-airlock discipline).
+    EvaluateResult { ok: bool, display: String },
 }
 
 /// The DBG debugger hook: the breakpoint side table + stepping state + the `Send`

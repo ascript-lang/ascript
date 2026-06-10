@@ -357,6 +357,84 @@ fn dap_happy_path_breakpoint_inspect_continue() {
     let _ = std::fs::remove_file(&program);
 }
 
+/// Test 1c (DBG Task 8 — `evaluate`) — pause inside `add` (a=2, b=3), then evaluate
+/// expressions in the paused frame: `a + b` → "5" (params), a reference to the function
+/// itself (a global) → success, and an undefined name → success=false with an error
+/// string (no hang, no panic). The evaluator reuses the tree-walker on the parked Vm.
+#[test]
+fn dap_evaluate_in_paused_frame() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let program = temp_program("evaluate", PROGRAM);
+    let mut c = DapClient::spawn_inspect(&program);
+
+    // initialize → launch → entry stop.
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline);
+
+    // Breakpoint on the `let s` line (line 2) inside `add`, then configurationDone.
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": program.to_string_lossy() },
+            "breakpoints": [ { "line": 2 } ],
+        }),
+    );
+    c.read_response(sb, deadline);
+    c.read_event("breakpoint", deadline);
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+    let stopped2 = c.read_event("stopped", deadline);
+    assert_eq!(stopped2["body"]["reason"], json!("breakpoint"), "{stopped2}");
+
+    // The top frame id (frame `add`).
+    let st = c.request("stackTrace", json!({ "threadId": 1 }));
+    let st_resp = c.read_response(st, deadline);
+    let frames = st_resp["body"]["stackFrames"].as_array().expect("frames");
+    let frame_id = frames[0]["id"].as_i64().expect("frame id");
+
+    // (1) `a + b` over the paused params (2 + 3) → "5".
+    let ev = c.request(
+        "evaluate",
+        json!({ "expression": "a + b", "frameId": frame_id, "context": "watch" }),
+    );
+    let ev_resp = c.read_response(ev, deadline);
+    assert_eq!(ev_resp["success"], json!(true), "evaluate a+b ok: {ev_resp}");
+    assert_eq!(ev_resp["body"]["result"], json!("5"), "a + b == 5: {ev_resp}");
+
+    // (2) A reference to the function itself (a module global) → success (renders SOME
+    // value; we only assert it resolved without error / hang).
+    let ev2 = c.request(
+        "evaluate",
+        json!({ "expression": "add", "frameId": frame_id, "context": "repl" }),
+    );
+    let ev2_resp = c.read_response(ev2, deadline);
+    assert_eq!(ev2_resp["success"], json!(true), "evaluate global `add` ok: {ev2_resp}");
+
+    // (3) An undefined name → success=false with an error string (no hang, no panic).
+    let ev3 = c.request(
+        "evaluate",
+        json!({ "expression": "no_such_name_here", "frameId": frame_id, "context": "hover" }),
+    );
+    let ev3_resp = c.read_response(ev3, deadline);
+    assert_eq!(
+        ev3_resp["success"], json!(false),
+        "an undefined name fails gracefully: {ev3_resp}"
+    );
+
+    // Continue to completion — the program still runs to its `print(5)` output.
+    let cont = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont, deadline);
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("5"), "program still produced output `5`: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+}
+
 /// Test 1b (review F1 regression) — an UNBINDABLE breakpoint (a line past EOF) must
 /// report `verified:false` via the authoritative `breakpoint` event. The pre-fix code
 /// fabricated `verified:true` for ANY line when parked, including lines that never bind

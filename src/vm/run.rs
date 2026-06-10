@@ -43,6 +43,19 @@ struct GlobalSlot {
     mutable: bool,
 }
 
+/// DBG: the outcome of one `debug_stop` park (the parked command loop). A resume command
+/// (`Continue`/`Next`/`StepIn`/`StepOut`) records the step mode on the hook and yields
+/// [`StopOutcome::Resume`] (the trap arm un-patches + resumes). An `Evaluate` command is
+/// NOT a resume — `debug_stop` returns [`StopOutcome::Evaluate`] (with the instrument box
+/// already restored, no borrow held) so the async trap arm can run the re-entrant
+/// evaluator on the tree-walker and then re-park. Plain owned data only.
+enum StopOutcome {
+    /// Resume execution (the step mode was already recorded on the hook).
+    Resume,
+    /// Evaluate `expr` in paused frame `frame_id`, ship the result, and re-park.
+    Evaluate { expr: String, frame_id: usize },
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -3695,18 +3708,47 @@ impl Vm {
                         continue;
                     };
 
-                    // Build the Send-safe frame/variable snapshot while `&fiber` is
-                    // live (Value access stays on the VM thread) and BEFORE the
-                    // blocking recv — owned Strings only, no borrow held across the
-                    // wait (Gate 4). Innermost frame first; the innermost frame's
-                    // active instruction is the trapped `fault_ip`.
-                    let frames = self.build_frame_snapshots(fiber, fault_ip);
-
-                    // Park: ship a `Stopped` event (carrying `frames`) and block on
-                    // the command channel for a resume. No Value/Cc/RefCell borrow is
-                    // held across the blocking recv (Gate 4) — `debug_stop` scopes
-                    // every borrow.
-                    self.debug_stop(proto_id, fault_ip, depth, frames);
+                    // Park: ship a `Stopped` event (carrying a fresh frame snapshot) and
+                    // block on the command channel. No Value/Cc/RefCell borrow is held
+                    // across the blocking recv (Gate 4) — `debug_stop` scopes every borrow.
+                    //
+                    // The command loop runs while parked. An `Evaluate` command is NOT a
+                    // resume: `debug_stop` returns it (instrument box already restored, no
+                    // borrow held), we evaluate the expression in the paused frame on the
+                    // tree-walker, ship the `EvaluateResult`, then LOOP back to park again
+                    // and wait for the next command. A resume command breaks the loop.
+                    loop {
+                        // Build the Send-safe frame/variable snapshot while `&fiber` is
+                        // live (Value access stays on the VM thread) and BEFORE the blocking
+                        // recv — owned Strings only, no borrow held across the wait (Gate 4).
+                        // Innermost frame first; the innermost frame's active instruction is
+                        // the trapped `fault_ip`. Re-built per Evaluate iteration so an
+                        // inspecting expression that mutated a local is reflected on the next
+                        // park (cheap; only reached while interactively paused — Gate 12 hot
+                        // loop untouched).
+                        let snap = self.build_frame_snapshots(fiber, fault_ip);
+                        match self.debug_stop(proto_id, fault_ip, depth, snap) {
+                            StopOutcome::Resume => break,
+                            StopOutcome::Evaluate { expr, frame_id } => {
+                                let (ok, display) =
+                                    self.eval_in_paused_frame(fiber, frame_id, &expr).await;
+                                // Ship the result back (scoped instrument borrow, dropped
+                                // before the next loop iteration — Gate 4). A disconnected
+                                // controller is harmless (the next park's recv catches it).
+                                let inst = self.instrument.borrow();
+                                if let Some(hook) =
+                                    inst.as_ref().and_then(|i| i.breakpoints.as_ref())
+                                {
+                                    let _ = hook.events.send(
+                                        crate::vm::instrument::DebugEvent::EvaluateResult {
+                                            ok,
+                                            display,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     // Un-patch this breakpoint and re-point `ip` to the break offset so
                     // the next loop iteration reads + executes the recovered original
@@ -3735,28 +3777,31 @@ impl Vm {
     }
 
     /// DBG: park the fiber at a breakpoint. Ships a `Stopped` event to the DAP server
-    /// thread and blocks on the command channel until a resume command, recording the
-    /// resume's step mode on the hook.
+    /// thread and blocks on the command channel until a resume command (recording the
+    /// resume's step mode on the hook) OR an `Evaluate` command (returned to the caller,
+    /// which evaluates it and re-parks). Breakpoint-management commands (SetBreakpoints /
+    /// ClearBreakpoints) are applied IN PLACE and the loop waits for the next command.
     ///
     /// Gate 4: builds the plain-data snapshot and ships it, then drops every borrow
     /// BEFORE blocking on the channel `recv` — no `RefCell`/`Cc` borrow is held across
     /// the wait. The `Instrumentation` box is TAKEN out of the cell across the blocking
     /// recv (a re-entrant native call the resumed program triggers could otherwise
-    /// re-borrow the cell), then put back.
+    /// re-borrow the cell), then put back BEFORE returning (so the caller's `Evaluate`
+    /// handling re-borrows a fully-restored cell — no borrow held across the return).
     fn debug_stop(
         &self,
         proto_id: usize,
         offset: usize,
         depth: usize,
         frames: Vec<crate::vm::instrument::FrameSnapshot>,
-    ) {
+    ) -> StopOutcome {
         use crate::vm::instrument::{DebugCommand, DebugEvent, StepMode};
         // Ship the Stopped event (scoped borrow, dropped immediately). `frames` is
         // already plain owned Send-safe data (built at the trap before this call).
         {
             let inst = self.instrument.borrow();
             let Some(hook) = inst.as_ref().and_then(|i| i.breakpoints.as_ref()) else {
-                return;
+                return StopOutcome::Resume;
             };
             // If the controller end has hung up, there is nothing to wait for —
             // resume immediately (a detached debugger must not deadlock the program).
@@ -3770,7 +3815,7 @@ impl Vm {
                 })
                 .is_err()
             {
-                return;
+                return StopOutcome::Resume;
             }
         }
         // Take the payload OUT across the blocking recv (Gate 4 — hold no cell borrow
@@ -3780,9 +3825,10 @@ impl Vm {
         // The command loop: breakpoint-management commands (SetBreakpoints /
         // ClearBreakpoints) are applied IN PLACE and the loop waits for the NEXT command
         // (they are not a resume); a resume command (Continue/Next/StepIn/StepOut) records
-        // the step mode and RETURNS. Each iteration blocks on `recv` holding NO RefCell/Cc
-        // borrow (Gate 4): we resolve/patch synchronously between recvs.
-        let mode = loop {
+        // the step mode and RETURNS `Resume`; an `Evaluate` command RETURNS `Evaluate{..}`
+        // for the caller to handle and re-park. Each iteration blocks on `recv` holding NO
+        // RefCell/Cc borrow (Gate 4): we resolve/patch synchronously between recvs.
+        let outcome = loop {
             // Block on the channel with no borrow held. `recv` returns `Err` if the
             // controller hung up → resume free-running.
             let cmd = match taken
@@ -3792,14 +3838,32 @@ impl Vm {
             {
                 Some(Ok(cmd)) => cmd,
                 // No hook, or the controller disconnected — resume free-running.
-                _ => break StepMode::Run,
+                _ => break StopOutcome::Resume,
             };
 
             match cmd {
-                DebugCommand::Continue => break StepMode::Run,
-                DebugCommand::Next => break StepMode::Over,
-                DebugCommand::StepIn => break StepMode::Into,
-                DebugCommand::StepOut => break StepMode::Out,
+                DebugCommand::Continue => {
+                    self.set_step(taken.as_mut(), StepMode::Run, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::Next => {
+                    self.set_step(taken.as_mut(), StepMode::Over, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::StepIn => {
+                    self.set_step(taken.as_mut(), StepMode::Into, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::StepOut => {
+                    self.set_step(taken.as_mut(), StepMode::Out, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::Evaluate { expr, frame_id } => {
+                    // Not a resume: hand the request back to the caller (which re-enters
+                    // the async evaluator). Restore the box FIRST so no borrow is held
+                    // across the return and the evaluator sees a fully-armed debugger.
+                    break StopOutcome::Evaluate { expr, frame_id };
+                }
                 DebugCommand::SetBreakpoints { source, lines } => {
                     let results = self.apply_set_breakpoints(taken.as_mut(), &source, &lines);
                     // Ship the verdict; ignore a disconnected controller (it will be
@@ -3818,12 +3882,111 @@ impl Vm {
             }
         };
 
-        if let Some(hook) = taken.as_mut().and_then(|i| i.breakpoints.as_mut()) {
+        // Restore the payload (the program continues with the debugger still armed).
+        *self.instrument.borrow_mut() = taken;
+        outcome
+    }
+
+    /// DBG: record the resume step mode + depth on the hook (in the already-TAKEN
+    /// instrumentation box — no re-borrow of `self.instrument`). A no-op if the hook is
+    /// gone (controller disconnected mid-stop).
+    fn set_step(
+        &self,
+        inst: Option<&mut Box<crate::vm::instrument::Instrumentation>>,
+        mode: crate::vm::instrument::StepMode,
+        depth: usize,
+    ) {
+        if let Some(hook) = inst.and_then(|i| i.breakpoints.as_mut()) {
             hook.step_mode = mode;
             hook.step_depth = depth;
         }
-        // Restore the payload (the program continues with the debugger still armed).
-        *self.instrument.borrow_mut() = taken;
+    }
+
+    /// DBG: evaluate `expr_text` in the PAUSED frame `frame_id` (the DAP `evaluate`
+    /// request — Watch / Debug Console / hover). The clean approach: REUSE the tree-walker
+    /// as the evaluator — the parked `Vm` already holds a full [`Interp`] (`self.interp()`)
+    /// with an async re-entrant `eval_expr` and an `Environment`, which `debug_stop`'s
+    /// blocking-`recv` command loop (a SYNC fn) cannot do. We bridge the paused frame's
+    /// live values into an `Environment` and run the parsed expression on the tree-walker.
+    ///
+    /// Returns plain owned `(ok, display)`: on success the value rendered via `Value`'s
+    /// `Display`; on a parse error / thrown panic / `?`-propagation, `ok=false` and the
+    /// error text. The caller ships this as a [`DebugEvent::EvaluateResult`] — NO
+    /// `Value`/`Rc`/`Cc` crosses the channel (the worker-airlock discipline).
+    ///
+    /// Side-effects in the expression DO run (like the V8 debug console) — the debugger
+    /// only ever evaluates an expression the user explicitly requested, so the
+    /// non-evaluated run's observation contract is untouched (Gate 1: `evaluate` adds no
+    /// behavior to a normal run; it is reached ONLY from the interactive command loop).
+    ///
+    /// Gate 4: no `RefCell`/`Cc` borrow is held across the `.await` — the environment is
+    /// built (cloning live values out) BEFORE `eval_expr`, and the `fiber` reads are
+    /// synchronous.
+    ///
+    /// This is the SHARED evaluator that conditional breakpoints / logpoints will reuse at
+    /// breakpoint-check time (a documented follow-up — DBG Task 8 scope is read/expression
+    /// evaluation for Watch/Repl/Hover).
+    async fn eval_in_paused_frame(
+        &self,
+        fiber: &Fiber,
+        frame_id: usize,
+        expr_text: &str,
+    ) -> (bool, String) {
+        // (1) Map the DAP frame id (innermost-first, as `build_frame_snapshots` /
+        // `stackTrace` order it) back to the bottom-first `fiber.frames` index.
+        let n = fiber.frames.len();
+        if frame_id >= n {
+            return (false, format!("<no such frame: {frame_id}>"));
+        }
+        let frame = &fiber.frames[n - 1 - frame_id];
+        let proto = &frame.closure.proto;
+
+        // (2) Build the evaluation environment: a fresh builtins child, then the module
+        // user-globals (so a top-level binding / the function itself resolves), then the
+        // frame's live locals LAST so they shadow globals. Every value is cloned OUT here
+        // (no borrow held across the later `.await`).
+        let env = crate::interp::global_env().child();
+        for (name, gslot) in self.user_globals.borrow().iter() {
+            let _ = env.define(name, gslot.value.clone(), gslot.mutable);
+        }
+        for (slot, name) in &proto.local_names {
+            let slot_idx = *slot as usize;
+            // Read the live value: a captured slot through its cell, else the plain stack
+            // slot at `slot_base + slot` (bounds-checked).
+            let val = match frame.cells.get(slot_idx).and_then(|c| c.as_ref()) {
+                Some(cell) => cell.borrow().clone(),
+                None => match fiber.stack.get(frame.slot_base + slot_idx) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                },
+            };
+            // Define-or-reassign (a later same-named slot wins; locals shadow globals).
+            if env.define(name, val.clone(), true).is_err() {
+                let _ = env.assign(name, val);
+            }
+        }
+
+        // (3) Parse the expression with the legacy front-end (the tree-walker's parser).
+        // There is no single-expression entry, so parse it as a one-statement program and
+        // extract the `Stmt::Expr`. A parse error → a clean `(false, …)` (never a panic).
+        let expr = match crate::lexer::lex(expr_text)
+            .map_err(|e| e.message)
+            .and_then(|toks| crate::parser::parse(&toks).map_err(|e| e.message))
+        {
+            Ok(stmts) => match stmts.into_iter().next() {
+                Some(crate::ast::Stmt::Expr(e)) => e,
+                _ => return (false, "<parse error: expected an expression>".to_string()),
+            },
+            Err(msg) => return (false, format!("<parse error: {msg}>")),
+        };
+
+        // (4) Evaluate on the tree-walker. Render the value via `Display`; a thrown panic
+        // / propagation becomes a `(false, message)` result.
+        match self.interp().eval_expr(&expr, &env).await {
+            Ok(v) => (true, format!("{v}")),
+            Err(Control::Panic(e)) => (false, e.message),
+            Err(_) => (false, "<propagated>".to_string()),
+        }
     }
 
     /// DBG: apply a `SetBreakpoints { source, lines }` against the live proto tree while

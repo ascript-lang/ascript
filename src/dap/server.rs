@@ -39,6 +39,13 @@ struct AdapterState {
     pending_verify: std::collections::VecDeque<Vec<i64>>,
     /// Monotonic breakpoint-id allocator (stable ids the editor uses to update markers).
     bp_id: i64,
+    /// FIFO of `evaluate` request seqs awaiting an `EvaluateResult` reply, pushed when an
+    /// `Evaluate` command is SENT to the VM. The VM processes commands in order and ships
+    /// exactly one `EvaluateResult` per `Evaluate`, so the pump pops the front to correlate
+    /// the reply back to the request seq and send the `evaluate` RESPONSE itself (the
+    /// reply crosses the pump-owned `evt_rx`, so the synchronous request handler cannot
+    /// read it — same shape as `pending_verify`).
+    pending_evaluate: std::collections::VecDeque<i64>,
 }
 
 impl AdapterState {
@@ -50,6 +57,7 @@ impl AdapterState {
             pending_breakpoints: Vec::new(),
             pending_verify: std::collections::VecDeque::new(),
             bp_id: 0,
+            pending_evaluate: std::collections::VecDeque::new(),
         }
     }
 
@@ -167,6 +175,27 @@ fn pump_events(
                         json!({ "category": category, "output": text }),
                     ),
                 );
+            }
+            DebugEvent::EvaluateResult { ok, display } => {
+                // The VM's reply to a `DebugCommand::Evaluate`. `evt_rx` is owned by THIS
+                // pump thread, so the synchronous `evaluate` request handler could not read
+                // the result; it pushed its request seq onto `pending_evaluate` (FIFO — the
+                // VM ships one reply per `Evaluate`, in order). Pop the matching request seq
+                // and send the `evaluate` RESPONSE carrying the rendered result. A failed
+                // eval (parse error / thrown panic) responds with `success:false` + the
+                // error text so the editor surfaces it without hanging.
+                let req_seq = {
+                    let mut st = state.lock().expect("state mutex");
+                    st.pending_evaluate.pop_front()
+                };
+                let Some(req_seq) = req_seq else { continue };
+                let rseq = state.lock().expect("state mutex").next_seq();
+                let body = if ok {
+                    json!({ "result": display, "variablesReference": 0 })
+                } else {
+                    json!({ "error": display })
+                };
+                send(&stdout, &response(rseq, req_seq, "evaluate", ok, body));
             }
             DebugEvent::Terminated { exit_code } => {
                 let (seq1, seq2) = {
@@ -518,6 +547,61 @@ pub fn run_server(
                 }
                 let rseq = state.lock().expect("state").next_seq();
                 send(&stdout, &response(rseq, req.seq, &req.command, true, json!({})));
+            }
+
+            "evaluate" => {
+                // DAP `evaluate` — the Watch panel / Debug Console / hover. Evaluate the
+                // `expression` in the paused frame `frameId`, returning the rendered value.
+                // The result crosses the pump-owned `evt_rx` as an `EvaluateResult`, so we
+                // CANNOT respond synchronously: send the command, push our request seq onto
+                // `pending_evaluate`, and let the pump correlate the reply and respond (same
+                // shape as `setBreakpoints` ↔ `BreakpointsVerified`).
+                let expr = req
+                    .arguments
+                    .get("expression")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // `frameId` is optional in DAP (a global eval omits it); default to the
+                // innermost frame (0). The VM bounds-checks the id.
+                let frame_id = req
+                    .arguments
+                    .get("frameId")
+                    .and_then(|f| f.as_i64())
+                    .unwrap_or(0)
+                    .max(0) as usize;
+
+                // Only meaningful while parked (a frame must exist). If no VM is parked
+                // (`entry_reported` is false → no stop yet, or no debuggee), respond
+                // unsuccessfully rather than send a command that would never get a reply
+                // (deadlock-avoidance).
+                let parked = {
+                    let st = state.lock().expect("state");
+                    st.entry_reported && cmd_tx.is_some()
+                };
+                if parked {
+                    if let Some(tx) = &cmd_tx {
+                        let _ = tx.send(DebugCommand::Evaluate { expr, frame_id });
+                        state
+                            .lock()
+                            .expect("state")
+                            .pending_evaluate
+                            .push_back(req.seq);
+                        // The pump sends the response when the `EvaluateResult` arrives.
+                    }
+                } else {
+                    let rseq = state.lock().expect("state").next_seq();
+                    send(
+                        &stdout,
+                        &response(
+                            rseq,
+                            req.seq,
+                            "evaluate",
+                            false,
+                            json!({ "error": "not paused: evaluate requires a stopped frame" }),
+                        ),
+                    );
+                }
             }
 
             "disconnect" | "terminate" => {
