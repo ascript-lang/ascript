@@ -157,7 +157,29 @@ fn replace_links(s: &str) -> String {
                     if let Some(paren) = find_from(&bytes, close + 2, ')') {
                         let text: String = bytes[i + 1..close].iter().collect();
                         let url: String = bytes[close + 2..paren].iter().collect();
-                        let external = url.starts_with("http://") || url.starts_with("https://");
+                        // XSS guard (allowlist, NOT a blocklist): only emit an anchor for a
+                        // URL whose scheme is known-safe. A doc body is untrusted source text
+                        // (anyone's `///` comment), and this HTML is opened in a browser, so a
+                        // `[x](javascript:…)` / `data:` / `vbscript:` / `file:` link must NEVER
+                        // become a clickable href. The scheme test is case-insensitive over the
+                        // trimmed URL (browsers strip leading whitespace/controls before the
+                        // scheme); anything else with a `:` is rejected. `text`/`url` are already
+                        // HTML-escaped (`esc` ran upstream), so the rejected case renders as inert
+                        // literal `[text](url)` text.
+                        let lower = url.trim_start().to_ascii_lowercase();
+                        let safe = lower.starts_with("http://")
+                            || lower.starts_with("https://")
+                            || lower.starts_with("mailto:")
+                            || url.starts_with('#')
+                            || url.starts_with('/')
+                            || !url.contains(':'); // a scheme-less relative link
+                        if !safe {
+                            out.push_str(&format!("[{text}]({url})"));
+                            i = paren + 1;
+                            continue;
+                        }
+                        let external =
+                            lower.starts_with("http://") || lower.starts_with("https://");
                         let ext_attr = if external {
                             " target=\"_blank\" rel=\"noopener\""
                         } else {
@@ -411,5 +433,38 @@ mod tests {
         let html = render_markdown("```\n<b>not bold</b>\n```");
         assert!(html.contains("&lt;b&gt;"), "fence content escaped: {html}");
         assert!(!html.contains("<b>not bold"), "no raw tag: {html}");
+    }
+
+    /// XSS guard: a Markdown link with an unsafe URL scheme must NOT become a clickable
+    /// anchor — it renders as inert literal text. Allowlist (http/https/mailto/#/abs/rel),
+    /// case-insensitive, leading-whitespace-tolerant; a colon-bearing non-allowlisted
+    /// scheme (incl. an internal-tab obfuscation) is rejected.
+    #[test]
+    fn markdown_link_rejects_unsafe_url_scheme() {
+        for bad in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "  javascript:alert(1)",
+            "java\tscript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+        ] {
+            let html = render_markdown(&format!("see [click]({bad})"));
+            assert!(
+                !html.contains("href=\"javascript")
+                    && !html.contains("href=\"data:")
+                    && !html.contains("href=\"vbscript")
+                    && !html.contains("href=\"file:")
+                    && !html.contains("href=\"java"),
+                "unsafe scheme `{bad}` must not become an href: {html}"
+            );
+            assert!(!html.contains("<a "), "no anchor at all for `{bad}`: {html}");
+        }
+        // Safe schemes still produce anchors.
+        assert!(render_markdown("[a](https://x.com)").contains("href=\"https://x.com\""));
+        assert!(render_markdown("[a](mailto:x@y.com)").contains("href=\"mailto:x@y.com\""));
+        assert!(render_markdown("[a](#anchor)").contains("href=\"#anchor\""));
+        assert!(render_markdown("[a](./rel/path)").contains("href=\"./rel/path\""));
     }
 }
