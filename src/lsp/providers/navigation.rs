@@ -133,6 +133,42 @@ fn binding_for_upvalue(model: &SemanticModel, use_range: TextRange, idx: u32) ->
     }
 }
 
+/// The frame chain reachable from byte `offset`: the innermost frame containing the
+/// cursor plus every ancestor frame up to and including the `SourceFile` frame. A
+/// non-global binding is LIVE at the cursor iff its OWNING frame is one of these — i.e.
+/// the binding's frame ENCLOSES the cursor (the cursor frame's own locals/params + the
+/// parent-frame / upvalue chain). A sibling scope that does not enclose the cursor is
+/// excluded. This reuses the exact frame model (`innermost_frame_containing` +
+/// `parent_frame`) that `definition`/`document-highlight` use — NOT a second resolver.
+pub(crate) fn frame_chain_at(
+    model: &SemanticModel,
+    offset: usize,
+) -> Vec<(SyntaxKind, TextRange)> {
+    let mut out = Vec::new();
+    let Some(mut frame) = innermost_frame_containing(model, offset) else {
+        return out;
+    };
+    out.push(frame);
+    while let Some(parent) = parent_frame(model, frame.1) {
+        out.push(parent);
+        frame = parent;
+    }
+    out
+}
+
+/// Whether the binding declared at `decl_range` is LIVE at `offset`: its owning frame
+/// is on the cursor's frame chain. The single SoT for "which non-global bindings are in
+/// scope here," reused by frame-precise identifier completion.
+pub(crate) fn binding_live_at(
+    model: &SemanticModel,
+    decl_range: TextRange,
+    chain: &[(SyntaxKind, TextRange)],
+) -> bool {
+    owning_frame_of(model, decl_range)
+        .map(|f| chain.contains(&f))
+        .unwrap_or(false)
+}
+
 /// The `(SyntaxKind, TextRange)` key of the INNERMOST frame whose range contains the
 /// byte `offset` — the smallest such frame. `None` if no frame contains it (cannot
 /// happen for a real use, which is always inside at least the `SourceFile` frame).

@@ -236,9 +236,13 @@ fn receiver_is_enum(member: &ResolvedNode, table: &crate::check::infer::table::T
 /// Refine an `Ident` token using the resolver. The token's byte span is its
 /// resolution key (uses/bindings are keyed by `TextRange` == byte offsets).
 fn classify_ident(model: &SemanticModel, t: &TokenSpan) -> Option<(u32, u32)> {
-    // A USE: is there a `uses` entry keyed exactly on this token's byte span?
+    // A USE: is there a `uses` entry whose NameRef range CONTAINS this token? The
+    // `uses` map is keyed by the NameRef NODE range, which can start at leading
+    // whitespace trivia (e.g. `x` in `return x`), so an exact span match would miss a
+    // trivia-preceded use and misclassify it. A NameRef node contains exactly one
+    // `Ident` token, so containment of this Ident is unambiguous.
     let is_use = model.resolved.uses.keys().any(|range| {
-        usize::from(range.start()) == t.start && usize::from(range.end()) == t.end()
+        usize::from(range.start()) <= t.start && t.end() <= usize::from(range.end())
     });
 
     // A DECL site: a binding whose name matches this token, whose decl_range
@@ -439,6 +443,26 @@ mod tests {
         let kinds: Vec<u32> = cs.iter().map(|c| c.token_type).collect();
         assert!(kinds.contains(&TYPE_FUNCTION), "{kinds:?}");
         assert!(kinds.contains(&TYPE_PARAMETER), "{kinds:?}");
+    }
+
+    #[test]
+    fn trivia_preceded_function_use_is_classified_as_function() {
+        // `helper` in `return helper()` is preceded by a space, so its NameRef NODE
+        // range (the `uses` map key) starts at the whitespace. An EXACT span match
+        // against that key missed the bare Ident token and the use fell through to a
+        // plain `TYPE_VARIABLE`; containment matching restores it to a FUNCTION use.
+        let cs = classify(&model(
+            "fn helper() { return 1 }\nfn main() { return helper() }\n",
+        ));
+        // The two decls (`helper`, `main`) are FUNCTION + DECLARATION; the call-site
+        // `helper` use must be a FUNCTION token WITHOUT the declaration modifier.
+        let function_use = cs
+            .iter()
+            .find(|c| c.token_type == TYPE_FUNCTION && c.modifiers & MOD_DECLARATION == 0);
+        assert!(
+            function_use.is_some(),
+            "the trivia-preceded `helper()` use must classify as a FUNCTION token: {cs:?}"
+        );
     }
 
     #[test]

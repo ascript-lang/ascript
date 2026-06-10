@@ -908,6 +908,155 @@ fn lsp_cross_file_goto_definition_and_rename() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// DX D3 Task 12 — the Task-11 shadowing edge holds END-TO-END through the LSP
+/// providers (not just the `WorkspaceIndex` unit tests). File A exports `x`; file B
+/// imports `x` AND declares a same-named local `let x` in a nested frame. Renaming
+/// A's export must edit B's IMPORTED use + import clause but NEVER B's shadowing
+/// local; renaming B's local must stay entirely within its frame. references mirror
+/// rename. This proves references/rename match on the unified `GlobalBindingId`, not
+/// on name text, all the way out at the wire.
+#[test]
+fn lsp_cross_file_rename_respects_shadowing_local() {
+    let dir = std::env::temp_dir().join(format!("ascript_lsp_shadow_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a_path = dir.join("a.as");
+    let b_path = dir.join("b.as");
+    let a_text = "export let x = 1\n";
+    // line0 import clause `x`@9; line2 local decl `x`@6; line3 local use `x`@9;
+    // line5 imported use `x`@6 (module scope — the nested local is out of scope here).
+    let b_text = "import { x } from \"./a\"\nfn g() {\n  let x = 2\n  return x\n}\nprint(x)\n";
+    std::fs::write(&a_path, a_text).unwrap();
+    std::fs::write(&b_path, b_text).unwrap();
+    let a_uri = format!("file://{}", a_path.display());
+    let b_uri = format!("file://{}", b_path.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let overall = Instant::now() + Duration::from_secs(90);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+    for (uri, text) in [(&a_uri, a_text), (&b_uri, b_text)] {
+        client.notify(
+            "textDocument/didOpen",
+            json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text } }),
+        );
+        let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+    }
+
+    // Helper: the set of (line, character) start positions edited in a file by a
+    // rename `changes` object.
+    let edited_lines = |changes: &Value, uri: &str| -> Vec<(i64, i64)> {
+        changes
+            .get(uri)
+            .and_then(|v| v.as_array())
+            .map(|edits| {
+                edits
+                    .iter()
+                    .map(|e| {
+                        (
+                            e["range"]["start"]["line"].as_i64().unwrap_or(-1),
+                            e["range"]["start"]["character"].as_i64().unwrap_or(-1),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // (1) Rename A's export `x` (decl at line 0 char 11) -> `z`.
+    client.request(
+        2,
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": a_uri },
+            "position": { "line": 0, "character": 11 },
+            "newName": "z"
+        }),
+    );
+    let ren = client.read_response(2, overall);
+    let changes = &ren["result"]["changes"];
+    let b_edits = edited_lines(changes, &b_uri);
+    // B's import clause (line 0) + imported use (line 5) ARE edited.
+    assert!(
+        b_edits.contains(&(0, 9)),
+        "import clause `x` should rename: {ren}"
+    );
+    assert!(
+        b_edits.contains(&(5, 6)),
+        "imported use `print(x)` should rename: {ren}"
+    );
+    // B's SHADOWING local (decl line 2, use line 3) must NOT be touched.
+    assert!(
+        !b_edits.iter().any(|&(l, _)| l == 2 || l == 3),
+        "the shadowing local `let x`/`return x` must NOT be renamed: {b_edits:?} in {ren}"
+    );
+
+    // (2) Inverse: rename B's LOCAL `x` (decl at line 2 char 6) -> `w` stays in B's
+    // frame — no edit to A, no edit to B's import clause or imported use.
+    client.request(
+        3,
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": b_uri },
+            "position": { "line": 2, "character": 6 },
+            "newName": "w"
+        }),
+    );
+    let ren2 = client.read_response(3, overall);
+    let changes2 = &ren2["result"]["changes"];
+    assert!(
+        changes2.get(&a_uri).is_none(),
+        "renaming B's local must not edit A: {ren2}"
+    );
+    let b_edits2 = edited_lines(changes2, &b_uri);
+    assert!(
+        b_edits2.contains(&(2, 6)) && b_edits2.contains(&(3, 9)),
+        "the local decl + its use should rename: {b_edits2:?} in {ren2}"
+    );
+    assert!(
+        !b_edits2.iter().any(|&(l, _)| l == 0 || l == 5),
+        "the import clause + imported use must NOT be touched by the local rename: {b_edits2:?}"
+    );
+
+    // (3) references on A's export `x` excludes B's shadowing local but includes the
+    // imported use.
+    client.request(
+        4,
+        "textDocument/references",
+        json!({
+            "textDocument": { "uri": a_uri },
+            "position": { "line": 0, "character": 11 },
+            "context": { "includeDeclaration": false }
+        }),
+    );
+    let refs = client.read_response(4, overall);
+    let ref_arr = refs["result"].as_array().cloned().unwrap_or_default();
+    let b_ref_lines: Vec<i64> = ref_arr
+        .iter()
+        .filter(|loc| loc["uri"].as_str() == Some(b_uri.as_str()))
+        .map(|loc| loc["range"]["start"]["line"].as_i64().unwrap_or(-1))
+        .collect();
+    assert!(
+        b_ref_lines.contains(&5),
+        "references should include the imported use on line 5: {refs}"
+    );
+    assert!(
+        !b_ref_lines.contains(&3),
+        "references must NOT include the shadowing local use on line 3: {refs}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Phase 7: exercise one representative request per provider family that the main
 /// smoke test does not already hit end-to-end (documentLink, formatting, range
 /// formatting, codeAction, codeLens, documentColor, linkedEditingRange, declaration,
@@ -1413,6 +1562,117 @@ fn lsp_offers_worker_completion() {
         labels.contains(&"worker"),
         "`worker` must appear in keyword completions; got: {labels:?}"
     );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// DX D3 Task 13: end-to-end frame-precise identifier completion — the cursor in
+/// `a`'s body offers `a`'s own local + a module-global + a builtin, but NOT a
+/// sibling function `b`'s local.
+#[test]
+fn lsp_completion_frame_precise_excludes_sibling_local() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://frame_precise.as";
+    // line 0: let g = 0
+    // line 1: fn a() {
+    // line 2:   let foo = 1
+    // line 3:   f         <- cursor here, char 3
+    // line 4: }
+    // line 5: fn b() {
+    // line 6:   let bar = 2
+    // line 7: }
+    let text = "let g = 0\nfn a() {\n  let foo = 1\n  f\n}\nfn b() {\n  let bar = 2\n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 3 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(labels.contains(&"foo"), "a's own local foo offered: {labels:?}");
+    assert!(!labels.contains(&"bar"), "sibling b's local bar NOT offered: {labels:?}");
+    assert!(labels.contains(&"g"), "module-global g offered: {labels:?}");
+    assert!(labels.contains(&"print"), "builtin print offered: {labels:?}");
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// DX D3 Task 13: end-to-end member completion on a TYPED VALUE receiver — `c.`
+/// where `c: C` is inferred offers class `C`'s field `x` and method `m`.
+#[test]
+fn lsp_completion_member_on_typed_instance() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://typed_member.as";
+    // line 0: class C {
+    // line 1:   x: number
+    // line 2:   fn m() {}
+    // line 3: }
+    // line 4: let c = C()
+    // line 5: c.        <- cursor at char 2 (just past the dot)
+    let text = "class C {\n  x: number\n  fn m() {}\n}\nlet c = C()\nc.\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 5, "character": 2 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(labels.contains(&"x"), "instance field x offered: {labels:?}");
+    assert!(labels.contains(&"m"), "instance method m offered: {labels:?}");
 
     client.request_no_params(99, "shutdown");
     let _ = client.read_response(99, overall);
@@ -2002,13 +2262,14 @@ fn lsp_navigation_finds_worker_class() {
 
     // `Counter` in `Counter.spawn()` on line 1.
     // "async fn main() { let h = await Counter.spawn() }"
-    // `Counter` starts at char 31 on line 1.
+    // `Counter`'s `C` is at char 32 (char 31 is the space after `await`; the use
+    // range is now the bare Ident token, not the NameRef node + leading trivia).
     client.request(
         2,
         "textDocument/definition",
         json!({
             "textDocument": { "uri": f_uri },
-            "position": { "line": 1, "character": 31 }
+            "position": { "line": 1, "character": 32 }
         }),
     );
     let def_resp = client.read_response(2, overall);
@@ -2174,4 +2435,231 @@ fn lsp_did_you_mean_quickfix() {
     client.notify_no_params("exit");
     client.close_stdin();
     let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+// ─── DX D3 Task 11: the LSP identity unification ─────────────────────────────
+//
+// These exercise `WorkspaceIndex` directly (in-process — no wire) to pin the
+// unified file-qualified identity (`GlobalBindingId`) and the shadow-correct
+// `references_at` join it powers. They are the LOCKED edges from spec §4.1.
+mod identity_unification {
+    use ascript::lsp::workspace::{canon, GlobalBindingId, WorkspaceIndex};
+    use std::path::{Path, PathBuf};
+
+    /// Build an index over in-memory `(path, text)` pairs.
+    fn idx(files: &[(&str, &str)]) -> WorkspaceIndex {
+        let owned: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|(p, t)| (PathBuf::from(p), t.to_string()))
+            .collect();
+        WorkspaceIndex::build_from_files(&owned)
+    }
+
+    /// A cursor ON an import-clause name (`f` in `import { f } from "./a"`) resolves
+    /// to the DEFINER's identity (via the import edge), so references/rename from the
+    /// clause find the def + every cross-file use — not an empty/importer-local set
+    /// that would otherwise produce a corrupt partial rename. (Holistic-review BLOCKER:
+    /// `def_identity` previously routed imports through `definition_at`, which can't
+    /// see the clause name since it is not a `UseSite`.)
+    #[test]
+    fn import_clause_cursor_resolves_to_definer_identity() {
+        let a_src = "export fn f() { return 1 }\n";
+        let b_src = "import { f } from \"./a\"\nprint(f(1))\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+        let clause_off = b_src.find("{ f }").unwrap() + 2; // the `f` inside `{ f }`
+        let refs = index.references_at(&b, clause_off, true);
+        assert!(
+            refs.iter().any(|(p, _)| *p == a),
+            "refs from the import clause must include a.as's def: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|(p, _)| *p == b),
+            "refs from the import clause must include b.as's use: {refs:?}"
+        );
+        // Rename from the clause edits BOTH files (def + clause + use), not just the
+        // clause token.
+        let edits = index
+            .rename_edits(&b, clause_off, "g")
+            .expect("import-clause rename is allowed");
+        assert!(
+            edits.iter().any(|(p, _)| *p == a) && edits.iter().any(|(p, _)| *p == b),
+            "rename from the import clause must edit both files: {edits:?}"
+        );
+    }
+
+    /// Shadowed-local cross-file rename/refs: A exports `x`; B imports `x` AND has
+    /// its OWN `let x`. Refs of A's export must include B's IMPORTED uses but NOT
+    /// B's local `x` uses.
+    #[test]
+    fn shadowed_local_refs_do_not_cross_import_boundary() {
+        let a_src = "export let x = 1\n";
+        // B: imports x, prints it (imported use), then shadows with a local `let x`
+        // and prints THAT (local use).
+        let b_src = "import { x } from \"./a\"\nprint(x)\nfn g() {\n  let x = 2\n  print(x)\n}\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        // Refs of A's exported `x` (cursor on the decl in a.as — `let x`, NOT the
+        // `x` inside "export").
+        let a_decl = a_src.find("let x").unwrap() + "let ".len();
+        let refs = index.references_at(&a, a_decl, true);
+
+        // Must include: a.as decl, and B's IMPORTED use `print(x)` (the FIRST `x` use
+        // in b, inside the import clause is a def not a use — the use is `print(x)`).
+        assert!(
+            refs.iter().any(|(p, _)| *p == a),
+            "refs must include a.as decl: {refs:?}"
+        );
+        // B's imported use offset: the `x` inside the FIRST `print(x)` (before the
+        // local block).
+        let imported_use_off = b_src.find("print(x)").unwrap() + "print(".len();
+        assert!(
+            refs.iter()
+                .any(|(p, r)| *p == b && r.start <= imported_use_off && imported_use_off < r.end),
+            "refs of A.x must include B's IMPORTED use: {refs:?}"
+        );
+
+        // Must NOT include B's LOCAL `x` use (inside fn g, the `print(x)` after `let x = 2`).
+        let local_use_off = b_src.rfind("print(x)").unwrap() + "print(".len();
+        assert!(
+            local_use_off != imported_use_off,
+            "test setup: local and imported uses must differ"
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|(p, r)| *p == b && r.start <= local_use_off && local_use_off < r.end),
+            "refs of A.x must NOT include B's shadowing LOCAL `x` use: {refs:?}"
+        );
+    }
+
+    /// The inverse: refs of B's LOCAL `x` must NOT include the import or A's def.
+    #[test]
+    fn shadowing_local_refs_exclude_import_and_definer() {
+        let a_src = "export let x = 1\n";
+        let b_src = "import { x } from \"./a\"\nprint(x)\nfn g() {\n  let x = 2\n  print(x)\n}\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        // Cursor on B's LOCAL decl `let x = 2`.
+        let local_decl_off = b_src.find("let x = 2").unwrap() + "let ".len();
+        let refs = index.references_at(&b, local_decl_off, true);
+
+        // All refs are in B only.
+        assert!(
+            refs.iter().all(|(p, _)| *p == b),
+            "local refs must stay in b.as: {refs:?}"
+        );
+        // Must NOT touch a.as at all.
+        assert!(
+            !refs.iter().any(|(p, _)| *p == a),
+            "local refs must not include the definer file: {refs:?}"
+        );
+        // Must include the local use `print(x)` inside fn g.
+        let local_use_off = b_src.rfind("print(x)").unwrap() + "print(".len();
+        assert!(
+            refs.iter()
+                .any(|(_, r)| r.start <= local_use_off && local_use_off < r.end),
+            "local refs must include the shadowing use: {refs:?}"
+        );
+        // Must NOT include the imported use `print(x)` before the block.
+        let imported_use_off = b_src.find("print(x)").unwrap() + "print(".len();
+        assert!(
+            !refs
+                .iter()
+                .any(|(_, r)| r.start <= imported_use_off && imported_use_off < r.end),
+            "local refs must not include the imported use: {refs:?}"
+        );
+    }
+
+    /// Same-name, same-byte-range, different file → DISTINCT `GlobalBindingId`s.
+    /// Two files each with a `let x` whose decl token sits at the SAME byte offset.
+    /// The old `Local(TextRange)` would collide; `Local(FileId, _)` disambiguates.
+    #[test]
+    fn same_range_different_file_ids_are_distinct() {
+        // Identical bodies → identical byte ranges for the `x` decl.
+        let src = "fn g() {\n  let x = 1\n  print(x)\n}\n";
+        let index = idx(&[("/ws/p.as", src), ("/ws/q.as", src)]);
+        let p = canon(Path::new("/ws/p.as"));
+        let q = canon(Path::new("/ws/q.as"));
+
+        let decl_off = src.find("let x").unwrap() + "let ".len();
+        let id_p = index
+            .binding_id_at(&p, decl_off)
+            .expect("p binding identity");
+        let id_q = index
+            .binding_id_at(&q, decl_off)
+            .expect("q binding identity");
+
+        // Both are Local with the SAME TextRange but DIFFERENT FileId → not equal.
+        assert_ne!(
+            id_p, id_q,
+            "same-range locals in different files must be distinct GlobalBindingIds: {id_p:?} vs {id_q:?}"
+        );
+        match (&id_p, &id_q) {
+            (GlobalBindingId::Local(fp, rp), GlobalBindingId::Local(fq, rq)) => {
+                assert_eq!(rp, rq, "ranges should be identical (same source)");
+                assert_ne!(fp, fq, "FileIds must differ");
+            }
+            other => panic!("expected two Local ids, got {other:?}"),
+        }
+    }
+
+    /// All importers' uses of an imported name + the definer's def share ONE
+    /// `Global(definerFileId, name)`. An importer's use resolves THROUGH the import
+    /// edge to the definer's FileId.
+    #[test]
+    fn imported_use_lifts_to_definer_global_identity() {
+        let a_src = "export fn f(x) { return x }\n";
+        let b_src = "import { f } from \"./a\"\nprint(f(1))\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        // The definer's def identity (cursor on `f`'s decl in a.as).
+        let a_decl = a_src.find("f(x)").unwrap();
+        let id_def = index.binding_id_at(&a, a_decl).expect("def identity");
+        // B's use of `f` (in `print(f(1))`).
+        let b_use = b_src.find("f(1)").unwrap();
+        let id_use = index.binding_id_at(&b, b_use).expect("use identity");
+
+        assert_eq!(
+            id_def, id_use,
+            "importer's use must lift to the definer's Global identity: {id_def:?} vs {id_use:?}"
+        );
+        match &id_def {
+            GlobalBindingId::Global(fid, name) => {
+                assert_eq!(name, "f");
+                assert_eq!(
+                    index.path_of(*fid).map(|p| p.to_path_buf()),
+                    Some(a.clone()),
+                    "the Global's FileId must be the DEFINER (a.as)"
+                );
+            }
+            other => panic!("expected a Global identity, got {other:?}"),
+        }
+    }
+
+    /// Uniform cross-file references: find-references on a binding returns the
+    /// frame-precise local def AND its cross-file uses through ONE identity model.
+    #[test]
+    fn uniform_cross_file_references_through_one_identity() {
+        let a_src = "export fn f(x) { return x }\nlet helper = 1\n";
+        let b_src = "import { f } from \"./a\"\nprint(f(1))\nprint(f(2))\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        let a_decl = a_src.find("f(x)").unwrap();
+        let refs = index.references_at(&a, a_decl, true);
+
+        // The decl in a + BOTH uses in b, all reached through the unified identity.
+        assert!(refs.iter().any(|(p, _)| *p == a), "a decl: {refs:?}");
+        let b_uses = refs.iter().filter(|(p, _)| *p == b).count();
+        assert_eq!(b_uses, 2, "both f(1) and f(2) uses in b: {refs:?}");
+    }
 }

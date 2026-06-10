@@ -311,4 +311,127 @@ mod tests {
         let r = resolve(h);
         assert!(r.tooltip.is_some());
     }
+
+    /// The FIRST inferred-type inlay label in `src` (the `: T` text), or `None` if
+    /// no type hint is emitted. The driver for the per-construct Display scaffold.
+    fn first_type_label(src: &str) -> Option<String> {
+        let m = model(src);
+        let hints = inlay_hints(&m, full_range(&m));
+        hints
+            .iter()
+            .filter(|h| h.kind == Some(InlayHintKind::TYPE))
+            .find_map(|h| match &h.label {
+                InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+    }
+
+    /// DX D3 Task 14 — the per-construct inlay-Display TEST SCAFFOLD.
+    ///
+    /// The DX contract: every `CheckTy` kind renders a SENSIBLE inlay label (so when
+    /// a construct spec adds a new kind, its inlay "just works"). This table pins the
+    /// rendered `: T` label for a representative source snippet of each kind in the
+    /// current `CheckTy` lattice. A construct spec EXTENDS this table with its own kind
+    /// (and, if its Display were non-sensible, would fix `CheckTy::display` first and
+    /// pin the corrected label here).
+    ///
+    /// Each label is the OUTPUT of `crate::check::infer::hover_type_at` → the public
+    /// `CheckTy::display`. The label must read like a user-facing type — never a
+    /// `Debug`-ish (`Class(0)`, `Var(…)`) string. The whole lattice is covered; the
+    /// few kinds the inference pass does not reach on a `let` binding RHS are reached
+    /// through an annotated helper return (the SAME Display path).
+    #[test]
+    fn inlay_display_per_construct_scaffold() {
+        // (case-name, source, expected `: T` inlay label) — extend per construct spec.
+        let cases: &[(&str, &str, &str)] = &[
+            // --- NUM primitives (literal-synthesized concrete subtypes) ---
+            ("int", "let x = 1\n", ": int"),
+            ("float", "let x = 1.5\n", ": float"),
+            ("number", "fn h(): number { return 1 }\nlet x = h()\n", ": number"),
+            // --- other scalar primitives ---
+            ("string", "let x = \"a\"\n", ": string"),
+            ("bool", "let x = true\n", ": bool"),
+            ("nil", "let x = nil\n", ": nil"),
+            // --- a user class (nominal, by declared name — NOT `Class(0)`) ---
+            ("class", "class User {}\nlet x = User()\n", ": User"),
+            // --- an enum (nominal, by declared name) ---
+            (
+                "enum",
+                "enum Color { Red, Green }\nfn h(): Color { return Color.Red }\nlet x = h()\n",
+                ": Color",
+            ),
+            // --- a structural interface (by declared name) ---
+            (
+                "interface",
+                "interface Shape { fn area(): int }\nfn h(): Shape { return y }\nlet x = h()\n",
+                ": Shape",
+            ),
+            // --- constructors ---
+            ("array", "let x = [1, 2]\n", ": array<int>"),
+            (
+                "map",
+                "fn h(): map<string, int> { return {} }\nlet x = h()\n",
+                ": map<string, int>",
+            ),
+            (
+                "future",
+                "async fn f() { return 1 }\nlet x = f()\n",
+                ": future<int>",
+            ),
+            // --- an optional `T?` (the canonical `T?` rendering, not `int | nil`) ---
+            (
+                "optional",
+                "fn g(): int? { return 1 }\nlet x = g()\n",
+                ": int?",
+            ),
+            // --- an INSTANTIATED user generic (the solved type arg surfaces) ---
+            (
+                "generic-classapp",
+                "class Box<T> { value: T }\nlet x = Box(5)\n",
+                ": Box<int>",
+            ),
+        ];
+        for (name, src, expected) in cases {
+            let got = first_type_label(src);
+            assert_eq!(
+                got.as_deref(),
+                Some(*expected),
+                "inlay Display for `{name}` should be `{expected}`, got {got:?}"
+            );
+            // Defensive: no `Debug`-ish leak (a bare variant ctor name) ever reaches
+            // the label — the contract is a user-facing type string.
+            let label = got.unwrap();
+            for debugish in ["Class(", "Var(", "Enum(", "ClassApp(", "Literal(", "EnumVariant("] {
+                assert!(
+                    !label.contains(debugish),
+                    "inlay label `{label}` for `{name}` leaked a Debug form `{debugish}`"
+                );
+            }
+        }
+    }
+
+    /// A generic type PARAMETER (`T`) is a gradual leaf: it widens to `any` in
+    /// `CheckTy::display`, and the inlay layer SUPPRESSES an `any` hint (no noise).
+    /// So an un-annotated binding whose inferred type is a bare type-param emits NO
+    /// type hint — the sensible behavior for the `Var` kind.
+    #[test]
+    fn inlay_generic_param_kind_is_suppressed_as_any() {
+        // Inside `Box<T>.get`, the field `self.value` has the param type `T`; an
+        // un-annotated `let v = self.value` infers a bare `Var` → widens to `any` →
+        // suppressed. (The instantiated form `Box<int>` is covered by the scaffold.)
+        let src = "class Box<T> {\n  value: T\n  fn get() {\n    let v = self.value\n    return v\n  }\n}\n";
+        let m = model(src);
+        let hints = inlay_hints(&m, full_range(&m));
+        // No `: any` label leaks for the `let v` binding.
+        assert!(
+            hints
+                .iter()
+                .filter(|h| h.kind == Some(InlayHintKind::TYPE))
+                .all(|h| match &h.label {
+                    InlayHintLabel::String(s) => s != ": any",
+                    _ => true,
+                }),
+            "a bare type-param binding must not emit an `: any` hint"
+        );
+    }
 }

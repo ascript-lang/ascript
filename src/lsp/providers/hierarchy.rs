@@ -62,10 +62,17 @@ fn is_call_site(
         return false;
     }
     let tree = crate::syntax::tree_builder::build_tree(parsed);
-    // The NameRef whose range is exactly the reference span.
+    // The NameRef whose bare `Ident` TOKEN range is exactly the reference span.
+    // `UseSite.range` (what `references_at` returns) is the use TOKEN range, NOT the
+    // NameRef NODE range — a NameRef node can carry leading whitespace trivia (DX
+    // D3-T12), so we match the Ident token, mirroring `collect_uses`.
     let Some(name_ref) = tree.descendants().find(|n| {
         n.kind() == SyntaxKind::NameRef
-            && crate::check::diagnostic::ByteSpan::from(n.text_range()) == span
+            && n.children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .find(|t| t.kind() == SyntaxKind::Ident)
+                .map(|t| crate::check::diagnostic::ByteSpan::from(t.text_range()) == span)
+                .unwrap_or(false)
     }) else {
         return false;
     };
@@ -205,7 +212,17 @@ pub fn outgoing_calls(
         let Some(name) = crate::syntax::resolve::ident_text(callee) else {
             continue;
         };
-        let call_site = crate::check::diagnostic::ByteSpan::from(callee.text_range());
+        // The callee's bare `Ident` TOKEN range — NOT the NameRef NODE range, which
+        // can carry leading whitespace trivia. `definition_at` resolves a use by the
+        // TOKEN-range `UseSite` (DX D3-T12), so a trivia-inclusive start would land
+        // before the use and silently return `def == None` for every trivia-preceded
+        // callee (the same class of bug fixed for `is_call_site`).
+        let call_site = callee
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == SyntaxKind::Ident)
+            .map(|t| crate::check::diagnostic::ByteSpan::from(t.text_range()))
+            .unwrap_or_else(|| crate::check::diagnostic::ByteSpan::from(callee.text_range()));
         let def = idx.definition_at(&anchor.path, call_site.start);
         out.push(OutgoingCall {
             name,
@@ -416,6 +433,17 @@ mod outgoing_tests {
         let main_off = src.find("fn main").unwrap() + 3;
         let anchor = prepare_call(&idx, &canon, main_off).expect("anchor on main");
         let outs = outgoing_calls(&idx, &model, &anchor);
-        assert!(outs.iter().any(|o| o.name == "a"), "{outs:?}");
+        let call = outs.iter().find(|o| o.name == "a").expect("outgoing call `a`");
+        // The callee `a` in `return a()` has leading trivia; its def must still
+        // resolve (regression guard: a trivia-inclusive call-site offset returned
+        // `def == None` because `UseSite.range` is the Ident TOKEN range, T12).
+        assert!(
+            call.def.is_some(),
+            "outgoing call `a` must resolve its definition: {outs:?}"
+        );
+        // And the reported call-site span is the bare token (1 char `a`), not the
+        // NameRef node + leading space.
+        let span = call.call_site;
+        assert_eq!(span.end - span.start, 1, "call_site should be the `a` token: {span:?}");
     }
 }
