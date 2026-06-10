@@ -2175,3 +2175,196 @@ fn lsp_did_you_mean_quickfix() {
     client.close_stdin();
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
+
+// ─── DX D3 Task 11: the LSP identity unification ─────────────────────────────
+//
+// These exercise `WorkspaceIndex` directly (in-process — no wire) to pin the
+// unified file-qualified identity (`GlobalBindingId`) and the shadow-correct
+// `references_at` join it powers. They are the LOCKED edges from spec §4.1.
+mod identity_unification {
+    use ascript::lsp::workspace::{canon, GlobalBindingId, WorkspaceIndex};
+    use std::path::{Path, PathBuf};
+
+    /// Build an index over in-memory `(path, text)` pairs.
+    fn idx(files: &[(&str, &str)]) -> WorkspaceIndex {
+        let owned: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|(p, t)| (PathBuf::from(p), t.to_string()))
+            .collect();
+        WorkspaceIndex::build_from_files(&owned)
+    }
+
+    /// Shadowed-local cross-file rename/refs: A exports `x`; B imports `x` AND has
+    /// its OWN `let x`. Refs of A's export must include B's IMPORTED uses but NOT
+    /// B's local `x` uses.
+    #[test]
+    fn shadowed_local_refs_do_not_cross_import_boundary() {
+        let a_src = "export let x = 1\n";
+        // B: imports x, prints it (imported use), then shadows with a local `let x`
+        // and prints THAT (local use).
+        let b_src = "import { x } from \"./a\"\nprint(x)\nfn g() {\n  let x = 2\n  print(x)\n}\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        // Refs of A's exported `x` (cursor on the decl in a.as — `let x`, NOT the
+        // `x` inside "export").
+        let a_decl = a_src.find("let x").unwrap() + "let ".len();
+        let refs = index.references_at(&a, a_decl, true);
+
+        // Must include: a.as decl, and B's IMPORTED use `print(x)` (the FIRST `x` use
+        // in b, inside the import clause is a def not a use — the use is `print(x)`).
+        assert!(
+            refs.iter().any(|(p, _)| *p == a),
+            "refs must include a.as decl: {refs:?}"
+        );
+        // B's imported use offset: the `x` inside the FIRST `print(x)` (before the
+        // local block).
+        let imported_use_off = b_src.find("print(x)").unwrap() + "print(".len();
+        assert!(
+            refs.iter()
+                .any(|(p, r)| *p == b && r.start <= imported_use_off && imported_use_off < r.end),
+            "refs of A.x must include B's IMPORTED use: {refs:?}"
+        );
+
+        // Must NOT include B's LOCAL `x` use (inside fn g, the `print(x)` after `let x = 2`).
+        let local_use_off = b_src.rfind("print(x)").unwrap() + "print(".len();
+        assert!(
+            local_use_off != imported_use_off,
+            "test setup: local and imported uses must differ"
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|(p, r)| *p == b && r.start <= local_use_off && local_use_off < r.end),
+            "refs of A.x must NOT include B's shadowing LOCAL `x` use: {refs:?}"
+        );
+    }
+
+    /// The inverse: refs of B's LOCAL `x` must NOT include the import or A's def.
+    #[test]
+    fn shadowing_local_refs_exclude_import_and_definer() {
+        let a_src = "export let x = 1\n";
+        let b_src = "import { x } from \"./a\"\nprint(x)\nfn g() {\n  let x = 2\n  print(x)\n}\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        // Cursor on B's LOCAL decl `let x = 2`.
+        let local_decl_off = b_src.find("let x = 2").unwrap() + "let ".len();
+        let refs = index.references_at(&b, local_decl_off, true);
+
+        // All refs are in B only.
+        assert!(
+            refs.iter().all(|(p, _)| *p == b),
+            "local refs must stay in b.as: {refs:?}"
+        );
+        // Must NOT touch a.as at all.
+        assert!(
+            !refs.iter().any(|(p, _)| *p == a),
+            "local refs must not include the definer file: {refs:?}"
+        );
+        // Must include the local use `print(x)` inside fn g.
+        let local_use_off = b_src.rfind("print(x)").unwrap() + "print(".len();
+        assert!(
+            refs.iter()
+                .any(|(_, r)| r.start <= local_use_off && local_use_off < r.end),
+            "local refs must include the shadowing use: {refs:?}"
+        );
+        // Must NOT include the imported use `print(x)` before the block.
+        let imported_use_off = b_src.find("print(x)").unwrap() + "print(".len();
+        assert!(
+            !refs
+                .iter()
+                .any(|(_, r)| r.start <= imported_use_off && imported_use_off < r.end),
+            "local refs must not include the imported use: {refs:?}"
+        );
+    }
+
+    /// Same-name, same-byte-range, different file → DISTINCT `GlobalBindingId`s.
+    /// Two files each with a `let x` whose decl token sits at the SAME byte offset.
+    /// The old `Local(TextRange)` would collide; `Local(FileId, _)` disambiguates.
+    #[test]
+    fn same_range_different_file_ids_are_distinct() {
+        // Identical bodies → identical byte ranges for the `x` decl.
+        let src = "fn g() {\n  let x = 1\n  print(x)\n}\n";
+        let index = idx(&[("/ws/p.as", src), ("/ws/q.as", src)]);
+        let p = canon(Path::new("/ws/p.as"));
+        let q = canon(Path::new("/ws/q.as"));
+
+        let decl_off = src.find("let x").unwrap() + "let ".len();
+        let id_p = index
+            .binding_id_at(&p, decl_off)
+            .expect("p binding identity");
+        let id_q = index
+            .binding_id_at(&q, decl_off)
+            .expect("q binding identity");
+
+        // Both are Local with the SAME TextRange but DIFFERENT FileId → not equal.
+        assert_ne!(
+            id_p, id_q,
+            "same-range locals in different files must be distinct GlobalBindingIds: {id_p:?} vs {id_q:?}"
+        );
+        match (&id_p, &id_q) {
+            (GlobalBindingId::Local(fp, rp), GlobalBindingId::Local(fq, rq)) => {
+                assert_eq!(rp, rq, "ranges should be identical (same source)");
+                assert_ne!(fp, fq, "FileIds must differ");
+            }
+            other => panic!("expected two Local ids, got {other:?}"),
+        }
+    }
+
+    /// All importers' uses of an imported name + the definer's def share ONE
+    /// `Global(definerFileId, name)`. An importer's use resolves THROUGH the import
+    /// edge to the definer's FileId.
+    #[test]
+    fn imported_use_lifts_to_definer_global_identity() {
+        let a_src = "export fn f(x) { return x }\n";
+        let b_src = "import { f } from \"./a\"\nprint(f(1))\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        // The definer's def identity (cursor on `f`'s decl in a.as).
+        let a_decl = a_src.find("f(x)").unwrap();
+        let id_def = index.binding_id_at(&a, a_decl).expect("def identity");
+        // B's use of `f` (in `print(f(1))`).
+        let b_use = b_src.find("f(1)").unwrap();
+        let id_use = index.binding_id_at(&b, b_use).expect("use identity");
+
+        assert_eq!(
+            id_def, id_use,
+            "importer's use must lift to the definer's Global identity: {id_def:?} vs {id_use:?}"
+        );
+        match &id_def {
+            GlobalBindingId::Global(fid, name) => {
+                assert_eq!(name, "f");
+                assert_eq!(
+                    index.path_of(*fid).map(|p| p.to_path_buf()),
+                    Some(a.clone()),
+                    "the Global's FileId must be the DEFINER (a.as)"
+                );
+            }
+            other => panic!("expected a Global identity, got {other:?}"),
+        }
+    }
+
+    /// Uniform cross-file references: find-references on a binding returns the
+    /// frame-precise local def AND its cross-file uses through ONE identity model.
+    #[test]
+    fn uniform_cross_file_references_through_one_identity() {
+        let a_src = "export fn f(x) { return x }\nlet helper = 1\n";
+        let b_src = "import { f } from \"./a\"\nprint(f(1))\nprint(f(2))\n";
+        let index = idx(&[("/ws/a.as", a_src), ("/ws/b.as", b_src)]);
+        let a = canon(Path::new("/ws/a.as"));
+        let b = canon(Path::new("/ws/b.as"));
+
+        let a_decl = a_src.find("f(x)").unwrap();
+        let refs = index.references_at(&a, a_decl, true);
+
+        // The decl in a + BOTH uses in b, all reached through the unified identity.
+        assert!(refs.iter().any(|(p, _)| *p == a), "a decl: {refs:?}");
+        let b_uses = refs.iter().filter(|(p, _)| *p == b).count();
+        assert_eq!(b_uses, 2, "both f(1) and f(2) uses in b: {refs:?}");
+    }
+}

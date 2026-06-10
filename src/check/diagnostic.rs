@@ -4,7 +4,7 @@
 //! the analysis core stays feature-independent and serde-free.
 
 /// A byte-offset span into the source text (half-open: `[start, end)`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ByteSpan {
     pub start: usize,
     pub end: usize,

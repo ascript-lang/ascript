@@ -40,12 +40,21 @@ pub struct SymbolDef {
 
 /// Where a name USE resolves (within the file's own resolution; the cross-file
 /// link is computed via the import edge + the target file's `exports`).
+///
+/// This is FRAME-PRECISE (DX D3 Task 11): a `LocalDecl` use carries the byte range
+/// of the binding's DECLARATION as resolved by the per-file `syntax::resolve` frame
+/// walk — NOT a name-coarse match — so two same-named sibling locals / a shadow of
+/// an imported name resolve to distinct targets. The cross-file identity is then
+/// lifted by pairing this with the file's [`FileId`] (see [`GlobalBindingId`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedTarget {
-    /// Resolves to a definition in the SAME file (its name-range).
-    LocalDef(ByteSpan),
+    /// A `Local`/`Upvalue` use: the byte range of its DECL in the SAME file
+    /// (frame-precise — the exact shadowing binding, not the first by name).
+    LocalDecl(ByteSpan),
+    /// A MODULE-GLOBAL use whose definer is THIS file: the def's name-range.
+    GlobalDef(ByteSpan),
     /// An imported name: `module` is the resolved file path (or `None` for std),
-    /// `name` the imported symbol.
+    /// `name` the imported symbol. Lifts THROUGH the import edge to the definer.
     Imported {
         module: Option<PathBuf>,
         name: String,
@@ -84,10 +93,77 @@ pub struct FileIndex {
     pub uses: Vec<UseSite>,
     /// Import edges out of this file.
     pub imports: Vec<ImportEdge>,
+    /// DX D3 Task 11: every NON-global (frame-local) binding's `(name-token range,
+    /// frame-precise decl range)`. Lets `binding_id_at` resolve a cursor sitting on
+    /// a LOCAL declaration (e.g. a `let x` inside a function) to its file-qualified
+    /// `GlobalBindingId::Local(thisFile, decl_range)` — the in-file frame-precise
+    /// projection, lifted by FileId.
+    pub local_decls: Vec<(ByteSpan, ByteSpan)>,
     /// `true` if the file parsed without a syntax error. On a parse error the
     /// previous (last-good) `FileIndex` is retained, so this is only `false` for a
     /// freshly-added file that never parsed.
     pub parsed_ok: bool,
+}
+
+/// A stable, file-qualified identity for the workspace (DX D3 Task 11). Interned
+/// over the index's canonical `PathBuf` keys; stable for the index's lifetime. The
+/// disambiguator that makes two same-named, same-byte-range locals in DIFFERENT
+/// files distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileId(pub u32);
+
+/// The UNIFIED binding identity shared by in-file and cross-file navigation
+/// (DX D3 Task 11, spec §4.1). The single model that replaces the old divergence
+/// between frame-precise in-file `navigation::BindingId` and name-coarse cross-file
+/// matching:
+///
+/// - a `Local`/`Upvalue` use lifts to `Local(use's FileId, its DECL TextRange)` —
+///   frame-precise AND file-qualified (so a same-range local in another file is a
+///   DISTINCT identity);
+/// - a module-global / exported name lifts to `Global(definer FileId, name)`. An
+///   importer's use of an imported name resolves THROUGH its `ImportEdge` to the
+///   DEFINER's `FileId`, so every importer's use + the def collapse to ONE
+///   `Global(definerFileId, name)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GlobalBindingId {
+    /// A frame-precise local/upvalue: the use's file + its decl's byte range.
+    Local(FileId, ByteSpan),
+    /// A module-global / export: the DEFINER's file + the exported name.
+    Global(FileId, String),
+}
+
+/// A `PathBuf <-> FileId` interner (an additive side-table; the `files` map stays
+/// keyed by `PathBuf`). Ids are assigned densely and never reused for the index's
+/// lifetime, so a `FileId` is a stable handle.
+#[derive(Debug, Clone, Default)]
+pub struct FileInterner {
+    /// `FileId(i)` -> the canonical path at index `i`.
+    paths: Vec<PathBuf>,
+    /// Reverse: canonical path -> its `FileId`.
+    ids: HashMap<PathBuf, FileId>,
+}
+
+impl FileInterner {
+    /// Intern `canon` (already canonical), returning its stable [`FileId`].
+    fn intern(&mut self, canon: &Path) -> FileId {
+        if let Some(id) = self.ids.get(canon) {
+            return *id;
+        }
+        let id = FileId(self.paths.len() as u32);
+        self.paths.push(canon.to_path_buf());
+        self.ids.insert(canon.to_path_buf(), id);
+        id
+    }
+
+    /// The [`FileId`] of `canon` if it has been interned.
+    fn get(&self, canon: &Path) -> Option<FileId> {
+        self.ids.get(canon).copied()
+    }
+
+    /// The canonical path of `id`.
+    fn path(&self, id: FileId) -> Option<&Path> {
+        self.paths.get(id.0 as usize).map(|p| p.as_path())
+    }
 }
 
 /// The cross-file symbol index over a set of `.as` files.
@@ -101,6 +177,9 @@ pub struct WorkspaceIndex {
     pub import_edges: HashMap<PathBuf, Vec<ImportEdge>>,
     /// Reverse edges: module path -> the set of files that import it.
     pub importers: HashMap<PathBuf, HashSet<PathBuf>>,
+    /// DX D3 Task 11: the `PathBuf <-> FileId` interner backing the unified
+    /// [`GlobalBindingId`]. An additive side-table over the canonical `files` keys.
+    interner: FileInterner,
 }
 
 impl WorkspaceIndex {
@@ -121,6 +200,105 @@ impl WorkspaceIndex {
         idx
     }
 
+    // ---- DX D3 Task 11: file-qualified identity ---------------------------
+
+    /// The stable [`FileId`] of `path` (canonicalized first), if it is indexed.
+    pub fn file_id(&self, path: &Path) -> Option<FileId> {
+        self.interner.get(&canonicalize(path))
+    }
+
+    /// The canonical path of a [`FileId`].
+    pub fn path_of(&self, id: FileId) -> Option<&Path> {
+        self.interner.path(id)
+    }
+
+    /// The UNIFIED [`GlobalBindingId`] the cursor at byte `offset` in `path`
+    /// refers to — the single identity both in-file and cross-file navigation
+    /// share (DX D3 Task 11). The cursor may sit on a definition, a same-file
+    /// frame-precise local/upvalue use, a module-global use, or an imported use.
+    ///
+    /// The lift:
+    /// - a `Local`/`Upvalue` use → `Local(this file's FileId, its DECL range)`
+    ///   (frame-precise — the exact shadowing binding);
+    /// - a module-global def/use in THIS file → `Global(this FileId, name)`;
+    /// - an imported use → resolve the [`ImportEdge`] to the DEFINER file and
+    ///   return `Global(definer FileId, name)`, so every importer's use and the
+    ///   def collapse to ONE identity.
+    pub fn binding_id_at(&self, path: &Path, offset: usize) -> Option<GlobalBindingId> {
+        let canon = canonicalize(path);
+        let file = self.files.get(&canon)?;
+        let this_id = self.interner.get(&canon)?;
+
+        // 1) On a top-level definition's own name token?
+        for d in &file.defs {
+            if offset >= d.name_range.start && offset < d.name_range.end {
+                return self.def_identity(&canon, this_id, d);
+            }
+        }
+        // 2) On a frame-LOCAL declaration's name token? → file-qualified Local.
+        for (name_tok, decl) in &file.local_decls {
+            if offset >= name_tok.start && offset < name_tok.end {
+                return Some(GlobalBindingId::Local(this_id, *decl));
+            }
+        }
+        // 3) On a use? Lift its frame-precise/cross-file target.
+        let site = file
+            .uses
+            .iter()
+            .find(|u| offset >= u.range.start && offset < u.range.end)?;
+        self.use_identity(&canon, this_id, site)
+    }
+
+    /// The identity of a DEFINITION site in `canon` (FileId `this_id`).
+    fn def_identity(
+        &self,
+        canon: &Path,
+        this_id: FileId,
+        d: &SymbolDef,
+    ) -> Option<GlobalBindingId> {
+        if d.kind == DefKind::Import {
+            // An import binding's identity IS the definer's Global identity.
+            if let Some((m, _)) = self.definition_at(canon, d.name_range.start) {
+                let def_id = self.interner.get(&m)?;
+                return Some(GlobalBindingId::Global(def_id, d.name.clone()));
+            }
+            // An unresolved/std import: fall back to a this-file Global.
+            return Some(GlobalBindingId::Global(this_id, d.name.clone()));
+        }
+        // A top-level decl is a module-global → Global(thisFile, name).
+        Some(GlobalBindingId::Global(this_id, d.name.clone()))
+    }
+
+    /// The identity of a USE site in `canon` (FileId `this_id`).
+    fn use_identity(
+        &self,
+        canon: &Path,
+        this_id: FileId,
+        site: &UseSite,
+    ) -> Option<GlobalBindingId> {
+        match &site.target {
+            // Frame-precise local/upvalue → file-qualified by THIS file.
+            ResolvedTarget::LocalDecl(decl) => Some(GlobalBindingId::Local(this_id, *decl)),
+            // A module-global whose definer is this file.
+            ResolvedTarget::GlobalDef(_) => {
+                Some(GlobalBindingId::Global(this_id, site.name.clone()))
+            }
+            // An imported name → lift THROUGH the edge to the definer's FileId.
+            ResolvedTarget::Imported {
+                module: Some(module),
+                name,
+            } => {
+                let def_id = self.interner.get(module)?;
+                Some(GlobalBindingId::Global(def_id, name.clone()))
+            }
+            // A std import or otherwise unresolved use has no workspace identity.
+            ResolvedTarget::Imported { module: None, .. } | ResolvedTarget::Other => {
+                let _ = canon;
+                None
+            }
+        }
+    }
+
     /// Re-index a single file (incremental update on `didOpen`/`didChange`). On a
     /// parse error the file's LAST-GOOD index is retained (navigation degrades
     /// gracefully); a never-parsed file gets an empty `parsed_ok = false` entry.
@@ -129,6 +307,9 @@ impl WorkspaceIndex {
     /// import edge, so editing one file never invalidates another's own index.
     pub fn reindex_file(&mut self, path: &Path, text: &str) {
         let canon = canonicalize(path);
+        // Intern the file so it has a stable FileId for the unified identity, even
+        // if it never parses cleanly (a known-to-exist file is still file-qualified).
+        self.interner.intern(&canon);
         let parsed = crate::syntax::parser::parse(text);
         let parsed_ok = parsed.errors.is_empty() && parsed.lex_errors.is_empty();
 
@@ -333,7 +514,9 @@ impl WorkspaceIndex {
             .iter()
             .find(|u| offset >= u.range.start && offset < u.range.end)?;
         match &site.target {
-            ResolvedTarget::LocalDef(span) => Some((canon, *span)),
+            ResolvedTarget::LocalDecl(span) | ResolvedTarget::GlobalDef(span) => {
+                Some((canon, *span))
+            }
             ResolvedTarget::Imported {
                 module: Some(module),
                 name,
@@ -379,38 +562,62 @@ impl WorkspaceIndex {
         offset: usize,
         include_decl: bool,
     ) -> Vec<(PathBuf, ByteSpan)> {
-        // Resolve the cursor to a canonical definition (path + name + range).
-        let Some((def_path, def_name, def_range)) = self.def_at(path, offset) else {
+        // DX D3 Task 11: resolve the cursor to the UNIFIED identity, then collect
+        // every use (and the decl) whose lifted `GlobalBindingId` EQUALS it. This is
+        // the frame-precise join — a use is a reference iff it shares the identity,
+        // NOT iff it shares the name (so a shadowing local of an imported name is
+        // correctly excluded).
+        let canon = canonicalize(path);
+        let Some(target_id) = self.binding_id_at(&canon, offset) else {
             return Vec::new();
         };
         let mut out: Vec<(PathBuf, ByteSpan)> = Vec::new();
+
+        // The decl site + the set of files to scan, derived from the identity.
+        let resolved: Option<(PathBuf, ByteSpan, Vec<PathBuf>)> = match &target_id {
+            GlobalBindingId::Local(fid, decl) => {
+                // A frame-precise local: the decl + uses live in ONE file only.
+                self.interner.path(*fid).map(|p| {
+                    let p = p.to_path_buf();
+                    (p.clone(), *decl, vec![p])
+                })
+            }
+            GlobalBindingId::Global(fid, name) => self.interner.path(*fid).and_then(|p| {
+                let p = p.to_path_buf();
+                // The definer's name-range for the decl edit.
+                let range = self
+                    .files
+                    .get(&p)
+                    .and_then(|f| {
+                        f.defs
+                            .iter()
+                            .find(|d| d.name == *name && d.kind != DefKind::Import)
+                    })
+                    .map(|d| d.name_range)?;
+                // Scan the definer + every importer of it.
+                let mut scan = vec![p.clone()];
+                if let Some(importers) = self.importers.get(&p) {
+                    scan.extend(importers.iter().cloned());
+                }
+                Some((p, range, scan))
+            }),
+        };
+        let Some((def_path, def_range, scan)) = resolved else {
+            return out;
+        };
+
         if include_decl {
             out.push((def_path.clone(), def_range));
-        }
-        // Scan the def's own file + every importer of it for uses targeting it.
-        let mut scan: Vec<PathBuf> = vec![def_path.clone()];
-        if let Some(importers) = self.importers.get(&def_path) {
-            scan.extend(importers.iter().cloned());
         }
         for file_path in scan {
             let Some(file) = self.files.get(&file_path) else {
                 continue;
             };
+            let Some(this_id) = self.interner.get(&file_path) else {
+                continue;
+            };
             for u in &file.uses {
-                if u.name != def_name {
-                    continue;
-                }
-                let hit = match &u.target {
-                    ResolvedTarget::LocalDef(span) => {
-                        file_path == def_path && *span == def_range
-                    }
-                    ResolvedTarget::Imported {
-                        module: Some(m),
-                        name,
-                    } => *m == def_path && *name == def_name,
-                    _ => false,
-                };
-                if hit {
+                if self.use_identity(&file_path, this_id, u).as_ref() == Some(&target_id) {
                     out.push((file_path.clone(), u.range));
                 }
             }
@@ -808,6 +1015,7 @@ fn build_file_index(
     }
 
     let uses = collect_uses(&tree, &resolved, &defs, &imports, dir);
+    let local_decls = collect_local_decls(&tree, &resolved);
 
     FileIndex {
         text: text.to_string(),
@@ -815,8 +1023,49 @@ fn build_file_index(
         defs,
         uses,
         imports,
+        local_decls,
         parsed_ok: true,
     }
+}
+
+/// Every NON-global (frame-local) binding's `(name-token range, decl range)` — so a
+/// cursor on a local DECL resolves to its frame-precise `GlobalBindingId::Local`.
+/// The name-token range narrows the binding's full `decl_range` to its identifier
+/// (mirroring `navigation::name_token_range_for`).
+fn collect_local_decls(
+    tree: &crate::syntax::cst::ResolvedNode,
+    resolved: &crate::syntax::resolve::types::ResolveResult,
+) -> Vec<(ByteSpan, ByteSpan)> {
+    let mut out = Vec::new();
+    for b in &resolved.bindings {
+        if b.is_global {
+            continue;
+        }
+        let name_tok = name_token_in_range(tree, b.decl_range, &b.name).unwrap_or(b.decl_range);
+        out.push((ByteSpan::from(name_tok), ByteSpan::from(b.decl_range)));
+    }
+    out
+}
+
+/// The NAME-token range of `name` within the node at `decl_range` (its first
+/// matching `Ident`, falling back to the first `Ident`). `None` if no node has that
+/// exact range. Mirrors `navigation::name_token_range_for`.
+fn name_token_in_range(
+    tree: &crate::syntax::cst::ResolvedNode,
+    decl_range: cstree::text::TextRange,
+    name: &str,
+) -> Option<cstree::text::TextRange> {
+    let node = tree.descendants().find(|n| n.text_range() == decl_range)?;
+    let idents: Vec<_> = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token().cloned())
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .collect();
+    idents
+        .iter()
+        .find(|t| t.text() == name)
+        .or_else(|| idents.first())
+        .map(|t| t.text_range())
 }
 
 /// The [`DefKind`] of a top-level declaration node, or `None` if it binds nothing.
@@ -899,8 +1148,16 @@ fn import_names(
     out
 }
 
-/// Project the resolver's `uses` into [`UseSite`]s with cross-file targets. A use
-/// of an imported name is linked to its module's path via the import edge.
+/// Project the resolver's `uses` into [`UseSite`]s with FRAME-PRECISE targets
+/// (DX D3 Task 11). Each `NameRef` is classified by the per-file `syntax::resolve`
+/// verdict FIRST (not by a name-coarse import-membership test), so a LOCAL that
+/// shadows an imported name resolves to its own decl — NOT to the import:
+///
+/// - `Resolution::Local`/`Upvalue` → `LocalDecl(its frame-precise DECL range)`;
+/// - `Resolution::Global(name)` where `name` is an IMPORTED name → `Imported`
+///   (lifts through the edge to the definer); otherwise → `GlobalDef(this file's
+///   def name-range)`;
+/// - everything else → `Other`.
 fn collect_uses(
     tree: &crate::syntax::cst::ResolvedNode,
     resolved: &crate::syntax::resolve::types::ResolveResult,
@@ -911,18 +1168,21 @@ fn collect_uses(
     use crate::syntax::resolve::types::Resolution;
     use SyntaxKind::*;
     // Map an imported NAME -> its resolved module path (first import wins).
-    let mut import_module: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut import_module: HashMap<&str, Option<PathBuf>> = HashMap::new();
     for e in imports {
         for n in &e.names {
             import_module
-                .entry(n.clone())
+                .entry(n.as_str())
                 .or_insert_with(|| e.resolved.clone());
         }
     }
-    // Map a local def NAME -> its name_range (for same-file LocalDef targets).
-    let mut local_def: HashMap<&str, ByteSpan> = HashMap::new();
+    // Map a module-global def NAME -> its name_range (for same-file GlobalDef
+    // targets). Import bindings are excluded (they are not the definer).
+    let mut global_def: HashMap<&str, ByteSpan> = HashMap::new();
     for d in defs {
-        local_def.entry(d.name.as_str()).or_insert(d.name_range);
+        if d.kind != DefKind::Import {
+            global_def.entry(d.name.as_str()).or_insert(d.name_range);
+        }
     }
 
     let mut out = Vec::new();
@@ -930,18 +1190,29 @@ fn collect_uses(
         let Some(name) = crate::syntax::resolve::ident_text(nameref) else {
             continue;
         };
-        let range = ByteSpan::from(nameref.text_range());
-        let target = match resolved.uses.get(&nameref.text_range()) {
-            // A use that resolves to an imported name → cross-file target.
-            _ if import_module.contains_key(&name) => ResolvedTarget::Imported {
-                module: import_module.get(&name).cloned().flatten(),
-                name: name.clone(),
-            },
-            // A use that resolves to a file-local global → same-file def.
-            Some(Resolution::Global(_)) | Some(Resolution::Local(_) | Resolution::Upvalue(_)) => {
-                match local_def.get(name.as_str()) {
-                    Some(span) => ResolvedTarget::LocalDef(*span),
+        let use_range = nameref.text_range();
+        let range = ByteSpan::from(use_range);
+        // FRAME-PRECISE: branch on the resolver's OWN verdict first.
+        let target = match resolved.uses.get(&use_range) {
+            // A local/upvalue use → its exact decl range (the shadowing binding).
+            Some(Resolution::Local(_) | Resolution::Upvalue(_)) => {
+                match frame_precise_decl(resolved, use_range) {
+                    Some(decl) => ResolvedTarget::LocalDecl(ByteSpan::from(decl)),
                     None => ResolvedTarget::Other,
+                }
+            }
+            // A module-global use. If it is an IMPORTED name, lift through the
+            // edge; otherwise it is defined in THIS file.
+            Some(Resolution::Global(_)) => {
+                if let Some(module) = import_module.get(name.as_str()) {
+                    ResolvedTarget::Imported {
+                        module: module.clone(),
+                        name: name.clone(),
+                    }
+                } else if let Some(span) = global_def.get(name.as_str()) {
+                    ResolvedTarget::GlobalDef(*span)
+                } else {
+                    ResolvedTarget::Other
                 }
             }
             _ => ResolvedTarget::Other,
@@ -953,6 +1224,117 @@ fn collect_uses(
         });
     }
     out
+}
+
+/// The FRAME-PRECISE declaration `TextRange` a `Local`/`Upvalue` use resolves to,
+/// computed by the SAME frame walk the in-file `navigation::BindingId` uses (here
+/// lifted onto the `ResolveResult` directly so the workspace index shares ONE
+/// resolution model). `None` if the use is not a local/upvalue or its binding
+/// cannot be located.
+fn frame_precise_decl(
+    resolved: &crate::syntax::resolve::types::ResolveResult,
+    use_range: cstree::text::TextRange,
+) -> Option<cstree::text::TextRange> {
+    use crate::syntax::resolve::types::{Resolution, UpvalueDescriptor};
+    let binding = match resolved.uses.get(&use_range)? {
+        Resolution::Local(slot) => {
+            let frame = innermost_frame_containing(resolved, use_range.start().into())?;
+            binding_in_frame(resolved, frame, *slot)?
+        }
+        Resolution::Upvalue(idx) => {
+            let mut frame = innermost_frame_containing(resolved, use_range.start().into())?;
+            let mut idx = *idx as usize;
+            loop {
+                let info = resolved.frames.get(&frame)?;
+                match info.upvalues.get(idx)? {
+                    UpvalueDescriptor::ParentLocal { slot, .. } => {
+                        let parent = parent_frame(resolved, frame.1)?;
+                        break binding_in_frame(resolved, parent, *slot)?;
+                    }
+                    UpvalueDescriptor::ParentUpvalue(parent_idx) => {
+                        frame = parent_frame(resolved, frame.1)?;
+                        idx = *parent_idx as usize;
+                    }
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(binding.decl_range)
+}
+
+/// The `(SyntaxKind, TextRange)` of the INNERMOST frame whose range contains `offset`.
+/// Mirrors `navigation::innermost_frame_containing` over the `ResolveResult`.
+fn innermost_frame_containing(
+    resolved: &crate::syntax::resolve::types::ResolveResult,
+    offset: usize,
+) -> Option<(SyntaxKind, cstree::text::TextRange)> {
+    resolved
+        .frames
+        .keys()
+        .filter(|(_, r)| {
+            let s: usize = r.start().into();
+            let e: usize = r.end().into();
+            offset >= s && offset < e
+        })
+        .min_by_key(|(_, r)| u32::from(r.end()) - u32::from(r.start()))
+        .copied()
+}
+
+/// The INNERMOST frame STRICTLY containing `child` — its parent frame. Mirrors
+/// `navigation::parent_frame`.
+fn parent_frame(
+    resolved: &crate::syntax::resolve::types::ResolveResult,
+    child: cstree::text::TextRange,
+) -> Option<(SyntaxKind, cstree::text::TextRange)> {
+    let cs: u32 = child.start().into();
+    let ce: u32 = child.end().into();
+    resolved
+        .frames
+        .keys()
+        .filter(|(_, r)| {
+            let s: u32 = r.start().into();
+            let e: u32 = r.end().into();
+            s <= cs && e >= ce && (e - s) > (ce - cs)
+        })
+        .min_by_key(|(_, r)| u32::from(r.end()) - u32::from(r.start()))
+        .copied()
+}
+
+/// The binding with `slot` whose OWNING frame is `frame`. Mirrors
+/// `navigation::binding_in_frame`.
+fn binding_in_frame(
+    resolved: &crate::syntax::resolve::types::ResolveResult,
+    frame: (SyntaxKind, cstree::text::TextRange),
+    slot: u32,
+) -> Option<&crate::syntax::resolve::types::Binding> {
+    resolved.bindings.iter().find(|b| {
+        !b.is_global
+            && b.slot == slot
+            && owning_frame_of(resolved, b.decl_range)
+                .map(|f| f == frame)
+                .unwrap_or(false)
+    })
+}
+
+/// The innermost frame whose range CONTAINS `decl_range`. Mirrors
+/// `navigation::owning_frame_of`.
+fn owning_frame_of(
+    resolved: &crate::syntax::resolve::types::ResolveResult,
+    decl_range: cstree::text::TextRange,
+) -> Option<(SyntaxKind, cstree::text::TextRange)> {
+    let ds: u32 = decl_range.start().into();
+    let de: u32 = decl_range.end().into();
+    resolved
+        .frames
+        .keys()
+        .filter(|(_, r)| {
+            let s: u32 = r.start().into();
+            let e: u32 = r.end().into();
+            s <= ds && e >= de
+        })
+        .min_by_key(|(_, r)| u32::from(r.end()) - u32::from(r.start()))
+        .copied()
 }
 
 #[cfg(test)]
