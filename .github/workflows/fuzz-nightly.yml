@@ -115,6 +115,39 @@ jobs:
           cargo +nightly fuzz run aso_roundtrip -- \
             -max_total_time=900 -rss_limit_mb=4096 -timeout=120
 
+      - name: Reader coverage report (aso_roundtrip only — the BIN coverage floor)
+        if: matrix.target == 'aso_roundtrip'
+        continue-on-error: true
+        run: |
+          # The BIN gate's SECOND condition (spec §4.1): the accumulated corpus must reach
+          # >= 90% line coverage of the `read_*` family in `src/vm/aso.rs`. Generate the
+          # coverage profile over the (committed + grown) corpus and emit a `read_*`-filtered
+          # line-coverage summary; it is uploaded as an artifact for the BIN Task 0 record.
+          # `continue-on-error` so a coverage-tooling hiccup never masks a real crash finding.
+          rustup component add llvm-tools-preview --toolchain nightly || true
+          cargo +nightly fuzz coverage aso_roundtrip
+          COV=$(find target -name 'coverage' -path '*aso_roundtrip*' -type d | head -1)
+          PROF="fuzz/coverage/aso_roundtrip/coverage.profdata"
+          BIN=$(find target -path '*aso_roundtrip*' -name 'aso_roundtrip' -type f | head -1)
+          mkdir -p fuzz/coverage-report
+          if [ -n "$BIN" ] && [ -f "$PROF" ]; then
+            LLVM_COV=$(find "$(rustc +nightly --print sysroot)" -name llvm-cov | head -1)
+            "$LLVM_COV" report "$BIN" -instr-profile="$PROF" \
+              -name-regex='read_.*' src/vm/aso.rs | tee fuzz/coverage-report/read_family.txt
+            echo "NOTE: the BIN gate requires >= 90% line coverage of the read_* family (manual check)."
+          else
+            echo "coverage artifacts not found (profdata=$PROF bin=$BIN) — see logs" | tee fuzz/coverage-report/read_family.txt
+          fi
+
+      - name: Upload reader coverage report (aso_roundtrip)
+        if: matrix.target == 'aso_roundtrip'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-coverage-aso_roundtrip-${{ github.run_id }}
+          path: fuzz/coverage-report/
+          if-no-files-found: ignore
+
       - name: Upload crash reproducer (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
