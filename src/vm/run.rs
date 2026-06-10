@@ -274,6 +274,17 @@ impl Vm {
             .and_then(|mut i| i.breakpoints.take())
     }
 
+    /// **DBG Task 7.** Reclaim the armed
+    /// [`ProfilerHook`](crate::vm::instrument::ProfilerHook) (if any). The profiled-run
+    /// driver calls this after `run` returns to stop the sampler (joining its thread in
+    /// wallclock mode) and aggregate its samples. `None` if no profiler was armed.
+    pub fn take_profiler(&self) -> Option<crate::vm::instrument::ProfilerHook> {
+        self.instrument
+            .borrow_mut()
+            .as_mut()
+            .and_then(|i| i.profiler.take())
+    }
+
     /// **DBG.** Register the program's proto tree for source-line breakpoint resolution.
     /// Walks `entry` and recursively each `chunk.protos`, storing every `Rc<FnProto>`
     /// flat in `debug_protos`. A debugger/launcher calls this once before `run` under
@@ -504,6 +515,58 @@ impl Vm {
     fn leave_frame_depth(&self) {
         let depth = self.interp.call_depth_cell();
         depth.set(depth.get() - 1);
+    }
+
+    /// **DBG Task 7 — the CPU-profiler publish seam (zero-cost when off).**
+    ///
+    /// Publishes the CURRENT frame-name stack (root → leaf) into the armed
+    /// profiler hook's `Send` snapshot, so a sampler thread (wallclock mode) or the
+    /// inline recorder (deterministic mode) can capture it. Called right AFTER every
+    /// frame push and right AFTER every frame pop, so the published stack always
+    /// reflects the NEW depth.
+    ///
+    /// # Zero-cost when no profiler is armed (Gate 12)
+    ///
+    /// The fast path is a SINGLE `None`-check: if `instrument` is `None`, or its
+    /// `profiler` sub-feature is `None`, this returns IMMEDIATELY without touching
+    /// `fiber.frames` or allocating anything. The per-instruction dispatch loop is
+    /// UNCHANGED — this is only called at the per-CALL push/pop sites (already cold
+    /// relative to dispatch), mirroring the placement of `enter_frame_depth` /
+    /// `leave_frame_depth`. When no profiler is armed the cost is exactly that one
+    /// borrow + two pointer comparisons.
+    ///
+    /// # The airlock
+    ///
+    /// Only owned `String`s cross to the sampler thread — each frame maps to its
+    /// `proto.debug_name` clone (or `"<anon>"` when unnamed), with the bottom (root)
+    /// frame rendered as `"<script>"`. No `Value`/`Rc`/`Cc` ever crosses.
+    fn publish_profile_frames(&self, fiber: &Fiber) {
+        // FAST PATH (Gate 12): a single None-check, BEFORE building anything.
+        {
+            let inst = self.instrument.borrow();
+            if inst.as_ref().and_then(|i| i.profiler.as_ref()).is_none() {
+                return;
+            }
+        }
+        // Armed: build the owned-String stack (root → leaf). Bottom frame = "<script>".
+        let mut stack: Vec<String> = Vec::with_capacity(fiber.frames.len());
+        for (i, frame) in fiber.frames.iter().enumerate() {
+            let name = match &frame.closure.proto.debug_name {
+                Some(n) => n.to_string(),
+                None if i == 0 => "<script>".to_string(),
+                None => "<anon>".to_string(),
+            };
+            stack.push(name);
+        }
+        let mut inst = self.instrument.borrow_mut();
+        if let Some(hook) = inst.as_mut().and_then(|i| i.profiler.as_mut()) {
+            hook.publish(stack);
+            // Deterministic mode: each push/pop also records a sample inline, so the
+            // sample set is a pure function of call structure (golden-stable).
+            if hook.mode == crate::vm::instrument::ProfileMode::Deterministic {
+                hook.record_inline_sample();
+            }
+        }
     }
 
     /// Force a full cycle collection (V13-T3). Thin pass-through to
@@ -1507,6 +1570,9 @@ impl Vm {
                                 def_class: None,
                                 argc: supplied,
                             });
+                            // DBG Task 7: publish the new (deeper) frame stack to an
+                            // armed profiler. Zero-cost None-check when off.
+                            self.publish_profile_frames(fiber);
                             // Continue the loop in the new frame (the run loop reads
                             // `fiber.frame()` at the top of each iteration). RETURN
                             // pops this frame and restores the caller.
@@ -4494,6 +4560,9 @@ impl Vm {
                     def_class: Some(def_class),
                     argc: supplied,
                 });
+                // DBG Task 7: publish the new (deeper) frame stack to an armed
+                // profiler. Zero-cost None-check when off.
+                self.publish_profile_frames(fiber);
                 // Continue the loop in the new frame; RETURN pops it and pushes the
                 // result onto the caller's stack.
             } else {
@@ -5322,6 +5391,10 @@ impl Vm {
         // SP3 §B: a non-root frame was popped — match the `enter_frame_depth`
         // increment from when it was pushed.
         self.leave_frame_depth();
+        // DBG Task 7: publish the now-shallower frame stack to an armed profiler so a
+        // sample taken after the return attributes time to the caller. Zero-cost
+        // None-check when off.
+        self.publish_profile_frames(fiber);
         fiber.push(value);
         Ok(None)
     }

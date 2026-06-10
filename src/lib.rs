@@ -28,6 +28,13 @@ pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 pub mod parser;
+// DBG Task 7: the CPU sampling profiler's aggregation + output (speedscope JSON +
+// collapsed folded-stacks). Feature-gated (`profile`, default-on); the publish seam
+// itself lives on the VM (`Vm::publish_profile_frames`) behind the single
+// `Vm.instrument` gate. `--no-default-features` builds none of this and `--profile`
+// reports a clean rebuild hint.
+#[cfg(feature = "profile")]
+pub mod profile;
 pub mod repl;
 pub mod span;
 pub mod stdlib;
@@ -650,6 +657,134 @@ pub async fn run_file_on_vm_with_packages(
         Ok(RunOutcome::Done(_)) => Ok(0),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
         // Attach the source so the panic's diagnostic points at this file.
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(0),
+        Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
+/// DBG Task 7: configuration for a CPU-profiled run, assembled from the
+/// `--profile`/`--profile-hz`/`--profile-format`/`-o` CLI flags.
+#[cfg(feature = "profile")]
+pub struct ProfileConfig {
+    /// Wall-clock sampling, or the deterministic (call-structure-driven) sample clock.
+    pub mode: crate::vm::instrument::ProfileMode,
+    /// The wall-clock sampling interval (ignored in deterministic mode).
+    pub interval: std::time::Duration,
+    /// The output artifact format.
+    pub format: crate::profile::ProfileFormat,
+    /// The output file path.
+    pub out: std::path::PathBuf,
+}
+
+/// DBG Task 7: run a `.as` file on the VM under the CPU sampling profiler, then write
+/// the aggregated profile (speedscope JSON or collapsed text) to `cfg.out`.
+///
+/// Behaviorally this is [`run_file_on_vm_with_packages`] with a [`ProfilerHook`] armed
+/// on the VM via [`Vm::with_instrument`] — profiling is OBSERVATION-ONLY, so the
+/// program's stdout/behavior/exit code are byte-identical to a non-profiled run (Gate
+/// 9). On completion the sampler is stopped, the samples aggregated, and the file
+/// written. Returns the same process exit code as the unprofiled path.
+///
+/// [`ProfilerHook`]: crate::vm::instrument::ProfilerHook
+/// [`Vm::with_instrument`]: crate::vm::Vm::with_instrument
+#[cfg(feature = "profile")]
+pub async fn run_file_on_vm_profiled(
+    path: &Path,
+    script_args: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    cfg: ProfileConfig,
+) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::instrument::{Instrumentation, ProfilerHook};
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    chunk.set_module_source(&src_info);
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_cli_args(script_args);
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
+    interp.set_worker_source(&src);
+    if let Some(map) = packages {
+        interp.set_package_resolver(map);
+    }
+    interp.install_self();
+
+    // Arm the profiler hook. In wallclock mode the sampler thread starts now (so it is
+    // already sampling when the run begins); deterministic mode collects inline.
+    let mut hook = ProfilerHook::new(cfg.mode, cfg.interval);
+    hook.start();
+    let vm = Vm::with_instrument(
+        interp.clone(),
+        Instrumentation {
+            breakpoints: None,
+            profiler: Some(hook),
+            coverage: None,
+        },
+    );
+    if let Some(dir) = path.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
+    local.run_until(interp.telemetry_flush_on_exit()).await;
+    local.await;
+    crate::gc::collect();
+
+    // Stop the sampler (joins the thread in wallclock mode) and aggregate. Reclaim the
+    // hook out of the VM's instrumentation seam.
+    let samples = match vm.take_profiler() {
+        Some(hook) => hook.finish(),
+        None => Vec::new(),
+    };
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("program")
+        .to_string();
+    let rendered = crate::profile::format_samples(&samples, cfg.format, &name);
+    std::fs::write(&cfg.out, rendered).map_err(|e| {
+        AsError::new(format!(
+            "cannot write profile to {}: {}",
+            cfg.out.display(),
+            e
+        ))
+    })?;
+
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(0),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         Err(crate::interp::Control::Propagate(_)) => Ok(0),
         Err(crate::interp::Control::Exit(code)) => Ok(code),

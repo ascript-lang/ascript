@@ -51,6 +51,28 @@ enum Command {
         /// hint. The program stops at entry; output rides DAP `output` events.
         #[arg(long = "inspect")]
         inspect: bool,
+        /// DBG: run under the CPU sampling profiler, writing a profile artifact on
+        /// exit. v1 accepts only `cpu` (the arg is reserved for future modes). The
+        /// program runs to completion normally — profiling is observation-only, so its
+        /// stdout is byte-identical to a plain run. Requires the `profile` feature
+        /// (default-on); a `--no-default-features` build reports a rebuild hint.
+        #[arg(long = "profile", value_name = "MODE")]
+        profile: Option<String>,
+        /// DBG: the profile output path (default `profile.json`, or `profile.txt` for
+        /// the collapsed format). Only meaningful with `--profile`.
+        #[arg(long = "out", short = 'o', value_name = "FILE")]
+        out: Option<String>,
+        /// DBG: the profiler's wall-clock sample rate in samples/second (default 1000,
+        /// i.e. ~1ms). Only meaningful with `--profile`.
+        #[arg(long = "profile-hz", value_name = "N")]
+        profile_hz: Option<u32>,
+        /// DBG: the profile artifact format — `speedscope` (default, opens at
+        /// speedscope.app) or `collapsed` (Brendan-Gregg folded stacks). Only
+        /// meaningful with `--profile`. The special value `deterministic-speedscope` /
+        /// `deterministic-collapsed` selects the deterministic (call-structure-driven,
+        /// golden-stable) sample clock — used by goldens/tests, no wall-clock thread.
+        #[arg(long = "profile-format", value_name = "FMT")]
+        profile_format: Option<String>,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -283,6 +305,80 @@ fn compose_caps(
     }
 }
 
+/// DBG Task 7: assemble a [`ascript::ProfileConfig`] from the `--profile`/`-o`/
+/// `--profile-hz`/`--profile-format` flags and run the program profiled. `mode` v1
+/// accepts only `cpu`. The `--profile-format` value also selects the sample clock:
+/// `speedscope`/`collapsed` use the wall-clock sampler thread, while the
+/// `deterministic-*` variants use the inline (call-structure-driven, golden-stable)
+/// clock with no thread.
+#[cfg(feature = "profile")]
+#[allow(clippy::too_many_arguments)]
+async fn run_profiled(
+    path: &std::path::Path,
+    args: &[String],
+    packages: Option<ascript::interp::PackageMap>,
+    caps: Option<ascript::stdlib::caps::CapSet>,
+    mode: &str,
+    out: Option<&str>,
+    profile_hz: Option<u32>,
+    profile_format: Option<&str>,
+) -> Result<i32, ascript::error::AsError> {
+    use ascript::profile::ProfileFormat;
+    use ascript::vm::instrument::ProfileMode;
+
+    if mode != "cpu" {
+        return Err(ascript::error::AsError::new(format!(
+            "unknown profile mode '{mode}' — v1 supports only 'cpu'"
+        )));
+    }
+
+    // Resolve format + sample clock from --profile-format. `deterministic-*` selects
+    // the inline sample clock (golden-stable, no thread); the bare names use the
+    // wall-clock sampler thread.
+    let (format, det) = match profile_format.unwrap_or("speedscope") {
+        "speedscope" => (ProfileFormat::Speedscope, false),
+        "collapsed" => (ProfileFormat::Collapsed, false),
+        "deterministic-speedscope" => (ProfileFormat::Speedscope, true),
+        "deterministic-collapsed" => (ProfileFormat::Collapsed, true),
+        other => {
+            return Err(ascript::error::AsError::new(format!(
+                "unknown profile format '{other}' — expected 'speedscope' or 'collapsed' (optionally 'deterministic-' prefixed)"
+            )));
+        }
+    };
+    let pmode = if det {
+        ProfileMode::Deterministic
+    } else {
+        ProfileMode::Wallclock
+    };
+
+    // Default sample rate 1000 Hz (~1ms); 0 is rejected (no division by zero).
+    let hz = profile_hz.unwrap_or(1000);
+    if hz == 0 {
+        return Err(ascript::error::AsError::new(
+            "--profile-hz must be a positive number of samples per second".to_string(),
+        ));
+    }
+    let interval = std::time::Duration::from_nanos(1_000_000_000u64 / hz as u64);
+
+    // Default output path depends on the format.
+    let out_path = match out {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from(match format {
+            ProfileFormat::Speedscope => "profile.json",
+            ProfileFormat::Collapsed => "profile.txt",
+        }),
+    };
+
+    let cfg = ascript::ProfileConfig {
+        mode: pmode,
+        interval,
+        format,
+        out: out_path,
+    };
+    ascript::run_file_on_vm_profiled(path, args, packages, caps, cfg).await
+}
+
 fn main() -> ExitCode {
     let worker = std::thread::Builder::new()
         .name("ascript-main".to_string())
@@ -365,6 +461,10 @@ async fn real_main() -> ExitCode {
             deny_net,
             deny_fs,
             inspect,
+            profile,
+            out,
+            profile_hz,
+            profile_format,
             file,
             args,
         } => {
@@ -441,6 +541,51 @@ async fn real_main() -> ExitCode {
             // otherwise. `caps` threads through every run path.
             #[cfg(not(feature = "pkg"))]
             let packages: Option<ascript::interp::PackageMap> = None;
+            // DBG Task 7: `--profile cpu` runs the program on the VM under the sampling
+            // profiler, then writes a profile artifact. Only for `.as` on the VM (not
+            // `.aso`, not the tree-walker — the profiler hangs off the VM frame seam).
+            // Without the flag the path is byte-for-byte unchanged. The `profile`
+            // feature owns this; without it, a clean rebuild hint.
+            if let Some(mode) = profile.as_deref() {
+                if is_aso || use_tree_walker {
+                    eprintln!(
+                        "error: --profile is only supported for `.as` files on the bytecode VM (not .aso or --tree-walker)"
+                    );
+                    return ExitCode::from(1);
+                }
+                #[cfg(feature = "profile")]
+                {
+                    let result = run_profiled(
+                        path,
+                        &args,
+                        packages,
+                        caps,
+                        mode,
+                        out.as_deref(),
+                        profile_hz,
+                        profile_format.as_deref(),
+                    )
+                    .await;
+                    return match result {
+                        Ok(code) => ExitCode::from(code as u8),
+                        Err(e) => {
+                            ascript::diagnostics::report(&e);
+                            ExitCode::from(1)
+                        }
+                    };
+                }
+                #[cfg(not(feature = "profile"))]
+                {
+                    let _ = (&packages, &caps, &out, &profile_hz, &profile_format, mode);
+                    eprintln!(
+                        "error: `--profile` requires the `profile` feature; rebuild with it enabled (it is on by default)"
+                    );
+                    return ExitCode::from(1);
+                }
+            }
+            // `out`/`profile_hz`/`profile_format` are only consulted on the profiled
+            // path above; keep them from tripping unused warnings on the normal path.
+            let _ = (&out, &profile_hz, &profile_format);
             let result = if is_aso {
                 ascript::run_aso_file(path, &args, caps).await
             } else if use_tree_walker {

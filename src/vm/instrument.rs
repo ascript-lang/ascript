@@ -23,7 +23,10 @@
 //!   placeholder here; DX owns the implementation).
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The single instrumentation payload hanging off `Vm.instrument`. Each sub-feature
 /// is independently `Option`al, so a run may arm any subset (e.g. `--profile cpu`
@@ -314,13 +317,143 @@ impl DebuggerHook {
     }
 }
 
-/// The DBG sampling-profiler hook (a later task). A typed placeholder this unit — the
-/// VM will publish a frame-name snapshot here at frame push/pop only, behind the same
-/// single `Vm.instrument` gate. Defined now so `Instrumentation`'s shape is stable.
-#[derive(Default)]
+/// The CROSS-THREAD frame-name snapshot the sampler thread reads. The VM thread
+/// publishes the current frame-name stack (root → leaf) into this on every frame
+/// push/pop; the sampler thread locks it, clones it, and records it as one sample.
+///
+/// PLAIN OWNED DATA ONLY — every element is an owned `String` (a function name, or
+/// `"<script>"`/`"<anon>"`), so the whole thing is `Send` (the worker-airlock
+/// discipline: NO `Value`/`Rc`/`Cc` crosses to the sampler thread). This is the only
+/// state shared between the VM thread and the sampler thread.
+pub type FrameStack = Arc<Mutex<Vec<String>>>;
+
+/// The mode the profiler samples in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProfileMode {
+    /// A wall-clock sampler thread snapshots the published frame stack every
+    /// `interval`. The natural, real-world mode.
+    Wallclock,
+    /// No timer thread — a sample is recorded INLINE at each frame push (sampling is
+    /// driven by call structure, not wall-clock). Makes goldens byte-stable.
+    Deterministic,
+}
+
+/// The DBG sampling-profiler hook. The VM publishes the current frame-name stack here
+/// at frame push/pop ONLY (never per instruction), behind the same single
+/// `Vm.instrument` gate as the debugger — so a run with no profiler armed is
+/// byte-identical to pre-DBG (the per-instruction dispatch loop is untouched; the only
+/// cost is a single `None`-check at the per-CALL push/pop sites).
+///
+/// # Two sampling modes
+///
+/// - [`ProfileMode::Wallclock`]: the hook owns a sampler thread (started by
+///   [`ProfilerHook::start`]) that wakes every `interval`, locks [`frames`], clones the
+///   current stack, and pushes it as one sample. On [`ProfilerHook::finish`] the stop
+///   flag is set, the thread joined, and its accumulated samples returned.
+/// - [`ProfileMode::Deterministic`]: NO thread — a sample is recorded inline at each
+///   publish (each frame push = one sample), so the sample set is a pure function of
+///   the program's call structure (golden-stable).
+///
+/// [`frames`]: ProfilerHook::frames
 pub struct ProfilerHook {
-    /// Reserved for the `Send` frame-name snapshot seam. Empty placeholder.
-    _reserved: (),
+    /// The current frame-name stack snapshot (root → leaf), shared with the sampler
+    /// thread. The VM writes it on every publish; the sampler reads it. Owned
+    /// `String`s only (`Send`).
+    pub frames: FrameStack,
+    /// The sampling mode.
+    pub mode: ProfileMode,
+    /// The wall-clock sampling interval (ignored in deterministic mode).
+    pub interval: Duration,
+    /// Stop flag for the sampler thread (set by `finish`).
+    stop: Arc<AtomicBool>,
+    /// The sampler thread handle (`Wallclock` mode only; `None` until `start`, and in
+    /// deterministic mode). The thread owns its sample buffer and returns it on join.
+    sampler: Option<std::thread::JoinHandle<Vec<Vec<String>>>>,
+    /// Samples collected INLINE in deterministic mode (one per publish). Unused in
+    /// wallclock mode (the thread owns the buffer there).
+    inline_samples: Vec<Vec<String>>,
+}
+
+impl ProfilerHook {
+    /// Build a hook in the given mode. In `Wallclock` mode the sampler thread is NOT
+    /// started yet — call [`start`](ProfilerHook::start) once the run begins. In
+    /// `Deterministic` mode there is no thread (samples accrue inline).
+    pub fn new(mode: ProfileMode, interval: Duration) -> Self {
+        ProfilerHook {
+            frames: Arc::new(Mutex::new(Vec::new())),
+            mode,
+            interval,
+            stop: Arc::new(AtomicBool::new(false)),
+            sampler: None,
+            inline_samples: Vec::new(),
+        }
+    }
+
+    /// Start the wall-clock sampler thread (no-op in deterministic mode, or if already
+    /// started). The thread loops: sleep `interval`, check the stop flag, snapshot the
+    /// published frame stack, push it as a sample — until `finish` sets the flag.
+    pub fn start(&mut self) {
+        if self.mode != ProfileMode::Wallclock || self.sampler.is_some() {
+            return;
+        }
+        let frames = Arc::clone(&self.frames);
+        let stop = Arc::clone(&self.stop);
+        let interval = self.interval;
+        let handle = std::thread::spawn(move || {
+            let mut samples: Vec<Vec<String>> = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                // Snapshot the current stack. A poisoned lock (a panic on the VM
+                // thread mid-publish) is recovered — a stale snapshot is harmless.
+                let snap = match frames.lock() {
+                    Ok(g) => g.clone(),
+                    Err(p) => p.into_inner().clone(),
+                };
+                if !snap.is_empty() {
+                    samples.push(snap);
+                }
+            }
+            samples
+        });
+        self.sampler = Some(handle);
+    }
+
+    /// Record one sample of the CURRENT published stack inline (deterministic mode).
+    /// Called by the VM's publish seam at each frame push when the mode is
+    /// `Deterministic`. A no-op for an empty stack.
+    pub fn record_inline_sample(&mut self) {
+        let snap = match self.frames.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        if !snap.is_empty() {
+            self.inline_samples.push(snap);
+        }
+    }
+
+    /// Publish a new frame-name stack snapshot (called by the VM publish seam after a
+    /// push/pop). Replaces the shared stack atomically under the lock.
+    pub fn publish(&self, stack: Vec<String>) {
+        match self.frames.lock() {
+            Ok(mut g) => *g = stack,
+            Err(p) => *p.into_inner() = stack,
+        }
+    }
+
+    /// Stop sampling and return all collected samples (each a root → leaf frame-name
+    /// path). In wallclock mode this sets the stop flag and JOINS the sampler thread
+    /// (so no thread is left running). In deterministic mode it returns the
+    /// inline-collected samples.
+    pub fn finish(mut self) -> Vec<Vec<String>> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.sampler.take() {
+            return handle.join().unwrap_or_default();
+        }
+        std::mem::take(&mut self.inline_samples)
+    }
 }
 
 /// The DX line-coverage table (DX §6.3). A typed placeholder — DX owns the
@@ -343,6 +476,39 @@ mod tests {
         _assert_send::<DebugEvent>();
         _assert_send::<DebugCommand>();
         _assert_send::<BreakpointBinding>();
+        // The profiler's cross-thread snapshot type (read by the sampler thread)
+        // carries owned `String`s only — proved `Send`/`Sync` at compile time.
+        fn _assert_send_sync<T: Send + Sync>() {}
+        _assert_send_sync::<FrameStack>();
+        _assert_send::<Vec<Vec<String>>>();
+    }
+
+    #[test]
+    fn deterministic_hook_collects_inline_samples() {
+        let mut hook = ProfilerHook::new(ProfileMode::Deterministic, Duration::from_millis(1));
+        hook.publish(vec!["<script>".to_string(), "a".to_string()]);
+        hook.record_inline_sample();
+        hook.publish(vec![
+            "<script>".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+        ]);
+        hook.record_inline_sample();
+        // An empty stack records nothing.
+        hook.publish(Vec::new());
+        hook.record_inline_sample();
+        let samples = hook.finish();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0], vec!["<script>", "a"]);
+        assert_eq!(samples[1], vec!["<script>", "a", "b"]);
+    }
+
+    #[test]
+    fn wallclock_finish_with_no_thread_is_empty() {
+        // A wallclock hook never `start`ed (no thread) finishes with no samples and
+        // does not hang.
+        let hook = ProfilerHook::new(ProfileMode::Wallclock, Duration::from_millis(1));
+        assert!(hook.finish().is_empty());
     }
 
     #[test]
