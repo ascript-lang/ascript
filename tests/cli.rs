@@ -15,6 +15,35 @@ fn runs_a_program_file_and_prints_result() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
 }
 
+/// DX D4 §5.1 multi-error reporting: a file with MULTIPLE parse errors renders
+/// ALL of them at once (the error-tolerant CST parser records every one), not just
+/// the first. Both malformed `let` statements must appear in stderr.
+#[test]
+fn run_reports_all_parse_errors_at_once() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    // Two distinct malformed statements — each records its own parse error.
+    let file = std::env::temp_dir().join(format!("ascript_multierr_{}.as", std::process::id()));
+    std::fs::write(&file, "let = 1\nlet = 2\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a parse failure, but the run succeeded"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Both error sites are reported. ariadne prints one report per error, each with
+    // an "Error:" header and a `path:line:col` location gutter. With two reports the
+    // header appears at least twice and BOTH source lines (`:1:` and `:2:`) are cited.
+    let report_count = err.matches("Error:").count();
+    assert!(
+        report_count >= 2,
+        "expected >=2 error reports, got {report_count}:\n{err}"
+    );
+    // ariadne colorizes the source text char-by-char, so match on the un-colorized
+    // location gutter (`…multierr_<pid>.as:1:` / `:2:`) instead of the raw line text.
+    assert!(err.contains(".as:1:"), "missing first error location:\n{err}");
+    assert!(err.contains(".as:2:"), "missing second error location:\n{err}");
+}
+
 #[test]
 fn nested_run_in_worker_with_caps_is_refused() {
     // FFI Unit-B review (NB#2): a `run_in_worker({caps})` called from INSIDE a worker

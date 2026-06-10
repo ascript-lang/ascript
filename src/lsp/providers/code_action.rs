@@ -29,6 +29,29 @@ pub fn quickfixes(model: &SemanticModel, uri: &Url) -> Vec<CodeActionOrCommand> 
     out
 }
 
+/// Diagnostic codes whose carried `Fix` is a "did you mean" SUGGESTION (DX D4
+/// §5.2) — offered as a quickfix in the editor but deliberately NOT in
+/// `FIXABLE_CODES`, so `--fix`/`source.fixAll` never auto-applies a guess.
+const SUGGESTION_CODES: &[&str] = &["undefined-variable"];
+
+/// One quickfix `CodeAction` per "did you mean" suggestion diagnostic carrying a
+/// `Fix` (DX D4 §5.2). Separate from [`quickfixes`] because these are guesses: the
+/// user picks them in the editor, but they are excluded from the auto-apply
+/// `fixAll`/`--fix` path.
+pub fn suggestion_quickfixes(model: &SemanticModel, uri: &Url) -> Vec<CodeActionOrCommand> {
+    let mut out = Vec::new();
+    for d in &model.diagnostics {
+        if !SUGGESTION_CODES.contains(&d.code.as_str()) {
+            continue;
+        }
+        let Some(fix) = &d.fix else { continue };
+        out.push(CodeActionOrCommand::CodeAction(quickfix_action(
+            model, uri, fix,
+        )));
+    }
+    out
+}
+
 /// Build a `quickfix` `CodeAction` from a `Fix` (its byte-span edits → LSP edits).
 fn quickfix_action(model: &SemanticModel, uri: &Url, fix: &Fix) -> CodeAction {
     let edits: Vec<TextEdit> = fix
@@ -127,6 +150,7 @@ pub fn code_actions(
     let mut out = Vec::new();
     if wants(&CodeActionKind::QUICKFIX) {
         out.extend(quickfixes(model, uri));
+        out.extend(suggestion_quickfixes(model, uri));
     }
     if wants(&CodeActionKind::SOURCE_FIX_ALL) {
         if let Some(a) = fix_all_action(model, uri) {
@@ -187,6 +211,37 @@ mod tests {
         };
         assert_eq!(ca.kind, Some(CodeActionKind::QUICKFIX));
         assert!(ca.edit.is_some(), "quickfix carries a WorkspaceEdit");
+    }
+
+    #[test]
+    fn offers_did_you_mean_quickfix() {
+        // `lenght` is a typo of the local `length` → a suggestion quickfix.
+        let m = model("let length = 5\nprint(lenght)\n");
+        let uri = Url::parse("file:///main.as").unwrap();
+        let actions = suggestion_quickfixes(&m, &uri);
+        assert!(!actions.is_empty(), "expected a did-you-mean quickfix");
+        let CodeActionOrCommand::CodeAction(ca) = &actions[0] else {
+            panic!("expected a CodeAction");
+        };
+        assert_eq!(ca.kind, Some(CodeActionKind::QUICKFIX));
+        assert!(ca.title.contains("length"), "title: {}", ca.title);
+        let edit = ca.edit.as_ref().expect("quickfix carries an edit");
+        let changes = edit.changes.as_ref().unwrap();
+        assert_eq!(changes[&uri][0].new_text, "length");
+    }
+
+    #[test]
+    fn did_you_mean_is_excluded_from_fix_all() {
+        // A did-you-mean suggestion must NOT be auto-applied by `fixAll`/`--fix`.
+        let m = model("print(lenght)\n");
+        let uri = Url::parse("file:///main.as").unwrap();
+        // `undefined-variable` is not in FIXABLE_CODES → no fixAll edit from it.
+        // (`print` is the only near match; the point is fixAll ignores the code.)
+        let none = fix_all_action(&m, &uri);
+        assert!(
+            none.is_none(),
+            "fixAll must not auto-apply a did-you-mean guess"
+        );
     }
 
     #[test]

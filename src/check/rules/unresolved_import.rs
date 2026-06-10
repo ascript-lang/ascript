@@ -47,11 +47,21 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
         if crate::stdlib::is_known_std_module(path) {
             continue; // a real std module → OK
         }
+        // DX D4 §5.2 "did you mean": suggest the closest real std module (e.g.
+        // `std/maths` → `std/math`). Candidate set = the feature-independent
+        // `STD_MODULES` registry. The suggestion only annotates the message (a CLI
+        // `help` note); no auto-fix is offered for an import path (an import edit
+        // can shift the bound names, so it stays a manual change).
+        let suggestion = crate::check::suggest::closest(path, crate::stdlib::STD_MODULES.iter().copied());
+        let message = match suggestion {
+            Some(s) => format!("unresolved import `{path}`: no such std module — did you mean `{s}`?"),
+            None => format!("unresolved import `{path}`: no such std module"),
+        };
         out.push(AsDiagnostic {
             range: code_range(import),
             severity: Severity::Warning,
             code: "unresolved-import".to_string(),
-            message: format!("unresolved import `{path}`: no such std module"),
+            message,
             fix: None,
         });
     }
@@ -144,9 +154,22 @@ mod tests {
             .into_iter()
             .find(|d| d.code == "unresolved-import")
             .unwrap();
+        // `std/maths` is one edit from `std/math` → the message names the path AND
+        // suggests the close match.
         assert_eq!(
             d.message,
-            "unresolved import `std/maths`: no such std module"
+            "unresolved import `std/maths`: no such std module — did you mean `std/math`?"
         );
+    }
+
+    #[test]
+    fn far_std_module_has_no_suggestion() {
+        // `std/doesnotexist` is far from every real module → no "did you mean".
+        let d = analyze("import * as x from \"std/doesnotexist\"\nprint(1)\n")
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "unresolved-import")
+            .unwrap();
+        assert!(!d.message.contains("did you mean"), "got: {}", d.message);
     }
 }

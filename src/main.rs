@@ -655,6 +655,21 @@ async fn real_main() -> ExitCode {
             // `out`/`profile_hz`/`profile_format` are only consulted on the profiled
             // path above; keep them from tripping unused warnings on the normal path.
             let _ = (&out, &profile_hz, &profile_format);
+            // DX D4 §5.1 multi-error reporting: a `.as` source file with several
+            // PARSE errors renders them ALL at once (the error-tolerant CST parser
+            // records every one) instead of the compiler bailing on the first. This
+            // runs only for `.as` files (a `.aso` is already-compiled bytecode); a
+            // clean parse falls through to the normal run, and a later FATAL runtime
+            // panic still goes through the single-report path below. The pre-check
+            // shares no state with the runner, so the program runs identically when
+            // the parse is clean.
+            if !is_aso {
+                let parse_errors = ascript::collect_parse_errors(path);
+                if !parse_errors.is_empty() {
+                    ascript::diagnostics::report_all(&parse_errors);
+                    return ExitCode::from(1);
+                }
+            }
             let result = if is_aso {
                 ascript::run_aso_file(path, &args, caps).await
             } else if use_tree_walker {

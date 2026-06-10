@@ -998,6 +998,32 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
     run_file_on_vm_with_packages(path, script_args, None, None).await
 }
 
+/// DX D4 §5.1: collect ALL recoverable parse diagnostics for a `.as` source file
+/// (grammar + lexical), each as an [`AsError`] with the file's source bound for
+/// caret rendering. The error-tolerant CST parser records every error and recovers
+/// into a best-effort tree, so the run path can show them ALL at once (via
+/// [`diagnostics::report_all`]) instead of bailing on the first the compiler hits.
+/// An empty `Vec` means the parse was clean (run proceeds normally). The byte
+/// offsets are used directly as the span (matching the single-error compile path,
+/// which the renderer maps through `char_to_byte`).
+pub fn collect_parse_errors(path: &Path) -> Vec<AsError> {
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return Vec::new(); // a read error is handled by the runner's own report
+    };
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let parsed = crate::syntax::parser::parse(&src);
+    crate::syntax::all_syntax_errors_in(&parsed)
+        .into_iter()
+        .map(|e| {
+            AsError::at(e.message, crate::span::Span::new(e.start, e.end))
+                .with_source(src_info.clone())
+        })
+        .collect()
+}
+
 /// Like [`run_file_on_vm`] (VM) but installs a CLI-resolved package map (SP6)
 /// before running, so a bare `import "pkg"` resolves through it. `None` = no
 /// package resolver (every bare specifier is "unknown package"). `caps` (FFI §4.5)

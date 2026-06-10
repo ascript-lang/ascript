@@ -38,6 +38,29 @@ fn is_instanceof_rhs(node: &ResolvedNode) -> bool {
     matches!(expr_children.next(), Some(rhs) if rhs.text_range() == node.text_range())
 }
 
+/// The closest known name to a typo'd `name` within edit distance, or `None`.
+/// Candidate set = every resolver binding name (locals/params/imports/top-level
+/// globals) plus `BUILTIN_NAMES`. Order is deterministic (binding declaration
+/// order, then builtins), so `suggest::closest`'s stable tie-break is stable here
+/// too. Returns an owned `String` so the diagnostic can carry it.
+fn closest_name(name: &str, resolved: &ResolveResult) -> Option<String> {
+    // Deduplicate while preserving first-seen order so a shadowed/repeated name
+    // does not perturb the candidate ordering (determinism).
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut candidates: Vec<&str> = Vec::new();
+    for b in &resolved.bindings {
+        if seen.insert(b.name.as_str()) {
+            candidates.push(b.name.as_str());
+        }
+    }
+    for &b in crate::interp::BUILTIN_NAMES {
+        if seen.insert(b) {
+            candidates.push(b);
+        }
+    }
+    crate::check::suggest::closest(name, candidates.iter().copied()).map(str::to_string)
+}
+
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
     let mut out = Vec::new();
     // Hoistable declarations (fn/class/enum) are visible before their textual
@@ -81,12 +104,33 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
                 continue;
             }
             if !is_allowed_global(name) && !hoisted.contains(name.as_str()) {
+                // DX D4 §5.2 "did you mean": suggest the closest in-scope binding /
+                // builtin within edit distance. Candidate set = every resolver
+                // binding name (locals, params, imports, top-level globals) +
+                // `BUILTIN_NAMES`. The suggestion is appended to the message (the CLI
+                // renders it as a `help` note) and carried as a `Fix` so the LSP can
+                // offer a one-shot replacement quickfix — but `undefined-variable` is
+                // NOT in `FIXABLE_CODES`, so `--fix`/`fixAll` never auto-applies a
+                // guess.
+                let range = crate::check::rules::code_range(n);
+                let suggestion = closest_name(name, resolved);
+                let message = match &suggestion {
+                    Some(s) => format!("`{name}` is not defined — did you mean `{s}`?"),
+                    None => format!("`{name}` is not defined"),
+                };
+                let fix = suggestion.map(|s| crate::check::diagnostic::Fix {
+                    title: format!("Change `{name}` to `{s}`"),
+                    edits: vec![crate::check::diagnostic::TextEdit {
+                        range,
+                        replacement: s,
+                    }],
+                });
                 out.push(AsDiagnostic {
-                    range: crate::check::rules::code_range(n),
+                    range,
                     severity: Severity::Warning,
                     code: "undefined-variable".to_string(),
-                    message: format!("`{name}` is not defined"),
-                    fix: None,
+                    message,
+                    fix,
                 });
             }
         }
@@ -140,6 +184,51 @@ mod tests {
             "no undefined-variable expected: {:?}",
             codes(src)
         );
+    }
+
+    fn message_for(src: &str) -> String {
+        analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "undefined-variable")
+            .map(|d| d.message)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn suggests_closest_builtin() {
+        // `lenght` is a typo of the builtin `len` (distance 3 — beyond) BUT also of
+        // nothing closer; use a clearer case: `prnt` → `print`.
+        let m = message_for("prnt([1])\n");
+        assert!(m.contains("did you mean `print`?"), "got: {m}");
+    }
+
+    #[test]
+    fn suggests_closest_local_binding() {
+        // A typo of a local `let` binding suggests it.
+        let src = "let length = 5\nprint(lenght)\n";
+        let m = message_for(src);
+        assert!(m.contains("did you mean `length`?"), "got: {m}");
+    }
+
+    #[test]
+    fn no_suggestion_beyond_distance() {
+        // `zzzzz` is far from every binding/builtin → no "did you mean".
+        let m = message_for("print(zzzzz)\n");
+        assert!(!m.contains("did you mean"), "got: {m}");
+        assert!(m.contains("is not defined"), "got: {m}");
+    }
+
+    #[test]
+    fn suggestion_carries_a_fix() {
+        let fix = analyze("let length = 5\nprint(lenght)\n")
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "undefined-variable")
+            .and_then(|d| d.fix);
+        let fix = fix.expect("a did-you-mean fix");
+        assert_eq!(fix.edits.len(), 1);
+        assert_eq!(fix.edits[0].replacement, "length");
     }
 
     #[test]
