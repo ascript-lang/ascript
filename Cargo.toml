@@ -153,7 +153,7 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile"]
 # FUZZ: the grammar-aware source generator (`src/fuzzgen/`). NON-default — enabled only by
 # the crate's self-dev-dependency for `tests/property.rs` (and by a `--cfg fuzzing` libFuzzer
 # build). Pulls `arbitrary`. Never in `default`, so production is byte-identical.
@@ -219,6 +219,14 @@ tui = ["dep:crossterm"]
 # completion/hover/goto-def); never runs the interpreter, so it avoids the !Send
 # Rc/RefCell runtime. tower-lsp bundles lsp-types + tower + JSON-RPC over stdio.
 lsp = ["dep:tower-lsp", "tokio/io-std"]
+# DX D1: `ascript doc` — the API documentation generator (`src/doc/`). Static-only
+# (CST front-end + the `///` doc-comment extractor in `src/syntax/doc_comment.rs`);
+# NEVER instantiates the interpreter. Reuses the `lsp` workspace index machinery
+# (`FileIndex.exports`/`decl_kind`/`discover_as_files`) — no second parse — so it
+# depends on `lsp`. All of `src/doc/` is `#[cfg(feature = "doc")]`, so
+# --no-default-features builds nothing from it. Default-on (batteries). Adds NO VM
+# behavior → four-mode byte-identity + `.aso` unchanged.
+doc = ["lsp"]
 # DBG Task 5b: the Debug Adapter Protocol (DAP) server over stdio + the CLI wiring
 # (`ascript dap`, `ascript run --inspect <file>`). A SYNCHRONOUS, blocking stdio
 # adapter (NOT tower-lsp / not async) that drives the already-landed VM debug core

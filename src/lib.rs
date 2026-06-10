@@ -8,6 +8,11 @@ pub mod coro;
 pub mod dap;
 pub mod det;
 pub mod diagnostics;
+// DX D1: `ascript doc` — the API documentation generator (CST walk → doc model →
+// HTML/Markdown). Static-only (never instantiates the interpreter); feature-gated
+// (`doc`, default-on) so `--no-default-features` builds none of it.
+#[cfg(feature = "doc")]
+pub mod doc;
 pub mod env;
 pub mod error;
 pub mod fmt;

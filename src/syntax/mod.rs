@@ -6,6 +6,7 @@
 
 pub mod ast;
 pub mod cst;
+pub mod doc_comment;
 pub mod event;
 pub mod format;
 pub mod kind;

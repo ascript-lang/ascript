@@ -2910,3 +2910,160 @@ fn manifest_capabilities_table_denies_and_composes_with_cli() {
     assert_eq!(out, "false\nfalse\ntrue\n", "manifest+CLI denials union");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── DX D1: `ascript doc` golden + smoke tests ──────────────────────────────
+
+/// A pinned Markdown golden over a documented module: signatures + `///` bodies +
+/// member rendering. `ascript doc --format md <file>` streams Markdown to stdout.
+#[test]
+fn doc_markdown_golden() {
+    let file = std::env::temp_dir().join("ascript_doc_golden.as");
+    std::fs::write(
+        &file,
+        "//! A tiny calculator.\n\
+         \n\
+         /// Adds two numbers.\n\
+         export fn add(a: number, b: number): number { return a + b }\n\
+         \n\
+         /// A 2D point.\n\
+         export class Point {\n  \
+           /// the x coordinate\n  \
+           x: number = 0\n  \
+           fn init(x) { self.x = x }\n\
+         }\n\
+         \n\
+         /// The shapes.\n\
+         export enum Shape { Circle(r: float), Square }\n\
+         \n\
+         fn hidden() { return 1 }\n",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("md")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "doc failed: {:?}", output);
+    let md = String::from_utf8_lossy(&output.stdout);
+
+    // Module heading + module doc.
+    assert!(md.contains("# ascript_doc_golden"), "module heading: {md}");
+    assert!(md.contains("A tiny calculator."), "module doc: {md}");
+    // Function signature + doc.
+    assert!(md.contains("## fn `add`"), "fn heading: {md}");
+    assert!(
+        md.contains("fn add(a: number, b: number): number"),
+        "fn sig: {md}"
+    );
+    assert!(md.contains("Adds two numbers."), "fn doc: {md}");
+    // Class + field + method.
+    assert!(md.contains("## class `Point`"), "class heading: {md}");
+    assert!(md.contains("`x: number = 0`"), "field sig: {md}");
+    assert!(md.contains("the x coordinate"), "field doc: {md}");
+    assert!(md.contains("#### method `init`"), "method heading: {md}");
+    // Enum variants.
+    assert!(md.contains("## enum `Shape`"), "enum heading: {md}");
+    assert!(md.contains("Circle(r: float)"), "variant sig: {md}");
+    // Private `hidden` is NOT in the public output.
+    assert!(!md.contains("hidden"), "private fn must be excluded: {md}");
+
+    std::fs::remove_file(&file).ok();
+}
+
+/// `--private` includes non-exported declarations.
+#[test]
+fn doc_private_flag_includes_unexported() {
+    let file = std::env::temp_dir().join("ascript_doc_private.as");
+    std::fs::write(
+        &file,
+        "export fn pub_one() {}\nfn priv_one() {}\n",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("md")
+        .arg("--private")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let md = String::from_utf8_lossy(&out.stdout);
+    assert!(md.contains("priv_one"), "--private must include unexported: {md}");
+    std::fs::remove_file(&file).ok();
+}
+
+/// `--format html` writes a self-contained tree: `index.html`, `style.css`, one
+/// page per module. Check the index structure links the module page.
+#[test]
+fn doc_html_index_structure() {
+    let file = std::env::temp_dir().join("ascript_doc_html.as");
+    std::fs::write(
+        &file,
+        "//! HTML module.\n/// A function.\nexport fn f() {}\n",
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join("ascript_doc_html_out");
+    std::fs::remove_dir_all(&dir).ok();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let status = Command::new(bin)
+        .arg("doc")
+        .arg("--format")
+        .arg("html")
+        .arg("--out")
+        .arg(&dir)
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "doc html failed: {:?}", status);
+
+    let index = std::fs::read_to_string(dir.join("index.html")).unwrap();
+    assert!(index.contains("<title>API documentation</title>"), "index title");
+    assert!(
+        index.contains("href=\"ascript_doc_html.html\""),
+        "index links module page: {index}"
+    );
+    assert!(
+        index.contains("<link rel=\"stylesheet\" href=\"style.css\">"),
+        "self-contained stylesheet link"
+    );
+    // The stylesheet exists (self-contained tree).
+    assert!(dir.join("style.css").exists(), "style.css written");
+    // The module page exists with the item.
+    let page = std::fs::read_to_string(dir.join("ascript_doc_html.html")).unwrap();
+    assert!(page.contains("fn f()"), "module page has the fn: {page}");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&file).ok();
+}
+
+/// `--check` exits non-zero on a deliberately-undocumented public symbol and zero
+/// when all public symbols are documented.
+#[test]
+fn doc_check_exits_nonzero_on_undocumented() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    // Undocumented public `bad` → non-zero, reports it.
+    let undoc = std::env::temp_dir().join("ascript_doc_check_undoc.as");
+    std::fs::write(&undoc, "/// ok\nexport fn good() {}\nexport fn bad() {}\n").unwrap();
+    let out = Command::new(bin).arg("doc").arg("--check").arg(&undoc).output().unwrap();
+    assert!(!out.status.success(), "must fail on undocumented symbol");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(combined.contains("bad"), "reports the undocumented symbol: {combined}");
+
+    // Fully documented → zero.
+    let doc = std::env::temp_dir().join("ascript_doc_check_ok.as");
+    std::fs::write(&doc, "/// a\nexport fn a() {}\n/// b\nexport fn b() {}\n").unwrap();
+    let out = Command::new(bin).arg("doc").arg("--check").arg(&doc).output().unwrap();
+    assert!(out.status.success(), "must pass when all documented: {:?}", out);
+
+    std::fs::remove_file(&undoc).ok();
+    std::fs::remove_file(&doc).ok();
+}
