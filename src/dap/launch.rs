@@ -70,35 +70,6 @@ async fn run_program(
     use crate::vm::Vm;
     use std::rc::Rc;
 
-    // ---- compile (mirrors run_file_on_vm_with_packages) --------------------
-    let src = match std::fs::read_to_string(&program) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = hook.events.send(DebugEvent::Output {
-                text: format!("cannot read {}: {}\n", program.display(), e),
-                stderr: true,
-            });
-            let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
-            return;
-        }
-    };
-    let src_info = Rc::new(SourceInfo {
-        path: program.display().to_string(),
-        text: src.clone(),
-    });
-    let chunk = match crate::compile::compile_source(&src) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = hook.events.send(DebugEvent::Output {
-                text: format!("compile error: {}\n", e.message),
-                stderr: true,
-            });
-            let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
-            return;
-        }
-    };
-    chunk.set_module_source(&src_info);
-
     // Capture program output (so it rides DAP `output` events, OFF the protocol
     // stdout which the framing owns). `Interp::new()` uses the Capture sink.
     let interp = Rc::new(crate::interp::Interp::new());
@@ -110,7 +81,73 @@ async fn run_program(
     if let Some(caps) = caps {
         interp.set_caps(caps);
     }
-    interp.set_worker_source(&src);
+
+    // Acquire the entry chunk. A `.as` file is compiled from source; a `.aso` file is
+    // loaded directly (no compile step) — its OPTIONAL embedded debug section (DBG Task 6)
+    // re-binds the module source onto the chunk tree, so an `.aso`-only debug session has
+    // line/variable info. A `--strip`ped `.aso` simply has no bound source, so the
+    // debugger degrades gracefully (`build_line_starts` is empty → "no debug info"), it
+    // does not error.
+    let is_aso = program.extension().and_then(|e| e.to_str()) == Some("aso");
+    let chunk = if is_aso {
+        let bytes = match std::fs::read(&program) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = hook.events.send(DebugEvent::Output {
+                    text: format!("cannot read {}: {}\n", program.display(), e),
+                    stderr: true,
+                });
+                let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
+                return;
+            }
+        };
+        let chunk = match crate::vm::chunk::Chunk::from_bytes_verified(&bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = hook.events.send(DebugEvent::Output {
+                    text: format!("cannot load {}: {}\n", program.display(), e),
+                    stderr: true,
+                });
+                let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
+                return;
+            }
+        };
+        // Workers Spec A (.aso path): retain the raw bytes so a `worker fn` can rebuild
+        // its slice without source (mirrors `run_aso_file`).
+        interp.set_worker_aso_bytes(Rc::from(bytes.into_boxed_slice()));
+        chunk
+    } else {
+        let src = match std::fs::read_to_string(&program) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = hook.events.send(DebugEvent::Output {
+                    text: format!("cannot read {}: {}\n", program.display(), e),
+                    stderr: true,
+                });
+                let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
+                return;
+            }
+        };
+        let src_info = Rc::new(SourceInfo {
+            path: program.display().to_string(),
+            text: src.clone(),
+        });
+        let chunk = match crate::compile::compile_source(&src) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = hook.events.send(DebugEvent::Output {
+                    text: format!("compile error: {}\n", e.message),
+                    stderr: true,
+                });
+                let _ = hook.events.send(DebugEvent::Terminated { exit_code: 1 });
+                return;
+            }
+        };
+        chunk.set_module_source(&src_info);
+        interp.set_worker_source(&src);
+        chunk
+    };
+
     interp.install_self();
 
     let vm = Vm::with_instrument(interp.clone(), Instrumentation::empty());
@@ -162,9 +199,11 @@ async fn run_program(
         Err(crate::interp::Control::Panic(_)) => 1,
     };
     let panic_text = match &result {
-        Err(crate::interp::Control::Panic(e)) => {
-            Some(format!("{}\n", e.clone().with_source(src_info).message))
-        }
+        // Only the message is shipped (the stderr `output` category) — the ariadne
+        // source caret a CLI run renders is not reproduced here, so the chunk's bound
+        // source (present for `.as` and a debug-info `.aso`, absent for a stripped one)
+        // is not needed.
+        Err(crate::interp::Control::Panic(e)) => Some(format!("{}\n", e.message)),
         _ => None,
     };
 

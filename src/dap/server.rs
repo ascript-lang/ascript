@@ -26,6 +26,12 @@ struct AdapterState {
     /// Whether the FIRST stop (break-on-entry) has been reported yet — the first
     /// `stopped` uses `reason: "entry"`, subsequent ones `reason: "breakpoint"`.
     entry_reported: bool,
+    /// Whether the VM is CURRENTLY parked at a stop (set on every `stopped`, cleared on
+    /// any resume command). Distinct from `entry_reported` (which latches true forever):
+    /// `evaluate` needs a frame to exist RIGHT NOW, so it gates on this — an `evaluate`
+    /// sent between a `continue` and the next breakpoint is rejected (success:false)
+    /// rather than sent to a non-parked VM whose reply would never arrive (review F2).
+    is_stopped: bool,
     /// Breakpoints buffered from a `setBreakpoints` that arrived BEFORE the VM parked
     /// at entry (so they could not be applied yet). `(source, lines, ids)` — the ids
     /// are the stable per-breakpoint ids already handed to the editor, carried so the
@@ -54,6 +60,7 @@ impl AdapterState {
             seq: 0,
             frames: Vec::new(),
             entry_reported: false,
+            is_stopped: false,
             pending_breakpoints: Vec::new(),
             pending_verify: std::collections::VecDeque::new(),
             bp_id: 0,
@@ -97,6 +104,7 @@ fn pump_events(
                 let (seq, reason) = {
                     let mut st = state.lock().expect("state mutex");
                     st.frames = frames;
+                    st.is_stopped = true; // the VM is now parked (review F2).
                     let reason = if st.entry_reported {
                         "breakpoint"
                     } else {
@@ -395,7 +403,11 @@ pub fn run_server(
                 if let Some(tx) = &cmd_tx {
                     let _ = tx.send(DebugCommand::Continue);
                 }
-                let rseq = state.lock().expect("state").next_seq();
+                let rseq = {
+                    let mut st = state.lock().expect("state");
+                    st.is_stopped = false; // resumed (review F2).
+                    st.next_seq()
+                };
                 send(
                     &stdout,
                     &response(rseq, req.seq, "configurationDone", true, json!({})),
@@ -518,7 +530,11 @@ pub fn run_server(
                 if let Some(tx) = &cmd_tx {
                     let _ = tx.send(DebugCommand::Continue);
                 }
-                let rseq = state.lock().expect("state").next_seq();
+                let rseq = {
+                    let mut st = state.lock().expect("state");
+                    st.is_stopped = false; // resumed (review F2).
+                    st.next_seq()
+                };
                 send(
                     &stdout,
                     &response(
@@ -545,7 +561,11 @@ pub fn run_server(
                     };
                     let _ = tx.send(cmd);
                 }
-                let rseq = state.lock().expect("state").next_seq();
+                let rseq = {
+                    let mut st = state.lock().expect("state");
+                    st.is_stopped = false; // resumed (review F2).
+                    st.next_seq()
+                };
                 send(&stdout, &response(rseq, req.seq, &req.command, true, json!({})));
             }
 
@@ -571,13 +591,15 @@ pub fn run_server(
                     .unwrap_or(0)
                     .max(0) as usize;
 
-                // Only meaningful while parked (a frame must exist). If no VM is parked
-                // (`entry_reported` is false → no stop yet, or no debuggee), respond
-                // unsuccessfully rather than send a command that would never get a reply
-                // (deadlock-avoidance).
+                // Only meaningful while the VM is CURRENTLY parked (a frame must exist).
+                // `is_stopped` (set on `stopped`, cleared on every resume) — NOT the
+                // latching `entry_reported` — so an `evaluate` sent between a `continue`
+                // and the next breakpoint is rejected here rather than dispatched to a
+                // non-parked VM whose reply would never arrive, dangling the request
+                // (review F2). Respond unsuccessfully instead (deadlock-avoidance).
                 let parked = {
                     let st = state.lock().expect("state");
-                    st.entry_reported && cmd_tx.is_some()
+                    st.is_stopped && cmd_tx.is_some()
                 };
                 if parked {
                     if let Some(tx) = &cmd_tx {

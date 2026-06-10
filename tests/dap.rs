@@ -435,6 +435,118 @@ fn dap_evaluate_in_paused_frame() {
     let _ = std::fs::remove_file(&program);
 }
 
+/// Compile `as_path` to a sibling `.aso` via `ascript build` (debug info INCLUDED by
+/// default unless `strip`), returning the `.aso` path.
+fn build_aso(as_path: &std::path::Path, strip: bool) -> std::path::PathBuf {
+    let aso = as_path.with_extension("aso");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ascript"));
+    cmd.arg("build");
+    if strip {
+        cmd.arg("--strip");
+    }
+    let out = cmd
+        .arg(as_path)
+        .arg("-o")
+        .arg(&aso)
+        .output()
+        .expect("spawn `ascript build`");
+    assert!(
+        out.status.success(),
+        "ascript build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    aso
+}
+
+/// Review F1 — a compiled `.aso` with the (default) embedded debug section is debuggable:
+/// `run --inspect program.aso` loads it, the embedded source drives line breakpoints, and
+/// stackTrace shows the function name + source line. This is the consumer of Task 6's
+/// `.aso` debug section.
+#[test]
+fn dap_inspect_aso_with_debug_info() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let program = temp_program("aso_dbg", PROGRAM);
+    let aso = build_aso(&program, false); // debug info included
+    let mut c = DapClient::spawn_inspect(&aso);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    let stopped = c.read_event("stopped", deadline);
+    assert_eq!(stopped["body"]["reason"], json!("entry"), "stops at entry: {stopped}");
+
+    // A line breakpoint resolves against the EMBEDDED source (the .aso has no .as on disk).
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": aso.to_string_lossy() },
+            "breakpoints": [ { "line": 2 } ],
+        }),
+    );
+    c.read_response(sb, deadline);
+    let bp_evt = c.read_event("breakpoint", deadline);
+    assert_eq!(
+        bp_evt["body"]["breakpoint"]["verified"], json!(true),
+        "the line binds via the embedded debug section: {bp_evt}"
+    );
+
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+    let stopped2 = c.read_event("stopped", deadline);
+    assert_eq!(stopped2["body"]["reason"], json!("breakpoint"), "{stopped2}");
+
+    let st = c.request("stackTrace", json!({ "threadId": 1 }));
+    let st_resp = c.read_response(st, deadline);
+    let frames = st_resp["body"]["stackFrames"].as_array().expect("frames");
+    assert_eq!(frames[0]["name"], json!("add"), "function name from .aso debug info: {st_resp}");
+    assert_eq!(frames[0]["line"], json!(2), "source line from .aso debug info: {st_resp}");
+
+    let cont = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont, deadline);
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("5"), "program output: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&aso);
+}
+
+/// Review F2 — an `evaluate` issued while the VM is NOT parked (between a `continue` and
+/// the next stop) is rejected with `success:false` rather than dispatched to a non-parked
+/// VM whose reply would never arrive (which would dangle the request forever).
+#[test]
+fn dap_evaluate_while_running_is_rejected() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let program = temp_program("eval_running", PROGRAM);
+    let mut c = DapClient::spawn_inspect(&program);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline); // entry
+
+    // No breakpoints — `continue` resumes to completion. `is_stopped` is cleared the
+    // moment the continue is handled, so the following `evaluate` sees a not-parked VM.
+    let cont = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont, deadline);
+    let ev = c.request("evaluate", json!({ "expression": "1 + 1", "context": "repl" }));
+    let ev_resp = c.read_response(ev, deadline);
+    assert_eq!(
+        ev_resp["success"], json!(false),
+        "evaluate while running is rejected, not dangled: {ev_resp}"
+    );
+
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("5"), "program still completes: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+}
+
 /// Test 1b (review F1 regression) — an UNBINDABLE breakpoint (a line past EOF) must
 /// report `verified:false` via the authoritative `breakpoint` event. The pre-fix code
 /// fabricated `verified:true` for ANY line when parked, including lines that never bind

@@ -507,9 +507,11 @@ async fn dbg_zero_cost_gate(benches: &[Bench]) {
 
     // PASS condition: the armed-idle geomean is within timing noise of not-attached.
     // The seams are `None`-gated (a single Option check at push/pop), so the only
-    // expected gap is sub-percent. Use a generous 8% bound so ordinary machine noise
-    // passes but a GROSS regression (a leaked per-instruction check would be 1.3x+) fails.
-    const ZERO_COST_BOUND: f64 = 1.08;
+    // expected gap is sub-percent (measured geomean ~1.000x, worst single bench ~1.017x).
+    // A 5% bound passes ordinary machine noise but trips a GENUINE leaked check sooner
+    // (a per-instruction check would be 1.3x+) — tightened from the initial 1.08x per the
+    // holistic review (the looser bound could mask a 2-7% armed-idle regression).
+    const ZERO_COST_BOUND: f64 = 1.05;
     if geomean <= ZERO_COST_BOUND {
         println!("  [PASS] armed-idle is within noise of not-attached → zero-cost-when-off holds");
     } else {

@@ -115,8 +115,10 @@ ascript build program.as              # debug info INCLUDED (default)
 ascript build --strip program.as      # smaller .aso, no debug info
 ```
 
-A debugger attached to a `--strip`ped `.aso` degrades gracefully — it reports "no debug
-info" rather than guessing.
+`ascript run --inspect program.aso` debugs the compiled artifact directly. With the
+debug section present, breakpoints and the call stack resolve against the embedded source;
+attached to a `--strip`ped `.aso` the debugger degrades gracefully — source lines are
+simply unavailable (it never guesses).
 
 ## Zero-cost guarantee
 

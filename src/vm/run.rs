@@ -3918,6 +3918,11 @@ impl Vm {
     /// only ever evaluates an expression the user explicitly requested, so the
     /// non-evaluated run's observation contract is untouched (Gate 1: `evaluate` adds no
     /// behavior to a normal run; it is reached ONLY from the interactive command loop).
+    /// Note the asymmetry: a HEAP mutation (a field/element write through a shared
+    /// `Rc`/`Cc` value) PERSISTS into the resumed program exactly as a normal write would,
+    /// but a rebind of a paused-frame LOCAL (`x = 99`) mutates only the throwaway eval
+    /// `Environment` and is LOST — the VM frame's stack slot is never written back. This
+    /// is what keeps the resumed frame uncorruptible by an evaluate.
     ///
     /// Gate 4: no `RefCell`/`Cc` borrow is held across the `.await` — the environment is
     /// built (cloning live values out) BEFORE `eval_expr`, and the `fiber` reads are
