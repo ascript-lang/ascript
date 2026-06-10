@@ -75,8 +75,16 @@ jobs:
         run: |
           for t in aso_roundtrip worker_serialize differential parser; do
             echo "::group::smoke $t"
-            # -runs caps it deterministically; the committed ex_*/bad_* seeds are replayed
-            # first, so a seed-reproducible crash fails here. 45s wall cap per target.
-            cargo +nightly fuzz run "$t" -- -max_total_time=45 -rss_limit_mb=4096 -timeout=25
+            # `aso_roundtrip` is DECODE-ONLY — a leak there is a real `.aso` reader bug (and it
+            # is BIN's gating target), so keep LeakSanitizer ON. The other targets RUN the
+            # managed runtime, whose intentional PROCESS-LIFETIME state (interned `Rc<str>`,
+            # `lazy_static`/`once_cell` globals, the tokio runtime, gcmodule's collector,
+            # thread-locals) LSan cannot distinguish from leaks → disable leak detection there.
+            # A genuine UNBOUNDED leak still surfaces as RSS growth → `-rss_limit_mb`.
+            leak=1; [ "$t" = aso_roundtrip ] || leak=0
+            # The committed ex_*/bad_* seeds are replayed first, so a seed-reproducible crash
+            # fails here. 45s wall cap per target.
+            cargo +nightly fuzz run "$t" -- \
+              -max_total_time=45 -rss_limit_mb=4096 -timeout=25 -detect_leaks=$leak
             echo "::endgroup::"
           done
