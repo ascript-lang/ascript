@@ -145,7 +145,16 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   existing byte values are unchanged). A non-interface program writes a `len(0)`
 ///   prefix, so its layout is otherwise identical to v24. Old readers must reject a v25
 ///   chunk. (Bumped by reading the ADT-left v24 and adding one.)
-pub const ASO_FORMAT_VERSION: u32 = 25;
+/// - **v26 (DBG):** an OPTIONAL, strippable debug section. Right after the version a
+///   `u8` debug-present flag is written; when set, the MODULE SOURCE block (a present
+///   flag + optional `path`/`text`) is written ONCE before the root chunk, and every
+///   `FnProto` gains a trailing `local_names` (slot→name) table + an `opt_str`
+///   `debug_name`. `to_bytes()` (worker code-shipping / tests / the differential `.aso`
+///   mode) writes the flag = 0 → debug OMITTED, so the minimal wire only grows by the
+///   single flag byte; `ascript build` defaults to flag = 1 (`--strip` opts back out).
+///   Old readers must reject a v26 chunk. (Bumped by reading the IFACE-left v25 and
+///   adding one.)
+pub const ASO_FORMAT_VERSION: u32 = 26;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -502,15 +511,41 @@ impl Chunk {
     /// check. (The literal-only invariant is also asserted per-value during
     /// encoding via [`write_value`].)
     pub fn to_bytes(&self) -> Result<Vec<u8>, AsoError> {
+        self.to_bytes_with_debug(false)
+    }
+
+    /// Serialize this chunk, optionally INCLUDING the strippable DBG debug section
+    /// (v26): when `with_debug`, the module SOURCE block (path + text) is written once
+    /// before the root chunk and every `FnProto` carries its `local_names` + `debug_name`
+    /// so an `.aso`-only debug session has line/variable info. When `with_debug == false`
+    /// (the default `to_bytes`, used by worker code-shipping / tests / the differential
+    /// `.aso` mode) the wire grows only by the single debug-present flag byte and no debug
+    /// metadata is emitted.
+    ///
+    /// `ascript build` opts into debug by default (`--strip` selects `with_debug = false`).
+    pub fn to_bytes_with_debug(&self, with_debug: bool) -> Result<Vec<u8>, AsoError> {
         let mut w = Writer::new();
         w.buf.extend_from_slice(&ASO_MAGIC);
         w.u32(ASO_FORMAT_VERSION);
+        // DBG (v26): the debug-present flag. When set, the module source block is
+        // written ONCE here, before the root chunk.
+        w.u8(u8::from(with_debug));
+        if with_debug {
+            match self.source.borrow().as_ref() {
+                Some(src) => {
+                    w.u8(1);
+                    w.str(&src.path);
+                    w.str(&src.text);
+                }
+                None => w.u8(0),
+            }
+        }
         // The const pool is a compiler invariant (literals-only), so a
         // `NonLiteralConst` from the const path would be a compiler bug — but IFACE
         // also returns `NonLiteralConst` to cleanly reject an interface program (whose
         // `.aso` serialization lands in Task 9). Propagate the error so `ascript build`
         // surfaces it as a clean diagnostic instead of panicking.
-        write_chunk(&mut w, self)?;
+        write_chunk(&mut w, self, with_debug)?;
         // SP3 §A: surface a wire-format capacity overflow as a clean typed error.
         if let Some(e) = w.overflow {
             return Err(e);
@@ -534,7 +569,23 @@ impl Chunk {
                 expected: ASO_FORMAT_VERSION,
             });
         }
-        let chunk = read_chunk(&mut r)?;
+        // DBG (v26): the debug-present flag (0/1). When set, read the module SOURCE
+        // block (present flag + optional path/text) ONCE, then the per-proto debug
+        // tables ride along inside `read_chunk`/`read_proto`.
+        let with_debug = r.u8()? != 0;
+        let src = if with_debug && r.u8()? != 0 {
+            let path = r.str()?;
+            let text = r.str()?;
+            Some(Rc::new(crate::error::SourceInfo { path, text }))
+        } else {
+            None
+        };
+        let chunk = read_chunk(&mut r, with_debug)?;
+        if let Some(src) = src {
+            // Bind the source onto the WHOLE proto tree so an `.aso`-only debug session
+            // can derive line/variable info (`build_line_starts`/`line_col_at`).
+            chunk.set_module_source(&src);
+        }
         if !r.at_end() {
             return Err(AsoError::TrailingBytes);
         }
@@ -586,7 +637,7 @@ fn literal_kind(v: &Value) -> Result<&'static str, &'static str> {
     }
 }
 
-fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
+fn write_chunk(w: &mut Writer, c: &Chunk, with_debug: bool) -> Result<(), AsoError> {
     // code
     w.bytes(&c.code);
     // consts
@@ -597,7 +648,7 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
     // protos (recursive)
     w.len(c.protos.len());
     for p in &c.protos {
-        write_proto(w, p)?;
+        write_proto(w, p, with_debug)?;
     }
     // class_protos
     w.len(c.class_protos.len());
@@ -648,7 +699,7 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
     Ok(())
 }
 
-fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
+fn read_chunk(r: &mut Reader, with_debug: bool) -> Result<Chunk, AsoError> {
     let mut c = Chunk::new();
     // code
     c.code = r.bytes()?.to_vec().into();
@@ -662,7 +713,7 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
     let n = r.len()?;
     c.protos.reserve(n.min(r.remaining()));
     for _ in 0..n {
-        c.protos.push(Rc::new(read_proto(r)?));
+        c.protos.push(Rc::new(read_proto(r, with_debug)?));
     }
     // class_protos
     let n = r.len()?;
@@ -888,7 +939,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
 
 // ---- FnProto -----------------------------------------------------------------
 
-fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
+fn write_proto(w: &mut Writer, p: &FnProto, with_debug: bool) -> Result<(), AsoError> {
     w.u8(p.arity);
     let flags = u8::from(p.has_rest)
         | (u8::from(p.is_async) << 1)
@@ -908,10 +959,21 @@ fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
         w.str(cls);
     }
     // recursive chunk
-    write_chunk(w, &p.chunk)
+    write_chunk(w, &p.chunk, with_debug)?;
+    // DBG (v26): the strippable per-proto debug tables, emitted ONLY with debug on.
+    // `local_names` is a slot→name table; `debug_name` is the proto's display name.
+    if with_debug {
+        w.len(p.local_names.len());
+        for (slot, name) in &p.local_names {
+            w.u32(*slot);
+            w.str(name);
+        }
+        w.opt_str(p.debug_name.as_deref());
+    }
+    Ok(())
 }
 
-fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
+fn read_proto(r: &mut Reader, with_debug: bool) -> Result<FnProto, AsoError> {
     let arity = r.u8()?;
     let flags = r.u8()?;
     let has_rest = flags & 1 != 0;
@@ -931,7 +993,25 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
     } else {
         None
     };
-    let chunk = read_chunk(r)?;
+    let chunk = read_chunk(r, with_debug)?;
+    // DBG (v26): read the per-proto debug tables when present; else leave them empty.
+    // Every variable-length read is bounds-checked the same way the rest of the reader
+    // is — the `len`/`u32`/`str` helpers return `Err(AsoError)` past end-of-buffer and
+    // the reservation is clamped by `remaining()`, so a malformed count is a clean
+    // error, never a panic or a multi-GB allocation.
+    let (local_names, debug_name) = if with_debug {
+        let n = r.len()?;
+        let mut local_names = Vec::with_capacity(n.min(r.remaining()));
+        for _ in 0..n {
+            let slot = r.u32()?;
+            let name: Rc<str> = Rc::from(r.str()?.as_str());
+            local_names.push((slot, name));
+        }
+        let debug_name = r.opt_str()?.map(|s| Rc::from(s.as_str()));
+        (local_names, debug_name)
+    } else {
+        (Vec::new(), None)
+    };
     Ok(FnProto {
         chunk,
         arity,
@@ -942,8 +1022,8 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
         owning_class,
         params,
         ret,
-        local_names: Vec::new(),
-        debug_name: None,
+        local_names,
+        debug_name,
     })
 }
 
@@ -1915,7 +1995,7 @@ mod tests {
         let buf = [0u8, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
         let mut r = Reader::new(&buf);
         assert!(
-            matches!(read_chunk(&mut r), Err(AsoError::Truncated)),
+            matches!(read_chunk(&mut r, false), Err(AsoError::Truncated)),
             "a bomb length must decode to a clean Truncated error, never an abort"
         );
     }
@@ -1937,6 +2017,7 @@ mod tests {
         let mut w = Writer::new();
         w.buf.extend_from_slice(&ASO_MAGIC);
         w.u32(ASO_FORMAT_VERSION);
+        w.u8(0); // DBG (v26): debug-present flag = 0 (no debug section)
         // code: a zero-length byte field (len-prefixed).
         w.len(0);
         // const-pool count = u32::MAX over an empty remainder.
@@ -1956,6 +2037,7 @@ mod tests {
         let mut w2 = Writer::new();
         w2.buf.extend_from_slice(&ASO_MAGIC);
         w2.u32(ASO_FORMAT_VERSION);
+        w2.u8(0); // DBG (v26): debug-present flag = 0 (no debug section)
         w2.len(0); // code
         w2.len(0); // consts (empty, valid)
         w2.len(u32::MAX as usize); // protos: bomb
@@ -2143,9 +2225,9 @@ run()
             debug_name: None,
         };
         let mut w = Writer::new();
-        write_proto(&mut w, &proto).unwrap();
+        write_proto(&mut w, &proto, false).unwrap();
         let mut r = Reader::new(&w.buf);
-        let back = read_proto(&mut r).unwrap();
+        let back = read_proto(&mut r, false).unwrap();
         assert!(back.is_worker, "is_worker must survive the .aso round-trip");
         // Also confirm the false case is still preserved.
         let proto_false = FnProto {
@@ -2166,9 +2248,9 @@ run()
             }
         };
         let mut w2 = Writer::new();
-        write_proto(&mut w2, &proto_false).unwrap();
+        write_proto(&mut w2, &proto_false, false).unwrap();
         let mut r2 = Reader::new(&w2.buf);
-        let back_false = read_proto(&mut r2).unwrap();
+        let back_false = read_proto(&mut r2, false).unwrap();
         assert!(!back_false.is_worker, "is_worker=false must also be preserved");
     }
 
@@ -2190,9 +2272,9 @@ run()
             debug_name: None,
         };
         let mut w = Writer::new();
-        write_proto(&mut w, &proto_with).unwrap();
+        write_proto(&mut w, &proto_with, false).unwrap();
         let mut r = Reader::new(&w.buf);
-        let back = read_proto(&mut r).unwrap();
+        let back = read_proto(&mut r, false).unwrap();
         assert_eq!(back.owning_class.as_deref(), Some("Img"),
                    "owning_class must survive the .aso round-trip");
 
@@ -2211,9 +2293,9 @@ run()
             debug_name: None,
         };
         let mut w2 = Writer::new();
-        write_proto(&mut w2, &proto_none).unwrap();
+        write_proto(&mut w2, &proto_none, false).unwrap();
         let mut r2 = Reader::new(&w2.buf);
-        let back_none = read_proto(&mut r2).unwrap();
+        let back_none = read_proto(&mut r2, false).unwrap();
         assert!(back_none.owning_class.is_none(),
                 "owning_class=None must also be preserved");
     }
@@ -2284,6 +2366,202 @@ run()
             Err(AsoError::VersionMismatch { found, expected }) => {
                 assert_eq!(expected, ASO_FORMAT_VERSION);
                 assert_ne!(found, ASO_FORMAT_VERSION);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    // ---- DBG Task 6: strippable debug section -------------------------------
+
+    /// Build a root chunk with a single nested proto carrying `local_names` +
+    /// `debug_name`, and bind a module source so a debug build has line info.
+    fn chunk_with_debug_proto() -> Chunk {
+        let mut inner = Chunk::new();
+        inner.code = vec![crate::vm::opcode::Op::Nil as u8, crate::vm::opcode::Op::Return as u8].into();
+        inner.spans.push((0, Span::new(0, 3)));
+        let proto = FnProto {
+            chunk: inner,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: vec![(0, Rc::from("a")), (1, Rc::from("b"))],
+            debug_name: Some(Rc::from("greet")),
+        };
+        let mut root = Chunk::new();
+        root.code = vec![crate::vm::opcode::Op::Nil as u8, crate::vm::opcode::Op::Return as u8].into();
+        root.spans.push((0, Span::new(0, 3)));
+        root.protos.push(Rc::new(proto));
+        let src = Rc::new(crate::error::SourceInfo {
+            path: "dbg.as".to_string(),
+            text: "fn greet() {\n  let a = 1\n  let b = 2\n}\n".to_string(),
+        });
+        root.set_module_source(&src);
+        root
+    }
+
+    /// (#1) A with-debug round-trip recovers `local_names`, `debug_name`, AND the
+    /// module source text — so an `.aso`-only debug session can derive line info.
+    #[test]
+    fn debug_section_round_trips_local_names_name_and_source() {
+        let original = chunk_with_debug_proto();
+        let bytes = original.to_bytes_with_debug(true).expect("serialize with debug");
+        let back = Chunk::from_bytes(&bytes).expect("a with-debug .aso must decode");
+
+        // local_names + debug_name survive on the nested proto.
+        let p = &back.protos[0];
+        assert_eq!(
+            p.local_names,
+            vec![(0u32, Rc::<str>::from("a")), (1u32, Rc::<str>::from("b"))],
+            "local_names must survive the with-debug round-trip"
+        );
+        assert_eq!(p.debug_name.as_deref(), Some("greet"));
+
+        // The module source is bound onto the whole tree (root + nested proto).
+        let src = back.source.borrow();
+        let src = src.as_ref().expect("source must be present after a with-debug load");
+        assert_eq!(src.path, "dbg.as");
+        assert!(src.text.contains("let a = 1"));
+        assert!(p.chunk.source.borrow().is_some(), "source binds the nested proto too");
+
+        // With source bound, the debugger's line table is non-empty.
+        assert!(
+            !back.build_line_starts().is_empty(),
+            "build_line_starts must be non-empty when the source is present"
+        );
+    }
+
+    /// (#2/#3) Debug-OFF (`to_bytes_with_debug(false)` and plain `to_bytes()`) strips
+    /// everything: empty local_names / None debug_name / None source, the encoding is
+    /// strictly smaller, and the line table is empty (graceful "no debug info").
+    #[test]
+    fn stripped_build_omits_debug_and_is_smaller() {
+        let original = chunk_with_debug_proto();
+        let with = original.to_bytes_with_debug(true).expect("with debug");
+        let without = original.to_bytes_with_debug(false).expect("stripped");
+        let plain = original.to_bytes().expect("plain == stripped");
+        assert_eq!(without, plain, "to_bytes() must equal to_bytes_with_debug(false)");
+        assert!(
+            without.len() < with.len(),
+            "the stripped encoding ({}) must be smaller than the with-debug one ({})",
+            without.len(),
+            with.len()
+        );
+
+        let back = Chunk::from_bytes(&without).expect("a stripped .aso must decode");
+        let p = &back.protos[0];
+        assert!(p.local_names.is_empty(), "local_names stripped");
+        assert!(p.debug_name.is_none(), "debug_name stripped");
+        assert!(back.source.borrow().is_none(), "source stripped");
+        // Debugger-style graceful degradation: no source → empty line table.
+        assert!(
+            back.build_line_starts().is_empty(),
+            "build_line_starts must be empty on a stripped .aso (no debug info)"
+        );
+        // The stripped chunk still verifies (would run).
+        crate::vm::verify::verify(&back).expect("a stripped chunk must still verify");
+    }
+
+    /// (#4) A truncated debug section must surface as a clean `Err(AsoError)`, never a
+    /// panic or a multi-GB allocation. Truncate a with-debug buffer partway through and
+    /// assert every prefix decodes to an `Err` (the `local_names` count over a short
+    /// remainder must clamp + report a short read).
+    #[test]
+    fn truncated_debug_section_is_clean_error() {
+        let original = chunk_with_debug_proto();
+        let bytes = original.to_bytes_with_debug(true).expect("serialize with debug");
+        // Every strict prefix of a valid buffer must decode to an Err (the full buffer
+        // is the only length that succeeds). This sweeps the source block AND the
+        // per-proto local_names/debug_name tables.
+        for cut in 8..bytes.len() {
+            let result = Chunk::from_bytes(&bytes[..cut]);
+            assert!(
+                result.is_err(),
+                "a truncated with-debug .aso (len {cut}) must be a clean Err, got {result:?}"
+            );
+        }
+
+        // A hand-crafted bomb: a valid header + present source + a nested proto whose
+        // local_names count claims u32::MAX over an empty remainder must clamp to a
+        // clean Truncated, not abort. We truncate right after the bomb count.
+        let mut w = Writer::new();
+        w.buf.extend_from_slice(&ASO_MAGIC);
+        w.u32(ASO_FORMAT_VERSION);
+        w.u8(1); // debug present
+        w.u8(0); // source absent
+        // root chunk: code(0), consts(0), protos(1)...
+        w.len(0); // code
+        w.len(0); // consts
+        w.len(1); // protos: one
+        // proto: arity, flags, params(0), ret(none), recursive chunk...
+        w.u8(0); // arity
+        w.u8(0); // flags
+        w.len(0); // params
+        w.u8(0); // ret: opt_type None
+        // inner chunk: code(0) consts(0) protos(0) class(0) iface(0) imports(0)
+        // type(0) spans(0) upvalues(0) cell_slots(0) slot_count(u16) ic_count(u16)
+        // name(opt_str None)
+        w.len(0); // code
+        w.len(0); // consts
+        w.len(0); // protos
+        w.len(0); // class_protos
+        w.len(0); // interface_protos
+        w.len(0); // imports
+        w.len(0); // type_consts
+        w.len(0); // spans
+        w.len(0); // upvalues
+        w.len(0); // cell_slots
+        w.u16(0); // slot_count
+        w.u16(0); // ic_count
+        w.opt_str(None); // name
+        // back in write_proto: the DBG local_names BOMB count over an empty remainder.
+        w.len(u32::MAX as usize);
+        let result = Chunk::from_bytes(&w.buf);
+        assert!(
+            matches!(result, Err(AsoError::Truncated)),
+            "a bomb local_names count must clamp to a clean Truncated, got {result:?}"
+        );
+    }
+
+    /// (#1, compiled) A real compiled program with a named function carries
+    /// `local_names`/`debug_name` and round-trips them when built with debug. Also
+    /// confirms a with-debug `.aso` still runs to the same output.
+    #[test]
+    fn compiled_program_debug_round_trips_and_runs() {
+        let src = "fn add(x, y) {\n  let s = x + y\n  return s\n}\nprint(add(2, 3))\n";
+        let original = compile(src);
+        let src_info = Rc::new(crate::error::SourceInfo {
+            path: "add.as".to_string(),
+            text: src.to_string(),
+        });
+        original.set_module_source(&src_info);
+
+        let bytes = original.to_bytes_with_debug(true).expect("serialize with debug");
+        let back = Chunk::from_bytes(&bytes).expect("decode");
+        assert!(back.source.borrow().is_some(), "source must round-trip");
+        // At least one nested proto recovered a debug_name.
+        let any_name = back.protos.iter().any(|p| p.debug_name.is_some());
+        assert!(any_name, "a named fn must round-trip its debug_name");
+        // Behavior-identical after the with-debug round-trip.
+        assert_eq!(run_chunk(compile(src)), run_chunk(back));
+    }
+
+    /// (#5) The format version is the live DBG value (26) and a mismatched-version
+    /// (here: one-older) buffer is rejected with the version error, never run.
+    #[test]
+    fn dbg_version_is_26_and_mismatch_rejected() {
+        assert_eq!(ASO_FORMAT_VERSION, 26, "DBG bumped the format version to 26");
+        let mut bytes = compile("print(1)").to_bytes().expect("serialize");
+        // Roll the version back one (simulating a v25 buffer).
+        bytes[4] = bytes[4].wrapping_sub(1);
+        match Chunk::from_bytes(&bytes) {
+            Err(AsoError::VersionMismatch { found, expected }) => {
+                assert_eq!(expected, 26);
+                assert_eq!(found, 25, "a one-older buffer reads as v25");
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }

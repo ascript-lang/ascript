@@ -442,7 +442,11 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
 /// an [`AsError`] (with the file's source attached for diagnostics); the `.aso` is
 /// only written when compilation succeeds. The chunk is verified before writing so
 /// a produced `.aso` always passes [`vm::Chunk::from_bytes_verified`].
-pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf, AsError> {
+pub fn build_file(
+    file: &Path,
+    out: Option<&Path>,
+    with_debug: bool,
+) -> Result<std::path::PathBuf, AsError> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
     let src_info = Rc::new(SourceInfo {
@@ -451,6 +455,12 @@ pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf,
     });
     let chunk = crate::compile::compile_source(&src)
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // DBG (v26): bind the module source onto the whole proto tree so a debug build
+    // serializes line/variable info. Harmless for a `--strip` build (the source is
+    // simply not written). `compile_source` does not bind a source itself.
+    if with_debug {
+        chunk.set_module_source(&src_info);
+    }
     // Defensive: verify before writing so a produced `.aso` is always loadable.
     crate::vm::verify::verify(&chunk).map_err(|e| {
         AsError::new(format!(
@@ -459,7 +469,7 @@ pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf,
         .with_source(src_info)
     })?;
     let bytes = chunk
-        .to_bytes()
+        .to_bytes_with_debug(with_debug)
         .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))?;
     let out_path = match out {
         Some(p) => p.to_path_buf(),

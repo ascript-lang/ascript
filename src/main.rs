@@ -63,6 +63,10 @@ enum Command {
         /// Output path (defaults to `<file-stem>.aso`).
         #[arg(long, short)]
         out: Option<String>,
+        /// Strip the optional DBG debug section (module source + per-proto
+        /// line/variable info). Default: debug info is INCLUDED.
+        #[arg(long = "strip")]
+        strip: bool,
     },
     /// Start the interactive REPL
     Repl {
@@ -454,9 +458,9 @@ async fn real_main() -> ExitCode {
                 }
             }
         }
-        Command::Build { file, out } => {
+        Command::Build { file, out, strip } => {
             let out_path = out.as_deref().map(std::path::Path::new);
-            match ascript::build_file(std::path::Path::new(&file), out_path) {
+            match ascript::build_file(std::path::Path::new(&file), out_path, !strip) {
                 Ok(written) => {
                     println!("compiled {} -> {}", file, written.display());
                     ExitCode::SUCCESS
