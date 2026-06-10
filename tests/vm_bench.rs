@@ -118,6 +118,25 @@
 //!   closure capture (1e6)      compute    4.26x     1.13x   (NEW — SP8 #136)
 //!   geomean spec/tw = 2.88x   (A0 baseline 2.73x → 2.88x; V11-T6 was 2.92x)
 //!
+//! ───────────────────────────────────────────────────────────────────────────────
+//! DBG TASK 9 — ZERO-COST GATE (the spec §3.4 PRIMARY ACCEPTANCE artifact). The post-DBG
+//! VM with NO debugger/profiler attached (`instrument == None`, the production path) must
+//! be a STATISTICAL NO-OP vs the same VM with an EMPTY instrumentation armed
+//! (`instrument == Some`, every sub-feature `None` — the "attached but idle" config). The
+//! `dbg_zero_cost_gate` section times both over the whole corpus and gates the geomean.
+//!
+//! GATE RESULT — PASS (recorded DBG Task 9, 2026-06-10, release):
+//!   - spec/tw geomean = **2.95x** (the standing >= 2x gate; ABOVE the pre-DBG SP8 2.88x
+//!     baseline → the new `publish_profile_frames` None-check at frame push/pop added NO
+//!     measurable cost to the `instrument == None` production path — config (1)≈(2)).
+//!   - armed/none geomean = **0.998x** (every bench within ±1.4% noise → arming an empty
+//!     instrumentation is free; the `Op::Break` trap arm is unreachable when no byte is
+//!     patched, and the push/pop publish is a single `Option` None-check — config (2)≈(3)).
+//!
+//! A non-noise gap in armed/none would mean a stray instrumentation check leaked into a
+//! hot path: a BUG to fix, never an accepted tradeoff. The `assert!` in
+//! `dbg_zero_cost_gate` enforces it (bound 1.08x — generous for machine noise).
+//!
 //!   (a) COMPUTE-BOUND >= 2x spec/tw: PASS (all 7 compute benches, min 2.87x).
 //!   (b) NO spec-vs-generic regression: PASS (every bench; alloc benches at ~1.0x
 //!       spec/gen with allocator jitter).
@@ -138,6 +157,11 @@ enum Engine {
     GenericVm,
     /// The SPECIALIZED VM (default): shapes + polymorphic ICs + adaptive arith/globals.
     SpecializedVm,
+    /// DBG Task 9: the SPECIALIZED VM with an EMPTY `Instrumentation` armed
+    /// (`instrument == Some`, all sub-features `None`; no byte patched, profiler off).
+    /// The "attached debugger, idle" config — its time must be within noise of
+    /// `SpecializedVm` (`instrument == None`), the zero-cost-when-off acceptance gate.
+    ArmedIdleVm,
 }
 
 /// Run `src` once on `engine`, asserting it succeeds. Returns the elapsed time.
@@ -158,6 +182,11 @@ async fn time_once(engine: Engine, src: &str, name: &str) -> Duration {
             ascript::vm_run_source(src)
                 .await
                 .unwrap_or_else(|e| panic!("specialized VM failed on `{name}`: {e}"));
+        }
+        Engine::ArmedIdleVm => {
+            ascript::vm_run_source_armed_idle(src)
+                .await
+                .unwrap_or_else(|e| panic!("armed-idle VM failed on `{name}`: {e}"));
         }
     }
     start.elapsed()
@@ -429,5 +458,68 @@ async fn run_baseline() {
     }
     println!("  [NOTE] string concat / template build are ALLOCATION-bound (shared Rc<str>);");
     println!("         EXEMPT from the >= 2x compute-bound target, but checked for no-regression.");
+    println!();
+
+    dbg_zero_cost_gate(&benches).await;
+}
+
+/// DBG Task 9 — the PRIMARY ACCEPTANCE GATE (spec §3.4): the post-DBG VM with NO
+/// debugger/profiler attached (`instrument == None`, the production path) must be a
+/// STATISTICAL NO-OP versus the same VM with an EMPTY instrumentation armed
+/// (`instrument == Some`, all sub-features `None` — the "attached but idle" config).
+///
+/// The two configs differ ONLY in:
+///   - the per-CALL `publish_profile_frames` None-check at frame push/pop sees `Some`
+///     (and `profiler == None`) instead of `None` — a single extra `Option` deref;
+///   - the `Op::Break` trap arm is present in both but UNREACHABLE in both (no byte is
+///     patched), so the per-INSTRUCTION dispatch loop is byte-identical.
+///
+/// So a non-noise gap here would mean a stray instrumentation check leaked into a hot
+/// path — a BUG to fix, never an accepted tradeoff. The compute corpus (esp. the
+/// recursion benches, which push/pop frames hardest) is the stress.
+async fn dbg_zero_cost_gate(benches: &[Bench]) {
+    println!("DBG ZERO-COST GATE (Task 9 §3.4): instrument==None vs armed-idle (Some, all None)");
+    println!(
+        "{:<28} {:>11} {:>11} {:>12}",
+        "benchmark", "none (ms)", "armed (ms)", "armed/none",
+    );
+    println!("{}", "-".repeat(28 + 11 * 2 + 12 + 3));
+
+    let mut ratios: Vec<f64> = Vec::new();
+    for b in benches {
+        // `SpecializedVm` == production (`instrument == None`); `ArmedIdleVm` == Some(empty).
+        let (none_med, _) = measure(Engine::SpecializedVm, b.src, b.name).await;
+        let (armed_med, _) = measure(Engine::ArmedIdleVm, b.src, b.name).await;
+        let ratio = armed_med.as_secs_f64() / none_med.as_secs_f64();
+        ratios.push(ratio);
+        println!(
+            "{:<28} {} {} {:>11.3}x",
+            b.name,
+            ms(none_med),
+            ms(armed_med),
+            ratio,
+        );
+    }
+
+    let geomean = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
+    println!();
+    println!("geomean armed/none = {geomean:.3}x  (1.000x = perfect zero-cost; >1 = idle overhead)");
+
+    // PASS condition: the armed-idle geomean is within timing noise of not-attached.
+    // The seams are `None`-gated (a single Option check at push/pop), so the only
+    // expected gap is sub-percent. Use a generous 8% bound so ordinary machine noise
+    // passes but a GROSS regression (a leaked per-instruction check would be 1.3x+) fails.
+    const ZERO_COST_BOUND: f64 = 1.08;
+    if geomean <= ZERO_COST_BOUND {
+        println!("  [PASS] armed-idle is within noise of not-attached → zero-cost-when-off holds");
+    } else {
+        println!("  [FAIL] armed-idle geomean {geomean:.3}x exceeds {ZERO_COST_BOUND:.2}x — a");
+        println!("         stray instrumentation check leaked into a hot path; fix it (do NOT relax).");
+    }
+    assert!(
+        geomean <= ZERO_COST_BOUND,
+        "DBG zero-cost gate FAILED: armed-idle geomean {geomean:.3}x > {ZERO_COST_BOUND:.2}x \
+         (instrumentation overhead leaked into a hot path)"
+    );
     println!();
 }

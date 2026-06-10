@@ -796,6 +796,26 @@ pub async fn run_file_on_vm_profiled(
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
 /// `specialize = false` here.
 async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg(src, specialize, false).await
+}
+
+/// DBG Task 9 (zero-cost bench): run `src` on the SPECIALIZED VM with an EMPTY
+/// [`Instrumentation`](crate::vm::instrument::Instrumentation) armed (`breakpoints`/
+/// `profiler`/`coverage` all `None`) — the "attached debugger, idle" config. No byte is
+/// patched (so the `Op::Break` trap arm is never reached) and the profiler is off, so
+/// this exercises ONLY the `Vm.instrument == Some` overhead (the per-call push/pop
+/// profiler None-check sees `Some`). The zero-cost gate asserts this is within timing
+/// noise of [`vm_run_source`] (`instrument == None`). `#[doc(hidden)]` test API.
+#[doc(hidden)]
+pub async fn vm_run_source_armed_idle(src: &str) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg(src, true, true).await
+}
+
+async fn vm_run_source_cfg(
+    src: &str,
+    specialize: bool,
+    armed: bool,
+) -> Result<(String, Option<i32>), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
@@ -825,7 +845,13 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
     interp.install_self();
     // Workers Spec A: retain the source so a `worker fn` call can build its slice.
     interp.set_worker_source(src);
-    let vm = Vm::with_specialize(interp.clone(), specialize);
+    // DBG Task 9: `armed` builds the VM with an EMPTY instrumentation payload (the
+    // attached-but-idle config); otherwise `instrument == None` (the production path).
+    let vm = if armed {
+        Vm::with_instrument(interp.clone(), crate::vm::instrument::Instrumentation::empty())
+    } else {
+        Vm::with_specialize(interp.clone(), specialize)
+    };
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
