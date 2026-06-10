@@ -256,7 +256,12 @@ const PROGRAM: &str = "fn add(a, b) {\n  let s = a + b\n  return s\n}\nprint(add
 /// appears as an `output` event.
 #[test]
 fn dap_happy_path_breakpoint_inspect_continue() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let program = temp_program("happy", PROGRAM);
     let mut c = DapClient::spawn_inspect(&program);
 
@@ -363,7 +368,12 @@ fn dap_happy_path_breakpoint_inspect_continue() {
 /// string (no hang, no panic). The evaluator reuses the tree-walker on the parked Vm.
 #[test]
 fn dap_evaluate_in_paused_frame() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let program = temp_program("evaluate", PROGRAM);
     let mut c = DapClient::spawn_inspect(&program);
 
@@ -464,7 +474,12 @@ fn build_aso(as_path: &std::path::Path, strip: bool) -> std::path::PathBuf {
 /// `.aso` debug section.
 #[test]
 fn dap_inspect_aso_with_debug_info() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let program = temp_program("aso_dbg", PROGRAM);
     let aso = build_aso(&program, false); // debug info included
     let mut c = DapClient::spawn_inspect(&aso);
@@ -518,7 +533,12 @@ fn dap_inspect_aso_with_debug_info() {
 /// VM whose reply would never arrive (which would dangle the request forever).
 #[test]
 fn dap_evaluate_while_running_is_rejected() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let program = temp_program("eval_running", PROGRAM);
     let mut c = DapClient::spawn_inspect(&program);
 
@@ -553,7 +573,12 @@ fn dap_evaluate_while_running_is_rejected() {
 /// or fire. This guards against that false-positive.
 #[test]
 fn dap_unbindable_breakpoint_reports_unverified() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let program = temp_program("unbindable", PROGRAM); // 5 lines
     let mut c = DapClient::spawn_inspect(&program);
 
@@ -603,7 +628,12 @@ fn dap_unbindable_breakpoint_reports_unverified() {
 #[cfg(feature = "sys")]
 #[test]
 fn dap_inspect_honors_sandbox_capabilities() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     // recover() keeps the denial recoverable so the program completes and prints it.
     let src = "import * as fs from \"std/fs\"\n\
                let r = recover(() => fs.read(\"/etc/hosts\"))\n\
@@ -636,7 +666,12 @@ fn dap_inspect_honors_sandbox_capabilities() {
 /// events; we reconstruct it and compare to the plain run's stdout.
 #[test]
 fn dap_observation_contract_output_byte_identical() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let program = temp_program("observe", PROGRAM);
 
     // (a) Plain run — capture child stdout.
@@ -685,7 +720,12 @@ fn dap_observation_contract_output_byte_identical() {
 /// also reaches a stop and terminates.
 #[test]
 fn dap_subcommand_launch_with_program_arg() {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // 180s (not 60s): these tests spawn the debuggee as a child process and exchange a
+    // multi-step DAP protocol; under a loaded CI runner — where the heavy `tests/native.rs`
+    // bundle builds and other binary-spawning tests run in parallel — the child can be CPU/IO
+    // starved past a tight deadline (the lsp tests use the same generous posture). A genuine
+    // protocol deadlock still fails (just later), with the child killed.
+    let deadline = Instant::now() + Duration::from_secs(180);
     let program = temp_program("subcmd", PROGRAM);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ascript"))
