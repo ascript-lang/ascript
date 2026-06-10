@@ -48,6 +48,19 @@ assert.eq({ x: [1, 2] }, { x: [1, 2] })
 assert.eq("hello", "hello", "greeting should match")
 ```
 
+On a container mismatch the failure message includes a **structural diff** (see
+[below](#structural-diff)) instead of a flat `expected X got Y` dump.
+
+### `assert.deepEq(a, b, msg?)`
+
+An explicit alias for `assert.eq` — identical semantics (deep structural
+equality with the same structural-diff failure message). Use it where you want
+the deep-equality intent spelled out at the call site.
+
+```ascript
+assert.deepEq([1, { a: 2 }], [1, { a: 2 }])
+```
+
 ### `assert.ne(a, b, msg?)`
 
 Fail if `a` and `b` ARE deeply equal.
@@ -121,6 +134,20 @@ assert.contains([1, 2, 3], 2)
 assert.contains({ name: "Ada" }, "name")
 ```
 
+### `assert.matches(value, regex)`
+
+Fail unless the string `value` matches `regex`. The pattern may be a compiled
+`regex` value or a pattern string (compiled on the fly, like `regex.test`). A
+non-string `value`, an invalid pattern, or a non-match each fail with a clear
+message showing the value and the pattern.
+
+```ascript
+import * as regex from "std/regex"
+
+assert.matches("hello123", "[a-z]+[0-9]+")     // string pattern
+assert.matches("42", regex.compile("^\\d+$")[0])  // compiled regex
+```
+
 ---
 
 ## Approximate equality
@@ -159,6 +186,44 @@ for a panic, so it works with async functions too:
 async fn risky() { let _ = [][0] }  // out-of-bounds panic
 let e = await assert.throws(risky)
 assert.notNil(e.message)
+```
+
+### `assert.throwsWith(fn, substr) -> errValue`
+
+Like `assert.throws`, but **also** asserts the recovered error message contains
+`substr`. A throw whose message does NOT contain `substr` fails (showing the
+actual message); a `fn` that does not throw fails. Drives a returned
+`future<T>` to completion exactly like `assert.throws`.
+
+```ascript
+let e = assert.throwsWith(() => assert.eq(1, 99), "assert.eq failed")
+assert.contains(e.message, "1 != 99")
+```
+
+---
+
+## Structural diff
+
+When `assert.eq` / `assert.deepEq` or `assert.snapshot` find a **container**
+mismatch, the failure message includes a path-qualified structural diff
+computed over the same deep-equality traversal — so "equal per `assert.eq`"
+exactly means "empty diff". The diff lists, recursively:
+
+- `<path>: <old> → <new>` — a changed value (object key or array index),
+- `+ <path>: <new>` — a key/index present only in the actual value,
+- `- <path>: <old>` — a key/index present only in the expected value,
+
+with `.key` for object keys and `[i]` for array indices, e.g.
+`.users[0].name: a → b`. Object keys are reported in insertion order
+(deterministic). The diff is depth-bounded and cycle-safe, so a deeply nested or
+self-referential structure never overflows the stack.
+
+```text
+assert.eq failed: ... != ...
+diff (expected → actual):
+.users[0].name: a → b
++ .extra: 1
+- .gone: 2
 ```
 
 ---
