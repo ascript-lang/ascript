@@ -104,6 +104,7 @@ ascript fmt file.as        # format in place
 ascript check file.as      # static check (syntax + lints)
 ascript check --fix *.as   # apply safe autofixes (unused-import removal)
 ascript test file.as       # run test(name, fn) cases
+ascript doc src/           # generate API docs from /// doc-comments (HTML or Markdown)
 ascript lsp                # language server over stdio (cross-file nav + rename)
 ascript run --inspect file.as          # debug over the Debug Adapter Protocol (DAP)
 ascript run --profile cpu -o p.json f.as  # CPU sampling profiler → speedscope/collapsed

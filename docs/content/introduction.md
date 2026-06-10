@@ -2,10 +2,12 @@
 
 # AScript
 
-AScript is a gradually-typed, multi-paradigm scripting language with **JavaScript-flavored syntax**,
-**runtime-checked type contracts** (plus an advisory static checker), **first-class structured
-concurrency**, and a **batteries-included standard library** — all compiled to bytecode and executed
-by a virtual machine inside a single Rust binary named `ascript`.
+AScript is a gradually-typed, **general-purpose**, multi-paradigm language with **JavaScript-flavored
+syntax**, a **real numeric tower** (64-bit `int` + IEEE-754 `float`, bitwise operators, checked
+overflow), **runtime-checked type contracts** (plus an advisory static checker with sound-for-annotated
+generics), **algebraic enums and structural interfaces**, **first-class structured concurrency** (plus
+shared-nothing workers for multi-core parallelism), and a **batteries-included standard library** — all
+compiled to bytecode and executed by a virtual machine inside a single Rust binary named `ascript`.
 
 The guiding model is **a focused core with a Go-class standard library.** The *language core* stays
 approachable — a small set of value kinds, gradual type contracts, and no hidden control flow — but it
@@ -36,7 +38,7 @@ In strict order — when two goals conflict, the earlier one wins:
 1. **Simplicity** — the core stays small and predictable; no hidden control flow.
 2. **Safety** — errors are explicit; mistakes fail loudly, not silently.
 3. **Familiarity** — anyone who knows JavaScript can read AScript immediately.
-4. **Performance** — adequate for scripting; never at the expense of the above.
+4. **Performance** — a fast bytecode VM (inline caches, adaptive arithmetic, a cycle-collecting GC); never at the expense of the above.
 
 ## What's in the box
 
