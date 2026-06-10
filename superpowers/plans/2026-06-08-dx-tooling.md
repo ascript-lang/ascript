@@ -359,6 +359,10 @@ spec / `CLAUDE.md`). **Tests:** the touched message tests.
   follows for its new errors (DX owns the guide; each spec writes its own messages).
 - [ ] Green both configs; clippy. Review. Commit.
 
+> **Landed:** the style guide is `CLAUDE.md` → "Diagnostic message style guide (DX D4-T18)". Surgical fixes
+> (shared-code, byte-identical): the `apply_binop` generic numeric/comparison fallback and the
+> `apply_unop` negate/`~` fallbacks now carry the `, got {type_name}` tail like their siblings.
+
 ---
 
 # Cross-cutting (DX-owned, runs/updated as other specs add surface)

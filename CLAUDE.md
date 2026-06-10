@@ -532,3 +532,50 @@ publish steps.
   (offsets are `usize` regardless of unit); four-mode byte-identity unchanged. The LEGACY front-end is
   untouched (it was already CHAR-correct). (2) a perf trade (~2.9× → ~2.5× geomean) from routing top-level vars
   through `GET_GLOBAL` for tree-walker-parity late-binding (still ≥2×, meets the gate).
+
+## Diagnostic message style guide (DX D4-T18)
+
+DX owns this guide; **every construct/spec writes its OWN error strings and MUST follow it.** It is grounded
+in the de-facto corpus (`src/interp.rs` ~166 `AsError::at` sites, `src/value.rs`, `src/vm/run.rs`,
+`src/stdlib/*.rs`, the checker `src/check/**`). A new message that violates these rules is a review nit, not a
+style preference. Checklist:
+
+- **Know the tier, name it correctly.** Three error tiers (`src/interp.rs` `Control`): a **Tier-1 recoverable**
+  result is the `[value, err]` pair (the err is a *value*, not a panic — fused decode/IO/parse); **`?`-propagate**
+  (`Control::Propagate`) early-returns that pair; a **Tier-2 panic** (`Control::Panic(AsError)`) is an
+  unrecoverable bug (bad type, arity, undefined name) caught only by `recover`. Most messages in this guide are
+  Tier-2 panic strings. Don't phrase a Tier-2 bug as if it were a recoverable result, and vice-versa.
+- **Lowercase, no trailing period.** The entire corpus is lowercase-leading and period-less
+  (`undefined variable '{}'`, `value is not callable`, `operator requires two numbers …`). A proper noun /
+  quoted identifier may be mixed-case, but the sentence starts lowercase and never ends in `.`.
+- **Single-quote identifiers, keywords, and operators.** `'{}' is not a function`, `undefined variable '{}'`,
+  `cannot assign to immutable binding '{}'`, `unexpected key '{}' for {} (strict)`. Type *names* in a
+  `got {type}` tail are NOT quoted (they come from `type_name()`, a closed vocabulary).
+- **When the cause is a type mismatch, include the offending `type_name()` with a `, got {type}` tail.** This
+  is the single most common shape (`array index must be an int, got float`; `bitwise op requires int operands,
+  got float`; `len() expects … , got {}`; `{}: expected {}, got {}`). Use `crate::interp::type_name(&v)` (or
+  `value.type_name()`) — never hand-spell the type. *Newly unified (T18): the generic arithmetic/comparison
+  fallback (`apply_binop`) and the negate/`~` fallbacks (`apply_unop`) now carry the `, got {type}` tail like
+  their siblings.*
+- **Preferred shape templates** (pick the one that fits, don't invent a fourth):
+  1. `expected <X>, got <Y>` — arity/shape/type contracts (`{}.{} expects {} field{}, got {}`,
+     `type contract violated at {}: expected {}, got {}`).
+  2. `cannot <verb> a <type>` / `cannot <verb> … , got {type}` — operations on a wrong-kind receiver
+     (`cannot destructure a non-array value of type {}`, `cannot negate a non-number, got {}`,
+     `cannot mutate a frozen {}`).
+  3. `'<name>' is …` / `<thing> requires <X>` — naming/requirement statements (`'{}' is not a function`,
+     `instanceof requires a class or interface on the right-hand side`).
+- **Attach a `help:` line for an actionable next step, did-you-mean, or the blessed pattern — not for
+  restating the error.** Reserve it for: a closest-name suggestion (`src/check/suggest.rs` `closest()` powers
+  the T16 did-you-mean), a fix hint (range-step lints, the `recover(() => …)` arrow-form note), or the one
+  correct spelling. If there is no concrete next action, omit it.
+- **Field-path panics** (`validate_into`, `src/interp.rs`): report the failing path as a dotted/indexed
+  selector so the user can locate the field (e.g. `user.roles[2]`); these are recoverable Tier-2.
+- **BYTE-IDENTITY RULE (load-bearing).** A Tier-2 panic message is observable output under the four-mode gate
+  (tree-walker == specialized-VM == generic-VM == `.aso`). **Raise the message from SHARED code both engines
+  reach** (`apply_binop`/`apply_unop`/`value.rs`/`validate_into`) so the string is identical by construction;
+  the VM's specialized fast paths must deopt to that shared site, never re-spell the message. If you change a
+  message: (1) prove it stays identical via `cargo test --test vm_differential` (377/0, BOTH feature configs),
+  and (2) update EVERY asserting test — `grep` the string across `tests/` and `src/` (prefer `.contains(prefix)`
+  assertions, which survive an appended `, got {type}` tail). If a change cascades into many goldens for
+  marginal benefit, document the convention and leave the message — churn is not an improvement.

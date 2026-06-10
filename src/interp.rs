@@ -6501,7 +6501,11 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
             },
             Value::Float(n) => Ok(Value::Float(-n)),
             Value::Decimal(d) => Ok(Value::Decimal(Rc::new(-*d))),
-            _ => Err(AsError::at("cannot negate a non-number", span).into()),
+            _ => Err(AsError::at(
+                format!("cannot negate a non-number, got {}", type_name(&v)),
+                span,
+            )
+            .into()),
         },
         UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
         // `~x` — int bitwise NOT (NUM §3.2). Int-only: a float (or any non-int)
@@ -6511,7 +6515,11 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
             Value::Float(_) => {
                 Err(AsError::at("bitwise op requires int operands, got float", span).into())
             }
-            _ => Err(AsError::at("cannot apply ~ to a non-int", span).into()),
+            _ => Err(AsError::at(
+                format!("cannot apply ~ to a non-int, got {}", type_name(&v)),
+                span,
+            )
+            .into()),
         },
     }
 }
@@ -6872,7 +6880,11 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         (Value::Float(f), Value::Int(i)) => mixed_binop(op, *i, *f, true),
         (Value::Float(a), Value::Float(b)) => Ok(float_binop(op, *a, *b)),
         _ => Err(AsError::at(
-            "operator requires two numbers (or two decimals, or number and decimal)",
+            format!(
+                "operator requires two numbers (or two decimals, or number and decimal), got {} and {}",
+                type_name(&l),
+                type_name(&r)
+            ),
             span,
         )
         .into()),
