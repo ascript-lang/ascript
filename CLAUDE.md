@@ -509,6 +509,19 @@ publish steps.
   binary (`env!("CARGO_BIN_EXE_ascript")`).
 - `examples/*.as` double as living documentation and are exercised by the conformance tests — keep them
   runnable.
+- **Fuzzing (FUZZ — CONTINUOUS infra).** Two layers: (1) **in-tree property tests** (`tests/property.rs`,
+  `proptest` + the `src/fuzzgen` grammar-aware generator) run in the normal `cargo test` — they guard the
+  three-way differential, the `.aso`/worker-clone round-trips, and the GC; (2) **libFuzzer targets** in the
+  **isolated `fuzz/` cargo workspace member** (its own `[workspace]` so `libfuzzer-sys`/`cargo-fuzz` NEVER
+  enter the root build graph — verify `cargo tree -e normal`): `aso_roundtrip`, `worker_serialize`,
+  `differential`, `parser`. Any fuzz-support seam added to production code (e.g. `lib.rs`
+  `aso_runnable_accept`) is `#[cfg(any(test, feature = "fuzzgen", fuzzing))]`-gated so it never ships. Only
+  curated `ex_*`/`bad_*` seeds under `fuzz/corpus/<target>/` are committed (the grown corpus is gitignored).
+  **Continuous obligation:** a syntax/numeric/`.aso`/worker-serialization change must EXTEND the generator +
+  corpus + a normal-suite regression guard; a fuzz crash is fixed with a permanent `bad_*` seed + a
+  `property.rs` test BEFORE the fix (Gate 0). CI: `ci.yml` `fuzz-smoke` (per-PR corpus replay) +
+  `fuzz-nightly.yml` (deep campaign; the `aso_roundtrip` 4 h run is BIN's sustained-clean gate — see
+  `CONTRIBUTING.md` "Fuzzing & property tests"). `ASO_FORMAT_VERSION` bump → `./fuzz/regenerate_aso_corpus.sh`.
 
 ## Conventions
 - Commit trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
