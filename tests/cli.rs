@@ -3526,6 +3526,167 @@ fn doc_check_rejects_empty_doc_body() {
     std::fs::remove_file(&file).ok();
 }
 
+// ── DX Task 20: the `examples/advanced/documented_library.as` dogfooding artifact ──
+//
+// One fully-documented production-shaped module that simultaneously is a clean
+// `ascript doc` source, exercises the parallel test runner + coverage path, and
+// stays runnable. These tests pin all three surfaces over the committed example.
+// Assertions are robust `contains`/set checks (not brittle full-file goldens) so
+// ordinary edits to the example don't spuriously break them — only a real
+// regression in run/doc/coverage does.
+mod documented_library_artifact {
+    use std::process::Command;
+
+    const EXAMPLE: &str = "examples/advanced/documented_library.as";
+
+    /// (1) The artifact runs to completion on the default VM with exit 0 and emits
+    /// its deterministic driver output. (It is intentionally NOT in `EXAMPLE_SKIPS`,
+    /// so the `vm_differential` corpus also runs it three-way; this is a focused
+    /// CLI-level sanity check of the same property.)
+    #[test]
+    fn runs_to_completion_deterministically() {
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin).arg("run").arg(EXAMPLE).output().unwrap();
+        assert!(out.status.success(), "run must exit 0: {:?}", out);
+        let s = String::from_utf8_lossy(&out.stdout);
+        // The driver's deterministic lines (formatting, ledger posting, sum).
+        assert!(s.contains("15.25 USD"), "money add+format: {s}");
+        assert!(s.contains("-12.50 USD"), "negate+format: {s}");
+        assert!(s.contains("1500 JPY"), "scale-1 currency format: {s}");
+        assert!(s.contains("posted, balance 20.00 USD"), "ledger Posted: {s}");
+        assert!(s.contains("rejected: would breach floor"), "ledger Rejected: {s}");
+        assert!(s.contains("16.25 USD"), "sumAmounts fold: {s}");
+    }
+
+    /// (2a) `ascript doc --format md` renders the module: the `//!` module header,
+    /// every public symbol's signature, and the `///` body text. Robust `contains`
+    /// assertions (mirroring `doc_markdown_golden`'s style), not a byte golden.
+    #[test]
+    fn doc_markdown_contains_public_surface() {
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin)
+            .arg("doc")
+            .arg("--format")
+            .arg("md")
+            .arg(EXAMPLE)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "doc md failed: {:?}", out);
+        let md = String::from_utf8_lossy(&out.stdout);
+
+        // Module heading + module-doc (`//!`) body.
+        assert!(md.contains("# documented_library"), "module heading: {md}");
+        assert!(
+            md.contains("money ledger") && md.contains("integer minor units"),
+            "module doc body: {md}"
+        );
+        // Enum + its variants.
+        assert!(md.contains("## enum `Currency`"), "enum heading: {md}");
+        assert!(md.contains("`USD`") && md.contains("`JPY`"), "enum variants: {md}");
+        // Functions: signature + a slice of the `///` body.
+        assert!(
+            md.contains("fn scaleOf(c: Currency): int"),
+            "scaleOf signature: {md}"
+        );
+        assert!(
+            md.contains("number of minor units in one major unit"),
+            "scaleOf doc body: {md}"
+        );
+        assert!(
+            md.contains("fn sumAmounts(amounts: array<Money>)"),
+            "sumAmounts signature: {md}"
+        );
+        // Class: heading + a documented field + a method signature.
+        assert!(md.contains("## class `Money`"), "class heading: {md}");
+        assert!(md.contains("minor: int = 0"), "documented field sig: {md}");
+        assert!(
+            md.contains("static fn fromUnits(major: int, minor: int, currency: Currency): Money"),
+            "static method signature: {md}"
+        );
+        // The payload-carrying ADT enum and its payload variant.
+        assert!(md.contains("## enum `PostResult`"), "PostResult heading: {md}");
+        assert!(md.contains("Posted(balance: Money)"), "payload variant sig: {md}");
+    }
+
+    /// (2b) Every public symbol is documented → `ascript doc --check` exits 0.
+    #[test]
+    fn doc_check_passes() {
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin)
+            .arg("doc")
+            .arg("--check")
+            .arg(EXAMPLE)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "every public symbol must be documented: {:?}",
+            out
+        );
+    }
+
+    /// (3) `ascript test --coverage` runs the in-file suite (all passing) and reports
+    /// line coverage over the artifact. Assert the tally, the per-file + TOTAL lines,
+    /// and that a healthy majority of lines are covered — not an exact ratio (which a
+    /// future edit would break).
+    #[test]
+    fn test_coverage_runs_suite_and_reports_lines() {
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin)
+            .arg("test")
+            .arg("--coverage")
+            .arg(EXAMPLE)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "all in-file tests must pass: {:?}", out);
+        let s = String::from_utf8_lossy(&out.stdout);
+        // The suite has six registered tests; all pass.
+        assert!(s.contains("6 passed"), "tally (6 tests): {s}");
+        assert!(s.contains("0 failed"), "no failures: {s}");
+        // Coverage report names the file and a TOTAL.
+        assert!(s.contains("documented_library.as:"), "per-file coverage line: {s}");
+        assert!(s.contains("TOTAL:"), "total coverage line: {s}");
+        // A healthy majority of instrumented lines are hit (the suite drives the public
+        // surface). Parse the per-file "<hit>/<found>" ratio robustly.
+        let ratio = s
+            .lines()
+            .find(|l| l.contains("documented_library.as:"))
+            .and_then(|l| {
+                // The ratio token is the `<hit>/<found>` where BOTH sides parse as
+                // integers (skip the file path, which also contains `/`).
+                l.split_whitespace().find_map(|w| {
+                    let (h, f) = w.split_once('/')?;
+                    Some((h.trim().parse::<u32>().ok()?, f.trim().parse::<u32>().ok()?))
+                })
+            });
+        let (hit, found) = ratio.unwrap_or_else(|| panic!("could not parse coverage ratio: {s}"));
+        assert!(found > 0, "instrumented some lines: {s}");
+        assert!(
+            hit * 4 >= found * 3,
+            "at least 75% of lines covered ({hit}/{found}): {s}"
+        );
+    }
+
+    /// (3b) The LCOV form is also well-formed over the artifact (a machine-readable
+    /// coverage consumer's path).
+    #[test]
+    fn test_coverage_lcov_well_formed() {
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let out = Command::new(bin)
+            .arg("test")
+            .arg("--coverage=lcov")
+            .arg(EXAMPLE)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{:?}", out);
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("SF:"), "LCOV source record: {s}");
+        assert!(s.contains("DA:"), "LCOV line records: {s}");
+        assert!(s.contains("LF:") && s.contains("LH:"), "LCOV found/hit: {s}");
+        assert!(s.contains("end_of_record"), "LCOV terminator: {s}");
+    }
+}
+
 // ── DX D2 Task 8: snapshot completion (--update-snapshots + orphan detection) ──
 //
 // These spawn `ascript test` with `current_dir` set to a fresh temp dir so the
