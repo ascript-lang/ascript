@@ -525,6 +525,42 @@ async fn vm_operator_errors_match_treewalker() {
     }
 }
 
+/// DX D4-T18 — the unified `, got {type_name}` tail on the arithmetic/unary
+/// fallbacks. These were the de-facto inconsistency the style guide codified: the
+/// generic `apply_binop` fallback and the `apply_unop` negate/`~` fallbacks omitted
+/// the offending type while every sibling (`got float`, `got {type}`) carried it.
+/// Both engines now emit the type-bearing tail identically (raised from the shared
+/// `apply_binop`/`apply_unop`), so this both pins the new info AND re-proves
+/// byte-identity for the touched messages.
+#[tokio::test]
+async fn vm_type_tail_on_arith_fallbacks() {
+    let cases = [
+        ("-(true)", "cannot negate a non-number, got bool"),
+        ("~(true)", "cannot apply ~ to a non-int, got bool"),
+        ("true + 1", "got bool and int"),
+        ("1 < \"x\"", "got int and string"),
+        ("nil * 2", "got nil and int"),
+    ];
+    for (expr, needle) in cases {
+        let tw = ascript::run_source(expr).await;
+        let vm = ascript::vm_run_source(expr).await;
+        match (tw, vm) {
+            (Err(tw_err), Err(vm_err)) => {
+                assert_eq!(
+                    tw_err.message, vm_err.message,
+                    "engines diverged for `{expr}`"
+                );
+                assert!(
+                    tw_err.message.contains(needle),
+                    "`{expr}` message {:?} should contain {needle:?}",
+                    tw_err.message
+                );
+            }
+            other => panic!("expected BOTH engines to error for `{expr}`: {other:?}"),
+        }
+    }
+}
+
 // ---- short-circuit `&&` / `||` / `??` (V2-T6) ---------------------------
 
 #[tokio::test]
