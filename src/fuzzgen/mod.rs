@@ -31,7 +31,8 @@
 //!     arithmetic, mixed with int).
 //!   - **Composite literals + ops:** object literals `{k: v}` (member/index read, `len`), map
 //!     literals `#{k: v}` (`map.get`/`len`, numeric-key MapKey canonicalization), array indexing,
-//!     `set.from` size, and `for…of` iteration.
+//!     and `set.from` size. (Loops are numeric `for (i in 0..k)` ranges — deterministic, ordered;
+//!     `for…of` over a collection is NOT emitted, to avoid any iteration-order dependence.)
 //!   - **Classes / enums / ADT / rich `match`** (see `class_decl`/`enum_decl`/`class_expr`/
 //!     `enum_expr`): typed fields/defaults/`init`/methods, `instanceof`, inheritance/`super`;
 //!     unit + positional + named ADT variants, constructors, exhaustive `match` over each with
