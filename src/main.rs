@@ -188,6 +188,19 @@ enum Command {
         /// Without the flag, a changed snapshot FAILS and orphans are only reported.
         #[arg(long = "update-snapshots")]
         update_snapshots: bool,
+        /// DX D2 Task 10: run only tests whose NAME matches PATTERN — a substring by
+        /// default, or a regex when written `/regex/`. Prunes both which registered tests
+        /// run and (with no match in a file) which files contribute. A skipped test is
+        /// reported as "filtered", never pass/fail. Composes with `--parallel`
+        /// deterministically. A malformed regex is a clean error.
+        #[arg(long = "filter", value_name = "PATTERN")]
+        filter: Option<String>,
+        /// DX D2 Task 10: re-run the affected tests on a file change, scoping by the
+        /// workspace import graph (only files whose import closure touched the change
+        /// re-run; falls back to all files if the graph is unavailable). Runs until
+        /// interrupted (Ctrl-C). Requires the `sys` feature (file watching).
+        #[arg(long = "watch")]
+        watch: bool,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
@@ -863,7 +876,19 @@ async fn real_main() -> ExitCode {
             sandbox,
             parallel,
             update_snapshots,
+            filter,
+            watch,
         } => {
+            // DX D2 Task 10: validate the `--filter` ONCE up front so a malformed regex is a
+            // clean error before any test runs (the raw string is re-parsed downstream — in
+            // each isolate / the serial path — but it is already known-good here).
+            if let Some(raw) = &filter {
+                if let Err(e) = ascript::test_filter::TestFilter::parse(raw) {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+            let filter_raw: Option<&str> = filter.as_deref();
             // DX D2: `--parallel` (no value) → `num_cpus` isolates; `--parallel=N` → N;
             // absent → `None` (serial). The `default_missing_value = "0"` sentinel maps
             // the bare flag to "auto" (num_cpus); the runner clamps to `$ASCRIPT_WORKERS`.
@@ -885,40 +910,68 @@ async fn real_main() -> ExitCode {
             // manifest (resolve+fetch-on-miss, or `--locked` offline) and inject
             // the resolved package map so a bare `import "pkg"` in a test works.
             #[cfg(feature = "pkg")]
-            let test_result = {
-                let packages = match files.first() {
-                    Some(first) => {
-                        match pkg::commands::ensure_lock(std::path::Path::new(first), locked) {
-                            Ok(map) => map,
-                            Err(e) => {
-                                eprintln!("error: {e}");
-                                return ExitCode::from(1);
-                            }
+            let packages = match files.first() {
+                Some(first) => {
+                    match pkg::commands::ensure_lock(std::path::Path::new(first), locked) {
+                        Ok(map) => map,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return ExitCode::from(1);
                         }
                     }
-                    None => None,
-                };
-                ascript::run_tests_with_options(
-                    &files,
-                    packages,
-                    caps,
-                    parallel,
-                    update_snapshots,
-                )
-                .await
+                }
+                None => None,
             };
             #[cfg(not(feature = "pkg"))]
-            let test_result = {
+            let packages = {
                 let _ = locked;
-                ascript::run_tests_with_options(&files, None, caps, parallel, update_snapshots)
-                    .await
+                None
             };
+
+            // DX D2 Task 10: `--watch` re-runs the affected tests on file change (sys-gated,
+            // import-graph-scoped). The loop never terminates, so it owns its own printing +
+            // exit. `--no-default-features` (no `sys`) reports a clean rebuild hint.
+            if watch {
+                #[cfg(feature = "sys")]
+                {
+                    match ascript::watch::run_watch(
+                        &files, packages, caps, parallel, filter_raw,
+                    )
+                    .await
+                    {
+                        Ok(()) => return ExitCode::SUCCESS,
+                        Err(e) => {
+                            ascript::diagnostics::report(&e);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "sys"))]
+                {
+                    let _ = (&packages, &caps);
+                    eprintln!(
+                        "error: `--watch` requires the 'sys' feature (file watching); \
+                         rebuild with default features"
+                    );
+                    return ExitCode::from(1);
+                }
+            }
+
+            let test_result = ascript::run_tests_with_options(
+                &files,
+                packages,
+                caps,
+                parallel,
+                update_snapshots,
+                filter_raw,
+            )
+            .await;
             match test_result {
             Ok(summary) => {
                 for (name, message) in &summary.failures {
                     println!("FAIL {}: {}", name, message);
                 }
-                println!("ok. {} passed; {} failed", summary.passed, summary.failed);
+                summary.print_tally();
                 if summary.failed > 0 {
                     ExitCode::from(1)
                 } else {

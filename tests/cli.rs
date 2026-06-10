@@ -1006,6 +1006,170 @@ fn parallel_test_file_with_nested_worker_takes_pool_path() {
     assert!(s.contains("2 passed"), "expected 2 passed; got: {s}");
 }
 
+// ---------------------------------------------------------------------------------------
+// DX D2 Task 10 — `--filter PATTERN` (substring or `/regex/`) prunes which tests run; a
+// skipped test is reported as "filtered", never pass/fail. Composes with `--parallel`
+// deterministically; a bad regex is a clean error.
+// ---------------------------------------------------------------------------------------
+
+/// Write a small mixed-name test corpus (one file, several tests with distinguishable
+/// names) and return its path.
+fn write_filter_corpus(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("ascript_filter_{}_{}", tag, std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("suite.as");
+    std::fs::write(
+        &file,
+        "test(\"adds numbers\", () => { assert(1 + 1 == 2) })\n\
+         test(\"adds strings\", () => { assert(\"a\" + \"b\" == \"ab\") })\n\
+         test(\"subtracts numbers\", () => { assert(3 - 1 == 2) })\n\
+         test(\"multiplies numbers\", () => { assert(2 * 3 == 6) })\n",
+    )
+    .unwrap();
+    (dir, file)
+}
+
+/// A substring `--filter` runs only the matching tests; the rest are reported as
+/// "filtered", not passed/failed.
+#[test]
+fn filter_substring_prunes_tests_and_reports_filtered_count() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let (dir, file) = write_filter_corpus("sub");
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--filter")
+        .arg("adds")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    // 2 tests contain "adds"; the other 2 ("subtracts numbers", "multiplies numbers") are
+    // filtered. ("subtracts" contains "...tracts", NOT "adds".)
+    assert!(
+        s.contains("2 passed; 0 failed; 2 filtered"),
+        "expected 2 passed / 2 filtered; got: {s}"
+    );
+    assert!(out.status.success(), "all run tests pass → exit 0; got: {s}");
+}
+
+/// A `/regex/` `--filter` matches by regular expression against the test name.
+#[test]
+fn filter_regex_prunes_tests() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let (dir, file) = write_filter_corpus("re");
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--filter")
+        .arg("/^adds/") // anchored: names STARTING with "adds"
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    // "adds numbers" + "adds strings" start with "adds"; the other two do not.
+    assert!(
+        s.contains("2 passed; 0 failed; 2 filtered"),
+        "expected 2 passed / 2 filtered for /^adds/; got: {s}"
+    );
+}
+
+/// A malformed `/regex/` is a CLEAN error (non-zero exit, a readable message), never a
+/// panic.
+#[test]
+fn filter_bad_regex_is_a_clean_error() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let (dir, file) = write_filter_corpus("bad");
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--filter")
+        .arg("/(unclosed/")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let s =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a bad regex must exit non-zero");
+    assert!(
+        s.contains("invalid --filter regex"),
+        "expected a clean regex error; got: {s}"
+    );
+    // No panic / abort.
+    assert_ne!(out.status.code(), Some(134), "must not abort/panic: {s}");
+}
+
+/// THE §7 contract for filtering: `--filter` + `--parallel=1` and `--filter` + `--parallel=N`
+/// over a multi-FILE corpus produce BYTE-IDENTICAL output (the filter is applied identically
+/// inside each isolate, independent of completion order).
+#[test]
+fn filter_with_parallel_is_deterministic() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_filter_par_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let a = dir.join("a.as");
+    let b = dir.join("b.as");
+    std::fs::write(
+        &a,
+        "test(\"keep a1\", () => { assert(true) })\n\
+         test(\"drop a2\", () => { assert(true) })\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        "test(\"keep b1\", () => { assert(true) })\n\
+         test(\"drop b2\", () => { assert(true) })\n",
+    )
+    .unwrap();
+
+    let run = |parallel_flag: &str| {
+        std::process::Command::new(bin)
+            .arg("test")
+            .arg(parallel_flag)
+            .arg("--filter")
+            .arg("keep")
+            .arg(&a)
+            .arg(&b)
+            .output()
+            .unwrap()
+    };
+    let one = run("--parallel=1");
+    let four = run("--parallel=4");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        String::from_utf8_lossy(&one.stdout),
+        String::from_utf8_lossy(&four.stdout),
+        "filtered output must be byte-identical across --parallel=1 and =4"
+    );
+    let s = String::from_utf8_lossy(&four.stdout);
+    // 2 "keep" tests run, 2 "drop" tests filtered.
+    assert!(
+        s.contains("2 passed; 0 failed; 2 filtered"),
+        "expected 2 passed / 2 filtered; got: {s}"
+    );
+}
+
+/// No `--filter` → the tally is byte-identical to the historical output (no "filtered"
+/// clause), so existing consumers are unaffected.
+#[test]
+fn no_filter_keeps_the_legacy_tally_shape() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let (dir, file) = write_filter_corpus("none");
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(s.contains("4 passed; 0 failed"), "got: {s}");
+    assert!(!s.contains("filtered"), "no filtered clause expected; got: {s}");
+}
+
 #[test]
 #[cfg(feature = "crypto")] // program imports std/crypto; only valid with the crypto feature.
 fn runs_crypto_sha256_and_password_roundtrip() {

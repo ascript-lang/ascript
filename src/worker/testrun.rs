@@ -64,6 +64,7 @@ pub async fn run_test_file_in_isolate(
     packages: Option<PackageMap>,
     caps: Option<CapSet>,
     update_snapshots: bool,
+    filter: Option<String>,
 ) -> FileRunResult {
     let path_str = path.to_string_lossy().into_owned();
 
@@ -75,6 +76,7 @@ pub async fn run_test_file_in_isolate(
     let caps_iso = caps.clone();
     let packages_iso = packages.clone();
     let path_iso = path_str.clone();
+    let filter_iso = filter.clone();
 
     // Spawn the dedicated isolate. Everything captured is `Send` (String / HashMap of
     // PathBufs / CapSet / the reply sender).
@@ -97,7 +99,7 @@ pub async fn run_test_file_in_isolate(
             return;
         }
 
-        let result = run_one_file(&interp, &path_iso).await;
+        let result = run_one_file(&interp, &path_iso, filter_iso.as_deref()).await;
         let _ = reply_tx.send(result);
         // Loop ends when `rx` closes (handle dropped after the reply).
     });
@@ -118,7 +120,7 @@ pub async fn run_test_file_in_isolate(
             }
             interp.set_snapshot_update(update_snapshots);
             interp.install_self();
-            return match run_one_file(&interp, &path_str).await {
+            return match run_one_file(&interp, &path_str, filter.as_deref()).await {
                 Ok(bytes) => decode_summary(&bytes, &path_str),
                 Err(reason) => Err(reason),
             };
@@ -183,19 +185,24 @@ fn decode_summary(bytes: &[u8], path_str: &str) -> FileRunResult {
 /// [`TestSummary`] as the airlock `Value::Object` bytes. Shared by the in-isolate path
 /// and the spawn-failure inline fallback. Returns `Err(reason)` (never a panic) on a load
 /// error or an `exit()` during the run.
-async fn run_one_file(interp: &crate::interp::Interp, path: &str) -> Result<Vec<u8>, String> {
+async fn run_one_file(
+    interp: &crate::interp::Interp,
+    path: &str,
+    filter: Option<&str>,
+) -> Result<Vec<u8>, String> {
     // The hosting thread is a worker isolate (its `IN_ISOLATE` flag is TRUE), but the test
     // FILE must behave like a normal top-level program: a `worker fn` it dispatches should
     // take the full POOL path (recompile-from-source code slice), NOT the inline-nesting
     // path (which assumes the entry is already a VM global from an enclosing slice). So we
     // force the flag FALSE for the file run; the file's own workers then spawn their own
     // (per-thread) pool isolates — correct shared-nothing semantics, no deadlock.
-    isolate::with_isolate_flag(false, || run_one_file_inner(interp, path)).await
+    isolate::with_isolate_flag(false, || run_one_file_inner(interp, path, filter)).await
 }
 
 async fn run_one_file_inner(
     interp: &crate::interp::Interp,
     path: &str,
+    filter: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     match interp.load_module(Path::new(path)).await {
         Ok(_) | Err(Control::Propagate(_)) => {}
@@ -204,7 +211,11 @@ async fn run_one_file_inner(
             return Err("exit() called during test run".to_string());
         }
     }
-    let summary = match interp.run_registered_tests().await {
+    // DX D2 Task 10: re-parse the (CLI-validated) raw filter inside the isolate and apply
+    // it identically to the serial path. A re-parse cannot realistically fail on an
+    // already-validated filter; treat any failure as "no filter" rather than panic.
+    let filter = filter.and_then(|raw| crate::test_filter::TestFilter::parse(raw).ok());
+    let summary = match interp.run_registered_tests_filtered(filter.as_ref()).await {
         Ok(summary) => summary,
         Err(Control::Exit(_)) => {
             return Err("exit() called during test run".to_string());

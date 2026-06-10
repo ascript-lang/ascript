@@ -45,6 +45,11 @@ pub mod span;
 pub mod stdlib;
 pub mod syntax;
 pub mod task;
+// DX D2 Task 10: `--filter PATTERN` test-name filtering (substring or `/regex/`) +
+// `--watch` import-graph scoping. Core (no feature gate); the regex branch is
+// `data`/`sys`-gated and degrades to a clean error otherwise.
+pub mod test_filter;
+pub mod watch;
 pub mod token;
 pub mod value;
 pub mod vm;
@@ -166,7 +171,7 @@ pub async fn run_tests_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<TestSummary, AsError> {
-    run_tests_with_options(files, packages, caps, None, false).await
+    run_tests_with_options(files, packages, caps, None, false, None).await
 }
 
 /// DX D2 Task 5 — the test runner with the `--parallel[=N]` option.
@@ -186,6 +191,7 @@ pub async fn run_tests_with_options(
     caps: Option<crate::stdlib::caps::CapSet>,
     parallel: Option<usize>,
     update_snapshots: bool,
+    filter: Option<&str>,
 ) -> Result<TestSummary, AsError> {
     // Parallelize only when asked for >1 isolate AND there is more than one file. A
     // single file in one isolate is the serial path with extra cost — degrade to serial
@@ -198,9 +204,13 @@ pub async fn run_tests_with_options(
             // airlock), but orphan detection/removal is a SERIAL-path feature (each
             // isolate sees only its own file's touches — it cannot tell a sibling
             // file's untouched snapshot from a genuine orphan). Documented asymmetry.
-            run_tests_parallel(files, packages, caps, n, update_snapshots).await
+            //
+            // DX D2 Task 10: the `--filter` is applied INSIDE each isolate (same parsed
+            // filter raw, re-parsed per isolate across the airlock), so the filtered/
+            // passed/failed aggregate is identical regardless of parallelism (§7).
+            run_tests_parallel(files, packages, caps, n, update_snapshots, filter).await
         }
-        _ => run_tests_serial(files, packages, caps, update_snapshots).await,
+        _ => run_tests_serial(files, packages, caps, update_snapshots, filter).await,
     }
 }
 
@@ -210,7 +220,16 @@ async fn run_tests_serial(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
     update_snapshots: bool,
+    filter: Option<&str>,
 ) -> Result<TestSummary, AsError> {
+    // Parse the (CLI-validated) raw filter once for this serial run. A re-parse of an
+    // already-validated filter cannot realistically fail, but a defensive `?` keeps the
+    // path panic-free if it ever did.
+    let filter = match filter {
+        Some(raw) => Some(crate::test_filter::TestFilter::parse(raw).map_err(AsError::new)?),
+        None => None,
+    };
+    let filter = filter.as_ref();
     let interp = Rc::new(Interp::new());
     if let Some(caps) = caps {
         interp.set_caps(caps);
@@ -236,7 +255,7 @@ async fn run_tests_serial(
                     }
                 }
             }
-            match interp.run_registered_tests().await {
+            match interp.run_registered_tests_filtered(filter).await {
                 Ok(summary) => Ok(summary),
                 // exit() inside a test is likewise a hard error: surface a clear
                 // failure (non-zero exit) instead of an empty success summary.
@@ -313,6 +332,7 @@ async fn run_tests_parallel(
     caps: Option<crate::stdlib::caps::CapSet>,
     n: usize,
     update_snapshots: bool,
+    filter: Option<&str>,
 ) -> Result<TestSummary, AsError> {
     use std::sync::Arc;
     // Cap the in-flight isolate count: the requested `n`, bounded by the same
@@ -332,6 +352,10 @@ async fn run_tests_parallel(
                 let sem = sem.clone();
                 let packages = packages.clone();
                 let caps = caps.clone();
+                // DX D2 Task 10: ship the RAW filter string into the isolate (Send); each
+                // isolate re-parses + applies it identically, so the filtered/passed/failed
+                // aggregate is independent of `--parallel` (§7).
+                let filter = filter.map(str::to_string);
                 let path = std::path::PathBuf::from(file);
                 handles.push(tokio::task::spawn_local(async move {
                     // A closed semaphore is unreachable here (we never close it); on the
@@ -349,6 +373,7 @@ async fn run_tests_parallel(
                         packages,
                         caps,
                         update_snapshots,
+                        filter,
                     )
                     .await
                 }));
@@ -380,6 +405,7 @@ async fn run_tests_parallel(
             Ok(summary) => {
                 agg.passed += summary.passed;
                 agg.failed += summary.failed;
+                agg.filtered += summary.filtered;
                 agg.failures.extend(summary.failures);
             }
             Err(reason) => {
