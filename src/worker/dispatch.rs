@@ -1499,6 +1499,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
 

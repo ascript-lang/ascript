@@ -2248,6 +2248,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let a = Closure::new(proto);
         let cv = Value::Closure(a.clone());
@@ -2275,6 +2276,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         }));
         assert_ne!(Value::Closure(a), Value::Closure(b));
 

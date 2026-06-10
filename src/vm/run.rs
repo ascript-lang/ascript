@@ -520,6 +520,7 @@ impl Vm {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let mut module_fiber = Fiber::new(closure);
@@ -612,6 +613,14 @@ impl Vm {
 
     /// The instruction-dispatch loop. Wrapped by [`run`] which binds the faulting
     /// module's source onto an escaping panic (SP4 §3 cross-module provenance).
+    ///
+    /// DBG (debug-info, §5.1) ZERO-COST INVARIANT: the debug-info tables
+    /// `Chunk::build_line_starts`/`line_col_at`/`first_offset_for_line` and
+    /// `FnProto.local_names` are PURE compile-time metadata — they are NEVER consulted
+    /// anywhere in this loop (an attached debugger reads them out-of-band). A grep for
+    /// `line_starts`/`local_names` in this file finds only the empty-`Vec::new()`
+    /// construction of runtime-built protos, never a read. Keep it that way: a debug
+    /// table reached from the hot loop is a Gate-12 regression.
     async fn run_loop(&self, fiber: &mut Fiber) -> Result<RunOutcome, Control> {
         loop {
             // Capture the faulting ip (the opcode byte's offset) before advancing.
@@ -5069,6 +5078,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5426,6 +5436,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5477,6 +5488,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5635,6 +5647,7 @@ mod tests {
                 owning_class: None,
                 params: Vec::new(),
                 ret: None,
+                local_names: Vec::new(),
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
 
@@ -5832,6 +5845,7 @@ mod tests {
                 owning_class: None,
                 params: Vec::new(),
                 ret: None,
+                local_names: Vec::new(),
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
             let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
@@ -6282,6 +6296,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -6603,6 +6618,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -6628,6 +6644,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);

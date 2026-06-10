@@ -942,6 +942,7 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
         owning_class,
         params,
         ret,
+        local_names: Vec::new(),
     })
 }
 
@@ -2001,6 +2002,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -2135,6 +2137,7 @@ run()
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto).unwrap();
@@ -2155,6 +2158,7 @@ run()
                 owning_class: None,
                 params: Vec::new(),
                 ret: None,
+                local_names: Vec::new(),
             }
         };
         let mut w2 = Writer::new();
@@ -2178,6 +2182,7 @@ run()
             owning_class: Some(Rc::from("Img")),
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto_with).unwrap();
@@ -2197,6 +2202,7 @@ run()
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         };
         let mut w2 = Writer::new();
         write_proto(&mut w2, &proto_none).unwrap();

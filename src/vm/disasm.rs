@@ -436,6 +436,7 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
         });
 
         let mut c = Chunk::new();
