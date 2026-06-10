@@ -5679,6 +5679,47 @@ mod tests {
     use super::*;
     use crate::vm::disasm::disasm;
 
+    /// DBG: `Op::Break` is the runtime breakpoint trap — it must NEVER be emitted by
+    /// the compiler (it only ever appears because a debugger patched a byte). Scan a
+    /// feature-rich compiled chunk (and every nested proto) for the BREAK opcode byte.
+    #[test]
+    fn compiler_never_emits_break_opcode() {
+        use crate::vm::opcode::Op;
+        fn scan(chunk: &crate::vm::chunk::Chunk) {
+            // Walk instructions by opcode width so an operand byte that happens to
+            // equal `Op::Break as u8` is not mistaken for an opcode.
+            let mut off = 0;
+            while off < chunk.code.len() {
+                let byte = chunk.code[off];
+                let op = Op::from_u8(byte)
+                    .unwrap_or_else(|| panic!("compiled an invalid opcode byte {byte:#x}"));
+                assert_ne!(op, Op::Break, "compiler emitted Op::Break at offset {off}");
+                off += 1 + op.operand_width();
+            }
+            for proto in &chunk.protos {
+                scan(&proto.chunk);
+            }
+        }
+        let src = r#"
+            fn fib(n: number): number {
+                if (n < 2) { return n }
+                return fib(n - 1) + fib(n - 2)
+            }
+            class Point { x: number; y: number }
+            enum Shape { Circle(r: number), Square }
+            let xs = [1, 2, 3].map((v) => v * 2)
+            for (i in 0..10 step 2) { print(i) }
+            let p = Point.from({ x: 1, y: 2 })
+            match (Shape.Circle(3.0)) {
+                Shape.Circle(r) => print(r),
+                Shape.Square => print("sq"),
+            }
+            print(fib(5), xs, p)
+        "#;
+        let chunk = compile_source(src).expect("compiles");
+        scan(&chunk);
+    }
+
     #[test]
     fn compile_one_plus_two_emits_const_const_add_return() {
         let chunk = compile_source("1 + 2").expect("compiles");

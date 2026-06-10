@@ -621,6 +621,41 @@ impl Chunk {
         self.code[at]
     }
 
+    /// DBG: runtime-patch ONE opcode byte at `off` to `b` through a shared `&Chunk`
+    /// (software-breakpoint patching, `src/vm/instrument.rs`). Used both to write
+    /// `Op::Break` at a breakpoint and to restore the original byte when the trap
+    /// fires (the v1 un-patch-on-hit re-execution, `Op::Break` arm in `run.rs`).
+    ///
+    /// # Why interior mutability here
+    ///
+    /// The run loop reaches a proto's `Chunk` only through a shared `Rc<FnProto>`
+    /// (`&Chunk`), but breakpoint patching is the textbook self-modifying-bytecode
+    /// technique (GDB/LLDB `int3`, the JVM `Breakpoint` bytecode, V8 debug bytecode):
+    /// the byte stream IS mutated in place. `Chunk.code` stays a plain `Vec<u8>` so
+    /// every other reader (the disassembler, verifier, `.aso` serializer, and the hot
+    /// fetch `code[ip]`) is byte-identical and pays nothing — the NOT-attached path is
+    /// completely untouched (Gate 12). Only this one method mutates through `&self`,
+    /// and only when a debugger is attached.
+    ///
+    /// # Safety
+    ///
+    /// Sound because the VM is single-threaded and `!Send` (one `Interp`/`Vm` per OS
+    /// thread; the chunk is never shared across threads). At the call site (the
+    /// `Op::Break` trap arm) the current instruction's byte has already been fetched
+    /// for this iteration, so no live `&u8` into `code[off]` is outstanding when the
+    /// write happens — the next loop iteration re-reads the freshly-written byte.
+    /// `off` is always an in-bounds opcode offset the breakpoint mechanism recorded.
+    pub fn patch_byte(&self, off: usize, b: u8) {
+        assert!(off < self.code.len(), "patch_byte offset out of bounds");
+        // SAFETY: see the doc-comment above — single-threaded `!Send` VM, no aliasing
+        // read of this byte is live across the write (the iteration already fetched
+        // it), in-bounds offset.
+        unsafe {
+            let ptr = self.code.as_ptr() as *mut u8;
+            *ptr.add(off) = b;
+        }
+    }
+
     /// Read the `i16` little-endian (jump) operand starting at byte `at`.
     pub fn read_i16(&self, at: usize) -> i16 {
         i16::from_le_bytes([self.code[at], self.code[at + 1]])

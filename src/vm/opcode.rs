@@ -613,6 +613,22 @@ pub enum Op {
     /// runtime "arguments must be all named or all positional, not mixed" panic there
     /// — never a compile-time rejection. No inline operand (arity is dynamic).
     CallNamedSpread,
+
+    // ---- DBG: the debugger trap opcode ------------------------------------
+    /// `BREAK` (no operand) — the software-breakpoint trap. **NEVER emitted by the
+    /// compiler.** It only ever appears because the debugger runtime-PATCHED an
+    /// opcode byte at a resolved breakpoint offset, saving the displaced byte in the
+    /// `DebuggerHook` side table (`src/vm/instrument.rs`). Its `run_loop` arm recovers
+    /// the original opcode from that side table, ships a `Stopped` event, parks the
+    /// fiber on the command channel until a resume command, then UN-PATCHES the byte
+    /// (restoring the original op) and re-points `ip` to the break offset so the next
+    /// dispatch iteration reads + executes the recovered original op normally — the
+    /// displaced instruction runs exactly once. (v1: a hit breakpoint un-patches
+    /// itself; persistent re-arming is a follow-up.) Patching is in-place — it never
+    /// moves an offset, so the inline-cache side maps and `spans`/`line_starts` stay
+    /// valid. Appended at the END so existing opcode byte values are unchanged; it is
+    /// never serialized (it exists only as a runtime patch), so no `.aso` bump.
+    Break,
 }
 
 impl Op {
@@ -761,6 +777,8 @@ impl Op {
             x if x == AppendSpreadArg as u8 => AppendSpreadArg,
             x if x == CallNamedSpread as u8 => CallNamedSpread,
 
+            x if x == Break as u8 => Break,
+
             _ => return None,
         })
     }
@@ -857,7 +875,10 @@ impl Op {
             | BitNot
             | WrapAdd
             | WrapSub
-            | WrapMul => 0,
+            | WrapMul
+            // DBG: the runtime-patched breakpoint trap carries no operand; the
+            // recovered original op advances its own width on re-dispatch.
+            | Break => 0,
         }
     }
 
@@ -997,6 +1018,7 @@ mod tests {
         Op::AppendPosArg,
         Op::AppendSpreadArg,
         Op::CallNamedSpread,
+        Op::Break,
     ];
 
     #[test]

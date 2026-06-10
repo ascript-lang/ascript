@@ -331,6 +331,7 @@ fn op_name(op: Op) -> &'static str {
         AppendPosArg => "APPEND_POS_ARG",
         AppendSpreadArg => "APPEND_SPREAD_ARG",
         CallNamedSpread => "CALL_NAMED_SPREAD",
+        Break => "BREAK",
     }
 }
 
@@ -474,6 +475,19 @@ mod tests {
         let l2 = disasm_at(&c, &mut off);
         assert_eq!(off, 4, "POP advances 1 byte");
         assert!(l2.starts_with("0003 ") && l2.contains("POP"));
+    }
+
+    #[test]
+    fn disasm_renders_break_trap() {
+        // DBG: a runtime-patched BREAK byte disassembles (zero operand). It is never
+        // compiler-emitted, but the disassembler must render it (e.g. a debugger's
+        // bytecode view of a patched chunk).
+        let mut c = Chunk::new();
+        c.code.push(Op::Break as u8);
+        let mut off = 0;
+        let line = disasm_at(&c, &mut off);
+        assert_eq!(off, 1, "BREAK is zero-operand, advances exactly 1");
+        assert!(line.contains("BREAK"), "got {line:?}");
     }
 
     #[test]

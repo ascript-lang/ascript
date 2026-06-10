@@ -157,6 +157,38 @@ impl DebuggerHook {
         (hook, cmd_tx, evt_rx)
     }
 
+    /// Set a breakpoint at `(proto_id, offset)`, saving the original byte and writing
+    /// [`Op::Break`](crate::vm::opcode::Op::Break) in its place. `code` is the proto's
+    /// `code` byte stream (the patch site). Idempotent: re-setting a live breakpoint
+    /// keeps the original byte (does NOT save the already-patched `Op::Break` over it).
+    /// Returns the original byte that was displaced.
+    ///
+    /// Patching is in place — it never moves an offset, so the inline-cache side maps
+    /// (`field_ics`/`method_ics`, keyed by offset) and the `spans`/`line_starts`
+    /// tables stay valid while the breakpoint is set.
+    pub fn set_breakpoint(&mut self, proto_id: usize, offset: usize, code: &mut [u8]) -> u8 {
+        let key = (proto_id, offset);
+        // If already patched, the saved byte is authoritative — never re-save the
+        // Op::Break byte over the real original.
+        let original = *self.breakpoints.entry(key).or_insert_with(|| code[offset]);
+        code[offset] = crate::vm::opcode::Op::Break as u8;
+        original
+    }
+
+    /// Clear a breakpoint at `(proto_id, offset)`, restoring the exact original byte.
+    /// No-op (returns `None`) if no breakpoint was set there.
+    pub fn clear_breakpoint(
+        &mut self,
+        proto_id: usize,
+        offset: usize,
+        code: &mut [u8],
+    ) -> Option<u8> {
+        let key = (proto_id, offset);
+        let original = self.breakpoints.remove(&key)?;
+        code[offset] = original;
+        Some(original)
+    }
+
     /// The original opcode byte a patched `(proto_id, offset)` displaced, if any. The
     /// trap handler uses this to recover and re-dispatch the real instruction.
     pub fn original_byte(&self, proto_id: usize, offset: usize) -> Option<u8> {
@@ -210,5 +242,53 @@ mod tests {
         assert_eq!(hook.len(), 0);
         assert_eq!(hook.original_byte(0, 0), None);
         assert_eq!(hook.step_mode, StepMode::Run);
+    }
+
+    #[test]
+    fn set_breakpoint_patches_and_saves_original() {
+        use crate::vm::opcode::Op;
+        let (mut hook, _cmd, _evt) = DebuggerHook::new();
+        let mut code = vec![Op::Add as u8, Op::Return as u8];
+        let original = hook.set_breakpoint(0xABCD, 0, &mut code);
+        assert_eq!(original, Op::Add as u8);
+        assert_eq!(code[0], Op::Break as u8, "byte patched to Op::Break");
+        assert_eq!(code[1], Op::Return as u8, "neighbor byte untouched");
+        assert_eq!(hook.original_byte(0xABCD, 0), Some(Op::Add as u8));
+        assert_eq!(hook.len(), 1);
+    }
+
+    #[test]
+    fn clear_restores_exact_original_byte() {
+        use crate::vm::opcode::Op;
+        let (mut hook, _cmd, _evt) = DebuggerHook::new();
+        let mut code = vec![Op::Mul as u8];
+        hook.set_breakpoint(7, 0, &mut code);
+        assert_eq!(code[0], Op::Break as u8);
+        let restored = hook.clear_breakpoint(7, 0, &mut code);
+        assert_eq!(restored, Some(Op::Mul as u8));
+        assert_eq!(code[0], Op::Mul as u8, "exact original byte restored");
+        assert!(hook.is_empty());
+        assert_eq!(hook.original_byte(7, 0), None);
+    }
+
+    #[test]
+    fn set_breakpoint_is_idempotent_keeps_original() {
+        use crate::vm::opcode::Op;
+        let (mut hook, _cmd, _evt) = DebuggerHook::new();
+        let mut code = vec![Op::Sub as u8];
+        hook.set_breakpoint(1, 0, &mut code); // saves Sub, writes Break
+        let again = hook.set_breakpoint(1, 0, &mut code); // re-set the live bp
+        assert_eq!(again, Op::Sub as u8, "re-set keeps the real original");
+        assert_eq!(code[0], Op::Break as u8);
+        assert_eq!(hook.len(), 1, "no duplicate entry");
+    }
+
+    #[test]
+    fn clear_missing_breakpoint_is_noop() {
+        use crate::vm::opcode::Op;
+        let (mut hook, _cmd, _evt) = DebuggerHook::new();
+        let mut code = vec![Op::Nil as u8];
+        assert_eq!(hook.clear_breakpoint(0, 0, &mut code), None);
+        assert_eq!(code[0], Op::Nil as u8);
     }
 }

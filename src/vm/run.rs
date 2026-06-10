@@ -3426,6 +3426,67 @@ impl Vm {
                     fiber.push(bound);
                 }
 
+                Op::Break => {
+                    // DBG: the software-breakpoint trap. Reached ONLY because the
+                    // debugger PATCHED this opcode byte (the side table holds the
+                    // displaced original op). This is the ONLY new hot-loop arm; the
+                    // `None`/no-breakpoint path never produces an `Op::Break` byte, so
+                    // every production run is byte-identical to pre-DBG (Gate 12).
+                    //
+                    // Re-execution technique (the simplest one — no dispatch
+                    // restructuring): recover the original byte, park on the command
+                    // channel, then UN-PATCH the byte (write the original back) and
+                    // reset `ip` to the break offset. The next iteration of THIS very
+                    // loop re-reads `code[ip]` — now the restored original opcode —
+                    // and executes it normally. The displaced instruction therefore
+                    // runs exactly once and the program result is identical to an
+                    // un-instrumented run.
+                    //
+                    // v1 trade-off (DOCUMENTED): a hit breakpoint UN-PATCHES itself,
+                    // so it traps at most once per set. Persistent re-arming (re-patch
+                    // after stepping off) is a Task-6 follow-up. Tests that need a
+                    // breakpoint to fire on every loop iteration re-patch from the
+                    // controller after each stop.
+                    let proto_id =
+                        Rc::as_ptr(&fiber.frame().closure.proto) as *const () as usize;
+                    let depth = fiber.frames.len();
+
+                    // Recover the original opcode byte from the hook's side table
+                    // (scoped borrow, dropped immediately — Gate 4).
+                    let original = {
+                        let inst = self.instrument.borrow();
+                        inst.as_ref()
+                            .and_then(|i| i.breakpoints.as_ref())
+                            .and_then(|h| h.original_byte(proto_id, fault_ip))
+                    };
+                    let Some(original_byte) = original else {
+                        // A stray Break with no side-table entry (no debugger, or a
+                        // cleared breakpoint left a Break byte): nothing to recover.
+                        // `ip` already advanced past the (0-width) Break, so just
+                        // continue — treat it as a no-op safepoint.
+                        continue;
+                    };
+
+                    // Park: ship a `Stopped` event and block on the command channel
+                    // for a resume. No Value/Cc/RefCell borrow is held across the
+                    // blocking recv (Gate 4) — `debug_stop` scopes every borrow.
+                    self.debug_stop(proto_id, fault_ip, depth);
+
+                    // Un-patch this breakpoint and re-point `ip` to the break offset so
+                    // the next loop iteration reads + executes the recovered original
+                    // op normally. `code` lives behind a `RefCell` on the chunk; write
+                    // the restored byte through it (no offset moves). If the byte was
+                    // already restored (e.g. the controller cleared it during the
+                    // stop), the write is harmless.
+                    {
+                        let chunk = &fiber.frame().closure.proto.chunk;
+                        chunk.patch_byte(fault_ip, original_byte);
+                    }
+                    fiber.frame_mut().ip = fault_ip;
+                    // Fall through to the top of the loop: it re-reads code[fault_ip]
+                    // (now the original op) and dispatches it. No restructuring.
+                }
+
                 other => {
                     return Err(self.panic_at(
                         fiber,
@@ -3435,6 +3496,61 @@ impl Vm {
                 }
             }
         }
+    }
+
+    /// DBG: park the fiber at a breakpoint. Ships a `Stopped` event to the DAP server
+    /// thread and blocks on the command channel until a resume command, recording the
+    /// resume's step mode on the hook.
+    ///
+    /// Gate 4: builds the plain-data snapshot and ships it, then drops every borrow
+    /// BEFORE blocking on the channel `recv` — no `RefCell`/`Cc` borrow is held across
+    /// the wait. The `Instrumentation` box is TAKEN out of the cell across the blocking
+    /// recv (a re-entrant native call the resumed program triggers could otherwise
+    /// re-borrow the cell), then put back.
+    fn debug_stop(&self, proto_id: usize, offset: usize, depth: usize) {
+        use crate::vm::instrument::{DebugCommand, DebugEvent, StepMode};
+        // Ship the Stopped event (scoped borrow, dropped immediately).
+        {
+            let inst = self.instrument.borrow();
+            let Some(hook) = inst.as_ref().and_then(|i| i.breakpoints.as_ref()) else {
+                return;
+            };
+            // If the controller end has hung up, there is nothing to wait for —
+            // resume immediately (a detached debugger must not deadlock the program).
+            if hook
+                .events
+                .send(DebugEvent::Stopped {
+                    proto_id,
+                    offset,
+                    depth,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+        // Take the payload OUT across the blocking recv (Gate 4 — hold no cell borrow
+        // while blocked). Nothing from the script heap (Value/Cc/fiber) is touched.
+        let mut taken = self.instrument.borrow_mut().take();
+        let cmd = taken
+            .as_mut()
+            .and_then(|i| i.breakpoints.as_mut())
+            .and_then(|hook| hook.commands.recv().ok());
+        // Record the resulting step mode (a disconnected channel / no command resumes
+        // free-running). Stepping itself (transient breakpoints) is a Task-6 follow-up;
+        // v1 records the mode so the DAP server can drive it later.
+        let mode = match cmd {
+            Some(DebugCommand::Continue) | None => StepMode::Run,
+            Some(DebugCommand::Next) => StepMode::Over,
+            Some(DebugCommand::StepIn) => StepMode::Into,
+            Some(DebugCommand::StepOut) => StepMode::Out,
+        };
+        if let Some(hook) = taken.as_mut().and_then(|i| i.breakpoints.as_mut()) {
+            hook.step_mode = mode;
+            hook.step_depth = depth;
+        }
+        // Restore the payload (the program continues with the debugger still armed).
+        *self.instrument.borrow_mut() = taken;
     }
 
     /// Call ANY value, the single primitive both engines re-enter through.
@@ -5444,6 +5560,312 @@ mod tests {
             "an all-None Instrumentation must not perturb program output"
         );
         assert_eq!(inst_out, "5.0\n");
+    }
+
+    // ---- DBG Task 2: the Op::Break trap / re-dispatch ---------------------
+
+    /// Run a watchdog-guarded closure. macOS has no `timeout(1)`, and a buggy
+    /// `Op::Break` arm BLOCKS forever on the command channel. The VM runtime is `!Send`
+    /// (`Rc`/`RefCell`), so the body CANNOT run on a spawned worker thread — it runs on
+    /// the calling (test) thread. Instead a separate WATCHDOG timer thread is armed: if
+    /// the body does not signal completion within `secs`, the watchdog ABORTS the
+    /// process with a loud message, so a regression-induced hang is a visible failure
+    /// (a non-zero exit + diagnostic) rather than a silent stall of the host / CI.
+    /// On normal completion the watchdog is disarmed (signalled) and joins immediately.
+    fn with_watchdog<T>(secs: u64, f: impl FnOnce() -> T) -> T {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(secs))
+                .is_err()
+            {
+                eprintln!(
+                    "DBG breakpoint test exceeded {secs}s watchdog — likely an Op::Break \
+                     arm hang (blocked on the command channel with no driver). Aborting."
+                );
+                std::process::abort();
+            }
+        });
+        let r = f();
+        let _ = done_tx.send(()); // disarm
+        watchdog.join().expect("watchdog thread");
+        r
+    }
+
+    /// Find the byte offset of the first instruction whose opcode is `target`, by
+    /// walking the chunk with the disassembler's offset stepper (so an operand byte
+    /// that happens to equal an opcode value is never mistaken for an instruction).
+    fn find_op_offset(chunk: &Chunk, target: Op) -> Option<usize> {
+        let mut off = 0;
+        while off < chunk.code.len() {
+            let at = off;
+            let op = Op::from_u8(chunk.code[at])?;
+            if op == target {
+                return Some(at);
+            }
+            off = at + 1 + op.operand_width();
+        }
+        None
+    }
+
+    /// Run `chunk` with a breakpoint patched at `bp_offset` (a real opcode-byte
+    /// offset). A controller thread DRIVES the command channel — it auto-`Continue`s
+    /// on every `Stopped` event (the `--inspect`-with-breakpoints-but-auto-continue
+    /// observation contract), so the trap arm never blocks indefinitely. Returns the
+    /// program output plus the number of times the breakpoint trapped.
+    ///
+    /// The whole thing runs under a watchdog: a bug that leaves the trap blocked
+    /// fails the test instead of hanging the host.
+    fn run_with_breakpoint_auto_continue(
+        chunk: Chunk,
+        bp_offset: usize,
+    ) -> (bool, String, usize) {
+        use crate::vm::instrument::{DebugCommand, DebuggerHook, Instrumentation};
+
+        with_watchdog(10, move || {
+            // Build the proto, capture its identity, then patch ONE byte via the hook
+            // while we still uniquely own the Rc (refcount 1, before `Closure::new`).
+            let mut proto = Rc::new(FnProto {
+                chunk,
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                owning_class: None,
+                params: Vec::new(),
+                ret: None,
+            });
+            let proto_id = Rc::as_ptr(&proto) as *const () as usize;
+
+            let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+            {
+                let p = Rc::get_mut(&mut proto).expect("uniquely own the proto");
+                let original = hook.set_breakpoint(proto_id, bp_offset, &mut p.chunk.code);
+                assert_ne!(
+                    original,
+                    crate::vm::opcode::Op::Break as u8,
+                    "patched a real opcode byte, not an already-Break byte"
+                );
+            }
+
+            // The controller thread: auto-continue on each Stopped, counting hits.
+            // It ends when the event Sender is dropped (the VM/hook is dropped).
+            let controller = std::thread::spawn(move || {
+                let mut hits = 0usize;
+                while evt_rx.recv().is_ok() {
+                    hits += 1;
+                    if cmd_tx.send(DebugCommand::Continue).is_err() {
+                        break;
+                    }
+                }
+                hits
+            });
+
+            let closure = Closure::new(proto);
+            let mut fiber = Fiber::new(closure);
+            let inst = Instrumentation {
+                breakpoints: Some(hook),
+                profiler: None,
+                coverage: None,
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build current-thread runtime");
+            let local = LocalSet::new();
+            let (outcome, out) = local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(interp.clone(), inst);
+                let outcome = vm.run(&mut fiber).await;
+                (outcome, interp.output())
+            });
+            let ok = matches!(outcome, Ok(RunOutcome::Done(_)));
+            // Dropping the VM dropped the hook's event Sender, so the controller loop
+            // ends; join it to read the hit count.
+            let hits = controller.join().expect("controller thread");
+            (ok, out, hits)
+        })
+    }
+
+    #[test]
+    fn breakpoint_traps_and_program_output_unchanged_after_continue() {
+        // Breakpoint on the ADD op: it traps once, the recovered ADD executes, and
+        // the program output is byte-identical to the un-instrumented run.
+        let plain = run_chunk_with_output(output_demo_chunk()).1;
+        let add_off = find_op_offset(&output_demo_chunk(), Op::Add).expect("chunk has an ADD");
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(output_demo_chunk(), add_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1, "the ADD breakpoint trapped exactly once");
+        assert_eq!(out, plain, "recovered op ran; output == un-instrumented run");
+        assert_eq!(out, "5.0\n");
+    }
+
+    #[test]
+    fn breakpoint_on_multi_operand_op_redispatches_correctly() {
+        // Patch the GET_GLOBAL (a u16-operand op at offset 0): the recovered op must
+        // read its 2 operand bytes from fault_ip+1 and advance ip by 2, then the
+        // program completes identically.
+        let plain = run_chunk_with_output(output_demo_chunk()).1;
+        let gg_off = find_op_offset(&output_demo_chunk(), Op::GetGlobal).expect("has GET_GLOBAL");
+        assert_eq!(gg_off, 0, "GET_GLOBAL is the first op");
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(output_demo_chunk(), gg_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1);
+        assert_eq!(out, plain, "multi-operand recovered op ran; output unchanged");
+        assert_eq!(out, "5.0\n");
+    }
+
+    #[test]
+    fn breakpoint_on_zero_operand_op_redispatches_correctly() {
+        // A pure 0-operand op (RETURN) as the breakpoint target.
+        fn demo() -> Chunk {
+            let mut c = Chunk::new();
+            let name = c.add_const(Value::Str(Rc::from("print")));
+            c.emit_u16(Op::GetGlobal, name, s());
+            let k = c.add_const(Value::Float(7.0));
+            c.emit_u16(Op::Const, k, s());
+            c.emit_u8(Op::Call, 1, s());
+            c.emit(Op::Return, s());
+            c
+        }
+        let plain = run_chunk_with_output(demo()).1;
+        let ret_off = find_op_offset(&demo(), Op::Return).expect("has RETURN");
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(demo(), ret_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1, "RETURN breakpoint trapped once");
+        assert_eq!(out, plain);
+        assert_eq!(out, "7.0\n");
+    }
+
+    #[test]
+    fn breakpoint_in_dead_code_never_traps() {
+        // A breakpoint on an instruction never reached (after RETURN) must never trap;
+        // the program output is unchanged.
+        fn demo() -> (Chunk, usize) {
+            let mut c = Chunk::new();
+            let name = c.add_const(Value::Str(Rc::from("print")));
+            c.emit_u16(Op::GetGlobal, name, s());
+            let k = c.add_const(Value::Float(9.0));
+            c.emit_u16(Op::Const, k, s());
+            c.emit_u8(Op::Call, 1, s());
+            c.emit(Op::Return, s());
+            // Dead code after the RETURN: a NIL that never executes.
+            let dead_off = c.code.len();
+            c.emit(Op::Nil, s());
+            c.emit(Op::Return, s());
+            (c, dead_off)
+        }
+        let (c, dead_off) = demo();
+        let plain = run_chunk_with_output(demo().0).1;
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(c, dead_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 0, "a breakpoint in dead/uncalled code never traps");
+        assert_eq!(out, plain);
+        assert_eq!(out, "9.0\n");
+    }
+
+    #[test]
+    fn breakpoint_in_loop_traps_once_then_unpatches_v1() {
+        // A breakpoint INSIDE a real loop body. Under the v1 un-patch-on-hit model
+        // (DOCUMENTED on Op::Break), the breakpoint traps EXACTLY ONCE: the first hit
+        // restores the original byte so subsequent iterations run un-patched. Crucially
+        // the loop output is byte-identical to an un-instrumented run (the displaced op
+        // ran exactly once per visit; iterations after the first run normally).
+        fn demo() -> (Chunk, usize) {
+            let mut c = Chunk::new();
+            c.slot_count = 1; // one local: the counter
+            let pname = c.add_const(Value::Str(Rc::from("print")));
+            let one = c.add_const(Value::Float(1.0));
+
+            // Seed slot 0 = 2.0: CONST 2.0; SET_LOCAL 0 (SET_LOCAL POPS the value).
+            let two = c.add_const(Value::Float(2.0));
+            c.emit_u16(Op::Const, two, s());
+            c.emit_u16(Op::SetLocal, 0, s());
+
+            let loop_top = c.code.len();
+            c.emit_u16(Op::GetLocal, 0, s());
+            let exit_jump = c.emit_jump(Op::JumpIfFalse, s()); // 0.0 is falsy → exit
+            c.emit_u16(Op::GetGlobal, pname, s());
+            let bp = c.code.len(); // BREAKPOINT: GET_LOCAL 0 (the print arg)
+            c.emit_u16(Op::GetLocal, 0, s());
+            c.emit_u8(Op::Call, 1, s());
+            c.emit(Op::Pop, s());
+            // counter -= 1
+            c.emit_u16(Op::GetLocal, 0, s());
+            c.emit_u16(Op::Const, one, s());
+            c.emit(Op::Sub, s());
+            c.emit_u16(Op::SetLocal, 0, s()); // pops the result into slot 0
+            c.emit_loop(Op::Loop, loop_top, s());
+            c.patch_jump(exit_jump);
+            c.emit(Op::Return, s());
+            (c, bp)
+        }
+        let (c, bp) = demo();
+        let plain = run_chunk_with_output(demo().0).1;
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(c, bp);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1, "v1: a hit breakpoint un-patches itself (traps once)");
+        // Counter 2 → prints 2.0 then 1.0; the loop body ran identically under the bp.
+        assert_eq!(out, plain, "loop output identical to the un-instrumented run");
+        assert_eq!(out, "2.0\n1.0\n");
+    }
+
+    #[test]
+    fn detached_controller_does_not_deadlock_the_program() {
+        // If the controller hangs up (drops the command sender) without sending a
+        // resume, the trap must NOT deadlock — `debug_stop` resumes free-running on a
+        // disconnected channel. Drive: a controller that drops immediately on the first
+        // Stopped (no Continue sent).
+        use crate::vm::instrument::{DebuggerHook, Instrumentation};
+        let (ok, out) = with_watchdog(10, || {
+            let chunk = output_demo_chunk();
+            let add_off = find_op_offset(&chunk, Op::Add).expect("has ADD");
+            let mut proto = Rc::new(FnProto {
+                chunk,
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                owning_class: None,
+                params: Vec::new(),
+                ret: None,
+            });
+            let proto_id = Rc::as_ptr(&proto) as *const () as usize;
+            let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+            {
+                let p = Rc::get_mut(&mut proto).unwrap();
+                hook.set_breakpoint(proto_id, add_off, &mut p.chunk.code);
+            }
+            // Controller: receive one Stopped, then DROP both ends (no resume).
+            let controller = std::thread::spawn(move || {
+                let _ = evt_rx.recv();
+                drop(cmd_tx);
+                drop(evt_rx);
+            });
+            let closure = Closure::new(proto);
+            let mut fiber = Fiber::new(closure);
+            let inst = Instrumentation {
+                breakpoints: Some(hook),
+                profiler: None,
+                coverage: None,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            let (outcome, out) = local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(interp.clone(), inst);
+                let outcome = vm.run(&mut fiber).await;
+                (outcome, interp.output())
+            });
+            controller.join().unwrap();
+            (matches!(outcome, Ok(RunOutcome::Done(_))), out)
+        });
+        assert!(ok, "a detached controller must not deadlock the program");
+        assert_eq!(out, "5.0\n", "output still correct after the auto-resume");
     }
 
     #[test]

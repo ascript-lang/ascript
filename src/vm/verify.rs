@@ -346,6 +346,12 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // the depth walk computes its exact effect from the class-proto, so this
         // placeholder is never consulted for CLASS.
         Class => Effect::new(0, 1),
+
+        // DBG: the breakpoint trap is NEVER compiler-emitted and NEVER serialized —
+        // it exists only as a runtime byte patch, so a verifier (which runs at load
+        // time, before any patching) should never encounter it in a valid chunk. If
+        // it somehow appears in corrupt bytecode it has no operand-stack effect.
+        Break => Effect::new(0, 0),
     }
 }
 
