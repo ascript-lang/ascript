@@ -6630,7 +6630,7 @@ mod tests {
         let proto = chunk.protos.first().expect("one nested proto");
         // The proto's code is exactly the two zero-operand ops NIL then RETURN.
         assert_eq!(
-            proto.chunk.code,
+            *proto.chunk.code,
             vec![Op::Nil as u8, Op::Return as u8],
             "empty fn body should compile to NIL; RETURN"
         );

@@ -651,7 +651,7 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
 fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
     let mut c = Chunk::new();
     // code
-    c.code = r.bytes()?.to_vec();
+    c.code = r.bytes()?.to_vec().into();
     // consts
     let n = r.len()?;
     c.consts.reserve(n.min(r.remaining()));

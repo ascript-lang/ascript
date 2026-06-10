@@ -77,6 +77,12 @@ pub enum VerifyError {
     /// An `Op::DefineInterface` references an `InterfaceProto` whose method-requirement
     /// set is malformed (an empty or duplicate requirement name). `what` describes it.
     BadInterface { offset: usize, what: &'static str },
+    /// DBG: an `Op::Break` byte appears in a chunk at verification (load) time.
+    /// `Break` is NEVER compiler-emitted and NEVER serialized — it exists only as a
+    /// transient runtime byte patch installed by an attached debugger. Its presence in
+    /// a loaded/`.aso` chunk is corruption (or a hostile hand-crafted file), so reject
+    /// it rather than treat it as a silent no-op safepoint.
+    BreakInSerializedCode { offset: usize },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -136,6 +142,11 @@ impl std::fmt::Display for VerifyError {
             VerifyError::BadInterface { offset, what } => {
                 write!(f, "{what} at offset {offset}")
             }
+            VerifyError::BreakInSerializedCode { offset } => write!(
+                f,
+                "Op::Break at offset {offset} is not valid in stored bytecode \
+                 (it is a runtime-only debugger patch)"
+            ),
         }
     }
 }
@@ -347,10 +358,10 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // placeholder is never consulted for CLASS.
         Class => Effect::new(0, 1),
 
-        // DBG: the breakpoint trap is NEVER compiler-emitted and NEVER serialized —
-        // it exists only as a runtime byte patch, so a verifier (which runs at load
-        // time, before any patching) should never encounter it in a valid chunk. If
-        // it somehow appears in corrupt bytecode it has no operand-stack effect.
+        // DBG: the breakpoint trap is NEVER compiler-emitted and NEVER serialized — it
+        // exists only as a runtime byte patch. Pass 1 of `verify_chunk` rejects a
+        // `Break` byte outright (`BreakInSerializedCode`), so this arm is unreachable in
+        // practice; it exists only to keep the `Op` match exhaustive (0 stack effect).
         Break => Effect::new(0, 0),
     }
 }
@@ -389,6 +400,12 @@ fn verify_chunk(chunk: &Chunk) -> Result<(), VerifyError> {
     while off < code.len() {
         let byte = code[off];
         let op = Op::from_u8(byte).ok_or(VerifyError::BadOpcode { offset: off, byte })?;
+        // DBG: `Op::Break` is a runtime-only byte patch — never compiler-emitted, never
+        // serialized. Encountering it at load/verify time means corrupt or hand-crafted
+        // bytecode; reject rather than admit it as a silent safepoint.
+        if op == Op::Break {
+            return Err(VerifyError::BreakInSerializedCode { offset: off });
+        }
         let width = op.operand_width();
         let operand_at = off + 1;
         if operand_at + width > code.len() {
@@ -974,6 +991,20 @@ mod tests {
                 assert_eq!((offset, byte), (0, 0xFE));
             }
             other => panic!("expected BadOpcode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialized_break_opcode_rejected() {
+        // DBG: a `Break` byte must never appear in a loaded/`.aso` chunk — the compiler
+        // never emits it and the serializer never writes it; it is a runtime-only patch.
+        // A hand-crafted file with one must be rejected, not treated as a no-op safepoint.
+        let mut c = Chunk::new();
+        c.code.push(Op::Break as u8);
+        c.code.push(Op::Return as u8);
+        match verify(&c) {
+            Err(VerifyError::BreakInSerializedCode { offset }) => assert_eq!(offset, 0),
+            other => panic!("expected BreakInSerializedCode, got {other:?}"),
         }
     }
 

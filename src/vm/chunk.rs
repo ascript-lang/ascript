@@ -293,11 +293,95 @@ impl ChunkLimit {
     }
 }
 
+/// The raw bytecode byte stream, with sound in-place breakpoint patching.
+///
+/// DBG software breakpoints overwrite a live opcode byte with [`Op::Break`] and later
+/// restore it — the classic self-modifying-bytecode technique (GDB/LLDB `int3`, the
+/// JVM `Breakpoint` bytecode, V8 debug bytecode). The runtime restore runs through a
+/// *shared* `&Chunk` (the run loop only ever reaches a proto's chunk via
+/// `Rc<FnProto>`), so the storage MUST carry interior mutability: a `*const → *mut`
+/// cast from a plain `&Vec<u8>` is undefined behavior under Rust's aliasing model
+/// (Stacked/Tree Borrows tag the pointer read-only at birth) even on one thread. We
+/// wrap the `Vec<u8>` in an [`UnsafeCell`] so [`patch_byte`](Code::patch_byte) derives
+/// its `*mut` from `UnsafeCell::get()` — the sanctioned shared-mutation path.
+///
+/// [`UnsafeCell`] (not `RefCell`) keeps reads branch-free: [`Deref`](std::ops::Deref)
+/// hands back `&Vec<u8>` with no borrow-flag check, so the hot fetch `code[ip]` is a
+/// plain pointer load — byte-identical codegen to the former bare `Vec<u8>`, so the
+/// Gate-12 zero-cost-when-not-debugging invariant holds. `Deref`/`DerefMut` to
+/// `Vec<u8>` keep every reader and every compiler emit/patch site unchanged
+/// (`code.push`, `code.extend_from_slice`, `code[ip]`, `code.len()`, `&code`).
+#[derive(Default)]
+pub struct Code {
+    inner: std::cell::UnsafeCell<Vec<u8>>,
+}
+
+impl Code {
+    /// Overwrite the byte at `off` in place through a *shared* reference (`&self`).
+    ///
+    /// # Soundness
+    ///
+    /// The VM is single-threaded and `!Send` (one isolate per OS thread; a `Chunk` is
+    /// never shared across threads), and the write derives its `*mut` from the
+    /// [`UnsafeCell`] — the legal interior-mutability path, not a `*const → *mut` cast.
+    /// The one obligation — no live `&` into the buffer across the write — holds at the
+    /// sole call site (the `Op::Break` trap in `run_loop`): the faulting byte was
+    /// fetched in a *prior*, already-finished loop iteration, so no borrow into the
+    /// buffer is outstanding when the restore runs.
+    #[inline]
+    pub fn patch_byte(&self, off: usize, b: u8) {
+        // SAFETY: see the doc-comment. `UnsafeCell`-sanctioned shared mutation,
+        // single-threaded, no aliasing `&` into the buffer live across this write. The
+        // single `&mut` below also covers the bounds check, so no separate `&` borrow
+        // (from `len()` via `Deref`) overlaps the write.
+        unsafe {
+            let v = &mut *self.inner.get();
+            assert!(off < v.len(), "patch_byte offset out of bounds");
+            v[off] = b;
+        }
+    }
+}
+
+impl std::ops::Deref for Code {
+    type Target = Vec<u8>;
+    #[inline(always)]
+    fn deref(&self) -> &Vec<u8> {
+        // SAFETY: shared read of the buffer. The only mutation through `&self` is
+        // `patch_byte`, which runs when no `&` into the buffer (this one included) is
+        // live — single-threaded, the trap holds no outstanding borrow.
+        unsafe { &*self.inner.get() }
+    }
+}
+
+impl std::ops::DerefMut for Code {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        // SAFETY: `&mut self` proves unique access to the cell.
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
+impl std::fmt::Debug for Code {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl From<Vec<u8>> for Code {
+    fn from(v: Vec<u8>) -> Self {
+        Self {
+            inner: std::cell::UnsafeCell::new(v),
+        }
+    }
+}
+
 /// A compiled function body (or top-level script body) plus its metadata.
 #[derive(Debug, Default)]
 pub struct Chunk {
     /// The raw instruction stream: opcode bytes interleaved with LE operands.
-    pub code: Vec<u8>,
+    /// A [`Code`] newtype (an `UnsafeCell<Vec<u8>>` that derefs to `Vec<u8>`) so the
+    /// debugger can patch breakpoint bytes through a shared `&Chunk` soundly.
+    pub code: Code,
     /// The constant pool. Holds only literal [`Value`]s
     /// (`Number`/`Str`/`Bool`/`Nil`/`Decimal`).
     pub consts: Vec<Value>,
@@ -678,32 +762,15 @@ impl Chunk {
     ///
     /// # Why interior mutability here
     ///
-    /// The run loop reaches a proto's `Chunk` only through a shared `Rc<FnProto>`
-    /// (`&Chunk`), but breakpoint patching is the textbook self-modifying-bytecode
-    /// technique (GDB/LLDB `int3`, the JVM `Breakpoint` bytecode, V8 debug bytecode):
-    /// the byte stream IS mutated in place. `Chunk.code` stays a plain `Vec<u8>` so
-    /// every other reader (the disassembler, verifier, `.aso` serializer, and the hot
-    /// fetch `code[ip]`) is byte-identical and pays nothing — the NOT-attached path is
-    /// completely untouched (Gate 12). Only this one method mutates through `&self`,
-    /// and only when a debugger is attached.
-    ///
-    /// # Safety
-    ///
-    /// Sound because the VM is single-threaded and `!Send` (one `Interp`/`Vm` per OS
-    /// thread; the chunk is never shared across threads). At the call site (the
-    /// `Op::Break` trap arm) the current instruction's byte has already been fetched
-    /// for this iteration, so no live `&u8` into `code[off]` is outstanding when the
-    /// write happens — the next loop iteration re-reads the freshly-written byte.
-    /// `off` is always an in-bounds opcode offset the breakpoint mechanism recorded.
+    /// Restore (or set) a single bytecode byte in place through a shared `&Chunk` —
+    /// the DBG breakpoint un-patch. Delegates to [`Code::patch_byte`], where the
+    /// soundness argument and the `UnsafeCell`-backed storage live. The run loop only
+    /// ever reaches a proto's `Chunk` via `Rc<FnProto>` (i.e. `&Chunk`), so this MUST
+    /// go through interior mutability; see [`Code`] for why a raw `*const → *mut` cast
+    /// would be undefined behavior. Off-path readers and the hot fetch pay nothing.
+    #[inline]
     pub fn patch_byte(&self, off: usize, b: u8) {
-        assert!(off < self.code.len(), "patch_byte offset out of bounds");
-        // SAFETY: see the doc-comment above — single-threaded `!Send` VM, no aliasing
-        // read of this byte is live across the write (the iteration already fetched
-        // it), in-bounds offset.
-        unsafe {
-            let ptr = self.code.as_ptr() as *mut u8;
-            *ptr.add(off) = b;
-        }
+        self.code.patch_byte(off, b);
     }
 
     /// Read the `i16` little-endian (jump) operand starting at byte `at`.
@@ -934,6 +1001,38 @@ mod tests {
 
     fn s(a: usize, b: usize) -> Span {
         Span::new(a, b)
+    }
+
+    /// Soundness regression guard for the DBG breakpoint un-patch. `patch_byte` mutates
+    /// the byte stream through a *shared* `&Code` (the run loop only ever holds
+    /// `&Chunk`); the storage MUST be `UnsafeCell`-backed for that to be defined
+    /// behavior. The former implementation cast `code.as_ptr() as *mut u8` from a plain
+    /// `&Vec<u8>` and wrote through it — UB under Stacked/Tree Borrows even
+    /// single-threaded. This test patches via a shared reference and confirms a
+    /// subsequent shared read sees the new byte; run under Miri it also proves the
+    /// aliasing model is satisfied (`cargo +nightly miri test patch_byte_through_shared`).
+    #[test]
+    fn patch_byte_through_shared_ref_is_observed() {
+        let code: Code = vec![Op::Nil as u8, Op::Add as u8, Op::Return as u8].into();
+        // A *shared* borrow — exactly what the `Op::Break` trap holds (`&Chunk`).
+        let shared: &Code = &code;
+        assert_eq!(shared[1], Op::Add as u8);
+        // The breakpoint mechanism overwrites a live opcode, then restores it; both
+        // writes go through the shared reference.
+        shared.patch_byte(1, Op::Break as u8);
+        assert_eq!(shared[1], Op::Break as u8, "patched byte must be visible");
+        shared.patch_byte(1, Op::Add as u8);
+        assert_eq!(shared[1], Op::Add as u8, "restore must be visible");
+        // The neighbours are untouched.
+        assert_eq!(shared[0], Op::Nil as u8);
+        assert_eq!(shared[2], Op::Return as u8);
+    }
+
+    #[test]
+    #[should_panic(expected = "patch_byte offset out of bounds")]
+    fn patch_byte_out_of_bounds_panics() {
+        let code: Code = vec![Op::Nil as u8].into();
+        code.patch_byte(5, Op::Break as u8);
     }
 
     #[test]
