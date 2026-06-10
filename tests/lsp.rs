@@ -1570,6 +1570,117 @@ fn lsp_offers_worker_completion() {
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
+/// DX D3 Task 13: end-to-end frame-precise identifier completion — the cursor in
+/// `a`'s body offers `a`'s own local + a module-global + a builtin, but NOT a
+/// sibling function `b`'s local.
+#[test]
+fn lsp_completion_frame_precise_excludes_sibling_local() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://frame_precise.as";
+    // line 0: let g = 0
+    // line 1: fn a() {
+    // line 2:   let foo = 1
+    // line 3:   f         <- cursor here, char 3
+    // line 4: }
+    // line 5: fn b() {
+    // line 6:   let bar = 2
+    // line 7: }
+    let text = "let g = 0\nfn a() {\n  let foo = 1\n  f\n}\nfn b() {\n  let bar = 2\n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 3 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(labels.contains(&"foo"), "a's own local foo offered: {labels:?}");
+    assert!(!labels.contains(&"bar"), "sibling b's local bar NOT offered: {labels:?}");
+    assert!(labels.contains(&"g"), "module-global g offered: {labels:?}");
+    assert!(labels.contains(&"print"), "builtin print offered: {labels:?}");
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// DX D3 Task 13: end-to-end member completion on a TYPED VALUE receiver — `c.`
+/// where `c: C` is inferred offers class `C`'s field `x` and method `m`.
+#[test]
+fn lsp_completion_member_on_typed_instance() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://typed_member.as";
+    // line 0: class C {
+    // line 1:   x: number
+    // line 2:   fn m() {}
+    // line 3: }
+    // line 4: let c = C()
+    // line 5: c.        <- cursor at char 2 (just past the dot)
+    let text = "class C {\n  x: number\n  fn m() {}\n}\nlet c = C()\nc.\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 5, "character": 2 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(labels.contains(&"x"), "instance field x offered: {labels:?}");
+    assert!(labels.contains(&"m"), "instance method m offered: {labels:?}");
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
 /// ADT Task 13: end-to-end LSP for payload enums — hover on a payload variant
 /// shows its declared signature, and completion after `Shape.` offers the variants
 /// (the payload variant with a snippet insert + signature detail).

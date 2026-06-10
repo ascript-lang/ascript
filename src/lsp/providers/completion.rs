@@ -8,9 +8,12 @@
 //! `import … from "std/…"` edit for a known stdlib export. `resolve_completion`
 //! lazily fills in detail/documentation for builtins and keywords.
 //!
-//! In-scope bindings are taken from the resolved set (de-duplicated by name); the
-//! list is not yet frame-precise, so a sibling-scope name may be over-offered — a
-//! documented Phase-2 refinement.
+//! In-scope bindings are FRAME-PRECISE (Task 13): a local/param/inner-fn binding is
+//! offered only when its owning frame encloses the cursor (the cursor frame + the
+//! parent-frame / upvalue chain), reusing navigation's frame model; module-globals,
+//! builtins, and keywords are in scope everywhere and always offered. Member access
+//! on a TYPED VALUE receiver resolves the receiver's type through `crate::check::infer`
+//! and offers that class's fields + methods.
 
 use crate::lsp::model::SemanticModel;
 use crate::syntax::resolve::types::BindingKind;
@@ -148,14 +151,29 @@ fn baseline_completions() -> Vec<CompletionItem> {
     out
 }
 
-/// In-scope user bindings as completion items. Phase 1 v1 offers EVERY binding in
-/// the resolved set (de-duplicated by name, last decl wins) — precise per-cursor
-/// scope filtering by frame is a Phase-2 refinement; over-offering a sibling-scope
-/// name is a benign, non-misleading suggestion. The binding KIND maps to an icon.
-fn binding_completions(model: &SemanticModel) -> Vec<CompletionItem> {
+/// In-scope user bindings as completion items, FRAME-PRECISE (Task 13). A binding is
+/// offered iff it is live at the cursor's frame:
+/// - a MODULE-SCOPE user-global (`is_global`) is in scope everywhere → always offered;
+/// - a local/param/inner-fn binding is offered ONLY when its OWNING frame ENCLOSES the
+///   cursor (the cursor frame's locals/params + the parent-frame / upvalue chain) — a
+///   sibling-scope name that does not enclose the cursor is NOT over-offered.
+///
+/// "Which frames enclose the cursor" reuses navigation's frame model
+/// (`frame_chain_at` + `binding_live_at`), the SAME structures `definition`/
+/// `document-highlight` walk — NOT a second resolver. The binding KIND maps to an icon.
+fn binding_completions(model: &SemanticModel, char_offset: usize) -> Vec<CompletionItem> {
+    use crate::lsp::providers::navigation::{binding_live_at, frame_chain_at};
+    // Frame ranges (cstree `TextRange`) are BYTE-based; the completion provider works
+    // in CHAR offsets — convert before consulting the frame model.
+    let byte_offset = crate::lsp::convert::char_to_byte(&model.text, char_offset);
+    let chain = frame_chain_at(model, byte_offset);
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for b in &model.resolved.bindings {
+        // A non-global binding must have its owning frame on the cursor's frame chain.
+        if !b.is_global && !binding_live_at(model, b.decl_range, &chain) {
+            continue;
+        }
         if !seen.insert(b.name.clone()) {
             continue;
         }
@@ -282,23 +300,23 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
         }
         if let Some(cid) = table.class_id(&alias) {
             if let Some(info) = table.class(cid) {
-                let mut out: Vec<CompletionItem> = info
-                    .fields
-                    .keys()
-                    .map(|f| item(f, CompletionItemKind::FIELD))
-                    .collect();
-                out.extend(
-                    info.methods
-                        .keys()
-                        .map(|m| item(m, CompletionItemKind::METHOD)),
-                );
-                return out;
+                return class_member_items(info);
             }
+        }
+
+        // Context 4: member access on a TYPED VALUE receiver — `c.` where `c` is a
+        // VALUE whose inferred type is a known class/shape (NOT the class NAME itself).
+        // Resolve the receiver's type through `crate::check::infer` (the same
+        // `hover_type_at` entry point hover/inlay use), extract its class name, and
+        // offer that class's fields + methods. The LSP runs NO code — `hover_type_at`
+        // is a pure static inference pass.
+        if let Some(info) = receiver_class_info(model, &chars, offset, &alias, &table) {
+            return class_member_items(info);
         }
     }
 
     let mut base = baseline_completions();
-    base.extend(binding_completions(model));
+    base.extend(binding_completions(model, offset));
     base.extend(snippet_completions());
     base.extend(auto_import_candidates(model));
     base
@@ -353,6 +371,76 @@ fn in_import_path_string(chars: &[char], offset: usize) -> bool {
     // Check the text before that opening quote ends with `from` (allowing whitespace).
     let before: String = line[..rel_quote].iter().collect();
     before.trim_end().ends_with("from")
+}
+
+/// A class's member completion surface: its declared FIELDS (FIELD kind) + METHODS
+/// (METHOD kind). Shared by the class-NAME static case and the typed-VALUE-receiver
+/// case (Context 3/4).
+fn class_member_items(info: &crate::check::infer::table::ClassInfo) -> Vec<CompletionItem> {
+    let mut out: Vec<CompletionItem> = info
+        .fields
+        .keys()
+        .map(|f| item(f, CompletionItemKind::FIELD))
+        .collect();
+    out.extend(
+        info.methods
+            .keys()
+            .map(|m| item(m, CompletionItemKind::METHOD)),
+    );
+    out
+}
+
+/// Context 4: if the receiver `alias` ending just before the dot at `offset` is a
+/// VALUE whose inferred type names a known class, return that `ClassInfo`. The
+/// receiver's type is resolved via `crate::check::infer::hover_type_at` (the static
+/// inference pass hover/inlay already use — runs NO code), the leading class
+/// identifier is extracted from the rendered type, and looked up in the SP10 table.
+/// `None` when the type is a primitive / `Any` / a non-class (then completion falls
+/// back to the baseline).
+fn receiver_class_info<'t>(
+    model: &SemanticModel,
+    chars: &[char],
+    offset: usize,
+    alias: &str,
+    table: &'t crate::check::infer::table::Table,
+) -> Option<&'t crate::check::infer::table::ClassInfo> {
+    // The receiver identifier occupies `[dot - alias_len, dot)` in CHAR space; aim at
+    // its middle char so the inference hover-span lookup lands inside the name. Convert
+    // to the BYTE offset `hover_type_at` expects (it operates on the raw source bytes).
+    let dot = offset.checked_sub(1)?;
+    let alias_chars = alias.chars().count();
+    let recv_start = dot.checked_sub(alias_chars)?;
+    let recv_mid_char = recv_start + alias_chars / 2;
+    let byte_off = crate::lsp::convert::char_to_byte(&model.text, recv_mid_char.min(chars.len()));
+    let rendered = crate::check::infer::hover_type_at(&model.text, byte_off)?;
+    let class_name = first_class_ident(&rendered)?;
+    let cid = table.class_id(&class_name)?;
+    table.class(cid)
+}
+
+/// Extract the leading user-CLASS identifier from a rendered `CheckTy` string,
+/// skipping builtin/container type names (`User` from `User`, `User?`,
+/// `array<User>`). Mirrors `navigation::first_type_ident`.
+fn first_class_ident(rendered: &str) -> Option<String> {
+    const BUILTIN: &[&str] = &[
+        "number", "string", "bool", "nil", "any", "array", "map", "future", "bytes", "regex",
+        "object", "void", "never", "int", "float", "set",
+    ];
+    let mut cur = String::new();
+    for ch in rendered.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else {
+            if !cur.is_empty() && !BUILTIN.contains(&cur.as_str()) {
+                return Some(cur);
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() && !BUILTIN.contains(&cur.as_str()) {
+        return Some(cur);
+    }
+    None
 }
 
 /// If the text immediately before `offset` is `<ident>.`, return `<ident>`.
@@ -700,5 +788,82 @@ mod tests {
             .find(|i| i.label == "test")
             .expect("test builtin in baseline");
         assert_eq!(t.kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    // ── Task 13: frame-precise identifier completion ─────────────────────────────
+
+    #[test]
+    fn frame_precise_excludes_sibling_scope_local() {
+        // Two sibling functions, each with a distinct local. The cursor sits in `a`'s
+        // body: `foo` (a's local) is offered, but `bar` (b's local — a sibling scope
+        // that does NOT enclose the cursor) is NOT. A module-global and a builtin are
+        // still offered.
+        let src = "let g = 0\nfn a() {\n  let foo = 1\n  f\n}\nfn b() {\n  let bar = 2\n}\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        // Cursor just after the lone `f` on line 3 (inside a's body).
+        let off = src.find("  f\n").unwrap() + "  f".len();
+        let items = completions(&model, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"foo"), "a's own local foo must be offered: {labels:?}");
+        assert!(!labels.contains(&"bar"), "sibling b's local bar must NOT be offered: {labels:?}");
+        // Module-global, builtin, keyword all still offered (in scope everywhere).
+        assert!(labels.contains(&"g"), "module-global g must be offered: {labels:?}");
+        assert!(labels.contains(&"print"), "builtin print must be offered: {labels:?}");
+        assert!(labels.contains(&"let"), "keyword let must be offered: {labels:?}");
+    }
+
+    #[test]
+    fn frame_precise_inner_closure_sees_enclosing_locals() {
+        // An inner closure sees its enclosing function's local via the upvalue chain.
+        let src = "fn outer() {\n  let captured = 1\n  fn inner() {\n    c\n  }\n}\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let off = src.find("    c\n").unwrap() + "    c".len();
+        let items = completions(&model, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"captured"),
+            "inner closure must see the enclosing local `captured`: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn frame_precise_excludes_later_sibling_scope() {
+        // A name declared LATER in a sibling scope is not offered (frame chain, not
+        // declaration order).
+        let src = "fn a() {\n  x\n}\nfn b() {\n  let later = 2\n}\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let off = src.find("  x\n").unwrap() + "  x".len();
+        let items = completions(&model, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            !labels.contains(&"later"),
+            "a later sibling-scope binding must NOT be offered: {labels:?}"
+        );
+    }
+
+    // ── Task 13: member completion via infer ─────────────────────────────────────
+
+    #[test]
+    fn member_access_on_typed_instance_offers_fields_and_methods() {
+        // `c.` where `c: C` (inferred) offers C's fields + methods.
+        let src = "class C {\n  x: number\n  fn m() {}\n}\nlet c = C()\nc.\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let off = src.rfind("c.\n").unwrap() + "c.".len();
+        let items = completions(&model, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"x"), "instance field x must be offered: {labels:?}");
+        assert!(labels.contains(&"m"), "instance method m must be offered: {labels:?}");
+    }
+
+    #[test]
+    fn member_access_on_namespace_offers_module_exports() {
+        // `math.` where `import * as math from "std/math"` offers module exports.
+        let src = "import * as math from \"std/math\"\nmath.\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let off = src.rfind("math.\n").unwrap() + "math.".len();
+        let items = completions(&model, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"abs"), "module export abs must be offered: {labels:?}");
+        assert!(labels.contains(&"sqrt"), "module export sqrt must be offered: {labels:?}");
     }
 }
