@@ -53,6 +53,16 @@ fn project(r: Result<(String, Option<i32>), ascript::error::AsError>) -> Outcome
     }
 }
 
+// LeakSanitizer: this target RUNS the managed runtime, whose process-lifetime state (interned
+// `Rc<str>`, `lazy_static`/`once_cell` globals, the tokio runtime, gcmodule's collector,
+// thread-locals) is NOT a leak. Disable LSan for THIS target's binary — the libFuzzer
+// `-detect_leaks=0` FLAG does NOT stop the shutdown LSan check; only this compiled-in default
+// does. (`aso_roundtrip` is decode-only and keeps leak detection: a leak there is a real bug.)
+#[no_mangle]
+pub extern "C" fn __lsan_default_options() -> *const std::os::raw::c_char {
+    c"detect_leaks=0".as_ptr()
+}
+
 fuzz_target!(|data: &[u8]| {
     // Bytes → a valid, deterministic, run-to-completion program. `gen_program_from_bytes`
     // never fails (it falls back to a trivial-but-valid program when bytes are exhausted).

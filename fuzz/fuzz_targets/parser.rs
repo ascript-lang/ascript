@@ -43,6 +43,15 @@ fn cst_accepts(src: &str) -> bool {
     parse.errors.is_empty() && parse.lex_errors.is_empty()
 }
 
+// LeakSanitizer: parsing builds managed-runtime AST/interner state whose process-lifetime
+// allocations (interned strings, lazy_static/once_cell globals, thread-locals) are NOT a leak.
+// Disable LSan for THIS binary — the libFuzzer `-detect_leaks=0` flag does NOT stop the
+// shutdown LSan check; only this compiled-in default does.
+#[no_mangle]
+pub extern "C" fn __lsan_default_options() -> *const std::os::raw::c_char {
+    c"detect_leaks=0".as_ptr()
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
