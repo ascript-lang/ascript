@@ -166,6 +166,43 @@ pub async fn run_tests_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<TestSummary, AsError> {
+    run_tests_with_options(files, packages, caps, None).await
+}
+
+/// DX D2 Task 5 — the test runner with the `--parallel[=N]` option.
+///
+/// `parallel`:
+///   - `None` → the SERIAL default: load every file into ONE `Interp` and run all tests
+///     together (today's behavior, unchanged).
+///   - `Some(n)` → dispatch each FILE to its own shared-nothing worker isolate, up to `n`
+///     at a time, then aggregate the per-file summaries in DETERMINISTIC input-file order
+///     (then registration order within a file). The printed summary AND exit code are
+///     byte-identical regardless of which isolate finishes first (the §7 contract). A
+///     single file (or `n <= 1`) degrades to the serial path — one isolate sequential is
+///     the serial path with extra overhead, so we reuse the serial path directly.
+pub async fn run_tests_with_options(
+    files: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    parallel: Option<usize>,
+) -> Result<TestSummary, AsError> {
+    // Parallelize only when asked for >1 isolate AND there is more than one file. A
+    // single file in one isolate is the serial path with extra cost — degrade to serial
+    // (point 3: "a SINGLE file (or --parallel=1) degrades to today's serial path").
+    match parallel {
+        Some(n) if n >= 2 && files.len() >= 2 => {
+            run_tests_parallel(files, packages, caps, n).await
+        }
+        _ => run_tests_serial(files, packages, caps).await,
+    }
+}
+
+/// The serial test path: every file loaded into one `Interp`, all tests run together.
+async fn run_tests_serial(
+    files: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+) -> Result<TestSummary, AsError> {
     let interp = Rc::new(Interp::new());
     if let Some(caps) = caps {
         interp.set_caps(caps);
@@ -203,6 +240,110 @@ pub async fn run_tests_with_packages(
         .await;
     local.await; // drain spawned tasks — no-op until Phase 2
     result
+}
+
+/// DX D2 Task 5 — the PARALLEL test path: each FILE runs in its own shared-nothing
+/// worker isolate, up to `n` at a time (capped by `$ASCRIPT_WORKERS`/`num_cpus`), then
+/// the per-file summaries are aggregated in DETERMINISTIC input-file order.
+///
+/// **Determinism (§7):** isolates finish in nondeterministic order, but results are slotted
+/// back into a `Vec` BY INPUT INDEX, then folded in that order — so the aggregate summary
+/// (passed/failed totals AND the failure list order) and therefore the printed output +
+/// exit code are byte-identical regardless of completion order. Within a file the isolate
+/// preserved the test-registration order, so the whole failure list is a stable function
+/// of input order.
+///
+/// A file that fails to load / `exit()`s / dies in its isolate becomes a synthetic FAILED
+/// entry (`"<file>": <reason>`) so the OTHER files' results are never lost, and the run
+/// still reports a non-zero exit. No reachable path panics or unwraps.
+async fn run_tests_parallel(
+    files: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    n: usize,
+) -> Result<TestSummary, AsError> {
+    use std::sync::Arc;
+    // Cap the in-flight isolate count: the requested `n`, bounded by the same
+    // `$ASCRIPT_WORKERS`/`num_cpus` ceiling the pool uses (so `--parallel` never
+    // oversubscribes beyond the worker budget), at least 1.
+    let cap = worker_isolate_cap().min(n).max(1);
+    let sem = Arc::new(tokio::sync::Semaphore::new(cap));
+
+    let local = tokio::task::LocalSet::new();
+    let per_file: Vec<crate::worker::testrun::FileRunResult> = local
+        .run_until(crate::interp::telemetry_root_scope(async {
+            // Spawn one local task per file; each acquires a permit (bounded concurrency)
+            // then runs its file in an isolate. The task index pins the result slot, so
+            // completion order is irrelevant to aggregation.
+            let mut handles = Vec::with_capacity(files.len());
+            for file in files {
+                let sem = sem.clone();
+                let packages = packages.clone();
+                let caps = caps.clone();
+                let path = std::path::PathBuf::from(file);
+                handles.push(tokio::task::spawn_local(async move {
+                    // A closed semaphore is unreachable here (we never close it); on the
+                    // impossible error, treat the file as un-runnable rather than panic.
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Err(
+                                "internal: test scheduler semaphore closed".to_string()
+                            )
+                        }
+                    };
+                    crate::worker::testrun::run_test_file_in_isolate(&path, packages, caps)
+                        .await
+                }));
+            }
+            // Await in INPUT order, slotting each result by index. A task that itself
+            // panicked (a JoinError) becomes a clean per-file error, never a lost run.
+            let mut results = Vec::with_capacity(handles.len());
+            for (idx, h) in handles.into_iter().enumerate() {
+                let r = match h.await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "test isolate for '{}' panicked",
+                        files.get(idx).map(String::as_str).unwrap_or("<file>")
+                    )),
+                };
+                results.push(r);
+            }
+            results
+        }))
+        .await;
+    local.await;
+
+    // Deterministic aggregation: fold per-file summaries in INPUT-FILE order. A file-level
+    // error (load failure / exit / dead isolate) becomes a synthetic failed test attributed
+    // to that file, so every file is accounted for and the run reports non-zero.
+    let mut agg = TestSummary::default();
+    for (file, result) in files.iter().zip(per_file) {
+        match result {
+            Ok(summary) => {
+                agg.passed += summary.passed;
+                agg.failed += summary.failed;
+                agg.failures.extend(summary.failures);
+            }
+            Err(reason) => {
+                agg.failed += 1;
+                agg.failures.push((file.clone(), reason));
+            }
+        }
+    }
+    Ok(agg)
+}
+
+/// The isolate-count ceiling shared with the worker pool: `$ASCRIPT_WORKERS` if a positive
+/// integer, else `num_cpus` (min 1). `--parallel=N` is clamped to this so it never
+/// oversubscribes beyond the worker budget.
+fn worker_isolate_cap() -> usize {
+    std::env::var("ASCRIPT_WORKERS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(num_cpus::get)
+        .max(1)
 }
 
 /// Lex → parse → evaluate in a fresh global environment. Returns captured output.

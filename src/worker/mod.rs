@@ -9,6 +9,7 @@ pub mod isolate;
 pub mod pool;
 pub mod serialize;
 pub mod stream;
+pub mod testrun;
 
 use crate::interp::{Control, Interp};
 use crate::span::Span;

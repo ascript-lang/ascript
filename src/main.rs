@@ -169,6 +169,19 @@ enum Command {
         /// FFI §4.2: deny ALL five dangerous capabilities for the test run.
         #[arg(long = "sandbox")]
         sandbox: bool,
+        /// DX D2: run each test FILE in its own shared-nothing worker isolate, in
+        /// parallel. `--parallel` (no value) uses `num_cpus` isolates; `--parallel=N`
+        /// caps at N (further clamped by `$ASCRIPT_WORKERS`). Omitted = serial (the
+        /// default). The aggregated result + exit code are deterministic regardless of
+        /// completion order; a single file degrades to the serial path.
+        #[arg(
+            long = "parallel",
+            value_name = "N",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "0"
+        )]
+        parallel: Option<usize>,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
@@ -842,7 +855,12 @@ async fn real_main() -> ExitCode {
             locked,
             deny,
             sandbox,
+            parallel,
         } => {
+            // DX D2: `--parallel` (no value) → `num_cpus` isolates; `--parallel=N` → N;
+            // absent → `None` (serial). The `default_missing_value = "0"` sentinel maps
+            // the bare flag to "auto" (num_cpus); the runner clamps to `$ASCRIPT_WORKERS`.
+            let parallel = parallel.map(|n| if n == 0 { num_cpus::get() } else { n });
             // FFI §4.2/§4.5: compose caps from CLI + the test files' nearest
             // manifest (no granular CLI carve-outs on `test`).
             let cap_path = files
@@ -873,12 +891,12 @@ async fn real_main() -> ExitCode {
                     }
                     None => None,
                 };
-                ascript::run_tests_with_packages(&files, packages, caps).await
+                ascript::run_tests_with_options(&files, packages, caps, parallel).await
             };
             #[cfg(not(feature = "pkg"))]
             let test_result = {
                 let _ = locked;
-                ascript::run_tests_with_packages(&files, None, caps).await
+                ascript::run_tests_with_options(&files, None, caps, parallel).await
             };
             match test_result {
             Ok(summary) => {

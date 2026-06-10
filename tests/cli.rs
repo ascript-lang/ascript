@@ -852,6 +852,160 @@ fn test_runner_reports_pass_and_fail() {
     assert!(!out.status.success()); // a failing test → non-zero exit
 }
 
+/// DX D2 Task 5 — write a small multi-file test corpus (mixed pass/fail across files) to
+/// a fresh temp dir and return the file paths in a stable order.
+fn write_parallel_test_corpus(tag: &str) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let dir = std::env::temp_dir().join(format!("ascript_par_{}_{}", tag, std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let files = [
+        // a.as — both pass
+        (
+            "a.as",
+            "test(\"a_one\", () => { assert(1 + 1 == 2) })\n\
+             test(\"a_two\", () => { assert(true) })\n",
+        ),
+        // b.as — one fails (with a distinct message), one passes
+        (
+            "b.as",
+            "test(\"b_one\", () => { assert(false, \"b boom\") })\n\
+             test(\"b_two\", () => { assert(2 * 2 == 4) })\n",
+        ),
+        // c.as — a fail, attributing the right name across the boundary
+        (
+            "c.as",
+            "test(\"c_one\", () => { assert(true) })\n\
+             test(\"c_two\", () => { assert(false, \"c boom\") })\n",
+        ),
+    ];
+    let mut paths = Vec::new();
+    for (name, body) in files {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        paths.push(p);
+    }
+    (dir, paths)
+}
+
+/// THE §7 determinism contract: a multi-file corpus run at `--parallel=1` and
+/// `--parallel=4` produces BYTE-IDENTICAL stdout and the SAME exit code, regardless of
+/// isolate completion order. (`--parallel=1` degrades to the serial path; the parallel
+/// aggregation must reproduce that exact output.)
+#[test]
+fn parallel_test_dispatch_is_deterministic() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let (dir, paths) = write_parallel_test_corpus("det");
+    let args: Vec<&std::ffi::OsStr> = paths.iter().map(|p| p.as_os_str()).collect();
+
+    let run = |parallel_flag: &str| {
+        std::process::Command::new(bin)
+            .arg("test")
+            .arg(parallel_flag)
+            .args(&args)
+            .output()
+            .unwrap()
+    };
+
+    let one = run("--parallel=1");
+    let four = run("--parallel=4");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        String::from_utf8_lossy(&one.stdout),
+        String::from_utf8_lossy(&four.stdout),
+        "stdout must be byte-identical between --parallel=1 and --parallel=4"
+    );
+    assert_eq!(
+        one.status.code(),
+        four.status.code(),
+        "exit code must match between --parallel=1 and --parallel=4"
+    );
+    // Sanity: the run reports a non-zero exit (b.as + c.as each have one failure) and the
+    // failures are attributed by name regardless of order.
+    let s = String::from_utf8_lossy(&four.stdout);
+    assert!(s.contains("b boom"), "missing b failure: {s}");
+    assert!(s.contains("c boom"), "missing c failure: {s}");
+    assert_eq!(four.status.code(), Some(1), "failures → exit 1");
+}
+
+/// A SINGLE file with `--parallel` degrades to the serial path: identical output to a
+/// plain serial run (no isolate path taken for one file).
+#[test]
+fn parallel_single_file_degrades_to_serial() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_par_single_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("solo.as");
+    std::fs::write(
+        &file,
+        "test(\"ok\", () => { assert(true) })\n\
+         test(\"bad\", () => { assert(false, \"solo boom\") })\n",
+    )
+    .unwrap();
+
+    let serial = std::process::Command::new(bin)
+        .arg("test")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let parallel = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--parallel=4")
+        .arg(&file)
+        .output()
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        String::from_utf8_lossy(&serial.stdout),
+        String::from_utf8_lossy(&parallel.stdout),
+        "a single file with --parallel must match the serial output exactly"
+    );
+    assert_eq!(serial.status.code(), parallel.status.code());
+}
+
+/// A test file that itself dispatches a `worker fn` runs it without deadlock and gets the
+/// correct result under `--parallel` (the file behaves like a normal top-level program in
+/// its test isolate — its workers take the pool path, no pool-reservation deadlock).
+#[test]
+fn parallel_test_file_with_nested_worker_takes_pool_path() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_par_nested_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let a = dir.join("worker_a.as");
+    let b = dir.join("plain_b.as");
+    std::fs::write(
+        &a,
+        "import * as task from \"std/task\"\n\
+         worker fn double(x) { return x * 2 }\n\
+         test(\"nested worker\", () => {\n  \
+           let rs = await task.gather([double(21)])\n  \
+           assert(rs[0] == 42)\n\
+         })\n",
+    )
+    .unwrap();
+    std::fs::write(&b, "test(\"plain\", () => { assert(true) })\n").unwrap();
+
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--parallel=4")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let s =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "nested-worker test must pass (ran via the pool path, no deadlock); output: {s}"
+    );
+    assert!(s.contains("2 passed"), "expected 2 passed; got: {s}");
+}
+
 #[test]
 #[cfg(feature = "crypto")] // program imports std/crypto; only valid with the crypto feature.
 fn runs_crypto_sha256_and_password_roundtrip() {
