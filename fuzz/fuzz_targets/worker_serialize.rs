@@ -42,6 +42,15 @@ use ascript::value::{ArrayCell, MapCell, MapKey, ObjectCell, SetCell, Value};
 use ascript::worker::serialize::{check_sendable, decode, encode};
 use indexmap::{IndexMap, IndexSet};
 
+// LeakSanitizer: this target builds + serializes managed-runtime `Value` graphs, whose
+// process-lifetime state (interned strings, lazy_static/once_cell globals, gcmodule internals,
+// thread-locals) is NOT a leak. Disable LSan for THIS binary — the libFuzzer `-detect_leaks=0`
+// flag does NOT stop the shutdown LSan check; only this compiled-in default does.
+#[no_mangle]
+pub extern "C" fn __lsan_default_options() -> *const std::os::raw::c_char {
+    c"detect_leaks=0".as_ptr()
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;

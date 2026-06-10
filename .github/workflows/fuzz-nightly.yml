@@ -98,23 +98,24 @@ jobs:
           # Guard: SECS must be a plain integer (defends the shell against a hostile input).
           case "$SECS" in (*[!0-9]*|"") echo "bad duration: $SECS" >&2; exit 1 ;; esac
           echo "::group::cargo fuzz run $TARGET (${SECS}s)"
-          # Keep LeakSanitizer ON for the DECODE-ONLY `aso_roundtrip` (a leak there is a real
-          # `.aso` reader bug — BIN's gating target). Disable it for the targets that RUN the
-          # managed runtime: their intentional process-lifetime state (interned strings,
-          # lazy_static/once_cell globals, tokio/gcmodule internals, thread-locals) is
-          # indistinguishable from a leak to LSan; a genuine unbounded leak still trips
-          # `-rss_limit_mb`.
-          leak=1; [ "$TARGET" = aso_roundtrip ] || leak=0
+          # LeakSanitizer policy is compiled into the targets (`__lsan_default_options`): the
+          # runtime-exercising targets disable LSan (process-lifetime runtime state is not a
+          # leak); the decode-only `aso_roundtrip` keeps it ON (a leak there is a real reader
+          # bug — BIN's gate). A genuine unbounded leak still trips `-rss_limit_mb`.
           # rss 4GB, per-input timeout 25s (a hang is a crash). The committed seeds + the
           # cached grown corpus are the starting set.
           cargo +nightly fuzz run "$TARGET" -- \
-            -max_total_time="$SECS" -rss_limit_mb=4096 -timeout=25 -detect_leaks=$leak
+            -max_total_time="$SECS" -rss_limit_mb=4096 -timeout=25
           echo "::endgroup::"
 
       - name: Verifier-gap pass (aso_roundtrip only — runnable-accept)
         if: matrix.target == 'aso_roundtrip'
         env:
           ASCRIPT_FUZZ_RUNNABLE: "1"
+          # This pass RUNS verifier-accepted chunks on the managed runtime, so disable LSan via
+          # the ASan runtime env (the `aso_roundtrip` binary has no compiled-in
+          # `__lsan_default_options` — it keeps leak detection ON for its DECODE-only deep run).
+          ASAN_OPTIONS: "detect_leaks=0"
         run: |
           # A SEPARATE, shorter pass that RUNS verifier-accepted chunks on the VM to catch a
           # verify.rs gap. Generous timeout: a valid-but-slow program is a §9 bound, not a bug;
