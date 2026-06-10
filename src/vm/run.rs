@@ -153,6 +153,17 @@ pub struct Vm {
     /// source onto an escaping panic, so a cross-module panic renders its caret in
     /// the module the span belongs to. `None` until the first sourced frame runs.
     last_fault_source: RefCell<Option<Rc<crate::error::SourceInfo>>>,
+    /// **DBG — the unified instrumentation seam (debugger/profiler/coverage).**
+    /// `None` is the default and the **production hot path**: with no debugger,
+    /// profiler, or coverage attached, this is `None` and `run_loop` is
+    /// byte-identical to pre-DBG — it is NEVER loaded per dispatch iteration. The
+    /// only hot-loop coupling is the [`Op::Break`] match arm, reached SOLELY when a
+    /// breakpoint patched a byte (a side-table trap). `Box` keeps `Vm` small so the
+    /// not-attached path stays cache-tight; `RefCell` lets a `&self` method arm/read
+    /// the hook (the VM is driven by `&self`). Mirrors the `None`-gated
+    /// zero-cost-when-off pattern of `specialize` and the SP9 determinism cell. See
+    /// [`crate::vm::instrument`].
+    instrument: RefCell<Option<Box<crate::vm::instrument::Instrumentation>>>,
 }
 
 impl Vm {
@@ -190,6 +201,7 @@ impl Vm {
             global_version: std::cell::Cell::new(0),
             struct_gen: std::cell::Cell::new(0),
             last_fault_source: RefCell::new(None),
+            instrument: RefCell::new(None),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -198,6 +210,28 @@ impl Vm {
         // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
         vm.interp.set_vm(Rc::downgrade(&vm));
         vm
+    }
+
+    /// **DBG.** Build a specializing VM with an instrumentation payload installed
+    /// (a debugger/profiler/coverage attach). Mirrors [`Vm::with_specialize`] — it
+    /// builds the default VM and then arms `instrument`, so the only difference from
+    /// a plain [`Vm::new`] is the `Some(inst)` seam. A run with an all-`None`
+    /// [`Instrumentation`](crate::vm::instrument::Instrumentation) is behaviorally
+    /// identical to `Vm::new` (the trap arm is unreachable until a byte is patched).
+    pub fn with_instrument(
+        interp: Rc<Interp>,
+        inst: crate::vm::instrument::Instrumentation,
+    ) -> Rc<Self> {
+        let vm = Self::with_specialize(interp, true);
+        *vm.instrument.borrow_mut() = Some(Box::new(inst));
+        vm
+    }
+
+    /// **DBG.** Whether any instrumentation is currently attached. `false` is the
+    /// production path. NOT consulted by `run_loop` (which reaches instrumentation
+    /// only via the patched-byte `Op::Break` trap) — exposed for the driver / tests.
+    pub fn is_instrumented(&self) -> bool {
+        self.instrument.borrow().is_some()
     }
 
     /// Set the directory used to resolve relative FILE imports from the ENTRY
@@ -5307,6 +5341,109 @@ mod tests {
         let (outcome, out) = run_chunk_with_output(c);
         assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "ran ok");
         assert_eq!(out, "42.0\n", "print wrote to the shared capture sink");
+    }
+
+    // ---- DBG Task 1: the Vm.instrument seam (zero-cost when off) -----------
+
+    /// Run a chunk on a VM built with the given (already-armed) instrumentation,
+    /// capturing program output — the Task-1 analogue of `run_chunk_with_output`.
+    fn run_chunk_with_instrument(
+        chunk: Chunk,
+        inst: crate::vm::instrument::Instrumentation,
+    ) -> (Result<RunOutcome, Control>, String) {
+        let proto = Rc::new(FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let local = LocalSet::new();
+        local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::with_instrument(interp.clone(), inst);
+            let outcome = vm.run(&mut fiber).await;
+            (outcome, interp.output())
+        })
+    }
+
+    #[test]
+    fn default_vm_has_no_instrument() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::new(interp);
+            assert!(
+                vm.instrument.borrow().is_none(),
+                "a default Vm has no instrumentation attached"
+            );
+            assert!(!vm.is_instrumented());
+        });
+    }
+
+    #[test]
+    fn with_instrument_round_trips() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let inst = crate::vm::instrument::Instrumentation::empty();
+            let vm = Vm::with_instrument(interp, inst);
+            assert!(vm.is_instrumented(), "with_instrument arms the seam");
+            assert!(vm.instrument.borrow().is_some());
+        });
+    }
+
+    /// A chunk that exercises a spread of opcode kinds (const push, print call,
+    /// arithmetic, return) so the byte-identity check covers more than a trivial op.
+    fn output_demo_chunk() -> Chunk {
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str(Rc::from("print")));
+        c.emit_u16(Op::GetGlobal, name, s());
+        let a = c.add_const(Value::Float(2.0));
+        c.emit_u16(Op::Const, a, s());
+        let b = c.add_const(Value::Float(3.0));
+        c.emit_u16(Op::Const, b, s());
+        c.emit(Op::Add, s()); // 2.0 + 3.0
+        c.emit_u8(Op::Call, 1, s()); // print(5.0)
+        c.emit(Op::Return, s());
+        c
+    }
+
+    #[test]
+    fn noop_instrumentation_is_byte_identical_to_plain_run() {
+        // The whole Gate-12 promise at the unit level: an all-None Instrumentation
+        // produces byte-identical program output to a plain Vm::new run.
+        let (plain_outcome, plain_out) = run_chunk_with_output(output_demo_chunk());
+        let (inst_outcome, inst_out) = run_chunk_with_instrument(
+            output_demo_chunk(),
+            crate::vm::instrument::Instrumentation::empty(),
+        );
+        assert!(matches!(plain_outcome, Ok(RunOutcome::Done(_))));
+        assert!(matches!(inst_outcome, Ok(RunOutcome::Done(_))));
+        assert_eq!(
+            plain_out, inst_out,
+            "an all-None Instrumentation must not perturb program output"
+        );
+        assert_eq!(inst_out, "5.0\n");
     }
 
     #[test]
