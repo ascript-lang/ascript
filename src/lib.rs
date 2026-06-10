@@ -166,7 +166,7 @@ pub async fn run_tests_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<TestSummary, AsError> {
-    run_tests_with_options(files, packages, caps, None).await
+    run_tests_with_options(files, packages, caps, None, false).await
 }
 
 /// DX D2 Task 5 — the test runner with the `--parallel[=N]` option.
@@ -185,15 +185,22 @@ pub async fn run_tests_with_options(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
     parallel: Option<usize>,
+    update_snapshots: bool,
 ) -> Result<TestSummary, AsError> {
     // Parallelize only when asked for >1 isolate AND there is more than one file. A
     // single file in one isolate is the serial path with extra cost — degrade to serial
     // (point 3: "a SINGLE file (or --parallel=1) degrades to today's serial path").
     match parallel {
         Some(n) if n >= 2 && files.len() >= 2 => {
-            run_tests_parallel(files, packages, caps, n).await
+            // DX D2 Task 8: ORPHAN detection requires the single-Interp touched-set,
+            // which only the serial path has. Under `--parallel`, snapshot re-baseline
+            // (`--update-snapshots`) still works per-isolate (the flag crosses the
+            // airlock), but orphan detection/removal is a SERIAL-path feature (each
+            // isolate sees only its own file's touches — it cannot tell a sibling
+            // file's untouched snapshot from a genuine orphan). Documented asymmetry.
+            run_tests_parallel(files, packages, caps, n, update_snapshots).await
         }
-        _ => run_tests_serial(files, packages, caps).await,
+        _ => run_tests_serial(files, packages, caps, update_snapshots).await,
     }
 }
 
@@ -202,6 +209,7 @@ async fn run_tests_serial(
     files: &[String],
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    update_snapshots: bool,
 ) -> Result<TestSummary, AsError> {
     let interp = Rc::new(Interp::new());
     if let Some(caps) = caps {
@@ -210,6 +218,8 @@ async fn run_tests_serial(
     if let Some(map) = packages {
         interp.set_package_resolver(map);
     }
+    // DX D2 Task 8: enable snapshot re-baseline BEFORE any test code runs.
+    interp.set_snapshot_update(update_snapshots);
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local
@@ -239,7 +249,48 @@ async fn run_tests_serial(
         }))
         .await;
     local.await; // drain spawned tasks — no-op until Phase 2
+
+    // DX D2 Task 8 — ORPHAN snapshot detection (spec §6.2). After a full serial run we
+    // know every `.snap` file an assertion TOUCHED; a `.snap` file in a touched
+    // `__snapshots__/` dir that was NOT touched is an orphan (its assertion was
+    // removed). We only run this on a SUCCESSFUL run (a load/exit error short-circuits
+    // before all assertions executed, so the touched-set is incomplete — never flag
+    // orphans from a partial run). Reported to stderr; removed only under
+    // `--update-snapshots` (the one destructive path, gated).
+    #[cfg(all(feature = "sys", feature = "data"))]
+    if result.is_ok() {
+        report_orphan_snapshots(&interp, update_snapshots);
+    }
     result
+}
+
+/// DX D2 Task 8 — report (and, under `--update-snapshots`, REMOVE) orphan snapshot
+/// files after a full serial run. Deterministic (sorted) output; never panics on an
+/// unreadable/permission-denied path (the scan + removal both degrade cleanly).
+#[cfg(all(feature = "sys", feature = "data"))]
+fn report_orphan_snapshots(interp: &Interp, update_snapshots: bool) {
+    let touched = interp.snapshots_touched();
+    let orphans = crate::stdlib::assert_mod::find_orphan_snapshots(&touched);
+    if orphans.is_empty() {
+        return;
+    }
+    if update_snapshots {
+        for orphan in &orphans {
+            match crate::stdlib::assert_mod::remove_orphan_snapshot(orphan) {
+                Ok(()) => eprintln!("removed orphan snapshot: {}", orphan.display()),
+                Err(e) => eprintln!("warning: {e}"),
+            }
+        }
+    } else {
+        eprintln!(
+            "warning: {} orphan snapshot file(s) found (no matching assertion this run):",
+            orphans.len()
+        );
+        for orphan in &orphans {
+            eprintln!("  {}", orphan.display());
+        }
+        eprintln!("  run with --update-snapshots to remove them");
+    }
 }
 
 /// DX D2 Task 5 — the PARALLEL test path: each FILE runs in its own shared-nothing
@@ -261,6 +312,7 @@ async fn run_tests_parallel(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
     n: usize,
+    update_snapshots: bool,
 ) -> Result<TestSummary, AsError> {
     use std::sync::Arc;
     // Cap the in-flight isolate count: the requested `n`, bounded by the same
@@ -292,8 +344,13 @@ async fn run_tests_parallel(
                             )
                         }
                     };
-                    crate::worker::testrun::run_test_file_in_isolate(&path, packages, caps)
-                        .await
+                    crate::worker::testrun::run_test_file_in_isolate(
+                        &path,
+                        packages,
+                        caps,
+                        update_snapshots,
+                    )
+                    .await
                 }));
             }
             // Await in INPUT order, slotting each result by index. A task that itself
