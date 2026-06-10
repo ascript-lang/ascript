@@ -3332,3 +3332,167 @@ fn doc_check_rejects_empty_doc_body() {
     assert!(combined.contains("a"), "reports the undocumented symbol: {combined}");
     std::fs::remove_file(&file).ok();
 }
+
+// ── DX D2 Task 8: snapshot completion (--update-snapshots + orphan detection) ──
+//
+// These spawn `ascript test` with `current_dir` set to a fresh temp dir so the
+// cwd-relative `__snapshots__/` store is hermetic and self-contained. All snapshot
+// state lives under that dir and is cleaned up at the end.
+
+#[cfg(all(feature = "sys", feature = "data"))]
+mod snapshot_cli {
+    use std::process::Command;
+
+    /// A fresh, empty temp dir for a hermetic snapshot run; removed first so a stale
+    /// `__snapshots__/` from a previous run never leaks in.
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ascript_snapcli_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn run_test(dir: &std::path::Path, file: &std::path::Path, update: bool) -> std::process::Output {
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let mut cmd = Command::new(bin);
+        cmd.arg("test").arg(file).current_dir(dir);
+        if update {
+            cmd.arg("--update-snapshots");
+        }
+        cmd.output().unwrap()
+    }
+
+    fn combined(out: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// First run WRITES the snapshot (file appears + passes); a second run with the SAME
+    /// value PASSES; a MUTATED value FAILS and the failure carries the structural diff.
+    #[test]
+    fn write_pass_then_mismatch_shows_diff() {
+        let dir = fresh_dir("write_pass");
+        let file = dir.join("t.as");
+        let v1 = r#"
+import * as assert from "std/assert"
+test("snap", () => { assert.snapshot("user", {name: "ada", age: 36}) })
+"#;
+        std::fs::write(&file, v1).unwrap();
+
+        // First run: writes + passes.
+        let out1 = run_test(&dir, &file, false);
+        assert!(out1.status.success(), "first run should pass: {}", combined(&out1));
+        let snap = dir.join("__snapshots__").join("user.snap");
+        assert!(snap.exists(), "snapshot file created");
+        let stored1 = std::fs::read_to_string(&snap).unwrap();
+        assert!(stored1.contains("ada"), "stored content: {stored1}");
+
+        // Second run, same value: passes, file unchanged.
+        let out2 = run_test(&dir, &file, false);
+        assert!(out2.status.success(), "matching second run passes: {}", combined(&out2));
+        assert_eq!(std::fs::read_to_string(&snap).unwrap(), stored1, "file unchanged");
+
+        // Mutate the value → mismatch → FAIL with structural diff.
+        let v2 = r#"
+import * as assert from "std/assert"
+test("snap", () => { assert.snapshot("user", {name: "ada", age: 99}) })
+"#;
+        std::fs::write(&file, v2).unwrap();
+        let out3 = run_test(&dir, &file, false);
+        assert!(!out3.status.success(), "mismatch must fail: {}", combined(&out3));
+        let c = combined(&out3);
+        assert!(c.contains(".age: 36 → 99"), "structural diff line: {c}");
+        // File NOT rewritten without --update-snapshots.
+        assert_eq!(std::fs::read_to_string(&snap).unwrap(), stored1, "no rewrite on a normal run");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--update-snapshots` re-baselines a CHANGED value: it re-writes the stored snapshot
+    /// AND passes (and the on-disk content updates).
+    #[test]
+    fn update_snapshots_rebaselines_changed_value() {
+        let dir = fresh_dir("rebaseline");
+        let file = dir.join("t.as");
+        std::fs::write(
+            &file,
+            "import * as assert from \"std/assert\"\ntest(\"s\", () => { assert.snapshot(\"k\", 1) })\n",
+        )
+        .unwrap();
+        // Establish the baseline.
+        assert!(run_test(&dir, &file, false).status.success());
+        let snap = dir.join("__snapshots__").join("k.snap");
+        let before = std::fs::read_to_string(&snap).unwrap();
+
+        // Change the value: without the flag it FAILS.
+        std::fs::write(
+            &file,
+            "import * as assert from \"std/assert\"\ntest(\"s\", () => { assert.snapshot(\"k\", 2) })\n",
+        )
+        .unwrap();
+        let out_fail = run_test(&dir, &file, false);
+        assert!(!out_fail.status.success(), "changed value fails without the flag");
+
+        // WITH --update-snapshots: re-baselines (passes) and the file updates on disk.
+        let out_upd = run_test(&dir, &file, true);
+        assert!(
+            out_upd.status.success(),
+            "--update-snapshots re-baselines + passes: {}",
+            combined(&out_upd)
+        );
+        let after = std::fs::read_to_string(&snap).unwrap();
+        assert_ne!(before, after, "on-disk content changed");
+        assert!(after.contains('2'), "now stores the new value: {after}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ORPHANED snapshot (a stored `.snap` no assertion touches this run) is REPORTED
+    /// on a normal run and REMOVED under `--update-snapshots`.
+    #[test]
+    fn orphan_reported_then_removed_with_update() {
+        let dir = fresh_dir("orphan");
+        let file = dir.join("t.as");
+        // Run 1: two snapshot assertions → two .snap files.
+        std::fs::write(
+            &file,
+            "import * as assert from \"std/assert\"\n\
+             test(\"s\", () => {\n  assert.snapshot(\"alpha\", 1)\n  assert.snapshot(\"beta\", 2)\n})\n",
+        )
+        .unwrap();
+        assert!(run_test(&dir, &file, false).status.success());
+        let alpha = dir.join("__snapshots__").join("alpha.snap");
+        let beta = dir.join("__snapshots__").join("beta.snap");
+        assert!(alpha.exists() && beta.exists(), "both snapshots written");
+
+        // Run 2: the program no longer makes the `beta` assertion → beta is an ORPHAN.
+        std::fs::write(
+            &file,
+            "import * as assert from \"std/assert\"\n\
+             test(\"s\", () => {\n  assert.snapshot(\"alpha\", 1)\n})\n",
+        )
+        .unwrap();
+        // Without --update-snapshots: REPORTED (stderr) but NOT removed.
+        let out_report = run_test(&dir, &file, false);
+        assert!(out_report.status.success(), "passing tests: orphan is a notice, not a failure");
+        let c = combined(&out_report);
+        assert!(c.contains("orphan"), "reports an orphan: {c}");
+        assert!(c.contains("beta"), "names the orphan file: {c}");
+        assert!(beta.exists(), "orphan NOT removed without the flag");
+
+        // With --update-snapshots: orphan REMOVED from disk.
+        let out_remove = run_test(&dir, &file, true);
+        assert!(out_remove.status.success(), "update run passes: {}", combined(&out_remove));
+        assert!(!beta.exists(), "orphan removed under --update-snapshots");
+        assert!(alpha.exists(), "the touched snapshot survives");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

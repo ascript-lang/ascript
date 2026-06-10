@@ -133,11 +133,21 @@ fn diff_inner(
 
 // ── snapshot_impl (sys-gated; testable pure helper) ──────────────────────────
 
+/// The outcome of a `snapshot_impl` PASS: the `.snap` file path it touched, so the
+/// caller (the `assert.snapshot` handler) can record it for orphan detection.
+#[cfg(all(feature = "sys", feature = "data"))]
+#[derive(Debug)]
+pub(crate) struct SnapshotPass {
+    /// The full path to the `.snap` file this call read or wrote.
+    pub file: std::path::PathBuf,
+}
+
 /// Core snapshot logic, parameterized by `dir` (base dir for `__snapshots__/`),
 /// `name` (snapshot name), `serialized` (the value already stringified to JSON),
 /// and `update` (whether to overwrite an existing snapshot).
 ///
-/// Returns `Ok(())` on pass (first-run write, match, or update-mode write) or
+/// Returns `Ok(SnapshotPass{file})` on pass (first-run write, match, or update-mode
+/// write) — `file` is the `.snap` path the call touched, for orphan tracking — or
 /// `Err(message)` on mismatch.
 ///
 /// Gated behind `cfg(all(feature = "sys", feature = "data"))`: requires `sys`
@@ -148,7 +158,7 @@ pub(crate) fn snapshot_impl(
     name: &str,
     serialized: &str,
     update: bool,
-) -> Result<(), String> {
+) -> Result<SnapshotPass, String> {
     // Sanitize the snapshot name: replace filesystem-unsafe chars with `_`.
     let safe_name: String = name
         .chars()
@@ -203,15 +213,74 @@ pub(crate) fn snapshot_impl(
                 ),
             });
         }
-        Ok(())
+        Ok(SnapshotPass { file: snap_file })
     } else {
         // First run (file absent) or update mode: write the snapshot.
         std::fs::create_dir_all(&snap_dir)
             .map_err(|e| format!("assert.snapshot: could not create __snapshots__ dir: {}", e))?;
         std::fs::write(&snap_file, serialized)
             .map_err(|e| format!("assert.snapshot: could not write snapshot file: {}", e))?;
-        Ok(())
+        Ok(SnapshotPass { file: snap_file })
     }
+}
+
+/// DX D2 Task 8 — orphan-snapshot detection (spec §6.2).
+///
+/// Scan every `__snapshots__/` directory that an assertion TOUCHED this run for
+/// `.snap` files that were NOT touched (their assertion was removed). This is scoped
+/// conservatively to the directories the run actually wrote into — a `__snapshots__/`
+/// dir no assertion in THIS run touched is never scanned (so a partial/filtered run
+/// can never flag a sibling test's snapshots as orphans). Returns the orphan file
+/// paths in deterministic (sorted) order.
+///
+/// `touched` is the set of `.snap` paths `snapshot_impl` reported this run (already
+/// sorted by the caller's `BTreeSet`). NEVER panics: an unreadable dir / unreadable
+/// entry / non-`.snap` file is skipped, not an error.
+#[cfg(all(feature = "sys", feature = "data"))]
+pub(crate) fn find_orphan_snapshots(touched: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    use std::collections::{BTreeSet, HashSet};
+    // The set of touched files (for O(1) membership) and the distinct parent dirs to
+    // scan (only dirs we actually wrote into — the conservative scoping).
+    let touched_set: HashSet<&std::path::Path> = touched.iter().map(|p| p.as_path()).collect();
+    let mut dirs: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for p in touched {
+        if let Some(parent) = p.parent() {
+            dirs.insert(parent.to_path_buf());
+        }
+    }
+    let mut orphans: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for dir in dirs {
+        // A missing / unreadable dir is skipped (never a crash).
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Only consider regular `.snap` files; skip subdirs / other files.
+            if path.extension().and_then(|e| e.to_str()) != Some("snap") {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            if !touched_set.contains(path.as_path()) {
+                orphans.insert(path);
+            }
+        }
+    }
+    orphans.into_iter().collect()
+}
+
+/// DX D2 Task 8 — remove an orphan snapshot file (only under `--update-snapshots`).
+/// DESTRUCTIVE: the caller MUST only call this in update mode and only for paths
+/// returned by [`find_orphan_snapshots`] (which are confined to touched
+/// `__snapshots__/` dirs). Returns `Ok(())` on delete or a clean error string on a
+/// failed removal — never panics.
+#[cfg(all(feature = "sys", feature = "data"))]
+pub(crate) fn remove_orphan_snapshot(path: &std::path::Path) -> Result<(), String> {
+    std::fs::remove_file(path)
+        .map_err(|e| format!("could not remove orphan snapshot {}: {}", path.display(), e))
 }
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -683,10 +752,13 @@ impl Interp {
                     }
                 };
 
-                // Check env var for update mode (non-empty string → update).
-                let update = std::env::var("ASCRIPT_UPDATE_SNAPSHOTS")
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false);
+                // Update mode (the `--update-snapshots` re-baseline): the Interp-level
+                // flag the test runner sets, OR the `ASCRIPT_UPDATE_SNAPSHOTS` env var
+                // (a non-empty string) as a fallback for non-runner entry points.
+                let update = self.snapshot_update_mode()
+                    || std::env::var("ASCRIPT_UPDATE_SNAPSHOTS")
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false);
 
                 // Resolve snapshot dir relative to cwd.
                 let cwd = std::env::current_dir().map_err(|e| {
@@ -697,7 +769,11 @@ impl Interp {
                 })?;
 
                 match snapshot_impl(&cwd, &name, &serialized, update) {
-                    Ok(()) => Ok(Value::Nil),
+                    Ok(pass) => {
+                        // Record the touched `.snap` file for post-run orphan detection.
+                        self.record_snapshot_touched(pass.file);
+                        Ok(Value::Nil)
+                    }
                     Err(msg) => Err(AsError::at(msg, span).into()),
                 }
             }
@@ -1544,6 +1620,102 @@ print(e.message)
             assert!(r.is_ok(), "update mode should pass: {:?}", r);
             let snap_file = dir.join("__snapshots__").join("my_snap.snap");
             assert_eq!(std::fs::read_to_string(&snap_file).unwrap(), "updated");
+        }
+
+        #[test]
+        fn impl_returns_touched_path_on_pass() {
+            // Both a first-run write AND a matching read report the .snap path so the
+            // runner can record it for orphan detection.
+            let dir = tmp_dir("touched_path");
+            let snap_file = dir.join("__snapshots__").join("my_snap.snap");
+            let p1 = snapshot_impl(&dir, "my_snap", "v", false).unwrap();
+            assert_eq!(p1.file, snap_file, "first-run write reports the path");
+            let p2 = snapshot_impl(&dir, "my_snap", "v", false).unwrap();
+            assert_eq!(p2.file, snap_file, "matching read reports the path");
+        }
+
+        // ── orphan detection (DX D2 Task 8) ────────────────────────────────────
+
+        #[test]
+        fn orphan_detected_when_not_touched() {
+            use super::super::find_orphan_snapshots;
+            let dir = tmp_dir("orphan_detect");
+            // Write two snapshots, then this "run" only touches one of them.
+            let kept = snapshot_impl(&dir, "kept", "1", false).unwrap().file;
+            let _gone = snapshot_impl(&dir, "gone", "2", false).unwrap().file;
+            // Touched-set = only `kept`. `gone.snap` is an orphan.
+            let touched = std::slice::from_ref(&kept);
+            let orphans = find_orphan_snapshots(touched);
+            assert_eq!(orphans.len(), 1, "exactly one orphan: {:?}", orphans);
+            assert!(
+                orphans[0].ends_with("gone.snap"),
+                "the untouched file is the orphan: {:?}",
+                orphans
+            );
+        }
+
+        #[test]
+        fn no_orphan_when_all_touched() {
+            use super::super::find_orphan_snapshots;
+            let dir = tmp_dir("orphan_none");
+            let a = snapshot_impl(&dir, "a", "1", false).unwrap().file;
+            let b = snapshot_impl(&dir, "b", "2", false).unwrap().file;
+            let orphans = find_orphan_snapshots(&[a, b]);
+            assert!(orphans.is_empty(), "no orphans: {:?}", orphans);
+        }
+
+        #[test]
+        fn orphan_scan_scoped_to_touched_dirs_only() {
+            // Conservative scoping: a __snapshots__ dir NO assertion touched this run is
+            // never scanned, so its files are NOT flagged as orphans.
+            use super::super::find_orphan_snapshots;
+            let dir_a = tmp_dir("orphan_scope_a");
+            let dir_b = tmp_dir("orphan_scope_b");
+            // dir_a gets touched; dir_b has a stray file but is NOT in the touched set.
+            let touched_a = snapshot_impl(&dir_a, "x", "1", false).unwrap().file;
+            let _stray = snapshot_impl(&dir_b, "y", "2", false).unwrap().file;
+            // Only dir_a's file is touched. dir_b is never scanned (not a touched dir).
+            let orphans = find_orphan_snapshots(&[touched_a]);
+            assert!(
+                orphans.is_empty(),
+                "dir_b's file must not be flagged (out of scope): {:?}",
+                orphans
+            );
+        }
+
+        #[test]
+        fn orphan_scan_missing_dir_does_not_panic() {
+            use super::super::find_orphan_snapshots;
+            // A touched path whose parent dir does not exist → no panic, no orphans.
+            let bogus = std::env::temp_dir()
+                .join("ascript_snap_test_nonexistent_xyz")
+                .join("__snapshots__")
+                .join("a.snap");
+            let orphans = find_orphan_snapshots(&[bogus]);
+            assert!(orphans.is_empty(), "missing dir yields no orphans");
+        }
+
+        #[test]
+        fn remove_orphan_deletes_file() {
+            use super::super::{find_orphan_snapshots, remove_orphan_snapshot};
+            let dir = tmp_dir("orphan_remove");
+            let kept = snapshot_impl(&dir, "kept", "1", false).unwrap().file;
+            let gone = snapshot_impl(&dir, "gone", "2", false).unwrap().file;
+            assert!(gone.exists(), "orphan present before removal");
+            let orphans = find_orphan_snapshots(std::slice::from_ref(&kept));
+            assert_eq!(orphans.len(), 1);
+            remove_orphan_snapshot(&orphans[0]).unwrap();
+            assert!(!gone.exists(), "orphan removed from disk");
+            assert!(kept.exists(), "the touched snapshot is untouched by removal");
+        }
+
+        #[test]
+        fn remove_orphan_missing_file_is_clean_error() {
+            use super::super::remove_orphan_snapshot;
+            let bogus = std::env::temp_dir().join("ascript_snap_test_no_such.snap");
+            let _ = std::fs::remove_file(&bogus);
+            let r = remove_orphan_snapshot(&bogus);
+            assert!(r.is_err(), "removing a missing file is a clean Err, not a panic");
         }
 
         #[test]

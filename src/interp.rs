@@ -617,6 +617,23 @@ pub struct Interp {
     /// has no source); `worker_source` takes priority when BOTH are set (a run-from-source
     /// always uses the source path). `None` in every run mode that sets `worker_source`.
     worker_aso_bytes: RefCell<Option<Rc<[u8]>>>,
+    /// DX D2 Task 8: snapshot "update mode" (the `--update-snapshots` re-baseline).
+    /// When `true`, `assert.snapshot` OVERWRITES the stored snapshot with the freshly
+    /// serialized value and PASSES (a `jest -u`-style bulk re-baseline without editing
+    /// source), and orphan snapshot files are DELETED after the run. Default `false`
+    /// (a normal run never writes a changed snapshot and never deletes). A `Cell`,
+    /// never held across an `.await`.
+    snapshot_update: Cell<bool>,
+    /// DX D2 Task 8: the set of snapshot FILES (canonical-ish `.snap` paths) that an
+    /// `assert.snapshot` call actually TOUCHED this run. After a full run, a `.snap`
+    /// file in a touched `__snapshots__/` dir that is NOT in this set is an ORPHAN
+    /// (its assertion was removed) — reported, and removed under `--update-snapshots`.
+    /// A `BTreeSet` for deterministic (sorted) orphan reporting. Never held across an
+    /// `.await`. Only read on a `sys`+`data` build (the `assert.snapshot` handler and
+    /// the orphan scan are feature-gated); the field is unconditional so the runner can
+    /// always call `set_snapshot_update`.
+    #[allow(dead_code)]
+    snapshots_touched: RefCell<std::collections::BTreeSet<PathBuf>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -967,6 +984,10 @@ impl Interp {
             caps_drop_allowed: Cell::new(true),
             worker_source: RefCell::new(None),
             worker_aso_bytes: RefCell::new(None),
+            // DX D2 Task 8: snapshot re-baseline is OFF by default — a normal run
+            // never overwrites a changed snapshot and never deletes an orphan.
+            snapshot_update: Cell::new(false),
+            snapshots_touched: RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -1003,6 +1024,36 @@ impl Interp {
     /// Consumed by `std/caps` `drop`/`dropAll` routing.
     pub(crate) fn caps_drop_allowed(&self) -> bool {
         self.caps_drop_allowed.get()
+    }
+
+    /// DX D2 Task 8: enable/disable snapshot "update mode" (the `--update-snapshots`
+    /// re-baseline). Set by the test runner BEFORE loading test files; the
+    /// `assert.snapshot` handler reads it via [`Interp::snapshot_update_mode`].
+    pub fn set_snapshot_update(&self, update: bool) {
+        self.snapshot_update.set(update);
+    }
+
+    /// DX D2 Task 8: whether snapshot re-baseline is active (`--update-snapshots`).
+    /// Read only by the `sys`+`data`-gated `assert.snapshot` handler.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_update_mode(&self) -> bool {
+        self.snapshot_update.get()
+    }
+
+    /// DX D2 Task 8: record that an `assert.snapshot` call touched `path` this run
+    /// (so a `.snap` file no assertion touched can be detected as an orphan). A short
+    /// borrow; never held across an `.await`. Used only on a `sys`+`data` build.
+    #[allow(dead_code)]
+    pub(crate) fn record_snapshot_touched(&self, path: PathBuf) {
+        self.snapshots_touched.borrow_mut().insert(path);
+    }
+
+    /// DX D2 Task 8: a sorted snapshot of the `.snap` files touched this run. Used by
+    /// the post-run orphan scan. Deterministic order (the set is a `BTreeSet`). Used
+    /// only on a `sys`+`data` build (the serial-path orphan reporter).
+    #[allow(dead_code)]
+    pub(crate) fn snapshots_touched(&self) -> Vec<PathBuf> {
+        self.snapshots_touched.borrow().iter().cloned().collect()
     }
 
     /// Irreversibly **deny** `cap` on this isolate (`caps.drop`). Subtractive only —

@@ -63,6 +63,7 @@ pub async fn run_test_file_in_isolate(
     path: &Path,
     packages: Option<PackageMap>,
     caps: Option<CapSet>,
+    update_snapshots: bool,
 ) -> FileRunResult {
     let path_str = path.to_string_lossy().into_owned();
 
@@ -85,6 +86,10 @@ pub async fn run_test_file_in_isolate(
         if let Some(map) = packages_iso {
             interp.set_package_resolver(map);
         }
+        // DX D2 Task 8: snapshot re-baseline crosses the airlock as a plain bool so
+        // `--update-snapshots` re-writes changed snapshots in this isolate too. (Orphan
+        // detection stays a serial-path feature — see `run_tests_with_options`.)
+        interp.set_snapshot_update(update_snapshots);
 
         // Wait for the start signal (the parent sends an empty message once it has
         // wired the bridge); if the handle is dropped first, the file is cancelled.
@@ -111,6 +116,7 @@ pub async fn run_test_file_in_isolate(
             if let Some(map) = packages {
                 interp.set_package_resolver(map);
             }
+            interp.set_snapshot_update(update_snapshots);
             interp.install_self();
             return match run_one_file(&interp, &path_str).await {
                 Ok(bytes) => decode_summary(&bytes, &path_str),

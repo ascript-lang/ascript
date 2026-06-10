@@ -182,6 +182,12 @@ enum Command {
             default_missing_value = "0"
         )]
         parallel: Option<usize>,
+        /// DX D2 Task 8: re-baseline ALL snapshots this run (`jest -u`-style). A changed
+        /// `assert.snapshot` value OVERWRITES the stored snapshot and PASSES (no source
+        /// edit), and ORPHAN snapshot files (no matching assertion this run) are DELETED.
+        /// Without the flag, a changed snapshot FAILS and orphans are only reported.
+        #[arg(long = "update-snapshots")]
+        update_snapshots: bool,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
@@ -856,6 +862,7 @@ async fn real_main() -> ExitCode {
             deny,
             sandbox,
             parallel,
+            update_snapshots,
         } => {
             // DX D2: `--parallel` (no value) → `num_cpus` isolates; `--parallel=N` → N;
             // absent → `None` (serial). The `default_missing_value = "0"` sentinel maps
@@ -891,12 +898,20 @@ async fn real_main() -> ExitCode {
                     }
                     None => None,
                 };
-                ascript::run_tests_with_options(&files, packages, caps, parallel).await
+                ascript::run_tests_with_options(
+                    &files,
+                    packages,
+                    caps,
+                    parallel,
+                    update_snapshots,
+                )
+                .await
             };
             #[cfg(not(feature = "pkg"))]
             let test_result = {
                 let _ = locked;
-                ascript::run_tests_with_options(&files, None, caps, parallel).await
+                ascript::run_tests_with_options(&files, None, caps, parallel, update_snapshots)
+                    .await
             };
             match test_result {
             Ok(summary) => {
