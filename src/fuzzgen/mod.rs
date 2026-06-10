@@ -60,6 +60,13 @@
 //! async/await/spawn/workers (deferred — nondeterministic scheduling, see spec §6); try/recover
 //! (the `recover(fn(){…})` carry-forward bug); generators `fn*`/`yield`.
 //!
+//! Known BLIND SPOT (tracked): class/enum/`fn` declarations are emitted TOP-LEVEL only — the
+//! generator cannot nest a declaration INSIDE a loop body. That pattern hid a real closure
+//! frame-leak (a loop-nested METHOD param colliding with a captured outer-loop cell — Unit-2
+//! bug #1's `MethodDecl` sibling, caught by REVIEW not the fuzzer; fixed + guarded by
+//! `vm_loop_nested_method_closure_capture_matches_treewalker`). Letting `stmt()` nest a
+//! declaration in a loop body would let the fuzzer reach this class of bug automatically.
+//!
 //! Crate-gated `#[cfg(any(test, fuzzing))]` (in `lib.rs`) so it compiles into `ascript`
 //! ONLY for `cargo test` (and a `--cfg fuzzing` libFuzzer build) — never in a normal or
 //! `--no-default-features` build, and `arbitrary` never enters the production graph.

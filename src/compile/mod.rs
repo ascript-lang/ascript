@@ -1018,16 +1018,31 @@ impl Compiler {
         // FRAME-FILTER (closure-capture bug fix): `self.resolved.bindings` holds EVERY
         // binding across ALL frames, and slot indices are reused across frames (a closure
         // param and an outer-frame local can both be slot 0). A binding declared inside a
-        // NESTED callable (`ArrowExpr`/`FnDecl`) that itself sits inside this loop body lives
-        // in a DIFFERENT frame — its slot index is meaningless here. Including it would emit a
-        // spurious `FRESH_CELL` for an UNRELATED current-frame cell slot, clobbering a captured
-        // outer variable to nil each iteration. So collect the ranges of nested callable bodies
-        // within the loop body and skip any binding declared inside one of them.
+        // NESTED frame that itself sits inside this loop body lives in a DIFFERENT frame —
+        // its slot index is meaningless here. Including it would emit a spurious `FRESH_CELL`
+        // for an UNRELATED current-frame cell slot, clobbering a captured outer variable to
+        // nil each iteration. So collect the ranges of nested-frame bodies within the loop
+        // body and skip any binding declared inside one of them.
+        //
+        // The exclusion set MUST cover EVERY node kind that opens a fresh resolver frame —
+        // this MUST stay in sync with the `frames.push` sites in `src/syntax/resolve/mod.rs`:
+        // `resolve_function` (`ArrowExpr` / `FnDecl` / `MethodDecl` — incl. a class method
+        // declared inside a loop body) and `resolve_field_default` (`FieldDecl` — a field
+        // default expression). Missing `MethodDecl` here was a four-mode-divergent bug (a
+        // method param/local in a loop-nested class clobbered a captured outer-loop var on the
+        // VM); see `vm_loop_nested_method_closure_capture_matches_treewalker`. The root frame
+        // (`resolve_file`) is never nested in a loop body, so it is irrelevant.
         let nested_frame_ranges: Vec<TextRange> = body
             .syntax()
             .descendants()
             .filter(|n| {
-                matches!(n.kind(), SyntaxKind::ArrowExpr | SyntaxKind::FnDecl)
+                matches!(
+                    n.kind(),
+                    SyntaxKind::ArrowExpr
+                        | SyntaxKind::FnDecl
+                        | SyntaxKind::MethodDecl
+                        | SyntaxKind::FieldDecl
+                )
             })
             .map(|n| n.text_range())
             .collect();

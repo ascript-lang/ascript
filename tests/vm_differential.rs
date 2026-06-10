@@ -7951,6 +7951,45 @@ async fn vm_nested_loop_closure_capture_matches_treewalker() {
 }
 
 #[tokio::test]
+async fn vm_loop_nested_method_closure_capture_matches_treewalker() {
+    // FUZZ Unit 2 bug #1 — SIBLING case caught by the Unit-2 review: the original
+    // `loop_refresh_slots` frame-filter excluded only `ArrowExpr`/`FnDecl` nested frames,
+    // but a `MethodDecl` (a class method declared INSIDE a loop body) opens a fresh frame
+    // via the SAME `resolve_function` path. Its param/local bindings start at slot 0 and
+    // collided with an outer-loop cell slot, so the inner loop's FRESH_CELL list clobbered
+    // the captured outer-loop variable to `nil` on the VM (the tree-walker read the real
+    // value). Fixed by adding `MethodDecl` (and `FieldDecl`) to the nested-frame exclusion.
+    let cases = [
+        // Method PARAM `x` (slot 0) collides with the captured outer-loop cell `w28`.
+        "let w27 = 0\n\
+         while (w27 < 2) {\n\
+           let w28 = 5\n\
+           while (w28 < 7) {\n\
+             class C { fn m(x) { return w28 } }\n\
+             let c = C()\n\
+             print(c.m(3))\n\
+             w28 = w28 + 1\n\
+           }\n\
+           w27 = w27 + 1\n\
+         }",
+        // Method LOCAL `y` collides; method reads the captured outer cell.
+        "let outer = 0\n\
+         while (outer < 2) {\n\
+           let acc = 10\n\
+           for (i in 0..3) {\n\
+             class M { fn build(p) { let y = p * 2\n return y + acc } }\n\
+             print(M().build(i))\n\
+             acc = acc + 1\n\
+           }\n\
+           outer = outer + 1\n\
+         }",
+    ];
+    for src in cases {
+        assert_four_way_run(src).await;
+    }
+}
+
+#[tokio::test]
 async fn vm_match_value_pattern_decimal_matches_treewalker() {
     // FUZZ Unit 2 bug #2 (tree-walker `Pattern::Value` used Rust structural `PartialEq`
     // instead of the `==` operator's NUM cross-kind equality): a `match` value pattern over
