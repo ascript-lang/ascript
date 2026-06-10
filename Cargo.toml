@@ -153,7 +153,7 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile"]
 # FUZZ: the grammar-aware source generator (`src/fuzzgen/`). NON-default — enabled only by
 # the crate's self-dev-dependency for `tests/property.rs` (and by a `--cfg fuzzing` libFuzzer
 # build). Pulls `arbitrary`. Never in `default`, so production is byte-identical.
@@ -219,6 +219,29 @@ tui = ["dep:crossterm"]
 # completion/hover/goto-def); never runs the interpreter, so it avoids the !Send
 # Rc/RefCell runtime. tower-lsp bundles lsp-types + tower + JSON-RPC over stdio.
 lsp = ["dep:tower-lsp", "tokio/io-std"]
+# DBG Task 5b: the Debug Adapter Protocol (DAP) server over stdio + the CLI wiring
+# (`ascript dap`, `ascript run --inspect <file>`). A SYNCHRONOUS, blocking stdio
+# adapter (NOT tower-lsp / not async) that drives the already-landed VM debug core
+# (the parked-VM command protocol in src/vm/instrument.rs + run.rs::debug_stop) over
+# its `Send` channel; the debuggee runs on its own dedicated thread + current-thread
+# runtime. Hand-rolled DAP message structs over serde/serde_json (no external DAP
+# crate). All of `src/dap/` is `#[cfg(feature = "dap")]`, so --no-default-features
+# builds nothing from it and `--inspect` reports a clean rebuild hint. Default-on
+# (batteries). Adds NO VM behavior → four-mode byte-identity + `.aso` unchanged.
+dap = ["dep:serde", "dep:serde_json"]
+# DBG Task 7: the CPU sampling profiler (`src/profile/`) + the CLI wiring
+# (`ascript run --profile cpu`). The publish seam (`Vm::publish_profile_frames`,
+# the `ProfilerHook` snapshot) and the aggregation/output (speedscope JSON +
+# collapsed folded-stacks) hang off the SAME single `Vm.instrument` gate as the
+# debugger — zero-cost when no profiler is armed (a single None-check at frame
+# push/pop; the per-instruction dispatch loop is untouched). The sampler thread is
+# `std::thread` + `Arc<Mutex<Vec<String>>>` (owned `String`s cross — the airlock
+# discipline); speedscope JSON is emitted via serde_json (no external profiler
+# crate). All of `src/profile/` is `#[cfg(feature = "profile")]`, so
+# --no-default-features builds nothing from it and `--profile` reports a clean
+# rebuild hint. Default-on (batteries). Adds NO VM behavior → four-mode
+# byte-identity + `.aso` unchanged.
+profile = ["dep:serde_json"]
 sysinfo = ["dep:sysinfo"]
 # SP12 std/telemetry: vendor-neutral observability facade (tracing spans, metrics,
 # analytics events) with three HAND-ROLLED HTTP exporters (OTLP http/json, Sentry

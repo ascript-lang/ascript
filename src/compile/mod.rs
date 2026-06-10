@@ -1079,6 +1079,60 @@ impl Compiler {
         slots
     }
 
+    /// DBG (debug-info, §5.1 #2): collect the `(slot, name)` table for the frame
+    /// whose defining node is `body_node` (a `FnDecl`/`ArrowExpr`/`MethodDecl`/
+    /// `FieldDecl` body, or the `SourceFile` root for the module frame). Mirrors the
+    /// FRAME-FILTER discipline of [`Self::loop_refresh_slots`]: `self.resolved.bindings`
+    /// holds EVERY binding across ALL frames and slot indices are reused across
+    /// frames, so we keep only bindings whose `decl_range` lies inside `body_node`'s
+    /// range AND NOT inside a nested callable frame (whose slots are that frame's, not
+    /// ours). Module-scope user-globals (`is_global`) have no frame slot and are
+    /// skipped. PURE debug metadata, populated at compile time only — never read by
+    /// the run loop. Params (`BindingKind::Param`) ARE this frame's locals, so they
+    /// keep their names too; the loop-var is a `BindingKind::LoopVar`, also kept.
+    fn collect_local_names(&self, body_node: &ResolvedNode) -> Vec<(u32, Rc<str>)> {
+        let body_range = body_node.text_range();
+        // Every nested callable/field-default frame opened inside this body — its
+        // bindings belong to THAT frame, not this one (slot indices are per-frame).
+        // MUST stay in sync with the `frames.push` sites in `src/syntax/resolve/mod.rs`
+        // (the same set `loop_refresh_slots` excludes).
+        let nested_frame_ranges: Vec<TextRange> = body_node
+            .descendants()
+            .filter(|n| {
+                n.text_range() != body_range
+                    && matches!(
+                        n.kind(),
+                        SyntaxKind::ArrowExpr
+                            | SyntaxKind::FnDecl
+                            | SyntaxKind::MethodDecl
+                            | SyntaxKind::FieldDecl
+                    )
+            })
+            .map(|n| n.text_range())
+            .collect();
+        let mut out: Vec<(u32, Rc<str>)> = Vec::new();
+        for b in &self.resolved.bindings {
+            if b.is_global {
+                continue; // module global — no frame slot
+            }
+            if !body_range.contains_range(b.decl_range) || b.decl_range == body_range {
+                continue; // not declared in this body
+            }
+            if nested_frame_ranges
+                .iter()
+                .any(|r| r.contains_range(b.decl_range))
+            {
+                continue; // belongs to a nested frame
+            }
+            out.push((b.slot, Rc::from(b.name.as_str())));
+        }
+        // Deterministic order: by slot, then keep the first name for a reused slot
+        // (block-scoped re-declarations can alias a slot; the first wins for labelling).
+        out.sort_by_key(|(slot, _)| *slot);
+        out.dedup_by_key(|(slot, _)| *slot);
+        out
+    }
+
     /// Emit a `FRESH_CELL` for each slot in `slots` (in order). Installs a fresh
     /// heap cell so closures created in this iteration capture only this
     /// iteration's value.
@@ -2616,6 +2670,7 @@ impl Compiler {
             return Err(limit.into_compile_error());
         }
 
+        let local_names = self.collect_local_names(field);
         Ok(Rc::new(FnProto {
             chunk: body_chunk,
             arity: 0,
@@ -2626,6 +2681,8 @@ impl Compiler {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names,
+            debug_name: None,
         }))
     }
 
@@ -2831,6 +2888,11 @@ impl Compiler {
             return Err(limit.into_compile_error());
         }
 
+        let local_names = self.collect_local_names(fn_node);
+        // DBG: the declared name for debugger frame labels. The fn's Ident token is its
+        // name for `fn f(){}` and methods (`greet`); anonymous arrows / fn-expressions
+        // have no Ident token → `None` (the snapshot then falls back to "fn@L<line>").
+        let debug_name = fn_name_token_text(fn_node).map(Rc::from);
         Ok(Rc::new(FnProto {
             chunk: body_chunk,
             arity,
@@ -2841,6 +2903,8 @@ impl Compiler {
             owning_class: None,
             params: proto_params,
             ret: ret_type,
+            local_names,
+            debug_name,
         }))
     }
 
@@ -5679,6 +5743,47 @@ mod tests {
     use super::*;
     use crate::vm::disasm::disasm;
 
+    /// DBG: `Op::Break` is the runtime breakpoint trap — it must NEVER be emitted by
+    /// the compiler (it only ever appears because a debugger patched a byte). Scan a
+    /// feature-rich compiled chunk (and every nested proto) for the BREAK opcode byte.
+    #[test]
+    fn compiler_never_emits_break_opcode() {
+        use crate::vm::opcode::Op;
+        fn scan(chunk: &crate::vm::chunk::Chunk) {
+            // Walk instructions by opcode width so an operand byte that happens to
+            // equal `Op::Break as u8` is not mistaken for an opcode.
+            let mut off = 0;
+            while off < chunk.code.len() {
+                let byte = chunk.code[off];
+                let op = Op::from_u8(byte)
+                    .unwrap_or_else(|| panic!("compiled an invalid opcode byte {byte:#x}"));
+                assert_ne!(op, Op::Break, "compiler emitted Op::Break at offset {off}");
+                off += 1 + op.operand_width();
+            }
+            for proto in &chunk.protos {
+                scan(&proto.chunk);
+            }
+        }
+        let src = r#"
+            fn fib(n: number): number {
+                if (n < 2) { return n }
+                return fib(n - 1) + fib(n - 2)
+            }
+            class Point { x: number; y: number }
+            enum Shape { Circle(r: number), Square }
+            let xs = [1, 2, 3].map((v) => v * 2)
+            for (i in 0..10 step 2) { print(i) }
+            let p = Point.from({ x: 1, y: 2 })
+            match (Shape.Circle(3.0)) {
+                Shape.Circle(r) => print(r),
+                Shape.Square => print("sq"),
+            }
+            print(fib(5), xs, p)
+        "#;
+        let chunk = compile_source(src).expect("compiles");
+        scan(&chunk);
+    }
+
     #[test]
     fn compile_one_plus_two_emits_const_const_add_return() {
         let chunk = compile_source("1 + 2").expect("compiles");
@@ -6531,7 +6636,7 @@ mod tests {
         let proto = chunk.protos.first().expect("one nested proto");
         // The proto's code is exactly the two zero-operand ops NIL then RETURN.
         assert_eq!(
-            proto.chunk.code,
+            *proto.chunk.code,
             vec![Op::Nil as u8, Op::Return as u8],
             "empty fn body should compile to NIL; RETURN"
         );
@@ -6695,6 +6800,99 @@ mod tests {
         assert_eq!(
             eval_number("import * as math from \"std/math\"\nmath.abs(-7)").await,
             7.0
+        );
+    }
+
+    // ---- DBG debug-info: FnProto.local_names (from resolver bindings) ------
+
+    /// Look up the named-after-`name` proto in a compiled chunk and return its
+    /// `local_names` as `(slot, name)` pairs sorted by slot.
+    fn proto_local_names(chunk: &crate::vm::chunk::Chunk, name: &str) -> Vec<(u32, String)> {
+        let proto = chunk
+            .protos
+            .iter()
+            .find(|p| p.chunk.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no proto named {name}"));
+        proto
+            .local_names
+            .iter()
+            .map(|(slot, n)| (*slot, n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn local_names_labels_params_and_lets() {
+        // A function with a param and two `let` locals — each keeps its source name.
+        let src = r#"
+            fn f(a) {
+                let x = a + 1
+                let y = x * 2
+                return y
+            }
+        "#;
+        let chunk = compile_source(src).expect("compiles");
+        let names = proto_local_names(&chunk, "f");
+        let just_names: Vec<&str> = names.iter().map(|(_, n)| n.as_str()).collect();
+        assert!(just_names.contains(&"a"), "param a missing: {names:?}");
+        assert!(just_names.contains(&"x"), "let x missing: {names:?}");
+        assert!(just_names.contains(&"y"), "let y missing: {names:?}");
+        // The param `a` is slot 0 (first declared local of the frame).
+        assert_eq!(names.iter().find(|(_, n)| n == "a").map(|(s, _)| *s), Some(0));
+    }
+
+    #[test]
+    fn local_names_labels_loop_var() {
+        let src = r#"
+            fn g() {
+                let total = 0
+                for (i in 0..3) {
+                    total = total + i
+                }
+                return total
+            }
+        "#;
+        let chunk = compile_source(src).expect("compiles");
+        let names = proto_local_names(&chunk, "g");
+        let just_names: Vec<&str> = names.iter().map(|(_, n)| n.as_str()).collect();
+        assert!(just_names.contains(&"total"), "let total missing: {names:?}");
+        assert!(just_names.contains(&"i"), "loop var i missing: {names:?}");
+    }
+
+    #[test]
+    fn local_names_empty_for_no_locals() {
+        // A function with no params and no locals has an empty name table.
+        let src = r#"
+            fn h() {
+                return 42
+            }
+        "#;
+        let chunk = compile_source(src).expect("compiles");
+        let names = proto_local_names(&chunk, "h");
+        assert!(names.is_empty(), "expected no locals, got {names:?}");
+    }
+
+    #[test]
+    fn local_names_nested_frame_locals_not_leaked() {
+        // An inner closure's locals belong to ITS frame — they must NOT appear in the
+        // outer function's `local_names` (slot indices are per-frame).
+        let src = r#"
+            fn outer(p) {
+                let cb = (q) => {
+                    let inner = q + 1
+                    return inner
+                }
+                return cb(p)
+            }
+        "#;
+        let chunk = compile_source(src).expect("compiles");
+        let outer = proto_local_names(&chunk, "outer");
+        let outer_names: Vec<&str> = outer.iter().map(|(_, n)| n.as_str()).collect();
+        assert!(outer_names.contains(&"p"), "outer param p missing: {outer:?}");
+        assert!(outer_names.contains(&"cb"), "outer let cb missing: {outer:?}");
+        // The arrow's `q`/`inner` belong to the arrow frame, not `outer`.
+        assert!(
+            !outer_names.contains(&"q") && !outer_names.contains(&"inner"),
+            "nested-frame locals leaked into outer: {outer:?}"
         );
     }
 }

@@ -43,6 +43,19 @@ struct GlobalSlot {
     mutable: bool,
 }
 
+/// DBG: the outcome of one `debug_stop` park (the parked command loop). A resume command
+/// (`Continue`/`Next`/`StepIn`/`StepOut`) records the step mode on the hook and yields
+/// [`StopOutcome::Resume`] (the trap arm un-patches + resumes). An `Evaluate` command is
+/// NOT a resume — `debug_stop` returns [`StopOutcome::Evaluate`] (with the instrument box
+/// already restored, no borrow held) so the async trap arm can run the re-entrant
+/// evaluator on the tree-walker and then re-park. Plain owned data only.
+enum StopOutcome {
+    /// Resume execution (the step mode was already recorded on the hook).
+    Resume,
+    /// Evaluate `expr` in paused frame `frame_id`, ship the result, and re-park.
+    Evaluate { expr: String, frame_id: usize },
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -153,6 +166,31 @@ pub struct Vm {
     /// source onto an escaping panic, so a cross-module panic renders its caret in
     /// the module the span belongs to. `None` until the first sourced frame runs.
     last_fault_source: RefCell<Option<Rc<crate::error::SourceInfo>>>,
+    /// **DBG — the unified instrumentation seam (debugger/profiler/coverage).**
+    /// `None` is the default and the **production hot path**: with no debugger,
+    /// profiler, or coverage attached, this is `None` and `run_loop` is
+    /// byte-identical to pre-DBG — it is NEVER loaded per dispatch iteration. The
+    /// only hot-loop coupling is the [`Op::Break`] match arm, reached SOLELY when a
+    /// breakpoint patched a byte (a side-table trap). `Box` keeps `Vm` small so the
+    /// not-attached path stays cache-tight; `RefCell` lets a `&self` method arm/read
+    /// the hook (the VM is driven by `&self`). Mirrors the `None`-gated
+    /// zero-cost-when-off pattern of `specialize` and the SP9 determinism cell. See
+    /// [`crate::vm::instrument`].
+    instrument: RefCell<Option<Box<crate::vm::instrument::Instrumentation>>>,
+    /// DBG: the flattened proto tree of the program under inspection, for resolving a
+    /// source (file, line) to a `(proto_id, offset)` to patch. Populated ONLY when a
+    /// debugger arms breakpoints (empty otherwise → zero cost, NEVER read on the hot
+    /// path; the dispatch loop never touches it). Each entry is an `Rc<FnProto>` clone
+    /// (the entry body + every nested fn, recursively) so a `(file, line)` can target
+    /// any proto, not just the current frame.
+    debug_protos: RefCell<Vec<Rc<crate::vm::chunk::FnProto>>>,
+}
+
+/// DBG: the final path component of a `/`- or `\`-separated path (the file name),
+/// used by the v1 multi-module breakpoint source-matching heuristic. A path with no
+/// separator returns itself.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 impl Vm {
@@ -190,6 +228,8 @@ impl Vm {
             global_version: std::cell::Cell::new(0),
             struct_gen: std::cell::Cell::new(0),
             last_fault_source: RefCell::new(None),
+            instrument: RefCell::new(None),
+            debug_protos: RefCell::new(Vec::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -198,6 +238,176 @@ impl Vm {
         // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
         vm.interp.set_vm(Rc::downgrade(&vm));
         vm
+    }
+
+    /// **DBG.** Build a specializing VM with an instrumentation payload installed
+    /// (a debugger/profiler/coverage attach). Mirrors [`Vm::with_specialize`] — it
+    /// builds the default VM and then arms `instrument`, so the only difference from
+    /// a plain [`Vm::new`] is the `Some(inst)` seam. A run with an all-`None`
+    /// [`Instrumentation`](crate::vm::instrument::Instrumentation) is behaviorally
+    /// identical to `Vm::new` (the trap arm is unreachable until a byte is patched).
+    pub fn with_instrument(
+        interp: Rc<Interp>,
+        inst: crate::vm::instrument::Instrumentation,
+    ) -> Rc<Self> {
+        let vm = Self::with_specialize(interp, true);
+        *vm.instrument.borrow_mut() = Some(Box::new(inst));
+        vm
+    }
+
+    /// **DBG.** Whether any instrumentation is currently attached. `false` is the
+    /// production path. NOT consulted by `run_loop` (which reaches instrumentation
+    /// only via the patched-byte `Op::Break` trap) — exposed for the driver / tests.
+    pub fn is_instrumented(&self) -> bool {
+        self.instrument.borrow().is_some()
+    }
+
+    /// **DBG Task 5b.** Install a [`DebuggerHook`](crate::vm::instrument::DebuggerHook)
+    /// as the sole armed sub-feature, replacing any existing instrumentation payload.
+    /// The DAP launcher uses this after patching break-on-entry on the hook. Behaves
+    /// exactly like setting `instrument = Some(Instrumentation{ breakpoints: Some(hook),
+    /// .. })` — kept as a method so the field stays private.
+    pub fn install_debugger_hook(&self, hook: crate::vm::instrument::DebuggerHook) {
+        *self.instrument.borrow_mut() = Some(Box::new(crate::vm::instrument::Instrumentation {
+            breakpoints: Some(hook),
+            profiler: None,
+            coverage: None,
+        }));
+    }
+
+    /// **DBG Task 5b.** Reclaim the armed
+    /// [`DebuggerHook`](crate::vm::instrument::DebuggerHook) (if any), leaving the VM
+    /// with no instrumentation. The DAP launcher calls this after `run` returns to ship
+    /// the terminal `Output`/`Terminated` events and then drop the hook (closing the
+    /// event channel). `None` if no debugger was armed.
+    pub fn take_debugger_hook(&self) -> Option<crate::vm::instrument::DebuggerHook> {
+        self.instrument
+            .borrow_mut()
+            .take()
+            .and_then(|mut i| i.breakpoints.take())
+    }
+
+    /// **DBG Task 7.** Reclaim the armed
+    /// [`ProfilerHook`](crate::vm::instrument::ProfilerHook) (if any). The profiled-run
+    /// driver calls this after `run` returns to stop the sampler (joining its thread in
+    /// wallclock mode) and aggregate its samples. `None` if no profiler was armed.
+    pub fn take_profiler(&self) -> Option<crate::vm::instrument::ProfilerHook> {
+        self.instrument
+            .borrow_mut()
+            .as_mut()
+            .and_then(|i| i.profiler.take())
+    }
+
+    /// **DBG.** Register the program's proto tree for source-line breakpoint resolution.
+    /// Walks `entry` and recursively each `chunk.protos`, storing every `Rc<FnProto>`
+    /// flat in `debug_protos`. A debugger/launcher calls this once before `run` under
+    /// instrumentation (so a parked VM can resolve a `(file, line)` to ANY proto, not
+    /// just the current frame). Idempotent-ish: replaces the table each call.
+    ///
+    /// Zero-cost when off: `debug_protos` is read ONLY inside `debug_stop` (reached only
+    /// via a patched `Op::Break`), never on the dispatch hot path.
+    pub fn register_debug_protos(&self, entry: &Rc<crate::vm::chunk::FnProto>) {
+        fn walk(proto: &Rc<crate::vm::chunk::FnProto>, out: &mut Vec<Rc<crate::vm::chunk::FnProto>>) {
+            out.push(proto.clone());
+            for nested in &proto.chunk.protos {
+                walk(nested, out);
+            }
+        }
+        let mut table = self.debug_protos.borrow_mut();
+        table.clear();
+        walk(entry, &mut table);
+    }
+
+    /// **DBG.** Resolve a source `(source, line_1based)` to a `(proto_id, offset)` to
+    /// patch with a breakpoint, by consulting the registered `debug_protos` tree.
+    /// Returns `None` when no proto has any instruction on or after the line (unbound).
+    ///
+    /// # v1 matching rules (single-module happy path + nested fns)
+    ///
+    /// - **Source match.** A proto's `chunk.source` carries the module path. If exactly
+    ///   one distinct source path is present across all protos, accept it for ANY
+    ///   requested `source` (the single-module case — the editor's path and the compiler's
+    ///   recorded path need not be byte-equal). Otherwise compare on the file NAME (the
+    ///   final path component), so `/abs/foo.as` matches a requested `foo.as`. A proto with
+    ///   no bound source is skipped.
+    /// - **Proto selection.** Convert to 0-based (`line0`). The right proto is the MOST
+    ///   SPECIFIC one whose own `build_line_starts()` has an instruction EXACTLY on
+    ///   `line0` (a real instruction starts on that line). Among several such, prefer the
+    ///   DEEPEST (last-registered ⇒ most-nested) proto — a nested fn body wins over the
+    ///   enclosing body. If NO proto has an exact-line instruction, fall back to the
+    ///   FIRST candidate's `first_offset_for_line` (next-line binding — DAP allows a
+    ///   breakpoint to bind to a later line).
+    fn resolve_line_breakpoint(
+        &self,
+        source: &str,
+        line_1based: u32,
+    ) -> Option<(usize, usize)> {
+        let line0 = line_1based.saturating_sub(1);
+        let protos = self.debug_protos.borrow();
+
+        // Collect the distinct bound source paths to decide the matching mode.
+        let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in protos.iter() {
+            if let Some(src) = p.chunk.source.borrow().as_ref() {
+                paths.insert(src.path.clone());
+            }
+        }
+        let single_source = paths.len() == 1;
+        let want_file = file_name_of(source);
+
+        // A proto is a candidate when its bound source matches the requested `source`
+        // per the v1 rules above.
+        let is_candidate = |p: &Rc<crate::vm::chunk::FnProto>| -> bool {
+            match p.chunk.source.borrow().as_ref() {
+                None => false,
+                Some(src) => {
+                    if single_source {
+                        true
+                    } else {
+                        file_name_of(&src.path) == want_file
+                    }
+                }
+            }
+        };
+
+        // First pass: a proto whose own line table has an EXACT instruction on `line0`.
+        // `debug_protos` is registered parent-before-child (pre-order walk), so a LATER
+        // index is a more-nested proto — iterate in reverse to prefer the deepest match.
+        for p in protos.iter().rev() {
+            if !is_candidate(p) {
+                continue;
+            }
+            let starts = p.chunk.build_line_starts();
+            if let Some((_, off)) = starts.iter().find(|(l, _)| *l == line0) {
+                let proto_id = Rc::as_ptr(p) as *const () as usize;
+                return Some((proto_id, *off as usize));
+            }
+        }
+
+        // Fallback: next-line binding on the FIRST candidate that has an instruction
+        // at/after `line0` (DAP permits binding to a later line). Iterate in registration
+        // (pre-)order so the outermost/entry-style proto is preferred for the fallback.
+        for p in protos.iter() {
+            if !is_candidate(p) {
+                continue;
+            }
+            if let Some(off) = p.chunk.first_offset_for_line(line0) {
+                let proto_id = Rc::as_ptr(p) as *const () as usize;
+                return Some((proto_id, off as usize));
+            }
+        }
+        None
+    }
+
+    /// **DBG.** Find the chunk of a registered proto by its `Rc::as_ptr` identity, so a
+    /// parked VM can patch/restore a breakpoint byte through the shared `&Chunk`. Returns
+    /// `None` if the id is not in `debug_protos` (a stale/foreign id).
+    fn debug_proto_for(&self, proto_id: usize) -> Option<Rc<crate::vm::chunk::FnProto>> {
+        self.debug_protos
+            .borrow()
+            .iter()
+            .find(|p| Rc::as_ptr(p) as *const () as usize == proto_id)
+            .cloned()
     }
 
     /// Set the directory used to resolve relative FILE imports from the ENTRY
@@ -318,6 +528,58 @@ impl Vm {
     fn leave_frame_depth(&self) {
         let depth = self.interp.call_depth_cell();
         depth.set(depth.get() - 1);
+    }
+
+    /// **DBG Task 7 — the CPU-profiler publish seam (zero-cost when off).**
+    ///
+    /// Publishes the CURRENT frame-name stack (root → leaf) into the armed
+    /// profiler hook's `Send` snapshot, so a sampler thread (wallclock mode) or the
+    /// inline recorder (deterministic mode) can capture it. Called right AFTER every
+    /// frame push and right AFTER every frame pop, so the published stack always
+    /// reflects the NEW depth.
+    ///
+    /// # Zero-cost when no profiler is armed (Gate 12)
+    ///
+    /// The fast path is a SINGLE `None`-check: if `instrument` is `None`, or its
+    /// `profiler` sub-feature is `None`, this returns IMMEDIATELY without touching
+    /// `fiber.frames` or allocating anything. The per-instruction dispatch loop is
+    /// UNCHANGED — this is only called at the per-CALL push/pop sites (already cold
+    /// relative to dispatch), mirroring the placement of `enter_frame_depth` /
+    /// `leave_frame_depth`. When no profiler is armed the cost is exactly that one
+    /// borrow + two pointer comparisons.
+    ///
+    /// # The airlock
+    ///
+    /// Only owned `String`s cross to the sampler thread — each frame maps to its
+    /// `proto.debug_name` clone (or `"<anon>"` when unnamed), with the bottom (root)
+    /// frame rendered as `"<script>"`. No `Value`/`Rc`/`Cc` ever crosses.
+    fn publish_profile_frames(&self, fiber: &Fiber) {
+        // FAST PATH (Gate 12): a single None-check, BEFORE building anything.
+        {
+            let inst = self.instrument.borrow();
+            if inst.as_ref().and_then(|i| i.profiler.as_ref()).is_none() {
+                return;
+            }
+        }
+        // Armed: build the owned-String stack (root → leaf). Bottom frame = "<script>".
+        let mut stack: Vec<String> = Vec::with_capacity(fiber.frames.len());
+        for (i, frame) in fiber.frames.iter().enumerate() {
+            let name = match &frame.closure.proto.debug_name {
+                Some(n) => n.to_string(),
+                None if i == 0 => "<script>".to_string(),
+                None => "<anon>".to_string(),
+            };
+            stack.push(name);
+        }
+        let mut inst = self.instrument.borrow_mut();
+        if let Some(hook) = inst.as_mut().and_then(|i| i.profiler.as_mut()) {
+            hook.publish(stack);
+            // Deterministic mode: each push/pop also records a sample inline, so the
+            // sample set is a pure function of call structure (golden-stable).
+            if hook.mode == crate::vm::instrument::ProfileMode::Deterministic {
+                hook.record_inline_sample();
+            }
+        }
     }
 
     /// Force a full cycle collection (V13-T3). Thin pass-through to
@@ -486,6 +748,8 @@ impl Vm {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut module_fiber = Fiber::new(closure);
@@ -578,6 +842,14 @@ impl Vm {
 
     /// The instruction-dispatch loop. Wrapped by [`run`] which binds the faulting
     /// module's source onto an escaping panic (SP4 §3 cross-module provenance).
+    ///
+    /// DBG (debug-info, §5.1) ZERO-COST INVARIANT: the debug-info tables
+    /// `Chunk::build_line_starts`/`line_col_at`/`first_offset_for_line` and
+    /// `FnProto.local_names` are PURE compile-time metadata — they are NEVER consulted
+    /// anywhere in this loop (an attached debugger reads them out-of-band). A grep for
+    /// `line_starts`/`local_names` in this file finds only the empty-`Vec::new()`
+    /// construction of runtime-built protos, never a read. Keep it that way: a debug
+    /// table reached from the hot loop is a Gate-12 regression.
     async fn run_loop(&self, fiber: &mut Fiber) -> Result<RunOutcome, Control> {
         loop {
             // Capture the faulting ip (the opcode byte's offset) before advancing.
@@ -1311,6 +1583,9 @@ impl Vm {
                                 def_class: None,
                                 argc: supplied,
                             });
+                            // DBG Task 7: publish the new (deeper) frame stack to an
+                            // armed profiler. Zero-cost None-check when off.
+                            self.publish_profile_frames(fiber);
                             // Continue the loop in the new frame (the run loop reads
                             // `fiber.frame()` at the top of each iteration). RETURN
                             // pops this frame and restores the caller.
@@ -3392,6 +3667,104 @@ impl Vm {
                     fiber.push(bound);
                 }
 
+                Op::Break => {
+                    // DBG: the software-breakpoint trap. Reached ONLY because the
+                    // debugger PATCHED this opcode byte (the side table holds the
+                    // displaced original op). This is the ONLY new hot-loop arm; the
+                    // `None`/no-breakpoint path never produces an `Op::Break` byte, so
+                    // every production run is byte-identical to pre-DBG (Gate 12).
+                    //
+                    // Re-execution technique (the simplest one — no dispatch
+                    // restructuring): recover the original byte, park on the command
+                    // channel, then UN-PATCH the byte (write the original back) and
+                    // reset `ip` to the break offset. The next iteration of THIS very
+                    // loop re-reads `code[ip]` — now the restored original opcode —
+                    // and executes it normally. The displaced instruction therefore
+                    // runs exactly once and the program result is identical to an
+                    // un-instrumented run.
+                    //
+                    // v1 trade-off (DOCUMENTED): a hit breakpoint UN-PATCHES itself,
+                    // so it traps at most once per set. Persistent re-arming (re-patch
+                    // after stepping off) is a Task-6 follow-up. Tests that need a
+                    // breakpoint to fire on every loop iteration re-patch from the
+                    // controller after each stop.
+                    let proto_id =
+                        Rc::as_ptr(&fiber.frame().closure.proto) as *const () as usize;
+                    let depth = fiber.frames.len();
+
+                    // Recover the original opcode byte from the hook's side table
+                    // (scoped borrow, dropped immediately — Gate 4).
+                    let original = {
+                        let inst = self.instrument.borrow();
+                        inst.as_ref()
+                            .and_then(|i| i.breakpoints.as_ref())
+                            .and_then(|h| h.original_byte(proto_id, fault_ip))
+                    };
+                    let Some(original_byte) = original else {
+                        // A stray Break with no side-table entry (no debugger, or a
+                        // cleared breakpoint left a Break byte): nothing to recover.
+                        // `ip` already advanced past the (0-width) Break, so just
+                        // continue — treat it as a no-op safepoint.
+                        continue;
+                    };
+
+                    // Park: ship a `Stopped` event (carrying a fresh frame snapshot) and
+                    // block on the command channel. No Value/Cc/RefCell borrow is held
+                    // across the blocking recv (Gate 4) — `debug_stop` scopes every borrow.
+                    //
+                    // The command loop runs while parked. An `Evaluate` command is NOT a
+                    // resume: `debug_stop` returns it (instrument box already restored, no
+                    // borrow held), we evaluate the expression in the paused frame on the
+                    // tree-walker, ship the `EvaluateResult`, then LOOP back to park again
+                    // and wait for the next command. A resume command breaks the loop.
+                    loop {
+                        // Build the Send-safe frame/variable snapshot while `&fiber` is
+                        // live (Value access stays on the VM thread) and BEFORE the blocking
+                        // recv — owned Strings only, no borrow held across the wait (Gate 4).
+                        // Innermost frame first; the innermost frame's active instruction is
+                        // the trapped `fault_ip`. Re-built per Evaluate iteration so an
+                        // inspecting expression that mutated a local is reflected on the next
+                        // park (cheap; only reached while interactively paused — Gate 12 hot
+                        // loop untouched).
+                        let snap = self.build_frame_snapshots(fiber, fault_ip);
+                        match self.debug_stop(proto_id, fault_ip, depth, snap) {
+                            StopOutcome::Resume => break,
+                            StopOutcome::Evaluate { expr, frame_id } => {
+                                let (ok, display) =
+                                    self.eval_in_paused_frame(fiber, frame_id, &expr).await;
+                                // Ship the result back (scoped instrument borrow, dropped
+                                // before the next loop iteration — Gate 4). A disconnected
+                                // controller is harmless (the next park's recv catches it).
+                                let inst = self.instrument.borrow();
+                                if let Some(hook) =
+                                    inst.as_ref().and_then(|i| i.breakpoints.as_ref())
+                                {
+                                    let _ = hook.events.send(
+                                        crate::vm::instrument::DebugEvent::EvaluateResult {
+                                            ok,
+                                            display,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Un-patch this breakpoint and re-point `ip` to the break offset so
+                    // the next loop iteration reads + executes the recovered original
+                    // op normally. `code` lives behind a `RefCell` on the chunk; write
+                    // the restored byte through it (no offset moves). If the byte was
+                    // already restored (e.g. the controller cleared it during the
+                    // stop), the write is harmless.
+                    {
+                        let chunk = &fiber.frame().closure.proto.chunk;
+                        chunk.patch_byte(fault_ip, original_byte);
+                    }
+                    fiber.frame_mut().ip = fault_ip;
+                    // Fall through to the top of the loop: it re-reads code[fault_ip]
+                    // (now the original op) and dispatches it. No restructuring.
+                }
+
                 other => {
                     return Err(self.panic_at(
                         fiber,
@@ -3401,6 +3774,386 @@ impl Vm {
                 }
             }
         }
+    }
+
+    /// DBG: park the fiber at a breakpoint. Ships a `Stopped` event to the DAP server
+    /// thread and blocks on the command channel until a resume command (recording the
+    /// resume's step mode on the hook) OR an `Evaluate` command (returned to the caller,
+    /// which evaluates it and re-parks). Breakpoint-management commands (SetBreakpoints /
+    /// ClearBreakpoints) are applied IN PLACE and the loop waits for the next command.
+    ///
+    /// Gate 4: builds the plain-data snapshot and ships it, then drops every borrow
+    /// BEFORE blocking on the channel `recv` — no `RefCell`/`Cc` borrow is held across
+    /// the wait. The `Instrumentation` box is TAKEN out of the cell across the blocking
+    /// recv (a re-entrant native call the resumed program triggers could otherwise
+    /// re-borrow the cell), then put back BEFORE returning (so the caller's `Evaluate`
+    /// handling re-borrows a fully-restored cell — no borrow held across the return).
+    fn debug_stop(
+        &self,
+        proto_id: usize,
+        offset: usize,
+        depth: usize,
+        frames: Vec<crate::vm::instrument::FrameSnapshot>,
+    ) -> StopOutcome {
+        use crate::vm::instrument::{DebugCommand, DebugEvent, StepMode};
+        // Ship the Stopped event (scoped borrow, dropped immediately). `frames` is
+        // already plain owned Send-safe data (built at the trap before this call).
+        {
+            let inst = self.instrument.borrow();
+            let Some(hook) = inst.as_ref().and_then(|i| i.breakpoints.as_ref()) else {
+                return StopOutcome::Resume;
+            };
+            // If the controller end has hung up, there is nothing to wait for —
+            // resume immediately (a detached debugger must not deadlock the program).
+            if hook
+                .events
+                .send(DebugEvent::Stopped {
+                    proto_id,
+                    offset,
+                    depth,
+                    frames,
+                })
+                .is_err()
+            {
+                return StopOutcome::Resume;
+            }
+        }
+        // Take the payload OUT across the blocking recv (Gate 4 — hold no cell borrow
+        // while blocked). Nothing from the script heap (Value/Cc/fiber) is touched.
+        let mut taken = self.instrument.borrow_mut().take();
+
+        // The command loop: breakpoint-management commands (SetBreakpoints /
+        // ClearBreakpoints) are applied IN PLACE and the loop waits for the NEXT command
+        // (they are not a resume); a resume command (Continue/Next/StepIn/StepOut) records
+        // the step mode and RETURNS `Resume`; an `Evaluate` command RETURNS `Evaluate{..}`
+        // for the caller to handle and re-park. Each iteration blocks on `recv` holding NO
+        // RefCell/Cc borrow (Gate 4): we resolve/patch synchronously between recvs.
+        let outcome = loop {
+            // Block on the channel with no borrow held. `recv` returns `Err` if the
+            // controller hung up → resume free-running.
+            let cmd = match taken
+                .as_mut()
+                .and_then(|i| i.breakpoints.as_mut())
+                .map(|hook| hook.commands.recv())
+            {
+                Some(Ok(cmd)) => cmd,
+                // No hook, or the controller disconnected — resume free-running.
+                _ => break StopOutcome::Resume,
+            };
+
+            match cmd {
+                DebugCommand::Continue => {
+                    self.set_step(taken.as_mut(), StepMode::Run, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::Next => {
+                    self.set_step(taken.as_mut(), StepMode::Over, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::StepIn => {
+                    self.set_step(taken.as_mut(), StepMode::Into, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::StepOut => {
+                    self.set_step(taken.as_mut(), StepMode::Out, depth);
+                    break StopOutcome::Resume;
+                }
+                DebugCommand::Evaluate { expr, frame_id } => {
+                    // Not a resume: hand the request back to the caller (which re-enters
+                    // the async evaluator). Restore the box FIRST so no borrow is held
+                    // across the return and the evaluator sees a fully-armed debugger.
+                    break StopOutcome::Evaluate { expr, frame_id };
+                }
+                DebugCommand::SetBreakpoints { source, lines } => {
+                    let results = self.apply_set_breakpoints(taken.as_mut(), &source, &lines);
+                    // Ship the verdict; ignore a disconnected controller (it will be
+                    // caught on the next recv). No borrow held across the send.
+                    if let Some(hook) = taken.as_ref().and_then(|i| i.breakpoints.as_ref()) {
+                        let _ = hook
+                            .events
+                            .send(DebugEvent::BreakpointsVerified { results });
+                    }
+                    // Not a resume — wait for the next command.
+                }
+                DebugCommand::ClearBreakpoints => {
+                    self.apply_clear_breakpoints(taken.as_mut());
+                    // Not a resume — wait for the next command.
+                }
+            }
+        };
+
+        // Restore the payload (the program continues with the debugger still armed).
+        *self.instrument.borrow_mut() = taken;
+        outcome
+    }
+
+    /// DBG: record the resume step mode + depth on the hook (in the already-TAKEN
+    /// instrumentation box — no re-borrow of `self.instrument`). A no-op if the hook is
+    /// gone (controller disconnected mid-stop).
+    fn set_step(
+        &self,
+        inst: Option<&mut Box<crate::vm::instrument::Instrumentation>>,
+        mode: crate::vm::instrument::StepMode,
+        depth: usize,
+    ) {
+        if let Some(hook) = inst.and_then(|i| i.breakpoints.as_mut()) {
+            hook.step_mode = mode;
+            hook.step_depth = depth;
+        }
+    }
+
+    /// DBG: evaluate `expr_text` in the PAUSED frame `frame_id` (the DAP `evaluate`
+    /// request — Watch / Debug Console / hover). The clean approach: REUSE the tree-walker
+    /// as the evaluator — the parked `Vm` already holds a full [`Interp`] (`self.interp()`)
+    /// with an async re-entrant `eval_expr` and an `Environment`, which `debug_stop`'s
+    /// blocking-`recv` command loop (a SYNC fn) cannot do. We bridge the paused frame's
+    /// live values into an `Environment` and run the parsed expression on the tree-walker.
+    ///
+    /// Returns plain owned `(ok, display)`: on success the value rendered via `Value`'s
+    /// `Display`; on a parse error / thrown panic / `?`-propagation, `ok=false` and the
+    /// error text. The caller ships this as a [`DebugEvent::EvaluateResult`] — NO
+    /// `Value`/`Rc`/`Cc` crosses the channel (the worker-airlock discipline).
+    ///
+    /// Side-effects in the expression DO run (like the V8 debug console) — the debugger
+    /// only ever evaluates an expression the user explicitly requested, so the
+    /// non-evaluated run's observation contract is untouched (Gate 1: `evaluate` adds no
+    /// behavior to a normal run; it is reached ONLY from the interactive command loop).
+    /// Note the asymmetry: a HEAP mutation (a field/element write through a shared
+    /// `Rc`/`Cc` value) PERSISTS into the resumed program exactly as a normal write would,
+    /// but a rebind of a paused-frame LOCAL (`x = 99`) mutates only the throwaway eval
+    /// `Environment` and is LOST — the VM frame's stack slot is never written back. This
+    /// is what keeps the resumed frame uncorruptible by an evaluate.
+    ///
+    /// Gate 4: no `RefCell`/`Cc` borrow is held across the `.await` — the environment is
+    /// built (cloning live values out) BEFORE `eval_expr`, and the `fiber` reads are
+    /// synchronous.
+    ///
+    /// This is the SHARED evaluator that conditional breakpoints / logpoints will reuse at
+    /// breakpoint-check time (a documented follow-up — DBG Task 8 scope is read/expression
+    /// evaluation for Watch/Repl/Hover).
+    async fn eval_in_paused_frame(
+        &self,
+        fiber: &Fiber,
+        frame_id: usize,
+        expr_text: &str,
+    ) -> (bool, String) {
+        // (1) Map the DAP frame id (innermost-first, as `build_frame_snapshots` /
+        // `stackTrace` order it) back to the bottom-first `fiber.frames` index.
+        let n = fiber.frames.len();
+        if frame_id >= n {
+            return (false, format!("<no such frame: {frame_id}>"));
+        }
+        let frame = &fiber.frames[n - 1 - frame_id];
+        let proto = &frame.closure.proto;
+
+        // (2) Build the evaluation environment: a fresh builtins child, then the module
+        // user-globals (so a top-level binding / the function itself resolves), then the
+        // frame's live locals LAST so they shadow globals. Every value is cloned OUT here
+        // (no borrow held across the later `.await`).
+        let env = crate::interp::global_env().child();
+        for (name, gslot) in self.user_globals.borrow().iter() {
+            let _ = env.define(name, gslot.value.clone(), gslot.mutable);
+        }
+        for (slot, name) in &proto.local_names {
+            let slot_idx = *slot as usize;
+            // Read the live value: a captured slot through its cell, else the plain stack
+            // slot at `slot_base + slot` (bounds-checked).
+            let val = match frame.cells.get(slot_idx).and_then(|c| c.as_ref()) {
+                Some(cell) => cell.borrow().clone(),
+                None => match fiber.stack.get(frame.slot_base + slot_idx) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                },
+            };
+            // Define-or-reassign (a later same-named slot wins; locals shadow globals).
+            if env.define(name, val.clone(), true).is_err() {
+                let _ = env.assign(name, val);
+            }
+        }
+
+        // (3) Parse the expression with the legacy front-end (the tree-walker's parser).
+        // There is no single-expression entry, so parse it as a one-statement program and
+        // extract the `Stmt::Expr`. A parse error → a clean `(false, …)` (never a panic).
+        let expr = match crate::lexer::lex(expr_text)
+            .map_err(|e| e.message)
+            .and_then(|toks| crate::parser::parse(&toks).map_err(|e| e.message))
+        {
+            Ok(stmts) => match stmts.into_iter().next() {
+                Some(crate::ast::Stmt::Expr(e)) => e,
+                _ => return (false, "<parse error: expected an expression>".to_string()),
+            },
+            Err(msg) => return (false, format!("<parse error: {msg}>")),
+        };
+
+        // (4) Evaluate on the tree-walker. Render the value via `Display`; a thrown panic
+        // / propagation becomes a `(false, message)` result.
+        match self.interp().eval_expr(&expr, &env).await {
+            Ok(v) => (true, format!("{v}")),
+            Err(Control::Panic(e)) => (false, e.message),
+            Err(_) => (false, "<propagated>".to_string()),
+        }
+    }
+
+    /// DBG: apply a `SetBreakpoints { source, lines }` against the live proto tree while
+    /// parked. DAP setBreakpoints is declarative/replace-all PER SOURCE: first clear this
+    /// source's existing breakpoints (restoring their bytes), then for each requested line
+    /// resolve to a `(proto_id, offset)` and patch `Op::Break` through the shared `&Chunk`.
+    /// Returns one [`BreakpointBinding`] per requested line (verdict + bound offset).
+    ///
+    /// Gate 4: fully synchronous — no `.await`, no `recv`. It briefly borrows
+    /// `debug_protos` to resolve/look up chunks, dropping the borrow before each
+    /// `patch_byte` is irrelevant (no await between), and operates on the hook in the
+    /// already-TAKEN instrumentation box (`inst`), never re-borrowing `self.instrument`.
+    fn apply_set_breakpoints(
+        &self,
+        inst: Option<&mut Box<crate::vm::instrument::Instrumentation>>,
+        source: &str,
+        lines: &[u32],
+    ) -> Vec<crate::vm::instrument::BreakpointBinding> {
+        use crate::vm::instrument::BreakpointBinding;
+        let Some(hook) = inst.and_then(|i| i.breakpoints.as_mut()) else {
+            return Vec::new();
+        };
+
+        // (1) Clear this source's existing breakpoints (replace-all per source). Determine
+        // which registered protos belong to `source`, then restore + forget any live
+        // breakpoint on them.
+        let source_proto_ids: std::collections::HashSet<usize> = {
+            let protos = self.debug_protos.borrow();
+            let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for p in protos.iter() {
+                if let Some(src) = p.chunk.source.borrow().as_ref() {
+                    paths.insert(src.path.clone());
+                }
+            }
+            let single_source = paths.len() == 1;
+            let want_file = file_name_of(source);
+            protos
+                .iter()
+                .filter(|p| match p.chunk.source.borrow().as_ref() {
+                    None => false,
+                    Some(src) => single_source || file_name_of(&src.path) == want_file,
+                })
+                .map(|p| Rc::as_ptr(p) as *const () as usize)
+                .collect()
+        };
+        for (pid, off) in hook.breakpoints_in(&source_proto_ids) {
+            if let Some(original) = hook.forget_breakpoint(pid, off) {
+                if let Some(proto) = self.debug_proto_for(pid) {
+                    proto.chunk.patch_byte(off, original);
+                }
+            }
+        }
+
+        // (2) Resolve + set each requested line. Resolution borrows `debug_protos`
+        // internally and drops the borrow before we patch (all synchronous, no await).
+        let mut results = Vec::with_capacity(lines.len());
+        for &line in lines {
+            match self.resolve_line_breakpoint(source, line) {
+                Some((proto_id, off)) => {
+                    if let Some(proto) = self.debug_proto_for(proto_id) {
+                        hook.set_breakpoint_shared(proto_id, off, &proto.chunk);
+                        results.push(BreakpointBinding {
+                            line,
+                            verified: true,
+                            offset: Some(off as u32),
+                        });
+                    } else {
+                        // Resolved to a proto not in the tree (should not happen) — unbound.
+                        results.push(BreakpointBinding {
+                            line,
+                            verified: false,
+                            offset: None,
+                        });
+                    }
+                }
+                None => results.push(BreakpointBinding {
+                    line,
+                    verified: false,
+                    offset: None,
+                }),
+            }
+        }
+        results
+    }
+
+    /// DBG: apply a `ClearBreakpoints` while parked — restore EVERY patched byte (drain
+    /// the side table; for each `(proto_id, offset) → original`, find the chunk in
+    /// `debug_protos` and write the original byte back). Synchronous, no await/recv.
+    fn apply_clear_breakpoints(
+        &self,
+        inst: Option<&mut Box<crate::vm::instrument::Instrumentation>>,
+    ) {
+        let Some(hook) = inst.and_then(|i| i.breakpoints.as_mut()) else {
+            return;
+        };
+        for ((pid, off), original) in hook.drain_breakpoints() {
+            if let Some(proto) = self.debug_proto_for(pid) {
+                proto.chunk.patch_byte(off, original);
+            }
+        }
+    }
+
+    /// DBG: build the Send-safe per-frame snapshot at a debugger stop. Walks the fiber's
+    /// call stack INNERMOST-first (`frames.iter().rev()`), rendering each frame's
+    /// location and locals to PLAIN OWNED `String`/`u32` — no `Value`/`Rc`/`Cc` escapes
+    /// (the worker-airlock discipline). Called ONLY from the `Op::Break` trap (reached
+    /// solely via a patched breakpoint byte), so the hot dispatch loop is untouched
+    /// (Gate 12). Fully synchronous — no `.await`; every Value access stays on the VM
+    /// thread and no `RefCell`/`Cc` borrow outlives its `format!`.
+    fn build_frame_snapshots(
+        &self,
+        fiber: &Fiber,
+        fault_ip: usize,
+    ) -> Vec<crate::vm::instrument::FrameSnapshot> {
+        use crate::vm::instrument::FrameSnapshot;
+        let n = fiber.frames.len();
+        let mut out = Vec::with_capacity(n);
+        // Innermost frame first; `idx` is the original (bottom = 0) frame index so we
+        // can detect the bottom/script frame and pick the right active instruction.
+        for (rev_i, frame) in fiber.frames.iter().rev().enumerate() {
+            let idx = n - 1 - rev_i;
+            let proto = &frame.closure.proto;
+            // Active instruction offset: the innermost (first visited) frame uses the
+            // trapped `fault_ip`; caller frames use their saved return address
+            // `frame.ip` — close enough to the call site for v1 (the displacement is at
+            // most one instruction past the call).
+            let offset = if rev_i == 0 { fault_ip } else { frame.ip };
+            let (line, column) = proto.chunk.line_col_at(offset).unwrap_or((0, 0));
+
+            // Frame label: declared name; else "<script>" for the bottom/module frame;
+            // else "fn@L<line>" (1-based line) for an anonymous proto.
+            let function = match &proto.debug_name {
+                Some(name) => name.to_string(),
+                None if idx == 0 => "<script>".to_string(),
+                None => format!("fn@L{}", line + 1),
+            };
+
+            // Locals: render each named slot to an owned String. Read a cell slot's live
+            // value through its `Cc<RefCell<Value>>`; else the plain stack slot at
+            // `slot_base + slot`. Defensive: skip an out-of-range stack index. The
+            // `format!` produces the owned String; no borrow outlives it (airlock).
+            let mut locals = Vec::with_capacity(proto.local_names.len());
+            for (slot, name) in &proto.local_names {
+                let slot_idx = *slot as usize;
+                let rendered = match frame.cells.get(slot_idx).and_then(|c| c.as_ref()) {
+                    Some(cell) => format!("{}", cell.borrow()),
+                    None => match fiber.stack.get(frame.slot_base + slot_idx) {
+                        Some(v) => format!("{v}"),
+                        None => continue,
+                    },
+                };
+                locals.push((name.to_string(), rendered));
+            }
+
+            out.push(FrameSnapshot {
+                function,
+                line,
+                column,
+                locals,
+            });
+        }
+        out
     }
 
     /// Call ANY value, the single primitive both engines re-enter through.
@@ -3975,6 +4728,9 @@ impl Vm {
                     def_class: Some(def_class),
                     argc: supplied,
                 });
+                // DBG Task 7: publish the new (deeper) frame stack to an armed
+                // profiler. Zero-cost None-check when off.
+                self.publish_profile_frames(fiber);
                 // Continue the loop in the new frame; RETURN pops it and pushes the
                 // result onto the caller's stack.
             } else {
@@ -4803,6 +5559,10 @@ impl Vm {
         // SP3 §B: a non-root frame was popped — match the `enter_frame_depth`
         // increment from when it was pushed.
         self.leave_frame_depth();
+        // DBG Task 7: publish the now-shallower frame stack to an armed profiler so a
+        // sample taken after the return attributes time to the caller. Zero-cost
+        // None-check when off.
+        self.publish_profile_frames(fiber);
         fiber.push(value);
         Ok(None)
     }
@@ -4919,6 +5679,8 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5276,6 +6038,8 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -5307,6 +6071,847 @@ mod tests {
         let (outcome, out) = run_chunk_with_output(c);
         assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "ran ok");
         assert_eq!(out, "42.0\n", "print wrote to the shared capture sink");
+    }
+
+    // ---- DBG Task 1: the Vm.instrument seam (zero-cost when off) -----------
+
+    /// Run a chunk on a VM built with the given (already-armed) instrumentation,
+    /// capturing program output — the Task-1 analogue of `run_chunk_with_output`.
+    fn run_chunk_with_instrument(
+        chunk: Chunk,
+        inst: crate::vm::instrument::Instrumentation,
+    ) -> (Result<RunOutcome, Control>, String) {
+        let proto = Rc::new(FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let local = LocalSet::new();
+        local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::with_instrument(interp.clone(), inst);
+            let outcome = vm.run(&mut fiber).await;
+            (outcome, interp.output())
+        })
+    }
+
+    #[test]
+    fn default_vm_has_no_instrument() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::new(interp);
+            assert!(
+                vm.instrument.borrow().is_none(),
+                "a default Vm has no instrumentation attached"
+            );
+            assert!(!vm.is_instrumented());
+        });
+    }
+
+    #[test]
+    fn with_instrument_round_trips() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let inst = crate::vm::instrument::Instrumentation::empty();
+            let vm = Vm::with_instrument(interp, inst);
+            assert!(vm.is_instrumented(), "with_instrument arms the seam");
+            assert!(vm.instrument.borrow().is_some());
+        });
+    }
+
+    /// A chunk that exercises a spread of opcode kinds (const push, print call,
+    /// arithmetic, return) so the byte-identity check covers more than a trivial op.
+    fn output_demo_chunk() -> Chunk {
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str(Rc::from("print")));
+        c.emit_u16(Op::GetGlobal, name, s());
+        let a = c.add_const(Value::Float(2.0));
+        c.emit_u16(Op::Const, a, s());
+        let b = c.add_const(Value::Float(3.0));
+        c.emit_u16(Op::Const, b, s());
+        c.emit(Op::Add, s()); // 2.0 + 3.0
+        c.emit_u8(Op::Call, 1, s()); // print(5.0)
+        c.emit(Op::Return, s());
+        c
+    }
+
+    #[test]
+    fn noop_instrumentation_is_byte_identical_to_plain_run() {
+        // The whole Gate-12 promise at the unit level: an all-None Instrumentation
+        // produces byte-identical program output to a plain Vm::new run.
+        let (plain_outcome, plain_out) = run_chunk_with_output(output_demo_chunk());
+        let (inst_outcome, inst_out) = run_chunk_with_instrument(
+            output_demo_chunk(),
+            crate::vm::instrument::Instrumentation::empty(),
+        );
+        assert!(matches!(plain_outcome, Ok(RunOutcome::Done(_))));
+        assert!(matches!(inst_outcome, Ok(RunOutcome::Done(_))));
+        assert_eq!(
+            plain_out, inst_out,
+            "an all-None Instrumentation must not perturb program output"
+        );
+        assert_eq!(inst_out, "5.0\n");
+    }
+
+    // ---- DBG Task 2: the Op::Break trap / re-dispatch ---------------------
+
+    /// Run a watchdog-guarded closure. macOS has no `timeout(1)`, and a buggy
+    /// `Op::Break` arm BLOCKS forever on the command channel. The VM runtime is `!Send`
+    /// (`Rc`/`RefCell`), so the body CANNOT run on a spawned worker thread — it runs on
+    /// the calling (test) thread. Instead a separate WATCHDOG timer thread is armed: if
+    /// the body does not signal completion within `secs`, the watchdog ABORTS the
+    /// process with a loud message, so a regression-induced hang is a visible failure
+    /// (a non-zero exit + diagnostic) rather than a silent stall of the host / CI.
+    /// On normal completion the watchdog is disarmed (signalled) and joins immediately.
+    fn with_watchdog<T>(secs: u64, f: impl FnOnce() -> T) -> T {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(secs))
+                .is_err()
+            {
+                eprintln!(
+                    "DBG breakpoint test exceeded {secs}s watchdog — likely an Op::Break \
+                     arm hang (blocked on the command channel with no driver). Aborting."
+                );
+                std::process::abort();
+            }
+        });
+        let r = f();
+        let _ = done_tx.send(()); // disarm
+        watchdog.join().expect("watchdog thread");
+        r
+    }
+
+    /// Find the byte offset of the first instruction whose opcode is `target`, by
+    /// walking the chunk with the disassembler's offset stepper (so an operand byte
+    /// that happens to equal an opcode value is never mistaken for an instruction).
+    fn find_op_offset(chunk: &Chunk, target: Op) -> Option<usize> {
+        let mut off = 0;
+        while off < chunk.code.len() {
+            let at = off;
+            let op = Op::from_u8(chunk.code[at])?;
+            if op == target {
+                return Some(at);
+            }
+            off = at + 1 + op.operand_width();
+        }
+        None
+    }
+
+    /// Run `chunk` with a breakpoint patched at `bp_offset` (a real opcode-byte
+    /// offset). A controller thread DRIVES the command channel — it auto-`Continue`s
+    /// on every `Stopped` event (the `--inspect`-with-breakpoints-but-auto-continue
+    /// observation contract), so the trap arm never blocks indefinitely. Returns the
+    /// program output plus the number of times the breakpoint trapped.
+    ///
+    /// The whole thing runs under a watchdog: a bug that leaves the trap blocked
+    /// fails the test instead of hanging the host.
+    fn run_with_breakpoint_auto_continue(
+        chunk: Chunk,
+        bp_offset: usize,
+    ) -> (bool, String, usize) {
+        use crate::vm::instrument::{DebugCommand, DebuggerHook, Instrumentation};
+
+        with_watchdog(10, move || {
+            // Build the proto, capture its identity, then patch ONE byte via the hook
+            // while we still uniquely own the Rc (refcount 1, before `Closure::new`).
+            let mut proto = Rc::new(FnProto {
+                chunk,
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                owning_class: None,
+                params: Vec::new(),
+                ret: None,
+                local_names: Vec::new(),
+                debug_name: None,
+            });
+            let proto_id = Rc::as_ptr(&proto) as *const () as usize;
+
+            let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+            {
+                let p = Rc::get_mut(&mut proto).expect("uniquely own the proto");
+                let original = hook.set_breakpoint(proto_id, bp_offset, &mut p.chunk.code);
+                assert_ne!(
+                    original,
+                    crate::vm::opcode::Op::Break as u8,
+                    "patched a real opcode byte, not an already-Break byte"
+                );
+            }
+
+            // The controller thread: auto-continue on each Stopped, counting hits.
+            // It ends when the event Sender is dropped (the VM/hook is dropped).
+            let controller = std::thread::spawn(move || {
+                let mut hits = 0usize;
+                while evt_rx.recv().is_ok() {
+                    hits += 1;
+                    if cmd_tx.send(DebugCommand::Continue).is_err() {
+                        break;
+                    }
+                }
+                hits
+            });
+
+            let closure = Closure::new(proto);
+            let mut fiber = Fiber::new(closure);
+            let inst = Instrumentation {
+                breakpoints: Some(hook),
+                profiler: None,
+                coverage: None,
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build current-thread runtime");
+            let local = LocalSet::new();
+            let (outcome, out) = local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(interp.clone(), inst);
+                let outcome = vm.run(&mut fiber).await;
+                (outcome, interp.output())
+            });
+            let ok = matches!(outcome, Ok(RunOutcome::Done(_)));
+            // Dropping the VM dropped the hook's event Sender, so the controller loop
+            // ends; join it to read the hit count.
+            let hits = controller.join().expect("controller thread");
+            (ok, out, hits)
+        })
+    }
+
+    #[test]
+    fn breakpoint_traps_and_program_output_unchanged_after_continue() {
+        // Breakpoint on the ADD op: it traps once, the recovered ADD executes, and
+        // the program output is byte-identical to the un-instrumented run.
+        let plain = run_chunk_with_output(output_demo_chunk()).1;
+        let add_off = find_op_offset(&output_demo_chunk(), Op::Add).expect("chunk has an ADD");
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(output_demo_chunk(), add_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1, "the ADD breakpoint trapped exactly once");
+        assert_eq!(out, plain, "recovered op ran; output == un-instrumented run");
+        assert_eq!(out, "5.0\n");
+    }
+
+    #[test]
+    fn breakpoint_on_multi_operand_op_redispatches_correctly() {
+        // Patch the GET_GLOBAL (a u16-operand op at offset 0): the recovered op must
+        // read its 2 operand bytes from fault_ip+1 and advance ip by 2, then the
+        // program completes identically.
+        let plain = run_chunk_with_output(output_demo_chunk()).1;
+        let gg_off = find_op_offset(&output_demo_chunk(), Op::GetGlobal).expect("has GET_GLOBAL");
+        assert_eq!(gg_off, 0, "GET_GLOBAL is the first op");
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(output_demo_chunk(), gg_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1);
+        assert_eq!(out, plain, "multi-operand recovered op ran; output unchanged");
+        assert_eq!(out, "5.0\n");
+    }
+
+    #[test]
+    fn breakpoint_on_zero_operand_op_redispatches_correctly() {
+        // A pure 0-operand op (RETURN) as the breakpoint target.
+        fn demo() -> Chunk {
+            let mut c = Chunk::new();
+            let name = c.add_const(Value::Str(Rc::from("print")));
+            c.emit_u16(Op::GetGlobal, name, s());
+            let k = c.add_const(Value::Float(7.0));
+            c.emit_u16(Op::Const, k, s());
+            c.emit_u8(Op::Call, 1, s());
+            c.emit(Op::Return, s());
+            c
+        }
+        let plain = run_chunk_with_output(demo()).1;
+        let ret_off = find_op_offset(&demo(), Op::Return).expect("has RETURN");
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(demo(), ret_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1, "RETURN breakpoint trapped once");
+        assert_eq!(out, plain);
+        assert_eq!(out, "7.0\n");
+    }
+
+    #[test]
+    fn breakpoint_in_dead_code_never_traps() {
+        // A breakpoint on an instruction never reached (after RETURN) must never trap;
+        // the program output is unchanged.
+        fn demo() -> (Chunk, usize) {
+            let mut c = Chunk::new();
+            let name = c.add_const(Value::Str(Rc::from("print")));
+            c.emit_u16(Op::GetGlobal, name, s());
+            let k = c.add_const(Value::Float(9.0));
+            c.emit_u16(Op::Const, k, s());
+            c.emit_u8(Op::Call, 1, s());
+            c.emit(Op::Return, s());
+            // Dead code after the RETURN: a NIL that never executes.
+            let dead_off = c.code.len();
+            c.emit(Op::Nil, s());
+            c.emit(Op::Return, s());
+            (c, dead_off)
+        }
+        let (c, dead_off) = demo();
+        let plain = run_chunk_with_output(demo().0).1;
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(c, dead_off);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 0, "a breakpoint in dead/uncalled code never traps");
+        assert_eq!(out, plain);
+        assert_eq!(out, "9.0\n");
+    }
+
+    #[test]
+    fn breakpoint_in_loop_traps_once_then_unpatches_v1() {
+        // A breakpoint INSIDE a real loop body. Under the v1 un-patch-on-hit model
+        // (DOCUMENTED on Op::Break), the breakpoint traps EXACTLY ONCE: the first hit
+        // restores the original byte so subsequent iterations run un-patched. Crucially
+        // the loop output is byte-identical to an un-instrumented run (the displaced op
+        // ran exactly once per visit; iterations after the first run normally).
+        fn demo() -> (Chunk, usize) {
+            let mut c = Chunk::new();
+            c.slot_count = 1; // one local: the counter
+            let pname = c.add_const(Value::Str(Rc::from("print")));
+            let one = c.add_const(Value::Float(1.0));
+
+            // Seed slot 0 = 2.0: CONST 2.0; SET_LOCAL 0 (SET_LOCAL POPS the value).
+            let two = c.add_const(Value::Float(2.0));
+            c.emit_u16(Op::Const, two, s());
+            c.emit_u16(Op::SetLocal, 0, s());
+
+            let loop_top = c.code.len();
+            c.emit_u16(Op::GetLocal, 0, s());
+            let exit_jump = c.emit_jump(Op::JumpIfFalse, s()); // 0.0 is falsy → exit
+            c.emit_u16(Op::GetGlobal, pname, s());
+            let bp = c.code.len(); // BREAKPOINT: GET_LOCAL 0 (the print arg)
+            c.emit_u16(Op::GetLocal, 0, s());
+            c.emit_u8(Op::Call, 1, s());
+            c.emit(Op::Pop, s());
+            // counter -= 1
+            c.emit_u16(Op::GetLocal, 0, s());
+            c.emit_u16(Op::Const, one, s());
+            c.emit(Op::Sub, s());
+            c.emit_u16(Op::SetLocal, 0, s()); // pops the result into slot 0
+            c.emit_loop(Op::Loop, loop_top, s());
+            c.patch_jump(exit_jump);
+            c.emit(Op::Return, s());
+            (c, bp)
+        }
+        let (c, bp) = demo();
+        let plain = run_chunk_with_output(demo().0).1;
+        let (ok, out, hits) = run_with_breakpoint_auto_continue(c, bp);
+        assert!(ok, "program ran to completion");
+        assert_eq!(hits, 1, "v1: a hit breakpoint un-patches itself (traps once)");
+        // Counter 2 → prints 2.0 then 1.0; the loop body ran identically under the bp.
+        assert_eq!(out, plain, "loop output identical to the un-instrumented run");
+        assert_eq!(out, "2.0\n1.0\n");
+    }
+
+    #[test]
+    fn detached_controller_does_not_deadlock_the_program() {
+        // If the controller hangs up (drops the command sender) without sending a
+        // resume, the trap must NOT deadlock — `debug_stop` resumes free-running on a
+        // disconnected channel. Drive: a controller that drops immediately on the first
+        // Stopped (no Continue sent).
+        use crate::vm::instrument::{DebuggerHook, Instrumentation};
+        let (ok, out) = with_watchdog(10, || {
+            let chunk = output_demo_chunk();
+            let add_off = find_op_offset(&chunk, Op::Add).expect("has ADD");
+            let mut proto = Rc::new(FnProto {
+                chunk,
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                owning_class: None,
+                params: Vec::new(),
+                ret: None,
+                local_names: Vec::new(),
+                debug_name: None,
+            });
+            let proto_id = Rc::as_ptr(&proto) as *const () as usize;
+            let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+            {
+                let p = Rc::get_mut(&mut proto).unwrap();
+                hook.set_breakpoint(proto_id, add_off, &mut p.chunk.code);
+            }
+            // Controller: receive one Stopped, then DROP both ends (no resume).
+            let controller = std::thread::spawn(move || {
+                let _ = evt_rx.recv();
+                drop(cmd_tx);
+                drop(evt_rx);
+            });
+            let closure = Closure::new(proto);
+            let mut fiber = Fiber::new(closure);
+            let inst = Instrumentation {
+                breakpoints: Some(hook),
+                profiler: None,
+                coverage: None,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            let (outcome, out) = local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(interp.clone(), inst);
+                let outcome = vm.run(&mut fiber).await;
+                (outcome, interp.output())
+            });
+            controller.join().unwrap();
+            (matches!(outcome, Ok(RunOutcome::Done(_))), out)
+        });
+        assert!(ok, "a detached controller must not deadlock the program");
+        assert_eq!(out, "5.0\n", "output still correct after the auto-resume");
+    }
+
+    // ---- DBG Task 4: the Send-safe frame/variable snapshot ----------------
+
+    #[test]
+    fn stopped_event_carries_frame_variable_snapshot() {
+        // Compile a real program with a named function holding locals, set a breakpoint
+        // INSIDE that function, run, and assert the `Stopped` event ships the Send-safe
+        // frame/variable snapshot: innermost frame is `add` with locals `a`/`b` bound,
+        // and the bottom frame is `<script>`. Watchdog-guarded so a regression hangs the
+        // test (fails loudly) rather than the host.
+        use crate::vm::instrument::{
+            DebugCommand, DebugEvent, DebuggerHook, FrameSnapshot, Instrumentation,
+        };
+
+        let src = "fn add(a, b) {\n  let s = a + b\n  return s\n}\nprint(add(2, 3))\n";
+        let frames: Vec<FrameSnapshot> = with_watchdog(10, move || {
+            let mut top_chunk = crate::compile::compile_source(src).expect("compiles");
+
+            // The `add` function is the top chunk's single nested proto. Bind the module
+            // source onto its chunk so `line_col_at` yields real line numbers, and pick
+            // the FIRST executable instruction of its body as the breakpoint site (params
+            // `a`/`b` are bound at frame entry, before any body op runs).
+            let src_info = Rc::new(crate::error::SourceInfo {
+                path: "<test>".into(),
+                text: src.into(),
+            });
+            {
+                let add = Rc::get_mut(&mut top_chunk.protos[0])
+                    .expect("uniquely own the nested proto");
+                add.chunk.set_module_source(&src_info);
+                assert_eq!(
+                    add.debug_name.as_deref(),
+                    Some("add"),
+                    "the nested fn proto carries its declared name"
+                );
+            }
+            // First executable op of the body (offset 0 of the add chunk).
+            let bp_off = 0usize;
+            let proto_id = Rc::as_ptr(&top_chunk.protos[0]) as *const () as usize;
+
+            let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+            {
+                let add = Rc::get_mut(&mut top_chunk.protos[0]).expect("own nested proto");
+                hook.set_breakpoint(proto_id, bp_off, &mut add.chunk.code);
+            }
+
+            // Controller: capture the FIRST Stopped event's frames, then auto-continue
+            // every stop so the program runs to completion (no deadlock).
+            let (snap_tx, snap_rx) = std::sync::mpsc::channel::<Vec<FrameSnapshot>>();
+            let controller = std::thread::spawn(move || {
+                let mut first = true;
+                while let Ok(evt) = evt_rx.recv() {
+                    if first {
+                        if let DebugEvent::Stopped { frames, .. } = evt {
+                            let _ = snap_tx.send(frames);
+                            first = false;
+                        }
+                    }
+                    if cmd_tx.send(DebugCommand::Continue).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Run the TOP-LEVEL chunk: it defines `add` as a module global and calls it,
+            // so the breakpoint inside `add` traps when the call runs.
+            let top_proto = Rc::new(FnProto {
+                chunk: top_chunk,
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                owning_class: None,
+                params: Vec::new(),
+                ret: None,
+                local_names: Vec::new(),
+                debug_name: None,
+            });
+            let closure = Closure::new(top_proto);
+            let mut fiber = Fiber::new(closure);
+            let inst = Instrumentation {
+                breakpoints: Some(hook),
+                profiler: None,
+                coverage: None,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            let outcome = local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(interp.clone(), inst);
+                vm.run(&mut fiber).await
+            });
+            assert!(
+                matches!(outcome, Ok(RunOutcome::Done(_))),
+                "program ran to completion"
+            );
+            controller.join().expect("controller thread");
+            snap_rx.recv().expect("a Stopped snapshot was captured")
+        });
+
+        // Two frames: the innermost is `add`, the bottom is the script.
+        assert!(!frames.is_empty(), "snapshot has at least one frame");
+        assert_eq!(frames.len(), 2, "add called from the script: two frames");
+
+        let inner = &frames[0];
+        assert_eq!(inner.function, "add", "innermost frame is the `add` function");
+        let names: Vec<&str> = inner.locals.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"a") && names.contains(&"b"),
+            "params a, b are present in the innermost locals: {names:?}"
+        );
+        // Params are bound to the call args 2 and 3 at frame entry.
+        let a = inner.locals.iter().find(|(n, _)| n == "a").map(|(_, v)| v.as_str());
+        let b = inner.locals.iter().find(|(n, _)| n == "b").map(|(_, v)| v.as_str());
+        assert_eq!(a, Some("2"), "a is bound to the first call arg");
+        assert_eq!(b, Some("3"), "b is bound to the second call arg");
+
+        let bottom = frames.last().expect("a bottom frame");
+        assert_eq!(bottom.function, "<script>", "the bottom frame is the script");
+    }
+
+    // ---- DBG Task 5a: parked breakpoint-management protocol ---------------
+
+    /// DBG Task-5a test scaffold: compile `src`, bind its module source onto the whole
+    /// chunk tree, build the entry `FnProto`, and register the proto tree on a freshly
+    /// built instrumented `Vm` (so `resolve_line_breakpoint` can see every proto).
+    /// Returns the entry proto, the bound `SourceInfo`, and the `Vm`. The caller installs
+    /// a `DebuggerHook` and drives the channel from a controller thread.
+    fn compile_and_register(
+        src: &str,
+        vm: &Rc<Vm>,
+    ) -> (Rc<FnProto>, Rc<crate::error::SourceInfo>) {
+        let top_chunk = crate::compile::compile_source(src).expect("compiles");
+        let src_info = Rc::new(crate::error::SourceInfo {
+            path: "prog.as".into(),
+            text: src.into(),
+        });
+        // Bind the source onto the entry chunk AND recursively every nested proto, so
+        // `build_line_starts`/`first_offset_for_line` work for the whole tree.
+        top_chunk.set_module_source(&src_info);
+        let entry = Rc::new(FnProto {
+            chunk: top_chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        vm.register_debug_protos(&entry);
+        (entry, src_info)
+    }
+
+    #[test]
+    fn resolve_line_breakpoint_maps_line_into_a_nested_fn() {
+        // A program with a named function. The `let x = 1` line lives INSIDE `f`, so its
+        // resolved (proto_id, offset) must point into `f`'s proto, not the entry proto.
+        let src = "fn f() {\n  let x = 1\n  return x\n}\nprint(f())\n";
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::with_instrument(
+                interp,
+                crate::vm::instrument::Instrumentation::empty(),
+            );
+            let (entry, _src) = compile_and_register(src, &vm);
+
+            // Line 2 (1-based) is `let x = 1`, inside `f`. The nested fn proto is the
+            // entry's single nested proto.
+            let f_proto = &entry.chunk.protos[0];
+            let f_id = Rc::as_ptr(f_proto) as *const () as usize;
+
+            let resolved = vm
+                .resolve_line_breakpoint("prog.as", 2)
+                .expect("line 2 resolves to a breakpoint");
+            assert_eq!(
+                resolved.0, f_id,
+                "the `let x` line binds INSIDE f (not the entry proto)"
+            );
+            // The resolved offset must be a real instruction offset inside f's chunk.
+            let f_line_starts = f_proto.chunk.build_line_starts();
+            assert!(
+                f_line_starts.iter().any(|(_, off)| *off as usize == resolved.1),
+                "resolved offset {} is a real line-start offset in f: {:?}",
+                resolved.1,
+                f_line_starts
+            );
+        });
+    }
+
+    #[test]
+    fn parked_set_breakpoints_binds_and_re_stops_at_the_new_breakpoint() {
+        // Break-on-entry (offset 0 of the entry chunk). When parked, the controller sends
+        // SetBreakpoints for a line INSIDE `f`, expects a BreakpointsVerified{verified}
+        // reply with the resolved offset, then Continue — and the program must STOP AGAIN
+        // at exactly that resolved offset before completing with correct output.
+        use crate::vm::instrument::{
+            BreakpointBinding, DebugCommand, DebugEvent, DebuggerHook, Instrumentation,
+        };
+
+        let src = "fn f() {\n  let x = 1\n  return x\n}\nprint(f())\n";
+        let (ok, out, second_offset, verified) = with_watchdog(10, move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let vm = Vm::with_instrument(
+                    interp.clone(),
+                    Instrumentation::empty(),
+                );
+                let (entry, _src) = compile_and_register(src, &vm);
+
+                // The breakpoint line inside f (line 2, 1-based) — pre-resolve the expected
+                // offset so the controller can assert the second stop lands there.
+                let expected = vm
+                    .resolve_line_breakpoint("prog.as", 2)
+                    .expect("line 2 resolves");
+
+                // Patch a break-on-entry (offset 0 of the ENTRY chunk) via the hook, while
+                // the controller drives set/continue. Install the hook into the VM's
+                // instrumentation.
+                let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+                let entry_id = Rc::as_ptr(&entry) as *const () as usize;
+                hook.set_breakpoint_shared(entry_id, 0, &entry.chunk);
+                *vm.instrument.borrow_mut() =
+                    Some(Box::new(Instrumentation {
+                        breakpoints: Some(hook),
+                        profiler: None,
+                        coverage: None,
+                    }));
+
+                // Controller thread: on the FIRST Stopped, send SetBreakpoints{line 2},
+                // read the BreakpointsVerified reply, then Continue. Capture the SECOND
+                // Stopped's offset (the newly-set breakpoint), then Continue to finish.
+                let (out_tx, out_rx) =
+                    std::sync::mpsc::channel::<(usize, Vec<BreakpointBinding>)>();
+                let controller = std::thread::spawn(move || {
+                    let mut stops = 0usize;
+                    let mut second_off: Option<usize> = None;
+                    let mut verified: Vec<BreakpointBinding> = Vec::new();
+                    while let Ok(evt) = evt_rx.recv() {
+                        match evt {
+                            DebugEvent::Stopped { offset, .. } => {
+                                stops += 1;
+                                if stops == 1 {
+                                    // Set a breakpoint inside f, then continue.
+                                    if cmd_tx
+                                        .send(DebugCommand::SetBreakpoints {
+                                            source: "prog.as".into(),
+                                            lines: vec![2],
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    // The verified reply arrives as the next event.
+                                } else {
+                                    // Second stop: record the offset, then continue.
+                                    second_off = Some(offset);
+                                }
+                                if stops >= 2 {
+                                    let _ = out_tx.send((
+                                        second_off.unwrap_or(usize::MAX),
+                                        verified.clone(),
+                                    ));
+                                }
+                                let _ = cmd_tx.send(DebugCommand::Continue);
+                            }
+                            DebugEvent::BreakpointsVerified { results } => {
+                                verified = results;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                let closure = Closure::new(entry);
+                let mut fiber = Fiber::new(closure);
+                let outcome = vm.run(&mut fiber).await;
+                let ok = matches!(outcome, Ok(RunOutcome::Done(_)));
+                let out = interp.output();
+                // Drop the VM's hook (drops the event Sender) so the controller ends.
+                *vm.instrument.borrow_mut() = None;
+                controller.join().expect("controller thread");
+                let (second_off, verified) =
+                    out_rx.recv().expect("the second stop was reported");
+                (ok, out, second_off, (verified, expected))
+            })
+        });
+
+        let (verified, expected) = verified;
+        assert!(ok, "program ran to completion");
+        assert_eq!(out, "1\n", "program output is correct and unchanged");
+        // The set-breakpoints reply verified the requested line and reported its offset.
+        assert_eq!(verified.len(), 1, "one line requested → one binding");
+        assert!(verified[0].verified, "the line inside f was bound");
+        assert_eq!(verified[0].line, 2);
+        assert_eq!(
+            verified[0].offset,
+            Some(expected.1 as u32),
+            "binding reports the resolved offset"
+        );
+        // The program stopped AGAIN at exactly the newly-set breakpoint offset.
+        assert_eq!(
+            second_offset, expected.1,
+            "the second stop landed at the newly-set breakpoint inside f"
+        );
+    }
+
+    #[test]
+    fn parked_clear_breakpoints_restores_the_original_byte() {
+        // Set a breakpoint inside f via SetBreakpoints while parked at entry, then send
+        // ClearBreakpoints and assert the patched byte is restored to the original opcode
+        // and the program runs free to completion (no second stop).
+        use crate::vm::instrument::{
+            DebugCommand, DebugEvent, DebuggerHook, Instrumentation,
+        };
+
+        let src = "fn f() {\n  let x = 1\n  return x\n}\nprint(f())\n";
+        let (ok, out, stops, byte_after_clear, expected_original) =
+            with_watchdog(10, move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                let local = LocalSet::new();
+                local.block_on(&rt, async move {
+                    let interp = Rc::new(Interp::new());
+                    interp.install_self();
+                    let vm =
+                        Vm::with_instrument(interp.clone(), Instrumentation::empty());
+                    let (entry, _src) = compile_and_register(src, &vm);
+
+                    // The offset we will set + then clear inside f, and the original byte
+                    // there (read BEFORE any patching).
+                    let expected = vm
+                        .resolve_line_breakpoint("prog.as", 2)
+                        .expect("line 2 resolves");
+                    let f_proto = vm
+                        .debug_proto_for(expected.0)
+                        .expect("resolved proto is registered");
+                    let original_byte = f_proto.chunk.code[expected.1];
+
+                    let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+                    let entry_id = Rc::as_ptr(&entry) as *const () as usize;
+                    hook.set_breakpoint_shared(entry_id, 0, &entry.chunk);
+                    *vm.instrument.borrow_mut() = Some(Box::new(Instrumentation {
+                        breakpoints: Some(hook),
+                        profiler: None,
+                        coverage: None,
+                    }));
+
+                    // Controller: on the first stop, SetBreakpoints{line 2} → read reply →
+                    // ClearBreakpoints → Continue. The clear restores the byte BEFORE the
+                    // call to f reaches it, so the program must NOT stop a second time.
+                    let controller = std::thread::spawn(move || {
+                        let mut stops = 0usize;
+                        while let Ok(evt) = evt_rx.recv() {
+                            match evt {
+                                DebugEvent::Stopped { .. } => {
+                                    stops += 1;
+                                    if stops == 1 {
+                                        let _ = cmd_tx.send(DebugCommand::SetBreakpoints {
+                                            source: "prog.as".into(),
+                                            lines: vec![2],
+                                        });
+                                        // wait for verified, handled below
+                                    } else {
+                                        let _ = cmd_tx.send(DebugCommand::Continue);
+                                    }
+                                }
+                                DebugEvent::BreakpointsVerified { .. } => {
+                                    // Now clear all breakpoints, then resume.
+                                    let _ = cmd_tx.send(DebugCommand::ClearBreakpoints);
+                                    let _ = cmd_tx.send(DebugCommand::Continue);
+                                }
+                                _ => {}
+                            }
+                        }
+                        stops
+                    });
+
+                    let closure = Closure::new(entry);
+                    let mut fiber = Fiber::new(closure);
+                    let outcome = vm.run(&mut fiber).await;
+                    let ok = matches!(outcome, Ok(RunOutcome::Done(_)));
+                    let out = interp.output();
+                    // After the run, the byte at the cleared offset must be the original.
+                    let byte_after = f_proto.chunk.code[expected.1];
+                    *vm.instrument.borrow_mut() = None;
+                    let stops = controller.join().expect("controller thread");
+                    (ok, out, stops, byte_after, original_byte)
+                })
+            });
+
+        assert!(ok, "program ran free to completion");
+        assert_eq!(out, "1\n", "program output unchanged");
+        assert_eq!(
+            stops, 1,
+            "only the entry break fired; the cleared breakpoint never trapped"
+        );
+        assert_eq!(
+            byte_after_clear, expected_original,
+            "ClearBreakpoints restored the exact original opcode byte"
+        );
+        assert_ne!(
+            byte_after_clear,
+            Op::Break as u8,
+            "the byte is not left patched after clear"
+        );
+    }
+
+    #[test]
+    fn debug_command_and_event_types_are_send() {
+        // Mirror the instrument.rs airlock proof at the run.rs layer too.
+        fn _assert_send<T: Send>() {}
+        _assert_send::<crate::vm::instrument::DebugCommand>();
+        _assert_send::<crate::vm::instrument::DebugEvent>();
+        _assert_send::<crate::vm::instrument::BreakpointBinding>();
     }
 
     #[test]
@@ -5723,6 +7328,8 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -6044,6 +7651,8 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -6069,6 +7678,8 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);

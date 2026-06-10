@@ -2,6 +2,10 @@ pub mod ast;
 pub mod check;
 pub mod compile;
 pub mod coro;
+// DBG Task 5b: the Debug Adapter Protocol (DAP) server over stdio. Feature-gated
+// (`dap`, default-on) so `--no-default-features` builds none of it.
+#[cfg(feature = "dap")]
+pub mod dap;
 pub mod det;
 pub mod diagnostics;
 pub mod env;
@@ -24,6 +28,13 @@ pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 pub mod parser;
+// DBG Task 7: the CPU sampling profiler's aggregation + output (speedscope JSON +
+// collapsed folded-stacks). Feature-gated (`profile`, default-on); the publish seam
+// itself lives on the VM (`Vm::publish_profile_frames`) behind the single
+// `Vm.instrument` gate. `--no-default-features` builds none of this and `--profile`
+// reports a clean rebuild hint.
+#[cfg(feature = "profile")]
+pub mod profile;
 pub mod repl;
 pub mod span;
 pub mod stdlib;
@@ -321,6 +332,8 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         owning_class: None,
         params: Vec::new(),
         ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
 
@@ -406,6 +419,8 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
         owning_class: None,
         params: Vec::new(),
         ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -434,7 +449,11 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
 /// an [`AsError`] (with the file's source attached for diagnostics); the `.aso` is
 /// only written when compilation succeeds. The chunk is verified before writing so
 /// a produced `.aso` always passes [`vm::Chunk::from_bytes_verified`].
-pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf, AsError> {
+pub fn build_file(
+    file: &Path,
+    out: Option<&Path>,
+    with_debug: bool,
+) -> Result<std::path::PathBuf, AsError> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
     let src_info = Rc::new(SourceInfo {
@@ -443,6 +462,12 @@ pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf,
     });
     let chunk = crate::compile::compile_source(&src)
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // DBG (v26): bind the module source onto the whole proto tree so a debug build
+    // serializes line/variable info. Harmless for a `--strip` build (the source is
+    // simply not written). `compile_source` does not bind a source itself.
+    if with_debug {
+        chunk.set_module_source(&src_info);
+    }
     // Defensive: verify before writing so a produced `.aso` is always loadable.
     crate::vm::verify::verify(&chunk).map_err(|e| {
         AsError::new(format!(
@@ -451,7 +476,7 @@ pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf,
         .with_source(src_info)
     })?;
     let bytes = chunk
-        .to_bytes()
+        .to_bytes_with_debug(with_debug)
         .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))?;
     let out_path = match out {
         Some(p) => p.to_path_buf(),
@@ -507,6 +532,8 @@ pub async fn run_aso_file(
         owning_class: None,
         params: Vec::new(),
         ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -611,6 +638,8 @@ pub async fn run_file_on_vm_with_packages(
         owning_class: None,
         params: Vec::new(),
         ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -634,11 +663,159 @@ pub async fn run_file_on_vm_with_packages(
     }
 }
 
+/// DBG Task 7: configuration for a CPU-profiled run, assembled from the
+/// `--profile`/`--profile-hz`/`--profile-format`/`-o` CLI flags.
+#[cfg(feature = "profile")]
+pub struct ProfileConfig {
+    /// Wall-clock sampling, or the deterministic (call-structure-driven) sample clock.
+    pub mode: crate::vm::instrument::ProfileMode,
+    /// The wall-clock sampling interval (ignored in deterministic mode).
+    pub interval: std::time::Duration,
+    /// The output artifact format.
+    pub format: crate::profile::ProfileFormat,
+    /// The output file path.
+    pub out: std::path::PathBuf,
+}
+
+/// DBG Task 7: run a `.as` file on the VM under the CPU sampling profiler, then write
+/// the aggregated profile (speedscope JSON or collapsed text) to `cfg.out`.
+///
+/// Behaviorally this is [`run_file_on_vm_with_packages`] with a [`ProfilerHook`] armed
+/// on the VM via [`Vm::with_instrument`] — profiling is OBSERVATION-ONLY, so the
+/// program's stdout/behavior/exit code are byte-identical to a non-profiled run (Gate
+/// 9). On completion the sampler is stopped, the samples aggregated, and the file
+/// written. Returns the same process exit code as the unprofiled path.
+///
+/// [`ProfilerHook`]: crate::vm::instrument::ProfilerHook
+/// [`Vm::with_instrument`]: crate::vm::Vm::with_instrument
+#[cfg(feature = "profile")]
+pub async fn run_file_on_vm_profiled(
+    path: &Path,
+    script_args: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    cfg: ProfileConfig,
+) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::instrument::{Instrumentation, ProfilerHook};
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    chunk.set_module_source(&src_info);
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_cli_args(script_args);
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
+    interp.set_worker_source(&src);
+    if let Some(map) = packages {
+        interp.set_package_resolver(map);
+    }
+    interp.install_self();
+
+    // Arm the profiler hook. In wallclock mode the sampler thread starts now (so it is
+    // already sampling when the run begins); deterministic mode collects inline.
+    let mut hook = ProfilerHook::new(cfg.mode, cfg.interval);
+    hook.start();
+    let vm = Vm::with_instrument(
+        interp.clone(),
+        Instrumentation {
+            breakpoints: None,
+            profiler: Some(hook),
+            coverage: None,
+        },
+    );
+    if let Some(dir) = path.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
+    local.run_until(interp.telemetry_flush_on_exit()).await;
+    local.await;
+    crate::gc::collect();
+
+    // Stop the sampler (joins the thread in wallclock mode) and aggregate. Reclaim the
+    // hook out of the VM's instrumentation seam.
+    let samples = match vm.take_profiler() {
+        Some(hook) => hook.finish(),
+        None => Vec::new(),
+    };
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("program")
+        .to_string();
+    let rendered = crate::profile::format_samples(&samples, cfg.format, &name);
+    std::fs::write(&cfg.out, rendered).map_err(|e| {
+        AsError::new(format!(
+            "cannot write profile to {}: {}",
+            cfg.out.display(),
+            e
+        ))
+    })?;
+
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(0),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(0),
+        Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
 /// Shared body for [`vm_run_source`] (specialize = true) and
 /// [`vm_run_source_generic`] (specialize = false). `specialize` is the kill-switch
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
 /// `specialize = false` here.
 async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg(src, specialize, false).await
+}
+
+/// DBG Task 9 (zero-cost bench): run `src` on the SPECIALIZED VM with an EMPTY
+/// [`Instrumentation`](crate::vm::instrument::Instrumentation) armed (`breakpoints`/
+/// `profiler`/`coverage` all `None`) — the "attached debugger, idle" config. No byte is
+/// patched (so the `Op::Break` trap arm is never reached) and the profiler is off, so
+/// this exercises ONLY the `Vm.instrument == Some` overhead (the per-call push/pop
+/// profiler None-check sees `Some`). The zero-cost gate asserts this is within timing
+/// noise of [`vm_run_source`] (`instrument == None`). `#[doc(hidden)]` test API.
+#[doc(hidden)]
+pub async fn vm_run_source_armed_idle(src: &str) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg(src, true, true).await
+}
+
+async fn vm_run_source_cfg(
+    src: &str,
+    specialize: bool,
+    armed: bool,
+) -> Result<(String, Option<i32>), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
@@ -659,6 +836,8 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
         owning_class: None,
         params: Vec::new(),
         ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
     });
     let closure = Closure::new(proto);
 
@@ -666,7 +845,13 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
     interp.install_self();
     // Workers Spec A: retain the source so a `worker fn` call can build its slice.
     interp.set_worker_source(src);
-    let vm = Vm::with_specialize(interp.clone(), specialize);
+    // DBG Task 9: `armed` builds the VM with an EMPTY instrumentation payload (the
+    // attached-but-idle config); otherwise `instrument == None` (the production path).
+    let vm = if armed {
+        Vm::with_instrument(interp.clone(), crate::vm::instrument::Instrumentation::empty())
+    } else {
+        Vm::with_specialize(interp.clone(), specialize)
+    };
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();

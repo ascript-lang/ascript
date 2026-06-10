@@ -307,6 +307,28 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   `bench/shared_heap_bench.as` + `run_shared_heap_bench.sh` (the zero-copy-vs-deep-clone headline + Gate-12
   no-tax). Docs: `docs/content/stdlib/shared.md` + the "Multi-core servers" section in
   `docs/content/language/workers.md`.
+- **DBG — source debugger (DAP) + CPU sampling profiler** (VM-only; spec/plan
+  `specs|plans/2026-06-08-debugger-profiler*`). Everything hangs off ONE **zero-cost-when-off** seam:
+  `Vm.instrument: RefCell<Option<Box<Instrumentation{breakpoints,profiler,coverage}>>>` (`src/vm/instrument.rs`).
+  The per-instruction dispatch loop is UNTOUCHED — breakpoints are reached ONLY via a runtime-patched
+  `Op::Break` byte (never compiler-emitted; the verifier REJECTS a serialized one). **`Chunk.code` is a
+  `Code` newtype = `UnsafeCell<Vec<u8>>` (derefs to `Vec<u8>`)** so `patch_byte(&self)` is sound (Miri-clean;
+  a `*const→*mut` cast would be UB). **Airlock:** the debugger ships only PLAIN OWNED `String`/`u32` across a
+  `Send` mpsc channel (`DebugCommand`/`DebugEvent`/`FrameSnapshot`) — NO `Value`/`Rc`/`Cc` crosses
+  (`_assert_send` proves it). The **debuggee runs on its OWN thread** (it parks by BLOCKING on `recv` in
+  `debug_stop`); the **DAP server** (`src/dap/`, `dap` feature, hand-rolled serde types, sync stdio loop +
+  event-pump thread) is on another thread. `ascript run --inspect <file>` (caps honored) / `ascript dap`
+  (program from `launch`). Stop-on-entry; line breakpoints (real verdict via a `breakpoint` event);
+  stackTrace/scopes/variables from the cached stop snapshot; `evaluate` reuses the tree-walker
+  (`self.interp().eval_expr` over an env built from the paused frame's locals + `user_globals`). v1 stepping =
+  resume-to-next-breakpoint (transient line-stepping deferred). **Profiler** (`src/profile/`, `profile`
+  feature): publishes the frame-name stack at frame push/pop ONLY (a single None-check when off), a sampler
+  aggregates a function-level call tree → speedscope JSON / collapsed folded-stacks; `ascript run --profile
+  cpu -o … [--profile-hz N] [--profile-format …]` (observation-only — stdout byte-identical). `.aso` gains an
+  OPTIONAL strippable debug section (module source + per-proto line/var tables; `build --strip` omits it);
+  **`ASO_FORMAT_VERSION = 26`**. **PRIMARY GATE** (`tests/vm_bench.rs` `dbg_zero_cost_gate`, `#[ignore]`,
+  release): instrument==None ≈ armed-idle (geomean 0.998×) AND spec/tw geomean ≥ 2× (2.95× ≥ pre-DBG 2.88×).
+  Docs: `docs/content/tooling/debugging-profiling.md`.
 
 ## Commands
 

@@ -18,6 +18,48 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
+/// DBG (debug-info): a CHAR-offset → `(line, col)` index over a module's source
+/// text. AScript `Span`s are CHAR offsets (`src/span.rs`), so the index counts
+/// `'\n'` chars to find line-start char offsets, then binary-searches them. This is
+/// a small, self-contained, CORE copy of the LSP's `LineIndex` (which depends on
+/// `tower-lsp` + UTF-16 columns and is feature-gated) — DBG needs plain 0-based
+/// `(line, col)` available under `--no-default-features`. Built ON DEMAND by the
+/// debug-info derivation (`build_line_starts`/`line_col_at`), NEVER on the hot path.
+struct LineIndex {
+    /// Char offset of the first char of each line. `line_starts[0] == 0`. Sorted
+    /// ascending, so `partition_point` finds the line of any char offset.
+    line_starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(text: &str) -> Self {
+        let mut line_starts = vec![0usize];
+        for (i, c) in text.chars().enumerate() {
+            if c == '\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        LineIndex { line_starts }
+    }
+
+    /// The 0-based line containing char `offset` (the greatest line start <= offset).
+    fn line_of(&self, offset: usize) -> u32 {
+        // `partition_point` counts entries with `line_start <= offset`; the last such
+        // entry's index is the line. There is always at least one (`line_starts[0]`).
+        let count = self.line_starts.partition_point(|&start| start <= offset);
+        (count.saturating_sub(1)) as u32
+    }
+
+    /// The 0-based `(line, col)` of char `offset`. `col` is char offsets from the
+    /// line start (good enough for DBG's source mapping; the DAP layer is char-based).
+    fn line_col(&self, offset: usize) -> (u32, u32) {
+        let line = self.line_of(offset);
+        let line_start = self.line_starts[line as usize];
+        let col = offset.saturating_sub(line_start) as u32;
+        (line, col)
+    }
+}
+
 /// A trivial pass-through [`Hasher`] for the offset-keyed VM side maps
 /// (`field_ics`/`method_ics`/`arith_caches`/`global_caches`).
 ///
@@ -251,11 +293,95 @@ impl ChunkLimit {
     }
 }
 
+/// The raw bytecode byte stream, with sound in-place breakpoint patching.
+///
+/// DBG software breakpoints overwrite a live opcode byte with [`Op::Break`] and later
+/// restore it — the classic self-modifying-bytecode technique (GDB/LLDB `int3`, the
+/// JVM `Breakpoint` bytecode, V8 debug bytecode). The runtime restore runs through a
+/// *shared* `&Chunk` (the run loop only ever reaches a proto's chunk via
+/// `Rc<FnProto>`), so the storage MUST carry interior mutability: a `*const → *mut`
+/// cast from a plain `&Vec<u8>` is undefined behavior under Rust's aliasing model
+/// (Stacked/Tree Borrows tag the pointer read-only at birth) even on one thread. We
+/// wrap the `Vec<u8>` in an [`UnsafeCell`] so [`patch_byte`](Code::patch_byte) derives
+/// its `*mut` from `UnsafeCell::get()` — the sanctioned shared-mutation path.
+///
+/// [`UnsafeCell`] (not `RefCell`) keeps reads branch-free: [`Deref`](std::ops::Deref)
+/// hands back `&Vec<u8>` with no borrow-flag check, so the hot fetch `code[ip]` is a
+/// plain pointer load — byte-identical codegen to the former bare `Vec<u8>`, so the
+/// Gate-12 zero-cost-when-not-debugging invariant holds. `Deref`/`DerefMut` to
+/// `Vec<u8>` keep every reader and every compiler emit/patch site unchanged
+/// (`code.push`, `code.extend_from_slice`, `code[ip]`, `code.len()`, `&code`).
+#[derive(Default)]
+pub struct Code {
+    inner: std::cell::UnsafeCell<Vec<u8>>,
+}
+
+impl Code {
+    /// Overwrite the byte at `off` in place through a *shared* reference (`&self`).
+    ///
+    /// # Soundness
+    ///
+    /// The VM is single-threaded and `!Send` (one isolate per OS thread; a `Chunk` is
+    /// never shared across threads), and the write derives its `*mut` from the
+    /// [`UnsafeCell`] — the legal interior-mutability path, not a `*const → *mut` cast.
+    /// The one obligation — no live `&` into the buffer across the write — holds at the
+    /// sole call site (the `Op::Break` trap in `run_loop`): the faulting byte was
+    /// fetched in a *prior*, already-finished loop iteration, so no borrow into the
+    /// buffer is outstanding when the restore runs.
+    #[inline]
+    pub fn patch_byte(&self, off: usize, b: u8) {
+        // SAFETY: see the doc-comment. `UnsafeCell`-sanctioned shared mutation,
+        // single-threaded, no aliasing `&` into the buffer live across this write. The
+        // single `&mut` below also covers the bounds check, so no separate `&` borrow
+        // (from `len()` via `Deref`) overlaps the write.
+        unsafe {
+            let v = &mut *self.inner.get();
+            assert!(off < v.len(), "patch_byte offset out of bounds");
+            v[off] = b;
+        }
+    }
+}
+
+impl std::ops::Deref for Code {
+    type Target = Vec<u8>;
+    #[inline(always)]
+    fn deref(&self) -> &Vec<u8> {
+        // SAFETY: shared read of the buffer. The only mutation through `&self` is
+        // `patch_byte`, which runs when no `&` into the buffer (this one included) is
+        // live — single-threaded, the trap holds no outstanding borrow.
+        unsafe { &*self.inner.get() }
+    }
+}
+
+impl std::ops::DerefMut for Code {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        // SAFETY: `&mut self` proves unique access to the cell.
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
+impl std::fmt::Debug for Code {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl From<Vec<u8>> for Code {
+    fn from(v: Vec<u8>) -> Self {
+        Self {
+            inner: std::cell::UnsafeCell::new(v),
+        }
+    }
+}
+
 /// A compiled function body (or top-level script body) plus its metadata.
 #[derive(Debug, Default)]
 pub struct Chunk {
     /// The raw instruction stream: opcode bytes interleaved with LE operands.
-    pub code: Vec<u8>,
+    /// A [`Code`] newtype (an `UnsafeCell<Vec<u8>>` that derefs to `Vec<u8>`) so the
+    /// debugger can patch breakpoint bytes through a shared `&Chunk` soundly.
+    pub code: Code,
     /// The constant pool. Holds only literal [`Value`]s
     /// (`Number`/`Str`/`Bool`/`Nil`/`Decimal`).
     pub consts: Vec<Value>,
@@ -390,6 +516,21 @@ pub struct FnProto {
     /// The declared return-type contract (`fn f(): T`), if any. Checked against the
     /// returned value at RETURN, panicking exactly as the tree-walker's `run_body`.
     pub ret: Option<crate::ast::Type>,
+    /// DBG (debug-info, §5.1 #2): slot → source-name table for this frame's locals
+    /// (`let`/`const`/loop-var/param), populated by the compiler from the resolver's
+    /// `bindings` grouped by frame. PURE debug metadata — NEVER read by the VM
+    /// run loop; consulted only by an attached debugger to label `scopes`/`variables`
+    /// (without it a local is `slot_N`). Strippable: a `--strip`ped `.aso` omits it
+    /// (Task 6), and an empty table simply means "no names" (the `slot_N` fallback).
+    /// Not serialized this task — reconstructed at attach time / serialized in Task 6.
+    pub local_names: Vec<(u32, Rc<str>)>,
+    /// DBG (debug-info): the function's declared name for debugger frame labels
+    /// (`fn f()` → "f", a method → its bare name). `None` for anonymous arrow /
+    /// fn-expression protos and the bottom/script proto. PURE debug metadata — NEVER
+    /// read by the VM run loop; consulted only by an attached debugger to label a
+    /// frame (without it the snapshot falls back to "<script>" / "fn@L<line>").
+    /// Not serialized this task — reconstructed/serialized in Task 6 (`.aso` unchanged).
+    pub debug_name: Option<Rc<str>>,
 }
 
 impl Chunk {
@@ -621,6 +762,24 @@ impl Chunk {
         self.code[at]
     }
 
+    /// DBG: runtime-patch ONE opcode byte at `off` to `b` through a shared `&Chunk`
+    /// (software-breakpoint patching, `src/vm/instrument.rs`). Used both to write
+    /// `Op::Break` at a breakpoint and to restore the original byte when the trap
+    /// fires (the v1 un-patch-on-hit re-execution, `Op::Break` arm in `run.rs`).
+    ///
+    /// # Why interior mutability here
+    ///
+    /// Restore (or set) a single bytecode byte in place through a shared `&Chunk` —
+    /// the DBG breakpoint un-patch. Delegates to [`Code::patch_byte`], where the
+    /// soundness argument and the `UnsafeCell`-backed storage live. The run loop only
+    /// ever reaches a proto's `Chunk` via `Rc<FnProto>` (i.e. `&Chunk`), so this MUST
+    /// go through interior mutability; see [`Code`] for why a raw `*const → *mut` cast
+    /// would be undefined behavior. Off-path readers and the hot fetch pay nothing.
+    #[inline]
+    pub fn patch_byte(&self, off: usize, b: u8) {
+        self.code.patch_byte(off, b);
+    }
+
     /// Read the `i16` little-endian (jump) operand starting at byte `at`.
     pub fn read_i16(&self, at: usize) -> i16 {
         i16::from_le_bytes([self.code[at], self.code[at + 1]])
@@ -714,6 +873,78 @@ impl Chunk {
         }
     }
 
+    // ---- DBG debug-info: line ↔ bytecode-offset (derived) -----------------
+
+    /// DBG (debug-info, §5.1 #1): build the `line → first-bytecode-offset` table
+    /// from this chunk's `spans` + its module `source`. A debugger uses it for
+    /// `setBreakpoints` (a source line → the FIRST executable instruction on it,
+    /// the breakpoint target). It is a PURE FUNCTION of `spans` + source, so it is
+    /// reconstructed lazily at attach time (and serialized in the later Task 6),
+    /// NEVER read by the run loop. Returns a `Vec<(line, offset)>` sorted ascending
+    /// by `line`, with at most one entry per distinct source line (the first
+    /// instruction whose span starts on that line). Lines are 0-based (matching the
+    /// internal newline index); the DAP layer adds the +1 the protocol expects.
+    ///
+    /// If the module source is not bound (`source == None`, e.g. an `.aso`-only run
+    /// before the Task-6 debug section lands) the table is empty — a debugger then
+    /// reports "no debug info" rather than guessing.
+    pub fn build_line_starts(&self) -> Vec<(u32, u32)> {
+        let source = self.source.borrow();
+        let Some(src) = source.as_ref() else {
+            return Vec::new();
+        };
+        let index = LineIndex::new(&src.text);
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        // `spans` is sorted ascending by code offset (emission is monotonic), so a
+        // forward scan visits offsets in order. For each distinct source line, keep
+        // the FIRST (lowest-offset) instruction whose span starts on that line.
+        let mut last_line: Option<u32> = None;
+        for (offset, span) in &self.spans {
+            let line = index.line_of(span.start);
+            if last_line == Some(line) {
+                // Same line as the previous instruction — already recorded its first.
+                continue;
+            }
+            // A line can still already be present out of monotonic order only if a
+            // later instruction's span jumps back to an earlier line (it cannot, as
+            // spans are emission-ordered and source-monotonic in practice); guard
+            // anyway so the first wins.
+            if out.iter().any(|(l, _)| *l == line) {
+                last_line = Some(line);
+                continue;
+            }
+            let off = u32::try_from(*offset).unwrap_or(u32::MAX);
+            out.push((line, off));
+            last_line = Some(line);
+        }
+        out.sort_unstable_by_key(|(line, _)| *line);
+        out
+    }
+
+    /// DBG: map a bytecode `offset` to its `(line, col)` (both 0-based) using the
+    /// instruction's recorded span + the module source. Returns `None` when the
+    /// source is unbound. Used for `stackTrace` (a frame's `ip` → its source line).
+    pub fn line_col_at(&self, offset: usize) -> Option<(u32, u32)> {
+        let source = self.source.borrow();
+        let src = source.as_ref()?;
+        let index = LineIndex::new(&src.text);
+        let span = self.span_at(offset);
+        Some(index.line_col(span.start))
+    }
+
+    /// DBG: the breakpoint target for a source `line` (0-based) — the FIRST
+    /// bytecode offset whose span starts on `line`, or, when `line` itself carries
+    /// no instruction (a blank/comment line), the first offset of the NEXT
+    /// executable line at or after it. Returns `None` when no instruction is on or
+    /// after `line` (a trailing blank line / unbound source). Binary-searches the
+    /// `line_starts` table via `partition_point`.
+    pub fn first_offset_for_line(&self, line: u32) -> Option<u32> {
+        let table = self.build_line_starts();
+        // First entry whose line >= the requested line.
+        let idx = table.partition_point(|(l, _)| *l < line);
+        table.get(idx).map(|(_, off)| *off)
+    }
+
     /// Record a span for the instruction about to be emitted at the current code
     /// length. Kept sorted by construction (offsets are monotonic).
     fn record_span(&mut self, span: Span) {
@@ -777,6 +1008,38 @@ mod tests {
 
     fn s(a: usize, b: usize) -> Span {
         Span::new(a, b)
+    }
+
+    /// Soundness regression guard for the DBG breakpoint un-patch. `patch_byte` mutates
+    /// the byte stream through a *shared* `&Code` (the run loop only ever holds
+    /// `&Chunk`); the storage MUST be `UnsafeCell`-backed for that to be defined
+    /// behavior. The former implementation cast `code.as_ptr() as *mut u8` from a plain
+    /// `&Vec<u8>` and wrote through it — UB under Stacked/Tree Borrows even
+    /// single-threaded. This test patches via a shared reference and confirms a
+    /// subsequent shared read sees the new byte; run under Miri it also proves the
+    /// aliasing model is satisfied (`cargo +nightly miri test patch_byte_through_shared`).
+    #[test]
+    fn patch_byte_through_shared_ref_is_observed() {
+        let code: Code = vec![Op::Nil as u8, Op::Add as u8, Op::Return as u8].into();
+        // A *shared* borrow — exactly what the `Op::Break` trap holds (`&Chunk`).
+        let shared: &Code = &code;
+        assert_eq!(shared[1], Op::Add as u8);
+        // The breakpoint mechanism overwrites a live opcode, then restores it; both
+        // writes go through the shared reference.
+        shared.patch_byte(1, Op::Break as u8);
+        assert_eq!(shared[1], Op::Break as u8, "patched byte must be visible");
+        shared.patch_byte(1, Op::Add as u8);
+        assert_eq!(shared[1], Op::Add as u8, "restore must be visible");
+        // The neighbours are untouched.
+        assert_eq!(shared[0], Op::Nil as u8);
+        assert_eq!(shared[2], Op::Return as u8);
+    }
+
+    #[test]
+    #[should_panic(expected = "patch_byte offset out of bounds")]
+    fn patch_byte_out_of_bounds_panics() {
+        let code: Code = vec![Op::Nil as u8].into();
+        code.patch_byte(5, Op::Break as u8);
     }
 
     #[test]
@@ -905,9 +1168,123 @@ mod tests {
             owning_class: None,
             params: Vec::new(),
             ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
         });
         assert_eq!(c.add_proto(p.clone()), 0);
         assert_eq!(c.add_proto(p), 1);
         assert_eq!(c.protos.len(), 2);
+    }
+
+    // ---- DBG debug-info: LineIndex (line ↔ char-offset) -------------------
+
+    #[test]
+    fn line_index_basic() {
+        // "ab\ncde\nf" — char offsets: a0 b1 \n2 c3 d4 e5 \n6 f7
+        let idx = LineIndex::new("ab\ncde\nf");
+        assert_eq!(idx.line_of(0), 0); // 'a'
+        assert_eq!(idx.line_of(1), 0); // 'b'
+        assert_eq!(idx.line_of(2), 0); // '\n' belongs to line 0
+        assert_eq!(idx.line_of(3), 1); // 'c'
+        assert_eq!(idx.line_of(5), 1); // 'e'
+        assert_eq!(idx.line_of(7), 2); // 'f'
+        assert_eq!(idx.line_col(0), (0, 0));
+        assert_eq!(idx.line_col(4), (1, 1)); // 'd', col 1 on line 1
+        assert_eq!(idx.line_col(7), (2, 0));
+    }
+
+    #[test]
+    fn line_index_empty_and_oob() {
+        let idx = LineIndex::new("");
+        assert_eq!(idx.line_of(0), 0);
+        // Out-of-range offset still resolves to the last line (no panic).
+        let idx2 = LineIndex::new("x\ny");
+        assert_eq!(idx2.line_of(999), 1);
+    }
+
+    // ---- DBG debug-info: line_starts / line_col / first_offset_for_line ---
+
+    /// Build a chunk whose instructions sit at known source-line offsets, with a
+    /// bound module source so the derived tables have line numbers to work with.
+    fn chunk_with_source(text: &str, instrs: &[(Op, Span)]) -> Chunk {
+        let mut c = Chunk::new();
+        for (op, span) in instrs {
+            c.emit(*op, *span);
+        }
+        let src = Rc::new(crate::error::SourceInfo {
+            path: "<test>".into(),
+            text: text.into(),
+        });
+        c.set_module_source(&src);
+        c
+    }
+
+    #[test]
+    fn line_starts_no_source_is_empty() {
+        // No module source bound -> no line numbers -> empty (debugger reports
+        // "no debug info" rather than guessing).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s(0, 1));
+        assert!(c.build_line_starts().is_empty());
+        assert_eq!(c.line_col_at(0), None);
+        assert_eq!(c.first_offset_for_line(0), None);
+    }
+
+    #[test]
+    fn line_starts_first_instruction_per_line() {
+        // Source: three lines. Line 0 spans chars 0..4 ("aaa\n"), line 1 chars 4..8
+        // ("bbb\n"), line 2 chars 8.. ("ccc"). Two instructions on line 0, one on
+        // line 2 — line 1 (blank of executable code) has none.
+        // code offsets: Nil@0 (line0), Pop@1 (line0), Add@2 (line2)
+        let text = "aaa\nbbb\nccc";
+        let c = chunk_with_source(
+            text,
+            &[
+                (Op::Nil, s(0, 1)),  // line 0
+                (Op::Pop, s(1, 2)),  // line 0 (same line, not a new line-start)
+                (Op::Add, s(8, 9)),  // line 2
+            ],
+        );
+        let table = c.build_line_starts();
+        // One entry per distinct source line that has an instruction: line 0 -> off 0,
+        // line 2 -> off 2. Line 1 has no instruction → absent.
+        assert_eq!(table, vec![(0u32, 0u32), (2u32, 2u32)]);
+    }
+
+    #[test]
+    fn line_starts_blank_line_maps_to_next_executable_offset() {
+        let text = "aaa\nbbb\nccc";
+        let c = chunk_with_source(text, &[(Op::Nil, s(0, 1)), (Op::Add, s(8, 9))]);
+        // Line 0 -> its own first offset.
+        assert_eq!(c.first_offset_for_line(0), Some(0));
+        // Line 1 (no instruction) -> the NEXT executable line's first offset (line 2 → off 1).
+        assert_eq!(c.first_offset_for_line(1), Some(1));
+        // Line 2 -> its own first offset.
+        assert_eq!(c.first_offset_for_line(2), Some(1));
+        // Past the last instruction's line -> None.
+        assert_eq!(c.first_offset_for_line(3), None);
+    }
+
+    #[test]
+    fn offset_to_line_round_trips() {
+        let text = "let a = 1\nlet b = 2\nb + a";
+        // Nil on line 0 (offset 0), Pop on line 1 (offset 1), Add on line 2 (offset 2).
+        let c = chunk_with_source(
+            text,
+            &[
+                (Op::Nil, s(0, 3)),   // line 0
+                (Op::Pop, s(10, 13)), // line 1 (after the first '\n' at char 9)
+                (Op::Add, s(20, 25)), // line 2 (after the second '\n' at char 19)
+            ],
+        );
+        assert_eq!(c.line_col_at(0), Some((0, 0)));
+        assert_eq!(c.line_col_at(1), Some((1, 0)));
+        assert_eq!(c.line_col_at(2), Some((2, 0)));
+        // line → offset and offset → line agree (round-trip) for each.
+        for (line, off) in c.build_line_starts() {
+            let (got_line, _col) = c.line_col_at(off as usize).unwrap();
+            assert_eq!(got_line, line);
+            assert_eq!(c.first_offset_for_line(line), Some(off));
+        }
     }
 }
