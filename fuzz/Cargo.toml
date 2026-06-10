@@ -21,6 +21,11 @@ libfuzzer-sys = "0.4"
 # differential/parser targets (landing in later tasks) `#[path]`-include the shared
 # `src/fuzzgen/` generator, which is `arbitrary`-driven. It never reaches the root graph.
 arbitrary = { version = "1", features = ["derive"] }
+# `indexmap` is a DIRECT dep of the `worker_serialize` target only (it builds `Value::Object`/
+# `Map`/`Set` graphs over `IndexMap`/`IndexSet` on the current thread — `Value` is `!Send`). It
+# is the SAME `indexmap` `ascript` uses, so no second copy enters the build. Like `arbitrary`,
+# it is a dep of THIS isolated crate only and never reaches the root `ascript` graph.
+indexmap = "2"
 
 # The `aso_roundtrip` target only needs the CORE `.aso` reader + verifier + VM run path,
 # all of which build under `--no-default-features`. We enable ONLY the `fuzzgen` feature:
@@ -42,6 +47,33 @@ overflow-checks = true
 [[bin]]
 name = "aso_roundtrip"
 path = "fuzz_targets/aso_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# FUZZ Task 7 — the headline three-way differential program fuzzer (reaches `ascript::fuzzgen`
+# via the `fuzzgen` feature; runs each generated program on tree-walker + specialized-VM +
+# generic-VM and asserts they agree).
+[[bin]]
+name = "differential"
+path = "fuzz_targets/differential.rs"
+test = false
+doc = false
+bench = false
+
+# FUZZ Task 7 — the source-parser no-panic + front-end-agreement target (CST + legacy parsers).
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+# FUZZ Task 6 — the worker structured-clone airlock (round-trip + sendability honesty +
+# decode-arbitrary-bytes rejection safety).
+[[bin]]
+name = "worker_serialize"
+path = "fuzz_targets/worker_serialize.rs"
 test = false
 doc = false
 bench = false

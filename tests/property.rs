@@ -442,6 +442,133 @@ mod worker_serialize {
         );
     }
 
+    /// The curated KNOWN-BAD worker-airlock byte set — each must `decode` to a clean `Err`,
+    /// never a panic / OOM / unbounded allocation. These mirror, by construction, the shipped
+    /// `decode_rejects_*` / `decode_huge_length_does_not_allocate` unit tests in
+    /// `src/worker/serialize.rs` AND the `bad_*` seeds committed under
+    /// `fuzz/corpus/worker_serialize/` (see `name`), so the corpus and this guard stay in
+    /// lockstep — exactly the discipline `aso_planted_bug_known_bad_bytes_are_clean_err` applies
+    /// on the `.aso` side. Wire tags: ARRAY=6, BYTES=5, STR=4, REF=13 (serialize.rs:82+).
+    fn known_bad_worker_inputs() -> Vec<(&'static str, Vec<u8>)> {
+        let u32max = u32::MAX.to_le_bytes();
+        let zero = 0u32.to_le_bytes();
+        vec![
+            // Empty buffer — no tag byte to read.
+            ("bad_empty", Vec::new()),
+            // An unknown / out-of-range tag byte.
+            ("bad_unknown_tag", vec![99]),
+            ("bad_unknown_tag_padded", vec![200, 0, 0, 0, 0]),
+            // TAG_REF (13) + id=7 with no container ever registered — a dangling back-ref.
+            ("bad_dangling_ref", {
+                let mut b = vec![13u8];
+                b.extend_from_slice(&7u32.to_le_bytes());
+                b
+            }),
+            // The huge-length BOMB on an ARRAY: tag + id=0 + len=u32::MAX, NO element bytes.
+            // Pre-clamp this pre-allocated; the `remaining()` clamp makes it a clean Err.
+            ("bad_bomb_array_len", {
+                let mut b = vec![6u8];
+                b.extend_from_slice(&zero); // serial id
+                b.extend_from_slice(&u32max); // claimed length (bomb)
+                b
+            }),
+            // The same bomb on BYTES (length-prefixed raw bytes).
+            ("bad_bomb_bytes_len", {
+                let mut b = vec![5u8];
+                b.extend_from_slice(&zero); // serial id
+                b.extend_from_slice(&u32max); // claimed length (bomb)
+                b
+            }),
+            // The same bomb on STR (length-prefixed UTF-8).
+            ("bad_bomb_str_len", {
+                let mut b = vec![4u8];
+                b.extend_from_slice(&u32max); // claimed length (bomb)
+                b
+            }),
+            // A truncated ARRAY: valid header claiming 3 elements but no element bytes.
+            ("bad_truncated_array", {
+                let mut b = vec![6u8];
+                b.extend_from_slice(&zero); // serial id
+                b.extend_from_slice(&3u32.to_le_bytes()); // 3 elements, none present
+                b
+            }),
+        ]
+    }
+
+    /// PLANTED-BAD-BYTES GUARD (Task 6, spec §7): every curated known-bad worker-airlock input
+    /// is a CLEAN `Err`, never a panic / abort / unbounded allocation — proving the
+    /// `worker_serialize` fuzz target's rejection-safety invariant (and that its crash-detection
+    /// can fire) WITHOUT the cargo-fuzz CLI. Pins the EXACT seed set the committed corpus ships,
+    /// so the corpus and the suite never drift.
+    #[test]
+    fn worker_planted_bad_bytes_are_clean_err() {
+        for (name, bytes) in known_bad_worker_inputs() {
+            let interp = Interp::new();
+            let r = decode(&bytes, &interp);
+            assert!(
+                r.is_err(),
+                "planted-bad worker case `{name}` must be a clean Err from `decode`, got Ok"
+            );
+        }
+    }
+
+    /// The committed worker-airlock seed corpus under `fuzz/corpus/worker_serialize/` is the
+    /// libFuzzer starting set AND a permanent regression guard. Assert (a) the `bad_*` seeds are
+    /// present + byte-identical to the planted-bad set above (corpus ⇔ suite lockstep), and (b)
+    /// every committed `ex_*` seed is a real encoded graph that `decode`s cleanly (so the mutator
+    /// flips bytes inside a VALID tagged tree, reaching the deep `decode_value` arms).
+    #[test]
+    fn worker_seed_corpus_is_present_and_current() {
+        let corpus =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/worker_serialize");
+        assert!(
+            corpus.is_dir(),
+            "worker seed corpus dir missing: {}",
+            corpus.display()
+        );
+        let mut ex_seeds = 0usize;
+        let mut bad_seeds = 0usize;
+        for entry in std::fs::read_dir(&corpus).expect("read corpus dir") {
+            let path = entry.expect("dir entry").path();
+            let fname = path.file_name().unwrap().to_string_lossy().to_string();
+            let bytes = std::fs::read(&path).expect("read seed");
+            let interp = Interp::new();
+            if fname.starts_with("ex_") {
+                ex_seeds += 1;
+                // A real `ex_*` seed begins with a `1` discriminant byte (round-trip mode); the
+                // body after it is a real encoded graph. We assert the body alone decodes — the
+                // direct in-suite proof the seed reaches the valid `decode_value` arms.
+                assert!(
+                    !bytes.is_empty(),
+                    "committed seed `{fname}` is empty"
+                );
+                let body = &bytes[1..];
+                assert!(
+                    decode(body, &interp).is_ok(),
+                    "committed `ex_*` seed `{fname}` body failed to decode (stale wire format?)"
+                );
+            } else if fname.starts_with("bad_") {
+                bad_seeds += 1;
+                // A `bad_*` seed begins with a `0` discriminant byte (decode-arbitrary mode); the
+                // body is a known-bad buffer that must decode to a clean Err.
+                let body = if bytes.is_empty() { &bytes[..] } else { &bytes[1..] };
+                assert!(
+                    decode(body, &interp).is_err(),
+                    "known-bad seed `{fname}` body unexpectedly decoded Ok"
+                );
+            }
+        }
+        assert!(
+            ex_seeds >= 1,
+            "expected at least one real encoded `ex_*` seed, found {ex_seeds}"
+        );
+        assert_eq!(
+            bad_seeds,
+            known_bad_worker_inputs().len(),
+            "the committed `bad_*` seed count must equal the planted-bad set"
+        );
+    }
+
     /// PLANTED-BUG self-test (spec §7): a deliberately-lossy decode (drop the last array
     /// element) must make the round-trip property FAIL — proving the round-trip check can
     /// detect a serializer bug. We simulate the lossy decode by truncating a known array's

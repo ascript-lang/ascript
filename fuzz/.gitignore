@@ -21,3 +21,19 @@ oom-*
 corpus/aso_roundtrip/*
 !corpus/aso_roundtrip/ex_*.aso
 !corpus/aso_roundtrip/bad_*
+
+# FUZZ Tasks 6 & 7 — the same discipline for the other three targets: ignore the whole
+# (nightly-GROWN, hash-named) corpus dir, then RE-INCLUDE only the hand-curated `ex_*`/`bad_*`
+# seeds. `differential`/`parser`/`worker_serialize` seeds are NOT `.aso` files, so the root
+# `.gitignore`'s `*.aso` rule does not touch them — these two negations are what tracks them.
+corpus/differential/*
+!corpus/differential/ex_*
+!corpus/differential/bad_*
+
+corpus/parser/*
+!corpus/parser/ex_*
+!corpus/parser/bad_*
+
+corpus/worker_serialize/*
+!corpus/worker_serialize/ex_*
+!corpus/worker_serialize/bad_*

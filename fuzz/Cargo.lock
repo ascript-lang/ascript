@@ -125,6 +125,7 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "ascript",
+ "indexmap",
  "libfuzzer-sys",
 ]
 
