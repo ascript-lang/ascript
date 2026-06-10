@@ -232,3 +232,34 @@ isolate with only deep-copied data crossing the boundary.
 
 See **[Workers & parallelism](workers)** for the full story — the model, the two lifecycles, the
 sendability line, actors, streaming, and the `task.pipe` event-bus bridge.
+
+## Native binaries
+
+`ascript build --native` produces a **self-contained native executable** — the whole runtime plus
+your compiled program in one file, with no `ascript` (or any other toolchain) needed on the target
+machine:
+
+```bash
+ascript build --native app.as -o app   # → a standalone `app` executable
+./app arg1 arg2                          # runs your program; args reach env.args()
+```
+
+This is **bundling, not ahead-of-time compilation** — the embedded bytecode VM still interprets, so
+runtime behavior is byte-for-byte identical to `ascript run app.as`. Mechanically, the output is a
+copy of the running runtime with the **verified** `.aso` bytecode (the exact bytes `ascript build`
+produces) plus a small trailing footer appended; at startup the binary reads its own footer and runs
+the payload through the **same verified load path** as `run app.aso`. A tampered or corrupt embedded
+program is rejected with a clean error, never a crash — it crosses the same hardened trust boundary.
+
+A few things to know:
+
+- **Size.** A native binary is **tens of MB** — that is the *runtime*, not your program (your bytecode
+  is typically a few KB). Every native binary is roughly the size of `ascript` itself.
+- **Host-only in v1.** `--target <triple>` is accepted but **rejected** with a clear error:
+  cross-compilation is a staged follow-up. Build on the platform you want to run on.
+- **Workers work unchanged.** A `worker fn`/`worker class`/`worker fn*` program bundles and runs with
+  full multi-core parallelism — isolates get their code from the embedded payload, no source required.
+- **macOS.** Native binaries are **ad-hoc code-signed** so the kernel will exec them (required on
+  Apple silicon). Ad-hoc signing establishes integrity, not authenticity — distributing to other users
+  without a Gatekeeper prompt still needs Developer-ID signing + notarization, which is out of scope
+  for `--native`.

@@ -82,13 +82,23 @@ enum Command {
     /// Compile a .as program to bytecode (.aso)
     Build {
         file: String,
-        /// Output path (defaults to `<file-stem>.aso`).
+        /// Output path (defaults to `<file-stem>.aso`, or the bare `<file-stem>`
+        /// executable with `--native`).
         #[arg(long, short)]
         out: Option<String>,
         /// Strip the optional DBG debug section (module source + per-proto
         /// line/variable info). Default: debug info is INCLUDED.
         #[arg(long = "strip")]
         strip: bool,
+        /// BIN — produce a self-contained NATIVE executable (the whole runtime +
+        /// the compiled program) instead of a `.aso`. Bundling, not AOT: the
+        /// embedded VM still interprets. Host-only in v1.
+        #[arg(long = "native")]
+        native: bool,
+        /// Target triple for `--native` (host-only in v1 — parsed but rejected with
+        /// a clear error). Requires `--native`.
+        #[arg(long = "target", requires = "native")]
+        target: Option<String>,
     },
     /// Start the interactive REPL
     Repl {
@@ -519,7 +529,52 @@ fn fix_edits_json(path: &str, edits: &[ascript::check::TextEdit]) -> String {
     out
 }
 
+/// BIN §2.3 — the pre-clap startup shim. If THIS executable is a native bundle (a trailing
+/// `ASCRIPTB` footer over a valid payload region), read the payload and run it through the
+/// embedded path, returning its exit code. A plain `ascript` launch (no footer) returns
+/// `None` and the caller falls through to `Cli::parse()`, byte-identical to before.
+///
+/// Cost on the NON-bundle path (every normal launch): a `current_exe()` resolve + open +
+/// stat + a single `FOOTER_SIZE`-byte tail read — it never loads the whole image (Task 7).
+/// Any I/O failure is treated as "not a bundle" (fall through) — a bundle that cannot read
+/// its own payload is indistinguishable from a non-bundle and must not abort startup.
+async fn try_run_embedded() -> Option<ExitCode> {
+    use std::io::{Read, Seek, SeekFrom};
+    const FOOTER_SIZE: usize = ascript::bundle::FOOTER_SIZE;
+
+    let exe = std::env::current_exe().ok()?;
+    let mut f = std::fs::File::open(&exe).ok()?;
+    let exe_len = f.metadata().ok()?.len();
+    if exe_len < FOOTER_SIZE as u64 {
+        return None;
+    }
+    // Read ONLY the trailing footer (cheap), validate against the file length.
+    f.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).ok()?;
+    let mut footer = [0u8; FOOTER_SIZE];
+    f.read_exact(&mut footer).ok()?;
+    let (offset, len) = ascript::bundle::validate_footer(&footer, exe_len)?;
+
+    // It IS a bundle — read the payload region and run it embedded.
+    f.seek(SeekFrom::Start(offset as u64)).ok()?;
+    let mut payload = vec![0u8; len];
+    f.read_exact(&mut payload).ok()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = match ascript::run_embedded_aso(&payload, &args).await {
+        Ok(code) => code,
+        Err(e) => {
+            ascript::diagnostics::report(&e);
+            1
+        }
+    };
+    Some(ExitCode::from(code as u8))
+}
+
 async fn real_main() -> ExitCode {
+    // BIN §2.3: a bundled binary runs its embedded program BEFORE clap ever sees argv — so
+    // `./app a b --c` forwards `[a, b, --c]` to the program, never as ascript subcommands.
+    if let Some(code) = try_run_embedded().await {
+        return code;
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Run {
@@ -687,16 +742,35 @@ async fn real_main() -> ExitCode {
                 }
             }
         }
-        Command::Build { file, out, strip } => {
+        Command::Build {
+            file,
+            out,
+            strip,
+            native,
+            target,
+        } => {
             let out_path = out.as_deref().map(std::path::Path::new);
-            match ascript::build_file(std::path::Path::new(&file), out_path, !strip) {
-                Ok(written) => {
-                    println!("compiled {} -> {}", file, written.display());
-                    ExitCode::SUCCESS
+            let src = std::path::Path::new(&file);
+            if native {
+                // BIN: bundle a self-contained native executable. `--target` is
+                // host-only in v1 (build_native returns the specific Tier-1 error).
+                match ascript::build_native(src, out_path, target.as_deref()) {
+                    Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
+                    Err(e) => {
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
                 }
-                Err(e) => {
-                    ascript::diagnostics::report(&e);
-                    ExitCode::from(1)
+            } else {
+                match ascript::build_file(src, out_path, !strip) {
+                    Ok(written) => {
+                        println!("compiled {} -> {}", file, written.display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
                 }
             }
         }

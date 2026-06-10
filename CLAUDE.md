@@ -363,6 +363,18 @@ lossless **CST front-end** (`src/syntax/` — trivia-preserving lexer + parser �
 a `Chunk` → the async VM (`src/vm/`). `ascript run file.as` compiles and runs on the VM; `ascript build`
 serializes the `Chunk` to a versioned, verified `.aso` (`src/vm/aso.rs` + `src/vm/verify.rs`).
 
+- **BIN — native single-binary** (`src/bundle.rs` + `build_native`/`run_embedded_aso` in `lib.rs`,
+  `try_run_embedded` shim in `main.rs`; `tests/native.rs`). `ascript build --native app.as -o app`
+  appends the **verified `.aso`** + a trailing magic-tagged footer (`ASCRIPTB`, bounds-checked) to a copy
+  of the running runtime (`current_exe()`); on macOS the clean stub is ad-hoc signed FIRST, then the
+  payload is appended AFTER the signature (the loader validates `[0, codeLimit)` and ignores the overlay
+  — append-then-sign would relocate it). Startup's `try_run_embedded` runs BEFORE `Cli::parse()`: it reads
+  only the 32-byte footer tail of `current_exe()` (~10µs, never the whole image) and, if present, runs the
+  payload via the SAME `from_bytes_verified` path as `run file.aso` — **bundling, not AOT** (the embedded
+  VM still interprets). Worker-in-bundle is free (`set_worker_aso_bytes`). `--target` is host-only
+  (parsed-but-rejected). **NO `.aso` format change, NO `ASO_FORMAT_VERSION` bump** (the embedded payload is
+  a byte-identical `build` artifact → four-mode parity stays free).
+
 The LEGACY path is `lexer` → `parser` (precedence-climbing) → `interp` (async tree-walker), retained as the
 differential oracle and `--tree-walker` debug engine (`ASCRIPT_ENGINE=tree-walker`; flag precedes the file,
 ignored for `.aso`). The legacy front-end (`lexer`/`token`/`ast`/`parser`/`span`) is also consumed by `fmt`,

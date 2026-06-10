@@ -133,6 +133,13 @@ libffi = { version = "3", optional = true, features = ["system"] }
 # codegen.
 static_assertions = "1"
 
+# BIN — macOS ad-hoc code-signing for `build --native` (the `codesign -s -` equivalent, no
+# Xcode). macOS-only: appending the payload invalidates the stub's signature, so an arm64
+# bundle must be re-signed or the kernel SIGKILLs it at exec. `default-features = false`
+# keeps the (large) signer dep lean — only the in-process Mach-O signing path is needed.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-codesign = { version = "0.29", default-features = false }
+
 [build-dependencies]
 cc = "1"
 ungrammar = "1"
