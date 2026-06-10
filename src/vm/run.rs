@@ -298,6 +298,16 @@ impl Vm {
             .and_then(|i| i.profiler.take())
     }
 
+    /// **DX D2 Task 6.** Reclaim the armed
+    /// [`CoverageTable`](crate::vm::instrument::CoverageTable) (if any) after a run, so the
+    /// caller can report it / merge it across isolates. `None` if no coverage was armed.
+    pub fn take_coverage(&self) -> Option<crate::vm::instrument::CoverageTable> {
+        self.instrument
+            .borrow_mut()
+            .as_mut()
+            .and_then(|i| i.coverage.take())
+    }
+
     /// **DBG.** Register the program's proto tree for source-line breakpoint resolution.
     /// Walks `entry` and recursively each `chunk.protos`, storing every `Rc<FnProto>`
     /// flat in `debug_protos`. A debugger/launcher calls this once before `run` under
@@ -316,6 +326,67 @@ impl Vm {
         let mut table = self.debug_protos.borrow_mut();
         table.clear();
         walk(entry, &mut table);
+    }
+
+    /// **DX D2 Task 6.** Arm LINE COVERAGE over the program's proto tree. Walks `entry`
+    /// and recursively each `chunk.protos` (mirroring [`register_debug_protos`]); for each
+    /// proto it builds the `line → first-bytecode-offset` table ([`Chunk::build_line_starts`])
+    /// and PATCHES each line's first offset to [`Op::Break`](crate::vm::opcode::Op::Break),
+    /// recording in the armed [`CoverageTable`](crate::vm::instrument::CoverageTable) the
+    /// displaced byte + line + the proto's source path. The cold `Op::Break` trap arm then
+    /// recovers each line on first execution (covered), un-patches, and re-dispatches — so
+    /// the hot loop is byte-identical to today (Gate 12) and the program output is unchanged.
+    ///
+    /// No-op unless a `CoverageTable` is armed in `instrument`. Skips cleanly (never panics)
+    /// on a proto with no bound source, an offset past the end, or an empty line table.
+    pub fn arm_coverage(&self, entry: &Rc<crate::vm::chunk::FnProto>) {
+        // Collect every proto (parent-before-child) into a flat list, like the debugger.
+        fn walk(
+            proto: &Rc<crate::vm::chunk::FnProto>,
+            out: &mut Vec<Rc<crate::vm::chunk::FnProto>>,
+        ) {
+            out.push(proto.clone());
+            for nested in &proto.chunk.protos {
+                walk(nested, out);
+            }
+        }
+        let mut protos: Vec<Rc<crate::vm::chunk::FnProto>> = Vec::new();
+        walk(entry, &mut protos);
+
+        let mut inst = self.instrument.borrow_mut();
+        let Some(table) = inst.as_mut().and_then(|i| i.coverage.as_mut()) else {
+            return; // no coverage armed — nothing to do.
+        };
+        for proto in &protos {
+            let chunk = &proto.chunk;
+            // The proto's source path (skip a proto with no bound source — it cannot be
+            // attributed to a file, so it is simply not instrumented).
+            let path = match chunk.source.borrow().as_ref() {
+                Some(src) => src.path.clone(),
+                None => continue,
+            };
+            let proto_id = Rc::as_ptr(proto) as *const () as usize;
+            table.record_path(proto_id, path);
+            let code_len = chunk.code.len();
+            for (line, offset) in chunk.build_line_starts() {
+                let off = offset as usize;
+                if off >= code_len {
+                    continue; // malformed/out-of-range offset — skip cleanly.
+                }
+                // Already patched at this offset (a line table that maps two lines to one
+                // offset cannot happen — first-wins — but guard anyway): keep the first.
+                if table.trap(proto_id, off).is_some() {
+                    continue;
+                }
+                let original = chunk.code[off];
+                // Don't double-patch an existing Op::Break (a debugger breakpoint, etc.).
+                if original == crate::vm::opcode::Op::Break as u8 {
+                    continue;
+                }
+                table.record_trap(proto_id, off, original, line);
+                chunk.patch_byte(off, crate::vm::opcode::Op::Break as u8);
+            }
+        }
     }
 
     /// **DBG.** Resolve a source `(source, line_1based)` to a `(proto_id, offset)` to
@@ -3692,6 +3763,32 @@ impl Vm {
                         Rc::as_ptr(&fiber.frame().closure.proto) as *const () as usize;
                     let depth = fiber.frames.len();
 
+                    // DX D2 Task 6 — COVERAGE TRAP (checked FIRST). If this patched byte is
+                    // a coverage trap, mark the line covered, restore the original op, point
+                    // `ip` back at it, and `continue` so the next loop iteration executes the
+                    // real op. No debugger stop, no pause — each line traps at most once then
+                    // runs free (zero steady-state cost; program output unchanged). Only when
+                    // it is NOT a coverage trap do we fall through to the debugger logic
+                    // below, byte-identical to pre-coverage. (Coverage's side table is
+                    // consulted ONLY here, inside the COLD trap arm — never on the hot path.)
+                    let cov_hit = {
+                        let mut inst = self.instrument.borrow_mut();
+                        match inst.as_mut().and_then(|i| i.coverage.as_mut()) {
+                            Some(table) => table.trap(proto_id, fault_ip).map(|(orig, line)| {
+                                table.mark_covered(proto_id, line);
+                                orig
+                            }),
+                            None => None,
+                        }
+                    };
+                    if let Some(original_byte) = cov_hit {
+                        let chunk = &fiber.frame().closure.proto.chunk;
+                        chunk.patch_byte(fault_ip, original_byte);
+                        fiber.frame_mut().ip = fault_ip;
+                        // Re-dispatch the recovered op next iteration. No debugger stop.
+                        continue;
+                    }
+
                     // Recover the original opcode byte from the hook's side table
                     // (scoped borrow, dropped immediately — Gate 4).
                     let original = {
@@ -6644,6 +6741,142 @@ mod tests {
         });
         vm.register_debug_protos(&entry);
         (entry, src_info)
+    }
+
+    // ---- DX D2 Task 6: line coverage on the Op::Break trap ----------------
+
+    /// Compile `src`, bind its source, arm coverage over the proto tree, run to
+    /// completion capturing output. Returns the reclaimed `CoverageTable` + the program
+    /// output. Coverage runs entirely on the VM via the patched `Op::Break` trap.
+    fn run_with_coverage(src: &str) -> (crate::vm::instrument::CoverageTable, String) {
+        use crate::vm::instrument::{CoverageTable, Instrumentation};
+        let top_chunk = crate::compile::compile_source(src).expect("compiles");
+        let src_info = Rc::new(crate::error::SourceInfo {
+            path: "prog.as".into(),
+            text: src.into(),
+        });
+        top_chunk.set_module_source(&src_info);
+        let entry = Rc::new(FnProto {
+            chunk: top_chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::with_instrument(
+                interp.clone(),
+                Instrumentation {
+                    breakpoints: None,
+                    profiler: None,
+                    coverage: Some(CoverageTable::new()),
+                },
+            );
+            vm.arm_coverage(&entry);
+            let closure = Closure::new(entry);
+            let mut fiber = Fiber::new(closure);
+            let outcome = vm.run(&mut fiber).await;
+            assert!(
+                matches!(outcome, Ok(RunOutcome::Done(_))),
+                "program ran to completion: {outcome:?}"
+            );
+            let table = vm.take_coverage().expect("coverage was armed");
+            (table, interp.output())
+        })
+    }
+
+    /// Run `src` on a plain (non-instrumented) VM and return its captured output, for
+    /// the observation-only equality assertion.
+    fn run_plain_output(src: &str) -> String {
+        let top_chunk = crate::compile::compile_source(src).expect("compiles");
+        let entry = Rc::new(FnProto {
+            chunk: top_chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let local = LocalSet::new();
+        local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::new(interp.clone());
+            let closure = Closure::new(entry);
+            let mut fiber = Fiber::new(closure);
+            let outcome = vm.run(&mut fiber).await;
+            assert!(matches!(outcome, Ok(RunOutcome::Done(_))));
+            interp.output()
+        })
+    }
+
+    #[test]
+    fn coverage_records_executed_lines_and_misses_dead_branch() {
+        // Line 1: `let x = 1` (executed)
+        // Line 2: `if (x > 5) {` (executed, condition false)
+        // Line 3: `  print("big")` (NEVER executed — dead branch)
+        // Line 4: `}` (no executable instruction)
+        // Line 5: `print("done")` (executed)
+        let src = "let x = 1\nif (x > 5) {\n  print(\"big\")\n}\nprint(\"done\")\n";
+        let (table, out) = run_with_coverage(src);
+        assert_eq!(out, "done\n", "the false branch never prints 'big'");
+        let files = table.by_file();
+        assert_eq!(files.len(), 1, "one source file");
+        let f = &files[0];
+        // The never-taken branch (line 3, 1-based) is uncovered; it must appear in the
+        // instrumented universe (so we can report it as a MISS) but not be covered.
+        assert!(
+            f.uncovered_lines().contains(&3),
+            "line 3 (dead branch) is uncovered: {:?}",
+            f.uncovered_lines()
+        );
+        // The executed lines are covered (not in the uncovered set).
+        assert!(!f.uncovered_lines().contains(&1), "line 1 executed");
+        assert!(!f.uncovered_lines().contains(&5), "line 5 executed");
+        assert!(f.covered() >= 1 && f.total() > f.covered());
+    }
+
+    #[test]
+    fn coverage_observation_only_stdout_identical() {
+        // A representative program with a loop, a fn call, and a conditional. Its stdout
+        // under coverage must be byte-identical to a plain run (the trap re-dispatches the
+        // SAME op — observation-only, Gate 1).
+        let src = "fn sq(n) {\n  return n * n\n}\nlet total = 0\n\
+                   for (i in 1..4) {\n  total = total + sq(i)\n}\nprint(total)\n";
+        let (_table, cov_out) = run_with_coverage(src);
+        let plain_out = run_plain_output(src);
+        assert_eq!(cov_out, plain_out, "coverage stdout == plain stdout");
+        assert_eq!(cov_out, "14\n", "1+4+9 = 14");
+    }
+
+    #[test]
+    fn coverage_covers_a_called_function_body() {
+        // The body of `f` (line 2) is reached only via the call on line 4 — coverage must
+        // record it (the trap fires inside f's proto, a different proto than the entry).
+        let src = "fn f() {\n  return 42\n}\nlet r = f()\nprint(r)\n";
+        let (table, out) = run_with_coverage(src);
+        assert_eq!(out, "42\n");
+        let files = table.by_file();
+        assert_eq!(files.len(), 1);
+        let f = &files[0];
+        // Line 2 (f's body) is covered.
+        assert!(!f.uncovered_lines().contains(&2), "f's body line 2 covered");
     }
 
     #[test]

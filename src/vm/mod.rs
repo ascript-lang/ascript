@@ -7,6 +7,7 @@
 pub mod adapt;
 pub mod aso;
 pub mod chunk;
+pub mod coverage_report;
 pub mod disasm;
 pub mod fiber;
 pub mod ic;

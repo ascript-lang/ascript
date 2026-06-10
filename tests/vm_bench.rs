@@ -135,7 +135,16 @@
 //!
 //! A non-noise gap in armed/none would mean a stray instrumentation check leaked into a
 //! hot path: a BUG to fix, never an accepted tradeoff. The `assert!` in
-//! `dbg_zero_cost_gate` enforces it (bound 1.08x — generous for machine noise).
+//! `dbg_zero_cost_gate` enforces it (bound 1.05x — generous for machine noise).
+//!
+//! DX D2 TASK 7 — COVERAGE BENCH (spec §6.3.2, recorded 2026-06-10, release). Coverage
+//! hangs off the SAME `None`-gated `Vm.instrument` seam (its check lives only in the cold
+//! `Op::Break` arm), so the armed/none gate above ALSO proves coverage-OFF == baseline
+//! (config (2)). RESULT — PASS: armed/none = **0.999x** (gate holds with coverage code
+//! present). The reported config (3) — `--coverage` ON — is **cov/off geomean = 0.999x**:
+//! coverage patches each line's first offset, so each line traps AT MOST ONCE then
+//! un-patches + runs free → for the compute-bound corpus the per-line traps amortize to
+//! the noise. The patch-based design keeps `--coverage` cheap; the OFF path pays nothing.
 //!
 //!   (a) COMPUTE-BOUND >= 2x spec/tw: PASS (all 7 compute benches, min 2.87x).
 //!   (b) NO spec-vs-generic regression: PASS (every bench; alloc benches at ~1.0x
@@ -162,6 +171,11 @@ enum Engine {
     /// The "attached debugger, idle" config — its time must be within noise of
     /// `SpecializedVm` (`instrument == None`), the zero-cost-when-off acceptance gate.
     ArmedIdleVm,
+    /// DX D2 Task 7: the SPECIALIZED VM with LINE COVERAGE armed (`--coverage` on, config
+    /// 3). Each line traps at most ONCE (then un-patches), so for a compute-bound loop the
+    /// cost is amortized; the overhead is REPORTED (not gated — the attached path is
+    /// expected to cost something, unlike the zero-cost OFF path).
+    CoverageVm,
 }
 
 /// Run `src` once on `engine`, asserting it succeeds. Returns the elapsed time.
@@ -187,6 +201,11 @@ async fn time_once(engine: Engine, src: &str, name: &str) -> Duration {
             ascript::vm_run_source_armed_idle(src)
                 .await
                 .unwrap_or_else(|e| panic!("armed-idle VM failed on `{name}`: {e}"));
+        }
+        Engine::CoverageVm => {
+            ascript::vm_run_source_coverage(src)
+                .await
+                .unwrap_or_else(|e| panic!("coverage VM failed on `{name}`: {e}"));
         }
     }
     start.elapsed()
@@ -522,6 +541,49 @@ async fn dbg_zero_cost_gate(benches: &[Bench]) {
         geomean <= ZERO_COST_BOUND,
         "DBG zero-cost gate FAILED: armed-idle geomean {geomean:.3}x > {ZERO_COST_BOUND:.2}x \
          (instrumentation overhead leaked into a hot path)"
+    );
+    println!();
+
+    dx_coverage_overhead(benches).await;
+}
+
+/// DX D2 Task 7 — the coverage benchmark (spec §6.3.2). The Gate-12 ACCEPTANCE (config (2)
+/// coverage-OFF == baseline) is already proven by [`dbg_zero_cost_gate`] above: coverage
+/// hangs off the SAME `None`-gated `Vm.instrument` seam and the coverage check lives ONLY
+/// in the cold `Op::Break` trap arm, so `instrument == None` (no `--coverage`) is the
+/// byte-identical production hot loop the armed/none gate measures at ~1.000x.
+///
+/// This section REPORTS (does not gate) config (3) — `--coverage` ON — overhead: coverage
+/// patches each line's first offset, so each line traps AT MOST ONCE then un-patches and
+/// runs free. For a compute-bound loop the traps are amortized over the run, so coverage/
+/// none approaches 1.0; the attached path is expected to cost SOMETHING (the arming walk +
+/// the one-time per-line traps), which is why it is reported, not gated.
+async fn dx_coverage_overhead(benches: &[Bench]) {
+    println!("DX COVERAGE OVERHEAD (Task 7 §6.3.2): --coverage ON vs OFF (reported, not gated)");
+    println!(
+        "{:<28} {:>11} {:>11} {:>12}",
+        "benchmark", "off (ms)", "cov (ms)", "cov/off",
+    );
+    println!("{}", "-".repeat(28 + 11 * 2 + 12 + 3));
+    let mut ratios: Vec<f64> = Vec::new();
+    for b in benches {
+        let (off_med, _) = measure(Engine::SpecializedVm, b.src, b.name).await;
+        let (cov_med, _) = measure(Engine::CoverageVm, b.src, b.name).await;
+        let ratio = cov_med.as_secs_f64() / off_med.as_secs_f64();
+        ratios.push(ratio);
+        println!(
+            "{:<28} {} {} {:>11.3}x",
+            b.name,
+            ms(off_med),
+            ms(cov_med),
+            ratio,
+        );
+    }
+    let geomean = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
+    println!();
+    println!(
+        "geomean cov/off = {geomean:.3}x  (REPORTED — coverage ON is an attached path; \
+         the OFF==baseline gate is the armed/none result above)"
     );
     println!();
 }

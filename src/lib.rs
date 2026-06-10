@@ -214,6 +214,201 @@ pub async fn run_tests_with_options(
     }
 }
 
+/// DX D2 Task 6 — run `files` as a test suite on the bytecode VM with LINE COVERAGE
+/// armed, returning the aggregated [`TestSummary`] plus the rendered coverage report
+/// string (text/lcov) or a path hint (html, written to `target/coverage/`).
+///
+/// **VM-only (documented asymmetry).** The normal `ascript test` path runs on the
+/// tree-walker (the differential oracle); coverage is recorded via the patch-based
+/// `Op::Break` trap on the `Vm.instrument` seam, so a coverage run executes on the VM
+/// instead. Each test FILE runs in its own `Interp`+`Vm` (so proto identities are
+/// per-chunk and the per-file table is independent); the per-file tables are MERGED in
+/// stable order (order-independent set/map unions). Because each registered `test(...)`
+/// closure is a `Value::Closure`, `run_registered_tests` re-enters the SAME armed `Vm`
+/// (via `interp.vm()`), so coverage observes both the module body and every test body.
+///
+/// **Observation-only.** The trap marks the line covered, restores the original opcode,
+/// and re-dispatches it — so the program's behavior + output are byte-identical to a
+/// non-coverage run (the Gate-1 invariant).
+pub async fn run_tests_with_coverage(
+    files: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    filter: Option<&str>,
+    format: crate::vm::coverage_report::CoverageFormat,
+) -> Result<(TestSummary, String), AsError> {
+    use crate::vm::instrument::CoverageTable;
+
+    let filter = match filter {
+        Some(raw) => Some(crate::test_filter::TestFilter::parse(raw).map_err(AsError::new)?),
+        None => None,
+    };
+    let filter = filter.as_ref();
+
+    let mut summary = TestSummary::default();
+    let mut merged = CoverageTable::new();
+    // For an HTML report we also keep each file's source text to color the line view.
+    let mut sources: Vec<(String, String)> = Vec::new();
+
+    for file in files {
+        let path = std::path::Path::new(file);
+        let (file_summary, table, src_pair) =
+            run_one_file_with_coverage(path, packages.clone(), caps.clone(), filter).await?;
+        // Stable input-file-order aggregation (mirrors the serial path's determinism).
+        summary.passed += file_summary.passed;
+        summary.failed += file_summary.failed;
+        summary.filtered += file_summary.filtered;
+        summary.failures.extend(file_summary.failures);
+        merged.merge(&table);
+        if let Some(pair) = src_pair {
+            sources.push(pair);
+        }
+    }
+
+    let report = render_coverage(&merged, format, &sources);
+    Ok((summary, report))
+}
+
+/// Run ONE test file on a coverage-armed VM: compile, arm coverage over the proto tree,
+/// run the module top-level (which registers `test(...)` closures), then run the
+/// registered tests (re-entering the same VM), and reclaim the coverage table. Returns
+/// the per-file summary, its coverage table, and its `(path, source)` pair.
+async fn run_one_file_with_coverage(
+    path: &std::path::Path,
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    filter: Option<&crate::test_filter::TestFilter>,
+) -> Result<
+    (
+        TestSummary,
+        crate::vm::instrument::CoverageTable,
+        Option<(String, String)>,
+    ),
+    AsError,
+> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::instrument::{CoverageTable, Instrumentation};
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // Bind the module source onto the whole proto tree so the coverage arming can read
+    // each proto's path + line table.
+    chunk.set_module_source(&src_info);
+
+    let interp = Rc::new(Interp::new());
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
+    interp.set_worker_source(&src);
+    if let Some(map) = packages {
+        interp.set_package_resolver(map);
+    }
+    interp.install_self();
+    let vm = Vm::with_instrument(
+        interp.clone(),
+        Instrumentation {
+            breakpoints: None,
+            profiler: None,
+            coverage: Some(CoverageTable::new()),
+        },
+    );
+    if let Some(dir) = path.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    // Arm coverage over the entry proto tree BEFORE running (patches each line's first
+    // offset to Op::Break; the cold trap arm recovers + records each line on first hit).
+    vm.arm_coverage(&proto);
+
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let mut file_summary = TestSummary::default();
+    let run_result: Result<(), AsError> = local
+        .run_until(crate::interp::telemetry_root_scope(async {
+            // Run the module body (registers tests; coverage records its lines).
+            match vm.run(&mut fiber).await {
+                Ok(RunOutcome::Done(_)) | Err(crate::interp::Control::Propagate(_)) => {}
+                Ok(RunOutcome::Yielded(_)) => {
+                    unreachable!("top-level program cannot yield")
+                }
+                Err(crate::interp::Control::Panic(e)) => {
+                    return Err(e.with_source(src_info.clone()))
+                }
+                Err(crate::interp::Control::Exit(_)) => {
+                    return Err(AsError::new("exit() called during test run"))
+                }
+            }
+            // Run the registered tests (each re-enters the same armed VM).
+            match interp.run_registered_tests_filtered(filter).await {
+                Ok(s) => {
+                    file_summary = s;
+                    Ok(())
+                }
+                Err(crate::interp::Control::Exit(_)) => {
+                    Err(AsError::new("exit() called during test run"))
+                }
+                Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info.clone())),
+                Err(crate::interp::Control::Propagate(_)) => Ok(()),
+            }
+        }))
+        .await;
+    local.await;
+    crate::gc::collect();
+    run_result?;
+
+    let table = vm.take_coverage().unwrap_or_default();
+    Ok((file_summary, table, Some((src_info.path.clone(), src))))
+}
+
+/// Render the merged coverage table in the requested format. For `html` the report is a
+/// self-contained tree written under `target/coverage/`; the returned string is a
+/// human-readable hint pointing at the written index.
+fn render_coverage(
+    table: &crate::vm::instrument::CoverageTable,
+    format: crate::vm::coverage_report::CoverageFormat,
+    sources: &[(String, String)],
+) -> String {
+    use crate::vm::coverage_report::{render_html, render_lcov, render_text, CoverageFormat};
+    match format {
+        CoverageFormat::Text => render_text(table),
+        CoverageFormat::Lcov => render_lcov(table),
+        CoverageFormat::Html => {
+            let html = render_html(table, sources);
+            let dir = std::path::Path::new("target").join("coverage");
+            let index = dir.join("index.html");
+            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&index, &html)) {
+                Ok(()) => format!("coverage html written to {}\n", index.display()),
+                // Fall back to emitting the HTML on stdout if the write fails (never
+                // panic on a reachable path — e.g. a read-only filesystem).
+                Err(e) => format!("warning: could not write {}: {e}\n{html}", index.display()),
+            }
+        }
+    }
+}
+
 /// The serial test path: every file loaded into one `Interp`, all tests run together.
 async fn run_tests_serial(
     files: &[String],
@@ -1025,7 +1220,7 @@ pub async fn run_file_on_vm_profiled(
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
 /// `specialize = false` here.
 async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Option<i32>), AsError> {
-    vm_run_source_cfg(src, specialize, false).await
+    vm_run_source_cfg(src, specialize, false, false).await
 }
 
 /// DBG Task 9 (zero-cost bench): run `src` on the SPECIALIZED VM with an EMPTY
@@ -1037,13 +1232,27 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
 /// noise of [`vm_run_source`] (`instrument == None`). `#[doc(hidden)]` test API.
 #[doc(hidden)]
 pub async fn vm_run_source_armed_idle(src: &str) -> Result<(String, Option<i32>), AsError> {
-    vm_run_source_cfg(src, true, true).await
+    vm_run_source_cfg(src, true, true, false).await
+}
+
+/// DX D2 Task 7 (coverage zero-cost bench): run `src` on the SPECIALIZED VM with LINE
+/// COVERAGE armed (`arm_coverage` patches each line's first offset to `Op::Break`). This
+/// is bench config (3) — `--coverage` ON. Its overhead is REPORTED (not gated): each line
+/// traps at most ONCE (then un-patches + runs free), so for a compute-bound loop the cost
+/// is amortized and the steady state matches `vm_run_source` — the demonstration that the
+/// patch-based design keeps coverage cheap. (Config (2), coverage-OFF == byte-identical to
+/// baseline, is proven by [`vm_run_source_armed_idle`]'s gate: the instrument seam is
+/// `None`-gated and the hot loop is untouched.) `#[doc(hidden)]` test API.
+#[doc(hidden)]
+pub async fn vm_run_source_coverage(src: &str) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg(src, true, false, true).await
 }
 
 async fn vm_run_source_cfg(
     src: &str,
     specialize: bool,
     armed: bool,
+    coverage: bool,
 ) -> Result<(String, Option<i32>), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -1068,15 +1277,23 @@ async fn vm_run_source_cfg(
         local_names: Vec::new(),
         debug_name: None,
     });
-    let closure = Closure::new(proto);
+    let closure = Closure::new(proto.clone());
 
     let interp = Rc::new(Interp::new());
     interp.install_self();
     // Workers Spec A: retain the source so a `worker fn` call can build its slice.
     interp.set_worker_source(src);
-    // DBG Task 9: `armed` builds the VM with an EMPTY instrumentation payload (the
-    // attached-but-idle config); otherwise `instrument == None` (the production path).
-    let vm = if armed {
+    // The instrumentation config (DBG Task 9 / DX D2 Task 7 — the zero-cost bench seam):
+    //   `coverage` → an armed CoverageTable + `arm_coverage` (config 3: --coverage on);
+    //   `armed`    → an EMPTY instrumentation payload (the attached-but-idle config);
+    //   else       → `instrument == None` (the production path).
+    let vm = if coverage {
+        let mut inst = crate::vm::instrument::Instrumentation::empty();
+        inst.coverage = Some(crate::vm::instrument::CoverageTable::new());
+        let vm = Vm::with_instrument(interp.clone(), inst);
+        vm.arm_coverage(&proto);
+        vm
+    } else if armed {
         Vm::with_instrument(interp.clone(), crate::vm::instrument::Instrumentation::empty())
     } else {
         Vm::with_specialize(interp.clone(), specialize)

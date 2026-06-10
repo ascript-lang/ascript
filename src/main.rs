@@ -201,6 +201,19 @@ enum Command {
         /// interrupted (Ctrl-C). Requires the `sys` feature (file watching).
         #[arg(long = "watch")]
         watch: bool,
+        /// DX D2 Task 6: record line COVERAGE for the test run on the bytecode VM and
+        /// report it. `--coverage` (no value) → a text report; `--coverage=lcov` → LCOV;
+        /// `--coverage=html` → a self-contained `target/coverage/` tree. The program
+        /// output is byte-identical to a non-coverage run (observation-only). Coverage
+        /// runs on the VM only (the tree-walker is the oracle, not instrumented).
+        #[arg(
+            long = "coverage",
+            value_name = "FORMAT",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "text"
+        )]
+        coverage: Option<String>,
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
@@ -878,6 +891,7 @@ async fn real_main() -> ExitCode {
             update_snapshots,
             filter,
             watch,
+            coverage,
         } => {
             // DX D2 Task 10: validate the `--filter` ONCE up front so a malformed regex is a
             // clean error before any test runs (the raw string is re-parsed downstream — in
@@ -888,6 +902,22 @@ async fn real_main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            // DX D2 Task 6: validate the `--coverage[=fmt]` value up front.
+            let coverage_fmt = match &coverage {
+                Some(raw) => {
+                    match ascript::vm::coverage_report::CoverageFormat::parse(raw) {
+                        Some(fmt) => Some(fmt),
+                        None => {
+                            eprintln!(
+                                "error: unknown coverage format '{raw}' \
+                                 (expected text, lcov, or html)"
+                            );
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                None => None,
+            };
             let filter_raw: Option<&str> = filter.as_deref();
             // DX D2: `--parallel` (no value) → `num_cpus` isolates; `--parallel=N` → N;
             // absent → `None` (serial). The `default_missing_value = "0"` sentinel maps
@@ -955,6 +985,39 @@ async fn real_main() -> ExitCode {
                     );
                     return ExitCode::from(1);
                 }
+            }
+
+            // DX D2 Task 6: a `--coverage` run uses the VM-based coverage runner (the
+            // normal `ascript test` path runs on the tree-walker, which is NOT instrumented
+            // — coverage is a VM-only feature, a documented asymmetry). It records line
+            // coverage on the `Vm.instrument` seam, prints the same FAIL/tally lines, then
+            // emits the coverage report in the requested format. Program output is
+            // byte-identical to a non-coverage run (the trap re-dispatches the same op).
+            if let Some(fmt) = coverage_fmt {
+                let cov_result =
+                    ascript::run_tests_with_coverage(&files, packages, caps, filter_raw, fmt)
+                        .await;
+                return match cov_result {
+                    Ok((summary, report)) => {
+                        for (name, message) in &summary.failures {
+                            println!("FAIL {}: {}", name, message);
+                        }
+                        summary.print_tally();
+                        // The report goes to stdout (text/lcov) or is written to
+                        // target/coverage/ (html) by the runner — `report` is the
+                        // stdout-bound text (a path hint for html).
+                        print!("{report}");
+                        if summary.failed > 0 {
+                            ExitCode::from(1)
+                        } else {
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(e) => {
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
+                };
             }
 
             let test_result = ascript::run_tests_with_options(
