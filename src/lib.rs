@@ -1220,7 +1220,7 @@ pub async fn run_file_on_vm_profiled(
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
 /// `specialize = false` here.
 async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Option<i32>), AsError> {
-    vm_run_source_cfg(src, specialize, false).await
+    vm_run_source_cfg(src, specialize, false, false).await
 }
 
 /// DBG Task 9 (zero-cost bench): run `src` on the SPECIALIZED VM with an EMPTY
@@ -1232,13 +1232,27 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
 /// noise of [`vm_run_source`] (`instrument == None`). `#[doc(hidden)]` test API.
 #[doc(hidden)]
 pub async fn vm_run_source_armed_idle(src: &str) -> Result<(String, Option<i32>), AsError> {
-    vm_run_source_cfg(src, true, true).await
+    vm_run_source_cfg(src, true, true, false).await
+}
+
+/// DX D2 Task 7 (coverage zero-cost bench): run `src` on the SPECIALIZED VM with LINE
+/// COVERAGE armed (`arm_coverage` patches each line's first offset to `Op::Break`). This
+/// is bench config (3) — `--coverage` ON. Its overhead is REPORTED (not gated): each line
+/// traps at most ONCE (then un-patches + runs free), so for a compute-bound loop the cost
+/// is amortized and the steady state matches `vm_run_source` — the demonstration that the
+/// patch-based design keeps coverage cheap. (Config (2), coverage-OFF == byte-identical to
+/// baseline, is proven by [`vm_run_source_armed_idle`]'s gate: the instrument seam is
+/// `None`-gated and the hot loop is untouched.) `#[doc(hidden)]` test API.
+#[doc(hidden)]
+pub async fn vm_run_source_coverage(src: &str) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg(src, true, false, true).await
 }
 
 async fn vm_run_source_cfg(
     src: &str,
     specialize: bool,
     armed: bool,
+    coverage: bool,
 ) -> Result<(String, Option<i32>), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -1263,15 +1277,23 @@ async fn vm_run_source_cfg(
         local_names: Vec::new(),
         debug_name: None,
     });
-    let closure = Closure::new(proto);
+    let closure = Closure::new(proto.clone());
 
     let interp = Rc::new(Interp::new());
     interp.install_self();
     // Workers Spec A: retain the source so a `worker fn` call can build its slice.
     interp.set_worker_source(src);
-    // DBG Task 9: `armed` builds the VM with an EMPTY instrumentation payload (the
-    // attached-but-idle config); otherwise `instrument == None` (the production path).
-    let vm = if armed {
+    // The instrumentation config (DBG Task 9 / DX D2 Task 7 — the zero-cost bench seam):
+    //   `coverage` → an armed CoverageTable + `arm_coverage` (config 3: --coverage on);
+    //   `armed`    → an EMPTY instrumentation payload (the attached-but-idle config);
+    //   else       → `instrument == None` (the production path).
+    let vm = if coverage {
+        let mut inst = crate::vm::instrument::Instrumentation::empty();
+        inst.coverage = Some(crate::vm::instrument::CoverageTable::new());
+        let vm = Vm::with_instrument(interp.clone(), inst);
+        vm.arm_coverage(&proto);
+        vm
+    } else if armed {
         Vm::with_instrument(interp.clone(), crate::vm::instrument::Instrumentation::empty())
     } else {
         Vm::with_specialize(interp.clone(), specialize)
