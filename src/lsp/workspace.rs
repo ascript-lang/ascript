@@ -576,10 +576,19 @@ impl WorkspaceIndex {
         // The decl site + the set of files to scan, derived from the identity.
         let resolved: Option<(PathBuf, ByteSpan, Vec<PathBuf>)> = match &target_id {
             GlobalBindingId::Local(fid, decl) => {
-                // A frame-precise local: the decl + uses live in ONE file only.
+                // A frame-precise local: the decl + uses live in ONE file only. The
+                // decl EDIT site is the binding's NAME token (from `local_decls`), not
+                // the whole decl-node range that keys the identity — so a rename
+                // replaces just `x`, not the entire `let x = …` statement.
                 self.interner.path(*fid).map(|p| {
                     let p = p.to_path_buf();
-                    (p.clone(), *decl, vec![p])
+                    let name_range = self
+                        .files
+                        .get(&p)
+                        .and_then(|f| f.local_decls.iter().find(|(_, d)| d == decl))
+                        .map(|(name_tok, _)| *name_tok)
+                        .unwrap_or(*decl);
+                    (p.clone(), name_range, vec![p])
                 })
             }
             GlobalBindingId::Global(fid, name) => self.interner.path(*fid).and_then(|p| {
@@ -660,27 +669,41 @@ impl WorkspaceIndex {
     /// have parsed cleanly. Returns the def's current name + name range for a
     /// `prepareRename`.
     pub fn prepare_rename(&self, path: &Path, offset: usize) -> Option<(String, ByteSpan)> {
-        let (def_path, name, range) = self.def_at(path, offset)?;
-        if !self.rename_scope_is_clean(&def_path) {
+        // DX D3 Task 12: prepareRename accepts any renameable binding the unified
+        // identity resolves — a top-level def/export, an imported use, OR a
+        // frame-local decl/use — refusing only when the binding has no identity or a
+        // touched file has a parse error (so a local rename is no longer rejected).
+        let canon = canonicalize(path);
+        let id = self.binding_id_at(&canon, offset)?;
+        let scope_root = match &id {
+            GlobalBindingId::Local(fid, _) | GlobalBindingId::Global(fid, _) => {
+                self.interner.path(*fid)?.to_path_buf()
+            }
+        };
+        if !self.rename_scope_is_clean(&scope_root) {
             return None;
         }
-        // The cursor's own file range (for the prepare highlight) — find the token
-        // under the cursor in THIS file.
-        let canon = canonicalize(path);
+        // The token under the cursor in THIS file (for the prepare highlight + the
+        // current name): a top-level def name, a frame-local decl name, or a use.
         let file = self.files.get(&canon)?;
-        let here = file
+        if let Some(d) = file
             .defs
             .iter()
             .find(|d| offset >= d.name_range.start && offset < d.name_range.end)
-            .map(|d| d.name_range)
-            .or_else(|| {
-                file.uses
-                    .iter()
-                    .find(|u| offset >= u.range.start && offset < u.range.end)
-                    .map(|u| u.range)
-            })?;
-        let _ = range;
-        Some((name, here))
+        {
+            return Some((d.name.clone(), d.name_range));
+        }
+        if let Some((name_tok, _)) = file
+            .local_decls
+            .iter()
+            .find(|(name_tok, _)| offset >= name_tok.start && offset < name_tok.end)
+        {
+            return Some((slice_text(&file.text, *name_tok), *name_tok));
+        }
+        file.uses
+            .iter()
+            .find(|u| offset >= u.range.start && offset < u.range.end)
+            .map(|u| (u.name.clone(), u.range))
     }
 
     /// Build the rename edit set: every reference to the def at `offset` (decl +
@@ -694,15 +717,31 @@ impl WorkspaceIndex {
         offset: usize,
         new_name: &str,
     ) -> Option<Vec<(PathBuf, ByteSpan)>> {
-        let (def_path, name, _range) = self.def_at(path, offset)?;
-        if !self.rename_scope_is_clean(&def_path) {
+        // DX D3 Task 12: route rename through the UNIFIED identity (the same
+        // `binding_id_at`/`references_at` join references uses), so renaming a
+        // FRAME-LOCAL binding works and the Task-11 shadowing edge holds end-to-end
+        // (a shadowing local of an imported name is never swept into the export's
+        // rename, and a local rename never escapes its file).
+        let canon = canonicalize(path);
+        let id = self.binding_id_at(&canon, offset)?;
+        // The scope root is the binding's home file: for a Local it is the only file
+        // touched; for a Global it is the DEFINER (its importers are touched too).
+        let (scope_root, global_name) = match &id {
+            GlobalBindingId::Local(fid, _) => (self.interner.path(*fid)?.to_path_buf(), None),
+            GlobalBindingId::Global(fid, name) => {
+                (self.interner.path(*fid)?.to_path_buf(), Some(name.clone()))
+            }
+        };
+        if !self.rename_scope_is_clean(&scope_root) {
             return None;
         }
         // Collision guard: the new name must not already be a top-level def in the
-        // def's file or any importer.
-        let mut touched: Vec<PathBuf> = vec![def_path.clone()];
-        if let Some(importers) = self.importers.get(&def_path) {
-            touched.extend(importers.iter().cloned());
+        // home file or — for a global — any importer.
+        let mut touched: Vec<PathBuf> = vec![scope_root.clone()];
+        if global_name.is_some() {
+            if let Some(importers) = self.importers.get(&scope_root) {
+                touched.extend(importers.iter().cloned());
+            }
         }
         for fp in &touched {
             if let Some(file) = self.files.get(fp) {
@@ -711,19 +750,21 @@ impl WorkspaceIndex {
                 }
             }
         }
-        // Collect: the def's name range + every reference (uses + the importers'
-        // import clauses that name it).
-        let mut edits = self.references_at(&def_path, def_range_offset(self, &def_path, &name)?, true);
-        // Add import-clause name tokens in importers (they are `defs` of kind
-        // Import in those files with the same name).
-        if let Some(importers) = self.importers.get(&def_path) {
-            for imp in importers {
-                if let Some(file) = self.files.get(imp) {
-                    for d in &file.defs {
-                        if d.kind == DefKind::Import && d.name == name {
-                            let loc = (imp.clone(), d.name_range);
-                            if !edits.contains(&loc) {
-                                edits.push(loc);
+        // Collect the decl + every reference by the unified identity (works for both
+        // a Local — one file — and a Global — definer + importers).
+        let mut edits = self.references_at(&canon, offset, true);
+        // For a global/export, also rename the import-clause name tokens in importers
+        // (they are `defs` of kind Import in those files with the same name).
+        if let Some(name) = global_name {
+            if let Some(importers) = self.importers.get(&scope_root) {
+                for imp in importers {
+                    if let Some(file) = self.files.get(imp) {
+                        for d in &file.defs {
+                            if d.kind == DefKind::Import && d.name == name {
+                                let loc = (imp.clone(), d.name_range);
+                                if !edits.contains(&loc) {
+                                    edits.push(loc);
+                                }
                             }
                         }
                     }
@@ -841,14 +882,12 @@ fn pathdiff_lexical(base: &Path, target: &Path) -> PathBuf {
     out
 }
 
-/// Find the byte offset of the def NAMED `name` in `def_path` (its name-range
-/// start), so `references_at` can be re-anchored on the canonical decl.
-fn def_range_offset(idx: &WorkspaceIndex, def_path: &Path, name: &str) -> Option<usize> {
-    let file = idx.files.get(def_path)?;
-    file.defs
-        .iter()
-        .find(|d| d.name == name && d.kind != DefKind::Import)
-        .map(|d| d.name_range.start)
+/// The text of a byte-`ByteSpan` slice of `src` (the source the span indexes). The
+/// span comes from the file's own resolver facts, so it is always on char
+/// boundaries; an out-of-range/non-boundary span degrades to `""` rather than
+/// panicking.
+fn slice_text(src: &str, span: ByteSpan) -> String {
+    src.get(span.start..span.end).unwrap_or("").to_string()
 }
 
 /// Convert a [`ByteSpan`] into an LSP `Range` against `text` (byte→char→UTF-16
@@ -1191,7 +1230,17 @@ fn collect_uses(
             continue;
         };
         let use_range = nameref.text_range();
-        let range = ByteSpan::from(use_range);
+        // The resolver keys its verdict by the NameRef NODE range (`use_range`), but
+        // the edit/reference position must be the bare `Ident` TOKEN — a NameRef node
+        // can carry leading whitespace trivia (e.g. `x` in `return x`), and using the
+        // node range would make a rename eat the preceding space (`returnw`).
+        let tok_range = nameref
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == Ident)
+            .map(|t| t.text_range())
+            .unwrap_or(use_range);
+        let range = ByteSpan::from(tok_range);
         // FRAME-PRECISE: branch on the resolver's OWN verdict first.
         let target = match resolved.uses.get(&use_range) {
             // A local/upvalue use → its exact decl range (the shadowing binding).

@@ -908,6 +908,155 @@ fn lsp_cross_file_goto_definition_and_rename() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// DX D3 Task 12 — the Task-11 shadowing edge holds END-TO-END through the LSP
+/// providers (not just the `WorkspaceIndex` unit tests). File A exports `x`; file B
+/// imports `x` AND declares a same-named local `let x` in a nested frame. Renaming
+/// A's export must edit B's IMPORTED use + import clause but NEVER B's shadowing
+/// local; renaming B's local must stay entirely within its frame. references mirror
+/// rename. This proves references/rename match on the unified `GlobalBindingId`, not
+/// on name text, all the way out at the wire.
+#[test]
+fn lsp_cross_file_rename_respects_shadowing_local() {
+    let dir = std::env::temp_dir().join(format!("ascript_lsp_shadow_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a_path = dir.join("a.as");
+    let b_path = dir.join("b.as");
+    let a_text = "export let x = 1\n";
+    // line0 import clause `x`@9; line2 local decl `x`@6; line3 local use `x`@9;
+    // line5 imported use `x`@6 (module scope — the nested local is out of scope here).
+    let b_text = "import { x } from \"./a\"\nfn g() {\n  let x = 2\n  return x\n}\nprint(x)\n";
+    std::fs::write(&a_path, a_text).unwrap();
+    std::fs::write(&b_path, b_text).unwrap();
+    let a_uri = format!("file://{}", a_path.display());
+    let b_uri = format!("file://{}", b_path.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let overall = Instant::now() + Duration::from_secs(90);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+    for (uri, text) in [(&a_uri, a_text), (&b_uri, b_text)] {
+        client.notify(
+            "textDocument/didOpen",
+            json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text } }),
+        );
+        let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+    }
+
+    // Helper: the set of (line, character) start positions edited in a file by a
+    // rename `changes` object.
+    let edited_lines = |changes: &Value, uri: &str| -> Vec<(i64, i64)> {
+        changes
+            .get(uri)
+            .and_then(|v| v.as_array())
+            .map(|edits| {
+                edits
+                    .iter()
+                    .map(|e| {
+                        (
+                            e["range"]["start"]["line"].as_i64().unwrap_or(-1),
+                            e["range"]["start"]["character"].as_i64().unwrap_or(-1),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // (1) Rename A's export `x` (decl at line 0 char 11) -> `z`.
+    client.request(
+        2,
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": a_uri },
+            "position": { "line": 0, "character": 11 },
+            "newName": "z"
+        }),
+    );
+    let ren = client.read_response(2, overall);
+    let changes = &ren["result"]["changes"];
+    let b_edits = edited_lines(changes, &b_uri);
+    // B's import clause (line 0) + imported use (line 5) ARE edited.
+    assert!(
+        b_edits.contains(&(0, 9)),
+        "import clause `x` should rename: {ren}"
+    );
+    assert!(
+        b_edits.contains(&(5, 6)),
+        "imported use `print(x)` should rename: {ren}"
+    );
+    // B's SHADOWING local (decl line 2, use line 3) must NOT be touched.
+    assert!(
+        !b_edits.iter().any(|&(l, _)| l == 2 || l == 3),
+        "the shadowing local `let x`/`return x` must NOT be renamed: {b_edits:?} in {ren}"
+    );
+
+    // (2) Inverse: rename B's LOCAL `x` (decl at line 2 char 6) -> `w` stays in B's
+    // frame — no edit to A, no edit to B's import clause or imported use.
+    client.request(
+        3,
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": b_uri },
+            "position": { "line": 2, "character": 6 },
+            "newName": "w"
+        }),
+    );
+    let ren2 = client.read_response(3, overall);
+    let changes2 = &ren2["result"]["changes"];
+    assert!(
+        changes2.get(&a_uri).is_none(),
+        "renaming B's local must not edit A: {ren2}"
+    );
+    let b_edits2 = edited_lines(changes2, &b_uri);
+    assert!(
+        b_edits2.contains(&(2, 6)) && b_edits2.contains(&(3, 9)),
+        "the local decl + its use should rename: {b_edits2:?} in {ren2}"
+    );
+    assert!(
+        !b_edits2.iter().any(|&(l, _)| l == 0 || l == 5),
+        "the import clause + imported use must NOT be touched by the local rename: {b_edits2:?}"
+    );
+
+    // (3) references on A's export `x` excludes B's shadowing local but includes the
+    // imported use.
+    client.request(
+        4,
+        "textDocument/references",
+        json!({
+            "textDocument": { "uri": a_uri },
+            "position": { "line": 0, "character": 11 },
+            "context": { "includeDeclaration": false }
+        }),
+    );
+    let refs = client.read_response(4, overall);
+    let ref_arr = refs["result"].as_array().cloned().unwrap_or_default();
+    let b_ref_lines: Vec<i64> = ref_arr
+        .iter()
+        .filter(|loc| loc["uri"].as_str() == Some(b_uri.as_str()))
+        .map(|loc| loc["range"]["start"]["line"].as_i64().unwrap_or(-1))
+        .collect();
+    assert!(
+        b_ref_lines.contains(&5),
+        "references should include the imported use on line 5: {refs}"
+    );
+    assert!(
+        !b_ref_lines.contains(&3),
+        "references must NOT include the shadowing local use on line 3: {refs}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Phase 7: exercise one representative request per provider family that the main
 /// smoke test does not already hit end-to-end (documentLink, formatting, range
 /// formatting, codeAction, codeLens, documentColor, linkedEditingRange, declaration,
@@ -2002,13 +2151,14 @@ fn lsp_navigation_finds_worker_class() {
 
     // `Counter` in `Counter.spawn()` on line 1.
     // "async fn main() { let h = await Counter.spawn() }"
-    // `Counter` starts at char 31 on line 1.
+    // `Counter`'s `C` is at char 32 (char 31 is the space after `await`; the use
+    // range is now the bare Ident token, not the NameRef node + leading trivia).
     client.request(
         2,
         "textDocument/definition",
         json!({
             "textDocument": { "uri": f_uri },
-            "position": { "line": 1, "character": 31 }
+            "position": { "line": 1, "character": 32 }
         }),
     );
     let def_resp = client.read_response(2, overall);
