@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod bundle;
 pub mod check;
 pub mod compile;
 pub mod coro;
