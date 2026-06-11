@@ -540,7 +540,7 @@ A handler's return value is converted to a response:
 - **an object** `{status?, headers?, body?}` → as specified (defaults: status `200`, empty body). `body` may be a string or bytes; a `text/plain` content-type is added if none was set and the body is non-empty.
 - **a result pair** `[value, err]` → if `err` is non-nil, a `500` with the error message; otherwise the `value` is converted as above.
 
-> [!NOTE] A handler or middleware **panic** (Tier-2) or a `?`-propagated error never kills the server — it is caught and converted to a `500` (the message is included for dev-friendliness), and the accept loop keeps serving. An **unmatched route** falls through to a `404` (middleware still runs first, so it can authenticate). Oversized headers → `431`; an oversized declared body → `413`; a read timeout → `408`.
+> [!NOTE] A handler or middleware **panic** (Tier-2) or a `?`-propagated error never kills the server — it is caught and converted to a `500` (the message is included for dev-friendliness), and the accept loop keeps serving. An **unmatched route** falls through to a `404` (middleware still runs first, so it can authenticate). Oversized headers → `431`; an oversized declared body → `413`; a read timeout → `408`. The server speaks HTTP/1 with a fixed `Content-Length` body only: a request carrying a `Transfer-Encoding` header (e.g. `chunked`) is **not** decoded and gets a clean `501 Not Implemented` (it never silently reads an empty body), and a conflicting/duplicate `Content-Length` (differing values) or a non-numeric/negative one gets a `400 Bad Request` (identical duplicate `Content-Length` values are accepted as one).
 
 #### Response header validation (response-splitting guard)
 

@@ -119,8 +119,14 @@ enum ReadError {
     HeadersTooLarge,
     /// Declared `Content-Length` exceeded the configured limit → 413.
     BodyTooLarge,
-    /// Malformed request or a mid-request I/O error → 400.
+    /// Malformed request or a mid-request I/O error → 400. Also covers a
+    /// conflicting/duplicate or non-numeric/negative `Content-Length` (the parser
+    /// refuses to guess a framing length rather than silently last-one-wins or zero).
     BadRequest,
+    /// A `Transfer-Encoding` header is present. The server does not implement any
+    /// transfer-coding (chunked decoding is unimplemented), so rather than silently
+    /// reading a chunked body as EMPTY it fails loudly → 501. (Task 0.19b.)
+    NotImplemented,
 }
 
 /// Typed route schemas (SP5 §2). A route may declare schemas for any of the
@@ -503,7 +509,15 @@ async fn read_request(
     let target = parts.next().unwrap_or("/").to_string();
 
     let mut headers: Vec<(String, String)> = Vec::new();
-    let mut content_length = 0usize;
+    // Framing-header tracking (Task 0.19b). The server hand-rolls HTTP/1 framing and
+    // must FAIL LOUDLY on anything it can't frame correctly, never silently guess:
+    //  - any `Transfer-Encoding` → 501 (no transfer-coding/chunked decoding is
+    //    implemented; reading a chunked body as empty would be a silent wrong result).
+    //  - a duplicate `Content-Length` with a DIFFERING value, or a non-numeric/negative
+    //    one → 400 (RFC 7230 §3.3.2; identical duplicates are collapsed to one).
+    let mut content_length: Option<usize> = None;
+    let mut has_transfer_encoding = false;
+    let mut bad_content_length = false;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -511,12 +525,36 @@ async fn read_request(
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_string();
             let value = value.trim().to_string();
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                has_transfer_encoding = true;
+            }
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().unwrap_or(0);
+                // Parse strictly: a non-numeric/negative value is malformed framing.
+                // (`value` is already trimmed at the top of this loop.)
+                match value.parse::<usize>() {
+                    Ok(n) => match content_length {
+                        // A second Content-Length must MATCH the first, else it's a
+                        // conflicting framing length (smuggling-class ambiguity) → 400.
+                        Some(prev) if prev != n => bad_content_length = true,
+                        _ => content_length = Some(n),
+                    },
+                    Err(_) => bad_content_length = true,
+                }
             }
             headers.push((name, value));
         }
     }
+
+    // Transfer-Encoding present → 501 (we implement no transfer-coding). Checked
+    // BEFORE the body is read or the handler runs, so a chunked upload fails loudly.
+    if has_transfer_encoding {
+        return Err(ReadError::NotImplemented);
+    }
+    // Conflicting/duplicate or non-numeric/negative Content-Length → 400.
+    if bad_content_length {
+        return Err(ReadError::BadRequest);
+    }
+    let content_length = content_length.unwrap_or(0);
 
     // Reject an oversized body up front (by its declared length) WITHOUT reading it.
     if content_length > max_body {
@@ -648,6 +686,7 @@ fn reason(status: u16) -> &'static str {
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         _ => "OK",
     }
 }
@@ -1775,6 +1814,10 @@ impl Interp {
             }
             Ok(Err(ReadError::BodyTooLarge)) => Some(simple_response(413, "payload too large")),
             Ok(Err(ReadError::BadRequest)) => Some(simple_response(400, "bad request")),
+            // Transfer-Encoding present: we implement no transfer-coding → 501.
+            Ok(Err(ReadError::NotImplemented)) => {
+                Some(simple_response(501, "transfer-encoding not implemented"))
+            }
             // Timer elapsed: the read didn't complete in time.
             Err(_) => Some(simple_response(408, "request timeout")),
         };
@@ -3364,6 +3407,26 @@ await s.serve({{ maxRequests: 1 }})
         }
     }
 
+    /// Send an EXACT byte string to `host:port` (no framing helpers) and return the
+    /// full raw response text. Lets a test craft otherwise-impossible requests —
+    /// a `Transfer-Encoding` header, duplicate `Content-Length`, a malformed request
+    /// line — that the framed `client_request`/`client_request_raw` helpers can't.
+    async fn send_raw(hostport: String, raw: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            match tokio::net::TcpStream::connect(&hostport).await {
+                Ok(mut s) => {
+                    s.write_all(raw.as_bytes()).await.unwrap();
+                    s.flush().await.unwrap();
+                    let mut resp = Vec::new();
+                    s.read_to_end(&mut resp).await.unwrap();
+                    return String::from_utf8_lossy(&resp).into_owned();
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+    }
+
     /// Issue `n` sequential GET requests to `url`, ignoring the response bodies.
     /// Owned args so the future is `'static` + `Send` (it runs in a spawned task,
     /// off the server's `!Send` LocalSet thread). Sequential (not concurrent) so
@@ -3512,5 +3575,193 @@ await s.serve({{ maxRequests: {N} }})
              per-request reference is the bug; do NOT weaken this assertion.",
             after as isize - before as isize
         );
+    }
+
+    // ── Task 0.19b: fail loudly on unsupported/conflicting framing headers ──────
+    //
+    // The hand-rolled HTTP/1 parser does NOT implement transfer-codings (chunked) and
+    // must not silently read a chunked body as EMPTY. It also must not last-one-wins a
+    // conflicting/duplicate Content-Length. Both are silent-WRONG-result bugs; these
+    // tests pin the loud failures (501 / 400).
+
+    /// A request with `Transfer-Encoding` (any value) is rejected with a clean 501
+    /// BEFORE the handler runs — NOT a 2xx with a silently-empty body. (We do not
+    /// implement chunked decoding; failing loudly is the correct, safe behavior.)
+    #[tokio::test]
+    async fn transfer_encoding_chunked_is_501() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("POST", "/upload", (req) => "got:" + req.body)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        // A chunked POST: "5\r\nhello\r\n0\r\n\r\n" body. The old parser would read
+        // content_length=0 → an EMPTY body and a 200 "got:".
+        let hostport = format!("127.0.0.1:{port}");
+        let raw = format!(
+            "POST /upload HTTP/1.1\r\nHost: {hostport}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        );
+        let resp = with_server(&src, move || async move {
+            send_raw(hostport, raw).await
+        })
+        .await;
+        let status = resp.lines().next().unwrap_or("");
+        assert_eq!(
+            status, "HTTP/1.1 501 Not Implemented",
+            "chunked request must get a clean 501, not a silent 2xx empty body:\n{resp}"
+        );
+        // It must NOT have reached the handler (no "got:" body).
+        assert!(
+            !resp.contains("got:"),
+            "chunked request reached the handler (silent empty body):\n{resp}"
+        );
+    }
+
+    /// Two `Content-Length` headers with DIFFERING values are rejected with a 400
+    /// (the parser must not last-one-wins a conflicting framing length).
+    #[tokio::test]
+    async fn conflicting_content_length_is_400() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("POST", "/echo", (req) => "got:" + req.body)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let hostport = format!("127.0.0.1:{port}");
+        let raw = format!(
+            "POST /echo HTTP/1.1\r\nHost: {hostport}\r\nContent-Length: 3\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        );
+        let resp = with_server(&src, move || async move {
+            send_raw(hostport, raw).await
+        })
+        .await;
+        let status = resp.lines().next().unwrap_or("");
+        assert_eq!(
+            status, "HTTP/1.1 400 Bad Request",
+            "conflicting Content-Length must get a 400:\n{resp}"
+        );
+        assert!(
+            !resp.contains("got:"),
+            "conflicting Content-Length reached the handler:\n{resp}"
+        );
+    }
+
+    /// A non-numeric / negative `Content-Length` is rejected with a 400 (the parser
+    /// must not silently treat an absurd length as 0).
+    #[tokio::test]
+    async fn non_numeric_content_length_is_400() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("POST", "/echo", (req) => "got:" + req.body)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let hostport = format!("127.0.0.1:{port}");
+        let raw = format!(
+            "POST /echo HTTP/1.1\r\nHost: {hostport}\r\nContent-Length: abc\r\nConnection: close\r\n\r\nhello"
+        );
+        let resp = with_server(&src, move || async move {
+            send_raw(hostport, raw).await
+        })
+        .await;
+        let status = resp.lines().next().unwrap_or("");
+        assert_eq!(
+            status, "HTTP/1.1 400 Bad Request",
+            "non-numeric Content-Length must get a 400:\n{resp}"
+        );
+    }
+
+    /// A NEGATIVE `Content-Length` is rejected with a 400 (the `usize` parse rejects
+    /// the leading `-`, so the negative case is covered, not just non-numeric text).
+    #[tokio::test]
+    async fn negative_content_length_is_400() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("POST", "/echo", (req) => "got:" + req.body)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let hostport = format!("127.0.0.1:{port}");
+        let raw = format!(
+            "POST /echo HTTP/1.1\r\nHost: {hostport}\r\nContent-Length: -1\r\nConnection: close\r\n\r\nhello"
+        );
+        let resp = with_server(&src, move || async move {
+            send_raw(hostport, raw).await
+        })
+        .await;
+        let status = resp.lines().next().unwrap_or("");
+        assert_eq!(
+            status, "HTTP/1.1 400 Bad Request",
+            "negative Content-Length must get a 400:\n{resp}"
+        );
+    }
+
+    /// REGRESSION: a normal request (single valid Content-Length, no Transfer-Encoding)
+    /// still works — both a GET and a POST with a real body.
+    #[tokio::test]
+    async fn normal_request_still_works_no_regression() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("POST", "/echo", (req) => "got:" + req.body)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/echo");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("POST", &url, Some("hello body".to_string())).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "got:hello body");
+    }
+
+    /// REGRESSION: two IDENTICAL Content-Length headers are accepted (RFC 7230 §3.3.2
+    /// permits collapsing identical duplicates to one) — the body is read normally.
+    #[tokio::test]
+    async fn identical_duplicate_content_length_is_accepted() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("POST", "/echo", (req) => "got:" + req.body)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let hostport = format!("127.0.0.1:{port}");
+        let raw = format!(
+            "POST /echo HTTP/1.1\r\nHost: {hostport}\r\nContent-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        );
+        let resp = with_server(&src, move || async move {
+            send_raw(hostport, raw).await
+        })
+        .await;
+        let status = resp.lines().next().unwrap_or("");
+        assert_eq!(
+            status, "HTTP/1.1 200 OK",
+            "identical duplicate Content-Length should be accepted:\n{resp}"
+        );
+        assert!(resp.ends_with("got:hello"), "body wrong:\n{resp}");
     }
 }
