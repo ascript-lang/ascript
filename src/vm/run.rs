@@ -7362,6 +7362,64 @@ mod tests {
     }
 
     #[test]
+    fn variant_elem_oob_operand_is_nil_not_panic() {
+        // Task 0.7 robustness: a `VARIANT_ELEM` whose operand is past the end of the
+        // variant's positional payload reads as `Value::Nil` (via `.get(idx)`), NOT a
+        // host panic. We build a real 2-field positional variant as a const and index
+        // element 0xFFFF — verify(`variant_elem_max_operand_verifies`) already accepts
+        // the operand; here we prove the run loop is independently OOB-safe so the
+        // verifier need not (and soundly cannot) cap the bare index below `u16::MAX`.
+        use crate::value::{ArrayCell, EnumVariant, Payload};
+        let variant = Value::EnumVariant(Rc::new(EnumVariant {
+            enum_name: "E".to_string(),
+            name: "Pair".to_string(),
+            value: Value::Nil,
+            payload: Some(Payload::Positional(ArrayCell::new(vec![
+                Value::Float(1.0),
+                Value::Float(2.0),
+            ]))),
+            ctor: false,
+            def: None,
+        }));
+        let mut c = Chunk::new();
+        let k = c.add_const(variant);
+        c.emit_u16(Op::Const, k, s()); // push the variant (depth 1)
+        c.emit_u16(Op::VariantElem, 0xFFFF, s()); // OOB index → Nil (net 0)
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("must not panic on an out-of-range VARIANT_ELEM index") {
+            RunOutcome::Done(Value::Nil) => {}
+            other => panic!("expected Done(Nil) for an OOB VARIANT_ELEM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_variant_arity_oob_operand_is_false_not_panic() {
+        // Companion: `MATCH_VARIANT_ARITY(0xFFFF)` on a 2-field variant is a false
+        // match (`len == Some(n)`), never an index panic.
+        use crate::value::{ArrayCell, EnumVariant, Payload};
+        let variant = Value::EnumVariant(Rc::new(EnumVariant {
+            enum_name: "E".to_string(),
+            name: "Pair".to_string(),
+            value: Value::Nil,
+            payload: Some(Payload::Positional(ArrayCell::new(vec![
+                Value::Float(1.0),
+                Value::Float(2.0),
+            ]))),
+            ctor: false,
+            def: None,
+        }));
+        let mut c = Chunk::new();
+        let k = c.add_const(variant);
+        c.emit_u16(Op::Const, k, s());
+        c.emit_u16(Op::MatchVariantArity, 0xFFFF, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("must not panic on an out-of-range MATCH_VARIANT_ARITY count") {
+            RunOutcome::Done(Value::Bool(false)) => {}
+            other => panic!("expected Done(Bool(false)) for an OOB arity, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn get_index_object_missing_key_is_nil() {
         // {a:1}["b"] → nil (missing object key is nil, not a panic).
         let mut c = Chunk::new();
