@@ -611,12 +611,14 @@ impl ModuleArchive {
 - Modify: `src/vm/run.rs` / `src/worker/` (the code-shipping path that stashes `worker_aso_bytes`)
 - Test: `tests/native.rs` (extend `native_worker_bundle_parity`)
 
-- [ ] **Step 1: Write the failing test** — a bundled multi-module app whose `worker fn` calls into an imported module runs correctly from an empty dir.
-- [ ] **Step 2: Run it — expect FAIL** (worker isolate can't find the imported module on disk).
-- [ ] **Step 3: Implement** — ship the whole `ModuleArchive` (not just the entry `.aso`) across the worker airlock; the worker isolate installs it into its own `module_archive` at bootstrap so `load_file_module` resolves embedded modules.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — native test; blast-radius: archive bytes crossing the airlock must be plain `Send` bytes (they are); confirm no `Rc`/handle leaks across the boundary.
-- [ ] **Step 6: Commit** — `git commit -m "feat(worker): ship module archive to worker isolates"`
+- [x] **Step 1: Write the failing test** — a bundled multi-module app whose `worker fn` calls into an imported module runs correctly from an empty dir.
+- [x] **Step 2: Run it — expect FAIL** (worker isolate can't find the imported module on disk).
+- [x] **Step 3: Implement** — ship the whole `ModuleArchive` (not just the entry `.aso`) across the worker airlock; the worker isolate installs it into its own `module_archive` at bootstrap so `load_file_module` resolves embedded modules.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — native test; blast-radius: archive bytes crossing the airlock must be plain `Send` bytes (they are); confirm no `Rc`/handle leaks across the boundary.
+- [x] **Step 6: Commit** — `git commit -m "feat(worker): ship module archive to worker isolates"`
+
+> **Accepted (1.6):** commits `7b0f20a`+`729cc5a` (impl+tests) + `6467e9e` (review fixes) + `6d3e7de` (native-suite robustness, a discovered-bug fix). New per-`Interp` `worker_archive_bytes` stash (mirrors `worker_aso_bytes`), set in `run_verified_archive`/`run_archive` from `archive.encode()`. ONE shared `install_module_archive(vm, bytes)` helper installs the archive at ALL FIVE isolate sites — pooled `isolate_loop` (via new `Send` `WorkerRequest.archive_bytes` + `archive_installed` once-guard), inline graceful-degradation `run_slice_inline`, dedicated `dispatch_worker_dedicated`, actor `actor_loop`, stream `stream_loop` — each BEFORE the slice that re-runs imports. Airlock invariant preserved (`archive_bytes: Option<Vec<u8>>` is `Send`; no `Rc`/`Value`/handle crosses); `None`-archive path byte-identical. Spec ✅ (headline test verified to FAIL on base `ead9d4a`: `cannot find module './util'`) + code-quality ✅. 4 new native tests cover pooled/dedicated/actor/stream. **Discovered-bug fix:** `tests/native.rs` exhausted a space-constrained tmpfs under default parallelism (each bundle = ~123 MB whole-runtime copy; several coexisting overran free space) — fixed with a `TmpDir` cleanup-on-drop guard + per-test `serial_native()` serialization (peak = 1 bundle). Gates: native **14/14 at default parallelism (verified ×2)**, differential 378/378 both configs, archive 15/15, clippy clean both configs. **Carry-forward to 1.7 (owner-noted optimization, NOT a bug):** the pooled path re-ships the full archive bytes on EVERY `worker fn` request (the isolate installs once); this mirrors the existing `slice_bytes` always-ship model. A per-isolate caller-side code cache (suppress re-send after first ack) would optimize BOTH `archive_bytes` and `slice_bytes` but needs an ack-based pool protocol — deferred as a documented, owner-visible airlock optimization, not silently dropped.
 
 ### Task 1.7: Phase 1 holistic review
 
