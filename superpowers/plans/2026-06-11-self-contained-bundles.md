@@ -756,12 +756,14 @@ impl ModuleArchive {
 - Modify: `src/main.rs` / the archive runner
 - Test: `tests/native.rs`
 
-- [ ] **Step 1: Write the failing test** — `ASCRIPT_DENY=fs ./app` denies `fs` even if the embedded set granted it; it can never RE-grant a denied cap.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Implement** — after installing the embedded `CapSet`, parse `ASCRIPT_DENY` (comma-separated cap names, same grammar as `--deny`) and subtract those caps (intersection-only; never add). Argv is untouched (still forwarded to the program).
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — native test; docs: bundles page "restricting a bundle at launch"; blast-radius: invalid cap names in `ASCRIPT_DENY` → a clear startup error, not a silent ignore.
-- [ ] **Step 6: Commit** — `git commit -m "feat(bin): ASCRIPT_DENY monotone subtracts from embedded caps"`
+- [x] **Step 1: Write the failing test** — `ASCRIPT_DENY=fs ./app` denies `fs` even if the embedded set granted it; it can never RE-grant a denied cap.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Implement** — after installing the embedded `CapSet`, parse `ASCRIPT_DENY` (comma-separated cap names, same grammar as `--deny`) and subtract those caps (intersection-only; never add). Argv is untouched (still forwarded to the program).
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — native test; docs: bundles page "restricting a bundle at launch"; blast-radius: invalid cap names in `ASCRIPT_DENY` → a clear startup error, not a silent ignore.
+- [x] **Step 6: Commit** — `git commit -m "feat(bin): ASCRIPT_DENY monotone subtracts from embedded caps"`
+
+> **Accepted (3.3):** commit `0155955`. `apply_ascript_deny(caps) -> Result<CapSet, AsError>` (lib.rs): reads `ASCRIPT_DENY` (comma-separated, same `cap_name` grammar as `--deny`), `caps.deny(cap)` per name (MONOTONE — `deny` only, never grant); unset/empty/whitespace/non-UTF-8 → unchanged; unknown name → clean STARTUP `AsError` (matches `--deny` vocabulary). Wired into BOTH cap-install points (`run_verified_archive` after the `restrict_with` floor compose; the bare-`ASO\0` branch of `run_verified_aso`, now starting from `all_granted` so an unrestricted bundle is still restrictable) — so native `./app` AND `ascript run x.aso` (archive AND bare-chunk forms) honor it. The `?` aborts before `set_caps`/any user code. Source runs use CLI `--deny` (out of scope, noted). **SECURITY review ✅ Sound** — adversarial matrix: NO re-grant primitive exists anywhere (`bits` only ever `&= !`-cleared); fail-CLOSED on every malformed value (`bogus`→error, `net,bogus`→errors on bogus with net NOT partially applied, uppercase `NET`→rejected not silent-no-op, empty segments trimmed, whitespace trimmed, non-UTF-8→unset); both launch paths + all 4 archive/bare × native/.aso combos covered; the post-subtraction floor crosses the WORKER airlock; argv intact (`--c` reaches the program); three-way compose `archive.caps ∩ CLI --deny ∩ ASCRIPT_DENY` all monotone, none lost/re-granted. No `.aso`/`ASO_FORMAT_VERSION` change. native 30/30 both configs; caps 46/0; cap_audit 19/0; differential 378/0 both configs; clippy clean both configs.
 
 ### Task 3.4: Phase 3 holistic review
 
