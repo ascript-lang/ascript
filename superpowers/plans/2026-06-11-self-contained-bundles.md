@@ -516,12 +516,12 @@ let len = match content_length {
 - Modify: `src/stdlib/caps.rs`
 - Test: inline `#[test]`
 
-- [ ] **Step 1: Write the failing test** — a `CapSet` with `bits`, an `fs_scope` (write-deny + allowed prefixes), and a `net_scope` (external-deny + allowed hosts) round-trips through `to_bytes`/`from_bytes`.
-- [ ] **Step 2: Run it — expect FAIL** (helpers don't exist).
-- [ ] **Step 3: Implement** `pub fn to_bytes(&self) -> Vec<u8>` and `pub fn from_bytes(b: &[u8]) -> Result<(CapSet, usize), CapsDecodeError>`: write `bits:u8`, then `fs_scope` as `0u8` (none) or `1u8 + mode + len-prefixed prefix list`, then `net_scope` likewise. `from_bytes` bounds-checks every length against `b.len()` and returns the bytes consumed.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust test only; blast-radius: ensure no existing `CapSet` field is omitted (compile-time exhaustiveness — destructure the struct in `to_bytes` so a new field breaks the build).
-- [ ] **Step 6: Commit** — `git commit -m "feat(caps): CapSet to_bytes/from_bytes for archive embedding"`
+- [x] **Step 1: Write the failing test** — a `CapSet` with `bits`, an `fs_scope` (write-deny + allowed prefixes), and a `net_scope` (external-deny + allowed hosts) round-trips through `to_bytes`/`from_bytes`.
+- [x] **Step 2: Run it — expect FAIL** (helpers don't exist).
+- [x] **Step 3: Implement** `pub fn to_bytes(&self) -> Vec<u8>` and `pub fn from_bytes(b: &[u8]) -> Result<(CapSet, usize), CapsDecodeError>`: write `bits:u8`, then `fs_scope` as `0u8` (none) or `1u8 + mode + len-prefixed prefix list`, then `net_scope` likewise. `from_bytes` bounds-checks every length against `b.len()` and returns the bytes consumed.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust test only; blast-radius: ensure no existing `CapSet` field is omitted (compile-time exhaustiveness — destructure the struct in `to_bytes` so a new field breaks the build).
+- [x] **Step 6: Commit** — `git commit -m "feat(caps): CapSet to_bytes/from_bytes for archive embedding"`
 
 ### Task 1.2: the `ModuleArchive` container codec
 
