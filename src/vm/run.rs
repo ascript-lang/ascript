@@ -932,6 +932,17 @@ impl Vm {
     /// `target_logical_dir` is `Some(dir)` for an archived module (so its nested archive
     /// imports resolve against its own logical dir) and `None` for a disk module (the
     /// logical dir is inert on the pure-disk path — kept at the importer's current value).
+    ///
+    /// ASSUMPTION (load-bearing for the archive-installed + archive-MISS → disk fallthrough):
+    /// leaving `module_logical_dir` at the importer's value for a disk module is sound ONLY
+    /// because a PRODUCED archive is COMPLETE — `compile_archive` walks the whole graph and
+    /// errors on any unresolvable import, so every embedded module's relative imports are
+    /// archive HITS; the disk fallthrough fires only for sibling-on-disk modules that are
+    /// absent from the archive entirely, and THEIR transitive imports likewise miss the
+    /// archive and resolve purely by `module_dir` on disk. Phase 2/3 (PARTIAL archives /
+    /// `pkg/` keys) MUST revisit: if a disk module's transitive import could legitimately
+    /// resolve to an *archived* module, this stale logical dir would compute a wrong key —
+    /// at that point the loader must derive the disk module's own logical dir here too.
     #[allow(clippy::too_many_arguments)]
     async fn run_module_body(
         &self,
