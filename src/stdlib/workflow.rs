@@ -149,6 +149,11 @@ fn event_to_json(seq: usize, ev: &DetEvent) -> serde_json::Value {
             json!({"seq": seq, "kind": "MonotonicRead", "value": value})
         }
         DetEvent::RandomRead { value } => json!({"seq": seq, "kind": "RandomRead", "value": value}),
+        // Task 0.19c: a seeded byte draw (`uuid.v4`/`uuid.v7`/`crypto.randomBytes`/salts).
+        // The drawn bytes are stored as a JSON number array (same convention as the
+        // boundary byte events above — no new base64 dep; the `workflow` feature only
+        // pulls `data`/`serde_json`).
+        DetEvent::BytesRead { bytes } => json!({"seq": seq, "kind": "BytesRead", "bytes": bytes}),
         DetEvent::TimerSet { wake } => json!({"seq": seq, "kind": "TimerSet", "wake": wake}),
         DetEvent::ActivityCompleted {
             name,
@@ -258,6 +263,12 @@ fn log_to_events(text: &str) -> Vec<DetEvent> {
                 if let Some(v) = rec.get("value").and_then(|v| v.as_f64()) {
                     events.push(DetEvent::RandomRead { value: v });
                 }
+            }
+            // Task 0.19c: a seeded byte draw — decode the JSON number array back to bytes.
+            "BytesRead" => {
+                events.push(DetEvent::BytesRead {
+                    bytes: json_bytes(rec.get("bytes")),
+                });
             }
             "TimerSet" => {
                 if let Some(w) = rec.get("wake").and_then(|v| v.as_f64()) {
@@ -909,5 +920,29 @@ mod write_log_tests {
             "a failed write must NOT corrupt or truncate the existing log"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Task 0.19c: the `BytesRead` det-event survives the newline-JSON log codec
+/// (`events_to_log` → `log_to_events`) byte-for-byte. Guards the serde path the
+/// end-to-end workflow replay depends on.
+#[cfg(test)]
+mod bytes_read_log_codec_tests {
+    use super::{events_to_log, log_to_events};
+    use crate::det::DetEvent;
+
+    #[test]
+    fn bytes_read_round_trips_through_the_log() {
+        let events = vec![
+            DetEvent::BytesRead {
+                bytes: vec![0, 1, 127, 128, 255, 16],
+            },
+            DetEvent::RandomRead { value: 0.25 },
+            DetEvent::BytesRead { bytes: vec![] }, // empty draw is faithful too
+        ];
+        let log = events_to_log(&events);
+        assert!(log.contains("\"kind\":\"BytesRead\""), "log must carry the kind tag");
+        let back = log_to_events(&log);
+        assert_eq!(back, events, "BytesRead must round-trip the exact bytes");
     }
 }

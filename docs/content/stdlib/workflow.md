@@ -98,9 +98,22 @@ The log is newline-delimited JSON, one event per line, `seq`-ordered:
 { "seq": 0, "kind": "ActivityCompleted", "name": "fetchUser", "argsHash": "…", "result": {…} }
 { "seq": 1, "kind": "ClockRead",  "value": 1717459200123 }
 { "seq": 2, "kind": "RandomRead", "value": 0.5734 }
-{ "seq": 3, "kind": "TimerSet",   "wake": 1717459260000 }
+{ "seq": 3, "kind": "BytesRead",  "bytes": [12, 240, 5, …] }
+{ "seq": 4, "kind": "TimerSet",   "wake": 1717459260000 }
 { "kind": "WorkflowCompleted", "result": {…} }
 ```
+
+`BytesRead` records a seeded **byte draw** — the entropy behind `ctx.uuid()`,
+`uuid.v4`/`uuid.v7`, `crypto.randomBytes`, and the `crypto.hashPassword`/`bcryptHash`
+salts. The *exact drawn bytes* are logged, so replay reproduces them **verbatim**
+(faithful regardless of the seed), and a wrong-kind or wrong-length event at that
+position surfaces a divergence — the same record/replay discipline as `RandomRead`.
+
+> **Large draws bloat the log.** Bytes are stored verbatim as a JSON number array
+> (~3 bytes per byte). A 16-byte UUID is nothing, but a large `crypto.randomBytes(n)`
+> in a workflow body balloons the log (a 1 MiB draw → a ~3 MB entry; the 16 MiB max →
+> ~56 MB). To draw a large key or blob, do it **inside an `activity`** — then only the
+> derived result, not the raw entropy, enters the event log.
 
 On replay, the Nth `ctx`-effect is matched to the Nth recorded event of that kind,
 and the **call signature** (activity name + args hash) is asserted — a workflow-code
@@ -130,6 +143,14 @@ replaying a wrong value.
 the virtual clock and seeded RNG that back `ctx.now`/`ctx.random`/`ctx.uuid` are the
 same seams `--deterministic` uses, so a workflow's clock/RNG are reproducible across
 record and replay.
+
+The seeded **byte** draws behind `uuid.v4`/`uuid.v7`, `crypto.randomBytes`, and the
+`crypto.hashPassword`/`bcryptHash` salts are **fully event-sourced** (a `BytesRead`
+event per draw): replay returns the exact recorded bytes and a desync is detected —
+so they are replay-faithful and divergence-safe, not merely seed-reproducible. (They
+are still advised toward the `ctx`/activity form by the `workflow-determinism` lint,
+for the same clarity reason `math.random` is — the seam is genuinely non-deterministic
+*outside* a workflow.)
 
 > **Out of scope (the one model-2b residual):** reproducible *interleaving order* of
 > arbitrary concurrent in-workflow `task.spawn` fan-out. Workflows stay deterministic

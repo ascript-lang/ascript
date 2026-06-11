@@ -249,6 +249,53 @@ print(r)
     );
 }
 
+/// Task 0.19c: a workflow that draws seeded BYTES (`ctx.uuid()` + `uuid.v4` +
+/// `crypto.randomBytes` — all three route through `fill_seeded_bytes`) records
+/// `BytesRead` events and, on an idempotent resume of the COMPLETED log, reproduces
+/// them BYTE-IDENTICALLY from the events. Before 0.19c these draws were seed-reproducible
+/// but NOT event-sourced; this asserts the end-to-end faithful path.
+#[cfg(all(feature = "data", feature = "crypto"))]
+#[test]
+fn workflow_seeded_byte_draws_replay_byte_identical() {
+    let log = temp_log("byte_draws");
+    let src = format!(
+        r#"
+import {{ run, resume }} from "std/workflow"
+import {{ v4 }} from "std/uuid"
+import {{ randomBytes }} from "std/crypto"
+import {{ hexEncode }} from "std/encoding"
+
+fn flow(ctx, input) {{
+  let cid = ctx.uuid()
+  let id = v4()
+  let rb = hexEncode(randomBytes(8))
+  return `${{cid}}|${{id}}|${{rb}}`
+}}
+
+let r1 = await run(flow, 0, {{ log: "{log}" }})
+print(r1)
+let r2 = await resume(flow, 0, {{ log: "{log}" }})
+print(r2)
+"#,
+        log = log
+    );
+    let (out, code) = run_as(&src, "byte_draws");
+    assert_eq!(code, Some(0), "workflow program should exit 0; got: {out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "expected record + resume output, got: {out}");
+    assert_eq!(
+        lines[0], lines[1],
+        "resume must reproduce the recorded ctx.uuid + uuid.v4 + random bytes byte-identically (from BytesRead events)"
+    );
+    // The log must actually carry BytesRead events (proves the draws were event-sourced,
+    // not bypassed).
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("\"kind\":\"BytesRead\""),
+        "the workflow log must contain BytesRead events; got log:\n{log_text}"
+    );
+}
+
 #[test]
 fn non_serializable_activity_result_is_a_constraint_violation() {
     let log = temp_log("nonser");

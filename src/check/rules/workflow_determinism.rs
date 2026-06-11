@@ -6,6 +6,15 @@
 //!
 //! BEST-EFFORT and ZERO-FALSE-POSITIVE on the corpus (the existing checker bar): the
 //! *runtime* replay-mismatch detector (`ctx.call`) is the authoritative guarantee.
+//!
+//! Task 0.19c note: `crypto.randomBytes`/`uuid.v4`/`uuid.v7` are now FULLY event-sourced
+//! inside a workflow (their seeded byte draws append a `DetEvent::BytesRead` that replay
+//! reproduces verbatim and a desync surfaces) — so they are already replay-FAITHFUL like
+//! `math.random`'s `RandomRead`. The lint KEEPS flagging them (advisory, default Warning):
+//! it is a consistency/clarity steer toward the explicit `ctx`/activity form (it flags the
+//! already-event-sourced `math.random` for the same reason), and the seam is genuinely
+//! non-deterministic OUTSIDE a deterministic context — which this static rule can't tell
+//! apart. Downgrading only the byte seams would be inconsistent and lose that steer.
 //! To stay zero-FP this rule is deliberately narrow:
 //! - it only inspects the workflow function when it is passed INLINE as an arrow
 //!   expression to `run`/`resume` (a named function passed by reference is not

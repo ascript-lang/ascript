@@ -1392,7 +1392,11 @@ impl Interp {
         let mut guard = self.determinism.borrow_mut();
         match guard.as_mut() {
             Some(ctx) => {
-                ctx.rng.fill_bytes(buf);
+                // Task 0.19c: event-source the byte draw (record the drawn bytes /
+                // replay them verbatim + detect a desync), symmetric with
+                // `next_seeded_f64` → `next_random_f64`. The NON-deterministic path
+                // (`None`) is unchanged: returns false so the caller uses the real CSPRNG.
+                ctx.next_seeded_bytes(buf);
                 true
             }
             None => false,

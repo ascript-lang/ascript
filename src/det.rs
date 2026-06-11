@@ -52,6 +52,19 @@ pub enum DetEvent {
     ClockRead { value: f64 },
     /// A `math.random`/seeded draw returned this `[0,1)` value.
     RandomRead { value: f64 },
+    /// A seeded BYTE draw (`fill_seeded_bytes` — `uuid.v4`/`uuid.v7` tail/
+    /// `crypto.randomBytes`/the `crypto.hashPassword`/`bcryptHash` salts) returned
+    /// these exact bytes. Recording the DRAWN BYTES (not just the count) makes replay
+    /// faithful regardless of the seed or any RNG-stream interleaving, and a wrong-kind
+    /// or wrong-length event at this cursor position surfaces a divergence (Task 0.19c).
+    ///
+    /// SIZE NOTE: the bytes are stored VERBATIM (the persisted workflow log encodes them
+    /// as a JSON number array, ~3 bytes/byte). A 16-byte UUID is trivial, but a large
+    /// `crypto.randomBytes(n)` inside a workflow body balloons the log (a 1 MiB draw →
+    /// ~3 MB entry; the 16 MiB max → ~56 MB). To draw a large key/blob in a workflow,
+    /// do it inside an `activity` so only the DERIVED result — not the raw entropy —
+    /// enters the event log.
+    BytesRead { bytes: Vec<u8> },
     /// A monotonic clock read returned this ms value.
     MonotonicRead { value: f64 },
     /// A durable timer was set to wake at this ms-epoch.
@@ -350,6 +363,45 @@ impl DeterminismContext {
         }
     }
 
+    /// Task 0.19c: draw `buf.len()` seeded bytes into `buf`, event-sourced so a replay
+    /// is FAITHFUL (returns the exact recorded bytes, independent of the seed) AND a
+    /// desync is DETECTED. Symmetric with [`Self::next_random_f64`]:
+    /// - Record: draw from the seeded PRNG, append a `BytesRead` of the drawn bytes.
+    /// - Replay: consume the next event; a `BytesRead` of the RIGHT LENGTH → copy into
+    ///   `buf`; a wrong-kind OR wrong-length event is a replay mismatch → surface the
+    ///   divergence (`replay_mismatch_recover_bytes`, the byte-path sibling of
+    ///   `replay_mismatch_recover`) and fill `buf` from the PRNG as a best-effort
+    ///   keep-going (the std/workflow detector is the authoritative guard).
+    /// - Exhaustion (None): fall through to Record (draw + append), matching the other
+    ///   readers' crash-point behavior.
+    pub fn next_seeded_bytes(&mut self, buf: &mut [u8]) {
+        match self.mode {
+            Mode::Record => {
+                self.rng.fill_bytes(buf);
+                self.events.push(DetEvent::BytesRead {
+                    bytes: buf.to_vec(),
+                });
+            }
+            Mode::Replay => match self.next_event() {
+                Some(DetEvent::BytesRead { bytes }) if bytes.len() == buf.len() => {
+                    buf.copy_from_slice(&bytes);
+                }
+                // A wrong-kind OR wrong-length event is a replay mismatch — surface it
+                // (LOUD divergence) rather than silently drawing fresh PRNG bytes (which
+                // would shift the whole replay one event out of phase) or copying a
+                // mismatched-length recorded value.
+                Some(other) => self.replay_mismatch_recover_bytes(other, buf),
+                None => {
+                    self.mode = Mode::Record;
+                    self.rng.fill_bytes(buf);
+                    self.events.push(DetEvent::BytesRead {
+                        bytes: buf.to_vec(),
+                    });
+                }
+            },
+        }
+    }
+
     /// Workers Spec B (Task 12): record one actor method-call boundary result.
     /// Record-mode ONLY (the caller checks `mode` first and crosses the isolate
     /// boundary for real before calling this); appends an [`DetEvent::ActorCall`].
@@ -473,6 +525,16 @@ impl DeterminismContext {
     /// a keep-going sentinel, not a unit-meaningful value.
     fn replay_mismatch_recover(&mut self, _got: DetEvent) -> f64 {
         self.clock.now_ms()
+    }
+
+    /// The byte-path sibling of [`Self::replay_mismatch_recover`] (Task 0.19c). A
+    /// `next_seeded_bytes` replay hit an unexpected event kind (or a `BytesRead` of the
+    /// wrong length). The recorded value must NOT leak through (a wrong-kind value is
+    /// meaningless as bytes, and a wrong-length one cannot fill `buf`), so we fill `buf`
+    /// from the seeded PRNG as a best-effort keep-going — the std/workflow non-determinism
+    /// detector is the authoritative guard that turns the divergence into a clean error.
+    fn replay_mismatch_recover_bytes(&mut self, _got: DetEvent, buf: &mut [u8]) {
+        self.rng.fill_bytes(buf);
     }
 
     /// Replay exhausted on a clock read → switch to Record and record from here.
@@ -742,6 +804,94 @@ mod tests {
     /// a wrong-kind event at the cursor silently drew a fresh PRNG value (bypassing
     /// replay, shifting the stream out of phase) instead of surfacing the divergence.
     /// A non-`RandomRead` event must now surface via `replay_mismatch_recover`.
+    /// Task 0.19c: a recorded byte draw replays FROM THE EVENT — faithful even when the
+    /// seed CHANGES between record and replay (proving the bytes come from the event, not
+    /// just a reproducible seed). This is the fidelity guarantee the pre-0.19c path lacked.
+    #[test]
+    fn record_then_replay_bytes_is_from_event_not_seed() {
+        // Record two byte draws of different lengths under seed 123.
+        let mut rec = DeterminismContext::record(123, 0.0);
+        let mut a0 = [0u8; 16];
+        let mut a1 = [0u8; 8];
+        rec.next_seeded_bytes(&mut a0);
+        rec.next_seeded_bytes(&mut a1);
+        let events = rec.events.clone();
+
+        // Replay with a DIFFERENT seed (999). If the bytes were re-drawn from the PRNG
+        // they'd diverge; because they come from the recorded event they're identical.
+        let mut rep = DeterminismContext::replay(999, 0.0, events);
+        let mut b0 = [0u8; 16];
+        let mut b1 = [0u8; 8];
+        rep.next_seeded_bytes(&mut b0);
+        rep.next_seeded_bytes(&mut b1);
+        assert_eq!(a0, b0, "byte draw must replay verbatim from the event");
+        assert_eq!(a1, b1, "second byte draw must replay verbatim from the event");
+
+        // Sanity: a fresh seed-999 PRNG would have produced DIFFERENT bytes — so the
+        // equality above genuinely proves event-fidelity, not seed-coincidence.
+        let mut fresh = SeededRng::new(999);
+        let mut diff = [0u8; 16];
+        fresh.fill_bytes(&mut diff);
+        assert_ne!(diff, b0, "seed 999 differs from recorded seed 123 — event was used");
+    }
+
+    /// Task 0.19c: a wrong-kind event at a byte-draw position surfaces a divergence — the
+    /// recorded value must NOT leak through (mirrors `next_random_f64`'s mismatch test).
+    #[test]
+    fn next_seeded_bytes_surfaces_replay_mismatch_on_clock_read() {
+        let events = vec![DetEvent::ClockRead { value: 999.0 }];
+        let mut rep = DeterminismContext::replay(7, 0.0, events);
+        let mut buf = [0u8; 8];
+        rep.next_seeded_bytes(&mut buf);
+        // The mismatch-recover fills from the seeded PRNG (best-effort keep-going). The
+        // recorded 999.0 has no byte representation that could leak; assert the buf was
+        // filled by the seed-7 PRNG, NOT left as a phase-shifted recorded value.
+        let mut expect = SeededRng::new(7);
+        let mut want = [0u8; 8];
+        expect.fill_bytes(&mut want);
+        assert_eq!(buf, want, "a wrong-kind event must surface via the byte mismatch-recover");
+    }
+
+    /// Task 0.19c: a `BytesRead` of the WRONG LENGTH is also a mismatch (not a silent
+    /// truncate/partial copy) — surfaced via the byte mismatch-recover.
+    #[test]
+    fn next_seeded_bytes_wrong_length_is_a_mismatch() {
+        let events = vec![DetEvent::BytesRead { bytes: vec![1, 2, 3, 4] }];
+        let mut rep = DeterminismContext::replay(7, 0.0, events);
+        let mut buf = [0u8; 8]; // asks for 8, recorded 4 → length mismatch
+        rep.next_seeded_bytes(&mut buf);
+        let mut expect = SeededRng::new(7);
+        let mut want = [0u8; 8];
+        expect.fill_bytes(&mut want);
+        assert_eq!(buf, want, "a wrong-length BytesRead must surface as a mismatch");
+        assert_eq!(rep.cursor, 1, "wrong-length BytesRead must be consumed");
+    }
+
+    /// Task 0.19c: byte-draw replay exhaustion falls through to Record (append a new
+    /// `BytesRead`), matching the clock/RNG seams' crash-point behavior.
+    #[test]
+    fn next_seeded_bytes_exhaustion_falls_through_to_record() {
+        let mut rec = DeterminismContext::record(5, 0.0);
+        let mut a0 = [0u8; 4];
+        rec.next_seeded_bytes(&mut a0);
+        let events = rec.events.clone();
+
+        let mut rep = DeterminismContext::replay(5, 0.0, events);
+        let mut b0 = [0u8; 4];
+        rep.next_seeded_bytes(&mut b0); // replayed
+        assert_eq!(a0, b0);
+        let mut b1 = [0u8; 4];
+        rep.next_seeded_bytes(&mut b1); // fell through to record
+        assert_eq!(rep.mode, Mode::Record);
+        assert_eq!(rep.events.len(), 2, "second draw appended a new BytesRead");
+        // The fall-through draw is the FIRST draw of a fresh seed-5 PRNG (replay returns
+        // recorded bytes WITHOUT advancing the PRNG, so the PRNG is still at its start).
+        let mut fresh = SeededRng::new(5);
+        let mut want = [0u8; 4];
+        fresh.fill_bytes(&mut want);
+        assert_eq!(b1, want);
+    }
+
     #[test]
     fn next_random_f64_surfaces_replay_mismatch_on_clock_read() {
         let events = vec![DetEvent::ClockRead { value: 999.0 }];
