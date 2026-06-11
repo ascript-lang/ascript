@@ -726,12 +726,14 @@ impl ModuleArchive {
 - Modify: `src/lib.rs` (`build_native`, `compile_archive`/`build`), `src/main.rs` (pass composed caps into the builder)
 - Test: `tests/native.rs`
 
-- [ ] **Step 1: Write the failing test** — `ascript build --native --deny net app.as -o app` produces an archive whose manifest `CapSet` has `net` denied.
-- [ ] **Step 2: Run it — expect FAIL** (manifest caps are all-granted placeholder).
-- [ ] **Step 3: Implement** — the builder receives the composed `CapSet` (from `compose_caps`: CLI `--deny`/`--sandbox`/carve-outs + `ascript.toml [capabilities]`) and stores it in the manifest via `CapSet::to_bytes`.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — native test; docs: bundles page "embedded capabilities"; blast-radius: a plain `build` (non-native) embeds caps too — confirm consistent.
-- [ ] **Step 6: Commit** — `git commit -m "feat(build): embed composed CapSet into the archive manifest"`
+- [x] **Step 1: Write the failing test** — `ascript build --native --deny net app.as -o app` produces an archive whose manifest `CapSet` has `net` denied.
+- [x] **Step 2: Run it — expect FAIL** (manifest caps are all-granted placeholder).
+- [x] **Step 3: Implement** — the builder receives the composed `CapSet` (from `compose_caps`: CLI `--deny`/`--sandbox`/carve-outs + `ascript.toml [capabilities]`) and stores it in the manifest via `CapSet::to_bytes`.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — native test; docs: bundles page "embedded capabilities"; blast-radius: a plain `build` (non-native) embeds caps too — confirm consistent.
+- [x] **Step 6: Commit** — `git commit -m "feat(build): embed composed CapSet into the archive manifest"`
+
+> **Accepted (3.1):** commits `74cea9f` (impl) + `2ceba01` (review fixes). Added the 4 cap flags (`--deny`/`--sandbox`/`--deny-net`/`--deny-fs`) to the `Build` command (mirroring `Run`); the Build dispatch reuses the SAME `compose_caps` chokepoint as `run`/`test`; `build_file`/`build_native` gained a `caps: Option<CapSet>` param and set `archive.caps = caps.unwrap_or_else(CapSet::all_granted)` before `encode()` (consistent for plain `build` AND `--native`). Spec review VERIFIED: caps decode identically for build/native/run (only `net` denied for `--deny net`); scope carve-outs round-trip through the manifest (`--deny-net=external` → `net_scope=Some(External)` survives); default = all-granted; NO early enforcement (a `--deny net` archive still calls net until 3.2 — runtime untouched, differential 378/0 both configs); no `.aso`/`ASO_FORMAT_VERSION` bump (caps field pre-existed). Single-module bare-chunk has no manifest → a VISIBLE `warning:` (shared `warn_single_module_caps()`, TODO-tagged for 3.2) fires only when `caps.is_some()` — not a silent drop; 3.2 makes `--native` always emit an archive. native 18/18 both configs; clippy clean both configs. **Owner-note (deferred to 3.4 holistic / a cleanup):** the 4 cap flags are now duplicated across `Run`/`Build` (+ `Test` has 2 of them) — extract a `#[command(flatten)]` cap-flags struct, but it touches Run/Test and Test deliberately lacks `--deny-net`/`--deny-fs` (a CLI-surface nuance), so it's a deliberate multi-command refactor, not a 3.1 drive-by.
 
 ### Task 3.2: enforce embedded caps at runtime (the N4 fix)
 
