@@ -925,3 +925,228 @@ fn build_without_cap_flags_embeds_all_granted() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── SELF-CONTAINED-BUNDLES Task 3.2 — ENFORCE the embedded CapSet at runtime (N4) ────────────
+
+/// `ascript run <ARGS> <artifact>` (run-time flags before the artifact path), cwd = `dir`.
+/// Used to drive a built `.aso`/bundle with run-time `--deny` flags for the composition tests.
+fn run_artifact_in(extra: &[&str], artifact: &Path, dir: &Path, args: &[&str]) -> Output {
+    Command::new(bin())
+        .arg("run")
+        .args(extra)
+        .arg(artifact)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+}
+
+/// Write a 2-module program that prints a NON-net line (from a sibling util), then makes a NET
+/// call (`net.lookup`) that is NOT recovered — so the line proves a non-net path runs while the
+/// net call's verdict decides exit/stderr. Returns the entry path.
+fn write_multimodule_net(dir: &Path) -> PathBuf {
+    write(
+        dir,
+        "util.as",
+        "export fn banner(): string { return \"non-net-ok\" }\n",
+    );
+    write(
+        dir,
+        "netapp.as",
+        "import { banner } from \"./util\"\n\
+         import * as net from \"std/net\"\n\
+         print(banner())\n\
+         let r = net.lookup(\"example.com\")\n\
+         print(\"reached-net\")\n",
+    )
+}
+
+/// THE N4 FIX (test 1) — a `--native --deny net` bundle ENFORCES the embedded floor at runtime:
+/// the net call is denied (non-zero exit, `capability 'net' denied` on stderr) while the non-net
+/// line still prints. Built WITHOUT `--deny`, the SAME program reaches the net call — proving
+/// enforcement (not some build artifact difference) is the sole cause.
+#[test]
+fn native_deny_net_enforced_at_runtime() {
+    let _serial = serial_native();
+    let dir = tmp_dir("enforce_net");
+    let entry = write_multimodule_net(&dir);
+    let empty = tmp_dir("enforce_net_cwd");
+
+    // (a) Built WITH --deny net → net denied at runtime.
+    let denied = dir.join("denied_app");
+    build_with(&["--native", "--deny", "net"], &entry, &denied);
+    let b = run_bundle(&denied, &empty, &[]);
+    assert!(!b.status.success(), "a --deny net bundle must fail at the net call");
+    let out = String::from_utf8_lossy(&b.stdout);
+    assert!(out.contains("non-net-ok"), "the non-net line must still print: {out}");
+    assert!(!out.contains("reached-net"), "the net call must NOT proceed: {out}");
+    let err = String::from_utf8_lossy(&b.stderr);
+    assert!(err.contains("capability 'net' denied"), "denial message expected: {err}");
+
+    // (b) Built WITHOUT --deny → the SAME program reaches the net call (no denial). The lookup
+    // itself may or may not resolve under a scrubbed env, but it is NOT a capability denial.
+    let granted = dir.join("granted_app");
+    build_native(&entry, &granted);
+    let g = run_bundle(&granted, &empty, &[]);
+    let gerr = String::from_utf8_lossy(&g.stderr);
+    assert!(
+        !gerr.contains("capability 'net' denied"),
+        "an unrestricted build must NOT deny net: {gerr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// GRANTED still works (test 2) — a multi-module `--native` bundle built with NO cap flags runs
+/// the net path with all caps granted (no capability denial). Pairs with test 1(b) but asserts a
+/// FULL multi-module bundle is unrestricted by default.
+#[test]
+fn native_no_cap_flags_grants_net() {
+    let _serial = serial_native();
+    let dir = tmp_dir("grant_net");
+    let entry = write_multimodule_net(&dir);
+    let empty = tmp_dir("grant_net_cwd");
+
+    let app = dir.join("grant_app");
+    build_native(&entry, &app);
+    let b = run_bundle(&app, &empty, &[]);
+    let out = String::from_utf8_lossy(&b.stdout);
+    let err = String::from_utf8_lossy(&b.stderr);
+    assert!(out.contains("non-net-ok"), "non-net line prints: {out}");
+    assert!(
+        !err.contains("capability 'net' denied"),
+        "all-granted bundle must not deny net: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// SINGLE-MODULE restricted now enforces (test 3, validates the artifact-format rule) — a
+/// `--native --deny net` build of a SINGLE-module program now emits an `ASCRIPTA` archive
+/// payload (not a bare `ASO\0` chunk), and the bundle denies net at runtime.
+#[test]
+fn native_single_module_deny_net_is_archive_and_enforces() {
+    let _serial = serial_native();
+    let dir = tmp_dir("single_net");
+    // A SINGLE-module program (no imports) that makes a net call.
+    let entry = write(
+        &dir,
+        "single.as",
+        "import * as net from \"std/net\"\n\
+         print(\"single-start\")\n\
+         let r = net.lookup(\"example.com\")\n\
+         print(\"single-reached-net\")\n",
+    );
+    let empty = tmp_dir("single_net_cwd");
+
+    let app = dir.join("single_app");
+    build_with(&["--native", "--deny", "net"], &entry, &app);
+
+    // The payload is now an ASCRIPTA archive (the caps floor has a home) — decode confirms it,
+    // with net denied in the embedded manifest.
+    let archive = decode_bundle_archive(&app);
+    assert_only_denied(&archive.caps, Cap::Net);
+    assert_eq!(archive.modules.len(), 1, "a single-module archive carries exactly one module");
+
+    // …and it ENFORCES at runtime.
+    let b = run_bundle(&app, &empty, &[]);
+    assert!(!b.status.success(), "single-module --deny net bundle must deny net");
+    let err = String::from_utf8_lossy(&b.stderr);
+    assert!(err.contains("capability 'net' denied"), "denial message expected: {err}");
+    let out = String::from_utf8_lossy(&b.stdout);
+    assert!(out.contains("single-start") && !out.contains("single-reached-net"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// COMPOSITION / NO RE-GRANT (test 4) — an `.aso` built `--deny net`, then `run` with a run-time
+/// `--deny fs`, denies BOTH net AND fs (monotone intersection). And run with NO run-time flag,
+/// net is STILL denied (the embedded floor cannot be re-granted). Uses the non-native `.aso`
+/// path (cheap, no full-runtime bundle) — the same `run_verified_archive` composition seam.
+#[test]
+fn aso_caps_compose_and_never_regrant() {
+    let dir = tmp_dir("compose");
+    // A program that (1) makes an fs call and (2) a net call, neither recovered, with markers so
+    // we can tell WHICH cap denied. fs is checked first in source order.
+    write(&dir, "cmput.as", "export fn tag(): string { return \"util\" }\n");
+    let entry = write(
+        &dir,
+        "compose.as",
+        "import { tag } from \"./cmput\"\n\
+         import * as net from \"std/net\"\n\
+         print(`start-${tag()}`)\n\
+         let n = net.lookup(\"example.com\")\n\
+         print(\"reached\")\n",
+    );
+    let out = dir.join("compose.aso");
+    // Build with the embedded floor denying net (multi-module → ASCRIPTA).
+    build_with(&["--deny", "net"], &entry, &out);
+    let arch = ModuleArchive::decode(&std::fs::read(&out).unwrap()).unwrap();
+    assert_only_denied(&arch.caps, Cap::Net);
+
+    // (a) No run-time flag → net STILL denied (the floor is enforced, not re-granted).
+    let b = run_artifact_in(&[], &out, &dir, &[]);
+    assert!(!b.status.success(), "embedded net-deny must be enforced with no run-time flag");
+    let berr = String::from_utf8_lossy(&b.stderr);
+    assert!(berr.contains("capability 'net' denied"), "net denied by the floor: {berr}");
+
+    // (b) Run-time --deny fs → BOTH net and fs denied. We assert the EFFECTIVE set via a probe
+    // program built into the same archive shape that prints caps.list(). Reuse the same artifact:
+    // run it with --deny fs; the program hits the net call first → still net denied, proving the
+    // floor survives AND the run-time flag composed (it cannot loosen net). The fs denial is
+    // proven by a dedicated caps.list probe below.
+    let probe = write(
+        &dir,
+        "probe.as",
+        "import { tag } from \"./cmput\"\n\
+         import * as caps from \"std/caps\"\n\
+         print(tag())\n\
+         print(caps.list())\n",
+    );
+    let pout = dir.join("probe.aso");
+    build_with(&["--deny", "net"], &probe, &pout);
+    // Run-time also denies fs → the effective list must exclude BOTH net and fs.
+    let p = run_artifact_in(&["--deny", "fs"], &pout, &dir, &[]);
+    assert!(p.status.success(), "probe should run: {}", String::from_utf8_lossy(&p.stderr));
+    let plist = String::from_utf8_lossy(&p.stdout);
+    assert!(
+        !plist.contains("net") && !plist.contains("fs"),
+        "effective caps must deny BOTH net (floor) and fs (run-time): {plist}"
+    );
+    assert!(
+        plist.contains("process") && plist.contains("ffi") && plist.contains("env"),
+        "the other caps stay granted: {plist}"
+    );
+
+    // (c) No run-time flag → the probe lists net DENIED but fs GRANTED (only the floor applies).
+    let p2 = run_artifact_in(&[], &pout, &dir, &[]);
+    let plist2 = String::from_utf8_lossy(&p2.stdout);
+    assert!(!plist2.contains("net"), "net denied by the floor: {plist2}");
+    assert!(plist2.contains("fs"), "fs still granted with no run-time flag: {plist2}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UNRESTRICTED single-module stays a bare `ASO\0` chunk (test 5) — `build <single>.as -o out.aso`
+/// with NO cap flags is byte-identical to today: a bare chunk, NOT an archive. (The default path
+/// is preserved → four-mode differential unaffected.)
+#[test]
+fn unrestricted_single_module_stays_bare_chunk() {
+    let dir = tmp_dir("bare_chunk");
+    let entry = write(&dir, "single.as", "print(6 * 7)\n");
+    let out = dir.join("out.aso");
+    build_with(&[], &entry, &out);
+
+    let bytes = std::fs::read(&out).unwrap();
+    // A bare chunk starts with the ASO magic; it is NOT an ASCRIPTA archive.
+    assert!(bytes.starts_with(b"ASO\0"), "unrestricted single-module build must be a bare ASO\\0 chunk");
+    assert!(
+        ModuleArchive::decode(&bytes).is_err(),
+        "a bare chunk must NOT decode as a ModuleArchive (it has no manifest)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

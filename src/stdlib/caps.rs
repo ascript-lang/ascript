@@ -263,6 +263,77 @@ pub fn host_of_url(url: &str) -> Option<String> {
     Some(host_of_addr(hostport).to_string())
 }
 
+/// The strictness order of the two `fs` deny modes: `All` (deny read AND write) is
+/// stricter than `Write` (deny writes only). Returns the stricter of `(a, b)`.
+fn stricter_fs_deny(a: FsDeny, b: FsDeny) -> FsDeny {
+    match (a, b) {
+        (FsDeny::All, _) | (_, FsDeny::All) => FsDeny::All,
+        _ => FsDeny::Write,
+    }
+}
+
+/// The strictness order of the two `net` deny modes: `All` (only allow-listed hosts)
+/// is stricter than `External` (loopback/private also reachable). Returns the
+/// stricter of `(a, b)`.
+fn stricter_net_deny(a: NetDeny, b: NetDeny) -> NetDeny {
+    match (a, b) {
+        (NetDeny::All, _) | (_, NetDeny::All) => NetDeny::All,
+        _ => NetDeny::External,
+    }
+}
+
+/// Intersect two allow-lists: an entry survives only if it appears in BOTH (so a
+/// merged carve-out can never allow back something either side denied). Order follows
+/// `a` and duplicates are dropped — the verdict is set-membership, so order/dup are
+/// not observable.
+fn intersect_allow(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in a {
+        if b.contains(s) && !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+/// The more-restrictive `fs` carve-out for `restrict_with`. `None` means the result
+/// has NO `fs` carve-out — either because both sides grant `fs` fully (the bit stays
+/// set via the bitset intersection) OR because some side denies `fs` outright (the
+/// bit is already clear and a denied class carries no allow-list).
+fn merge_fs(a: &CapSet, b: &CapSet) -> Option<FsScope> {
+    let a_full = a.has(Cap::Fs);
+    let b_full = b.has(Cap::Fs);
+    match (a_full, &a.fs_scope, b_full, &b.fs_scope) {
+        // Both grant fully → no carve-out (bit intersection leaves it granted).
+        (true, _, true, _) => None,
+        // One grants fully, the other carves out → use the carve-out.
+        (true, _, false, Some(s)) | (false, Some(s), true, _) => Some(s.clone()),
+        // Both carve out → stricter deny mode + intersected allow-list.
+        (false, Some(sa), false, Some(sb)) => Some(FsScope {
+            deny: stricter_fs_deny(sa.deny, sb.deny),
+            allow: intersect_allow(&sa.allow, &sb.allow),
+        }),
+        // Some side denies fs outright (no scope) → whole cap denied, no carve-out.
+        _ => None,
+    }
+}
+
+/// The more-restrictive `net` carve-out for `restrict_with` — the `net` mirror of
+/// [`merge_fs`].
+fn merge_net(a: &CapSet, b: &CapSet) -> Option<NetScope> {
+    let a_full = a.has(Cap::Net);
+    let b_full = b.has(Cap::Net);
+    match (a_full, &a.net_scope, b_full, &b.net_scope) {
+        (true, _, true, _) => None,
+        (true, _, false, Some(s)) | (false, Some(s), true, _) => Some(s.clone()),
+        (false, Some(sa), false, Some(sb)) => Some(NetScope {
+            deny: stricter_net_deny(sa.deny, sb.deny),
+            allow: intersect_allow(&sa.allow, &sb.allow),
+        }),
+        _ => None,
+    }
+}
+
 /// The per-`Interp` capability set: a five-bit grant bitset plus the two optional
 /// granular carve-outs for `fs`/`net` (§4.3/§4.4).
 ///
@@ -385,6 +456,43 @@ impl CapSet {
             Cap::Net if self.net_scope.is_some() => CapDecision::Defer,
             _ => CapDecision::Deny,
         }
+    }
+
+    /// Compose this set with `other` by **monotone intersection** (BNDL N4): the
+    /// result grants a capability ONLY IF BOTH sets grant it — neither side can
+    /// re-grant what the other denied. This is the security property of an embedded
+    /// capability floor: `archive.caps.restrict_with(&cli_caps)` enforces the
+    /// build-time restriction AND any run-time `--deny`, and a run-time flag can only
+    /// ever narrow further, never widen.
+    ///
+    /// Per whole-cap bit: granted in the result iff granted in BOTH (`bits & bits`).
+    /// For the `fs`/`net` carve-outs the result is the **more restrictive** of the
+    /// two sides (so a carve-out never widens access):
+    /// - either side denies the whole cap (bit clear, no scope) → the result denies
+    ///   the whole cap (no scope; over-restriction is sound);
+    /// - one side grants the cap fully and the other carries a scope → the result
+    ///   uses that scope;
+    /// - both carry a scope → the **stricter** deny-mode and the **intersection** of
+    ///   allow-lists; if the deny-modes are incomparable (they are totally ordered
+    ///   here, so this never fires) the whole cap is denied.
+    ///
+    /// Monotone, commutative on the verdict, and idempotent (`x.restrict_with(&x) == x`).
+    pub fn restrict_with(&self, other: &CapSet) -> CapSet {
+        let mut out = CapSet {
+            // Whole-cap intersection: granted iff granted in BOTH.
+            bits: self.bits & other.bits,
+            fs_scope: None,
+            net_scope: None,
+        };
+        // fs carve-out: the more restrictive of the two sides.
+        if let Some(scope) = merge_fs(self, other) {
+            out.set_fs_scope(scope);
+        }
+        // net carve-out: the more restrictive of the two sides.
+        if let Some(scope) = merge_net(self, other) {
+            out.set_net_scope(scope);
+        }
+        out
     }
 
     /// Build a `CapSet` by denying every name in `names` (CLI `--deny a,b` /
@@ -1302,6 +1410,133 @@ mod tests {
             CapSet::from_bytes(&bytes),
             Err(CapsDecodeError::InvalidUtf8)
         ));
+    }
+
+    // ─────────────────────── restrict_with — monotone intersection (N4) ───────
+    // The embedded-caps floor: archive.caps.restrict_with(&cli_caps). A capability is
+    // granted in the result iff BOTH sides grant it; a scope merges to the stricter.
+
+    #[test]
+    fn restrict_all_granted_is_identity() {
+        // all_granted ∩ X == X and X ∩ all_granted == X for any X.
+        let mut x = CapSet::all_granted();
+        x.deny(Cap::Process);
+        x.set_net_scope(NetScope { deny: NetDeny::External, allow: vec!["api.internal".into()] });
+        assert_eq!(CapSet::all_granted().restrict_with(&x), x);
+        assert_eq!(x.restrict_with(&CapSet::all_granted()), x);
+    }
+
+    #[test]
+    fn restrict_is_idempotent() {
+        let mut x = CapSet::all_granted();
+        x.deny(Cap::Env);
+        x.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec!["./cache".into()] });
+        assert_eq!(x.restrict_with(&x), x, "x ∩ x == x");
+    }
+
+    #[test]
+    fn restrict_deny_net_and_deny_fs_denies_both() {
+        let deny_net = CapSet::from_deny_list(["net"]).unwrap();
+        let deny_fs = CapSet::from_deny_list(["fs"]).unwrap();
+        let r = deny_net.restrict_with(&deny_fs);
+        assert!(!r.has(Cap::Net), "net denied (from the net side)");
+        assert!(!r.has(Cap::Fs), "fs denied (from the fs side)");
+        // Everything else stays granted (neither side denied it).
+        assert!(r.has(Cap::Process) && r.has(Cap::Ffi) && r.has(Cap::Env));
+        // A whole-deny carries no carve-out.
+        assert!(r.net_scope.is_none() && r.fs_scope.is_none());
+        // Commutative verdict.
+        assert_eq!(deny_fs.restrict_with(&deny_net), r);
+    }
+
+    #[test]
+    fn restrict_never_regrants_embedded_floor() {
+        // The N4 property: an embedded floor that denies net can NOT be re-granted by
+        // a run-time set that grants net (here: all_granted).
+        let floor = CapSet::from_deny_list(["net"]).unwrap();
+        let runtime = CapSet::all_granted();
+        let eff = floor.restrict_with(&runtime);
+        assert!(!eff.has(Cap::Net), "embedded net-deny survives an all-granted runtime");
+    }
+
+    #[test]
+    fn restrict_scope_intersect_whole_deny_is_whole_deny() {
+        // A net carve-out ∩ a whole net-deny → the whole cap is denied (the carve-out's
+        // allow-list is dropped; over-restriction is sound).
+        let mut carved = CapSet::all_granted();
+        carved.set_net_scope(NetScope { deny: NetDeny::External, allow: vec!["api.internal".into()] });
+        let whole_deny = CapSet::from_deny_list(["net"]).unwrap();
+        let r = carved.restrict_with(&whole_deny);
+        assert!(!r.has(Cap::Net));
+        assert!(r.net_scope.is_none(), "no carve-out survives a whole-cap deny");
+        // fs mirror.
+        let mut fscarved = CapSet::all_granted();
+        fscarved.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec!["./cache".into()] });
+        let rf = fscarved.restrict_with(&CapSet::from_deny_list(["fs"]).unwrap());
+        assert!(!rf.has(Cap::Fs));
+        assert!(rf.fs_scope.is_none());
+    }
+
+    #[test]
+    fn restrict_full_grant_with_scope_uses_the_scope() {
+        // all_granted ∩ (net carve-out) → the carve-out (the grant side imposes nothing).
+        let mut carved = CapSet::all_granted();
+        carved.set_net_scope(NetScope { deny: NetDeny::All, allow: vec!["10.0.0.5".into()] });
+        let r = CapSet::all_granted().restrict_with(&carved);
+        assert!(!r.has(Cap::Net), "carve-out clears the bit");
+        let s = r.net_scope.as_ref().expect("carve-out carried through");
+        assert_eq!(s.deny, NetDeny::All);
+        assert_eq!(s.allow, vec!["10.0.0.5".to_string()]);
+    }
+
+    #[test]
+    fn restrict_scope_intersect_scope_takes_stricter_and_intersects_allow() {
+        // net: External (on a) ∩ All (on b) → All (stricter); allow = intersection.
+        let mut a = CapSet::all_granted();
+        a.set_net_scope(NetScope {
+            deny: NetDeny::External,
+            allow: vec!["api.internal".into(), "10.0.0.5".into()],
+        });
+        let mut b = CapSet::all_granted();
+        b.set_net_scope(NetScope {
+            deny: NetDeny::All,
+            allow: vec!["10.0.0.5".into(), "other.host".into()],
+        });
+        let r = a.restrict_with(&b);
+        let s = r.net_scope.as_ref().expect("merged carve-out");
+        assert_eq!(s.deny, NetDeny::All, "All is stricter than External");
+        assert_eq!(s.allow, vec!["10.0.0.5".to_string()], "allow = intersection of both");
+        // Commutative.
+        assert_eq!(b.restrict_with(&a).net_scope, r.net_scope);
+
+        // fs: Write (on a) ∩ All (on b) → All (stricter); allow = intersection.
+        let mut fa = CapSet::all_granted();
+        fa.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec!["./cache".into(), "/tmp/x".into()] });
+        let mut fb = CapSet::all_granted();
+        fb.set_fs_scope(FsScope { deny: FsDeny::All, allow: vec!["/tmp/x".into()] });
+        let rf = fa.restrict_with(&fb);
+        let sf = rf.fs_scope.as_ref().expect("merged fs carve-out");
+        assert_eq!(sf.deny, FsDeny::All);
+        assert_eq!(sf.allow, vec!["/tmp/x".to_string()]);
+    }
+
+    #[test]
+    fn restrict_is_monotone_no_bit_appears_that_was_absent() {
+        // Exhaustive over all 32 bit combinations: a bit is set in the result ONLY IF
+        // it was set in BOTH inputs (the core monotone property over whole caps).
+        for ab in 0u8..32 {
+            for bb in 0u8..32 {
+                let a = CapSet { bits: ab, fs_scope: None, net_scope: None };
+                let b = CapSet { bits: bb, fs_scope: None, net_scope: None };
+                let r = a.restrict_with(&b);
+                for cap in Cap::ALL {
+                    if r.has(cap) {
+                        assert!(a.has(cap) && b.has(cap),
+                            "{} granted in result but not in both inputs", cap.name());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
