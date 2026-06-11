@@ -458,9 +458,9 @@ let len = match content_length {
 - Modify: `src/main.rs` (`try_run_embedded` ~558), `src/lib.rs` (`build_native` stub read ~1007, output write ~1033)
 - Test: `tests/native.rs`
 
-- [ ] **Step 1: Write the failing test** — (a) a valid footer whose payload read fails reports a clear error (not clap's "missing subcommand"); (b) building with an already-bundled `ascript` strips the old overlay (output not double-sized); (c) the output is written via temp+rename.
-- [ ] **Step 2: Run them — expect FAIL.**
-- [ ] **Step 3: Apply the fixes** —
+- [x] **Step 1: Write the failing test** — (a) a valid footer whose payload read fails reports a clear error (not clap's "missing subcommand"); (b) building with an already-bundled `ascript` strips the old overlay (output not double-sized); (c) the output is written via temp+rename.
+- [x] **Step 2: Run them — expect FAIL.**
+- [x] **Step 3: Apply the fixes** —
   - `try_run_embedded`: after `validate_footer` returns `Some`, switch the payload `seek`/`read_exact` from `.ok()?` to explicit error reporting that returns `Some(ExitCode::from(1))` with `eprintln!("error: failed to read embedded program: {e}")`.
   - `build_native`: strip an existing overlay before using the stub —
     ```rust
@@ -471,9 +471,9 @@ let len = match content_length {
     };
     ```
   - output: write to `out_path.with_extension("tmp")`, chmod, sign, append payload+footer, then atomic `rename` to `out_path`.
-- [ ] **Step 4: Run them — expect PASS** (incl. existing `native_*` tests).
-- [ ] **Step 5: §9.1** — native tests; docs: native-build page note; blast-radius: confirm worker re-exec / `current_exe` paths still resolve after the rename.
-- [ ] **Step 6: Commit** — `git commit -m "fix(bin): report embedded payload errors; strip double-bundle; atomic output"`
+- [x] **Step 4: Run them — expect PASS** (incl. existing `native_*` tests).
+- [x] **Step 5: §9.1** — native tests; docs: native-build page note; blast-radius: confirm worker re-exec / `current_exe` paths still resolve after the rename.
+- [x] **Step 6: Commit** — `git commit -m "fix(bin): report embedded payload errors; strip double-bundle; atomic output"`
 
 ### Task 0.19b: (DISCOVERED during 0.8) HTTP request parser — fail loudly on chunked / duplicate Content-Length
 
