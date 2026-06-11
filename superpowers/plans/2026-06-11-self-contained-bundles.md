@@ -581,12 +581,14 @@ impl ModuleArchive {
 - Modify: `src/vm/run.rs` (`load_file_module`), the `Interp`/`Vm` setup in `src/lib.rs`
 - Test: `tests/archive.rs`
 
-- [ ] **Step 1: Write the failing test** — running an archive whose modules exist ONLY in-memory (no files on disk) executes correctly and produces the same output as the on-disk run.
-- [ ] **Step 2: Run it — expect FAIL** (loader hits disk, file absent).
-- [ ] **Step 3: Implement** — add `module_archive: Rc<RefCell<Option<Rc<ModuleArchive>>>>` to the runtime; at the top of `load_file_module`, after computing the logical `canon`/key, consult the archive: a hit returns the embedded verified chunk (run it through `from_bytes_verified` exactly as the disk path does, then proceed identically); a miss falls through to today's disk path unchanged.
-- [ ] **Step 4: Run it — expect PASS**; `cargo test --test vm_differential` over a multi-module example.
-- [ ] **Step 5: §9.1** — archive test; blast-radius: the module cache key, circular-import in-progress marker, and once-only side-effect semantics must be identical whether loaded from archive or disk (assert with a side-effect-counting example).
-- [ ] **Step 6: Commit** — `git commit -m "feat(vm): consult in-memory module archive before disk in load_file_module"`
+- [x] **Step 1: Write the failing test** — running an archive whose modules exist ONLY in-memory (no files on disk) executes correctly and produces the same output as the on-disk run.
+- [x] **Step 2: Run it — expect FAIL** (loader hits disk, file absent).
+- [x] **Step 3: Implement** — add `module_archive: Rc<RefCell<Option<Rc<ModuleArchive>>>>` to the runtime; at the top of `load_file_module`, after computing the logical `canon`/key, consult the archive: a hit returns the embedded verified chunk (run it through `from_bytes_verified` exactly as the disk path does, then proceed identically); a miss falls through to today's disk path unchanged.
+- [x] **Step 4: Run it — expect PASS**; `cargo test --test vm_differential` over a multi-module example.
+- [x] **Step 5: §9.1** — archive test; blast-radius: the module cache key, circular-import in-progress marker, and once-only side-effect semantics must be identical whether loaded from archive or disk (assert with a side-effect-counting example).
+- [x] **Step 6: Commit** — `git commit -m "feat(vm): consult in-memory module archive before disk in load_file_module"`
+
+> **Accepted (1.4):** commit `8495807` (loader) + `68a193c7` (review fixes: O(1) `ModuleArchive::get` via private `key_index`, sole `new()` constructor; `run_archive` `module_dir` doc). The make-or-break guarantee holds — `join_logical`/`logical_parent` moved to `src/vm/archive.rs` as the SINGLE shared key fn called by both `compile_archive` (builder) and `load_file_module` (loader). Spec review ✅ + code-quality review ✅ (APPROVED). 15 archive tests both configs; four-mode differential 378/378 both configs; clippy clean both configs. **Carry-forward to 1.5:** a path-carrying dispatch (`ascript run app.aso`/`--native`) MUST `set_module_dir` to the archive's parent so an archive-miss can still resolve sibling on-disk sources (`run_archive` deliberately leaves `module_dir` at cwd).
 
 ### Task 1.5: emit/run archives from `build` and `--native`
 
