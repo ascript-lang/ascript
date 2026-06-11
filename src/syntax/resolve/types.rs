@@ -88,6 +88,10 @@ pub struct FrameInfo {
 pub struct ResolveDiagnostic {
     pub message: String,
     pub range: TextRange,
+    /// The lint code the checker surfaces this under (e.g. `duplicate-binding`,
+    /// `or-pattern-binding`). A `&'static str` because every resolver diagnostic is a
+    /// fixed, blocking class — not config-driven text.
+    pub code: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]

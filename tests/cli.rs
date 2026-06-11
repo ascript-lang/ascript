@@ -673,6 +673,53 @@ print(out)
     assert_eq!(outputs[0], outputs[1], "VM and tree-walker output must match");
 }
 
+/// An or-pattern whose alternatives bind DIFFERENT name sets
+/// (`Shape.Circle(r) | Shape.Empty => r` — `r` bound in one alternative, absent in
+/// the other) is a STATIC compile error, rejected BYTE-IDENTICALLY before running on
+/// the VM and the tree-walker, and by `ascript check` — Rust-style "variable `r` is
+/// not bound in all patterns". This resolves the earlier runtime divergence (VM:
+/// "expected int, got nil" vs tree-walker: "undefined variable 'r'").
+#[test]
+fn match_or_pattern_mismatched_names_is_static_error_on_all_paths() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = "\
+enum Shape { Circle(radius: int), Empty }
+fn f(s: Shape): int {
+  return match s {
+    Shape.Circle(r) | Shape.Empty => r,
+  }
+}
+print(f(Shape.Empty))
+";
+    let file =
+        std::env::temp_dir().join(format!("ascript_orpat_bad_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    let expected = "variable 'r' is not bound in all alternatives of the or-pattern";
+    // Each invocation must FAIL with the SAME message. Strip ANSI so the substring
+    // match is robust to ariadne's per-char colorization.
+    for args in [
+        vec!["run"],
+        vec!["run", "--tree-walker"],
+        vec!["check"],
+    ] {
+        let out = Command::new(bin).args(&args).arg(&file).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "expected `{args:?}` to FAIL on the mismatched-name or-pattern, but it succeeded"
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plain = strip_ansi(&combined);
+        assert!(
+            plain.contains(expected),
+            "`{args:?}` must report {expected:?}; got:\n{plain}"
+        );
+    }
+}
+
 #[test]
 fn repl_vm_fn_and_class_reassignment_across_lines_error() {
     // fn / class names are immutable top-level bindings: reassigning one on a later

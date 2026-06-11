@@ -69,7 +69,7 @@ pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
         diagnostics.push(AsDiagnostic {
             range: ByteSpan::from(d.range),
             severity: Severity::Error,
-            code: "duplicate-binding".to_string(),
+            code: d.code.to_string(),
             message: d.message.clone(),
             fix: None,
         });

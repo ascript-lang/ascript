@@ -250,6 +250,7 @@ impl Resolver {
             self.result.diagnostics.push(ResolveDiagnostic {
                 message: format!("'{name}' is already defined in this scope"),
                 range: decl_range,
+                code: "duplicate-binding",
             });
             return;
         }
@@ -1174,10 +1175,15 @@ impl Resolver {
     /// allocated binding back onto the first alternative's slot and restore the
     /// scope entry — leaving exactly one shared slot per name, visible to the body.
     fn resolve_or_pattern(&mut self, pat: &ResolvedNode) {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         // name -> shared slot (the slot the FIRST alternative allocated for it).
         let mut or_slots: HashMap<String, u32> = HashMap::new();
+        // Per-alternative: (its source range, the SET of names it binds). Used after
+        // the loop to verify every alternative binds the SAME name set (Rust's
+        // "variable `x` is not bound in all patterns").
+        let mut alt_binds: Vec<(TextRange, HashSet<String>)> = Vec::new();
         for alt in pat.children().filter(|c| is_pattern(c.kind())) {
+            let alt_range = alt.text_range();
             // Hide every already-shared name so a same-named bind site in THIS
             // alternative is seen as unbound (→ Option-C binds it) rather than a
             // compare against a sibling alternative's binding.
@@ -1194,7 +1200,9 @@ impl Resolver {
                 .iter()
                 .map(|b| (b.name.clone(), b.slot))
                 .collect();
+            let mut this_alt: HashSet<String> = HashSet::new();
             for (name, fresh_slot) in new_names {
+                this_alt.insert(name.clone());
                 if let Some(&shared) = or_slots.get(&name) {
                     // A later alternative re-bound an existing or-name: point every
                     // binding this alternative just created for `name` at the shared
@@ -1213,17 +1221,40 @@ impl Resolver {
                     or_slots.insert(name, fresh_slot);
                 }
             }
+            alt_binds.push((alt_range, this_alt));
         }
         // Every or-bound name must be visible to the arm guard/body via its shared
-        // slot — including a name that a LATER alternative did NOT re-bind (an
-        // INVALID or-pattern with mismatched name sets, e.g. `Foo(x) | Empty => x`).
-        // Restoring the scope entry keeps the body's `x` use resolving to the shared
-        // slot (the tree-walker likewise leaves the name reachable by-env), so the VM
-        // does not statically reject a program the oracle would run; whether the slot
-        // actually holds a value at runtime depends on which alternative matched.
+        // slot (the body has ONE use per name). Restore each shared name to the scope
+        // so the body resolves to the shared slot regardless of which alternative
+        // matched.
         for (name, slot) in &or_slots {
             if let Some(scope) = self.scopes.last_mut() {
                 scope.names.insert(name.clone(), *slot);
+            }
+        }
+        // STATIC VALIDATION: every alternative must bind the SAME set of names. The
+        // arm body reads ONE binding per name, so a name bound by some alternatives
+        // but absent from others is unbound when a missing alternative matches — a
+        // compile error on BOTH engines (Rust-style "variable `x` is not bound in all
+        // patterns"), not a runtime divergence. Emit ONE diagnostic per missing name,
+        // pointed at the FIRST alternative that fails to bind it (deterministic order:
+        // by union iteration sorted, then first-missing alternative).
+        if alt_binds.len() >= 2 {
+            let mut all_names: Vec<&String> = or_slots.keys().collect();
+            all_names.sort();
+            for name in all_names {
+                if let Some((miss_range, _)) = alt_binds
+                    .iter()
+                    .find(|(_, set)| !set.contains(name))
+                {
+                    self.result.diagnostics.push(ResolveDiagnostic {
+                        message: format!(
+                            "variable '{name}' is not bound in all alternatives of the or-pattern"
+                        ),
+                        range: *miss_range,
+                        code: "or-pattern-binding",
+                    });
+                }
             }
         }
     }

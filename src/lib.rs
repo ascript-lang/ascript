@@ -1224,6 +1224,41 @@ pub fn collect_parse_errors(path: &Path) -> Vec<AsError> {
         .collect()
 }
 
+/// Collect BLOCKING semantic diagnostics from the CST resolver that BOTH engines
+/// must reject identically BEFORE running (the shared `run` gate, alongside
+/// [`collect_parse_errors`]). Today this is exactly the `or-pattern-binding` error
+/// (an or-pattern whose alternatives bind different name sets) — a compile error,
+/// not a runtime divergence. The same diagnostic is surfaced by the VM compiler
+/// (so a direct `vm_run_source` rejects too) and by `ascript check`; routing the
+/// tree-walker `run` path through this gate makes ALL of them byte-identical.
+///
+/// An empty `Vec` means there is nothing blocking (the run proceeds on either
+/// engine). Returns `AsError`s with the file source bound for caret rendering and
+/// CHAR-offset spans (resolver ranges are BYTE offsets, converted here).
+pub fn collect_blocking_diagnostics(path: &Path) -> Vec<AsError> {
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return Vec::new(); // a read error is handled by the runner's own report
+    };
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let tree = crate::syntax::parse_to_tree(&src);
+    let resolved = crate::syntax::resolve::resolve(&tree);
+    resolved
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "or-pattern-binding")
+        .map(|d| {
+            let span = crate::span::Span::new(
+                byte_to_char_offset(&src, usize::from(d.range.start())),
+                byte_to_char_offset(&src, usize::from(d.range.end())),
+            );
+            AsError::at(d.message.clone(), span).with_source(src_info.clone())
+        })
+        .collect()
+}
+
 /// Convert a BYTE offset into a CHAR offset within `src` (clamping a mid-codepoint
 /// byte down to the largest char boundary `<= byte`). A small CORE copy of the
 /// LSP's `byte_to_char` (which is feature-gated), used where a byte-native syntax

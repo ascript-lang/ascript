@@ -682,9 +682,12 @@ fn dimension(s: Shape): int {
 }
 ```
 
-Binding **different** names across alternatives (`Foo(a) | Bar(b) => …`) is a mistake — the body can
-only see a name that *every* matched alternative binds, so a name present in just one alternative is
-unbound when the other matches. Keep the alternatives uniform.
+Binding **different** names across alternatives is a **compile error** — every alternative must bind
+the same set of names, exactly like Rust's *"variable `x` is not bound in all patterns"*. Both
+`Foo(a) | Bar(b) => …` (disjoint names) and `Foo(x) | Empty => x` (a name present in only one
+alternative) are rejected statically by `ascript run` (on either engine) and `ascript check`, with the
+message *"variable 'x' is not bound in all alternatives of the or-pattern"* — so the body never sees a
+name that some matched alternative failed to bind.
 
 #### Guards `pattern if condition`
 

@@ -724,6 +724,16 @@ async fn real_main() -> ExitCode {
                     ascript::diagnostics::report_all(&parse_errors);
                     return ExitCode::from(1);
                 }
+                // Shared BLOCKING semantic gate (both engines): reject statically-
+                // invalid programs the same way before EITHER engine runs — currently
+                // an or-pattern whose alternatives bind different name sets. Runs only
+                // on a clean parse; shares no state with the runner, so a valid program
+                // runs identically.
+                let blocking = ascript::collect_blocking_diagnostics(path);
+                if !blocking.is_empty() {
+                    ascript::diagnostics::report_all(&blocking);
+                    return ExitCode::from(1);
+                }
             }
             let result = if is_aso {
                 ascript::run_aso_file(path, &args, caps).await
