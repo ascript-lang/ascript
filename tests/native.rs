@@ -850,6 +850,15 @@ fn decode_bundle_archive(bundle: &Path) -> ModuleArchive {
     assert_eq!(&footer[24..32], b"ASCRIPTB", "footer magic not at the tail");
     let off = u64::from_le_bytes(footer[0..8].try_into().unwrap()) as usize;
     let len = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
+    // Bounds-check the raw footer values before slicing so a malformed footer (or a
+    // future build regression) is a CLEAN test failure, not an opaque OOB panic. The
+    // payload region must lie strictly before the trailing footer.
+    assert!(
+        off.checked_add(len)
+            .is_some_and(|end| end <= bytes.len().saturating_sub(ascript::bundle::FOOTER_SIZE)),
+        "footer payload region [{off}..{off}+{len}] out of bounds for image size {}",
+        bytes.len()
+    );
     let payload = &bytes[off..off + len];
     ModuleArchive::decode(payload).expect("embedded payload decodes as a ModuleArchive")
 }

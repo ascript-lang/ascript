@@ -921,6 +921,20 @@ pub async fn aso_runnable_accept(bytes: &[u8]) {
     crate::gc::collect();
 }
 
+/// SELF-CONTAINED-BUNDLES (Task 3.1): warn that a single-module program's composed caps
+/// are NOT embedded yet. A single-module build emits a bare `ASO\0` chunk with no
+/// capability manifest, so the composed `--deny`/`--sandbox` restriction has no home in
+/// the artifact. Shared by `build_file` and `build_native` so the two cannot drift and
+/// 3.2's removal is a one-liner.
+// TODO(Task 3.2): remove once --native always emits an archive (caps always have a home).
+fn warn_single_module_caps() {
+    eprintln!(
+        "warning: a single-module program compiles to a bare chunk with no capability \
+         manifest, so the composed --deny/--sandbox restriction is NOT embedded yet \
+         (it requires the archive path, coming in Task 3.2); run-time `--deny` still applies"
+    );
+}
+
 /// Compile a `.as` source file to a verified bytecode [`Chunk`] and write it to
 /// `out` as a `.aso` file (VM plan V12-T4 — `ascript build`).
 ///
@@ -957,11 +971,7 @@ pub fn build_file(
         // 3.2 will make this path always emit an archive (so caps always have a home). Do
         // NOT silently drop a restriction: warn the user that the embedding lands in 3.2.
         if caps.is_some() {
-            eprintln!(
-                "warning: a single-module program compiles to a bare chunk with no capability \
-                 manifest, so the composed --deny/--sandbox restriction is NOT embedded yet \
-                 (it requires the archive path, coming in Task 3.2); run-time `--deny` still applies"
-            );
+            warn_single_module_caps();
         }
         // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
         // entry under its CANONICALIZED absolute path for stable dedup identity, which a
@@ -1538,11 +1548,7 @@ pub fn build_native(
         // payload yet. Task 3.2 will make `--native` always emit an archive (so caps always
         // have a home). Warn rather than silently drop a user's restriction.
         if caps.is_some() {
-            eprintln!(
-                "warning: a single-module program bundles a bare chunk with no capability \
-                 manifest, so the composed --deny/--sandbox restriction is NOT embedded yet \
-                 (it requires the archive path, coming in Task 3.2); run-time `--deny` still applies"
-            );
+            warn_single_module_caps();
         }
         // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
         // entry under its CANONICALIZED absolute path, which a debug `.aso` embeds as the
