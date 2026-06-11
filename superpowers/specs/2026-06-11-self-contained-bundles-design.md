@@ -89,11 +89,37 @@ allocation-bomb clamps) and never trusts the count or any key/blob length blindl
 
 ### 3.3 Module identity & keys
 
-The `logical_path_key` is the **canonical logical specifier** a module is reached by — the same
-key `load_file_module` already computes (`as_path.canonicalize()` → `aso` → requested stem,
-`src/vm/run.rs`). For a package module it is the store-relative logical id, not the absolute
-`$ASCRIPT_CACHE` path, so a bundle built on one machine resolves on another. Identity is
-preserved exactly so circular imports and the once-only side-effect cache behave as today.
+> **Correction (2026-06-11, after Task 1.3):** the original draft said the key is "the same key
+> `load_file_module` computes (`as_path.canonicalize()` …)". That is **wrong** — a canonicalized
+> *absolute* path is machine-DEPENDENT (it leaks the build machine's layout) and directly
+> contradicts the portability requirement below. The implemented convention is the **lexical
+> entry-relative logical path**, described here.
+
+The `logical_path_key` is a **machine-independent lexical logical path**, derived purely from
+import specifiers relative to the **entry file's directory** (the namespace root), never from a
+canonicalized absolute path:
+
+- The **entry** is keyed by its file name; its logical directory is the root (`""`).
+- A **relative import** `S` from a module whose logical dir is `D` is keyed
+  `join_logical(D, S)` + a defaulted `.as` extension — lexically normalizing `.`/`..` and using
+  forward slashes. A `..` that escapes the root is **preserved verbatim** (e.g. `../shared.as`);
+  it stays machine-independent (relative, no absolute prefix) and keeps `../a` distinct from `a`.
+- A **package import** is keyed under a stable `pkg/<specifier>` namespace (the store-relative
+  logical id, independent of the importer), so the same package resolves to the same key
+  regardless of which module imports it — **not** the absolute `$ASCRIPT_CACHE` store path.
+
+The build-time **dedup identity** (so a module reached two ways is archived once, and cycles
+terminate) is the module's **canonical on-disk path** — deliberately separate from the **stored
+key** (the portable logical path above). This split is what keeps the archive both
+de-duplicated and machine-independent.
+
+**Runtime matchability (Task 1.4):** `load_file_module` today resolves against the on-disk
+`module_dir` and caches by canonical absolute path; it has no notion of a "logical dir". To find
+embedded modules it MUST track a parallel **logical dir** (seeded to `""` for the entry, derived
+per-import by the same `join_logical` lexical rule, swapped alongside `module_dir`) and look the
+archive up by that logical key. The lexical key convention is implementable on the runtime side
+but is **new work, not a reuse of the existing canonical-path key**. Circular imports and the
+once-only side-effect cache are unaffected (they key on the unchanged on-disk canonical path).
 
 ### 3.4 Versioning
 
@@ -184,14 +210,20 @@ cap-name grammar as `--deny`.
 
 An `Interp`-held `module_archive: Option<ModuleArchive>` maps `logical_path_key → verified
 Chunk`. `load_file_module` (`src/vm/run.rs:705`) consults it **before** the disk
-`stat`/`read`:
+`stat`/`read`, keyed by the **lexical logical key** (§3.3) — which requires the loader to track
+a per-module **logical dir** in parallel with the existing on-disk `module_dir` (seeded `""` for
+the entry, derived per-import by the same `join_logical` rule `compile_archive` uses, swapped
+alongside `module_dir`). This logical-dir tracking is **new work in this task**, not a reuse of
+the existing canonical-path cache key (§3.3 correction):
 
-- **Hit** → use the embedded chunk, skip disk entirely.
+- **Hit** (logical key present in the archive) → use the embedded chunk, skip disk entirely.
 - **Miss** → fall through to today's exact disk path (so mixed dev/partial scenarios and
   on-disk `.aso`/`.as` still work).
 
 std stays native (resolved via the registry, never the archive). Circular imports and the
-once-only side-effect cache are unchanged because module identity (§3.3) is preserved.
+once-only side-effect cache are unchanged because the **on-disk canonical path** (the cache
+identity) is untouched — the archive lookup adds the logical key as a *separate* index, exactly
+mirroring `compile_archive`'s dedup-identity/stored-key split (§3.3).
 
 **Worker parity:** the entry already stashes `worker_aso_bytes` for code-shipping; this extends
 to ship the whole archive so a `worker fn`/`worker class`/`worker fn*` inside a bundled app
