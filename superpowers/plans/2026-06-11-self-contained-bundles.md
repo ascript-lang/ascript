@@ -699,12 +699,14 @@ impl ModuleArchive {
 - Modify: `tests/archive.rs`
 - Test: this IS the test
 
-- [ ] **Step 1: Write the test** — for each multi-module example, run it (a) unshaken from disk and (b) as a shaken archive; assert byte-identical stdout across both, and across all engine modes.
-- [ ] **Step 2: Run it — expect PASS** (if it fails, shaking dropped live code — a real bug to fix before proceeding).
-- [ ] **Step 3:** Add adversarial fixtures: namespace + dynamic index, re-exports, escaping function values, circular imports, side-effectful top-level.
-- [ ] **Step 4: Run them — expect PASS.**
-- [ ] **Step 5: §9.1** — this is the test; blast-radius: this gate guards the whole feature's correctness.
-- [ ] **Step 6: Commit** — `git commit -m "test(shake): shaken-vs-unshaken byte-identical differential"`
+- [x] **Step 1: Write the test** — for each multi-module example, run it (a) unshaken from disk and (b) as a shaken archive; assert byte-identical stdout across both, and across all engine modes.
+- [x] **Step 2: Run it — expect PASS** (if it fails, shaking dropped live code — a real bug to fix before proceeding).
+- [x] **Step 3:** Add adversarial fixtures: namespace + dynamic index, re-exports, escaping function values, circular imports, side-effectful top-level.
+- [x] **Step 4: Run them — expect PASS.**
+- [x] **Step 5: §9.1** — this is the test; blast-radius: this gate guards the whole feature's correctness.
+- [x] **Step 6: Commit** — `git commit -m "test(shake): shaken-vs-unshaken byte-identical differential"`
+
+> **Accepted (2.5):** commits `3f2c652` (differential) + `6962c08` (review fixes). THE LOAD-BEARING TRIPWIRE. Two test seams: `#[doc(hidden)] compile_archive_with_shake(entry, with_debug, shake)` (`compile_archive` delegates with `shake=true`; `shake=false` skips pass-2 → genuinely unshaken archive — isolates shaking as the ONLY variable) + `vm_run_file_captured(entry)` (captured disk-run baseline). Helper `assert_shaken_equals_unshaken(entry) -> ShakeReport` builds BOTH, round-trips through encode/decode, runs both, asserts byte-identical stdout+exit, RETURNS the report so each fixture asserts a concrete drop/pin (NON-VACUOUS — a no-op shaker fails). 8 adversarial fixtures (namespace dynamic-index PIN, namespace static method-call shake, escaping fn value, circular imports, side-effect retention IN SOURCE ORDER + computed-init, diamond dedup-once, cross-module class+superclass+enum-in-match) + 3 corpus entries (`bundle_multimodule.as`, `app/main.as`, `modules/main.as` — ALL multi-module examples). **Soundness review VERIFIED the gate genuinely trips:** INJECTED an over-shake (force-dropped a used binding) → the differential CAUGHT it (test failed), then reverted; empirically confirmed the no-shake baseline is unshaken (950-byte unshaken lib chunk keeps {dead,used,unused} vs 394-byte shaken keeps {used}). Re-exports: no AScript form (noted). 32/32 archive tests both configs; four-mode differential 378/0 both configs; clippy clean both configs.
 
 ### Task 2.6: Phase 2 holistic review
 
