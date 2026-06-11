@@ -455,31 +455,29 @@ async fn non_archive_multifile_still_loads_from_disk() {
 // ===========================================================================================
 
 /// Decode a module's archived chunk and return the set of top-level GLOBAL names it
-/// DEFINES (`DEFINE_GLOBAL`) plus every proto's debug-name — i.e. the names that survived
-/// the shake. A dropped `fn`/`let` leaves NEITHER a `DEFINE_GLOBAL` nor a proto, so this is
-/// a robust presence probe.
+/// DEFINES (`DEFINE_GLOBAL`) — i.e. the module-globals that survived the shake. Probes
+/// the BYTECODE directly (walking the top chunk's `code`, reading each `DEFINE_GLOBAL`'s
+/// name-const operand) rather than the disasm TEXT (which Task 2.4 may reformat) or the
+/// proto debug-names (which would false-positive a class METHOD's name as a global). A
+/// dropped `fn`/`let` emits no `DEFINE_GLOBAL`, so its name is absent here.
 fn module_defined_names(arch: &ModuleArchive, key: &str) -> std::collections::HashSet<String> {
+    use ascript::value::Value;
+    use ascript::vm::opcode::Op;
     let bytes = arch.get(key).unwrap_or_else(|| panic!("module {key} present; keys present"));
     let chunk = Chunk::from_bytes_verified(bytes)
         .unwrap_or_else(|e| panic!("module {key} re-verifies: {e:?}"));
     let mut names = std::collections::HashSet::new();
-    // Proto debug-names (every top-level `fn` that was emitted).
-    for p in &chunk.protos {
-        if let Some(n) = &p.debug_name {
-            names.insert(n.to_string());
-        }
-    }
-    // DEFINE_GLOBAL operands, read out of the disassembly text (the `; const <name>` /
-    // `; let <name>` tail names the defined global with its source string literal).
-    for line in ascript::vm::disasm::disasm(&chunk).lines() {
-        if let Some(rest) = line.split("DEFINE_GLOBAL").nth(1) {
-            // tail form: `   <idx> <flag> ; <let|const> "<name>"`
-            if let Some(open) = rest.find('"') {
-                if let Some(close) = rest[open + 1..].find('"') {
-                    names.insert(rest[open + 1..open + 1 + close].to_string());
-                }
+    let code = &chunk.code;
+    let mut ip = 0;
+    while ip < code.len() {
+        let Some(op) = Op::from_u8(code[ip]) else { break };
+        if op == Op::DefineGlobal && ip + 2 < code.len() {
+            let idx = chunk.read_u16(ip + 1) as usize;
+            if let Some(Value::Str(name)) = chunk.consts.get(idx) {
+                names.insert(name.to_string());
             }
         }
+        ip += 1 + op.operand_width();
     }
     names
 }

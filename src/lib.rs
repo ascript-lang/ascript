@@ -1221,8 +1221,12 @@ pub fn compile_archive(
     // RE-EMIT each LIBRARY module dropping unreferenced INERT top-level declarations.
     // The ENTRY (index 0) is kept WHOLE — its pass-1 bytes are stored UNCHANGED, so a
     // single-module program (and the entry of any program) is byte-identical to today.
-    // A re-compile reuses the SAME source the BFS read; the keep-set's closure property
-    // guarantees no dropped name is referenced by kept code (no dangling globals).
+    // A re-compile RE-READS each library module's source from disk (the pass-1 source
+    // string isn't preserved — `compile_verified_aso_bytes` is self-contained), so a
+    // library module is compiled TWICE: O(2N) compiles for N library modules. Fine for
+    // a one-shot build; worth a pass-1-source cache later if build time matters. The
+    // keep-set's closure property guarantees no dropped name is referenced by kept code
+    // (no dangling globals).
     let graph: Vec<crate::compile::shake::ModuleNode> = modules
         .iter()
         .zip(graph_chunks)
@@ -1234,8 +1238,7 @@ pub fn compile_archive(
         })
         .collect();
     let reach = crate::compile::shake::compute_reachable(&graph);
-    // (`reach.report` is threaded to Task 2.4 for the digest + stderr printing; unused here.)
-    let _ = &reach.report;
+    // reach.report is threaded to Task 2.4's digest + stderr printer; unused here.
 
     for (idx, (_key, bytes)) in modules.iter_mut().enumerate() {
         if idx == 0 {

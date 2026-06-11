@@ -830,6 +830,11 @@ pub fn reparse_default_from_source(padded: &str) -> Result<crate::ast::Expr, Str
 /// The name match mirrors the resolver's `collect_module_globals` (so the names
 /// reported here are exactly the module-globals the resolver registered), reusing
 /// the byte-for-byte same ident-extraction the declaration compilers use.
+///
+/// NOTE: keep in sync with the resolver's `collect_module_globals`
+/// (`src/syntax/resolve/mod.rs`) — a future change to which top-level forms bind a
+/// module-global must update BOTH (here the names that survive the shake, there the
+/// names the resolver registers).
 fn top_level_bound_names(stmt: &Stmt) -> Option<Vec<Rc<str>>> {
     use crate::syntax::kind::SyntaxKind as K;
     match stmt {
@@ -881,6 +886,9 @@ fn top_level_bound_names(stmt: &Stmt) -> Option<Vec<Rc<str>>> {
 /// `ObjectBindPat`), mirroring the resolver's `collect_pattern_global_names`: a
 /// `BindEntry`'s LAST ident is the bound local (the renamed `"k" as v` form), and a
 /// `RestBind`'s first ident is the rest collector.
+///
+/// NOTE: keep in sync with the resolver's `collect_pattern_global_names`
+/// (`src/syntax/resolve/mod.rs`) — a future destructuring-syntax change must update BOTH.
 fn pattern_bound_names(pat: &crate::syntax::cst::ResolvedNode) -> Vec<Rc<str>> {
     use crate::syntax::kind::SyntaxKind as K;
     let mut out = Vec::new();

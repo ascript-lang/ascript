@@ -478,6 +478,9 @@ impl Resolver {
     /// module `Environment`: a `let`/`const` (ident or destructuring-pattern names),
     /// a hoisted `fn`/`class`/`enum`, and `import` names. An `export <decl>` is
     /// unwrapped to its inner decl. Statements that bind nothing are ignored.
+    ///
+    /// NOTE: keep in sync with `compile::top_level_bound_names` (`src/compile/mod.rs`),
+    /// which mirrors this match to decide which top-level decls the tree-shaker may drop.
     fn collect_module_globals(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         match node.kind() {
@@ -524,6 +527,8 @@ impl Resolver {
         self.module_globals.insert(name);
     }
 
+    // NOTE: keep in sync with `compile::pattern_bound_names` (`src/compile/mod.rs`),
+    // which mirrors this walk for tree-shake name extraction.
     fn collect_pattern_global_names(&mut self, pat: &ResolvedNode, mutable: bool) {
         use SyntaxKind::*;
         for entry in pat.children() {
