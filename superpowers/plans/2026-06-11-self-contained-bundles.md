@@ -159,9 +159,9 @@ OrPat => {
 - Modify: `src/fmt.rs` (`write_params`, ~44)
 - Test: inline `#[test]` in `src/fmt.rs`
 
-- [ ] **Step 1: Write the failing test** — formatting `fn f(x = 5) {}` yields `fn f(x = 5) {}` (idempotent), not `fn f(x) {}`.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Apply the fix** — render the default after the type annotation:
+- [x] **Step 1: Write the failing test** — formatting `fn f(x = 5) {}` yields `fn f(x = 5) {}` (idempotent), not `fn f(x) {}`.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Apply the fix** — render the default after the type annotation:
 
 ```rust
 if let Some(ty) = &p.ty {
@@ -174,9 +174,9 @@ if let Some(def) = &p.default {            // NEW
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS**; run an idempotence check over `examples/**`.
-- [ ] **Step 5: §9.1** — covered by examples already containing default params; docs: none; blast-radius: confirm the CST formatter (`syntax/format/`) already renders defaults (it does) so both formatters agree; add a fmt round-trip assertion.
-- [ ] **Step 6: Commit** — `git commit -m "fix(fmt): render parameter default values"`
+- [x] **Step 4: Run it — expect PASS**; run an idempotence check over `examples/**`.
+- [x] **Step 5: §9.1** — covered by examples already containing default params; docs: none; blast-radius: confirm the CST formatter (`syntax/format/`) already renders defaults (it does) so both formatters agree; add a fmt round-trip assertion.
+- [x] **Step 6: Commit** — `git commit -m "fix(fmt): render parameter default values"`
 
 ### Task 0.6: `SetGlobal` verifier stack-depth precondition
 
