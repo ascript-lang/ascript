@@ -11,20 +11,67 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ascript")
 }
 
-/// A unique temp dir for one test (avoids cross-test collisions in parallel runs).
-fn tmp_dir(tag: &str) -> PathBuf {
+/// Serializes the disk-heavy native-bundle tests. Each bundle is the WHOLE runtime (~123 MB)
+/// written to a temp dir, and it lingers for the test's run/assert phase before its [`TmpDir`]
+/// guard cleans it up. Under default parallelism several such bundles coexist, so on a
+/// space-constrained volume the peak overruns free space ("No space left on device"). A test
+/// that builds a bundle takes this guard FIRST (see [`serial_native`]) so at most ONE bundle
+/// exists at a time (the single-threaded peak, which fits); paired with [`TmpDir`] cleanup
+/// (which frees each bundle before the next), the whole file stays within a single bundle's
+/// footprint regardless of `--test-threads`.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the [`BUILD_LOCK`] for the lifetime of a native-bundle test. Bind it as the FIRST
+/// statement of any test that calls [`build_native`] (`let _serial = serial_native();`). Held
+/// across the whole test (not just the build) because the 123 MB bundle persists until the
+/// test's `TmpDir` drops; releasing after the build alone would let bundles pile up. A poisoned
+/// lock (a panicking test) is recovered — serialization, not data, is what it guards.
+fn serial_native() -> std::sync::MutexGuard<'static, ()> {
+    BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A unique temp dir for one test, removed when the returned guard drops (so bundles — each a
+/// full runtime copy — do not accumulate in the tmpfs across the run). Derefs to `&Path`, so
+/// call sites use it exactly like a `PathBuf` (`dir.join(...)`, `&dir` into `&Path` params).
+struct TmpDir(PathBuf);
+
+impl std::ops::Deref for TmpDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TmpDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A unique temp dir for one test (avoids cross-test collisions in parallel runs). The tag
+/// must be unique per test; the PID disambiguates concurrent test-runner processes.
+fn tmp_dir(tag: &str) -> TmpDir {
     let d = std::env::temp_dir().join(format!("ascript_native_{}_{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    TmpDir(d)
 }
 
-/// `ascript build --native <src> -o <out>` — asserts success, returns the bundle path.
+/// `ascript build --native <src> -o <out>` — asserts success. The CALLER must hold
+/// [`serial_native`] (so concurrent builds don't overrun a space-constrained volume); this
+/// function does not lock itself, because some tests build twice and a self-lock would deadlock.
 fn build_native(src: &Path, out: &Path) {
     let o = Command::new(bin())
         .args(["build", "--native"])
@@ -87,6 +134,7 @@ fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
 /// stderr-emitting program (a non-vacuous stderr channel).
 #[test]
 fn native_bundle_equivalence_stdout_stderr_exit() {
+    let _serial = serial_native();
     let dir = tmp_dir("equiv");
 
     // (a) A plain program with deterministic stdout.
@@ -123,6 +171,7 @@ fn native_bundle_equivalence_stdout_stderr_exit() {
 /// so it reaches the program.)
 #[test]
 fn native_bundle_forwards_argv() {
+    let _serial = serial_native();
     let dir = tmp_dir("argv");
     let src = write(
         &dir,
@@ -161,6 +210,7 @@ fn footer_payload_offset(bundle: &Path) -> u64 {
 /// execution. This is the test that the FUZZ-hardened `from_bytes_verified` is the real gate.
 #[test]
 fn native_tampered_payload_rejected_cleanly() {
+    let _serial = serial_native();
     let dir = tmp_dir("tamper");
     let src = write(&dir, "p.as", "print(\"should not run\")\n");
     let app = dir.join("tamper_app");
@@ -210,6 +260,7 @@ fn native_tampered_payload_rejected_cleanly() {
 /// (clean, no OOB slice / panic). With no subcommand it is a clap usage error (non-zero).
 #[test]
 fn native_corrupt_footer_offset_falls_through_cleanly() {
+    let _serial = serial_native();
     let dir = tmp_dir("footer");
     let src = write(&dir, "p.as", "print(\"x\")\n");
     let app = dir.join("footer_app");
@@ -250,6 +301,7 @@ fn native_corrupt_footer_offset_falls_through_cleanly() {
 /// re-exec, no worker code change.
 #[test]
 fn native_worker_bundle_parity() {
+    let _serial = serial_native();
     let dir = tmp_dir("worker");
     // Use the shipped, deterministic `worker fn` parallel-map+gather example.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/workers_parallel_map.as");
@@ -314,6 +366,7 @@ fn native_target_is_rejected_and_requires_native() {
 /// exercises the closest observable proxy.
 #[test]
 fn native_confirmed_bundle_reports_load_error_not_clap() {
+    let _serial = serial_native();
     let dir = tmp_dir("n5");
     let src = write(&dir, "p.as", "print(\"should not run\")\n");
     let app = dir.join("n5_app");
@@ -400,6 +453,7 @@ fn native_double_bundle_strip_recovers_clean_stub() {
 /// double-sized).
 #[test]
 fn native_real_bundle_strips_back_to_clean_runtime() {
+    let _serial = serial_native();
     use ascript::bundle::read_bundle_footer;
 
     let dir = tmp_dir("n6e2e");
@@ -441,6 +495,7 @@ fn native_real_bundle_strips_back_to_clean_runtime() {
 /// the atomic-output contract: a clean final artifact and no leftover temp.)
 #[test]
 fn native_output_is_atomic_no_temp_leftover() {
+    let _serial = serial_native();
     let dir = tmp_dir("n7");
     let src = write(&dir, "p.as", "print(\"atomic\")\n");
     let app = dir.join("n7_app");
@@ -473,6 +528,7 @@ fn native_output_is_atomic_no_temp_leftover() {
 /// embedding + run-time archive decode/install across the native-bundle boundary.
 #[test]
 fn native_multimodule_bundle_runs_from_empty_dir() {
+    let _serial = serial_native();
     let dir = tmp_dir("mm_native");
     // Two sibling modules; the entry imports the util by a relative specifier.
     write(
@@ -519,6 +575,7 @@ fn native_multimodule_bundle_runs_from_empty_dir() {
 /// isolate before any user worker code runs fixes it. Bundled, run from an EMPTY cwd.
 #[test]
 fn native_worker_imports_module_from_bundle() {
+    let _serial = serial_native();
     let dir = tmp_dir("mm_worker_native");
     write(
         &dir,
@@ -573,6 +630,7 @@ fn native_worker_imports_module_from_bundle() {
 /// loads. Bundled, run from an EMPTY cwd.
 #[test]
 fn native_run_in_worker_imports_module_from_bundle() {
+    let _serial = serial_native();
     let dir = tmp_dir("mm_riw_native");
     write(
         &dir,
@@ -621,6 +679,7 @@ fn native_run_in_worker_imports_module_from_bundle() {
 /// before the class/producer slice loads. Bundled, run from an EMPTY cwd.
 #[test]
 fn native_actor_and_stream_import_module_from_bundle() {
+    let _serial = serial_native();
     let dir = tmp_dir("mm_as_native");
     write(
         &dir,
