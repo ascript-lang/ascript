@@ -784,11 +784,13 @@ impl ModuleArchive {
 - Modify: `docs/assets/app.js` (`NAV` array), `README.md`
 - Test: manual + the docs-build check
 
-- [ ] **Step 1:** Write `bundles.md`: what `build`/`--native` embed, the module archive, tree-shaking + reading the report, embedded capabilities + `ASCRIPT_DENY`, the std-stays-native and macOS-signing notes.
-- [ ] **Step 2:** Add the `bundles` slug to the `NAV` array (sidebar + cmd-K), and a README mention.
-- [ ] **Step 3:** Verify in-content links resolve relative to the page dir.
-- [ ] **Step 4: §9.1** — docs is the deliverable; blast-radius: a new page absent from `NAV` is unreachable — assert the slug is present.
-- [ ] **Step 5: Commit** — `git commit -m "docs(bundles): self-contained bundles, tree-shaking, embedded caps"`
+- [x] **Step 1:** Write `bundles.md`: what `build`/`--native` embed, the module archive, tree-shaking + reading the report, embedded capabilities + `ASCRIPT_DENY`, the std-stays-native and macOS-signing notes.
+- [x] **Step 2:** Add the `bundles` slug to the `NAV` array (sidebar + cmd-K), and a README mention.
+- [x] **Step 3:** Verify in-content links resolve relative to the page dir.
+- [x] **Step 4: §9.1** — docs is the deliverable; blast-radius: a new page absent from `NAV` is unreachable — assert the slug is present.
+- [x] **Step 5: Commit** — `git commit -m "docs(bundles): self-contained bundles, tree-shaking, embedded caps"`
+
+> **Accepted (4.1):** commit `f6b65d0`. `docs/content/language/bundles.md` covers: `build`/`--native` (bundling not AOT), std-stays-native, the `ASCRIPTA` module archive (portable logical keys, circular/diamond, side-effect/once-only preserved), tree-shaking (entry kept whole; named per-binding vs namespace static-`m.foo`/`m.foo(args)` shake vs dynamic-`m[k]`/escape WHOLE-module pin; "over-include never under-include"), reading the build report (with REAL captured stderr), the reproducible 32-byte digest, embedded capabilities (monotone `build ∩ --deny ∩ ASCRIPT_DENY`), `ASCRIPT_DENY` launch-time subtraction, and the macOS signing caveat (tamper-EVIDENT not tamper-proof — closes the 3.4 follow-up). NAV slug `['language/bundles', 'Self-contained bundles']` wired (app.js:27, verified reachable); README mention added. In-content links relative + VERIFIED to resolve (`modules-async`, `../stdlib/caps`, `../runtime` all exist). Implementer captured REAL CLI output (build reports, native build, caps-denied run, ASCRIPT_DENY error) — no invented claims. Docs-only; no behavior change.
 
 ### Task 4.2: archive deserialization fuzz target
 
