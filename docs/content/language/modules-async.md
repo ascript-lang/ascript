@@ -263,3 +263,10 @@ A few things to know:
   Apple silicon). Ad-hoc signing establishes integrity, not authenticity — distributing to other users
   without a Gatekeeper prompt still needs Developer-ID signing + notarization, which is out of scope
   for `--native`.
+- **Atomic output.** The bundle is assembled on a temporary sibling file (write the stub → make it
+  executable → sign → append the payload) and only **renamed onto the output path as the very last
+  step**, so a failed build never leaves a partial or unsigned binary in place, and the output appears
+  atomically.
+- **No double-bundles.** If the `ascript` doing the build is *itself* already a native bundle, the
+  existing payload overlay is **stripped first**, so the new binary carries exactly one program and is
+  not doubled in size.

@@ -1003,11 +1003,19 @@ pub fn build_native(
     // Step 1: the payload is the SAME verified `.aso` byte vector a `build` produces.
     let payload = compile_verified_aso_bytes(file, true)?;
 
-    // Step 2: the stub is a byte-for-byte copy of the running runtime.
+    // Step 2: the stub is a byte-for-byte copy of the running runtime — but if THIS binary is
+    // itself a bundle (a double-bundle: someone ran a bundled `ascript` as the builder, or a
+    // future self-rebundle), strip the existing overlay first so the new output carries exactly
+    // ONE payload+footer and is not double-sized. The clean stub is everything before the
+    // existing payload offset; the recovered prefix is a footer-free runtime by construction.
     let exe = std::env::current_exe()
         .map_err(|e| AsError::new(format!("cannot locate the running executable: {e}")))?;
-    let stub = std::fs::read(&exe)
+    let raw = std::fs::read(&exe)
         .map_err(|e| AsError::new(format!("cannot read the runtime {}: {}", exe.display(), e)))?;
+    let stub = match crate::bundle::read_bundle_footer(&raw) {
+        Some((offset, _len)) => raw[..offset].to_vec(), // strip old overlay → clean runtime
+        None => raw,
+    };
 
     // Step 3: choose the output path (source stem; `.exe` on Windows; NEVER `.aso`).
     let out_path = match out {
@@ -1025,31 +1033,54 @@ pub fn build_native(
         }
     };
 
-    // Step 4: write the stub, make it executable, and (macOS) ad-hoc sign the CLEAN Mach-O
-    // so its signature `codeLimit` covers only the stub. The payload+footer are appended in
-    // step 5 AFTER the signature — the macOS loader validates `[0, codeLimit)` and ignores
-    // the trailing overlay, so an arm64 bundle execs WITHOUT re-signing the overlay (the
-    // alternative — append then re-sign — relocates the overlay and breaks the footer).
-    std::fs::write(&out_path, &stub)
-        .map_err(|e| AsError::new(format!("cannot write {}: {}", out_path.display(), e)))?;
+    // Step 4: build the bundle on a TEMP sibling, then atomically rename onto `out_path` at the
+    // very end. Every prior step (write stub → chmod → macOS sign → append payload+footer)
+    // touches ONLY the temp path, so a symlink-swap of `out_path` can no longer redirect the
+    // chmod / sign / append onto an arbitrary file — all the TOCTOU windows collapse into the
+    // single final `rename`. CRITICAL: the macOS ad-hoc sign still runs on the CLEAN stub
+    // BEFORE the payload is appended, so the signature's `codeLimit` covers only the stub and
+    // the loader ignores the trailing overlay — that ordering is preserved on the temp file.
+    let tmp_path = {
+        let mut p = out_path.clone();
+        let ext = out_path
+            .extension()
+            .map(|e| format!("{}.{}.tmp", e.to_string_lossy(), std::process::id()))
+            .unwrap_or_else(|| format!("{}.tmp", std::process::id()));
+        p.set_extension(ext);
+        p
+    };
+    // Any early return from here on must not leak the temp file: a tiny RAII guard removes it
+    // unless `disarm`ed right before the successful rename.
+    struct TmpGuard(std::path::PathBuf, bool);
+    impl Drop for TmpGuard {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+    }
+    let mut guard = TmpGuard(tmp_path.clone(), true);
+
+    std::fs::write(&tmp_path, &stub)
+        .map_err(|e| AsError::new(format!("cannot write {}: {}", tmp_path.display(), e)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&out_path)
-            .map_err(|e| AsError::new(format!("cannot stat {}: {}", out_path.display(), e)))?
+        let mut perms = std::fs::metadata(&tmp_path)
+            .map_err(|e| AsError::new(format!("cannot stat {}: {}", tmp_path.display(), e)))?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&out_path, perms).map_err(|e| {
-            AsError::new(format!("cannot chmod +x {}: {}", out_path.display(), e))
+        std::fs::set_permissions(&tmp_path, perms).map_err(|e| {
+            AsError::new(format!("cannot chmod +x {}: {}", tmp_path.display(), e))
         })?;
     }
-    crate::bundle::adhoc_sign_macos(&out_path).map_err(AsError::new)?;
+    crate::bundle::adhoc_sign_macos(&tmp_path).map_err(AsError::new)?;
 
     // Step 5: append `payload || footer` AFTER the (now-signed) stub. `payload_offset` is the
     // on-disk size of the signed stub — signing rewrites `__LINKEDIT`, so it may differ from
     // `stub.len()`; read it back rather than assuming.
-    let payload_offset = std::fs::metadata(&out_path)
-        .map_err(|e| AsError::new(format!("cannot stat {}: {}", out_path.display(), e)))?
+    let payload_offset = std::fs::metadata(&tmp_path)
+        .map_err(|e| AsError::new(format!("cannot stat {}: {}", tmp_path.display(), e)))?
         .len();
     let footer = crate::bundle::write_footer(
         payload_offset,
@@ -1060,12 +1091,25 @@ pub fn build_native(
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
-            .open(&out_path)
-            .map_err(|e| AsError::new(format!("cannot open {} to append: {}", out_path.display(), e)))?;
+            .open(&tmp_path)
+            .map_err(|e| AsError::new(format!("cannot open {} to append: {}", tmp_path.display(), e)))?;
         f.write_all(&payload)
             .and_then(|()| f.write_all(&footer))
-            .map_err(|e| AsError::new(format!("cannot append payload to {}: {}", out_path.display(), e)))?;
+            .map_err(|e| AsError::new(format!("cannot append payload to {}: {}", tmp_path.display(), e)))?;
     }
+
+    // Step 6: atomic publish — a single `rename` makes the fully-built bundle appear at
+    // `out_path` (replacing any prior file in one syscall). Only on success do we disarm the
+    // cleanup guard so it does NOT delete the now-renamed file.
+    std::fs::rename(&tmp_path, &out_path).map_err(|e| {
+        AsError::new(format!(
+            "cannot finalize {} (rename from {}): {}",
+            out_path.display(),
+            tmp_path.display(),
+            e
+        ))
+    })?;
+    guard.1 = false;
 
     let total = payload_offset + payload.len() as u64 + crate::bundle::FOOTER_SIZE as u64;
     println!(

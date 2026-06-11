@@ -536,8 +536,11 @@ fn fix_edits_json(path: &str, edits: &[ascript::check::TextEdit]) -> String {
 ///
 /// Cost on the NON-bundle path (every normal launch): a `current_exe()` resolve + open +
 /// stat + a single `FOOTER_SIZE`-byte tail read — it never loads the whole image (Task 7).
-/// Any I/O failure is treated as "not a bundle" (fall through) — a bundle that cannot read
-/// its own payload is indistinguishable from a non-bundle and must not abort startup.
+/// Any I/O failure BEFORE footer confirmation (open / stat / footer read / `validate_footer`)
+/// is treated as "not a bundle" — it may be a plain `ascript` launch, so it falls through to
+/// `Cli::parse()`. Once the `ASCRIPTB` magic is confirmed, a payload-read failure is a
+/// REPORTED error (exit 1), NOT a silent fall-through — the binary IS a bundle, so a confusing
+/// clap "missing subcommand" error would be wrong.
 async fn try_run_embedded() -> Option<ExitCode> {
     use std::io::{Read, Seek, SeekFrom};
     const FOOTER_SIZE: usize = ascript::bundle::FOOTER_SIZE;
@@ -554,10 +557,18 @@ async fn try_run_embedded() -> Option<ExitCode> {
     f.read_exact(&mut footer).ok()?;
     let (offset, len) = ascript::bundle::validate_footer(&footer, exe_len)?;
 
-    // It IS a bundle — read the payload region and run it embedded.
-    f.seek(SeekFrom::Start(offset as u64)).ok()?;
+    // It IS a bundle (the `ASCRIPTB` magic is confirmed) — from here a read failure is a
+    // REPORTED error, NOT a silent fall-through to clap. A transient I/O error (e.g. EINTR
+    // under load) on the payload read used to `.ok()?` → `None` → `Cli::parse()` → clap's
+    // confusing "missing subcommand" usage error; the binary IS a bundle, so surface it.
     let mut payload = vec![0u8; len];
-    f.read_exact(&mut payload).ok()?;
+    if let Err(e) = f
+        .seek(SeekFrom::Start(offset as u64))
+        .and_then(|_| f.read_exact(&mut payload))
+    {
+        eprintln!("error: failed to read embedded program: {e}");
+        return Some(ExitCode::from(1));
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match ascript::run_embedded_aso(&payload, &args).await {
         Ok(code) => code,
