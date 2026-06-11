@@ -137,7 +137,7 @@ pub struct BreakpointBinding {
 /// the VM thread (where `Value` access is fine) and rendered to `String`/`u32` before
 /// sending, so the whole snapshot is `Send` (compile-time-proved by an `_assert_send`
 /// test). Never add an `Rc`/`Value`/`Cc` field — that would break the airlock.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameSnapshot {
     /// Human label for the frame: the function name, "<script>" for the bottom/module
     /// frame, or "fn@L<line>" when no name is recorded.

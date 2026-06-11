@@ -61,6 +61,7 @@ and register the adapter (in an extension or your settings) as
 | `stackTrace` / `scopes` / `variables` | The paused call stack, each frame's `Locals` scope, and the rendered local values — answered from a plain-data snapshot taken at the stop. |
 | `evaluate` | Evaluate an expression (Watch / Debug Console / hover) against the paused frame's locals + module globals. **Side-effecting expressions do run** — like the V8 debug console — but only when *you* request them. |
 | `disconnect` / `terminate` | Resume the program to completion and end the session. |
+| Re-`launch` | A `launch` while a session is already live cleanly reaps the old session (resumes it, joins its threads) and resets the session state, so the re-launch behaves like a fresh session with no stale frames or zombie threads. |
 
 ### v1 limitations
 
