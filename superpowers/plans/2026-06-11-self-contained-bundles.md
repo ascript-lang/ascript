@@ -767,9 +767,11 @@ impl ModuleArchive {
 
 ### Task 3.4: Phase 3 holistic review
 
-- [ ] **Step 1:** Holistic-review subagent: caps are sourced identically by `build` and `--native`, enforcement matches a normal `--deny` run, `ASCRIPT_DENY` is strictly monotone, the macOS overlay-signing caveat (spec §10) is documented, clippy both configs.
-- [ ] **Step 2:** Findings → tracked tasks, fixed before phase close.
-- [ ] **Step 3:** Tick only when capability-enforcement tests pass in both configs.
+- [x] **Step 1:** Holistic-review subagent: caps are sourced identically by `build` and `--native`, enforcement matches a normal `--deny` run, `ASCRIPT_DENY` is strictly monotone, the macOS overlay-signing caveat (spec §10) is documented, clippy both configs.
+- [x] **Step 2:** Findings → tracked tasks, fixed before phase close.
+- [x] **Step 3:** Tick only when capability-enforcement tests pass in both configs.
+
+> **Phase 3 CLOSED (holistic review: SHIP WITH FOLLOW-UPS — N4 closed end-to-end).** Combined diff `5266bc6..HEAD` reviewed as one system. Verdict **SHIP**, NO Critical/Important security findings. Reviewer built REAL bundles across all three paths (`run --deny X`, `build --deny X`→`.aso`, `build --native --deny X`→binary) and probed ALL FIVE caps end-to-end: (1) caps sourced IDENTICALLY via the single `compose_caps` chokepoint (net/fs/process/env/ffi + the `--deny-net=external` carve-out all decode/enforce identically across the three paths); (2) enforcement PARITY with a normal `--deny` run (same `require_cap`/`call_stdlib` chokepoint; no cap gated in-process but not embedded); (3) the 3-layer chain `archive.caps ∩ CLI --deny ∩ ASCRIPT_DENY` is monotone — NO grant/widen primitive exists anywhere (`bits` only ever `&= !`-cleared), no re-grant constructible; (4) the reduced floor crosses the WORKER airlock (worker net-call denied; pooled `caps.drop` refused §4.5a); (5) FAIL-CLOSED everywhere (corrupt caps blob, invalid `ASCRIPT_DENY`, bad `--deny`/toml all refuse to run, never fail-open); (6) macOS overlay-signing caveat in spec §10 + now a code comment at the embed site (commit `4ea2dfe`); (7) artifact rule consistent (unrestricted single-module byte-identical, differential 378/0 both configs); (8) `restrict_with` scope-merge sound for all fs/net combos. **Two FOLLOW-UPS carried to Phase 4 (both NON-security):** (a) the user-doc signing caveat → Task 4.1's `bundles.md`; (b) the cap-flag `#[command(flatten)]` refactor → a cleanup (deferred — `Test` deliberately omits `--deny-net`/`--deny-fs`, so it's a multi-command CLI refactor with no security content; correct to keep out of the security phase). Gates: native 30/30 both configs, caps 46/0 both configs, cap_audit 19/0, differential 378/0 both configs, `--no-default-features` builds, clippy clean both configs.
 
 ---
 
