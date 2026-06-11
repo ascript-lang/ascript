@@ -453,3 +453,47 @@ fn native_output_is_atomic_no_temp_leftover() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&empty);
 }
+
+/// SELF-CONTAINED-BUNDLES (Task 1.5) — a MULTI-module `build --native` embeds the whole import
+/// graph as an `ASCRIPTA` archive in the payload; the produced binary runs from an EMPTY cwd
+/// (no `.as` sources anywhere) and prints the right output. This proves build-time graph
+/// embedding + run-time archive decode/install across the native-bundle boundary.
+#[test]
+fn native_multimodule_bundle_runs_from_empty_dir() {
+    let dir = tmp_dir("mm_native");
+    // Two sibling modules; the entry imports the util by a relative specifier.
+    write(
+        &dir,
+        "util.as",
+        "export fn greet(name: string): string { return `Hello, ${name}!` }\n",
+    );
+    let entry = write(
+        &dir,
+        "app.as",
+        "import { greet } from \"./util\"\nprint(greet(\"bundle\"))\n",
+    );
+    let app = dir.join("mm_app");
+    build_native(&entry, &app);
+
+    // Run from an EMPTY dir with a scrubbed PATH — nothing on disk to fall back to.
+    let empty = tmp_dir("mm_native_cwd");
+    let b = run_bundle(&app, &empty, &[]);
+    assert!(
+        b.status.success(),
+        "multi-module native bundle failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&b.stdout),
+        "Hello, bundle!\n",
+        "the bundled multi-module program must produce the imported function's output"
+    );
+    // Equivalence with `ascript run` of the source.
+    let r = run_ref(&entry, &[]);
+    assert_eq!(b.stdout, r.stdout, "native multimodule stdout differs from source run");
+    assert_eq!(b.status.code(), r.status.code());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}

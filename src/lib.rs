@@ -933,7 +933,17 @@ pub fn build_file(
     out: Option<&Path>,
     with_debug: bool,
 ) -> Result<std::path::PathBuf, AsError> {
-    let bytes = compile_verified_aso_bytes(file, with_debug)?;
+    // SELF-CONTAINED-BUNDLES (Task 1.5): a multi-module program is emitted as an
+    // `ASCRIPTA` archive embedding the whole reachable import graph (so `run out.aso`
+    // works from a directory WITHOUT the sources). A single-module program recompiles
+    // the lone entry to a bare `ASO\0` chunk — byte-identical to the pre-archive
+    // artifact, so existing `.aso` goldens/tests stay valid.
+    let archive = compile_archive(file, with_debug)?;
+    let bytes = if archive.modules.len() > 1 {
+        archive.encode() // ASCRIPTA — embed the whole module graph
+    } else {
+        compile_verified_aso_bytes(file, with_debug)? // bare ASO\0 — byte-identical to today
+    };
     let out_path = match out {
         Some(p) => p.to_path_buf(),
         None => file.with_extension("aso"),
@@ -1026,7 +1036,15 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
 ///
 /// `caps` is a default all-granted [`CapSet`] and `shake_digest` is all-zero for now;
 /// Phase 3 fills the composed caps and Phase 2 fills the shake digest.
-pub fn compile_archive(entry: &Path) -> Result<crate::vm::archive::ModuleArchive, AsError> {
+///
+/// `with_debug` is threaded into every module's compile: the stored chunk bytes are
+/// what actually RUN at bundle time (the archive replaces the source tree), so debug
+/// info (line/variable tables for panic diagnostics) is preserved per the caller's
+/// choice, exactly as a single-module `build`/`--native` would.
+pub fn compile_archive(
+    entry: &Path,
+    with_debug: bool,
+) -> Result<crate::vm::archive::ModuleArchive, AsError> {
     use crate::vm::archive::ModuleArchive;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1078,9 +1096,10 @@ pub fn compile_archive(entry: &Path) -> Result<crate::vm::archive::ModuleArchive
 
     while let Some(item) = queue.pop_front() {
         // Compile this module to verified `.aso` bytes (reusing the SAME path `build`
-        // uses, so the stored chunk always re-verifies). `with_debug = false`: an
-        // archive is a distribution artifact; debug info is not needed to walk imports.
-        let bytes = compile_verified_aso_bytes(&item.path, false)?;
+        // uses, so the stored chunk always re-verifies). The stored bytes are what RUN
+        // (the archive replaces the source tree), so debug info is preserved per the
+        // caller's `with_debug` choice — NOT dropped — matching a single-module build.
+        let bytes = compile_verified_aso_bytes(&item.path, with_debug)?;
 
         // Decode the just-produced chunk to read its import table. These are OUR OWN
         // freshly-verified bytes, so this never sees hostile input.
@@ -1238,8 +1257,17 @@ pub fn build_native(
         )));
     }
 
-    // Step 1: the payload is the SAME verified `.aso` byte vector a `build` produces.
-    let payload = compile_verified_aso_bytes(file, true)?;
+    // Step 1: the payload is the SAME verified bytes a `build` produces — a bare `ASO\0`
+    // chunk for a single-module program (byte-identical to today's bundle) or an
+    // `ASCRIPTA` archive embedding the whole import graph for a multi-module program
+    // (so the bundled binary runs from an empty directory). The `stub || payload ||
+    // footer` framing below is unchanged: the payload is opaque to the bundler.
+    let archive = compile_archive(file, true)?;
+    let payload = if archive.modules.len() > 1 {
+        archive.encode() // ASCRIPTA — embed the whole module graph
+    } else {
+        compile_verified_aso_bytes(file, true)? // bare ASO\0 — byte-identical to today
+    };
 
     // Step 2: the stub is a byte-for-byte copy of the running runtime — but if THIS binary is
     // itself a bundle (a double-bundle: someone ran a bundled `ascript` as the builder, or a
@@ -1401,9 +1429,17 @@ async fn run_verified_aso(
     module_dir: Option<std::path::PathBuf>,
     what: &str,
 ) -> Result<i32, AsError> {
-    use crate::vm::chunk::FnProto;
-    use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
+
+    // SELF-CONTAINED-BUNDLES (Task 1.5): magic-dispatch. A multi-module `build`/`--native`
+    // emits an `ASCRIPTA` archive embedding the whole graph; decode + run it via the
+    // archive runner. A single-module artifact leads with `ASO\0` and falls through to the
+    // unchanged single-chunk path below — byte-identical to the pre-archive run.
+    if payload.starts_with(&crate::vm::archive::ARCHIVE_MAGIC) {
+        let archive = crate::vm::archive::ModuleArchive::decode(payload)
+            .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
+        return run_verified_archive(archive, script_args, caps, module_dir, what).await;
+    }
 
     let chunk = crate::vm::chunk::Chunk::from_bytes_verified(payload)
         .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
@@ -1423,6 +1459,82 @@ async fn run_verified_aso(
     if let Some(dir) = module_dir {
         vm.set_module_dir(dir);
     }
+
+    run_entry_proto_to_exit(&interp, &vm, chunk).await
+}
+
+/// SELF-CONTAINED-BUNDLES (Task 1.5) — the PRODUCTION runner for an `ASCRIPTA` module
+/// archive (mirrors [`run_verified_aso`]'s single-chunk body, dispatched into from the
+/// shared magic-routing above). The entry chunk is the program start; every reachable
+/// module is embedded, so the program runs with NO source tree on disk.
+///
+/// Unlike the [`run_archive`] test seam (`Interp::new()`, captured output, cwd module
+/// dir), this uses `Interp::new_live` (streamed output), honors the passed-in CLI `caps`,
+/// and — CRUCIALLY — calls `vm.set_module_dir(dir)` BEFORE `set_module_archive` when a
+/// `module_dir` is known (the `.aso`'s / executable's directory), so an archive MISS can
+/// still resolve a sibling on-disk source (the Task 1.4 carry-forward). `set_module_archive`
+/// then seeds the entry's logical dir to the archive root (`""`).
+///
+/// NOTE on scope (do NOT widen here): the passed-in CLI `caps` are installed as-is — the
+/// archive's own embedded `archive.caps` are NOT yet composed/enforced (Phase 3), and only
+/// the ENTRY chunk's bytes are handed to `set_worker_aso_bytes` (single-module worker fns
+/// work; full archive→worker parity is Task 1.6).
+async fn run_verified_archive(
+    archive: crate::vm::archive::ModuleArchive,
+    script_args: &[String],
+    caps: Option<crate::stdlib::caps::CapSet>,
+    module_dir: Option<std::path::PathBuf>,
+    what: &str,
+) -> Result<i32, AsError> {
+    use crate::vm::Vm;
+
+    // The entry module's verified chunk is the program start, decoded through the SAME
+    // `from_bytes_verified` trust boundary the disk `.aso` path uses. A bounds-check on the
+    // entry index yields a clean error rather than a panic (decode already validates this,
+    // but never index without a check on possibly-foreign data).
+    let entry_bytes = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(_, b)| b.clone())
+        .ok_or_else(|| {
+            AsError::new(format!("cannot load {what}: archive entry index is out of range"))
+        })?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+        .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_cli_args(script_args);
+    // FFI §4.5: install the composed (CLI/manifest) capability set before running any code.
+    if let Some(caps) = caps {
+        interp.set_caps(caps);
+    }
+    // Workers Spec A: retain the ENTRY chunk bytes so `dispatch_worker_closure` can re-parse
+    // them (single-module worker fns work; full archive→worker parity is Task 1.6).
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    // Seed the on-disk fallback dir BEFORE installing the archive: `set_module_archive`
+    // overrides the entry's LOGICAL dir to the archive root, but an archive-miss still
+    // resolves sibling sources against `module_dir` on disk (Task 1.4 carry-forward).
+    if let Some(dir) = module_dir {
+        vm.set_module_dir(dir);
+    }
+    vm.set_module_archive(Rc::new(archive));
+
+    run_entry_proto_to_exit(&interp, &vm, chunk).await
+}
+
+/// The shared run tail behind [`run_verified_aso`] and [`run_verified_archive`]: wrap the
+/// entry `chunk` in a top-level proto, run it on a `LocalSet`, flush telemetry, end-of-run
+/// GC, then map the `RunOutcome`/`Control` to a process exit code. Borrow discipline is the
+/// callers' (no `RefCell`/resource borrow is held across the `.await` here).
+async fn run_entry_proto_to_exit(
+    interp: &Rc<Interp>,
+    vm: &crate::vm::Vm,
+    chunk: crate::vm::chunk::Chunk,
+) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
 
     let proto = Rc::new(FnProto {
         chunk,

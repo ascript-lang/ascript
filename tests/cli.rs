@@ -4340,3 +4340,105 @@ fn multibyte_check_lint_underlines_correctly() {
     assert_eq!(col_of("\u{3c0}"), "11", "lint column must be char col 11 (1-based)");
 }
 
+
+/// SELF-CONTAINED-BUNDLES (Task 1.5) — `ascript build` of a MULTI-module program emits an
+/// `ASCRIPTA` archive embedding the whole import graph, and `ascript run out.aso` works from
+/// a directory that does NOT contain the sources. A SINGLE-module program still emits a bare
+/// `ASO\0` chunk (back-compat — byte-identical to the pre-archive artifact).
+#[test]
+fn build_multimodule_emits_archive_and_runs_without_sources() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    // A temp dir with NO `.as` sources — the run must be entirely self-contained.
+    let dir = std::env::temp_dir().join(format!("ascript_bundle15_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_aso = dir.join("out.aso");
+
+    // The example pair lives under `examples/` (the build reads sources from there); the
+    // produced `.aso` is self-contained and is run from `dir`, which has none of them.
+    let entry = std::path::Path::new("examples/bundle_multimodule.as");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(entry)
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    // The artifact leads with the ARCHIVE magic (`ASCRIPTA`), not a bare `ASO\0` chunk.
+    let bytes = std::fs::read(&out_aso).unwrap();
+    assert_eq!(
+        &bytes[..8],
+        b"ASCRIPTA",
+        "a multi-module build must emit an ASCRIPTA archive"
+    );
+
+    // Run the archive from a directory WITHOUT the sources — output must match the source run.
+    let run = Command::new(bin)
+        .arg("run")
+        .arg(&out_aso)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "running the archive failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let reference = Command::new(bin).arg("run").arg(entry).output().unwrap();
+    assert_eq!(
+        run.stdout, reference.stdout,
+        "archive run stdout must match the source run"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "Hello, world!\nbundled!!!\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compat: a SINGLE-module `ascript build` still emits a bare `ASO\0` chunk (NOT an archive),
+/// so existing `.aso` artifacts/goldens stay byte-identical to today.
+#[test]
+fn build_single_module_emits_bare_aso_chunk() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_bundle15_single_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_aso = dir.join("hello.aso");
+
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg("examples/hello.as")
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let bytes = std::fs::read(&out_aso).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        b"ASO\0",
+        "a single-module build must emit a bare ASO\\0 chunk (compat)"
+    );
+
+    // And it still runs.
+    let run = Command::new(bin).arg("run").arg(&out_aso).output().unwrap();
+    assert!(run.status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

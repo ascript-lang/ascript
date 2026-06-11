@@ -15,7 +15,7 @@ use std::path::Path;
 /// present under the relative-to-entry-dir convention, and every chunk re-verifies.
 #[test]
 fn multimodule_archive_has_both_modules() {
-    let arch = compile_archive(Path::new("examples/bundle_multimodule.as"))
+    let arch = compile_archive(Path::new("examples/bundle_multimodule.as"), false)
         .expect("compile_archive succeeds for the multi-module example");
 
     // Both modules are present, keyed by their entry-dir-relative logical path.
@@ -52,7 +52,7 @@ fn multimodule_archive_has_both_modules() {
 /// forbidden.
 #[test]
 fn logical_keys_are_machine_independent() {
-    let arch = compile_archive(Path::new("examples/bundle_multimodule.as")).expect("archives");
+    let arch = compile_archive(Path::new("examples/bundle_multimodule.as"), false).expect("archives");
     let build_dir = env!("CARGO_MANIFEST_DIR");
     for (key, _) in &arch.modules {
         assert!(
@@ -96,7 +96,7 @@ fn parent_directory_import_keys_with_dotdot() {
     )
     .expect("write shared");
 
-    let arch = compile_archive(&entry).expect("archives a parent-dir import");
+    let arch = compile_archive(&entry, false).expect("archives a parent-dir import");
     assert_eq!(arch.modules.len(), 2);
     // Entry keys to its file name at the logical root.
     assert_eq!(&arch.modules[arch.entry as usize].0, "main.as");
@@ -143,7 +143,7 @@ fn diamond_import_dedups_shared_module() {
     .expect("write b");
     std::fs::write(&util, "export fn shared(): number { return 1 }\n").expect("write util");
 
-    let arch = compile_archive(&entry).expect("archives the diamond");
+    let arch = compile_archive(&entry, false).expect("archives the diamond");
     assert_eq!(
         arch.modules.len(),
         4,
@@ -178,7 +178,7 @@ fn circular_import_terminates_and_archives_both() {
     )
     .expect("write b");
 
-    let arch = compile_archive(&a).expect("compile_archive terminates on a cycle");
+    let arch = compile_archive(&a, false).expect("compile_archive terminates on a cycle");
     assert_eq!(arch.modules.len(), 2, "both cycle members archived once each");
     assert!(arch.get("a.as").is_some(), "a archived; keys={:?}", keys(&arch));
     assert!(arch.get("b.as").is_some(), "b archived; keys={:?}", keys(&arch));
@@ -195,7 +195,7 @@ fn unknown_package_is_a_clean_error() {
         "import { x } from \"definitely_not_a_real_package\"\nprint(x)\n",
     )
     .expect("write");
-    let err = compile_archive(&entry).expect_err("unknown package must error");
+    let err = compile_archive(&entry, false).expect_err("unknown package must error");
     assert!(
         err.message.contains("definitely_not_a_real_package")
             || err.message.contains("unknown package"),
@@ -210,7 +210,7 @@ fn missing_import_is_a_clean_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let entry = dir.path().join("main.as");
     std::fs::write(&entry, "import { y } from \"./does_not_exist\"\nprint(y)\n").expect("write");
-    let err = compile_archive(&entry).expect_err("missing module must error");
+    let err = compile_archive(&entry, false).expect_err("missing module must error");
     assert!(!err.message.is_empty(), "missing-module error is non-empty");
 }
 
@@ -220,7 +220,7 @@ fn single_module_archive_has_one_entry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let entry = dir.path().join("solo.as");
     std::fs::write(&entry, "print(1 + 1)\n").expect("write");
-    let arch = compile_archive(&entry).expect("archives a zero-import program");
+    let arch = compile_archive(&entry, false).expect("archives a zero-import program");
     assert_eq!(arch.modules.len(), 1);
     assert_eq!(arch.entry, 0);
     assert_eq!(&arch.modules[0].0, "solo.as");
@@ -245,7 +245,7 @@ fn std_imports_are_not_archived() {
     )
     .expect("write helper");
 
-    let arch = compile_archive(&entry).expect("archives, skipping std");
+    let arch = compile_archive(&entry, false).expect("archives, skipping std");
     assert_eq!(arch.modules.len(), 2, "only entry + helper; std is not archived");
     assert!(arch.get("main.as").is_some());
     assert!(arch.get("helper.as").is_some());
@@ -275,7 +275,7 @@ fn keys(arch: &ascript::vm::archive::ModuleArchive) -> Vec<&str> {
 #[tokio::test]
 async fn runs_purely_from_archive_with_sources_absent() {
     // 1. The archive is built from the real example (the only place the sources are read).
-    let arch = compile_archive(Path::new("examples/bundle_multimodule.as"))
+    let arch = compile_archive(Path::new("examples/bundle_multimodule.as"), false)
         .expect("compile_archive succeeds");
 
     // 2. Make the sources INACCESSIBLE: copy the archive into a process where the loader's
@@ -307,7 +307,7 @@ async fn archive_run_survives_deleted_source_tree() {
     .expect("write entry");
     std::fs::write(&util, "export fn val(): number { return 2 }\n").expect("write util");
 
-    let arch = compile_archive(&entry).expect("archives");
+    let arch = compile_archive(&entry, false).expect("archives");
     // Re-encode/decode to prove the archive is fully self-contained bytes (no borrowed
     // path state), then DELETE the sources entirely.
     let bytes = arch.encode();
@@ -350,7 +350,7 @@ async fn circular_archive_runs_once_no_infinite_loop() {
     )
     .expect("write b");
 
-    let arch = compile_archive(&main).expect("archives the cycle");
+    let arch = compile_archive(&main, false).expect("archives the cycle");
     let bytes = arch.encode();
     drop(dir);
     let arch = ModuleArchive::decode(&bytes).expect("decodes");
@@ -384,7 +384,7 @@ async fn nested_and_parent_dir_imports_resolve_from_archive() {
     std::fs::write(&sibling, "export fn h(): number { return 10 }\n").expect("write helper");
     std::fs::write(&shared, "export fn s(): number { return 5 }\n").expect("write shared");
 
-    let arch = compile_archive(&entry).expect("archives nested + parent imports");
+    let arch = compile_archive(&entry, false).expect("archives nested + parent imports");
     // Sanity: the parent import keyed with a verbatim `..`.
     assert!(
         arch.get("../shared.as").is_some(),
