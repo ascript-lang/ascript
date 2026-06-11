@@ -494,15 +494,15 @@ let len = match content_length {
 >
 > **Needs an OWNER DECISION (escalate at the Phase 0 holistic review), not a unilateral fix** — options: (a) event-source byte draws (append an event so drift is detectable + replayable; changes the det-log format), (b) document the limitation + a `workflow-determinism` lint flagging `uuid.v4`/`crypto.randomBytes` in a workflow body (cheaper, advisory), or (c) accept as-is with a documented note. Resolve before Phase 0 closes; do not drop.
 
-- [ ] **Step 1:** Escalate the (a)/(b)/(c) decision to the owner at the Phase 0 holistic review.
-- [ ] **Step 2:** Implement the chosen option with tests + docs (and a det-log version bump if (a)).
-- [ ] **Step 3:** Tick only when the chosen option is implemented and verified, or the owner explicitly accepts (c) with the documented note in place.
+- [x] **Step 1:** Escalate the (a)/(b)/(c) decision to the owner at the Phase 0 holistic review.
+- [x] **Step 2:** Implement the chosen option with tests + docs (and a det-log version bump if (a)).
+- [x] **Step 3:** Tick only when the chosen option is implemented and verified, or the owner explicitly accepts (c) with the documented note in place.
 
 ### Task 0.20: Phase 0 holistic review
 
-- [ ] **Step 1:** Dispatch a holistic-review subagent over the **combined** Phase 0 diff: cross-fix consistency, no regressions to the four-mode differential, clippy clean in BOTH feature configs, every fix has a regression test + the `.as`/docs deliverables where surface-visible, and the NUM-split / replay-reader / `as usize` blast-radius audits actually landed their discovered fixes.
-- [ ] **Step 2:** Any holistic finding becomes a tracked task in this phase and is fixed before Phase 0 closes.
-- [ ] **Step 3:** Tick this box only when the holistic review passes and `cargo test` + `cargo test --no-default-features` + both clippy configs are green.
+- [x] **Step 1:** Dispatch a holistic-review subagent over the **combined** Phase 0 diff: cross-fix consistency, no regressions to the four-mode differential, clippy clean in BOTH feature configs, every fix has a regression test + the `.as`/docs deliverables where surface-visible, and the NUM-split / replay-reader / `as usize` blast-radius audits actually landed their discovered fixes.
+- [x] **Step 2:** Any holistic finding becomes a tracked task in this phase and is fixed before Phase 0 closes.
+- [x] **Step 3:** Tick this box only when the holistic review passes and `cargo test` + `cargo test --no-default-features` + both clippy configs are green.
 
 ---
 
