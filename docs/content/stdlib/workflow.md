@@ -73,6 +73,23 @@ methods are call-position only (`ctx.now()`, not a bare `ctx.now`):
 `{ log: "path", durability?: "fsync" | "buffered" }` — `log` is the event-log file
 path (required). `durability` defaults to `"fsync"` (the log is flushed to disk).
 
+### Crash-atomic log writes
+
+The event log is rewritten **atomically**: the new contents are written to a sibling
+temp file, fsync'd (under `"fsync"`), and then `rename`d over the target — a POSIX
+`rename` is atomic at the directory level. So at every instant the log path holds
+**either the previous complete log or the new complete log, never a zero-byte or
+half-written file**. A crash (OOM / `SIGKILL` / power loss) mid-write therefore cannot
+corrupt the log into re-executing already-completed activities; the exactly-once
+activity guarantee holds across a crash *during* the persist step, not just between
+steps. Under `"fsync"` the parent directory is also fsync'd after the rename so the
+rename itself is durable.
+
+> **Single-writer per log.** A given log path must be written by **one** workflow
+> run/`resume` at a time (the replay model already assumes this). The temp sibling is
+> pid-qualified so two unrelated processes don't clobber each other's in-flight write;
+> concurrent writers to the same log within one process are not supported.
+
 ## Event-log format
 
 The log is newline-delimited JSON, one event per line, `seq`-ordered:

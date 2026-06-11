@@ -112,10 +112,21 @@ impl Lockfile {
     }
 
     /// Write the lockfile beside `manifest_dir` (`<manifest_dir>/ascript.lock`).
+    ///
+    /// Atomic: written to a pid-qualified sibling temp, then `rename`d over the
+    /// target (POSIX rename is atomic at the directory level). The lockfile is read
+    /// back as a source of truth by `--locked`, so a crash mid-write must not leave a
+    /// partial/empty `ascript.lock` that fails to parse — the rename guarantees the
+    /// file holds either the previous or the new complete lockfile, never a torn one.
     pub fn write_beside(&self, manifest_dir: &Path) -> Result<(), String> {
         let path = manifest_dir.join("ascript.lock");
-        std::fs::write(&path, self.to_toml())
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+        let tmp = path.with_extension(format!("lock.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, self.to_toml())
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot write {}: {e}", path.display())
+        })
     }
 }
 
