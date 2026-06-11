@@ -110,7 +110,14 @@ impl WorkerActorHandle {
 ///
 /// FALLIBLE (thread-limit / memory pressure → `Err`, mapped by the host to a
 /// recoverable panic).
-pub fn spawn_actor_isolate() -> std::io::Result<(mpsc::UnboundedSender<ActorMsg>, IsolateHandle)> {
+///
+/// `archive_bytes` (Task 1.6): the bundled program's encoded `ModuleArchive`, `Some` for a
+/// bundled multi-module program. Captured into the `Send` `make_loop` closure and installed
+/// on the actor isolate's `Vm` before the class slice loads, so an actor method that calls
+/// into an imported module resolves it from memory. `None` for an unbundled program.
+pub fn spawn_actor_isolate(
+    archive_bytes: Option<Vec<u8>>,
+) -> std::io::Result<(mpsc::UnboundedSender<ActorMsg>, IsolateHandle)> {
     // A SECOND `Send` channel carries the typed `ActorMsg`s. The dedicated
     // `IsolateHandle`'s own byte channel (`Vec<u8>`) is unused for actors (the actor
     // protocol is typed, not raw bytes) — we just need the handle for teardown. So we
@@ -118,16 +125,28 @@ pub fn spawn_actor_isolate() -> std::io::Result<(mpsc::UnboundedSender<ActorMsg>
     // `ActorMsg` receiver we move into it.
     let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ActorMsg>();
     // `spawn_isolate`'s closure must be `Send + 'static` and capture only `Send`
-    // values; `msg_rx` is `Send`. The byte receiver is unused.
-    let isolate = spawn_isolate(move |vm, _byte_rx| actor_loop(vm, msg_rx))?;
+    // values; `msg_rx` + `archive_bytes` are `Send`. The byte receiver is unused.
+    let isolate = spawn_isolate(move |vm, _byte_rx| actor_loop(vm, msg_rx, archive_bytes))?;
     Ok((msg_tx, isolate))
 }
 
 /// The actor's FIFO mailbox loop, on the dedicated isolate thread. Processes each
 /// message to completion before the next (one-at-a-time). Ends when the inbound
 /// channel closes (the `WorkerActorHandle` dropped → `close()`/last-drop/teardown).
-async fn actor_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
+async fn actor_loop(
+    vm: Rc<crate::vm::Vm>,
+    mut rx: mpsc::UnboundedReceiver<ActorMsg>,
+    archive_bytes: Option<Vec<u8>>,
+) {
     let interp = vm.interp().clone();
+    // Task 1.6: install the bundled program's archive (if any) on this isolate's `Vm`
+    // BEFORE any class slice loads (the slice re-runs the program's top-level imports). The
+    // actor isolate is single-tenant + long-lived, so install once at boot. A decode failure
+    // is reported as the construction panic on the first `Init` (the actor never builds).
+    let archive_err: Option<String> = match archive_bytes {
+        Some(bytes) => crate::worker::isolate::install_module_archive(&vm, &bytes).err(),
+        None => None,
+    };
     // The actor's instance, built on `Init` and reused for every `Call`. Method
     // dispatch resolves through the instance's class (the VM side table), so no
     // separate class handle is kept.
@@ -142,6 +161,11 @@ async fn actor_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Actor
                 shared,
                 reply,
             } => {
+                // Task 1.6: a boot-time archive install failure fails construction loudly.
+                if let Some(msg) = archive_err.clone() {
+                    let _ = reply.send(ActorReply::Panic(msg));
+                    continue;
+                }
                 let result =
                     init_instance(&vm, &interp, &class_name, &slice_bytes, &args, &shared).await;
                 match result {

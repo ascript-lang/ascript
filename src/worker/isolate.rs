@@ -78,6 +78,12 @@ pub struct WorkerRequest {
     /// The `.aso` code-slice bytes. `Some` when the isolate has not yet cached
     /// `fn_id`; `None` once it has (the caller-side pool tracks this per isolate).
     pub slice_bytes: Option<Vec<u8>>,
+    /// SELF-CONTAINED-BUNDLES Task 1.6 — the encoded `ModuleArchive` of a BUNDLED
+    /// multi-module program. Mirrors `slice_bytes`: a `Send` field shipped when the
+    /// program is archived, installed ONCE per isolate (the isolate tracks it, like the
+    /// `loaded` slice cache) BEFORE the slice loads (the slice re-runs imports). `None`
+    /// for an ordinary unbundled program → nothing installed → today's exact path.
+    pub archive_bytes: Option<Vec<u8>>,
     /// `Some(class)` for a `static worker fn` (currently advisory — the entry is a
     /// free top-level fn in the slice; kept for diagnostics + future class binding).
     #[allow(dead_code)]
@@ -296,11 +302,16 @@ where
 async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>) {
     let interp = vm.interp().clone();
     let mut loaded: HashSet<u64> = HashSet::new();
+    // Task 1.6: the bundled program's archive is installed once per isolate (the first
+    // request that carries it), so a worker fn that calls into an imported module resolves
+    // it from memory on the isolate's re-run imports.
+    let mut archive_installed = false;
 
     while let Some(req) = rx.recv().await {
         let WorkerRequest {
             fn_id,
             slice_bytes,
+            archive_bytes,
             class_name: _,
             entry_name,
             args,
@@ -320,6 +331,21 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
         // program isolate and a DEDICATED `run_in_worker({caps})` isolate.
         interp.set_caps(*caps);
         interp.set_caps_drop_allowed(false);
+
+        // Task 1.6: install the bundled program's archive BEFORE the slice loads (the slice
+        // re-runs the program's top-level imports). Once per isolate; a decode failure is a
+        // recoverable panic reply. `None` (unbundled) installs nothing → today's exact path.
+        if let Some(bytes) = archive_bytes {
+            if !archive_installed {
+                match install_module_archive(&vm, &bytes) {
+                    Ok(()) => archive_installed = true,
+                    Err(msg) => {
+                        let _ = reply.send(WorkerReply::Panic(msg));
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Ensure the slice's globals are defined on this isolate's Vm (once per fn_id).
         if !loaded.contains(&fn_id) {
@@ -380,6 +406,20 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
         };
         let _ = reply.send(reply_msg);
     }
+}
+
+/// SELF-CONTAINED-BUNDLES Task 1.6: decode `bytes` into a [`crate::vm::archive::ModuleArchive`]
+/// and install it on `vm` so the isolate's re-run top-level imports resolve from memory
+/// (the bundled multi-module case). The SINGLE install seam — ALL five isolate sites
+/// (pooled / inline-fallback / dedicated / actor / stream) call THIS, so the decode/install
+/// step and its error string never drift. Returns a recoverable error message on a decode
+/// failure (`.expect`-free); the caller maps it to a `WorkerReply::Panic`/`Control::Panic`.
+/// `None` archive bytes never reach here (the caller skips the call) — today's exact path.
+pub(crate) fn install_module_archive(vm: &Vm, bytes: &[u8]) -> Result<(), String> {
+    let archive = crate::vm::archive::ModuleArchive::decode(bytes)
+        .map_err(|e| format!("cannot install module archive on worker isolate: {e}"))?;
+    vm.set_module_archive(Rc::new(archive));
+    Ok(())
 }
 
 /// Load a code slice's fragment `.aso` into a `Vm`, defining its globals (the worker

@@ -617,6 +617,15 @@ pub struct Interp {
     /// has no source); `worker_source` takes priority when BOTH are set (a run-from-source
     /// always uses the source path). `None` in every run mode that sets `worker_source`.
     worker_aso_bytes: RefCell<Option<Rc<[u8]>>>,
+    /// SELF-CONTAINED-BUNDLES Task 1.6: the encoded [`crate::vm::archive::ModuleArchive`]
+    /// bytes of a BUNDLED multi-module program, retained so every worker isolate can decode
+    /// and install the archive on its own fresh `Vm` BEFORE re-running the program's
+    /// top-level imports. A worker isolate re-runs those imports; without the archive a
+    /// re-run `Op::Import` of an imported module finds no archive and no source tree. Plain
+    /// `Send` bytes (an `Rc<[u8]>` here; `.to_vec()`d at each dispatch site to cross the
+    /// airlock). `None` for an ordinary unbundled program (no archive) gives zero behavior
+    /// change. Mirrors [`worker_aso_bytes`].
+    worker_archive_bytes: RefCell<Option<Rc<[u8]>>>,
     /// DX D2 Task 8: snapshot "update mode" (the `--update-snapshots` re-baseline).
     /// When `true`, `assert.snapshot` OVERWRITES the stored snapshot with the freshly
     /// serialized value and PASSES (a `jest -u`-style bulk re-baseline without editing
@@ -1014,6 +1023,7 @@ impl Interp {
             caps_drop_allowed: Cell::new(true),
             worker_source: RefCell::new(None),
             worker_aso_bytes: RefCell::new(None),
+            worker_archive_bytes: RefCell::new(None),
             // DX D2 Task 8: snapshot re-baseline is OFF by default — a normal run
             // never overwrites a changed snapshot and never deletes an orphan.
             snapshot_update: Cell::new(false),
@@ -1220,6 +1230,21 @@ impl Interp {
     /// Cloned out so the borrow never spans the re-parse/dispatch below.
     pub(crate) fn worker_aso_bytes(&self) -> Option<Rc<[u8]>> {
         self.worker_aso_bytes.borrow().clone()
+    }
+
+    /// SELF-CONTAINED-BUNDLES Task 1.6: record the encoded `ModuleArchive` bytes of a bundled
+    /// multi-module program so each worker isolate can decode + install the archive on its own
+    /// `Vm` before re-running the program's top-level imports. Called by the archive run entry
+    /// points (`run_verified_archive` / `run_archive`). Mirrors [`set_worker_aso_bytes`].
+    pub fn set_worker_archive_bytes(&self, bytes: Rc<[u8]>) {
+        *self.worker_archive_bytes.borrow_mut() = Some(bytes);
+    }
+
+    /// The encoded `ModuleArchive` bytes of a bundled program, if recorded. Cloned out (an
+    /// `Rc` bump) so the borrow never spans the `.to_vec()`/dispatch at a worker site;
+    /// `None` for an ordinary unbundled program. Mirrors [`worker_aso_bytes`].
+    pub(crate) fn worker_archive_bytes(&self) -> Option<Rc<[u8]>> {
+        self.worker_archive_bytes.borrow().clone()
     }
 
     /// Store the script's trailing CLI arguments so `env.args()` can return them.
@@ -2292,13 +2317,17 @@ impl Interp {
         let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
-        // Spawn the dedicated actor isolate + its mailbox.
-        let (tx, isolate) = crate::worker::actor::spawn_actor_isolate().map_err(|e| {
-            Control::Panic(AsError::at(
-                format!("could not spawn actor isolate: {e}"),
-                span,
-            ))
-        })?;
+        // Spawn the dedicated actor isolate + its mailbox. Task 1.6: ship the bundled
+        // program's archive (if any) so the isolate installs it before the class slice loads
+        // — an actor method that calls into an imported module resolves it from memory.
+        let archive_bytes = self.worker_archive_bytes().map(|b| b.to_vec());
+        let (tx, isolate) =
+            crate::worker::actor::spawn_actor_isolate(archive_bytes).map_err(|e| {
+                Control::Panic(AsError::at(
+                    format!("could not spawn actor isolate: {e}"),
+                    span,
+                ))
+            })?;
 
         // Send the Init message; await the ack on a future.
         let (init_reply_tx, init_reply_rx) =
@@ -2545,12 +2574,17 @@ impl Interp {
         let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
-        // Spawn the dedicated isolate + build the producer (awaits the Init ack).
+        // Spawn the dedicated isolate + build the producer (awaits the Init ack). Task 1.6:
+        // ship the bundled program's archive (if any) so the isolate installs it before the
+        // producer slice loads — a `worker fn*` that calls an imported fn resolves it from
+        // memory. Read the `Rc` out before the `.await` (no borrow held across it).
+        let archive_bytes = self.worker_archive_bytes().map(|b| b.to_vec());
         let driver = crate::worker::stream::StreamDriver::spawn(
             entry_name.to_string(),
             slice.entry_aso.to_vec(),
             encoded,
             encoded_shared,
+            archive_bytes,
         )
         .await
         .map_err(|msg| Control::Panic(AsError::at(msg, span)))?;

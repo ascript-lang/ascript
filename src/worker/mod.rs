@@ -115,10 +115,14 @@ pub fn dispatch_worker(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<isolate::WorkerReply>();
     let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
 
+    // Task 1.6: ship the bundled program's archive (if any) so the isolate installs it
+    // before its re-run imports — read the `Rc` out here (no borrow across the dispatch).
+    let archive_bytes = interp.worker_archive_bytes().map(|b| b.to_vec());
     let req = isolate::WorkerRequest {
         fn_id: slice.fn_id,
         // Always ship the slice; the isolate caches by fn_id and ignores re-sends.
         slice_bytes: Some(slice.entry_aso.to_vec()),
+        archive_bytes,
         class_name: slice.class_name.as_deref().map(|s| s.to_string()),
         entry_name: slice.entry_name.to_string(),
         args: encoded,
@@ -144,6 +148,7 @@ pub fn dispatch_worker(
         Err(req) => {
             return run_slice_inline(
                 req.slice_bytes.as_deref(),
+                req.archive_bytes.as_deref(),
                 &req.entry_name,
                 &req.args,
                 &req.shared,
@@ -246,6 +251,7 @@ pub fn dispatch_worker_inline(
 /// caller's `LocalSet`, like any async call).
 fn run_slice_inline(
     slice_bytes: Option<&[u8]>,
+    archive_bytes: Option<&[u8]>,
     entry_name: &str,
     encoded_args: &[u8],
     encoded_shared: &[std::sync::Arc<crate::value::SharedNode>],
@@ -268,11 +274,20 @@ fn run_slice_inline(
         .map_err(|msg| Control::Panic(crate::error::AsError::at(msg, span)))?;
 
     let slice_owned: Option<Vec<u8>> = slice_bytes.map(|b| b.to_vec());
+    let archive_owned: Option<Vec<u8>> = archive_bytes.map(|b| b.to_vec());
     let entry_owned = entry_name.to_string();
 
     let fut = crate::task::SharedFuture::new();
     let cell = fut.cell();
     let handle = tokio::task::spawn_local(async move {
+        // Task 1.6: install the bundled program's archive (if any) BEFORE the slice loads,
+        // so this inline fallback re-runs imports from memory exactly like a pool isolate.
+        if let Some(bytes) = archive_owned.as_deref() {
+            if let Err(msg) = isolate::install_module_archive(&vm, bytes) {
+                cell.resolve(Err(Control::Panic(crate::error::AsError::at(msg, span))));
+                return;
+            }
+        }
         // Load the slice's globals into the fresh Vm.
         if let Err(msg) = isolate::load_slice(&vm, slice_owned.as_deref()).await {
             cell.resolve(Err(Control::Panic(crate::error::AsError::at(msg, span))));
@@ -341,6 +356,9 @@ pub fn dispatch_worker_dedicated(
 
     let slice_bytes: Vec<u8> = slice.entry_aso.to_vec();
     let entry_name: String = slice.entry_name.to_string();
+    // Task 1.6: capture the bundled program's archive bytes (if any) into the `Send`
+    // `make_loop` closure so the dedicated isolate installs it before its re-run imports.
+    let archive_bytes: Option<Vec<u8>> = interp.worker_archive_bytes().map(|b| b.to_vec());
 
     // `Send` back-channel for the one reply (the dedicated isolate is single-shot here).
     let (reply_tx, reply_rx) = std::sync::mpsc::channel::<isolate::WorkerReply>();
@@ -353,6 +371,15 @@ pub fn dispatch_worker_dedicated(
         // BEFORE running any plugin code. `caps_drop_allowed` stays true (the default):
         // a dedicated isolate is single-tenant, so an in-plugin drop is terminal.
         iso_interp.set_caps(caps);
+
+        // Task 1.6: install the bundled program's archive BEFORE the slice loads (the slice
+        // re-runs the program's top-level imports). `None` (unbundled) installs nothing.
+        if let Some(bytes) = archive_bytes.as_deref() {
+            if let Err(msg) = isolate::install_module_archive(&vm, bytes) {
+                let _ = reply_tx.send(isolate::WorkerReply::Panic(msg));
+                return;
+            }
+        }
 
         // Load the slice's globals once.
         if let Err(msg) = isolate::load_slice(&vm, Some(&slice_bytes)).await {

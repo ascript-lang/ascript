@@ -1489,9 +1489,11 @@ async fn run_verified_aso(
 /// then seeds the entry's logical dir to the archive root (`""`).
 ///
 /// NOTE on scope (do NOT widen here): the passed-in CLI `caps` are installed as-is — the
-/// archive's own embedded `archive.caps` are NOT yet composed/enforced (Phase 3), and only
-/// the ENTRY chunk's bytes are handed to `set_worker_aso_bytes` (single-module worker fns
-/// work; full archive→worker parity is Task 1.6).
+/// archive's own embedded `archive.caps` are NOT yet composed/enforced (Phase 3). Full
+/// archive→worker parity IS shipped (Task 1.6): the ENTRY chunk's bytes go to
+/// `set_worker_aso_bytes` (so a worker fn's code slice still builds from the entry chunk),
+/// AND the whole encoded archive is stashed via `set_worker_archive_bytes` so every worker
+/// isolate decodes + installs it before re-running the program's top-level imports.
 async fn run_verified_archive(
     archive: crate::vm::archive::ModuleArchive,
     script_args: &[String],
@@ -1523,8 +1525,13 @@ async fn run_verified_archive(
         interp.set_caps(caps);
     }
     // Workers Spec A: retain the ENTRY chunk bytes so `dispatch_worker_closure` can re-parse
-    // them (single-module worker fns work; full archive→worker parity is Task 1.6).
+    // them to build a worker fn's code slice.
     interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    // SELF-CONTAINED-BUNDLES Task 1.6: stash the WHOLE encoded archive so every worker isolate
+    // decodes + installs it on its own `Vm` before re-running the program's top-level imports
+    // (a worker that calls into an imported module would otherwise fail on the archive-less
+    // isolate). Encode BEFORE `archive` is moved into `Rc::new` at `set_module_archive` below.
+    interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
     interp.install_self();
     let vm = Vm::new(interp.clone());
     // Seed the on-disk fallback dir BEFORE installing the archive: `set_module_archive`
@@ -2032,6 +2039,10 @@ pub async fn run_archive(
         .map_err(|e| AsError::new(format!("cannot load archive entry module: {e}")))?;
 
     let interp = Rc::new(Interp::new());
+    // SELF-CONTAINED-BUNDLES Task 1.6: stash the whole encoded archive so a worker isolate
+    // spawned by this captured-output run installs it before re-running top-level imports
+    // (archive→worker parity holds in the test path too). Encode BEFORE the move below.
+    interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
     interp.install_self();
     let vm = Vm::new(interp.clone());
     // Install the archive so every relative import resolves from memory by logical key.
