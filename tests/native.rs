@@ -63,6 +63,19 @@ fn run_ref(src: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Reference: `ascript run <src> [args]` with `cwd` set to `dir`. Needed when a worker
+/// isolate re-runs the program's relative imports — they resolve against the cwd, so the
+/// source reference must run from the module dir to match the bundled (archive-carrying) run.
+fn run_ref_in(src: &Path, dir: &Path, args: &[&str]) -> Output {
+    Command::new(bin())
+        .arg("run")
+        .arg(src)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+}
+
 fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
     let p = dir.join(name);
     std::fs::write(&p, body).unwrap();
@@ -492,6 +505,170 @@ fn native_multimodule_bundle_runs_from_empty_dir() {
     // Equivalence with `ascript run` of the source.
     let r = run_ref(&entry, &[]);
     assert_eq!(b.stdout, r.stdout, "native multimodule stdout differs from source run");
+    assert_eq!(b.status.code(), r.status.code());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// SELF-CONTAINED-BUNDLES (Task 1.6) — HEADLINE: a POOLED `worker fn` in a bundled
+/// MULTI-module program calls into an IMPORTED module. The worker isolate builds a fresh,
+/// archive-less `Vm` and re-runs the program's top-level imports on itself, so without the
+/// archive shipped to the isolate the re-run `Op::Import` finds no archive and no source
+/// tree on disk → the worker fails. Shipping + installing the whole `ModuleArchive` on each
+/// isolate before any user worker code runs fixes it. Bundled, run from an EMPTY cwd.
+#[test]
+fn native_worker_imports_module_from_bundle() {
+    let dir = tmp_dir("mm_worker_native");
+    write(
+        &dir,
+        "util.as",
+        "export fn dbl(n: number): number { return n * 2 }\n",
+    );
+    let entry = write(
+        &dir,
+        "app.as",
+        "import { dbl } from \"./util\"\n\
+         import * as task from \"std/task\"\n\
+         worker fn w(n: number): number { return dbl(n) }\n\
+         fn main() {\n\
+         \x20 let rs = await task.gather([w(1), w(2), w(3), w(4)])\n\
+         \x20 print(rs)\n\
+         }\n\
+         await main()\n",
+    );
+    let app = dir.join("mm_worker_app");
+    build_native(&entry, &app);
+
+    // Reference: `ascript run` of the source FROM the module dir (so the worker isolate's
+    // re-run imports resolve `./util` on disk — the bundled case must match this output).
+    let r = run_ref_in(&entry, &dir, &[]);
+    assert!(
+        r.status.success(),
+        "multimodule-worker reference failed: {:?}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Run from an EMPTY dir with a scrubbed PATH — nothing on disk for the worker isolate's
+    // re-run imports to fall back to. The archive must travel to the isolate.
+    let empty = tmp_dir("mm_worker_cwd");
+    let b = run_bundle(&app, &empty, &[]);
+    assert!(
+        b.status.success(),
+        "bundled worker→imported-module failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    assert_eq!(b.stdout, r.stdout, "bundled worker→import stdout differs from source run");
+    assert_eq!(b.stderr, r.stderr, "bundled worker→import stderr differs from source run");
+    assert_eq!(b.status.code(), r.status.code());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// SELF-CONTAINED-BUNDLES (Task 1.6) — a DEDICATED `run_in_worker(fn, input, {...})` body in
+/// a bundled multi-module program calls an imported binding. The dedicated isolate gets the
+/// archive captured into its `Send` `make_loop` closure and installs it before the slice
+/// loads. Bundled, run from an EMPTY cwd.
+#[test]
+fn native_run_in_worker_imports_module_from_bundle() {
+    let dir = tmp_dir("mm_riw_native");
+    write(
+        &dir,
+        "util.as",
+        "export fn trip(n: number): number { return n * 3 }\n",
+    );
+    let entry = write(
+        &dir,
+        "app.as",
+        "import { trip } from \"./util\"\n\
+         worker fn plugin(n: number): number { return trip(n) }\n\
+         fn main() {\n\
+         \x20 let r = await run_in_worker(plugin, 7, {caps: {deny: [\"ffi\"]}})\n\
+         \x20 print(r)\n\
+         }\n\
+         await main()\n",
+    );
+    let app = dir.join("mm_riw_app");
+    build_native(&entry, &app);
+
+    let r = run_ref_in(&entry, &dir, &[]);
+    assert!(
+        r.status.success(),
+        "run_in_worker multimodule reference failed: {:?}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let empty = tmp_dir("mm_riw_cwd");
+    let b = run_bundle(&app, &empty, &[]);
+    assert!(
+        b.status.success(),
+        "bundled run_in_worker→imported-module failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    assert_eq!(b.stdout, r.stdout, "bundled run_in_worker→import stdout differs");
+    assert_eq!(b.status.code(), r.status.code());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// SELF-CONTAINED-BUNDLES (Task 1.6) — an ACTOR (`worker class`) method calls an imported
+/// fn, AND a streaming `worker fn*` uses an imported fn, in a bundled multi-module program.
+/// Both dedicated isolates get the archive captured into their spawn closures and install it
+/// before the class/producer slice loads. Bundled, run from an EMPTY cwd.
+#[test]
+fn native_actor_and_stream_import_module_from_bundle() {
+    let dir = tmp_dir("mm_as_native");
+    write(
+        &dir,
+        "util.as",
+        "export fn inc(n: number): number { return n + 1 }\n",
+    );
+    let entry = write(
+        &dir,
+        "app.as",
+        "import { inc } from \"./util\"\n\
+         worker class Counter {\n\
+         \x20 count: number = 0\n\
+         \x20 async fn bump(): number { self.count = inc(self.count); return self.count }\n\
+         }\n\
+         worker fn* squares(n: number) {\n\
+         \x20 let i = 0\n\
+         \x20 while (i < n) { yield inc(i * i - 1); i = i + 1 }\n\
+         }\n\
+         fn main() {\n\
+         \x20 let c = await Counter.spawn()\n\
+         \x20 let a = await c.bump()\n\
+         \x20 let b = await c.bump()\n\
+         \x20 print([a, b])\n\
+         \x20 let acc = []\n\
+         \x20 for await (v in squares(3)) { acc = [...acc, v] }\n\
+         \x20 print(acc)\n\
+         }\n\
+         await main()\n",
+    );
+    let app = dir.join("mm_as_app");
+    build_native(&entry, &app);
+
+    let r = run_ref_in(&entry, &dir, &[]);
+    assert!(
+        r.status.success(),
+        "actor/stream multimodule reference failed: {:?}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let empty = tmp_dir("mm_as_cwd");
+    let b = run_bundle(&app, &empty, &[]);
+    assert!(
+        b.status.success(),
+        "bundled actor/stream→imported-module failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    assert_eq!(b.stdout, r.stdout, "bundled actor/stream→import stdout differs");
     assert_eq!(b.status.code(), r.status.code());
 
     let _ = std::fs::remove_dir_all(&dir);
