@@ -1529,6 +1529,11 @@ pub fn build_native(
         // Embed the composed CapSet into the archive manifest BEFORE encoding — consistent
         // with the plain `build` path (Task 3.2 enforces it at runtime). `None` → all
         // granted (byte-identical placeholder).
+        // SECURITY NOTE (spec §10, macOS): for a `--native` bundle this caps blob rides the
+        // footer PAYLOAD, which is appended AFTER the ad-hoc signature — so it is NOT covered
+        // by that signature. Embedded caps are tamper-EVIDENT only, not tamper-proof; this is
+        // acceptable for v1 because lowering one's own caps is not an attacker goal, and an
+        // attacker who can rewrite the binary can replace the whole payload anyway.
         archive.caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
         // Surface the tree-shaking summary on STDERR (the `bundled … -> …` line stays on
         // stdout).
