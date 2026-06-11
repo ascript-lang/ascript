@@ -445,3 +445,233 @@ async fn non_archive_multifile_still_loads_from_disk() {
         .expect("disk multi-file program runs");
     assert_eq!(code, 0, "disk run exits cleanly");
 }
+
+// ===========================================================================================
+// Task 2.3 — TREE-SHAKE EMISSION: unreferenced INERT top-level declarations are actually
+// DROPPED from archived LIBRARY modules (the entry is kept whole). These prove the keep-set
+// becomes OBSERVABLE in the stored bytecode, that the shaken archive still RUNS (the keep-set
+// is closed under references → no dangling globals), that side effects are preserved, and
+// that the shaken run is behavior-identical to the unshaken disk run.
+// ===========================================================================================
+
+/// Decode a module's archived chunk and return the set of top-level GLOBAL names it
+/// DEFINES (`DEFINE_GLOBAL`) plus every proto's debug-name — i.e. the names that survived
+/// the shake. A dropped `fn`/`let` leaves NEITHER a `DEFINE_GLOBAL` nor a proto, so this is
+/// a robust presence probe.
+fn module_defined_names(arch: &ModuleArchive, key: &str) -> std::collections::HashSet<String> {
+    let bytes = arch.get(key).unwrap_or_else(|| panic!("module {key} present; keys present"));
+    let chunk = Chunk::from_bytes_verified(bytes)
+        .unwrap_or_else(|e| panic!("module {key} re-verifies: {e:?}"));
+    let mut names = std::collections::HashSet::new();
+    // Proto debug-names (every top-level `fn` that was emitted).
+    for p in &chunk.protos {
+        if let Some(n) = &p.debug_name {
+            names.insert(n.to_string());
+        }
+    }
+    // DEFINE_GLOBAL operands, read out of the disassembly text (the `; const <name>` /
+    // `; let <name>` tail names the defined global with its source string literal).
+    for line in ascript::vm::disasm::disasm(&chunk).lines() {
+        if let Some(rest) = line.split("DEFINE_GLOBAL").nth(1) {
+            // tail form: `   <idx> <flag> ; <let|const> "<name>"`
+            if let Some(open) = rest.find('"') {
+                if let Some(close) = rest[open + 1..].find('"') {
+                    names.insert(rest[open + 1..open + 1 + close].to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// THE HEADLINE TEST (observable drop). An entry imports `{ used }` from a lib that also
+/// defines `unused` — and each of those calls a private helper (`h` / `dead`). After the
+/// shake, the lib's archived chunk must CONTAIN `used`/`h` and NOT CONTAIN `unused`/`dead`,
+/// the program must RUN with the correct output, and the run must match the unshaken disk run.
+#[tokio::test]
+async fn shake_drops_unused_library_declarations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib = dir.path().join("lib.as");
+    std::fs::write(&entry, "import { used } from \"./lib\"\nprint(used())\n").expect("write entry");
+    std::fs::write(
+        &lib,
+        "fn h(): number { return 7 }\n\
+         fn dead(): number { return 99 }\n\
+         export fn used(): number { return h() + 1 }\n\
+         export fn unused(): number { return dead() + 1 }\n",
+    )
+    .expect("write lib");
+
+    let arch = compile_archive(&entry, false).expect("archives");
+
+    // OBSERVABLE: the lib chunk keeps `used` + its helper `h`, drops `unused` + `dead`.
+    let defined = module_defined_names(&arch, "lib.as");
+    assert!(defined.contains("used"), "kept export `used`; defined = {defined:?}");
+    assert!(defined.contains("h"), "kept transitively-referenced helper `h`; defined = {defined:?}");
+    assert!(
+        !defined.contains("unused"),
+        "DROPPED unreferenced export `unused`; defined = {defined:?}"
+    );
+    assert!(
+        !defined.contains("dead"),
+        "DROPPED `dead` (only `unused` referenced it); defined = {defined:?}"
+    );
+
+    // RUNS correctly from the (shaken) archive with the source tree gone.
+    let shaken_bytes = arch.encode();
+    let shaken = ModuleArchive::decode(&shaken_bytes).expect("decodes");
+    let (out, code) = ascript::run_archive(shaken)
+        .await
+        .expect("shaken archive runs (no dangling refs)");
+    assert_eq!(out, "8\n", "used() = h() + 1 = 8");
+    assert_eq!(code, None);
+
+    // SHAKEN == UNSHAKEN: the disk run of the same program produces the SAME stdout.
+    let disk_code = ascript::run_file_on_vm(&entry, &[]).await.expect("disk run");
+    assert_eq!(disk_code, 0);
+}
+
+/// A library top-level SIDE EFFECT (a bare `print(...)`) runs when the module is imported —
+/// even though the shaker pruned the library's unreferenced decls around it. The side effect
+/// must survive (it is a non-binding statement → always kept) and run exactly once.
+#[tokio::test]
+async fn shake_preserves_library_side_effects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib = dir.path().join("lib.as");
+    std::fs::write(&entry, "import { keep } from \"./lib\"\nprint(keep())\n").expect("write entry");
+    std::fs::write(
+        &lib,
+        "print(\"loaded\")\n\
+         fn dropme(): number { return 0 }\n\
+         export fn keep(): number { return 1 }\n",
+    )
+    .expect("write lib");
+
+    let arch = compile_archive(&entry, false).expect("archives");
+    let defined = module_defined_names(&arch, "lib.as");
+    assert!(defined.contains("keep"), "kept `keep`; defined = {defined:?}");
+    assert!(!defined.contains("dropme"), "dropped `dropme`; defined = {defined:?}");
+
+    let (out, code) = ascript::run_archive(arch).await.expect("runs");
+    assert_eq!(out, "loaded\n1\n", "side effect ran, then keep() = 1");
+    assert_eq!(code, None);
+}
+
+/// A computed/side-effecting top-level `let x = sideEffect()` in a library is FORCE-KEPT by
+/// the shaker (a `ComputedConst`), so its init side effect runs on import even though `x`
+/// itself is never imported.
+#[tokio::test]
+async fn shake_keeps_computed_let_side_effect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib = dir.path().join("lib.as");
+    std::fs::write(&entry, "import { f } from \"./lib\"\nprint(f())\n").expect("write entry");
+    std::fs::write(
+        &lib,
+        "fn announce(): number { print(\"side\")\n return 0 }\n\
+         let _boot = announce()\n\
+         export fn f(): number { return 5 }\n",
+    )
+    .expect("write lib");
+
+    let arch = compile_archive(&entry, false).expect("archives");
+    let (out, code) = ascript::run_archive(arch).await.expect("runs");
+    // The computed `let _boot = announce()` ran its side effect; then f() = 5.
+    assert_eq!(out, "side\n5\n", "computed-let side effect ran; out = {out:?}");
+    assert_eq!(code, None);
+}
+
+/// NAMESPACE static shake (2.2 integration): an `import * as m` that uses ONLY `m.foo`
+/// drops the lib's unaccessed `bar`, while `foo` still resolves through the namespace.
+#[tokio::test]
+async fn shake_namespace_only_accessed_exports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib = dir.path().join("lib.as");
+    std::fs::write(
+        &entry,
+        "import * as m from \"./lib\"\nprint(m.foo())\n",
+    )
+    .expect("write entry");
+    std::fs::write(
+        &lib,
+        "export fn foo(): number { return 1 }\n\
+         export fn bar(): number { return 2 }\n",
+    )
+    .expect("write lib");
+
+    let arch = compile_archive(&entry, false).expect("archives");
+    let defined = module_defined_names(&arch, "lib.as");
+    assert!(defined.contains("foo"), "kept accessed `foo`; defined = {defined:?}");
+    assert!(
+        !defined.contains("bar"),
+        "DROPPED unaccessed namespace export `bar`; defined = {defined:?}"
+    );
+
+    let (out, code) = ascript::run_archive(arch).await.expect("namespace shake runs");
+    assert_eq!(out, "1\n");
+    assert_eq!(code, None);
+}
+
+/// The ENTRY module is kept WHOLE: its own unreferenced top-level `fn` is STILL present in
+/// the archived entry chunk (only LIBRARY modules are pruned).
+#[tokio::test]
+async fn shake_keeps_entry_module_whole() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib = dir.path().join("lib.as");
+    // The entry defines an unreferenced `entry_unused` AND imports `used` from the lib.
+    std::fs::write(
+        &entry,
+        "import { used } from \"./lib\"\n\
+         fn entry_unused(): number { return 123 }\n\
+         print(used())\n",
+    )
+    .expect("write entry");
+    std::fs::write(&lib, "export fn used(): number { return 1 }\n").expect("write lib");
+
+    let arch = compile_archive(&entry, false).expect("archives");
+    let entry_defined = module_defined_names(&arch, "main.as");
+    assert!(
+        entry_defined.contains("entry_unused"),
+        "entry kept WHOLE — its unreferenced fn survives; defined = {entry_defined:?}"
+    );
+
+    let (out, code) = ascript::run_archive(arch).await.expect("runs");
+    assert_eq!(out, "1\n");
+    assert_eq!(code, None);
+}
+
+/// SLOT-SAFETY: dropping a top-level binding must NOT shift a later KEPT binding's slot
+/// indices or break a forward/backward reference between surviving globals. A lib defines
+/// `dropme` BETWEEN two kept, mutually-referencing globals — after the shake `a`/`b` still
+/// resolve each other and the program runs correctly.
+#[tokio::test]
+async fn shake_slot_safety_kept_globals_still_resolve() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib = dir.path().join("lib.as");
+    std::fs::write(&entry, "import { a } from \"./lib\"\nprint(a())\n").expect("write entry");
+    std::fs::write(
+        &lib,
+        "fn dropme(): number { return 999 }\n\
+         fn b(): number { return 40 }\n\
+         fn dropme2(): number { return 888 }\n\
+         export fn a(): number { return b() + 2 }\n",
+    )
+    .expect("write lib");
+
+    let arch = compile_archive(&entry, false).expect("archives");
+    let defined = module_defined_names(&arch, "lib.as");
+    assert!(defined.contains("a") && defined.contains("b"), "kept a,b; defined = {defined:?}");
+    assert!(
+        !defined.contains("dropme") && !defined.contains("dropme2"),
+        "dropped both unused fns; defined = {defined:?}"
+    );
+
+    let (out, code) = ascript::run_archive(arch).await.expect("shaken globals resolve");
+    assert_eq!(out, "42\n", "a() = b() + 2 = 42 — references intact after the drop");
+    assert_eq!(code, None);
+}

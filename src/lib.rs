@@ -1085,6 +1085,14 @@ pub fn compile_archive(
         .unwrap_or_else(|| "entry.as".to_string());
 
     let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
+    // The decoded chunk + on-disk source path for each module, parallel to `modules`
+    // by index — pass 2 (tree-shake) re-compiles each LIBRARY module's source under
+    // its keep-set, and the shaker reads each chunk's `imports`.
+    let mut graph_chunks: Vec<crate::vm::chunk::Chunk> = Vec::new();
+    let mut module_paths: Vec<PathBuf> = Vec::new();
+    // Per-module RESOLVED import edges (target = module index), parallel to `modules`.
+    // Filled as the BFS resolves each import specifier to its dedup'd target index.
+    let mut module_edges: Vec<Vec<crate::compile::shake::ImportEdge>> = Vec::new();
     // Dedup by canonical path → the module's index in `modules`. Keyed by canonical
     // path (not logical key) so two specifiers reaching the same file collapse to one.
     let mut seen: HashMap<PathBuf, usize> = HashMap::new();
@@ -1125,6 +1133,10 @@ pub fn compile_archive(
             .expect("every queued module is pre-registered in `seen`");
         debug_assert_eq!(this_index, modules.len());
         modules.push((item.key.clone(), bytes));
+        module_paths.push(item.path.clone());
+        // The edges for THIS module are accumulated below as imports resolve.
+        debug_assert_eq!(module_edges.len(), this_index);
+        let mut this_edges: Vec<crate::compile::shake::ImportEdge> = Vec::new();
 
         // The directory inside this module that its imports resolve against on disk.
         let this_disk_dir = item
@@ -1139,7 +1151,7 @@ pub fn compile_archive(
             interp.set_module_dir(this_disk_dir.clone());
             match interp.classify_specifier(source) {
                 crate::interp::SpecifierKind::Std => {
-                    // Native stdlib — linked in, never archived.
+                    // Native stdlib — linked in, never archived (no shake edge).
                 }
                 kind @ (crate::interp::SpecifierKind::Relative(_)
                 | crate::interp::SpecifierKind::Package { .. }) => {
@@ -1171,19 +1183,25 @@ pub fn compile_archive(
                     };
                     let dep_logical_dir = crate::vm::archive::logical_parent(&dep_key);
 
-                    if seen.contains_key(&dep_path) {
-                        continue; // already archived (or queued) — dedup terminates cycles
-                    }
-                    // Reserve the next archive index for this module. `seen` maps every
-                    // known module (recorded or queued) to a unique, monotonically
-                    // assigned index, so the next free index is exactly `seen.len()`.
-                    let reserved = seen.len();
-                    seen.insert(dep_path.clone(), reserved);
-                    queue.push_back(Pending {
-                        path: dep_path,
-                        key: dep_key,
-                        logical_dir: dep_logical_dir,
-                    });
+                    // Resolve (or reserve) the dedup'd archive index this import targets.
+                    // A diamond / cycle dep is ALREADY in `seen`; a fresh one reserves the
+                    // next monotonic index and is enqueued. Either way we know the target
+                    // index NOW, so the shake edge is recorded for both.
+                    let target_index = if let Some(&idx) = seen.get(&dep_path) {
+                        idx // already archived (or queued) — dedup terminates cycles
+                    } else {
+                        // `seen` maps every known module (recorded or queued) to a unique,
+                        // monotonically assigned index, so the next free index is `seen.len()`.
+                        let reserved = seen.len();
+                        seen.insert(dep_path.clone(), reserved);
+                        queue.push_back(Pending {
+                            path: dep_path,
+                            key: dep_key,
+                            logical_dir: dep_logical_dir,
+                        });
+                        reserved
+                    };
+                    this_edges.push(import_desc_to_edge(imp, target_index));
                 }
                 crate::interp::SpecifierKind::UnknownPackage(key) => {
                     return Err(AsError::new(format!(
@@ -1194,14 +1212,111 @@ pub fn compile_archive(
                 }
             }
         }
+        graph_chunks.push(chunk);
+        module_edges.push(this_edges);
+    }
+
+    // ── Phase 2, Task 2.3: tree-shake. ─────────────────────────────────────────
+    // Compute the per-module keep-set (the reachable closure of top-level names) and
+    // RE-EMIT each LIBRARY module dropping unreferenced INERT top-level declarations.
+    // The ENTRY (index 0) is kept WHOLE — its pass-1 bytes are stored UNCHANGED, so a
+    // single-module program (and the entry of any program) is byte-identical to today.
+    // A re-compile reuses the SAME source the BFS read; the keep-set's closure property
+    // guarantees no dropped name is referenced by kept code (no dangling globals).
+    let graph: Vec<crate::compile::shake::ModuleNode> = modules
+        .iter()
+        .zip(graph_chunks)
+        .zip(module_edges)
+        .map(|(((key, _bytes), chunk), edges)| crate::compile::shake::ModuleNode {
+            key: key.clone(),
+            chunk,
+            edges,
+        })
+        .collect();
+    let reach = crate::compile::shake::compute_reachable(&graph);
+    // (`reach.report` is threaded to Task 2.4 for the digest + stderr printing; unused here.)
+    let _ = &reach.report;
+
+    for (idx, (_key, bytes)) in modules.iter_mut().enumerate() {
+        if idx == 0 {
+            continue; // entry kept whole — byte-identical to today
+        }
+        // The keep-set should exist for every module index; a missing one is an internal
+        // invariant break — defensively keep the module WHOLE rather than over-prune.
+        let Some(keep) = reach.keep.get(&idx) else {
+            continue;
+        };
+        let path = &module_paths[idx];
+        let pruned = compile_pruned_aso_bytes(path, keep, with_debug)?;
+        *bytes = pruned;
     }
 
     Ok(ModuleArchive::new(
         entry,
         crate::stdlib::caps::CapSet::default(), // Phase 3 fills the composed caps
-        [0u8; 32],                              // Phase 2 fills the shake digest
+        [0u8; 32],                              // Task 2.4 fills the shake digest
         modules,
     ))
+}
+
+/// Convert a decoded [`crate::vm::chunk::ImportDesc`] into a tree-shaker
+/// [`crate::compile::shake::ImportEdge`] targeting the already-resolved dedup'd module
+/// index. A `Named` import contributes the imported export names as roots in the target;
+/// a `Namespace` import contributes its alias (the shaker statically refines a
+/// namespace-only `alias.foo` use down to the accessed exports, or pins the whole target
+/// if the alias escapes — see [`crate::compile::shake::classify_namespace_use`]).
+fn import_desc_to_edge(
+    imp: &crate::vm::chunk::ImportDesc,
+    target: usize,
+) -> crate::compile::shake::ImportEdge {
+    use crate::compile::shake::ImportEdge;
+    match imp {
+        crate::vm::chunk::ImportDesc::Named { names, .. } => ImportEdge::Named {
+            target,
+            names: names
+                .iter()
+                .map(|(export_name, _slot, _is_cell, _is_global)| Rc::from(export_name.as_str()))
+                .collect(),
+        },
+        crate::vm::chunk::ImportDesc::Namespace { alias, .. } => ImportEdge::Namespace {
+            target,
+            alias: Rc::from(alias.as_str()),
+        },
+    }
+}
+
+/// Compile a LIBRARY module's source to verified `.aso` bytes, PRUNED to its
+/// tree-shake `keep` set (Task 2.3). Mirrors [`compile_verified_aso_bytes`] exactly
+/// (read source → compile → bind debug source → VERIFY → serialize) but routes the
+/// compile through [`crate::compile::compile_source_with_keep`] so unreferenced INERT
+/// top-level declarations are never emitted. The pruned chunk is RE-VERIFIED through the
+/// same `vm::verify` boundary the runtime trusts — a pruning bug surfaces as a clean
+/// error here, never a runtime crash.
+fn compile_pruned_aso_bytes(
+    file: &Path,
+    keep: &std::collections::HashSet<Rc<str>>,
+    with_debug: bool,
+) -> Result<Vec<u8>, AsError> {
+    let src = std::fs::read_to_string(file)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: file.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source_with_keep(&src, keep)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    if with_debug {
+        chunk.set_module_source(&src_info);
+    }
+    crate::vm::verify::verify(&chunk).map_err(|e| {
+        AsError::new(format!(
+            "internal: pruned bytecode failed verification: {e}"
+        ))
+        .with_source(src_info)
+    })?;
+    chunk
+        .to_bytes_with_debug(with_debug)
+        .map_err(|e| AsError::new(format!("cannot serialize pruned bytecode: {e}")))
 }
 
 /// Resolve a requested module path (already importer-joined, e.g. `<dir>/util.as` or an

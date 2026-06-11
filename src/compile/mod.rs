@@ -815,6 +815,99 @@ pub fn reparse_default_from_source(padded: &str) -> Result<crate::ast::Expr, Str
 }
 
 /// The text of the first `Ident` token directly under a CST node.
+/// The top-level binding NAME(s) a statement declares, for tree-shake pruning
+/// (Task 2.3). Returns:
+///
+/// - `None` for a NON-binding statement (an import, a bare expression statement, a
+///   top-level control-flow statement `if`/`while`/`for`/`return`/`block`/`break`/
+///   `continue`) — these run for their side effects and are ALWAYS kept.
+/// - `Some(names)` for a binding declaration (`fn`/`class`/`enum`/`interface`/`let`/
+///   `const`, including an `export`-wrapped one). For a simple binder this is the
+///   single declared name; for a destructuring `let` it is every pattern-bound
+///   local (a destructuring `let` is force-kept by the shaker as a `ComputedConst`,
+///   so its names are always in the keep-set — but we still report them faithfully).
+///
+/// The name match mirrors the resolver's `collect_module_globals` (so the names
+/// reported here are exactly the module-globals the resolver registered), reusing
+/// the byte-for-byte same ident-extraction the declaration compilers use.
+fn top_level_bound_names(stmt: &Stmt) -> Option<Vec<Rc<str>>> {
+    use crate::syntax::kind::SyntaxKind as K;
+    match stmt {
+        Stmt::FnDecl(_)
+        | Stmt::ClassDecl(_)
+        | Stmt::EnumDecl(_)
+        | Stmt::InterfaceDecl(_) => {
+            let node = stmt_node(stmt);
+            Some(
+                cst_first_ident(node)
+                    .map(|n| vec![Rc::from(n.as_str())])
+                    .unwrap_or_default(),
+            )
+        }
+        Stmt::LetStmt(let_stmt) => {
+            let node = let_stmt.syntax();
+            // A destructuring binder has an ArrayBindPat / ObjectBindPat child; walk
+            // it for every bound local (mirrors `collect_pattern_global_names`).
+            if let Some(pat) = node
+                .children()
+                .find(|c| matches!(c.kind(), K::ArrayBindPat | K::ObjectBindPat))
+            {
+                Some(pattern_bound_names(pat))
+            } else {
+                Some(
+                    cst_first_ident(node)
+                        .map(|n| vec![Rc::from(n.as_str())])
+                        .unwrap_or_default(),
+                )
+            }
+        }
+        // `export <decl>` binds whatever the inner declaration binds.
+        Stmt::ExportStmt(export) => export.stmt().and_then(|inner| top_level_bound_names(&inner)),
+        // Non-binding statements (imports, control-flow, bare expressions) declare no
+        // module-global → never droppable.
+        Stmt::ImportStmt(_)
+        | Stmt::ExprStmt(_)
+        | Stmt::Block(_)
+        | Stmt::IfStmt(_)
+        | Stmt::WhileStmt(_)
+        | Stmt::ForStmt(_)
+        | Stmt::ReturnStmt(_)
+        | Stmt::BreakStmt(_)
+        | Stmt::ContinueStmt(_) => None,
+    }
+}
+
+/// Every local NAME bound by a destructuring pattern node (`ArrayBindPat` /
+/// `ObjectBindPat`), mirroring the resolver's `collect_pattern_global_names`: a
+/// `BindEntry`'s LAST ident is the bound local (the renamed `"k" as v` form), and a
+/// `RestBind`'s first ident is the rest collector.
+fn pattern_bound_names(pat: &crate::syntax::cst::ResolvedNode) -> Vec<Rc<str>> {
+    use crate::syntax::kind::SyntaxKind as K;
+    let mut out = Vec::new();
+    for entry in pat.children() {
+        match entry.kind() {
+            K::BindEntry => {
+                let local = entry
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .filter(|t| t.kind() == K::Ident)
+                    .last()
+                    .map(|t| Rc::from(t.text()));
+                if let Some(name) = local {
+                    out.push(name);
+                }
+            }
+            K::RestBind => {
+                if let Some(name) = cst_first_ident(entry) {
+                    out.push(Rc::from(name.as_str()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn cst_first_ident(node: &crate::syntax::cst::ResolvedNode) -> Option<String> {
     node.children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -906,6 +999,47 @@ fn short_circuit_op(op: SyntaxKind) -> Option<Op> {
 /// expression and emitting `RETURN`. The source is parsed exactly once: the
 /// gate reads the errors off the `Parse` and the same `Parse` becomes the tree.
 pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
+    compile_source_inner(src, None)
+}
+
+/// Compile `src` into a top-level [`Chunk`], PRUNING unreferenced top-level
+/// declarations to the tree-shaker's keep-set (self-contained bundles, Phase 2,
+/// Task 2.3).
+///
+/// This is `compile_source` with EXACTLY one behavioral change: in the top-level
+/// emit loop, a DIRECT-child top-level BINDING declaration (`fn`/`class`/`enum`/
+/// `interface`/`let`/`const`, including an `export`-wrapped one) whose bound
+/// name(s) are ALL absent from `keep` is SKIPPED — its bytecode (and, for a `fn`,
+/// its proto) is never emitted. Everything else — imports, bare expression
+/// statements, control-flow, and any binding whose name IS in `keep` — is emitted
+/// in SOURCE ORDER, preserving side-effect semantics.
+///
+/// Soundness rests on two properties of the keep-set ([`crate::compile::shake`]):
+/// it already FORCE-KEEPS every side-effecting / computed binding (a
+/// `let x = sideEffect()` / destructuring `let` is a `ComputedConst`, always in
+/// `keep`), and it is CLOSED under references (a dropped name is never referenced
+/// by kept code → no dangling `GET_GLOBAL`). Slot-safety: a DIRECT-child top-level
+/// binding is a module-scope user-global (`DEFINE_GLOBAL`), NOT a frame slot, and
+/// the chunk's `slot_count` is sized once from the resolver's FULL-module frame —
+/// so skipping a statement's EMISSION shifts no other statement's slot indices.
+///
+/// The ENTRY module is NOT pruned (the caller passes `None`); only LIBRARY modules
+/// receive a keep-set.
+pub fn compile_source_with_keep(
+    src: &str,
+    keep: &HashSet<Rc<str>>,
+) -> Result<Chunk, CompileError> {
+    compile_source_inner(src, Some(keep))
+}
+
+/// The shared body of [`compile_source`] / [`compile_source_with_keep`]. When
+/// `keep` is `Some`, the top-level emit loop drops unreferenced top-level binding
+/// declarations (see [`compile_source_with_keep`]); when `None`, every top-level
+/// statement is emitted (the unchanged default `run`/`build` path).
+fn compile_source_inner(
+    src: &str,
+    keep: Option<&HashSet<Rc<str>>>,
+) -> Result<Chunk, CompileError> {
     // The CST parser is error-RECOVERING: it never aborts, it records a
     // diagnostic and patches a best-effort tree (e.g. an anonymous `fn(){...}`
     // EXPRESSION — not a language construct — recovers into a name-less,
@@ -999,6 +1133,19 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     });
 
     for s in &stmts {
+        // Task 2.3 — tree-shake: when a keep-set is threaded in (a LIBRARY module
+        // in an archive build), SKIP a top-level binding declaration whose bound
+        // name(s) are ALL absent from the keep-set. The resolver already ran on the
+        // FULL module, so resolution of every KEPT statement is unchanged; we only
+        // skip EMISSION. `None` (the default `run`/`build` path) keeps everything →
+        // byte-identical to before.
+        if let Some(keep) = keep {
+            if let Some(names) = top_level_bound_names(s) {
+                if !names.is_empty() && names.iter().all(|n| !keep.contains(&**n)) {
+                    continue;
+                }
+            }
+        }
         if let Stmt::ExprStmt(es) = s {
             let is_trailing = trailing_expr_node.as_ref() == Some(es.syntax());
             let expr = es

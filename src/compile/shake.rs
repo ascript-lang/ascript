@@ -163,8 +163,8 @@ fn side_effect_roots(chunk: &Chunk) -> Vec<Rc<str>> {
     for (i, &start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(code_len);
         if statement_is_definition(chunk, start, end) {
-            // A binding-producing statement: its refs are pulled by the closure when
-            // the bound NAME is reachable, not here.
+            // A binding-producing OR export-registration statement: its refs are pulled
+            // by the closure when the bound NAME is reachable, not force-rooted here.
             continue;
         }
         collect_range_refs(chunk, start, end, &mut out);
@@ -172,10 +172,18 @@ fn side_effect_roots(chunk: &Chunk) -> Vec<Rc<str>> {
     out
 }
 
-/// Does the top-level statement spanning `[start, end)` end in a `DefineGlobal`? Such
-/// a statement is a binding (its run is `<value-producing ops>; DEFINE_GLOBAL name`);
-/// anything else at top level is a side-effect statement. We find the LAST decodable
-/// instruction in the range and test its opcode.
+/// Is the top-level statement spanning `[start, end)` a BINDING or EXPORT-registration
+/// statement (as opposed to a real side-effect statement)?
+///
+/// A binding compiles to `<value-producing ops>; DEFINE_GLOBAL name`. The `export`
+/// keyword adds a SEPARATE top-level statement `GET_GLOBAL name; DEFINE_EXPORT name`
+/// that merely registers the already-bound global for importers — it is NOT a load-time
+/// side effect, so its `GET_GLOBAL name` must NOT be force-rooted (otherwise EVERY
+/// exported name would be unconditionally kept, defeating the shake). Such an export
+/// statement's name is kept ONLY when an inbound import edge demands it; if the name is
+/// dropped, the source-level `export <decl>` is pruned as a unit in pass 2, so no
+/// dangling `GET_GLOBAL` survives. We find the LAST decodable instruction in the range
+/// and test for either terminator.
 fn statement_is_definition(chunk: &Chunk, start: usize, end: usize) -> bool {
     use crate::vm::opcode::Op;
     let mut ip = start;
@@ -187,7 +195,7 @@ fn statement_is_definition(chunk: &Chunk, start: usize, end: usize) -> bool {
         last = Some(op);
         ip += 1 + op.operand_width();
     }
-    matches!(last, Some(Op::DefineGlobal))
+    matches!(last, Some(Op::DefineGlobal | Op::DefineExport))
 }
 
 /// How a namespace alias is used throughout an importing module's chunk — the verdict
