@@ -382,9 +382,9 @@ let salt = SaltString::encode_b64(&salt_bytes).map_err(...)?;
 - Modify: `src/lsp/server.rs:1568` (and the `:1587` rename-path sibling if applicable)
 - Test: `tests/lsp.rs`
 
-- [ ] **Step 1: Write the failing test** — after a `workspace/didRenameFiles`, a go-to-def / workspace-symbol for a symbol from the old path returns NO stale entry pointing at the old path.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Apply the fix** — remove the old path via the full unindex, not just the `files` map:
+- [x] **Step 1: Write the failing test** — after a `workspace/didRenameFiles`, a go-to-def / workspace-symbol for a symbol from the old path returns NO stale entry pointing at the old path.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Apply the fix** — remove the old path via the full unindex, not just the `files` map:
 
 ```rust
 idx.remove_file_from_maps(&workspace::canon(&old));
@@ -392,9 +392,9 @@ idx.files.remove(&workspace::canon(&old));
 idx.reindex_file(&new, &text);
 ```
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — lsp test; blast-radius: audit `didDeleteFiles` and any other path that removes from `files` directly without `remove_file_from_maps`.
-- [ ] **Step 6: Commit** — `git commit -m "fix(lsp): fully unindex renamed files (defs + import edges)"`
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — lsp test; blast-radius: audit `didDeleteFiles` and any other path that removes from `files` directly without `remove_file_from_maps`.
+- [x] **Step 6: Commit** — `git commit -m "fix(lsp): fully unindex renamed files (defs + import edges)"`
 
 ### Task 0.16: CST `return;` spurious error node
 
