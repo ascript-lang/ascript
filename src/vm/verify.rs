@@ -263,7 +263,13 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // ADT spread+named lockstep builder: each APPEND_*_ARG pops one value/operand,
         // leaving the two builder arrays it just appended to (net -1). CALL_NAMED_SPREAD
         // pops the callee + args array + names array, pushes 1 result (net -2).
-        AppendNamedArg | AppendPosArg | AppendSpreadArg => Effect::new(1, 0),
+        // Each pops the trailing `value`/`operand`, then `peek(1)`+`peek(0)`s the two
+        // builder arrays (`argsArray`, `namesArray`) it mutates in place — so the op
+        // REQUIRES depth >= 3 at runtime (`fiber.peek(1)` would panic below that),
+        // even though it only consumes one value (net -1, leaving the two arrays).
+        // `pops` doubles as the minimum-depth check, so it must be 3 (not 1); push the
+        // two arrays back → `pushes` 2 keeps the net at -1.
+        AppendNamedArg | AppendPosArg | AppendSpreadArg => Effect::new(3, 2),
         CallNamedSpread => Effect::new(3, 1),
         Return => Effect::new(1, 0),
 
@@ -339,10 +345,13 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 
         // DEFINE_GLOBAL pops the value and binds it as a module-scope user-global.
         DefineGlobal => Effect::new(1, 0),
-        // SET_GLOBAL stores TOS into an existing user-global but LEAVES it on the
-        // stack (an assignment is an expression yielding the assigned value), exactly
-        // like SET_LOCAL.
-        SetGlobal => Effect::new(0, 0),
+        // SET_GLOBAL `peek(0)`s TOS, stores it into an existing user-global, and
+        // LEAVES it on the stack (an assignment is an expression yielding the assigned
+        // value — UNLIKE SET_LOCAL, which pops). It is a "peek-and-keep" op: it
+        // REQUIRES depth >= 1 (the runtime `fiber.peek(0)` would otherwise panic) but
+        // is net-zero, so `pops` and `pushes` are both 1 (the `pops` field doubles as
+        // the minimum-depth requirement; see the `Effect` doc).
+        SetGlobal => Effect::new(1, 1),
         // METHOD attaches TOS closure onto the class below it, leaving the class.
         Method => Effect::new(2, 1),
         // INSTANCE_OF: inst cls -- bool.
@@ -926,6 +935,23 @@ mod tests {
         Span::new(0, 0)
     }
 
+    /// Whether `target` appears as an opcode byte anywhere in `chunk.code`
+    /// (decoding linearly so an operand byte equal to the opcode is not mistaken
+    /// for the op). Only the top-level chunk is scanned.
+    fn find_op(chunk: &Chunk, target: Op) -> bool {
+        let mut ip = 0;
+        while ip < chunk.code.len() {
+            let Some(op) = Op::from_u8(chunk.code[ip]) else {
+                return false;
+            };
+            if op == target {
+                return true;
+            }
+            ip += 1 + op.operand_width();
+        }
+        false
+    }
+
     /// A spread of programs exercising every compiler feature; every one must
     /// VERIFY OK (the compiler emits valid bytecode).
     const PROGRAMS: &[&str] = &[
@@ -1103,12 +1129,80 @@ mod tests {
     }
 
     #[test]
+    fn set_global_on_empty_stack_rejected() {
+        // SET_GLOBAL `peek(0)`s its target value at RUNTIME (it leaves TOS on the
+        // stack — assignment is an expression). A crafted chunk that runs SET_GLOBAL
+        // at abstract stack depth 0 would `Fiber::peek(0)`-PANIC at runtime. The
+        // verifier's stack-effect for SET_GLOBAL therefore requires depth >= 1, so
+        // this malformed chunk must be REJECTED (was wrongly accepted when the effect
+        // was `(0, 0)`).
+        let mut c = Chunk::new();
+        let n = c.add_const(Value::Str("g".into())); // a valid name-const (Str)
+        c.emit_u16(Op::SetGlobal, n, s()); // depth 0 here -> underflow
+        c.emit(Op::Return, s());
+        match verify(&c) {
+            Err(VerifyError::StackUnderflow { offset }) => assert_eq!(offset, 0),
+            other => panic!("expected StackUnderflow for SET_GLOBAL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_arg_below_builder_depth_rejected() {
+        // BLAST-RADIUS sibling of SET_GLOBAL: APPEND_POS_ARG (and its NAMED/SPREAD
+        // kin) pop the trailing value, then `peek(1)`+`peek(0)` the two builder arrays
+        // it mutates — so it REQUIRES abstract depth >= 3. A crafted chunk that runs it
+        // with only one value present would `Fiber::peek(1)`-PANIC at runtime; the
+        // verifier must reject it (was wrongly accepted when the effect was `(1, 0)`).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s()); // depth 1 (just the "value"); the two builder arrays are absent
+        c.emit(Op::AppendPosArg, s()); // requires depth 3 -> underflow at this op
+        c.emit(Op::Return, s());
+        match verify(&c) {
+            Err(VerifyError::StackUnderflow { offset }) => assert_eq!(offset, 1),
+            other => panic!("expected StackUnderflow for APPEND_POS_ARG, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_spread_named_call_still_verifies() {
+        // POSITIVE control for the APPEND_*_ARG depth fix. A call MIXING a named arg
+        // with a `...spread` lowers to the lockstep builder (the only path that emits
+        // APPEND_*_ARG), with the two builder arrays already on the stack — it must
+        // still verify under the depth-3 requirement. The mix is a *runtime* error for
+        // ADT construction, but `verify` runs on the COMPILED chunk regardless: the
+        // point is only that the emitted bytecode is well-formed.
+        let chunk = compile(
+            "enum Shape { Rect(w: number, h: number) }\nlet extra = [2]\nlet r = Shape.Rect(w: 1, ...extra)\nprint(r)",
+        );
+        assert!(
+            find_op(&chunk, Op::AppendNamedArg) && find_op(&chunk, Op::AppendSpreadArg),
+            "expected the program to emit the APPEND_NAMED_ARG + APPEND_SPREAD_ARG builder ops"
+        );
+        verify(&chunk).expect("valid named+spread builder bytecode must verify");
+    }
+
+    #[test]
+    fn valid_global_assignment_still_verifies() {
+        // POSITIVE control: a real top-level reassignment lowers to SET_GLOBAL with the
+        // RHS value already on the stack — it must still verify OK after the depth-1
+        // requirement. (Also covered by `all_compiler_output_verifies_ok` via the
+        // `while (t < 5) { t = t + 1 }` program, but asserted directly here too.)
+        let chunk = compile("let t = 0\nt = t + 1\nprint(t)");
+        // sanity: the program actually emits a SET_GLOBAL
+        assert!(
+            find_op(&chunk, Op::SetGlobal),
+            "expected the program to emit SET_GLOBAL"
+        );
+        verify(&chunk).expect("valid global assignment must verify");
+    }
+
+    #[test]
     fn stack_join_mismatch_rejected() {
         // Build: NIL ; JUMP_IF_FALSE +k (pops the NIL) ; NIL ; <join> RETURN
         // The two edges into the join have different depths.
         let mut c = Chunk::new();
         c.emit(Op::Nil, s()); // off 0  depth 0 -> 1
-        let site = c.emit_jump(Op::JumpIfFalse, s()); // off 1, pops -> depth 0; operand at 2
+        let site = c.emit_jump(Op::JumpIfFalse, s()); // opcode at off 1; operand (site=2) -> depth 0 after pop
         c.emit(Op::Nil, s()); // off 4  depth 0 -> 1
         c.patch_jump(site); // target = current len (5) = the RETURN below
         c.emit(Op::Return, s()); // off 5: fall-through arrives depth 1; jump arrives 0
