@@ -457,8 +457,9 @@ fn transitive_file_imports_on_vm() {
 
 #[test]
 fn aso_only_dependency_runs_without_source() {
-    // Build the dependency to .aso, then remove its source; importing it must
-    // still work (prefers the .aso when no source is present).
+    // SELF-CONTAINED-BUNDLES: `build use.as` EMBEDS `./dep` into the artifact, so after
+    // deleting BOTH dep sources (dep.as removed below; the embedded copy lives in use.aso)
+    // the program still runs — the self-contained artifact carries its whole module graph.
     let dir = unique_dir("asoonly");
     write(&dir, "dep.as", "export const V = 42\n");
     write(&dir, "use.as", "import { V } from \"./dep\"\nprint(V)\n");
@@ -472,44 +473,58 @@ fn aso_only_dependency_runs_without_source() {
 }
 
 #[test]
-fn stale_aso_recompiles_from_newer_source() {
-    // A dependency whose source is NEWER than its .aso must be recompiled from
-    // source (Python's rule: prefer .aso only when aso_mtime >= src_mtime).
-    let dir = unique_dir("stale");
+fn built_aso_embeds_deps_and_is_frozen_until_rebuilt() {
+    // SELF-CONTAINED-BUNDLES: a multi-module `build use.as` embeds the whole reachable
+    // module graph (`./dep`) into the produced `.aso` (an `ASCRIPTA` archive), so the
+    // artifact is SELF-CONTAINED and FROZEN at build time — running it does NOT consult
+    // (or recompile from) the on-disk `dep.as`. Editing the source after the build does
+    // not change the artifact; you REBUILD to pick up the change. (This intentionally
+    // replaces the pre-feature "recompile a stale dependency `.aso` from newer source"
+    // behavior, which was the external-reference model self-containment deliberately
+    // removed: the user asked for imports to be INCLUDED, not referenced externally. The
+    // live-edit dev workflow is `ascript run use.as`, which always recompiles from source.)
+    let dir = unique_dir("frozen");
     write(&dir, "dep.as", "export const V = \"old\"\n");
     write(&dir, "use.as", "import { V } from \"./dep\"\nprint(V)\n");
-    build(&dir, "dep.as");
-    build(&dir, "use.as");
+    build(&dir, "use.as"); // embeds dep="old" into use.aso
 
-    // First run uses the built dep.aso → "old".
+    // The built artifact runs the embedded dep → "old".
     let (out1, _) = run(&dir, &["run", "use.aso"]);
     assert_eq!(out1, "old\n");
 
-    // Make the source newer than the .aso and change its value.
+    // Editing the source AFTER the build does NOT change the frozen artifact: it embeds
+    // the build-time dep, and a re-run resolves the import from the embedded archive (an
+    // archive hit), never the (now-newer) on-disk `dep.as`.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     write(&dir, "dep.as", "export const V = \"new\"\n");
-
-    // Now the importer must pick up the recompiled source → "new".
     let (out2, _) = run(&dir, &["run", "use.aso"]);
-    assert_eq!(out2, "new\n");
+    assert_eq!(out2, "old\n", "a built .aso is self-contained — it does not pick up source edits");
+
+    // REBUILDING the artifact embeds the new source → "new".
+    build(&dir, "use.as");
+    let (out3, _) = run(&dir, &["run", "use.aso"]);
+    assert_eq!(out3, "new\n", "rebuilding re-embeds the edited dependency");
 }
 
 #[test]
-fn corrupt_aso_dep_recompiles_when_source_present() {
-    // A present-but-unloadable (corrupt header) dependency `.aso` falls back to
-    // recompiling the source when source is present.
+fn built_aso_ignores_corrupt_ondisk_dep() {
+    // SELF-CONTAINED-BUNDLES: because a multi-module `build use.as` EMBEDS `./dep` into
+    // the artifact, running `use.aso` resolves the import from the embedded archive (an
+    // archive hit) and NEVER consults the on-disk `dep.aso` — so a corrupt/garbage
+    // sibling `dep.aso` is irrelevant and cannot break the self-contained run. (This
+    // replaces the pre-feature "corrupt dep.aso falls back to recompiling dep.as" test:
+    // under the external-reference model the loader consulted the on-disk dep; under
+    // self-containment the embedded dep is authoritative. The corrupt→recompile fallback
+    // still exists for the archive-MISS disk path, just not for an embedded module.)
     let dir = unique_dir("corrupt");
     write(&dir, "dep.as", "export const V = \"src\"\n");
     write(&dir, "use.as", "import { V } from \"./dep\"\nprint(V)\n");
-    build(&dir, "use.as");
-    // Corrupt the dep.aso but keep it NEWER than dep.as so it would be preferred.
-    write(&dir, "dep.aso", "GARBAGE-NOT-A-VALID-ASO");
-    // Make sure dep.as is older.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    build(&dir, "use.as"); // embeds dep="src"
+    // Drop a garbage `dep.aso` next to the artifact — the self-contained run must ignore it.
     std::fs::write(dir.join("dep.aso"), b"GARBAGE-NOT-A-VALID-ASO").unwrap();
 
     let (out, code) = run(&dir, &["run", "use.aso"]);
-    assert_eq!(out, "src\n", "should recompile from source on corrupt .aso");
+    assert_eq!(out, "src\n", "embedded dep is authoritative; the corrupt on-disk dep.aso is ignored");
     assert_eq!(code, 0);
 }
 
