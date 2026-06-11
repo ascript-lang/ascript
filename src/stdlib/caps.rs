@@ -405,6 +405,264 @@ impl CapSet {
         }
         Ok(set)
     }
+
+    // ─────────────────── Module-archive serialization (BNDL §5) ───────────────
+    // The build-time CapSet (its `bits` plus the variable-length `fs_scope`/
+    // `net_scope` carve-outs) is embedded in a module-archive manifest — the
+    // variable-length home the fixed 32-byte bundle footer cannot provide. The
+    // decoder runs over UNTRUSTED bytes (a tampered archive), so it is fully
+    // bounds-checked and allocation-bomb-capped: it returns a clean error and
+    // NEVER panics or indexes out of range.
+
+    /// Serialize this `CapSet` to a self-describing byte vector for embedding in a
+    /// module-archive manifest (BNDL §5). Little-endian length prefixes.
+    ///
+    /// Layout:
+    /// - `bits: u8`
+    /// - `fs_scope`: presence `u8` (0 = `None`, 1 = `Some`); if present, a `deny`
+    ///   mode byte then a `u16` count of allowed prefixes, each a `u32`-len-prefixed
+    ///   UTF-8 string.
+    /// - `net_scope`: same shape, with allowed hosts.
+    ///
+    /// Written by **destructuring** `self` so a future `CapSet` field is a compile
+    /// error here until it is handled — the serializer can never silently drop a
+    /// field.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // Exhaustiveness: destructure so a new field fails to compile here.
+        let CapSet {
+            bits,
+            fs_scope,
+            net_scope,
+        } = self;
+
+        let mut out = Vec::new();
+        out.push(*bits);
+        write_fs_scope(&mut out, fs_scope.as_ref());
+        write_net_scope(&mut out, net_scope.as_ref());
+        out
+    }
+
+    /// Parse a `CapSet` from the front of `b`, returning the decoded value and the
+    /// number of bytes consumed (so trailing manifest data is allowed). Every read
+    /// is bounds-checked and every count/length is capped — malformed or hostile
+    /// input yields a [`CapsDecodeError`], never a panic.
+    pub fn from_bytes(b: &[u8]) -> Result<(CapSet, usize), CapsDecodeError> {
+        let mut cur = Cursor::new(b);
+        let bits = cur.u8()?;
+        let fs_scope = read_fs_scope(&mut cur)?;
+        let net_scope = read_net_scope(&mut cur)?;
+        Ok((
+            CapSet {
+                bits,
+                fs_scope,
+                net_scope,
+            },
+            cur.pos,
+        ))
+    }
+}
+
+/// These cap the decoder's allocation against a tampered archive. An `fs`/`net`
+/// carve-out is human-authored config, so both limits sit far above any legitimate
+/// value while staying small enough to bound a hostile decode.
+///
+/// `MAX_ENTRIES` — a real allow-list is O(10) entries; 4096 is generous yet stays
+/// **below `u16::MAX` (65535)**, so the serialized `u16` count field can never
+/// overflow for a legitimately-constructed carve-out.
+const MAX_ENTRIES: usize = 4096;
+/// `MAX_STRING_LEN` — a real path prefix / host is O(200) bytes; 64 KiB is far above
+/// any legitimate entry while capping the per-string decode allocation.
+const MAX_STRING_LEN: usize = 64 * 1024;
+
+/// Mode wire bytes (kept local to the (de)serializer so the on-disk encoding is a
+/// single source of truth, decoupled from any future enum reordering).
+const FS_DENY_WRITE: u8 = 0;
+const FS_DENY_ALL: u8 = 1;
+const NET_DENY_EXTERNAL: u8 = 0;
+const NET_DENY_ALL: u8 = 1;
+
+/// An error decoding a serialized [`CapSet`] from (possibly hostile) archive bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapsDecodeError {
+    /// The input ended before a required field could be read.
+    Truncated,
+    /// A presence byte was neither 0 (`None`) nor 1 (`Some`).
+    InvalidPresence(u8),
+    /// A deny-mode byte did not name a known mode.
+    InvalidMode(u8),
+    /// An allow-list entry count exceeded [`MAX_ENTRIES`].
+    CountTooLarge(usize),
+    /// A string length exceeded [`MAX_STRING_LEN`].
+    StringTooLong(usize),
+    /// An allow-list entry was not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for CapsDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapsDecodeError::Truncated => write!(f, "truncated capability-set encoding"),
+            CapsDecodeError::InvalidPresence(b) => {
+                write!(f, "invalid carve-out presence byte {b} (expected 0 or 1)")
+            }
+            CapsDecodeError::InvalidMode(b) => write!(f, "invalid deny-mode byte {b}"),
+            CapsDecodeError::CountTooLarge(n) => {
+                write!(f, "allow-list entry count {n} exceeds the maximum {MAX_ENTRIES}")
+            }
+            CapsDecodeError::StringTooLong(n) => {
+                write!(f, "allow-list string length {n} exceeds the maximum {MAX_STRING_LEN}")
+            }
+            CapsDecodeError::InvalidUtf8 => write!(f, "allow-list entry is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for CapsDecodeError {}
+
+/// A bounds-checked forward reader over a byte slice. Every accessor advances `pos`
+/// only after verifying the read fits, so an out-of-range read is a clean
+/// [`CapsDecodeError::Truncated`], never a slice panic.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Cursor { buf, pos: 0 }
+    }
+
+    /// Borrow the next `n` bytes (checked), advancing past them.
+    fn take(&mut self, n: usize) -> Result<&'a [u8], CapsDecodeError> {
+        let end = self.pos.checked_add(n).ok_or(CapsDecodeError::Truncated)?;
+        let slice = self.buf.get(self.pos..end).ok_or(CapsDecodeError::Truncated)?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, CapsDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, CapsDecodeError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, CapsDecodeError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Read a `u32`-length-prefixed UTF-8 string, capped at [`MAX_STRING_LEN`].
+    fn string(&mut self) -> Result<String, CapsDecodeError> {
+        let len = self.u32()? as usize;
+        if len > MAX_STRING_LEN {
+            return Err(CapsDecodeError::StringTooLong(len));
+        }
+        let bytes = self.take(len)?;
+        std::str::from_utf8(bytes)
+            .map(|s| s.to_string())
+            .map_err(|_| CapsDecodeError::InvalidUtf8)
+    }
+
+    /// Read a `u16`-count then that many `u32`-length-prefixed strings. The count is
+    /// capped at [`MAX_ENTRIES`] BEFORE any reservation, so a hostile count can't
+    /// trigger an allocation bomb.
+    fn string_list(&mut self) -> Result<Vec<String>, CapsDecodeError> {
+        let count = self.u16()? as usize;
+        if count > MAX_ENTRIES {
+            return Err(CapsDecodeError::CountTooLarge(count));
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.string()?);
+        }
+        Ok(out)
+    }
+}
+
+/// Append a `u32`-length-prefixed UTF-8 string.
+fn write_string(out: &mut Vec<u8>, s: &str) {
+    // Lengths are capped on decode; on encode a legitimately-authored allow-list is
+    // always well under the cap, so a plain truncating cast is safe in practice and
+    // the decoder rejects anything pathological.
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Append a `u16`-count then each string in `list`.
+fn write_string_list(out: &mut Vec<u8>, list: &[String]) {
+    // MAX_ENTRIES (4096) << u16::MAX (65535), so a legitimately-constructed allow-list
+    // never overflows; the decoder rejects counts > MAX_ENTRIES anyway.
+    debug_assert!(list.len() <= u16::MAX as usize, "allow-list too long for u16 count");
+    out.extend_from_slice(&(list.len() as u16).to_le_bytes());
+    for s in list {
+        write_string(out, s);
+    }
+}
+
+fn write_fs_scope(out: &mut Vec<u8>, scope: Option<&FsScope>) {
+    match scope {
+        None => out.push(0),
+        Some(s) => {
+            // Destructure for exhaustiveness — a new FsScope field breaks here.
+            let FsScope { deny, allow } = s;
+            out.push(1);
+            out.push(match deny {
+                FsDeny::Write => FS_DENY_WRITE,
+                FsDeny::All => FS_DENY_ALL,
+            });
+            write_string_list(out, allow);
+        }
+    }
+}
+
+fn write_net_scope(out: &mut Vec<u8>, scope: Option<&NetScope>) {
+    match scope {
+        None => out.push(0),
+        Some(s) => {
+            let NetScope { deny, allow } = s;
+            out.push(1);
+            out.push(match deny {
+                NetDeny::External => NET_DENY_EXTERNAL,
+                NetDeny::All => NET_DENY_ALL,
+            });
+            write_string_list(out, allow);
+        }
+    }
+}
+
+fn read_fs_scope(cur: &mut Cursor) -> Result<Option<FsScope>, CapsDecodeError> {
+    match cur.u8()? {
+        0 => Ok(None),
+        1 => {
+            let deny = match cur.u8()? {
+                FS_DENY_WRITE => FsDeny::Write,
+                FS_DENY_ALL => FsDeny::All,
+                other => return Err(CapsDecodeError::InvalidMode(other)),
+            };
+            let allow = cur.string_list()?;
+            Ok(Some(FsScope { deny, allow }))
+        }
+        other => Err(CapsDecodeError::InvalidPresence(other)),
+    }
+}
+
+fn read_net_scope(cur: &mut Cursor) -> Result<Option<NetScope>, CapsDecodeError> {
+    match cur.u8()? {
+        0 => Ok(None),
+        1 => {
+            let deny = match cur.u8()? {
+                NET_DENY_EXTERNAL => NetDeny::External,
+                NET_DENY_ALL => NetDeny::All,
+                other => return Err(CapsDecodeError::InvalidMode(other)),
+            };
+            let allow = cur.string_list()?;
+            Ok(Some(NetScope { deny, allow }))
+        }
+        other => Err(CapsDecodeError::InvalidPresence(other)),
+    }
 }
 
 /// The dispatch-site verdict for a capability (§4.4). `Defer` is only ever
@@ -895,6 +1153,155 @@ mod tests {
         // No authority → None (caller lets the connect surface its own error).
         assert_eq!(host_of_url("not-a-url"), None);
         assert_eq!(host_of_url("/relative/path"), None);
+    }
+
+    // ─────────────────────── CapSet serialization (Task 1.1) ──────────────────
+    // `to_bytes`/`from_bytes` for embedding a build-time CapSet into a module-archive
+    // manifest (§5). Variable-length carve-outs don't fit the fixed 32-byte footer.
+
+    #[test]
+    fn capset_roundtrip_full() {
+        // A non-trivial set: some bits dropped, an fs carve-out, a net carve-out.
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Process);
+        cs.deny(Cap::Env);
+        cs.set_fs_scope(FsScope {
+            deny: FsDeny::All,
+            allow: vec!["./cache".into(), "/var/tmp/app".into()],
+        });
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::External,
+            allow: vec!["api.internal".into(), "10.0.0.5".into(), "héllo.example".into()],
+        });
+
+        let bytes = cs.to_bytes();
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).expect("round-trips");
+        assert_eq!(decoded, cs, "round-trip yields an equal CapSet");
+        assert_eq!(consumed, bytes.len(), "consumes exactly the serialized region");
+    }
+
+    #[test]
+    fn capset_roundtrip_default_no_carveouts() {
+        let cs = CapSet::all_granted();
+        let bytes = cs.to_bytes();
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, cs);
+        assert_eq!(consumed, bytes.len());
+        // No carve-outs → presence bytes are 0, so the encoding is compact.
+        assert_eq!(bytes.len(), 3, "bits + two presence bytes when no carve-outs");
+    }
+
+    #[test]
+    fn capset_roundtrip_fs_only() {
+        let mut cs = CapSet::all_granted();
+        cs.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec![] });
+        let bytes = cs.to_bytes();
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, cs);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn from_bytes_allows_trailing_data() {
+        // The decoder reports bytes_consumed so a manifest can hold trailing fields.
+        let cs = CapSet::all_granted();
+        let mut bytes = cs.to_bytes();
+        let n = bytes.len();
+        bytes.extend_from_slice(b"TRAILING MANIFEST DATA");
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, cs);
+        assert_eq!(consumed, n, "stops after the CapSet region, leaving trailing bytes");
+    }
+
+    #[test]
+    fn from_bytes_empty_is_err_not_panic() {
+        assert!(matches!(
+            CapSet::from_bytes(&[]),
+            Err(CapsDecodeError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn from_bytes_truncated_is_clean_err() {
+        // Build a valid encoding, then truncate at every prefix — none may panic.
+        let mut cs = CapSet::all_granted();
+        cs.set_fs_scope(FsScope {
+            deny: FsDeny::All,
+            allow: vec!["abc".into(), "defg".into()],
+        });
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::All,
+            allow: vec!["host.example".into()],
+        });
+        let full = cs.to_bytes();
+        for cut in 0..full.len() {
+            // Any strict prefix must be Err, never a panic and never a partial Ok.
+            let r = CapSet::from_bytes(&full[..cut]);
+            assert!(r.is_err(), "prefix of len {cut} must be Err");
+        }
+        // The full buffer is Ok.
+        assert!(CapSet::from_bytes(&full).is_ok());
+    }
+
+    #[test]
+    fn from_bytes_invalid_mode_byte_is_err() {
+        // bits=0x1f (all granted), fs present, mode = 99 (invalid) → clean Err.
+        let bytes = [ALL_BITS, 1u8, 99u8, 0u8, 0u8 /* net absent */];
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::InvalidMode(99))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_invalid_presence_byte_is_err() {
+        let bytes = [ALL_BITS, 7u8 /* not 0 or 1 */];
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::InvalidPresence(7))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_over_large_count_is_err_not_alloc_bomb() {
+        // bits, fs present, mode=All(1), count = u16::MAX (way over MAX_ENTRIES) →
+        // clean Err BEFORE any allocation; the buffer is tiny so a naive
+        // `Vec::with_capacity(count)` would also be caught, but the cap rejects first.
+        let mut bytes = vec![ALL_BITS, 1u8, 1u8];
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes()); // count = 65535
+        bytes.extend_from_slice(b"x"); // a few stray bytes
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::CountTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_over_large_string_len_is_err() {
+        // fs present, mode=All, count=1, then a string len of u32::MAX → clean Err,
+        // never an allocation bomb or out-of-bounds read.
+        let mut bytes = vec![ALL_BITS, 1u8, 1u8];
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // string len = 4GB
+        bytes.extend_from_slice(b"short");
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::StringTooLong(_))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_invalid_utf8_is_err() {
+        // fs present, mode=All, count=1, len=2, bytes = invalid utf8 (0xff 0xff).
+        let mut bytes = vec![ALL_BITS, 1u8, 1u8];
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // len = 2
+        bytes.extend_from_slice(&[0xff, 0xff]); // invalid utf8
+        bytes.push(0u8); // net absent
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::InvalidUtf8)
+        ));
     }
 
     #[test]
