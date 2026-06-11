@@ -1786,10 +1786,11 @@ async fn run_verified_archive(
     // with the run-time (CLI/manifest) caps by MONOTONE INTERSECTION — a capability is
     // effective only if BOTH the build-time floor AND the run-time set grant it, so a
     // run-time flag can only narrow further and can NEVER re-grant what the build denied.
-    // Clone `archive.caps` out BEFORE `archive` is encoded/moved below. A native bundle
-    // passes `caps = None` (the startup shim runs before clap, so there are no run-time
-    // `--deny` flags) → the effective set is exactly the embedded floor; `run x.aso --deny X`
-    // intersects the floor with `{X denied}`. The effective set is installed ALWAYS.
+    // `restrict_with` borrows `archive.caps` by ref — call it BEFORE `archive` is moved
+    // into `encode()` / `Rc::new` below. A native bundle passes `caps = None` (the startup
+    // shim runs before clap, so there are no run-time `--deny` flags) → the effective set is
+    // exactly the embedded floor; `run x.aso --deny X` intersects the floor with `{X denied}`.
+    // The effective set is installed ALWAYS.
     let effective_caps = archive
         .caps
         .restrict_with(&caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted));

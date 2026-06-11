@@ -287,6 +287,10 @@ fn stricter_net_deny(a: NetDeny, b: NetDeny) -> NetDeny {
 /// `a` and duplicates are dropped — the verdict is set-membership, so order/dup are
 /// not observable.
 fn intersect_allow(a: &[String], b: &[String]) -> Vec<String> {
+    // O(|a|×|b|), capped at MAX_ENTRIES² (~16M comparisons worst case) — safe because
+    // allow-lists are human-authored config. The `!out.contains` guard handles a
+    // hypothetical duplicate in `a` (legitimately-built CapSets never carry duplicates,
+    // but the decoder yields whatever was serialized).
     let mut out = Vec::new();
     for s in a {
         if b.contains(s) && !out.contains(s) {
@@ -473,8 +477,9 @@ impl CapSet {
     /// - one side grants the cap fully and the other carries a scope → the result
     ///   uses that scope;
     /// - both carry a scope → the **stricter** deny-mode and the **intersection** of
-    ///   allow-lists; if the deny-modes are incomparable (they are totally ordered
-    ///   here, so this never fires) the whole cap is denied.
+    ///   allow-lists. Deny modes are a two-element total order (Write < All /
+    ///   External < All), so `stricter_*` is always conclusive. A future third
+    ///   variant would need a tiebreak here.
     ///
     /// Monotone, commutative on the verdict, and idempotent (`x.restrict_with(&x) == x`).
     pub fn restrict_with(&self, other: &CapSet) -> CapSet {

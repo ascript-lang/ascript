@@ -1150,3 +1150,72 @@ fn unrestricted_single_module_stays_bare_chunk() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Build a 2-module program — `import` + a sibling util to force an `ASCRIPTA` archive — whose
+/// entry calls a representative gated `<expr>` (NOT recovered) — to an `.aso` with `--deny <cap>`,
+/// run it, and assert the EMBEDDED floor denies that cap at runtime: non-zero exit and the
+/// `capability '<cap>' denied` Tier-2 message on stderr, while the pre-call line still prints.
+/// Confirms enforcement of the embedded floor on the `.aso` run path (`run_verified_archive`).
+#[cfg_attr(not(any(feature = "sys", feature = "ffi")), allow(dead_code))]
+fn assert_embedded_denial(dir: &Path, tag: &str, import: &str, expr: &str, cap: &str) {
+    write(dir, "audit_util.as", "export fn ok(): string { return \"pre-call-ok\" }\n");
+    let src = format!(
+        "import {{ ok }} from \"./audit_util\"\n\
+         {import}\n\
+         print(ok())\n\
+         let r = {expr}\n\
+         print(\"reached\")\n"
+    );
+    let entry = write(dir, &format!("audit_{tag}.as"), &src);
+    let out = dir.join(format!("audit_{tag}.aso"));
+    build_with(&["--deny", cap], &entry, &out);
+    // Sanity: the embedded floor denies exactly this cap.
+    let arch = ModuleArchive::decode(&std::fs::read(&out).unwrap()).unwrap();
+    assert_only_denied(&arch.caps, ascript::stdlib::caps::cap_name(cap).unwrap());
+
+    let r = run_artifact_in(&[], &out, dir, &[]);
+    assert!(!r.status.success(), "{tag}: embedded --deny {cap} must deny at runtime");
+    let out_s = String::from_utf8_lossy(&r.stdout);
+    assert!(out_s.contains("pre-call-ok"), "{tag}: the pre-call line must print: {out_s}");
+    assert!(!out_s.contains("reached"), "{tag}: the gated call must NOT proceed: {out_s}");
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        err.contains(&format!("capability '{cap}' denied")),
+        "{tag}: expected `capability '{cap}' denied`: {err}"
+    );
+}
+
+/// PER-CAP EMBEDDED-DENIAL AUDIT (3.2 review) — locks in embedded-path parity with
+/// `cap_audit`'s in-process matrix: each remaining OS-surface cap, embedded as an `.aso` floor
+/// via `--deny <cap>`, is enforced by `run_verified_archive` at runtime. Uses the `.aso` path
+/// (not `--native`) to stay cheap/hermetic. `net` is covered by the dedicated bundle tests above;
+/// here we audit `fs` / `process` / `env` (the `sys` feature) and `ffi` (the `ffi` feature).
+#[test]
+#[cfg(any(feature = "sys", feature = "ffi"))]
+fn embedded_caps_denied_per_cap_audit() {
+    let dir = tmp_dir("embedded_audit");
+
+    // fs → fs.read (the canonical read surface, same as cap_audit).
+    #[cfg(feature = "sys")]
+    assert_embedded_denial(
+        &dir, "fs", "import * as fs from \"std/fs\"", "fs.read(\"/etc/hosts\")", "fs",
+    );
+    // process → process.run (subprocess spawn).
+    #[cfg(feature = "sys")]
+    assert_embedded_denial(
+        &dir, "proc", "import * as process from \"std/process\"", "process.run(\"true\", [])", "process",
+    );
+    // env → env.get (env-var read).
+    #[cfg(feature = "sys")]
+    assert_embedded_denial(
+        &dir, "env", "import * as env from \"std/env\"", "env.get(\"PATH\")", "env",
+    );
+    // ffi → ffi.open (native library load; the gate fires before the open is attempted, so the
+    // library name need not exist on the test host).
+    #[cfg(feature = "ffi")]
+    assert_embedded_denial(
+        &dir, "ffi", "import * as ffi from \"std/ffi\"", "ffi.open(\"libm.so.6\")", "ffi",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
