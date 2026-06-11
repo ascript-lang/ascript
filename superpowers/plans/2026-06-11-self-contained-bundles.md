@@ -369,12 +369,12 @@ let salt = SaltString::encode_b64(&salt_bytes).map_err(...)?;
 - Modify: `src/check/infer/pass.rs:1489` (`synth_array`)
 - Test: `tests/check.rs`
 
-- [ ] **Step 1: Write the failing test** — `let x: int? = nil; let a = [x + 1]` emits the `possibly-nil` diagnostic exactly once.
-- [ ] **Step 2: Run it — expect FAIL** (emitted twice).
-- [ ] **Step 3: Apply the fix** — remove the first (discarded) `for e in &elems { self.synth(e, env); }` pass; keep the single pass that both folds element types and emits diagnostics.
-- [ ] **Step 4: Run it — expect PASS**; run the `corpus::` gate (examples emit 0 type diagnostics).
-- [ ] **Step 5: §9.1** — check-test; blast-radius: scan other `synth_*` for accidental double-synthesis.
-- [ ] **Step 6: Commit** — `git commit -m "fix(check): remove duplicate synthesis in synth_array"`
+- [x] **Step 1: Write the failing test** — `let x: int? = nil; let a = [x + 1]` emits the `possibly-nil` diagnostic exactly once.
+- [x] **Step 2: Run it — expect FAIL** (emitted twice).
+- [x] **Step 3: Apply the fix** — remove the first (discarded) `for e in &elems { self.synth(e, env); }` pass; keep the single pass that both folds element types and emits diagnostics.
+- [x] **Step 4: Run it — expect PASS**; run the `corpus::` gate (examples emit 0 type diagnostics).
+- [x] **Step 5: §9.1** — check-test; blast-radius: scan other `synth_*` for accidental double-synthesis.
+- [x] **Step 6: Commit** — `git commit -m "fix(check): remove duplicate synthesis in synth_array"`
 
 ### Task 0.15: LSP `did_rename_files` stale index
 
