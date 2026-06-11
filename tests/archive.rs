@@ -673,3 +673,368 @@ async fn shake_slot_safety_kept_globals_still_resolve() {
     assert_eq!(out, "42\n", "a() = b() + 2 = 42 — references intact after the drop");
     assert_eq!(code, None);
 }
+
+// ===========================================================================================
+// Task 2.5 — THE LOAD-BEARING TRIPWIRE: a DIFFERENTIAL proving tree-shaking NEVER changes a
+// program's observable behavior. For each multi-module program we build TWO archives over the
+// SAME walk — one SHAKEN (pass-2 pruning applied), one UNSHAKEN (pass-2 skipped, library
+// modules keep their full pass-1 bytes) — run BOTH via `run_archive`, and assert byte-identical
+// stdout + exit code. The comparison is DYNAMIC (both outputs computed, never hardcoded). To
+// avoid passing vacuously (a no-op shaker would trivially satisfy "shaken == unshaken"), the
+// fixtures with unused code ALSO assert the SHAKEN report actually DROPPED the expected names.
+//
+// BASELINE APPROACH (A) — no-shake archive. We toggle ONLY pass-2 pruning via the test seam
+// `compile_archive_with_shake(entry, with_debug, shake)`; `compile_archive(entry, dbg)` is
+// exactly `..._with_shake(entry, dbg, true)`. Building both forms over the identical archive
+// walk isolates SHAKING as the single variable (same logical keys, same entry chunk, only
+// pruning differs) and needs no new run helper — both archives feed the existing `run_archive`.
+// This is the precision baseline the task recommends. (Approach B — a disk-run baseline — is
+// also exercised, additively, by `differential_*_matches_disk_run` below for the corpus
+// examples, re-validating the full archive↔disk pipeline.)
+//
+// NOTE on re-exports: AScript has NO `export {x} from "./y"` re-export form (confirmed in
+// Task 2.2), so adversarial fixture #8 needs no test — there is no re-export edge to shake.
+
+/// Build a SHAKEN and an UNSHAKEN archive for `entry`, run BOTH from the archive (sources may
+/// be absent — the archive is self-contained), and assert their stdout + exit code are
+/// byte-identical. Returns the SHAKEN report so the caller can assert specific drops/pins (the
+/// tripwire-vs-vacuous guard). If shaken ≠ unshaken this is a REAL shaker bug (live code was
+/// dropped) — the assertion fails loudly with both outputs rather than being weakened.
+async fn assert_shaken_equals_unshaken(entry: &Path) -> ascript::compile::shake::ShakeReport {
+    let (shaken_arch, report) =
+        ascript::compile_archive_with_shake(entry, false, true).expect("shaken archive builds");
+    let (unshaken_arch, _unshaken_report) =
+        ascript::compile_archive_with_shake(entry, false, false).expect("unshaken archive builds");
+
+    // Round-trip BOTH through encode/decode so we run exactly what a self-contained bundle
+    // would carry on disk (no borrowed path state, no source-tree dependence).
+    let shaken = ModuleArchive::decode(&shaken_arch.encode()).expect("shaken decodes");
+    let unshaken = ModuleArchive::decode(&unshaken_arch.encode()).expect("unshaken decodes");
+
+    let (shaken_out, shaken_code) = ascript::run_archive(shaken)
+        .await
+        .expect("shaken archive runs");
+    let (unshaken_out, unshaken_code) = ascript::run_archive(unshaken)
+        .await
+        .expect("unshaken archive runs");
+
+    assert_eq!(
+        shaken_out, unshaken_out,
+        "SHAKER BUG: shaken stdout diverged from unshaken for {}\n  shaken:   {shaken_out:?}\n  unshaken: {unshaken_out:?}",
+        entry.display()
+    );
+    assert_eq!(
+        shaken_code, unshaken_code,
+        "SHAKER BUG: shaken exit code diverged from unshaken for {}: {shaken_code:?} vs {unshaken_code:?}",
+        entry.display()
+    );
+    report
+}
+
+/// True if the SHAKEN report dropped `name` from ANY module — the non-vacuous guard.
+fn report_dropped(report: &ascript::compile::shake::ShakeReport, name: &str) -> bool {
+    report
+        .dropped
+        .iter()
+        .any(|d| d.names.iter().any(|n| n.as_ref() == name))
+}
+
+// ── Adversarial fixtures ───────────────────────────────────────────────────────────────────
+
+/// #1 — Namespace + DYNAMIC index. `import * as m; print(m[someKey])` indexes the namespace
+/// dynamically, so the shaker cannot prove which exports are used → `util` is PINNED WHOLE.
+/// Output identical; the report carries a PIN for util (and drops nothing from it).
+#[tokio::test]
+async fn differential_namespace_dynamic_index_pins_whole() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let util = dir.path().join("util.as");
+    std::fs::write(
+        &entry,
+        "import * as m from \"./util\"\nlet someKey = \"foo\"\nprint(m[someKey]())\n",
+    )
+    .expect("write entry");
+    std::fs::write(
+        &util,
+        "export fn foo(): number { return 1 }\n\
+         export fn bar(): number { return 2 }\n",
+    )
+    .expect("write util");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    // util is pinned whole: a PIN is recorded for it, and nothing was dropped from it.
+    assert!(
+        report.pins.iter().any(|p| p.key == "util.as"),
+        "util must be PINNED whole (dynamic index); pins = {:?}",
+        report.pins.iter().map(|p| &p.key).collect::<Vec<_>>()
+    );
+    assert!(
+        !report_dropped(&report, "bar") && !report_dropped(&report, "foo"),
+        "a pinned module drops nothing; dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// #2 — Namespace + STATIC method calls. `import * as m; m.foo(...); m.bar()` uses ONLY
+/// `foo`/`bar` statically → util shaken to {foo,bar}; the unused `baz` is dropped. Output
+/// identical; assert `baz` dropped.
+#[tokio::test]
+async fn differential_namespace_static_calls_drops_unaccessed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let util = dir.path().join("util.as");
+    std::fs::write(
+        &entry,
+        "import * as m from \"./util\"\nprint(m.foo(3) + m.bar())\n",
+    )
+    .expect("write entry");
+    std::fs::write(
+        &util,
+        "export fn foo(a: number): number { return a }\n\
+         export fn bar(): number { return 2 }\n\
+         export fn baz(): number { return 99 }\n",
+    )
+    .expect("write util");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_dropped(&report, "baz"),
+        "unaccessed namespace export `baz` must be dropped; dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// #3 — ESCAPING function value. `import { f } from "./util"; let g = f; print(g())` aliases
+/// the imported `f` into a local — `f` is kept whole (a named import keeps its target). Output
+/// identical. (No drop asserted: the lib only exports `f`, which is used.)
+#[tokio::test]
+async fn differential_escaping_function_value_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let util = dir.path().join("util.as");
+    std::fs::write(
+        &entry,
+        "import { f } from \"./util\"\nlet g = f\nprint(g())\n",
+    )
+    .expect("write entry");
+    std::fs::write(&util, "export fn f(): number { return 7 }\n").expect("write util");
+
+    // The whole value of this fixture is that the escape does NOT change behavior under shaking.
+    let _report = assert_shaken_equals_unshaken(&entry).await;
+}
+
+/// #4 — CIRCULAR imports. A imports B, B imports A, with a value used across the cycle. Output
+/// identical; both modules' used parts kept (the deferred-namespace cycle the disk loader
+/// handles). The entry sits outside the tight cycle so it can read A's settled export.
+#[tokio::test]
+async fn differential_circular_imports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let main = dir.path().join("main.as");
+    let a = dir.path().join("a.as");
+    let b = dir.path().join("b.as");
+    std::fs::write(&main, "import { fromA } from \"./a\"\nprint(fromA())\n").expect("write main");
+    std::fs::write(
+        &a,
+        "import * as b from \"./b\"\n\
+         export fn fromA(): number { return 10 + b.fromB() }\n",
+    )
+    .expect("write a");
+    std::fs::write(
+        &b,
+        "import * as a from \"./a\"\n\
+         export fn fromB(): number { return 5 }\n\
+         export fn deadInB(): number { return 999 }\n",
+    )
+    .expect("write b");
+
+    let _report = assert_shaken_equals_unshaken(&main).await;
+    // (No drop ASSERT: whether `deadInB` is droppable depends on whether the `a`↔`b` namespace
+    // cycle pins; the load-bearing claim here is shaken == unshaken across the cycle.)
+}
+
+/// #5 — SIDE-EFFECTFUL top-level in source order. A lib has a top-level `print("loaded")`, a
+/// computed `let x = sideEffect()`, AND an unused `dead` fn. The side effects must run IN
+/// SOURCE ORDER in the shaken archive; output identical; assert `dead` dropped but the side
+/// effects present (the differential proves order + presence, the drop proves non-vacuity).
+#[tokio::test]
+async fn differential_side_effectful_toplevel_in_source_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib = dir.path().join("lib.as");
+    std::fs::write(&entry, "import { keep } from \"./lib\"\nprint(keep())\n").expect("write entry");
+    std::fs::write(
+        &lib,
+        "fn compute(): number { print(\"computing\")\n return 1 }\n\
+         print(\"loaded\")\n\
+         let x = compute()\n\
+         fn dead(): number { return 0 }\n\
+         export fn keep(): number { return 42 }\n",
+    )
+    .expect("write lib");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_dropped(&report, "dead"),
+        "unused `dead` fn must be dropped; dropped = {:?}",
+        report.dropped
+    );
+
+    // Belt-and-braces: the SHAKEN run's stdout shows the side effects IN SOURCE ORDER
+    // (print("loaded") then the computed-let's print("computing")), then keep().
+    let (arch, _r) = compile_archive(&entry, false).expect("archives");
+    let (out, _code) = ascript::run_archive(arch).await.expect("runs");
+    assert_eq!(
+        out, "loaded\ncomputing\n42\n",
+        "side effects ran in source order; out = {out:?}"
+    );
+}
+
+/// #6 — DIAMOND. entry → A, entry → B; A → D, B → D. D has a used + an unused export; D's
+/// unused is dropped ONCE (D is archived once). Output identical; assert the unused export
+/// dropped.
+#[tokio::test]
+async fn differential_diamond_drops_shared_unused_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let a = dir.path().join("a.as");
+    let b = dir.path().join("b.as");
+    let d = dir.path().join("d.as");
+    std::fs::write(
+        &entry,
+        "import { fa } from \"./a\"\nimport { fb } from \"./b\"\nprint(fa() + fb())\n",
+    )
+    .expect("write entry");
+    std::fs::write(
+        &a,
+        "import { used } from \"./d\"\nexport fn fa(): number { return used() }\n",
+    )
+    .expect("write a");
+    std::fs::write(
+        &b,
+        "import { used } from \"./d\"\nexport fn fb(): number { return used() }\n",
+    )
+    .expect("write b");
+    std::fs::write(
+        &d,
+        "export fn used(): number { return 3 }\n\
+         export fn unusedInD(): number { return 100 }\n",
+    )
+    .expect("write d");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_dropped(&report, "unusedInD"),
+        "diamond's shared `unusedInD` must be dropped; dropped = {:?}",
+        report.dropped
+    );
+    // Dropped exactly once — D appears once in the report (one ModuleDrops entry naming it).
+    let d_drop_entries = report
+        .dropped
+        .iter()
+        .filter(|m| m.names.iter().any(|n| n.as_ref() == "unusedInD"))
+        .count();
+    assert_eq!(d_drop_entries, 1, "D is shaken once, not per-importer");
+}
+
+/// #7 — CROSS-MODULE classes/enums. The entry uses a class from lib1 (with a SUPERCLASS) and
+/// an enum from lib2 in a match; each lib carries an UNUSED sibling class / enum-helper that is
+/// dropped. Output identical; assert the unused class dropped.
+#[tokio::test]
+async fn differential_cross_module_classes_enums() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let lib1 = dir.path().join("lib1.as");
+    let lib2 = dir.path().join("lib2.as");
+    std::fs::write(
+        &entry,
+        "import { Dog } from \"./lib1\"\nimport { Color, describe } from \"./lib2\"\n\
+         let d = Dog(\"Rex\")\nprint(d.speak())\nprint(describe(Color.Red))\n",
+    )
+    .expect("write entry");
+    std::fs::write(
+        &lib1,
+        "class Animal {\n  fn init(name: string) { self.name = name }\n  fn speak(): string { return \"...\" }\n}\n\
+         export class Dog extends Animal {\n  fn init(name: string) { super.init(name) }\n  fn speak(): string { return `${self.name} says woof` }\n}\n\
+         export class Cat extends Animal {\n  fn init(name: string) { super.init(name) }\n  fn speak(): string { return `${self.name} meows` }\n}\n",
+    )
+    .expect("write lib1");
+    std::fs::write(
+        &lib2,
+        "export enum Color { Red, Green, Blue }\n\
+         export fn describe(c: Color): string {\n  return match c {\n    Color.Red => \"r\",\n    Color.Green => \"g\",\n    Color.Blue => \"b\",\n  }\n}\n\
+         export fn unusedHelper(): number { return 42 }\n",
+    )
+    .expect("write lib2");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    // lib1's unused `Cat` (only `Dog` + its superclass `Animal` are reachable) is dropped.
+    assert!(
+        report_dropped(&report, "Cat"),
+        "unused class `Cat` must be dropped; dropped = {:?}",
+        report.dropped
+    );
+    // lib2's unused `unusedHelper` is dropped (the enum + describe are reachable).
+    assert!(
+        report_dropped(&report, "unusedHelper"),
+        "unused `unusedHelper` must be dropped; dropped = {:?}",
+        report.dropped
+    );
+}
+
+// ── Corpus coverage: the existing multi-module EXAMPLES ──────────────────────────────────────
+
+/// The shipped `bundle_multimodule.as` example (named import of a sibling) is shaken ==
+/// unshaken, byte-identical.
+#[tokio::test]
+async fn differential_corpus_bundle_multimodule() {
+    let _report = assert_shaken_equals_unshaken(Path::new("examples/bundle_multimodule.as")).await;
+}
+
+/// The `examples/app/main.as` example (named import + transitive + a NAMESPACE import + a
+/// cross-module class) is shaken == unshaken, byte-identical.
+#[tokio::test]
+async fn differential_corpus_app_main() {
+    let _report = assert_shaken_equals_unshaken(Path::new("examples/app/main.as")).await;
+}
+
+/// The `examples/modules/main.as` example (named + namespace import of the same geometry
+/// module, plus a class) is shaken == unshaken, byte-identical.
+#[tokio::test]
+async fn differential_corpus_modules_main() {
+    let _report = assert_shaken_equals_unshaken(Path::new("examples/modules/main.as")).await;
+}
+
+// ── Approach (B), additive: the corpus shaken archive matches the on-DISK run ────────────────
+// Re-validates the full archive↔disk pipeline for the headline examples — the shaken archive's
+// captured stdout equals the on-disk run's stdout (computed dynamically, never hardcoded). The
+// disk run is INHERENTLY unshaken (the loader hits disk for every import, no archive, no
+// pruning), so this is a second, independent unshaken baseline.
+
+/// Run an on-disk multi-file program through the VM with CAPTURED stdout, returning
+/// `(stdout, exit_code)`. Mirrors `run_archive`'s capture but loads imports from DISK (no
+/// archive installed) — the inherently-unshaken baseline for approach (B).
+async fn run_disk_captured(entry: &Path) -> (String, Option<i32>) {
+    ascript::vm_run_file_captured(entry)
+        .await
+        .expect("disk program runs")
+}
+
+/// Headline corpus example: the SHAKEN archive's stdout equals the on-disk (unshaken) run's
+/// stdout, byte-for-byte. Proves shaking + the archive loader together preserve behavior end
+/// to end.
+#[tokio::test]
+async fn differential_bundle_multimodule_archive_matches_disk_run() {
+    let entry = Path::new("examples/bundle_multimodule.as");
+    let (arch, _report) = compile_archive(entry, false).expect("archives");
+    // (This example's exports are all used, so it shakes nothing — that's fine here: this
+    // approach-(B) test validates the archive↔DISK pipeline preserves behavior, not
+    // non-vacuity. The adversarial fixtures above own the "shaking actually happened" guard.)
+    let shaken = ModuleArchive::decode(&arch.encode()).expect("decodes");
+    let (archive_out, archive_code) = ascript::run_archive(shaken).await.expect("archive runs");
+    let (disk_out, disk_code) = run_disk_captured(entry).await;
+    assert_eq!(
+        archive_out, disk_out,
+        "shaken archive stdout must equal the on-disk run; archive={archive_out:?} disk={disk_out:?}"
+    );
+    assert_eq!(archive_code, disk_code, "exit codes match");
+}

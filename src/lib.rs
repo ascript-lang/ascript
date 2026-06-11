@@ -1058,6 +1058,28 @@ pub fn compile_archive(
     entry: &Path,
     with_debug: bool,
 ) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
+    compile_archive_with_shake(entry, with_debug, true)
+}
+
+/// Like [`compile_archive`], but with the pass-2 TREE-SHAKE toggleable. This is the
+/// load-bearing TEST seam for the shaken-vs-unshaken differential (Phase 2, Task 2.5):
+/// `compile_archive(entry, dbg)` is exactly `compile_archive_with_shake(entry, dbg, true)`,
+/// and `shake = false` skips pass-2 pruning entirely so each LIBRARY module keeps its full
+/// pass-1 bytes (every top-level declaration present). Building BOTH forms and asserting
+/// their runs are byte-identical isolates SHAKING as the only variable — same archive walk,
+/// same logical keys, only pruning toggled.
+///
+/// When `shake = false` the returned [`ShakeReport`](crate::compile::shake::ShakeReport) is
+/// still computed (so a caller can compare it to the shaken report), but it is NOT applied
+/// to the stored bytes — the report is purely informational for the no-shake build.
+///
+/// `#[doc(hidden)]` test/seam API — production callers use the 2-arg [`compile_archive`].
+#[doc(hidden)]
+pub fn compile_archive_with_shake(
+    entry: &Path,
+    with_debug: bool,
+    shake: bool,
+) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
     use crate::vm::archive::ModuleArchive;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1262,18 +1284,24 @@ pub fn compile_archive(
         }
     }
 
-    for (idx, (_key, bytes)) in modules.iter_mut().enumerate() {
-        if idx == 0 {
-            continue; // entry kept whole — byte-identical to today
+    // The no-shake TEST seam (`shake == false`, Task 2.5) skips this loop entirely: every
+    // library module keeps its full pass-1 bytes. The report above is still COMPUTED (so a
+    // caller can diff it against the shaken report) but never APPLIED — the differential
+    // builds both forms and asserts their runs are byte-identical.
+    if shake {
+        for (idx, (_key, bytes)) in modules.iter_mut().enumerate() {
+            if idx == 0 {
+                continue; // entry kept whole — byte-identical to today
+            }
+            // The keep-set should exist for every module index; a missing one is an internal
+            // invariant break — defensively keep the module WHOLE rather than over-prune.
+            let Some(keep) = reach.keep.get(&idx) else {
+                continue;
+            };
+            let path = &module_paths[idx];
+            let pruned = compile_pruned_aso_bytes(path, keep, with_debug)?;
+            *bytes = pruned;
         }
-        // The keep-set should exist for every module index; a missing one is an internal
-        // invariant break — defensively keep the module WHOLE rather than over-prune.
-        let Some(keep) = reach.keep.get(&idx) else {
-            continue;
-        };
-        let path = &module_paths[idx];
-        let pruned = compile_pruned_aso_bytes(path, keep, with_debug)?;
-        *bytes = pruned;
     }
 
     // The manifest digest is the reproducible sha256 of the shake report (machine-
@@ -2213,6 +2241,65 @@ async fn vm_run_source_cfg(
         // A top-level `?` propagation simply ends the program.
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// **SELF-CONTAINED-BUNDLES Phase 2 (Task 2.5) test seam.** Run a multi-file program from
+/// DISK on the specialized VM with CAPTURED stdout, resolving relative `import`s against the
+/// entry file's directory (`set_module_dir`) — NO archive installed, so every import hits
+/// disk and NOTHING is tree-shaken. This is the inherently-unshaken baseline (B) the
+/// shaken-vs-unshaken differential compares the archive run against. It mirrors
+/// [`vm_run_source`]'s capture but is file/dir-aware (the bare `vm_run_source` can't load
+/// relative imports). `#[doc(hidden)]` test API.
+#[doc(hidden)]
+pub async fn vm_run_file_captured(entry: &Path) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(entry)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", entry.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: entry.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(&src);
+    let vm = Vm::new(interp.clone());
+    // Resolve relative imports against the entry's directory (disk loader, no archive).
+    if let Some(dir) = entry.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
     }
 }
