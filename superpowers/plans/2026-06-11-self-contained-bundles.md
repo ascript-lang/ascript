@@ -402,9 +402,9 @@ idx.reindex_file(&new, &text);
 - Modify: `src/syntax/parser.rs` (`return_stmt`)
 - Test: `tests/frontend_conformance.rs`
 
-- [ ] **Step 1: Write the failing test** — parsing `fn f() { return; }` produces a clean `ReturnStmt` with no `Error` child.
-- [ ] **Step 2: Run it — expect FAIL** (error node from `expr(p)` on `;`).
-- [ ] **Step 3: Apply the fix** — guard the optional expression on `;`:
+- [x] **Step 1: Write the failing test** — parsing `fn f() { return; }` produces a clean `ReturnStmt` with no `Error` child.
+- [x] **Step 2: Run it — expect FAIL** (error node from `expr(p)` on `;`).
+- [x] **Step 3: Apply the fix** — guard the optional expression on `;`:
 
 ```rust
 if !p.at(RBrace) && !p.at_end() && !p.at(Semicolon) {
@@ -412,9 +412,9 @@ if !p.at(RBrace) && !p.at_end() && !p.at(Semicolon) {
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS**; tree-sitter conformance unaffected.
-- [ ] **Step 5: §9.1** — frontend-conformance snippet; blast-radius: check other statement parsers (e.g. `break;`/`continue;`) for the same missing `Semicolon` guard.
-- [ ] **Step 6: Commit** — `git commit -m "fix(cst): no spurious error node for bare return;"`
+- [x] **Step 4: Run it — expect PASS**; tree-sitter conformance unaffected.
+- [x] **Step 5: §9.1** — frontend-conformance snippet; blast-radius: check other statement parsers (e.g. `break;`/`continue;`) for the same missing `Semicolon` guard.
+- [x] **Step 6: Commit** — `git commit -m "fix(cst): no spurious error node for bare return;"`
 
 ### Task 0.17: DAP unbounded Content-Length
 
