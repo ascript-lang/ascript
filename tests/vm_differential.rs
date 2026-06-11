@@ -1071,6 +1071,23 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/fs_toolkit.as",
         SkipReason::SharedExternalState,
     ),
+    // Writes its durable-workflow event log to a FIXED path
+    // (`/tmp/ascript_workflow_signup.log`) and `remove`s it at the end. The
+    // multiple corpus oracles run this example concurrently (in-process, parallel
+    // `#[tokio::test]`s, each running it twice — tree-walker then VM); one run's
+    // end-of-program cleanup unlinks the log mid-`resume`/`commit` of another,
+    // surfacing as a flaky `workflow: log commit failed: No such file or directory
+    // (os error 2)`. The engines are byte-identical — this is purely a shared-
+    // fixed-path race, the same class as system.as / fs_toolkit.as. It runs
+    // deterministically in ISOLATION (`ascript run …workflow_signup.as`) and the
+    // workflow record/replay behavior is covered by `tests/workflow.rs` and the
+    // durable-replay tests, so corpus coverage is not weakened. The example is a
+    // clean user-facing demo (a fixed log path is reasonable standalone); only the
+    // parallel multi-oracle harness can't run it safely.
+    (
+        "examples/advanced/workflow_signup.as",
+        SkipReason::SharedExternalState,
+    ),
     // ---- Network-peer / long-running servers (cannot run headless) ------------
     // Forever-serving HTTP API: blocks on `serve` awaiting a client in a separate
     // process; it does not terminate on its own and hangs even the tree-walker.
