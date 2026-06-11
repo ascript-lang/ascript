@@ -183,9 +183,11 @@ shared = []
 # core: ALL of `src/pkg/` is `#[cfg(feature = "pkg")]`. The ONLY non-`pkg` change
 # is the dependency-free package-resolver map + the shared `classify_specifier`
 # helper in the core (so a bare `import "x"` resolves on both engines). Needs
-# `net` (reqwest for url-tarball fetch), `compress` (flate2/zip/tar extract), and
-# `sha2` (the `asum1` content hash); `toml` is already non-optional; `git` is the
-# system binary (no crate linked). Under `--no-default-features` `pkg` is off → no
+# `net` (reqwest for url-tarball fetch) and `compress` (flate2/zip/tar extract);
+# `toml` is already non-optional; `git` is the system binary (no crate linked). The
+# `asum1` content hash uses `sha2`, which is now a CORE dependency (since Task 2.4:
+# the self-contained-bundle shake digest needs sha256 under `--no-default-features`),
+# so `pkg` no longer pulls it in. Under `--no-default-features` `pkg` is off → no
 # network/git surface, the resolver map stays empty, and a bare specifier yields a
 # clean "unknown package" error. Default-on (batteries; the CLI ships it).
 pkg = ["net", "compress", "dep:base64"]

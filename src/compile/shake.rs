@@ -445,15 +445,10 @@ fn classify_site(chunk: &Chunk, site_ip: usize) -> SiteVerdict {
             // plus `m` (never below) AND it is a member-access op with `m` as receiver.
             if pops == above + 1 {
                 match op {
-                    // GetProp/GetPropOpt pop exactly 1, so within `pops == above + 1`
-                    // we already have `above == 0` — `m` is on top, the only valid
-                    // receiver position for a member read. The guard is kept (and
-                    // asserted) to make that invariant legible at the match site.
+                    // GetProp/GetPropOpt pop 1, so pops == above + 1 implies above == 0
+                    // (the guard); `m` is on top — the only valid receiver position for a
+                    // member read. The guard makes that invariant legible at the match site.
                     Op::GetProp | Op::GetPropOpt if above == 0 => {
-                        debug_assert_eq!(
-                            above, 0,
-                            "GetProp/GetPropOpt pop 1 → pops == above + 1 implies above == 0"
-                        );
                         return match member_name_at(chunk, ip) {
                             Some(name) => SiteVerdict::Static(name),
                             None => SiteVerdict::Escape,
@@ -1385,6 +1380,52 @@ mod tests {
             base.digest(),
             permuted.digest(),
             "digest must be independent of in-memory collection order"
+        );
+    }
+
+    #[test]
+    fn digest_independent_of_pin_order() {
+        // The digest sorts PINS by (pinned key, importer key, alias, span). Build two
+        // reports with the SAME two pins in OPPOSITE Vec orders and assert an identical
+        // digest — guarding the pin sort the way `dropped` is guarded above. (Constructed
+        // directly so the test isolates the sort from graph traversal.)
+        let mk_pin = |key: &str, importer_key: &str, alias: &str, span: Span| PinReason {
+            module: 0, // index is NOT part of the digest — only logical keys are
+            key: key.into(),
+            importer: 0,
+            importer_key: importer_key.into(),
+            alias: rc(alias),
+            reason: format!("namespace `{alias}` used dynamically or escapes"),
+            span,
+            location: None, // excluded from the digest
+        };
+        let pins_a = vec![
+            mk_pin("a_util.as", "app.as", "m", Span::new(10, 11)),
+            mk_pin("z_util.as", "app.as", "n", Span::new(20, 21)),
+        ];
+        let pins_b = vec![
+            mk_pin("z_util.as", "app.as", "n", Span::new(20, 21)),
+            mk_pin("a_util.as", "app.as", "m", Span::new(10, 11)),
+        ];
+        let report_a = ShakeReport {
+            dropped: Vec::new(),
+            pins: pins_a,
+        };
+        let report_b = ShakeReport {
+            dropped: Vec::new(),
+            pins: pins_b,
+        };
+        assert_eq!(
+            report_a.digest(),
+            report_b.digest(),
+            "digest must be independent of the in-memory pin order"
+        );
+        // Sanity: a report WITH pins is distinct from the empty report (the pins hash).
+        let empty = ShakeReport::default();
+        assert_ne!(
+            report_a.digest(),
+            empty.digest(),
+            "pins must actually contribute to the digest"
         );
     }
 }
