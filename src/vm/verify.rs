@@ -877,23 +877,21 @@ fn count_operand(chunk: &Chunk, op: Op, operand_at: usize) -> usize {
 /// bound a computed-`const` initializer to its own statement) reuse one source of
 /// truth rather than re-deriving stack effects.
 pub(crate) fn op_stack_delta(chunk: &Chunk, op: Op, operand_at: usize) -> isize {
-    if op == Op::Class {
-        // CLASS pops n_defaults + n_methods (+1 superclass), pushes the class.
-        if let Some(cp) = chunk.class_protos.get(chunk.read_u16(operand_at) as usize) {
-            let pops = cp.default_fields.len() + cp.method_names.len() + usize::from(cp.has_super);
-            return 1 - pops as isize;
-        }
-        return 0;
-    }
-    stack_effect(op, count_operand(chunk, op, operand_at)).net()
+    // Net is just pushes - pops over the ONE source of truth below (no second copy of
+    // the `Op::Class` special case).
+    let (pops, pushes) = op_stack_pops_pushes(chunk, op, operand_at);
+    pushes as isize - pops as isize
 }
 
-/// The `(pops, pushes)` of the instruction `op` at `operand_at` in `chunk` — the SAME
-/// authoritative [`stack_effect`] table [`op_stack_delta`] nets, but exposing both
-/// halves so a forward stack SIMULATION (the tree-shaker's namespace receiver tracker,
-/// which must know whether an op reaches DOWN to a specific stack slot, not just the
-/// net delta) can reuse one source of truth. Mirrors `op_stack_delta`'s `Op::Class`
-/// special case.
+/// The `(pops, pushes)` of the instruction `op` at `operand_at` in `chunk` — the SINGLE
+/// authoritative source of stack effects ([`op_stack_delta`] just nets this), exposing
+/// both halves so a forward stack SIMULATION (the tree-shaker's namespace receiver
+/// tracker, which must know whether an op reaches DOWN to a specific stack slot, not
+/// just the net delta) can reuse it. The `Op::Class` pop count comes from the class
+/// proto (it pops `n_defaults + n_methods` closures + 1 superclass if `has_super`, and
+/// always pushes the one class value); on an out-of-range proto index — unreachable on
+/// VALID bytecode — we fall back to `(0, 1)`, the self-consistent "pushes one value"
+/// answer.
 pub(crate) fn op_stack_pops_pushes(chunk: &Chunk, op: Op, operand_at: usize) -> (usize, usize) {
     if op == Op::Class {
         if let Some(cp) = chunk.class_protos.get(chunk.read_u16(operand_at) as usize) {

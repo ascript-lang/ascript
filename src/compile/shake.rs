@@ -312,7 +312,15 @@ fn classify_site(chunk: &Chunk, site_ip: usize) -> SiteVerdict {
             // plus `m` (never below) AND it is a member-access op with `m` as receiver.
             if pops == above + 1 {
                 match op {
+                    // GetProp/GetPropOpt pop exactly 1, so within `pops == above + 1`
+                    // we already have `above == 0` — `m` is on top, the only valid
+                    // receiver position for a member read. The guard is kept (and
+                    // asserted) to make that invariant legible at the match site.
                     Op::GetProp | Op::GetPropOpt if above == 0 => {
+                        debug_assert_eq!(
+                            above, 0,
+                            "GetProp/GetPropOpt pop 1 → pops == above + 1 implies above == 0"
+                        );
                         return match member_name_at(chunk, ip) {
                             Some(name) => SiteVerdict::Static(name),
                             None => SiteVerdict::Escape,
@@ -847,6 +855,16 @@ mod tests {
     }
 
     #[test]
+    fn classify_optional_chain_is_static() {
+        // `m?.foo` lowers to GET_GLOBAL m; GET_PROP_OPT foo — still a static member use.
+        let c = chunk("import * as m from \"./lib\"\nlet a = m?.foo\n");
+        match classify_namespace_use(&c, "m") {
+            NamespaceUse::Static(props) => assert!(props.contains(&rc("foo"))),
+            other => panic!("expected Static, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn classify_unused_alias_is_static_empty() {
         // Imported but never used → Static(∅): everything in the target is shakeable.
         let c = chunk("import * as m from \"./lib\"\nlet x = 1\n");
@@ -1126,4 +1144,5 @@ mod tests {
         assert!(!kept(&res, 2, "unusedC"), "C.unusedC dropped");
     }
 }
+
 
