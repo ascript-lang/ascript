@@ -481,12 +481,12 @@ let len = match content_length {
 
 **Files:** `src/stdlib/http_server.rs` (the request parser / `read_request`), test alongside the 0.8 server tests.
 
-- [ ] **Step 1: Write the failing test** — a request with `Transfer-Encoding: chunked` currently yields an empty body with a 2xx; assert instead it gets a clean `501 Not Implemented` (or `400`). A request with two conflicting `Content-Length` headers currently last-wins-silently; assert a clean `400 Bad Request`. Use the raw-socket server test harness from 0.8.
-- [ ] **Step 2: Run them — expect FAIL** (chunked → silent empty 2xx; duplicate CL → silent accept).
-- [ ] **Step 3: Apply the fix** — in the header-parse loop: if a `Transfer-Encoding` header is present (any value), respond `501 Not Implemented` (the server does not implement transfer-codings) before dispatching. If `Content-Length` appears more than once with differing values (or a non-numeric value), respond `400 Bad Request`. Reuse the existing early-response path (the same one `MAX_HEADER_BYTES`→431 / `max_body`→413 use). Keep it minimal and fail-closed.
-- [ ] **Step 4: Run them — expect PASS** (clean 501/400, no silent empty body).
-- [ ] **Step 5: §9.1** — tests are the deliverable (internal server behavior). Docs: add a one-line note to `docs/content/stdlib/net.md` that the server does not support `Transfer-Encoding` (returns 501) and rejects conflicting `Content-Length` (400). Blast-radius: confirm no legitimate request path sets Transfer-Encoding; confirm the one-request-then-close invariant still holds so this stays non-smuggling-relevant.
-- [ ] **Step 6: Commit** — `git commit -m "fix(http): reject Transfer-Encoding and conflicting Content-Length (no silent empty body)"`
+- [x] **Step 1: Write the failing test** — a request with `Transfer-Encoding: chunked` currently yields an empty body with a 2xx; assert instead it gets a clean `501 Not Implemented` (or `400`). A request with two conflicting `Content-Length` headers currently last-wins-silently; assert a clean `400 Bad Request`. Use the raw-socket server test harness from 0.8.
+- [x] **Step 2: Run them — expect FAIL** (chunked → silent empty 2xx; duplicate CL → silent accept).
+- [x] **Step 3: Apply the fix** — in the header-parse loop: if a `Transfer-Encoding` header is present (any value), respond `501 Not Implemented` (the server does not implement transfer-codings) before dispatching. If `Content-Length` appears more than once with differing values (or a non-numeric value), respond `400 Bad Request`. Reuse the existing early-response path (the same one `MAX_HEADER_BYTES`→431 / `max_body`→413 use). Keep it minimal and fail-closed.
+- [x] **Step 4: Run them — expect PASS** (clean 501/400, no silent empty body).
+- [x] **Step 5: §9.1** — tests are the deliverable (internal server behavior). Docs: add a one-line note to `docs/content/stdlib/net.md` that the server does not support `Transfer-Encoding` (returns 501) and rejects conflicting `Content-Length` (400). Blast-radius: confirm no legitimate request path sets Transfer-Encoding; confirm the one-request-then-close invariant still holds so this stays non-smuggling-relevant.
+- [x] **Step 6: Commit** — `git commit -m "fix(http): reject Transfer-Encoding and conflicting Content-Length (no silent empty body)"`
 
 ### Task 0.19c: (DISCOVERED during 0.12) byte draws (`uuid.v4` / `crypto.randomBytes`) are not event-sourced in Record/Replay
 
