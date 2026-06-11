@@ -888,6 +888,24 @@ pub(crate) fn op_stack_delta(chunk: &Chunk, op: Op, operand_at: usize) -> isize 
     stack_effect(op, count_operand(chunk, op, operand_at)).net()
 }
 
+/// The `(pops, pushes)` of the instruction `op` at `operand_at` in `chunk` — the SAME
+/// authoritative [`stack_effect`] table [`op_stack_delta`] nets, but exposing both
+/// halves so a forward stack SIMULATION (the tree-shaker's namespace receiver tracker,
+/// which must know whether an op reaches DOWN to a specific stack slot, not just the
+/// net delta) can reuse one source of truth. Mirrors `op_stack_delta`'s `Op::Class`
+/// special case.
+pub(crate) fn op_stack_pops_pushes(chunk: &Chunk, op: Op, operand_at: usize) -> (usize, usize) {
+    if op == Op::Class {
+        if let Some(cp) = chunk.class_protos.get(chunk.read_u16(operand_at) as usize) {
+            let pops = cp.default_fields.len() + cp.method_names.len() + usize::from(cp.has_super);
+            return (pops, 1);
+        }
+        return (0, 1);
+    }
+    let e = stack_effect(op, count_operand(chunk, op, operand_at));
+    (e.pops, e.pushes)
+}
+
 /// Push a jump-target successor onto the worklist, validating it lands on a
 /// boundary (defence-in-depth; pass 2 already checked jumps).
 fn push_succ(

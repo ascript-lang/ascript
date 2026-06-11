@@ -211,39 +211,142 @@ pub enum NamespaceUse {
     },
 }
 
-/// Is `op` a STATIC-member access op whose FIRST `u16` operand is the accessed property
-/// NAME const index? These are exactly the ops a `GET_GLOBAL <alias>` may be immediately
-/// followed by for the use to count as a static `alias.<name>` access:
-///   - [`Op::GetProp`] / [`Op::GetPropOpt`] — `alias.name` / `alias?.name` reads, and the
-///     named-arg method-call lowering (`alias.name(x: 1)` emits `GET_PROP` then
-///     `CALL_NAMED`).
-///   - [`Op::CallMethod`] / [`Op::CallMethodSpread`] — `alias.name(args)` method calls
-///     (the name rides the call op; for a zero-arg call the op immediately follows the
-///     `GET_GLOBAL`).
+/// Should the forward receiver-simulation BAIL (classify the site as escape) if it
+/// encounters `op` before resolving the namespace value's consumer? These are the ops
+/// over which a straight-line stack simulation is NOT valid or NOT sound:
 ///
-/// Every other successor (an arg-computing op for `alias.name(arg)`, `GET_INDEX`'s key
-/// computation for `alias[k]`, a `DEFINE_GLOBAL`/`CALL`/`RETURN` consuming the namespace
-/// value) means the namespace is dynamically indexed or escapes — NOT a static member.
-/// Conservatively treating `alias.name(arg)` and `alias["literal"]` as non-static is
-/// SOUND (under-shaking never drops live code).
-fn static_member_op(op: Op) -> bool {
+/// - jumps/branches ([`Op::Jump`]/`JumpIf*`/[`Op::Loop`]/`JumpIfArgSupplied`) — the
+///   consumer might be reached via control flow, so the linear height tracking breaks
+///   (e.g. `m.foo(cond ? a : b)` has a branch in its args);
+/// - terminators ([`Op::Return`]/[`Op::Yield`]/[`Op::MatchNoArm`]/[`Op::ImmutableError`]) —
+///   the path ends without a clean consumer;
+/// - value-reshapers ([`Op::Dup`]/[`Op::Swap`]/[`Op::Rot3`]) — they DUPLICATE or REORDER
+///   stack slots, so our single "height above `m`" counter can no longer prove WHERE the
+///   namespace value sits.
+///
+/// Bailing here is always SOUND (under-shaking never drops live code).
+fn sim_bails_on(op: Op) -> bool {
     matches!(
         op,
-        Op::GetProp | Op::GetPropOpt | Op::CallMethod | Op::CallMethodSpread
+        Op::Jump
+            | Op::JumpIfFalse
+            | Op::JumpIfTrue
+            | Op::JumpIfNotNil
+            | Op::Loop
+            | Op::JumpIfArgSupplied
+            | Op::Return
+            | Op::Yield
+            | Op::MatchNoArm
+            | Op::ImmutableError
+            | Op::Dup
+            | Op::Swap
+            | Op::Rot3
     )
+}
+
+/// The verdict for ONE `GET_GLOBAL <alias>` use site, resolved by forward stack
+/// simulation (see [`classify_site`]).
+enum SiteVerdict {
+    /// The site is a static `alias.<name>` member access / method call; `name` is the
+    /// accessed property/method.
+    Static(Rc<str>),
+    /// The site escapes / is dynamically indexed — pin the whole target.
+    Escape,
+}
+
+/// Read the property/method NAME const that rides a static-member op's FIRST `u16`
+/// operand (`GET_PROP`/`GET_PROP_OPT`/`CALL_METHOD`/`CALL_METHOD_SPREAD`). Returns
+/// `None` if the operand or const is missing/not a string (→ caller treats as escape).
+fn member_name_at(chunk: &Chunk, op_ip: usize) -> Option<Rc<str>> {
+    let name_ip = op_ip + 1;
+    if name_ip + 1 >= chunk.code.len() {
+        return None;
+    }
+    let idx = chunk.read_u16(name_ip) as usize;
+    match chunk.consts.get(idx) {
+        Some(crate::value::Value::Str(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Classify a single `GET_GLOBAL <alias>` use at `site_ip` (the opcode byte) by FORWARD
+/// stack simulation, finding the op that CONSUMES the namespace value `m`.
+///
+/// We track `above` = the stack height STRICTLY ABOVE `m` (starts at 0, `m` just pushed).
+/// Walking forward, for each op with stack effect `(pops, pushes)` (the authoritative
+/// `verify::op_stack_pops_pushes` table):
+///
+/// - `pops <= above` → the op consumes only values above `m`; `m` survives. Update
+///   `above = above - pops + pushes` and continue.
+/// - `pops > above` → the op reaches DOWN to (and below) `m`'s slot — THIS is `m`'s
+///   consumer. It is a STATIC member use iff it pops EXACTLY the args above `m` plus `m`
+///   itself (`pops == above + 1`, so it never reaches BELOW `m`) AND it is either a
+///   `GET_PROP`/`GET_PROP_OPT` with `above == 0` (`m` on top, a plain read) or a
+///   `CALL_METHOD`/`CALL_METHOD_SPREAD` with `m` as the receiver at the bottom of its
+///   `pops` (`above` args sit above the receiver `m`). The accessed name then rides the
+///   op's first `u16` operand. Anything else (`pops > above + 1` reaching below `m`, a
+///   `GET_INDEX`/`CALL`/`SET_*`/store, …) is an escape.
+///
+/// BAIL → escape if, before the consumer is found, we hit a [`sim_bails_on`] op, an op
+/// we cannot decode, or the scan runs off the end of `code` (the consumer is unreachable
+/// on this straight-line path). Bailing is sound (under-shaking).
+fn classify_site(chunk: &Chunk, site_ip: usize) -> SiteVerdict {
+    let code = &chunk.code;
+    let len = code.len();
+    // Step over the GET_GLOBAL itself; `m` is now on top, `above` = 0.
+    let Some(site_op) = Op::from_u8(code[site_ip]) else {
+        return SiteVerdict::Escape;
+    };
+    let mut ip = site_ip + 1 + site_op.operand_width();
+    let mut above: usize = 0;
+    while ip < len {
+        let Some(op) = Op::from_u8(code[ip]) else {
+            return SiteVerdict::Escape; // undecodable → bail.
+        };
+        if sim_bails_on(op) {
+            return SiteVerdict::Escape; // control flow / reshaper / terminator → bail.
+        }
+        let (pops, pushes) = crate::vm::verify::op_stack_pops_pushes(chunk, op, ip + 1);
+        if pops > above {
+            // This op consumes `m`. Static only if it pops exactly the args above `m`
+            // plus `m` (never below) AND it is a member-access op with `m` as receiver.
+            if pops == above + 1 {
+                match op {
+                    Op::GetProp | Op::GetPropOpt if above == 0 => {
+                        return match member_name_at(chunk, ip) {
+                            Some(name) => SiteVerdict::Static(name),
+                            None => SiteVerdict::Escape,
+                        };
+                    }
+                    Op::CallMethod | Op::CallMethodSpread => {
+                        return match member_name_at(chunk, ip) {
+                            Some(name) => SiteVerdict::Static(name),
+                            None => SiteVerdict::Escape,
+                        };
+                    }
+                    _ => return SiteVerdict::Escape,
+                }
+            }
+            return SiteVerdict::Escape; // reaches below `m` → escape.
+        }
+        // `m` survives; update the height above it.
+        above = above - pops + pushes;
+        ip += 1 + op.operand_width();
+    }
+    SiteVerdict::Escape // ran off the end without a consumer → bail.
 }
 
 /// Classify how the namespace `alias` is used across `chunk` (recursing into every
 /// nested proto). A namespace alias is a user-global, so every use begins with
-/// `GET_GLOBAL <alias>`. For each such site we inspect the IMMEDIATELY following op:
-///   - a [`static_member_op`] → a static `alias.<name>` access; collect `<name>` (its
-///     first `u16` operand is the property-name const index).
-///   - anything else → the namespace escapes or is dynamically indexed → the whole
-///     target cannot be shaken. We return [`NamespaceUse::Dynamic`] on the FIRST such
-///     site (capturing its span) — but only after also scanning for it across protos.
+/// `GET_GLOBAL <alias>`. EACH such site is classified INDEPENDENTLY by forward stack
+/// simulation ([`classify_site`]): a static `alias.name` read or `alias.name(args)`
+/// method call contributes `name` to the accessed set; any escaping / dynamically
+/// indexed / uncertain site makes the WHOLE result [`NamespaceUse::Dynamic`].
 ///
-/// The walk is byte-level and decode-resilient: an undecodable byte stops the linear
-/// scan of that chunk (we never index past `code`), and we never `.unwrap()`/`panic!`.
+/// Because each site is classified on its own, a mix of static and escaping sites
+/// correctly pins whole (the escaping site forces it) — only when ALL sites are static
+/// do we shake to the union of accessed names. The walk is byte-level and
+/// decode-resilient and never `.unwrap()`/`panic!`s on chunk contents.
 pub fn classify_namespace_use(chunk: &Chunk, alias: &str) -> NamespaceUse {
     let mut props: BTreeSet<Rc<str>> = BTreeSet::new();
     if let Some(span) = classify_namespace_use_rec(chunk, alias, &mut props) {
@@ -254,7 +357,7 @@ pub fn classify_namespace_use(chunk: &Chunk, alias: &str) -> NamespaceUse {
 }
 
 /// The recursive worker for [`classify_namespace_use`]. Walks `chunk.code`, then every
-/// nested proto's chunk. Returns `Some(span)` at the FIRST dynamic/escaping use of
+/// nested proto's chunk. Returns `Some(span)` at the FIRST escaping/dynamic use of
 /// `alias` (short-circuiting), or `None` if every use is a static member (with the
 /// accessed names accumulated into `props`).
 fn classify_namespace_use_rec(
@@ -272,40 +375,21 @@ fn classify_namespace_use_rec(
             break;
         };
         let width = op.operand_width();
-        if op == Op::GetGlobal {
+        if op == Op::GetGlobal && ip + 2 < len {
             // The GET_GLOBAL's u16 operand names the global being read.
-            if ip + 2 < len {
-                let name_idx = chunk.read_u16(ip + 1) as usize;
-                let is_alias = matches!(
-                    chunk.consts.get(name_idx),
-                    Some(crate::value::Value::Str(name)) if &**name == alias
-                );
-                if is_alias {
-                    // Inspect the op immediately after this GET_GLOBAL.
-                    let next_ip = ip + 1 + width;
-                    let next_op = if next_ip < len {
-                        Op::from_u8(code[next_ip])
-                    } else {
-                        None
-                    };
-                    match next_op {
-                        Some(next) if static_member_op(next) => {
-                            // The accessed property name is the next op's first u16
-                            // operand. Collect it; this use is static.
-                            if next_ip + 2 < len {
-                                let prop_idx = chunk.read_u16(next_ip + 1) as usize;
-                                if let Some(crate::value::Value::Str(name)) =
-                                    chunk.consts.get(prop_idx)
-                                {
-                                    props.insert(name.clone());
-                                }
-                            }
-                        }
-                        _ => {
-                            // Dynamic index or escape: capture the span of THIS
-                            // GET_GLOBAL site and short-circuit.
-                            return Some(chunk.span_at(ip));
-                        }
+            let name_idx = chunk.read_u16(ip + 1) as usize;
+            let is_alias = matches!(
+                chunk.consts.get(name_idx),
+                Some(crate::value::Value::Str(name)) if &**name == alias
+            );
+            if is_alias {
+                match classify_site(chunk, ip) {
+                    SiteVerdict::Static(name) => {
+                        props.insert(name);
+                    }
+                    SiteVerdict::Escape => {
+                        // Capture the span of THIS GET_GLOBAL site and short-circuit.
+                        return Some(chunk.span_at(ip));
                     }
                 }
             }
@@ -874,6 +958,97 @@ mod tests {
         assert!(res.report.pins.is_empty());
     }
 
+    // ---- 2.2 enhancement: namespace method-call receiver tracking ---------------
+
+    #[test]
+    fn classify_method_call_with_one_arg_is_static() {
+        // `m.foo(arg)` lowers to GET_GLOBAL m; <arg ops>; CALL_METHOD foo 1 — the
+        // forward receiver sim must see `m` as the receiver beneath its one arg.
+        let c = chunk("import * as m from \"./lib\"\nlet arg = 1\nlet r = m.foo(arg)\n");
+        match classify_namespace_use(&c, "m") {
+            NamespaceUse::Static(props) => {
+                assert!(props.contains(&rc("foo")));
+                assert_eq!(props.len(), 1);
+            }
+            other => panic!("expected Static({{foo}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_method_call_with_two_args_is_static() {
+        // `m.foo(a, b)` → receiver beneath two args.
+        let c = chunk("import * as m from \"./lib\"\nlet a = 1\nlet b = 2\nlet r = m.foo(a, b)\n");
+        match classify_namespace_use(&c, "m") {
+            NamespaceUse::Static(props) => assert!(props.contains(&rc("foo"))),
+            other => panic!("expected Static, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_nested_method_calls_both_static() {
+        // `m.foo(m.bar())` → TWO independent sites, BOTH static: foo (outer receiver
+        // beneath its one arg) and bar (inner receiver, zero args).
+        let c = chunk("import * as m from \"./lib\"\nlet r = m.foo(m.bar())\n");
+        match classify_namespace_use(&c, "m") {
+            NamespaceUse::Static(props) => {
+                assert!(props.contains(&rc("foo")), "outer foo static");
+                assert!(props.contains(&rc("bar")), "inner bar static");
+                assert_eq!(props.len(), 2);
+            }
+            other => panic!("expected Static({{foo, bar}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_branch_in_args_pins_whole() {
+        // `m.foo(cond ? a : b)` — a jump inside the args → the forward sim bails
+        // conservatively (sound under-shake) → Dynamic.
+        let c = chunk(
+            "import * as m from \"./lib\"\nlet c = true\nlet a = 1\nlet b = 2\nlet r = m.foo(c ? a : b)\n",
+        );
+        assert!(
+            matches!(classify_namespace_use(&c, "m"), NamespaceUse::Dynamic { .. }),
+            "branch in args must conservatively pin whole"
+        );
+    }
+
+    #[test]
+    fn namespace_method_call_args_shakes_unused() {
+        // Integration: entry calls only m.foo(arg); lib keeps foo (+helper), drops baz.
+        let graph = ns_graph(
+            "import * as m from \"./lib\"\nlet arg = 1\nlet r = m.foo(arg)\n",
+            LIB_ABC_HELPER,
+        );
+        let res = compute_reachable(&graph);
+        assert!(kept(&res, 1, "foo"), "m.foo(arg) → foo kept");
+        assert!(kept(&res, 1, "helper"), "foo's transitive helper kept");
+        assert!(!kept(&res, 1, "baz"), "unaccessed baz dropped");
+        assert!(
+            res.report.pins.is_empty(),
+            "static method-call use must not pin"
+        );
+    }
+
+    #[test]
+    fn namespace_branch_in_args_pins_whole_integration() {
+        // Integration of test 4: m.foo(cond ? a : b) → whole-module pin + PinReason.
+        let graph = ns_graph(
+            "import * as m from \"./lib\"\nlet c = true\nlet a = 1\nlet b = 2\nlet r = m.foo(c ? a : b)\n",
+            LIB_ABC_HELPER,
+        );
+        let res = compute_reachable(&graph);
+        for name in ["foo", "bar", "baz", "helper"] {
+            assert!(kept(&res, 1, name), "branch-in-args pins whole: {name} kept");
+        }
+        let pin = res
+            .report
+            .pins
+            .iter()
+            .find(|p| p.module == 1)
+            .expect("lib pinned whole");
+        assert_eq!(&*pin.alias, "m");
+    }
+
     #[test]
     fn entry_module_kept_whole() {
         // The entry's own unreferenced fn is STILL kept (entry never shaken).
@@ -951,3 +1126,4 @@ mod tests {
         assert!(!kept(&res, 2, "unusedC"), "C.unusedC dropped");
     }
 }
+
