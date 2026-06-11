@@ -976,6 +976,299 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
         .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
 }
 
+/// BNDL §3 — walk a program's import graph from `entry` and compile every reachable
+/// user/package module into a [`ModuleArchive`] (Phase 1, Task 1.3). Later phases
+/// consult this archive at runtime (so a multi-file program needs no source tree on
+/// disk), tree-shake it, and embed the composed `CapSet`.
+///
+/// # The walk
+///
+/// A breadth-first worklist over the import graph. The entry is compiled first; each
+/// module's compiled chunk is decoded back (through the SAME `from_bytes_verified`
+/// trust boundary the runtime uses) only to read its `imports`. Every `import`
+/// specifier is classified via [`Interp::classify_specifier`]:
+///
+/// - `std/*` → SKIPPED (native Rust, linked into the runtime, never archived).
+/// - relative / package → resolved to a file path, deduped by **canonical path**, and
+///   (if new) compiled and enqueued so its OWN imports are walked transitively.
+/// - unknown package → a clean [`AsError`] (the program references a package that is
+///   not installed; Phase 1 installs no resolver, so every bare specifier lands here).
+///
+/// Dedup happens BEFORE recursing, so a cycle (`A` imports `B` imports `A`) terminates.
+///
+/// # The logical-key convention (load-bearing — Task 1.4 MUST match it)
+///
+/// Each module's archive key is its **lexical logical path relative to the entry
+/// file's directory**, normalized to forward slashes — NOT an absolute, canonicalized
+/// path (which would leak the build machine's layout and break cross-machine
+/// portability, spec §3.3). It is computed purely from `import` specifiers:
+///
+/// - the entry's key is its file name (e.g. `bundle_multimodule.as`); its logical
+///   directory is the archive-namespace root (`""`);
+/// - an import with specifier `S` from a module whose logical directory is `D` keys
+///   the imported module at `lexically_normalize(D `join` S)` with a default `.as`
+///   extension — e.g. `./bundle_util` from the root keys `bundle_util.as`.
+///
+/// `.`/`..` segments are resolved LEXICALLY ([`join_logical`]): a `..` cancels the
+/// preceding segment, but a `..` that escapes the logical root is **PRESERVED VERBATIM**
+/// — so a module in a subdirectory importing `../shared` produces the stable key
+/// `../shared.as`. That key is still machine-independent (relative to the entry dir, no
+/// absolute leak) and stays unique (`../a` ≠ `a`); Task 1.4 MUST reproduce the same
+/// `..`-preserving join. (Package specifiers are NOT importer-relative — they key under
+/// a stable `pkg/<specifier>` namespace, §below.)
+///
+/// This is exactly what the Task 1.4 runtime loader can reproduce: it resolves an
+/// import against the importer's *logical* directory (the archive-relative dir), not
+/// the on-disk absolute dir, and normalizes the same way. Dedup identity is the
+/// canonical on-disk path (so two specifiers reaching the same file collapse to one
+/// module, matching `load_file_module`'s cache identity), while the STORED key stays
+/// machine-independent.
+///
+/// `caps` is a default all-granted [`CapSet`] and `shake_digest` is all-zero for now;
+/// Phase 3 fills the composed caps and Phase 2 fills the shake digest.
+pub fn compile_archive(entry: &Path) -> Result<crate::vm::archive::ModuleArchive, AsError> {
+    use crate::vm::archive::ModuleArchive;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // A work item: the file to compile, the importer-relative logical key the archive
+    // stores it under, and the logical directory imports inside it resolve against.
+    struct Pending {
+        path: PathBuf,
+        key: String,
+        logical_dir: String,
+    }
+
+    // An `Interp` is used ONLY as the host for `classify_specifier` (it reads the
+    // importer's `module_dir` to resolve a relative specifier to a path). No code runs.
+    // No package resolver is installed in Phase 1, so a bare package specifier
+    // classifies as `UnknownPackage` → a clean error below.
+    let interp = Interp::new();
+
+    // The entry file anchors the logical namespace. Canonicalize it for a stable dedup
+    // identity and to derive the entry directory all relative imports resolve against.
+    let entry_canon = entry
+        .canonicalize()
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", entry.display(), e)))?;
+    let entry_dir = entry_canon
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let entry_key = entry_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "entry.as".to_string());
+
+    let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
+    // Dedup by canonical path → the module's index in `modules`. Keyed by canonical
+    // path (not logical key) so two specifiers reaching the same file collapse to one.
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+
+    let mut queue: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    queue.push_back(Pending {
+        path: entry_canon.clone(),
+        key: entry_key,
+        logical_dir: String::new(),
+    });
+    seen.insert(entry_canon.clone(), 0); // reserve index 0 for the entry (filled below)
+
+    // The entry is enqueued first and BFS dequeues it first, so it is always archived at
+    // index 0 — no need to track which dequeued module was the entry.
+    let entry: u32 = 0;
+
+    while let Some(item) = queue.pop_front() {
+        // Compile this module to verified `.aso` bytes (reusing the SAME path `build`
+        // uses, so the stored chunk always re-verifies). `with_debug = false`: an
+        // archive is a distribution artifact; debug info is not needed to walk imports.
+        let bytes = compile_verified_aso_bytes(&item.path, false)?;
+
+        // Decode the just-produced chunk to read its import table. These are OUR OWN
+        // freshly-verified bytes, so this never sees hostile input.
+        let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes).map_err(|e| {
+            AsError::new(format!(
+                "internal: re-decoding compiled module {} failed: {e:?}",
+                item.path.display()
+            ))
+        })?;
+
+        // Record this module. Indices are assigned in `seen` in monotonic queue order,
+        // and BFS pops in that same order, so the reserved index always equals the
+        // current `modules` length — append lands exactly at this module's slot.
+        let this_index = *seen
+            .get(&item.path)
+            .expect("every queued module is pre-registered in `seen`");
+        debug_assert_eq!(this_index, modules.len());
+        modules.push((item.key.clone(), bytes));
+
+        // The directory inside this module that its imports resolve against on disk.
+        let this_disk_dir = item
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| entry_dir.clone());
+
+        for imp in &chunk.imports {
+            let source = imp.source();
+            // Resolve the specifier relative to THIS module's on-disk directory.
+            interp.set_module_dir(this_disk_dir.clone());
+            match interp.classify_specifier(source) {
+                crate::interp::SpecifierKind::Std => {
+                    // Native stdlib — linked in, never archived.
+                }
+                kind @ (crate::interp::SpecifierKind::Relative(_)
+                | crate::interp::SpecifierKind::Package { .. }) => {
+                    let target = match &kind {
+                        crate::interp::SpecifierKind::Relative(t) => t.clone(),
+                        crate::interp::SpecifierKind::Package { target, .. } => target.clone(),
+                        _ => unreachable!("matched only Relative|Package"),
+                    };
+                    let dep_path = resolve_module_file(&target).map_err(|msg| {
+                        AsError::new(format!(
+                            "cannot resolve import '{source}' from {}: {msg}",
+                            item.path.display()
+                        ))
+                    })?;
+                    // The lexical, machine-independent archive key for this dependency.
+                    //  - A RELATIVE import keys relative to the IMPORTER's logical dir
+                    //    (`./util` from the root → `bundle_util.as`).
+                    //  - A PACKAGE import is NOT importer-relative: it keys under a stable
+                    //    `pkg/<specifier>` namespace so the same package resolves to the
+                    //    same key regardless of which module imported it (the store-relative
+                    //    logical id of spec §3.3). Phase 1 installs no resolver, so the
+                    //    package branch is currently unreachable (bare specifiers land in
+                    //    `UnknownPackage` below) — this keeps Phase 4 correct-by-construction.
+                    let dep_key = match &kind {
+                        crate::interp::SpecifierKind::Package { .. } => {
+                            join_logical("pkg", source)
+                        }
+                        _ => join_logical(&item.logical_dir, source),
+                    };
+                    let dep_logical_dir = logical_parent(&dep_key);
+
+                    if seen.contains_key(&dep_path) {
+                        continue; // already archived (or queued) — dedup terminates cycles
+                    }
+                    // Reserve the next archive index for this module. `seen` maps every
+                    // known module (recorded or queued) to a unique, monotonically
+                    // assigned index, so the next free index is exactly `seen.len()`.
+                    let reserved = seen.len();
+                    seen.insert(dep_path.clone(), reserved);
+                    queue.push_back(Pending {
+                        path: dep_path,
+                        key: dep_key,
+                        logical_dir: dep_logical_dir,
+                    });
+                }
+                crate::interp::SpecifierKind::UnknownPackage(key) => {
+                    return Err(AsError::new(format!(
+                        "unknown package '{key}' — add it with 'ascript add' \
+                         (imported from {})",
+                        item.path.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(ModuleArchive {
+        entry,
+        caps: crate::stdlib::caps::CapSet::default(), // Phase 3 fills the composed caps
+        shake_digest: [0u8; 32],                      // Phase 2 fills the shake digest
+        modules,
+    })
+}
+
+/// Resolve a requested module path (already importer-joined, e.g. `<dir>/util.as` or an
+/// extension-less stem) to the actual file on disk, returning its CANONICAL path. Mirrors
+/// `load_file_module`'s `.as`/`.aso` precedence: an explicit extension is honored; a bare
+/// stem prefers `<stem>.as`, then `<stem>.aso`. A missing file is an `Err(message)`.
+fn resolve_module_file(target: &Path) -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+    // `classify_specifier` already defaulted a bare specifier to `.as`, but a `Package`
+    // target or an explicit extension may differ; be robust to both. Only an EXPLICIT
+    // known module extension (`.as`/`.aso`) is honored literally — any other extension
+    // (or none) is treated as a stem and resolved `.as`-then-`.aso`, so a path like
+    // `mod.config` is never silently rewritten to `mod.aso`.
+    let stem: PathBuf = target.to_path_buf();
+    let ext = stem
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let candidates: [PathBuf; 2] = match ext.as_deref() {
+        // An explicit `.as`/`.aso` — honor it literally first, then the sibling form.
+        Some("as") => [stem.clone(), stem.with_extension("aso")],
+        Some("aso") => [stem.clone(), stem.with_extension("as")],
+        // No extension, or a non-module extension that is part of the file STEM:
+        // resolve `<stem>.as` then `<stem>.aso` (the bare-specifier default path).
+        _ => [stem.with_extension("as"), stem.with_extension("aso")],
+    };
+    for cand in &candidates {
+        if let Ok(canon) = cand.canonicalize() {
+            return Ok(canon);
+        }
+    }
+    Err(format!(
+        "looked for {} and {}",
+        candidates[0].display(),
+        candidates[1].display()
+    ))
+}
+
+/// Lexically join a logical directory `dir` (archive-relative, `/`-separated, possibly
+/// empty for the root) with an import specifier `source`, defaulting a `.as` extension,
+/// and lexically resolve `.`/`..` segments. The result is the archive key — machine
+/// independent (no absolute prefix), the convention Task 1.4 reproduces.
+///
+/// A `.` segment is dropped and a `..` cancels the preceding real segment — but a `..`
+/// that **escapes the logical root** (nothing left to pop) is **PRESERVED VERBATIM**, so
+/// the key may legitimately contain leading `..` (e.g. `../shared.as`). This is correct
+/// and deliberate: such a key is still machine-independent (it is relative to the entry
+/// dir, leaking no absolute build path) AND preserves uniqueness — `../a` must stay
+/// distinct from `a`. Task 1.4's loader MUST reproduce this identically (the same
+/// `join_logical` over the same importer logical dir), so the `..`-preservation is part
+/// of the load-bearing convention, not an edge case to "fix".
+fn join_logical(dir: &str, source: &str) -> String {
+    // `classify_specifier` only routes `./`, `../`, or absolute (Relative) and bare
+    // (Package) specifiers here. For a Package the `source` is the bare specifier
+    // (`pkg/sub`); the caller keys it under a `pkg/` namespace dir.
+    let mut segments: Vec<&str> = Vec::new();
+    if !dir.is_empty() {
+        segments.extend(dir.split('/').filter(|s| !s.is_empty()));
+    }
+    for seg in source.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                // Cancel the preceding REAL segment; but if there is none to pop (we are
+                // at — or already above — the logical root), PRESERVE the `..` verbatim so
+                // an escaping key stays unique and machine-independently reproducible.
+                if segments.last().map(|s| *s != "..").unwrap_or(false) {
+                    segments.pop();
+                } else {
+                    segments.push("..");
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut key = segments.join("/");
+    // Default the `.as` extension to match the on-disk resolution and the entry key.
+    if !key.ends_with(".as") && !key.ends_with(".aso") {
+        key.push_str(".as");
+    }
+    key
+}
+
+/// The logical directory of a logical key — everything before the final `/` segment, or
+/// the empty string for a root-level module. Used as the resolution base for a module's
+/// OWN transitive imports.
+fn logical_parent(key: &str) -> String {
+    match key.rfind('/') {
+        Some(i) => key[..i].to_string(),
+        None => String::new(),
+    }
+}
+
 /// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
 /// executable that bundles the whole runtime + the compiled program. This is **bundling, not
 /// AOT**: the output is a copy of the running runtime (`current_exe()`) with the *verified*

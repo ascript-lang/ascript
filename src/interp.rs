@@ -2814,6 +2814,14 @@ impl Interp {
         p
     }
 
+    /// Set the directory a relative import resolves against (the importer's dir).
+    /// Used by BNDL's `compile_archive` to drive [`Self::classify_specifier`] per
+    /// module while walking the import graph — no code runs; this only positions the
+    /// resolver's base. (The normal load path sets `module_dir` internally per module.)
+    pub(crate) fn set_module_dir(&self, dir: PathBuf) {
+        *self.module_dir.borrow_mut() = dir;
+    }
+
     /// Install the CLI-resolved third-party package set (SP6 §6). Called once,
     /// before running, by `ascript run`/`test`. A subsequent bare specifier
     /// (`import "http"`) resolves through this map on BOTH engines. Replaces any

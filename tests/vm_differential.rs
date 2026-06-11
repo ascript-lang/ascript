@@ -957,6 +957,16 @@ enum SkipReason {
     /// EVEN the tree-walker oracle — so it is excluded the same way the CLI/
     /// conformance suites leave the server/peer examples out of their run set.
     LongRunningServer,
+    /// A MULTI-FILE example whose entry has a relative `import "./sibling"`. The
+    /// whole-corpus oracle runs each example via `run_source_exit(&src)` — the SOURCE
+    /// TEXT only, with NO real file path — so a relative import resolves against the
+    /// process cwd (the crate root), not the example's directory, and the sibling
+    /// cannot be found. This is a test-harness limitation, NOT a VM divergence (the
+    /// program runs byte-identically on BOTH engines when launched from its real
+    /// directory: `target/release/ascript run examples/bundle_multimodule.as`).
+    /// Documented-only; not executed here. Covered instead by `tests/archive.rs`
+    /// (which builds the module archive from the real files) and the CLI run above.
+    RelativeImports,
 }
 
 /// The explicit, per-file SKIP list for the whole-corpus opt-out gate. EVERY entry
@@ -1085,6 +1095,15 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     (
         "examples/advanced/server_multicore.as",
         SkipReason::LongRunningServer,
+    ),
+    // BNDL: the self-contained-bundles entry imports a sibling (`./bundle_util`). The
+    // source-only corpus oracle can't resolve a relative import (no real file path), so
+    // it is documented-only here and covered by `tests/archive.rs` + the CLI run. The
+    // sibling `examples/bundle_util.as` has NO imports and runs standalone, so it stays
+    // in the must-run gate (it just prints nothing).
+    (
+        "examples/bundle_multimodule.as",
+        SkipReason::RelativeImports,
     ),
 ];
 
@@ -1230,11 +1249,13 @@ async fn vm_whole_corpus_skips_are_still_justified() {
         match reason {
             SkipReason::Nondeterministic
             | SkipReason::SharedExternalState
-            | SkipReason::LongRunningServer => {
+            | SkipReason::LongRunningServer
+            | SkipReason::RelativeImports => {
                 // Documented-only; not executed (random/time/network bytes can't
                 // match across two runs, a shared-/tmp file races across the
-                // parallel oracles, or a server blocks forever). Existence is
-                // already asserted above.
+                // parallel oracles, a server blocks forever, or a relative import
+                // can't resolve in the source-only oracle). Existence is already
+                // asserted above.
             }
         }
     }
