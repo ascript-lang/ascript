@@ -4442,3 +4442,237 @@ fn build_single_module_emits_bare_aso_chunk() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── SELF-CONTAINED-BUNDLES (Task 2.4) — tree-shake build report + reproducible digest ──
+
+/// A fresh, empty scratch dir under the system temp, named for this test + process.
+fn bundle_scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ascript_shake24_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A NAMESPACE import whose alias is used DYNAMICALLY (`m[key]`) pins the whole target —
+/// the build's stderr names the pinned module, the alias, the reason, and a `key:line:col`
+/// LOCATION rendered against the importer's source. The `bundled`/`compiled` line stays on
+/// stdout; the shake summary is stderr-only.
+#[test]
+fn build_report_pin_lists_namespace_with_location() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("pin");
+
+    // `util.as` exports two fns; `app.as` imports the whole namespace then indexes it
+    // dynamically → the shaker cannot prove which exports are live → pin whole.
+    std::fs::write(
+        dir.join("util.as"),
+        "export fn alpha(): int { return 1 }\nexport fn beta(): int { return 2 }\n",
+    )
+    .unwrap();
+    // The dynamic `m[k]` sits on a known line/col so we can assert a concrete location.
+    std::fs::write(
+        dir.join("app.as"),
+        "import * as m from \"./util\"\nlet k = \"alpha\"\nlet r = m[k]\nprint(r)\n",
+    )
+    .unwrap();
+
+    let out_aso = dir.join("app.aso");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(dir.join("app.as"))
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("util.as"),
+        "pin line must name the pinned module 'util.as'; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("namespace 'm'"),
+        "pin line must name the offending alias 'm'; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("indexed/escapes"),
+        "pin line must state the reason; stderr=\n{stderr}"
+    );
+    // The rendered location is `<importer key>:line:col` — `app.as:3:9` (1-based) for the
+    // `m[k]` use on line 3. We assert the location is importer-relative and anchored to the
+    // `m[k]` line (line 3), robustly to the exact column.
+    assert!(
+        stderr.contains("at app.as:3:"),
+        "pin line must carry an importer-relative `key:line:col` location; stderr=\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `{ used }` named import from a library with an unused `dead` fn drops `dead`; the
+/// build's stderr summary names the dropped declaration and a drop count.
+#[test]
+fn build_report_lists_dropped_declarations() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("drop");
+
+    std::fs::write(
+        dir.join("lib.as"),
+        "export fn used(): int { return 1 }\nexport fn dead(): int { return 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.as"),
+        "import { used } from \"./lib\"\nprint(used())\n",
+    )
+    .unwrap();
+
+    let out_aso = dir.join("main.aso");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(dir.join("main.as"))
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("tree-shaking: dropped"),
+        "stderr must carry the tree-shaking summary line; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("dead"),
+        "summary must name the dropped 'dead' fn; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("lib.as"),
+        "summary must name the dropping module 'lib.as'; stderr=\n{stderr}"
+    );
+    // `used` is KEPT → only one declaration is dropped from lib.as.
+    assert!(
+        !stderr.contains("dropped 2"),
+        "only 'dead' is dropped, not 'used'; stderr=\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Building the SAME multi-module program twice (to two different outputs) produces a
+/// byte-identical, NON-ZERO `shake_digest` in the archive manifest — the digest is a
+/// reproducible function of the source (no machine-specific data, no HashMap iteration).
+#[test]
+fn build_shake_digest_is_reproducible_and_nonzero() {
+    use ascript::vm::archive::ModuleArchive;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("digest");
+
+    std::fs::write(
+        dir.join("lib.as"),
+        "export fn used(): int { return 1 }\nexport fn dead(): int { return 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.as"),
+        "import { used } from \"./lib\"\nprint(used())\n",
+    )
+    .unwrap();
+
+    let build_to = |name: &str| -> [u8; 32] {
+        let out = dir.join(name);
+        let b = Command::new(bin)
+            .args(["build"])
+            .arg(dir.join("main.as"))
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            b.status.success(),
+            "build failed: {}",
+            String::from_utf8_lossy(&b.stderr)
+        );
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..8], b"ASCRIPTA", "expected a multi-module archive");
+        let arch = ModuleArchive::decode(&bytes).expect("archive decodes");
+        arch.shake_digest
+    };
+
+    let d1 = build_to("a.aso");
+    let d2 = build_to("b.aso");
+    assert_eq!(d1, d2, "the shake digest must be reproducible across builds");
+    assert_ne!(d1, [0u8; 32], "a program with drops must have a non-zero digest");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The shake report goes to STDERR only: `build`'s stdout carries just the `compiled …`
+/// line, and the bundled program's own stdout (when later run) is unchanged by shaking.
+#[test]
+fn build_report_does_not_pollute_stdout() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("stdout");
+
+    std::fs::write(
+        dir.join("lib.as"),
+        "export fn used(): int { return 7 }\nexport fn dead(): int { return 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.as"),
+        "import { used } from \"./lib\"\nprint(used())\n",
+    )
+    .unwrap();
+
+    let out_aso = dir.join("main.aso");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(dir.join("main.as"))
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(build.status.success());
+
+    // build's STDOUT must contain ONLY the `compiled … -> …` line — no shake report.
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    assert!(
+        stdout.starts_with("compiled "),
+        "build stdout must lead with the `compiled …` line; stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("tree-shaking"),
+        "the tree-shaking report must NOT be on stdout; stdout=\n{stdout}"
+    );
+    // The shake summary IS on stderr.
+    assert!(
+        String::from_utf8_lossy(&build.stderr).contains("tree-shaking"),
+        "the tree-shaking report must be on stderr"
+    );
+
+    // Running the bundled program emits exactly the program's own stdout, unaffected.
+    let run = Command::new(bin)
+        .arg("run")
+        .arg(&out_aso)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "7\n",
+        "the program's own stdout must be unchanged by shaking"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

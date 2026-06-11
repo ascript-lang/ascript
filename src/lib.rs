@@ -938,8 +938,11 @@ pub fn build_file(
     // works from a directory WITHOUT the sources). A single-module program recompiles
     // the lone entry to a bare `ASO\0` chunk — byte-identical to the pre-archive
     // artifact, so existing `.aso` goldens/tests stay valid.
-    let archive = compile_archive(file, with_debug)?;
+    let (archive, report) = compile_archive(file, with_debug)?;
     let bytes = if archive.modules.len() > 1 {
+        // Multi-module archive: surface the tree-shaking summary on STDERR (never stdout
+        // — stdout carries only `compiled … -> …`, keeping the program corpus byte-clean).
+        print_shake_report(&report);
         archive.encode() // ASCRIPTA — embed the whole module graph
     } else {
         // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
@@ -1041,8 +1044,11 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
 /// module, matching `load_file_module`'s cache identity), while the STORED key stays
 /// machine-independent.
 ///
-/// `caps` is a default all-granted [`CapSet`] and `shake_digest` is all-zero for now;
-/// Phase 3 fills the composed caps and Phase 2 fills the shake digest.
+/// `caps` is a default all-granted [`CapSet`] for now (Phase 3 fills the composed caps);
+/// `shake_digest` is the reproducible 32-byte sha256 of the tree-shake report
+/// ([`crate::compile::shake::ShakeReport::digest`]). The report is RETURNED alongside the
+/// archive so the caller (`build_file`/`build_native`) can print a human-readable
+/// tree-shaking summary to stderr.
 ///
 /// `with_debug` is threaded into every module's compile: the stored chunk bytes are
 /// what actually RUN at bundle time (the archive replaces the source tree), so debug
@@ -1051,7 +1057,7 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
 pub fn compile_archive(
     entry: &Path,
     with_debug: bool,
-) -> Result<crate::vm::archive::ModuleArchive, AsError> {
+) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
     use crate::vm::archive::ModuleArchive;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1237,8 +1243,24 @@ pub fn compile_archive(
             edges,
         })
         .collect();
-    let reach = crate::compile::shake::compute_reachable(&graph);
-    // reach.report is threaded to Task 2.4's digest + stderr printer; unused here.
+    let mut reach = crate::compile::shake::compute_reachable(&graph);
+    // reach.report drives BOTH the reproducible manifest digest (below) and the
+    // stderr tree-shaking summary the caller prints — it is RETURNED to the caller.
+
+    // Pre-render each pin's `<importer_key>:line:col` location against the IMPORTER's
+    // source (the module whose namespace use forced the pin). We hold the sources here;
+    // the printer then needs none. Reading the source is best-effort — a read failure
+    // simply leaves `location` as `None` (the printer falls back to the bare key). The
+    // rendered location is deliberately NOT part of the digest (it is redundant with the
+    // importer key + char span the digest already covers).
+    for pin in &mut reach.report.pins {
+        if let Some(path) = module_paths.get(pin.importer) {
+            if let Ok(src) = std::fs::read_to_string(path) {
+                pin.location =
+                    Some(crate::compile::shake::render_pin_location(&pin.importer_key, &src, pin.span));
+            }
+        }
+    }
 
     for (idx, (_key, bytes)) in modules.iter_mut().enumerate() {
         if idx == 0 {
@@ -1254,12 +1276,17 @@ pub fn compile_archive(
         *bytes = pruned;
     }
 
-    Ok(ModuleArchive::new(
+    // The manifest digest is the reproducible sha256 of the shake report (machine-
+    // independent: logical keys + dropped names + pins, NO absolute paths — same source
+    // ⇒ same digest). The report is then returned for the caller's stderr summary.
+    let shake_digest = reach.report.digest();
+    let archive = ModuleArchive::new(
         entry,
         crate::stdlib::caps::CapSet::default(), // Phase 3 fills the composed caps
-        [0u8; 32],                              // Task 2.4 fills the shake digest
+        shake_digest,
         modules,
-    ))
+    );
+    Ok((archive, reach.report))
 }
 
 /// Convert a decoded [`crate::vm::chunk::ImportDesc`] into a tree-shaker
@@ -1285,6 +1312,67 @@ fn import_desc_to_edge(
             target,
             alias: Rc::from(alias.as_str()),
         },
+    }
+}
+
+/// Print a human-readable tree-shaking summary to STDERR (Task 2.4). Called by
+/// `build_file`/`build_native` for MULTI-MODULE archives only (a single-module build
+/// emits a bare chunk with no shaking, so there is nothing to report). STDERR keeps the
+/// summary off the program's stdout / the `compiled … -> …` / `bundled … -> …` lines.
+///
+/// Format (everything deterministically ordered — modules by logical key, names sorted):
+///
+/// ```text
+/// tree-shaking: dropped 3 declaration(s) across 2 module(s); 1 module(s) pinned
+///   util.as: dropped 2 — dead, helper
+///   math.as: dropped 1 — unused
+///   kept all exports of 'config.as' — namespace 'm' is indexed/escapes at app.as:12:7
+/// ```
+///
+/// A build with no drops and no pins prints a single `tree-shaking: nothing to drop`
+/// line. The report is purely informational; it never fails the build.
+fn print_shake_report(report: &crate::compile::shake::ShakeReport) {
+    let total = report.total_dropped();
+    let mods = report.modules_with_drops();
+    let pins = report.pins.len();
+
+    if total == 0 && pins == 0 {
+        eprintln!("tree-shaking: nothing to drop");
+        return;
+    }
+
+    eprintln!(
+        "tree-shaking: dropped {total} declaration(s) across {mods} module(s); \
+         {pins} module(s) pinned"
+    );
+
+    // Per-module drops, ordered by logical key (machine-independent), skipping modules
+    // with no drops (the entry, and any fully-used library).
+    let mut drops: Vec<&crate::compile::shake::ModuleDrops> = report
+        .dropped
+        .iter()
+        .filter(|d| !d.names.is_empty())
+        .collect();
+    drops.sort_by(|a, b| a.key.cmp(&b.key));
+    for d in &drops {
+        let names: Vec<&str> = d.names.iter().map(|n| n.as_ref()).collect();
+        eprintln!("  {}: dropped {} — {}", d.key, d.names.len(), names.join(", "));
+    }
+
+    // Pins, ordered by the pinned module's logical key.
+    let mut pin_list: Vec<&crate::compile::shake::PinReason> = report.pins.iter().collect();
+    pin_list.sort_by(|a, b| a.key.cmp(&b.key));
+    for p in &pin_list {
+        // `location` is pre-rendered (`compile_archive` holds the sources); fall back to
+        // the bare importer key if a source read failed during the build.
+        let at = p
+            .location
+            .clone()
+            .unwrap_or_else(|| p.importer_key.clone());
+        eprintln!(
+            "  kept all exports of '{}' — namespace '{}' is indexed/escapes at {}",
+            p.key, p.alias, at
+        );
     }
 }
 
@@ -1387,8 +1475,11 @@ pub fn build_native(
     // `ASCRIPTA` archive embedding the whole import graph for a multi-module program
     // (so the bundled binary runs from an empty directory). The `stub || payload ||
     // footer` framing below is unchanged: the payload is opaque to the bundler.
-    let archive = compile_archive(file, true)?;
+    let (archive, report) = compile_archive(file, true)?;
     let payload = if archive.modules.len() > 1 {
+        // Multi-module bundle: surface the tree-shaking summary on STDERR (the `bundled …
+        // -> …` line stays on stdout).
+        print_shake_report(&report);
         archive.encode() // ASCRIPTA — embed the whole module graph
     } else {
         // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the

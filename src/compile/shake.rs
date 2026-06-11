@@ -104,10 +104,16 @@ pub struct ReachResult {
     pub report: ShakeReport,
 }
 
-/// A minimal shake report (Task 2.1 skeleton). Task 2.4 will add the digest +
-/// stderr printing; for now it records, per module, the names DROPPED (all top-level
-/// names minus the keep-set) and any "pinned whole" reasons — deterministically
-/// ordered for stable diagnostics.
+/// The shake report: everything needed to (a) PRINT a human-readable tree-shaking
+/// summary to stderr and (b) compute a REPRODUCIBLE 32-byte manifest digest (Task 2.4).
+///
+/// Every collection it carries is built deterministically so two builds of the SAME
+/// source produce a byte-identical [`digest`](Self::digest): per-module dropped names are
+/// sorted (a `BTreeSet`), and the digest re-orders modules + pins by their machine-
+/// independent LOGICAL KEY (never the graph index, never an absolute path) before
+/// hashing. The in-memory `dropped`/`pins` `Vec`s stay in graph index order (the printer
+/// is index-friendly); the digest does its OWN key-sort so it is independent of graph
+/// traversal order.
 #[derive(Debug, Default)]
 pub struct ShakeReport {
     /// Per-module dropped top-level names (index → sorted names), in the order the
@@ -115,6 +121,80 @@ pub struct ShakeReport {
     pub dropped: Vec<ModuleDrops>,
     /// Reasons a module was pinned whole (e.g. a namespace import), in graph order.
     pub pins: Vec<PinReason>,
+}
+
+impl ShakeReport {
+    /// The TOTAL number of dropped declarations across all modules.
+    pub fn total_dropped(&self) -> usize {
+        self.dropped.iter().map(|d| d.names.len()).sum()
+    }
+
+    /// The number of modules that actually dropped at least one declaration.
+    pub fn modules_with_drops(&self) -> usize {
+        self.dropped.iter().filter(|d| !d.names.is_empty()).count()
+    }
+
+    /// Compute the REPRODUCIBLE 32-byte sha256 digest of this report. The serialization
+    /// is CANONICAL — building the same source twice yields byte-identical input here
+    /// (and therefore an identical digest):
+    ///
+    ///   - a fixed `b"ascript-shake-v1\0"` domain tag (so an unrelated sha256 can never
+    ///     collide with a shake digest, and a future format bump is unambiguous);
+    ///   - the DROPS, sorted by the module's LOGICAL KEY (machine-independent — never the
+    ///     graph index, never an absolute path); per module, the key then the dropped
+    ///     names (already `BTreeSet`-sorted);
+    ///   - the PINS, sorted by `(pinned key, importer key, alias, span.start, span.end)`;
+    ///     per pin, those fields.
+    ///
+    /// Every string is LENGTH-PREFIXED with a `u32` (big-endian) so no concatenation
+    /// ambiguity exists, every count is a `u32` (big-endian), and NOTHING is iterated
+    /// from a `HashMap` (the keep-set table is never touched here). The result is stored
+    /// in `ModuleArchive.shake_digest`.
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut h = Sha256::new();
+        let put_bytes = |h: &mut Sha256, b: &[u8]| {
+            h.update((b.len() as u32).to_be_bytes());
+            h.update(b);
+        };
+
+        h.update(b"ascript-shake-v1\0");
+
+        // ── Drops, sorted by logical key (machine-independent). ──────────────────
+        let mut drops: Vec<&ModuleDrops> = self.dropped.iter().collect();
+        drops.sort_by(|a, b| a.key.cmp(&b.key));
+        h.update((drops.len() as u32).to_be_bytes());
+        for d in &drops {
+            put_bytes(&mut h, d.key.as_bytes());
+            h.update((d.names.len() as u32).to_be_bytes());
+            for name in &d.names {
+                put_bytes(&mut h, name.as_bytes());
+            }
+        }
+
+        // ── Pins, sorted by (pinned key, importer key, alias, span). ─────────────
+        let mut pins: Vec<&PinReason> = self.pins.iter().collect();
+        pins.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| a.importer_key.cmp(&b.importer_key))
+                .then_with(|| a.alias.cmp(&b.alias))
+                .then_with(|| a.span.start.cmp(&b.span.start))
+                .then_with(|| a.span.end.cmp(&b.span.end))
+        });
+        h.update((pins.len() as u32).to_be_bytes());
+        for p in &pins {
+            put_bytes(&mut h, p.key.as_bytes());
+            put_bytes(&mut h, p.importer_key.as_bytes());
+            put_bytes(&mut h, p.alias.as_bytes());
+            put_bytes(&mut h, p.reason.as_bytes());
+            h.update((p.span.start as u32).to_be_bytes());
+            h.update((p.span.end as u32).to_be_bytes());
+        }
+
+        h.finalize().into()
+    }
 }
 
 /// The names dropped from one module.
@@ -135,14 +215,59 @@ pub struct PinReason {
     pub module: usize,
     /// The pinned module's archive logical key.
     pub key: String,
+    /// The IMPORTER module's index in the graph — the module whose namespace use forced
+    /// the pin and whose source the [`span`](Self::span) is an offset into. The report
+    /// printer renders the location against THIS module's source (Task 2.4).
+    pub importer: usize,
+    /// The IMPORTER module's archive logical key (machine-independent), used both for the
+    /// rendered `<key>:line:col` location and as the digest's importer identity. NEVER an
+    /// absolute path.
+    pub importer_key: String,
     /// The importer's local alias for the namespace that triggered the pin
     /// (`import * as <alias>`), for the Task 2.4 report.
     pub alias: Rc<str>,
     /// A human-readable reason (e.g. "namespace `m` used dynamically or escapes").
     pub reason: String,
-    /// The source span of the offending `GET_GLOBAL <alias>` use in the IMPORTER's
-    /// chunk (a zero span if the chunk records no instruction spans).
+    /// The source span (CHAR offsets) of the offending `GET_GLOBAL <alias>` use in the
+    /// IMPORTER's chunk (a zero span if the chunk records no instruction spans). Rendered
+    /// to `line:col` against the importer's source at print time.
     pub span: Span,
+    /// The PRE-RENDERED `<importer_key>:line:col` location string, filled by the caller
+    /// (`compile_archive`) which holds the module sources — `compute_reachable` itself has
+    /// no sources, so it leaves this `None`. Deterministic (line/col are derived from the
+    /// machine-independent source + char span); deliberately EXCLUDED from
+    /// [`ShakeReport::digest`] (it is redundant with `importer_key` + `span`, which the
+    /// digest already covers).
+    pub location: Option<String>,
+}
+
+/// Render a CHAR offset into `source` as a 1-based `(line, col)` pair. The line is the
+/// count of `\n` at-or-before `offset` plus one; the column is the char count since the
+/// last `\n` plus one. Robust to an out-of-range offset (clamped to the source length) so
+/// a stale/zero span never panics. Used by [`render_pin_location`] for the build report.
+pub fn line_col(source: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, ch) in source.chars().enumerate() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Pre-render a pin's `<importer_key>:line:col` location string against the importer's
+/// `source`. The caller (`compile_archive`) holds the sources; the printer then needs
+/// none. Machine-independent (the key is logical, line/col are source-derived).
+pub fn render_pin_location(importer_key: &str, source: &str, span: Span) -> String {
+    let (line, col) = line_col(source, span.start);
+    format!("{importer_key}:{line}:{col}")
 }
 
 /// Collect the NAMES referenced by a module's top-level SIDE-EFFECT statements — the
@@ -473,10 +598,11 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
     //     dynamic edge into a target pins it whole (over a `Static` edge from elsewhere).
     let mut import_roots: Vec<Vec<Rc<str>>> = vec![Vec::new(); n];
     let mut pinned_whole: Vec<bool> = vec![false; n];
-    // Per-pinned-target: the (alias, span) of the FIRST dynamic namespace use that
-    // pinned it (for the report). Graph-deterministic: edges are walked in node order.
-    let mut pin_info: Vec<Option<(Rc<str>, Span)>> = vec![None; n];
-    for node in graph {
+    // Per-pinned-target: the (importer index, alias, span) of the FIRST dynamic namespace
+    // use that pinned it (for the report). Graph-deterministic: edges are walked in node
+    // order, so the FIRST dynamic importer is stable across builds.
+    let mut pin_info: Vec<Option<(usize, Rc<str>, Span)>> = vec![None; n];
+    for (importer, node) in graph.iter().enumerate() {
         for edge in &node.edges {
             match edge {
                 ImportEdge::Named { target, names } => {
@@ -499,7 +625,7 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
                             }
                             if let Some(slot) = pin_info.get_mut(t) {
                                 if slot.is_none() {
-                                    *slot = Some((alias.clone(), span));
+                                    *slot = Some((importer, alias.clone(), span));
                                 }
                             }
                         }
@@ -557,16 +683,24 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
         if pinned_whole[i] {
             // `pin_info[i]` is set whenever `pinned_whole[i]` is (they are written
             // together in the namespace-classification loop); fall back to a placeholder
-            // span + empty alias only if it were somehow absent (never in practice).
-            let (alias, span) = pin_info[i]
+            // importer (self) + span + empty alias only if it were somehow absent (never
+            // in practice).
+            let (importer, alias, span) = pin_info[i]
                 .clone()
-                .unwrap_or_else(|| (Rc::from(""), Span::new(0, 0)));
+                .unwrap_or_else(|| (i, Rc::from(""), Span::new(0, 0)));
+            let importer_key = graph
+                .get(importer)
+                .map(|m| m.key.clone())
+                .unwrap_or_default();
             pins.push(PinReason {
                 module: i,
                 key: node.key.clone(),
+                importer,
+                importer_key,
                 reason: format!("namespace `{alias}` used dynamically or escapes"),
                 alias,
                 span,
+                location: None, // filled by the caller, which holds the module sources
             });
         }
     }
@@ -1150,6 +1284,108 @@ mod tests {
         assert!(!kept(&res, 1, "unusedB"), "B.unusedB dropped");
         assert!(kept(&res, 2, "useC"), "C.useC kept (transitive)");
         assert!(!kept(&res, 2, "unusedC"), "C.unusedC dropped");
+    }
+
+    /// Build the same shake graph twice; assert the canonical [`ShakeReport::digest`] is
+    /// (a) byte-identical across the two builds and (b) non-zero (there ARE drops).
+    fn headline_graph() -> Vec<ModuleNode> {
+        let entry = chunk(r#"let x = 1"#);
+        let lib = chunk(
+            r#"
+            fn h() { 42 }
+            fn used() { h() }
+            fn unused() { 99 }
+        "#,
+        );
+        vec![
+            ModuleNode {
+                key: "entry.as".into(),
+                chunk: entry,
+                edges: vec![ImportEdge::Named {
+                    target: 1,
+                    names: vec![rc("used")],
+                }],
+            },
+            ModuleNode {
+                key: "lib.as".into(),
+                chunk: lib,
+                edges: vec![],
+            },
+        ]
+    }
+
+    #[test]
+    fn digest_is_reproducible_and_nonzero() {
+        let d1 = compute_reachable(&headline_graph()).report.digest();
+        let d2 = compute_reachable(&headline_graph()).report.digest();
+        assert_eq!(d1, d2, "same source → byte-identical digest");
+        assert_ne!(d1, [0u8; 32], "a report with drops must hash to a non-zero digest");
+    }
+
+    #[test]
+    fn digest_changes_when_drops_change() {
+        // A graph that drops `unused` vs. an otherwise-identical graph that imports it
+        // too (so `unused` is kept) must produce DIFFERENT digests — the digest reflects
+        // the shake outcome, not just the module set.
+        let d_with_drop = compute_reachable(&headline_graph()).report.digest();
+
+        let entry = chunk(r#"let x = 1"#);
+        let lib = chunk(
+            r#"
+            fn h() { 42 }
+            fn used() { h() }
+            fn unused() { 99 }
+        "#,
+        );
+        let graph_no_drop = vec![
+            ModuleNode {
+                key: "entry.as".into(),
+                chunk: entry,
+                edges: vec![ImportEdge::Named {
+                    target: 1,
+                    names: vec![rc("used"), rc("unused")], // now both kept → no drops
+                }],
+            },
+            ModuleNode {
+                key: "lib.as".into(),
+                chunk: lib,
+                edges: vec![],
+            },
+        ];
+        let d_no_drop = compute_reachable(&graph_no_drop).report.digest();
+        assert_ne!(
+            d_with_drop, d_no_drop,
+            "a different drop set must change the digest"
+        );
+    }
+
+    #[test]
+    fn digest_independent_of_graph_order_by_key() {
+        // The digest sorts by LOGICAL KEY, so it must not depend on the in-memory `pins`/
+        // `dropped` Vec order. We build a report, then a permuted clone of its collections,
+        // and assert the digest matches. (Construct ShakeReports directly to isolate the
+        // sort from graph traversal.)
+        let base = compute_reachable(&headline_graph()).report;
+        // A reversed-order clone of the same logical content.
+        let mut dropped_rev: Vec<ModuleDrops> = base
+            .dropped
+            .iter()
+            .map(|d| ModuleDrops {
+                module: d.module,
+                key: d.key.clone(),
+                names: d.names.clone(),
+            })
+            .collect();
+        dropped_rev.reverse();
+        let permuted = ShakeReport {
+            dropped: dropped_rev,
+            pins: Vec::new(),
+        };
+        assert_eq!(
+            base.digest(),
+            permuted.digest(),
+            "digest must be independent of in-memory collection order"
+        );
     }
 }
 
