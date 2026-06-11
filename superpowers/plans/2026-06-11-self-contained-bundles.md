@@ -684,12 +684,14 @@ impl ModuleArchive {
 - Modify: `src/compile/shake.rs` (`ShakeReport`), `src/lib.rs` (emit to stderr; digest into manifest)
 - Test: `tests/cli.rs`
 
-- [ ] **Step 1: Write the failing test** — building a program with a dynamically-indexed namespace prints a report line naming the kept module + reason + span; a fully-shakeable build prints what was dropped.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Implement** — `ShakeReport` records per-module dropped names and kept-because-unprovable entries (reason + span); `build`/`--native` print it to stderr; a 32-byte digest of the canonicalized report goes into the archive manifest.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — cli test; docs: bundles page "reading the shake report"; blast-radius: report must be deterministic (stable ordering) so the digest is reproducible.
-- [ ] **Step 6: Commit** — `git commit -m "feat(shake): build report + reproducible manifest digest"`
+- [x] **Step 1: Write the failing test** — building a program with a dynamically-indexed namespace prints a report line naming the kept module + reason + span; a fully-shakeable build prints what was dropped.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Implement** — `ShakeReport` records per-module dropped names and kept-because-unprovable entries (reason + span); `build`/`--native` print it to stderr; a 32-byte digest of the canonicalized report goes into the archive manifest.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — cli test; docs: bundles page "reading the shake report"; blast-radius: report must be deterministic (stable ordering) so the digest is reproducible.
+- [x] **Step 6: Commit** — `git commit -m "feat(shake): build report + reproducible manifest digest"`
+
+> **Accepted (2.4):** commits `685f7b4` (impl) + `4527142` (review fixes). `compile_archive -> (ModuleArchive, ShakeReport)`; `archive.shake_digest = report.digest()` (replaced the `[0u8;32]` stub). **Reproducible digest** (`ShakeReport::digest() -> [u8;32]`, sha256 over a CANONICAL form: domain tag `ascript-shake-v1` + drops sorted by logical KEY + pins sorted by `(key, importer_key, alias, span)`, all `u32`-length-prefixed; NO HashMap iteration, NO indices, NO absolute paths). Spec review VERIFIED reproducibility: identical 32-byte digest across two DIFFERENT absolute build dirs, stable under import reorder, sensitive to drop-set changes. **stderr report** (multi-module builds only, via `eprintln!` → never pollutes stdout/the four-mode corpus): summary line + per-module dropped names + per-pin `kept all exports of '<key>' — namespace '<alias>' is indexed/escapes at <importer_key>:line:col`. `PinReason` gained `importer`/`importer_key`/`location` (pre-rendered logical-key location). **sha2 promoted optional→CORE** (the digest is core/`compile_archive`; sha2 was ALREADY in the `--no-default-features` graph via `apple-codesign` → zero new crates, `Cargo.lock` unchanged). NIT (no action): pin COLUMN off-by-one (pre-existing cstree `GET_GLOBAL` span quirk, deterministic → digest unaffected; cli test asserts `:line:` only). Docs page DEFERRED to 4.1. 29/29 shake (digest reproducibility + sensitivity + drop/pin-order independence); cli 155/0; differential 378/0 both configs; `--no-default-features` builds; clippy clean both configs.
 
 ### Task 2.5: the shaken-vs-unshaken differential (the load-bearing tripwire)
 
