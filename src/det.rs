@@ -305,8 +305,14 @@ impl DeterminismContext {
                     self.clock.monotonic_ms = value;
                     value
                 }
-                Some(DetEvent::ClockRead { value }) => value,
-                Some(_) => self.clock.monotonic_ms(),
+                // A non-`MonotonicRead` event is a replay mismatch — surface it via
+                // `replay_mismatch_recover` (LOUD divergence) rather than silently
+                // cross-consuming a `ClockRead` as a monotonic value or bypassing replay.
+                // NOTE: `replay_mismatch_recover` returns wall-clock ms — a different unit
+                // than a monotonic reader expects. That's acceptable here because the
+                // std/workflow non-determinism detector is the authoritative guard (this
+                // value is a best-effort keep-going, not a basis for elapsed-time math).
+                Some(other) => self.replay_mismatch_recover(other),
                 None => {
                     self.mode = Mode::Record;
                     let v = self.clock.monotonic_ms();
@@ -329,11 +335,11 @@ impl DeterminismContext {
             }
             Mode::Replay => match self.next_event() {
                 Some(DetEvent::RandomRead { value }) => value,
-                Some(_) => {
-                    // Wrong kind during replay — advance the rng anyway to keep
-                    // determinism for any subsequent fall-through-to-record draws.
-                    self.rng.next_f64()
-                }
+                // A non-`RandomRead` event is a replay mismatch — surface it via
+                // `replay_mismatch_recover` (LOUD divergence) rather than silently
+                // bypassing replay by drawing a fresh PRNG value, which would shift the
+                // whole replay one event out of phase.
+                Some(other) => self.replay_mismatch_recover(other),
                 None => {
                     self.mode = Mode::Record;
                     let v = self.rng.next_f64();
@@ -459,10 +465,12 @@ impl DeterminismContext {
         e
     }
 
-    /// A clock read hit a non-clock recorded event during replay — return the
-    /// current virtual clock value as a best-effort (the workflow-level detector in
-    /// `std/workflow` is the authoritative non-determinism guard for activities;
-    /// bare clock/RNG seams outside a workflow never reach this in practice).
+    /// Any seam reader (clock / RNG) hit an unexpected recorded event kind during
+    /// replay — return the current virtual wall-clock value as a best-effort (the
+    /// workflow-level detector in `std/workflow` is the authoritative non-determinism
+    /// guard for activities; bare clock/RNG seams outside a workflow never reach this in
+    /// practice). Callers in non-wall-clock units (monotonic / RNG) treat this purely as
+    /// a keep-going sentinel, not a unit-meaningful value.
     fn replay_mismatch_recover(&mut self, _got: DetEvent) -> f64 {
         self.clock.now_ms()
     }
@@ -690,5 +698,61 @@ mod tests {
             "correct method must still find the event"
         );
         assert_eq!(rep.cursor, 1, "cursor must advance after a successful match");
+    }
+
+    /// A wrong-kind recorded event under `clock_monotonic_ms` must surface the replay
+    /// mismatch via `replay_mismatch_recover` — NOT silently cross-consume a `ClockRead`
+    /// as if it were a monotonic value (which would shift the whole replay one event out
+    /// of phase). Mirrors `clock_now_ms`'s mismatch discipline.
+    fn replay_mismatch_recover_value(start_ms: f64) -> f64 {
+        // `replay_mismatch_recover` returns `self.clock.now_ms()`, which a replay clock
+        // initializes to `start_ms`. Picking a `start_ms` distinct from any seeded event
+        // value makes the mismatch path observable.
+        start_ms
+    }
+
+    #[test]
+    fn clock_monotonic_ms_surfaces_replay_mismatch_on_clock_read() {
+        // Seed a ClockRead (a DIFFERENT event kind) at the cursor; replaying a monotonic
+        // read against it is a divergence. The recorded value (999.0) must NOT be returned
+        // — the mismatch-recover value (the wall clock = start_ms = 42.0) is.
+        let events = vec![DetEvent::ClockRead { value: 999.0 }];
+        let mut rep = DeterminismContext::replay(0, 42.0, events);
+        let got = rep.clock_monotonic_ms();
+        assert_eq!(
+            got,
+            replay_mismatch_recover_value(42.0),
+            "a ClockRead under clock_monotonic_ms must surface via replay_mismatch_recover, \
+             not be silently cross-consumed as a monotonic value"
+        );
+        assert_ne!(got, 999.0, "the recorded wrong-kind value must NOT leak through");
+    }
+
+    #[test]
+    fn clock_monotonic_ms_surfaces_replay_mismatch_on_random_read() {
+        // Same divergence with a RandomRead at the cursor.
+        let events = vec![DetEvent::RandomRead { value: 0.123 }];
+        let mut rep = DeterminismContext::replay(0, 77.0, events);
+        let got = rep.clock_monotonic_ms();
+        assert_eq!(got, replay_mismatch_recover_value(77.0));
+        assert_ne!(got, 0.123);
+    }
+
+    /// Blast-radius (Task 0.12): `next_random_f64` had the same silent-mismatch bug —
+    /// a wrong-kind event at the cursor silently drew a fresh PRNG value (bypassing
+    /// replay, shifting the stream out of phase) instead of surfacing the divergence.
+    /// A non-`RandomRead` event must now surface via `replay_mismatch_recover`.
+    #[test]
+    fn next_random_f64_surfaces_replay_mismatch_on_clock_read() {
+        let events = vec![DetEvent::ClockRead { value: 999.0 }];
+        let mut rep = DeterminismContext::replay(0, 55.0, events);
+        let got = rep.next_random_f64();
+        assert_eq!(
+            got,
+            replay_mismatch_recover_value(55.0),
+            "a ClockRead under next_random_f64 must surface via replay_mismatch_recover, \
+             not silently draw a fresh PRNG value"
+        );
+        assert_ne!(got, 999.0, "the recorded wrong-kind value must NOT leak through");
     }
 }
