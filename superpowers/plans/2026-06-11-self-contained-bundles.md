@@ -77,9 +77,9 @@ fn float_two_pow_63_is_not_i64_max() {
 - Modify: `src/compile/mod.rs:2447`
 - Test: `tests/cli.rs` (or inline compile test) + `examples`
 
-- [ ] **Step 1: Write the failing test** — a program `enum E { A = -1, B = 2 } print(E.A.value)` run on the VM expects `-1`.
-- [ ] **Step 2: Run it — expect FAIL** (`enum variant backing value must be a number or string literal`).
-- [ ] **Step 3: Apply the fix** — add the `Int` arm to the unary-minus match:
+- [x] **Step 1: Write the failing test** — a program `enum E { A = -1, B = 2 } print(E.A.value)` run on the VM expects `-1`.
+- [x] **Step 2: Run it — expect FAIL** (`enum variant backing value must be a number or string literal`).
+- [x] **Step 3: Apply the fix** — add the `Int` arm to the unary-minus match:
 
 ```rust
 match self.const_eval_enum_backing(&operand)? {
@@ -92,9 +92,9 @@ match self.const_eval_enum_backing(&operand)? {
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS**; `cargo test --test vm_differential` (tree-walker already accepts it) — expect byte-identical.
-- [ ] **Step 5: §9.1** — `examples/enums_negative_backing.as`; docs: `classes-enums.md` enum-backing note; blast-radius: scan `const_eval_*` / literal-fold helpers for other `Value::Float`-only arms missing `Value::Int` (NUM-split stragglers) and fix any found (log them as discovered bugs per §9.4).
-- [ ] **Step 6: Commit** — `git commit -m "fix(compile): negative integer enum backing after NUM split"`
+- [x] **Step 4: Run it — expect PASS**; `cargo test --test vm_differential` (tree-walker already accepts it) — expect byte-identical.
+- [x] **Step 5: §9.1** — `examples/enums_negative_backing.as`; docs: `classes-enums.md` enum-backing note; blast-radius: scan `const_eval_*` / literal-fold helpers for other `Value::Float`-only arms missing `Value::Int` (NUM-split stragglers) and fix any found (log them as discovered bugs per §9.4).
+- [x] **Step 6: Commit** — `git commit -m "fix(compile): negative integer enum backing after NUM split"`
 
 ### Task 0.3: `.aso` range-`step` round-trip loss in field defaults
 
