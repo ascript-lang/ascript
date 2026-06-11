@@ -626,6 +626,53 @@ c == Shape.Circle(2.0)
     assert_eq!(vm_out, tw_out, "VM/TW REPL output must match for ADT session");
 }
 
+/// An or-pattern alternative that BINDS a name (`Circle(r) | Square(r)`) must make
+/// that binding visible in the arm body on the VM — the CST resolver was dropping
+/// the bindings inside an `OrPat` (no `OrPat` arm in `resolve_pattern`), so the name
+/// fell through to a `Global` fallback and failed at runtime with `undefined
+/// variable`. The legacy tree-walker oracle already binds these correctly, so the
+/// fix is asserted as VM == tree-walker byte-identity.
+#[test]
+fn match_or_pattern_binds_names_on_both_engines() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = "\
+enum Shape {
+  Circle(radius: int),
+  Square(side: int),
+  Empty,
+}
+let c = Shape.Circle(2)
+let out = match c {
+  Shape.Circle(r) | Shape.Square(r) => r,
+  Shape.Empty => 0,
+}
+print(out)
+";
+    let file =
+        std::env::temp_dir().join(format!("ascript_orpat_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    let mut outputs = Vec::new();
+    for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+        let out = Command::new(bin)
+            .args(&engine_args)
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "expected or-pattern binding to succeed on {engine_args:?}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            stdout, "2\n",
+            "or-pattern binding must print 2 on {engine_args:?}; got {stdout:?}"
+        );
+        outputs.push(stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "VM and tree-walker output must match");
+}
+
 #[test]
 fn repl_vm_fn_and_class_reassignment_across_lines_error() {
     // fn / class names are immutable top-level bindings: reassigning one on a later

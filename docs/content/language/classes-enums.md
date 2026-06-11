@@ -659,14 +659,32 @@ match event {
 
 #### Alternatives `|`
 
-Separate multiple patterns with `|`. The arm fires if **any** pattern matches. Alternatives are
-typically literals or value patterns that bind nothing; only the matched alternative's bindings are
-in scope in the guard/body, so keep alternatives uniform (bind the same names) if you do bind.
+Separate multiple patterns with `|`. The arm fires if **any** pattern matches; the alternatives are
+tried in order and a guard runs after the matched alternative binds.
 
 ```ascript
 match day { "sat" | "sun" => "weekend", _ => "weekday" }
 match n    { 0 | 1        => "tiny",    _ => "bigger"  }
 ```
+
+Alternatives may also **bind**: a single guard/body is shared across every alternative, so each one
+must bind the **same set of names**, and that shared name is what the body reads regardless of which
+alternative matched.
+
+```ascript
+enum Shape { Circle(radius: int), Square(side: int), Empty }
+
+fn dimension(s: Shape): int {
+  return match s {
+    Shape.Circle(r) | Shape.Square(r) => r,   // both alternatives bind `r`
+    Shape.Empty                       => 0,
+  }
+}
+```
+
+Binding **different** names across alternatives (`Foo(a) | Bar(b) => …`) is a mistake — the body can
+only see a name that *every* matched alternative binds, so a name present in just one alternative is
+unbound when the other matches. Keep the alternatives uniform.
 
 #### Guards `pattern if condition`
 

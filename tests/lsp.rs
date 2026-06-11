@@ -2609,6 +2609,45 @@ mod identity_unification {
         }
     }
 
+    /// A name bound INSIDE an or-pattern alternative (`Circle(r) | Square(r) => r`)
+    /// is now declared by the CST resolver, so go-to-definition and find-references
+    /// on the arm-body use of `r` resolve to a pattern bind site (not a Global
+    /// fallback that would yield no definition). Regression for the `OrPat`-arm fix.
+    #[test]
+    fn or_pattern_binding_resolves_for_goto_and_references() {
+        let src = "enum Shape {\n  Circle(radius: int),\n  Square(side: int),\n}\n\
+fn dim(s: Shape): int {\n  return match s {\n    Shape.Circle(r) | Shape.Square(r) => r,\n  }\n}\n";
+        let index = idx(&[("/ws/m.as", src)]);
+        let m = canon(Path::new("/ws/m.as"));
+
+        // Cursor on the arm BODY use of `r` (after `=> `).
+        let body_use = src.find("=> r").unwrap() + "=> ".len();
+        // Go-to-definition must resolve to SOME location in this file (a pattern bind
+        // site), not fail with no definition (the pre-fix Global fallback).
+        let def = index.definition_at(&m, body_use);
+        assert!(
+            def.is_some(),
+            "goto-def on an or-pattern-bound name must resolve, got None"
+        );
+        let (def_path, def_span) = def.unwrap();
+        assert_eq!(def_path, m, "definition must be in the same file");
+        // The def span must land on one of the two `r` bind sites in the pattern
+        // (the FIRST alternative's `r` owns the shared slot).
+        let first_bind = src.find("Circle(r)").unwrap() + "Circle(".len();
+        assert!(
+            def_span.start <= first_bind && first_bind < def_span.end,
+            "definition should point at the first `r` bind site; span={def_span:?}"
+        );
+
+        // find-references (including the decl) must include the body use of `r`.
+        let refs = index.references_at(&m, body_use, true);
+        assert!(
+            refs.iter()
+                .any(|(p, r)| *p == m && r.start <= body_use && body_use < r.end),
+            "references of the or-pattern-bound `r` must include the body use: {refs:?}"
+        );
+    }
+
     /// All importers' uses of an imported name + the definer's def share ONE
     /// `Global(definerFileId, name)`. An importer's use resolves THROUGH the import
     /// edge to the definer's FileId.

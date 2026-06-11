@@ -1153,7 +1153,78 @@ impl Resolver {
                     }
                 }
             }
+            OrPat => self.resolve_or_pattern(pat),
             _ => {}
+        }
+    }
+
+    /// Resolve an or-pattern `Foo(x) | Bar(x) | …`. Each alternative is a sibling
+    /// pattern that the VM compiler lowers and binds INDEPENDENTLY, but the arm body
+    /// has a SINGLE use of each bound name (`x`), so every alternative's bind site
+    /// for a given name must resolve to ONE shared slot. A valid or-pattern binds the
+    /// SAME name set in every alternative (the tree-walker enforces this at match
+    /// time; here we make the slots agree).
+    ///
+    /// The subtlety is Option-C: a bare-ident pattern whose name is already IN SCOPE
+    /// is a value-compare, not a bind. Alternatives are MUTUALLY EXCLUSIVE branches,
+    /// so a name bound by an EARLIER alternative must NOT make a later alternative's
+    /// same-named bind site compare instead of bind. We therefore resolve each
+    /// alternative with the prior alternatives' bound names temporarily HIDDEN from
+    /// the live scope map (so Option-C binds them fresh), then remap the freshly
+    /// allocated binding back onto the first alternative's slot and restore the
+    /// scope entry — leaving exactly one shared slot per name, visible to the body.
+    fn resolve_or_pattern(&mut self, pat: &ResolvedNode) {
+        use std::collections::HashMap;
+        // name -> shared slot (the slot the FIRST alternative allocated for it).
+        let mut or_slots: HashMap<String, u32> = HashMap::new();
+        for alt in pat.children().filter(|c| is_pattern(c.kind())) {
+            // Hide every already-shared name so a same-named bind site in THIS
+            // alternative is seen as unbound (→ Option-C binds it) rather than a
+            // compare against a sibling alternative's binding.
+            for name in or_slots.keys() {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.remove(name);
+                }
+            }
+            // Snapshot the binding count so we can find what this alternative adds.
+            let before_len = self.frame_ref().bindings.len();
+            self.resolve_pattern(alt);
+            // Collect the names this alternative bound (the new bindings' names).
+            let new_names: Vec<(String, u32)> = self.frame_ref().bindings[before_len..]
+                .iter()
+                .map(|b| (b.name.clone(), b.slot))
+                .collect();
+            for (name, fresh_slot) in new_names {
+                if let Some(&shared) = or_slots.get(&name) {
+                    // A later alternative re-bound an existing or-name: point every
+                    // binding this alternative just created for `name` at the shared
+                    // slot, and restore the scope entry to that shared slot.
+                    let bindings = &mut self.frame().bindings;
+                    for b in bindings[before_len..].iter_mut() {
+                        if b.name == name {
+                            b.slot = shared;
+                        }
+                    }
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope.names.insert(name.clone(), shared);
+                    }
+                } else {
+                    // First alternative to bind this name: it owns the shared slot.
+                    or_slots.insert(name, fresh_slot);
+                }
+            }
+        }
+        // Every or-bound name must be visible to the arm guard/body via its shared
+        // slot — including a name that a LATER alternative did NOT re-bind (an
+        // INVALID or-pattern with mismatched name sets, e.g. `Foo(x) | Empty => x`).
+        // Restoring the scope entry keeps the body's `x` use resolving to the shared
+        // slot (the tree-walker likewise leaves the name reachable by-env), so the VM
+        // does not statically reject a program the oracle would run; whether the slot
+        // actually holds a value at runtime depends on which alternative matched.
+        for (name, slot) in &or_slots {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.names.insert(name.clone(), *slot);
+            }
         }
     }
 
