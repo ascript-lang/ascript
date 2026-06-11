@@ -43,7 +43,9 @@
 //! (`crate::worker::dispatch`) — we reuse its `pub(crate)` helpers rather than
 //! re-walking bytecode here.
 
+use crate::span::Span;
 use crate::vm::chunk::Chunk;
+use crate::vm::opcode::Op;
 use crate::worker::dispatch::{
     collect_range_refs, compute_closure, top_level_defs, top_level_statement_starts, TopDef,
 };
@@ -72,12 +74,19 @@ pub enum ImportEdge {
         /// The imported export names.
         names: Vec<Rc<str>>,
     },
-    /// `import * as m from <target>` — Task 2.1 conservative rule: pin the WHOLE
-    /// target module (every top-level name becomes a root). Task 2.2 will refine
-    /// namespace imports to allow static-only shaking.
+    /// `import * as m from <target>` — bind the target's namespace under the local
+    /// `alias`. Task 2.2 refines this: if the importer uses `alias` ONLY as a static
+    /// `alias.literalName` member access, only the accessed exports are seeded as roots
+    /// (per-binding shakeable); if `alias` is ever used dynamically (`alias[key]`) or
+    /// ESCAPES as a value (returned / stored / passed as an arg), the WHOLE target is
+    /// pinned (every top-level name becomes a root) and a [`PinReason`] is recorded. See
+    /// [`classify_namespace_use`].
     Namespace {
         /// The target module's index in the graph.
         target: usize,
+        /// The importer's LOCAL alias for the namespace (`import * as <alias>`). Every
+        /// use of the namespace in the importer's chunk begins with `GET_GLOBAL <alias>`.
+        alias: Rc<str>,
     },
 }
 
@@ -126,8 +135,14 @@ pub struct PinReason {
     pub module: usize,
     /// The pinned module's archive logical key.
     pub key: String,
-    /// A human-readable reason (e.g. "namespace import").
+    /// The importer's local alias for the namespace that triggered the pin
+    /// (`import * as <alias>`), for the Task 2.4 report.
+    pub alias: Rc<str>,
+    /// A human-readable reason (e.g. "namespace `m` used dynamically or escapes").
     pub reason: String,
+    /// The source span of the offending `GET_GLOBAL <alias>` use in the IMPORTER's
+    /// chunk (a zero span if the chunk records no instruction spans).
+    pub span: Span,
 }
 
 /// Collect the NAMES referenced by a module's top-level SIDE-EFFECT statements — the
@@ -175,6 +190,137 @@ fn statement_is_definition(chunk: &Chunk, start: usize, end: usize) -> bool {
     matches!(last, Some(Op::DefineGlobal))
 }
 
+/// How a namespace alias is used throughout an importing module's chunk — the verdict
+/// that decides whether the target module is per-binding shakeable or must be pinned
+/// whole. See [`classify_namespace_use`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceUse {
+    /// EVERY use of the alias is a STATIC member access (`alias.literalName`,
+    /// `alias.method()`, `alias?.literalName`) — the set of accessed property names
+    /// (possibly empty if the alias is imported but never used). The target is
+    /// per-binding shakeable: only these names need be seeded as roots.
+    Static(BTreeSet<Rc<str>>),
+    /// At least one use of the alias is DYNAMIC (`alias[key]`) or ESCAPES (the
+    /// namespace value flows into a call / return / store / arg / anything other than
+    /// an immediately-following static-member op). The target CANNOT be shaken; pin it
+    /// whole. `span` is the source span of the FIRST offending `GET_GLOBAL <alias>`.
+    Dynamic {
+        /// The source span of the first offending use (a zero span if the chunk has
+        /// no instruction span table).
+        span: Span,
+    },
+}
+
+/// Is `op` a STATIC-member access op whose FIRST `u16` operand is the accessed property
+/// NAME const index? These are exactly the ops a `GET_GLOBAL <alias>` may be immediately
+/// followed by for the use to count as a static `alias.<name>` access:
+///   - [`Op::GetProp`] / [`Op::GetPropOpt`] — `alias.name` / `alias?.name` reads, and the
+///     named-arg method-call lowering (`alias.name(x: 1)` emits `GET_PROP` then
+///     `CALL_NAMED`).
+///   - [`Op::CallMethod`] / [`Op::CallMethodSpread`] — `alias.name(args)` method calls
+///     (the name rides the call op; for a zero-arg call the op immediately follows the
+///     `GET_GLOBAL`).
+///
+/// Every other successor (an arg-computing op for `alias.name(arg)`, `GET_INDEX`'s key
+/// computation for `alias[k]`, a `DEFINE_GLOBAL`/`CALL`/`RETURN` consuming the namespace
+/// value) means the namespace is dynamically indexed or escapes — NOT a static member.
+/// Conservatively treating `alias.name(arg)` and `alias["literal"]` as non-static is
+/// SOUND (under-shaking never drops live code).
+fn static_member_op(op: Op) -> bool {
+    matches!(
+        op,
+        Op::GetProp | Op::GetPropOpt | Op::CallMethod | Op::CallMethodSpread
+    )
+}
+
+/// Classify how the namespace `alias` is used across `chunk` (recursing into every
+/// nested proto). A namespace alias is a user-global, so every use begins with
+/// `GET_GLOBAL <alias>`. For each such site we inspect the IMMEDIATELY following op:
+///   - a [`static_member_op`] → a static `alias.<name>` access; collect `<name>` (its
+///     first `u16` operand is the property-name const index).
+///   - anything else → the namespace escapes or is dynamically indexed → the whole
+///     target cannot be shaken. We return [`NamespaceUse::Dynamic`] on the FIRST such
+///     site (capturing its span) — but only after also scanning for it across protos.
+///
+/// The walk is byte-level and decode-resilient: an undecodable byte stops the linear
+/// scan of that chunk (we never index past `code`), and we never `.unwrap()`/`panic!`.
+pub fn classify_namespace_use(chunk: &Chunk, alias: &str) -> NamespaceUse {
+    let mut props: BTreeSet<Rc<str>> = BTreeSet::new();
+    if let Some(span) = classify_namespace_use_rec(chunk, alias, &mut props) {
+        NamespaceUse::Dynamic { span }
+    } else {
+        NamespaceUse::Static(props)
+    }
+}
+
+/// The recursive worker for [`classify_namespace_use`]. Walks `chunk.code`, then every
+/// nested proto's chunk. Returns `Some(span)` at the FIRST dynamic/escaping use of
+/// `alias` (short-circuiting), or `None` if every use is a static member (with the
+/// accessed names accumulated into `props`).
+fn classify_namespace_use_rec(
+    chunk: &Chunk,
+    alias: &str,
+    props: &mut BTreeSet<Rc<str>>,
+) -> Option<Span> {
+    let code = &chunk.code;
+    let len = code.len();
+    let mut ip = 0usize;
+    while ip < len {
+        let Some(op) = Op::from_u8(code[ip]) else {
+            // Undecodable byte: stop scanning this chunk's linear stream (defensive —
+            // never read past the code).
+            break;
+        };
+        let width = op.operand_width();
+        if op == Op::GetGlobal {
+            // The GET_GLOBAL's u16 operand names the global being read.
+            if ip + 2 < len {
+                let name_idx = chunk.read_u16(ip + 1) as usize;
+                let is_alias = matches!(
+                    chunk.consts.get(name_idx),
+                    Some(crate::value::Value::Str(name)) if &**name == alias
+                );
+                if is_alias {
+                    // Inspect the op immediately after this GET_GLOBAL.
+                    let next_ip = ip + 1 + width;
+                    let next_op = if next_ip < len {
+                        Op::from_u8(code[next_ip])
+                    } else {
+                        None
+                    };
+                    match next_op {
+                        Some(next) if static_member_op(next) => {
+                            // The accessed property name is the next op's first u16
+                            // operand. Collect it; this use is static.
+                            if next_ip + 2 < len {
+                                let prop_idx = chunk.read_u16(next_ip + 1) as usize;
+                                if let Some(crate::value::Value::Str(name)) =
+                                    chunk.consts.get(prop_idx)
+                                {
+                                    props.insert(name.clone());
+                                }
+                            }
+                        }
+                        _ => {
+                            // Dynamic index or escape: capture the span of THIS
+                            // GET_GLOBAL site and short-circuit.
+                            return Some(chunk.span_at(ip));
+                        }
+                    }
+                }
+            }
+        }
+        ip += 1 + width;
+    }
+    // Recurse into nested protos (a static/dynamic use can live inside a fn body).
+    for proto in &chunk.protos {
+        if let Some(span) = classify_namespace_use_rec(&proto.chunk, alias, props) {
+            return Some(span);
+        }
+    }
+    None
+}
+
 /// Compute, for each module in `graph`, the set of top-level binding NAMES that must
 /// be KEPT (the reachable closure), plus a minimal report. See the module docs for
 /// the semantics; `graph[0]` is the entry and is kept whole.
@@ -216,10 +362,20 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
         base_roots.push(roots);
     }
 
-    // Import roots + namespace pins. An edge's contribution is static (a top-level
-    // import always runs), so these are computed once, up front.
+    // Import roots + namespace classification. An edge's contribution is static (a
+    // top-level import always runs), so these are computed once, up front.
+    //
+    // A `Namespace` edge is classified by [`classify_namespace_use`] against the
+    // IMPORTER's chunk:
+    //   - `Static(props)` → seed `target`'s roots with `props` (exactly like a `Named`
+    //     edge) — the unaccessed exports become shakeable.
+    //   - `Dynamic { span }` → pin the WHOLE `target` AND record a `PinReason`. ANY
+    //     dynamic edge into a target pins it whole (over a `Static` edge from elsewhere).
     let mut import_roots: Vec<Vec<Rc<str>>> = vec![Vec::new(); n];
     let mut pinned_whole: Vec<bool> = vec![false; n];
+    // Per-pinned-target: the (alias, span) of the FIRST dynamic namespace use that
+    // pinned it (for the report). Graph-deterministic: edges are walked in node order.
+    let mut pin_info: Vec<Option<(Rc<str>, Span)>> = vec![None; n];
     for node in graph {
         for edge in &node.edges {
             match edge {
@@ -228,9 +384,25 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
                         slot.extend(names.iter().cloned());
                     }
                 }
-                ImportEdge::Namespace { target } => {
-                    if let Some(slot) = pinned_whole.get_mut(*target) {
-                        *slot = true;
+                ImportEdge::Namespace { target, alias } => {
+                    let t = *target;
+                    match classify_namespace_use(&node.chunk, alias) {
+                        NamespaceUse::Static(props) => {
+                            // Per-binding shake: seed only the accessed exports.
+                            if let Some(slot) = import_roots.get_mut(t) {
+                                slot.extend(props.iter().cloned());
+                            }
+                        }
+                        NamespaceUse::Dynamic { span } => {
+                            if let Some(slot) = pinned_whole.get_mut(t) {
+                                *slot = true;
+                            }
+                            if let Some(slot) = pin_info.get_mut(t) {
+                                if slot.is_none() {
+                                    *slot = Some((alias.clone(), span));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -283,10 +455,18 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
             names: drop_names,
         });
         if pinned_whole[i] {
+            // `pin_info[i]` is set whenever `pinned_whole[i]` is (they are written
+            // together in the namespace-classification loop); fall back to a placeholder
+            // span + empty alias only if it were somehow absent (never in practice).
+            let (alias, span) = pin_info[i]
+                .clone()
+                .unwrap_or_else(|| (Rc::from(""), Span::new(0, 0)));
             pins.push(PinReason {
                 module: i,
                 key: node.key.clone(),
-                reason: "namespace import".to_string(),
+                reason: format!("namespace `{alias}` used dynamically or escapes"),
+                alias,
+                span,
             });
         }
     }
@@ -530,37 +710,168 @@ mod tests {
         assert!(!kept(&res, 1, "Other"), "unrelated class Other dropped");
     }
 
-    #[test]
-    fn namespace_import_pins_whole_module() {
-        // import * as m from lib → ALL of lib kept, report records the pin.
-        let entry = chunk(r#"let x = 1"#);
-        let lib = chunk(
-            r#"
-            fn a() { 1 }
-            fn b() { 2 }
-            fn c() { 3 }
-        "#,
-        );
-        let graph = vec![
+    /// Build a two-node graph: entry (index 0) `import * as m from "./lib"` with the
+    /// given entry source body, and `lib` (index 1) with the given lib source. The
+    /// namespace edge uses alias `m`.
+    fn ns_graph(entry_src: &str, lib_src: &str) -> Vec<ModuleNode> {
+        vec![
             ModuleNode {
                 key: "entry".into(),
-                chunk: entry,
-                edges: vec![ImportEdge::Namespace { target: 1 }],
+                chunk: chunk(entry_src),
+                edges: vec![ImportEdge::Namespace {
+                    target: 1,
+                    alias: rc("m"),
+                }],
             },
             ModuleNode {
                 key: "lib".into(),
-                chunk: lib,
+                chunk: chunk(lib_src),
                 edges: vec![],
             },
-        ];
+        ]
+    }
+
+    const LIB_ABC_HELPER: &str = r#"
+        fn helper() { return 0 }
+        fn foo() { return helper() }
+        fn bar() { return 2 }
+        fn baz() { return 3 }
+    "#;
+
+    #[test]
+    fn classify_static_member_reads() {
+        // `m.foo` (bare read) + `m.bar` (bare read) → Static({foo, bar}).
+        let c = chunk("import * as m from \"./lib\"\nlet a = m.foo\nlet b = m.bar\n");
+        match classify_namespace_use(&c, "m") {
+            NamespaceUse::Static(props) => {
+                assert!(props.contains(&rc("foo")));
+                assert!(props.contains(&rc("bar")));
+                assert_eq!(props.len(), 2);
+            }
+            other => panic!("expected Static, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_zero_arg_method_call_is_static() {
+        // `m.foo()` lowers to GET_GLOBAL m; CALL_METHOD foo — still a static member use.
+        let c = chunk("import * as m from \"./lib\"\nlet a = m.foo()\n");
+        match classify_namespace_use(&c, "m") {
+            NamespaceUse::Static(props) => assert!(props.contains(&rc("foo"))),
+            other => panic!("expected Static, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_unused_alias_is_static_empty() {
+        // Imported but never used → Static(∅): everything in the target is shakeable.
+        let c = chunk("import * as m from \"./lib\"\nlet x = 1\n");
+        assert_eq!(classify_namespace_use(&c, "m"), NamespaceUse::Static(BTreeSet::new()));
+    }
+
+    #[test]
+    fn classify_dynamic_index_is_dynamic() {
+        let c = chunk("import * as m from \"./lib\"\nlet k = \"foo\"\nlet r = m[k]\n");
+        assert!(matches!(
+            classify_namespace_use(&c, "m"),
+            NamespaceUse::Dynamic { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_escape_is_dynamic() {
+        // `let g = m` — the namespace value flows into a store.
+        let c = chunk("import * as m from \"./lib\"\nlet g = m\n");
+        assert!(matches!(
+            classify_namespace_use(&c, "m"),
+            NamespaceUse::Dynamic { .. }
+        ));
+    }
+
+    #[test]
+    fn namespace_static_use_shakes_unused() {
+        // Test 1: entry uses only m.foo + m.bar; lib has foo (calls helper), bar, baz.
+        // keep[lib] ⊇ {foo, bar, helper}, ∌ baz.
+        let graph = ns_graph(
+            "import * as m from \"./lib\"\nlet a = m.foo()\nlet b = m.bar()\n",
+            LIB_ABC_HELPER,
+        );
         let res = compute_reachable(&graph);
-        assert!(kept(&res, 1, "a"));
-        assert!(kept(&res, 1, "b"));
-        assert!(kept(&res, 1, "c"));
-        // Nothing dropped from a pinned module.
-        assert!(res.report.dropped[1].names.is_empty());
-        // The pin is recorded.
+        assert!(kept(&res, 1, "foo"), "m.foo accessed → foo kept");
+        assert!(kept(&res, 1, "bar"), "m.bar accessed → bar kept");
+        assert!(kept(&res, 1, "helper"), "foo's transitive helper kept");
+        assert!(!kept(&res, 1, "baz"), "unaccessed baz dropped");
+        assert!(res.report.dropped[1].names.contains(&rc("baz")));
+        // A statically-shaken namespace records NO pin.
+        assert!(
+            res.report.pins.is_empty(),
+            "static namespace use must not pin"
+        );
+    }
+
+    #[test]
+    fn namespace_dynamic_index_pins_whole() {
+        // Test 2: entry uses m[k] (computed) → keep[lib] = ALL lib exports; pin recorded.
+        let graph = ns_graph(
+            "import * as m from \"./lib\"\nlet k = \"foo\"\nlet r = m[k]\n",
+            LIB_ABC_HELPER,
+        );
+        let res = compute_reachable(&graph);
+        for name in ["foo", "bar", "baz", "helper"] {
+            assert!(kept(&res, 1, name), "dynamic index pins whole: {name} kept");
+        }
+        assert!(res.report.dropped[1].names.is_empty(), "nothing dropped");
+        let pin = res
+            .report
+            .pins
+            .iter()
+            .find(|p| p.module == 1)
+            .expect("lib pinned");
+        assert_eq!(&*pin.alias, "m");
+        assert!(pin.reason.contains('m'));
+    }
+
+    #[test]
+    fn namespace_escape_pins_whole() {
+        // Test 3: entry does `let g = m` (escape) → whole-module pin + report.
+        let graph = ns_graph(
+            "import * as m from \"./lib\"\nlet g = m\n",
+            LIB_ABC_HELPER,
+        );
+        let res = compute_reachable(&graph);
+        for name in ["foo", "bar", "baz", "helper"] {
+            assert!(kept(&res, 1, name), "escape pins whole: {name} kept");
+        }
         assert!(res.report.pins.iter().any(|p| p.module == 1));
+    }
+
+    #[test]
+    fn namespace_mixed_static_and_dynamic_pins_whole() {
+        // Test 4: m.foo AND m[k] in the same module → ANY dynamic pins whole.
+        let graph = ns_graph(
+            "import * as m from \"./lib\"\nlet a = m.foo()\nlet k = \"bar\"\nlet r = m[k]\n",
+            LIB_ABC_HELPER,
+        );
+        let res = compute_reachable(&graph);
+        for name in ["foo", "bar", "baz", "helper"] {
+            assert!(kept(&res, 1, name), "mixed → whole pin: {name} kept");
+        }
+        assert!(res.report.pins.iter().any(|p| p.module == 1));
+    }
+
+    #[test]
+    fn namespace_static_use_inside_nested_fn() {
+        // Test 5: `fn wrap() { return m.foo() }` — static use inside a proto (not
+        // top-level). Proto recursion must still detect static `foo`; baz dropped.
+        let graph = ns_graph(
+            "import * as m from \"./lib\"\nfn wrap() { return m.foo() }\n",
+            LIB_ABC_HELPER,
+        );
+        let res = compute_reachable(&graph);
+        assert!(kept(&res, 1, "foo"), "m.foo inside wrap → foo kept");
+        assert!(kept(&res, 1, "helper"), "foo's helper kept");
+        assert!(!kept(&res, 1, "baz"), "baz dropped (proto recursion works)");
+        assert!(res.report.pins.is_empty());
     }
 
     #[test]
