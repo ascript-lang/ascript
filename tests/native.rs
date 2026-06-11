@@ -797,3 +797,122 @@ fn native_worker_returns_class_with_nested_field_from_bundle() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&empty);
 }
+
+// ── SELF-CONTAINED-BUNDLES Task 3.1 — embed the composed CapSet in the archive ──────────────
+
+use ascript::stdlib::caps::{Cap, CapSet};
+use ascript::vm::archive::ModuleArchive;
+
+/// `ascript build <ARGS> <src> -o <out>` (arbitrary extra flags, e.g. `--native --deny net`).
+/// Asserts success. The CALLER must hold [`serial_native`] when building a `--native` bundle.
+fn build_with(extra: &[&str], src: &Path, out: &Path) {
+    let o = Command::new(bin())
+        .arg("build")
+        .args(extra)
+        .arg(src)
+        .arg("-o")
+        .arg(out)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "build {:?} failed: stdout={:?} stderr={:?}",
+        extra,
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.exists(), "artifact not written to {}", out.display());
+}
+
+/// Write a 2-module program (entry imports a sibling util) so `build` produces an `ASCRIPTA`
+/// archive (a single-module program would emit a bare `ASO\0` chunk with no manifest). Returns
+/// the entry path.
+fn write_multimodule(dir: &Path) -> PathBuf {
+    write(
+        dir,
+        "util.as",
+        "export fn greet(name: string): string { return `Hi, ${name}!` }\n",
+    );
+    write(
+        dir,
+        "app.as",
+        "import { greet } from \"./util\"\nprint(greet(\"caps\"))\n",
+    )
+}
+
+/// Decode the `ModuleArchive` embedded in a `--native` bundle: read the footer to find the
+/// payload region, slice it, and `ModuleArchive::decode`. The payload is the EXACT archive bytes
+/// a plain `build` writes (BIN: bundling, not AOT), so the same decode applies to both.
+fn decode_bundle_archive(bundle: &Path) -> ModuleArchive {
+    let bytes = std::fs::read(bundle).unwrap();
+    assert!(bytes.len() >= 32, "bundle too small for a footer");
+    let footer = &bytes[bytes.len() - 32..];
+    assert_eq!(&footer[24..32], b"ASCRIPTB", "footer magic not at the tail");
+    let off = u64::from_le_bytes(footer[0..8].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
+    let payload = &bytes[off..off + len];
+    ModuleArchive::decode(payload).expect("embedded payload decodes as a ModuleArchive")
+}
+
+/// Assert a `CapSet` denies exactly `denied` and grants every other cap.
+fn assert_only_denied(caps: &CapSet, denied: Cap) {
+    for cap in Cap::ALL {
+        if cap == denied {
+            assert!(!caps.has(cap), "expected {} DENIED", cap.name());
+        } else {
+            assert!(caps.has(cap), "expected {} granted", cap.name());
+        }
+    }
+}
+
+/// HEADLINE (Task 3.1) — `ascript build --native --deny net <multimodule>` embeds a `CapSet`
+/// in the archive manifest with `net` DENIED and every other cap granted.
+#[test]
+fn native_build_embeds_denied_net_in_archive() {
+    let _serial = serial_native();
+    let dir = tmp_dir("caps_native_net");
+    let entry = write_multimodule(&dir);
+    let app = dir.join("caps_net_app");
+    build_with(&["--native", "--deny", "net"], &entry, &app);
+
+    let archive = decode_bundle_archive(&app);
+    assert_only_denied(&archive.caps, Cap::Net);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plain `build` (no `--native`) embeds caps IDENTICALLY: `--deny fs` over a multi-module program
+/// produces an `.aso` ARCHIVE whose manifest denies `fs`. (Confirms `build` and `--native` agree.)
+#[test]
+fn plain_build_embeds_denied_fs_in_archive() {
+    let dir = tmp_dir("caps_plain_fs");
+    let entry = write_multimodule(&dir);
+    let out = dir.join("out.aso");
+    build_with(&["--deny", "fs"], &entry, &out);
+
+    let bytes = std::fs::read(&out).unwrap();
+    let archive = ModuleArchive::decode(&bytes).expect("multi-module build is an ASCRIPTA archive");
+    assert_only_denied(&archive.caps, Cap::Fs);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Default — a build with NO cap flags embeds an ALL-GRANTED `CapSet` (the placeholder behavior,
+/// now explicit and verified). Plain `build` over a multi-module program.
+#[test]
+fn build_without_cap_flags_embeds_all_granted() {
+    let dir = tmp_dir("caps_default");
+    let entry = write_multimodule(&dir);
+    let out = dir.join("out.aso");
+    build_with(&[], &entry, &out);
+
+    let bytes = std::fs::read(&out).unwrap();
+    let archive = ModuleArchive::decode(&bytes).expect("multi-module build is an ASCRIPTA archive");
+    assert_eq!(
+        archive.caps,
+        CapSet::all_granted(),
+        "a build with no cap flags must embed an all-granted CapSet"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

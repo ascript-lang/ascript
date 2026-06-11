@@ -932,19 +932,37 @@ pub fn build_file(
     file: &Path,
     out: Option<&Path>,
     with_debug: bool,
+    caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<std::path::PathBuf, AsError> {
     // SELF-CONTAINED-BUNDLES (Task 1.5): a multi-module program is emitted as an
     // `ASCRIPTA` archive embedding the whole reachable import graph (so `run out.aso`
     // works from a directory WITHOUT the sources). A single-module program recompiles
     // the lone entry to a bare `ASO\0` chunk — byte-identical to the pre-archive
     // artifact, so existing `.aso` goldens/tests stay valid.
-    let (archive, report) = compile_archive(file, with_debug)?;
+    let (mut archive, report) = compile_archive(file, with_debug)?;
     let bytes = if archive.modules.len() > 1 {
+        // SELF-CONTAINED-BUNDLES (Task 3.1): embed the composed CapSet into the archive
+        // manifest BEFORE encoding (Task 3.2 enforces it at runtime). `None` → all
+        // granted (the byte-identical placeholder), so a build with no cap flags is
+        // unchanged. Set on the returned archive so `compile_archive`'s signature is
+        // untouched.
+        archive.caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
         // Multi-module archive: surface the tree-shaking summary on STDERR (never stdout
         // — stdout carries only `compiled … -> …`, keeping the program corpus byte-clean).
         print_shake_report(&report);
         archive.encode() // ASCRIPTA — embed the whole module graph
     } else {
+        // SELF-CONTAINED-BUNDLES (Task 3.1): a single-module program emits a bare `ASO\0`
+        // chunk that carries NO manifest, so the composed caps have no home here yet. Task
+        // 3.2 will make this path always emit an archive (so caps always have a home). Do
+        // NOT silently drop a restriction: warn the user that the embedding lands in 3.2.
+        if caps.is_some() {
+            eprintln!(
+                "warning: a single-module program compiles to a bare chunk with no capability \
+                 manifest, so the composed --deny/--sandbox restriction is NOT embedded yet \
+                 (it requires the archive path, coming in Task 3.2); run-time `--deny` still applies"
+            );
+        }
         // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
         // entry under its CANONICALIZED absolute path for stable dedup identity, which a
         // debug `.aso` embeds as the source path — leaking the build machine's layout. A
@@ -1488,6 +1506,7 @@ pub fn build_native(
     file: &Path,
     out: Option<&Path>,
     target: Option<&str>,
+    caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<std::path::PathBuf, AsError> {
     // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
     // naming the requested triple, never a silent ignore or a generic clap failure.
@@ -1503,13 +1522,28 @@ pub fn build_native(
     // `ASCRIPTA` archive embedding the whole import graph for a multi-module program
     // (so the bundled binary runs from an empty directory). The `stub || payload ||
     // footer` framing below is unchanged: the payload is opaque to the bundler.
-    let (archive, report) = compile_archive(file, true)?;
+    let (mut archive, report) = compile_archive(file, true)?;
     let payload = if archive.modules.len() > 1 {
+        // SELF-CONTAINED-BUNDLES (Task 3.1): embed the composed CapSet into the archive
+        // manifest BEFORE encoding — consistent with the plain `build` path (Task 3.2
+        // enforces it at runtime). `None` → all granted (byte-identical placeholder).
+        archive.caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
         // Multi-module bundle: surface the tree-shaking summary on STDERR (the `bundled …
         // -> …` line stays on stdout).
         print_shake_report(&report);
         archive.encode() // ASCRIPTA — embed the whole module graph
     } else {
+        // SELF-CONTAINED-BUNDLES (Task 3.1): a single-module program bundles a bare `ASO\0`
+        // chunk with NO capability manifest, so the composed caps have no home in the
+        // payload yet. Task 3.2 will make `--native` always emit an archive (so caps always
+        // have a home). Warn rather than silently drop a user's restriction.
+        if caps.is_some() {
+            eprintln!(
+                "warning: a single-module program bundles a bare chunk with no capability \
+                 manifest, so the composed --deny/--sandbox restriction is NOT embedded yet \
+                 (it requires the archive path, coming in Task 3.2); run-time `--deny` still applies"
+            );
+        }
         // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
         // entry under its CANONICALIZED absolute path, which a debug `.aso` embeds as the
         // source path (this is always a debug build → `with_debug=true`). A fresh compile

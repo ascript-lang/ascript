@@ -99,6 +99,25 @@ enum Command {
         /// a clear error). Requires `--native`.
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
+        /// FFI §4.2: deny one or more capabilities (opt-out). Repeatable and/or
+        /// comma-separated, e.g. `--deny ffi,process`. Valid names: fs, net,
+        /// process, ffi, env. Composes (union of denials) with the manifest
+        /// `[capabilities]` table; denial is monotone (CLI cannot re-grant). The
+        /// composed set is EMBEDDED in the produced archive manifest.
+        #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
+        deny: Vec<String>,
+        /// FFI §4.2: deny ALL five dangerous capabilities (fs, net, process, ffi,
+        /// env). Sugar for `--deny fs,net,process,ffi,env`.
+        #[arg(long = "sandbox")]
+        sandbox: bool,
+        /// FFI §4.4: a granular net carve-out: `--deny-net=external` (allow
+        /// loopback/private, block public) or `--deny-net=all`.
+        #[arg(long = "deny-net", value_name = "MODE")]
+        deny_net: Option<String>,
+        /// FFI §4.4: a granular fs carve-out: `--deny-fs=write` (reads allowed,
+        /// writes denied) or `--deny-fs=all`.
+        #[arg(long = "deny-fs", value_name = "MODE")]
+        deny_fs: Option<String>,
     },
     /// Start the interactive REPL
     Repl {
@@ -769,13 +788,30 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
+            deny,
+            sandbox,
+            deny_net,
+            deny_fs,
         } => {
             let out_path = out.as_deref().map(std::path::Path::new);
             let src = std::path::Path::new(&file);
+            // SELF-CONTAINED-BUNDLES (Task 3.1): compose the initial CapSet from the
+            // CLI flags + the nearest `ascript.toml` `[capabilities]` table (the SAME
+            // `compose_caps` the `run`/`test` commands use — single source of truth).
+            // `None` → all granted (the byte-identical default); `Some` → restricted.
+            // The composed set is EMBEDDED into the produced archive manifest (Task 3.2
+            // enforces it at runtime).
+            let caps = match compose_caps(src, &deny, sandbox, deny_net.as_deref(), deny_fs.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            };
             if native {
                 // BIN: bundle a self-contained native executable. `--target` is
                 // host-only in v1 (build_native returns the specific Tier-1 error).
-                match ascript::build_native(src, out_path, target.as_deref()) {
+                match ascript::build_native(src, out_path, target.as_deref(), caps) {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
                     Err(e) => {
                         ascript::diagnostics::report(&e);
@@ -783,7 +819,7 @@ async fn real_main() -> ExitCode {
                     }
                 }
             } else {
-                match ascript::build_file(src, out_path, !strip) {
+                match ascript::build_file(src, out_path, !strip, caps) {
                     Ok(written) => {
                         println!("compiled {} -> {}", file, written.display());
                         ExitCode::SUCCESS
