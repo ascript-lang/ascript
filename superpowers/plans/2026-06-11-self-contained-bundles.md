@@ -596,12 +596,14 @@ impl ModuleArchive {
 - Modify: `src/lib.rs` (`compile_verified_aso_bytes`, `build_native`, `run_embedded_aso`, `run_verified_aso`/`run_aso_file`), `src/main.rs`
 - Test: `tests/native.rs`, `tests/cli.rs`
 
-- [ ] **Step 1: Write the failing test** — (a) `ascript build multimodule.as -o out.aso` then `ascript run out.aso` from a directory WITHOUT the sources works; (b) `ascript build --native multimodule.as -o app` then `./app` from an empty dir works.
-- [ ] **Step 2: Run them — expect FAIL.**
-- [ ] **Step 3: Implement** — `build`/`build --native` call `compile_archive`; when the graph has >1 module, serialize the `ModuleArchive` (magic `ASCRIPTA`) as the `.aso`/payload; a single-module graph still emits a bare chunk (`ASO\0`) for compat. The loader/`run_aso_file`/`run_embedded_aso` dispatch on the leading magic: `ASO\0` → today's single-chunk path; `ASCRIPTA` → decode the archive, install it into `module_archive`, run the entry chunk.
-- [ ] **Step 4: Run them — expect PASS.**
-- [ ] **Step 5: §9.1** — native + cli tests; docs: bundles page "what's embedded"; blast-radius: `bundle.rs` `validate_footer` is unchanged (payload is opaque), but `try_run_embedded` must hand the archive bytes to the archive-aware runner; verify `.aso` golden tests dispatch correctly.
-- [ ] **Step 6: Commit** — `git commit -m "feat(build): emit and run module archives from build and --native"`
+- [x] **Step 1: Write the failing test** — (a) `ascript build multimodule.as -o out.aso` then `ascript run out.aso` from a directory WITHOUT the sources works; (b) `ascript build --native multimodule.as -o app` then `./app` from an empty dir works.
+- [x] **Step 2: Run them — expect FAIL.**
+- [x] **Step 3: Implement** — `build`/`build --native` call `compile_archive`; when the graph has >1 module, serialize the `ModuleArchive` (magic `ASCRIPTA`) as the `.aso`/payload; a single-module graph still emits a bare chunk (`ASO\0`) for compat. The loader/`run_aso_file`/`run_embedded_aso` dispatch on the leading magic: `ASO\0` → today's single-chunk path; `ASCRIPTA` → decode the archive, install it into `module_archive`, run the entry chunk.
+- [x] **Step 4: Run them — expect PASS.**
+- [x] **Step 5: §9.1** — native + cli tests; docs: bundles page "what's embedded"; blast-radius: `bundle.rs` `validate_footer` is unchanged (payload is opaque), but `try_run_embedded` must hand the archive bytes to the archive-aware runner; verify `.aso` golden tests dispatch correctly.
+- [x] **Step 6: Commit** — `git commit -m "feat(build): emit and run module archives from build and --native"`
+
+> **Accepted (1.5):** commit `c324d1e` (build/run wiring) + `930f134` (review-fix comments). Magic dispatch in the SHARED `run_verified_aso` (covers both `run app.aso` and native `./app`); new `run_verified_archive` mirrors the single-chunk runner but installs the archive (`set_module_dir` BEFORE `set_module_archive` for the 1.4 sibling-fallback carry-forward), bounds-checks the entry index, installs only CLI caps (archive.caps enforcement = Phase 3). **Diagnostics-parity fix folded in:** `compile_archive(entry, with_debug)` — multi-module archives now preserve debug info per the caller (`build` honors `!strip`, `--native` always debug) instead of the old hardcoded `false`. **Single-module byte-identicality preserved** by recompiling via `compile_verified_aso_bytes(file, with_debug)` (NOT reusing the archive's canonicalized-path entry bytes — verified via `aso.rs:547` that reuse would leak the absolute build-machine path). `bundle.rs` untouched (0-byte diff). Spec ✅ + code-quality ✅. Gates: cli 151/0, native 11/0, archive 15/15 both configs, four-mode differential 378/378 both configs, clippy clean both configs. **Carry-forward to 1.6:** archive-mode worker bytes are the ENTRY chunk only (`set_worker_aso_bytes(entry)`); 1.6 must ship the WHOLE `ModuleArchive` across the airlock so a `worker fn` calling an imported module resolves from the embedded graph.
 
 ### Task 1.6: worker parity for embedded archives
 
