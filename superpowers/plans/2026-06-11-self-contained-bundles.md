@@ -654,12 +654,14 @@ impl ModuleArchive {
 - Modify: `src/compile/shake.rs`
 - Test: inline `#[test]`
 
-- [ ] **Step 1: Write the failing test** — a module namespace-imported as `import * as m` and then indexed `m[key]` (dynamic) keeps ALL of `m`'s exports; a namespace used only as `m.literal` shakes the rest.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Implement** — when resolving a `Namespace` import, scan its uses: any dynamic `GetIndex`/computed member on `m`, or `m` escaping (returned/stored/passed), pins every export of the target module (mark all reachable + record the reason+span in the report). Only all-static-`.literal` access permits per-binding shaking.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust test; blast-radius: re-exports (`export { x } from "./y"`) treated as a reference to `x` in `y`; a value-returning function whose result escapes does not under-shake.
-- [ ] **Step 6: Commit** — `git commit -m "feat(shake): pin whole module on dynamic namespace access/escape"`
+- [x] **Step 1: Write the failing test** — a module namespace-imported as `import * as m` and then indexed `m[key]` (dynamic) keeps ALL of `m`'s exports; a namespace used only as `m.literal` shakes the rest.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Implement** — when resolving a `Namespace` import, scan its uses: any dynamic `GetIndex`/computed member on `m`, or `m` escaping (returned/stored/passed), pins every export of the target module (mark all reachable + record the reason+span in the report). Only all-static-`.literal` access permits per-binding shaking.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust test; blast-radius: re-exports (`export { x } from "./y"`) treated as a reference to `x` in `y`; a value-returning function whose result escapes does not under-shake.
+- [x] **Step 6: Commit** — `git commit -m "feat(shake): pin whole module on dynamic namespace access/escape"`
+
+> **Accepted (2.2):** commits `8a153b9` (dynamic/escape pin) + `6420ad1` (method-call receiver shaking) + `12f3cb5` (review fixes). `ImportEdge::Namespace{target, alias}`; `classify_namespace_use(chunk, alias)` scans every `GET_GLOBAL alias` site (recursing into protos) and classifies each via a forward STACK SIMULATION tracking the height above `m`: consumer is `GetProp`/`GetPropOpt` (member read) or `CallMethod`/`CallMethodSpread` with `m` as receiver (`pops == above+1`) → STATIC (record name); else ESCAPE. **Beyond the bare plan (per user's "trace everything"):** static `m.foo(args)` method calls (the dominant pattern) are shaken, not just `m.foo` reads. **SOUNDNESS:** the sim bails to ESCAPE (pin whole) on any jump/branch/terminator/`Dup`/`Swap`/`Rot3`/undecodable/run-off — straight-line only; per-site independence means ANY escaping site pins the whole module; only all-static shakes to the union. Pop/push counts come from the authoritative `verify::op_stack_pops_pushes` (and `op_stack_delta` now DELEGATES to it — single source of truth for the `Op::Class` special case). Spec/soundness review threw 35+ adversarial cases (arg-vs-receiver, spread, nested `m.foo(m.bar())`, all 118 opcodes for bail completeness) → ZERO over-shapes. Re-export form confirmed ABSENT in the grammar (only `export <decl>`). Analysis-only; runtime untouched. 25/25 shake tests; vm::verify 26/0; differential 378/0 both configs; vm_limits 16/0; clippy clean both configs.
 
 ### Task 2.3: compile only kept declarations into each archived module
 
