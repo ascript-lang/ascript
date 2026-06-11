@@ -1692,6 +1692,41 @@ pub async fn run_embedded_aso(payload: &[u8], args: &[String]) -> Result<i32, As
     run_verified_aso(payload, args, None, module_dir, "the embedded program").await
 }
 
+/// SELF-CONTAINED-BUNDLES (Task 3.3): MONOTONE launch-time capability subtraction via the
+/// `ASCRIPT_DENY` env var. A deployer can FURTHER restrict an already-built `.aso`/bundle at
+/// launch (`ASCRIPT_DENY=fs ./app`) — it can ONLY subtract (`CapSet::deny`), NEVER re-grant.
+/// Unset/empty/whitespace → `caps` unchanged (the common case, zero behavior change). An
+/// unknown name is a clean STARTUP `AsError` (the `?` at each call site aborts before any code
+/// runs — non-zero exit), matching the `--deny` error grammar in `compose_caps`. Wired ONLY
+/// into the `.aso`/bundle launch paths (`run_verified_aso`/`run_verified_archive`); a source
+/// run (`ascript run x.as`) restricts via CLI `--deny` instead.
+fn apply_ascript_deny(
+    mut caps: crate::stdlib::caps::CapSet,
+) -> Result<crate::stdlib::caps::CapSet, AsError> {
+    let raw = match std::env::var("ASCRIPT_DENY") {
+        Ok(v) => v,
+        Err(_) => return Ok(caps), // unset (or non-UTF-8) → no further restriction
+    };
+    if raw.trim().is_empty() {
+        return Ok(caps);
+    }
+    for name in raw.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match crate::stdlib::caps::cap_name(name) {
+            Some(cap) => caps.deny(cap), // MONOTONE: only ever subtracts
+            None => {
+                return Err(AsError::new(format!(
+                    "ASCRIPT_DENY: unknown capability '{name}' (expected one of: fs, net, process, ffi, env)"
+                )))
+            }
+        }
+    }
+    Ok(caps)
+}
+
 /// The shared verified-run body behind [`run_aso_file`] and [`run_embedded_aso`] (BIN Task
 /// 2): `Chunk::from_bytes_verified` (the single trust boundary) → `Interp` setup →
 /// `set_worker_aso_bytes` → `Vm` → `LocalSet` run → telemetry flush → GC → the
@@ -1722,10 +1757,14 @@ async fn run_verified_aso(
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
-    // FFI §4.5: install the composed capability set before running any code.
-    if let Some(caps) = caps {
-        interp.set_caps(caps);
-    }
+    // FFI §4.5: install the composed capability set before running any code. Start from the
+    // passed-in caps (or all-granted for a native bare-chunk bundle with no CLI `--deny`),
+    // then apply the MONOTONE `ASCRIPT_DENY` launch-time subtraction (Task 3.3) so even an
+    // unrestricted bundle can be tightened by `ASCRIPT_DENY=fs ./app` — `?` makes an invalid
+    // name a clean startup error (the program never runs). `script_args` is untouched.
+    let caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
+    let caps = apply_ascript_deny(caps)?;
+    interp.set_caps(caps);
     // Workers Spec A (.aso path): retain the raw bytes so `dispatch_worker_closure` can
     // re-parse them into the top-level chunk and build a worker code slice without source.
     interp.set_worker_aso_bytes(Rc::from(payload));
@@ -1794,6 +1833,12 @@ async fn run_verified_archive(
     let effective_caps = archive
         .caps
         .restrict_with(&caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted));
+    // SELF-CONTAINED-BUNDLES (Task 3.3): apply the MONOTONE `ASCRIPT_DENY` launch-time
+    // subtraction on top of the composed floor — a native bundle has NO CLI `--deny` (the
+    // startup shim runs before clap), so `ASCRIPT_DENY` is the only launch-time restriction
+    // knob. It can ONLY subtract (never re-grant); `?` turns an invalid name into a clean
+    // startup error before any code runs. Idempotent w.r.t. the floor (denying twice = denied).
+    let effective_caps = apply_ascript_deny(effective_caps)?;
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);

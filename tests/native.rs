@@ -941,6 +941,39 @@ fn run_artifact_in(extra: &[&str], artifact: &Path, dir: &Path, args: &[&str]) -
         .unwrap()
 }
 
+// ── SELF-CONTAINED-BUNDLES Task 3.3 — `ASCRIPT_DENY` monotone launch-time subtraction ─────────
+//
+// `ASCRIPT_DENY=fs ./app` further restricts an already-built bundle at launch. It can ONLY
+// subtract caps (never re-grant); an invalid name is a clean STARTUP error (the program never
+// runs). It is the ONLY launch-time restriction knob for a native `./app` (no CLI `--deny`
+// reaches the shim, which runs before clap), and it ALSO covers `ascript run x.aso`.
+
+/// Run a native bundle (like [`run_bundle`]) but with `ASCRIPT_DENY` set to `deny` on the
+/// spawned process. The shim reads it before clap; argv (`args`) is still forwarded intact.
+fn run_bundle_deny(bundle: &Path, cwd: &Path, deny: &str, args: &[&str]) -> Output {
+    Command::new(bundle)
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", "") // genuinely scrubbed — nothing to fall back to
+        .env("ASCRIPT_DENY", deny)
+        .output()
+        .unwrap()
+}
+
+/// Run an `.aso`/archive artifact via `ascript run` (like [`run_artifact_in`]) with
+/// `ASCRIPT_DENY` set on the spawned process.
+#[cfg_attr(not(feature = "sys"), allow(dead_code))]
+fn run_artifact_deny(artifact: &Path, dir: &Path, deny: &str, args: &[&str]) -> Output {
+    Command::new(bin())
+        .arg("run")
+        .arg(artifact)
+        .args(args)
+        .current_dir(dir)
+        .env("ASCRIPT_DENY", deny)
+        .output()
+        .unwrap()
+}
+
 /// Write a 2-module program that prints a NON-net line (from a sibling util), then makes a NET
 /// call (`net.lookup`) that is NOT recovered — so the line proves a non-net path runs while the
 /// net call's verdict decides exit/stderr. Returns the entry path.
@@ -1215,6 +1248,251 @@ fn embedded_caps_denied_per_cap_audit() {
     #[cfg(feature = "ffi")]
     assert_embedded_denial(
         &dir, "ffi", "import * as ffi from \"std/ffi\"", "ffi.open(\"libm.so.6\")", "ffi",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write a 2-module program (forces an `ASCRIPTA` archive) that prints `caps.list()` after a
+/// non-cap marker line. The effective capability set is OBSERVABLE on stdout — used to prove
+/// `ASCRIPT_DENY` subtracts (and never re-grants) without needing any OS-surface feature.
+fn write_caps_probe(dir: &Path) -> PathBuf {
+    write(dir, "probe_util.as", "export fn tag(): string { return \"probe-ok\" }\n");
+    write(
+        dir,
+        "probe.as",
+        "import { tag } from \"./probe_util\"\n\
+         import * as caps from \"std/caps\"\n\
+         print(tag())\n\
+         print(caps.list())\n",
+    )
+}
+
+/// SUBTRACT FROM ALL-GRANTED (Task 3.3, test 1) — a multi-module bundle built with NO cap flags
+/// (all-granted) is FURTHER restricted at launch by `ASCRIPT_DENY=fs ./app`: an `fs.*` call is
+/// denied (`capability 'fs' denied`, non-zero exit) while a non-fs path still runs. Proves
+/// launch-time subtraction over a bundle that itself granted everything.
+#[test]
+#[cfg(feature = "sys")]
+fn ascript_deny_subtracts_from_all_granted_bundle() {
+    let _serial = serial_native();
+    let dir = tmp_dir("deny_subtract");
+    write(&dir, "subutil.as", "export fn ok(): string { return \"non-fs-ok\" }\n");
+    let entry = write(
+        &dir,
+        "subapp.as",
+        "import { ok } from \"./subutil\"\n\
+         import * as fs from \"std/fs\"\n\
+         print(ok())\n\
+         let r = fs.read(\"/etc/hosts\")\n\
+         print(\"reached-fs\")\n",
+    );
+    let empty = tmp_dir("deny_subtract_cwd");
+
+    // Built all-granted (no cap flags).
+    let app = dir.join("subtract_app");
+    build_native(&entry, &app);
+
+    // Launch with ASCRIPT_DENY=fs → the fs call is denied, the non-fs line still prints.
+    let b = run_bundle_deny(&app, &empty, "fs", &[]);
+    assert!(!b.status.success(), "ASCRIPT_DENY=fs must deny the fs call");
+    let out = String::from_utf8_lossy(&b.stdout);
+    assert!(out.contains("non-fs-ok"), "the non-fs line must still print: {out}");
+    assert!(!out.contains("reached-fs"), "the fs call must NOT proceed: {out}");
+    let err = String::from_utf8_lossy(&b.stderr);
+    assert!(err.contains("capability 'fs' denied"), "fs denial expected: {err}");
+
+    // Sanity: the SAME bundle without ASCRIPT_DENY does NOT deny fs (proves the env var is the
+    // cause, not a build artifact).
+    let g = run_bundle(&app, &empty, &[]);
+    let gerr = String::from_utf8_lossy(&g.stderr);
+    assert!(
+        !gerr.contains("capability 'fs' denied"),
+        "an all-granted bundle with no ASCRIPT_DENY must not deny fs: {gerr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// CANNOT RE-GRANT (Task 3.3, test 2) — a bundle built `--deny net` keeps `net` denied no matter
+/// what `ASCRIPT_DENY` is: `ASCRIPT_DENY` has NO grant syntax. With `ASCRIPT_DENY=fs` the embedded
+/// `net` floor survives (now BOTH net and fs are gone via the `caps.list()` probe); with
+/// `ASCRIPT_DENY` UNSET the embedded floor is unchanged (net denied, fs still granted). Uses the
+/// CORE `caps.list()` probe so no OS-surface feature is needed.
+#[test]
+fn ascript_deny_cannot_regrant_embedded_floor() {
+    let _serial = serial_native();
+    let dir = tmp_dir("deny_no_regrant");
+    let entry = write_caps_probe(&dir);
+    let empty = tmp_dir("deny_no_regrant_cwd");
+
+    // Built with the embedded floor denying net.
+    let app = dir.join("noregrant_app");
+    build_with(&["--native", "--deny", "net"], &entry, &app);
+    let arch = decode_bundle_archive(&app);
+    assert_only_denied(&arch.caps, Cap::Net);
+
+    // (a) ASCRIPT_DENY=fs → net STILL denied (floor cannot be re-granted) AND fs now denied too.
+    let b = run_bundle_deny(&app, &empty, "fs", &[]);
+    assert!(b.status.success(), "probe should run: {}", String::from_utf8_lossy(&b.stderr));
+    let list = String::from_utf8_lossy(&b.stdout);
+    assert!(list.contains("probe-ok"), "marker line prints: {list}");
+    assert!(
+        !list.contains("net") && !list.contains("fs"),
+        "net (floor, never re-granted) AND fs (ASCRIPT_DENY) must both be denied: {list}"
+    );
+
+    // (b) ASCRIPT_DENY UNSET → embedded floor unchanged: net denied, fs still granted.
+    let g = run_bundle(&app, &empty, &[]);
+    let glist = String::from_utf8_lossy(&g.stdout);
+    assert!(!glist.contains("net"), "net denied by the embedded floor: {glist}");
+    assert!(glist.contains("fs"), "fs still granted with no ASCRIPT_DENY: {glist}");
+
+    // (c) ASCRIPT_DENY="" (empty) → no further restriction; floor unchanged (net denied, fs granted).
+    let e = run_bundle_deny(&app, &empty, "", &[]);
+    let elist = String::from_utf8_lossy(&e.stdout);
+    assert!(!elist.contains("net"), "empty ASCRIPT_DENY: net still denied by the floor: {elist}");
+    assert!(elist.contains("fs"), "empty ASCRIPT_DENY adds no denial: fs still granted: {elist}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// STACKING (Task 3.3, test 3) — a bundle built `--deny net`, launched with `ASCRIPT_DENY=fs`,
+/// has BOTH net (embedded floor) AND fs (`ASCRIPT_DENY`) denied while the other three caps stay
+/// granted. The `caps.list()` probe makes the effective set directly observable.
+#[test]
+fn ascript_deny_stacks_with_embedded_floor() {
+    let _serial = serial_native();
+    let dir = tmp_dir("deny_stack");
+    let entry = write_caps_probe(&dir);
+    let empty = tmp_dir("deny_stack_cwd");
+
+    let app = dir.join("stack_app");
+    build_with(&["--native", "--deny", "net"], &entry, &app);
+
+    let b = run_bundle_deny(&app, &empty, "fs", &[]);
+    assert!(b.status.success(), "probe should run: {}", String::from_utf8_lossy(&b.stderr));
+    let list = String::from_utf8_lossy(&b.stdout);
+    assert!(
+        !list.contains("net") && !list.contains("fs"),
+        "stacking must deny BOTH net (floor) and fs (ASCRIPT_DENY): {list}"
+    );
+    assert!(
+        list.contains("process") && list.contains("ffi") && list.contains("env"),
+        "the other three caps stay granted: {list}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// INVALID NAME → STARTUP ERROR (Task 3.3, test 4) — `ASCRIPT_DENY=bogus ./app` is a clean
+/// startup error mentioning `bogus` and the expected names; the exit is non-zero and the
+/// program's OWN output never appears (it never ran — the `?` aborts before any code runs).
+#[test]
+fn ascript_deny_invalid_name_is_startup_error() {
+    let _serial = serial_native();
+    let dir = tmp_dir("deny_invalid");
+    // A program whose stdout is a distinctive marker — it must NOT appear (program never runs).
+    write(&dir, "invutil.as", "export fn m(): string { return \"PROGRAM-RAN-MARKER\" }\n");
+    let entry = write(
+        &dir,
+        "invapp.as",
+        "import { m } from \"./invutil\"\nprint(m())\n",
+    );
+    let empty = tmp_dir("deny_invalid_cwd");
+
+    let app = dir.join("invalid_app");
+    build_native(&entry, &app);
+
+    let b = run_bundle_deny(&app, &empty, "bogus", &[]);
+    assert!(!b.status.success(), "an invalid ASCRIPT_DENY name must be a non-zero startup error");
+    let out = String::from_utf8_lossy(&b.stdout);
+    assert!(
+        !out.contains("PROGRAM-RAN-MARKER"),
+        "the program must NEVER run on an invalid ASCRIPT_DENY: {out}"
+    );
+    let err = String::from_utf8_lossy(&b.stderr);
+    assert!(err.contains("ASCRIPT_DENY"), "the error must mention ASCRIPT_DENY: {err}");
+    assert!(err.contains("bogus"), "the error must name the bad cap 'bogus': {err}");
+    assert!(
+        err.contains("fs, net, process, ffi, env"),
+        "the error must list the expected cap names: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// ARGV PRESERVED (Task 3.3, test 5) — `ASCRIPT_DENY=fs ./app a b` still forwards `a`, `b` to the
+/// program. `ASCRIPT_DENY` affects ONLY the `CapSet`; argv is untouched.
+#[test]
+fn ascript_deny_preserves_argv() {
+    let _serial = serial_native();
+    let dir = tmp_dir("deny_argv");
+    write(&dir, "argutil.as", "export fn n(): string { return \"args\" }\n");
+    let entry = write(
+        &dir,
+        "argapp.as",
+        "import { n } from \"./argutil\"\n\
+         import * as env from \"std/env\"\n\
+         print(n())\n\
+         for (a in env.args()) { print(`arg:${a}`) }\n",
+    );
+    let empty = tmp_dir("deny_argv_cwd");
+
+    let app = dir.join("argv_app");
+    build_native(&entry, &app);
+
+    // ASCRIPT_DENY=net (does not touch env.args, which is gated on `env`) so the program runs and
+    // prints its argv. `a`, `b` must both reach the program.
+    let b = run_bundle_deny(&app, &empty, "net", &["a", "b"]);
+    assert!(b.status.success(), "program should run: {}", String::from_utf8_lossy(&b.stderr));
+    let out = String::from_utf8_lossy(&b.stdout);
+    assert!(out.contains("arg:a"), "argv 'a' must reach the program: {out}");
+    assert!(out.contains("arg:b"), "argv 'b' must reach the program: {out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// `ascript run x.aso` HONORS ASCRIPT_DENY TOO (Task 3.3, test 6) — the OTHER launch path. An
+/// `.aso` built all-granted, run via `ascript run out.aso` with `ASCRIPT_DENY=fs`, denies fs.
+/// Proves BOTH cap-install points (`run_verified_archive` here) honor the env var.
+#[test]
+#[cfg(feature = "sys")]
+fn ascript_deny_honored_on_aso_run_path() {
+    let dir = tmp_dir("deny_aso_run");
+    write(&dir, "rutil.as", "export fn ok(): string { return \"aso-non-fs-ok\" }\n");
+    let entry = write(
+        &dir,
+        "rapp.as",
+        "import { ok } from \"./rutil\"\n\
+         import * as fs from \"std/fs\"\n\
+         print(ok())\n\
+         let r = fs.read(\"/etc/hosts\")\n\
+         print(\"aso-reached-fs\")\n",
+    );
+    // Built all-granted (multi-module → ASCRIPTA archive on the .aso path).
+    let out = dir.join("run.aso");
+    build_with(&[], &entry, &out);
+
+    let b = run_artifact_deny(&out, &dir, "fs", &[]);
+    assert!(!b.status.success(), "ASCRIPT_DENY=fs on `ascript run x.aso` must deny fs");
+    let so = String::from_utf8_lossy(&b.stdout);
+    assert!(so.contains("aso-non-fs-ok"), "the non-fs line must still print: {so}");
+    assert!(!so.contains("aso-reached-fs"), "the fs call must NOT proceed: {so}");
+    let err = String::from_utf8_lossy(&b.stderr);
+    assert!(err.contains("capability 'fs' denied"), "fs denial expected: {err}");
+
+    // Without ASCRIPT_DENY, the same .aso reaches the fs call (no capability denial).
+    let g = run_artifact_in(&[], &out, &dir, &[]);
+    let gerr = String::from_utf8_lossy(&g.stderr);
+    assert!(
+        !gerr.contains("capability 'fs' denied"),
+        "an all-granted .aso without ASCRIPT_DENY must not deny fs: {gerr}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
