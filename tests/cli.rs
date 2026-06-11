@@ -301,6 +301,56 @@ fn arrow_in_call_argument_works_on_both_engines() {
     }
 }
 
+/// Regression: `string.repeat(s, 1/0)` / `string.repeat(s, 1e18)` and
+/// `string.padStart(s, 1/0)` used to cast `Inf`/huge to `usize::MAX` and abort
+/// the host with `capacity overflow`, bypassing `recover`. They must now be
+/// CLEAN, recoverable Tier-2 panics — the subprocess exits 0 (no abort) and
+/// `recover` catches the error pair. Running the real binary proves there is no
+/// host abort (an abort would make `out.status.success()` false with a non-zero
+/// / signal exit). (The reader `.read(n)` sites share the same `want_count`
+/// guard but need live OS resources, so they are covered by the stdlib unit
+/// tests rather than here.)
+#[test]
+fn string_count_guards_are_recoverable_not_abort() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = r#"
+import * as string from "std/string"
+// Infinity (1.0/0.0) — would previously abort via `f64::INFINITY as usize`.
+let [v1, e1] = recover(() => string.repeat("x", 1.0 / 0.0))
+print(e1 != nil)
+print(v1 == nil)
+// Huge finite count — would previously attempt a 10^18-byte allocation (OOM abort).
+let [v2, e2] = recover(() => string.repeat("x", 1e18))
+print(e2 != nil)
+// padStart width guard.
+let [v3, e3] = recover(() => string.padStart("x", 1.0 / 0.0, "-"))
+print(e3 != nil)
+// A normal repeat still works after the recovered panics.
+print(string.repeat("ab", 3))
+"#;
+    let file = std::env::temp_dir().join(format!("ascript_repeatguard_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+        let out = Command::new(bin)
+            .args(&engine_args)
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "expected NO host abort on {engine_args:?}; status {:?}, stderr: {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "true\ntrue\ntrue\ntrue\nababab\n",
+            "recover must catch the count-guard panics on {engine_args:?}"
+        );
+    }
+    let _ = std::fs::remove_file(&file);
+}
+
 #[test]
 fn runs_modules_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");

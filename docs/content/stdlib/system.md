@@ -569,7 +569,7 @@ The handle exposes a `pid` field plus the following methods. The `stdin`/`stdout
 
 A Reader degrades gracefully to EOF (returns `nil`) once its stream is exhausted or the child has been `wait()`ed.
 
-- **await reader.read(n?)** — read up to `n` bytes (default 64 KiB). Returns a string or bytes chunk (per `capture`), or `nil` at EOF. `read(0)` returns an empty chunk without advancing.
+- **await reader.read(n?)** — read up to `n` bytes (default 64 KiB). Returns a string or bytes chunk (per `capture`), or `nil` at EOF. `read(0)` returns an empty chunk without advancing. `n` must be a finite, non-negative, in-range count: a negative, `Infinity`/`NaN`, or out-of-range value is a recoverable Tier-2 panic (the size is validated before any buffer is reserved, so it cannot abort the host).
 - **await reader.readLine()** — read one line with the trailing `\n` (and optional `\r`) stripped. Returns the line, or `nil` at EOF.
 - **await reader.readToEnd()** — read the remaining stream in full. Returns the collected data, or `nil` if already drained.
 

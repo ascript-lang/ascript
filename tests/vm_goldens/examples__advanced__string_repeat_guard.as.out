@@ -1,0 +1,8 @@
+# exit: none
+repeat(Infinity): rejected -> string.repeat: expected a finite, in-range, non-negative count (got inf)
+repeat(1e18): rejected -> string.repeat: expected a finite, in-range, non-negative count (got 1000000000000000000)
+repeat(NaN): rejected -> string.repeat: expected a finite, in-range, non-negative count (got NaN)
+repeat(-1): rejected -> string.repeat: expected a finite, in-range, non-negative count (got -1)
+padStart(Infinity): rejected -> string.padStart: expected a finite, in-range, non-negative count (got inf)
+normal: ababab
+repeat(huge product): rejected -> string.repeat: resulting string of 10 × 4294967295 bytes exceeds the maximum size

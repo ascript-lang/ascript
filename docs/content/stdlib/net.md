@@ -153,7 +153,7 @@ let port = server.port   // the OS-assigned port
 
 A connected stream (from `connect` or `accept`) exposes:
 
-- `await stream.read(n?)` — reads up to `n` bytes (default 64 KiB if omitted). Returns **bytes**, or **`nil` at EOF**. `read(0)` returns empty bytes without touching the socket. A negative `n` is a Tier-2 panic.
+- `await stream.read(n?)` — reads up to `n` bytes (default 64 KiB if omitted). Returns **bytes**, or **`nil` at EOF**. `read(0)` returns empty bytes without touching the socket. `n` must be a finite, non-negative, in-range count: a negative, `Infinity`/`NaN`, or out-of-range `n` is a (recoverable) Tier-2 panic — the size is validated before any buffer is reserved, so it can never abort the host.
 - `await stream.readLine()` — reads a single line, stripping a trailing `\n` (and an optional preceding `\r`). Returns a **string**, or **`nil` at EOF**.
 - `await stream.readToEnd()` — reads to end-of-stream. Always returns **bytes** (empty if already drained); consumes and finalizes the stream.
 - `await stream.write(data)` — writes a string or bytes. Returns `[nil, err]` — a write to a closed stream returns `[nil, err]` rather than panicking.
@@ -372,7 +372,7 @@ let [resp, err] = await http.post("https://api.example.com/upload", {
 
 With `opts.stream: true`, the body is not buffered: `resp.body` is a reader handle that pulls chunks on demand (a slow consumer applies backpressure to the transfer). It supports the same reader idiom as a TCP stream:
 
-- `await resp.body.read(n?)` → a chunk (string or bytes per `opts.bodyMode`), or `nil` at EOF.
+- `await resp.body.read(n?)` → a chunk (string or bytes per `opts.bodyMode`), or `nil` at EOF. `n` must be a finite, non-negative, in-range count (same guard as `stream.read`); a pathological size is a recoverable Tier-2 panic, never a host abort.
 - `await resp.body.readLine()` → a line, or `nil` at EOF.
 - `await resp.body.readToEnd()` → the remainder (always in the body's mode).
 

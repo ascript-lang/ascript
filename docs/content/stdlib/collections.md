@@ -155,9 +155,11 @@ string.format("{{literal}}")             // "{literal}"
 Pad the start of a string with a fill string until it reaches a target character width. Returns the input unchanged if it is already at least `width` characters, or if `fill` is empty.
 
 - `s: string` — the source string
-- `width: number` — target width in characters
+- `width: number` — target width in characters; must be finite and within range
 - `fill: string` (optional) — fill string, defaults to a single space
 - Returns: `string`
+
+> [!TIER2] Panics if `width` is not finite (`Infinity`/`NaN`), is negative, or exceeds the maximum allocation size — the width drives a buffer allocation, so an unbounded value is rejected up front rather than aborting the host.
 
 ```ascript
 string.padStart("7", 3, "0")   // "007"
@@ -168,9 +170,11 @@ string.padStart("7", 3, "0")   // "007"
 Pad the end of a string with a fill string until it reaches a target character width. Returns the input unchanged if it is already at least `width` characters, or if `fill` is empty.
 
 - `s: string` — the source string
-- `width: number` — target width in characters
+- `width: number` — target width in characters; must be finite and within range
 - `fill: string` (optional) — fill string, defaults to a single space
 - Returns: `string`
+
+> [!TIER2] Panics if `width` is not finite (`Infinity`/`NaN`), is negative, or exceeds the maximum allocation size (same guard as `padStart`).
 
 ```ascript
 string.padEnd("7", 3)   // "7  "
@@ -181,13 +185,14 @@ string.padEnd("7", 3)   // "7  "
 Concatenate `n` copies of a string. The count is truncated toward zero.
 
 - `s: string` — the string to repeat
-- `n: number` — non-negative repeat count
+- `n: number` — non-negative repeat count; must be finite and within range
 - Returns: `string`
 
-> [!TIER2] Panics if the count is negative.
+> [!TIER2] Panics if the count is negative, not finite (`Infinity`/`NaN`), or so large that the resulting string would exceed the maximum allocation size. The count and the resulting `s.length × n` size are validated before allocation, so a pathological count (`string.repeat("x", 1/0)`) is a recoverable Tier-2 panic — caught by `recover` — rather than a host abort.
 
 ```ascript
-string.repeat("ab", 3)   // "ababab"
+string.repeat("ab", 3)              // "ababab"
+recover(() => string.repeat("x", 1.0 / 0.0))  // [nil, err] — caught, no abort
 ```
 
 ### string.startsWith
