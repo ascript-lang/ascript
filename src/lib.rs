@@ -942,6 +942,13 @@ pub fn build_file(
     let bytes = if archive.modules.len() > 1 {
         archive.encode() // ASCRIPTA — embed the whole module graph
     } else {
+        // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
+        // entry under its CANONICALIZED absolute path for stable dedup identity, which a
+        // debug `.aso` embeds as the source path — leaking the build machine's layout. A
+        // fresh compile from the as-passed `file` keeps the relative source path, so the
+        // single-module artifact stays byte-identical to the pre-archive output (and stays
+        // decoupled from archive internals as Phase 2 evolves `compile_archive`). `build` is
+        // a one-shot CLI compile, so re-compiling this one file is negligible.
         compile_verified_aso_bytes(file, with_debug)? // bare ASO\0 — byte-identical to today
     };
     let out_path = match out {
@@ -1266,6 +1273,12 @@ pub fn build_native(
     let payload = if archive.modules.len() > 1 {
         archive.encode() // ASCRIPTA — embed the whole module graph
     } else {
+        // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
+        // entry under its CANONICALIZED absolute path, which a debug `.aso` embeds as the
+        // source path (this is always a debug build → `with_debug=true`). A fresh compile
+        // from the as-passed `file` keeps the relative source path, so the single-module
+        // bundle stays byte-identical to the pre-archive output. `build` is one-shot, so
+        // re-compiling this one file is negligible.
         compile_verified_aso_bytes(file, true)? // bare ASO\0 — byte-identical to today
     };
 
@@ -1495,6 +1508,7 @@ async fn run_verified_archive(
     let entry_bytes = archive
         .modules
         .get(archive.entry as usize)
+        // clone the entry chunk out before `archive` is moved into `Rc::new` below
         .map(|(_, b)| b.clone())
         .ok_or_else(|| {
             AsError::new(format!("cannot load {what}: archive entry index is out of range"))
