@@ -976,10 +976,25 @@ async fn differential_cross_module_classes_enums() {
 // ── Corpus coverage: the existing multi-module EXAMPLES ──────────────────────────────────────
 
 /// The shipped `bundle_multimodule.as` example (named import of a sibling) is shaken ==
-/// unshaken, byte-identical.
+/// unshaken, byte-identical. The sibling `bundle_util.as` carries an intentionally-unused
+/// `whisper` export, so this is ALSO a non-vacuous shake: the shaken archive must drop it.
 #[tokio::test]
 async fn differential_corpus_bundle_multimodule() {
-    let _report = assert_shaken_equals_unshaken(Path::new("examples/bundle_multimodule.as")).await;
+    let report = assert_shaken_equals_unshaken(Path::new("examples/bundle_multimodule.as")).await;
+    assert!(
+        report_dropped(&report, "whisper"),
+        "the unused `whisper` export must be dropped by the shaker; dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// The shipped `examples/advanced/bundle_caps.as` example (a `std/caps` posture demo that
+/// imports its sibling `./bundle_caps_util` BOTH ways — namespace + named) is shaken ==
+/// unshaken, byte-identical. Validates the bundle + capabilities corpus example end to end.
+#[tokio::test]
+async fn differential_corpus_bundle_caps() {
+    let _report =
+        assert_shaken_equals_unshaken(Path::new("examples/advanced/bundle_caps.as")).await;
 }
 
 /// The `examples/app/main.as` example (named import + transitive + a NAMESPACE import + a

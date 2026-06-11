@@ -1122,6 +1122,18 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/bundle_multimodule.as",
         SkipReason::RelativeImports,
     ),
+    // BNDL: the bundle + capabilities example imports its sibling
+    // `./bundle_caps_util` BOTH ways (namespace + named). Like
+    // `bundle_multimodule.as`, the source-only corpus oracle can't resolve a
+    // relative import, so it is documented-only here and covered by the CLI run +
+    // `tests/archive.rs`. The sibling `examples/advanced/bundle_caps_util.as` has
+    // NO imports and runs standalone (printing nothing), so it stays in the
+    // must-run gate. The example is single-threaded, clock/RNG/IO-free, and runs
+    // identically under `--no-default-features` (`std/caps` is CORE).
+    (
+        "examples/advanced/bundle_caps.as",
+        SkipReason::RelativeImports,
+    ),
 ];
 
 /// Enumerate EVERY `examples/*.as` and `examples/advanced/*.as` file, paths

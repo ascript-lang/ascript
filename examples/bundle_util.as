@@ -13,3 +13,10 @@ export fn shout(text: string): string {
     // (kept method-free so the module needs no stdlib imports)
     return `${text}!!!`
 }
+
+// Intentionally UNUSED export: nothing imports `whisper`, so it is a real drop
+// target for the bundle tree-shaker (the shaken archive omits it). It never runs,
+// so it changes no program output — the existing run-output assertions still hold.
+export fn whisper(text: string): string {
+    return text
+}
