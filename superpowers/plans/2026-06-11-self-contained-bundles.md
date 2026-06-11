@@ -445,12 +445,12 @@ let len = match content_length {
 - Modify: `src/dap/server.rs` (~470 scopes; the `launch` arm ~322)
 - Test: inline `#[test]`s
 
-- [ ] **Step 1: Write the failing test** — a `scopes` request with `frameId: i64::MAX` does not panic; a second `launch` resets session state (no stale frames served).
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Apply the fix** — `let var_ref = frame_id.saturating_add(1);`; in the `launch` arm, if a session is already live, send `Continue` to the old VM, join/detach the old pump+debuggee handles, and reset the session-scoped `AdapterState` fields before starting the new session.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust tests; blast-radius: audit all `as_i64().unwrap_or(...)` + arithmetic in DAP handlers for overflow; confirm no other handler mutates shared state without a session guard.
-- [ ] **Step 6: Commit** — `git commit -m "fix(dap): saturating frame_id; reset state on re-launch"`
+- [x] **Step 1: Write the failing test** — a `scopes` request with `frameId: i64::MAX` does not panic; a second `launch` resets session state (no stale frames served).
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Apply the fix** — `let var_ref = frame_id.saturating_add(1);`; in the `launch` arm, if a session is already live, send `Continue` to the old VM, join/detach the old pump+debuggee handles, and reset the session-scoped `AdapterState` fields before starting the new session.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust tests; blast-radius: audit all `as_i64().unwrap_or(...)` + arithmetic in DAP handlers for overflow; confirm no other handler mutates shared state without a session guard.
+- [x] **Step 6: Commit** — `git commit -m "fix(dap): saturating frame_id; reset state on re-launch"`
 
 ### Task 0.19: BIN startup payload-read error reporting + double-bundle + TOCTOU
 
