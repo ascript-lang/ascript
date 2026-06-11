@@ -117,7 +117,23 @@ pub fn call(
         }
         "hashPassword" => {
             let pw = source_bytes(&arg(args, 0), span, &ctx("hashPassword"))?;
-            let salt = SaltString::generate(&mut OsRng);
+            // SP9 §3: in deterministic (`workflow`/replay) mode the argon2 salt is
+            // drawn from the per-`Interp` seeded PRNG so `hashPassword` is reproducible
+            // across record/replay; the default path is the real CSPRNG (`OsRng`),
+            // BYTE-IDENTICAL in security strength to pre-SP9.
+            let mut salt_bytes = [0u8; argon2::password_hash::Salt::RECOMMENDED_LENGTH];
+            if !interp.fill_seeded_bytes(&mut salt_bytes) {
+                OsRng.fill_bytes(&mut salt_bytes);
+            }
+            let salt = match SaltString::encode_b64(&salt_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Ok(make_pair(
+                        Value::Nil,
+                        make_error(Value::Str(format!("argon2 salt encode failed: {}", e).into())),
+                    ))
+                }
+            };
             match Argon2::default().hash_password(&pw, &salt) {
                 Ok(hash) => Ok(make_pair(Value::Str(hash.to_string().into()), Value::Nil)),
                 Err(e) => Ok(make_pair(
@@ -153,8 +169,18 @@ pub fn call(
                     c as u32
                 }
             };
-            match bcrypt::hash(&pw, cost) {
-                Ok(h) => Ok(make_pair(Value::Str(h.into()), Value::Nil)),
+            // SP9 §3: like `hashPassword`, draw the 16-byte bcrypt salt from the
+            // seeded PRNG in deterministic (`workflow`/replay) mode so `bcryptHash` is
+            // reproducible across record/replay; the default path is the real CSPRNG
+            // (`OsRng`) — BYTE-IDENTICAL in security strength to pre-SP9. `bcryptVerify`
+            // reads the salt back out of the stored `$2b$…` string, so both seeded- and
+            // random-salted hashes verify.
+            let mut salt_bytes = [0u8; 16];
+            if !interp.fill_seeded_bytes(&mut salt_bytes) {
+                OsRng.fill_bytes(&mut salt_bytes);
+            }
+            match bcrypt::hash_with_salt(&pw, cost, salt_bytes) {
+                Ok(parts) => Ok(make_pair(Value::Str(parts.to_string().into()), Value::Nil)),
                 Err(e) => Ok(make_pair(
                     Value::Nil,
                     make_error(Value::Str(format!("bcrypt hash failed: {}", e).into())),
@@ -306,6 +332,71 @@ mod tests {
         );
     }
 
+    /// Extract the hash string out of a `hashPassword`/`bcryptHash` `[value, err]`
+    /// pair (an argon2 PHC string or a bcrypt `$2b$…` string — both `[Str, Nil]`).
+    fn hash_of(pair: &Value) -> String {
+        match pair {
+            Value::Array(a) => {
+                let v = a.borrow();
+                assert_eq!(v[1], Value::Nil, "password hashing errored: {:?}", v[1]);
+                match &v[0] {
+                    Value::Str(s) => s.to_string(),
+                    _ => panic!("hash should be a string"),
+                }
+            }
+            _ => panic!("password hashing should return a pair"),
+        }
+    }
+
+    /// SP9 §3: under deterministic (workflow/replay) mode the argon2 salt is drawn
+    /// from the seeded PRNG, so two `hashPassword(samePw)` calls with the same seed
+    /// produce the SAME hash — reproducible across record/replay.
+    ///
+    /// Gated on `workflow` because `restore_determinism` is `#[cfg(feature =
+    /// "workflow")]` (a partial `--features crypto` build without `workflow` must
+    /// still compile this module's tests).
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn hash_password_seeded_salt_is_reproducible_under_determinism() {
+        let run = |seed: u64| {
+            let interp = crate::interp::Interp::new();
+            interp.restore_determinism(Some(crate::det::DeterminismContext::record(seed, 0.0)));
+            hash_of(&super::call(&interp, "hashPassword", &[s("secret")], sp()).unwrap())
+        };
+        // Same seed → byte-identical hash (the salt is reproducible).
+        assert_eq!(run(42), run(42));
+        // Different seed → different salt → different hash.
+        assert_ne!(run(42), run(7));
+        // And the reproducible hash still round-trips through verifyPassword.
+        let phc = run(42);
+        assert_eq!(
+            call("verifyPassword", &[s("secret"), s(&phc)], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("verifyPassword", &[s("wrong"), s(&phc)], sp()).unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    /// Outside deterministic mode the salt is a real CSPRNG draw, so two
+    /// `hashPassword(samePw)` calls produce DIFFERENT hashes (no security regression).
+    #[test]
+    fn hash_password_random_salt_in_default_mode() {
+        let a = hash_of(&call("hashPassword", &[s("secret")], sp()).unwrap());
+        let b = hash_of(&call("hashPassword", &[s("secret")], sp()).unwrap());
+        assert_ne!(a, b, "default-mode salt must be random");
+        // Both still verify (verifyPassword reads the salt from the stored hash).
+        assert_eq!(
+            call("verifyPassword", &[s("secret"), s(&a)], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("verifyPassword", &[s("secret"), s(&b)], sp()).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
     #[test]
     fn verify_password_malformed_is_false() {
         assert_eq!(
@@ -356,6 +447,61 @@ mod tests {
         };
         // bcrypt encodes the cost as a two-digit field: `$2b$04$...`.
         assert!(hash_str.contains("$04$"), "got {}", hash_str);
+    }
+
+    /// SP9 §3: under deterministic mode the bcrypt salt is drawn from the seeded
+    /// PRNG, so two `bcryptHash(samePw)` calls with the same seed produce the SAME
+    /// hash — reproducible across record/replay.
+    ///
+    /// Gated on `workflow` (see `hash_password_seeded_salt_…`): `restore_determinism`
+    /// is `#[cfg(feature = "workflow")]`.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn bcrypt_seeded_salt_is_reproducible_under_determinism() {
+        let run = |seed: u64| {
+            let interp = crate::interp::Interp::new();
+            interp.restore_determinism(Some(crate::det::DeterminismContext::record(seed, 0.0)));
+            // cost 4 keeps the test fast.
+            hash_of(
+                &super::call(
+                    &interp,
+                    "bcryptHash",
+                    &[s("secret"), Value::Float(4.0)],
+                    sp(),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(run(42), run(42));
+        assert_ne!(run(42), run(7));
+        let hash = run(42);
+        assert!(hash.starts_with("$2"), "got {}", hash);
+        assert_eq!(
+            call("bcryptVerify", &[s("secret"), s(&hash)], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("bcryptVerify", &[s("wrong"), s(&hash)], sp()).unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    /// Outside deterministic mode the bcrypt salt is a real CSPRNG draw, so two
+    /// `bcryptHash(samePw)` calls produce DIFFERENT hashes (no security regression).
+    #[test]
+    fn bcrypt_random_salt_in_default_mode() {
+        let a = hash_of(&call("bcryptHash", &[s("secret"), Value::Float(4.0)], sp()).unwrap());
+        let b = hash_of(&call("bcryptHash", &[s("secret"), Value::Float(4.0)], sp()).unwrap());
+        assert_ne!(a, b, "default-mode bcrypt salt must be random");
+        // Both still verify (bcryptVerify reads the salt from the stored hash).
+        assert_eq!(
+            call("bcryptVerify", &[s("secret"), s(&a)], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("bcryptVerify", &[s("secret"), s(&b)], sp()).unwrap(),
+            Value::Bool(true)
+        );
     }
 
     #[test]

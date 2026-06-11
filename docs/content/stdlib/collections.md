@@ -1125,10 +1125,11 @@ math.random()   // e.g. 0.7421…
 ```
 
 > **Deterministic mode (SP9).** Inside a `std/workflow` run (or under deterministic mode),
-> `math.random`/`randomInt`/`shuffle`/`sample`, `uuid.v4`, and `crypto.randomBytes` draw from a
-> per-`Interp` **seeded** PRNG that is recorded and replayed, so two same-seed runs are
-> byte-identical. Outside deterministic mode the generator is the normal time-seeded one (no
-> behavior change). See [Workflows](workflow).
+> `math.random`/`randomInt`/`shuffle`/`sample`, `uuid.v4`/`uuid.v7`, and `crypto.randomBytes` draw
+> from a per-`Interp` **seeded** PRNG that is recorded and replayed, so two same-seed runs are
+> byte-identical (`uuid.v7` also takes its time prefix from the virtual clock). Outside
+> deterministic mode the generator is the normal time-seeded one (no behavior change). See
+> [Workflows](workflow).
 
 ### math.sin
 

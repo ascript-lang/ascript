@@ -18,7 +18,7 @@ pub fn call(
 ) -> Result<Value, Control> {
     match func {
         "v4" => Ok(Value::Str(v4(interp).to_string().into())),
-        "v7" => Ok(Value::Str(uuid::Uuid::now_v7().to_string().into())),
+        "v7" => Ok(Value::Str(v7(interp).to_string().into())),
         _ => Err(AsError::at(format!("std/uuid has no function '{}'", func), span).into()),
     }
 }
@@ -36,6 +36,30 @@ fn v4(interp: &crate::interp::Interp) -> uuid::Uuid {
         uuid::Uuid::from_bytes(bytes)
     } else {
         uuid::Uuid::new_v4()
+    }
+}
+
+/// A v7 (time-ordered) UUID. SP9 §3: in deterministic mode BOTH halves are
+/// reproducible — the 48-bit unix-ms time prefix comes from the determinism
+/// context's virtual clock (so the recorded/replayed timestamp matches) and the
+/// 10 `rand_a`/`rand_b` tail bytes come from the per-`Interp` seeded PRNG; the
+/// `Builder::from_unix_timestamp_millis` constructor sets the version (7) and
+/// RFC 4122 variant bits. Otherwise the real `Uuid::now_v7()` (real clock + real
+/// entropy) — BYTE-IDENTICAL to pre-SP9.
+fn v7(interp: &crate::interp::Interp) -> uuid::Uuid {
+    let mut tail = [0u8; 10];
+    if interp.fill_seeded_bytes(&mut tail) {
+        // Deterministic: draw the time prefix from the virtual clock (saturating
+        // the ms-epoch into the v7 48-bit field; negative/huge clocks clamp to 0).
+        let millis = interp.clock_now_ms();
+        let millis = if millis.is_finite() && millis >= 0.0 {
+            millis as u64
+        } else {
+            0
+        };
+        uuid::Builder::from_unix_timestamp_millis(millis, &tail).into_uuid()
+    } else {
+        uuid::Uuid::now_v7()
     }
 }
 
@@ -71,5 +95,48 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    /// Dispatch under deterministic Record mode seeded by `seed`.
+    ///
+    /// Gated on `workflow` because `restore_determinism` is `#[cfg(feature =
+    /// "workflow")]` (a partial `--features data` build without `workflow` must still
+    /// compile this module's tests).
+    #[cfg(feature = "workflow")]
+    fn call_det(func: &str, seed: u64) -> Value {
+        let interp = crate::interp::Interp::new();
+        interp.restore_determinism(Some(crate::det::DeterminismContext::record(seed, 0.0)));
+        super::call(&interp, func, &[], sp()).unwrap()
+    }
+
+    /// SP9 §3: under deterministic mode both the v7 time prefix (virtual clock) and
+    /// the random tail (seeded PRNG) are reproducible, so two same-seed runs match —
+    /// and differ across seeds. (Matches v4's determinism behavior.)
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn v7_reproducible_under_determinism() {
+        assert_eq!(call_det("v7", 42), call_det("v7", 42));
+        assert_ne!(call_det("v7", 42), call_det("v7", 7));
+        // Still a well-formed v7 string.
+        if let Value::Str(s) = call_det("v7", 42) {
+            assert_eq!(s.len(), 36);
+            assert_eq!(&s[14..15], "7");
+        } else {
+            panic!("expected string");
+        }
+    }
+
+    /// And v4 likewise (kept here for symmetry with the v7 case).
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn v4_reproducible_under_determinism() {
+        assert_eq!(call_det("v4", 42), call_det("v4", 42));
+        assert_ne!(call_det("v4", 42), call_det("v4", 7));
+    }
+
+    /// Outside deterministic mode, v7 uses real entropy → two calls differ.
+    #[test]
+    fn v7_random_in_default_mode() {
+        assert_ne!(call("v7", &[], sp()).unwrap(), call("v7", &[], sp()).unwrap());
     }
 }

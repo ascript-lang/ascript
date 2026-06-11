@@ -673,6 +673,8 @@ Hashes a password with Argon2, returning a self-describing PHC string.
 - **password** `string | bytes` — the password.
 - **Returns** `[string, err]` — the PHC hash string (begins with `$argon2`).
 
+The Argon2 salt is drawn from a real CSPRNG by default. **Inside a durable `workflow`** (under record/replay), the salt is instead drawn from the workflow's seeded PRNG, so `hashPassword` is **replay-safe**: re-running a recorded workflow produces the byte-identical hash rather than diverging on a fresh random salt. Outside a workflow the salt stays fully random (no security change).
+
 ```ascript
 import { hashPassword } from "std/crypto"
 let [phc, err] = hashPassword("correct horse")
@@ -701,6 +703,8 @@ Hashes a password with bcrypt.
 - **password** `string | bytes` — the password.
 - **cost** `number` (optional) — the bcrypt cost factor, an integer in `4..=31`. Defaults to the library default; out-of-range or non-integer costs are a Tier-2 panic.
 - **Returns** `[string, err]` — the bcrypt hash string.
+
+Like `hashPassword`, `bcryptHash` is **replay-safe inside a durable `workflow`**: under record/replay the salt is drawn from the workflow's seeded PRNG (reproducible), and outside a workflow it stays a fully random CSPRNG draw (no security change).
 
 ```ascript
 import { bcryptHash } from "std/crypto"

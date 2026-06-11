@@ -1380,9 +1380,11 @@ impl Interp {
         guard.as_mut().map(|ctx| ctx.next_random_f64())
     }
 
-    /// Fill `buf` with deterministic bytes when in deterministic mode (for
-    /// `uuid.v4` / `crypto.randomBytes`), returning `true` if it did; `false` means
-    /// not deterministic and the caller uses its real RNG (byte-identical default).
+    /// Fill `buf` with deterministic bytes when in deterministic mode — the random
+    /// source for `uuid.v4`, the `uuid.v7` random tail, `crypto.randomBytes`, and the
+    /// `crypto.hashPassword` / `crypto.bcryptHash` salts. Returns `true` if it filled;
+    /// `false` means not deterministic and the caller uses its real RNG (byte-identical
+    /// default).
     /// Gated on the features whose modules call it so it is not dead under
     /// `--no-default-features` (where `uuid`/`crypto` are compiled out).
     #[cfg(any(feature = "data", feature = "crypto"))]
