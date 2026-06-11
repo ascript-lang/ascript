@@ -372,7 +372,7 @@ fn collect_def_refs(top: &Chunk, def: &TopDef, name: &str, out: &mut Vec<Rc<str>
         TopDef::ComputedConst { start, end } => collect_range_refs(top, *start, *end, out),
         TopDef::Class => {
             // Pull the class's method/default bodies' refs (and its superclass names).
-            if let Ok((members, _cp)) = locate_class_group(top, name) {
+            if let Ok((members, cp)) = locate_class_group(top, name) {
                 for m in &members {
                     match m {
                         GroupMember::SuperGlobal(sup) => out.push(sup.clone()),
@@ -381,6 +381,24 @@ fn collect_def_refs(top: &Chunk, def: &TopDef, name: &str, out: &mut Vec<Rc<str>
                         }
                     }
                 }
+                // SOUNDNESS (validate_into): a class's declared FIELD TYPES carry no
+                // bytecode reference, but they ARE load-bearing at runtime. `.from` /
+                // typed-parse validation walks each field's declared `Type` through the
+                // class's `def_env`: `coerce_field` resolves a `Type::Named` leaf and,
+                // finding a `Value::Class`, COERCES a raw Object into a nested class
+                // instance (recursing element-wise through `array<Class>` / `map<K,Class>`);
+                // `check_type_env` likewise resolves an interface-typed leaf for a
+                // structural `conforms`. A class/enum/interface referenced ONLY as a field
+                // type therefore has no `GET_GLOBAL` edge yet MUST be kept — dropping it
+                // makes the env lookup fail and breaks the contract check. Walk every
+                // `Type::Named` leaf of every field type (this is intentionally
+                // conservative: walking a leaf that turns out to be a primitive/unbound
+                // name is a harmless under-shake, never an unsound drop).
+                let mut named: HashSet<Rc<str>> = HashSet::new();
+                for fs in cp.class.fields.values() {
+                    collect_type_named_refs(&fs.ty, &mut named);
+                }
+                out.extend(named);
             }
         }
         TopDef::Interface(proto) => {
@@ -392,7 +410,80 @@ fn collect_def_refs(top: &Chunk, def: &TopDef, name: &str, out: &mut Vec<Rc<str>
                 out.push(Rc::from(parent.as_str()));
             }
         }
-        TopDef::Const(_) => {}
+        TopDef::Const(v) => {
+            // SOUNDNESS (validate_into, conservative): an `enum` ships as a
+            // `TopDef::Const` holding a `Value::Enum`. A PAYLOAD variant
+            // (`Circle(radius: SomeClass)`) declares per-field `Type`s in its
+            // `VariantSchema`. The enum CONSTRUCTOR path (`construct_variant_args`) uses
+            // the ENV-FREE `check_type` and does NOT coerce a raw Object into a nested
+            // class, so a class used only as an enum payload field type is not, today,
+            // strictly load-bearing through `validate_into`. We walk these field types
+            // ANYWAY: it is a sound under-shake (never drops live code), it future-proofs
+            // the closure against a payload-coercion path being added, and it keeps the
+            // worker slice conservative. A non-enum const contributes nothing.
+            if let Value::Enum(def) = v {
+                let mut named: HashSet<Rc<str>> = HashSet::new();
+                for schema in def.variant_schemas.values() {
+                    for (_fname, ty) in &schema.fields {
+                        collect_type_named_refs(ty, &mut named);
+                    }
+                }
+                out.extend(named);
+            }
+        }
+    }
+}
+
+/// Collect every `Type::Named` leaf reachable in `ty`, descending through all type
+/// combinators (`Optional`/`T?`, `Array<T>`, `Map<K,V>`, `Union`, `Tuple`, `Result`,
+/// `Future`, `FnSig`), into `out`. Used by [`collect_def_refs`] to add a class's /
+/// enum's FIELD-TYPE references to the reachability closure (the `validate_into`
+/// soundness fix): a class/enum/interface named only as a field type carries no
+/// bytecode `GET_GLOBAL`, but is resolved through the env at runtime by `coerce_field`
+/// / `check_type_env`, so it MUST be kept by the tree-shaker.
+///
+/// Intentionally conservative: a `Type::Named` leaf is pushed regardless of whether it
+/// ultimately resolves to a class, enum, interface, or an unbound name — walking a
+/// non-class leaf is a harmless under-shake (it merely keeps an already-present global),
+/// never an unsound drop. `Type::Param` (a runtime-ERASED generic parameter) names no
+/// shippable global, so it is NOT walked.
+fn collect_type_named_refs(ty: &crate::ast::Type, out: &mut HashSet<Rc<str>>) {
+    use crate::ast::Type;
+    match ty {
+        Type::Named(name) => {
+            out.insert(Rc::from(name.as_str()));
+        }
+        Type::Optional(inner)
+        | Type::Array(inner)
+        | Type::Result(inner)
+        | Type::Future(inner) => collect_type_named_refs(inner, out),
+        Type::Map(k, v) | Type::Union(k, v) => {
+            collect_type_named_refs(k, out);
+            collect_type_named_refs(v, out);
+        }
+        Type::Tuple(items) => {
+            for t in items {
+                collect_type_named_refs(t, out);
+            }
+        }
+        Type::FnSig(params, ret) => {
+            for t in params {
+                collect_type_named_refs(t, out);
+            }
+            collect_type_named_refs(ret, out);
+        }
+        // Primitive/erased leaves name no shippable global.
+        Type::Number
+        | Type::Int
+        | Type::Float
+        | Type::String
+        | Type::Bool
+        | Type::Nil
+        | Type::Any
+        | Type::Fn
+        | Type::Object
+        | Type::Error
+        | Type::Param(_) => {}
     }
 }
 
@@ -1621,6 +1712,54 @@ mod tests {
         assert!(names.contains("Circle"), "missing Circle: {names:?}");
         assert!(names.contains("Shape"), "missing superclass Shape: {names:?}");
         assert!(!names.contains("Unused"), "shipped unrelated class: {names:?}");
+    }
+
+    /// validate_into SOUNDNESS (Phase 2): a class referenced ONLY as a FIELD TYPE of a
+    /// shipped class is itself shipped. `Inner` has no `GET_GLOBAL` edge — it appears
+    /// only as the declared type of `Outer.inner` — yet `Outer.from({inner:{...}})`
+    /// coerces the nested Object into an `Inner` instance via `coerce_field`, so the
+    /// worker slice MUST keep `Inner`. This guards the shared `collect_def_refs` fix on
+    /// the worker path (the bundle tree-shaker shares the same function). Also asserts the
+    /// element type of an `array<Item>` field is shipped, and an unrelated class is not.
+    #[tokio::test]
+    async fn slice_ships_class_referenced_only_as_field_type() {
+        let src = "
+            class Inner { v: number }
+            class Item { n: number }
+            class Unrelated { x: number }
+            class Outer {
+                inner: Inner
+                items: array<Item>
+            }
+            worker fn g(n) {
+                let o = Outer.from({ inner: { v: n }, items: [{ n: n }] })
+                return o.inner.v + o.items[0].n
+            }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let names = slice.dep_names();
+        assert!(names.contains("Outer"), "missing Outer: {names:?}");
+        assert!(
+            names.contains("Inner"),
+            "missing field-type class Inner (validate_into soundness): {names:?}"
+        );
+        assert!(
+            names.contains("Item"),
+            "missing array<Item> element-type class Item: {names:?}"
+        );
+        assert!(
+            !names.contains("Unrelated"),
+            "shipped unrelated class (over-shake): {names:?}"
+        );
+
+        // End-to-end: the shipped fragment runs in a FRESH isolate with NO access to the
+        // original heap and `Outer.from` validates the nested `Inner`/`Item` correctly —
+        // the exact path that errored before the fix (`type contract violated … expected
+        // Inner, got object`). g(5) => inner.v(5) + items[0].n(5) == 10.
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Int(5)])
+            .await
+            .expect("fragment runs in a fresh isolate");
+        assert_eq!(out, Value::Int(10), "got: {out:?}");
     }
 
     #[tokio::test]

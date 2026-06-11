@@ -1024,3 +1024,198 @@ async fn differential_bundle_multimodule_archive_matches_disk_run() {
     );
     assert_eq!(archive_code, disk_code, "exit codes match");
 }
+
+// ── Field-type reachability (validate_into SOUNDNESS) ────────────────────────────────────────
+// Phase 2 holistic-review BLOCKER: a class/enum referenced ONLY as a FIELD TYPE carries no
+// bytecode `GET_GLOBAL`, so the pre-fix reachability closure dropped it — yet `.from` /
+// typed-parse validation resolves the field's declared `Type::Named` leaf through the class's
+// `def_env` (`coerce_field` → `validate_into`), coercing a nested Object into a class instance.
+// Dropping that class makes the lookup fail and the contract check error: shaken ≠ unshaken,
+// the cardinal-rule violation. These fixtures are the permanent differential guard for that
+// missing dimension. (`report_kept` = a non-vacuity counterpart to `report_dropped`: the class
+// MUST survive the shake.)
+
+/// A class is KEPT (not in the dropped report) — the keep-side counterpart to `report_dropped`.
+fn report_kept(report: &ascript::compile::shake::ShakeReport, name: &str) -> bool {
+    !report_dropped(report, name)
+}
+
+/// HEADLINE (the repro): `Inner` is referenced ONLY as the field type of `Outer.inner`. After
+/// the fix `Outer.from({inner:{v:5}})` coerces the nested object into an `Inner` instance, so
+/// `o.inner.v` prints `5` identically shaken and unshaken — and `Inner` is KEPT.
+#[tokio::test]
+async fn differential_class_kept_as_field_type_headline() {
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { Outer } from \"./lib\"\n\
+             let o = Outer.from({ inner: { v: 5 } })\n\
+             print(o.inner.v)\n",
+        ),
+        (
+            "lib.as",
+            "class Inner { v: number }\n\
+             export class Outer { inner: Inner }\n",
+        ),
+    ]);
+    let entry = dir.path().join("main.as");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_kept(&report, "Inner"),
+        "Inner is load-bearing (Outer.inner field type) and MUST be kept; dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// `array<Item>` field type: `Bag.items: array<Item>`; `.from` with an array coerces each
+/// element into an `Item`. `Item` kept, output identical.
+#[tokio::test]
+async fn differential_class_kept_as_array_field_element_type() {
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { Bag } from \"./lib\"\n\
+             let b = Bag.from({ items: [{ v: 1 }, { v: 2 }] })\n\
+             print(b.items[0].v + b.items[1].v)\n",
+        ),
+        (
+            "lib.as",
+            "class Item { v: number }\n\
+             export class Bag { items: array<Item> }\n",
+        ),
+    ]);
+    let entry = dir.path().join("main.as");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_kept(&report, "Item"),
+        "Item is load-bearing (array<Item> element type) and MUST be kept; dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// `map<string, Cell>` field type: `Grid.cells: map<string, Cell>`; `.from` with a nested
+/// object coerces each value into a `Cell`. `Cell` kept, output identical.
+#[tokio::test]
+async fn differential_class_kept_as_map_value_field_type() {
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import * as map from \"std/map\"\n\
+             import { Grid } from \"./lib\"\n\
+             let g = Grid.from({ cells: { \"a\": { n: 10 }, \"b\": { n: 20 } } })\n\
+             print(map.get(g.cells, \"a\").n + map.get(g.cells, \"b\").n)\n",
+        ),
+        (
+            "lib.as",
+            "class Cell { n: number }\n\
+             export class Grid { cells: map<string, Cell> }\n",
+        ),
+    ]);
+    let entry = dir.path().join("main.as");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_kept(&report, "Cell"),
+        "Cell is load-bearing (map<string, Cell> value type) and MUST be kept; dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// TRANSITIVE chain: `Outer.inner: Mid`, `Mid.deep: Leaf` — all three kept via the field-type
+/// chain; an unrelated `Dead` class (referenced nowhere) is still dropped (non-vacuity).
+#[tokio::test]
+async fn differential_class_kept_transitively_via_field_types() {
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { Outer } from \"./lib\"\n\
+             let o = Outer.from({ mid: { leaf: { v: 7 } } })\n\
+             print(o.mid.leaf.v)\n",
+        ),
+        (
+            "lib.as",
+            "class Leaf { v: number }\n\
+             class Mid { leaf: Leaf }\n\
+             class Dead { junk: number }\n\
+             export class Outer { mid: Mid }\n",
+        ),
+    ]);
+    let entry = dir.path().join("main.as");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_kept(&report, "Mid") && report_kept(&report, "Leaf"),
+        "Mid + Leaf are load-bearing via the field-type chain; dropped = {:?}",
+        report.dropped
+    );
+    assert!(
+        report_dropped(&report, "Dead"),
+        "the unrelated `Dead` class must STILL be dropped (non-vacuity); dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// ENUM payload field type (conservative under-shake). An enum payload variant
+/// `Shape.Circle(c: Cell)` names `Cell` as a payload FIELD TYPE. We keep `Cell` (the shaker
+/// walks enum payload field `Type::Named` leaves) so a payload-coercion path could never drop
+/// live code. Output identical shaken vs unshaken; `Cell` kept.
+#[tokio::test]
+async fn differential_class_kept_as_enum_payload_field_type() {
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { Shape, Cell } from \"./lib\"\n\
+             let s = Shape.Circle(Cell.from({ n: 9 }))\n\
+             match s {\n\
+             \tShape.Circle(c) => print(c.n)\n\
+             }\n",
+        ),
+        (
+            "lib.as",
+            "export class Cell { n: number }\n\
+             export enum Shape { Circle(c: Cell) }\n",
+        ),
+    ]);
+    let entry = dir.path().join("main.as");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_kept(&report, "Cell"),
+        "Cell is referenced as an enum payload field type and is kept (conservative); dropped = {:?}",
+        report.dropped
+    );
+}
+
+/// NEGATIVE (preserve shaking): a class used ONLY as a PARAM type annotation is STILL dropped.
+/// `CheckParam` uses the ENV-FREE `check_type` (no global lookup, no coercion), so a
+/// param-type-only class is sound to drop — the fix must not over-correct into keeping it.
+#[tokio::test]
+async fn differential_param_type_only_class_still_dropped() {
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { run } from \"./lib\"\nprint(run())\n",
+        ),
+        (
+            "lib.as",
+            // `helper` IS kept (called transitively from the exported `run`), so this is a
+            // genuine over-correction guard: `Unused` appears ONLY as `helper`'s param TYPE
+            // annotation — never constructed, never a field type. `CheckParam` uses the
+            // ENV-FREE `check_type` (no global lookup, no coercion), so `Unused` has no runtime
+            // edge and MUST stay dropped even though `helper` survives.
+            "class Unused { tag: number }\n\
+             fn helper(x: Unused?): number { return 5 }\n\
+             export fn run(): number { return helper(nil) }\n",
+        ),
+    ]);
+    let entry = dir.path().join("main.as");
+
+    let report = assert_shaken_equals_unshaken(&entry).await;
+    assert!(
+        report_dropped(&report, "Unused"),
+        "a class used ONLY as a param type annotation must STILL be dropped (env-free check_type); dropped = {:?}",
+        report.dropped
+    );
+}

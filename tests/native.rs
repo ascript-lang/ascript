@@ -733,3 +733,67 @@ fn native_actor_and_stream_import_module_from_bundle() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&empty);
 }
+
+/// SELF-CONTAINED-BUNDLES (Phase 2, validate_into SOUNDNESS) — WORKER PARITY: a `worker fn`
+/// whose body calls `Outer.from({inner:{v}})` validates a NESTED-class field whose type
+/// (`Inner`) is referenced ONLY as that field type. The worker code-slice's reachability
+/// closure shares `collect_def_refs` with the bundle tree-shaker, so the field-type fix keeps
+/// `Inner` in the worker fragment too — without it the isolate's `validate_into` would fail
+/// with `type contract violated at outer.inner: expected Inner, got object`. Both classes are
+/// defined TOP-LEVEL in the entry module (so they ship via the class-slice machinery, not via
+/// import re-run), exercising the shared shaker fix on the worker path. Bundled, EMPTY cwd.
+#[test]
+fn native_worker_returns_class_with_nested_field_from_bundle() {
+    let _serial = serial_native();
+    let dir = tmp_dir("mm_worker_field_native");
+    // A sibling module supplies the worker's input scalar, so this is a genuine multi-module
+    // bundle (the worker isolate re-runs the import); the load-bearing classes live in `app`.
+    write(
+        &dir,
+        "util.as",
+        "export fn seed(): number { return 5 }\n",
+    );
+    let entry = write(
+        &dir,
+        "app.as",
+        "import { seed } from \"./util\"\n\
+         import * as task from \"std/task\"\n\
+         class Inner { v: number }\n\
+         class Outer { inner: Inner }\n\
+         worker fn build(n: number): number {\n\
+         \x20 let o = Outer.from({ inner: { v: n } })\n\
+         \x20 return o.inner.v\n\
+         }\n\
+         fn main() {\n\
+         \x20 let r = await task.gather([build(seed())])\n\
+         \x20 print(r)\n\
+         }\n\
+         await main()\n",
+    );
+    let app = dir.join("mm_worker_field_app");
+    build_native(&entry, &app);
+
+    let r = run_ref_in(&entry, &dir, &[]);
+    assert!(
+        r.status.success(),
+        "worker→nested-field reference failed: {:?}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let empty = tmp_dir("mm_worker_field_cwd");
+    let b = run_bundle(&app, &empty, &[]);
+    assert!(
+        b.status.success(),
+        "bundled worker→nested-field validate_into failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    assert_eq!(
+        b.stdout, r.stdout,
+        "bundled worker→nested-field stdout differs from source run"
+    );
+    assert_eq!(b.status.code(), r.status.code());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
