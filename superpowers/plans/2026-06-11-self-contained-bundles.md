@@ -184,12 +184,12 @@ if let Some(def) = &p.default {            // NEW
 - Modify: `src/vm/verify.rs:345`
 - Test: inline `#[test]` in `src/vm/verify.rs`
 
-- [ ] **Step 1: Write the failing test** — a hand-built chunk with `SetGlobal` where the abstract stack depth is 0 must be REJECTED by `verify`, not accepted.
-- [ ] **Step 2: Run it — expect FAIL** (currently accepted; would `expect`-panic at `fiber.peek(0)` at run time).
-- [ ] **Step 3: Apply the fix** — `SetGlobal => Effect::new(1, 1)` (consume 1 for the min-depth check, push it back — net zero, matching the "leaves TOS" semantics and aligning with `SetLocal`).
-- [ ] **Step 4: Run it — expect PASS**; full `cargo test` to confirm no valid chunk regressed.
-- [ ] **Step 5: §9.1** — Rust unit test only (internal); blast-radius: re-audit `stack_effect` for any other op whose `pops` is 0 but whose run.rs arm `peek`s/`pop`s.
-- [ ] **Step 6: Commit** — `git commit -m "fix(verify): SetGlobal requires stack depth >= 1"`
+- [x] **Step 1: Write the failing test** — a hand-built chunk with `SetGlobal` where the abstract stack depth is 0 must be REJECTED by `verify`, not accepted.
+- [x] **Step 2: Run it — expect FAIL** (currently accepted; would `expect`-panic at `fiber.peek(0)` at run time).
+- [x] **Step 3: Apply the fix** — `SetGlobal => Effect::new(1, 1)` (consume 1 for the min-depth check, push it back — net zero, matching the "leaves TOS" semantics and aligning with `SetLocal`).
+- [x] **Step 4: Run it — expect PASS**; full `cargo test` to confirm no valid chunk regressed.
+- [x] **Step 5: §9.1** — Rust unit test only (internal); blast-radius: re-audit `stack_effect` for any other op whose `pops` is 0 but whose run.rs arm `peek`s/`pop`s.
+- [x] **Step 6: Commit** — `git commit -m "fix(verify): SetGlobal requires stack depth >= 1"`
 
 ### Task 0.7: verifier bounds for `VariantElem` / `MatchVariantArity`
 
