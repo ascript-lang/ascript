@@ -26,24 +26,8 @@ enum Command {
         /// mismatch. For CI / sandboxes.
         #[arg(long = "locked")]
         locked: bool,
-        /// FFI §4.2: deny one or more capabilities (opt-out). Repeatable and/or
-        /// comma-separated, e.g. `--deny ffi,process`. Valid names: fs, net,
-        /// process, ffi, env. Composes (union of denials) with the manifest
-        /// `[capabilities]` table; denial is monotone (CLI cannot re-grant).
-        #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
-        deny: Vec<String>,
-        /// FFI §4.2: deny ALL five dangerous capabilities (fs, net, process, ffi,
-        /// env). Sugar for `--deny fs,net,process,ffi,env`.
-        #[arg(long = "sandbox")]
-        sandbox: bool,
-        /// FFI §4.4: a granular net carve-out: `--deny-net=external` (allow
-        /// loopback/private, block public) or `--deny-net=all`.
-        #[arg(long = "deny-net", value_name = "MODE")]
-        deny_net: Option<String>,
-        /// FFI §4.4: a granular fs carve-out: `--deny-fs=write` (reads allowed,
-        /// writes denied) or `--deny-fs=all`.
-        #[arg(long = "deny-fs", value_name = "MODE")]
-        deny_fs: Option<String>,
+        #[command(flatten)]
+        caps: CapFlags,
         /// DBG: run under the debugger — start a Debug Adapter Protocol (DAP) server
         /// over stdio for this program instead of running it normally. An editor's
         /// DAP client drives breakpoints/stepping/inspection. Requires the `dap`
@@ -99,25 +83,8 @@ enum Command {
         /// a clear error). Requires `--native`.
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
-        /// FFI §4.2: deny one or more capabilities (opt-out). Repeatable and/or
-        /// comma-separated, e.g. `--deny ffi,process`. Valid names: fs, net,
-        /// process, ffi, env. Composes (union of denials) with the manifest
-        /// `[capabilities]` table; denial is monotone (CLI cannot re-grant). The
-        /// composed set is EMBEDDED in the produced archive manifest.
-        #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
-        deny: Vec<String>,
-        /// FFI §4.2: deny ALL five dangerous capabilities (fs, net, process, ffi,
-        /// env). Sugar for `--deny fs,net,process,ffi,env`.
-        #[arg(long = "sandbox")]
-        sandbox: bool,
-        /// FFI §4.4: a granular net carve-out: `--deny-net=external` (allow
-        /// loopback/private, block public) or `--deny-net=all`.
-        #[arg(long = "deny-net", value_name = "MODE")]
-        deny_net: Option<String>,
-        /// FFI §4.4: a granular fs carve-out: `--deny-fs=write` (reads allowed,
-        /// writes denied) or `--deny-fs=all`.
-        #[arg(long = "deny-fs", value_name = "MODE")]
-        deny_fs: Option<String>,
+        #[command(flatten)]
+        caps: CapFlags,
     },
     /// Start the interactive REPL
     Repl {
@@ -291,6 +258,34 @@ enum Command {
     /// Re-hash the cache store against the lock integrity (fail-closed).
     #[cfg(feature = "pkg")]
     Verify,
+}
+
+/// FFI §4.2/§4.4: the shared capability CLI flags, flattened into both the `run`
+/// and `build` subcommands (DRY — identical surface + help text by construction).
+/// `test` deliberately exposes only `--deny`/`--sandbox` (no granular carve-outs),
+/// so it keeps its own inline pair rather than flattening this.
+#[derive(clap::Args, Debug)]
+struct CapFlags {
+    /// FFI §4.2: deny capabilities for this run (comma-separated / repeatable:
+    /// fs, net, process, ffi, env), composed with any `ascript.toml
+    /// [capabilities]` (denial is monotone — the CLI cannot re-grant). For
+    /// `build`/`build --native` the composed set is additionally EMBEDDED in the
+    /// produced artifact and enforced at launch (further restrictable with
+    /// `ASCRIPT_DENY`); see the bundles docs.
+    #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
+    deny: Vec<String>,
+    /// FFI §4.2: deny ALL five dangerous capabilities (fs, net, process, ffi,
+    /// env). Sugar for `--deny fs,net,process,ffi,env`.
+    #[arg(long = "sandbox")]
+    sandbox: bool,
+    /// FFI §4.4: a granular net carve-out: `--deny-net=external` (allow
+    /// loopback/private, block public) or `--deny-net=all`.
+    #[arg(long = "deny-net", value_name = "MODE")]
+    deny_net: Option<String>,
+    /// FFI §4.4: a granular fs carve-out: `--deny-fs=write` (reads allowed,
+    /// writes denied) or `--deny-fs=all`.
+    #[arg(long = "deny-fs", value_name = "MODE")]
+    deny_fs: Option<String>,
 }
 
 // SP3 §B: run the whole program on a worker thread with an enlarged
@@ -610,10 +605,7 @@ async fn real_main() -> ExitCode {
         Command::Run {
             tree_walker,
             locked,
-            deny,
-            sandbox,
-            deny_net,
-            deny_fs,
+            caps: CapFlags { deny, sandbox, deny_net, deny_fs },
             inspect,
             profile,
             out,
@@ -788,10 +780,7 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
-            deny,
-            sandbox,
-            deny_net,
-            deny_fs,
+            caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
             let out_path = out.as_deref().map(std::path::Path::new);
             let src = std::path::Path::new(&file);
