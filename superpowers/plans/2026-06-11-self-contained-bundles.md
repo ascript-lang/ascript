@@ -530,9 +530,9 @@ let len = match content_length {
 - Modify: `src/vm/mod.rs` (`pub mod archive;`)
 - Test: inline `#[test]` + `tests/archive.rs`
 
-- [ ] **Step 1: Write the failing test** — build a `ModuleArchive` with entry id 0, a `CapSet`, and two `(key, chunk_bytes)` modules; `encode` then `decode` yields an equal archive; a truncated buffer and an over-large `count` both return `ArchiveError`, never panic.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Implement**:
+- [x] **Step 1: Write the failing test** — build a `ModuleArchive` with entry id 0, a `CapSet`, and two `(key, chunk_bytes)` modules; `encode` then `decode` yields an equal archive; a truncated buffer and an over-large `count` both return `ArchiveError`, never panic.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Implement**:
 
 ```rust
 pub const ARCHIVE_MAGIC: [u8; 8] = *b"ASCRIPTA";
@@ -555,9 +555,9 @@ impl ModuleArchive {
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust + `tests/archive.rs`; blast-radius: confirm `ARCHIVE_MAGIC` is distinct from `bundle::BUNDLE_MAGIC` (`ASCRIPTB`) and `aso::ASO_MAGIC` (`ASO\0`) with an assertion test.
-- [ ] **Step 6: Commit** — `git commit -m "feat(vm): ModuleArchive container codec with bounds-checked decode"`
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust + `tests/archive.rs`; blast-radius: confirm `ARCHIVE_MAGIC` is distinct from `bundle::BUNDLE_MAGIC` (`ASCRIPTB`) and `aso::ASO_MAGIC` (`ASO\0`) with an assertion test.
+- [x] **Step 6: Commit** — `git commit -m "feat(vm): ModuleArchive container codec with bounds-checked decode"`
 
 ### Task 1.3: build the archive by walking the import graph (whole modules)
 
