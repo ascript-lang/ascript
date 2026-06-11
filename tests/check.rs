@@ -502,6 +502,53 @@ fn same_typed_params_incompatible_types_still_caught() {
     );
 }
 
+#[test]
+fn array_element_diagnostic_is_emitted_exactly_once() {
+    // Regression: `synth_array` used to synthesize every element TWICE (a discarded
+    // first pass + the folding pass), so any diagnostic on an array element was emitted
+    // twice. The element `x + 1` (x: int?) trips `possibly-nil` — it must appear once.
+    let p = write_tmp(
+        "arr_dup.as",
+        "let x: int? = nil\nlet a = [x + 1]\nprint(a)\n",
+    );
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--json")
+        .arg(&p)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let count = stdout.matches("\"code\":\"possibly-nil\"").count();
+    assert_eq!(
+        count, 1,
+        "the array-element possibly-nil diagnostic must be emitted exactly once; got {count} in: {stdout}"
+    );
+}
+
+#[test]
+fn member_call_receiver_diagnostic_is_emitted_exactly_once() {
+    // Regression (blast-radius of the synth_array dedupe): a `MemberExpr`-callee call
+    // used to synthesize the receiver TWICE (once in `synth_variant_construction`, again
+    // in `synth_member_call`), duplicating any receiver sub-diagnostic. `(x + 1)` with
+    // `x: int?` trips `possibly-nil` — it must appear once.
+    let p = write_tmp(
+        "memcall_dup.as",
+        "let x: int? = nil\nlet r = (x + 1).foo()\nprint(r)\n",
+    );
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--json")
+        .arg(&p)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let count = stdout.matches("\"code\":\"possibly-nil\"").count();
+    assert_eq!(
+        count, 1,
+        "the member-call receiver possibly-nil diagnostic must be emitted exactly once; got {count} in: {stdout}"
+    );
+}
+
 // --- CFG-T3: ascript.toml [lint] config -----------------------------------
 //
 // Discovery walks UP from each checked file's parent directory looking for
