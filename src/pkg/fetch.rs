@@ -120,8 +120,44 @@ fn fetch_path(path: &str, manifest_dir: &Path) -> Result<Fetched, String> {
     })
 }
 
+/// Validate that a git dependency `url` begins with a recognized, safe scheme
+/// BEFORE it is handed to the `git` CLI. Defense-in-depth on top of the `--`
+/// separator: a value like `--upload-pack=…`/`--config=…` (or a bare `-…`) would
+/// otherwise be read by git as an OPTION, not a remote, enabling argument/option
+/// injection (arbitrary command execution via a crafted dependency).
+///
+/// Allowed forms: `https://`, `http://`, `git://`, `ssh://`, `file://`, and the
+/// scp-like shorthand `user@host:path` (e.g. `git@github.com:acme/x.git`).
+/// Anything else — including a leading `-` — is rejected.
+fn validate_git_url(url: &str) -> Result<(), String> {
+    const SCHEMES: &[&str] = &[
+        "https://", "http://", "git://", "ssh://", "file://",
+    ];
+    if SCHEMES.iter().any(|s| url.starts_with(s)) {
+        return Ok(());
+    }
+    // scp-like shorthand `user@host:path` — no `://`, has an `@` in the part
+    // before the first `:`, and does NOT begin with `-` (which would be
+    // option-injection). A bare `@host:path` (empty user) is intentionally
+    // accepted; `contains('@')` already guarantees the part is non-empty.
+    if !url.starts_with('-') && !url.contains("://") {
+        if let Some((userhost, _path)) = url.split_once(':') {
+            if userhost.contains('@') {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "git dependency URL '{url}' has an unrecognized or unsafe scheme \
+         (expected https://, http://, git://, ssh://, file://, or user@host:path)"
+    ))
+}
+
 /// Git dep: bare clone/fetch, checkout the tag/rev, rev-parse, stage + hash.
 fn fetch_git(url: &str, pin: &GitPin) -> Result<Fetched, String> {
+    // Scheme-allowlist the url FIRST: reject an option-injection url before any
+    // subprocess or filesystem touch (defense-in-depth atop the `--` separators).
+    validate_git_url(url)?;
     if !git_available() {
         return Err("the `git` binary is required to fetch git dependencies".to_string());
     }
@@ -230,7 +266,14 @@ fn ensure_bare_clone(url: &str, bare: &Path) -> Result<(), String> {
         }
         run_git(
             None,
-            &["clone", "--bare", "--quiet", url, &bare.to_string_lossy()],
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                "--",
+                url,
+                &bare.to_string_lossy(),
+            ],
         )?;
     }
     Ok(())
@@ -239,11 +282,19 @@ fn ensure_bare_clone(url: &str, bare: &Path) -> Result<(), String> {
 /// Resolve a tag/rev/branch to a concrete commit hash within the bare repo.
 fn git_rev_parse(bare: &Path, refspec: &str) -> Result<String, String> {
     // `<ref>^{commit}` peels an annotated tag to its commit.
+    // NOTE on the separator: `git rev-parse` does NOT accept a plain `--` to guard
+    // its revision operand (`--` switches rev-parse into path/echo mode and prints
+    // the args verbatim). The correct separator is `--end-of-options` (git ≥ 2.24),
+    // which stops option parsing so a `-`-leading refspec is read as a REVISION,
+    // never as an option. `--verify` makes rev-parse emit exactly one resolved id
+    // (no echo) and fail cleanly on a non-revision.
     let out = git_output(
         &[
             "--git-dir",
             &bare.to_string_lossy(),
             "rev-parse",
+            "--verify",
+            "--end-of-options",
             &format!("{refspec}^{{commit}}"),
         ],
     )
@@ -252,6 +303,8 @@ fn git_rev_parse(bare: &Path, refspec: &str) -> Result<String, String> {
             "--git-dir",
             &bare.to_string_lossy(),
             "rev-parse",
+            "--verify",
+            "--end-of-options",
             refspec,
         ])
     })
@@ -260,11 +313,24 @@ fn git_rev_parse(bare: &Path, refspec: &str) -> Result<String, String> {
     if rev.is_empty() {
         return Err(format!("git ref '{refspec}' resolved to an empty commit"));
     }
+    // A resolved commit is a hex object id of a fixed width (SHA-1 = 40, SHA-256
+    // = 64). Enforce that shape so the value handed to the downstream `git archive`
+    // (whose `<tree-ish>` operand CANNOT take a `--` separator — `--` there
+    // switches to <path> mode) can never be option-injected, even if a future git
+    // version returned something odd.
+    if !rev.chars().all(|c| c.is_ascii_hexdigit()) || (rev.len() != 40 && rev.len() != 64) {
+        return Err(format!(
+            "git ref '{refspec}' resolved to a non-commit-hash value '{rev}'"
+        ));
+    }
     Ok(rev)
 }
 
 /// Stage the tree at `rev` into `dest` via `git archive | tar -x` (no working
-/// tree, no hooks, no submodule scripts).
+/// tree, no hooks, no submodule scripts). `rev` is the hex commit id resolved +
+/// shape-checked by [`git_rev_parse`], so it can never be a `-`-leading option
+/// (no `--` is used here: for `git archive`, a `--` switches the operand to
+/// <path> mode rather than protecting the <tree-ish>).
 fn git_archive_into(bare: &Path, rev: &str, dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("cannot create stage dir: {e}"))?;
     let archive = git_output_bytes(&[
@@ -646,5 +712,140 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&cache_dir);
         let _ = fs::remove_dir_all(&pkg);
+    }
+
+    // ---- argument/option-injection hardening (Task 0.9) ---------------------
+
+    #[test]
+    fn validate_git_url_accepts_recognized_schemes() {
+        for ok in [
+            "https://github.com/acme/x.git",
+            "http://example.com/x.git",
+            "git://example.com/x.git",
+            "ssh://git@example.com/x.git",
+            "git@github.com:acme/x.git",
+            "file:///tmp/repo",
+        ] {
+            assert!(validate_git_url(ok).is_ok(), "should accept {ok}");
+        }
+    }
+
+    #[test]
+    fn validate_git_url_rejects_option_injection() {
+        // A `url` crafted to be read by git as an OPTION rather than data.
+        for bad in [
+            "--upload-pack=/bin/false",
+            "--config=core.sshCommand=touch /tmp/pwned",
+            "-oProxyCommand=evil",
+            "ext::sh -c id",
+            "ftp://example.com/x",
+            "",
+        ] {
+            let e = validate_git_url(bad).unwrap_err();
+            assert!(
+                e.contains("scheme") || e.contains("URL"),
+                "expected a scheme rejection for {bad:?}, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_git_rejects_dash_leading_url_via_scheme_check() {
+        // No `git_available()` guard: the scheme check is pure-Rust and rejects
+        // BEFORE `fetch_git` ever consults `git`, so this test runs unconditionally.
+        // A `--config=...` url never reaches the `git clone` argv: the scheme
+        // allowlist rejects it BEFORE any subprocess runs.
+        let e = fetch_git(
+            "--config=core.sshCommand=touch /tmp/ascript-pwned",
+            &GitPin::Tag("v1.0.0".to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("scheme") || e.contains("URL"),
+            "crafted url must be scheme-rejected, got: {e}"
+        );
+        // The injection side effect must not have fired.
+        assert!(
+            !Path::new("/tmp/ascript-pwned").exists(),
+            "injection executed — the scheme check failed to block it"
+        );
+    }
+
+    /// A `tag`/`rev` beginning with `-` must NOT be interpreted by git as an
+    /// OPTION: the `--end-of-options` separator before the rev-parse operand
+    /// protects it. We pass a `-`-leading refspec against a real local repo and
+    /// assert it fails as a clean ref-resolution error (NOT an "unknown option" /
+    /// "is not a git command" leak that would prove option-injection got through).
+    #[tokio::test]
+    async fn git_dash_leading_refspec_is_treated_as_data() {
+        if !git_available() {
+            eprintln!("SKIP git_dash_leading_refspec_is_treated_as_data: `git` not found");
+            return;
+        }
+        let _g = cache::TEST_ENV_ALOCK.lock().await;
+        let cache_dir = scratch("gitcache-dash");
+        let prev = std::env::var_os("ASCRIPT_CACHE");
+        std::env::set_var("ASCRIPT_CACHE", &cache_dir);
+
+        let work = scratch("gitwork-dash");
+        write(&work, "main.as", "print(\"v1\")\n");
+        write(
+            &work,
+            "ascript.toml",
+            "[package]\nname=\"demo\"\nversion=\"1.0.0\"\n",
+        );
+        let g = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        g(&["init", "-q"]);
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "v1"]);
+
+        // A refspec crafted to look like a git option. git refuses to CREATE a
+        // `-`-leading ref, so we feed it as a pin directly: it must NOT resolve
+        // (no such ref) AND must not be parsed as an option.
+        let url = format!("file://{}", work.display());
+        let f = fetch_git(&url, &GitPin::Rev("--upload-pack=/bin/false".to_string()));
+        let e = f.unwrap_err();
+        assert!(
+            e.contains("cannot resolve git ref"),
+            "must fail as a ref-resolution error, got: {e}"
+        );
+        // The protection signature: git never reported it as an OPTION.
+        let low = e.to_ascii_lowercase();
+        assert!(
+            !low.contains("unknown option")
+                && !low.contains("is not a git command")
+                && !low.contains("usage:"),
+            "refspec leaked as an option (separator failed): {e}"
+        );
+
+        // And a NORMAL tag still resolves through the hardened path (no over-block).
+        g(&["tag", "v1.0.0"]);
+        let ok = fetch_git(&url, &GitPin::Tag("v1.0.0".to_string()))
+            .expect("a normal tag must still resolve");
+        assert_eq!(ok.rev.as_ref().unwrap().len(), 40, "full sha");
+        assert_eq!(ok.resolved, "v1.0.0");
+
+        match prev {
+            Some(v) => std::env::set_var("ASCRIPT_CACHE", v),
+            None => std::env::remove_var("ASCRIPT_CACHE"),
+        }
+        let _ = fs::remove_dir_all(&cache_dir);
+        let _ = fs::remove_dir_all(&work);
     }
 }

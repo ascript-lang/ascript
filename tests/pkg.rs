@@ -384,3 +384,50 @@ fn cmd_add_git_at_tag() {
     let _ = std::fs::remove_dir_all(&app);
     let _ = std::fs::remove_dir_all(&cache);
 }
+
+/// SECURITY (Task 0.9): a git dependency whose `url` is crafted to be read by the
+/// `git` CLI as an OPTION (`--config=core.sshCommand=…`, enabling code execution)
+/// is REJECTED by the scheme allowlist before any subprocess runs — and the
+/// injection payload never fires. The manifest is hand-written (an attacker would
+/// craft it); we then `run` and assert a clean failure + no side effect.
+#[cfg(feature = "pkg")]
+#[test]
+fn git_dep_url_option_injection_is_rejected() {
+    let app = scratch("inject-app");
+    // A sentinel the injection payload would create if `git clone` ran it.
+    let sentinel = scratch("inject-sentinel").join("pwned");
+    let payload = format!("touch {}", sentinel.display());
+    // A url that is actually a `git` option, carrying a sshCommand payload.
+    let evil_url = format!("--config=core.sshCommand={payload}");
+    write(
+        &app,
+        "ascript.toml",
+        &format!(
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\n\n[dependencies]\n\
+             evil = {{ git = \"{evil_url}\", tag = \"v1.0.0\" }}\n"
+        ),
+    );
+    write(&app, "main.as", "import { x } from \"evil\"\nprint(x)\n");
+    let main_as = app.join("main.as");
+    let cache = scratch("inject-cache");
+
+    let out = run_in(&main_as, &cache, false, false);
+    assert!(
+        !out.status.success(),
+        "a crafted-option git url must NOT succeed"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unrecognized or unsafe scheme") || stderr.contains("scheme"),
+        "expected a scheme rejection, got: {stderr}"
+    );
+    // The injection payload must not have executed.
+    assert!(
+        !sentinel.exists(),
+        "INJECTION EXECUTED — the scheme check did not block it"
+    );
+
+    let _ = std::fs::remove_dir_all(&app);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_dir_all(sentinel.parent().unwrap());
+}

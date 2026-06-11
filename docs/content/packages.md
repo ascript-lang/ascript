@@ -158,6 +158,15 @@ hermetic for CI: no network, fail on any drift or integrity mismatch.
   consumer's engine compiles it (the `.aso` cache is a local optimization).
   Because the source is what is hashed, the contract survives a bytecode-format
   bump.
+- **Scheme-validated git URLs.** A git dependency `url` must begin with a
+  recognized, safe scheme — `https://`, `http://`, `git://`, `ssh://`, `file://`,
+  or the `user@host:path` shorthand. Anything else (including a value crafted to
+  begin with `-`) is rejected before the `git` CLI is invoked. Together with
+  explicit `--` (for `git clone`) and `--end-of-options` (for `git rev-parse`)
+  separators before user-supplied values, this blocks argument/option injection
+  — a malicious manifest cannot smuggle a
+  `--upload-pack=…` or `--config=core.sshCommand=…` flag through a `url`, `tag`,
+  or `rev`.
 
 ## The registry upgrade path
 
