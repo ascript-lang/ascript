@@ -739,6 +739,17 @@ fn report_dropped(report: &ascript::compile::shake::ShakeReport, name: &str) -> 
         .any(|d| d.names.iter().any(|n| n.as_ref() == name))
 }
 
+/// Write a set of `(file_name, source)` fixtures into a fresh tempdir and return it (kept
+/// alive by the caller — dropping it deletes the tree). Lets each fixture's PROGRAM stand out
+/// from the I/O scaffolding; the entry path is `dir.path().join(<entry name>)`.
+fn write_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, src) in files {
+        std::fs::write(dir.path().join(name), src).expect("write fixture");
+    }
+    dir
+}
+
 // ── Adversarial fixtures ───────────────────────────────────────────────────────────────────
 
 /// #1 — Namespace + DYNAMIC index. `import * as m; print(m[someKey])` indexes the namespace
@@ -746,20 +757,18 @@ fn report_dropped(report: &ascript::compile::shake::ShakeReport, name: &str) -> 
 /// Output identical; the report carries a PIN for util (and drops nothing from it).
 #[tokio::test]
 async fn differential_namespace_dynamic_index_pins_whole() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import * as m from \"./util\"\nlet someKey = \"foo\"\nprint(m[someKey]())\n",
+        ),
+        (
+            "util.as",
+            "export fn foo(): number { return 1 }\n\
+             export fn bar(): number { return 2 }\n",
+        ),
+    ]);
     let entry = dir.path().join("main.as");
-    let util = dir.path().join("util.as");
-    std::fs::write(
-        &entry,
-        "import * as m from \"./util\"\nlet someKey = \"foo\"\nprint(m[someKey]())\n",
-    )
-    .expect("write entry");
-    std::fs::write(
-        &util,
-        "export fn foo(): number { return 1 }\n\
-         export fn bar(): number { return 2 }\n",
-    )
-    .expect("write util");
 
     let report = assert_shaken_equals_unshaken(&entry).await;
     // util is pinned whole: a PIN is recorded for it, and nothing was dropped from it.
@@ -780,21 +789,19 @@ async fn differential_namespace_dynamic_index_pins_whole() {
 /// identical; assert `baz` dropped.
 #[tokio::test]
 async fn differential_namespace_static_calls_drops_unaccessed() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import * as m from \"./util\"\nprint(m.foo(3) + m.bar())\n",
+        ),
+        (
+            "util.as",
+            "export fn foo(a: number): number { return a }\n\
+             export fn bar(): number { return 2 }\n\
+             export fn baz(): number { return 99 }\n",
+        ),
+    ]);
     let entry = dir.path().join("main.as");
-    let util = dir.path().join("util.as");
-    std::fs::write(
-        &entry,
-        "import * as m from \"./util\"\nprint(m.foo(3) + m.bar())\n",
-    )
-    .expect("write entry");
-    std::fs::write(
-        &util,
-        "export fn foo(a: number): number { return a }\n\
-         export fn bar(): number { return 2 }\n\
-         export fn baz(): number { return 99 }\n",
-    )
-    .expect("write util");
 
     let report = assert_shaken_equals_unshaken(&entry).await;
     assert!(
@@ -809,15 +816,14 @@ async fn differential_namespace_static_calls_drops_unaccessed() {
 /// identical. (No drop asserted: the lib only exports `f`, which is used.)
 #[tokio::test]
 async fn differential_escaping_function_value_kept() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { f } from \"./util\"\nlet g = f\nprint(g())\n",
+        ),
+        ("util.as", "export fn f(): number { return 7 }\n"),
+    ]);
     let entry = dir.path().join("main.as");
-    let util = dir.path().join("util.as");
-    std::fs::write(
-        &entry,
-        "import { f } from \"./util\"\nlet g = f\nprint(g())\n",
-    )
-    .expect("write entry");
-    std::fs::write(&util, "export fn f(): number { return 7 }\n").expect("write util");
 
     // The whole value of this fixture is that the escape does NOT change behavior under shaking.
     let _report = assert_shaken_equals_unshaken(&entry).await;
@@ -828,24 +834,21 @@ async fn differential_escaping_function_value_kept() {
 /// handles). The entry sits outside the tight cycle so it can read A's settled export.
 #[tokio::test]
 async fn differential_circular_imports() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = write_fixture(&[
+        ("main.as", "import { fromA } from \"./a\"\nprint(fromA())\n"),
+        (
+            "a.as",
+            "import * as b from \"./b\"\n\
+             export fn fromA(): number { return 10 + b.fromB() }\n",
+        ),
+        (
+            "b.as",
+            "import * as a from \"./a\"\n\
+             export fn fromB(): number { return 5 }\n\
+             export fn deadInB(): number { return 999 }\n",
+        ),
+    ]);
     let main = dir.path().join("main.as");
-    let a = dir.path().join("a.as");
-    let b = dir.path().join("b.as");
-    std::fs::write(&main, "import { fromA } from \"./a\"\nprint(fromA())\n").expect("write main");
-    std::fs::write(
-        &a,
-        "import * as b from \"./b\"\n\
-         export fn fromA(): number { return 10 + b.fromB() }\n",
-    )
-    .expect("write a");
-    std::fs::write(
-        &b,
-        "import * as a from \"./a\"\n\
-         export fn fromB(): number { return 5 }\n\
-         export fn deadInB(): number { return 999 }\n",
-    )
-    .expect("write b");
 
     let _report = assert_shaken_equals_unshaken(&main).await;
     // (No drop ASSERT: whether `deadInB` is droppable depends on whether the `a`↔`b` namespace
@@ -858,19 +861,18 @@ async fn differential_circular_imports() {
 /// effects present (the differential proves order + presence, the drop proves non-vacuity).
 #[tokio::test]
 async fn differential_side_effectful_toplevel_in_source_order() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = write_fixture(&[
+        ("main.as", "import { keep } from \"./lib\"\nprint(keep())\n"),
+        (
+            "lib.as",
+            "fn compute(): number { print(\"computing\")\n return 1 }\n\
+             print(\"loaded\")\n\
+             let x = compute()\n\
+             fn dead(): number { return 0 }\n\
+             export fn keep(): number { return 42 }\n",
+        ),
+    ]);
     let entry = dir.path().join("main.as");
-    let lib = dir.path().join("lib.as");
-    std::fs::write(&entry, "import { keep } from \"./lib\"\nprint(keep())\n").expect("write entry");
-    std::fs::write(
-        &lib,
-        "fn compute(): number { print(\"computing\")\n return 1 }\n\
-         print(\"loaded\")\n\
-         let x = compute()\n\
-         fn dead(): number { return 0 }\n\
-         export fn keep(): number { return 42 }\n",
-    )
-    .expect("write lib");
 
     let report = assert_shaken_equals_unshaken(&entry).await;
     assert!(
@@ -879,8 +881,8 @@ async fn differential_side_effectful_toplevel_in_source_order() {
         report.dropped
     );
 
-    // Belt-and-braces: the SHAKEN run's stdout shows the side effects IN SOURCE ORDER
-    // (print("loaded") then the computed-let's print("computing")), then keep().
+    // asserts the specific SOURCE ORDER of side effects — distinct from the shaken==unshaken
+    // equality above (print("loaded") then the computed-let's print("computing")), then keep().
     let (arch, _r) = compile_archive(&entry, false).expect("archives");
     let (out, _code) = ascript::run_archive(arch).await.expect("runs");
     assert_eq!(
@@ -894,32 +896,26 @@ async fn differential_side_effectful_toplevel_in_source_order() {
 /// dropped.
 #[tokio::test]
 async fn differential_diamond_drops_shared_unused_once() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { fa } from \"./a\"\nimport { fb } from \"./b\"\nprint(fa() + fb())\n",
+        ),
+        (
+            "a.as",
+            "import { used } from \"./d\"\nexport fn fa(): number { return used() }\n",
+        ),
+        (
+            "b.as",
+            "import { used } from \"./d\"\nexport fn fb(): number { return used() }\n",
+        ),
+        (
+            "d.as",
+            "export fn used(): number { return 3 }\n\
+             export fn unusedInD(): number { return 100 }\n",
+        ),
+    ]);
     let entry = dir.path().join("main.as");
-    let a = dir.path().join("a.as");
-    let b = dir.path().join("b.as");
-    let d = dir.path().join("d.as");
-    std::fs::write(
-        &entry,
-        "import { fa } from \"./a\"\nimport { fb } from \"./b\"\nprint(fa() + fb())\n",
-    )
-    .expect("write entry");
-    std::fs::write(
-        &a,
-        "import { used } from \"./d\"\nexport fn fa(): number { return used() }\n",
-    )
-    .expect("write a");
-    std::fs::write(
-        &b,
-        "import { used } from \"./d\"\nexport fn fb(): number { return used() }\n",
-    )
-    .expect("write b");
-    std::fs::write(
-        &d,
-        "export fn used(): number { return 3 }\n\
-         export fn unusedInD(): number { return 100 }\n",
-    )
-    .expect("write d");
 
     let report = assert_shaken_equals_unshaken(&entry).await;
     assert!(
@@ -941,30 +937,26 @@ async fn differential_diamond_drops_shared_unused_once() {
 /// dropped. Output identical; assert the unused class dropped.
 #[tokio::test]
 async fn differential_cross_module_classes_enums() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = write_fixture(&[
+        (
+            "main.as",
+            "import { Dog } from \"./lib1\"\nimport { Color, describe } from \"./lib2\"\n\
+             let d = Dog(\"Rex\")\nprint(d.speak())\nprint(describe(Color.Red))\n",
+        ),
+        (
+            "lib1.as",
+            "class Animal {\n  fn init(name: string) { self.name = name }\n  fn speak(): string { return \"...\" }\n}\n\
+             export class Dog extends Animal {\n  fn init(name: string) { super.init(name) }\n  fn speak(): string { return `${self.name} says woof` }\n}\n\
+             export class Cat extends Animal {\n  fn init(name: string) { super.init(name) }\n  fn speak(): string { return `${self.name} meows` }\n}\n",
+        ),
+        (
+            "lib2.as",
+            "export enum Color { Red, Green, Blue }\n\
+             export fn describe(c: Color): string {\n  return match c {\n    Color.Red => \"r\",\n    Color.Green => \"g\",\n    Color.Blue => \"b\",\n  }\n}\n\
+             export fn unusedHelper(): number { return 42 }\n",
+        ),
+    ]);
     let entry = dir.path().join("main.as");
-    let lib1 = dir.path().join("lib1.as");
-    let lib2 = dir.path().join("lib2.as");
-    std::fs::write(
-        &entry,
-        "import { Dog } from \"./lib1\"\nimport { Color, describe } from \"./lib2\"\n\
-         let d = Dog(\"Rex\")\nprint(d.speak())\nprint(describe(Color.Red))\n",
-    )
-    .expect("write entry");
-    std::fs::write(
-        &lib1,
-        "class Animal {\n  fn init(name: string) { self.name = name }\n  fn speak(): string { return \"...\" }\n}\n\
-         export class Dog extends Animal {\n  fn init(name: string) { super.init(name) }\n  fn speak(): string { return `${self.name} says woof` }\n}\n\
-         export class Cat extends Animal {\n  fn init(name: string) { super.init(name) }\n  fn speak(): string { return `${self.name} meows` }\n}\n",
-    )
-    .expect("write lib1");
-    std::fs::write(
-        &lib2,
-        "export enum Color { Red, Green, Blue }\n\
-         export fn describe(c: Color): string {\n  return match c {\n    Color.Red => \"r\",\n    Color.Green => \"g\",\n    Color.Blue => \"b\",\n  }\n}\n\
-         export fn unusedHelper(): number { return 42 }\n",
-    )
-    .expect("write lib2");
 
     let report = assert_shaken_equals_unshaken(&entry).await;
     // lib1's unused `Cat` (only `Dog` + its superclass `Animal` are reachable) is dropped.
@@ -1010,15 +1002,6 @@ async fn differential_corpus_modules_main() {
 // disk run is INHERENTLY unshaken (the loader hits disk for every import, no archive, no
 // pruning), so this is a second, independent unshaken baseline.
 
-/// Run an on-disk multi-file program through the VM with CAPTURED stdout, returning
-/// `(stdout, exit_code)`. Mirrors `run_archive`'s capture but loads imports from DISK (no
-/// archive installed) — the inherently-unshaken baseline for approach (B).
-async fn run_disk_captured(entry: &Path) -> (String, Option<i32>) {
-    ascript::vm_run_file_captured(entry)
-        .await
-        .expect("disk program runs")
-}
-
 /// Headline corpus example: the SHAKEN archive's stdout equals the on-disk (unshaken) run's
 /// stdout, byte-for-byte. Proves shaking + the archive loader together preserve behavior end
 /// to end.
@@ -1031,7 +1014,10 @@ async fn differential_bundle_multimodule_archive_matches_disk_run() {
     // non-vacuity. The adversarial fixtures above own the "shaking actually happened" guard.)
     let shaken = ModuleArchive::decode(&arch.encode()).expect("decodes");
     let (archive_out, archive_code) = ascript::run_archive(shaken).await.expect("archive runs");
-    let (disk_out, disk_code) = run_disk_captured(entry).await;
+    // The on-disk run is inherently unshaken (loads every import from disk, no archive/pruning).
+    let (disk_out, disk_code) = ascript::vm_run_file_captured(entry)
+        .await
+        .expect("disk program runs");
     assert_eq!(
         archive_out, disk_out,
         "shaken archive stdout must equal the on-disk run; archive={archive_out:?} disk={disk_out:?}"

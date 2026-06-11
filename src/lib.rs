@@ -2266,6 +2266,9 @@ pub async fn vm_run_file_captured(entry: &Path) -> Result<(String, Option<i32>),
     });
     let chunk = crate::compile::compile_source(&src)
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // Match production (`run_file_on_vm_with_packages`): bind the module source onto the proto
+    // tree so a Tier-2 panic renders with source context, instead of silently diverging.
+    chunk.set_module_source(&src_info);
     let proto = Rc::new(FnProto {
         chunk,
         arity: 0,
