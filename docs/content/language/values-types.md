@@ -98,7 +98,9 @@ print(int("x"))     // [nil, {message: ...}]
 ```
 
 **Exact cross-subtype comparison.** `1 == 1.0` is `true`, but a large `int` not exactly representable
-as a `float` compares exactly — no precision bug at the `2^53` boundary.
+as a `float` compares exactly — no precision bug at the `2^53` boundary. A `float` at or above `2^63`
+(`9223372036854775808.0` and up) is past the `int` range, so it is **never equal to any `int`** and
+**never shares a map key** with one — e.g. `9223372036854775808.0 == 9223372036854775807` is `false`.
 
 **Reflection / narrowing.** `x instanceof int` / `float` / `number` are runtime type guards (the
 checker narrows `number` to the subtype in the guarded branch):

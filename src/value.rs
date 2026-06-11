@@ -215,7 +215,11 @@ impl MapKey {
                 if n.fract() == 0.0
                     && n.is_finite()
                     && *n >= i64::MIN as f64
-                    && *n <= i64::MAX as f64
+                    // STRICT upper bound: `i64::MAX as f64` rounds UP to 2^63 (out of
+                    // i64 range), so `<=` would admit 2^63 and `as i64` would saturate
+                    // to i64::MAX — wrongly colliding 2^63 with `int` i64::MAX as a key.
+                    // `-(i64::MIN as f64)` is exactly 2^63; `<` excludes it (no i64 ≥ 2^63).
+                    && *n < -(i64::MIN as f64)
                 {
                     Some(MapKey::Int(*n as i64))
                 } else {
@@ -1252,7 +1256,10 @@ impl Value {
                 if f.is_finite()
                     && f.fract() == 0.0
                     && *f >= i64::MIN as f64
-                    && *f <= i64::MAX as f64
+                    // STRICT upper bound: `i64::MAX as f64` rounds UP to 2^63 (out of
+                    // i64 range); `-(i64::MIN as f64)` == 2^63 and `<` excludes it so
+                    // 2^63 is rejected instead of silently saturating via `as i64`.
+                    && *f < -(i64::MIN as f64)
                 {
                     Some(*f as i64)
                 } else {
@@ -1327,7 +1334,10 @@ fn int_eq_float(i: i64, f: f64) -> bool {
     f.is_finite()
         && f.fract() == 0.0
         && f >= i64::MIN as f64
-        && f <= i64::MAX as f64
+        // STRICT upper bound: `i64::MAX as f64` rounds UP to 2^63 (out of i64 range),
+        // so `<=` would admit 2^63 and `f as i64` would saturate to i64::MAX, making
+        // `2^63 == i64::MAX` wrongly true. `-(i64::MIN as f64)` == 2^63; `<` excludes it.
+        && f < -(i64::MIN as f64)
         && f as i64 == i
 }
 
@@ -1720,6 +1730,26 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Task 0.1 regression: `i64::MAX as f64` rounds UP to 2^63 (out of i64 range),
+    // so a `<=` upper bound wrongly admitted 2^63 across equality, MapKey folding,
+    // and `as_int_exact`. The strict `< -(i64::MIN as f64)` bound rejects it.
+    #[test]
+    fn float_two_pow_63_is_not_i64_max() {
+        let two63 = 9223372036854775808.0_f64; // 2^63, NOT representable as i64
+        assert!(!int_eq_float(i64::MAX, two63));
+        assert_eq!(Value::Float(two63).as_int_exact(), None);
+        // `MapKey` has no `Debug`, so compare for inequality with `==` directly.
+        assert!(
+            MapKey::from_value(&Value::Float(two63))
+                != MapKey::from_value(&Value::Int(i64::MAX)),
+            "2^63 float must not share a map key with i64::MAX"
+        );
+        // The largest in-range integral float (2^63 − 2048) still folds correctly.
+        let max_in_range = 9223372036854773760.0_f64;
+        assert!(int_eq_float(9223372036854773760, max_in_range));
+        assert_eq!(Value::Float(max_in_range).as_int_exact(), Some(9223372036854773760));
+    }
 
     // VAL Task 0 — the MOVING SIZE TRIPWIRE. `Value` is the runtime tagged union
     // threaded through every fiber stack slot, frame slot, array element, and map

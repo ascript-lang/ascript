@@ -106,9 +106,13 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
     }
 }
 
-/// Encode a number: integer-valued in i128 range → integer, else → float.
+/// Encode a number: integer-valued in i64/u64 range → integer, else → float.
 fn number_to_cbor(n: f64) -> Cb {
-    if n.fract() == 0.0 && n.is_finite() && n >= i64::MIN as f64 && n <= u64::MAX as f64 {
+    // STRICT upper bound: `u64::MAX as f64` rounds UP to 2^64 (out of u64 range), so
+    // `<=` would admit 2^64 and `n as u64` would saturate. `2.0^64` is exact; `<`
+    // excludes it (an out-of-range integral float falls through to `Cb::Float`). The
+    // negative branch only reaches `n as i64` for n ≥ i64::MIN (≥ -2^63), in range.
+    if n.fract() == 0.0 && n.is_finite() && n >= i64::MIN as f64 && n < 2.0_f64.powi(64) {
         if n >= 0.0 {
             return Cb::Integer((n as u64).into());
         }

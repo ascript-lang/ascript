@@ -102,7 +102,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         .into());
                     }
                     // Integer-valued floats → exact integer Decimal (no fractional part).
-                    if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                    // STRICT upper bound: `i64::MAX as f64` rounds UP to 2^63 (out of
+                    // i64 range), so `<=` would admit 2^63 and `as i64` would saturate;
+                    // `-(i64::MIN as f64)` == 2^63 and `<` excludes it. Out-of-i64-range
+                    // integral floats fall through to the exact `from_f64` path below.
+                    if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n < -(i64::MIN as f64) {
                         Ok(Value::Decimal(Rc::new(Decimal::from(*n as i64))))
                     } else {
                         // Non-integer: use shortest round-trip via from_f64.
