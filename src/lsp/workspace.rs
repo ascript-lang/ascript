@@ -374,8 +374,22 @@ impl WorkspaceIndex {
         self.files.insert(canon, file);
     }
 
+    /// Fully remove a path from the index: its `defs_by_name` / `import_edges` /
+    /// `importers` contributions AND its `files` entry. Use for a path that is
+    /// genuinely going away (rename / delete) — this makes forgetting the second
+    /// half impossible. `reindex_file` uses the lower-level
+    /// `remove_file_from_maps` instead because it re-inserts immediately after.
+    pub fn fully_unindex(&mut self, canon: &Path) {
+        self.remove_file_from_maps(canon);
+        self.files.remove(canon);
+    }
+
     /// Remove a file's contributions to `defs_by_name` and `import_edges` /
     /// `importers` (called before re-adding on reindex).
+    ///
+    /// This does NOT remove the file's own `files` entry — a caller that fully
+    /// drops a path must use [`Self::fully_unindex`] instead. `reindex_file`
+    /// calls this then re-inserts.
     fn remove_file_from_maps(&mut self, canon: &Path) {
         for defs in self.defs_by_name.values_mut() {
             defs.retain(|d| d.path != canon);

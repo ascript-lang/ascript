@@ -2701,4 +2701,91 @@ fn dim(s: Shape): int {\n  return match s {\n    Shape.Circle(r) | Shape.Square(
         let b_uses = refs.iter().filter(|(p, _)| *p == b).count();
         assert_eq!(b_uses, 2, "both f(1) and f(2) uses in b: {refs:?}");
     }
+
+    /// Renaming a file (the `didRenameFiles` re-key) must FULLY unindex the old
+    /// path from EVERY map — `defs_by_name`, `import_edges`, AND `importers` —
+    /// not just `files`. Otherwise workspace-symbols / go-to-def return stale
+    /// results pointing at the now-deleted old path, and a reverse import edge to
+    /// the old path lingers. Regression for Task 0.15.
+    ///
+    /// NOTE: this drives the index ops directly (`fully_unindex(old)` +
+    /// `reindex_file(new)`) — NOT through the live server's `didRenameFiles`
+    /// notification handler, so the LSP wire/protocol path is not exercised here.
+    #[test]
+    fn rename_file_fully_unindexes_old_path() {
+        // old.as: exports `Widget` AND imports `./dep` (an outgoing edge).
+        let old_src = "import { helper } from \"./dep\"\nexport fn Widget() { return helper() }\n";
+        let dep_src = "export fn helper() { return 1 }\n";
+        let mut index = idx(&[("/ws/old.as", old_src), ("/ws/dep.as", dep_src)]);
+        let old = canon(Path::new("/ws/old.as"));
+        let new = canon(Path::new("/ws/new.as"));
+        let dep = canon(Path::new("/ws/dep.as"));
+
+        // Sanity: before the rename the symbol resolves under the OLD path, and
+        // dep records old.as as an importer.
+        let syms = index.workspace_symbols("Widget");
+        assert!(
+            syms.iter().any(|d| d.path == old && d.name == "Widget"),
+            "before rename, Widget is defined in old.as: {syms:?}"
+        );
+        assert!(
+            index
+                .defs_by_name
+                .get("Widget")
+                .is_some_and(|v| v.iter().any(|d| d.path == old)),
+            "defs_by_name has Widget@old before rename"
+        );
+        assert!(
+            index
+                .importers
+                .get(&dep)
+                .is_some_and(|s| s.contains(&old)),
+            "dep records old.as as an importer before rename"
+        );
+
+        // The re-key the handler performs (Task 0.15 fix): the combined
+        // `fully_unindex` makes the old "files-only remove" footgun impossible.
+        index.fully_unindex(&old);
+        let new_src = old_src; // the renamed file keeps its contents
+        index.reindex_file(&new, new_src);
+
+        // 1) The OLD path is gone from `files`.
+        assert!(
+            !index.files.contains_key(&old),
+            "old.as must be removed from files"
+        );
+        // 2) No `defs_by_name` entry points at the OLD path anywhere.
+        for (name, defs) in &index.defs_by_name {
+            assert!(
+                defs.iter().all(|d| d.path != old),
+                "stale def `{name}` still points at old.as: {defs:?}"
+            );
+        }
+        // 3) workspace-symbols for Widget now resolves under NEW, never OLD.
+        let syms = index.workspace_symbols("Widget");
+        assert!(
+            syms.iter().any(|d| d.path == new && d.name == "Widget"),
+            "after rename, Widget is defined in new.as: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|d| d.path == old),
+            "workspace-symbols must not return the stale old.as path: {syms:?}"
+        );
+        // 4) No outgoing import edge keyed on the OLD path.
+        assert!(
+            !index.import_edges.contains_key(&old),
+            "import_edges must not retain the old.as key"
+        );
+        // 5) The reverse edge: dep no longer records old.as as an importer (the
+        //    new path takes its place).
+        let dep_importers = index.importers.get(&dep);
+        assert!(
+            dep_importers.is_none_or(|s| !s.contains(&old)),
+            "importers[dep] must not retain old.as: {dep_importers:?}"
+        );
+        assert!(
+            dep_importers.is_some_and(|s| s.contains(&new)),
+            "importers[dep] must now record new.as: {dep_importers:?}"
+        );
+    }
 }
