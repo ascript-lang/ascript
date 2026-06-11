@@ -244,9 +244,9 @@ fn sanitize_header(name: &str, val: &str) -> Result<(), Control> {
 - Modify: `src/pkg/fetch.rs:233` (clone) and `:246/:254` (rev-parse)
 - Test: `tests/pkg.rs`
 
-- [ ] **Step 1: Write the failing test** — a dependency `url = "--upload-pack=touch /tmp/x"` (or a refspec starting with `-`) must not be treated as a git flag; assert the args contain a `--` separator before untrusted input.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Apply the fix** — insert `--` before untrusted positional args:
+- [x] **Step 1: Write the failing test** — a dependency `url = "--upload-pack=touch /tmp/x"` (or a refspec starting with `-`) must not be treated as a git flag; assert the args contain a `--` separator before untrusted input.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Apply the fix** — insert `--` before untrusted positional args:
 
 ```rust
 run_git(None, &["clone", "--bare", "--quiet", "--", url, &bare.to_string_lossy()])?;
@@ -256,9 +256,9 @@ git_output(&["--git-dir", &bare.to_string_lossy(), "rev-parse", "--", &format!("
 
 Additionally validate `url` begins with a known scheme (`https://`/`git@`/`ssh://`/`file://`) before use.
 
-- [ ] **Step 4: Run it — expect PASS**; `cargo test --test pkg`.
-- [ ] **Step 5: §9.1** — pkg test only (hermetic); docs: pkg page security note; blast-radius: audit every `run_git`/`git_output` call for the same omission.
-- [ ] **Step 6: Commit** — `git commit -m "fix(pkg): add -- separator + scheme check to git invocations"`
+- [x] **Step 4: Run it — expect PASS**; `cargo test --test pkg`.
+- [x] **Step 5: §9.1** — pkg test only (hermetic); docs: pkg page security note; blast-radius: audit every `run_git`/`git_output` call for the same omission.
+- [x] **Step 6: Commit** — `git commit -m "fix(pkg): add -- separator + scheme check to git invocations"`
 
 ### Task 0.10: non-finite count guards (`string.repeat`, `reader.read`)
 
