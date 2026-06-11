@@ -37,6 +37,12 @@ pub struct ModuleArchive {
     pub shake_digest: [u8; 32],
     /// Per module: its logical path key and the verified `.aso` chunk bytes (stored opaque).
     pub modules: Vec<(String, Vec<u8>)>,
+    /// Logical key → index into [`modules`](Self::modules), so [`get`](Self::get) is O(1) on
+    /// the per-import hot path (the format admits up to [`MAX_MODULES`] entries). A PURE function
+    /// of `modules` (built once in [`new`](Self::new), never written elsewhere), so it does not
+    /// affect `PartialEq`/`Eq` semantics — two archives with equal `modules` have equal indices.
+    /// FIRST-occurrence-wins on a duplicate key, matching the prior linear `.find`.
+    key_index: std::collections::HashMap<String, usize>,
 }
 
 /// Cap on the module count and on each key/chunk length, applied BEFORE any `Vec::with_capacity`
@@ -177,6 +183,31 @@ fn write_len(out: &mut Vec<u8>, n: usize) {
 }
 
 impl ModuleArchive {
+    /// Build an archive from its manifest fields, deriving the private `key_index`. This is the
+    /// SOLE constructor (the field is private), so every archive — built, decoded, or in a test —
+    /// has a `key_index` consistent with its `modules`.
+    ///
+    /// Duplicate-key semantics match the prior linear [`get`](Self::get): the FIRST occurrence of
+    /// a key wins (`or_insert` keeps the earliest index).
+    pub fn new(
+        entry: u32,
+        caps: CapSet,
+        shake_digest: [u8; 32],
+        modules: Vec<(String, Vec<u8>)>,
+    ) -> Self {
+        let mut key_index = std::collections::HashMap::with_capacity(modules.len());
+        for (i, (k, _)) in modules.iter().enumerate() {
+            key_index.entry(k.clone()).or_insert(i);
+        }
+        ModuleArchive {
+            entry,
+            caps,
+            shake_digest,
+            modules,
+            key_index,
+        }
+    }
+
     /// Serialize to the archive wire form:
     ///
     /// ```text
@@ -259,20 +290,13 @@ impl ModuleArchive {
             modules.push((key, chunk));
         }
 
-        Ok(ModuleArchive {
-            entry,
-            caps,
-            shake_digest,
-            modules,
-        })
+        Ok(ModuleArchive::new(entry, caps, shake_digest, modules))
     }
 
-    /// Look up a module's opaque `.aso` chunk bytes by its logical key.
+    /// Look up a module's opaque `.aso` chunk bytes by its logical key. O(1) via the
+    /// `key_index` (called once per import on the archive-run hot path).
     pub fn get(&self, key: &str) -> Option<&[u8]> {
-        self.modules
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, chunk)| chunk.as_slice())
+        self.key_index.get(key).map(|&i| self.modules[i].1.as_slice())
     }
 }
 
@@ -403,16 +427,16 @@ mod tests {
         for (i, byte) in shake.iter_mut().enumerate() {
             *byte = (i as u8).wrapping_mul(7).wrapping_add(1);
         }
-        ModuleArchive {
-            entry: 0,
-            caps: sample_caps(),
-            shake_digest: shake,
-            modules: vec![
+        ModuleArchive::new(
+            0,
+            sample_caps(),
+            shake,
+            vec![
                 ("main".to_string(), vec![0xAA, 0xBB, 0xCC, 0x00, 0xFF]),
                 ("std/foo".to_string(), vec![1, 2, 3]),
                 ("pkg/bar/baz".to_string(), vec![]),
             ],
-        }
+        )
     }
 
     #[test]
@@ -436,15 +460,15 @@ mod tests {
 
     #[test]
     fn empty_chunk_and_nonzero_entry_round_trip() {
-        let arch = ModuleArchive {
-            entry: 1,
-            caps: CapSet::default(),
-            shake_digest: [0u8; 32],
-            modules: vec![
+        let arch = ModuleArchive::new(
+            1,
+            CapSet::default(),
+            [0u8; 32],
+            vec![
                 ("a".to_string(), vec![9, 9]),
                 ("b".to_string(), vec![7]),
             ],
-        };
+        );
         let decoded = ModuleArchive::decode(&arch.encode()).expect("decodes");
         assert_eq!(decoded, arch);
         assert_eq!(decoded.entry, 1);

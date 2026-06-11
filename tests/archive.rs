@@ -406,13 +406,13 @@ async fn nested_and_parent_dir_imports_resolve_from_archive() {
 /// never a panic.
 #[tokio::test]
 async fn corrupt_embedded_entry_chunk_is_clean_error() {
-    let arch = ModuleArchive {
-        entry: 0,
-        caps: ascript::stdlib::caps::CapSet::default(),
-        shake_digest: [0u8; 32],
+    let arch = ModuleArchive::new(
+        0,
+        ascript::stdlib::caps::CapSet::default(),
+        [0u8; 32],
         // Garbage bytes where a verified chunk should be.
-        modules: vec![("main.as".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF])],
-    };
+        vec![("main.as".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF])],
+    );
     let err = ascript::run_archive(arch)
         .await
         .expect_err("a corrupt embedded chunk must be a clean error");

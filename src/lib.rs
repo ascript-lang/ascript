@@ -1170,12 +1170,12 @@ pub fn compile_archive(entry: &Path) -> Result<crate::vm::archive::ModuleArchive
         }
     }
 
-    Ok(ModuleArchive {
+    Ok(ModuleArchive::new(
         entry,
-        caps: crate::stdlib::caps::CapSet::default(), // Phase 3 fills the composed caps
-        shake_digest: [0u8; 32],                      // Phase 2 fills the shake digest
+        crate::stdlib::caps::CapSet::default(), // Phase 3 fills the composed caps
+        [0u8; 32],                              // Phase 2 fills the shake digest
         modules,
-    })
+    ))
 }
 
 /// Resolve a requested module path (already importer-joined, e.g. `<dir>/util.as` or an
@@ -1910,6 +1910,10 @@ pub async fn run_archive(
     let vm = Vm::new(interp.clone());
     // Install the archive so every relative import resolves from memory by logical key.
     // The entry's logical dir is seeded to the archive root ("") by `set_module_archive`.
+    // `module_dir` is INTENTIONALLY left at cwd: an archive is expected to be self-contained,
+    // so a disk fallback never fires here. A future path-carrying dispatch (Task 1.5, e.g.
+    // `ascript run app.aso`) MUST call `set_module_dir` to the archive's parent so an
+    // archive-miss can still resolve sibling sources on disk.
     vm.set_module_archive(Rc::new(archive));
 
     let proto = Rc::new(FnProto {
