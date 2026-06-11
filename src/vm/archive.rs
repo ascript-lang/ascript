@@ -276,6 +276,114 @@ impl ModuleArchive {
     }
 }
 
+/// Lexically join a logical directory `dir` (archive-relative, `/`-separated, possibly
+/// empty for the root) with a RELATIVE import specifier `source`, defaulting a `.as`
+/// extension, and lexically resolve `.`/`..` segments. The result is the module's
+/// archive key — machine independent (no absolute prefix).
+///
+/// This is the **load-bearing key convention** (spec §3.3): `compile_archive` (the
+/// builder) and `load_file_module` (the runtime loader) BOTH call this so they compute
+/// IDENTICAL keys for the same import from the same logical position — if they ever
+/// drifted, an embedded module would be archived under one key and looked up under
+/// another, and the bundle would silently fail to find it. Keeping ONE implementation is
+/// the guarantee they cannot drift.
+///
+/// A `.` segment is dropped and a `..` cancels the preceding real segment — but a `..`
+/// that **escapes the logical root** (nothing left to pop) is **PRESERVED VERBATIM**, so
+/// the key may legitimately contain leading `..` (e.g. `../shared.as`). This is correct
+/// and deliberate: such a key is still machine-independent (it is relative to the entry
+/// dir, leaking no absolute build path) AND preserves uniqueness — `../a` must stay
+/// distinct from `a`.
+///
+/// NOTE: this handles the RELATIVE case only. A PACKAGE specifier is keyed by the caller
+/// under a stable `pkg/` namespace (`join_logical("pkg", source)`), which simply reuses
+/// this same routine with `dir == "pkg"` — there is no special package logic here.
+pub fn join_logical(dir: &str, source: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    if !dir.is_empty() {
+        segments.extend(dir.split('/').filter(|s| !s.is_empty()));
+    }
+    for seg in source.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                // Cancel the preceding REAL segment; but if there is none to pop (we are
+                // at — or already above — the logical root), PRESERVE the `..` verbatim so
+                // an escaping key stays unique and machine-independently reproducible.
+                if segments.last().map(|s| *s != "..").unwrap_or(false) {
+                    segments.pop();
+                } else {
+                    segments.push("..");
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut key = segments.join("/");
+    // Default the `.as` extension to match the on-disk resolution and the entry key.
+    if !key.ends_with(".as") && !key.ends_with(".aso") {
+        key.push_str(".as");
+    }
+    key
+}
+
+/// The logical directory of a logical key — everything before the final `/` segment, or
+/// the empty string for a root-level module. Used as the resolution base for a module's
+/// OWN transitive imports (the importer's logical dir for the next [`join_logical`]).
+pub fn logical_parent(key: &str) -> String {
+    match key.rfind('/') {
+        Some(i) => key[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{join_logical, logical_parent};
+
+    #[test]
+    fn entry_relative_sibling() {
+        // `./util` from the root keys at `util.as`.
+        assert_eq!(join_logical("", "./bundle_util"), "bundle_util.as");
+        assert_eq!(join_logical("", "bundle_util"), "bundle_util.as");
+    }
+
+    #[test]
+    fn subdir_relative() {
+        assert_eq!(join_logical("a/b", "./c"), "a/b/c.as");
+        assert_eq!(join_logical("a/b", "../c"), "a/c.as");
+        assert_eq!(join_logical("a/b", "../../c"), "c.as");
+    }
+
+    #[test]
+    fn dotdot_escaping_root_is_preserved() {
+        // From the root, `../shared` escapes → `../shared.as` verbatim.
+        assert_eq!(join_logical("", "../shared"), "../shared.as");
+        assert_eq!(join_logical("", "../../x"), "../../x.as");
+        // `../a` must stay distinct from `a`.
+        assert_ne!(join_logical("", "../a"), join_logical("", "a"));
+    }
+
+    #[test]
+    fn explicit_extension_kept() {
+        assert_eq!(join_logical("", "./mod.as"), "mod.as");
+        assert_eq!(join_logical("", "./mod.aso"), "mod.aso");
+    }
+
+    #[test]
+    fn package_namespace_via_pkg_dir() {
+        // The caller keys a package under the `pkg` dir; same routine.
+        assert_eq!(join_logical("pkg", "foo/bar"), "pkg/foo/bar.as");
+    }
+
+    #[test]
+    fn parent_of_key() {
+        assert_eq!(logical_parent("util.as"), "");
+        assert_eq!(logical_parent("a/b/c.as"), "a/b");
+        assert_eq!(logical_parent("../shared.as"), "..");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

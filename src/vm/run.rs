@@ -133,6 +133,24 @@ pub struct Vm {
     /// relative file import (`from "./mod"`). Mirrors `Interp::module_dir`. Swapped
     /// around a nested module run and restored after.
     module_dir: RefCell<std::path::PathBuf>,
+    /// **SELF-CONTAINED-BUNDLES Phase 1.** An optional in-memory module archive. `None`
+    /// is the default and the production disk path: `load_file_module` resolves every
+    /// relative import on disk exactly as before (byte-identical). When `Some` (a `run`
+    /// of a `.aso` archive / native bundle, installed via [`set_module_archive`]), each
+    /// relative import is FIRST looked up in the archive by its machine-independent
+    /// LOGICAL KEY (`join_logical(module_logical_dir, source)`) — a hit runs the embedded
+    /// verified chunk through the SAME `from_bytes_verified` trust boundary as the disk
+    /// path, with NO source tree on disk; a miss falls through to the unchanged disk path.
+    module_archive: RefCell<Option<Rc<crate::vm::archive::ModuleArchive>>>,
+    /// **SELF-CONTAINED-BUNDLES Phase 1.** The CURRENT module's LOGICAL directory — its
+    /// archive-relative, `/`-separated directory (the entry's is `""`). Parallel to
+    /// [`module_dir`](Self::module_dir) and swapped IN LOCKSTEP with it around a nested
+    /// module run. It is the resolution base for an archive lookup: an import `S` from a
+    /// module whose logical dir is `D` keys at `join_logical(D, S)`. Inert overhead when
+    /// no archive is installed (a single string swap), so the default path stays
+    /// byte-identical. The two must compute the SAME key `compile_archive` stored —
+    /// guaranteed by sharing `crate::vm::archive::join_logical`.
+    module_logical_dir: RefCell<String>,
     /// MODULE-SCOPE USER-GLOBALS: every DIRECT-child top-level binding of the entry
     /// program (`let`/`const`/`fn`/`class`/`enum`/`import`) is a late-bound global
     /// stored here by name, NOT a SourceFile-frame slot-local. `Op::DefineGlobal`
@@ -224,6 +242,8 @@ impl Vm {
             module_exports: RefCell::new(Rc::new(RefCell::new(indexmap::IndexMap::new()))),
             file_modules: RefCell::new(HashMap::new()),
             module_dir: RefCell::new(std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            module_archive: RefCell::new(None),
+            module_logical_dir: RefCell::new(String::new()),
             user_globals: RefCell::new(indexmap::IndexMap::new()),
             global_version: std::cell::Cell::new(0),
             struct_gen: std::cell::Cell::new(0),
@@ -489,6 +509,22 @@ impl Vm {
         *self.module_dir.borrow_mut() = dir;
     }
 
+    /// **SELF-CONTAINED-BUNDLES Phase 1.** Install an in-memory [`ModuleArchive`] as the
+    /// source for relative file imports, and seed the entry's logical dir to the archive
+    /// root (`""`). After this, `load_file_module` consults the archive by logical key
+    /// BEFORE touching disk, so the program runs with NO source tree present. With no
+    /// archive installed (the default) the loader is byte-identical to the disk-only path.
+    ///
+    /// The caller seeds the entry program's run with the entry CHUNK (the archive's
+    /// `modules[entry]` bytes) separately — this only governs how that entry's *imports*
+    /// resolve.
+    ///
+    /// [`ModuleArchive`]: crate::vm::archive::ModuleArchive
+    pub fn set_module_archive(&self, archive: Rc<crate::vm::archive::ModuleArchive>) {
+        *self.module_archive.borrow_mut() = Some(archive);
+        *self.module_logical_dir.borrow_mut() = String::new();
+    }
+
     /// Recover an owned `Rc<Vm>` from `&self`. Used by the async-fn eager-spawn in
     /// the `Op::Call` arm (V7) to hand an owned VM into the `'static` spawned task.
     pub fn rc(&self) -> Rc<Vm> {
@@ -710,6 +746,30 @@ impl Vm {
     ) -> Result<ModuleExports, Control> {
         use std::path::PathBuf;
 
+        // SELF-CONTAINED-BUNDLES Phase 1: if an in-memory archive is installed, look the
+        // import up FIRST by its machine-independent logical key, computed against the
+        // importer's CURRENT logical dir with the SAME `join_logical` the builder used.
+        // A hit runs the embedded verified chunk with NO disk access. A miss (no archive,
+        // or key absent) falls straight through to the unchanged disk path below.
+        //
+        // Only RELATIVE imports are archive-resolved here: `load_file_module` is reached
+        // for relative file imports (std is linked; package/unknown specifiers are routed
+        // earlier), so the importer-relative `join_logical` matches the builder's relative
+        // branch. (Package archive keys — a future `pkg/` namespace — are out of Phase 1
+        // scope; no resolver ships one yet.)
+        // Clone the `Rc<ModuleArchive>` OUT of the cell so no borrow is held across the
+        // `.await` below (the `await_holding_refcell_ref` invariant).
+        let archive = self.module_archive.borrow().clone();
+        if let Some(archive) = archive {
+            let logical_dir = self.module_logical_dir.borrow().clone();
+            let logical_key = crate::vm::archive::join_logical(&logical_dir, source);
+            if let Some(bytes) = archive.get(&logical_key) {
+                return self
+                    .load_archived_module(bytes, &logical_key, fault_ip, fiber)
+                    .await;
+            }
+        }
+
         // Resolve the requested module path relative to the importer's dir; default
         // the extension to `.as` (so `./mod` finds `mod.as`/`mod.aso`).
         let requested = self.module_dir.borrow().join(source);
@@ -792,20 +852,110 @@ impl Vm {
             ));
         };
 
+        // The module's own logical dir governs how ITS transitive imports resolve. On
+        // the disk path there is no archive consulted, so the logical dir is inert — but
+        // keep it consistent (the canonical-path parent has no archive-relative meaning,
+        // so a disk-loaded module resolves its children purely by `module_dir`). The
+        // logical-dir swap below is a no-op string move on the pure-disk path.
+        let module_dir = canon
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.run_module_body(chunk, canon, module_dir, None, fault_ip, fiber)
+            .await
+    }
+
+    /// SELF-CONTAINED-BUNDLES Phase 1: load + run a module whose VERIFIED chunk bytes
+    /// come from the in-memory archive (NO disk file). The trust boundary is identical to
+    /// the disk `.aso` path — the bytes go through `from_bytes_verified`, so a corrupt
+    /// embedded chunk surfaces the SAME clean error as a corrupt `.aso`.
+    ///
+    /// Cache + circular-import identity: there is no canonical disk path, so the stable
+    /// identity is the module's LOGICAL KEY (unique per archive module). Keying
+    /// `file_modules` by a `PathBuf` built from the logical key gives correct once-only
+    /// side effects (a re-import returns the cached exports) and cycle termination (a
+    /// cycle resolves to the in-progress entry inserted before the body runs) WITHOUT a
+    /// real file. The logical key is also swapped in as the module's logical dir base so
+    /// ITS nested imports resolve against `logical_parent(logical_key)`.
+    #[async_recursion::async_recursion(?Send)]
+    async fn load_archived_module(
+        &self,
+        bytes: &[u8],
+        logical_key: &str,
+        fault_ip: usize,
+        fiber: &Fiber,
+    ) -> Result<ModuleExports, Control> {
+        use std::path::PathBuf;
+
+        // The cache/circular identity for an archived module: a virtual path derived from
+        // its unique logical key (prefixed so it can never collide with a real canonical
+        // disk path the disk branch would produce).
+        let cache_key = PathBuf::from(format!("<archive>/{logical_key}"));
+        if let Some(entry) = self.file_modules.borrow().get(&cache_key) {
+            return Ok(entry.clone()); // cached (or in-progress: circular import)
+        }
+
+        // SAME trust boundary as the disk `.aso` path: re-verify the embedded chunk. A
+        // corrupt embedded chunk → the same clean Tier-2 error a corrupt `.aso` gives.
+        let chunk = crate::vm::chunk::Chunk::from_bytes_verified(bytes).map_err(|e| {
+            self.panic_at(
+                fiber,
+                fault_ip,
+                format!("cannot load embedded module '{logical_key}': {e}"),
+            )
+        })?;
+
+        // The embedded module's transitive imports resolve against ITS logical dir.
+        let child_logical_dir = crate::vm::archive::logical_parent(logical_key);
+        // `module_dir` has no on-disk meaning for an archived module; keep the importer's
+        // current `module_dir` for the body run (it is only consulted on the disk
+        // fall-through path, which an archive hit never reaches for THIS module's own
+        // imports — those resolve via the archive against `child_logical_dir`).
+        let module_dir = self.module_dir.borrow().clone();
+        self.run_module_body(
+            chunk,
+            cache_key,
+            module_dir,
+            Some(child_logical_dir),
+            fault_ip,
+            fiber,
+        )
+        .await
+    }
+
+    /// The shared body-run tail for BOTH module load paths (disk and archive). Inserts a
+    /// fresh in-progress exports map under `cache_key` BEFORE running the body (so a
+    /// circular import resolves to it), swaps in this module's `module_exports`,
+    /// `module_dir`, AND `module_logical_dir` for the duration of its top-level run, then
+    /// restores all three regardless of outcome.
+    ///
+    /// `target_logical_dir` is `Some(dir)` for an archived module (so its nested archive
+    /// imports resolve against its own logical dir) and `None` for a disk module (the
+    /// logical dir is inert on the pure-disk path — kept at the importer's current value).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_module_body(
+        &self,
+        chunk: crate::vm::chunk::Chunk,
+        cache_key: std::path::PathBuf,
+        module_dir: std::path::PathBuf,
+        target_logical_dir: Option<String>,
+        fault_ip: usize,
+        fiber: &Fiber,
+    ) -> Result<ModuleExports, Control> {
         // Build a fresh exports map and cache it BEFORE running the body so a
         // circular import resolves to this (in-progress) entry rather than re-running.
         let exports: ModuleExports = Rc::new(RefCell::new(indexmap::IndexMap::new()));
         self.file_modules
             .borrow_mut()
-            .insert(canon.clone(), exports.clone());
+            .insert(cache_key.clone(), exports.clone());
 
-        // Swap in this module's exports + dir for the duration of its top-level run.
-        let module_dir = canon
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+        // Swap in this module's exports + dir (+ logical dir) for the top-level run.
         let prev_exports = self.module_exports.replace(exports.clone());
         let prev_dir = self.module_dir.replace(module_dir);
+        // Swap the logical dir in LOCKSTEP with module_dir. For a disk module there is no
+        // archive-relative dir, so leave the current value in place (inert) by replacing
+        // it with itself; for an archived module swap to its own logical dir.
+        let prev_logical_dir = target_logical_dir.map(|d| self.module_logical_dir.replace(d));
 
         // Run the module's top-level on its own fiber. Build a zero-arg top-level
         // closure exactly like `vm_run_source_with`.
@@ -826,9 +976,12 @@ impl Vm {
         let mut module_fiber = Fiber::new(closure);
         let run_result = self.run(&mut module_fiber).await;
 
-        // Restore the importer's exports/dir regardless of outcome.
+        // Restore the importer's exports/dir/logical-dir regardless of outcome.
         self.module_exports.replace(prev_exports);
         self.module_dir.replace(prev_dir);
+        if let Some(prev) = prev_logical_dir {
+            self.module_logical_dir.replace(prev);
+        }
 
         match run_result {
             Ok(RunOutcome::Done(_)) => Ok(exports),
@@ -839,7 +992,7 @@ impl Vm {
             )),
             Err(c) => {
                 // On failure, drop the half-built cache entry so a retry can re-run.
-                self.file_modules.borrow_mut().remove(&canon);
+                self.file_modules.borrow_mut().remove(&cache_key);
                 Err(c)
             }
         }

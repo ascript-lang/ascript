@@ -1139,11 +1139,11 @@ pub fn compile_archive(entry: &Path) -> Result<crate::vm::archive::ModuleArchive
                     //    `UnknownPackage` below) — this keeps Phase 4 correct-by-construction.
                     let dep_key = match &kind {
                         crate::interp::SpecifierKind::Package { .. } => {
-                            join_logical("pkg", source)
+                            crate::vm::archive::join_logical("pkg", source)
                         }
-                        _ => join_logical(&item.logical_dir, source),
+                        _ => crate::vm::archive::join_logical(&item.logical_dir, source),
                     };
-                    let dep_logical_dir = logical_parent(&dep_key);
+                    let dep_logical_dir = crate::vm::archive::logical_parent(&dep_key);
 
                     if seen.contains_key(&dep_path) {
                         continue; // already archived (or queued) — dedup terminates cycles
@@ -1212,61 +1212,6 @@ fn resolve_module_file(target: &Path) -> Result<std::path::PathBuf, String> {
         candidates[0].display(),
         candidates[1].display()
     ))
-}
-
-/// Lexically join a logical directory `dir` (archive-relative, `/`-separated, possibly
-/// empty for the root) with an import specifier `source`, defaulting a `.as` extension,
-/// and lexically resolve `.`/`..` segments. The result is the archive key — machine
-/// independent (no absolute prefix), the convention Task 1.4 reproduces.
-///
-/// A `.` segment is dropped and a `..` cancels the preceding real segment — but a `..`
-/// that **escapes the logical root** (nothing left to pop) is **PRESERVED VERBATIM**, so
-/// the key may legitimately contain leading `..` (e.g. `../shared.as`). This is correct
-/// and deliberate: such a key is still machine-independent (it is relative to the entry
-/// dir, leaking no absolute build path) AND preserves uniqueness — `../a` must stay
-/// distinct from `a`. Task 1.4's loader MUST reproduce this identically (the same
-/// `join_logical` over the same importer logical dir), so the `..`-preservation is part
-/// of the load-bearing convention, not an edge case to "fix".
-fn join_logical(dir: &str, source: &str) -> String {
-    // `classify_specifier` only routes `./`, `../`, or absolute (Relative) and bare
-    // (Package) specifiers here. For a Package the `source` is the bare specifier
-    // (`pkg/sub`); the caller keys it under a `pkg/` namespace dir.
-    let mut segments: Vec<&str> = Vec::new();
-    if !dir.is_empty() {
-        segments.extend(dir.split('/').filter(|s| !s.is_empty()));
-    }
-    for seg in source.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                // Cancel the preceding REAL segment; but if there is none to pop (we are
-                // at — or already above — the logical root), PRESERVE the `..` verbatim so
-                // an escaping key stays unique and machine-independently reproducible.
-                if segments.last().map(|s| *s != "..").unwrap_or(false) {
-                    segments.pop();
-                } else {
-                    segments.push("..");
-                }
-            }
-            other => segments.push(other),
-        }
-    }
-    let mut key = segments.join("/");
-    // Default the `.as` extension to match the on-disk resolution and the entry key.
-    if !key.ends_with(".as") && !key.ends_with(".aso") {
-        key.push_str(".as");
-    }
-    key
-}
-
-/// The logical directory of a logical key — everything before the final `/` segment, or
-/// the empty string for a root-level module. Used as the resolution base for a module's
-/// OWN transitive imports.
-fn logical_parent(key: &str) -> String {
-    match key.rfind('/') {
-        Some(i) => key[..i].to_string(),
-        None => String::new(),
-    }
 }
 
 /// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
@@ -1926,6 +1871,72 @@ async fn vm_run_source_cfg(
         // A top-level `?` propagation simply ends the program.
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// **SELF-CONTAINED-BUNDLES Phase 1 (Task 1.4).** Run a program PURELY from an in-memory
+/// [`ModuleArchive`] — its entry chunk plus every reachable module is embedded, so the
+/// program runs with NO source tree on disk. The entry chunk (`archive.modules[entry]`)
+/// is the start; every relative `import` it (transitively) makes is satisfied by an
+/// archive lookup by logical key in [`Vm::load_file_module`] (NOT disk), proving the
+/// runtime loader reproduces the exact key `compile_archive` stored.
+///
+/// Output is CAPTURED (returned), like [`vm_run_source`], so a test can assert it equals
+/// the on-disk run. The embedded chunks pass through `from_bytes_verified` (the SAME trust
+/// boundary as `run file.aso`), so a corrupt embedded chunk is a clean error.
+///
+/// Task 1.5 wires up WHO installs the archive (build/`--native`/run dispatch); this is the
+/// loader-facing seam that 1.5 and the headline test drive. `#[doc(hidden)]` test/seam API.
+#[doc(hidden)]
+pub async fn run_archive(
+    archive: crate::vm::archive::ModuleArchive,
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    // The entry module's verified chunk is the program start. Decode through the SAME
+    // trust boundary the disk `.aso` path uses.
+    let (_entry_key, entry_bytes) = archive
+        .modules
+        .get(archive.entry as usize)
+        .ok_or_else(|| AsError::new("archive entry index is out of range"))?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(entry_bytes)
+        .map_err(|e| AsError::new(format!("cannot load archive entry module: {e}")))?;
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    // Install the archive so every relative import resolves from memory by logical key.
+    // The entry's logical dir is seeded to the archive root ("") by `set_module_archive`.
+    vm.set_module_archive(Rc::new(archive));
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
     }
 }

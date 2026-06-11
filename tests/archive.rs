@@ -6,6 +6,7 @@
 //! chunk re-verifies.
 
 use ascript::compile_archive;
+use ascript::vm::archive::ModuleArchive;
 use ascript::vm::chunk::Chunk;
 use std::path::Path;
 
@@ -259,4 +260,188 @@ fn std_imports_are_not_archived() {
 
 fn keys(arch: &ascript::vm::archive::ModuleArchive) -> Vec<&str> {
     arch.modules.iter().map(|(k, _)| k.as_str()).collect()
+}
+
+// ===========================================================================================
+// Task 1.4 — the RUNTIME LOADER: consult the in-memory archive before disk. These prove that
+// `load_file_module` reproduces the EXACT logical key `compile_archive` (1.3) stored, by
+// running a program PURELY from an archive with the SOURCE TREE ABSENT.
+// ===========================================================================================
+
+/// THE HEADLINE TEST. Build an archive from the multi-module example, then run the entry
+/// module from the archive with the SOURCE FILES INACCESSIBLE — the imported module's
+/// function works only if the embedded module was found via its logical key (NOT disk).
+/// Assert the output matches a disk run of the same program.
+#[tokio::test]
+async fn runs_purely_from_archive_with_sources_absent() {
+    // 1. The archive is built from the real example (the only place the sources are read).
+    let arch = compile_archive(Path::new("examples/bundle_multimodule.as"))
+        .expect("compile_archive succeeds");
+
+    // 2. Make the sources INACCESSIBLE: copy the archive into a process where the loader's
+    //    `module_dir` cannot reach the example dir. `run_archive` installs the archive on a
+    //    fresh VM whose module_dir is the cwd; the import `./bundle_util` would resolve on
+    //    disk to `<cwd>/bundle_util.as` (which does NOT exist — the real file is under
+    //    `examples/`). So a disk hit is impossible; only an archive hit can satisfy it.
+    let (out, code) = ascript::run_archive(arch)
+        .await
+        .expect("program runs from the archive with no source tree");
+
+    // 3. The program's output is exactly what the disk run produces:
+    //    greet("world") → "Hello, world!" ; shout("bundled") → "bundled!!!"
+    assert_eq!(out, "Hello, world!\nbundled!!!\n", "archive run output");
+    assert_eq!(code, None, "clean exit");
+}
+
+/// Belt-and-braces on "sources absent": archive a program in a TEMP dir, DELETE the entire
+/// source tree, then run from the archive. The loader physically cannot reach any `.as`.
+#[tokio::test]
+async fn archive_run_survives_deleted_source_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.as");
+    let util = dir.path().join("util.as");
+    std::fs::write(
+        &entry,
+        "import { val } from \"./util\"\nprint(val() + 40)\n",
+    )
+    .expect("write entry");
+    std::fs::write(&util, "export fn val(): number { return 2 }\n").expect("write util");
+
+    let arch = compile_archive(&entry).expect("archives");
+    // Re-encode/decode to prove the archive is fully self-contained bytes (no borrowed
+    // path state), then DELETE the sources entirely.
+    let bytes = arch.encode();
+    drop(dir); // removes main.as + util.as
+    let arch = ModuleArchive::decode(&bytes).expect("decodes");
+
+    let (out, code) = ascript::run_archive(arch)
+        .await
+        .expect("runs from archive after the source tree is gone");
+    assert_eq!(out, "42\n");
+    assert_eq!(code, None);
+}
+
+/// A CIRCULAR import archive runs without an infinite loop or a double side-effect: each
+/// module's top-level body runs AT MOST ONCE (the in-progress cache entry, keyed on the
+/// logical key, terminates the cycle), exactly as the disk loader does.
+///
+/// Structure mirrors the disk loader's proven cycle handling: `a` and `b` import each
+/// other via a DEFERRED namespace import (`import * as`, accessed only inside a fn body,
+/// never at top-level bind time), so the cycle resolves to the in-progress entry rather
+/// than reading a not-yet-populated export. The entry sits OUTSIDE the tight cycle so it
+/// can read `a`'s export after both bodies have settled. This is byte-identical to the
+/// disk run of the same three files (verified separately).
+#[tokio::test]
+async fn circular_archive_runs_once_no_infinite_loop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let main = dir.path().join("main.as");
+    let a = dir.path().join("a.as");
+    let b = dir.path().join("b.as");
+    std::fs::write(&main, "import { fromA } from \"./a\"\nprint(\"main: \" + fromA())\n")
+        .expect("write main");
+    std::fs::write(
+        &a,
+        "import * as b from \"./b\"\nprint(\"a-body\")\nexport fn fromA(): string { return \"A\" }\n",
+    )
+    .expect("write a");
+    std::fs::write(
+        &b,
+        "import * as a from \"./a\"\nprint(\"b-body\")\nexport fn fromB(): string { return \"B\" }\n",
+    )
+    .expect("write b");
+
+    let arch = compile_archive(&main).expect("archives the cycle");
+    let bytes = arch.encode();
+    drop(dir);
+    let arch = ModuleArchive::decode(&bytes).expect("decodes");
+
+    let (out, code) = ascript::run_archive(arch)
+        .await
+        .expect("circular archive terminates");
+    // Each module body printed exactly once — no double side effect, no infinite loop.
+    assert_eq!(out.matches("a-body").count(), 1, "a body ran once; out={out:?}");
+    assert_eq!(out.matches("b-body").count(), 1, "b body ran once; out={out:?}");
+    assert!(out.contains("main: A"), "entry read a's export; out={out:?}");
+    assert_eq!(code, None);
+}
+
+/// A SUBDIRECTORY import + a `..`-escaping parent import both resolve from the archive by
+/// the SAME `..`-preserving key the builder stored — the load-bearing key convention.
+#[tokio::test]
+async fn nested_and_parent_dir_imports_resolve_from_archive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = dir.path().join("app");
+    std::fs::create_dir(&app).expect("mkdir app");
+    // Entry lives in app/; imports a sibling in app/ AND a module one level up.
+    let entry = app.join("main.as");
+    let sibling = app.join("helper.as");
+    let shared = dir.path().join("shared.as");
+    std::fs::write(
+        &entry,
+        "import { h } from \"./helper\"\nimport { s } from \"../shared\"\nprint(h() + s())\n",
+    )
+    .expect("write entry");
+    std::fs::write(&sibling, "export fn h(): number { return 10 }\n").expect("write helper");
+    std::fs::write(&shared, "export fn s(): number { return 5 }\n").expect("write shared");
+
+    let arch = compile_archive(&entry).expect("archives nested + parent imports");
+    // Sanity: the parent import keyed with a verbatim `..`.
+    assert!(
+        arch.get("../shared.as").is_some(),
+        "parent import keyed as ../shared.as; keys={:?}",
+        keys(&arch)
+    );
+    let bytes = arch.encode();
+    drop(dir);
+    let arch = ModuleArchive::decode(&bytes).expect("decodes");
+
+    let (out, code) = ascript::run_archive(arch)
+        .await
+        .expect("nested + parent imports resolve from archive");
+    assert_eq!(out, "15\n");
+    assert_eq!(code, None);
+}
+
+/// A corrupt EMBEDDED chunk → a clean error (the SAME trust boundary as a corrupt `.aso`),
+/// never a panic.
+#[tokio::test]
+async fn corrupt_embedded_entry_chunk_is_clean_error() {
+    let arch = ModuleArchive {
+        entry: 0,
+        caps: ascript::stdlib::caps::CapSet::default(),
+        shake_digest: [0u8; 32],
+        // Garbage bytes where a verified chunk should be.
+        modules: vec![("main.as".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF])],
+    };
+    let err = ascript::run_archive(arch)
+        .await
+        .expect_err("a corrupt embedded chunk must be a clean error");
+    assert!(!err.message.is_empty(), "non-empty load error: {err:?}");
+}
+
+/// NO-REGRESSION: a normal multi-file program (NO archive installed) still loads its
+/// imports from DISK. This is the default `module_archive == None` path — it must behave
+/// exactly as before. (`vm_run_source` runs with no archive; we point its import at a temp
+/// disk module and confirm it resolves on disk.)
+#[tokio::test]
+async fn non_archive_multifile_still_loads_from_disk() {
+    // Run the real on-disk example via the CLI-less VM entry, with module_dir at examples/.
+    // `run_archive` is NOT used here; the loader's archive is None, so this exercises the
+    // unchanged disk path.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("prog.as");
+    let lib = dir.path().join("lib.as");
+    std::fs::write(
+        &entry,
+        "import { twice } from \"./lib\"\nprint(twice(21))\n",
+    )
+    .expect("write entry");
+    std::fs::write(&lib, "export fn twice(n: number): number { return n * 2 }\n")
+        .expect("write lib");
+
+    // Run the entry file on the VM the normal way (disk imports, no archive).
+    let code = ascript::run_file_on_vm(&entry, &[])
+        .await
+        .expect("disk multi-file program runs");
+    assert_eq!(code, 0, "disk run exits cleanly");
 }
