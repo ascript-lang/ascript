@@ -2030,19 +2030,25 @@ pub async fn run_archive(
     use crate::vm::Vm;
 
     // The entry module's verified chunk is the program start. Decode through the SAME
-    // trust boundary the disk `.aso` path uses.
-    let (_entry_key, entry_bytes) = archive
+    // trust boundary the disk `.aso` path uses. Clone the entry bytes OUT (bounds-checked,
+    // clean error) before `archive` is moved into `Rc::new` below — they are stashed as the
+    // worker `.aso` bytes too (Task 1.6 parity, mirroring `run_verified_archive`).
+    let entry_bytes = archive
         .modules
         .get(archive.entry as usize)
+        .map(|(_, b)| b.clone())
         .ok_or_else(|| AsError::new("archive entry index is out of range"))?;
-    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(entry_bytes)
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
         .map_err(|e| AsError::new(format!("cannot load archive entry module: {e}")))?;
 
     let interp = Rc::new(Interp::new());
     // SELF-CONTAINED-BUNDLES Task 1.6: stash the whole encoded archive so a worker isolate
-    // spawned by this captured-output run installs it before re-running top-level imports
-    // (archive→worker parity holds in the test path too). Encode BEFORE the move below.
+    // spawned by this captured-output run installs it before re-running top-level imports,
+    // AND the ENTRY chunk bytes so a worker fn's code slice can build from them — together
+    // these give full archive→worker parity in the test path too (it mirrors
+    // `run_verified_archive`). Encode BEFORE `archive` moves into `Rc::new` below.
     interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
     interp.install_self();
     let vm = Vm::new(interp.clone());
     // Install the archive so every relative import resolves from memory by logical key.

@@ -75,14 +75,23 @@ where
 pub struct WorkerRequest {
     /// Stable identity of the worker entry (keys the per-isolate code cache).
     pub fn_id: u64,
-    /// The `.aso` code-slice bytes. `Some` when the isolate has not yet cached
-    /// `fn_id`; `None` once it has (the caller-side pool tracks this per isolate).
+    /// The `.aso` code-slice bytes. `dispatch_worker` ALWAYS ships `Some` (it cannot know
+    /// what a given pooled isolate has already cached); the isolate dedups by `fn_id`
+    /// (`isolate_loop`'s `loaded` set) and ignores a re-send. `Option` is kept because the
+    /// inline graceful-degradation fallback may pass `None` to `load_slice` once cached in
+    /// process. A per-isolate caller-side code cache would let the caller stop re-shipping —
+    /// a documented future airlock optimization, NOT done here.
     pub slice_bytes: Option<Vec<u8>>,
     /// SELF-CONTAINED-BUNDLES Task 1.6 — the encoded `ModuleArchive` of a BUNDLED
-    /// multi-module program. Mirrors `slice_bytes`: a `Send` field shipped when the
-    /// program is archived, installed ONCE per isolate (the isolate tracks it, like the
-    /// `loaded` slice cache) BEFORE the slice loads (the slice re-runs imports). `None`
-    /// for an ordinary unbundled program → nothing installed → today's exact path.
+    /// multi-module program. `dispatch_worker` ships these bytes on EVERY pooled request
+    /// (no caller-side suppression); the isolate installs the archive AT MOST ONCE, guarded
+    /// by `isolate_loop`'s `archive_installed` flag, BEFORE the slice loads (the slice
+    /// re-runs the program's top-level imports). The dedicated/actor/stream isolates instead
+    /// capture the bytes ONCE at spawn (a single-tenant isolate, installed at boot). This
+    /// per-request re-ship mirrors the existing `slice_bytes` shipping model above — a
+    /// per-isolate caller-side cache would optimize BOTH (the same documented future airlock
+    /// optimization), an accepted characteristic, not a defect. `None` for an ordinary
+    /// unbundled program → nothing installed → today's exact path.
     pub archive_bytes: Option<Vec<u8>>,
     /// `Some(class)` for a `static worker fn` (currently advisory — the entry is a
     /// free top-level fn in the slice; kept for diagnostics + future class binding).
