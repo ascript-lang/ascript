@@ -197,9 +197,9 @@ if let Some(def) = &p.default {            // NEW
 - Modify: `src/vm/verify.rs:509`
 - Test: inline `#[test]`
 
-- [ ] **Step 1: Write the failing test** — a chunk with `VariantElem(0xFFFF)` on a 2-field variant is REJECTED by `verify`.
-- [ ] **Step 2: Run it — expect FAIL** (currently pass-through).
-- [ ] **Step 3: Apply the fix** — cap the operands at a conservative practical maximum (the payload-field ceiling, 255) so an out-of-range index is a clean `VerifyError`, not a runtime panic:
+- [x] **Step 1: Write the failing test** — a chunk with `VariantElem(0xFFFF)` on a 2-field variant is REJECTED by `verify`.
+- [x] **Step 2: Run it — expect FAIL** (currently pass-through).
+- [x] **Step 3: Apply the fix** — cap the operands at a conservative practical maximum (the payload-field ceiling, 255) so an out-of-range index is a clean `VerifyError`, not a runtime panic:
 
 ```rust
 VariantElem(n) | MatchVariantArity(n) => {
@@ -207,9 +207,11 @@ VariantElem(n) | MatchVariantArity(n) => {
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS**; `cargo test`.
-- [ ] **Step 5: §9.1** — Rust unit test; blast-radius: confirm no legitimate program emits >255 payload fields (the parser already bounds named-payload arity).
-- [ ] **Step 6: Commit** — `git commit -m "fix(verify): bound VariantElem/MatchVariantArity operands"`
+- [x] **Step 4: Run it — expect PASS**; `cargo test`.
+- [x] **Step 5: §9.1** — Rust unit test; blast-radius: confirm no legitimate program emits >255 payload fields (the parser already bounds named-payload arity).
+- [x] **Step 6: Commit** — `git commit -m "fix(verify): bound VariantElem/MatchVariantArity operands"`
+
+> **Correction (verified, 2026-06-11):** the plan's premise for 0.7 was wrong — `VariantElem`/`MatchVariantArity` are already runtime-safe (`.get`→Nil, length compare→false) and a 255 cap would over-reject valid >255-field variants. The REAL panic vector found by blast-radius was `Op::CheckParam` directly indexing `proto.params[param]`; fixed by threading `params_len` (per-proto, recursive) through the verifier and range-checking. Commit 5b873b6 → 920d30f.
 
 ### Task 0.8: HTTP response header CRLF injection
 
