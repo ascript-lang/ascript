@@ -741,12 +741,14 @@ impl ModuleArchive {
 - Modify: `src/lib.rs` (`run_embedded_aso`, archive runner), `src/main.rs`
 - Test: `tests/native.rs`
 
-- [ ] **Step 1: Write the failing test** — `./app` (built with `--deny net`) attempting `net.*` gets a capability-denied Tier-2 error.
-- [ ] **Step 2: Run it — expect FAIL** (currently all-granted via `caps: None`).
-- [ ] **Step 3: Implement** — the archive runner reads the manifest `CapSet` and calls `interp.set_caps(...)`, replacing the `caps: None` at `lib.rs:1106`.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — native test (run a denied + a granted call); docs: confirm the page documents the enforcement; blast-radius: a single-module bundle (bare chunk, no manifest) — decide + implement its caps source (embed a minimal caps header in the single-chunk native payload, or always emit an archive for `--native` so caps always have a home; choose the latter for uniformity and document).
-- [ ] **Step 6: Commit** — `git commit -m "fix(bin): enforce embedded capabilities at runtime (closes N4)"`
+- [x] **Step 1: Write the failing test** — `./app` (built with `--deny net`) attempting `net.*` gets a capability-denied Tier-2 error.
+- [x] **Step 2: Run it — expect FAIL** (currently all-granted via `caps: None`).
+- [x] **Step 3: Implement** — the archive runner reads the manifest `CapSet` and calls `interp.set_caps(...)`, replacing the `caps: None` at `lib.rs:1106`.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — native test (run a denied + a granted call); docs: confirm the page documents the enforcement; blast-radius: a single-module bundle (bare chunk, no manifest) — decide + implement its caps source (embed a minimal caps header in the single-chunk native payload, or always emit an archive for `--native` so caps always have a home; choose the latter for uniformity and document).
+- [x] **Step 6: Commit** — `git commit -m "fix(bin): enforce embedded capabilities at runtime (closes N4)"`
+
+> **Accepted (3.2) — N4 CLOSED.** commits `31868f3` (impl) + `8453e19` (review fixes + per-cap audit). The original user-reported bug ("caps = none" — a bundled program ignored its build-time restrictions) is FIXED. `run_verified_archive` now installs `effective = archive.caps.restrict_with(&cli_caps.unwrap_or(all_granted))` ALWAYS (was: install only CLI caps, ignore the manifest). **`CapSet::restrict_with` = MONOTONE intersection** (granted iff BOTH grant; `merge_fs`/`merge_net` take the stricter deny-mode + `intersect_allow` keeps only entries in BOTH allow-lists — neither side can re-grant). **Artifact rule (REFINES plan §3.2-step-5, dominates it):** emit an `ASCRIPTA` archive when `modules.len() > 1 || caps.is_some()`; bare `ASO\0` only for unrestricted single-module → caps have a home EVERYWHERE they're set (incl. a non-native single-module `--deny` `.aso`), unrestricted single-module stays byte-identical. Obsolete `warn_single_module_caps` removed. **SECURITY review ✅ Sound** — adversarially probed: monotone holds (exhaustive 32×32 bit-test + all carve-out cases, NO re-grant); enforcement PARITY with a normal `--deny` run (same `set_caps`→`call_stdlib`/`required_cap` chokepoint, multi-surface probe all denied); the reduced floor crosses the WORKER airlock (a `worker fn` net-call denied on the isolate; pooled `caps.drop` refused §4.5a); native `./app` (caps=None) enforces the embedded floor with no loosening (argv→program, ASCRIPT_DENY not yet wired); tamper FAILS CLOSED (corrupt caps blob → clean error, program never runs; `restrict_with` normalizes stray high bits). **Per-cap embedded-denial audit** (`embedded_caps_denied_per_cap_audit`): fs→`fs.read`, process→`process.run`, env→`env.get`, ffi→`ffi.open` all denied via the embedded `.aso` floor (net via the dedicated bundle tests) — locks in embedded-path parity with `cap_audit`. No `.aso`/`ASO_FORMAT_VERSION` bump. caps 46/0, cap_audit 19/0, native 24/24 both configs, differential 378/0 both configs, clippy clean both configs.
 
 ### Task 3.3: `ASCRIPT_DENY` monotone launch-time subtraction
 
