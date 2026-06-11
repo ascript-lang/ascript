@@ -152,6 +152,15 @@ legacy tree-walker is retained as a differential oracle and a debugging escape h
 `ascript run file.as --tree-walker` (or `ASCRIPT_ENGINE=tree-walker`). See
 [Compilation & runtime](docs/content/runtime.md) for the full picture.
 
+**Self-contained bundles** — a multi-file program builds into one artifact that runs with no
+source tree present. `ascript build app.as` embeds the whole reachable module graph (**tree-shaken**
+— unused library declarations are dropped, with a per-module report to stderr) into a single `.aso`;
+`ascript build --native app.as -o app` does the same into a standalone executable (bundling, not
+AOT — the embedded VM still interprets). **Capabilities travel with the binary**: `ascript build
+--native --deny net app.as -o app` embeds the restriction, and `./app` enforces it at launch
+(further tightenable, never loosenable, via `ASCRIPT_DENY=fs,net ./app`). `std/*` stays native.
+See [Self-contained bundles](docs/content/language/bundles.md).
+
 ### Checking
 
 `ascript check` statically checks `.as` files (syntax errors + lints) and reports

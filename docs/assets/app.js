@@ -24,6 +24,7 @@ const NAV = [
     ['language/classes-enums', 'Classes, enums, match'],
     ['language/modules-async', 'Modules & async'],
     ['language/workers', 'Workers & parallelism'],
+    ['language/bundles', 'Self-contained bundles'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
