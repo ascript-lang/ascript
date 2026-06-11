@@ -31,6 +31,8 @@ use cstree::text::TextRange;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+pub mod shake;
+
 /// A compile-time error: a message plus the source span that triggered it. The
 /// lib boundary converts this into an [`crate::error::AsError`] for reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]

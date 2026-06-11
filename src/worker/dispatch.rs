@@ -68,7 +68,7 @@ use std::rc::Rc;
 
 /// A resolved top-level binding the closure can ship.
 #[derive(Clone)]
-enum TopDef {
+pub(crate) enum TopDef {
     /// A top-level `fn` — ships as its `FnProto` (re-`CLOSURE`d in the fragment).
     Fn(Rc<FnProto>),
     /// A top-level `const`/`let` bound to a literal value — ships as that value.
@@ -115,7 +115,7 @@ enum TopDef {
 /// boundary (NOT merely since the last define/import: a preceding bare expression,
 /// `for`, `while`, or `if` statement must NOT be absorbed into the const's range). The
 /// boundaries come from [`top_level_statement_starts`] (a CFG-aware top-level pass).
-fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
+pub(crate) fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
     let mut defs: HashMap<Rc<str>, TopDef> = HashMap::new();
     // The offsets at which a fresh top-level statement BEGINS (sorted ascending). A
     // computed const's initializer starts at the greatest boundary `<= define_ip`.
@@ -175,7 +175,7 @@ fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
 /// ternary carries the partial value at depth ≥ 1, so the depth-0 filter excludes it
 /// without any extra "predecessor is a jump" rule — which would wrongly drop the
 /// loop exit, whose physical predecessor is the back-edge `Loop`.)
-fn top_level_statement_starts(top: &Chunk) -> Vec<usize> {
+pub(crate) fn top_level_statement_starts(top: &Chunk) -> Vec<usize> {
     // Decode all top-level instruction offsets + an offset->index map.
     let mut offsets: Vec<usize> = Vec::new();
     let mut ip = 0usize;
@@ -333,7 +333,7 @@ fn collect_get_global_names(chunk: &Chunk, out: &mut Vec<Rc<str>>) {
 /// `CLOSURE`'d nested proto the range references. These are the computed const's
 /// transitive top-level dependencies (the helper fn it calls, an imported module
 /// name, another const it reads, …) — fed into the same closure fixpoint.
-fn collect_range_refs(top: &Chunk, start: usize, end: usize, out: &mut Vec<Rc<str>>) {
+pub(crate) fn collect_range_refs(top: &Chunk, start: usize, end: usize, out: &mut Vec<Rc<str>>) {
     let mut ip = start;
     while ip < end {
         let Some(op) = Op::from_u8(top.code[ip]) else {
@@ -400,7 +400,7 @@ fn collect_def_refs(top: &Chunk, def: &TopDef, name: &str, out: &mut Vec<Rc<str>
 /// returning the set of included NAMES. Shared by the worker-fn slice and the actor
 /// class slice so both ship the same closure semantics (fns + literal consts +
 /// computed consts + classes, transitively).
-fn compute_closure(
+pub(crate) fn compute_closure(
     top: &Chunk,
     defs: &HashMap<Rc<str>, TopDef>,
     roots: Vec<Rc<str>>,
