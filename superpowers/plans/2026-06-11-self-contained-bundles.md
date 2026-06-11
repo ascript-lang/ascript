@@ -318,9 +318,9 @@ fn write_log(path: &str, contents: &str, fsync: bool, span: Span) -> Result<(), 
 - Modify: `src/det.rs:308`
 - Test: inline `#[test]` in `src/det.rs`
 
-- [ ] **Step 1: Write the failing test** — in Replay, a `clock_monotonic_ms` call facing a non-`MonotonicRead` event calls `replay_mismatch_recover` (surfaces divergence), matching `clock_now_ms`.
-- [ ] **Step 2: Run it — expect FAIL** (currently `ClockRead => value` silently, `_ => live clock`).
-- [ ] **Step 3: Apply the fix** — align with `clock_now_ms`:
+- [x] **Step 1: Write the failing test** — in Replay, a `clock_monotonic_ms` call facing a non-`MonotonicRead` event calls `replay_mismatch_recover` (surfaces divergence), matching `clock_now_ms`.
+- [x] **Step 2: Run it — expect FAIL** (currently `ClockRead => value` silently, `_ => live clock`).
+- [x] **Step 3: Apply the fix** — align with `clock_now_ms`:
 
 ```rust
 Mode::Replay => match self.next_event() {
@@ -335,9 +335,9 @@ Mode::Replay => match self.next_event() {
 },
 ```
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust test; blast-radius: audit every other Replay reader for the same silent cross-consumption pattern.
-- [ ] **Step 6: Commit** — `git commit -m "fix(det): clock_monotonic_ms surfaces replay mismatch"`
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust test; blast-radius: audit every other Replay reader for the same silent cross-consumption pattern.
+- [x] **Step 6: Commit** — `git commit -m "fix(det): clock_monotonic_ms surfaces replay mismatch"`
 
 ### Task 0.13: `crypto.hashPassword` seeded salt under replay
 
@@ -485,6 +485,16 @@ let len = match content_length {
 - [ ] **Step 4: Run them — expect PASS** (clean 501/400, no silent empty body).
 - [ ] **Step 5: §9.1** — tests are the deliverable (internal server behavior). Docs: add a one-line note to `docs/content/stdlib/net.md` that the server does not support `Transfer-Encoding` (returns 501) and rejects conflicting `Content-Length` (400). Blast-radius: confirm no legitimate request path sets Transfer-Encoding; confirm the one-request-then-close invariant still holds so this stays non-smuggling-relevant.
 - [ ] **Step 6: Commit** — `git commit -m "fix(http): reject Transfer-Encoding and conflicting Content-Length (no silent empty body)"`
+
+### Task 0.19c: (DISCOVERED during 0.12) byte draws (`uuid.v4` / `crypto.randomBytes`) are not event-sourced in Record/Replay
+
+> Logged per §9.4. Surfaced by the Task 0.12 spec review. `Interp::fill_seeded_bytes` advances the shared `ctx.rng` state directly without appending a `RandomRead` (or any) event. In a clean record→replay of the same code path this stays in lockstep, BUT it couples two recovery mechanisms to the same `ctx.rng`: if `next_random_f64` falls through to Record on stream exhaustion (appending events) while interleaved uuid/crypto byte draws silently consume RNG state without leaving events, the RNG-state-vs-event-stream alignment can drift relative to a prior recorded run — and unlike `f64` reads, there is no event to DETECT that drift. Pre-existing design property of the byte-draw seam, NOT introduced by 0.12.
+>
+> **Needs an OWNER DECISION (escalate at the Phase 0 holistic review), not a unilateral fix** — options: (a) event-source byte draws (append an event so drift is detectable + replayable; changes the det-log format), (b) document the limitation + a `workflow-determinism` lint flagging `uuid.v4`/`crypto.randomBytes` in a workflow body (cheaper, advisory), or (c) accept as-is with a documented note. Resolve before Phase 0 closes; do not drop.
+
+- [ ] **Step 1:** Escalate the (a)/(b)/(c) decision to the owner at the Phase 0 holistic review.
+- [ ] **Step 2:** Implement the chosen option with tests + docs (and a det-log version bump if (a)).
+- [ ] **Step 3:** Tick only when the chosen option is implemented and verified, or the owner explicitly accepts (c) with the documented note in place.
 
 ### Task 0.20: Phase 0 holistic review
 
