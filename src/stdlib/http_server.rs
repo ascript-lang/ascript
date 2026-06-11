@@ -737,16 +737,69 @@ fn route_schema_failure(
 }
 
 /// Convert a handler's return value into an `HttpResponse`.
+/// Validate a single handler-supplied response header before it is written to the
+/// wire. This is the chokepoint that prevents **HTTP response splitting / header
+/// injection**: a handler that reflects user-controlled input into a header value
+/// (or name) containing CR/LF could otherwise inject extra headers or a whole second
+/// response. Every header collected in `value_to_response` passes through here.
+///
+/// - The NAME must be a non-empty HTTP token (RFC 7230 §3.2.6): no controls, no
+///   separators (incl. `:`), and no space. We reject the ASCII control range
+///   (`< 0x21`, covering CTL + space), DEL (`0x7f`), and the `tchar`-excluded
+///   separators; `-` and alphanumerics (the norm) are fine. Bytes `>= 0x80` are
+///   deliberately ACCEPTED — they are neither a `tchar` separator nor a
+///   response-splitting risk (the security-critical bytes are CR/LF only), and
+///   rejecting them would needlessly break non-ASCII names some clients tolerate.
+/// - The VALUE must not contain a bare CR or LF (the security-critical bytes). Other
+///   bytes — including `:` (legitimate in e.g. a `Location:` URL) — are allowed.
+///
+/// On violation it raises a recoverable Tier-2 panic (`AsError` → `Control::Panic`),
+/// which `dispatch_request` converts to a 500 — so the malformed header is never
+/// written and the response is never split.
+fn validate_header(name: &str, val: &str, span: Span) -> Result<(), Control> {
+    // `tchar` separators that must NOT appear in a token (RFC 7230 §3.2.6), plus the
+    // ASCII control range (`< 0x21` covers CTL + space) and DEL (`0x7f`). Bytes
+    // `>= 0x80` are intentionally NOT rejected (see the doc comment above).
+    let is_bad_name_byte = |b: u8| {
+        b < 0x21
+            || b == 0x7f
+            || matches!(
+                b,
+                b'"' | b'(' | b')' | b',' | b'/' | b':' | b';' | b'<' | b'=' | b'>' | b'?'
+                    | b'@' | b'[' | b'\\' | b']' | b'{' | b'}'
+            )
+    };
+    if name.is_empty() || name.bytes().any(is_bad_name_byte) {
+        return Err(AsError::at(
+            format!("invalid response header name {name:?}: must be a valid HTTP token (no control chars, separators, or spaces)"),
+            span,
+        )
+        .into());
+    }
+    if val.bytes().any(|b| b == b'\r' || b == b'\n') {
+        return Err(AsError::at(
+            format!("invalid response header value for {name:?}: must not contain CR or LF (response-splitting guard)"),
+            span,
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// - string → 200 text/plain
 /// - object `{status?, headers?, body?}` → as specified (defaults 200, body "")
 /// - `[value, err]` → if err non-nil → 500 with the error message; else convert value
-fn value_to_response(v: &Value) -> HttpResponse {
+///
+/// Returns `Err(Control)` when a handler-supplied header name/value fails
+/// `validate_header` (response-splitting guard). The server-built headers
+/// (`content-type`, etc.) are constant tokens and always pass.
+fn value_to_response(v: &Value, span: Span) -> Result<HttpResponse, Control> {
     match v {
-        Value::Str(s) => HttpResponse {
+        Value::Str(s) => Ok(HttpResponse {
             status: 200,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
             body: s.as_bytes().to_vec(),
-        },
+        }),
         Value::Array(a) => {
             // A Result pair `[value, err]`.
             let a = a.borrow();
@@ -754,20 +807,20 @@ fn value_to_response(v: &Value) -> HttpResponse {
                 let err = &a[1];
                 if !matches!(err, Value::Nil) {
                     let msg = error_message(err);
-                    return HttpResponse {
+                    return Ok(HttpResponse {
                         status: 500,
                         headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
                         body: msg.into_bytes(),
-                    };
+                    });
                 }
-                return value_to_response(&a[0]);
+                return value_to_response(&a[0], span);
             }
             // A non-pair array: serialize via display.
-            HttpResponse {
+            Ok(HttpResponse {
                 status: 200,
                 headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
                 body: v.to_string().into_bytes(),
-            }
+            })
         }
         Value::Object(o) => {
             let o = o.borrow();
@@ -778,7 +831,11 @@ fn value_to_response(v: &Value) -> HttpResponse {
             let mut headers: Vec<(String, String)> = Vec::new();
             if let Some(Value::Object(h)) = o.get("headers") {
                 for (k, val) in h.borrow().iter() {
-                    headers.push((k.clone(), val.to_string()));
+                    let val = val.to_string();
+                    // Reject CRLF in handler-supplied header names/values BEFORE they
+                    // reach serialize_response (response-splitting guard).
+                    validate_header(k, &val, span)?;
+                    headers.push((k.clone(), val));
                 }
             }
             let body = match o.get("body") {
@@ -794,22 +851,22 @@ fn value_to_response(v: &Value) -> HttpResponse {
             {
                 headers.push(("content-type".into(), "text/plain; charset=utf-8".into()));
             }
-            HttpResponse {
+            Ok(HttpResponse {
                 status,
                 headers,
                 body,
-            }
+            })
         }
-        Value::Nil => HttpResponse {
+        Value::Nil => Ok(HttpResponse {
             status: 200,
             headers: Vec::new(),
             body: Vec::new(),
-        },
-        other => HttpResponse {
+        }),
+        other => Ok(HttpResponse {
             status: 200,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
             body: other.to_string().into_bytes(),
-        },
+        }),
     }
 }
 
@@ -1912,7 +1969,17 @@ impl Interp {
         // the accept loop keeps serving. The message is included for dev-friendliness.
         // (Modeled on how the `recover` builtin catches `Control::Panic`.)
         let resp = match result {
-            Ok(v) => value_to_response(&v),
+            // A handler-supplied header containing CR/LF (or an invalid name) makes
+            // `value_to_response` raise a Tier-2 panic — converted to a 500 here, so a
+            // response-splitting attempt fails closed instead of reaching the wire.
+            Ok(v) => match value_to_response(&v, span) {
+                Ok(resp) => resp,
+                Err(Control::Panic(e)) => simple_response(500, &e.message),
+                Err(Control::Propagate(pv)) => {
+                    simple_response(500, &error_message(&propagated_error(&pv)))
+                }
+                Err(Control::Exit(code)) => return Err(Control::Exit(code)),
+            },
             Err(Control::Panic(e)) => simple_response(500, &e.message),
             Err(Control::Propagate(v)) => {
                 // An escaped `?` carries the err pair's value; surface its message.
@@ -2179,6 +2246,118 @@ await s.serve({{ maxRequests: 1 }})
             "missing header in:\n{raw}"
         );
         assert!(raw.ends_with("created"), "body wrong in:\n{raw}");
+    }
+
+    /// Security: a handler that echoes user-controlled input containing CR/LF into
+    /// a response header VALUE must NOT split the response (HTTP response splitting /
+    /// header injection). The CRLF-bearing header is rejected → the request fails
+    /// with a 500, and crucially the injected `X-Injected` header / second response
+    /// never reaches the wire.
+    #[tokio::test]
+    async fn crlf_in_header_value_is_rejected_not_split() {
+        let port = reserve_port().await;
+        // The handler puts "a\r\nX-Injected: 1" into a header value (as a real
+        // attacker would by reflecting unsanitized input).
+        let src = format!(
+            "import {{ create }} from \"std/http/server\"\n\
+             let s = create()\n\
+             s.route(\"GET\", \"/inject\", (req) => ({{ status: 200, headers: {{ \"X-Reflect\": \"a\\r\\nX-Injected: 1\" }}, body: \"ok\" }}))\n\
+             await s.bind(\"127.0.0.1\", {port})\n\
+             await s.serve({{ maxRequests: 1 }})\n"
+        );
+        let url = format!("http://127.0.0.1:{port}/inject");
+        let (status, raw) = with_server(&src, move || async move {
+            client_request_raw("GET", &url, None).await
+        })
+        .await;
+        // The CRLF header is rejected → a 500, NOT a 200 with a split body.
+        assert_eq!(status, "HTTP/1.1 500 Internal Server Error", "raw:\n{raw}");
+        // Inspect ONLY the response head (the error message body legitimately names
+        // the rejected header in its diagnostic text). No injected/reflected header
+        // line may appear in the head.
+        let head = raw.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(&raw);
+        let head = head.to_lowercase();
+        assert!(
+            !head.contains("x-injected"),
+            "response was split — injected header reached the wire:\n{raw}"
+        );
+        assert!(
+            !head.contains("x-reflect"),
+            "the unvalidated header leaked onto the wire:\n{raw}"
+        );
+    }
+
+    /// Security: a handler-supplied header NAME containing a newline is rejected too
+    /// (injecting via the name side rather than the value side).
+    #[tokio::test]
+    async fn crlf_in_header_name_is_rejected() {
+        let port = reserve_port().await;
+        let src = format!(
+            "import {{ create }} from \"std/http/server\"\n\
+             let s = create()\n\
+             s.route(\"GET\", \"/inject\", (req) => ({{ status: 200, headers: {{ \"X-Bad\\r\\nX-Injected: 1\": \"v\" }}, body: \"ok\" }}))\n\
+             await s.bind(\"127.0.0.1\", {port})\n\
+             await s.serve({{ maxRequests: 1 }})\n"
+        );
+        let url = format!("http://127.0.0.1:{port}/inject");
+        let (status, raw) = with_server(&src, move || async move {
+            client_request_raw("GET", &url, None).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 500 Internal Server Error", "raw:\n{raw}");
+        let head = raw.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(&raw);
+        assert!(
+            !head.to_lowercase().contains("x-injected"),
+            "response was split via the header name:\n{raw}"
+        );
+    }
+
+    /// A legitimate header (alphanumerics + `-`, ordinary value) still works.
+    #[tokio::test]
+    async fn legitimate_header_still_works() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/ok", (req) => ({{ status: 200, headers: {{ "X-Request-Id": "abc-123" }}, body: "ok" }}))
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/ok");
+        let (status, raw) = with_server(&src, move || async move {
+            client_request_raw("GET", &url, None).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK", "raw:\n{raw}");
+        assert!(
+            raw.to_lowercase().contains("x-request-id: abc-123"),
+            "valid header missing:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn validate_header_unit() {
+        use super::validate_header;
+        let sp = crate::span::Span::new(0, 0);
+        // Valid.
+        assert!(validate_header("X-Request-Id", "abc-123", sp).is_ok());
+        assert!(validate_header("content-type", "text/plain; charset=utf-8", sp).is_ok());
+        // A colon in the VALUE is intentionally allowed (a common legitimate case,
+        // e.g. a `Location` URL) — only the NAME is colon-restricted, and only CR/LF
+        // are rejected from the value. Guards against a future over-restriction.
+        assert!(validate_header("Location", "https://example.com/redir", sp).is_ok());
+        // CR/LF in value → rejected.
+        assert!(validate_header("X-Reflect", "a\r\nX-Injected: 1", sp).is_err());
+        assert!(validate_header("X-Reflect", "a\nb", sp).is_err());
+        assert!(validate_header("X-Reflect", "a\rb", sp).is_err());
+        // Bad name: empty, contains separators / control / space / colon.
+        assert!(validate_header("", "v", sp).is_err());
+        assert!(validate_header("X-Bad\r\nX-Injected: 1", "v", sp).is_err());
+        assert!(validate_header("has space", "v", sp).is_err());
+        assert!(validate_header("has:colon", "v", sp).is_err());
+        assert!(validate_header("tab\there", "v", sp).is_err());
     }
 
     #[tokio::test]

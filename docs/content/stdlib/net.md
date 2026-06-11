@@ -542,6 +542,15 @@ A handler's return value is converted to a response:
 
 > [!NOTE] A handler or middleware **panic** (Tier-2) or a `?`-propagated error never kills the server — it is caught and converted to a `500` (the message is included for dev-friendliness), and the accept loop keeps serving. An **unmatched route** falls through to a `404` (middleware still runs first, so it can authenticate). Oversized headers → `431`; an oversized declared body → `413`; a read timeout → `408`.
 
+#### Response header validation (response-splitting guard)
+
+Every handler-supplied response header is validated **before** it is written to the wire:
+
+- a header **name** must be a non-empty HTTP token (RFC 7230 §3.2.6) — visible ASCII with no control characters, no separators (including `:`), and no spaces. Alphanumerics and `-` (the norm) are fine.
+- a header **value** must not contain a bare **CR (`\r`)** or **LF (`\n`)**.
+
+This closes **HTTP response splitting / header injection**: a handler that reflects untrusted input (a query param, a request header) straight into a response header value containing `\r\n` could otherwise inject extra headers or a whole second response. A handler that produces such a header **fails closed** — the request returns a `500` (a recoverable Tier-2 panic, caught like any other handler panic) and the malformed header never reaches the client; the response is never split. Validate or sanitize untrusted input before placing it in a header (or rely on this guard to reject it). See `examples/advanced/http_header_safety.as`.
+
 ### Example: middleware, params, and a JSON echo
 
 ```ascript
