@@ -131,6 +131,11 @@ class Grid {
 print(Grid().cells)               // [1, 2, 3]
 ```
 
+A **stepped** range default keeps its stride everywhere, including across a compiled
+[`.aso`](../cli) build — `xs: array<number> = 0..10 step 2` produces `[0, 2, 4, 6, 8]` whether you
+`run` the source or `build` it and `run` the bytecode (the step is serialized inside the field
+default). See [`examples/range_step_default.as`](https://github.com/ascript-lang/ascript/blob/main/examples/range_step_default.as).
+
 The only field-default expression that is **rejected** is `yield` (it is never valid outside a
 generator body) — both engines reject it symmetrically.
 

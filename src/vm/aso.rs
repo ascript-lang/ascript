@@ -65,8 +65,9 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 /// - 8: stepped ranges — three new opcodes (`RangeStepValue`/`RangeResolveStep`/
 ///   `RangeHasNext`) for signed-`step` value materialization + for-range iteration
 ///   (shifts opcode byte values for everything after `CheckNumbers`). The
-///   field-default `EX_RANGE` byte layout is unchanged (step still rejected in
-///   field-default position by `cst_default_expr`).
+///   field-default `EX_RANGE` byte layout is unchanged here (the step was DROPPED
+///   on write at this point — a latent bug, since `cst_default_expr` already
+///   lowered stepped defaults to `step: Some(..)`; corrected in v27).
 /// - 9: stepped match-range patterns — `Op::MatchRange`'s u8 operand changed from a
 ///   plain `inclusive` flag to a `flags` byte (bit0 = inclusive, bit1 = step
 ///   PRESENT) and its stack shape grew from `subject lo hi` to `subject lo hi step`
@@ -154,7 +155,16 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   single flag byte; `ascript build` defaults to flag = 1 (`--strip` opts back out).
 ///   Old readers must reject a v26 chunk. (Bumped by reading the IFACE-left v25 and
 ///   adding one.)
-pub const ASO_FORMAT_VERSION: u32 = 26;
+/// - **v27 (bundles):** the const-folded field-default expr stream's `EX_RANGE` tag
+///   now serializes the optional `step` of a value-position range (a presence `u8`
+///   followed by the step expr when present), after the `inclusive` flag + the
+///   `start`/`end` exprs. Previously the writer dropped `step` and the reader always
+///   re-defaulted it to `None`, so a stepped range field default
+///   (`xs: array<number> = 0..10 step 2`) silently lost its stride across a build
+///   round-trip. Only the `EX_RANGE` byte stream grows (by one byte, plus the step
+///   expr when present); every other layout is unchanged. Old readers must reject a
+///   v27 chunk. (Bumped by reading the DBG-left v26 and adding one.)
+pub const ASO_FORMAT_VERSION: u32 = 27;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -290,8 +300,8 @@ const EX_TRY: u8 = 16;
 const EX_UNWRAP: u8 = 17;
 const EX_AWAIT: u8 = 18;
 const EX_ASSIGN: u8 = 19;
-/// A value-position range `a..b` / `a..=b` (`ExprKind::Range`); `step` defaults
-/// never reach here (`cst_default_expr` rejects a stepped default).
+/// A value-position range `a..b` / `a..=b` / `a..b step k` (`ExprKind::Range`).
+/// The optional `step` is serialized as a presence byte + step expr (v27).
 const EX_RANGE: u8 = 20;
 /// An ARROW or `match` field default, lowered by RE-PARSING source text (SP1 §4,
 /// format v11). The payload is the left-padded source string (`reparse_default_source`);
@@ -1360,18 +1370,28 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
         ExprKind::Arrow { .. } => return Err(AsoError::NonLiteralConst("arrow-default")),
         ExprKind::Match { .. } => return Err(AsoError::NonLiteralConst("match-default")),
         ExprKind::Yield(_) => return Err(AsoError::NonLiteralConst("yield-default")),
-        // A value-position range `a..b` / `a..=b` field default. `step` defaults are
-        // rejected upstream (`cst_default_expr`), so only the inclusive flag varies.
+        // A value-position range `a..b` / `a..=b` / `a..b step k` field default.
+        // `cst_default_expr` lowers a stepped range default to `step: Some(..)`, so
+        // the optional step MUST be serialized (a presence byte + the step expr) or
+        // the `.from()`/instantiation path rebuilds the wrong array after a build
+        // round-trip. Mirror this exactly in the `EX_RANGE` read arm.
         ExprKind::Range {
             start,
             end,
             inclusive,
-            step: _,
+            step,
         } => {
             w.u8(EX_RANGE);
             w.u8(u8::from(*inclusive));
             write_expr(w, start)?;
             write_expr(w, end)?;
+            match step {
+                Some(s) => {
+                    w.u8(1);
+                    write_expr(w, s)?;
+                }
+                None => w.u8(0),
+            }
         }
     }
     Ok(())
@@ -1605,11 +1625,19 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
             let inclusive = r.u8()? != 0;
             let start = Box::new(read_expr(r)?);
             let end = Box::new(read_expr(r)?);
+            // Mirror the writer's optional-step encoding: a presence byte, then the
+            // step expr when present. A truncated step byte/expr surfaces as a clean
+            // `AsoError` (via `r.u8()?` / `read_expr`), never a panic.
+            let step = if r.u8()? == 1 {
+                Some(Box::new(read_expr(r)?))
+            } else {
+                None
+            };
             ExprKind::Range {
                 start,
                 end,
                 inclusive,
-                step: None,
+                step,
             }
         }
         // `EX_REPARSE` (arrow/`match` field default, SP1 §4) only ever appears at the
@@ -2188,6 +2216,49 @@ run()
     }
 
     #[test]
+    fn roundtrip_range_step_field_default() {
+        // Task 0.3 regression: a value-position STEPPED range as a class field
+        // default (`xs: array<number> = 0..10 step 2`) must survive the `.aso`
+        // round-trip. `cst_default_expr` lowers it to `Range { step: Some(..) }`;
+        // the `EX_RANGE` write/read arms must preserve the step. Before the fix the
+        // step was dropped on write and re-defaulted to `None` on read, so `.from()`
+        // / instantiation rebuilt the WRONG array (11 elements `0..10` instead of
+        // the 5-element strided `[0, 2, 4, 6, 8]`).
+        let src = "class C {\n xs: array<number> = 0..10 step 2\n}\n\
+                   let c = C.from({})\nprint(len(c.xs))\nprint(c.xs)\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize");
+        let rt = Chunk::from_bytes(&bytes).expect("decode");
+        let direct = run_chunk(original);
+        let viaso = run_chunk(rt);
+        assert_eq!(
+            direct, viaso,
+            "stepped-range field default differs after .aso round-trip"
+        );
+        assert_eq!(
+            viaso, "5\n[0, 2, 4, 6, 8]\n",
+            "stepped-range field default produced the wrong array after round-trip"
+        );
+    }
+
+    #[test]
+    fn truncated_range_step_field_default_is_clean_error() {
+        // Robustness: a `.aso` whose stepped-range field default is cut off partway
+        // (e.g. inside the new step presence byte or the step expr) must surface as a
+        // clean `Err(AsoError)`, never a panic. Every strict prefix of a valid buffer
+        // must fail to decode.
+        let src = "class C {\n xs: array<number> = 0..10 step 2\n}\nlet c = C.from({})\n";
+        let bytes = compile(src).to_bytes().expect("serialize");
+        for cut in 8..bytes.len() {
+            let result = Chunk::from_bytes(&bytes[..cut]);
+            assert!(
+                result.is_err(),
+                "a truncated stepped-range field-default .aso (len {cut}) must be a clean Err, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn roundtrip_capture_by_value_upvalue() {
         // SP8 #136: a closure capturing a never-reassigned local (by VALUE) and one
         // capturing a reassigned local (by REFERENCE) both serialize their
@@ -2550,18 +2621,22 @@ run()
         assert_eq!(run_chunk(compile(src)), run_chunk(back));
     }
 
-    /// (#5) The format version is the live DBG value (26) and a mismatched-version
-    /// (here: one-older) buffer is rejected with the version error, never run.
+    /// (#5) The format version is the live value (27, the bundles range-step bump)
+    /// and a mismatched-version (here: one-older) buffer is rejected with the version
+    /// error, never run.
     #[test]
-    fn dbg_version_is_26_and_mismatch_rejected() {
-        assert_eq!(ASO_FORMAT_VERSION, 26, "DBG bumped the format version to 26");
+    fn aso_version_is_current_and_mismatch_rejected() {
+        assert_eq!(
+            ASO_FORMAT_VERSION, 27,
+            "the range-step field-default fix bumped the format version to 27"
+        );
         let mut bytes = compile("print(1)").to_bytes().expect("serialize");
-        // Roll the version back one (simulating a v25 buffer).
+        // Roll the version back one (simulating a v26 buffer).
         bytes[4] = bytes[4].wrapping_sub(1);
         match Chunk::from_bytes(&bytes) {
             Err(AsoError::VersionMismatch { found, expected }) => {
-                assert_eq!(expected, 26);
-                assert_eq!(found, 25, "a one-older buffer reads as v25");
+                assert_eq!(expected, 27);
+                assert_eq!(found, 26, "a one-older buffer reads as v26");
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
