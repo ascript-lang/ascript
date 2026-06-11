@@ -102,9 +102,9 @@ match self.const_eval_enum_backing(&operand)? {
 - Modify: `src/vm/aso.rs` (`EX_RANGE` write ~1365 + read ~1604)
 - Test: `tests/archive.rs` (new) or `tests/cli.rs` round-trip
 
-- [ ] **Step 1: Write the failing test** — compile `class C { xs: array<number> = 0..10 step 2 }` to `.aso`, load, `C.from({})`, assert `xs == [0,2,4,6,8]` (len 5). Currently loads as `0..10` (len 11).
-- [ ] **Step 2: Run it — expect FAIL** (len 11).
-- [ ] **Step 3: Apply the fix** — serialize the optional step. In the `EX_RANGE` write arm, after writing `start`/`end`, emit a presence byte then the step expr; mirror in the reader:
+- [x] **Step 1: Write the failing test** — compile `class C { xs: array<number> = 0..10 step 2 }` to `.aso`, load, `C.from({})`, assert `xs == [0,2,4,6,8]` (len 5). Currently loads as `0..10` (len 11).
+- [x] **Step 2: Run it — expect FAIL** (len 11).
+- [x] **Step 3: Apply the fix** — serialize the optional step. In the `EX_RANGE` write arm, after writing `start`/`end`, emit a presence byte then the step expr; mirror in the reader:
 
 ```rust
 // write (replace the `step: _` wildcard):
@@ -125,9 +125,9 @@ ExprKind::Range { start, end, inclusive, step }
 
 Remove the now-false comment claiming "step rejected upstream"; bump `ASO_FORMAT_VERSION` and update `verify.rs` if the expr-tag stream is length-validated.
 
-- [ ] **Step 4: Run it — expect PASS**; `cargo test --test vm_differential`.
-- [ ] **Step 5: §9.1** — `examples/range_step_default.as`; docs: ranges section already documents `step` — add the field-default note; blast-radius: confirm `cst_default_expr` (compile/mod.rs:492) and the value-position range writer agree; the `ASO_FORMAT_VERSION` bump ripples to any golden `.aso`.
-- [ ] **Step 6: Commit** — `git commit -m "fix(aso): preserve range step in field-default round-trip; bump ASO version"`
+- [x] **Step 4: Run it — expect PASS**; `cargo test --test vm_differential`.
+- [x] **Step 5: §9.1** — `examples/range_step_default.as`; docs: ranges section already documents `step` — add the field-default note; blast-radius: confirm `cst_default_expr` (compile/mod.rs:492) and the value-position range writer agree; the `ASO_FORMAT_VERSION` bump ripples to any golden `.aso`.
+- [x] **Step 6: Commit** — `git commit -m "fix(aso): preserve range step in field-default round-trip; bump ASO version"`
 
 ### Task 0.4: or-pattern bindings dropped by the resolver
 
