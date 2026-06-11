@@ -43,7 +43,7 @@
 - Modify: `src/value.rs:218`, `src/value.rs:1255`, `src/value.rs:1330`
 - Test: inline `#[test]` in `src/value.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -59,17 +59,17 @@ fn float_two_pow_63_is_not_i64_max() {
 }
 ```
 
-- [ ] **Step 2: Run it — expect FAIL** — `cargo test float_two_pow_63_is_not_i64_max`
-- [ ] **Step 3: Apply the fix** — at all three sites replace the upper bound `… <= i64::MAX as f64` with the strict exclusive bound already used at `value.rs:1359`:
+- [x] **Step 2: Run it — expect FAIL** — `cargo test float_two_pow_63_is_not_i64_max`
+- [x] **Step 3: Apply the fix** — at all three sites replace the upper bound `… <= i64::MAX as f64` with the strict exclusive bound already used at `value.rs:1359`:
 
 ```rust
 // before: && *f <= i64::MAX as f64      (and the *n / f variants at 218 / 1330)
 && *f < -(i64::MIN as f64)   // 2^63 exactly; no i64 is >= 2^63
 ```
 
-- [ ] **Step 4: Run it — expect PASS**; then `cargo test --test vm_differential` (both configs) — expect PASS.
-- [ ] **Step 5: §9.1** — add `examples/num_int_float_edges.as` exercising `9223372036854775808.0 == 9223372036854775807` (→ `false`) and a map keyed by both; docs: note in `docs/content/language/values-types.md` numeric-equality section; blast-radius: grep every `i64::MAX as f64` / `i64::MIN as f64` use and confirm none remain lossy.
-- [ ] **Step 6: Commit** — `git commit -m "fix(num): strict i64/float upper bound in eq, MapKey, as_int_exact"`
+- [x] **Step 4: Run it — expect PASS**; then `cargo test --test vm_differential` (both configs) — expect PASS.
+- [x] **Step 5: §9.1** — add `examples/num_int_float_edges.as` exercising `9223372036854775808.0 == 9223372036854775807` (→ `false`) and a map keyed by both; docs: note in `docs/content/language/values-types.md` numeric-equality section; blast-radius: grep every `i64::MAX as f64` / `i64::MIN as f64` use and confirm none remain lossy.
+- [x] **Step 6: Commit** — `git commit -m "fix(num): strict i64/float upper bound in eq, MapKey, as_int_exact"`
 
 ### Task 0.2: negative integer enum backing value (VM compile path)
 
