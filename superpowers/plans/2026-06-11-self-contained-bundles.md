@@ -639,12 +639,14 @@ impl ModuleArchive {
 - Modify: `src/compile/mod.rs` (`mod shake;`)
 - Test: inline `#[test]` + `tests/archive.rs`
 
-- [ ] **Step 1: Write the failing test** — given a graph where the entry uses `import { used } from "./m"` and `m` also defines an unreferenced `fn unused()`, `compute_reachable` returns a keep-set for `m` containing `used` (and its transitive refs) but NOT `unused`.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Implement** `compute_reachable(graph) -> ReachResult { keep: Map<ModuleId, Set<BindingId>>, report: ShakeReport }`: roots = all entry top-level statements; worklist marks referenced top-level bindings, follows import edges (named → specific export; transitively into definitions), keeps all side-effectful top-level statements unconditionally. Uses the resolver's existing reference info.
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust + archive test; blast-radius: classes kept whole (superclass chain, interfaces, enum variants reachable); enums/interfaces handled.
-- [ ] **Step 6: Commit** — `git commit -m "feat(shake): reachability worklist over module graph"`
+- [x] **Step 1: Write the failing test** — given a graph where the entry uses `import { used } from "./m"` and `m` also defines an unreferenced `fn unused()`, `compute_reachable` returns a keep-set for `m` containing `used` (and its transitive refs) but NOT `unused`.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Implement** `compute_reachable(graph) -> ReachResult { keep: Map<ModuleId, Set<BindingId>>, report: ShakeReport }`: roots = all entry top-level statements; worklist marks referenced top-level bindings, follows import edges (named → specific export; transitively into definitions), keeps all side-effectful top-level statements unconditionally. Uses the resolver's existing reference info.
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust + archive test; blast-radius: classes kept whole (superclass chain, interfaces, enum variants reachable); enums/interfaces handled.
+- [x] **Step 6: Commit** — `git commit -m "feat(shake): reachability worklist over module graph"`
+
+> **Accepted (2.1):** commits `1f34dad` (impl) + `840be71` (soundness fix) + `38594eb` (cleanups). New `src/compile/shake.rs` (analysis only — no pruning/no `compile_archive` wiring, that's 2.3). BYTECODE-level reachability reusing `worker::dispatch` helpers (`top_level_defs`/`top_level_statement_starts`/`collect_range_refs`/`compute_closure`/`TopDef`, made `pub(crate)` — no logic dup). `ModuleNode{key,chunk,edges}` + `ImportEdge::{Named{target,names},Namespace{target}}`; `compute_reachable -> ReachResult{keep: HashMap<usize,HashSet<Rc<str>>>, report: ShakeReport}`. Entry (idx 0) kept WHOLE; library modules keep imported-names + side-effect-statement refs + transitive closure; namespace import conservatively pins whole target (2.2 refines). Cross-module fixpoint (monotone over finite name set). **Spec review caught + fixed a real soundness BLOCKER:** a top-level `let x = sideEffect()` (computed initializer) was false-dropped — fixed by force-keeping `TopDef::ComputedConst` bindings (they run eagerly on module import); literal `let x=5`/`Fn`/`Class`/`Enum`/`Interface` stay droppable-if-unreferenced. Code-quality: dead fixpoint branch removed, deterministic report ordering (BTreeSet). Soundness rule: NEVER drop live code (under-shake safe, over-shake = bug). 9/9 shake tests; differential 378/0 both configs (runtime untouched); clippy clean both configs. **Note for 2.6 holistic:** the shared bytecode-analysis primitives now live in `worker::dispatch` but are used by the compile-layer shaker too — consider relocating to a neutral module.
 
 ### Task 2.2: dynamic-access & escape detection → pin whole module
 
