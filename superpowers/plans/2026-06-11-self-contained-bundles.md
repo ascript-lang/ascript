@@ -669,12 +669,14 @@ impl ModuleArchive {
 - Modify: `src/lib.rs` (`compile_archive` uses the keep-set), `src/compile/mod.rs` (compile-with-keep-set entry)
 - Test: `tests/archive.rs`
 
-- [ ] **Step 1: Write the failing test** — the archive chunk for `m` does NOT contain `unused`'s code (assert by size/disasm or by a runtime probe that `m.unused` is absent when shaken), while `used` works.
-- [ ] **Step 2: Run it — expect FAIL** (whole module still compiled).
-- [ ] **Step 3: Implement** — thread the per-module keep-set into compilation so unreferenced inert top-level declarations are not emitted; side-effectful statements and kept decls are emitted in source order (preserving side-effect semantics).
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — archive test; blast-radius: a dropped binding must not leave a dangling reference (the keep-set is closed under references by construction — assert no `undefined` at runtime).
-- [ ] **Step 6: Commit** — `git commit -m "feat(build): emit only reachable declarations per archived module"`
+- [x] **Step 1: Write the failing test** — the archive chunk for `m` does NOT contain `unused`'s code (assert by size/disasm or by a runtime probe that `m.unused` is absent when shaken), while `used` works.
+- [x] **Step 2: Run it — expect FAIL** (whole module still compiled).
+- [x] **Step 3: Implement** — thread the per-module keep-set into compilation so unreferenced inert top-level declarations are not emitted; side-effectful statements and kept decls are emitted in source order (preserving side-effect semantics).
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — archive test; blast-radius: a dropped binding must not leave a dangling reference (the keep-set is closed under references by construction — assert no `undefined` at runtime).
+- [x] **Step 6: Commit** — `git commit -m "feat(build): emit only reachable declarations per archived module"`
+
+> **Accepted (2.3):** commits `fc974a6` (impl) + `0fd5778` (review fixes). SHAKING IS NOW OBSERVABLE. **AST-level filtered re-emission** (NOT bytecode surgery): `compile_source_with_keep(src, keep)` (`src/compile/mod.rs`, via a shared `compile_source_inner(src, keep: Option<&HashSet<Rc<str>>>)`) skips a DIRECT-child top-level BINDING decl iff its name(s) ∉ keep; imports + bare-expr/control-flow + kept decls emit in SOURCE ORDER. `keep=None` (default run/build) byte-identical. **Slot-safety VERIFIED** (top-level decls are `DEFINE_GLOBAL` user-globals, not frame slots → skipping shifts no slots; `shake_slot_safety_*` test drops fns between mutually-referencing kept globals). `compile_archive` is now TWO-PASS: pass 1 BFS builds the `ModuleNode` graph (chunks + `ImportEdge`s, edges recorded for BOTH new + already-seen targets → diamonds/cycles); `compute_reachable`; pass 2 re-compiles each LIBRARY module (idx>0) pruned + RE-VERIFIES (`vm::verify`) before storing; ENTRY (idx 0) stored byte-identical. **Load-bearing shaker bug found + fixed:** `export fn` lowers to `DEFINE_GLOBAL name` + a separate `DEFINE_EXPORT name`; the latter was treated as a side-effect → force-rooting EVERY export (shaking was a no-op for exports) — fixed by `statement_is_definition` matching `DEFINE_EXPORT`. Soundness review: 13 adversarial archives (diamonds, circular, transitive exports, class/superclass/enum, destructuring, namespace shake) → ZERO live-code drops / dangling refs / altered side-effects; entry byte-for-byte equal to unshaken compile; pruned chunks re-verify. Keep-set's closure property → no dangling `undefined` by construction. NIT (no action): typed literal `let x: number = 5` conservatively kept (its `CHECK_TYPE` op classifies it `ComputedConst`) — sound under-shake. 21/21 archive tests both configs; 25/25 shake; differential 378/0 both configs; native 14/0; clippy clean both configs. Digest (`[0u8;32]`) + report stderr DEFERRED to 2.4 (stubbed, not dropped).
 
 ### Task 2.4: the build report + manifest digest
 
