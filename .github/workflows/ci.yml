@@ -75,10 +75,11 @@ jobs:
         run: |
           # LeakSanitizer policy is COMPILED INTO the targets via `__lsan_default_options`: the
           # runtime-exercising targets (worker_serialize/differential/parser) disable LSan (their
-          # process-lifetime runtime state is not a leak); the decode-only `aso_roundtrip` keeps
-          # it ON (a leak there is a real `.aso` reader bug — BIN's gate). The libFuzzer
-          # `-detect_leaks` FLAG cannot do this — it does not stop the shutdown LSan check.
-          for t in aso_roundtrip worker_serialize differential parser; do
+          # process-lifetime runtime state is not a leak); the decode-only `aso_roundtrip` /
+          # `archive_roundtrip` targets keep it ON (a leak there is a real reader bug — BIN's
+          # gate). The libFuzzer `-detect_leaks` FLAG cannot do this — it does not stop the
+          # shutdown LSan check.
+          for t in aso_roundtrip archive_roundtrip worker_serialize differential parser; do
             echo "::group::smoke $t"
             # The committed ex_*/bad_* seeds are replayed first, so a seed-reproducible crash
             # fails here. 45s wall cap per target.

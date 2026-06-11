@@ -291,6 +291,7 @@ dependencies = [
  "num_cpus",
  "rust_decimal",
  "rustyline",
+ "sha2",
  "stacker",
  "static_assertions",
  "tokio",

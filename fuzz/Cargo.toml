@@ -51,6 +51,16 @@ test = false
 doc = false
 bench = false
 
+# SELF-CONTAINED-BUNDLES Task 4.2 — the `ASCRIPTA` module-archive container decoder
+# (`ModuleArchive::decode`, a security surface: a shipped bundle parses untrusted
+# archive bytes). Decode no-panic + decode-stability + structured encode∘decode.
+[[bin]]
+name = "archive_roundtrip"
+path = "fuzz_targets/archive_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
 # FUZZ Task 7 — the headline three-way differential program fuzzer (reaches `ascript::fuzzgen`
 # via the `fuzzgen` feature; runs each generated program on tree-walker + specialized-VM +
 # generic-VM and asserts they agree).
