@@ -85,6 +85,11 @@ pub enum ImportEdge {
 pub struct ReachResult {
     /// Per-module keep-set: module index → the set of top-level binding NAMES that
     /// must be retained. The entry (index 0) keeps all of its names.
+    ///
+    /// This is a membership LOOKUP table only (Task 2.3 queries it by name); the inner
+    /// `HashSet` iteration order is NON-deterministic. It is NOT an ordered structure —
+    /// Task 2.4's reproducible digest must be built from the sorted [`ShakeReport`]
+    /// (`dropped`/`pins`), never by iterating `keep`.
     pub keep: HashMap<usize, HashSet<Rc<str>>>,
     /// A minimal report of what the analysis decided (Task 2.4 fleshes this out).
     pub report: ShakeReport,
@@ -224,8 +229,8 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
                     }
                 }
                 ImportEdge::Namespace { target } => {
-                    if *target < n {
-                        pinned_whole[*target] = true;
+                    if let Some(slot) = pinned_whole.get_mut(*target) {
+                        *slot = true;
                     }
                 }
             }
@@ -253,19 +258,11 @@ pub fn compute_reachable(graph: &[ModuleNode]) -> ReachResult {
             roots.extend(import_roots[i].iter().cloned());
             roots.extend(keep[i].iter().cloned());
             let closure = compute_closure(&graph[i].chunk, &defs[i], roots);
+            // closure ⊇ keep[i] by construction (keep[i] is seeded into roots above);
+            // size growth is the exact termination criterion.
             if closure.len() > keep[i].len() {
                 keep[i] = closure;
                 changed = true;
-            } else {
-                // Same size could still differ in identity in pathological cases;
-                // detect any new member explicitly.
-                for name in &closure {
-                    if !keep[i].contains(name) {
-                        keep[i] = closure.clone();
-                        changed = true;
-                        break;
-                    }
-                }
             }
         }
     }
