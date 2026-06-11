@@ -266,9 +266,9 @@ Additionally validate `url` begins with a known scheme (`https://`/`git@`/`ssh:/
 - Modify: `src/stdlib/string.rs:153`, `src/stdlib/process.rs:664`, `src/stdlib/net_http.rs:1553`
 - Test: inline `#[test]`s
 
-- [ ] **Step 1: Write the failing test** — `string.repeat("x", 1/0)` and `string.repeat("x", 1e18)` return a recoverable Tier-2 panic, not a process abort.
-- [ ] **Step 2: Run it — expect FAIL** (allocator abort).
-- [ ] **Step 3: Apply the fix** — a shared guard mirroring `bytes.rs`'s `want_index`: reject `!n.is_finite()` and `n` above a sane cap before `as usize`:
+- [x] **Step 1: Write the failing test** — `string.repeat("x", 1/0)` and `string.repeat("x", 1e18)` return a recoverable Tier-2 panic, not a process abort.
+- [x] **Step 2: Run it — expect FAIL** (allocator abort).
+- [x] **Step 3: Apply the fix** — a shared guard mirroring `bytes.rs`'s `want_index`: reject `!n.is_finite()` and `n` above a sane cap before `as usize`:
 
 ```rust
 if !n.is_finite() || n < 0.0 || n > (u32::MAX as f64) {
@@ -278,9 +278,9 @@ if !n.is_finite() || n < 0.0 || n > (u32::MAX as f64) {
 
 Apply the same finite+cap guard at the `reader.read` sites.
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — `examples/advanced/string_repeat_guard.as`; docs: string/process pages; blast-radius: grep `as usize`/`as u64` on `want_number` results across stdlib and guard any unguarded site (log discoveries per §9.4).
-- [ ] **Step 6: Commit** — `git commit -m "fix(stdlib): finite/in-range guards on repeat and read counts"`
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — `examples/advanced/string_repeat_guard.as`; docs: string/process pages; blast-radius: grep `as usize`/`as u64` on `want_number` results across stdlib and guard any unguarded site (log discoveries per §9.4).
+- [x] **Step 6: Commit** — `git commit -m "fix(stdlib): finite/in-range guards on repeat and read counts"`
 
 ### Task 0.11: workflow log atomic write
 
