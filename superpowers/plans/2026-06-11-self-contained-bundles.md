@@ -422,9 +422,9 @@ if !p.at(RBrace) && !p.at_end() && !p.at(Semicolon) {
 - Modify: `src/dap/proto.rs` (~49)
 - Test: inline `#[test]`
 
-- [ ] **Step 1: Write the failing test** — a frame `Content-Length: 999999999` returns `Ok(None)` (or a clean error), not a multi-hundred-MB allocation/hang.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Apply the fix** — cap before allocating:
+- [x] **Step 1: Write the failing test** — a frame `Content-Length: 999999999` returns `Ok(None)` (or a clean error), not a multi-hundred-MB allocation/hang.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Apply the fix** — cap before allocating:
 
 ```rust
 const MAX_DAP_MESSAGE: usize = 64 * 1024 * 1024;
@@ -435,9 +435,9 @@ let len = match content_length {
 };
 ```
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust test; blast-radius: confirm `write_message`'s `expect("DAP message serializes")` cannot be reached from untrusted input (it serializes our own values — OK).
-- [ ] **Step 6: Commit** — `git commit -m "fix(dap): cap Content-Length before allocation"`
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust test; blast-radius: confirm `write_message`'s `expect("DAP message serializes")` cannot be reached from untrusted input (it serializes our own values — OK).
+- [x] **Step 6: Commit** — `git commit -m "fix(dap): cap Content-Length before allocation"`
 
 ### Task 0.18: DAP `scopes` frame_id overflow + double-launch
 
