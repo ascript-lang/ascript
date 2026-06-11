@@ -219,9 +219,9 @@ VariantElem(n) | MatchVariantArity(n) => {
 - Modify: `src/stdlib/http_server.rs` (`serialize_response` ~859, `value_to_response` ~778)
 - Test: inline `#[test]` + `examples/advanced`
 
-- [ ] **Step 1: Write the failing test** — a handler returning a header value `"a\r\nX-Injected: 1"` must NOT produce two headers; the value is rejected (Tier-2 panic) or the CRLF stripped.
-- [ ] **Step 2: Run it — expect FAIL** (currently splits).
-- [ ] **Step 3: Apply the fix** — validate header name + value when building the response; reject names with non-token chars and values containing `\r`/`\n` (recoverable Tier-2 panic with a field-path message), in `value_to_response` before they reach `serialize_response`:
+- [x] **Step 1: Write the failing test** — a handler returning a header value `"a\r\nX-Injected: 1"` must NOT produce two headers; the value is rejected (Tier-2 panic) or the CRLF stripped.
+- [x] **Step 2: Run it — expect FAIL** (currently splits).
+- [x] **Step 3: Apply the fix** — validate header name + value when building the response; reject names with non-token chars and values containing `\r`/`\n` (recoverable Tier-2 panic with a field-path message), in `value_to_response` before they reach `serialize_response`:
 
 ```rust
 fn sanitize_header(name: &str, val: &str) -> Result<(), Control> {
@@ -234,9 +234,9 @@ fn sanitize_header(name: &str, val: &str) -> Result<(), Control> {
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — `examples/advanced/http_header_safety.as`; docs: `stdlib/*` http server page note; blast-radius: check every site that writes user values into the response head (status reason, trailers).
-- [ ] **Step 6: Commit** — `git commit -m "fix(http): reject CRLF in response header names/values"`
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — `examples/advanced/http_header_safety.as`; docs: `stdlib/*` http server page note; blast-radius: check every site that writes user values into the response head (status reason, trailers).
+- [x] **Step 6: Commit** — `git commit -m "fix(http): reject CRLF in response header names/values"`
 
 ### Task 0.9: git argument injection in the package fetcher
 
