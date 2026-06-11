@@ -135,9 +135,9 @@ Remove the now-false comment claiming "step rejected upstream"; bump `ASO_FORMAT
 - Modify: `src/syntax/resolve/mod.rs` (`resolve_pattern`, ~1082) and `declare_pattern_names` (~748)
 - Test: `tests/cli.rs` + example
 
-- [ ] **Step 1: Write the failing test** — `match Shape.Circle(2) { Shape.Circle(r) | Shape.Square(r) => print(r) }` expects `2`; currently `undefined variable: r`.
-- [ ] **Step 2: Run it — expect FAIL.**
-- [ ] **Step 3: Apply the fix** — add an `OrPat` arm to both `resolve_pattern` and `declare_pattern_names` that recurses into each alternative sub-pattern:
+- [x] **Step 1: Write the failing test** — `match Shape.Circle(2) { Shape.Circle(r) | Shape.Square(r) => print(r) }` expects `2`; currently `undefined variable: r`.
+- [x] **Step 2: Run it — expect FAIL.**
+- [x] **Step 3: Apply the fix** — add an `OrPat` arm to both `resolve_pattern` and `declare_pattern_names` that recurses into each alternative sub-pattern:
 
 ```rust
 OrPat => {
@@ -147,9 +147,11 @@ OrPat => {
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS** in both engines; `cargo test --test vm_differential`.
-- [ ] **Step 5: §9.1** — `examples/match_or_patterns.as`; docs: match section note that alternatives must bind the same names; LSP: confirm go-to-def/rename on an or-pattern binding resolves; blast-radius: the legacy `parser.rs`/tree-walker path — verify it already binds (oracle parity) and add a frontend-conformance snippet.
-- [ ] **Step 6: Commit** — `git commit -m "fix(resolve): bind names inside or-patterns"`
+- [x] **Step 4: Run it — expect PASS** in both engines; `cargo test --test vm_differential`.
+- [x] **Step 5: §9.1** — `examples/match_or_patterns.as`; docs: match section note that alternatives must bind the same names; LSP: confirm go-to-def/rename on an or-pattern binding resolves; blast-radius: the legacy `parser.rs`/tree-walker path — verify it already binds (oracle parity) and add a frontend-conformance snippet.
+- [x] **Step 6: Commit** — `git commit -m "fix(resolve): bind names inside or-patterns"`
+
+> **Scope note (owner decision, 2026-06-11):** Task 0.4 was extended beyond the binding fix — a mismatched-name-set or-pattern is now a **static compile error** byte-identically rejected on VM, tree-walker, and `ascript check` (new `or-pattern-binding` diagnostic, a `blocking` property on `ResolveDiagnostic`, and a shared `collect_blocking_diagnostics` pre-dispatch gate). Commits a884bed → 830ec11 → afd4fd7.
 
 ### Task 0.5: legacy formatter drops parameter defaults
 
