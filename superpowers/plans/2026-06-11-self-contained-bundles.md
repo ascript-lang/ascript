@@ -345,9 +345,9 @@ Mode::Replay => match self.next_event() {
 - Modify: `src/stdlib/crypto.rs` (`hashPassword` ~118)
 - Test: inline `#[test]`
 
-- [ ] **Step 1: Write the failing test** — under deterministic mode two `hashPassword` calls with the same input + seed produce the same hash (reproducible salt).
-- [ ] **Step 2: Run it — expect FAIL** (`OsRng` salt differs each run).
-- [ ] **Step 3: Apply the fix** — draw the salt bytes through `interp.fill_seeded_bytes` when in deterministic mode (mirroring `randomBytes`), else `OsRng`:
+- [x] **Step 1: Write the failing test** — under deterministic mode two `hashPassword` calls with the same input + seed produce the same hash (reproducible salt).
+- [x] **Step 2: Run it — expect FAIL** (`OsRng` salt differs each run).
+- [x] **Step 3: Apply the fix** — draw the salt bytes through `interp.fill_seeded_bytes` when in deterministic mode (mirroring `randomBytes`), else `OsRng`:
 
 ```rust
 let mut salt_bytes = [0u8; 16];
@@ -357,9 +357,11 @@ if !interp.fill_seeded_bytes(&mut salt_bytes) {
 let salt = SaltString::encode_b64(&salt_bytes).map_err(...)?;
 ```
 
-- [ ] **Step 4: Run it — expect PASS**; confirm non-deterministic mode is byte-identical to before.
-- [ ] **Step 5: §9.1** — Rust test; docs: note `hashPassword` is replay-safe; `ffi`/workflow lint: confirm `crypto` in a workflow body is covered by determinism guidance; blast-radius: audit other `OsRng`/`thread_rng` uses in crypto for replay-safety.
-- [ ] **Step 6: Commit** — `git commit -m "fix(crypto): seeded salt for hashPassword under deterministic mode"`
+- [x] **Step 4: Run it — expect PASS**; confirm non-deterministic mode is byte-identical to before.
+- [x] **Step 5: §9.1** — Rust test; docs: note `hashPassword` is replay-safe; `ffi`/workflow lint: confirm `crypto` in a workflow body is covered by determinism guidance; blast-radius: audit other `OsRng`/`thread_rng` uses in crypto for replay-safety.
+- [x] **Step 6: Commit** — `git commit -m "fix(crypto): seeded salt for hashPassword under deterministic mode"`
+
+> **Scope note (2026-06-11):** Task 0.13 expanded (same bug class, per §9.4) from argon2 `hashPassword` to also cover `bcryptHash` and `uuid.v7` — all three now route salt/random bytes through `fill_seeded_bytes` (v7 also takes its time prefix from the virtual clock), making them replay-safe; `task.retry` jitter documented as a timing-only exemption. Commits 6601c84 → ef7290b → de87f00 → 786f9c1.
 
 ### Task 0.14: `synth_array` double-synthesis (duplicate diagnostics)
 
