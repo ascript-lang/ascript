@@ -824,14 +824,16 @@ impl ModuleArchive {
 
 **Files:** none (verification)
 
-- [ ] **Step 1:** `cargo test` (default) green.
-- [ ] **Step 2:** `cargo test --no-default-features` green.
-- [ ] **Step 3:** `cargo clippy --all-targets` clean.
-- [ ] **Step 4:** `cargo clippy --no-default-features --all-targets` clean.
-- [ ] **Step 5:** `cargo test --test vm_differential` (both configs) green over the multi-module corpus.
-- [ ] **Step 6:** shaken-vs-unshaken differential green.
-- [ ] **Step 7:** LSP / tree-sitter / formatter checks green for any surface touched.
-- [ ] **Step 8:** docs/examples present; `NAV` updated; `ASO_FORMAT_VERSION`/`ARCHIVE_VERSION` bumped where layout changed.
+- [x] **Step 1:** `cargo test` (default) green. — **35 test binaries passed, 0 failures.**
+- [x] **Step 2:** `cargo test --no-default-features` green. — **35 binaries passed, 0 failures.**
+- [x] **Step 3:** `cargo clippy --all-targets` clean.
+- [x] **Step 4:** `cargo clippy --no-default-features --all-targets` clean.
+- [x] **Step 5:** `cargo test --test vm_differential` (both configs) green over the multi-module corpus. — **378/0 both configs.**
+- [x] **Step 6:** shaken-vs-unshaken differential green. — `tests/archive.rs` (45/0 both configs).
+- [x] **Step 7:** LSP / tree-sitter / formatter checks green for any surface touched. — the bundles feature (Phases 1–4) added NO grammar/syntax; the only `parser.rs`/`fmt.rs` deltas are Phase-0 bug fixes, validated by `frontend_conformance` + `treesitter_conformance` (green in the suite). No `tree-sitter-ascript/**` change.
+- [x] **Step 8:** docs/examples present; `NAV` updated; `ASO_FORMAT_VERSION`/`ARCHIVE_VERSION` bumped where layout changed. — `bundles.md`+NAV (4.1), examples (4.3); `ASO_FORMAT_VERSION=27` UNCHANGED (no `.aso` chunk-format change — the feature frames existing chunks in a NEW container with its own `ARCHIVE_VERSION=1`).
+
+> **Accepted (4.4) — full matrix GREEN.** Discovered + fixed a LATENT blast-radius regression the per-task gates missed (no gate ran `tests/aso.rs`): 3 tests in `tests/aso.rs` encoded the pre-feature EXTERNAL-REFERENCE `.aso` model (recompile a stale/corrupt on-disk dependency at run). The feature INTENTIONALLY changed this — a multi-module `build use.as` now EMBEDS `./dep` into `use.aso` (the user's explicit "include imports, not reference externally" request), so the artifact is self-contained + frozen at build (a re-run resolves the import from the embedded archive, never the on-disk dep). Updated the tests to assert the new semantics (commit `820318d`): `stale→built_aso_embeds_deps_and_is_frozen_until_rebuilt` (editing a dep doesn't change the artifact; rebuilding does), `corrupt-fallback→built_aso_ignores_corrupt_ondisk_dep` (embedded dep is authoritative), + the aso-only comment. **Behavior change to surface to the user:** `ascript build x.as` (non-native) now produces a frozen, self-contained `.aso`; the live-edit dev workflow is `ascript run x.as` (always recompiles). This is the approved spec/plan (Task 1.5) behavior; flagged for visibility.
 
 ### Task 4.5: Phase 4 + whole-effort holistic review (Definition of Done)
 
