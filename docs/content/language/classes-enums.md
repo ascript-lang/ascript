@@ -375,7 +375,11 @@ An enum is a **closed sum of named variants**. A variant is one of three shapes:
 enum Color  { Red, Green, Blue }                    // unit variants
 enum Status { Ok = 200, NotFound = 404, Err = 500 } // number-backed units
 enum Mode   { Read = "r", Write = "w" }             // string-backed units
+enum Signal { Error = -1, Ok = 0, Pending = 1 }     // negative integer backing
 ```
+
+A backing value is a number or string literal; a leading `-` makes it a **negative integer** (or
+float) backing — the one constant unary form allowed.
 
 Access a unit variant with `Enum.Variant`. Each exposes its `.name` and `.value`:
 

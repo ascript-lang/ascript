@@ -1859,9 +1859,11 @@ fn vm_step_stays_usable_as_identifier() {
 // ===== RANGES FEATURE, Phase 2: inclusive `..=` ranges (both engines) =========
 
 /// Run `src` as a `.as` program on a chosen engine, returning stdout. Panics if
-/// the process fails (so callers assert on successful output).
+/// the process fails (so callers assert on successful output). General-purpose
+/// "run source on both engines and compare" helper — the `tag` namespaces the
+/// temp file, so callers outside the RANGES section pass their own prefix.
 fn run_range_src(src: &str, tree_walker: bool, tag: &str) -> String {
-    let file = std::env::temp_dir().join(format!("ascript_range_{tag}.as"));
+    let file = std::env::temp_dir().join(format!("ascript_{tag}.as"));
     std::fs::write(&file, src).unwrap();
     let bin = env!("CARGO_BIN_EXE_ascript");
     let mut cmd = Command::new(bin);
@@ -1895,6 +1897,41 @@ fn inclusive_range_iteration_and_value_both_engines() {
     for (i, (src, expected)) in cases.iter().enumerate() {
         let vm = run_range_src(src, false, &format!("vm_{i}"));
         let tw = run_range_src(src, true, &format!("tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn negative_integer_enum_backing_both_engines() {
+    // NUM-split regression: a NEGATIVE INTEGER enum backing value (`A = -1`) must
+    // compile + run byte-identically on the default VM and the tree-walker. Before
+    // the fix, `const_eval_enum_backing`'s unary-minus arm only handled
+    // `Value::Float`, so an integer literal (now `Value::Int`) fell through to
+    // "enum variant backing value must be a number or string literal" — the VM
+    // rejected legal code the tree-walker accepted.
+    let cases = [
+        (
+            "enum E { A = -1, B = 2 }\nprint(E.A.value)\nprint(E.B.value)",
+            "-1\n2\n",
+        ),
+        (
+            // Negative float backing still works (the original arm).
+            "enum F { Lo = -2.5, Hi = 3 }\nprint(F.Lo.value)",
+            "-2.5\n",
+        ),
+        (
+            // A large in-range negative int literal.
+            "enum G { Min = -9223372036854775807 }\nprint(G.Min.value)",
+            "-9223372036854775807\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        // `run_range_src` is a general-purpose "run on both engines" helper (it
+        // lives under the RANGES section but is engine-agnostic).
+        let vm = run_range_src(src, false, &format!("neg_enum_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("neg_enum_tw_{i}"));
         assert_eq!(vm, *expected, "VM output wrong for `{src}`");
         assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
         assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
