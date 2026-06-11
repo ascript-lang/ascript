@@ -288,9 +288,9 @@ Apply the same finite+cap guard at the `reader.read` sites.
 - Modify: `src/stdlib/workflow.rs:730`
 - Test: `tests/` (workflow durability)
 
-- [ ] **Step 1: Write the failing test** — simulate a crash between truncate and write by asserting `write_log` never leaves a zero-byte/partial file visible at `path` (write goes to a temp sibling then renames).
-- [ ] **Step 2: Run it — expect FAIL** (current `File::create` truncates in place).
-- [ ] **Step 3: Apply the fix** — write-to-temp + fsync + atomic rename:
+- [x] **Step 1: Write the failing test** — simulate a crash between truncate and write by asserting `write_log` never leaves a zero-byte/partial file visible at `path` (write goes to a temp sibling then renames).
+- [x] **Step 2: Run it — expect FAIL** (current `File::create` truncates in place).
+- [x] **Step 3: Apply the fix** — write-to-temp + fsync + atomic rename:
 
 ```rust
 fn write_log(path: &str, contents: &str, fsync: bool, span: Span) -> Result<(), Control> {
@@ -308,9 +308,9 @@ fn write_log(path: &str, contents: &str, fsync: bool, span: Span) -> Result<(), 
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: §9.1** — Rust test; docs: workflow durability note; blast-radius: the workflow append model rewrites the whole log each event — confirm rename semantics hold for the replay reader; no concurrent same-path runs (document the single-writer assumption).
-- [ ] **Step 6: Commit** — `git commit -m "fix(workflow): atomic log write via temp+rename"`
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: §9.1** — Rust test; docs: workflow durability note; blast-radius: the workflow append model rewrites the whole log each event — confirm rename semantics hold for the replay reader; no concurrent same-path runs (document the single-writer assumption).
+- [x] **Step 6: Commit** — `git commit -m "fix(workflow): atomic log write via temp+rename"`
 
 ### Task 0.12: `clock_monotonic_ms` replay-mismatch handling
 
