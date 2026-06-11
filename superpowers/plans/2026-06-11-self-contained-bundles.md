@@ -813,10 +813,12 @@ impl ModuleArchive {
 - Create: `examples/bundle_multimodule.as`, `examples/bundle_util.as`, `examples/advanced/bundle_caps.as`
 - Test: the conformance corpus
 
-- [ ] **Step 1:** Ensure the examples are runnable (`target/release/ascript run`), error-handled (advanced), and exercise named + namespace imports, a shaken unused export, and (advanced) a `--deny`-built bundle.
-- [ ] **Step 2:** Add them to the corpus/skip lists appropriately (a port-binding server-style example would be skipped; these run to completion so they are NOT skipped).
-- [ ] **Step 3: §9.1** — the examples are the deliverable; blast-radius: they participate in the four-mode differential.
-- [ ] **Step 4: Commit** — `git commit -m "examples(bundle): multi-module + caps examples"`
+- [x] **Step 1:** Ensure the examples are runnable (`target/release/ascript run`), error-handled (advanced), and exercise named + namespace imports, a shaken unused export, and (advanced) a `--deny`-built bundle.
+- [x] **Step 2:** Add them to the corpus/skip lists appropriately (a port-binding server-style example would be skipped; these run to completion so they are NOT skipped).
+- [x] **Step 3: §9.1** — the examples are the deliverable; blast-radius: they participate in the four-mode differential.
+- [x] **Step 4: Commit** — `git commit -m "examples(bundle): multi-module + caps examples"`
+
+> **Accepted (4.3):** commit `fa89b7e`. Added an output-safe unused `whisper` export to `examples/bundle_util.as` (a real tree-shaker drop target — never imported, so existing hardcoded-output tests unaffected). New `examples/advanced/bundle_caps.as` (production-shaped, fully error-handled): uses the REAL CORE `std/caps` script API (`caps.drop`/`caps.has`/`caps.list`) to irreversibly self-restrict net/fs/process then gracefully degrade (`recover`-wrapped config load branching on `caps.has("fs")`) — mirrors the posture a `--deny`-built bundle runs, while running fine under `ascript run` (all-granted) via in-code self-drop; DETERMINISTIC, byte-identical under BOTH feature configs. Exercises named + namespace imports over a real relative edge to a sibling `bundle_caps_util.as`. Skip-listed as `RelativeImports` in `vm_differential` (CLI corpus + archive tests cover it). **Non-vacuous shake proof:** extended `differential_corpus_bundle_multimodule` to assert `whisper` IS dropped + added `differential_corpus_bundle_caps` (shaken == unshaken byte-identical). cli 155/0, archive 39/0 both configs, differential 378/0 both configs, `ascript check` 0 diagnostics, clippy clean both configs.
 
 ### Task 4.4: full matrix + Definition of Done
 
