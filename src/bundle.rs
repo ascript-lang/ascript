@@ -164,11 +164,16 @@ pub fn adhoc_sign_macos(_path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The current `.aso` format version, used for the informational `aso_version`
+    /// footer field in these fixtures (bound to the live constant so it never goes stale
+    /// on an `ASO_FORMAT_VERSION` bump).
+    const AV: u32 = crate::vm::aso::ASO_FORMAT_VERSION;
+
     /// A synthetic bundle image: `stub_len` zero stub bytes + `payload` + the footer.
     fn make_image(stub_len: usize, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![0u8; stub_len];
         v.extend_from_slice(payload);
-        v.extend_from_slice(&write_footer(stub_len as u64, payload.len() as u64, 26));
+        v.extend_from_slice(&write_footer(stub_len as u64, payload.len() as u64, AV));
         v
     }
 
@@ -188,7 +193,7 @@ mod tests {
         let f = BundleFooter {
             payload_offset: 12345,
             payload_len: 678,
-            aso_version: 26,
+            aso_version: AV,
             bundle_version: BUNDLE_FOOTER_VERSION,
             reserved: 0,
             magic: BUNDLE_MAGIC,
@@ -216,7 +221,7 @@ mod tests {
         let stub_len = MIN_STUB_SIZE;
         let mut img = vec![0u8; stub_len as usize + 16]; // small payload region
         // footer claims a payload far larger than what's present.
-        img.extend_from_slice(&write_footer(stub_len, 1_000_000, 26));
+        img.extend_from_slice(&write_footer(stub_len, 1_000_000, AV));
         assert_eq!(read_bundle_footer(&img), None);
     }
 
@@ -227,7 +232,7 @@ mod tests {
         let footer = BundleFooter {
             payload_offset: u64::MAX - 10,
             payload_len: u64::MAX - 10,
-            aso_version: 26,
+            aso_version: AV,
             bundle_version: BUNDLE_FOOTER_VERSION,
             reserved: 0,
             magic: BUNDLE_MAGIC,
@@ -243,7 +248,7 @@ mod tests {
         let mut img = vec![0u8; 100];
         img.extend_from_slice(payload);
         // offset 0 (< MIN_STUB_SIZE) even though offset+len fits.
-        img.extend_from_slice(&write_footer(0, payload.len() as u64, 26));
+        img.extend_from_slice(&write_footer(0, payload.len() as u64, AV));
         assert_eq!(read_bundle_footer(&img), None);
     }
 
@@ -257,6 +262,6 @@ mod tests {
     fn footer_size_matches_layout() {
         // 8 + 8 + 4 + 2 + 2 + 8 = 32.
         assert_eq!(FOOTER_SIZE, 32);
-        assert_eq!(write_footer(MIN_STUB_SIZE, 0, 26).len(), FOOTER_SIZE);
+        assert_eq!(write_footer(MIN_STUB_SIZE, 0, AV).len(), FOOTER_SIZE);
     }
 }
