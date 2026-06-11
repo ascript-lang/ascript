@@ -799,11 +799,13 @@ impl ModuleArchive {
 - Modify: `fuzz/Cargo.toml`
 - Test: `cargo fuzz run archive_roundtrip -- -runs=100000` (CI smoke)
 
-- [ ] **Step 1:** Write a fuzz target that feeds arbitrary bytes to `ModuleArchive::decode` and asserts it never panics (always `Ok`/`Err`), and that `encode∘decode` round-trips a structured input.
-- [ ] **Step 2:** Register the target; add a seed corpus from real archives.
-- [ ] **Step 3:** Run the smoke campaign — expect zero crashes.
-- [ ] **Step 4: §9.1** — the fuzz target is the deliverable; blast-radius: wire into the nightly fuzz CI alongside `aso_roundtrip`.
-- [ ] **Step 5: Commit** — `git commit -m "test(fuzz): archive decode fuzzing target"`
+- [x] **Step 1:** Write a fuzz target that feeds arbitrary bytes to `ModuleArchive::decode` and asserts it never panics (always `Ok`/`Err`), and that `encode∘decode` round-trips a structured input.
+- [x] **Step 2:** Register the target; add a seed corpus from real archives.
+- [x] **Step 3:** Run the smoke campaign — expect zero crashes.
+- [x] **Step 4: §9.1** — the fuzz target is the deliverable; blast-radius: wire into the nightly fuzz CI alongside `aso_roundtrip`.
+- [x] **Step 5: Commit** — `git commit -m "test(fuzz): archive decode fuzzing target"`
+
+> **Accepted (4.2):** commit `f3a5619`. `fuzz/fuzz_targets/archive_roundtrip.rs` (mirrors `aso_roundtrip`): (a) `ModuleArchive::decode(arbitrary)` never panics; (b) decode-stability (`decode(a.encode()) == Ok(a)`); (c) structured `encode∘decode` round-trip from a deterministic generator. Registered as a `[[bin]]` in `fuzz/Cargo.toml` + wired into CI (`ci.yml` fuzz-smoke + `fuzz-nightly.yml` deep matrix) alongside `aso_roundtrip`. 11 committed seeds (1 REAL `ASCRIPTA` archive `ex_multimodule` + 10 `bad_*` rejection seeds). **In-tree guards** (`tests/property.rs`, the normal-suite proof): `archive_decode_arbitrary_never_panics`, `archive_structured_round_trip`, `archive_planted_bug_known_bad_bytes_are_clean_err`, `archive_seed_corpus_is_present_and_current`. cargo-fuzz available → built + 50k-run smoke campaign → ZERO crashes. **Isolation VERIFIED** (`cargo tree -e normal | grep libfuzzer` empty — libfuzzer NOT in the root graph). No production-code change; no `.aso`/`ASO_FORMAT_VERSION`/`ARCHIVE_VERSION` change. property 4/4 (22/22 full) both configs; clippy clean both configs.
 
 ### Task 4.3: corpus examples + advanced
 
