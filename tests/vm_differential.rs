@@ -6165,6 +6165,30 @@ async fn vm_parser_accepts_runs_legitimate_rejections() {
              tree-walker: {tw:?}\n  spec: {spec:?}\n  generic: {generic:?}"
         );
     }
+
+    // An or-pattern whose alternatives bind DIFFERENT name sets
+    // (`Shape.Circle(r) | Shape.Empty => r` — `r` bound in one alternative, absent
+    // from the other) is rejected by every engine, but the VM rejects it at
+    // COMPILE time (the resolver `or-pattern-binding` diagnostic lifted to a
+    // `CompileError`) and the tree-walker at RUNTIME (the missing binding surfaces
+    // when the unbound alternative matches), so the message/timing legitimately
+    // differ. Assert symmetry-of-rejection (all three `Err`), NOT byte-identical
+    // text — mirroring the `yield`-field-default case above. (The same program also
+    // rejects byte-identically through the CLI gate; that path is covered in
+    // `cli::match_or_pattern_mismatched_names_is_static_error_on_all_paths`.)
+    {
+        let src = "enum Shape { Circle(radius: int), Empty }\n\
+fn f(s: Shape): int {\n  return match s {\n    Shape.Circle(r) | Shape.Empty => r,\n  }\n}\n\
+print(f(Shape.Empty))\n";
+        let tw = ascript::run_source_exit(src).await;
+        let spec = ascript::vm_run_source(src).await;
+        let generic = ascript::vm_run_source_generic(src).await;
+        assert!(
+            tw.is_err() && spec.is_err() && generic.is_err(),
+            "expected ALL engines to reject the mismatched-name or-pattern\n  \
+             tree-walker: {tw:?}\n  spec: {spec:?}\n  generic: {generic:?}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -938,17 +938,13 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     let resolved = resolve(&root);
 
     // STATIC REJECTION (byte-identical with the tree-walker via the CLI gate and
-    // `ascript check`): an or-pattern whose alternatives bind DIFFERENT name sets is
-    // a compile error, not a runtime divergence. The resolver records it as an
-    // `or-pattern-binding` diagnostic; surface the FIRST one as a `CompileError` so
-    // the VM refuses to run the program. (Other resolver diagnostics — e.g.
-    // `duplicate-binding` — stay runtime-timed, matching the tree-walker, so they are
-    // deliberately NOT lifted here.)
-    if let Some(d) = resolved
-        .diagnostics
-        .iter()
-        .find(|d| d.code == "or-pattern-binding")
-    {
+    // `ascript check`): a BLOCKING resolver diagnostic (e.g. an or-pattern whose
+    // alternatives bind DIFFERENT name sets) is a compile error, not a runtime
+    // divergence. Surface the FIRST one as a `CompileError` so the VM refuses to run.
+    // (Non-blocking resolver diagnostics — e.g. `duplicate-binding` — stay
+    // runtime-timed, matching the tree-walker, so they are NOT lifted here. The
+    // `blocking` flag is the SoT, not a hardcoded code allowlist.)
+    if let Some(d) = resolved.diagnostics.iter().find(|d| d.blocking) {
         let span = Span::new(
             byte_to_char(usize::from(d.range.start())),
             byte_to_char(usize::from(d.range.end())),

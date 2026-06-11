@@ -24,6 +24,14 @@ use std::collections::HashMap;
 /// code rather than rejected as unknown — but it is a NO-OP: `analyze_with_config`
 /// makes `syntax-error` immune (always `Error`, never dropped or downgraded), so
 /// configuring it has no effect.
+///
+/// RESOLVER-STRUCTURAL codes are intentionally OMITTED (`duplicate-binding`,
+/// `or-pattern-binding`): they are structural compile errors the resolver emits
+/// directly (like `syntax-error`, not advisory lints), so they are deliberately
+/// non-configurable — `--deny`/`--warn`/`--allow` cannot target them (a flag naming
+/// one is correctly rejected as unknown), and `effective` passes their emitted
+/// `Severity::Error` straight through. Do NOT add them here unless they become
+/// downgradeable.
 pub const RULE_CODES: &[&str] = &[
     "syntax-error",
     "undefined-variable",

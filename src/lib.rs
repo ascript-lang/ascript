@@ -1226,11 +1226,12 @@ pub fn collect_parse_errors(path: &Path) -> Vec<AsError> {
 
 /// Collect BLOCKING semantic diagnostics from the CST resolver that BOTH engines
 /// must reject identically BEFORE running (the shared `run` gate, alongside
-/// [`collect_parse_errors`]). Today this is exactly the `or-pattern-binding` error
-/// (an or-pattern whose alternatives bind different name sets) — a compile error,
-/// not a runtime divergence. The same diagnostic is surfaced by the VM compiler
-/// (so a direct `vm_run_source` rejects too) and by `ascript check`; routing the
-/// tree-walker `run` path through this gate makes ALL of them byte-identical.
+/// [`collect_parse_errors`]). A diagnostic is blocking iff its `blocking` flag is
+/// set (today: the `or-pattern-binding` error — an or-pattern whose alternatives
+/// bind different name sets) — a compile error, not a runtime divergence. The same
+/// diagnostics are surfaced by the VM compiler (so a direct `vm_run_source` rejects
+/// too) and by `ascript check`; routing the tree-walker `run` path through this gate
+/// makes ALL of them byte-identical.
 ///
 /// An empty `Vec` means there is nothing blocking (the run proceeds on either
 /// engine). Returns `AsError`s with the file source bound for caret rendering and
@@ -1248,7 +1249,7 @@ pub fn collect_blocking_diagnostics(path: &Path) -> Vec<AsError> {
     resolved
         .diagnostics
         .iter()
-        .filter(|d| d.code == "or-pattern-binding")
+        .filter(|d| d.blocking)
         .map(|d| {
             let span = crate::span::Span::new(
                 byte_to_char_offset(&src, usize::from(d.range.start())),

@@ -250,7 +250,8 @@ impl Resolver {
             self.result.diagnostics.push(ResolveDiagnostic {
                 message: format!("'{name}' is already defined in this scope"),
                 range: decl_range,
-                code: "duplicate-binding",
+                code: codes::DUPLICATE_BINDING,
+                blocking: false,
             });
             return;
         }
@@ -1175,7 +1176,7 @@ impl Resolver {
     /// allocated binding back onto the first alternative's slot and restore the
     /// scope entry — leaving exactly one shared slot per name, visible to the body.
     fn resolve_or_pattern(&mut self, pat: &ResolvedNode) {
-        use std::collections::{HashMap, HashSet};
+        // `HashMap`/`HashSet` are imported at module scope (line 8).
         // name -> shared slot (the slot the FIRST alternative allocated for it).
         let mut or_slots: HashMap<String, u32> = HashMap::new();
         // Per-alternative: (its source range, the SET of names it binds). Used after
@@ -1252,7 +1253,8 @@ impl Resolver {
                             "variable '{name}' is not bound in all alternatives of the or-pattern"
                         ),
                         range: *miss_range,
-                        code: "or-pattern-binding",
+                        code: codes::OR_PATTERN_BINDING,
+                        blocking: true,
                     });
                 }
             }

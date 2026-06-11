@@ -84,14 +84,33 @@ pub struct FrameInfo {
     pub value_capture_slots: Vec<u32>,
 }
 
+/// Stable lint codes for resolver-produced diagnostics. Shared constants so the
+/// emit site and every far-away filter reference ONE symbol — a typo becomes a
+/// compile error instead of silently disabling a gate.
+pub mod codes {
+    /// A same-scope REDECLARATION of a top-level binding (`let x; let x`). NON-blocking
+    /// (runtime-timed on both engines via `DEFINE_GLOBAL`); the checker only surfaces it.
+    pub const DUPLICATE_BINDING: &str = "duplicate-binding";
+    /// An or-pattern whose alternatives bind DIFFERENT name sets
+    /// (`Foo(x) | Bar(y) => …`). BLOCKING — rejected statically before either engine runs.
+    pub const OR_PATTERN_BINDING: &str = "or-pattern-binding";
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolveDiagnostic {
     pub message: String,
     pub range: TextRange,
-    /// The lint code the checker surfaces this under (e.g. `duplicate-binding`,
-    /// `or-pattern-binding`). A `&'static str` because every resolver diagnostic is a
-    /// fixed, blocking class — not config-driven text.
+    /// The lint code the checker surfaces this under (e.g. [`codes::DUPLICATE_BINDING`],
+    /// [`codes::OR_PATTERN_BINDING`]). A `&'static str` because it is a fixed code, not
+    /// config-driven text.
     pub code: &'static str,
+    /// Whether this diagnostic must REJECT the program before either engine runs (a
+    /// hard compile error, surfaced by the shared `run` gate AND the VM compiler).
+    /// `false` for advisory/runtime-timed codes (e.g. `duplicate-binding`, which both
+    /// engines defer to runtime); `true` only for genuine static-rejection classes
+    /// (e.g. `or-pattern-binding`). One flag at the emit site keeps "blocking" a
+    /// self-documenting property instead of a hardcoded code allowlist in two filters.
+    pub blocking: bool,
 }
 
 #[derive(Debug, Clone, Default)]
