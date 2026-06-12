@@ -42,7 +42,7 @@
 
 DEFER touches the same return/unwind paths LANE/CALL/DECODE rework (goal-perf, restated in spec §0). It must land **before LANE starts or after the engine waves merge — never concurrently**.
 
-- [ ] **Step 1:** Confirm with the owner and RECORD here (edit this file, replace this sentence): *sequencing decision = ______ (before LANE / after engine waves), decided by owner on ______.* Do not start Phase 1 until recorded.
+- [x] **Step 1:** *sequencing decision = **before LANE** (DEFER lands first; SHAPE parallel-allowed), decided by owner in the goal-perf.md 2026-06-12 lock record ("Owner decisions recorded at lock: **DEFER lands first** (before LANE; SHAPE parallel-allowed)") and reaffirmed in the campaign execution brief ("DEFER first").* Recorded 2026-06-12.
 - [ ] **Step 2:** `git checkout -b feat/defer-statement main` (or rebase target per the decision).
 - [ ] **Step 3:** Re-run the collision audit and paste the (empty) results into the commit body of the first Phase-1 commit: `grep -rn '\bdefer\b' examples docs/content tests --include='*.as' --include='*.md' --include='*.rs'` and `grep -rn '"defer"' src/stdlib/` — both must show no identifier/export uses (prose comments in `src/` are fine). A hit = a real collision to resolve with the owner BEFORE reserving the keyword.
 - [ ] **Step 4:** Read the spec end-to-end. Confirm `ASO_FORMAT_VERSION` is still 27 (`src/vm/aso.rs:167`) — if another spec merged a bump, this plan's "28" means "current + 1" everywhere (the cross-spec rule).
