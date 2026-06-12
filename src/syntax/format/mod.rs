@@ -171,6 +171,22 @@ impl Printer<'_> {
                 }
                 self.out.newline();
             }
+            DeferStmt => {
+                self.out.text("defer");
+                // The optional `await` keyword token is a direct child token of DeferStmt.
+                let has_await = node
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .any(|t| t.kind() == AwaitKw);
+                if has_await {
+                    self.out.text(" await");
+                }
+                if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.out.text(" ");
+                    self.expr(e);
+                }
+                self.out.newline();
+            }
             Block => self.block(node),
             FnDecl => self.fn_decl(node),
             ClassDecl => self.class_decl(node),
