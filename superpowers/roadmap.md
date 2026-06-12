@@ -497,6 +497,31 @@ stays 25; `freeze` is a runtime call, the `TAG_SHARED` tag is worker-wire only) 
    covered by `tests/server_multicore.rs`. Docs `docs/content/stdlib/shared.md` + the "Multi-core servers"
    section in `docs/content/language/workers.md` (+ NAV).
 
+## DEFER — `defer` statement ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-defer-statement-design.md`, plan
+`…/plans/2026-06-12-defer-statement.md`. The campaign's **one grammar change** — adds `defer
+[await] <call>` as a reserved-keyword statement. Closes the recurring gap where `?` early-exits
+silently skip manual cleanup below them.
+
+- **Surface:** `defer` is a **reserved keyword**; call-only (parse-time enforcement — a no-call
+  deferred expression is a silent bug). `defer await f()` for async cleanup; bare `defer f()`
+  that returns a future is a loud Tier-2 error directing to the `await` form.
+- **Semantics:** callee + args evaluated AT the `defer` statement (Go semantics — snapshot, not
+  re-evaluate at exit). Per-function scope (not block). Drains LIFO. Runs on normal return, `?`
+  propagation, and panic unwind. Does **NOT** run on `exit()`, task cancellation, or
+  `gen.close()`/last-drop. §3.6 merge rules: defer panic replaces a live return; supersedes a
+  live propagation; appends as
+  `<orig> (suppressed panic in deferred call: <new>)` into an existing panic; remaining defers
+  always run.
+- **Engines:** both — tree-walker (oracle) and VM (specialized + generic + `.aso`),
+  byte-identical across all four modes. **`.aso` bumps `ASO_FORMAT_VERSION` 27 → 28** (two new
+  opcodes: `Op::DeferPush`, `Op::DeferPushMethod`). Verifier, disasm, and `bcanalysis` updated.
+- **Lints:** `defer-in-loop` (Warning), `defer-async-call` (Warning).
+- **Examples:** `examples/defer.as` + `examples/advanced/defer_resources.as`.
+- **Docs:** "Cleanup with `defer`" section in `docs/content/language/errors.md`; async/cancellation
+  rules in `docs/content/language/modules-async.md`; statement form in `syntax.md`.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

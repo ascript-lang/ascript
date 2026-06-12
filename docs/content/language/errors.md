@@ -188,3 +188,121 @@ may be dropped — but this is rarely a concern in practice, since test assertio
 any `exit` is reached.
 
 For scripts that need to signal failure to the shell, `exit(1)` at the end is the conventional idiom.
+
+## Cleanup with `defer`
+
+`defer <call>` registers a function call to run when the **enclosing function exits — by any
+route**: normal return, `?`-propagation, or panic unwind. It is the answer to the recurring
+problem where a `?` early-exit silently skips cleanup below it.
+
+```ascript
+import * as fs from "std/fs"
+import * as io from "std/io"
+
+fn copy(srcPath: string, dstPath: string): Result<number> {
+  let [src, err] = fs.open(srcPath)
+  if (err != nil) { return Err(err.message) }
+  defer src.close()                      // runs on EVERY exit below, including the ?s
+
+  let [dst, derr] = fs.create(dstPath)
+  if (derr != nil) { return Err(derr.message) }   // src.close() runs here
+  defer dst.close()                               // LIFO: dst closes before src
+
+  let n = io.copy(dst, src)?             // propagation runs BOTH defers
+  return Ok(n)
+}
+```
+
+### The statement form
+
+```
+defer [await] <call>
+```
+
+`defer` accepts **call expressions only** — `defer f()`, `defer obj.close()`,
+`defer a?.flush()`, `defer (() => { … })()` (the inline-block form). Expressions with no call
+(`defer x`, `defer f`) are a parse error, because a deferred non-call has no side effect and is
+a silent bug. `defer` is a **reserved keyword**.
+
+**Evaluation timing (Go semantics):** the callee and all arguments are evaluated **immediately**
+when the `defer` statement executes — only the *call itself* is deferred. This means
+`defer f(x)` snapshots the current value of `x`; if `x` is later mutated the deferred call sees
+the snapshot, not the mutation. To observe later mutations, use the arrow-IIFE form:
+`defer (() => f(x))()` (the closure captures `x` by reference if it is mutated anywhere).
+
+### Scope and ordering
+
+The defer stack is **per function activation** — not per block. A `defer` inside an `if` branch
+or a loop body runs at function exit, not at the end of the block. Defers inside a loop
+accumulate one entry per iteration; they all run at function exit in LIFO order. (The
+`defer-in-loop` lint warns about this accumulation pattern.)
+
+Defers run **LIFO** (last registered, first run) and **innermost-frame-first** during unwind:
+if `f` calls `g` and both register defers, `g`'s defers run when `g` exits (before returning to
+`f`), and `f`'s defers run when `f` exits.
+
+### When defers run — the frame-exit matrix
+
+| Exit route | Defers run? |
+|---|---|
+| Normal return | **yes** |
+| `return v` | **yes** — after `v` is computed |
+| `?` propagation | **yes** — the `[nil, err]` pair is the in-flight outcome |
+| Panic unwind | **yes** — every frame between the raise and the `recover` boundary drains |
+| `exit()` | **NO** — `exit` means "terminate now"; defers are skipped, matching Go's `os.Exit` |
+| Task cancellation (handle drop) | **NO** — see [async cleanup](#async-cleanup-with-defer-await) below |
+| Generator `close()` / last-drop | **NO** — `close()` is synchronous; defers require the async engine |
+
+**Cleanup that must survive cancellation belongs on the resource's deterministic Drop** — every
+native handle (files, sockets, database connections, processes) already has one. `defer` is for
+script-level ordering; the native safety net is independent and unaffected.
+
+**`recover` interplay:** `recover(f)` observes the panic only *after* every frame inside `f` has
+drained. The `[nil, err]` pair that `recover` returns carries the final merged panic message.
+
+### A defer call cannot modify the return value
+
+The return value (or propagating pair) is fully computed before any defer runs. A deferred call
+that *panics* can replace it (rule 1 below), but an ordinary deferred call that just returns a
+value cannot change what the function returns. Results of deferred calls are always discarded —
+if you need to handle an error from a cleanup call, use the arrow-IIFE form and handle it there.
+
+### Panics inside deferred calls
+
+When a deferred call panics, the outcome depends on what was already in flight:
+
+1. **In-flight normal return or `?`-propagation:** the defer's panic **becomes** the frame's
+   outcome — the return value or propagating pair is discarded and the panic unwinds. (A Tier-2
+   bug outranks a Tier-1 expected error.)
+2. **In-flight panic (already unwinding):** the **original panic wins**. The new message is
+   appended as a suppressed note — exact format:
+   `<original> (suppressed panic in deferred call: <new>)` — so the root cause is always
+   visible. Multiple suppressed panics append left-to-right in drain order.
+3. **Remaining defers always run** regardless of whether a previous deferred call panicked.
+   Cleanup must not be lost because other cleanup failed.
+
+### Async cleanup with `defer await`
+
+A bare `defer f()` where `f` returns a future is a **runtime error** — discarding the future
+would cancel the async work instantly (cancel-on-drop). The explicit form is required:
+
+```ascript
+defer await teardown()    // drives the future to completion before the next (older) defer
+```
+
+`defer await f()` evaluates `f`'s arguments at the `defer` statement, marks the entry as
+awaited, and drives the resulting future to completion before advancing to older defers.
+`defer await` on a synchronous call is harmless (awaiting a non-future is identity).
+
+**Cancellation during `defer await`:** if the enclosing task is cancelled while a deferred
+`await` is suspended, the remaining (older) defers do not run — this is the same cancellation
+rule above, observed mid-drain.
+
+The `defer-async-call` lint warns statically when a bare `defer` is used with a call that
+resolves to a known `async fn` — a provable future-return caught before runtime.
+
+### Examples
+
+- `examples/defer.as` — file close, LIFO, `?` interplay, `defer await`, evaluation timing
+- `examples/advanced/defer_resources.as` — multi-resource acquisition, panic-unwind + `recover`
+  observation of the merged message, the generator-owner pattern

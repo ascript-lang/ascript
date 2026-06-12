@@ -174,6 +174,14 @@ normatives; the plan's tasks carry the full outlines):
   anonymous-fn-EXPRESSION argument fails ("function declaration has no resolver binding");
   arrow form works — **owner triage at drafting time** (fix in-branch with regression test, or
   spec the limitation with the owner note; Gate-14 path, plan Task 2.9).
+  **DEFER coordination (2026-06-12):** the `defer` statement's grammar flows into Ch.3 and Ch.6
+  automatically from the tree-sitter grammar and `Stmt::Defer` AST addition, but the **Ch.9
+  semantics chapter must absorb DEFER's §3 frame-exit matrix** — the complete table of when defers
+  run (normal return, `?` propagation, panic unwind) and when they do not (`exit()`, task
+  cancellation, `gen.close()`/last-drop) — plus the §3.6 merge rules (defer panic replaces
+  return, supersedes propagation, appends-as-suppressed into existing panic) and the `defer await`
+  rule (bare future-returning defer is a Tier-2 error). Conformance pins: `examples/defer.as`,
+  `examples/advanced/defer_resources.as`, `tests/vm_differential.rs` defer battery.
 - **Ch.10 Modules & packages.** ESM-style, no default exports, evaluate-once + cache, circular
   import semantics; specifier classification (`Std`/`Relative`/`Package`/`UnknownPackage`) and
   the SP6 resolution pipeline (MVS, content-addressed store, lockfile, `--locked` fail-closed);
