@@ -127,15 +127,24 @@ this situation is reservation:
    (caps.rs/run.rs/types.rs doc text). No stdlib module exports a `defer` binding. Pre-1.0
    breaking is sanctioned and here breaks nobody.
 4. **Go, Swift, and Zig all reserve it.** Users coming from any of them expect a keyword.
-5. **Tree-sitter agrees for free:** a literal `'defer'` in the grammar plus the `word` token
-   triggers tree-sitter's keyword extraction, which reserves it in the generated parser too —
-   so all three front-ends reject `let defer = 5` identically (conformance-testable), instead
-   of the hand parsers rejecting what tree-sitter accepts.
+5. **Tree-sitter highlights `defer` as a keyword:** a literal `'defer'` in the grammar plus the
+   `word` token gives `defer` keyword styling. **Correction (verified during implementation,
+   2026-06-12 — owner-noted):** tree-sitter's error-recovery does NOT reject `let defer = 5` —
+   its lexer reinterprets the leading keyword as the `let_declaration` name identifier and the
+   tree parses cleanly. This is **not specific to `defer`**: `let class = 5`, `let return = 5`,
+   etc. all parse identically today (a pre-existing characteristic of this grammar's recovery,
+   confirmed against the shipped `parser.c`). The keyword-reservation guarantee therefore lives
+   in the **two hand parsers** (the authoritative engines + checker reject `let defer = 5` /
+   `fn defer() {}`), exactly as for every other reserved keyword; tree-sitter drives editor
+   highlighting/structure, not the language's acceptance decision. The §8.4 conformance entry is
+   adjusted to match: the hand parsers both-reject the reservation, and the tree-sitter catalog
+   documents the recovery behavior rather than asserting an ERROR.
 
 Mechanically: `Tok::Defer` in the legacy lexer keyword table (`src/lexer.rs:589` block),
 `SyntaxKind::DeferKw` in the CST lexer keyword table (`src/syntax/lexer.rs:416` block), a
-`'defer'` literal in `grammar.js`. `let defer = 5` / `fn defer() {}` become parse errors in all
-three front-ends.
+`'defer'` literal in `grammar.js`. `let defer = 5` / `fn defer() {}` become parse errors in the
+two hand parsers (the SoT); tree-sitter styles `defer` as a keyword but recovers it as an
+identifier in name position like all other reserved words.
 
 ### 2.3 Where `defer` is legal — every statement position; the scope is the FUNCTION
 
@@ -671,7 +680,9 @@ exercise §3.3's matrix. The differential fuzz target inherits it; a smoke campa
 
 ### 8.4 Negative spaces
 
-`let defer = 5` rejected by all three front-ends (conformance catalog); non-call defer parse
+`let defer = 5` rejected by **both hand parsers** (the authoritative SoT; conformance catalog) —
+the tree-sitter catalog documents that its recovery parses the keyword as an identifier name,
+the same as every existing reserved word (§2.2.5 correction); non-call defer parse
 errors (every §2.1 rejected form, both parsers, message-identical); named-arg defer error;
 verifier rejection of a hand-built `DeferPushMethod` with a non-string name const and of nonzero
 undefined flag bits; `ASO_FORMAT_VERSION == 28` asserted with the version-gate test updated (old
