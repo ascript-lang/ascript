@@ -27,7 +27,7 @@ use tower_lsp::lsp_types::{
 const KEYWORDS: &[&str] = &[
     "let", "const", "fn", "return", "if", "else", "while", "for", "of", "in", "match", "async",
     "await", "yield", "class", "enum", "import", "export", "nil", "true", "false", "break",
-    "continue", "worker",
+    "continue", "worker", "defer",
 ];
 
 /// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.
@@ -172,6 +172,7 @@ fn snippet_completions() -> Vec<CompletionItem> {
         ("if", "if (${1:cond}) {\n  $0\n}"),
         ("for", "for (${1:item} of ${2:iter}) {\n  $0\n}"),
         ("while", "while (${1:cond}) {\n  $0\n}"),
+        ("defer", "defer ${1:resource}.close()"),
         ("match", "match ${1:subject} {\n  ${2:pattern} => $0,\n}"),
         ("class", "class ${1:Name} {\n  $0\n}"),
     ];

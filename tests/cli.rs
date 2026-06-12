@@ -4763,3 +4763,42 @@ fn build_report_does_not_pollute_stdout() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// DEFER Task 4.3 (REPL): a top-level `defer print(...)` in a REPL submission
+/// runs at the END of that submission (§2.3). The REPL treats each newline-
+/// delimited line as its own program, so `defer print("deferred")` in
+/// submission 1 fires at the end of that submission — BEFORE submission 2's
+/// `print("before")`. This pins the correct REPL defer semantics.
+#[test]
+fn repl_defer_top_level_runs_at_submission_end() {
+    // Submission 1: `defer print("deferred")` — registers the defer, body
+    // completes, defer fires → "deferred" is printed.
+    // Submission 2: `print("before")` → "before" is printed.
+    // Expected: "deferred" appears BEFORE "before" in the combined output.
+    let (out, _) =
+        run_repl_session("defer print(\"deferred\")\nprint(\"before\")\n", false);
+    assert!(out.contains("deferred"), "'deferred' missing from output: {out:?}");
+    assert!(out.contains("before"), "'before' missing from output: {out:?}");
+    let deferred_pos = out.find("deferred").unwrap();
+    let before_pos = out.find("before").unwrap();
+    assert!(
+        deferred_pos < before_pos,
+        "top-level defer fires at end of its submission (before the next submission); got: {out:?}"
+    );
+}
+
+/// DEFER Task 4.3 (REPL): `defer` inside a REPL-defined fn fires when that fn
+/// returns — not at submission end.
+#[test]
+fn repl_defer_inside_fn_runs_on_fn_return() {
+    // Define a fn with a defer, then call it.
+    let session =
+        "fn cleanup() { defer print(\"done\") \n print(\"body\") }\ncleanup()\n";
+    let (out, _) = run_repl_session(session, false);
+    let body_pos = out.find("body").expect("'body' missing from output");
+    let done_pos = out.find("done").expect("'done' missing from output");
+    assert!(
+        body_pos < done_pos,
+        "defer inside fn must fire after fn body; got: {out:?}"
+    );
+}

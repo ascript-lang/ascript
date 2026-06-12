@@ -331,6 +331,8 @@ fn is_keyword_kind(k: SyntaxKind) -> bool {
             | WorkerKw
             // IFACE: `interface` is a reserved keyword (CST `InterfaceKw`).
             | InterfaceKw
+            // DEFER: `defer` is a reserved keyword (CST `DeferKw`, §2.2).
+            | DeferKw
     )
 }
 
