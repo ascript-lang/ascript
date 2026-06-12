@@ -183,6 +183,79 @@ fn three_way_differential_fixed_seed_battery() {
     }
 }
 
+/// Gate 15 — DEFER coverage assertion (anti-false-green). After running the fixed-seed
+/// batch through all four engines, the `defer_metrics` counters MUST be nonzero — proving
+/// the generated programs actually exercised the defer push/drain paths (not merely compiled
+/// them). This is a MONOTONIC `> 0` assertion (race-safe): the counters only grow, so once
+/// the batch runs complete their increments the assertion is stable under parallel noise
+/// from other concurrent tests.
+///
+/// The counters reset is intentionally NOT called here — we want at-least-one semantics
+/// across the whole `cargo test` run, not an isolated batch. The assertion uses `> 0` so
+/// any number of parallel test increments between the batch and the read only HELP (they
+/// can never make a nonzero count go back to zero).
+#[test]
+fn defer_coverage_assertion_gate15() {
+    use ascript::vm::defer_metrics::defer_metrics::{ENTRIES_DRAINED, ENTRIES_PUSHED};
+    use std::sync::atomic::Ordering;
+
+    // Run 200 generated programs through all four engine modes to guarantee enough
+    // defer-emitting seeds are exercised. The programs are deterministic (fixed seeds),
+    // so this is also a regression guard — the same batch is always exercised.
+    let n = 200u64;
+    let progs: Vec<String> = (0..n)
+        .map(|seed| {
+            let bytes = seed_bytes(seed.wrapping_mul(0xC4CEB9FE1A85EC53), 512);
+            fuzzgen::gen_program_from_bytes(&bytes).source
+        })
+        .collect();
+    // Run through all engines (amortized in one worker-stack thread).
+    let results = run_all_engines_batch(progs.clone());
+    // Confirm no divergences (the defer axis must not introduce a bug).
+    for (seed, ((tw, vm, gen, aso), src)) in results.iter().zip(progs.iter()).enumerate() {
+        assert_eq!(
+            tw, vm,
+            "Gate15 seed {seed}: specialized-VM divergence\n--- program ---\n{src}"
+        );
+        assert_eq!(
+            tw, gen,
+            "Gate15 seed {seed}: generic-VM divergence\n--- program ---\n{src}"
+        );
+        assert_eq!(
+            tw, aso,
+            "Gate15 seed {seed}: .aso round-trip divergence\n--- program ---\n{src}"
+        );
+    }
+
+    // GATE 15: the defer push/drain counters MUST be nonzero — proving the fuzzer's
+    // defer axis actually exercised the push site (Op::DeferPush / tree-walker defer
+    // registration) AND the drain site (vm_run_defers / interp run_defers). A zero
+    // counter means the generator is not emitting defer programs or the counter wiring
+    // broke — either way it is an anti-false-green failure.
+    //
+    // Race-safety: the counters are AtomicU64, incremented monotonically. Using
+    // Ordering::Relaxed (same as the increment sites) gives no false zeros: once the
+    // batch above has finished executing (we are past the `run_all_engines_batch` call),
+    // ALL increments from that batch are complete. Any ADDITIONAL increments from
+    // parallel tests running concurrently only increase the value — `> 0` stays true.
+    let pushed = ENTRIES_PUSHED.load(Ordering::Relaxed);
+    let drained = ENTRIES_DRAINED.load(Ordering::Relaxed);
+    assert!(
+        pushed > 0,
+        "Gate 15: ENTRIES_PUSHED == 0 after 200 generated programs — \
+         the defer fuzzer axis is not reaching the push site (DeferPush opcode / \
+         tree-walker defer registration). Check that stmt() emits defer forms and \
+         that defer_metrics is wired correctly."
+    );
+    assert!(
+        drained > 0,
+        "Gate 15: ENTRIES_DRAINED == 0 after 200 generated programs — \
+         the defer fuzzer axis is not reaching the drain site (vm_run_defers / \
+         interp run_defers). Check that generated programs run to completion and \
+         that defer_metrics is wired at the drain callsite."
+    );
+}
+
 /// HIGH-VOLUME stress differential (FUZZ Unit 2). `#[ignore]` by default (it runs many
 /// thousands of programs through four engine modes — too slow for the default `cargo test`),
 /// but it is the breadth net used when broadening the generator: run with
@@ -1228,3 +1301,4 @@ proptest! {
         prop_assert_eq!(decoded, arch, "encode∘decode lost or changed a field");
     }
 }
+

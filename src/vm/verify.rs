@@ -375,10 +375,10 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // placeholder is never consulted for CLASS.
         Class => Effect::new(0, 1),
 
-        // DEFER §5.2: DeferPush / DeferPushMethod — captured-call registration (no
-        // push; pops callee/recv + args). The exact pop count is argc-dependent and
-        // is handled by `op_stack_pops_pushes` before reaching here; this arm exists
-        // solely for `Op` match exhaustiveness (the verifier early-returns above).
+        // DEFER §5.2: DeferPush / DeferPushMethod — the exact pop count is argc-
+        // dependent and is handled by `op_stack_pops_pushes` BEFORE `stack_effect` is
+        // ever called for these ops. This arm exists solely to satisfy the exhaustive
+        // match; it is unreachable in the verifier's normal code path.
         DeferPush | DeferPushMethod => Effect::new(0, 0),
 
         // DBG: the breakpoint trap is NEVER compiler-emitted and NEVER serialized — it
@@ -812,6 +812,29 @@ fn verify_stack_balance(
                 return Err(VerifyError::StackUnderflow { offset: off });
             }
             after + 1
+        } else if op == Op::DeferPush {
+            // DEFER §5.2: DeferPush — pops (callee + argc args), pushes nothing.
+            // Operand layout: u8 flags (bit1=spread) + u8 argc.
+            // Spread variant: compiler pushes callee + one spread-array → pops 2.
+            let flags = chunk.read_u8(operand_at);
+            let spread = (flags & 2) != 0;
+            let argc = if spread { 1 } else { chunk.read_u8(operand_at + 1) as isize };
+            let pops = 1 + argc; // callee/recv + args
+            if depth_in < pops {
+                return Err(VerifyError::StackUnderflow { offset: off });
+            }
+            depth_in - pops // pushes 0
+        } else if op == Op::DeferPushMethod {
+            // DEFER §5.2: DeferPushMethod — pops (recv + argc args), pushes nothing.
+            // Operand layout: u16 name_idx + u8 flags (bit1=spread) + u8 argc.
+            let flags = chunk.read_u8(operand_at + 2);
+            let spread = (flags & 2) != 0;
+            let argc = if spread { 1 } else { chunk.read_u8(operand_at + 3) as isize };
+            let pops = 1 + argc; // recv + args
+            if depth_in < pops {
+                return Err(VerifyError::StackUnderflow { offset: off });
+            }
+            depth_in - pops // pushes 0
         } else {
             let n = count_operand(chunk, op, operand_at);
             let eff = stack_effect(op, n);
@@ -928,6 +951,25 @@ pub(crate) fn op_stack_pops_pushes(chunk: &Chunk, op: Op, operand_at: usize) -> 
             return (pops, 1);
         }
         return (0, 1);
+    }
+    // DEFER §5.2: DeferPush / DeferPushMethod pop (argc + 1) values from the stack
+    // (callee/receiver + argc args) and push nothing. The spread variant pops exactly
+    // 2 (callee/receiver + the spread array); bit1 of the flags byte signals spread.
+    // These are NOT counted via `count_operand` (which returns 0 for unknown ops) so
+    // we special-case them here — the single authoritative source of stack truth.
+    if op == Op::DeferPush {
+        // Operand layout: u8 flags + u8 argc.
+        let flags = chunk.read_u8(operand_at);
+        let spread = (flags & 2) != 0;
+        let argc = if spread { 1 } else { chunk.read_u8(operand_at + 1) as usize };
+        return (1 + argc, 0); // callee + argc args → 0 pushed
+    }
+    if op == Op::DeferPushMethod {
+        // Operand layout: u16 name_idx + u8 flags + u8 argc.
+        let flags = chunk.read_u8(operand_at + 2);
+        let spread = (flags & 2) != 0;
+        let argc = if spread { 1 } else { chunk.read_u8(operand_at + 3) as usize };
+        return (1 + argc, 0); // recv + argc args → 0 pushed
     }
     let e = stack_effect(op, count_operand(chunk, op, operand_at));
     (e.pops, e.pushes)
