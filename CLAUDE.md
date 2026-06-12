@@ -155,6 +155,26 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   `self.call_log`; stderr (Live) or capture buffer (tests). Serializes via `json::to_json_lossy` (never
   panics). Object args merge as fields; a thunk first-arg defers message work past the level filter; default
   level from `ASCRIPT_LOG`.
+- **`defer [await] <call>`** — **RESERVED keyword**. Call-only (enforced at parse time — `defer x` is a parse
+  error; a no-effect deferred expression is a silent bug). The callee and args are evaluated **AT the `defer`
+  statement** (Go semantics — `defer f(x)` snapshots `x`; `defer (() => f(x))()` does not if `x` is mutated).
+  Per-**function** scope (not block — a `defer` inside an `if`/loop runs at function exit). Drains **LIFO**.
+  Frame-exit matrix: runs on normal return / `?`-propagation / panic-unwind; does **NOT** run on `exit()`,
+  task cancellation (cancel-on-drop is unsound to interrupt), or `gen.close()`/last-drop (`close()` is
+  sync). Cancellation non-run is loud + documented: cleanup that must survive cancellation belongs on the
+  resource's deterministic Drop. **`defer await f()`** drives the returned future before the next older defer;
+  a bare `defer f()` whose call returns a future is a Tier-2 error:
+  `deferred call returned a future that would be cancelled on drop — use 'defer await f()' or do async cleanup before exit`.
+  §3.6 merge rules (both engines share `merge_defer_panic`): (1) defer panic into a live normal/return →
+  defer panic **replaces** the return; (2) defer panic into a live `?`-propagate → defer panic
+  **supersedes** the pair; (3) defer panic into an existing panic → **ORIGINAL wins**, new message
+  appended as `<orig> (suppressed panic in deferred call: <new>)`; (4) remaining defers still run.
+  Method-callee entries store `(recv, name, args)` and re-enter the member-call evaluator (not a
+  pre-bound value) to preserve schema/shared/workflow call-site hooks byte-identically with normal calls.
+  Two VM opcodes: `Op::DeferPush` (flags byte: bit0 `awaited`, bit1 spread; width 2) and
+  `Op::DeferPushMethod` (name const-idx u16 + flags u8 + argc u8; width 4). **`.aso` bumps
+  `ASO_FORMAT_VERSION` 27 → 28**. Lints: `defer-in-loop` (Warning — accumulates per iteration),
+  `defer-async-call` (Warning — bare defer of a known `async fn`). Both engines byte-identical.
 
 ## Larger subsystems (campaign work, condensed)
 

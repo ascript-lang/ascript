@@ -1056,6 +1056,33 @@ impl Vm {
     /// `clippy::await_holding_refcell_ref` clean once V7 introduces awaits.
     pub async fn run(&self, fiber: &mut Fiber) -> Result<RunOutcome, Control> {
         let result = self.run_loop(fiber).await;
+
+        // DEFER §3.3: on a panic escaping the run loop, drain the defer lists of
+        // ALL live frames (innermost first — top of `fiber.frames` stack first).
+        // This mirrors the tree-walker's `run_body` which drains even on Panic.
+        // We use mem::take + run_defers per frame so no borrow is held across .await.
+        if let Err(Control::Panic(_)) = &result {
+            // Check whether any live frame has defers to run.
+            let any_defers = fiber.frames.iter().any(|f| !f.defers.is_empty());
+            if any_defers {
+                // Seed the outcome with the escaping panic so merge_defer_panic
+                // applies §3.6 r3 (suppressed note) if any deferred call also panics.
+                let panic_err = match result {
+                    Err(e) => e,
+                    Ok(_) => unreachable!(),
+                };
+                let mut outcome: Result<Value, Control> = Err(panic_err);
+                // Drain from innermost (last) to outermost (first) frame.
+                for frame in fiber.frames.iter_mut().rev() {
+                    let defers = std::mem::take(&mut frame.defers);
+                    if !defers.is_empty() {
+                        self.vm_run_defers(defers, &mut outcome).await;
+                    }
+                }
+                return outcome.map(|_| RunOutcome::Done(Value::Nil));
+            }
+        }
+
         // SP4 §3: bind the FAULTING frame's module source onto an escaping panic
         // that has a span but no span-source yet. The fault propagates
         // synchronously up this `run` (no `.await` between the raise and here), so
@@ -1817,6 +1844,7 @@ impl Vm {
                                 // is correct — `super` only appears in method bodies).
                                 def_class: None,
                                 argc: supplied,
+                                defers: Vec::new(),
                             });
                             // DBG Task 7: publish the new (deeper) frame stack to an
                             // armed profiler. Zero-cost None-check when off.
@@ -3342,16 +3370,157 @@ impl Vm {
                     *fiber.frame().closure.upvalues[idx].borrow_mut() = v;
                 }
 
+                // DEFER §5.2: capture callee + args at statement time; push a
+                // DeferEntry onto the current frame's defer list. Execution is
+                // deferred to frame exit (Op::Return / Op::Propagate drain).
+                // Operand layout: u8 flags (bit0=awaited, bit1=spread) + u8 argc.
+                Op::DeferPush => {
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 1) as usize;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let awaited = (flags & 1) != 0;
+                    let spread = (flags & 2) != 0;
+                    // Pop args (stack is callee, arg0, arg1, … argN-1 top; pop in reverse).
+                    let args: Vec<Value> = if spread {
+                        // Spread args: single array/spread was compiled; read it.
+                        let arr = fiber.pop();
+                        match arr {
+                            Value::Array(a) => a.borrow().clone(),
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "defer spread requires an array, got {}",
+                                        crate::interp::type_name(&other)
+                                    ),
+                                ))
+                            }
+                        }
+                    } else {
+                        let mut v = vec![Value::Nil; argc];
+                        for slot in v.iter_mut().rev() {
+                            *slot = fiber.pop();
+                        }
+                        v
+                    };
+                    let callee = fiber.pop();
+                    fiber.frame_mut().defers.push(crate::interp::DeferEntry {
+                        kind: crate::interp::DeferKind::Call { callee },
+                        args,
+                        awaited,
+                        span,
+                    });
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    crate::vm::defer_metrics::defer_metrics::ENTRIES_PUSHED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // DEFER §5.2: method-call variant. Captures receiver + method name +
+                // args; execution deferred to frame exit.
+                // Operand layout: u16 name_idx + u8 flags + u8 argc.
+                Op::DeferPushMethod => {
+                    let name_idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2);
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 3) as usize;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let awaited = (flags & 1) != 0;
+                    let spread = (flags & 2) != 0;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[name_idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "defer method name must be a string, got {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    };
+                    let args: Vec<Value> = if spread {
+                        let arr = fiber.pop();
+                        match arr {
+                            Value::Array(a) => a.borrow().clone(),
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "defer spread requires an array, got {}",
+                                        crate::interp::type_name(&other)
+                                    ),
+                                ))
+                            }
+                        }
+                    } else {
+                        let mut v = vec![Value::Nil; argc];
+                        for slot in v.iter_mut().rev() {
+                            *slot = fiber.pop();
+                        }
+                        v
+                    };
+                    let recv = fiber.pop();
+                    // For VM-compiled class instances, methods are stored in the VM's
+                    // `class_methods` side table — NOT in `Class.methods` (which is
+                    // empty for VM classes). The tree-walker's `read_member` uses
+                    // `find_method` on `Class.methods` and therefore cannot dispatch to
+                    // VM-compiled methods at drain time. Resolve non-hook receivers to
+                    // a `BoundMethod` NOW (at capture time, matching spec §3.1 semantics
+                    // since the receiver is captured at statement time anyway) so that
+                    // `exec_defer_entry` uses the `DeferKind::Call` arm → `call_value`
+                    // which correctly dispatches VM `BoundMethod`s.
+                    //
+                    // Hook receivers (schema, workflow-ctx, shared, actor, worker-class
+                    // spawn) MUST be kept as `DeferKind::Method` so that
+                    // `call_method_recv`'s hook dispatch fires at drain time (spec §3.1
+                    // — pre-binding would silently skip the hooks).
+                    let kind = if self.interp.member_call_is_hook(&recv, &name) {
+                        crate::interp::DeferKind::Method { recv, name }
+                    } else {
+                        // Resolve the method to a BoundMethod/Closure/etc. now.
+                        // If the lookup fails (e.g. the method does not exist), surface
+                        // the error immediately at defer-statement time (consistent with
+                        // how the tree-walker would surface it on the read).
+                        let callee = match self.vm_read_member(&recv, &name, span) {
+                            Ok(v) => v,
+                            Err(e) => return Err(e),
+                        };
+                        crate::interp::DeferKind::Call { callee }
+                    };
+                    fiber.frame_mut().defers.push(crate::interp::DeferEntry {
+                        kind,
+                        args,
+                        awaited,
+                        span,
+                    });
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    crate::vm::defer_metrics::defer_metrics::ENTRIES_PUSHED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 Op::Return => {
                     // Pop the result and unwind one frame, returning that value to
                     // the caller (or ending the program if this was the root frame).
-                    // The shared `return_from_frame` helper applies the return-type
-                    // contract, drops the frame (releasing its cell `Rc`s — captured
-                    // cells stay alive via the closures' own refs), truncates the
-                    // stack to `slot_base`, and pushes the result into the caller.
-                    // `PROPAGATE` reuses this SAME unwind on a propagated error.
+                    // DEFER §3.3: drain the current frame's defers BEFORE applying
+                    // the return-type contract — mirrors run_body drain order. Take
+                    // the list with mem::take to satisfy the no-borrow-across-await
+                    // invariant, then run_defers, then fall through to return_from_frame.
                     let result = fiber.pop();
-                    if let Some(outcome) = self.return_from_frame(fiber, result)? {
+                    let defers = std::mem::take(&mut fiber.frame_mut().defers);
+                    if !defers.is_empty() {
+                        let mut outcome: Result<Value, Control> = Ok(result);
+                        self.vm_run_defers(defers, &mut outcome).await;
+                        let drained = match outcome {
+                            Ok(v) => v,
+                            Err(e) => return Err(e),
+                        };
+                        if let Some(out) = self.return_from_frame(fiber, drained)? {
+                            return Ok(out);
+                        }
+                    } else if let Some(outcome) = self.return_from_frame(fiber, result)? {
                         return Ok(outcome);
                     }
                 }
@@ -3367,6 +3536,8 @@ impl Vm {
                     // enclosing function returns the propagated pair (and at the top
                     // level the program ends with that pair, treated as `Ok` by the
                     // driver, just like `Control::Propagate` in `run_file`).
+                    // DEFER §3.3: on an early-return propagation, drain defers first
+                    // (with the Propagate stash so §3.6 r2 fires if a defer panics).
                     let v = fiber.pop();
                     let (value, err) = match &v {
                         Value::Array(a) if a.borrow().len() == 2 => {
@@ -3385,7 +3556,21 @@ impl Vm {
                         fiber.push(value);
                     } else {
                         let pair = crate::interp::make_pair(Value::Nil, err);
-                        if let Some(outcome) = self.return_from_frame(fiber, pair)? {
+                        let defers = std::mem::take(&mut fiber.frame_mut().defers);
+                        if !defers.is_empty() {
+                            // Stash as Propagate so §3.6 r2 fires if a defer panics.
+                            let mut outcome: Result<Value, Control> =
+                                Err(Control::Propagate(pair.clone()));
+                            self.vm_run_defers(defers, &mut outcome).await;
+                            let result_pair = match outcome {
+                                Ok(v) => v,
+                                Err(Control::Propagate(p)) => p,
+                                Err(e) => return Err(e),
+                            };
+                            if let Some(out) = self.return_from_frame(fiber, result_pair)? {
+                                return Ok(out);
+                            }
+                        } else if let Some(outcome) = self.return_from_frame(fiber, pair)? {
                             return Ok(outcome);
                         }
                     }
@@ -4458,6 +4643,122 @@ impl Vm {
         }
     }
 
+    /// VM-aware defer entry execution (DEFER §3.1). Routes through `Vm::call_value`
+    /// instead of `Interp::call_value` so VM-compiled class methods (stored in
+    /// `class_methods`, NOT in `Class.methods`) dispatch correctly. Mirrors
+    /// `Interp::exec_defer_entry`'s semantics exactly: discards the return value,
+    /// converts `Propagate` to `Ok(())`, surfaces `Panic`/`Exit` to the caller.
+    ///
+    /// For `DeferKind::Method { recv, name }` (hook receivers only — schema,
+    /// workflow-ctx, shared, actor, worker-class spawn): re-enters
+    /// `Interp::call_method_recv` so the hook dispatch fires.
+    /// For `DeferKind::Call { callee }`: dispatches via `Vm::call_value`.
+    async fn vm_exec_defer_entry(
+        &self,
+        entry: crate::interp::DeferEntry,
+    ) -> Result<(), crate::interp::Control> {
+        use crate::interp::Control;
+        // DEFER §3.4 VM fix: a bare `defer async_fn()` must produce the §3.4 loud
+        // Tier-2 error on the VM exactly as on the tree-walker. On the tree-walker,
+        // `call_value` for an async fn returns `Value::Future`, and the check below
+        // (`else if let Value::Future(_)`) fires. On the VM, `Vm::call_value` runs the
+        // async body INLINE (a fresh fiber, no `spawn_local`) and returns the body
+        // result directly — so the result is `Value::Nil`, not `Value::Future`, and the
+        // check never fires. We detect the mismatch HERE, before calling, by inspecting
+        // whether the callee is a VM async closure: if it is and `!entry.awaited`, raise
+        // the §3.4 panic immediately (byte-identical to the tree-walker). The `awaited`
+        // path intentionally keeps the inline execution (running the body synchronously
+        // inside the drain is correct for `defer await` — the side effects must happen
+        // before the drain completes, and a `spawn_local` inside the panic-unwind path
+        // would race with the caller frame's teardown).
+        if !entry.awaited {
+            let is_vm_async_closure = match &entry.kind {
+                crate::interp::DeferKind::Call { callee } => match callee {
+                    Value::Closure(c) => c.proto.is_async && !c.proto.is_generator,
+                    _ => false,
+                },
+                crate::interp::DeferKind::Method { .. } => false,
+            };
+            if is_vm_async_closure {
+                return Err(Control::Panic(crate::AsError::at(
+                    "deferred call returned a future that would be cancelled on drop \
+                     — use 'defer await f()' or do async cleanup before exit",
+                    entry.span,
+                )));
+            }
+        }
+        let result = match entry.kind {
+            crate::interp::DeferKind::Call { callee } => {
+                // Route through the VM's call_value so VM-compiled BoundMethods
+                // and Closures are dispatched correctly (the tree-walker's
+                // call_value would use the stub BoundMethod's empty params).
+                self.call_value(callee, entry.args, entry.span).await
+            }
+            crate::interp::DeferKind::Method { recv, name } => {
+                // Hook receivers (schema, workflow-ctx, shared, actor, spawn) must
+                // go through call_method_recv so the hooks fire — same as the
+                // interp path. This arm is only reached when member_call_is_hook
+                // returned true at capture time (see Op::DeferPushMethod).
+                self.interp
+                    .call_method_recv(recv, &name, entry.args, entry.span)
+                    .await
+            }
+        };
+        let result_v = match result {
+            Ok(v) => v,
+            // A Tier-1 `?`-propagation from a deferred call: discard per §3.2.
+            Err(Control::Propagate(_)) => return Ok(()),
+            // Panic or Exit propagates to vm_run_defers for handling.
+            Err(e) => return Err(e),
+        };
+        if entry.awaited {
+            if let Value::Future(f) = result_v {
+                f.get().await.map(|_| ())?;
+            }
+        } else if let Value::Future(_) = result_v {
+            // Non-VM-compiled callables (native fns, interp builtins) that return a
+            // future: the existing post-call check catches them (byte-identical to the
+            // tree-walker's path).
+            return Err(Control::Panic(crate::AsError::at(
+                "deferred call returned a future that would be cancelled on drop \
+                 — use 'defer await f()' or do async cleanup before exit",
+                entry.span,
+            )));
+        }
+        Ok(())
+    }
+
+    /// VM-aware defer drain (DEFER §3.6). Mirrors `Interp::run_defers` but routes
+    /// each entry through `Vm::vm_exec_defer_entry` so VM-compiled callables are
+    /// dispatched correctly. All drain sites in the VM run loop must use this.
+    pub(super) async fn vm_run_defers(
+        &self,
+        entries: Vec<crate::interp::DeferEntry>,
+        outcome: &mut Result<Value, crate::interp::Control>,
+    ) {
+        use crate::interp::{merge_defer_panic, Control};
+        #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+        if !entries.is_empty() {
+            crate::vm::defer_metrics::defer_metrics::CHOKEPOINT_DRAINS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // LIFO: entries were pushed in declaration order; drain in reverse.
+        for entry in entries.into_iter().rev() {
+            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+            crate::vm::defer_metrics::defer_metrics::ENTRIES_DRAINED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.vm_exec_defer_entry(entry).await {
+                Ok(()) => {}
+                Err(Control::Exit(code)) => {
+                    *outcome = Err(Control::Exit(code));
+                    return;
+                }
+                Err(Control::Panic(e)) => merge_defer_panic(outcome, e),
+                Err(Control::Propagate(_)) => {}
+            }
+        }
+    }
+
     #[async_recursion::async_recursion(?Send)]
     pub async fn call_value(
         &self,
@@ -4988,6 +5289,7 @@ impl Vm {
                     ret_span: span,
                     def_class: Some(def_class),
                     argc: supplied,
+                    defers: Vec::new(),
                 });
                 // DBG Task 7: publish the new (deeper) frame stack to an armed
                 // profiler. Zero-cost None-check when off.

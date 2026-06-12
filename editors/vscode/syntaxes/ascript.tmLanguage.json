@@ -107,7 +107,7 @@
       "patterns": [
         {
           "name": "keyword.control.ascript",
-          "match": "\\b(if|else|for|while|loop|match|return|break|continue|in|step|yield|await|recover|throw|try)\\b"
+          "match": "\\b(if|else|for|while|loop|match|return|break|continue|in|step|yield|await|recover|throw|try|defer)\\b"
         },
         {
           "name": "keyword.control.import.ascript",

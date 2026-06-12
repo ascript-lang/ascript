@@ -383,6 +383,15 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             out.push_str("export ");
             out.push_str(inner_str.trim_start_matches(pad.as_str()));
         }
+        Stmt::Defer { call, awaited, .. } => {
+            indent(out, level);
+            out.push_str("defer ");
+            if *awaited {
+                out.push_str("await ");
+            }
+            write_expr(out, call, 0);
+            out.push('\n');
+        }
     }
 }
 

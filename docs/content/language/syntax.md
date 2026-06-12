@@ -20,7 +20,7 @@ always allowed but never required. The same optional `;` may separate **class me
 `;` back to newlines. Note that `enum` variants are **comma**-separated, not `;`-separated.
 
 **Keywords:** `let const fn return if else while for of in instanceof match async await class extends
-super self enum import export nil true false`.
+super self enum import export nil true false defer`.
 
 ## Bindings
 
@@ -170,6 +170,21 @@ for (item of [10, 20, 30]) {  // values of an array (or characters of a string)
 
 `break` and `continue` work inside both loop forms. `for (… in range)` iterates lazily — no
 intermediate array is built (see [Ranges](#ranges) for the full model).
+
+### `defer` — cleanup at function exit
+
+`defer <call>` schedules a function call to run when the enclosing function exits, regardless of
+how it exits (normal return, `?` propagation, or panic). It is the standard idiom for resource
+cleanup:
+
+```ascript
+defer resource.close()           // runs at every exit below this line
+defer await asyncTeardown()      // drives the future before the next (older) defer
+```
+
+See [Cleanup with `defer`](errors#cleanup-with-defer) in **Errors & results** for the full
+semantics: LIFO ordering, evaluation timing, the frame-exit matrix (when defers run and when they
+do not), async cleanup, and panic-merge rules.
 
 ## Ranges
 

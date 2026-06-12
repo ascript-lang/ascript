@@ -1216,6 +1216,10 @@
           "named": true
         },
         {
+          "type": "defer_statement",
+          "named": true
+        },
+        {
           "type": "enum_declaration",
           "named": true
         },
@@ -1638,6 +1642,22 @@
     "type": "continue_statement",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "defer_statement",
+    "named": true,
+    "fields": {
+      "call": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "call_expression",
+            "named": true
+          }
+        ]
+      }
+    }
   },
   {
     "type": "enum_declaration",
@@ -5869,6 +5889,10 @@
           "named": true
         },
         {
+          "type": "defer_statement",
+          "named": true
+        },
+        {
           "type": "enum_declaration",
           "named": true
         },
@@ -7630,6 +7654,10 @@
   },
   {
     "type": "continue",
+    "named": false
+  },
+  {
+    "type": "defer",
     "named": false
   },
   {

@@ -327,7 +327,7 @@ stated, results are measured.
 
 ### Language surface track (the campaign's ONE grammar change)
 
-- 🔒 **DEFER — `defer` statement for scoped cleanup.** Go-shaped: function-scoped, LIFO,
+- ✅ **DEFER — `defer` statement for scoped cleanup.** Go-shaped: function-scoped, LIFO,
   arguments evaluated at `defer` time, deferred calls run on EVERY body exit — normal return,
   `?`-propagation, and panic unwind to a `recover` boundary. Closes the recurring gap where
   `?` early-exits skip manual `close()` calls. Pays the full grammar tax (both parsers,
@@ -356,6 +356,40 @@ stated, results are measured.
 - **Tail-call threaded dispatch** — blocked on Rust `become` stabilization; zero cost to wait.
 - **Small-string optimization** — demoted to opportunistic (no profiling evidence); NANB may
   revisit inline short strings ONLY behind its measured-win gate.
+
+## EXECUTION LOG (live)
+
+- **DEFER** — ✅ MERGED to `main` (`--no-ff`). The campaign's one grammar change: `defer [await]
+  <call>`, reserved keyword, call-only, args-evaluated-at-statement, per-activation LIFO, drained
+  on every frame exit (normal/return/`?`-propagate/panic-unwind; NOT on `exit()`/cancellation/
+  `gen.close()`), §3.6 panic-merge rules, first-class `defer await`. Four-mode byte-identical
+  (tree-walker == specialized == generic == `.aso`); full grammar tax paid (both hand parsers +
+  tree-sitter regen `--abi 14` + editor-pin bump to split SHA `3c2bb8b`; CI mirrors the grammar on
+  origin push); ASO_FORMAT_VERSION 27→28 (two opcodes `DeferPush`/`DeferPushMethod` + verifier
+  negative-space + disasm + bcanalysis). 6 phases, subagent-driven (fresh implementer + independent
+  spec & quality reviewers per task; per-phase holistic; whole-effort holistic). **Six real defects
+  caught + fixed in-branch by the review/fuzz gates** (production-grade mandate, each with a
+  failing-test-first regression guard): (1) CST nested-named-arg false-positive (`defer
+  f(g(x:1))` wrongly rejected); (2) **concurrency unsoundness** — an Interp-level defer stack let
+  concurrent async activations clobber each other's lists → reworked to the spec's per-activation
+  env-scope (`Scope.defers`); (3) module-import top-level defers silently dropped (`load_module` →
+  `exec_program`); (4) a vacuous cancellation test + missing `task.timeout`/`async fn*` coverage;
+  (5) **VM async-closure inline-drain** returning `Nil` instead of a `Future` (the bare-future §3.4
+  panic never fired on the VM — a four-mode divergence) — found by mandating four-mode coverage of
+  §8.1; (6) **verifier `StackJoinMismatch`** — `verify_stack_balance` treated `DeferPush`/
+  `DeferPushMethod` as stack-neutral, so a `defer` inside an `if`/`else` branch failed `.aso`
+  round-trip — **found by the Gate-15 differential fuzzer** (no hand-written test had a defer in a
+  conditional), fixed + a deterministic Gate-0 regression test + a corpus seed. Plus a holistic-
+  found flaky example (shared `/tmp` path raced the concurrent four-mode corpus) → per-execution
+  unique temp dir, 10/10 vm_differential green. Gates: vm_differential 409/0 both feature configs;
+  full suite + clippy clean both configs (+ `--features fuzzgen`); Gate-5 0 on `examples/**` both
+  configs; perf (`bench/DEFER_RESULTS.md`) defer-free geomean +0.6%, spec/tw geomean 2.94× ≥ 2×,
+  dbg_zero_cost 0.998×, RSS noise-level; two lints (`defer-in-loop`, `defer-async-call`); fmt/LSP/
+  REPL parity; examples (intro + advanced, four-mode + fmt-idempotent); docs (errors/syntax/
+  modules-async + CLAUDE.md + roadmap + LSPEC note, NAV intact). Spec correction recorded in-branch:
+  §2.2.5/§8.4 — tree-sitter recovers a reserved keyword as an identifier name (true of every
+  reserved word; the hand parsers are the reservation SoT) — a tooling-reality correction, no change
+  to recorded language semantics.
 
 ## Execution order
 

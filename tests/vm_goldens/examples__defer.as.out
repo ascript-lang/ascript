@@ -1,0 +1,26 @@
+# exit: none
+using: db
+closed: db
+body
+third registered
+second registered
+first registered
+x is now 42
+1
+cleanup: runs even when ? propagates
+something went wrong
+cleanup: runs even when ? propagates
+ok
+async body
+async close: first
+async close: second
+after if block
+deferred inside if — runs at FUNCTION exit
+--- loop demo ---
+  process: a
+  cleanup: a
+  process: b
+  cleanup: b
+  process: c
+  cleanup: c
+defer ok

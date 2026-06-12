@@ -20,6 +20,7 @@ pub enum SyntaxKind {
     IfStmt,
     WhileStmt,
     ReturnStmt,
+    DeferStmt,
     FnDecl,
     ParamList,
     Param,
@@ -275,6 +276,8 @@ pub enum SyntaxKind {
     ClassKw,
     #[static_text("interface")]
     InterfaceKw,
+    #[static_text("defer")]
+    DeferKw,
     #[static_text("import")]
     ImportKw,
     #[static_text("export")]

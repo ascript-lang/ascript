@@ -2,10 +2,17 @@
 //! child scopes link to their parent so name lookup walks outward. Single
 //! threaded, so `Rc<RefCell<…>>` (never `Arc`/`Mutex`).
 
+use crate::interp::DeferEntry;
 use crate::value::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// A per-activation defer list (spec §5.1): the ordered list of [`DeferEntry`]s
+/// registered by `defer` statements executing in a given call activation. Drained
+/// LIFO at frame exit. Shared via `Rc` so `run_body` keeps a handle to drain it
+/// while the `Stmt::Defer` evaluator (reached through the env chain) appends to it.
+pub(crate) type DeferList = Rc<RefCell<Vec<DeferEntry>>>;
 
 struct Binding {
     value: Value,
@@ -15,6 +22,12 @@ struct Binding {
 struct Scope {
     vars: HashMap<String, Binding>,
     parent: Option<Environment>,
+    /// DEFER §5.1: the defer list OWNED by this scope, if this scope is an
+    /// activation boundary (a function call frame or the program/module root).
+    /// `None` for ordinary lexical child scopes (blocks, loop bodies) and for
+    /// `global()`/`child()` — those resolve their enclosing activation's list by
+    /// walking parents to the nearest `Some` via [`Environment::defer_scope`].
+    defers: Option<DeferList>,
 }
 
 /// A handle to a lexical scope. Cloning shares the same underlying scope.
@@ -34,6 +47,7 @@ impl Environment {
         Environment(Rc::new(RefCell::new(Scope {
             vars: HashMap::new(),
             parent: None,
+            defers: None,
         })))
     }
 
@@ -42,7 +56,40 @@ impl Environment {
         Environment(Rc::new(RefCell::new(Scope {
             vars: HashMap::new(),
             parent: Some(self.clone()),
+            defers: None,
         })))
+    }
+
+    /// DEFER §5.1: install a FRESH defer list on THIS scope, marking it an
+    /// activation boundary, and return the shared handle. Called by `run_body`
+    /// (per function call) and the program/module/REPL drivers (per top-level run)
+    /// on the activation's own env. The returned `Rc` is what the caller drains at
+    /// frame exit; `Stmt::Defer` appends to the SAME list via [`Self::defer_scope`].
+    /// Idempotent-by-replacement: a second call replaces the list (never observed
+    /// in practice — each activation installs exactly once on a fresh env).
+    pub(crate) fn install_defer_scope(&self) -> DeferList {
+        let list: DeferList = Rc::new(RefCell::new(Vec::new()));
+        self.0.borrow_mut().defers = Some(Rc::clone(&list));
+        list
+    }
+
+    /// DEFER §5.1: resolve the NEAREST enclosing activation's defer list by walking
+    /// parents to the first scope carrying `Some`. Concurrency-sound: each live
+    /// activation installs its OWN list on its OWN `call_env`, and a closure's
+    /// definition env sits BEHIND the callee's call env in the chain, so this always
+    /// resolves the CURRENTLY-EXECUTING activation's list regardless of how many
+    /// other activations are concurrently suspended (unlike an `Interp`-level stack,
+    /// whose `last()` is corrupted by interleaving). `None` only if no activation
+    /// boundary was installed above this scope (a bare env with no driver).
+    pub(crate) fn defer_scope(&self) -> Option<DeferList> {
+        let scope = self.0.borrow();
+        if let Some(list) = &scope.defers {
+            return Some(Rc::clone(list));
+        }
+        match &scope.parent {
+            Some(parent) => parent.defer_scope(),
+            None => None,
+        }
     }
 
     /// Define a binding in THIS scope. Errors if the name is already bound here

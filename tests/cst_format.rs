@@ -365,3 +365,69 @@ fn consecutive_comments_stay_together_no_inserted_blank() {
         assert_eq!(once, twice, "not idempotent for {src:?}");
     }
 }
+
+#[test]
+fn formats_defer_statement_canonical_and_idempotent() {
+    // DEFER Task 4.2 (CST formatter): `defer <call>` and `defer await <call>` render
+    // with a single space, args canonicalized by the existing expression renderer.
+    // Idempotent + reparses cleanly.
+    let cases: &[(&str, &str)] = &[
+        // Excess spaces in args are normalized.
+        (
+            "fn f() {\ndefer   g( 1,2 )\n}\n",
+            "fn f() {\n  defer g(1, 2)\n}\n",
+        ),
+        // `defer await` form: spaces canonicalized.
+        (
+            "fn f() {\ndefer  await  h()\n}\n",
+            "fn f() {\n  defer await h()\n}\n",
+        ),
+        // Already canonical — idempotent.
+        (
+            "fn f() {\n  defer g()\n}\n",
+            "fn f() {\n  defer g()\n}\n",
+        ),
+        // Member call form.
+        (
+            "fn f() {\ndefer src.close()\n}\n",
+            "fn f() {\n  defer src.close()\n}\n",
+        ),
+    ];
+    for (src, want) in cases {
+        let once = ascript::syntax::format_tree(src);
+        assert_eq!(&once, want, "unexpected defer format for {src:?}");
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "defer format not idempotent for {src:?}");
+        assert!(
+            ascript::syntax::parser::parse(&once).errors.is_empty(),
+            "formatted defer output does not reparse: {once:?}"
+        );
+    }
+}
+
+#[test]
+fn defer_with_leading_comment_survives_round_trip() {
+    // DEFER Task 4.2: a comment attached to a defer statement must survive
+    // formatting (the IFACE comment-attachment lesson — leading comments must
+    // be explicitly tested).
+    let src = "fn f() {\n  // cleanup on exit\n  defer src.close()\n}\n";
+    let once = ascript::syntax::format_tree(src);
+    // The comment line must be preserved.
+    assert!(
+        once.contains("// cleanup on exit"),
+        "leading comment lost after fmt: {once:?}"
+    );
+    // The defer statement must still be present.
+    assert!(
+        once.contains("defer src.close()"),
+        "defer statement lost after fmt: {once:?}"
+    );
+    // Idempotent.
+    let twice = ascript::syntax::format_tree(&once);
+    assert_eq!(once, twice, "defer+comment not idempotent: {once:?}");
+    // Reparses cleanly.
+    assert!(
+        ascript::syntax::parser::parse(&once).errors.is_empty(),
+        "formatted defer+comment does not reparse: {once:?}"
+    );
+}

@@ -418,13 +418,19 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) -> bool {
     let local = tokio::task::LocalSet::new();
     let should_exit = local
         .run_until(crate::interp::telemetry_root_scope(async {
+            // DEFER §5.1: install a fresh defer list on the persistent session env for
+            // THIS line, so a top-level `defer` typed at the REPL drains at line end.
+            // The list is separate from variable bindings, so the session scope (vars)
+            // is unaffected; each line installs a fresh empty list and drains it.
+            let defer_list = env.install_defer_scope();
             match interp.exec(&program, env).await {
                 Err(Control::Panic(e)) => {
+                    interp.drain_session_defers(&defer_list).await;
                     flush_output(interp);
                     crate::diagnostics::report(&e.with_source(src_info.clone()));
                     return false;
                 }
-                // exit() — signal the REPL loop to end cleanly.
+                // exit() — signal the REPL loop to end cleanly (defers skipped, §3.3).
                 Err(Control::Exit(_)) => {
                     flush_output(interp);
                     return true;
@@ -435,23 +441,30 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) -> bool {
             if let Some(Stmt::Expr(expr)) = trailing {
                 match interp.eval_expr(&expr, env).await {
                     Ok(value) => {
+                        interp.drain_session_defers(&defer_list).await;
                         flush_output(interp);
                         if !matches!(value, Value::Nil) {
                             println!("{}", value);
                         }
                     }
                     Err(Control::Panic(e)) => {
+                        interp.drain_session_defers(&defer_list).await;
                         flush_output(interp);
                         crate::diagnostics::report(&e.with_source(src_info));
                     }
-                    Err(Control::Propagate(_)) => flush_output(interp),
-                    // exit() during trailing-expression evaluation — end the REPL.
+                    Err(Control::Propagate(_)) => {
+                        interp.drain_session_defers(&defer_list).await;
+                        flush_output(interp);
+                    }
+                    // exit() during trailing-expression evaluation — end the REPL
+                    // (defers skipped, §3.3).
                     Err(Control::Exit(_)) => {
                         flush_output(interp);
                         return true;
                     }
                 }
             } else {
+                interp.drain_session_defers(&defer_list).await;
                 flush_output(interp);
             }
             false

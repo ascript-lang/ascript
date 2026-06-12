@@ -12,11 +12,11 @@ use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_templat
 use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
-    ClassDecl, ContinueStmt, EnumDecl, ExportStmt, Expr, FnDecl, ForStmt, IfStmt, ImportStmt,
-    IndexExpr, LetStmt, Literal, MapExpr, MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef,
-    ObjectExpr, ObjectField, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile,
-    SpreadElem, Stmt,
-    TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
+    ClassDecl, ContinueStmt, DeferStmt, EnumDecl, ExportStmt, Expr, FnDecl, ForStmt, IfStmt,
+    ImportStmt, IndexExpr, LetStmt, Literal, MapExpr, MatchArm, MatchExpr, MemberExpr,
+    MethodDecl, NameRef, ObjectExpr, ObjectField, OptMemberExpr, ParenExpr, RangeExpr,
+    ReturnStmt, SourceFile, SpreadElem, Stmt, TemplateExpr, TernaryExpr, TryExpr, UnaryExpr,
+    UnwrapExpr, WhileStmt, YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -871,6 +871,7 @@ fn top_level_bound_names(stmt: &Stmt) -> Option<Vec<Rc<str>>> {
         // Non-binding statements (imports, control-flow, bare expressions) declare no
         // module-global → never droppable.
         Stmt::ImportStmt(_)
+        | Stmt::DeferStmt(_)
         | Stmt::ExprStmt(_)
         | Stmt::Block(_)
         | Stmt::IfStmt(_)
@@ -1211,6 +1212,7 @@ fn stmt_node(stmt: &Stmt) -> &ResolvedNode {
         Stmt::InterfaceDecl(n) => n.syntax(),
         Stmt::ImportStmt(n) => n.syntax(),
         Stmt::ExportStmt(n) => n.syntax(),
+        Stmt::DeferStmt(n) => n.syntax(),
     }
 }
 
@@ -1796,6 +1798,7 @@ impl Compiler {
             Stmt::EnumDecl(enum_decl) => self.compile_enum(enum_decl),
             Stmt::ImportStmt(import_stmt) => self.compile_import(import_stmt),
             Stmt::ExportStmt(export_stmt) => self.compile_export(export_stmt),
+            Stmt::DeferStmt(defer_stmt) => self.compile_defer(defer_stmt),
             other => Err(CompileError::new(
                 "internal: unexpected statement kind in compile_stmt (compiler invariant)",
                 stmt_span(other),
@@ -2844,6 +2847,202 @@ impl Compiler {
             let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
             self.chunk.emit_u16(Op::DefineExport, name_idx, span);
         }
+        Ok(())
+    }
+
+    /// Compile a `defer f(args)` / `defer o.m(args)` / `defer await f(args)` statement.
+    ///
+    /// DEFER §5.2 lowering: evaluate the callee (or receiver) and args NOW (at the
+    /// `defer` statement), capture them into a `DeferEntry`, and append it to the
+    /// current frame's `defers` list via `Op::DeferPush` / `Op::DeferPushMethod`.
+    ///
+    /// Layout:
+    /// - plain call `defer f(args)`:
+    ///   `<f>  arg0 … argN  DEFER_PUSH flags, argc`
+    ///   (spread: `<f>  <argsArray>  DEFER_PUSH flags|SPREAD, 0`)
+    /// - member call `defer o.m(args)`:
+    ///   `<o>  arg0 … argN  DEFER_PUSH_METHOD name, flags, argc`
+    /// - opt-member `defer o?.m(args)`:
+    ///   `<o>  DUP  JIF_NIL→skip  Pop  arg0 … argN  DEFER_PUSH_METHOD name, flags, argc  skip:`
+    ///   (nil receiver → skip the entire push, consistent with tree-walker §3.1)
+    fn compile_defer(&mut self, defer_stmt: &DeferStmt) -> Result<(), CompileError> {
+        let span = node_span(defer_stmt);
+
+        let call_expr = match defer_stmt.call() {
+            Some(Expr::CallExpr(c)) => c,
+            Some(_) => {
+                return Err(CompileError::new(
+                    "defer requires a call expression",
+                    span,
+                ))
+            }
+            None => {
+                return Err(CompileError::new(
+                    "defer statement missing call expression",
+                    span,
+                ))
+            }
+        };
+
+        // Named args are not supported for defer (ADT construction is semantically
+        // wrong to defer; the tree-walker has the same restriction).
+        if self.arg_list_has_named(&call_expr) {
+            return Err(CompileError::new(
+                "defer does not support named-argument calls",
+                span,
+            ));
+        }
+
+        let awaited: u8 = if defer_stmt.await_token().is_some() { 1 } else { 0 };
+
+        let callee = call_expr
+            .expr()
+            .ok_or_else(|| CompileError::new("defer call missing callee", span))?;
+
+        match &callee {
+            // `defer o.m(args)` — member call
+            Expr::MemberExpr(m) => {
+                let recv = m
+                    .expr()
+                    .ok_or_else(|| CompileError::new("defer method call missing receiver", span))?;
+                let name = m
+                    .ident_token()
+                    .ok_or_else(|| {
+                        CompileError::new("defer method call missing method name", span)
+                    })?
+                    .text()
+                    .to_string();
+                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+
+                // Compile the receiver.
+                self.compile_expr(&recv)?;
+
+                // Compile args (spread or individual).
+                let flags: u8;
+                let argc: u8;
+                if self.arg_list_has_spread(&call_expr) {
+                    self.compile_spread_args(&call_expr, span)?;
+                    flags = awaited | 2; // bit1 = spread
+                    argc = 0;
+                } else {
+                    let mut n: u8 = 0;
+                    if let Some(arg_list) = call_expr.arg_list() {
+                        for arg in arg_list.exprs() {
+                            self.compile_expr(&arg)?;
+                            n = n.checked_add(1).ok_or_else(|| {
+                                CompileError::new("too many defer arguments (max 255)", span)
+                            })?;
+                        }
+                    }
+                    flags = awaited;
+                    argc = n;
+                }
+
+                self.chunk
+                    .emit_u16_u8_u8(Op::DeferPushMethod, name_idx, flags, argc, span);
+            }
+
+            // `defer o?.m(args)` — optional-member call; nil receiver → skip (spec §3.1)
+            Expr::OptMemberExpr(m) => {
+                let recv = m
+                    .expr()
+                    .ok_or_else(|| CompileError::new("defer method call missing receiver", span))?;
+                let name = m
+                    .ident_token()
+                    .ok_or_else(|| {
+                        CompileError::new("defer method call missing method name", span)
+                    })?
+                    .text()
+                    .to_string();
+                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+
+                // Compile the receiver, dup, test for nil.
+                self.compile_expr(&recv)?;
+                self.chunk.emit(Op::Dup, span);
+                // JUMP_IF_NOT_NIL: falls through on non-nil, jumps to skip on nil.
+                // We actually want to jump OVER the push when receiver IS nil.
+                // So: JumpIfNil (jump if nil → skip). But we only have JumpIfNotNil.
+                // Use: JumpIfNotNil → over_jump_site (keep receiver, compile args, push)
+                //      Jump → skip_site
+                //      over: ... args ... DEFER_PUSH_METHOD ...
+                //      skip: Pop (the dup'd receiver)
+                // Actually simpler: duplicate → JumpIfFalse-equivalent...
+                // The cleanest way: Dup + JumpIfNil (we don't have JumpIfNil, only JumpIfNotNil).
+                // Use: Dup → JumpIfNotNil → A → jump B → A: pop recv, goto skip → B: args + push → skip:
+                // Actually the SIMPLEST way matching existing opt-chain lowering:
+                //   Dup
+                //   JumpIfNotNil → body (past the skip-jump)
+                //   Pop (clean up the dup'd nil)
+                //   Jump → skip
+                // body:
+                //   Pop (clean up the dup — receiver is still on stack below; but wait...)
+                //
+                // Let me reconsider: we need ONE copy of the receiver on the stack at DEFER_PUSH_METHOD time.
+                // Stack at Dup: [recv, recv]
+                // JumpIfNotNil: pops dup'd recv → if not nil, jumps to body; if nil, falls through
+                // Fall-through (nil case): stack is [recv]; Pop → []; Jump skip
+                // body: stack is [recv]; compile args; DEFER_PUSH_METHOD (pops recv + args)
+                // skip:
+                self.chunk.emit(Op::Dup, span);
+                let not_nil_jump = self.chunk.emit_jump(Op::JumpIfNotNil, span);
+                // Nil path: pop the (nil) receiver that's now TOS (original), jump to skip
+                self.chunk.emit(Op::Pop, span);
+                let skip_jump = self.chunk.emit_jump(Op::Jump, span);
+                // Non-nil path: patch not_nil_jump here
+                self.chunk.patch_jump(not_nil_jump);
+                // Receiver is on stack. Compile args.
+                let flags: u8;
+                let argc: u8;
+                if self.arg_list_has_spread(&call_expr) {
+                    self.compile_spread_args(&call_expr, span)?;
+                    flags = awaited | 2;
+                    argc = 0;
+                } else {
+                    let mut n: u8 = 0;
+                    if let Some(arg_list) = call_expr.arg_list() {
+                        for arg in arg_list.exprs() {
+                            self.compile_expr(&arg)?;
+                            n = n.checked_add(1).ok_or_else(|| {
+                                CompileError::new("too many defer arguments (max 255)", span)
+                            })?;
+                        }
+                    }
+                    flags = awaited;
+                    argc = n;
+                }
+                self.chunk
+                    .emit_u16_u8_u8(Op::DeferPushMethod, name_idx, flags, argc, span);
+                // Patch the skip jump to here (past the DEFER_PUSH_METHOD).
+                self.chunk.patch_jump(skip_jump);
+            }
+
+            // `defer f(args)` — plain call
+            _ => {
+                self.compile_expr(&callee)?;
+
+                let flags: u8;
+                let argc: u8;
+                if self.arg_list_has_spread(&call_expr) {
+                    self.compile_spread_args(&call_expr, span)?;
+                    flags = awaited | 2;
+                    argc = 0;
+                } else {
+                    let mut n: u8 = 0;
+                    if let Some(arg_list) = call_expr.arg_list() {
+                        for arg in arg_list.exprs() {
+                            self.compile_expr(&arg)?;
+                            n = n.checked_add(1).ok_or_else(|| {
+                                CompileError::new("too many defer arguments (max 255)", span)
+                            })?;
+                        }
+                    }
+                    flags = awaited;
+                    argc = n;
+                }
+                self.chunk.emit_u8_u8(Op::DeferPush, flags, argc, span);
+            }
+        }
+
         Ok(())
     }
 

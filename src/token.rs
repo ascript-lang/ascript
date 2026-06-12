@@ -94,6 +94,8 @@ pub enum Tok {
     Class,
     /// IFACE: `interface` — a new RESERVED keyword (only ever a top-level decl).
     Interface,
+    /// DEFER: `defer` — a RESERVED keyword; introduces `defer [await] <call>`.
+    Defer,
     Import,
     Export,
     Async,

@@ -86,6 +86,33 @@ let result = await f                 // 42
 un-awaited, un-held async call is therefore cancelled, not orphaned. Use `task.spawn` from `std/task`
 to explicitly detach a task so it keeps running after the handle is dropped.
 
+### `defer` in async functions
+
+`defer` works naturally in `async fn` bodies — the defer stack lives in the async activation and
+persists across `await` points. A defer registered before an `await` runs when the body exits at
+any later point, whether by a normal return, a `?`-propagation from an awaited future, or a panic.
+
+```ascript
+async fn processFile(path: string) {
+  let [f, err] = await fs.openAsync(path)
+  if (err != nil) { return Err(err.message) }
+  defer await f.closeAsync()    // runs when this function exits, even on error paths
+
+  let data = await f.readAll()?  // propagation runs the defer above
+  return Ok(process(data))
+}
+```
+
+**A bare `defer f()` whose call returns a future is a runtime error** — the future would be
+instantly cancelled on drop (cancel-on-drop). Use `defer await f()` for async cleanup functions.
+The `defer-async-call` lint catches this statically when the callee is a known `async fn`.
+
+**Cancellation:** a cancelled task's defers do **not** run. M17 structured concurrency cancels
+by dropping the body future (cancel-on-drop); running script code from inside a Rust `Drop` is
+unsound. The analogy is a killed Go goroutine — its defers do not run either. Cleanup that must
+survive cancellation belongs on the **resource's deterministic Drop**: every native handle (files,
+sockets, database connections, processes) already has one and reclaims its OS resource on drop.
+
 ### Top-level await
 
 The top level of a program may use `await` directly, or you can define and await a `main`:
@@ -181,6 +208,12 @@ g.next("two")            // exhausted; "two" becomes b
 ```
 
 `gen.close()` stops the generator; any subsequent `next()` returns `nil`.
+
+**`defer` inside a generator body** runs at body *completion* (a natural return or panic), but
+**not** when `gen.close()` or last-handle drop abandons the body mid-execution. `close()` is a
+synchronous method — it cannot drive the async engine needed to execute deferred calls. For
+cleanup that must happen when a generator stops early, own the cleanup in the *consumer* function
+using a `defer` there, or complete the generator before discarding it.
 
 ### `for await` — the primary consumption form
 

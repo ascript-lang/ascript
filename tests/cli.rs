@@ -1701,6 +1701,93 @@ fn exit_out_of_range_panics() {
     );
 }
 
+// ─── §3.3 exit() skips defers ─────────────────────────────────────────────────
+//
+// Per spec §3.3 (the Go `os.Exit` rule): `exit()` is process termination, NOT a
+// frame exit — defers registered in the current function / at top-level are NOT
+// drained. This is tested via a subprocess for both engines (VM default + tree-walker)
+// so we observe real process exit code and captured stdout.
+
+#[test]
+fn defer_exit_skips_defers_vm() {
+    // Program: register a defer that would print, then call exit(0).
+    // If defers ran, "SHOULD_NOT_APPEAR" would be in stdout.
+    // Positive control: "REGISTERED" is printed BEFORE exit(), proving the
+    // defer was registered before the exit() call — the test is meaningful.
+    let src = r#"
+fn main() {
+    defer print("SHOULD_NOT_APPEAR")
+    print("REGISTERED")
+    exit(0)
+}
+main()
+"#;
+    let path = std::env::temp_dir().join(format!(
+        "ascript_defer_exit_vm_{}.as",
+        std::process::id()
+    ));
+    std::fs::write(&path, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "VM: expected exit code 0; got {:?}; stdout: {stdout:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("REGISTERED"),
+        "VM: positive control 'REGISTERED' must appear (defer was registered before exit); stdout: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_APPEAR"),
+        "VM: §3.3 exit() must NOT run defers — 'SHOULD_NOT_APPEAR' must be absent; stdout: {stdout:?}"
+    );
+}
+
+#[test]
+fn defer_exit_skips_defers_tree_walker() {
+    // Same program as above but run on the tree-walker oracle — §3.3 must hold
+    // on BOTH engines.
+    let src = r#"
+fn main() {
+    defer print("SHOULD_NOT_APPEAR")
+    print("REGISTERED")
+    exit(0)
+}
+main()
+"#;
+    let path = std::env::temp_dir().join(format!(
+        "ascript_defer_exit_tw_{}.as",
+        std::process::id()
+    ));
+    std::fs::write(&path, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin)
+        .args(["run", "--tree-walker"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "TW: expected exit code 0; got {:?}; stdout: {stdout:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("REGISTERED"),
+        "TW: positive control 'REGISTERED' must appear (defer was registered before exit); stdout: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_APPEAR"),
+        "TW: §3.3 exit() must NOT run defers — 'SHOULD_NOT_APPEAR' must be absent; stdout: {stdout:?}"
+    );
+}
+
 // ---- std/io stdin tests ----
 
 #[test]
@@ -4675,4 +4762,43 @@ fn build_report_does_not_pollute_stdout() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DEFER Task 4.3 (REPL): a top-level `defer print(...)` in a REPL submission
+/// runs at the END of that submission (§2.3). The REPL treats each newline-
+/// delimited line as its own program, so `defer print("deferred")` in
+/// submission 1 fires at the end of that submission — BEFORE submission 2's
+/// `print("before")`. This pins the correct REPL defer semantics.
+#[test]
+fn repl_defer_top_level_runs_at_submission_end() {
+    // Submission 1: `defer print("deferred")` — registers the defer, body
+    // completes, defer fires → "deferred" is printed.
+    // Submission 2: `print("before")` → "before" is printed.
+    // Expected: "deferred" appears BEFORE "before" in the combined output.
+    let (out, _) =
+        run_repl_session("defer print(\"deferred\")\nprint(\"before\")\n", false);
+    assert!(out.contains("deferred"), "'deferred' missing from output: {out:?}");
+    assert!(out.contains("before"), "'before' missing from output: {out:?}");
+    let deferred_pos = out.find("deferred").unwrap();
+    let before_pos = out.find("before").unwrap();
+    assert!(
+        deferred_pos < before_pos,
+        "top-level defer fires at end of its submission (before the next submission); got: {out:?}"
+    );
+}
+
+/// DEFER Task 4.3 (REPL): `defer` inside a REPL-defined fn fires when that fn
+/// returns — not at submission end.
+#[test]
+fn repl_defer_inside_fn_runs_on_fn_return() {
+    // Define a fn with a defer, then call it.
+    let session =
+        "fn cleanup() { defer print(\"done\") \n print(\"body\") }\ncleanup()\n";
+    let (out, _) = run_repl_session(session, false);
+    let body_pos = out.find("body").expect("'body' missing from output");
+    let done_pos = out.find("done").expect("'done' missing from output");
+    assert!(
+        body_pos < done_pos,
+        "defer inside fn must fire after fn body; got: {out:?}"
+    );
 }

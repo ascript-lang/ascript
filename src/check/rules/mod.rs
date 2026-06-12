@@ -7,6 +7,8 @@ use crate::syntax::resolve::types::{Resolution, ResolveResult};
 pub mod call_arity;
 pub mod contract;
 pub mod dead_recover;
+pub mod defer_async_call;
+pub mod defer_in_loop;
 pub mod duplicate_member;
 pub mod ffi_nondeterminism;
 pub mod field_default_type;
@@ -49,6 +51,8 @@ pub static ALL: &[Rule] = &[
     workflow_determinism::check,
     ffi_nondeterminism::check,
     worker_capture::check,
+    defer_in_loop::check,
+    defer_async_call::check,
 ];
 
 /// The `CallExpr` directly dropped by an `ExprStmt` (result unused). `None` if the

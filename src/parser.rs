@@ -132,6 +132,33 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Stmt::Continue)
             }
+            Tok::Defer => {
+                let start = self.span().start;
+                self.advance(); // consume `defer`
+                let awaited = if *self.peek() == Tok::Await {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let call = self.expr()?;
+                let span = Span::new(start, call.span.end);
+                match &call.kind {
+                    ExprKind::Call { args, .. } => {
+                        if args.iter().any(|a| matches!(a, crate::ast::CallArg::Named { .. })) {
+                            return Err(AsError::at(
+                                "defer does not support named-argument calls — bind the value first or use an arrow",
+                                span,
+                            ));
+                        }
+                        Ok(Stmt::Defer { call, awaited, span })
+                    }
+                    _ => Err(AsError::at(
+                        "defer requires a call — only a call expression can be deferred (write `defer (() => …)()` for inline cleanup)",
+                        span,
+                    )),
+                }
+            }
             _ => Ok(Stmt::Expr(self.expr()?)),
         }
     }
@@ -3573,6 +3600,92 @@ mod tests {
                 assert!(matches!(params[0].ty, Some(crate::ast::Type::Param(_))));
             }
             o => panic!("got {o:?}"),
+        }
+    }
+
+    // ---- DEFER Task 1.1: reserve keyword + legacy parser ----
+
+    #[test]
+    fn defer_is_reserved_and_call_only() {
+        // Accepted forms — these must all parse without error.
+        for src in [
+            "fn f() { defer g() }",
+            "fn f() { defer obj.close() }",
+            "fn f() { defer a?.flush() }",
+            "fn f() { defer (cond ? a : b)() }",
+            "fn f() { defer (() => { print(1) })() }",
+            "fn f() { defer g(...xs) }",
+            "fn f() { defer await g() }",
+            "defer g()",  // top level is legal
+        ] {
+            assert!(
+                parse_src(src).is_ok(),
+                "should accept: {src}"
+            );
+        }
+
+        // Rejected: non-call expressions.
+        for src in [
+            "fn f() { defer x }",
+            "fn f() { defer a + b }",
+            "fn f() { defer g }",
+            "fn f() { defer g()? }",
+            "fn f() { defer g()! }",
+        ] {
+            let err = parse_src(src).unwrap_err();
+            assert!(
+                err.message.contains("defer requires a call"),
+                "expected 'defer requires a call' for `{src}`, got: {}",
+                err.message
+            );
+        }
+
+        // Rejected: named-argument calls (spec §2.1 v1 Tier-1).
+        let err = parse_src("fn f() { defer g(x: 1) }").unwrap_err();
+        assert!(
+            err.message.contains("defer does not support named-argument calls"),
+            "expected named-arg error, got: {}",
+            err.message
+        );
+
+        // `defer` is a RESERVED keyword — cannot be used as an identifier.
+        assert!(
+            parse_src("let defer = 5").is_err(),
+            "defer must be reserved (let defer = 5)"
+        );
+        assert!(
+            parse_src("fn defer() {}").is_err(),
+            "defer must be reserved (fn defer() {{}})"
+        );
+    }
+
+    #[test]
+    fn defer_stmt_node_fields() {
+        // Verify the AST node carries the right fields.
+        let s = parse_one("fn f() { defer g() }");
+        match s {
+            Stmt::Fn { body, .. } => match &body[0] {
+                Stmt::Defer { awaited, .. } => {
+                    assert!(!awaited, "plain defer should have awaited=false");
+                }
+                o => panic!("expected Stmt::Defer, got {o:?}"),
+            },
+            o => panic!("expected Stmt::Fn, got {o:?}"),
+        }
+
+        let s = parse_one("fn f() { defer await teardown() }");
+        match s {
+            Stmt::Fn { body, .. } => match &body[0] {
+                Stmt::Defer { awaited, call, .. } => {
+                    assert!(*awaited, "defer await should have awaited=true");
+                    assert!(
+                        matches!(call.kind, ExprKind::Call { .. }),
+                        "call must be ExprKind::Call"
+                    );
+                }
+                o => panic!("expected Stmt::Defer, got {o:?}"),
+            },
+            o => panic!("expected Stmt::Fn, got {o:?}"),
         }
     }
 }

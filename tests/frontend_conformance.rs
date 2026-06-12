@@ -738,3 +738,56 @@ fn both_frontends_keep_comparison_when_not_a_type_arg_call() {
     both_accept("let _ = x < y ? a : b");
     both_accept("let _ = a < b > c");
 }
+
+// ---- DEFER Task 1.2: `defer [await] <call>` — both front-ends agree ----
+
+/// Both front-ends accept every legal `defer` form from §2.1.
+#[test]
+fn both_frontends_accept_defer_stmt() {
+    both_accept("fn f() { defer g() }");
+    both_accept("fn f() { defer obj.close() }");
+    both_accept("fn f() { defer a?.flush() }");
+    both_accept("fn f() { defer (cond ? a : b)() }");
+    both_accept("fn f() { defer (() => { print(1) })() }");
+    both_accept("fn f() { defer g(...xs) }");
+    both_accept("fn f() { defer await g() }");
+    // top-level defer is legal (module body)
+    both_accept("defer g()");
+    // parenthesized callee is still a call
+    both_accept("fn f() { defer (f)() }");
+}
+
+/// Both front-ends reject non-call expressions after `defer`.
+#[test]
+fn both_frontends_reject_defer_non_call() {
+    both_reject("fn f() { defer x }");
+    both_reject("fn f() { defer a + b }");
+    both_reject("fn f() { defer g }");
+    both_reject("fn f() { defer g()? }");
+    both_reject("fn f() { defer g()! }");
+}
+
+/// Both front-ends reject named-argument calls after `defer` (§2.1 v1 Tier-1).
+#[test]
+fn both_frontends_reject_defer_named_args() {
+    both_reject("fn f() { defer g(x: 1) }");
+}
+
+/// Only the DEFERRED call's OWN named args are a Tier-1 error (§2.1). A NESTED
+/// call with named args (ADT-variant-style construction) inside a deferred call
+/// whose own args are positional is ACCEPTED on BOTH front-ends — the named-arg
+/// rejection must NOT fire on nested calls.
+#[test]
+fn both_frontends_accept_defer_with_nested_named_args() {
+    // The deferred call `g(...)` has a single POSITIONAL arg; `x:` belongs to
+    // the nested `inner(...)`.
+    both_accept("fn f() { defer g(inner(x: 1)) }");
+    // ADT-variant-style named construction nested inside a positional deferred call.
+    both_accept("fn f() { defer cleanup(Rect(w: 1, h: 2)) }");
+}
+
+/// `defer` is RESERVED — both front-ends reject its use as an identifier.
+#[test]
+fn both_frontends_reject_defer_as_identifier() {
+    both_reject("let defer = 5");
+}

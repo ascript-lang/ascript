@@ -1,0 +1,23 @@
+# exit: none
+=== §1 multi-resource LIFO ===
+opened source
+opened dest
+opened log
+all three resources open — LIFO teardown on exit
+closed log
+closed dest
+closed source
+removed temp dir
+
+=== §2 panic-unwind + suppressed note ===
+body completed normally
+rule 1 — return value: nil
+rule 1 — error: index 0 out of bounds (len 0)
+rule 3 — message: index 0 out of bounds (len 0) (suppressed panic in deferred call: index 99 out of bounds (len 0))
+
+=== §3 generator-owner pattern ===
+record 1: alpha
+record 2: beta
+generator owner exited cleanly
+
+defer_resources ok

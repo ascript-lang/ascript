@@ -581,6 +581,24 @@ impl Chunk {
         self.code.push(b);
     }
 
+    /// Emit an op with two `u8` operands (e.g. `DEFER_PUSH flags, argc`).
+    pub fn emit_u8_u8(&mut self, op: Op, a: u8, b: u8, span: Span) {
+        self.record_span(span);
+        self.code.push(op as u8);
+        self.code.push(a);
+        self.code.push(b);
+    }
+
+    /// Emit an op with a `u16` little-endian operand followed by two `u8` operands
+    /// (e.g. `DEFER_PUSH_METHOD name, flags, argc`).
+    pub fn emit_u16_u8_u8(&mut self, op: Op, a: u16, b: u8, c: u8, span: Span) {
+        self.record_span(span);
+        self.code.push(op as u8);
+        self.code.extend_from_slice(&a.to_le_bytes());
+        self.code.push(b);
+        self.code.push(c);
+    }
+
     /// Emit a jump op with a placeholder `i16` displacement of `0`. Returns the
     /// offset of the operand bytes (the *patch site*) for a later
     /// [`Chunk::patch_jump`].

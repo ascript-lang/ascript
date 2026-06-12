@@ -722,7 +722,8 @@ impl Resolver {
                 }
             }
             BreakStmt | ContinueStmt => {}
-            ExprStmt | ReturnStmt => {
+            // DeferStmt: resolve the call expression (no new binding semantics).
+            ExprStmt | ReturnStmt | DeferStmt => {
                 for child in node.children() {
                     if is_expr(child.kind()) {
                         self.resolve_expr(child);

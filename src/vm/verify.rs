@@ -83,6 +83,10 @@ pub enum VerifyError {
     /// a loaded/`.aso` chunk is corruption (or a hostile hand-crafted file), so reject
     /// it rather than treat it as a silent no-op safepoint.
     BreakInSerializedCode { offset: usize },
+    /// A `DeferPush` or `DeferPushMethod` instruction has a `flags` byte with
+    /// undefined bits set. Valid flags are bit0 (awaited) and bit1 (spread);
+    /// bits 2–7 must be zero in any well-formed chunk.
+    BadDeferFlags { offset: usize, flags: u8 },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -146,6 +150,10 @@ impl std::fmt::Display for VerifyError {
                 f,
                 "Op::Break at offset {offset} is not valid in stored bytecode \
                  (it is a runtime-only debugger patch)"
+            ),
+            VerifyError::BadDeferFlags { offset, flags } => write!(
+                f,
+                "DEFER_PUSH* at offset {offset} has undefined flag bits (flags = {flags:#04x})"
             ),
         }
     }
@@ -366,6 +374,12 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // the depth walk computes its exact effect from the class-proto, so this
         // placeholder is never consulted for CLASS.
         Class => Effect::new(0, 1),
+
+        // DEFER §5.2: DeferPush / DeferPushMethod — the exact pop count is argc-
+        // dependent and is handled by `op_stack_pops_pushes` BEFORE `stack_effect` is
+        // ever called for these ops. This arm exists solely to satisfy the exhaustive
+        // match; it is unreachable in the verifier's normal code path.
+        DeferPush | DeferPushMethod => Effect::new(0, 0),
 
         // DBG: the breakpoint trap is NEVER compiler-emitted and NEVER serialized — it
         // exists only as a runtime byte patch. Pass 1 of `verify_chunk` rejects a
@@ -721,6 +735,21 @@ fn check_operands(
             }
         }
 
+        // ---- DEFER: DeferPushMethod needs a name-const (Str); both ops reject undefined flag bits ----
+        DeferPushMethod => {
+            check_name_const(chunk.read_u16(operand_at) as usize)?;
+            let flags = chunk.read_u8(operand_at + 2);
+            if flags & !0x03 != 0 {
+                return Err(VerifyError::BadDeferFlags { offset: off, flags });
+            }
+        }
+        DeferPush => {
+            let flags = chunk.read_u8(operand_at);
+            if flags & !0x03 != 0 {
+                return Err(VerifyError::BadDeferFlags { offset: off, flags });
+            }
+        }
+
         // ---- ops with no operand or a count operand needing no table check ----
         _ => {}
     }
@@ -783,6 +812,19 @@ fn verify_stack_balance(
                 return Err(VerifyError::StackUnderflow { offset: off });
             }
             after + 1
+        } else if op == Op::DeferPush || op == Op::DeferPushMethod {
+            // DEFER §5.2: DeferPush / DeferPushMethod pop (argc + 1) values (callee/recv
+            // + argc args, or callee/recv + ONE spread array) and push nothing. The pop
+            // count is argc-/spread-dependent, so `count_operand` (0 for unknown ops)
+            // can't reach it — we DELEGATE to `op_stack_pops_pushes`, the single
+            // authoritative source of stack truth, rather than re-deriving the layout
+            // here (keeps the two sites from silently disagreeing on a future edit).
+            let (pops, pushes) = op_stack_pops_pushes(chunk, op, operand_at);
+            let pops = pops as isize;
+            if depth_in < pops {
+                return Err(VerifyError::StackUnderflow { offset: off });
+            }
+            depth_in - pops + pushes as isize // pushes 0, but keep the form explicit
         } else {
             let n = count_operand(chunk, op, operand_at);
             let eff = stack_effect(op, n);
@@ -871,11 +913,17 @@ fn count_operand(chunk: &Chunk, op: Op, operand_at: usize) -> usize {
 
 /// The NET operand-stack delta (`pushes - pops`) of the instruction `op` at
 /// `operand_at` in `chunk`, decoding its inline count operand and handling the
-/// `Op::Class` special case (whose pop count comes from its class-proto). This is the
-/// SAME authoritative table [`verify_stack_balance`] uses; it is exposed so other
-/// passes (e.g. the worker code-slice builder, which tracks top-level stack depth to
-/// bound a computed-`const` initializer to its own statement) reuse one source of
-/// truth rather than re-deriving stack effects.
+/// `Op::Class` special case (whose pop count comes from its class-proto). Shares the
+/// `op_stack_pops_pushes` table; it is exposed so other passes (e.g. the worker
+/// code-slice builder, which tracks top-level stack depth to bound a computed-`const`
+/// initializer to its own statement) reuse one source of truth rather than re-deriving
+/// stack effects.
+///
+/// Cross-reference: [`verify_stack_balance`] DELEGATES its `DeferPush`/`DeferPushMethod`
+/// arms to [`op_stack_pops_pushes`] (so the data-dependent defer pop counts have ONE
+/// home). It keeps its OWN inline `Op::Class` arm because it must emit a `StackUnderflow`
+/// at the right offset mid-walk; that arm and the `Op::Class` arm here must stay in
+/// lockstep — edit both if the class layout changes.
 pub(crate) fn op_stack_delta(chunk: &Chunk, op: Op, operand_at: usize) -> isize {
     // Net is just pushes - pops over the ONE source of truth below (no second copy of
     // the `Op::Class` special case).
@@ -899,6 +947,25 @@ pub(crate) fn op_stack_pops_pushes(chunk: &Chunk, op: Op, operand_at: usize) -> 
             return (pops, 1);
         }
         return (0, 1);
+    }
+    // DEFER §5.2: DeferPush / DeferPushMethod pop (argc + 1) values from the stack
+    // (callee/receiver + argc args) and push nothing. The spread variant pops exactly
+    // 2 (callee/receiver + the spread array); bit1 of the flags byte signals spread.
+    // These are NOT counted via `count_operand` (which returns 0 for unknown ops) so
+    // we special-case them here — the single authoritative source of stack truth.
+    if op == Op::DeferPush {
+        // Operand layout: u8 flags + u8 argc.
+        let flags = chunk.read_u8(operand_at);
+        let spread = (flags & 2) != 0;
+        let argc = if spread { 1 } else { chunk.read_u8(operand_at + 1) as usize };
+        return (1 + argc, 0); // callee + argc args → 0 pushed
+    }
+    if op == Op::DeferPushMethod {
+        // Operand layout: u16 name_idx + u8 flags + u8 argc.
+        let flags = chunk.read_u8(operand_at + 2);
+        let spread = (flags & 2) != 0;
+        let argc = if spread { 1 } else { chunk.read_u8(operand_at + 3) as usize };
+        return (1 + argc, 0); // recv + argc args → 0 pushed
     }
     let e = stack_effect(op, count_operand(chunk, op, operand_at));
     (e.pops, e.pushes)
@@ -1491,5 +1558,92 @@ mod tests {
             }
             other => panic!("expected OperandOutOfRange(param) from a nested proto, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn defer_push_bad_flags_rejected() {
+        // DeferPush with flags=0xFF (undefined bits 2–7 set) must be rejected.
+        // Stack note: pass 2 (check_operands) runs BEFORE pass 3 (stack balance),
+        // so the flags error surfaces even if the chunk would also fail stack balance.
+        let mut c = Chunk::new();
+        // Emit DeferPush manually: opcode byte + flags u8 + argc u8
+        c.code.push(Op::DeferPush as u8);
+        c.code.push(0xFF); // flags — bits 2–7 are undefined → BadDeferFlags
+        c.code.push(0);    // argc
+        c.code.push(Op::Return as u8);
+        match verify(&c) {
+            Err(VerifyError::BadDeferFlags { offset: 0, flags: 0xFF }) => {}
+            other => panic!("expected BadDeferFlags(0xFF), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defer_push_valid_flags_accepted() {
+        // Positive control: flags=0x03 (both valid bits set) must NOT trigger BadDeferFlags.
+        // Stack balance will still fail (no values on stack for the spread pop), but the
+        // flags check itself must pass — we get StackUnderflow, not BadDeferFlags.
+        let mut c = Chunk::new();
+        c.code.push(Op::DeferPush as u8);
+        c.code.push(0x03); // flags = bit0+bit1 = valid
+        c.code.push(0);    // argc
+        c.code.push(Op::Return as u8);
+        // Should NOT be a BadDeferFlags error (may be StackUnderflow or another error)
+        assert!(!matches!(verify(&c), Err(VerifyError::BadDeferFlags { .. })));
+    }
+
+    #[test]
+    fn defer_push_method_bad_flags_rejected() {
+        // DeferPushMethod with flags=0xF0 must be rejected.
+        let mut c = Chunk::new();
+        let idx = c.add_const(Value::Str("m".into()));
+        // Emit DeferPushMethod: opcode + u16 name_idx (LE) + u8 flags + u8 argc
+        c.code.push(Op::DeferPushMethod as u8);
+        let [lo, hi] = idx.to_le_bytes();
+        c.code.push(lo);
+        c.code.push(hi);
+        c.code.push(0xF0); // flags — undefined bits set → BadDeferFlags
+        c.code.push(0);    // argc
+        c.code.push(Op::Return as u8);
+        match verify(&c) {
+            Err(VerifyError::BadDeferFlags { offset: 0, flags: 0xF0 }) => {}
+            other => panic!("expected BadDeferFlags(0xF0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defer_push_method_name_not_string_rejected() {
+        // DeferPushMethod with a non-Str name const must be rejected.
+        let mut c = Chunk::new();
+        let idx = c.add_const(Value::Float(1.0)); // not a Str
+        c.code.push(Op::DeferPushMethod as u8);
+        let [lo, hi] = idx.to_le_bytes();
+        c.code.push(lo);
+        c.code.push(hi);
+        c.code.push(0x00); // flags — valid (so flags check doesn't fire first)
+        c.code.push(0);    // argc
+        c.code.push(Op::Return as u8);
+        assert!(matches!(verify(&c), Err(VerifyError::NameConstNotString { .. })));
+    }
+
+    #[test]
+    fn defer_push_method_name_out_of_range_rejected() {
+        // DeferPushMethod with a name_idx beyond the const pool must be rejected.
+        let mut c = Chunk::new();
+        // No consts added — index 0 is out of range.
+        c.code.push(Op::DeferPushMethod as u8);
+        c.code.push(0); // name_idx lo — index 0, but consts is empty
+        c.code.push(0); // name_idx hi
+        c.code.push(0x00); // flags
+        c.code.push(0);    // argc
+        c.code.push(Op::Return as u8);
+        match verify(&c) {
+            Err(VerifyError::OperandOutOfRange { kind: "const", .. }) => {}
+            other => panic!("expected OperandOutOfRange(const), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aso_format_version_is_28() {
+        assert_eq!(crate::vm::aso::ASO_FORMAT_VERSION, 28);
     }
 }

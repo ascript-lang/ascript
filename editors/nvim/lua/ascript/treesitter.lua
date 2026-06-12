@@ -15,7 +15,7 @@ local M = {}
 
 local GRAMMAR_URL = "https://github.com/ascript-lang/tree-sitter-ascript"
 -- Pinned to the published grammar commit for reproducibility; bump on grammar updates.
-local GRAMMAR_REV = "7227fb7fa00fd6675b03883556906ba8aafed577"
+local GRAMMAR_REV = "3c2bb8b5ffb4eef21b3f6224428ad248804fc338"
 
 -- Start tree-sitter highlighting for AScript buffers via core Neovim APIs. Branch-agnostic,
 -- and a harmless no-op (pcall) until the `ascript` parser is actually installed.

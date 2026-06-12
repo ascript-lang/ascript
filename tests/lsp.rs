@@ -1570,6 +1570,146 @@ fn lsp_offers_worker_completion() {
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
+/// DEFER Task 4.3: `defer` is offered as a completion keyword + has a snippet.
+#[test]
+fn lsp_offers_defer_keyword_and_snippet() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://defer_comp.as";
+    let text = "fn f() {\n  \n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    // `defer` must appear as a keyword completion item.
+    assert!(
+        labels.contains(&"defer"),
+        "`defer` must appear in keyword completions; got: {labels:?}"
+    );
+    // A snippet item with label "defer" must also be offered.
+    let has_defer_snippet = items.iter().any(|i| {
+        i["label"].as_str() == Some("defer")
+            && i["kind"].as_u64() == Some(15) // CompletionItemKind::SNIPPET = 15
+    });
+    assert!(
+        has_defer_snippet,
+        "`defer` snippet must be offered; got items: {items:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// DEFER Task 4.3: `defer` is a reserved keyword (§2.2), so the CST emits
+/// `DeferKw` and the semantic-token classifier styles it as KEYWORD (legend
+/// index 0). This test pins that the `defer` token in `fn f() { defer g() }`
+/// is classified as KEYWORD.
+#[test]
+fn lsp_defer_is_keyword_semantic_token() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    // A simple function with a defer statement.  The `defer` keyword appears at
+    // line 0, char 11, length 5.
+    // text: "fn f() { defer g() }\n"
+    //        0123456789012345...
+    //                  ^char 9
+    let uri = "ascript-test://defer_tokens.as";
+    let text = "fn f() { defer g() }\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let st_resp = client.read_response(2, overall);
+    let raw = st_resp["result"]["data"]
+        .as_array()
+        .expect("semanticTokens data array");
+    let nums: Vec<u32> = raw.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+    assert!(
+        nums.len().is_multiple_of(5) && !nums.is_empty(),
+        "token stream must be non-empty groups of 5; got: {nums:?}"
+    );
+
+    // Decode delta-encoded stream to absolute (line, char, len, type) tuples.
+    let mut toks: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let (mut line, mut ch) = (0u32, 0u32);
+    for g in nums.chunks(5) {
+        if g[0] != 0 {
+            line += g[0];
+            ch = g[1];
+        } else {
+            ch += g[1];
+        }
+        toks.push((line, ch, g[2], g[3]));
+    }
+    const KEYWORD: u32 = 0;
+    // `defer` appears at line 0, char 9, length 5.
+    assert!(
+        toks.iter().any(|&(l, c, len, ty)| l == 0 && c == 9 && len == 5 && ty == KEYWORD),
+        "`defer` at (line=0, char=9, len=5) must be classified as KEYWORD; got: {toks:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
 /// DX D3 Task 13: end-to-end frame-precise identifier completion — the cursor in
 /// `a`'s body offers `a`'s own local + a module-global + a builtin, but NOT a
 /// sibling function `b`'s local.

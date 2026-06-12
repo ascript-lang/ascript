@@ -47,6 +47,9 @@ fn is_attachable(kind: SyntaxKind) -> bool {
             | MethodDecl
             | MethodReq
             | EnumVariant
+            // DEFER: a `defer` statement is a first-class attachable statement node;
+            // without this, a leading comment before `defer` is lost during formatting.
+            | DeferStmt
     )
 }
 

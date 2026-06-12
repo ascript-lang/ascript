@@ -27,16 +27,21 @@ fn repo_root() -> &'static Path {
 /// SRV must NOT bump the `.aso` format version. The shared heap is a runtime value
 /// (a frozen `Arc` graph built by a runtime call), and the `TAG_SHARED` serializer
 /// tag is the worker-wire airlock format, NOT the `.aso` constant pool — so the
-/// bytecode format is untouched. This literal pin trips on ANY bump.
+/// bytecode format is untouched. This literal pin trips on ANY bump, forcing each
+/// bumping feature to consciously update it and confirm the bump is not from SRV.
 #[test]
 fn aso_format_version_is_unchanged_by_srv() {
+    // Literal pin (trips on ANY bump). SRV itself bumped nothing; the value has since
+    // been bumped to 28 by DEFER (the DeferPush / DeferPushMethod opcodes, ASO 27→28).
+    // The invariant this guards is that SRV is NOT the cause of any bump. When a later
+    // feature legitimately bumps the version, update this literal in the same commit
+    // after confirming the bump is NOT attributable to SRV.
     assert_eq!(
         ascript::vm::aso::ASO_FORMAT_VERSION,
-        27,
-        "SRV must not bump ASO_FORMAT_VERSION — the shared heap is a runtime value, \
-         not a bytecode constant, and TAG_SHARED is a worker-wire tag, not an .aso \
-         constant. If a LATER feature legitimately bumps the version, update this pin \
-         in the same commit and confirm the bump is NOT attributable to SRV."
+        28,
+        "ASO_FORMAT_VERSION changed — confirm the bump is NOT attributable to SRV \
+         (the shared heap is a runtime value, not a bytecode constant; TAG_SHARED is a \
+         worker-wire tag, not an .aso constant), then update this literal pin."
     );
 }
 

@@ -1416,3 +1416,264 @@ mod did_you_mean {
         assert_eq!(fix.edits[0].replacement, "length");
     }
 }
+
+// ---------------------------------------------------------------------------
+// DEFER §6.1 — `defer-in-loop` lint (Warning, default-on)
+// ---------------------------------------------------------------------------
+mod defer_in_loop {
+    use super::bin;
+    use ascript::check::analyze;
+    use std::process::Command;
+
+    fn count(src: &str) -> usize {
+        analyze(src)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "defer-in-loop")
+            .count()
+    }
+
+    fn has(src: &str) -> bool {
+        count(src) > 0
+    }
+
+    // --- fires cases ---
+
+    #[test]
+    fn fires_inside_while_loop() {
+        let src = "fn f() { while (true) { defer print(1) } }\n";
+        assert!(has(src), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn fires_inside_for_range() {
+        let src = "fn f() { for (i in 1..10) { defer print(i) } }\n";
+        assert!(has(src), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn fires_inside_for_of() {
+        let src = "fn f(xs) { for (x of xs) { defer print(x) } }\n";
+        assert!(has(src), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn fires_inside_for_await() {
+        // for-await uses the same ForStmt CST node.
+        let src = "async fn f(g) { for await (x of g) { defer print(x) } }\n";
+        assert!(has(src), "{:?}", analyze(src).diagnostics);
+    }
+
+    // --- no-fire cases ---
+
+    #[test]
+    fn no_fire_outside_any_loop() {
+        let src = "fn f() { defer print(1) }\n";
+        assert!(!has(src), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn no_fire_nested_fn_inside_loop() {
+        // The nested fn body resets the walk; its defer is per-call of the inner fn.
+        let src = "fn outer() { while (true) { fn inner() { defer print(1) } inner() } }\n";
+        assert!(
+            !has(src),
+            "nested fn inside loop should NOT fire: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn no_fire_nested_arrow_inside_loop() {
+        // Arrow body also resets the walk.
+        let src = "fn outer() { while (true) { let f = () => { defer print(1) } f() } }\n";
+        assert!(
+            !has(src),
+            "nested arrow inside loop should NOT fire: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn severity_is_warning() {
+        use ascript::check::Severity;
+        let src = "fn f() { while (true) { defer print(1) } }\n";
+        let diag = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "defer-in-loop")
+            .unwrap();
+        assert!(
+            matches!(diag.severity, Severity::Warning),
+            "severity should be Warning, got {:?}",
+            diag.severity
+        );
+    }
+
+    #[test]
+    fn suppression_via_toml_allow() {
+        // `ascript.toml [lint] allow = ["defer-in-loop"]` must suppress the warning.
+        use std::fs;
+        let dir = std::env::temp_dir().join("ascript_defer_in_loop_toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("loop.as");
+        fs::write(&f, "fn f() { while (true) { defer print(1) } }\n").unwrap();
+        fs::write(
+            dir.join("ascript.toml"),
+            "[lint]\nallow = [\"defer-in-loop\"]\n",
+        )
+        .unwrap();
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "toml allow must suppress defer-in-loop; out: {combined}"
+        );
+        assert!(
+            !combined.contains("defer-in-loop"),
+            "toml allow must drop the diagnostic; out: {combined}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DEFER §6.2 — `defer-async-call` lint (Warning, default-on)
+// ---------------------------------------------------------------------------
+mod defer_async_call {
+    use super::bin;
+    use ascript::check::analyze;
+    use std::process::Command;
+
+    fn count(src: &str) -> usize {
+        analyze(src)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "defer-async-call")
+            .count()
+    }
+
+    fn has(src: &str) -> bool {
+        count(src) > 0
+    }
+
+    // --- fires cases ---
+
+    #[test]
+    fn fires_on_bare_defer_to_async_fn() {
+        let src = "async fn teardown() { }\nfn main() { defer teardown() }\n";
+        assert!(has(src), "{:?}", analyze(src).diagnostics);
+    }
+
+    // --- no-fire cases ---
+
+    #[test]
+    fn no_fire_on_defer_await_async_fn() {
+        // `defer await` is the correct form.
+        let src = "async fn teardown() { }\nasync fn main() { defer await teardown() }\n";
+        assert!(
+            !has(src),
+            "defer await should not fire: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn no_fire_on_member_callee() {
+        // Out-of-scope: member callees.
+        let src = "fn main() { let r = {} defer r.teardown() }\n";
+        assert!(
+            !has(src),
+            "member callee should not fire: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn no_fire_on_non_async_fn() {
+        let src = "fn cleanup() { }\nfn main() { defer cleanup() }\n";
+        assert!(
+            !has(src),
+            "non-async fn should not fire: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn no_fire_when_name_shadows_async_fn() {
+        // Two bindings for the same name → ambiguous → zero-FP: silent.
+        let src = "async fn teardown() { }\nfn main() { fn teardown() { } defer teardown() }\n";
+        assert!(
+            !has(src),
+            "shadowed name should not fire: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn severity_is_warning() {
+        use ascript::check::Severity;
+        let src = "async fn teardown() { }\nfn main() { defer teardown() }\n";
+        let diag = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "defer-async-call")
+            .unwrap();
+        assert!(
+            matches!(diag.severity, Severity::Warning),
+            "severity should be Warning, got {:?}",
+            diag.severity
+        );
+    }
+
+    #[test]
+    fn message_is_verbatim() {
+        let src = "async fn teardown() { }\nfn main() { defer teardown() }\n";
+        let diag = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "defer-async-call")
+            .unwrap();
+        assert_eq!(
+            diag.message,
+            "deferred call to async fn 'teardown' will panic at runtime — use 'defer await teardown(…)'"
+        );
+    }
+
+    #[test]
+    fn suppression_via_toml_allow() {
+        use std::fs;
+        let dir = std::env::temp_dir().join("ascript_defer_async_call_toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("asyncdefer.as");
+        fs::write(
+            &f,
+            "async fn teardown() { }\nfn main() { defer teardown() }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("ascript.toml"),
+            "[lint]\nallow = [\"defer-async-call\"]\n",
+        )
+        .unwrap();
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "toml allow must suppress defer-async-call; out: {combined}"
+        );
+        assert!(
+            !combined.contains("defer-async-call"),
+            "toml allow must drop the diagnostic; out: {combined}"
+        );
+    }
+}

@@ -178,6 +178,27 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let target = (after as i64 + disp as i64) as usize;
             let _ = write!(line, "{param:>5} {disp} ; arg {param} present -> {target:04}");
         }
+        // DEFER §5.2: u8 flags + u8 argc (2 bytes total operand).
+        Op::DeferPush => {
+            let flags = chunk.read_u8(at + 1);
+            let argc = chunk.read_u8(at + 2);
+            let awaited = if (flags & 1) != 0 { " await" } else { "" };
+            let spread = if (flags & 2) != 0 { " ...spread" } else { "" };
+            let _ = write!(line, "{flags:>5} {argc} ;{awaited}{spread} argc={argc}");
+        }
+        // DEFER §5.2: u16 name_idx + u8 flags + u8 argc (4 bytes total operand).
+        Op::DeferPushMethod => {
+            let name_idx = chunk.read_u16(at + 1);
+            let flags = chunk.read_u8(at + 3);
+            let argc = chunk.read_u8(at + 4);
+            let awaited = if (flags & 1) != 0 { " await" } else { "" };
+            let spread = if (flags & 2) != 0 { " ...spread" } else { "" };
+            let _ = write!(
+                line,
+                "{name_idx:>5} {flags} {argc} ; .{}({argc} args){awaited}{spread}",
+                const_repr(chunk, name_idx)
+            );
+        }
         // Other u16-operand ops: just show the operand (no special comment).
         _ if width == 2 => {
             let idx = chunk.read_u16(at + 1);
@@ -331,6 +352,8 @@ fn op_name(op: Op) -> &'static str {
         AppendPosArg => "APPEND_POS_ARG",
         AppendSpreadArg => "APPEND_SPREAD_ARG",
         CallNamedSpread => "CALL_NAMED_SPREAD",
+        DeferPush => "DEFER_PUSH",
+        DeferPushMethod => "DEFER_PUSH_METHOD",
         Break => "BREAK",
     }
 }

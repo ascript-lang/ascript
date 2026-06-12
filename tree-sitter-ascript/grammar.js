@@ -127,6 +127,14 @@ module.exports = grammar({
     // both live (GLR) so the return binds the union (matching the legacy parser's
     // `parse_type`, where `->` is followed by a full `parse_type` incl. unions).
     [$._type, $.union_type],
+    // DEFER §2.4: after `defer call_expression`, a `[` is ambiguous between an
+    // index-expression extending the call into a longer postfix chain OR the
+    // next statement starting (an `[`-led array literal / destructuring). GLR
+    // keeps both alive; the hand parsers both stop the defer operand at the
+    // first token that can't extend a call, so the `defer_statement` reduction
+    // wins whenever the `[` is not a valid index continuation. Same pattern as
+    // the propagate/unwrap vs expression splits above.
+    [$.defer_statement, $._postfix_expression],
   ],
 
   rules: {
@@ -183,6 +191,7 @@ module.exports = grammar({
       $.return_statement,
       $.break_statement,
       $.continue_statement,
+      $.defer_statement,
       $.block,
       $.expression_statement,
     ),
@@ -404,6 +413,17 @@ module.exports = grammar({
       field('iterable', $._expression),
       ')',
       field('body', $.block),
+    ),
+
+    // `defer [await] <call>` — run a call when the enclosing function exits (DEFER §2.1).
+    // `defer` is a RESERVED keyword (keyword extraction via `word: $ => $.identifier`).
+    // Only a `call_expression` is accepted as the operand — call-only, enforced at parse
+    // time. `optional('await')` covers `defer await teardown()` (§3.4).
+    defer_statement: $ => seq(
+      'defer',
+      optional('await'),
+      field('call', $.call_expression),
+      optional(';'),
     ),
 
     return_statement: $ => prec.right(seq(

@@ -2,7 +2,7 @@ SourceFile = Stmt*
 Stmt =
     LetStmt | ExprStmt | Block | IfStmt | WhileStmt | ReturnStmt | FnDecl
   | ForStmt | BreakStmt | ContinueStmt | EnumDecl | ClassDecl | InterfaceDecl
-  | ImportStmt | ExportStmt
+  | ImportStmt | ExportStmt | DeferStmt
 LetStmt = ('let' | 'const') 'ident' ('=' Expr)?
 ExprStmt = Expr
 Block = '{' Stmt* '}'
@@ -87,3 +87,4 @@ UnionType = Type '|' Type
 TupleType = '[' Type* ']'
 ParamType = 'ident'
 FnType = 'fn' '(' Type* ')' '->' Type
+DeferStmt = 'defer' 'await'? call:Expr

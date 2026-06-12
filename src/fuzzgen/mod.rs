@@ -131,6 +131,9 @@ struct Scope {
 struct FnSig {
     name: String,
     arity: usize,
+    /// True if the fn prints its first argument — used as a `defer` target so the
+    /// differential bites on LIFO drain ORDER (a wrong drain order → divergent stdout).
+    prints_arg: bool,
 }
 
 /// A declared class: its name, the number of positional `init` params (so construction
@@ -292,6 +295,14 @@ impl<'a, 'b> Gen<'a, 'b> {
         for _ in 0..n_enums {
             self.enum_decl();
         }
+        // FUZZ DEFER — emit 1..2 "print-fn" helpers that print their single int arg.
+        // These serve as `defer` targets where the differential bites on LIFO drain ORDER
+        // (a wrong drain order → divergent stdout). Declared before the general fns so they
+        // are in scope for every subsequent defer emission.
+        let n_print_fns = 1 + self.choice(2); // 1..2 print fns
+        for _ in 0..n_print_fns {
+            self.print_fn_decl();
+        }
         // A handful of top-level functions first (so later code can call them).
         let n_fns = self.choice(3); // 0..3
         for _ in 0..n_fns {
@@ -339,7 +350,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
         // Register AFTER the body so a fn cannot (yet) call itself — keeps recursion
         // bounded by construction (no unbounded self-recursion in generated programs).
-        self.fns.push(FnSig { name, arity });
+        self.fns.push(FnSig { name, arity, prints_arg: false });
     }
 
     /// FUZZ Unit 2 — emit a top-level class declaration. The class has one required int
@@ -460,7 +471,9 @@ impl<'a, 'b> Gen<'a, 'b> {
         }
         // Weighted choice over statement kinds. Assignment/break/continue/return are
         // gated on legality; we re-roll to a safe default when illegal.
-        let pick = self.choice(13);
+        // Choices 13..15 are the DEFER axis (Gate 15): a modest weight (~3/16) so other
+        // statements still dominate and the generator explores a broad surface.
+        let pick = self.choice(16);
         match pick {
             0 | 1 => self.let_stmt(depth),
             2 => self.const_stmt(depth),
@@ -473,6 +486,14 @@ impl<'a, 'b> Gen<'a, 'b> {
             9 if self.in_fn => self.propagate_stmt(depth), // `?` inside a fn body
             10 => self.closure_capture_stmt(depth),
             11 => self.loop_closure_stmt(depth),
+            // DEFER axis — three shapes covering §3.3's matrix:
+            //   13: plain `defer <print_fn>(arg)` — drain ORDER is observable
+            //   14: defer arrow-IIFE touching a mutable local (capture-by-value)
+            //   15: `defer await <print_fn>(arg)` — the §3.4 await form (await on a
+            //       sync fn is identity, so this stays deterministic)
+            13 => self.defer_stmt(depth),
+            14 => self.defer_iife_stmt(depth),
+            15 => self.defer_await_stmt(depth),
             _ => self.print_stmt(depth),
         }
     }
@@ -589,6 +610,114 @@ impl<'a, 'b> Gen<'a, 'b> {
         for idx in 0..k {
             self.indent(depth);
             let _ = writeln!(self.out, "print({bag}[{idx}]())");
+        }
+    }
+
+    // ---- DEFER axis (Gate 15, FUZZ §8.3) ----------------------------------------
+    //
+    // Three emission shapes covering §3.3's frame-exit matrix:
+    //   1. `defer <print_fn>(arg)` — normal return path; LIFO drain order is
+    //      observable in stdout → the differential catches any wrong-order drain.
+    //   2. `defer (() => { let t = mut_local; print(t) })()` — arrow-IIFE that
+    //      reads a mutable local (capture-by-value interplay, §3.1 subtlety).
+    //   3. `defer await <print_fn>(arg)` — the §3.4 `await` form applied to a SYNC
+    //      fn; `await` on a non-future is identity, so output stays deterministic.
+    //
+    // Defers in loop bodies, nested fn bodies, and propagating bodies arise
+    // NATURALLY: `defer_stmt` / `defer_iife_stmt` / `defer_await_stmt` are called
+    // from `stmt()`, which is already called inside `for_stmt`, `while_stmt`,
+    // `fn_decl`, and `propagate_stmt`'s host fn — no extra loop/fn wrapping needed.
+    //
+    // All three helpers emit valid AScript regardless of whether `print_fns()` is
+    // empty (they fall back to a plain `print(int_atom())` defer, which still
+    // pushes/drains one entry and increments both counters).
+
+    /// Return the subset of declared fns that print their single arg.
+    fn print_fns(&self) -> Vec<FnSig> {
+        self.fns
+            .iter()
+            .filter(|f| f.prints_arg)
+            .cloned()
+            .collect()
+    }
+
+    /// Emit a top-level 1-arg fn that prints its arg and returns it. Registered with
+    /// `prints_arg: true` so `defer_stmt` / `defer_await_stmt` can target it — the
+    /// observable `print` makes the differential catch a wrong LIFO drain order.
+    fn print_fn_decl(&mut self) {
+        let name = self.fresh("pf");
+        let param = self.fresh("x");
+        let _ = writeln!(self.out, "fn {name}({param}) {{");
+        let _ = writeln!(self.out, "    print({param})");
+        let _ = writeln!(self.out, "    return {param}");
+        self.out.push_str("}\n");
+        self.fns.push(FnSig {
+            name,
+            arity: 1,
+            prints_arg: true,
+        });
+    }
+
+    /// DEFER shape 1 — `defer <print_fn>(arg)`: a plain deferred call to a print fn.
+    /// Emits 1..3 defers so the LIFO drain order (last-registered runs first) produces
+    /// a visible stdout sequence that the differential can catch if wrong.
+    fn defer_stmt(&mut self, depth: u32) {
+        let pfs = self.print_fns();
+        let n = 1 + self.choice(3); // 1..3 defers
+        for i in 0..n {
+            self.indent(depth);
+            if let Some(pf) = pfs.first() {
+                // Use the first print fn; vary the arg by iteration so each print line
+                // is distinct (LIFO order has observable content, not just count).
+                let arg = self.int_atom();
+                // Mix in the iteration index to make args distinct across the n defers
+                // even when int_atom returns the same literal.
+                if i == 0 {
+                    let _ = writeln!(self.out, "defer {}({arg})", pf.name);
+                } else {
+                    let _ = writeln!(self.out, "defer {}({i} + {arg})", pf.name);
+                }
+            } else {
+                // No print fn yet (very early in program) — emit a plain print defer.
+                let e = self.int_atom();
+                let _ = writeln!(self.out, "defer print({e})");
+            }
+        }
+    }
+
+    /// DEFER shape 2 — `defer (() => { let t = <local>; print(t) })()`: an arrow-IIFE
+    /// that reads a mutable local through the capture (exercises capture-by-value
+    /// inside a deferred IIFE body, §3.1 capture timing). The local is read at IIFE
+    /// construction time (the arrow captures the binding value then), so the value
+    /// observed at drain time reflects the local's value at defer-statement time — not
+    /// at drain time. This is the by-value capture subtlety the generator already
+    /// exercises for closures; `defer` adds the "runs at frame exit" dimension.
+    fn defer_iife_stmt(&mut self, depth: u32) {
+        self.indent(depth);
+        let e = self.int_atom();
+        // The IIFE captures `e` by value (e is an expression, not a binding, so the
+        // IIFE body uses a fresh local `t` to hold it — making the capture explicit
+        // and exercising the let-in-arrow-body path).
+        let _ = writeln!(self.out, "defer (() => {{ let t = {e}; print(t) }})()");
+    }
+
+    /// DEFER shape 3 — `defer await <print_fn>(arg)`: the §3.4 first-class `await`
+    /// form. Targets a sync print fn; `await` on a non-future is identity (the
+    /// language-wide rule), so the program stays deterministic. This exercises the
+    /// `awaited` flag in the defer entry and the `DeferKind::Call { awaited: true }`
+    /// drain path without requiring a real async fn (which would introduce
+    /// nondeterministic scheduling, violating spec §6).
+    fn defer_await_stmt(&mut self, depth: u32) {
+        self.indent(depth);
+        let pfs = self.print_fns();
+        if let Some(pf) = pfs.first() {
+            let arg = self.int_atom();
+            let _ = writeln!(self.out, "defer await {}({arg})", pf.name);
+        } else {
+            // Fallback: `defer await print(e)` — `print` is a builtin, non-async;
+            // `await print(v)` is identity. Still exercises the `await` defer path.
+            let e = self.int_atom();
+            let _ = writeln!(self.out, "defer await print({e})");
         }
     }
 

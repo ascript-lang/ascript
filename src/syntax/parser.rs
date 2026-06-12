@@ -300,6 +300,7 @@ fn stmt(p: &mut Parser) {
         EnumKw => enum_decl(p),
         ClassKw => class_decl(p),
         InterfaceKw => interface_decl(p),
+        DeferKw => defer_stmt(p),
         ImportKw => import_stmt(p),
         ExportKw => export_stmt(p),
         _ => expr_stmt(p),
@@ -686,6 +687,79 @@ fn return_stmt(p: &mut Parser) {
         expr(p);
     }
     p.complete(m, ReturnStmt);
+}
+
+fn defer_stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    use crate::syntax::event::Event;
+    let m = p.start();
+    p.bump(); // defer
+    // Optional statement-level `await` modifier: `defer await teardown()`.
+    // We bump it here (not part of the inner expression); the inner expr is the
+    // call itself, parsed immediately below.
+    if p.at(AwaitKw) {
+        p.bump();
+    }
+    // Parse the expression that must be a call.  `expr_returning` gives back a
+    // `CompletedMarker` whose events-list position identifies the outer node kind.
+    let cm = expr_returning(p);
+    // Retrieve the outer expression's SyntaxKind from the events array.
+    // `CompletedMarker.pos` indexes the `Start` event that was assigned the kind
+    // by `complete()`.  Content events (ArgList, NamedArg, …) appear at higher
+    // indices; the NameRef/callee that was preceded is at a lower index.
+    let outer_kind = match p.events.get(cm.pos) {
+        Some(Event::Start { kind, .. }) => *kind,
+        _ => Error,
+    };
+    if outer_kind != CallExpr {
+        p.error(
+            "defer requires a call \
+             — only a call expression can be deferred \
+             (write `defer (() => \u{2026})()` for inline cleanup)",
+        );
+    } else {
+        // The call is valid shape; check for named arguments (rejected in v1,
+        // spec §2.1).  Events from cm.pos onward form the CallExpr subtree:
+        // cm.pos is the Start{CallExpr} and its content (ArgList, NamedArg, …)
+        // follows linearly up to the matching Finish.
+        //
+        // Only the deferred call's OWN named args are a Tier-1 error — a NESTED
+        // call's named args (`defer g(mk(w: 1))`) are fine.  Depth bookkeeping:
+        // the first event is Start{CallExpr} (depth 0→1), then its Start{ArgList}
+        // (depth 1→2); a NamedArg that is a DIRECT child of that ArgList is seen
+        // at depth EXACTLY 2.  A nested call re-opens CallExpr/ArgList, so its
+        // NamedArg arrives at depth 4, 6, … — those must NOT reject.
+        let has_named = {
+            let mut depth = 0i32;
+            let mut found = false;
+            for ev in &p.events[cm.pos..] {
+                match ev {
+                    Event::Start { kind, .. } => {
+                        if depth == 2 && *kind == NamedArg {
+                            found = true;
+                            break;
+                        }
+                        depth += 1;
+                    }
+                    Event::Finish => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found
+        };
+        if has_named {
+            p.error(
+                "defer does not support named-argument calls \
+                 — bind the value first or use an arrow",
+            );
+        }
+    }
+    p.complete(m, DeferStmt);
 }
 
 fn fn_decl(p: &mut Parser) {
