@@ -3582,6 +3582,9 @@ impl Interp {
                 // `.await` follows; the borrow is short-lived and dropped before return.
                 if let Some(list) = env.defer_scope() {
                     list.borrow_mut().push(entry);
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    crate::vm::defer_metrics::defer_metrics::ENTRIES_PUSHED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // If no defer list is installed (a bare env with no driver), the entry
                 // is silently dropped. In practice run_body / the program/module/REPL
@@ -5476,8 +5479,16 @@ impl Interp {
         entries: Vec<DeferEntry>,
         outcome: &mut Result<Value, Control>,
     ) {
+        #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+        if !entries.is_empty() {
+            crate::vm::defer_metrics::defer_metrics::CHOKEPOINT_DRAINS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // LIFO: entries were pushed in declaration order; drain in reverse.
         for entry in entries.into_iter().rev() {
+            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+            crate::vm::defer_metrics::defer_metrics::ENTRIES_DRAINED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.exec_defer_entry(entry).await {
                 Ok(()) => {}
                 Err(Control::Exit(code)) => {

@@ -3411,6 +3411,9 @@ impl Vm {
                         awaited,
                         span,
                     });
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    crate::vm::defer_metrics::defer_metrics::ENTRIES_PUSHED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // DEFER §5.2: method-call variant. Captures receiver + method name +
@@ -3493,6 +3496,9 @@ impl Vm {
                         awaited,
                         span,
                     });
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    crate::vm::defer_metrics::defer_metrics::ENTRIES_PUSHED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 Op::Return => {
@@ -4699,8 +4705,16 @@ impl Vm {
         outcome: &mut Result<Value, crate::interp::Control>,
     ) {
         use crate::interp::{merge_defer_panic, Control};
+        #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+        if !entries.is_empty() {
+            crate::vm::defer_metrics::defer_metrics::CHOKEPOINT_DRAINS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // LIFO: entries were pushed in declaration order; drain in reverse.
         for entry in entries.into_iter().rev() {
+            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+            crate::vm::defer_metrics::defer_metrics::ENTRIES_DRAINED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.vm_exec_defer_entry(entry).await {
                 Ok(()) => {}
                 Err(Control::Exit(code)) => {

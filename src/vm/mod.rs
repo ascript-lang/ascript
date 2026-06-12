@@ -7,6 +7,7 @@
 pub mod adapt;
 pub mod archive;
 pub mod aso;
+pub mod defer_metrics;
 pub(crate) mod bcanalysis;
 pub mod chunk;
 pub mod coverage_report;
