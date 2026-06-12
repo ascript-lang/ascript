@@ -382,24 +382,24 @@ defer_await_cancelled_mid_drain: cancellation while a deferred await is suspende
 
 **Files:** `examples/defer.as`, `examples/advanced/defer_resources.as`
 
-- [ ] **Step 1:** `examples/defer.as` — intro, printing deterministically: basic close pattern, LIFO, args-at-statement timing, `?`-interplay (a propagating fn whose defers run), `defer await` of an async cleanup, the function-scoped rule, and the loop-accumulation demo structured to keep Gate 5 at zero (wrapper fn per spec discussion — decide here, record in the file's comments).
-- [ ] **Step 2:** `examples/advanced/defer_resources.as` — production-shaped, fully error-handled: multi-resource acquire-with-defer (real `std/fs` temp files so it runs everywhere), panic-unwind observed through `recover` including the §3.6 suppressed-note message, the generator-owner pattern (§4.3), `exit`-free, deterministic output → joins the corpus (NOT in `EXAMPLE_SKIPS`).
-- [ ] **Step 3:** Verify four ways: `target/release/ascript run`, `run --tree-walker`, generic (via differential), `build` + `run .aso`; `ascript fmt` idempotent; `ascript check` clean (Gate 5).
-- [ ] **Step 4: Commit** — `examples(defer): intro + production-shaped resource cleanup corpus`.
+- [x] **Step 1:** `examples/defer.as` — intro, printing deterministically: basic close pattern, LIFO, args-at-statement timing, `?`-interplay (a propagating fn whose defers run), `defer await` of an async cleanup, the function-scoped rule, and the loop-accumulation demo structured to keep Gate 5 at zero (wrapper fn per spec discussion — decide here, record in the file's comments).
+- [x] **Step 2:** `examples/advanced/defer_resources.as` — production-shaped, fully error-handled: multi-resource acquire-with-defer (real `std/fs` temp files so it runs everywhere), panic-unwind observed through `recover` including the §3.6 suppressed-note message, the generator-owner pattern (§4.3), `exit`-free, deterministic output → joins the corpus (NOT in `EXAMPLE_SKIPS`).
+- [x] **Step 3:** Verify four ways: `target/release/ascript run`, `run --tree-walker`, generic (via differential), `build` + `run .aso`; `ascript fmt` idempotent; `ascript check` clean (Gate 5).
+- [x] **Step 4: Commit** — `examples(defer): intro + production-shaped resource cleanup corpus`.
 
 ### Task 5.2: docs + CLAUDE.md + LSPEC note
 
 **Files:** `docs/content/language/{errors,syntax,modules-async}.md`, `CLAUDE.md`, `superpowers/roadmap.md`, `superpowers/specs/2026-06-12-language-spec-stability-design.md` (inventory note)
 
-- [ ] **Step 1:** Write per spec §10: errors.md primary section ("Cleanup with `defer`": form, call-only, timing, LIFO, the frame-exit matrix table, merge rules in user terms, `defer await` + the bare-future error, the cancellation/`gen.close()`/`exit()` non-runs stated LOUDLY with the native-`Drop` guidance); syntax.md statement-list line + link; modules-async.md async/generator/cancellation rules. No new page → no `NAV` change. Serve the site and sanity-check rendering + in-content links.
-- [ ] **Step 2:** `CLAUDE.md` gotcha bullet (spec §10 contents); roadmap entry; goal-perf status at merge; one-line LSPEC coordination note (the semantics chapter must absorb §3's matrix).
-- [ ] **Step 3: Commit** — `docs(defer): errors-page section, async rules, CLAUDE.md, LSPEC note`.
+- [x] **Step 1:** Write per spec §10: errors.md primary section ("Cleanup with `defer`": form, call-only, timing, LIFO, the frame-exit matrix table, merge rules in user terms, `defer await` + the bare-future error, the cancellation/`gen.close()`/`exit()` non-runs stated LOUDLY with the native-`Drop` guidance); syntax.md statement-list line + link; modules-async.md async/generator/cancellation rules. No new page → no `NAV` change. Serve the site and sanity-check rendering + in-content links.
+- [x] **Step 2:** `CLAUDE.md` gotcha bullet (spec §10 contents); roadmap entry; goal-perf status at merge; one-line LSPEC coordination note (the semantics chapter must absorb §3's matrix).
+- [x] **Step 3: Commit** — `docs(defer): errors-page section, async rules, CLAUDE.md, LSPEC note`.
 
 ### Task 5.3: grammar publish + editor pins (merge-wave step)
 
-- [ ] **Step 1:** `./scripts/sync-grammar.sh` (subtree-split + mirror push; prints the new SHA). If sandbox-gated, note that CI `mirror-grammar.yml` publishes deterministically on origin push (the ADT precedent) — but the PIN BUMP is manual either way.
-- [ ] **Step 2:** Bump `editors/zed/extension.toml` (`commit`) and `editors/nvim/lua/ascript/treesitter.lua` (`revision`) to the split SHA. One publish per merge wave — coordinate if another grammar-touching branch is in flight (none expected; DEFER is the campaign's only grammar change).
-- [ ] **Step 3: Commit** — `chore(grammar): publish tree-sitter mirror + bump zed/nvim pins`.
+- [x] **Step 1:** `./scripts/sync-grammar.sh` (subtree-split + mirror push; prints the new SHA). If sandbox-gated, note that CI `mirror-grammar.yml` publishes deterministically on origin push (the ADT precedent) — but the PIN BUMP is manual either way.
+- [x] **Step 2:** Bump `editors/zed/extension.toml` (`commit`) and `editors/nvim/lua/ascript/treesitter.lua` (`revision`) to the split SHA. One publish per merge wave — coordinate if another grammar-touching branch is in flight (none expected; DEFER is the campaign's only grammar change).
+- [x] **Step 3: Commit** — `chore(grammar): publish tree-sitter mirror + bump zed/nvim pins`.
 
 ---
 
