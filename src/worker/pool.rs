@@ -137,6 +137,14 @@ impl Pool {
         // (bytes-carrying) request is processed before any later (cleared) one reaches the
         // isolate, so this slot-state mirrors its cache. Inline degradation can never be
         // stranded: `dispatch` returns `Err(req)` (full bytes) BEFORE any `send_to`.
+        //
+        // ASSUMPTION (load-bearing): the mirror flips on SHIP, not on install-SUCCESS. This is
+        // sound only because the shipped bytes are deterministic, already-verified compiler
+        // output of THIS process — `archive.encode()` (its `decode` inverse cannot fail on own
+        // output) and a verified `.aso` slice fragment — so the isolate's first-request install
+        // cannot fail. If a future change makes the first install/load FALLIBLE (e.g. a slice
+        // top-level that acquires a resource), this must flip the mirror only on a success ack
+        // instead, or calls 2..N would arrive bytes-cleared and panic instead of re-shipping.
         if slot.archive_loaded {
             req.archive_bytes = None;
         } else if req.archive_bytes.is_some() {
