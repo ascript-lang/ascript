@@ -342,37 +342,37 @@ defer_await_cancelled_mid_drain: cancellation while a deferred await is suspende
 
 **Files:** `src/check/rules/{defer_in_loop,defer_async_call}.rs`, `src/check/rules/mod.rs`, `tests/check.rs`
 
-- [ ] **Step 1: Failing tests:** `defer-in-loop` fires inside `while`/`for` (incl. for-range/for-of/for-await), does NOT fire for a defer inside a nested `fn`/arrow within the loop, does not fire outside loops; `defer-async-call` fires on bare `defer asyncDecl()` (same-file `async fn` decl), does NOT fire on `defer await asyncDecl()`, member callees, imported names, or dynamic callees; both Warning; both suppressible via `ascript.toml [lint]`; **Gate 5:** zero hits on `examples/**` in both configs after Phase 5's examples land (the intro example structures its loop demo inside a wrapper fn or carries the documented suppression — decide in Task 5.1, never weaken the gate).
-- [ ] **Step 2:** Implement (the `range_step.rs` walking idiom; messages verbatim from spec §6.1/§6.2); register both in `ALL` (`rules/mod.rs:31`); add the lint docs lines wherever lints are enumerated (check `docs/content` lint listing and `src/check/config.rs` name registry — follow the `range-step` registration trail end-to-end).
-- [ ] **Step 3:** Green both configs; **Commit** — `feat(check): defer-in-loop + defer-async-call lints (Warning)`.
+- [x] **Step 1: Failing tests:** `defer-in-loop` fires inside `while`/`for` (incl. for-range/for-of/for-await), does NOT fire for a defer inside a nested `fn`/arrow within the loop, does not fire outside loops; `defer-async-call` fires on bare `defer asyncDecl()` (same-file `async fn` decl), does NOT fire on `defer await asyncDecl()`, member callees, imported names, or dynamic callees; both Warning; both suppressible via `ascript.toml [lint]`; **Gate 5:** zero hits on `examples/**` in both configs after Phase 5's examples land (the intro example structures its loop demo inside a wrapper fn or carries the documented suppression — decide in Task 5.1, never weaken the gate).
+- [x] **Step 2:** Implement (the `range_step.rs` walking idiom; messages verbatim from spec §6.1/§6.2); register both in `ALL` (`rules/mod.rs:31`); add the lint docs lines wherever lints are enumerated (check `docs/content` lint listing and `src/check/config.rs` name registry — follow the `range-step` registration trail end-to-end).
+- [x] **Step 3:** Green both configs; **Commit** — `feat(check): defer-in-loop + defer-async-call lints (Warning)`.
 
 ### Task 4.2: formatter (CST + legacy) + idempotence
 
 **Files:** `src/syntax/format/mod.rs`, `src/fmt.rs` (arm landed in 1.1 — verify), `tests` (fmt suites)
 
-- [ ] **Step 1: Failing tests:** `fmt` canonicalizes `defer   f( 1,2 )` → `defer f(1, 2)`; `defer  await  f()` → `defer await f()`; idempotent on both examples (Task 5.1) and on a comment-attached defer (`// note` above a defer survives — the IFACE comment-attachment lesson: test leading comments explicitly).
-- [ ] **Step 2:** Implement the `DeferStmt` arm in `src/syntax/format/mod.rs` (beside `ReturnStmt:166`): `defer` + space + optional `await` + space + the expression renderer. Run the formatter over the whole `examples/**` corpus — zero diffs on non-defer files.
-- [ ] **Step 3:** Green; **Commit** — `feat(fmt): canonical defer rendering (CST formatter) + idempotence`.
+- [x] **Step 1: Failing tests:** `fmt` canonicalizes `defer   f( 1,2 )` → `defer f(1, 2)`; `defer  await  f()` → `defer await f()`; idempotent on both examples (Task 5.1) and on a comment-attached defer (`// note` above a defer survives — the IFACE comment-attachment lesson: test leading comments explicitly).
+- [x] **Step 2:** Implement the `DeferStmt` arm in `src/syntax/format/mod.rs` (beside `ReturnStmt:166`): `defer` + space + optional `await` + space + the expression renderer. Run the formatter over the whole `examples/**` corpus — zero diffs on non-defer files.
+- [x] **Step 3:** Green; **Commit** — `feat(fmt): canonical defer rendering (CST formatter) + idempotence`.
 
 ### Task 4.3: LSP + REPL
 
 **Files:** `src/lsp/providers/{completion,semantic_tokens}.rs`, LSP/REPL tests
 
-- [ ] **Step 1: Failing tests:** completion offers `defer` keyword + the snippet in statement position; semantic tokens classify the `defer` keyword token as keyword (provider test on a defer-containing file — it is a real reserved token, so this pins the default classification rather than adding a remap, spec §7); REPL session test: top-level defer runs at submission end; a REPL-defined fn with a defer behaves on a later line.
-- [ ] **Step 2:** Implement: `"defer"` in the keyword list (`completion.rs:28`) + snippet (`completion.rs:174` table). Check `editors/vscode` for a TextMate keyword enumeration — update if present (record either way in the commit body).
-- [ ] **Step 3:** Green; **Commit** — `feat(lsp,repl): defer keyword completion/snippet + semantic token + REPL pins`.
+- [x] **Step 1: Failing tests:** completion offers `defer` keyword + the snippet in statement position; semantic tokens classify the `defer` keyword token as keyword (provider test on a defer-containing file — it is a real reserved token, so this pins the default classification rather than adding a remap, spec §7); REPL session test: top-level defer runs at submission end; a REPL-defined fn with a defer behaves on a later line.
+- [x] **Step 2:** Implement: `"defer"` in the keyword list (`completion.rs:28`) + snippet (`completion.rs:174` table). Check `editors/vscode` for a TextMate keyword enumeration — update if present (record either way in the commit body).
+- [x] **Step 3:** Green; **Commit** — `feat(lsp,repl): defer keyword completion/snippet + semantic token + REPL pins`.
 
 ### Task 4.4: fuzzer axis (Gate 15, same PR)
 
 **Files:** `src/fuzzgen/mod.rs`, `tests/property.rs` (if the seed-battery lives there)
 
-- [ ] **Step 1:** Teach `stmt()` to emit, weighted: bare `defer declared_fn(args…)` (printing fns so order bites), `defer (() => …)()` touching a mutable local, defer inside generated loops and nested fns, `defer await generated_async_fn()`, and defers in bodies that `?`-propagate via `rerr`. Keep generated programs deterministic (no clock/rng — the standing fuzzgen rule).
-- [ ] **Step 2:** Extend the multi-seed differential stress test; assert via the Task-3.4 counters that a 200-seed batch pushes AND drains defers (anti-false-green). Smoke campaign if cargo-fuzz available: `cargo +nightly fuzz run differential -- -runs=50000` → zero divergences.
-- [ ] **Step 3:** Green; **Commit** — `test(fuzz): defer axis in the grammar-aware generator + coverage assertion`.
+- [x] **Step 1:** Teach `stmt()` to emit, weighted: bare `defer declared_fn(args…)` (printing fns so order bites), `defer (() => …)()` touching a mutable local, defer inside generated loops and nested fns, `defer await generated_async_fn()`, and defers in bodies that `?`-propagate via `rerr`. Keep generated programs deterministic (no clock/rng — the standing fuzzgen rule).
+- [x] **Step 2:** Extend the multi-seed differential stress test; assert via the Task-3.4 counters that a 200-seed batch pushes AND drains defers (anti-false-green). Smoke campaign if cargo-fuzz available: `cargo +nightly fuzz run differential -- -runs=50000` → zero divergences.
+- [x] **Step 3:** Green; **Commit** — `test(fuzz): defer axis in the grammar-aware generator + coverage assertion`.
 
 ### Task 4.5: Phase 4 holistic review
 
-- [ ] **Step 1:** Holistic subagent: Gate 11 evidence per tool (conformance tests, fmt idempotence run, LSP provider tests, REPL session test — run them, paste outputs); lints registered exactly once; fuzzgen inspection of 20 generated programs shows defers in varied positions; both configs green + clippy clean.
+- [x] **Step 1:** Holistic subagent: Gate 11 evidence per tool (conformance tests, fmt idempotence run, LSP provider tests, REPL session test — run them, paste outputs); lints registered exactly once; fuzzgen inspection of 20 generated programs shows defers in varied positions; both configs green + clippy clean.
 
 ---
 
