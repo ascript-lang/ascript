@@ -20,6 +20,7 @@
 
 use super::isolate::{Isolate, WorkerRequest};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 thread_local! {
@@ -28,10 +29,22 @@ thread_local! {
 }
 
 /// A live isolate plus its caller-side in-flight job counter (for least-loaded
-/// scheduling and idle detection).
+/// scheduling and idle detection) and a MIRROR of the isolate's own code cache.
+///
+/// The mirror (`loaded_fns` / `archive_loaded`) lets the pool ship each `worker fn`'s
+/// slice bytes AND the bundled module archive AT MOST ONCE per isolate: the isolate
+/// already dedups (it installs the archive once via `archive_installed` and caches each
+/// slice by `fn_id` in its `loaded` set, ignoring re-sent bytes), so this slot-state is a
+/// pure mirror of that cache. FIFO on the isolate's `Send` mpsc guarantees the FIRST
+/// (bytes-carrying) request to a slot is processed — populating the isolate's cache —
+/// before any LATER (cleared) request on the same channel reaches it.
 struct Slot {
     isolate: Isolate,
     inflight: Rc<Cell<usize>>,
+    /// `fn_id`s whose slice bytes this isolate has been shipped (and thus cached).
+    loaded_fns: HashSet<u64>,
+    /// Whether this isolate has been shipped (and thus installed) the module archive.
+    archive_loaded: bool,
 }
 
 /// The isolate pool. Caller-thread-owned (`!Send`); isolates run on their own threads.
@@ -72,20 +85,29 @@ impl Pool {
     /// degradation path for no benefit.
     #[allow(clippy::result_large_err)]
     fn dispatch(&mut self, req: WorkerRequest) -> Result<Rc<Cell<usize>>, WorkerRequest> {
+        // INDEX-based slot selection (not `&Slot` references): `send_to` needs `&mut Slot`
+        // to update the per-isolate cache mirror, so each branch resolves a slot INDEX and
+        // then borrows it mutably once. The policy is unchanged: idle → grow → least-loaded
+        // → inline-degradation (`Err`). The inline-degradation `Err` returns BEFORE any
+        // `send_to`, so the handed-back request is UNTOUCHED (full bytes) — inline always
+        // has the bytes it needs.
+
         // 1. An idle isolate?
-        if let Some(slot) = self.slots.iter().find(|s| s.inflight.get() == 0) {
-            return Ok(Self::send_to(slot, req));
+        if let Some(idx) = self.slots.iter().position(|s| s.inflight.get() == 0) {
+            return Ok(Self::send_to(&mut self.slots[idx], req));
         }
         // 2. Room to grow? Try to spawn; on failure, fall through (don't grow).
         if self.slots.len() < self.cap {
             if let Ok(isolate) = Isolate::spawn() {
-                let slot = Slot {
+                self.slots.push(Slot {
                     isolate,
                     inflight: Rc::new(Cell::new(0)),
-                };
-                self.slots.push(slot);
-                let slot = self.slots.last().unwrap();
-                return Ok(Self::send_to(slot, req));
+                    // A fresh isolate has an empty code cache — nothing loaded yet.
+                    loaded_fns: HashSet::new(),
+                    archive_loaded: false,
+                });
+                let idx = self.slots.len() - 1;
+                return Ok(Self::send_to(&mut self.slots[idx], req));
             }
             // Spawn failed: if there is at least one live isolate, queue on it
             // (step 3). If there are NONE, degrade to inline (return the request).
@@ -94,15 +116,37 @@ impl Pool {
             }
         }
         // 3. Least-loaded existing isolate (its mpsc queue provides FIFO backpressure).
-        match self.slots.iter().min_by_key(|s| s.inflight.get()) {
-            Some(slot) => Ok(Self::send_to(slot, req)),
+        match self
+            .slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.inflight.get())
+            .map(|(i, _)| i)
+        {
+            Some(idx) => Ok(Self::send_to(&mut self.slots[idx], req)),
             // No isolates at all and at/over cap with none spawnable — run inline.
             None => Err(req),
         }
     }
 
-    fn send_to(slot: &Slot, req: WorkerRequest) -> Rc<Cell<usize>> {
+    fn send_to(slot: &mut Slot, mut req: WorkerRequest) -> Rc<Cell<usize>> {
         slot.inflight.set(slot.inflight.get() + 1);
+        // OPTIMIZATION: don't re-ship code the isolate already cached. It installs the
+        // archive once (`archive_installed`) and caches each slice by `fn_id` (`loaded`);
+        // it ignores re-sent bytes. FIFO on this channel guarantees the first
+        // (bytes-carrying) request is processed before any later (cleared) one reaches the
+        // isolate, so this slot-state mirrors its cache. Inline degradation can never be
+        // stranded: `dispatch` returns `Err(req)` (full bytes) BEFORE any `send_to`.
+        if slot.archive_loaded {
+            req.archive_bytes = None;
+        } else if req.archive_bytes.is_some() {
+            slot.archive_loaded = true;
+        }
+        if slot.loaded_fns.contains(&req.fn_id) {
+            req.slice_bytes = None;
+        } else if req.slice_bytes.is_some() {
+            slot.loaded_fns.insert(req.fn_id);
+        }
         // The isolate thread is alive for the pool's lifetime; a send failure would
         // mean the isolate panicked — extremely unlikely. The bridge's reply oneshot
         // will simply never resolve in that case (the dropped sender surfaces as a
@@ -139,11 +183,79 @@ pub fn in_isolate() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::worker::isolate::{Isolate, WorkerReply, WorkerRequest};
+    use tokio::sync::{mpsc, oneshot};
+
     /// The lazy-pool proof: on a fresh thread (this test thread, which never
     /// dispatches a worker), the pool is never initialized. A program with zero
     /// `worker fn` calls therefore spawns no isolate thread.
     #[test]
     fn pool_not_initialized_until_first_dispatch() {
         assert!(!crate::worker::pool_is_initialized());
+    }
+
+    /// Build a `WorkerRequest` carrying `Some` slice + archive bytes for `fn_id`, with
+    /// throw-away reply/abort channels (this test never runs the request — it only
+    /// inspects what `send_to` shipped).
+    fn req_with_bytes(fn_id: u64) -> WorkerRequest {
+        let (reply, _reply_rx) = oneshot::channel::<WorkerReply>();
+        let (_abort_tx, abort) = oneshot::channel::<()>();
+        WorkerRequest {
+            fn_id,
+            slice_bytes: Some(vec![1, 2, 3]),
+            archive_bytes: Some(vec![4, 5, 6]),
+            class_name: None,
+            entry_name: "w".to_string(),
+            args: Vec::new(),
+            shared: Vec::new(),
+            caps: Box::new(crate::stdlib::caps::CapSet::all_granted()),
+            reply,
+            abort,
+        }
+    }
+
+    /// WHITE-BOX: `send_to` ships the slice + archive bytes ONCE per isolate and clears
+    /// them on subsequent requests, while the slot's cache mirror (`loaded_fns`,
+    /// `archive_loaded`) tracks exactly what the isolate has been shipped. We construct a
+    /// `Slot` over a channel WE own (no real isolate thread) so we can inspect each
+    /// received request directly.
+    #[test]
+    fn send_to_ships_bytes_once_per_isolate() {
+        // A channel we own, wrapped as a fake `Isolate` (the thread handle is `None` —
+        // `send_to` only touches `isolate.tx`).
+        let (tx, mut rx) = mpsc::unbounded_channel::<WorkerRequest>();
+        let mut slot = Slot {
+            isolate: Isolate { tx, thread: None },
+            inflight: Rc::new(Cell::new(0)),
+            loaded_fns: HashSet::new(),
+            archive_loaded: false,
+        };
+
+        // Before anything: the mirror is empty.
+        assert!(!slot.archive_loaded);
+        assert!(slot.loaded_fns.is_empty());
+
+        // First request for fn_id=7: carries the bytes; the mirror records them.
+        Pool::send_to(&mut slot, req_with_bytes(7));
+        assert!(slot.archive_loaded, "archive_loaded must flip true after the first ship");
+        assert!(slot.loaded_fns.contains(&7), "loaded_fns must record fn_id 7");
+        let first = rx.try_recv().expect("first request was sent");
+        assert!(first.slice_bytes.is_some(), "first request carries the slice bytes");
+        assert!(first.archive_bytes.is_some(), "first request carries the archive bytes");
+
+        // Second request for the SAME fn_id: bytes suppressed (the isolate already cached).
+        Pool::send_to(&mut slot, req_with_bytes(7));
+        let second = rx.try_recv().expect("second request was sent");
+        assert!(second.slice_bytes.is_none(), "second request drops the (cached) slice");
+        assert!(second.archive_bytes.is_none(), "second request drops the (installed) archive");
+
+        // A DIFFERENT fn_id: its slice is shipped (new to the isolate) but the archive,
+        // already installed, stays suppressed.
+        Pool::send_to(&mut slot, req_with_bytes(9));
+        assert!(slot.loaded_fns.contains(&9), "loaded_fns now also records fn_id 9");
+        let third = rx.try_recv().expect("third request was sent");
+        assert!(third.slice_bytes.is_some(), "a new fn_id still ships its slice");
+        assert!(third.archive_bytes.is_none(), "the archive stays suppressed once installed");
     }
 }

@@ -120,7 +120,10 @@ pub fn dispatch_worker(
     let archive_bytes = interp.worker_archive_bytes().map(|b| b.to_vec());
     let req = isolate::WorkerRequest {
         fn_id: slice.fn_id,
-        // Always ship the slice; the isolate caches by fn_id and ignores re-sends.
+        // Always BUILD the request with the slice bytes; the pool's `send_to` suppresses
+        // the re-send per isolate (it mirrors the isolate's `fn_id` cache and clears
+        // `slice_bytes` once an isolate has been shipped them), and the isolate itself
+        // dedups by `fn_id` and ignores any re-send as a belt-and-braces backstop.
         slice_bytes: Some(slice.entry_aso.to_vec()),
         archive_bytes,
         class_name: slice.class_name.as_deref().map(|s| s.to_string()),

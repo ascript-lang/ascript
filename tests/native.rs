@@ -92,12 +92,19 @@ fn build_native(src: &Path, out: &Path) {
 /// Run a bundle with a SCRUBBED `PATH` (no `ascript` reachable) and `cwd` set to an empty
 /// dir, forwarding `args`. The bundle must be entirely self-contained.
 fn run_bundle(bundle: &Path, cwd: &Path, args: &[&str]) -> Output {
-    Command::new(bundle)
-        .args(args)
+    run_bundle_env(bundle, cwd, args, &[])
+}
+
+/// Like [`run_bundle`] but with extra environment variables (e.g. `ASCRIPT_WORKERS`).
+fn run_bundle_env(bundle: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bundle);
+    cmd.args(args)
         .current_dir(cwd)
-        .env("PATH", "") // genuinely scrubbed — nothing to fall back to
-        .output()
-        .unwrap()
+        .env("PATH", ""); // genuinely scrubbed — nothing to fall back to
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
 }
 
 /// Reference: `ascript run <src> [args]`.
@@ -114,13 +121,17 @@ fn run_ref(src: &Path, args: &[&str]) -> Output {
 /// isolate re-runs the program's relative imports — they resolve against the cwd, so the
 /// source reference must run from the module dir to match the bundled (archive-carrying) run.
 fn run_ref_in(src: &Path, dir: &Path, args: &[&str]) -> Output {
-    Command::new(bin())
-        .arg("run")
-        .arg(src)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
+    run_ref_in_env(src, dir, args, &[])
+}
+
+/// Like [`run_ref_in`] but with extra environment variables (e.g. `ASCRIPT_WORKERS`).
+fn run_ref_in_env(src: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.arg("run").arg(src).args(args).current_dir(dir);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
 }
 
 fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -618,6 +629,80 @@ fn native_worker_imports_module_from_bundle() {
     );
     assert_eq!(b.stdout, r.stdout, "bundled worker→import stdout differs from source run");
     assert_eq!(b.stderr, r.stderr, "bundled worker→import stderr differs from source run");
+    assert_eq!(b.status.code(), r.status.code());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// WORKER POOL-CACHE OPTIMIZATION — the KEY correctness guard for shipping each worker's
+/// slice + the bundled module archive AT MOST ONCE per isolate. A pooled `worker fn` that
+/// calls into an IMPORTED module is invoked MANY times (50). Each pool isolate is reused
+/// across many of those calls (cap = num_cpus ≪ 50), so calls 2..N to a reused isolate
+/// arrive with `slice_bytes`/`archive_bytes` SUPPRESSED by the pool's per-isolate cache
+/// mirror. Every result must still be correct — proving the isolate's own cache
+/// (`archive_installed` + `loaded`) carries the imports/slice across the cleared requests.
+/// Forced bottleneck: `ASCRIPT_WORKERS=2` so 50 calls share just two reused isolates,
+/// maximizing the suppressed-bytes path. Bundled, run from an EMPTY cwd.
+#[test]
+fn native_worker_many_calls_with_suppressed_bytes() {
+    let _serial = serial_native();
+    let dir = tmp_dir("mm_worker_many_native");
+    write(
+        &dir,
+        "util.as",
+        "export fn dbl(n: number): number { return n * 2 }\n",
+    );
+    let entry = write(
+        &dir,
+        "app.as",
+        "import { dbl } from \"./util\"\n\
+         import * as task from \"std/task\"\n\
+         worker fn w(n: number): number { return dbl(n) }\n\
+         fn main() {\n\
+         \x20 let jobs = []\n\
+         \x20 for (i in 0..50) { jobs = [...jobs, w(i)] }\n\
+         \x20 let rs = await task.gather(jobs)\n\
+         \x20 print(rs)\n\
+         }\n\
+         await main()\n",
+    );
+    let app = dir.join("mm_worker_many_app");
+    build_native(&entry, &app);
+
+    // Force a SMALL pool (2 isolates) so 50 calls heavily reuse isolates — the suppressed
+    // re-send path (calls 2..N on a reused isolate) is exercised on both the reference and
+    // the bundle. Reference: `ascript run` from the module dir (imports resolve on disk).
+    let workers = [("ASCRIPT_WORKERS", "2")];
+    let r = run_ref_in_env(&entry, &dir, &[], &workers);
+    assert!(
+        r.status.success(),
+        "many-calls worker reference failed: {:?}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Run from an EMPTY dir with a scrubbed PATH — nothing on disk for the worker isolate's
+    // re-run imports. The archive must travel to (and be cached on) each isolate ONCE.
+    let empty = tmp_dir("mm_worker_many_cwd");
+    let b = run_bundle_env(&app, &empty, &[], &workers);
+    assert!(
+        b.status.success(),
+        "bundled many-calls worker failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    assert_eq!(
+        b.stdout, r.stdout,
+        "bundled many-calls worker stdout differs from source run"
+    );
+    // Spot-check the actual values: w(i) = i*2 for i in 0..50.
+    let expected: Vec<String> = (0..50).map(|i| (i * 2).to_string()).collect();
+    let out = String::from_utf8_lossy(&b.stdout);
+    assert_eq!(
+        out.trim(),
+        format!("[{}]", expected.join(", ")),
+        "every one of the 50 suppressed-bytes worker calls must return i*2"
+    );
     assert_eq!(b.status.code(), r.status.code());
 
     let _ = std::fs::remove_dir_all(&dir);
