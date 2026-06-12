@@ -8945,3 +8945,27 @@ run(false)
     // defer-in-branch bytecode — and that all four modes are byte-identical.
     assert_four_way_run(src).await;
 }
+
+// ── LANE §6.1 / §6.4 kill-switch + counter tests ────────────────────────────
+
+/// LANE §6.1: `vm_run_source_no_sync_lane` (sync_lane=false) produces byte-identical
+/// output to `vm_run_source` (sync_lane=true, the default). LANE §6.4: the lane
+/// counters read 0 before Task 4 wires up the burst driver, so no false-green
+/// assertions fire yet.
+#[tokio::test]
+async fn no_sync_lane_entry_point_runs_byte_identically() {
+    let src = "let s = 0\nfor (i in 0..100) { s = s + i }\nprint(s)";
+    let (on_out, on_exit) =
+        ascript::vm_run_source(src).await.expect("lane-on ok");
+    let (off_out, off_exit) =
+        ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    assert_eq!(on_out, off_out, "sync_lane=true vs false must be byte-identical");
+    assert_eq!(on_exit, off_exit, "exit codes must match");
+    let (_out, _exit, sync_ops, bursts) =
+        ascript::vm_run_source_lane_stats(src).await.expect("stats ok");
+    assert_eq!(
+        (sync_ops, bursts),
+        (0, 0),
+        "no driver yet — counters must read 0 before Task 4 wires the burst driver"
+    );
+}

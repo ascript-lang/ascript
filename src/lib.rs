@@ -813,6 +813,47 @@ pub async fn vm_run_source_generic(src: &str) -> Result<(String, Option<i32>), A
     vm_run_source_with(src, false).await
 }
 
+/// Like [`vm_run_source`] but with the LANE sync driver DISABLED — the
+/// `ASCRIPT_NO_SYNC_LANE=1` kill switch (LANE §6.1). Every instruction takes the
+/// async driver path regardless of whether it is in the sync subset. Observable
+/// behavior is byte-identical to [`vm_run_source`]; only throughput differs.
+///
+/// Used by the differential test (`no_sync_lane_entry_point_runs_byte_identically`)
+/// and any future lane-correctness checks. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_no_sync_lane(src: &str) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg(src, true, false, false, false).await
+}
+
+/// Like [`vm_run_source`] but also returns the LANE counters (LANE §6.4).
+///
+/// Returns `(output, exit_code, lane_sync_ops, lane_bursts)`.
+///
+/// `lane_sync_ops` = total bytecode instructions retired inside the sync lane;
+/// `lane_bursts`   = number of times the sync driver was entered.
+///
+/// Both counters are 0 until Task 4 wires up the burst driver. Once wired, the
+/// coverage assertion suite uses this to prove the lane is actually running
+/// (`sync_ops > 0` on the corpus, `≥ 1_000_000` on a tight loop). `#[doc(hidden)]`
+/// — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_lane_stats(
+    src: &str,
+) -> Result<(String, Option<i32>, u64, u64), AsError> {
+    vm_run_source_cfg_stats(src, true, false, false, true).await
+}
+
+/// Like [`vm_run_source_lane_stats`] but with `sync_lane = false` (LANE §6.4).
+///
+/// Allows the coverage assertion to check that `sync_lane == false` ⟹
+/// `lane_sync_ops == 0` even after Task 4 wires up the driver. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub async fn vm_run_source_lane_stats_no_lane(
+    src: &str,
+) -> Result<(String, Option<i32>, u64, u64), AsError> {
+    vm_run_source_cfg_stats(src, true, false, false, false).await
+}
+
 /// FUZZ `.aso` round-trip seam (`#[doc(hidden)]` test API, not a stable surface):
 /// compile `src` to a [`Chunk`], serialize it to `.aso` bytes ([`vm::Chunk::to_bytes`]),
 /// deserialize + verify them back ([`vm::Chunk::from_bytes_verified`]), then run the
@@ -2071,6 +2112,9 @@ pub async fn run_file_on_vm_with_packages(
     // byte-identical by the three-way differential, so this is a pure
     // measurement/debug seam — it changes speed, never observable behavior. Absent
     // or any non-"1" value keeps the default specialized VM (byte-identical default).
+    // LANE §6.1: `ASCRIPT_NO_SYNC_LANE=1` suppresses the sync-lane driver on the
+    // CLI path (worker isolates inherit this at construction via Vm::with_specialize
+    // → with_lanes reading the same env). Speed-only, never observable behavior.
     let specialize = std::env::var("ASCRIPT_NO_SPECIALIZE").as_deref() != Ok("1");
     let vm = Vm::with_specialize(interp.clone(), specialize);
     // Resolve relative imports against the source file's directory.
@@ -2245,8 +2289,12 @@ pub async fn run_file_on_vm_profiled(
 /// [`vm_run_source_generic`] (specialize = false). `specialize` is the kill-switch
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
 /// `specialize = false` here.
+/// LANE §6.1: `sync_lane` defaults `true` here (env is read inside
+/// `Vm::with_specialize`); the explicit test helpers use `vm_run_source_cfg` directly.
 async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Option<i32>), AsError> {
-    vm_run_source_cfg(src, specialize, false, false).await
+    // sync_lane = true here: the env-read default inside with_specialize applies;
+    // we pass it explicitly so vm_run_source_cfg doesn't re-read the env.
+    vm_run_source_cfg(src, specialize, false, false, true).await
 }
 
 /// DBG Task 9 (zero-cost bench): run `src` on the SPECIALIZED VM with an EMPTY
@@ -2258,7 +2306,7 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
 /// noise of [`vm_run_source`] (`instrument == None`). `#[doc(hidden)]` test API.
 #[doc(hidden)]
 pub async fn vm_run_source_armed_idle(src: &str) -> Result<(String, Option<i32>), AsError> {
-    vm_run_source_cfg(src, true, true, false).await
+    vm_run_source_cfg(src, true, true, false, true).await
 }
 
 /// DX D2 Task 7 (coverage zero-cost bench): run `src` on the SPECIALIZED VM with LINE
@@ -2271,15 +2319,38 @@ pub async fn vm_run_source_armed_idle(src: &str) -> Result<(String, Option<i32>)
 /// `None`-gated and the hot loop is untouched.) `#[doc(hidden)]` test API.
 #[doc(hidden)]
 pub async fn vm_run_source_coverage(src: &str) -> Result<(String, Option<i32>), AsError> {
-    vm_run_source_cfg(src, true, false, true).await
+    vm_run_source_cfg(src, true, false, true, true).await
 }
 
+/// Shared VM-run body. Parameters:
+/// - `specialize`: V11-T5 kill switch — when `false`, all IC/adaptive fast paths skipped.
+/// - `armed`:      DBG zero-cost bench — attach an empty instrumentation payload.
+/// - `coverage`:   DX D2 Task 7 — arm line coverage (patches breakpoints).
+/// - `sync_lane`:  LANE §6.1 kill switch — when `false`, sync-lane driver is suppressed.
+///   NOTE: `armed`/`coverage` force the instrumentation path which uses
+///   `Vm::with_instrument` (always specialize=true, sync_lane from env). When
+///   `armed` or `coverage` is true, `sync_lane` is irrelevant (instrument path).
 async fn vm_run_source_cfg(
     src: &str,
     specialize: bool,
     armed: bool,
     coverage: bool,
+    sync_lane: bool,
 ) -> Result<(String, Option<i32>), AsError> {
+    let (output, exit, _, _) =
+        vm_run_source_cfg_stats(src, specialize, armed, coverage, sync_lane).await?;
+    Ok((output, exit))
+}
+
+/// Like [`vm_run_source_cfg`] but also returns the LANE counters (LANE §6.4):
+/// `(output, exit_code, lane_sync_ops, lane_bursts)`.
+async fn vm_run_source_cfg_stats(
+    src: &str,
+    specialize: bool,
+    armed: bool,
+    coverage: bool,
+    sync_lane: bool,
+) -> Result<(String, Option<i32>, u64, u64), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
@@ -2312,7 +2383,10 @@ async fn vm_run_source_cfg(
     // The instrumentation config (DBG Task 9 / DX D2 Task 7 — the zero-cost bench seam):
     //   `coverage` → an armed CoverageTable + `arm_coverage` (config 3: --coverage on);
     //   `armed`    → an EMPTY instrumentation payload (the attached-but-idle config);
-    //   else       → `instrument == None` (the production path).
+    //   else       → `instrument == None` (the production path, sync_lane respected).
+    // LANE §6.1: instrument paths use with_instrument (which calls with_specialize,
+    // which reads the env for sync_lane). The plain path uses with_lanes to set sync_lane
+    // explicitly without a second env read.
     let vm = if coverage {
         let mut inst = crate::vm::instrument::Instrumentation::empty();
         inst.coverage = Some(crate::vm::instrument::CoverageTable::new());
@@ -2322,7 +2396,8 @@ async fn vm_run_source_cfg(
     } else if armed {
         Vm::with_instrument(interp.clone(), crate::vm::instrument::Instrumentation::empty())
     } else {
-        Vm::with_specialize(interp.clone(), specialize)
+        // LANE §6.1: use with_lanes so sync_lane is set explicitly (no env re-read).
+        Vm::with_lanes(interp.clone(), specialize, sync_lane)
     };
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
@@ -2333,7 +2408,11 @@ async fn vm_run_source_cfg(
                  // output is already captured on `interp`, so a final sweep of dead
                  // cycles is observably invisible.
     crate::gc::collect();
-    match result {
+    // LANE §6.4: read counters after the run completes (Task 4 wires these up;
+    // for now they are always 0).
+    let lane_sync_ops = vm.lane_sync_ops();
+    let lane_bursts = vm.lane_bursts();
+    let pair = match result {
         Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
         // A panic aborts the program with its diagnostic.
@@ -2342,7 +2421,8 @@ async fn vm_run_source_cfg(
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
-    }
+    }?;
+    Ok((pair.0, pair.1, lane_sync_ops, lane_bursts))
 }
 
 /// **SELF-CONTAINED-BUNDLES Phase 2 (Task 2.5) test seam.** Run a multi-file program from

@@ -195,6 +195,24 @@ pub struct Vm {
     /// zero-cost-when-off pattern of `specialize` and the SP9 determinism cell. See
     /// [`crate::vm::instrument`].
     instrument: RefCell<Option<Box<crate::vm::instrument::Instrumentation>>>,
+    /// **LANE — the sync-lane kill switch (LANE §6.1).** When `true` (the default),
+    /// the two-lane driver may run synchronous instruction bursts without suspending
+    /// to the async executor. When `false` (`ASCRIPT_NO_SYNC_LANE=1`), the sync lane
+    /// is entirely suppressed and every instruction goes through the async driver —
+    /// observable behavior is byte-identical; only throughput differs. Orthogonal to
+    /// `specialize` (IC/adaptive guards are inside shared helpers). Worker isolates
+    /// inherit this flag from the env at construction time.
+    sync_lane: bool,
+    /// **LANE — sync-lane ops counter (LANE §6.4).** Counts the total number of
+    /// bytecode instructions retired inside the sync lane across all bursts.
+    /// Incremented once per burst (flushed from a burst-local `u64` accumulator).
+    /// Read via `lane_sync_ops()`. Zero until Task 4 wires up the burst driver;
+    /// used by `vm_run_source_lane_stats` to assert coverage.
+    lane_sync_ops: std::cell::Cell<u64>,
+    /// **LANE — sync-lane burst counter (LANE §6.4).** Counts the number of times
+    /// the sync driver was entered (one burst = one uninterrupted run of the sync
+    /// lane until a non-sync op is reached). Zero until Task 4.
+    lane_bursts: std::cell::Cell<u64>,
     /// DBG: the flattened proto tree of the program under inspection, for resolving a
     /// source (file, line) to a `(proto_id, offset)` to patch. Populated ONLY when a
     /// debugger arms breakpoints (empty otherwise → zero cost, NEVER read on the hot
@@ -229,6 +247,21 @@ impl Vm {
     /// Shared constructor: build a VM with `specialize` set explicitly and install
     /// its self-`Weak` (mirroring [`Interp::install_self`]).
     pub fn with_specialize(interp: Rc<Interp>, specialize: bool) -> Rc<Self> {
+        // LANE §6.1: default sync_lane from the environment, exactly like
+        // ASCRIPT_NO_SPECIALIZE does for `specialize`. The env default is what
+        // lets worker isolates inherit the kill switch without explicit plumbing.
+        let sync_lane = std::env::var("ASCRIPT_NO_SYNC_LANE").as_deref() != Ok("1");
+        Self::with_lanes(interp, specialize, sync_lane)
+    }
+
+    /// Build a VM with `specialize` and `sync_lane` set explicitly (LANE §6.1).
+    ///
+    /// Unlike [`with_specialize`](Self::with_specialize), this constructor does NOT
+    /// consult the environment — the caller controls both kill switches directly.
+    /// Used by the test entry points (`vm_run_source_no_sync_lane`,
+    /// `vm_run_source_lane_stats`) so tests can toggle `sync_lane` without setting
+    /// environment variables.
+    pub fn with_lanes(interp: Rc<Interp>, specialize: bool, sync_lane: bool) -> Rc<Self> {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
@@ -250,6 +283,9 @@ impl Vm {
             last_fault_source: RefCell::new(None),
             instrument: RefCell::new(None),
             debug_protos: RefCell::new(Vec::new()),
+            sync_lane,
+            lane_sync_ops: std::cell::Cell::new(0),
+            lane_bursts: std::cell::Cell::new(0),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -258,6 +294,24 @@ impl Vm {
         // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
         vm.interp.set_vm(Rc::downgrade(&vm));
         vm
+    }
+
+    /// Whether the sync lane is enabled (LANE §6.1). `true` = sync bursts allowed;
+    /// `false` = kill switch active, every instruction takes the async driver.
+    pub fn sync_lane(&self) -> bool {
+        self.sync_lane
+    }
+
+    /// Total bytecode instructions retired inside the sync lane (LANE §6.4).
+    /// Always 0 until Task 4 wires up the burst driver.
+    pub fn lane_sync_ops(&self) -> u64 {
+        self.lane_sync_ops.get()
+    }
+
+    /// Number of sync-lane bursts entered (LANE §6.4).
+    /// Always 0 until Task 4 wires up the burst driver.
+    pub fn lane_bursts(&self) -> u64 {
+        self.lane_bursts.get()
     }
 
     /// **DBG.** Build a specializing VM with an instrumentation payload installed
