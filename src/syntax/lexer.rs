@@ -414,6 +414,7 @@ fn keyword_kind(s: &str) -> Option<SyntaxKind> {
         "match" => MatchKw,
         "class" => ClassKw,
         "interface" => InterfaceKw,
+        "defer" => DeferKw,
         "import" => ImportKw,
         "export" => ExportKw,
         "async" => AsyncKw,

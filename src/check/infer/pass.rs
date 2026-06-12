@@ -172,6 +172,13 @@ impl<'a> Pass<'a> {
                     self.synth(&e, env);
                 }
             }
+            // DeferStmt: synth the deferred call so arg-level type diagnostics
+            // surface inside deferred calls (no new CheckTy, no exhaustiveness).
+            DeferStmt => {
+                if let Some(e) = first_expr_child(stmt) {
+                    self.synth(&e, env);
+                }
+            }
             IfStmt => self.walk_if(stmt, env),
             WhileStmt | ForStmt => self.walk_loop(stmt, env),
             Block => self.walk_child_block(stmt, env),
@@ -2252,6 +2259,7 @@ fn is_stmt_kind(kind: SyntaxKind) -> bool {
         LetStmt
             | ReturnStmt
             | ExprStmt
+            | DeferStmt
             | IfStmt
             | WhileStmt
             | ForStmt

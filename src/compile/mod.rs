@@ -15,8 +15,8 @@ use crate::syntax::ast::{
     ClassDecl, ContinueStmt, EnumDecl, ExportStmt, Expr, FnDecl, ForStmt, IfStmt, ImportStmt,
     IndexExpr, LetStmt, Literal, MapExpr, MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef,
     ObjectExpr, ObjectField, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile,
-    SpreadElem, Stmt,
-    TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
+    SpreadElem, Stmt, TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt,
+    YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -878,7 +878,8 @@ fn top_level_bound_names(stmt: &Stmt) -> Option<Vec<Rc<str>>> {
         | Stmt::ForStmt(_)
         | Stmt::ReturnStmt(_)
         | Stmt::BreakStmt(_)
-        | Stmt::ContinueStmt(_) => None,
+        | Stmt::ContinueStmt(_)
+        | Stmt::DeferStmt(_) => None,
     }
 }
 
@@ -1211,6 +1212,7 @@ fn stmt_node(stmt: &Stmt) -> &ResolvedNode {
         Stmt::InterfaceDecl(n) => n.syntax(),
         Stmt::ImportStmt(n) => n.syntax(),
         Stmt::ExportStmt(n) => n.syntax(),
+        Stmt::DeferStmt(n) => n.syntax(),
     }
 }
 
@@ -1796,6 +1798,11 @@ impl Compiler {
             Stmt::EnumDecl(enum_decl) => self.compile_enum(enum_decl),
             Stmt::ImportStmt(import_stmt) => self.compile_import(import_stmt),
             Stmt::ExportStmt(export_stmt) => self.compile_export(export_stmt),
+            // DEFER Phase 2/3: execution semantics not yet implemented.
+            Stmt::DeferStmt(_) => Err(CompileError::new(
+                "defer is not yet executable (DEFER Phase 2/3)",
+                stmt_span(stmt),
+            )),
             other => Err(CompileError::new(
                 "internal: unexpected statement kind in compile_stmt (compiler invariant)",
                 stmt_span(other),
