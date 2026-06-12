@@ -43,9 +43,9 @@
 DEFER touches the same return/unwind paths LANE/CALL/DECODE rework (goal-perf, restated in spec §0). It must land **before LANE starts or after the engine waves merge — never concurrently**.
 
 - [x] **Step 1:** *sequencing decision = **before LANE** (DEFER lands first; SHAPE parallel-allowed), decided by owner in the goal-perf.md 2026-06-12 lock record ("Owner decisions recorded at lock: **DEFER lands first** (before LANE; SHAPE parallel-allowed)") and reaffirmed in the campaign execution brief ("DEFER first").* Recorded 2026-06-12.
-- [ ] **Step 2:** `git checkout -b feat/defer-statement main` (or rebase target per the decision).
-- [ ] **Step 3:** Re-run the collision audit and paste the (empty) results into the commit body of the first Phase-1 commit: `grep -rn '\bdefer\b' examples docs/content tests --include='*.as' --include='*.md' --include='*.rs'` and `grep -rn '"defer"' src/stdlib/` — both must show no identifier/export uses (prose comments in `src/` are fine). A hit = a real collision to resolve with the owner BEFORE reserving the keyword.
-- [ ] **Step 4:** Read the spec end-to-end. Confirm `ASO_FORMAT_VERSION` is still 27 (`src/vm/aso.rs:167`) — if another spec merged a bump, this plan's "28" means "current + 1" everywhere (the cross-spec rule).
+- [x] **Step 2:** `git checkout -b feat/defer-statement main` (or rebase target per the decision).
+- [x] **Step 3:** Re-run the collision audit and paste the (empty) results into the commit body of the first Phase-1 commit: `grep -rn '\bdefer\b' examples docs/content tests --include='*.as' --include='*.md' --include='*.rs'` and `grep -rn '"defer"' src/stdlib/` — both must show no identifier/export uses (prose comments in `src/` are fine). A hit = a real collision to resolve with the owner BEFORE reserving the keyword.
+- [x] **Step 4:** Read the spec end-to-end. Confirm `ASO_FORMAT_VERSION` is still 27 (`src/vm/aso.rs:167`) — if another spec merged a bump, this plan's "28" means "current + 1" everywhere (the cross-spec rule).
 
 ---
 
@@ -57,7 +57,7 @@ DEFER touches the same return/unwind paths LANE/CALL/DECODE rework (goal-perf, r
 
 **Files:** `src/lexer.rs`, `src/parser.rs`, `src/ast.rs`, `src/fmt.rs`, `src/interp.rs` (arm stub), `tests/frontend_conformance.rs` (legacy half)
 
-- [ ] **Step 1: Failing tests first** — in `src/parser.rs`'s test module (the `worker_is_contextual_not_reserved` idiom):
+- [x] **Step 1: Failing tests first** — in `src/parser.rs`'s test module (the `worker_is_contextual_not_reserved` idiom):
 
 ```rust
 #[test]
@@ -86,8 +86,8 @@ fn defer_is_reserved_and_call_only() {
 }
 ```
 
-- [ ] **Step 2:** Run — expect FAIL (no `Tok::Defer`).
-- [ ] **Step 3: Implement.** `Tok::Defer` in the keyword table beside `"interface"` (`src/lexer.rs:601`). `statement()` (`src/parser.rs:96`) gains:
+- [x] **Step 2:** Run — expect FAIL (no `Tok::Defer`).
+- [x] **Step 3: Implement.** `Tok::Defer` in the keyword table beside `"interface"` (`src/lexer.rs:601`). `statement()` (`src/parser.rs:96`) gains:
 
 ```rust
 Tok::Defer => {
@@ -113,33 +113,33 @@ Tok::Defer => {
 ```
 
   `Stmt::Defer { call: Expr, awaited: bool, span: Span }` in `src/ast.rs:285`; `Display` arm (`(defer …)` / `(defer-await …)` s-expr); `src/fmt.rs` statement arm (`defer `/`defer await ` + the expression writer). The interp `exec` arm: temporary branch-local error per the phase note. NOTE: `await` here is the STATEMENT form — the parsed `call` is the bare call (the parser consumed `await` itself; do NOT wrap in `ExprKind::Await`).
-- [ ] **Step 4:** Run — expect PASS. Full `cargo test --lib` green (legacy-parser suites).
-- [ ] **Step 5: Commit** — `git commit -m "feat(parser): reserve 'defer'; legacy parse of defer [await] <call> + Stmt::Defer" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"` (paste the Task 0.1 grep audit in the body).
+- [x] **Step 4:** Run — expect PASS. Full `cargo test --lib` green (legacy-parser suites).
+- [x] **Step 5: Commit** — `git commit -m "feat(parser): reserve 'defer'; legacy parse of defer [await] <call> + Stmt::Defer" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"` (paste the Task 0.1 grep audit in the body).
 
 ### Task 1.2: CST front-end — DeferKw/DeferStmt, typed AST, resolver, infer walk
 
 **Files:** `src/syntax/{lexer,kind,parser}.rs`, `src/syntax/ast/{ascript.ungram,mod.rs}`, `src/syntax/resolve/mod.rs`, `src/check/infer/pass.rs`, `src/compile/mod.rs` (arm stub), `tests/frontend_conformance.rs`
 
-- [ ] **Step 1: Failing tests** — extend the `both_accept`/both-reject catalog (`tests/frontend_conformance.rs:43` idiom) with EVERY Task-1.1 form: each accepted form `both_accept`, each rejected form rejected **by both front-ends** (assert legacy AND CST reject — the `;`-in-class lesson: the catalog must be both-sided). Include `let defer = 5` both-reject.
-- [ ] **Step 2:** Run — expect FAIL (CST side).
-- [ ] **Step 3: Implement.** `SyntaxKind::DeferKw` (keyword table `src/syntax/lexer.rs:416`) + `SyntaxKind::DeferStmt` (`kind.rs`, registered beside `WhileStmt`); `stmt()` arm (`src/syntax/parser.rs:268`): `DeferKw => defer_stmt(p)` — bump kw, optional `AwaitKw` bump, parse expression, complete `DeferStmt`; the call-shape + named-arg validation lives in the CST→checks layer exactly where other structural validations live (match the legacy messages verbatim; the ±1-column caret tolerance applies). `ascript.ungram`: `DeferStmt = 'defer' 'await'? Expr` + the typed-AST node in `src/syntax/ast/mod.rs` (`call()` accessor, `awaited()` flag via token probe). Resolver (`src/syntax/resolve/mod.rs:648` region): walk `DeferStmt` like `ExprStmt` (resolve the inner expression; no bindings). Infer pass (`src/check/infer/pass.rs`): statement walk arm = `synth` the call expression. Compiler `compile_stmt` (`src/compile/mod.rs:1783`): temporary branch-local `CompileError` per the phase note. `compile/mod.rs` helpers that enumerate `Stmt::` (`top_level_bound_names:841`, the stmt-syntax table `:1199`) gain arms (Defer binds nothing).
-- [ ] **Step 4:** Run conformance — PASS. `cargo test --test frontend_conformance` green.
-- [ ] **Step 5: Independent review checkpoint** — reviewer probes: `defer await await f()` (reject — inner expr is `Await`, not a call), `defer (f)()` (accept), `defer f ()` with newline between (per existing newline rules — document observed behavior in the test), REPL `is_incomplete` unaffected (`defer` alone on a line = parse error, not continuation).
-- [ ] **Step 6: Commit** — `feat(cst): DeferKw/DeferStmt — parser, ungram AST, resolver, infer walk`.
+- [x] **Step 1: Failing tests** — extend the `both_accept`/both-reject catalog (`tests/frontend_conformance.rs:43` idiom) with EVERY Task-1.1 form: each accepted form `both_accept`, each rejected form rejected **by both front-ends** (assert legacy AND CST reject — the `;`-in-class lesson: the catalog must be both-sided). Include `let defer = 5` both-reject.
+- [x] **Step 2:** Run — expect FAIL (CST side).
+- [x] **Step 3: Implement.** `SyntaxKind::DeferKw` (keyword table `src/syntax/lexer.rs:416`) + `SyntaxKind::DeferStmt` (`kind.rs`, registered beside `WhileStmt`); `stmt()` arm (`src/syntax/parser.rs:268`): `DeferKw => defer_stmt(p)` — bump kw, optional `AwaitKw` bump, parse expression, complete `DeferStmt`; the call-shape + named-arg validation lives in the CST→checks layer exactly where other structural validations live (match the legacy messages verbatim; the ±1-column caret tolerance applies). `ascript.ungram`: `DeferStmt = 'defer' 'await'? Expr` + the typed-AST node in `src/syntax/ast/mod.rs` (`call()` accessor, `awaited()` flag via token probe). Resolver (`src/syntax/resolve/mod.rs:648` region): walk `DeferStmt` like `ExprStmt` (resolve the inner expression; no bindings). Infer pass (`src/check/infer/pass.rs`): statement walk arm = `synth` the call expression. Compiler `compile_stmt` (`src/compile/mod.rs:1783`): temporary branch-local `CompileError` per the phase note. `compile/mod.rs` helpers that enumerate `Stmt::` (`top_level_bound_names:841`, the stmt-syntax table `:1199`) gain arms (Defer binds nothing).
+- [x] **Step 4:** Run conformance — PASS. `cargo test --test frontend_conformance` green.
+- [x] **Step 5: Independent review checkpoint** — reviewer probes: `defer await await f()` (reject — inner expr is `Await`, not a call), `defer (f)()` (accept), `defer f ()` with newline between (per existing newline rules — document observed behavior in the test), REPL `is_incomplete` unaffected (`defer` alone on a line = parse error, not continuation).
+- [x] **Step 6: Commit** — `feat(cst): DeferKw/DeferStmt — parser, ungram AST, resolver, infer walk`.
 
 ### Task 1.3: tree-sitter grammar + regen + conformance + queries
 
 **Files:** `tree-sitter-ascript/grammar.js`, regenerated `tree-sitter-ascript/src/parser.c`, `tree-sitter-ascript/queries/highlights.scm`, `tests/treesitter_conformance.rs`
 
-- [ ] **Step 1: Failing test** — add the defer catalog to `treesitter_conformance` (accepted forms parse with zero ERROR nodes and a `defer_statement` node with a `call` field; rejected forms produce ERROR or fail the structural assertion the harness uses; `let defer = 5` errors — keyword extraction reserves it).
-- [ ] **Step 2:** Implement in `grammar.js`: `defer_statement` per spec §2.4 (`seq('defer', optional('await'), field('call', $.call_expression), optional(';'))`), added to `_statement` (`grammar.js:173`). If `tree-sitter generate --abi 14` reports a conflict with `await_expression`, declare the GLR conflict (the `?`/ternary precedent) — never weaken the hand parsers to match. **Regenerate:** `cd tree-sitter-ascript && tree-sitter generate --abi 14`; commit the regenerated `src/parser.c`.
-- [ ] **Step 3:** `queries/highlights.scm:21` keyword list gains `"defer"` (and verify the statement's `"await"` is captured — the existing `await` capture may already match the literal). Spot-check `indents.scm`/`folds.scm` need nothing (statement-level).
-- [ ] **Step 4:** `cargo test --test treesitter_conformance` green (build.rs picks up the new parser.c); `cargo test --test frontend_conformance` still green.
-- [ ] **Step 5: Commit** — `feat(grammar): tree-sitter defer_statement + regen --abi 14 + highlights`. (Publish + editor pins happen at the merge wave — Task 5.3.)
+- [x] **Step 1: Failing test** — add the defer catalog to `treesitter_conformance` (accepted forms parse with zero ERROR nodes and a `defer_statement` node with a `call` field; rejected forms produce ERROR or fail the structural assertion the harness uses; `let defer = 5` errors — keyword extraction reserves it).
+- [x] **Step 2:** Implement in `grammar.js`: `defer_statement` per spec §2.4 (`seq('defer', optional('await'), field('call', $.call_expression), optional(';'))`), added to `_statement` (`grammar.js:173`). If `tree-sitter generate --abi 14` reports a conflict with `await_expression`, declare the GLR conflict (the `?`/ternary precedent) — never weaken the hand parsers to match. **Regenerate:** `cd tree-sitter-ascript && tree-sitter generate --abi 14`; commit the regenerated `src/parser.c`.
+- [x] **Step 3:** `queries/highlights.scm:21` keyword list gains `"defer"` (and verify the statement's `"await"` is captured — the existing `await` capture may already match the literal). Spot-check `indents.scm`/`folds.scm` need nothing (statement-level).
+- [x] **Step 4:** `cargo test --test treesitter_conformance` green (build.rs picks up the new parser.c); `cargo test --test frontend_conformance` still green.
+- [x] **Step 5: Commit** — `feat(grammar): tree-sitter defer_statement + regen --abi 14 + highlights`. (Publish + editor pins happen at the merge wave — Task 5.3.)
 
 ### Task 1.4: Phase 1 holistic review
 
-- [ ] **Step 1:** Holistic subagent: all three front-ends agree on the FULL accept/reject catalog; the reserved keyword errors are clear; no front-end accepts named-arg or non-call defers; both feature configs build + clippy clean; the temporary not-yet-executable markers are present in exactly two places (interp exec arm, compile_stmt arm) and tracked.
+- [x] **Step 1:** Holistic subagent: all three front-ends agree on the FULL accept/reject catalog; the reserved keyword errors are clear; no front-end accepts named-arg or non-call defers; both feature configs build + clippy clean; the temporary not-yet-executable markers are present in exactly two places (interp exec arm, compile_stmt arm) and tracked.
 
 ---
 
