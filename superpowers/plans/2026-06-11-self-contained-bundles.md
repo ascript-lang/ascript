@@ -837,9 +837,11 @@ impl ModuleArchive {
 
 ### Task 4.5: Phase 4 + whole-effort holistic review (Definition of Done)
 
-- [ ] **Step 1:** Final holistic-review subagent over the ENTIRE diff (Phases 0–4): spec §1–§8 coverage, §9 execution-standard adherence, zero open `TODO`/deferral, zero known unfixed bugs, every discovered bug fixed with a regression test.
-- [ ] **Step 2:** Confirm every checkbox in this plan is ticked.
-- [ ] **Step 3:** Tick this box — **nothing left to do.**
+- [x] **Step 1:** Final holistic-review subagent over the ENTIRE diff (Phases 0–4): spec §1–§8 coverage, §9 execution-standard adherence, zero open `TODO`/deferral, zero known unfixed bugs, every discovered bug fixed with a regression test.
+- [x] **Step 2:** Confirm every checkbox in this plan is ticked.
+- [x] **Step 3:** Tick this box — **nothing left to do.**
+
+> **Accepted (4.5) — DEFINITION OF DONE MET. Verdict: SHIP.** Whole-effort holistic over the entire `1a1a1bd..HEAD` diff (227 files): full spec §1–§8 coverage table (every requirement implemented + located); CROSS-PHASE integration probe PASSED — built a real `--native --deny net` bundle (multi-module, a shaken unused export, a `worker fn` calling an imported module), DELETED the source tree, ran from an empty dir: the unused export was shaken (Phase 2), the embedded module resolved in-memory (Phase 1), the worker honored the cap on its isolate (Phase 1.6), net was denied (Phase 3), and `ASCRIPT_DENY=bogus` failed closed — all four phases compose end-to-end. Zero open planned-work deferrals (the 2 owner-noted follow-ups — pooled-worker archive re-ship optimization + relocating the shared `worker::dispatch` bytecode-analysis primitives — are confirmed NON-functional and the ONLY open items; the feature is complete without them). Every discovered bug has a permanent regression test (field-type over-shake, aso external-ref obsolescence, native tmpfs flake, export-statement shaker bug, the Phase-0 19 — spot-checked). `ASO_FORMAT_VERSION` 26→27 = the Phase-0 range-step fix (NOT this feature; bundles uses `ARCHIVE_VERSION=1`). Two Minor doc/comment items found + FIXED (commit `f7e7a03`: stale Phase-3 caps comments refreshed; frozen-artifact caveat documented in `bundles.md`). **Gates: 3669 passed / 0 failed in BOTH feature configs (35 binaries each); clippy clean both configs; `--no-default-features` builds; differential 378/0 + shaken-vs-unshaken green.** Invariants intact (`Value: !Send`, airlock all-`Send`, no borrow-across-await, bounds-checked decoders, fuzz workspace isolated). **Nothing left to do.**
 
 ---
 
