@@ -40,6 +40,14 @@ At run time the embedded modules are consulted **before** disk, so a bundled pro
 its sources. (If a key is absent from the archive — a partial/dev build — the loader falls
 through to the on-disk path.)
 
+> **A built artifact is frozen.** Because `build` embeds the whole module graph, a `.aso`/native
+> bundle is a self-contained snapshot taken at build time. Editing a sibling `.as` afterward has
+> **no effect** until you rebuild — the run resolves the import from the embedded archive, not the
+> (now-newer) source on disk. For a live-edit dev loop, run the source directly with `ascript run
+> app.as`, which always recompiles; reach for `build` when you want a portable, reproducible
+> artifact. (This is the intended shift from the older model where a `.aso` referenced its imports
+> externally and recompiled stale dependencies.)
+
 ## Tree-shaking
 
 Embedding the whole import graph naively would bloat artifacts with code that is never used, so

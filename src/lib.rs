@@ -1058,8 +1058,11 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
 /// module, matching `load_file_module`'s cache identity), while the STORED key stays
 /// machine-independent.
 ///
-/// `caps` is a default all-granted [`CapSet`] for now (Phase 3 fills the composed caps);
-/// `shake_digest` is the reproducible 32-byte sha256 of the tree-shake report
+/// `caps` is a default all-granted [`CapSet`] placeholder here — the build commands
+/// (`build_file`/`build_native`) OVERRIDE `archive.caps` with the composed capability set
+/// (`compose_caps`: CLI `--deny`/`--sandbox`/carve-outs + `ascript.toml`) before encoding, and
+/// `run_verified_archive` enforces it at run (monotone `restrict_with`). `shake_digest` is the
+/// reproducible 32-byte sha256 of the tree-shake report
 /// ([`crate::compile::shake::ShakeReport::digest`]). The report is RETURNED alongside the
 /// archive so the caller (`build_file`/`build_native`) can print a human-readable
 /// tree-shaking summary to stderr.
@@ -1324,7 +1327,7 @@ pub fn compile_archive_with_shake(
     let shake_digest = reach.report.digest();
     let archive = ModuleArchive::new(
         entry,
-        crate::stdlib::caps::CapSet::default(), // Phase 3 fills the composed caps
+        crate::stdlib::caps::CapSet::default(), // all-granted placeholder; build_file/build_native override archive.caps with the composed set before encoding
         shake_digest,
         modules,
     );
