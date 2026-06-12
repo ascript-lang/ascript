@@ -299,40 +299,40 @@ defer_await_cancelled_mid_drain: cancellation while a deferred await is suspende
 **Files:** `src/vm/{opcode,fiber,run}.rs`, `src/compile/mod.rs`
 **Tests:** hand-built-chunk unit tests (the `run.rs` idiom) + `tests/vm_differential.rs` (first four-mode battery)
 
-- [ ] **Step 1: Failing tests** — (a) opcode round-trip/width units in `opcode.rs` (`DeferPush` width 2, `DeferPushMethod` width 4, dense discriminants test extended); (b) a four-mode `assert_three_way_matches` battery porting Task 2.1/2.2's CORE cases (timing, LIFO, scoping, return/propagate drains, §3.6 r1/r2, §3.7 ordering, top-level).
-- [ ] **Step 2:** Implement:
+- [x] **Step 1: Failing tests** — (a) opcode round-trip/width units in `opcode.rs` (`DeferPush` width 2, `DeferPushMethod` width 4, dense discriminants test extended); (b) a four-mode `assert_three_way_matches` battery porting Task 2.1/2.2's CORE cases (timing, LIFO, scoping, return/propagate drains, §3.6 r1/r2, §3.7 ordering, top-level).
+- [x] **Step 2:** Implement:
   - `Op::DeferPush` (flags u8: bit0 awaited, bit1 spread; argc u8) and `Op::DeferPushMethod` (name u16 const, flags u8, argc u8) appended after `Op::Break`; `operand_width` arms; `ALL` list.
   - `CallFrame.defers: Vec<DeferEntry>` (`src/vm/fiber.rs:20`; both construction sites init `Vec::new()`).
   - `compile_stmt` `DeferStmt` arm (spec §5.2): member callee → receiver, args, `DeferPushMethod` (OptMember: dup/nil-test jump that pops and skips — mirror the existing optional-chain lowering and pin a bytecode-shape unit test); other → callee value, args, `DeferPush`; spread → the existing array-builder + bit1; named → unreachable (parser rejects; keep a defensive `CompileError`).
   - `run_loop` arms: `DeferPush`/`DeferPushMethod` pop into a `DeferEntry` (span = op span) and append to `fiber.frame_mut().defers`.
   - `Op::Return` (`run.rs:3345`) + `Op::Propagate` err path (`run.rs:3359`): `if !fiber.frame().defers.is_empty()` → `let list = mem::take(&mut fiber.frame_mut().defers);` → `self.run_frame_defers(list, &mut pending).await` (the VM drain: Method → the generic member-call routine — the hook chokepoint; Call → `call_value`; `awaited`/bare-future per §3.4; merge via the SHARED `interp::merge_defer_panic`) → on surviving value, `return_from_frame`; on panic, `return Err(...)` (the chokepoint will see this frame's list empty).
-- [ ] **Step 3:** Four-mode battery green in BOTH feature configs; the hand-chunk tests green; `--no-specialize` runs identical (defer has no specialized path — assert by running the battery generic).
-- [ ] **Step 4: Commit** — `feat(vm): DeferPush/DeferPushMethod + frame defer stack + Return/Propagate drains`.
+- [x] **Step 3:** Four-mode battery green in BOTH feature configs; the hand-chunk tests green; `--no-specialize` runs identical (defer has no specialized path — assert by running the battery generic).
+- [x] **Step 4: Commit** — `feat(vm): DeferPush/DeferPushMethod + frame defer stack + Return/Propagate drains`.
 
 ### Task 3.2: the unwind chokepoint + async/generator parity
 
 **Files:** `src/vm/run.rs`
 **Tests:** `tests/vm_differential.rs`
 
-- [ ] **Step 1: Failing tests** — four-mode port of the panic-path matrix: panic unwind innermost-first across nested frames; recover-after-defers; §3.6 r3 exact suppressed-note message; r4 remaining-defers; deep-recursion cap; `exit()` skip; generator completion/panic/close()/drop; cancellation; defer await full matrix (happy/propagate/panic-to-recover/mixed-LIFO/bare-future message).
-- [ ] **Step 2:** Implement in `Vm::run` (`run.rs:1057`, beside the SP4 span-source binder): on `Err(Control::Panic(_) | Control::Propagate(_))` from `run_loop` — never `Exit` — if any live frame has defers, run the chokepoint drain: walk `fiber.frames` top-down, `mem::take` each frame's list, drain LIFO into the pending control (shared merge), then return the final control. Frames are NOT popped (unchanged abandonment semantics); document why double-drain is impossible (taken lists). Mind: the drain awaits (re-entrant `self.run` on fresh fibers; `run` is already async) — no fiber borrow held across it (`fiber` is `&mut`, fine).
-- [ ] **Step 3:** All Phase-2 tree-walker tests get four-mode twins; run the FULL `cargo test --test vm_differential` both configs — the entire existing corpus + the defer batteries byte-identical. Any divergence: fix the ENGINE (usually drain placement vs the contract check, or depth accounting), never the assertion.
-- [ ] **Step 4: Independent review checkpoint** — reviewer hand-probes: a panic raised INSIDE `return_from_frame`'s contract check after a successful drain (caller defers must still run via the chokepoint; this frame's list empty); a defer registered in a generator that is resumed across `task.spawn` boundaries; `Op::Break` (DBG breakpoint) inside a deferred body; profiler attribution sanity (`--profile cpu` on a defer-heavy script doesn't crash and attributes to the deferred fn).
-- [ ] **Step 5: Commit** — `feat(vm): unwind chokepoint drain — defers on panic/propagate unwind, byte-identical four-mode`.
+- [x] **Step 1: Failing tests** — four-mode port of the panic-path matrix: panic unwind innermost-first across nested frames; recover-after-defers; §3.6 r3 exact suppressed-note message; r4 remaining-defers; deep-recursion cap; `exit()` skip; generator completion/panic/close()/drop; cancellation; defer await full matrix (happy/propagate/panic-to-recover/mixed-LIFO/bare-future message).
+- [x] **Step 2:** Implement in `Vm::run` (`run.rs:1057`, beside the SP4 span-source binder): on `Err(Control::Panic(_) | Control::Propagate(_))` from `run_loop` — never `Exit` — if any live frame has defers, run the chokepoint drain: walk `fiber.frames` top-down, `mem::take` each frame's list, drain LIFO into the pending control (shared merge), then return the final control. Frames are NOT popped (unchanged abandonment semantics); document why double-drain is impossible (taken lists). Mind: the drain awaits (re-entrant `self.run` on fresh fibers; `run` is already async) — no fiber borrow held across it (`fiber` is `&mut`, fine).
+- [x] **Step 3:** All Phase-2 tree-walker tests get four-mode twins; run the FULL `cargo test --test vm_differential` both configs — the entire existing corpus + the defer batteries byte-identical. Any divergence: fix the ENGINE (usually drain placement vs the contract check, or depth accounting), never the assertion.
+- [x] **Step 4: Independent review checkpoint** — reviewer hand-probes: a panic raised INSIDE `return_from_frame`'s contract check after a successful drain (caller defers must still run via the chokepoint; this frame's list empty); a defer registered in a generator that is resumed across `task.spawn` boundaries; `Op::Break` (DBG breakpoint) inside a deferred body; profiler attribution sanity (`--profile cpu` on a defer-heavy script doesn't crash and attributes to the deferred fn).
+- [x] **Step 5: Commit** — `feat(vm): unwind chokepoint drain — defers on panic/propagate unwind, byte-identical four-mode`.
 
 ### Task 3.3: `.aso` 27→28, verifier, disasm, bcanalysis, negative space
 
 **Files:** `src/vm/{aso,verify,disasm,bcanalysis}.rs`, `tests/` (aso/verify suites)
 
-- [ ] **Step 1: Failing tests:** verifier accepts a compiled defer program; rejects hand-built bad forms — `DeferPushMethod` name idx out of range / non-string const (structured error, the `BadInterface` precedent), nonzero undefined flag bits (both ops), `DeferPush` with insufficient stack depth; `ASO_FORMAT_VERSION == 28` asserted; an `.aso` built pre-bump rejected with the clean version error; round-trip: `build` then `run file.aso` joins the four-mode battery (it already does via the standing pipeline — verify defer examples flow through).
-- [ ] **Step 2:** Implement: bump `ASO_FORMAT_VERSION` to 28 (read-the-constant rule); `stack_effect` (`verify.rs:217`): `DeferPush` pops `argc+1` (bit1 → 2), pushes 0; `DeferPushMethod` pops `argc+1` (bit1 → 2), pushes 0; operand validation incl. flags-bit whitelist; `disasm.rs` renders both (decoded flags + name); `bcanalysis.rs` decode table arms. Regenerate the fuzz `.aso` corpus if the version gate invalidates it (`fuzz/regenerate_aso_corpus.sh`).
-- [ ] **Step 3:** Green; **Commit** — `feat(aso): ASO 28 — defer opcodes verified, disassembled, analyzed`.
+- [x] **Step 1: Failing tests:** verifier accepts a compiled defer program; rejects hand-built bad forms — `DeferPushMethod` name idx out of range / non-string const (structured error, the `BadInterface` precedent), nonzero undefined flag bits (both ops), `DeferPush` with insufficient stack depth; `ASO_FORMAT_VERSION == 28` asserted; an `.aso` built pre-bump rejected with the clean version error; round-trip: `build` then `run file.aso` joins the four-mode battery (it already does via the standing pipeline — verify defer examples flow through).
+- [x] **Step 2:** Implement: bump `ASO_FORMAT_VERSION` to 28 (read-the-constant rule); `stack_effect` (`verify.rs:217`): `DeferPush` pops `argc+1` (bit1 → 2), pushes 0; `DeferPushMethod` pops `argc+1` (bit1 → 2), pushes 0; operand validation incl. flags-bit whitelist; `disasm.rs` renders both (decoded flags + name); `bcanalysis.rs` decode table arms. Regenerate the fuzz `.aso` corpus if the version gate invalidates it (`fuzz/regenerate_aso_corpus.sh`).
+- [x] **Step 3:** Green; **Commit** — `feat(aso): ASO 28 — defer opcodes verified, disassembled, analyzed`.
 
 ### Task 3.4: coverage counters + Phase 3 holistic review
 
-- [ ] **Step 1:** `#[cfg(feature = "fuzzgen")]`-gated counters on `Vm` + the interp (entries pushed / drained / chokepoint drains taken) + the corpus assertion test: after the differential corpus runs, all nonzero (anti-false-green, Gate 15).
-- [ ] **Step 2:** Holistic subagent: the two temporary Phase-1 stub strings are GONE (grep `not yet executable` → zero); the merge helper has exactly ONE definition with both engines calling it; every §3.3 matrix row has a four-mode test; full suite + clippy both configs; `vm_differential` full corpus green both configs.
-- [ ] **Step 3: Commit** — `test(vm): defer coverage counters + corpus assertion`.
+- [x] **Step 1:** `#[cfg(feature = "fuzzgen")]`-gated counters on `Vm` + the interp (entries pushed / drained / chokepoint drains taken) + the corpus assertion test: after the differential corpus runs, all nonzero (anti-false-green, Gate 15).
+- [x] **Step 2:** Holistic subagent: the two temporary Phase-1 stub strings are GONE (grep `not yet executable` → zero); the merge helper has exactly ONE definition with both engines calling it; every §3.3 matrix row has a four-mode test; full suite + clippy both configs; `vm_differential` full corpus green both configs.
+- [x] **Step 3: Commit** — `test(vm): defer coverage counters + corpus assertion`.
 
 ---
 
