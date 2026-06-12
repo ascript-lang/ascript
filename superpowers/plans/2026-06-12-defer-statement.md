@@ -152,7 +152,7 @@ Tok::Defer => {
 **Files:** `src/interp.rs`, `src/env.rs`
 **Tests:** inline `#[tokio::test]`s in `src/interp.rs` (the existing eval-test idiom)
 
-- [ ] **Step 1: Failing tests** — evaluation timing + LIFO + scoping:
+- [x] **Step 1: Failing tests** — evaluation timing + LIFO + scoping:
 
 ```rust
 // (sketch — use the crate's run_source_capture helper; assert captured output)
@@ -167,8 +167,8 @@ defer_spread_materialized(): `defer f(...xs); xs.push(9)` → f sees the snapsho
 defer_top_level_runs_at_program_end(): top-level defer prints after last top-level stmt
 ```
 
-- [ ] **Step 2:** Run — FAIL (the Phase-1 stub error).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2:** Run — FAIL (the Phase-1 stub error).
+- [x] **Step 3: Implement.**
   - `src/interp.rs` (beside `Control`): the shared types — these exact shapes are consumed by the VM in Phase 3:
 
 ```rust
@@ -194,15 +194,15 @@ pub(crate) struct DeferEntry {
   - `run_body` (`interp.rs:5146`): `let defers = call_env.install_defer_scope();` before binding args.
   - `Stmt::Defer` exec arm: match `call.kind` — `Call{callee: box Member{object,name}}` → eval `object`, Method entry; `OptMember` → eval object, if `nil` do nothing (skip arg eval), else Method; other callee → eval callee, Call entry. Then eval args (the existing `CallArg` eval path used by call sites — positional + spread, flat vec). Push. Returns `Flow::Normal`.
   - Top-level drivers: every `exec(program, env)` driver (enumerate: `grep -n '\.exec(' src/interp.rs src/lib.rs src/repl*.rs` — run_file/run_source/run_tests path, REPL submission, module import exec, worker isolate entry if it bypasses run_body) installs a defer scope on the program env and (Task 2.2) drains it.
-- [ ] **Step 4:** Tests for push-side behavior that don't need drain ordering (the nil-receiver/arg-eval ones) — note most Step-1 tests also need Task 2.2's drain; implement 2.1+2.2 as one TDD arc if cleaner, but commit separately only when both green.
-- [ ] **Step 5: Commit** — `feat(interp): DeferEntry + activation defer scopes + defer statement evaluation`.
+- [x] **Step 4:** Tests for push-side behavior that don't need drain ordering (the nil-receiver/arg-eval ones) — note most Step-1 tests also need Task 2.2's drain; implement 2.1+2.2 as one TDD arc if cleaner, but commit separately only when both green.
+- [x] **Step 5: Commit** — `feat(interp): DeferEntry + activation defer scopes + defer statement evaluation`.
 
 ### Task 2.2: draining — every tree-walker exit path + the merge rules
 
 **Files:** `src/interp.rs`
 **Tests:** inline + `tests/cli.rs` (program-level exit-code/panic-output cases)
 
-- [ ] **Step 1: Failing tests** — the frame-exit matrix (spec §3.3) + merge rules (§3.6) + ordering (§3.7/§3.8):
+- [x] **Step 1: Failing tests** — the frame-exit matrix (spec §3.3) + merge rules (§3.6) + ordering (§3.7/§3.8):
 
 ```text
 drain_on_normal_completion / drain_on_return / drain_on_propagate (the `?` runs defers; pair preserved)
@@ -224,8 +224,8 @@ schema_method_defer_hook_preserved: defer s.parse(x) on a schema → call_schema
 frozen_instance_method_defer: distinct "not available on a frozen instance" diagnostic preserved
 ```
 
-- [ ] **Step 2:** Run — FAIL.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2:** Run — FAIL.
+- [x] **Step 3: Implement.**
   - The shared merge helper (single SoT, spec §3.6 — VM reuses it verbatim in Phase 3):
 
 ```rust
@@ -257,16 +257,16 @@ async fn run_defers(&self, list: &Rc<RefCell<Vec<DeferEntry>>>,
     Per entry: Method → the member-call evaluator path (the SAME function the `Call`-with-`Member`-callee evaluator uses — factor it if needed so the schema/shared/workflow hooks are structurally shared, not copied); Call → `call_value`. Result: `Value::Future` + `awaited` → `f.get().await` (its Err merges); `Value::Future` + bare → `merge_defer_panic` with the §3.4 message `deferred call returned a future that would be cancelled on drop — use 'defer await f()' or do async cleanup before exit` anchored at `entry.span`; other results discarded. `Err(Control::Exit)` from an entry → `*pending = Err(exit)` and `return` (remaining entries skipped, spec §3.6 r5).
   - `run_body`: restructure the outcome match into `let mut pending: Result<Value, Control> = …` (Exit short-circuits BEFORE drain), `self.run_defers(&defers, &mut pending, call_env).await`, then the return-contract check applies only to `Ok` — keeping the existing Propagate-pair contract behavior (a Propagate that SURVIVED the drain converts to the pair result exactly as today). The `_depth` guard is still alive across the drain (§3.8) — verify by reading the drop order.
   - Top-level drivers: drain after the body with the same helper; `Propagate => Ok` conversion stays AFTER the drain.
-- [ ] **Step 4:** Run — PASS. Full `cargo test` (default config) green — the entire existing corpus must be untouched (no defers = empty lists = no behavior change).
-- [ ] **Step 5: Independent review checkpoint** — reviewer probes: defer inside `init` with a failing field contract; defer in a method calling `super`; double-`recover` nesting; a deferred call that itself defers (inner activation drains first); `exit()` raised INSIDE a deferred call (terminates, skips remaining — cli.rs observation); borrow-across-await audit of the new drain (`cargo clippy` + manual read).
-- [ ] **Step 6: Commit** — `feat(interp): defer draining on every frame exit + the §3.6 merge rules (oracle complete)`.
+- [x] **Step 4:** Run — PASS. Full `cargo test` (default config) green — the entire existing corpus must be untouched (no defers = empty lists = no behavior change).
+- [x] **Step 5: Independent review checkpoint** — reviewer probes: defer inside `init` with a failing field contract; defer in a method calling `super`; double-`recover` nesting; a deferred call that itself defers (inner activation drains first); `exit()` raised INSIDE a deferred call (terminates, skips remaining — cli.rs observation); borrow-across-await audit of the new drain (`cargo clippy` + manual read).
+- [x] **Step 6: Commit** — `feat(interp): defer draining on every frame exit + the §3.6 merge rules (oracle complete)`.
 
 ### Task 2.3: tree-walker `defer await` + async/generator/cancellation semantics
 
 **Files:** `src/interp.rs`, `src/coro.rs` (tests only — no behavior change)
 **Tests:** inline async tests
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
 
 ```text
 defer_await_happy_path: async cleanup fn; defer await teardown(); body returns → teardown completed before caller's await resolves
@@ -283,12 +283,12 @@ task_cancellation_does_NOT_run_defers (spec §4.2): spawn an async fn parked on 
 defer_await_cancelled_mid_drain: cancellation while a deferred await is suspended → older defers don't run (documented rule) — use a controllable future
 ```
 
-- [ ] **Step 2:** Implement: this is mostly already done by Task 2.2's `awaited` handling — this task PROVES the async matrix and fixes whatever it flushes out (e.g. the drain helper must not hold the `RefCell` list borrow across the per-entry await — entries were taken out, verify).
-- [ ] **Step 3:** Run — PASS. **Commit** — `test(interp): defer await + async/generator/cancellation matrix (tree-walker)`.
+- [x] **Step 2:** Implement: this is mostly already done by Task 2.2's `awaited` handling — this task PROVES the async matrix and fixes whatever it flushes out (e.g. the drain helper must not hold the `RefCell` list borrow across the per-entry await — entries were taken out, verify).
+- [x] **Step 3:** Run — PASS. **Commit** — `test(interp): defer await + async/generator/cancellation matrix (tree-walker)`.
 
 ### Task 2.4: Phase 2 holistic review
 
-- [ ] **Step 1:** Holistic subagent over the tree-walker semantics: every spec §3/§4 rule has a named test; the merge helper is the only place outcome-folding happens; the member-call hook path is structurally shared (grep for a second schema-hook check — must not exist); no `RefCell` borrow across await in any new code; full suite + clippy BOTH configs green; the existing corpus byte-identical (run the tree-walker side of `vm_differential` — VM still errors on defer, expected until Phase 3, so restrict to non-defer corpus = the whole existing corpus).
+- [x] **Step 1:** Holistic subagent over the tree-walker semantics: every spec §3/§4 rule has a named test; the merge helper is the only place outcome-folding happens; the member-call hook path is structurally shared (grep for a second schema-hook check — must not exist); no `RefCell` borrow across await in any new code; full suite + clippy BOTH configs green; the existing corpus byte-identical (run the tree-walker side of `vm_differential` — VM still errors on defer, expected until Phase 3, so restrict to non-defer corpus = the whole existing corpus).
 
 ---
 
