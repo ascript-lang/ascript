@@ -2842,7 +2842,16 @@ impl Interp {
             lexer::lex(&src).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
         let program =
             parser::parse(&tokens).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
-        let result = self.exec(&program, &env).await;
+        // DEFER §2.3: run the module body via `exec_program` so a top-level `defer`
+        // (in the entry module OR any imported module) installs + drains its defer
+        // scope. The module body runs to completion during import and its defers run
+        // BEFORE the importer reads the exports. `exec_program` returns
+        // `Result<Flow, Control>` with the SAME completion semantics `exec` had here:
+        // `Ok(Flow::Normal)`/`Ok(Flow::Return(_))` = normal module completion (ignored),
+        // a top-level `?` is folded to `Ok(Flow::Normal)`, and Panic/Exit stay `Err`
+        // (propagated below). Break/Continue at module top level become a `Panic` (the
+        // same "'break'/'continue' outside of a loop" the entry path produces).
+        let result = self.exec_program(&program, &env).await;
 
         *self.module_dir.borrow_mut() = prev_dir;
         *self.current_exports.borrow_mut() = prev_exports;
@@ -2850,7 +2859,7 @@ impl Interp {
         if let Err(Control::Panic(e)) = result {
             return Err(Control::Panic(e.with_source(src_info)));
         }
-        result?; // propagate any other control flow from the module body
+        result?; // propagate any other control flow from the module body (Exit)
         Ok(entry)
     }
 

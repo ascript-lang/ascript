@@ -166,6 +166,50 @@ fn exports_destructured_names() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n");
 }
 
+#[test]
+fn module_import_defers_run_at_import() {
+    // DEFER §2.3: a `defer` at an imported MODULE's top level must run when the
+    // module body finishes loading (at import time), BEFORE the importer reads its
+    // exports / runs its own body. The module body runs to completion during import;
+    // its defers drain first. Tree-walker engine (the VM's defer is Phase 3).
+    //
+    // mod.as: top-level body prints "mod-body", registers `defer print("mod-defer")`,
+    //         exports V. The defer must fire at the end of loading mod.as.
+    // main.as: imports V, prints "main-body". Because mod.as finishes loading (and
+    //          drains its defer) BEFORE main.as's body runs, the order is:
+    //          mod-body, mod-defer, main-body.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let d = temp_dir("module_defer");
+    fs::write(
+        d.join("mod.as"),
+        "print(\"mod-body\")\ndefer print(\"mod-defer\")\nexport const V = 1",
+    )
+    .unwrap();
+    fs::write(
+        d.join("main.as"),
+        "import { V } from \"./mod\"\nprint(\"main-body\")\nprint(V)",
+    )
+    .unwrap();
+    let out = std::process::Command::new(bin)
+        .arg("run")
+        .arg("--tree-walker")
+        .arg(d.join("main.as"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The module's defer ran at import time: "mod-defer" appears AFTER "mod-body"
+    // and BEFORE "main-body" (the importer's body runs only after the module loaded).
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mod-body\nmod-defer\nmain-body\n1\n",
+        "imported-module top-level defer must run at import time"
+    );
+}
+
 // Gated on the `shared` feature: the built binary ships `std/shared` only when the
 // feature is on (it folds into `default`). Under `--no-default-features` the import is
 // an unknown-module error, so the test is skipped there.

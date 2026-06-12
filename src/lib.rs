@@ -658,11 +658,11 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
         .await;
     local.await; // drain spawned tasks — no-op until Phase 2
     match result {
-        Ok(crate::interp::Flow::Break) => Err(AsError::new("'break' outside of a loop")),
-        Ok(crate::interp::Flow::Continue) => Err(AsError::new("'continue' outside of a loop")),
-        Ok(crate::interp::Flow::Normal) | Ok(crate::interp::Flow::Return(_)) => {
-            Ok((interp.output(), None))
-        }
+        // Any `Ok(Flow)` is normal program completion. `exec_program` converts a
+        // top-level `break`/`continue` into `Err(Control::Panic("… outside of a
+        // loop"))` before returning, so the `Flow::Break`/`Flow::Continue` variants
+        // never reach here (no separate arms needed).
+        Ok(_) => Ok((interp.output(), None)),
         // A panic aborts the program with its diagnostic.
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         // A top-level `?` propagation simply ends the program.
