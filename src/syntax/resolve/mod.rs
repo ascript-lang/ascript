@@ -250,6 +250,8 @@ impl Resolver {
             self.result.diagnostics.push(ResolveDiagnostic {
                 message: format!("'{name}' is already defined in this scope"),
                 range: decl_range,
+                code: codes::DUPLICATE_BINDING,
+                blocking: false,
             });
             return;
         }
@@ -476,6 +478,9 @@ impl Resolver {
     /// module `Environment`: a `let`/`const` (ident or destructuring-pattern names),
     /// a hoisted `fn`/`class`/`enum`, and `import` names. An `export <decl>` is
     /// unwrapped to its inner decl. Statements that bind nothing are ignored.
+    ///
+    /// NOTE: keep in sync with `compile::top_level_bound_names` (`src/compile/mod.rs`),
+    /// which mirrors this match to decide which top-level decls the tree-shaker may drop.
     fn collect_module_globals(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         match node.kind() {
@@ -522,6 +527,8 @@ impl Resolver {
         self.module_globals.insert(name);
     }
 
+    // NOTE: keep in sync with `compile::pattern_bound_names` (`src/compile/mod.rs`),
+    // which mirrors this walk for tree-shake name extraction.
     fn collect_pattern_global_names(&mut self, pat: &ResolvedNode, mutable: bool) {
         use SyntaxKind::*;
         for entry in pat.children() {
@@ -1153,7 +1160,109 @@ impl Resolver {
                     }
                 }
             }
+            OrPat => self.resolve_or_pattern(pat),
             _ => {}
+        }
+    }
+
+    /// Resolve an or-pattern `Foo(x) | Bar(x) | …`. Each alternative is a sibling
+    /// pattern that the VM compiler lowers and binds INDEPENDENTLY, but the arm body
+    /// has a SINGLE use of each bound name (`x`), so every alternative's bind site
+    /// for a given name must resolve to ONE shared slot. A valid or-pattern binds the
+    /// SAME name set in every alternative (the tree-walker enforces this at match
+    /// time; here we make the slots agree).
+    ///
+    /// The subtlety is Option-C: a bare-ident pattern whose name is already IN SCOPE
+    /// is a value-compare, not a bind. Alternatives are MUTUALLY EXCLUSIVE branches,
+    /// so a name bound by an EARLIER alternative must NOT make a later alternative's
+    /// same-named bind site compare instead of bind. We therefore resolve each
+    /// alternative with the prior alternatives' bound names temporarily HIDDEN from
+    /// the live scope map (so Option-C binds them fresh), then remap the freshly
+    /// allocated binding back onto the first alternative's slot and restore the
+    /// scope entry — leaving exactly one shared slot per name, visible to the body.
+    fn resolve_or_pattern(&mut self, pat: &ResolvedNode) {
+        // `HashMap`/`HashSet` are imported at module scope (line 8).
+        // name -> shared slot (the slot the FIRST alternative allocated for it).
+        let mut or_slots: HashMap<String, u32> = HashMap::new();
+        // Per-alternative: (its source range, the SET of names it binds). Used after
+        // the loop to verify every alternative binds the SAME name set (Rust's
+        // "variable `x` is not bound in all patterns").
+        let mut alt_binds: Vec<(TextRange, HashSet<String>)> = Vec::new();
+        for alt in pat.children().filter(|c| is_pattern(c.kind())) {
+            let alt_range = alt.text_range();
+            // Hide every already-shared name so a same-named bind site in THIS
+            // alternative is seen as unbound (→ Option-C binds it) rather than a
+            // compare against a sibling alternative's binding.
+            for name in or_slots.keys() {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.remove(name);
+                }
+            }
+            // Snapshot the binding count so we can find what this alternative adds.
+            let before_len = self.frame_ref().bindings.len();
+            self.resolve_pattern(alt);
+            // Collect the names this alternative bound (the new bindings' names).
+            let new_names: Vec<(String, u32)> = self.frame_ref().bindings[before_len..]
+                .iter()
+                .map(|b| (b.name.clone(), b.slot))
+                .collect();
+            let mut this_alt: HashSet<String> = HashSet::new();
+            for (name, fresh_slot) in new_names {
+                this_alt.insert(name.clone());
+                if let Some(&shared) = or_slots.get(&name) {
+                    // A later alternative re-bound an existing or-name: point every
+                    // binding this alternative just created for `name` at the shared
+                    // slot, and restore the scope entry to that shared slot.
+                    let bindings = &mut self.frame().bindings;
+                    for b in bindings[before_len..].iter_mut() {
+                        if b.name == name {
+                            b.slot = shared;
+                        }
+                    }
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope.names.insert(name.clone(), shared);
+                    }
+                } else {
+                    // First alternative to bind this name: it owns the shared slot.
+                    or_slots.insert(name, fresh_slot);
+                }
+            }
+            alt_binds.push((alt_range, this_alt));
+        }
+        // Every or-bound name must be visible to the arm guard/body via its shared
+        // slot (the body has ONE use per name). Restore each shared name to the scope
+        // so the body resolves to the shared slot regardless of which alternative
+        // matched.
+        for (name, slot) in &or_slots {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.names.insert(name.clone(), *slot);
+            }
+        }
+        // STATIC VALIDATION: every alternative must bind the SAME set of names. The
+        // arm body reads ONE binding per name, so a name bound by some alternatives
+        // but absent from others is unbound when a missing alternative matches — a
+        // compile error on BOTH engines (Rust-style "variable `x` is not bound in all
+        // patterns"), not a runtime divergence. Emit ONE diagnostic per missing name,
+        // pointed at the FIRST alternative that fails to bind it (deterministic order:
+        // by union iteration sorted, then first-missing alternative).
+        if alt_binds.len() >= 2 {
+            let mut all_names: Vec<&String> = or_slots.keys().collect();
+            all_names.sort();
+            for name in all_names {
+                if let Some((miss_range, _)) = alt_binds
+                    .iter()
+                    .find(|(_, set)| !set.contains(name))
+                {
+                    self.result.diagnostics.push(ResolveDiagnostic {
+                        message: format!(
+                            "variable '{name}' is not bound in all alternatives of the or-pattern"
+                        ),
+                        range: *miss_range,
+                        code: codes::OR_PATTERN_BINDING,
+                        blocking: true,
+                    });
+                }
+            }
         }
     }
 

@@ -149,6 +149,11 @@ fn event_to_json(seq: usize, ev: &DetEvent) -> serde_json::Value {
             json!({"seq": seq, "kind": "MonotonicRead", "value": value})
         }
         DetEvent::RandomRead { value } => json!({"seq": seq, "kind": "RandomRead", "value": value}),
+        // Task 0.19c: a seeded byte draw (`uuid.v4`/`uuid.v7`/`crypto.randomBytes`/salts).
+        // The drawn bytes are stored as a JSON number array (same convention as the
+        // boundary byte events above — no new base64 dep; the `workflow` feature only
+        // pulls `data`/`serde_json`).
+        DetEvent::BytesRead { bytes } => json!({"seq": seq, "kind": "BytesRead", "bytes": bytes}),
         DetEvent::TimerSet { wake } => json!({"seq": seq, "kind": "TimerSet", "wake": wake}),
         DetEvent::ActivityCompleted {
             name,
@@ -258,6 +263,12 @@ fn log_to_events(text: &str) -> Vec<DetEvent> {
                 if let Some(v) = rec.get("value").and_then(|v| v.as_f64()) {
                     events.push(DetEvent::RandomRead { value: v });
                 }
+            }
+            // Task 0.19c: a seeded byte draw — decode the JSON number array back to bytes.
+            "BytesRead" => {
+                events.push(DetEvent::BytesRead {
+                    bytes: json_bytes(rec.get("bytes")),
+                });
             }
             "TimerSet" => {
                 if let Some(w) = rec.get("wake").and_then(|v| v.as_f64()) {
@@ -726,15 +737,57 @@ fn completed_result(text: &str) -> Option<Value> {
     None
 }
 
-/// Write the event log to disk, fsync-ing when `fsync` (durability "fsync").
+/// Write the event log to disk **atomically**: write to a sibling temp file, fsync it
+/// (when `fsync`), then `rename` it over the target. POSIX `rename` is atomic at the
+/// directory level, so a crash (OOM/SIGKILL/power loss) at any instant leaves `path`
+/// holding EITHER the previous complete log OR the new complete log — never a
+/// zero-byte/partial file. This is the keystone of the exactly-once activity
+/// guarantee: the old in-place `File::create(path)` truncated the target before
+/// writing, so a crash mid-write corrupted the log and forced a full re-execution.
+///
+/// **Single-writer-per-log** (module contract): only one process/isolate writes a
+/// given log path at a time (the replay model already depends on this). The temp
+/// sibling is pid-qualified (`<path>.<pid>.tmp`) so two unrelated processes targeting
+/// the same path don't clobber each other's in-flight temp; concurrent writers within
+/// the SAME process are not supported by design.
+///
+/// **Durability:** when `fsync`, the temp file's data is fsync'd before the rename and
+/// the parent directory is fsync'd AFTER the rename, so the directory entry update
+/// (the rename itself) is durable — without that, a crash could lose the rename even
+/// though the file data was synced. (POSIX; on platforms where opening the directory
+/// for fsync is unsupported, the dir-sync is a best-effort no-op.)
 fn write_log(path: &str, contents: &str, fsync: bool, span: Span) -> Result<(), Control> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)
-        .map_err(|e| AsError::at(format!("workflow: cannot write log '{}': {}", path, e), span))?;
+    let tmp = format!("{}.{}.tmp", path, std::process::id());
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| AsError::at(format!("workflow: cannot write log '{}': {}", tmp, e), span))?;
     f.write_all(contents.as_bytes())
         .map_err(|e| AsError::at(format!("workflow: log write failed: {}", e), span))?;
     if fsync {
-        let _ = f.sync_all();
+        // The user explicitly opted into durability — a failed fsync (ENOSPC/EIO)
+        // means the data is NOT durable, so surface it rather than rename-and-lie.
+        f.sync_all()
+            .map_err(|e| AsError::at(format!("workflow: log sync failed: {}", e), span))?;
+    }
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // Clean up the orphaned temp so a failed commit doesn't leave litter.
+        let _ = std::fs::remove_file(&tmp);
+        AsError::at(format!("workflow: log commit failed: {}", e), span)
+    })?;
+    if fsync {
+        // Fsync the parent directory so the rename (a directory-entry change) is itself
+        // durable. Best-effort: not all platforms allow opening a dir for sync.
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let dir = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
     }
     Ok(())
 }
@@ -743,3 +796,153 @@ fn write_log(path: &str, contents: &str, fsync: bool, span: Span) -> Result<(), 
 const _: fn() = || {
     let _ = Rc::new(RefCell::new(0u8));
 };
+
+#[cfg(test)]
+mod write_log_tests {
+    use super::write_log;
+    use crate::span::Span;
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "ascript_wflog_{}_{}_{:?}",
+            name,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A successful atomic write leaves the complete content at `path` and NO stray
+    /// `.tmp` sibling behind.
+    #[test]
+    fn success_writes_complete_content_and_leaves_no_tmp() {
+        let dir = tmp_dir("ok");
+        let path = dir.join("events.log");
+        let p = path.to_string_lossy().into_owned();
+
+        write_log(&p, "first\n", false, Span::new(0, 0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+
+        write_log(&p, "first\nsecond\n", false, Span::new(0, 0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+
+        // No `.tmp` sibling may linger after a committed rename.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "the .tmp sibling must be renamed away on success; found {strays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `fsync=true` durability path (the production default `durability:"fsync"`)
+    /// completes the full write → file-fsync → rename → dir-fsync sequence, leaving the
+    /// correct content and no stray `.tmp`. This is the regression guard for surfacing
+    /// the file `sync_all()` error: the success branch must still return `Ok` and
+    /// commit. (The only prior fsync=true test failed at `File::create` and never
+    /// reached the sync, so this branch was untested.)
+    #[test]
+    fn fsync_true_success_path_commits_correct_content() {
+        let dir = tmp_dir("fsync_ok");
+        let path = dir.join("events.log");
+        let p = path.to_string_lossy().into_owned();
+
+        write_log(&p, "durable-line-1\n", true, Span::new(0, 0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "durable-line-1\n");
+
+        // Overwrite atomically again with fsync on.
+        write_log(&p, "durable-line-1\ndurable-line-2\n", true, Span::new(0, 0)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "durable-line-1\ndurable-line-2\n"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "fsync path must rename the .tmp away; found {strays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the commit cannot proceed (here: the parent directory is read-only so the
+    /// temp sibling can't even be created), the ORIGINAL log is left fully intact.
+    /// The old `File::create(path)` truncated the target BEFORE writing, so this
+    /// property failed for it; temp+rename never touches `path` until the atomic
+    /// rename. Unix-only (read-only-dir enforcement is reliable on POSIX).
+    #[cfg(unix)]
+    #[test]
+    fn failure_leaves_original_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_dir("fail");
+        let path = dir.join("events.log");
+
+        // Seed a valid previous log.
+        std::fs::write(&path, "old-complete-log\n").unwrap();
+
+        // Make the directory read-only so creating the temp sibling fails AND (with
+        // the old code) re-creating `path` would also have to truncate it first.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o500); // r-x------ : no write/create in the dir
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let p = path.to_string_lossy().into_owned();
+        let res = write_log(&p, "brand-new-content\n", true, Span::new(0, 0));
+
+        // Restore write perms so we can read/clean up regardless of outcome.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        // The temp-then-rename approach cannot create the `.tmp` sibling in a
+        // read-only directory, so the commit fails cleanly. The OLD in-place
+        // `File::create(path)` truncated and rewrote the EXISTING file (no directory
+        // entry created → permitted even in a read-only dir), silently destroying the
+        // prior log. The decisive guarantee: the original log is never destroyed by a
+        // write that did not fully commit.
+        assert!(res.is_err(), "write into a read-only dir must error cleanly");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "old-complete-log\n",
+            "a failed write must NOT corrupt or truncate the existing log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Task 0.19c: the `BytesRead` det-event survives the newline-JSON log codec
+/// (`events_to_log` → `log_to_events`) byte-for-byte. Guards the serde path the
+/// end-to-end workflow replay depends on.
+#[cfg(test)]
+mod bytes_read_log_codec_tests {
+    use super::{events_to_log, log_to_events};
+    use crate::det::DetEvent;
+
+    #[test]
+    fn bytes_read_round_trips_through_the_log() {
+        let events = vec![
+            DetEvent::BytesRead {
+                bytes: vec![0, 1, 127, 128, 255, 16],
+            },
+            DetEvent::RandomRead { value: 0.25 },
+            DetEvent::BytesRead { bytes: vec![] }, // empty draw is faithful too
+        ];
+        let log = events_to_log(&events);
+        assert!(log.contains("\"kind\":\"BytesRead\""), "log must carry the kind tag");
+        let back = log_to_events(&log);
+        assert_eq!(back, events, "BytesRead must round-trip the exact bytes");
+    }
+}

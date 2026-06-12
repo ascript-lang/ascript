@@ -5,7 +5,9 @@
 //! later VM plan slices (V2–V10).
 
 pub mod adapt;
+pub mod archive;
 pub mod aso;
+pub(crate) mod bcanalysis;
 pub mod chunk;
 pub mod coverage_report;
 pub mod disasm;

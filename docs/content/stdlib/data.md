@@ -551,6 +551,8 @@ Generates a time-ordered (version 7) UUID based on the current timestamp.
 - Takes no arguments.
 - Returns a UUID string. Values are monotonically ordered by creation time, which makes them well-suited as sortable database keys.
 
+Like `uuid.v4`, `uuid.v7` is **replay-safe inside a durable `workflow`**: under record/replay both halves are reproducible — the time prefix is drawn from the workflow's virtual clock and the random tail from its seeded PRNG. Outside a workflow it uses the real clock and real entropy (no change).
+
 ```ascript
 let id = uuid.v7()
 // id == "018f9b4e-3a7c-7c1d-9f2a-1b2c3d4e5f60"  (time-ordered, 36 chars)

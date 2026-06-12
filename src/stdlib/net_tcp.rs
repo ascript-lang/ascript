@@ -200,15 +200,9 @@ impl Interp {
             "read" => {
                 let n = match args.first() {
                     None | Some(Value::Nil) => DEFAULT_CHUNK,
-                    Some(v) => {
-                        let n = super::want_number(v, span, "stream.read")?;
-                        if n < 0.0 {
-                            return Err(
-                                AsError::at("stream.read n must be non-negative", span).into()
-                            );
-                        }
-                        n as usize
-                    }
+                    // Guard before the cast: an `Inf`/`NaN`/out-of-range `n` would cast
+                    // to `usize::MAX` and abort the host via `buf.reserve(n)`.
+                    Some(v) => super::want_count(v, span, "stream.read", super::MAX_ALLOC_COUNT)?,
                 };
                 // read(0) is a no-op: return empty bytes WITHOUT touching the resource.
                 // (Otherwise an empty read buffer yields Ok(0), which the match below

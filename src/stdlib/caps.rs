@@ -263,6 +263,81 @@ pub fn host_of_url(url: &str) -> Option<String> {
     Some(host_of_addr(hostport).to_string())
 }
 
+/// The strictness order of the two `fs` deny modes: `All` (deny read AND write) is
+/// stricter than `Write` (deny writes only). Returns the stricter of `(a, b)`.
+fn stricter_fs_deny(a: FsDeny, b: FsDeny) -> FsDeny {
+    match (a, b) {
+        (FsDeny::All, _) | (_, FsDeny::All) => FsDeny::All,
+        _ => FsDeny::Write,
+    }
+}
+
+/// The strictness order of the two `net` deny modes: `All` (only allow-listed hosts)
+/// is stricter than `External` (loopback/private also reachable). Returns the
+/// stricter of `(a, b)`.
+fn stricter_net_deny(a: NetDeny, b: NetDeny) -> NetDeny {
+    match (a, b) {
+        (NetDeny::All, _) | (_, NetDeny::All) => NetDeny::All,
+        _ => NetDeny::External,
+    }
+}
+
+/// Intersect two allow-lists: an entry survives only if it appears in BOTH (so a
+/// merged carve-out can never allow back something either side denied). Order follows
+/// `a` and duplicates are dropped — the verdict is set-membership, so order/dup are
+/// not observable.
+fn intersect_allow(a: &[String], b: &[String]) -> Vec<String> {
+    // O(|a|×|b|), capped at MAX_ENTRIES² (~16M comparisons worst case) — safe because
+    // allow-lists are human-authored config. The `!out.contains` guard handles a
+    // hypothetical duplicate in `a` (legitimately-built CapSets never carry duplicates,
+    // but the decoder yields whatever was serialized).
+    let mut out = Vec::new();
+    for s in a {
+        if b.contains(s) && !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+/// The more-restrictive `fs` carve-out for `restrict_with`. `None` means the result
+/// has NO `fs` carve-out — either because both sides grant `fs` fully (the bit stays
+/// set via the bitset intersection) OR because some side denies `fs` outright (the
+/// bit is already clear and a denied class carries no allow-list).
+fn merge_fs(a: &CapSet, b: &CapSet) -> Option<FsScope> {
+    let a_full = a.has(Cap::Fs);
+    let b_full = b.has(Cap::Fs);
+    match (a_full, &a.fs_scope, b_full, &b.fs_scope) {
+        // Both grant fully → no carve-out (bit intersection leaves it granted).
+        (true, _, true, _) => None,
+        // One grants fully, the other carves out → use the carve-out.
+        (true, _, false, Some(s)) | (false, Some(s), true, _) => Some(s.clone()),
+        // Both carve out → stricter deny mode + intersected allow-list.
+        (false, Some(sa), false, Some(sb)) => Some(FsScope {
+            deny: stricter_fs_deny(sa.deny, sb.deny),
+            allow: intersect_allow(&sa.allow, &sb.allow),
+        }),
+        // Some side denies fs outright (no scope) → whole cap denied, no carve-out.
+        _ => None,
+    }
+}
+
+/// The more-restrictive `net` carve-out for `restrict_with` — the `net` mirror of
+/// [`merge_fs`].
+fn merge_net(a: &CapSet, b: &CapSet) -> Option<NetScope> {
+    let a_full = a.has(Cap::Net);
+    let b_full = b.has(Cap::Net);
+    match (a_full, &a.net_scope, b_full, &b.net_scope) {
+        (true, _, true, _) => None,
+        (true, _, false, Some(s)) | (false, Some(s), true, _) => Some(s.clone()),
+        (false, Some(sa), false, Some(sb)) => Some(NetScope {
+            deny: stricter_net_deny(sa.deny, sb.deny),
+            allow: intersect_allow(&sa.allow, &sb.allow),
+        }),
+        _ => None,
+    }
+}
+
 /// The per-`Interp` capability set: a five-bit grant bitset plus the two optional
 /// granular carve-outs for `fs`/`net` (§4.3/§4.4).
 ///
@@ -387,6 +462,44 @@ impl CapSet {
         }
     }
 
+    /// Compose this set with `other` by **monotone intersection** (BNDL N4): the
+    /// result grants a capability ONLY IF BOTH sets grant it — neither side can
+    /// re-grant what the other denied. This is the security property of an embedded
+    /// capability floor: `archive.caps.restrict_with(&cli_caps)` enforces the
+    /// build-time restriction AND any run-time `--deny`, and a run-time flag can only
+    /// ever narrow further, never widen.
+    ///
+    /// Per whole-cap bit: granted in the result iff granted in BOTH (`bits & bits`).
+    /// For the `fs`/`net` carve-outs the result is the **more restrictive** of the
+    /// two sides (so a carve-out never widens access):
+    /// - either side denies the whole cap (bit clear, no scope) → the result denies
+    ///   the whole cap (no scope; over-restriction is sound);
+    /// - one side grants the cap fully and the other carries a scope → the result
+    ///   uses that scope;
+    /// - both carry a scope → the **stricter** deny-mode and the **intersection** of
+    ///   allow-lists. Deny modes are a two-element total order (Write < All /
+    ///   External < All), so `stricter_*` is always conclusive. A future third
+    ///   variant would need a tiebreak here.
+    ///
+    /// Monotone, commutative on the verdict, and idempotent (`x.restrict_with(&x) == x`).
+    pub fn restrict_with(&self, other: &CapSet) -> CapSet {
+        let mut out = CapSet {
+            // Whole-cap intersection: granted iff granted in BOTH.
+            bits: self.bits & other.bits,
+            fs_scope: None,
+            net_scope: None,
+        };
+        // fs carve-out: the more restrictive of the two sides.
+        if let Some(scope) = merge_fs(self, other) {
+            out.set_fs_scope(scope);
+        }
+        // net carve-out: the more restrictive of the two sides.
+        if let Some(scope) = merge_net(self, other) {
+            out.set_net_scope(scope);
+        }
+        out
+    }
+
     /// Build a `CapSet` by denying every name in `names` (CLI `--deny a,b` /
     /// manifest `deny = [...]`). An unknown name is a clean `Err(name)` — never a
     /// panic — so a hostile manifest/CLI input is rejected, not crashed.
@@ -404,6 +517,264 @@ impl CapSet {
             }
         }
         Ok(set)
+    }
+
+    // ─────────────────── Module-archive serialization (BNDL §5) ───────────────
+    // The build-time CapSet (its `bits` plus the variable-length `fs_scope`/
+    // `net_scope` carve-outs) is embedded in a module-archive manifest — the
+    // variable-length home the fixed 32-byte bundle footer cannot provide. The
+    // decoder runs over UNTRUSTED bytes (a tampered archive), so it is fully
+    // bounds-checked and allocation-bomb-capped: it returns a clean error and
+    // NEVER panics or indexes out of range.
+
+    /// Serialize this `CapSet` to a self-describing byte vector for embedding in a
+    /// module-archive manifest (BNDL §5). Little-endian length prefixes.
+    ///
+    /// Layout:
+    /// - `bits: u8`
+    /// - `fs_scope`: presence `u8` (0 = `None`, 1 = `Some`); if present, a `deny`
+    ///   mode byte then a `u16` count of allowed prefixes, each a `u32`-len-prefixed
+    ///   UTF-8 string.
+    /// - `net_scope`: same shape, with allowed hosts.
+    ///
+    /// Written by **destructuring** `self` so a future `CapSet` field is a compile
+    /// error here until it is handled — the serializer can never silently drop a
+    /// field.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // Exhaustiveness: destructure so a new field fails to compile here.
+        let CapSet {
+            bits,
+            fs_scope,
+            net_scope,
+        } = self;
+
+        let mut out = Vec::new();
+        out.push(*bits);
+        write_fs_scope(&mut out, fs_scope.as_ref());
+        write_net_scope(&mut out, net_scope.as_ref());
+        out
+    }
+
+    /// Parse a `CapSet` from the front of `b`, returning the decoded value and the
+    /// number of bytes consumed (so trailing manifest data is allowed). Every read
+    /// is bounds-checked and every count/length is capped — malformed or hostile
+    /// input yields a [`CapsDecodeError`], never a panic.
+    pub fn from_bytes(b: &[u8]) -> Result<(CapSet, usize), CapsDecodeError> {
+        let mut cur = Cursor::new(b);
+        let bits = cur.u8()?;
+        let fs_scope = read_fs_scope(&mut cur)?;
+        let net_scope = read_net_scope(&mut cur)?;
+        Ok((
+            CapSet {
+                bits,
+                fs_scope,
+                net_scope,
+            },
+            cur.pos,
+        ))
+    }
+}
+
+/// These cap the decoder's allocation against a tampered archive. An `fs`/`net`
+/// carve-out is human-authored config, so both limits sit far above any legitimate
+/// value while staying small enough to bound a hostile decode.
+///
+/// `MAX_ENTRIES` — a real allow-list is O(10) entries; 4096 is generous yet stays
+/// **below `u16::MAX` (65535)**, so the serialized `u16` count field can never
+/// overflow for a legitimately-constructed carve-out.
+const MAX_ENTRIES: usize = 4096;
+/// `MAX_STRING_LEN` — a real path prefix / host is O(200) bytes; 64 KiB is far above
+/// any legitimate entry while capping the per-string decode allocation.
+const MAX_STRING_LEN: usize = 64 * 1024;
+
+/// Mode wire bytes (kept local to the (de)serializer so the on-disk encoding is a
+/// single source of truth, decoupled from any future enum reordering).
+const FS_DENY_WRITE: u8 = 0;
+const FS_DENY_ALL: u8 = 1;
+const NET_DENY_EXTERNAL: u8 = 0;
+const NET_DENY_ALL: u8 = 1;
+
+/// An error decoding a serialized [`CapSet`] from (possibly hostile) archive bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapsDecodeError {
+    /// The input ended before a required field could be read.
+    Truncated,
+    /// A presence byte was neither 0 (`None`) nor 1 (`Some`).
+    InvalidPresence(u8),
+    /// A deny-mode byte did not name a known mode.
+    InvalidMode(u8),
+    /// An allow-list entry count exceeded [`MAX_ENTRIES`].
+    CountTooLarge(usize),
+    /// A string length exceeded [`MAX_STRING_LEN`].
+    StringTooLong(usize),
+    /// An allow-list entry was not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for CapsDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapsDecodeError::Truncated => write!(f, "truncated capability-set encoding"),
+            CapsDecodeError::InvalidPresence(b) => {
+                write!(f, "invalid carve-out presence byte {b} (expected 0 or 1)")
+            }
+            CapsDecodeError::InvalidMode(b) => write!(f, "invalid deny-mode byte {b}"),
+            CapsDecodeError::CountTooLarge(n) => {
+                write!(f, "allow-list entry count {n} exceeds the maximum {MAX_ENTRIES}")
+            }
+            CapsDecodeError::StringTooLong(n) => {
+                write!(f, "allow-list string length {n} exceeds the maximum {MAX_STRING_LEN}")
+            }
+            CapsDecodeError::InvalidUtf8 => write!(f, "allow-list entry is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for CapsDecodeError {}
+
+/// A bounds-checked forward reader over a byte slice. Every accessor advances `pos`
+/// only after verifying the read fits, so an out-of-range read is a clean
+/// [`CapsDecodeError::Truncated`], never a slice panic.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Cursor { buf, pos: 0 }
+    }
+
+    /// Borrow the next `n` bytes (checked), advancing past them.
+    fn take(&mut self, n: usize) -> Result<&'a [u8], CapsDecodeError> {
+        let end = self.pos.checked_add(n).ok_or(CapsDecodeError::Truncated)?;
+        let slice = self.buf.get(self.pos..end).ok_or(CapsDecodeError::Truncated)?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, CapsDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, CapsDecodeError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, CapsDecodeError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Read a `u32`-length-prefixed UTF-8 string, capped at [`MAX_STRING_LEN`].
+    fn string(&mut self) -> Result<String, CapsDecodeError> {
+        let len = self.u32()? as usize;
+        if len > MAX_STRING_LEN {
+            return Err(CapsDecodeError::StringTooLong(len));
+        }
+        let bytes = self.take(len)?;
+        std::str::from_utf8(bytes)
+            .map(|s| s.to_string())
+            .map_err(|_| CapsDecodeError::InvalidUtf8)
+    }
+
+    /// Read a `u16`-count then that many `u32`-length-prefixed strings. The count is
+    /// capped at [`MAX_ENTRIES`] BEFORE any reservation, so a hostile count can't
+    /// trigger an allocation bomb.
+    fn string_list(&mut self) -> Result<Vec<String>, CapsDecodeError> {
+        let count = self.u16()? as usize;
+        if count > MAX_ENTRIES {
+            return Err(CapsDecodeError::CountTooLarge(count));
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.string()?);
+        }
+        Ok(out)
+    }
+}
+
+/// Append a `u32`-length-prefixed UTF-8 string.
+fn write_string(out: &mut Vec<u8>, s: &str) {
+    // Lengths are capped on decode; on encode a legitimately-authored allow-list is
+    // always well under the cap, so a plain truncating cast is safe in practice and
+    // the decoder rejects anything pathological.
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Append a `u16`-count then each string in `list`.
+fn write_string_list(out: &mut Vec<u8>, list: &[String]) {
+    // MAX_ENTRIES (4096) << u16::MAX (65535), so a legitimately-constructed allow-list
+    // never overflows; the decoder rejects counts > MAX_ENTRIES anyway.
+    debug_assert!(list.len() <= u16::MAX as usize, "allow-list too long for u16 count");
+    out.extend_from_slice(&(list.len() as u16).to_le_bytes());
+    for s in list {
+        write_string(out, s);
+    }
+}
+
+fn write_fs_scope(out: &mut Vec<u8>, scope: Option<&FsScope>) {
+    match scope {
+        None => out.push(0),
+        Some(s) => {
+            // Destructure for exhaustiveness — a new FsScope field breaks here.
+            let FsScope { deny, allow } = s;
+            out.push(1);
+            out.push(match deny {
+                FsDeny::Write => FS_DENY_WRITE,
+                FsDeny::All => FS_DENY_ALL,
+            });
+            write_string_list(out, allow);
+        }
+    }
+}
+
+fn write_net_scope(out: &mut Vec<u8>, scope: Option<&NetScope>) {
+    match scope {
+        None => out.push(0),
+        Some(s) => {
+            let NetScope { deny, allow } = s;
+            out.push(1);
+            out.push(match deny {
+                NetDeny::External => NET_DENY_EXTERNAL,
+                NetDeny::All => NET_DENY_ALL,
+            });
+            write_string_list(out, allow);
+        }
+    }
+}
+
+fn read_fs_scope(cur: &mut Cursor) -> Result<Option<FsScope>, CapsDecodeError> {
+    match cur.u8()? {
+        0 => Ok(None),
+        1 => {
+            let deny = match cur.u8()? {
+                FS_DENY_WRITE => FsDeny::Write,
+                FS_DENY_ALL => FsDeny::All,
+                other => return Err(CapsDecodeError::InvalidMode(other)),
+            };
+            let allow = cur.string_list()?;
+            Ok(Some(FsScope { deny, allow }))
+        }
+        other => Err(CapsDecodeError::InvalidPresence(other)),
+    }
+}
+
+fn read_net_scope(cur: &mut Cursor) -> Result<Option<NetScope>, CapsDecodeError> {
+    match cur.u8()? {
+        0 => Ok(None),
+        1 => {
+            let deny = match cur.u8()? {
+                NET_DENY_EXTERNAL => NetDeny::External,
+                NET_DENY_ALL => NetDeny::All,
+                other => return Err(CapsDecodeError::InvalidMode(other)),
+            };
+            let allow = cur.string_list()?;
+            Ok(Some(NetScope { deny, allow }))
+        }
+        other => Err(CapsDecodeError::InvalidPresence(other)),
     }
 }
 
@@ -895,6 +1266,282 @@ mod tests {
         // No authority → None (caller lets the connect surface its own error).
         assert_eq!(host_of_url("not-a-url"), None);
         assert_eq!(host_of_url("/relative/path"), None);
+    }
+
+    // ─────────────────────── CapSet serialization (Task 1.1) ──────────────────
+    // `to_bytes`/`from_bytes` for embedding a build-time CapSet into a module-archive
+    // manifest (§5). Variable-length carve-outs don't fit the fixed 32-byte footer.
+
+    #[test]
+    fn capset_roundtrip_full() {
+        // A non-trivial set: some bits dropped, an fs carve-out, a net carve-out.
+        let mut cs = CapSet::all_granted();
+        cs.deny(Cap::Process);
+        cs.deny(Cap::Env);
+        cs.set_fs_scope(FsScope {
+            deny: FsDeny::All,
+            allow: vec!["./cache".into(), "/var/tmp/app".into()],
+        });
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::External,
+            allow: vec!["api.internal".into(), "10.0.0.5".into(), "héllo.example".into()],
+        });
+
+        let bytes = cs.to_bytes();
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).expect("round-trips");
+        assert_eq!(decoded, cs, "round-trip yields an equal CapSet");
+        assert_eq!(consumed, bytes.len(), "consumes exactly the serialized region");
+    }
+
+    #[test]
+    fn capset_roundtrip_default_no_carveouts() {
+        let cs = CapSet::all_granted();
+        let bytes = cs.to_bytes();
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, cs);
+        assert_eq!(consumed, bytes.len());
+        // No carve-outs → presence bytes are 0, so the encoding is compact.
+        assert_eq!(bytes.len(), 3, "bits + two presence bytes when no carve-outs");
+    }
+
+    #[test]
+    fn capset_roundtrip_fs_only() {
+        let mut cs = CapSet::all_granted();
+        cs.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec![] });
+        let bytes = cs.to_bytes();
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, cs);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn from_bytes_allows_trailing_data() {
+        // The decoder reports bytes_consumed so a manifest can hold trailing fields.
+        let cs = CapSet::all_granted();
+        let mut bytes = cs.to_bytes();
+        let n = bytes.len();
+        bytes.extend_from_slice(b"TRAILING MANIFEST DATA");
+        let (decoded, consumed) = CapSet::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, cs);
+        assert_eq!(consumed, n, "stops after the CapSet region, leaving trailing bytes");
+    }
+
+    #[test]
+    fn from_bytes_empty_is_err_not_panic() {
+        assert!(matches!(
+            CapSet::from_bytes(&[]),
+            Err(CapsDecodeError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn from_bytes_truncated_is_clean_err() {
+        // Build a valid encoding, then truncate at every prefix — none may panic.
+        let mut cs = CapSet::all_granted();
+        cs.set_fs_scope(FsScope {
+            deny: FsDeny::All,
+            allow: vec!["abc".into(), "defg".into()],
+        });
+        cs.set_net_scope(NetScope {
+            deny: NetDeny::All,
+            allow: vec!["host.example".into()],
+        });
+        let full = cs.to_bytes();
+        for cut in 0..full.len() {
+            // Any strict prefix must be Err, never a panic and never a partial Ok.
+            let r = CapSet::from_bytes(&full[..cut]);
+            assert!(r.is_err(), "prefix of len {cut} must be Err");
+        }
+        // The full buffer is Ok.
+        assert!(CapSet::from_bytes(&full).is_ok());
+    }
+
+    #[test]
+    fn from_bytes_invalid_mode_byte_is_err() {
+        // bits=0x1f (all granted), fs present, mode = 99 (invalid) → clean Err.
+        let bytes = [ALL_BITS, 1u8, 99u8, 0u8, 0u8 /* net absent */];
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::InvalidMode(99))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_invalid_presence_byte_is_err() {
+        let bytes = [ALL_BITS, 7u8 /* not 0 or 1 */];
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::InvalidPresence(7))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_over_large_count_is_err_not_alloc_bomb() {
+        // bits, fs present, mode=All(1), count = u16::MAX (way over MAX_ENTRIES) →
+        // clean Err BEFORE any allocation; the buffer is tiny so a naive
+        // `Vec::with_capacity(count)` would also be caught, but the cap rejects first.
+        let mut bytes = vec![ALL_BITS, 1u8, 1u8];
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes()); // count = 65535
+        bytes.extend_from_slice(b"x"); // a few stray bytes
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::CountTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_over_large_string_len_is_err() {
+        // fs present, mode=All, count=1, then a string len of u32::MAX → clean Err,
+        // never an allocation bomb or out-of-bounds read.
+        let mut bytes = vec![ALL_BITS, 1u8, 1u8];
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // string len = 4GB
+        bytes.extend_from_slice(b"short");
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::StringTooLong(_))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_invalid_utf8_is_err() {
+        // fs present, mode=All, count=1, len=2, bytes = invalid utf8 (0xff 0xff).
+        let mut bytes = vec![ALL_BITS, 1u8, 1u8];
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // len = 2
+        bytes.extend_from_slice(&[0xff, 0xff]); // invalid utf8
+        bytes.push(0u8); // net absent
+        assert!(matches!(
+            CapSet::from_bytes(&bytes),
+            Err(CapsDecodeError::InvalidUtf8)
+        ));
+    }
+
+    // ─────────────────────── restrict_with — monotone intersection (N4) ───────
+    // The embedded-caps floor: archive.caps.restrict_with(&cli_caps). A capability is
+    // granted in the result iff BOTH sides grant it; a scope merges to the stricter.
+
+    #[test]
+    fn restrict_all_granted_is_identity() {
+        // all_granted ∩ X == X and X ∩ all_granted == X for any X.
+        let mut x = CapSet::all_granted();
+        x.deny(Cap::Process);
+        x.set_net_scope(NetScope { deny: NetDeny::External, allow: vec!["api.internal".into()] });
+        assert_eq!(CapSet::all_granted().restrict_with(&x), x);
+        assert_eq!(x.restrict_with(&CapSet::all_granted()), x);
+    }
+
+    #[test]
+    fn restrict_is_idempotent() {
+        let mut x = CapSet::all_granted();
+        x.deny(Cap::Env);
+        x.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec!["./cache".into()] });
+        assert_eq!(x.restrict_with(&x), x, "x ∩ x == x");
+    }
+
+    #[test]
+    fn restrict_deny_net_and_deny_fs_denies_both() {
+        let deny_net = CapSet::from_deny_list(["net"]).unwrap();
+        let deny_fs = CapSet::from_deny_list(["fs"]).unwrap();
+        let r = deny_net.restrict_with(&deny_fs);
+        assert!(!r.has(Cap::Net), "net denied (from the net side)");
+        assert!(!r.has(Cap::Fs), "fs denied (from the fs side)");
+        // Everything else stays granted (neither side denied it).
+        assert!(r.has(Cap::Process) && r.has(Cap::Ffi) && r.has(Cap::Env));
+        // A whole-deny carries no carve-out.
+        assert!(r.net_scope.is_none() && r.fs_scope.is_none());
+        // Commutative verdict.
+        assert_eq!(deny_fs.restrict_with(&deny_net), r);
+    }
+
+    #[test]
+    fn restrict_never_regrants_embedded_floor() {
+        // The N4 property: an embedded floor that denies net can NOT be re-granted by
+        // a run-time set that grants net (here: all_granted).
+        let floor = CapSet::from_deny_list(["net"]).unwrap();
+        let runtime = CapSet::all_granted();
+        let eff = floor.restrict_with(&runtime);
+        assert!(!eff.has(Cap::Net), "embedded net-deny survives an all-granted runtime");
+    }
+
+    #[test]
+    fn restrict_scope_intersect_whole_deny_is_whole_deny() {
+        // A net carve-out ∩ a whole net-deny → the whole cap is denied (the carve-out's
+        // allow-list is dropped; over-restriction is sound).
+        let mut carved = CapSet::all_granted();
+        carved.set_net_scope(NetScope { deny: NetDeny::External, allow: vec!["api.internal".into()] });
+        let whole_deny = CapSet::from_deny_list(["net"]).unwrap();
+        let r = carved.restrict_with(&whole_deny);
+        assert!(!r.has(Cap::Net));
+        assert!(r.net_scope.is_none(), "no carve-out survives a whole-cap deny");
+        // fs mirror.
+        let mut fscarved = CapSet::all_granted();
+        fscarved.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec!["./cache".into()] });
+        let rf = fscarved.restrict_with(&CapSet::from_deny_list(["fs"]).unwrap());
+        assert!(!rf.has(Cap::Fs));
+        assert!(rf.fs_scope.is_none());
+    }
+
+    #[test]
+    fn restrict_full_grant_with_scope_uses_the_scope() {
+        // all_granted ∩ (net carve-out) → the carve-out (the grant side imposes nothing).
+        let mut carved = CapSet::all_granted();
+        carved.set_net_scope(NetScope { deny: NetDeny::All, allow: vec!["10.0.0.5".into()] });
+        let r = CapSet::all_granted().restrict_with(&carved);
+        assert!(!r.has(Cap::Net), "carve-out clears the bit");
+        let s = r.net_scope.as_ref().expect("carve-out carried through");
+        assert_eq!(s.deny, NetDeny::All);
+        assert_eq!(s.allow, vec!["10.0.0.5".to_string()]);
+    }
+
+    #[test]
+    fn restrict_scope_intersect_scope_takes_stricter_and_intersects_allow() {
+        // net: External (on a) ∩ All (on b) → All (stricter); allow = intersection.
+        let mut a = CapSet::all_granted();
+        a.set_net_scope(NetScope {
+            deny: NetDeny::External,
+            allow: vec!["api.internal".into(), "10.0.0.5".into()],
+        });
+        let mut b = CapSet::all_granted();
+        b.set_net_scope(NetScope {
+            deny: NetDeny::All,
+            allow: vec!["10.0.0.5".into(), "other.host".into()],
+        });
+        let r = a.restrict_with(&b);
+        let s = r.net_scope.as_ref().expect("merged carve-out");
+        assert_eq!(s.deny, NetDeny::All, "All is stricter than External");
+        assert_eq!(s.allow, vec!["10.0.0.5".to_string()], "allow = intersection of both");
+        // Commutative.
+        assert_eq!(b.restrict_with(&a).net_scope, r.net_scope);
+
+        // fs: Write (on a) ∩ All (on b) → All (stricter); allow = intersection.
+        let mut fa = CapSet::all_granted();
+        fa.set_fs_scope(FsScope { deny: FsDeny::Write, allow: vec!["./cache".into(), "/tmp/x".into()] });
+        let mut fb = CapSet::all_granted();
+        fb.set_fs_scope(FsScope { deny: FsDeny::All, allow: vec!["/tmp/x".into()] });
+        let rf = fa.restrict_with(&fb);
+        let sf = rf.fs_scope.as_ref().expect("merged fs carve-out");
+        assert_eq!(sf.deny, FsDeny::All);
+        assert_eq!(sf.allow, vec!["/tmp/x".to_string()]);
+    }
+
+    #[test]
+    fn restrict_is_monotone_no_bit_appears_that_was_absent() {
+        // Exhaustive over all 32 bit combinations: a bit is set in the result ONLY IF
+        // it was set in BOTH inputs (the core monotone property over whole caps).
+        for ab in 0u8..32 {
+            for bb in 0u8..32 {
+                let a = CapSet { bits: ab, fs_scope: None, net_scope: None };
+                let b = CapSet { bits: bb, fs_scope: None, net_scope: None };
+                let r = a.restrict_with(&b);
+                for cap in Cap::ALL {
+                    if r.has(cap) {
+                        assert!(a.has(cap) && b.has(cap),
+                            "{} granted in result but not in both inputs", cap.name());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

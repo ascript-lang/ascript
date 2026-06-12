@@ -957,6 +957,16 @@ enum SkipReason {
     /// EVEN the tree-walker oracle — so it is excluded the same way the CLI/
     /// conformance suites leave the server/peer examples out of their run set.
     LongRunningServer,
+    /// A MULTI-FILE example whose entry has a relative `import "./sibling"`. The
+    /// whole-corpus oracle runs each example via `run_source_exit(&src)` — the SOURCE
+    /// TEXT only, with NO real file path — so a relative import resolves against the
+    /// process cwd (the crate root), not the example's directory, and the sibling
+    /// cannot be found. This is a test-harness limitation, NOT a VM divergence (the
+    /// program runs byte-identically on BOTH engines when launched from its real
+    /// directory: `target/release/ascript run examples/bundle_multimodule.as`).
+    /// Documented-only; not executed here. Covered instead by `tests/archive.rs`
+    /// (which builds the module archive from the real files) and the CLI run above.
+    RelativeImports,
 }
 
 /// The explicit, per-file SKIP list for the whole-corpus opt-out gate. EVERY entry
@@ -1061,6 +1071,23 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/fs_toolkit.as",
         SkipReason::SharedExternalState,
     ),
+    // Writes its durable-workflow event log to a FIXED path
+    // (`/tmp/ascript_workflow_signup.log`) and `remove`s it at the end. The
+    // multiple corpus oracles run this example concurrently (in-process, parallel
+    // `#[tokio::test]`s, each running it twice — tree-walker then VM); one run's
+    // end-of-program cleanup unlinks the log mid-`resume`/`commit` of another,
+    // surfacing as a flaky `workflow: log commit failed: No such file or directory
+    // (os error 2)`. The engines are byte-identical — this is purely a shared-
+    // fixed-path race, the same class as system.as / fs_toolkit.as. It runs
+    // deterministically in ISOLATION (`ascript run …workflow_signup.as`) and the
+    // workflow record/replay behavior is covered by `tests/workflow.rs` and the
+    // durable-replay tests, so corpus coverage is not weakened. The example is a
+    // clean user-facing demo (a fixed log path is reasonable standalone); only the
+    // parallel multi-oracle harness can't run it safely.
+    (
+        "examples/advanced/workflow_signup.as",
+        SkipReason::SharedExternalState,
+    ),
     // ---- Network-peer / long-running servers (cannot run headless) ------------
     // Forever-serving HTTP API: blocks on `serve` awaiting a client in a separate
     // process; it does not terminate on its own and hangs even the tree-walker.
@@ -1085,6 +1112,27 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     (
         "examples/advanced/server_multicore.as",
         SkipReason::LongRunningServer,
+    ),
+    // BNDL: the self-contained-bundles entry imports a sibling (`./bundle_util`). The
+    // source-only corpus oracle can't resolve a relative import (no real file path), so
+    // it is documented-only here and covered by `tests/archive.rs` + the CLI run. The
+    // sibling `examples/bundle_util.as` has NO imports and runs standalone, so it stays
+    // in the must-run gate (it just prints nothing).
+    (
+        "examples/bundle_multimodule.as",
+        SkipReason::RelativeImports,
+    ),
+    // BNDL: the bundle + capabilities example imports its sibling
+    // `./bundle_caps_util` BOTH ways (namespace + named). Like
+    // `bundle_multimodule.as`, the source-only corpus oracle can't resolve a
+    // relative import, so it is documented-only here and covered by the CLI run +
+    // `tests/archive.rs`. The sibling `examples/advanced/bundle_caps_util.as` has
+    // NO imports and runs standalone (printing nothing), so it stays in the
+    // must-run gate. The example is single-threaded, clock/RNG/IO-free, and runs
+    // identically under `--no-default-features` (`std/caps` is CORE).
+    (
+        "examples/advanced/bundle_caps.as",
+        SkipReason::RelativeImports,
     ),
 ];
 
@@ -1230,11 +1278,13 @@ async fn vm_whole_corpus_skips_are_still_justified() {
         match reason {
             SkipReason::Nondeterministic
             | SkipReason::SharedExternalState
-            | SkipReason::LongRunningServer => {
+            | SkipReason::LongRunningServer
+            | SkipReason::RelativeImports => {
                 // Documented-only; not executed (random/time/network bytes can't
                 // match across two runs, a shared-/tmp file races across the
-                // parallel oracles, or a server blocks forever). Existence is
-                // already asserted above.
+                // parallel oracles, a server blocks forever, or a relative import
+                // can't resolve in the source-only oracle). Existence is already
+                // asserted above.
             }
         }
     }
@@ -6162,6 +6212,30 @@ async fn vm_parser_accepts_runs_legitimate_rejections() {
         assert!(
             tw.is_err() && spec.is_err() && generic.is_err(),
             "expected ALL engines to reject the `{default}` field default\n  \
+             tree-walker: {tw:?}\n  spec: {spec:?}\n  generic: {generic:?}"
+        );
+    }
+
+    // An or-pattern whose alternatives bind DIFFERENT name sets
+    // (`Shape.Circle(r) | Shape.Empty => r` — `r` bound in one alternative, absent
+    // from the other) is rejected by every engine, but the VM rejects it at
+    // COMPILE time (the resolver `or-pattern-binding` diagnostic lifted to a
+    // `CompileError`) and the tree-walker at RUNTIME (the missing binding surfaces
+    // when the unbound alternative matches), so the message/timing legitimately
+    // differ. Assert symmetry-of-rejection (all three `Err`), NOT byte-identical
+    // text — mirroring the `yield`-field-default case above. (The same program also
+    // rejects byte-identically through the CLI gate; that path is covered in
+    // `cli::match_or_pattern_mismatched_names_is_static_error_on_all_paths`.)
+    {
+        let src = "enum Shape { Circle(radius: int), Empty }\n\
+fn f(s: Shape): int {\n  return match s {\n    Shape.Circle(r) | Shape.Empty => r,\n  }\n}\n\
+print(f(Shape.Empty))\n";
+        let tw = ascript::run_source_exit(src).await;
+        let spec = ascript::vm_run_source(src).await;
+        let generic = ascript::vm_run_source_generic(src).await;
+        assert!(
+            tw.is_err() && spec.is_err() && generic.is_err(),
+            "expected ALL engines to reject the mismatched-name or-pattern\n  \
              tree-walker: {tw:?}\n  spec: {spec:?}\n  generic: {generic:?}"
         );
     }

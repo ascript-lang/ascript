@@ -86,6 +86,8 @@ print(ffi.get(Point, buf, "x"))              // 3
 - **`ffi.struct(fields)`** computes C offsets + alignment; **`ffi.alloc(layout)`**
   zeroes a correctly-aligned buffer; **`ffi.get`/`ffi.set`** read/write fields by name.
 
+> [!TIER2] `ffi.alloc` panics if the layout's `size` is negative or exceeds the maximum allocation size (`u32::MAX`, ≈4 GiB) — the size is validated before the buffer is allocated, so a malformed layout is a recoverable Tier-2 panic rather than a host abort.
+
 ## The three handles
 
 - **`ForeignLib`** — an open library; its `Drop` `dlclose`s deterministically.

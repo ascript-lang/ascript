@@ -929,17 +929,27 @@ impl<'a> Pass<'a> {
                     return self.fn_return_type(&fn_decl);
                 }
             } else if callee.kind() == MemberExpr {
+                // Synthesize the receiver EXACTLY ONCE here (emitting its sub-diagnostics)
+                // and thread the type into BOTH helpers below — each previously synthesized
+                // the receiver independently, duplicating receiver diagnostics on a member
+                // call that is neither a variant construction nor a worker pattern.
+                let recv_ty = callee
+                    .children()
+                    .find(|c| crate::check::rules::is_expr_kind(c.kind()))
+                    .map(|recv| self.synth(recv, env));
                 // ADT §7.2: a payload-variant CONSTRUCTION `Shape.Circle(2.0)`. When the
                 // receiver provably resolves to enum `E` and the member is a variant,
                 // synth `EnumVariant(E, V)` (widens to `Enum(E)`), check each provably-
                 // wrong payload arg against the declared field type, and return the type.
-                if let Some(ty) = self.synth_variant_construction(callee, arg_list, env) {
+                if let Some(ty) =
+                    self.synth_variant_construction(callee, arg_list, recv_ty.clone(), env)
+                {
                     return ty;
                 }
                 // Workers Spec B (Task 8):
                 // (1) `WorkerClass.spawn(args)` → `future<WorkerClass>`.
                 // (2) `handle.method(args)` where handle : WorkerClass → `future<method_ret>`.
-                if let Some(ty) = self.synth_member_call(callee, arg_list, env) {
+                if let Some(ty) = self.synth_member_call(callee, arg_list, recv_ty, env) {
                     return ty;
                 }
             }
@@ -955,6 +965,7 @@ impl<'a> Pass<'a> {
         &mut self,
         member: &ResolvedNode,
         arg_list: Option<&ResolvedNode>,
+        recv_ty: Option<CheckTy>,
         env: &mut Env,
     ) -> Option<CheckTy> {
         let recv = member
@@ -971,13 +982,16 @@ impl<'a> Pass<'a> {
                 self.synth_arg_list(arg_list, env);
                 return Some(CheckTy::Future(Box::new(CheckTy::Class(cid))));
             }
-            // Not a worker class — fall through to default.
+            // Not a worker class — give up; `.spawn` on a non-worker NameRef is not a
+            // recognized pattern (Pattern 3 does not apply to NameRef receivers).
             return None;
         }
 
         // Pattern (2): `handle.method(args)` — receiver has type `Class(cid)` for a
-        // known worker class. All methods synthesize `future<method_ret>`.
-        let recv_ty = self.synth(recv, env);
+        // known worker class. All methods synthesize `future<method_ret>`. The receiver
+        // type is supplied by the caller (synthesized once in `synth_call`) — do NOT
+        // re-synth here (it would duplicate the receiver's sub-diagnostics).
+        let recv_ty = recv_ty.unwrap_or(CheckTy::Any);
         if let CheckTy::Class(cid) = recv_ty {
             if self.table.is_worker_class(cid) {
                 self.synth_arg_list(arg_list, env);
@@ -1012,6 +1026,7 @@ impl<'a> Pass<'a> {
         &mut self,
         member: &ResolvedNode,
         arg_list: Option<&ResolvedNode>,
+        recv_ty: Option<CheckTy>,
         env: &mut Env,
     ) -> Option<CheckTy> {
         let recv = member
@@ -1022,8 +1037,9 @@ impl<'a> Pass<'a> {
         //  (a) the receiver is the enum NAME used as a value (`Shape.Circle(…)`) — a
         //      `NameRef` resolving to the unique enum binding; or
         //  (b) the receiver is a VARIABLE typed as the enum (rare for construction).
-        // Synth the receiver regardless (so its own sub-diagnostics flow).
-        let recv_synth = self.synth(recv, env);
+        // The receiver is synthesized ONCE by the caller (`synth_call`) and its type
+        // passed in — re-synthesizing here would duplicate its sub-diagnostics.
+        let recv_synth = recv_ty.unwrap_or(CheckTy::Any);
         let eid = if recv.kind() == SyntaxKind::NameRef {
             let name = crate::syntax::resolve::ident_text(recv).unwrap_or_default();
             self.enum_id_of_ref(recv, &name)
@@ -1492,10 +1508,14 @@ impl<'a> Pass<'a> {
             .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
             .cloned()
             .collect();
-        for e in &elems {
-            self.synth(e, env);
-        }
+        // Synthesize each element EXACTLY ONCE — `self.synth` emits diagnostics as a
+        // side effect, so a second pass duplicates them. On the spread/empty path the
+        // element type is gradual (`Any`), but the elements must still be visited once
+        // so their own diagnostics (and hover types) are emitted.
         if expr.children().any(|c| c.kind() == SyntaxKind::SpreadElem) || elems.is_empty() {
+            for e in &elems {
+                self.synth(e, env);
+            }
             return CheckTy::Array(Box::new(CheckTy::Any));
         }
         let mut acc = CheckTy::Never;

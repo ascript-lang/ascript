@@ -50,8 +50,9 @@ jobs:
       fail-fast: false
       matrix:
         # aso_roundtrip is the BIN-gating target (4h, + a runnable-accept verifier-gap pass);
-        # the rest are deep-but-shorter coverage runs.
-        target: [aso_roundtrip, worker_serialize, differential, parser]
+        # the rest are deep-but-shorter coverage runs (incl. archive_roundtrip — the
+        # `ASCRIPTA` module-archive container decoder, a shipped-bundle security surface).
+        target: [aso_roundtrip, archive_roundtrip, worker_serialize, differential, parser]
     steps:
       - uses: actions/checkout@v5
 

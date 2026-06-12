@@ -443,6 +443,12 @@ impl Interp {
 
 /// Minimal xorshift64* PRNG for retry jitter. Thread-local, seeded from the
 /// system clock. NOT cryptographic — adequate for backoff jitter only.
+///
+/// SP9 §3 — DELIBERATE timing-only (non-data) entropy exemption: this perturbs
+/// only the retry-backoff *sleep DURATION*, never an observable script value, so it
+/// is intentionally NOT routed through `interp.fill_seeded_bytes`. A divergent jitter
+/// across replay changes only wall-clock pacing (which the virtual clock already
+/// abstracts away), never the recorded result — so it cannot break replay fidelity.
 fn retry_rand_f64() -> f64 {
     use std::cell::Cell;
     thread_local! {

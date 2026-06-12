@@ -170,6 +170,10 @@ fn interpreter_parses_each_grammar_construct() {
         // --- match statement form ---
         "let m = match a { 1 => \"one\", 2 | 3 => \"few\", _ => \"many\" }",
         "let m2 = match a { x => 1, _ => 2 }",
+        // Or-pattern alternatives that BIND the same name (must parse on both
+        // front-ends; the same-name-set rule is a SEMANTIC resolver check, not a
+        // parse error — see `cli::match_or_pattern_*`):
+        "let mor = match a { Shape.Circle(r) | Shape.Square(r) => r, _ => 0 }",
         // --- match patterns (Phase 8): array / object / range / guard ---
         "let m3 = match a { [x] => x, [first, ...rest] => first, [] => 0 }",
         "let m4 = match a { [u, nil] => u, [_, e] => e, _ => 0 }",

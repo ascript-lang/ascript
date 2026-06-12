@@ -118,17 +118,23 @@ impl StreamDriver {
     ///
     /// `!Send`: the isolate builds its own `Interp`/`Vm`; only the `Send` slice bytes +
     /// encoded args cross.
+    ///
+    /// `archive_bytes` (Task 1.6): the bundled program's encoded `ModuleArchive`, `Some` for
+    /// a bundled multi-module program. Captured into the `Send` `make_loop` closure and
+    /// installed on the producer isolate's `Vm` before the slice loads, so a `worker fn*` that
+    /// calls into an imported module resolves it from memory. `None` for an unbundled program.
     pub async fn spawn(
         entry_name: String,
         slice_bytes: Vec<u8>,
         encoded_args: Vec<u8>,
         encoded_shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
+        archive_bytes: Option<Vec<u8>>,
     ) -> Result<StreamDriver, String> {
         // A typed `Send` demand channel; the dedicated `IsolateHandle`'s own byte
         // channel is unused (the stream protocol is typed, not raw bytes) — we keep the
         // handle only for teardown, exactly like the actor.
         let (tx, rx) = mpsc::unbounded_channel::<StreamMsg>();
-        let isolate = spawn_isolate(move |vm, _byte_rx| stream_loop(vm, rx))
+        let isolate = spawn_isolate(move |vm, _byte_rx| stream_loop(vm, rx, archive_bytes))
             .map_err(|e| format!("could not spawn streaming-generator isolate: {e}"))?;
 
         // Send Init and await the ack.
@@ -198,8 +204,20 @@ impl StreamDriver {
 /// The producer isolate's run-loop. Builds the producer generator on `Init`, then
 /// services `Resume` credits one at a time (strict pull). Ends when the demand channel
 /// closes (the [`StreamDriver`] dropped → `close()`/last-drop/teardown).
-async fn stream_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<StreamMsg>) {
+async fn stream_loop(
+    vm: Rc<crate::vm::Vm>,
+    mut rx: mpsc::UnboundedReceiver<StreamMsg>,
+    archive_bytes: Option<Vec<u8>>,
+) {
     let interp = vm.interp().clone();
+    // Task 1.6: install the bundled program's archive (if any) BEFORE any producer slice
+    // loads (the slice re-runs the program's top-level imports). The stream isolate is
+    // single-tenant + long-lived, so install once at boot; a decode failure surfaces as the
+    // `Init` panic (the producer never builds).
+    let archive_err: Option<String> = match archive_bytes {
+        Some(bytes) => crate::worker::isolate::install_module_archive(&vm, &bytes).err(),
+        None => None,
+    };
     // The producer generator, built on `Init`, driven one step per `Resume`. Held as a
     // `Value::Generator` (an `Rc<GeneratorHandle>`) on the isolate's own heap — never
     // crosses the boundary.
@@ -214,6 +232,10 @@ async fn stream_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Stre
                 shared,
                 reply,
             } => {
+                if let Some(msg) = archive_err.clone() {
+                    let _ = reply.send(StreamReply::Panic(msg));
+                    continue;
+                }
                 match build_producer(&vm, &interp, &entry_name, &slice_bytes, &args, &shared).await {
                     Ok(gen) => {
                         producer = Some(gen);

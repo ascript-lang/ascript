@@ -121,10 +121,16 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
 /// integer, otherwise a float (matches AScript's number display).
 fn number_to_mp(n: f64) -> Mp {
     if n.fract() == 0.0 && n.is_finite() {
-        if n >= 0.0 && n <= u64::MAX as f64 {
+        // STRICT upper bound: `u64::MAX as f64` rounds UP to 2^64 (out of u64 range),
+        // so `<=` would admit 2^64 and `n as u64` would saturate. `2.0^64` is exact;
+        // `<` excludes it (out-of-range falls through to `Mp::F64`).
+        if n >= 0.0 && n < 2.0_f64.powi(64) {
             return Mp::Integer((n as u64).into());
         }
-        if n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        // Upper bound also rejects large positive values (>= 2^64) that fell through
+        // the u64 arm, where `n as i64` would saturate. `-(i64::MIN as f64)` == 2^63;
+        // `<` excludes it (an out-of-range value falls through to `Mp::F64`).
+        if n >= i64::MIN as f64 && n < -(i64::MIN as f64) {
             return Mp::Integer((n as i64).into());
         }
     }

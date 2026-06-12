@@ -675,7 +675,14 @@ fn return_stmt(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // return
-    if !p.at(RBrace) && !p.at_end() {
+    // A bare `return` (no value) when no expression follows: `;` (optional
+    // statement separator), `}` (end of block), EOF, or any other
+    // non-expression-starting token. `can_start_expr` is the file's positive
+    // idiom (used by `yield` and the open-range RHS) — a strict allowlist of
+    // expression starters — so this matches the legacy oracle's
+    // `Tok::RBrace | Tok::Eof | Tok::Semicolon => Return(None)` and is strictly
+    // more correct (no stray non-expression token is ever fed to expr()).
+    if can_start_expr(p) {
         expr(p);
     }
     p.complete(m, ReturnStmt);
@@ -2912,6 +2919,67 @@ mod tests {
     fn yield_expression() {
         assert!(tree_shape("yield x").contains(&SyntaxKind::YieldExpr));
         assert!(tree_shape("yield").contains(&SyntaxKind::YieldExpr));
+    }
+
+    #[test]
+    fn bare_return_before_semicolon_has_no_error_node() {
+        use crate::syntax::cst::ResolvedNode;
+
+        // Find the (single) ReturnStmt node in the tree.
+        fn return_node(src: &str) -> ResolvedNode {
+            fn find(n: &ResolvedNode) -> Option<ResolvedNode> {
+                if n.kind() == SyntaxKind::ReturnStmt {
+                    return Some(n.clone());
+                }
+                n.children().find_map(find)
+            }
+            let root = crate::syntax::tree_builder::build_tree(parse(src));
+            find(&root).expect("expected a ReturnStmt node")
+        }
+
+        // `return;` is a value-less return — `;` is an optional statement
+        // separator, so the `return` takes no operand (matching the legacy
+        // oracle's `Tok::Semicolon => Return(None)`). The CST `ReturnStmt`
+        // must NOT contain a junk `Error` child from feeding `;` to expr(),
+        // and must have NO child node at all (no expression).
+        let src = "fn f() { return; }";
+        let p = parse(src);
+        assert!(p.errors.is_empty(), "spurious parse errors: {:?}", p.errors);
+        let shape = tree_shape(src);
+        assert!(
+            shape.contains(&SyntaxKind::ReturnStmt),
+            "expected a ReturnStmt node"
+        );
+        assert!(
+            !shape.contains(&SyntaxKind::Error),
+            "bare `return;` must not produce an Error node; shape = {shape:?}"
+        );
+        // No child NODE (an expression operand — or a stray token wrapped as
+        // one — would show up here). `children()` yields child nodes, not tokens.
+        assert_eq!(
+            return_node(src).children().count(),
+            0,
+            "bare `return;` must have no expression child"
+        );
+
+        // Also at end-of-block with no separator (`return` then `}`).
+        let src2 = "fn f() { return }";
+        let p2 = parse(src2);
+        assert!(p2.errors.is_empty(), "spurious parse errors: {:?}", p2.errors);
+        assert!(!tree_shape(src2).contains(&SyntaxKind::Error));
+        assert_eq!(
+            return_node(src2).children().count(),
+            0,
+            "bare `return }}` must have no expression child"
+        );
+
+        // Sanity: a VALUED return DOES carry an expression child node — so the
+        // zero-child assertions above are meaningful, not vacuous.
+        assert_eq!(
+            return_node("fn f() { return 5 }").children().count(),
+            1,
+            "`return 5` must have exactly one expression child"
+        );
     }
 
     #[test]

@@ -55,6 +55,14 @@ fn write_params(out: &mut String, params: &[Param]) {
             out.push_str(": ");
             out.push_str(&render_type(ty));
         }
+        // A parameter default (`b = expr`) is part of the signature — render it
+        // (the CST formatter does too) so `fmt` does not silently delete it.
+        // `PREC_ASSIGN` keeps a bare expression unparenthesized (mirrors
+        // `write_field`, which renders field defaults the same way).
+        if let Some(def) = &p.default {
+            out.push_str(" = ");
+            write_expr(out, def, PREC_ASSIGN);
+        }
     }
     out.push(')');
 }
@@ -319,6 +327,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
         }
         Stmt::Interface {
             name,
+            type_params,
             extends,
             methods,
             ..
@@ -326,6 +335,15 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("interface ");
             out.push_str(name);
+            // TYPE: a generic interface declares `<T, U>` (bounds are runtime-erased
+            // — the legacy AST stores names only). Dropping the list would change
+            // which names are in scope for the method signatures on re-parse, so
+            // render it.
+            if !type_params.is_empty() {
+                out.push('<');
+                out.push_str(&type_params.join(", "));
+                out.push('>');
+            }
             if !extends.is_empty() {
                 out.push_str(" extends ");
                 out.push_str(&extends.join(", "));
@@ -994,6 +1012,22 @@ mod tests {
     }
 
     #[test]
+    fn renders_generic_interface_type_params() {
+        // A generic interface must keep its `<T>` list — dropping it would change
+        // the names in scope for the method signatures on re-parse.
+        let src = "interface Box<T> {\n  fn get(): T\n}\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        let src2 = "interface Pair<K, V> {\n  fn key(): K\n  fn val(): V\n}\n";
+        assert_eq!(format_source(src2).unwrap(), src2);
+        // Idempotent + re-parses.
+        for src in [src, src2] {
+            let once = format_source(src).unwrap();
+            assert_eq!(format_source(&once).unwrap(), once);
+            assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+        }
+    }
+
+    #[test]
     fn renders_interface_extends_composition() {
         let stmt = Stmt::Interface {
             name: "ReadWriter".to_string(),
@@ -1339,6 +1373,55 @@ fn area(s:Shape):float{return match s{Circle(r)=>3.14159*r*r,Rect(w:ww,h:hh)=>ww
     fn object_rest_destructuring_round_trips() {
         let src = "let {a, ...rest} = obj\n";
         assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
+    fn param_defaults_round_trip() {
+        // The legacy formatter must RENDER a parameter default (`b = 5`), not
+        // silently drop it. Canonical spacing matches the CST formatter (` = `).
+        let src = "fn f(x = 5) {\n  return x\n}\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        // Typed-and-defaulted, plus a default referencing an earlier param.
+        let src2 = "fn g(a, b: number = 1, c = a + b) {\n  return c\n}\n";
+        assert_eq!(format_source(src2).unwrap(), src2);
+        // Rest after a default (legal: rest is the collector).
+        let src3 = "fn pack(a, b = 2, ...xs) {\n  return xs\n}\n";
+        assert_eq!(format_source(src3).unwrap(), src3);
+        // Defaulted param in an arrow.
+        let src4 = "let scale = (x, factor = 2) => x * factor\n";
+        assert_eq!(format_source(src4).unwrap(), src4);
+        // A ternary default exercises the PREC_ASSIGN floor: the ternary binds at
+        // the lowest tier, so `write_expr(.., PREC_ASSIGN)` adds NO spurious parens.
+        let src5 = "fn t(x, y = a ? b : c) {\n  return y\n}\n";
+        assert_eq!(format_source(src5).unwrap(), src5);
+        // Idempotent for every shape.
+        for src in [src, src2, src3, src4, src5] {
+            let once = format_source(src).unwrap();
+            let twice = format_source(&once).unwrap();
+            assert_eq!(once, twice, "fmt not idempotent for: {src}");
+            assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_and_cst_agree_on_param_defaults() {
+        // The two formatters must render parameter defaults in the SAME surface
+        // form (` = expr`), so a file formatted by either tool is stable.
+        for src in [
+            "fn f(x = 5) {\n  return x\n}\n",
+            "fn g(a, b: number = 1, c = a + b) {\n  return c\n}\n",
+            "let scale = (x, factor = 2) => x * factor\n",
+            // A defaulted param in a METHOD signature also routes through
+            // write_params (via write_method) — cover that path too.
+            "class C {\n  fn m(x, y = 10) {\n  }\n}\n",
+            // A ternary default exercises the PREC_ASSIGN floor: a ternary binds at
+            // the lowest tier, so it needs NO parens (both formatters must agree).
+            "fn t(x, y = a ? b : c) {\n  return y\n}\n",
+        ] {
+            let legacy = format_source(src).unwrap();
+            let cst = crate::syntax::format_tree(src);
+            assert_eq!(legacy, cst, "legacy/CST formatter disagree on: {src}");
+        }
     }
 
     #[test]

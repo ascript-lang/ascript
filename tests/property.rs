@@ -983,3 +983,248 @@ fn aso_seed_corpus_is_present_and_current() {
         "the committed `bad_*` seed count must equal the planted-bug set"
     );
 }
+
+// ===========================================================================
+// FUZZ — the `ASCRIPTA` module-archive decoder fuzzing guards (self-contained
+// bundles, Phase 4 Task 4.2). The in-tree mirror of the `archive_roundtrip`
+// libFuzzer target (`fuzz/fuzz_targets/archive_roundtrip.rs`).
+//
+// A shipped bundle parses attacker-influenceable `ASCRIPTA` archive bytes
+// (`ModuleArchive::decode` in `src/vm/archive.rs`), so the decoder is a SECURITY
+// surface. These guards run in the NORMAL `cargo test` suite (the load-bearing
+// in-session proof; the cargo-fuzz campaign is the CI-side coverage-guided
+// extension) and pin these invariants:
+//   (a) `decode(any_bytes)` NEVER panics — only `Ok`/`Err(ArchiveError)`.
+//   (b) decode-stability: a successful decode re-encodes idempotently
+//       (`decode(a.encode()) == Ok(a)`) — a divergence is a codec bug.
+//   (c) structured `encode∘decode` round-trip over generated archives.
+//   (d) a curated known-bad byte set classifies as a clean `Err`, never a panic
+//       (mirrors `aso_planted_bug_known_bad_bytes_are_clean_err`).
+// ===========================================================================
+
+use ascript::stdlib::caps::CapSet;
+use ascript::vm::archive::{ModuleArchive, ARCHIVE_MAGIC, ARCHIVE_VERSION};
+
+/// A `u32` length prefix, little-endian — mirrors the private `write_len` in
+/// `archive.rs` so the hand-built known-bad buffers below match the wire form.
+fn arch_write_len(out: &mut Vec<u8>, n: usize) {
+    let v = u32::try_from(n).unwrap_or(u32::MAX);
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// A well-formed header (magic · version · `entry` · caps · 32-byte shake ·
+/// `module_count`) with the module bodies left to the caller to append.
+fn arch_header(entry: u32, module_count: usize) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&ARCHIVE_MAGIC);
+    b.extend_from_slice(&ARCHIVE_VERSION.to_le_bytes());
+    b.extend_from_slice(&entry.to_le_bytes());
+    let caps = CapSet::default().to_bytes();
+    arch_write_len(&mut b, caps.len());
+    b.extend_from_slice(&caps);
+    b.extend_from_slice(&[0u8; 32]); // shake digest
+    arch_write_len(&mut b, module_count);
+    b
+}
+
+/// The curated KNOWN-BAD archive byte set — each must classify as a clean `Err`,
+/// never a panic / OOM / unbounded allocation. These mirror, by construction, the
+/// `bad_*` seeds committed under `fuzz/corpus/archive_roundtrip/` (see `name`), so
+/// the corpus and this guard stay in lockstep.
+fn known_bad_archive_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        // Empty — too short to even read the 8-byte magic.
+        ("bad_empty", Vec::new()),
+        // A short prefix of the magic.
+        ("bad_short_magic", b"ASCRIP".to_vec()),
+        // Right length, wrong magic bytes (e.g. an `.aso`-ish blob).
+        ("bad_wrong_magic", {
+            let mut b = b"ASO\x00\x00\x00\x00\x00".to_vec();
+            b.extend_from_slice(&[0u8; 32]);
+            b
+        }),
+        // Correct magic, an unsupported (future) version word.
+        ("bad_version_future", {
+            let mut b = ARCHIVE_MAGIC.to_vec();
+            b.extend_from_slice(&ARCHIVE_VERSION.wrapping_add(1).to_le_bytes());
+            b.extend_from_slice(&[0u8; 16]);
+            b
+        }),
+        // Truncated right after the header prefix (no caps/shake/count).
+        ("bad_truncated_after_version", {
+            let mut b = ARCHIVE_MAGIC.to_vec();
+            b.extend_from_slice(&ARCHIVE_VERSION.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // entry, then nothing
+            b
+        }),
+        // A valid header with a bogus, oversized module count — the allocation-bomb
+        // case: the `MAX_MODULES` cap must fire BEFORE any pre-allocation.
+        ("bad_bomb_module_count", arch_header(0, u32::MAX as usize)),
+        // entry index points past the (one declared) module → EntryOutOfRange.
+        ("bad_entry_out_of_range", arch_header(5, 1)),
+        // A valid header, module_count=1, then an oversized key length far beyond
+        // the buffer → a clean Truncated, never a slice panic / huge alloc.
+        ("bad_bomb_key_len", {
+            let mut b = arch_header(0, 1);
+            arch_write_len(&mut b, u32::MAX as usize); // key_len, no bytes follow
+            b
+        }),
+        // A valid header + a 1-byte key, then an oversized chunk length.
+        ("bad_bomb_chunk_len", {
+            let mut b = arch_header(0, 1);
+            arch_write_len(&mut b, 1);
+            b.push(b'm'); // key = "m"
+            arch_write_len(&mut b, u32::MAX as usize); // chunk_len, no bytes follow
+            b
+        }),
+        // A non-UTF-8 module key.
+        ("bad_invalid_utf8_key", {
+            let mut b = arch_header(0, 1);
+            let bad = [0xFFu8, 0xFE, 0xFD];
+            arch_write_len(&mut b, bad.len());
+            b.extend_from_slice(&bad);
+            arch_write_len(&mut b, 0); // chunk_len = 0
+            b
+        }),
+    ]
+}
+
+/// PLANTED-BUG GUARD: every curated known-bad archive input is a CLEAN `Err`, never
+/// a panic / abort / unbounded allocation — proving the `archive_roundtrip` fuzz
+/// target's invariant (and that its crash-detection can fire).
+#[test]
+fn archive_planted_bug_known_bad_bytes_are_clean_err() {
+    for (name, bytes) in known_bad_archive_inputs() {
+        let res = ModuleArchive::decode(&bytes);
+        assert!(
+            res.is_err(),
+            "planted-bug case `{name}` must be a clean Err from `ModuleArchive::decode`, got Ok"
+        );
+    }
+}
+
+/// The committed seed corpus under `fuzz/corpus/archive_roundtrip/` is the libFuzzer
+/// starting set AND a permanent regression guard. Assert (a) every `ex_*` seed is a
+/// real, fully-decodable archive that idempotently re-encodes, and (b) the committed
+/// `bad_*` seeds are present and byte-identical to the planted-bug set above (so the
+/// corpus and suite never drift).
+#[test]
+fn archive_seed_corpus_is_present_and_current() {
+    let corpus =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/archive_roundtrip");
+    assert!(
+        corpus.is_dir(),
+        "seed corpus dir missing: {}",
+        corpus.display()
+    );
+
+    let mut ex_seeds = 0usize;
+    let mut bad_seeds = 0usize;
+    for entry in std::fs::read_dir(&corpus).expect("read corpus dir") {
+        let path = entry.expect("dir entry").path();
+        let fname = path.file_name().unwrap().to_string_lossy().to_string();
+        let bytes = std::fs::read(&path).expect("read seed");
+
+        if fname.starts_with("ex_") {
+            ex_seeds += 1;
+            // A real example seed MUST decode AND re-encode idempotently.
+            let a = ModuleArchive::decode(&bytes).unwrap_or_else(|e| {
+                panic!("committed seed `{fname}` failed to decode ({e}) — stale archive format?")
+            });
+            let b = ModuleArchive::decode(&a.encode())
+                .expect("re-encode of a decoded seed must decode");
+            assert_eq!(a, b, "committed seed `{fname}` is not decode-stable");
+        } else if fname.starts_with("bad_") {
+            bad_seeds += 1;
+            // A known-bad seed must NOT decode (it is a rejection seed).
+            assert!(
+                ModuleArchive::decode(&bytes).is_err(),
+                "known-bad seed `{fname}` unexpectedly decoded Ok"
+            );
+        }
+    }
+
+    assert!(
+        ex_seeds >= 1,
+        "expected at least one real example archive seed, found {ex_seeds}"
+    );
+    assert_eq!(
+        bad_seeds,
+        known_bad_archive_inputs().len(),
+        "the committed `bad_*` seed count must equal the planted-bug set"
+    );
+}
+
+/// Build a `ModuleArchive` deterministically from arbitrary `data` (the SAME
+/// generator the libFuzzer target's structured round-trip uses): derive a few
+/// `(key, opaque-bytes)` modules, a `CapSet`, a `shake_digest`, and an in-range
+/// `entry`. Guarantees `entry < modules.len()` (≥ 1 module, unique keys) so the
+/// result is a VALID archive that must survive an `encode∘decode` round-trip.
+fn archive_from_bytes(data: &[u8]) -> ModuleArchive {
+    // 1..=4 modules, driven by the first byte (always ≥ 1 so `entry` is in range).
+    let n = 1 + (data.first().copied().unwrap_or(0) as usize % 4);
+    let mut modules: Vec<(String, Vec<u8>)> = Vec::with_capacity(n);
+    let mut cursor = 1usize;
+    for i in 0..n {
+        // A unique, valid-UTF-8 key (so no two collide — preserves all entries).
+        let key = format!("mod{i}");
+        // An opaque chunk: a deterministic slice derived from `data`.
+        let want = data.get(cursor).copied().unwrap_or(0) as usize % 8;
+        cursor = cursor.saturating_add(1);
+        let chunk: Vec<u8> = data.iter().cycle().skip(cursor).take(want).copied().collect();
+        cursor = cursor.saturating_add(want);
+        modules.push((key, chunk));
+    }
+    let entry = (data.get(1).copied().unwrap_or(0) as u32) % (n as u32);
+
+    let mut shake = [0u8; 32];
+    for (i, b) in shake.iter_mut().enumerate() {
+        *b = data
+            .get(i + 2)
+            .copied()
+            .unwrap_or((i as u8).wrapping_mul(7).wrapping_add(1));
+    }
+
+    // A CapSet from a small deny carve-out selected by a data byte (covers the
+    // default-all-granted case AND a non-trivial deny carve-out).
+    let caps = match data.get(2).copied().unwrap_or(0) % 4 {
+        0 => CapSet::default(),
+        1 => CapSet::from_deny_list(["net"]).unwrap(),
+        2 => CapSet::from_deny_list(["fs", "process"]).unwrap(),
+        _ => CapSet::from_deny_list(["env"]).unwrap(),
+    };
+
+    ModuleArchive::new(entry, caps, shake, modules)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, .. ProptestConfig::default() })]
+
+    /// (a) `ModuleArchive::decode` over ARBITRARY bytes NEVER panics — only
+    /// `Ok`/`Err`. (b) Decode-stability: a successful decode re-encodes idempotently
+    /// (`decode(a.encode()) == Ok(a)`). This is the security-critical surface: the
+    /// decoder parses attacker-influenceable archive bytes.
+    #[test]
+    fn archive_decode_arbitrary_never_panics(data in prop::collection::vec(any::<u8>(), 0..512)) {
+        if let Ok(a) = ModuleArchive::decode(&data) {
+            // Decode-stability: re-encode and decode again, must equal `a`.
+            let re = a.encode();
+            let b = ModuleArchive::decode(&re)
+                .expect("re-encode of a decoded archive must itself decode");
+            prop_assert_eq!(a, b, "decode∘encode is not idempotent (codec bug)");
+        }
+        // A clean `Err` on arbitrary bytes is the expected common case.
+    }
+
+    /// Structured `encode∘decode` round-trip: a VALID archive built from arbitrary
+    /// `data` must survive `encode → decode` byte-for-byte (field equality). This
+    /// exercises the ENCODE side that the arbitrary-bytes property cannot reach.
+    #[test]
+    fn archive_structured_round_trip(data in prop::collection::vec(any::<u8>(), 0..256)) {
+        let arch = archive_from_bytes(&data);
+        let bytes = arch.encode();
+        let decoded = ModuleArchive::decode(&bytes)
+            .expect("a well-formed archive must decode");
+        prop_assert_eq!(decoded, arch, "encode∘decode lost or changed a field");
+    }
+}

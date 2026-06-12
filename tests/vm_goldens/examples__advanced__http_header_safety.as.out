@@ -1,0 +1,4 @@
+# exit: none
+safe header preserved: X-Request-Id=abc-123
+response-splitting attempt rejected: status=500, X-Injected=nil
+http_header_safety ok

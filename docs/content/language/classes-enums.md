@@ -131,6 +131,11 @@ class Grid {
 print(Grid().cells)               // [1, 2, 3]
 ```
 
+A **stepped** range default keeps its stride everywhere, including across a compiled
+[`.aso`](../cli) build — `xs: array<number> = 0..10 step 2` produces `[0, 2, 4, 6, 8]` whether you
+`run` the source or `build` it and `run` the bytecode (the step is serialized inside the field
+default). See [`examples/range_step_default.as`](https://github.com/ascript-lang/ascript/blob/main/examples/range_step_default.as).
+
 The only field-default expression that is **rejected** is `yield` (it is never valid outside a
 generator body) — both engines reject it symmetrically.
 
@@ -375,7 +380,11 @@ An enum is a **closed sum of named variants**. A variant is one of three shapes:
 enum Color  { Red, Green, Blue }                    // unit variants
 enum Status { Ok = 200, NotFound = 404, Err = 500 } // number-backed units
 enum Mode   { Read = "r", Write = "w" }             // string-backed units
+enum Signal { Error = -1, Ok = 0, Pending = 1 }     // negative integer backing
 ```
+
+A backing value is a number or string literal; a leading `-` makes it a **negative integer** (or
+float) backing — the one constant unary form allowed.
 
 Access a unit variant with `Enum.Variant`. Each exposes its `.name` and `.value`:
 
@@ -650,14 +659,35 @@ match event {
 
 #### Alternatives `|`
 
-Separate multiple patterns with `|`. The arm fires if **any** pattern matches. Alternatives are
-typically literals or value patterns that bind nothing; only the matched alternative's bindings are
-in scope in the guard/body, so keep alternatives uniform (bind the same names) if you do bind.
+Separate multiple patterns with `|`. The arm fires if **any** pattern matches; the alternatives are
+tried in order and a guard runs after the matched alternative binds.
 
 ```ascript
 match day { "sat" | "sun" => "weekend", _ => "weekday" }
 match n    { 0 | 1        => "tiny",    _ => "bigger"  }
 ```
+
+Alternatives may also **bind**: a single guard/body is shared across every alternative, so each one
+must bind the **same set of names**, and that shared name is what the body reads regardless of which
+alternative matched.
+
+```ascript
+enum Shape { Circle(radius: int), Square(side: int), Empty }
+
+fn dimension(s: Shape): int {
+  return match s {
+    Shape.Circle(r) | Shape.Square(r) => r,   // both alternatives bind `r`
+    Shape.Empty                       => 0,
+  }
+}
+```
+
+Binding **different** names across alternatives is a **compile error** — every alternative must bind
+the same set of names, exactly like Rust's *"variable `x` is not bound in all patterns"*. Both
+`Foo(a) | Bar(b) => …` (disjoint names) and `Foo(x) | Empty => x` (a name present in only one
+alternative) are rejected statically by `ascript run` (on either engine) and `ascript check`, with the
+message *"variable 'x' is not bound in all alternatives of the or-pattern"* — so the body never sees a
+name that some matched alternative failed to bind.
 
 #### Guards `pattern if condition`
 

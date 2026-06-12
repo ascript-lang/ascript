@@ -2609,6 +2609,45 @@ mod identity_unification {
         }
     }
 
+    /// A name bound INSIDE an or-pattern alternative (`Circle(r) | Square(r) => r`)
+    /// is now declared by the CST resolver, so go-to-definition and find-references
+    /// on the arm-body use of `r` resolve to a pattern bind site (not a Global
+    /// fallback that would yield no definition). Regression for the `OrPat`-arm fix.
+    #[test]
+    fn or_pattern_binding_resolves_for_goto_and_references() {
+        let src = "enum Shape {\n  Circle(radius: int),\n  Square(side: int),\n}\n\
+fn dim(s: Shape): int {\n  return match s {\n    Shape.Circle(r) | Shape.Square(r) => r,\n  }\n}\n";
+        let index = idx(&[("/ws/m.as", src)]);
+        let m = canon(Path::new("/ws/m.as"));
+
+        // Cursor on the arm BODY use of `r` (after `=> `).
+        let body_use = src.find("=> r").unwrap() + "=> ".len();
+        // Go-to-definition must resolve to SOME location in this file (a pattern bind
+        // site), not fail with no definition (the pre-fix Global fallback).
+        let def = index.definition_at(&m, body_use);
+        assert!(
+            def.is_some(),
+            "goto-def on an or-pattern-bound name must resolve, got None"
+        );
+        let (def_path, def_span) = def.unwrap();
+        assert_eq!(def_path, m, "definition must be in the same file");
+        // The def span must land on one of the two `r` bind sites in the pattern
+        // (the FIRST alternative's `r` owns the shared slot).
+        let first_bind = src.find("Circle(r)").unwrap() + "Circle(".len();
+        assert!(
+            def_span.start <= first_bind && first_bind < def_span.end,
+            "definition should point at the first `r` bind site; span={def_span:?}"
+        );
+
+        // find-references (including the decl) must include the body use of `r`.
+        let refs = index.references_at(&m, body_use, true);
+        assert!(
+            refs.iter()
+                .any(|(p, r)| *p == m && r.start <= body_use && body_use < r.end),
+            "references of the or-pattern-bound `r` must include the body use: {refs:?}"
+        );
+    }
+
     /// All importers' uses of an imported name + the definer's def share ONE
     /// `Global(definerFileId, name)`. An importer's use resolves THROUGH the import
     /// edge to the definer's FileId.
@@ -2661,5 +2700,92 @@ mod identity_unification {
         assert!(refs.iter().any(|(p, _)| *p == a), "a decl: {refs:?}");
         let b_uses = refs.iter().filter(|(p, _)| *p == b).count();
         assert_eq!(b_uses, 2, "both f(1) and f(2) uses in b: {refs:?}");
+    }
+
+    /// Renaming a file (the `didRenameFiles` re-key) must FULLY unindex the old
+    /// path from EVERY map — `defs_by_name`, `import_edges`, AND `importers` —
+    /// not just `files`. Otherwise workspace-symbols / go-to-def return stale
+    /// results pointing at the now-deleted old path, and a reverse import edge to
+    /// the old path lingers. Regression for Task 0.15.
+    ///
+    /// NOTE: this drives the index ops directly (`fully_unindex(old)` +
+    /// `reindex_file(new)`) — NOT through the live server's `didRenameFiles`
+    /// notification handler, so the LSP wire/protocol path is not exercised here.
+    #[test]
+    fn rename_file_fully_unindexes_old_path() {
+        // old.as: exports `Widget` AND imports `./dep` (an outgoing edge).
+        let old_src = "import { helper } from \"./dep\"\nexport fn Widget() { return helper() }\n";
+        let dep_src = "export fn helper() { return 1 }\n";
+        let mut index = idx(&[("/ws/old.as", old_src), ("/ws/dep.as", dep_src)]);
+        let old = canon(Path::new("/ws/old.as"));
+        let new = canon(Path::new("/ws/new.as"));
+        let dep = canon(Path::new("/ws/dep.as"));
+
+        // Sanity: before the rename the symbol resolves under the OLD path, and
+        // dep records old.as as an importer.
+        let syms = index.workspace_symbols("Widget");
+        assert!(
+            syms.iter().any(|d| d.path == old && d.name == "Widget"),
+            "before rename, Widget is defined in old.as: {syms:?}"
+        );
+        assert!(
+            index
+                .defs_by_name
+                .get("Widget")
+                .is_some_and(|v| v.iter().any(|d| d.path == old)),
+            "defs_by_name has Widget@old before rename"
+        );
+        assert!(
+            index
+                .importers
+                .get(&dep)
+                .is_some_and(|s| s.contains(&old)),
+            "dep records old.as as an importer before rename"
+        );
+
+        // The re-key the handler performs (Task 0.15 fix): the combined
+        // `fully_unindex` makes the old "files-only remove" footgun impossible.
+        index.fully_unindex(&old);
+        let new_src = old_src; // the renamed file keeps its contents
+        index.reindex_file(&new, new_src);
+
+        // 1) The OLD path is gone from `files`.
+        assert!(
+            !index.files.contains_key(&old),
+            "old.as must be removed from files"
+        );
+        // 2) No `defs_by_name` entry points at the OLD path anywhere.
+        for (name, defs) in &index.defs_by_name {
+            assert!(
+                defs.iter().all(|d| d.path != old),
+                "stale def `{name}` still points at old.as: {defs:?}"
+            );
+        }
+        // 3) workspace-symbols for Widget now resolves under NEW, never OLD.
+        let syms = index.workspace_symbols("Widget");
+        assert!(
+            syms.iter().any(|d| d.path == new && d.name == "Widget"),
+            "after rename, Widget is defined in new.as: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|d| d.path == old),
+            "workspace-symbols must not return the stale old.as path: {syms:?}"
+        );
+        // 4) No outgoing import edge keyed on the OLD path.
+        assert!(
+            !index.import_edges.contains_key(&old),
+            "import_edges must not retain the old.as key"
+        );
+        // 5) The reverse edge: dep no longer records old.as as an importer (the
+        //    new path takes its place).
+        let dep_importers = index.importers.get(&dep);
+        assert!(
+            dep_importers.is_none_or(|s| !s.contains(&old)),
+            "importers[dep] must not retain old.as: {dep_importers:?}"
+        );
+        assert!(
+            dep_importers.is_some_and(|s| s.contains(&new)),
+            "importers[dep] must now record new.as: {dep_importers:?}"
+        );
     }
 }

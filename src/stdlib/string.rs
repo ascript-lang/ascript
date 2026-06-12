@@ -1,6 +1,6 @@
 //! `std/string` — string manipulation.
 
-use super::{arg, bi, clamp_index, want_array, want_number, want_string};
+use super::{arg, bi, clamp_index, want_array, want_count, want_number, want_string, MAX_ALLOC_COUNT};
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
@@ -128,7 +128,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "padStart" | "padEnd" => {
             let s = want_string(&arg(args, 0), span, &ctx(func))?;
-            let width = want_number(&arg(args, 1), span, &ctx(func))? as usize;
+            // Guard the target width before it drives a `take(need)` allocation: a
+            // non-finite / out-of-range width would cast to `usize::MAX` and OOM-abort.
+            let width = want_count(&arg(args, 1), span, &ctx(func), MAX_ALLOC_COUNT)?;
             let fill = match args.get(2) {
                 None | Some(Value::Nil) => " ".to_string(),
                 Some(v) => want_string(v, span, &ctx(func))?.to_string(),
@@ -148,12 +150,26 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "repeat" => {
             let s = want_string(&arg(args, 0), span, &ctx("repeat"))?;
-            let n = want_number(&arg(args, 1), span, &ctx("repeat"))?;
-            // `n` truncates toward zero (and NaN → 0), matching `clamp_index`'s convention.
-            if n < 0.0 {
-                return Err(AsError::at("string.repeat count must be non-negative", span).into());
+            // Guard the count before the `f64 → usize` cast: `repeat("x", 1/0)` would
+            // otherwise cast `Inf` to `usize::MAX` and abort the host with a
+            // `capacity overflow`. A finite, in-range, non-negative count truncates
+            // toward zero (NaN is already rejected).
+            let n = want_count(&arg(args, 1), span, &ctx("repeat"), MAX_ALLOC_COUNT)?;
+            // Even an in-range count can overflow `s.len() * n`; reject a product that
+            // would exceed the generic allocation bound so `String::repeat` cannot
+            // panic on capacity overflow.
+            if s.len().checked_mul(n).is_none_or(|bytes| bytes as f64 > MAX_ALLOC_COUNT) {
+                return Err(AsError::at(
+                    format!(
+                        "string.repeat: resulting string of {} × {} bytes exceeds the maximum size",
+                        s.len(),
+                        n
+                    ),
+                    span,
+                )
+                .into());
             }
-            Ok(str_val(s.repeat(n as usize)))
+            Ok(str_val(s.repeat(n)))
         }
         "startsWith" => {
             let s = want_string(&arg(args, 0), span, &ctx("startsWith"))?;
@@ -622,6 +638,59 @@ mod tests {
         // non-integral float index → panic.
         assert!(matches!(
             call("code_at", &[s("ABC"), Value::Float(1.5)], sp),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    // ── repeat: alloc-size guards (regression for the `Inf as usize` host abort) ─
+    #[test]
+    fn repeat_count_guards_are_tier2() {
+        let sp = sp();
+        // A finite, in-range count still works.
+        assert_eq!(call("repeat", &[s("ab"), Value::Int(3)], sp).unwrap(), s("ababab"));
+        assert_eq!(call("repeat", &[s("x"), Value::Int(0)], sp).unwrap(), s(""));
+        // Infinity (`1/0`) must be a CLEAN Tier-2 panic, NOT a `usize::MAX` abort.
+        assert!(matches!(
+            call("repeat", &[s("x"), Value::Float(f64::INFINITY)], sp),
+            Err(Control::Panic(_))
+        ));
+        // NaN → panic.
+        assert!(matches!(
+            call("repeat", &[s("x"), Value::Float(f64::NAN)], sp),
+            Err(Control::Panic(_))
+        ));
+        // Huge finite count (10^18) → OOM-class allocation → panic, not abort.
+        assert!(matches!(
+            call("repeat", &[s("x"), Value::Float(1e18)], sp),
+            Err(Control::Panic(_))
+        ));
+        // Negative → panic.
+        assert!(matches!(
+            call("repeat", &[s("x"), Value::Float(-1.0)], sp),
+            Err(Control::Panic(_))
+        ));
+        // In-range count but the PRODUCT overflows the bound → panic (no `repeat` panic).
+        assert!(matches!(
+            call("repeat", &[s("0123456789"), Value::Float(u32::MAX as f64)], sp),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    // ── padStart/padEnd: width guards (alloc via `take(need)`) ─────────────────
+    #[test]
+    fn pad_width_guards_are_tier2() {
+        let sp = sp();
+        assert_eq!(
+            call("padStart", &[s("7"), Value::Int(3), s("0")], sp).unwrap(),
+            s("007")
+        );
+        // Infinite width → clean Tier-2 panic, not a `usize::MAX` cycle/take abort.
+        assert!(matches!(
+            call("padStart", &[s("x"), Value::Float(f64::INFINITY), s("-")], sp),
+            Err(Control::Panic(_))
+        ));
+        assert!(matches!(
+            call("padEnd", &[s("x"), Value::Float(1e18), s("-")], sp),
             Err(Control::Panic(_))
         ));
     }

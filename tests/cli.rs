@@ -301,6 +301,56 @@ fn arrow_in_call_argument_works_on_both_engines() {
     }
 }
 
+/// Regression: `string.repeat(s, 1/0)` / `string.repeat(s, 1e18)` and
+/// `string.padStart(s, 1/0)` used to cast `Inf`/huge to `usize::MAX` and abort
+/// the host with `capacity overflow`, bypassing `recover`. They must now be
+/// CLEAN, recoverable Tier-2 panics — the subprocess exits 0 (no abort) and
+/// `recover` catches the error pair. Running the real binary proves there is no
+/// host abort (an abort would make `out.status.success()` false with a non-zero
+/// / signal exit). (The reader `.read(n)` sites share the same `want_count`
+/// guard but need live OS resources, so they are covered by the stdlib unit
+/// tests rather than here.)
+#[test]
+fn string_count_guards_are_recoverable_not_abort() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = r#"
+import * as string from "std/string"
+// Infinity (1.0/0.0) — would previously abort via `f64::INFINITY as usize`.
+let [v1, e1] = recover(() => string.repeat("x", 1.0 / 0.0))
+print(e1 != nil)
+print(v1 == nil)
+// Huge finite count — would previously attempt a 10^18-byte allocation (OOM abort).
+let [v2, e2] = recover(() => string.repeat("x", 1e18))
+print(e2 != nil)
+// padStart width guard.
+let [v3, e3] = recover(() => string.padStart("x", 1.0 / 0.0, "-"))
+print(e3 != nil)
+// A normal repeat still works after the recovered panics.
+print(string.repeat("ab", 3))
+"#;
+    let file = std::env::temp_dir().join(format!("ascript_repeatguard_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+        let out = Command::new(bin)
+            .args(&engine_args)
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "expected NO host abort on {engine_args:?}; status {:?}, stderr: {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "true\ntrue\ntrue\ntrue\nababab\n",
+            "recover must catch the count-guard panics on {engine_args:?}"
+        );
+    }
+    let _ = std::fs::remove_file(&file);
+}
+
 #[test]
 fn runs_modules_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
@@ -624,6 +674,100 @@ c == Shape.Circle(2.0)
     }
     // The two engines produce byte-identical session output.
     assert_eq!(vm_out, tw_out, "VM/TW REPL output must match for ADT session");
+}
+
+/// An or-pattern alternative that BINDS a name (`Circle(r) | Square(r)`) must make
+/// that binding visible in the arm body on the VM — the CST resolver was dropping
+/// the bindings inside an `OrPat` (no `OrPat` arm in `resolve_pattern`), so the name
+/// fell through to a `Global` fallback and failed at runtime with `undefined
+/// variable`. The legacy tree-walker oracle already binds these correctly, so the
+/// fix is asserted as VM == tree-walker byte-identity.
+#[test]
+fn match_or_pattern_binds_names_on_both_engines() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = "\
+enum Shape {
+  Circle(radius: int),
+  Square(side: int),
+  Empty,
+}
+let c = Shape.Circle(2)
+let out = match c {
+  Shape.Circle(r) | Shape.Square(r) => r,
+  Shape.Empty => 0,
+}
+print(out)
+";
+    let file =
+        std::env::temp_dir().join(format!("ascript_orpat_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    let mut outputs = Vec::new();
+    for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+        let out = Command::new(bin)
+            .args(&engine_args)
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "expected or-pattern binding to succeed on {engine_args:?}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            stdout, "2\n",
+            "or-pattern binding must print 2 on {engine_args:?}; got {stdout:?}"
+        );
+        outputs.push(stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "VM and tree-walker output must match");
+}
+
+/// An or-pattern whose alternatives bind DIFFERENT name sets
+/// (`Shape.Circle(r) | Shape.Empty => r` — `r` bound in one alternative, absent in
+/// the other) is a STATIC compile error, rejected BYTE-IDENTICALLY before running on
+/// the VM and the tree-walker, and by `ascript check` — Rust-style "variable `r` is
+/// not bound in all patterns". This resolves the earlier runtime divergence (VM:
+/// "expected int, got nil" vs tree-walker: "undefined variable 'r'").
+#[test]
+fn match_or_pattern_mismatched_names_is_static_error_on_all_paths() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = "\
+enum Shape { Circle(radius: int), Empty }
+fn f(s: Shape): int {
+  return match s {
+    Shape.Circle(r) | Shape.Empty => r,
+  }
+}
+print(f(Shape.Empty))
+";
+    let file =
+        std::env::temp_dir().join(format!("ascript_orpat_bad_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    let expected = "variable 'r' is not bound in all alternatives of the or-pattern";
+    // Each invocation must FAIL with the SAME message. Strip ANSI so the substring
+    // match is robust to ariadne's per-char colorization.
+    for args in [
+        vec!["run"],
+        vec!["run", "--tree-walker"],
+        vec!["check"],
+    ] {
+        let out = Command::new(bin).args(&args).arg(&file).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "expected `{args:?}` to FAIL on the mismatched-name or-pattern, but it succeeded"
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plain = strip_ansi(&combined);
+        assert!(
+            plain.contains(expected),
+            "`{args:?}` must report {expected:?}; got:\n{plain}"
+        );
+    }
 }
 
 #[test]
@@ -1859,9 +2003,11 @@ fn vm_step_stays_usable_as_identifier() {
 // ===== RANGES FEATURE, Phase 2: inclusive `..=` ranges (both engines) =========
 
 /// Run `src` as a `.as` program on a chosen engine, returning stdout. Panics if
-/// the process fails (so callers assert on successful output).
+/// the process fails (so callers assert on successful output). General-purpose
+/// "run source on both engines and compare" helper — the `tag` namespaces the
+/// temp file, so callers outside the RANGES section pass their own prefix.
 fn run_range_src(src: &str, tree_walker: bool, tag: &str) -> String {
-    let file = std::env::temp_dir().join(format!("ascript_range_{tag}.as"));
+    let file = std::env::temp_dir().join(format!("ascript_{tag}.as"));
     std::fs::write(&file, src).unwrap();
     let bin = env!("CARGO_BIN_EXE_ascript");
     let mut cmd = Command::new(bin);
@@ -1895,6 +2041,41 @@ fn inclusive_range_iteration_and_value_both_engines() {
     for (i, (src, expected)) in cases.iter().enumerate() {
         let vm = run_range_src(src, false, &format!("vm_{i}"));
         let tw = run_range_src(src, true, &format!("tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn negative_integer_enum_backing_both_engines() {
+    // NUM-split regression: a NEGATIVE INTEGER enum backing value (`A = -1`) must
+    // compile + run byte-identically on the default VM and the tree-walker. Before
+    // the fix, `const_eval_enum_backing`'s unary-minus arm only handled
+    // `Value::Float`, so an integer literal (now `Value::Int`) fell through to
+    // "enum variant backing value must be a number or string literal" — the VM
+    // rejected legal code the tree-walker accepted.
+    let cases = [
+        (
+            "enum E { A = -1, B = 2 }\nprint(E.A.value)\nprint(E.B.value)",
+            "-1\n2\n",
+        ),
+        (
+            // Negative float backing still works (the original arm).
+            "enum F { Lo = -2.5, Hi = 3 }\nprint(F.Lo.value)",
+            "-2.5\n",
+        ),
+        (
+            // A large in-range negative int literal.
+            "enum G { Min = -9223372036854775807 }\nprint(G.Min.value)",
+            "-9223372036854775807\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        // `run_range_src` is a general-purpose "run on both engines" helper (it
+        // lives under the RANGES section but is engine-agnostic).
+        let vm = run_range_src(src, false, &format!("neg_enum_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("neg_enum_tw_{i}"));
         assert_eq!(vm, *expected, "VM output wrong for `{src}`");
         assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
         assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
@@ -4159,3 +4340,339 @@ fn multibyte_check_lint_underlines_correctly() {
     assert_eq!(col_of("\u{3c0}"), "11", "lint column must be char col 11 (1-based)");
 }
 
+
+/// SELF-CONTAINED-BUNDLES (Task 1.5) — `ascript build` of a MULTI-module program emits an
+/// `ASCRIPTA` archive embedding the whole import graph, and `ascript run out.aso` works from
+/// a directory that does NOT contain the sources. A SINGLE-module program still emits a bare
+/// `ASO\0` chunk (back-compat — byte-identical to the pre-archive artifact).
+#[test]
+fn build_multimodule_emits_archive_and_runs_without_sources() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    // A temp dir with NO `.as` sources — the run must be entirely self-contained.
+    let dir = std::env::temp_dir().join(format!("ascript_bundle15_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_aso = dir.join("out.aso");
+
+    // The example pair lives under `examples/` (the build reads sources from there); the
+    // produced `.aso` is self-contained and is run from `dir`, which has none of them.
+    let entry = std::path::Path::new("examples/bundle_multimodule.as");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(entry)
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    // The artifact leads with the ARCHIVE magic (`ASCRIPTA`), not a bare `ASO\0` chunk.
+    let bytes = std::fs::read(&out_aso).unwrap();
+    assert_eq!(
+        &bytes[..8],
+        b"ASCRIPTA",
+        "a multi-module build must emit an ASCRIPTA archive"
+    );
+
+    // Run the archive from a directory WITHOUT the sources — output must match the source run.
+    let run = Command::new(bin)
+        .arg("run")
+        .arg(&out_aso)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "running the archive failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let reference = Command::new(bin).arg("run").arg(entry).output().unwrap();
+    assert_eq!(
+        run.stdout, reference.stdout,
+        "archive run stdout must match the source run"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "Hello, world!\nbundled!!!\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compat: a SINGLE-module `ascript build` still emits a bare `ASO\0` chunk (NOT an archive),
+/// so existing `.aso` artifacts/goldens stay byte-identical to today.
+#[test]
+fn build_single_module_emits_bare_aso_chunk() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_bundle15_single_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_aso = dir.join("hello.aso");
+
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg("examples/hello.as")
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let bytes = std::fs::read(&out_aso).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        b"ASO\0",
+        "a single-module build must emit a bare ASO\\0 chunk (compat)"
+    );
+
+    // And it still runs.
+    let run = Command::new(bin).arg("run").arg(&out_aso).output().unwrap();
+    assert!(run.status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── SELF-CONTAINED-BUNDLES (Task 2.4) — tree-shake build report + reproducible digest ──
+
+/// A fresh, empty scratch dir under the system temp, named for this test + process.
+fn bundle_scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ascript_shake24_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A NAMESPACE import whose alias is used DYNAMICALLY (`m[key]`) pins the whole target —
+/// the build's stderr names the pinned module, the alias, the reason, and a `key:line:col`
+/// LOCATION rendered against the importer's source. The `bundled`/`compiled` line stays on
+/// stdout; the shake summary is stderr-only.
+#[test]
+fn build_report_pin_lists_namespace_with_location() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("pin");
+
+    // `util.as` exports two fns; `app.as` imports the whole namespace then indexes it
+    // dynamically → the shaker cannot prove which exports are live → pin whole.
+    std::fs::write(
+        dir.join("util.as"),
+        "export fn alpha(): int { return 1 }\nexport fn beta(): int { return 2 }\n",
+    )
+    .unwrap();
+    // The dynamic `m[k]` sits on a known line/col so we can assert a concrete location.
+    std::fs::write(
+        dir.join("app.as"),
+        "import * as m from \"./util\"\nlet k = \"alpha\"\nlet r = m[k]\nprint(r)\n",
+    )
+    .unwrap();
+
+    let out_aso = dir.join("app.aso");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(dir.join("app.as"))
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("util.as"),
+        "pin line must name the pinned module 'util.as'; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("namespace 'm'"),
+        "pin line must name the offending alias 'm'; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("indexed/escapes"),
+        "pin line must state the reason; stderr=\n{stderr}"
+    );
+    // The rendered location is `<importer key>:line:col` — `app.as:3:9` (1-based) for the
+    // `m[k]` use on line 3. We assert the location is importer-relative and anchored to the
+    // `m[k]` line (line 3), robustly to the exact column.
+    assert!(
+        stderr.contains("at app.as:3:"),
+        "pin line must carry an importer-relative `key:line:col` location; stderr=\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `{ used }` named import from a library with an unused `dead` fn drops `dead`; the
+/// build's stderr summary names the dropped declaration and a drop count.
+#[test]
+fn build_report_lists_dropped_declarations() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("drop");
+
+    std::fs::write(
+        dir.join("lib.as"),
+        "export fn used(): int { return 1 }\nexport fn dead(): int { return 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.as"),
+        "import { used } from \"./lib\"\nprint(used())\n",
+    )
+    .unwrap();
+
+    let out_aso = dir.join("main.aso");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(dir.join("main.as"))
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("tree-shaking: dropped"),
+        "stderr must carry the tree-shaking summary line; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("dead"),
+        "summary must name the dropped 'dead' fn; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("lib.as"),
+        "summary must name the dropping module 'lib.as'; stderr=\n{stderr}"
+    );
+    // `used` is KEPT → only one declaration is dropped from lib.as.
+    assert!(
+        !stderr.contains("dropped 2"),
+        "only 'dead' is dropped, not 'used'; stderr=\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Building the SAME multi-module program twice (to two different outputs) produces a
+/// byte-identical, NON-ZERO `shake_digest` in the archive manifest — the digest is a
+/// reproducible function of the source (no machine-specific data, no HashMap iteration).
+#[test]
+fn build_shake_digest_is_reproducible_and_nonzero() {
+    use ascript::vm::archive::ModuleArchive;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("digest");
+
+    std::fs::write(
+        dir.join("lib.as"),
+        "export fn used(): int { return 1 }\nexport fn dead(): int { return 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.as"),
+        "import { used } from \"./lib\"\nprint(used())\n",
+    )
+    .unwrap();
+
+    let build_to = |name: &str| -> [u8; 32] {
+        let out = dir.join(name);
+        let b = Command::new(bin)
+            .args(["build"])
+            .arg(dir.join("main.as"))
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            b.status.success(),
+            "build failed: {}",
+            String::from_utf8_lossy(&b.stderr)
+        );
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..8], b"ASCRIPTA", "expected a multi-module archive");
+        let arch = ModuleArchive::decode(&bytes).expect("archive decodes");
+        arch.shake_digest
+    };
+
+    let d1 = build_to("a.aso");
+    let d2 = build_to("b.aso");
+    assert_eq!(d1, d2, "the shake digest must be reproducible across builds");
+    assert_ne!(d1, [0u8; 32], "a program with drops must have a non-zero digest");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The shake report goes to STDERR only: `build`'s stdout carries just the `compiled …`
+/// line, and the bundled program's own stdout (when later run) is unchanged by shaking.
+#[test]
+fn build_report_does_not_pollute_stdout() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = bundle_scratch("stdout");
+
+    std::fs::write(
+        dir.join("lib.as"),
+        "export fn used(): int { return 7 }\nexport fn dead(): int { return 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.as"),
+        "import { used } from \"./lib\"\nprint(used())\n",
+    )
+    .unwrap();
+
+    let out_aso = dir.join("main.aso");
+    let build = Command::new(bin)
+        .args(["build"])
+        .arg(dir.join("main.as"))
+        .arg("-o")
+        .arg(&out_aso)
+        .output()
+        .unwrap();
+    assert!(build.status.success());
+
+    // build's STDOUT must contain ONLY the `compiled … -> …` line — no shake report.
+    let stdout = String::from_utf8_lossy(&build.stdout);
+    assert!(
+        stdout.starts_with("compiled "),
+        "build stdout must lead with the `compiled …` line; stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("tree-shaking"),
+        "the tree-shaking report must NOT be on stdout; stdout=\n{stdout}"
+    );
+    // The shake summary IS on stderr.
+    assert!(
+        String::from_utf8_lossy(&build.stderr).contains("tree-shaking"),
+        "the tree-shaking report must be on stderr"
+    );
+
+    // Running the bundled program emits exactly the program's own stdout, unaffected.
+    let run = Command::new(bin)
+        .arg("run")
+        .arg(&out_aso)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "7\n",
+        "the program's own stdout must be unchanged by shaking"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

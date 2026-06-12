@@ -32,7 +32,7 @@ fn repo_root() -> &'static Path {
 fn aso_format_version_is_unchanged_by_srv() {
     assert_eq!(
         ascript::vm::aso::ASO_FORMAT_VERSION,
-        26,
+        27,
         "SRV must not bump ASO_FORMAT_VERSION — the shared heap is a runtime value, \
          not a bytecode constant, and TAG_SHARED is a worker-wire tag, not an .aso \
          constant. If a LATER feature legitimately bumps the version, update this pin \

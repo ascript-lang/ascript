@@ -932,8 +932,42 @@ pub fn build_file(
     file: &Path,
     out: Option<&Path>,
     with_debug: bool,
+    caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<std::path::PathBuf, AsError> {
-    let bytes = compile_verified_aso_bytes(file, with_debug)?;
+    // SELF-CONTAINED-BUNDLES (Task 1.5): a multi-module program is emitted as an
+    // `ASCRIPTA` archive embedding the whole reachable import graph (so `run out.aso`
+    // works from a directory WITHOUT the sources). A single-module program recompiles
+    // the lone entry to a bare `ASO\0` chunk — byte-identical to the pre-archive
+    // artifact, so existing `.aso` goldens/tests stay valid.
+    let (mut archive, report) = compile_archive(file, with_debug)?;
+    // SELF-CONTAINED-BUNDLES (Task 3.2, ARTIFACT-FORMAT RULE): emit an `ASCRIPTA` archive
+    // when the graph has >1 module OR the caps are restricted (`caps.is_some()`); emit the
+    // bare `ASO\0` chunk ONLY when single-module AND `caps` is `None`. This gives the
+    // embedded capability floor a home EVERYWHERE it is set — including a single-module
+    // `.aso` built with `--deny` — while keeping the common unrestricted single-module build
+    // byte-identical to today (a bare chunk, so existing goldens/tests stay valid).
+    let bytes = if archive.modules.len() > 1 || caps.is_some() {
+        // Embed the composed CapSet into the archive manifest BEFORE encoding (Task 3.2
+        // enforces it at runtime via `restrict_with`). `None` → all granted (the
+        // byte-identical placeholder). Set on the returned archive so `compile_archive`'s
+        // signature is untouched.
+        archive.caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
+        // Surface the tree-shaking summary on STDERR (never stdout — stdout carries only
+        // `compiled … -> …`, keeping the program corpus byte-clean). Harmless for a
+        // single-module archive (the report is then a one-module summary).
+        print_shake_report(&report);
+        archive.encode() // ASCRIPTA — embed the module graph + the caps floor
+    } else {
+        // Unrestricted single-module: a bare `ASO\0` chunk, byte-identical to today.
+        // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
+        // entry under its CANONICALIZED absolute path for stable dedup identity, which a
+        // debug `.aso` embeds as the source path — leaking the build machine's layout. A
+        // fresh compile from the as-passed `file` keeps the relative source path, so the
+        // single-module artifact stays byte-identical to the pre-archive output (and stays
+        // decoupled from archive internals as Phase 2 evolves `compile_archive`). `build` is
+        // a one-shot CLI compile, so re-compiling this one file is negligible.
+        compile_verified_aso_bytes(file, with_debug)? // bare ASO\0 — byte-identical to today
+    };
     let out_path = match out {
         Some(p) => p.to_path_buf(),
         None => file.with_extension("aso"),
@@ -976,6 +1010,487 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
         .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
 }
 
+/// BNDL §3 — walk a program's import graph from `entry` and compile every reachable
+/// user/package module into a [`ModuleArchive`] (Phase 1, Task 1.3). Later phases
+/// consult this archive at runtime (so a multi-file program needs no source tree on
+/// disk), tree-shake it, and embed the composed `CapSet`.
+///
+/// # The walk
+///
+/// A breadth-first worklist over the import graph. The entry is compiled first; each
+/// module's compiled chunk is decoded back (through the SAME `from_bytes_verified`
+/// trust boundary the runtime uses) only to read its `imports`. Every `import`
+/// specifier is classified via [`Interp::classify_specifier`]:
+///
+/// - `std/*` → SKIPPED (native Rust, linked into the runtime, never archived).
+/// - relative / package → resolved to a file path, deduped by **canonical path**, and
+///   (if new) compiled and enqueued so its OWN imports are walked transitively.
+/// - unknown package → a clean [`AsError`] (the program references a package that is
+///   not installed; Phase 1 installs no resolver, so every bare specifier lands here).
+///
+/// Dedup happens BEFORE recursing, so a cycle (`A` imports `B` imports `A`) terminates.
+///
+/// # The logical-key convention (load-bearing — Task 1.4 MUST match it)
+///
+/// Each module's archive key is its **lexical logical path relative to the entry
+/// file's directory**, normalized to forward slashes — NOT an absolute, canonicalized
+/// path (which would leak the build machine's layout and break cross-machine
+/// portability, spec §3.3). It is computed purely from `import` specifiers:
+///
+/// - the entry's key is its file name (e.g. `bundle_multimodule.as`); its logical
+///   directory is the archive-namespace root (`""`);
+/// - an import with specifier `S` from a module whose logical directory is `D` keys
+///   the imported module at `lexically_normalize(D `join` S)` with a default `.as`
+///   extension — e.g. `./bundle_util` from the root keys `bundle_util.as`.
+///
+/// `.`/`..` segments are resolved LEXICALLY ([`join_logical`]): a `..` cancels the
+/// preceding segment, but a `..` that escapes the logical root is **PRESERVED VERBATIM**
+/// — so a module in a subdirectory importing `../shared` produces the stable key
+/// `../shared.as`. That key is still machine-independent (relative to the entry dir, no
+/// absolute leak) and stays unique (`../a` ≠ `a`); Task 1.4 MUST reproduce the same
+/// `..`-preserving join. (Package specifiers are NOT importer-relative — they key under
+/// a stable `pkg/<specifier>` namespace, §below.)
+///
+/// This is exactly what the Task 1.4 runtime loader can reproduce: it resolves an
+/// import against the importer's *logical* directory (the archive-relative dir), not
+/// the on-disk absolute dir, and normalizes the same way. Dedup identity is the
+/// canonical on-disk path (so two specifiers reaching the same file collapse to one
+/// module, matching `load_file_module`'s cache identity), while the STORED key stays
+/// machine-independent.
+///
+/// `caps` is a default all-granted [`CapSet`] placeholder here — the build commands
+/// (`build_file`/`build_native`) OVERRIDE `archive.caps` with the composed capability set
+/// (`compose_caps`: CLI `--deny`/`--sandbox`/carve-outs + `ascript.toml`) before encoding, and
+/// `run_verified_archive` enforces it at run (monotone `restrict_with`). `shake_digest` is the
+/// reproducible 32-byte sha256 of the tree-shake report
+/// ([`crate::compile::shake::ShakeReport::digest`]). The report is RETURNED alongside the
+/// archive so the caller (`build_file`/`build_native`) can print a human-readable
+/// tree-shaking summary to stderr.
+///
+/// `with_debug` is threaded into every module's compile: the stored chunk bytes are
+/// what actually RUN at bundle time (the archive replaces the source tree), so debug
+/// info (line/variable tables for panic diagnostics) is preserved per the caller's
+/// choice, exactly as a single-module `build`/`--native` would.
+pub fn compile_archive(
+    entry: &Path,
+    with_debug: bool,
+) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
+    compile_archive_with_shake(entry, with_debug, true)
+}
+
+/// Like [`compile_archive`], but with the pass-2 TREE-SHAKE toggleable. This is the
+/// load-bearing TEST seam for the shaken-vs-unshaken differential (Phase 2, Task 2.5):
+/// `compile_archive(entry, dbg)` is exactly `compile_archive_with_shake(entry, dbg, true)`,
+/// and `shake = false` skips pass-2 pruning entirely so each LIBRARY module keeps its full
+/// pass-1 bytes (every top-level declaration present). Building BOTH forms and asserting
+/// their runs are byte-identical isolates SHAKING as the only variable — same archive walk,
+/// same logical keys, only pruning toggled.
+///
+/// When `shake = false` the returned [`ShakeReport`](crate::compile::shake::ShakeReport) is
+/// still computed (so a caller can compare it to the shaken report), but it is NOT applied
+/// to the stored bytes — the report is purely informational for the no-shake build.
+///
+/// `#[doc(hidden)]` test/seam API — production callers use the 2-arg [`compile_archive`].
+#[doc(hidden)]
+pub fn compile_archive_with_shake(
+    entry: &Path,
+    with_debug: bool,
+    shake: bool,
+) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
+    use crate::vm::archive::ModuleArchive;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // A work item: the file to compile, the importer-relative logical key the archive
+    // stores it under, and the logical directory imports inside it resolve against.
+    struct Pending {
+        path: PathBuf,
+        key: String,
+        logical_dir: String,
+    }
+
+    // An `Interp` is used ONLY as the host for `classify_specifier` (it reads the
+    // importer's `module_dir` to resolve a relative specifier to a path). No code runs.
+    // No package resolver is installed in Phase 1, so a bare package specifier
+    // classifies as `UnknownPackage` → a clean error below.
+    let interp = Interp::new();
+
+    // The entry file anchors the logical namespace. Canonicalize it for a stable dedup
+    // identity and to derive the entry directory all relative imports resolve against.
+    let entry_canon = entry
+        .canonicalize()
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", entry.display(), e)))?;
+    let entry_dir = entry_canon
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let entry_key = entry_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "entry.as".to_string());
+
+    let mut modules: Vec<(String, Vec<u8>)> = Vec::new();
+    // The decoded chunk + on-disk source path for each module, parallel to `modules`
+    // by index — pass 2 (tree-shake) re-compiles each LIBRARY module's source under
+    // its keep-set, and the shaker reads each chunk's `imports`.
+    let mut graph_chunks: Vec<crate::vm::chunk::Chunk> = Vec::new();
+    let mut module_paths: Vec<PathBuf> = Vec::new();
+    // Per-module RESOLVED import edges (target = module index), parallel to `modules`.
+    // Filled as the BFS resolves each import specifier to its dedup'd target index.
+    let mut module_edges: Vec<Vec<crate::compile::shake::ImportEdge>> = Vec::new();
+    // Dedup by canonical path → the module's index in `modules`. Keyed by canonical
+    // path (not logical key) so two specifiers reaching the same file collapse to one.
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+
+    let mut queue: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    queue.push_back(Pending {
+        path: entry_canon.clone(),
+        key: entry_key,
+        logical_dir: String::new(),
+    });
+    seen.insert(entry_canon.clone(), 0); // reserve index 0 for the entry (filled below)
+
+    // The entry is enqueued first and BFS dequeues it first, so it is always archived at
+    // index 0 — no need to track which dequeued module was the entry.
+    let entry: u32 = 0;
+
+    while let Some(item) = queue.pop_front() {
+        // Compile this module to verified `.aso` bytes (reusing the SAME path `build`
+        // uses, so the stored chunk always re-verifies). The stored bytes are what RUN
+        // (the archive replaces the source tree), so debug info is preserved per the
+        // caller's `with_debug` choice — NOT dropped — matching a single-module build.
+        let bytes = compile_verified_aso_bytes(&item.path, with_debug)?;
+
+        // Decode the just-produced chunk to read its import table. These are OUR OWN
+        // freshly-verified bytes, so this never sees hostile input.
+        let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes).map_err(|e| {
+            AsError::new(format!(
+                "internal: re-decoding compiled module {} failed: {e:?}",
+                item.path.display()
+            ))
+        })?;
+
+        // Record this module. Indices are assigned in `seen` in monotonic queue order,
+        // and BFS pops in that same order, so the reserved index always equals the
+        // current `modules` length — append lands exactly at this module's slot.
+        let this_index = *seen
+            .get(&item.path)
+            .expect("every queued module is pre-registered in `seen`");
+        debug_assert_eq!(this_index, modules.len());
+        modules.push((item.key.clone(), bytes));
+        module_paths.push(item.path.clone());
+        // The edges for THIS module are accumulated below as imports resolve.
+        debug_assert_eq!(module_edges.len(), this_index);
+        let mut this_edges: Vec<crate::compile::shake::ImportEdge> = Vec::new();
+
+        // The directory inside this module that its imports resolve against on disk.
+        let this_disk_dir = item
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| entry_dir.clone());
+
+        for imp in &chunk.imports {
+            let source = imp.source();
+            // Resolve the specifier relative to THIS module's on-disk directory.
+            interp.set_module_dir(this_disk_dir.clone());
+            match interp.classify_specifier(source) {
+                crate::interp::SpecifierKind::Std => {
+                    // Native stdlib — linked in, never archived (no shake edge).
+                }
+                kind @ (crate::interp::SpecifierKind::Relative(_)
+                | crate::interp::SpecifierKind::Package { .. }) => {
+                    let target = match &kind {
+                        crate::interp::SpecifierKind::Relative(t) => t.clone(),
+                        crate::interp::SpecifierKind::Package { target, .. } => target.clone(),
+                        _ => unreachable!("matched only Relative|Package"),
+                    };
+                    let dep_path = resolve_module_file(&target).map_err(|msg| {
+                        AsError::new(format!(
+                            "cannot resolve import '{source}' from {}: {msg}",
+                            item.path.display()
+                        ))
+                    })?;
+                    // The lexical, machine-independent archive key for this dependency.
+                    //  - A RELATIVE import keys relative to the IMPORTER's logical dir
+                    //    (`./util` from the root → `bundle_util.as`).
+                    //  - A PACKAGE import is NOT importer-relative: it keys under a stable
+                    //    `pkg/<specifier>` namespace so the same package resolves to the
+                    //    same key regardless of which module imported it (the store-relative
+                    //    logical id of spec §3.3). Phase 1 installs no resolver, so the
+                    //    package branch is currently unreachable (bare specifiers land in
+                    //    `UnknownPackage` below) — this keeps Phase 4 correct-by-construction.
+                    let dep_key = match &kind {
+                        crate::interp::SpecifierKind::Package { .. } => {
+                            crate::vm::archive::join_logical("pkg", source)
+                        }
+                        _ => crate::vm::archive::join_logical(&item.logical_dir, source),
+                    };
+                    let dep_logical_dir = crate::vm::archive::logical_parent(&dep_key);
+
+                    // Resolve (or reserve) the dedup'd archive index this import targets.
+                    // A diamond / cycle dep is ALREADY in `seen`; a fresh one reserves the
+                    // next monotonic index and is enqueued. Either way we know the target
+                    // index NOW, so the shake edge is recorded for both.
+                    let target_index = if let Some(&idx) = seen.get(&dep_path) {
+                        idx // already archived (or queued) — dedup terminates cycles
+                    } else {
+                        // `seen` maps every known module (recorded or queued) to a unique,
+                        // monotonically assigned index, so the next free index is `seen.len()`.
+                        let reserved = seen.len();
+                        seen.insert(dep_path.clone(), reserved);
+                        queue.push_back(Pending {
+                            path: dep_path,
+                            key: dep_key,
+                            logical_dir: dep_logical_dir,
+                        });
+                        reserved
+                    };
+                    this_edges.push(import_desc_to_edge(imp, target_index));
+                }
+                crate::interp::SpecifierKind::UnknownPackage(key) => {
+                    return Err(AsError::new(format!(
+                        "unknown package '{key}' — add it with 'ascript add' \
+                         (imported from {})",
+                        item.path.display()
+                    )));
+                }
+            }
+        }
+        graph_chunks.push(chunk);
+        module_edges.push(this_edges);
+    }
+
+    // ── Phase 2, Task 2.3: tree-shake. ─────────────────────────────────────────
+    // Compute the per-module keep-set (the reachable closure of top-level names) and
+    // RE-EMIT each LIBRARY module dropping unreferenced INERT top-level declarations.
+    // The ENTRY (index 0) is kept WHOLE — its pass-1 bytes are stored UNCHANGED, so a
+    // single-module program (and the entry of any program) is byte-identical to today.
+    // A re-compile RE-READS each library module's source from disk (the pass-1 source
+    // string isn't preserved — `compile_verified_aso_bytes` is self-contained), so a
+    // library module is compiled TWICE: O(2N) compiles for N library modules. Fine for
+    // a one-shot build; worth a pass-1-source cache later if build time matters. The
+    // keep-set's closure property guarantees no dropped name is referenced by kept code
+    // (no dangling globals).
+    let graph: Vec<crate::compile::shake::ModuleNode> = modules
+        .iter()
+        .zip(graph_chunks)
+        .zip(module_edges)
+        .map(|(((key, _bytes), chunk), edges)| crate::compile::shake::ModuleNode {
+            key: key.clone(),
+            chunk,
+            edges,
+        })
+        .collect();
+    let mut reach = crate::compile::shake::compute_reachable(&graph);
+    // reach.report drives BOTH the reproducible manifest digest (below) and the
+    // stderr tree-shaking summary the caller prints — it is RETURNED to the caller.
+
+    // Pre-render each pin's `<importer_key>:line:col` location against the IMPORTER's
+    // source (the module whose namespace use forced the pin). We hold the sources here;
+    // the printer then needs none. Reading the source is best-effort — a read failure
+    // simply leaves `location` as `None` (the printer falls back to the bare key). The
+    // rendered location is deliberately NOT part of the digest (it is redundant with the
+    // importer key + char span the digest already covers).
+    for pin in &mut reach.report.pins {
+        if let Some(path) = module_paths.get(pin.importer) {
+            if let Ok(src) = std::fs::read_to_string(path) {
+                pin.location =
+                    Some(crate::compile::shake::render_pin_location(&pin.importer_key, &src, pin.span));
+            }
+        }
+    }
+
+    // The no-shake TEST seam (`shake == false`, Task 2.5) skips this loop entirely: every
+    // library module keeps its full pass-1 bytes. The report above is still COMPUTED (so a
+    // caller can diff it against the shaken report) but never APPLIED — the differential
+    // builds both forms and asserts their runs are byte-identical.
+    if shake {
+        for (idx, (_key, bytes)) in modules.iter_mut().enumerate() {
+            if idx == 0 {
+                continue; // entry kept whole — byte-identical to today
+            }
+            // The keep-set should exist for every module index; a missing one is an internal
+            // invariant break — defensively keep the module WHOLE rather than over-prune.
+            let Some(keep) = reach.keep.get(&idx) else {
+                continue;
+            };
+            let path = &module_paths[idx];
+            let pruned = compile_pruned_aso_bytes(path, keep, with_debug)?;
+            *bytes = pruned;
+        }
+    }
+
+    // The manifest digest is the reproducible sha256 of the shake report (machine-
+    // independent: logical keys + dropped names + pins, NO absolute paths — same source
+    // ⇒ same digest). The report is then returned for the caller's stderr summary.
+    let shake_digest = reach.report.digest();
+    let archive = ModuleArchive::new(
+        entry,
+        crate::stdlib::caps::CapSet::default(), // all-granted placeholder; build_file/build_native override archive.caps with the composed set before encoding
+        shake_digest,
+        modules,
+    );
+    Ok((archive, reach.report))
+}
+
+/// Convert a decoded [`crate::vm::chunk::ImportDesc`] into a tree-shaker
+/// [`crate::compile::shake::ImportEdge`] targeting the already-resolved dedup'd module
+/// index. A `Named` import contributes the imported export names as roots in the target;
+/// a `Namespace` import contributes its alias (the shaker statically refines a
+/// namespace-only `alias.foo` use down to the accessed exports, or pins the whole target
+/// if the alias escapes — see [`crate::compile::shake::classify_namespace_use`]).
+fn import_desc_to_edge(
+    imp: &crate::vm::chunk::ImportDesc,
+    target: usize,
+) -> crate::compile::shake::ImportEdge {
+    use crate::compile::shake::ImportEdge;
+    match imp {
+        crate::vm::chunk::ImportDesc::Named { names, .. } => ImportEdge::Named {
+            target,
+            names: names
+                .iter()
+                .map(|(export_name, _slot, _is_cell, _is_global)| Rc::from(export_name.as_str()))
+                .collect(),
+        },
+        crate::vm::chunk::ImportDesc::Namespace { alias, .. } => ImportEdge::Namespace {
+            target,
+            alias: Rc::from(alias.as_str()),
+        },
+    }
+}
+
+/// Print a human-readable tree-shaking summary to STDERR (Task 2.4). Called by
+/// `build_file`/`build_native` for MULTI-MODULE archives only (a single-module build
+/// emits a bare chunk with no shaking, so there is nothing to report). STDERR keeps the
+/// summary off the program's stdout / the `compiled … -> …` / `bundled … -> …` lines.
+///
+/// Format (everything deterministically ordered — modules by logical key, names sorted):
+///
+/// ```text
+/// tree-shaking: dropped 3 declaration(s) across 2 module(s); 1 module(s) pinned
+///   util.as: dropped 2 — dead, helper
+///   math.as: dropped 1 — unused
+///   kept all exports of 'config.as' — namespace 'm' is indexed/escapes at app.as:12:7
+/// ```
+///
+/// A build with no drops and no pins prints a single `tree-shaking: nothing to drop`
+/// line. The report is purely informational; it never fails the build.
+fn print_shake_report(report: &crate::compile::shake::ShakeReport) {
+    let total = report.total_dropped();
+    let mods = report.modules_with_drops();
+    let pins = report.pins.len();
+
+    if total == 0 && pins == 0 {
+        eprintln!("tree-shaking: nothing to drop");
+        return;
+    }
+
+    eprintln!(
+        "tree-shaking: dropped {total} declaration(s) across {mods} module(s); \
+         {pins} module(s) pinned"
+    );
+
+    // Per-module drops, ordered by logical key (machine-independent), skipping modules
+    // with no drops (the entry, and any fully-used library).
+    let mut drops: Vec<&crate::compile::shake::ModuleDrops> = report
+        .dropped
+        .iter()
+        .filter(|d| !d.names.is_empty())
+        .collect();
+    drops.sort_by(|a, b| a.key.cmp(&b.key));
+    for d in &drops {
+        let names: Vec<&str> = d.names.iter().map(|n| n.as_ref()).collect();
+        eprintln!("  {}: dropped {} — {}", d.key, d.names.len(), names.join(", "));
+    }
+
+    // Pins, ordered by the pinned module's logical key.
+    let mut pin_list: Vec<&crate::compile::shake::PinReason> = report.pins.iter().collect();
+    pin_list.sort_by(|a, b| a.key.cmp(&b.key));
+    for p in &pin_list {
+        // `location` is pre-rendered (`compile_archive` holds the sources); fall back to
+        // the bare importer key if a source read failed during the build.
+        let at = p
+            .location
+            .clone()
+            .unwrap_or_else(|| p.importer_key.clone());
+        eprintln!(
+            "  kept all exports of '{}' — namespace '{}' is indexed/escapes at {}",
+            p.key, p.alias, at
+        );
+    }
+}
+
+/// Compile a LIBRARY module's source to verified `.aso` bytes, PRUNED to its
+/// tree-shake `keep` set (Task 2.3). Mirrors [`compile_verified_aso_bytes`] exactly
+/// (read source → compile → bind debug source → VERIFY → serialize) but routes the
+/// compile through [`crate::compile::compile_source_with_keep`] so unreferenced INERT
+/// top-level declarations are never emitted. The pruned chunk is RE-VERIFIED through the
+/// same `vm::verify` boundary the runtime trusts — a pruning bug surfaces as a clean
+/// error here, never a runtime crash.
+fn compile_pruned_aso_bytes(
+    file: &Path,
+    keep: &std::collections::HashSet<Rc<str>>,
+    with_debug: bool,
+) -> Result<Vec<u8>, AsError> {
+    let src = std::fs::read_to_string(file)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: file.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source_with_keep(&src, keep)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    if with_debug {
+        chunk.set_module_source(&src_info);
+    }
+    crate::vm::verify::verify(&chunk).map_err(|e| {
+        AsError::new(format!(
+            "internal: pruned bytecode failed verification: {e}"
+        ))
+        .with_source(src_info)
+    })?;
+    chunk
+        .to_bytes_with_debug(with_debug)
+        .map_err(|e| AsError::new(format!("cannot serialize pruned bytecode: {e}")))
+}
+
+/// Resolve a requested module path (already importer-joined, e.g. `<dir>/util.as` or an
+/// extension-less stem) to the actual file on disk, returning its CANONICAL path. Mirrors
+/// `load_file_module`'s `.as`/`.aso` precedence: an explicit extension is honored; a bare
+/// stem prefers `<stem>.as`, then `<stem>.aso`. A missing file is an `Err(message)`.
+fn resolve_module_file(target: &Path) -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+    // `classify_specifier` already defaulted a bare specifier to `.as`, but a `Package`
+    // target or an explicit extension may differ; be robust to both. Only an EXPLICIT
+    // known module extension (`.as`/`.aso`) is honored literally — any other extension
+    // (or none) is treated as a stem and resolved `.as`-then-`.aso`, so a path like
+    // `mod.config` is never silently rewritten to `mod.aso`.
+    let stem: PathBuf = target.to_path_buf();
+    let ext = stem
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let candidates: [PathBuf; 2] = match ext.as_deref() {
+        // An explicit `.as`/`.aso` — honor it literally first, then the sibling form.
+        Some("as") => [stem.clone(), stem.with_extension("aso")],
+        Some("aso") => [stem.clone(), stem.with_extension("as")],
+        // No extension, or a non-module extension that is part of the file STEM:
+        // resolve `<stem>.as` then `<stem>.aso` (the bare-specifier default path).
+        _ => [stem.with_extension("as"), stem.with_extension("aso")],
+    };
+    for cand in &candidates {
+        if let Ok(canon) = cand.canonicalize() {
+            return Ok(canon);
+        }
+    }
+    Err(format!(
+        "looked for {} and {}",
+        candidates[0].display(),
+        candidates[1].display()
+    ))
+}
+
 /// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
 /// executable that bundles the whole runtime + the compiled program. This is **bundling, not
 /// AOT**: the output is a copy of the running runtime (`current_exe()`) with the *verified*
@@ -990,6 +1505,7 @@ pub fn build_native(
     file: &Path,
     out: Option<&Path>,
     target: Option<&str>,
+    caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<std::path::PathBuf, AsError> {
     // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
     // naming the requested triple, never a silent ignore or a generic clap failure.
@@ -1000,14 +1516,56 @@ pub fn build_native(
         )));
     }
 
-    // Step 1: the payload is the SAME verified `.aso` byte vector a `build` produces.
-    let payload = compile_verified_aso_bytes(file, true)?;
+    // Step 1: the payload is the SAME verified bytes a `build` produces — a bare `ASO\0`
+    // chunk for a single-module program (byte-identical to today's bundle) or an
+    // `ASCRIPTA` archive embedding the whole import graph for a multi-module program
+    // (so the bundled binary runs from an empty directory). The `stub || payload ||
+    // footer` framing below is unchanged: the payload is opaque to the bundler.
+    let (mut archive, report) = compile_archive(file, true)?;
+    // SELF-CONTAINED-BUNDLES (Task 3.2, ARTIFACT-FORMAT RULE — same rule as `build_file`):
+    // bundle an `ASCRIPTA` archive when the graph has >1 module OR the caps are restricted
+    // (`caps.is_some()`); bundle the bare `ASO\0` chunk ONLY when single-module AND `caps`
+    // is `None`. So a `--native --deny X` of a single-module program now gets an archive
+    // payload (the caps floor has a home and is enforced at run), while the common
+    // unrestricted single-module bundle stays byte-identical to today.
+    let payload = if archive.modules.len() > 1 || caps.is_some() {
+        // Embed the composed CapSet into the archive manifest BEFORE encoding — consistent
+        // with the plain `build` path (Task 3.2 enforces it at runtime). `None` → all
+        // granted (byte-identical placeholder).
+        // SECURITY NOTE (spec §10, macOS): for a `--native` bundle this caps blob rides the
+        // footer PAYLOAD, which is appended AFTER the ad-hoc signature — so it is NOT covered
+        // by that signature. Embedded caps are tamper-EVIDENT only, not tamper-proof; this is
+        // acceptable for v1 because lowering one's own caps is not an attacker goal, and an
+        // attacker who can rewrite the binary can replace the whole payload anyway.
+        archive.caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
+        // Surface the tree-shaking summary on STDERR (the `bundled … -> …` line stays on
+        // stdout).
+        print_shake_report(&report);
+        archive.encode() // ASCRIPTA — embed the module graph + the caps floor
+    } else {
+        // Unrestricted single-module: a bare `ASO\0` chunk, byte-identical to today.
+        // RECOMPILE (do NOT reuse `archive.modules[0].1`): `compile_archive` compiles the
+        // entry under its CANONICALIZED absolute path, which a debug `.aso` embeds as the
+        // source path (this is always a debug build → `with_debug=true`). A fresh compile
+        // from the as-passed `file` keeps the relative source path, so the single-module
+        // bundle stays byte-identical to the pre-archive output. `build` is one-shot, so
+        // re-compiling this one file is negligible.
+        compile_verified_aso_bytes(file, true)? // bare ASO\0 — byte-identical to today
+    };
 
-    // Step 2: the stub is a byte-for-byte copy of the running runtime.
+    // Step 2: the stub is a byte-for-byte copy of the running runtime — but if THIS binary is
+    // itself a bundle (a double-bundle: someone ran a bundled `ascript` as the builder, or a
+    // future self-rebundle), strip the existing overlay first so the new output carries exactly
+    // ONE payload+footer and is not double-sized. The clean stub is everything before the
+    // existing payload offset; the recovered prefix is a footer-free runtime by construction.
     let exe = std::env::current_exe()
         .map_err(|e| AsError::new(format!("cannot locate the running executable: {e}")))?;
-    let stub = std::fs::read(&exe)
+    let raw = std::fs::read(&exe)
         .map_err(|e| AsError::new(format!("cannot read the runtime {}: {}", exe.display(), e)))?;
+    let stub = match crate::bundle::read_bundle_footer(&raw) {
+        Some((offset, _len)) => raw[..offset].to_vec(), // strip old overlay → clean runtime
+        None => raw,
+    };
 
     // Step 3: choose the output path (source stem; `.exe` on Windows; NEVER `.aso`).
     let out_path = match out {
@@ -1025,31 +1583,54 @@ pub fn build_native(
         }
     };
 
-    // Step 4: write the stub, make it executable, and (macOS) ad-hoc sign the CLEAN Mach-O
-    // so its signature `codeLimit` covers only the stub. The payload+footer are appended in
-    // step 5 AFTER the signature — the macOS loader validates `[0, codeLimit)` and ignores
-    // the trailing overlay, so an arm64 bundle execs WITHOUT re-signing the overlay (the
-    // alternative — append then re-sign — relocates the overlay and breaks the footer).
-    std::fs::write(&out_path, &stub)
-        .map_err(|e| AsError::new(format!("cannot write {}: {}", out_path.display(), e)))?;
+    // Step 4: build the bundle on a TEMP sibling, then atomically rename onto `out_path` at the
+    // very end. Every prior step (write stub → chmod → macOS sign → append payload+footer)
+    // touches ONLY the temp path, so a symlink-swap of `out_path` can no longer redirect the
+    // chmod / sign / append onto an arbitrary file — all the TOCTOU windows collapse into the
+    // single final `rename`. CRITICAL: the macOS ad-hoc sign still runs on the CLEAN stub
+    // BEFORE the payload is appended, so the signature's `codeLimit` covers only the stub and
+    // the loader ignores the trailing overlay — that ordering is preserved on the temp file.
+    let tmp_path = {
+        let mut p = out_path.clone();
+        let ext = out_path
+            .extension()
+            .map(|e| format!("{}.{}.tmp", e.to_string_lossy(), std::process::id()))
+            .unwrap_or_else(|| format!("{}.tmp", std::process::id()));
+        p.set_extension(ext);
+        p
+    };
+    // Any early return from here on must not leak the temp file: a tiny RAII guard removes it
+    // unless `disarm`ed right before the successful rename.
+    struct TmpGuard(std::path::PathBuf, bool);
+    impl Drop for TmpGuard {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+    }
+    let mut guard = TmpGuard(tmp_path.clone(), true);
+
+    std::fs::write(&tmp_path, &stub)
+        .map_err(|e| AsError::new(format!("cannot write {}: {}", tmp_path.display(), e)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&out_path)
-            .map_err(|e| AsError::new(format!("cannot stat {}: {}", out_path.display(), e)))?
+        let mut perms = std::fs::metadata(&tmp_path)
+            .map_err(|e| AsError::new(format!("cannot stat {}: {}", tmp_path.display(), e)))?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&out_path, perms).map_err(|e| {
-            AsError::new(format!("cannot chmod +x {}: {}", out_path.display(), e))
+        std::fs::set_permissions(&tmp_path, perms).map_err(|e| {
+            AsError::new(format!("cannot chmod +x {}: {}", tmp_path.display(), e))
         })?;
     }
-    crate::bundle::adhoc_sign_macos(&out_path).map_err(AsError::new)?;
+    crate::bundle::adhoc_sign_macos(&tmp_path).map_err(AsError::new)?;
 
     // Step 5: append `payload || footer` AFTER the (now-signed) stub. `payload_offset` is the
     // on-disk size of the signed stub — signing rewrites `__LINKEDIT`, so it may differ from
     // `stub.len()`; read it back rather than assuming.
-    let payload_offset = std::fs::metadata(&out_path)
-        .map_err(|e| AsError::new(format!("cannot stat {}: {}", out_path.display(), e)))?
+    let payload_offset = std::fs::metadata(&tmp_path)
+        .map_err(|e| AsError::new(format!("cannot stat {}: {}", tmp_path.display(), e)))?
         .len();
     let footer = crate::bundle::write_footer(
         payload_offset,
@@ -1060,12 +1641,25 @@ pub fn build_native(
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
-            .open(&out_path)
-            .map_err(|e| AsError::new(format!("cannot open {} to append: {}", out_path.display(), e)))?;
+            .open(&tmp_path)
+            .map_err(|e| AsError::new(format!("cannot open {} to append: {}", tmp_path.display(), e)))?;
         f.write_all(&payload)
             .and_then(|()| f.write_all(&footer))
-            .map_err(|e| AsError::new(format!("cannot append payload to {}: {}", out_path.display(), e)))?;
+            .map_err(|e| AsError::new(format!("cannot append payload to {}: {}", tmp_path.display(), e)))?;
     }
+
+    // Step 6: atomic publish — a single `rename` makes the fully-built bundle appear at
+    // `out_path` (replacing any prior file in one syscall). Only on success do we disarm the
+    // cleanup guard so it does NOT delete the now-renamed file.
+    std::fs::rename(&tmp_path, &out_path).map_err(|e| {
+        AsError::new(format!(
+            "cannot finalize {} (rename from {}): {}",
+            out_path.display(),
+            tmp_path.display(),
+            e
+        ))
+    })?;
+    guard.1 = false;
 
     let total = payload_offset + payload.len() as u64 + crate::bundle::FOOTER_SIZE as u64;
     println!(
@@ -1106,6 +1700,41 @@ pub async fn run_embedded_aso(payload: &[u8], args: &[String]) -> Result<i32, As
     run_verified_aso(payload, args, None, module_dir, "the embedded program").await
 }
 
+/// SELF-CONTAINED-BUNDLES (Task 3.3): MONOTONE launch-time capability subtraction via the
+/// `ASCRIPT_DENY` env var. A deployer can FURTHER restrict an already-built `.aso`/bundle at
+/// launch (`ASCRIPT_DENY=fs ./app`) — it can ONLY subtract (`CapSet::deny`), NEVER re-grant.
+/// Unset/empty/whitespace → `caps` unchanged (the common case, zero behavior change). An
+/// unknown name is a clean STARTUP `AsError` (the `?` at each call site aborts before any code
+/// runs — non-zero exit), matching the `--deny` error grammar in `compose_caps`. Wired ONLY
+/// into the `.aso`/bundle launch paths (`run_verified_aso`/`run_verified_archive`); a source
+/// run (`ascript run x.as`) restricts via CLI `--deny` instead.
+fn apply_ascript_deny(
+    mut caps: crate::stdlib::caps::CapSet,
+) -> Result<crate::stdlib::caps::CapSet, AsError> {
+    let raw = match std::env::var("ASCRIPT_DENY") {
+        Ok(v) => v,
+        Err(_) => return Ok(caps), // unset (or non-UTF-8) → no further restriction
+    };
+    if raw.trim().is_empty() {
+        return Ok(caps);
+    }
+    for name in raw.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match crate::stdlib::caps::cap_name(name) {
+            Some(cap) => caps.deny(cap), // MONOTONE: only ever subtracts
+            None => {
+                return Err(AsError::new(format!(
+                    "ASCRIPT_DENY: unknown capability '{name}' (expected one of: fs, net, process, ffi, env)"
+                )))
+            }
+        }
+    }
+    Ok(caps)
+}
+
 /// The shared verified-run body behind [`run_aso_file`] and [`run_embedded_aso`] (BIN Task
 /// 2): `Chunk::from_bytes_verified` (the single trust boundary) → `Interp` setup →
 /// `set_worker_aso_bytes` → `Vm` → `LocalSet` run → telemetry flush → GC → the
@@ -1119,19 +1748,31 @@ async fn run_verified_aso(
     module_dir: Option<std::path::PathBuf>,
     what: &str,
 ) -> Result<i32, AsError> {
-    use crate::vm::chunk::FnProto;
-    use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
+
+    // SELF-CONTAINED-BUNDLES (Task 1.5): magic-dispatch. A multi-module `build`/`--native`
+    // emits an `ASCRIPTA` archive embedding the whole graph; decode + run it via the
+    // archive runner. A single-module artifact leads with `ASO\0` and falls through to the
+    // unchanged single-chunk path below — byte-identical to the pre-archive run.
+    if payload.starts_with(&crate::vm::archive::ARCHIVE_MAGIC) {
+        let archive = crate::vm::archive::ModuleArchive::decode(payload)
+            .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
+        return run_verified_archive(archive, script_args, caps, module_dir, what).await;
+    }
 
     let chunk = crate::vm::chunk::Chunk::from_bytes_verified(payload)
         .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
-    // FFI §4.5: install the composed capability set before running any code.
-    if let Some(caps) = caps {
-        interp.set_caps(caps);
-    }
+    // FFI §4.5: install the composed capability set before running any code. Start from the
+    // passed-in caps (or all-granted for a native bare-chunk bundle with no CLI `--deny`),
+    // then apply the MONOTONE `ASCRIPT_DENY` launch-time subtraction (Task 3.3) so even an
+    // unrestricted bundle can be tightened by `ASCRIPT_DENY=fs ./app` — `?` makes an invalid
+    // name a clean startup error (the program never runs). `script_args` is untouched.
+    let caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
+    let caps = apply_ascript_deny(caps)?;
+    interp.set_caps(caps);
     // Workers Spec A (.aso path): retain the raw bytes so `dispatch_worker_closure` can
     // re-parse them into the top-level chunk and build a worker code slice without source.
     interp.set_worker_aso_bytes(Rc::from(payload));
@@ -1141,6 +1782,109 @@ async fn run_verified_aso(
     if let Some(dir) = module_dir {
         vm.set_module_dir(dir);
     }
+
+    run_entry_proto_to_exit(&interp, &vm, chunk).await
+}
+
+/// SELF-CONTAINED-BUNDLES (Task 1.5) — the PRODUCTION runner for an `ASCRIPTA` module
+/// archive (mirrors [`run_verified_aso`]'s single-chunk body, dispatched into from the
+/// shared magic-routing above). The entry chunk is the program start; every reachable
+/// module is embedded, so the program runs with NO source tree on disk.
+///
+/// Unlike the [`run_archive`] test seam (`Interp::new()`, captured output, cwd module
+/// dir), this uses `Interp::new_live` (streamed output), honors the passed-in CLI `caps`,
+/// and — CRUCIALLY — calls `vm.set_module_dir(dir)` BEFORE `set_module_archive` when a
+/// `module_dir` is known (the `.aso`'s / executable's directory), so an archive MISS can
+/// still resolve a sibling on-disk source (the Task 1.4 carry-forward). `set_module_archive`
+/// then seeds the entry's logical dir to the archive root (`""`).
+///
+/// CAPS (Task 3.2, N4): the archive's embedded `archive.caps` floor is composed with the
+/// passed-in run-time `caps` by MONOTONE INTERSECTION (`restrict_with`) and installed —
+/// a run-time `--deny` can only narrow the floor, never re-grant a build-time denial. Full
+/// archive→worker parity IS shipped (Task 1.6): the ENTRY chunk's bytes go to
+/// `set_worker_aso_bytes` (so a worker fn's code slice still builds from the entry chunk),
+/// AND the whole encoded archive is stashed via `set_worker_archive_bytes` so every worker
+/// isolate decodes + installs it before re-running the program's top-level imports.
+async fn run_verified_archive(
+    archive: crate::vm::archive::ModuleArchive,
+    script_args: &[String],
+    caps: Option<crate::stdlib::caps::CapSet>,
+    module_dir: Option<std::path::PathBuf>,
+    what: &str,
+) -> Result<i32, AsError> {
+    use crate::vm::Vm;
+
+    // The entry module's verified chunk is the program start, decoded through the SAME
+    // `from_bytes_verified` trust boundary the disk `.aso` path uses. A bounds-check on the
+    // entry index yields a clean error rather than a panic (decode already validates this,
+    // but never index without a check on possibly-foreign data).
+    let entry_bytes = archive
+        .modules
+        .get(archive.entry as usize)
+        // clone the entry chunk out before `archive` is moved into `Rc::new` below
+        .map(|(_, b)| b.clone())
+        .ok_or_else(|| {
+            AsError::new(format!("cannot load {what}: archive entry index is out of range"))
+        })?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+        .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
+
+    // SELF-CONTAINED-BUNDLES (Task 3.2, N4): compose the archive's EMBEDDED capability floor
+    // with the run-time (CLI/manifest) caps by MONOTONE INTERSECTION — a capability is
+    // effective only if BOTH the build-time floor AND the run-time set grant it, so a
+    // run-time flag can only narrow further and can NEVER re-grant what the build denied.
+    // `restrict_with` borrows `archive.caps` by ref — call it BEFORE `archive` is moved
+    // into `encode()` / `Rc::new` below. A native bundle passes `caps = None` (the startup
+    // shim runs before clap, so there are no run-time `--deny` flags) → the effective set is
+    // exactly the embedded floor; `run x.aso --deny X` intersects the floor with `{X denied}`.
+    // The effective set is installed ALWAYS.
+    let effective_caps = archive
+        .caps
+        .restrict_with(&caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted));
+    // SELF-CONTAINED-BUNDLES (Task 3.3): apply the MONOTONE `ASCRIPT_DENY` launch-time
+    // subtraction on top of the composed floor — a native bundle has NO CLI `--deny` (the
+    // startup shim runs before clap), so `ASCRIPT_DENY` is the only launch-time restriction
+    // knob. It can ONLY subtract (never re-grant); `?` turns an invalid name into a clean
+    // startup error before any code runs. Idempotent w.r.t. the floor (denying twice = denied).
+    let effective_caps = apply_ascript_deny(effective_caps)?;
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_cli_args(script_args);
+    // FFI §4.5 + BNDL N4: install the composed (embedded-floor ∩ CLI/manifest) capability
+    // set before running any code.
+    interp.set_caps(effective_caps);
+    // Workers Spec A: retain the ENTRY chunk bytes so `dispatch_worker_closure` can re-parse
+    // them to build a worker fn's code slice.
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    // SELF-CONTAINED-BUNDLES Task 1.6: stash the WHOLE encoded archive so every worker isolate
+    // decodes + installs it on its own `Vm` before re-running the program's top-level imports
+    // (a worker that calls into an imported module would otherwise fail on the archive-less
+    // isolate). Encode BEFORE `archive` is moved into `Rc::new` at `set_module_archive` below.
+    interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    // Seed the on-disk fallback dir BEFORE installing the archive: `set_module_archive`
+    // overrides the entry's LOGICAL dir to the archive root, but an archive-miss still
+    // resolves sibling sources against `module_dir` on disk (Task 1.4 carry-forward).
+    if let Some(dir) = module_dir {
+        vm.set_module_dir(dir);
+    }
+    vm.set_module_archive(Rc::new(archive));
+
+    run_entry_proto_to_exit(&interp, &vm, chunk).await
+}
+
+/// The shared run tail behind [`run_verified_aso`] and [`run_verified_archive`]: wrap the
+/// entry `chunk` in a top-level proto, run it on a `LocalSet`, flush telemetry, end-of-run
+/// GC, then map the `RunOutcome`/`Control` to a process exit code. Borrow discipline is the
+/// callers' (no `RefCell`/resource borrow is held across the `.await` here).
+async fn run_entry_proto_to_exit(
+    interp: &Rc<Interp>,
+    vm: &crate::vm::Vm,
+    chunk: crate::vm::chunk::Chunk,
+) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
 
     let proto = Rc::new(FnProto {
         chunk,
@@ -1220,6 +1964,42 @@ pub fn collect_parse_errors(path: &Path) -> Vec<AsError> {
                 byte_to_char_offset(&src, e.end),
             );
             AsError::at(e.message, span).with_source(src_info.clone())
+        })
+        .collect()
+}
+
+/// Collect BLOCKING semantic diagnostics from the CST resolver that BOTH engines
+/// must reject identically BEFORE running (the shared `run` gate, alongside
+/// [`collect_parse_errors`]). A diagnostic is blocking iff its `blocking` flag is
+/// set (today: the `or-pattern-binding` error — an or-pattern whose alternatives
+/// bind different name sets) — a compile error, not a runtime divergence. The same
+/// diagnostics are surfaced by the VM compiler (so a direct `vm_run_source` rejects
+/// too) and by `ascript check`; routing the tree-walker `run` path through this gate
+/// makes ALL of them byte-identical.
+///
+/// An empty `Vec` means there is nothing blocking (the run proceeds on either
+/// engine). Returns `AsError`s with the file source bound for caret rendering and
+/// CHAR-offset spans (resolver ranges are BYTE offsets, converted here).
+pub fn collect_blocking_diagnostics(path: &Path) -> Vec<AsError> {
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return Vec::new(); // a read error is handled by the runner's own report
+    };
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let tree = crate::syntax::parse_to_tree(&src);
+    let resolved = crate::syntax::resolve::resolve(&tree);
+    resolved
+        .diagnostics
+        .iter()
+        .filter(|d| d.blocking)
+        .map(|d| {
+            let span = crate::span::Span::new(
+                byte_to_char_offset(&src, usize::from(d.range.start())),
+                byte_to_char_offset(&src, usize::from(d.range.end())),
+            );
+            AsError::at(d.message.clone(), span).with_source(src_info.clone())
         })
         .collect()
 }
@@ -1553,6 +2333,148 @@ async fn vm_run_source_cfg(
         // A top-level `?` propagation simply ends the program.
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// **SELF-CONTAINED-BUNDLES Phase 2 (Task 2.5) test seam.** Run a multi-file program from
+/// DISK on the specialized VM with CAPTURED stdout, resolving relative `import`s against the
+/// entry file's directory (`set_module_dir`) — NO archive installed, so every import hits
+/// disk and NOTHING is tree-shaken. This is the inherently-unshaken baseline (B) the
+/// shaken-vs-unshaken differential compares the archive run against. It mirrors
+/// [`vm_run_source`]'s capture but is file/dir-aware (the bare `vm_run_source` can't load
+/// relative imports). `#[doc(hidden)]` test API.
+#[doc(hidden)]
+pub async fn vm_run_file_captured(entry: &Path) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(entry)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", entry.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: entry.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // Match production (`run_file_on_vm_with_packages`): bind the module source onto the proto
+    // tree so a Tier-2 panic renders with source context, instead of silently diverging.
+    chunk.set_module_source(&src_info);
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(&src);
+    let vm = Vm::new(interp.clone());
+    // Resolve relative imports against the entry's directory (disk loader, no archive).
+    if let Some(dir) = entry.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// **SELF-CONTAINED-BUNDLES Phase 1 (Task 1.4).** Run a program PURELY from an in-memory
+/// [`ModuleArchive`] — its entry chunk plus every reachable module is embedded, so the
+/// program runs with NO source tree on disk. The entry chunk (`archive.modules[entry]`)
+/// is the start; every relative `import` it (transitively) makes is satisfied by an
+/// archive lookup by logical key in [`Vm::load_file_module`] (NOT disk), proving the
+/// runtime loader reproduces the exact key `compile_archive` stored.
+///
+/// Output is CAPTURED (returned), like [`vm_run_source`], so a test can assert it equals
+/// the on-disk run. The embedded chunks pass through `from_bytes_verified` (the SAME trust
+/// boundary as `run file.aso`), so a corrupt embedded chunk is a clean error.
+///
+/// Task 1.5 wires up WHO installs the archive (build/`--native`/run dispatch); this is the
+/// loader-facing seam that 1.5 and the headline test drive. `#[doc(hidden)]` test/seam API.
+#[doc(hidden)]
+pub async fn run_archive(
+    archive: crate::vm::archive::ModuleArchive,
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    // The entry module's verified chunk is the program start. Decode through the SAME
+    // trust boundary the disk `.aso` path uses. Clone the entry bytes OUT (bounds-checked,
+    // clean error) before `archive` is moved into `Rc::new` below — they are stashed as the
+    // worker `.aso` bytes too (Task 1.6 parity, mirroring `run_verified_archive`).
+    let entry_bytes = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(_, b)| b.clone())
+        .ok_or_else(|| AsError::new("archive entry index is out of range"))?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+        .map_err(|e| AsError::new(format!("cannot load archive entry module: {e}")))?;
+
+    let interp = Rc::new(Interp::new());
+    // SELF-CONTAINED-BUNDLES Task 1.6: stash the whole encoded archive so a worker isolate
+    // spawned by this captured-output run installs it before re-running top-level imports,
+    // AND the ENTRY chunk bytes so a worker fn's code slice can build from them — together
+    // these give full archive→worker parity in the test path too (it mirrors
+    // `run_verified_archive`). Encode BEFORE `archive` moves into `Rc::new` below.
+    interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    // Install the archive so every relative import resolves from memory by logical key.
+    // The entry's logical dir is seeded to the archive root ("") by `set_module_archive`.
+    // `module_dir` is INTENTIONALLY left at cwd: an archive is expected to be self-contained,
+    // so a disk fallback never fires here. A future path-carrying dispatch (Task 1.5, e.g.
+    // `ascript run app.aso`) MUST call `set_module_dir` to the archive's parent so an
+    // archive-miss can still resolve sibling sources on disk.
+    vm.set_module_archive(Rc::new(archive));
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
     }
 }

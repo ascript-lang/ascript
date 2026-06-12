@@ -26,24 +26,8 @@ enum Command {
         /// mismatch. For CI / sandboxes.
         #[arg(long = "locked")]
         locked: bool,
-        /// FFI §4.2: deny one or more capabilities (opt-out). Repeatable and/or
-        /// comma-separated, e.g. `--deny ffi,process`. Valid names: fs, net,
-        /// process, ffi, env. Composes (union of denials) with the manifest
-        /// `[capabilities]` table; denial is monotone (CLI cannot re-grant).
-        #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
-        deny: Vec<String>,
-        /// FFI §4.2: deny ALL five dangerous capabilities (fs, net, process, ffi,
-        /// env). Sugar for `--deny fs,net,process,ffi,env`.
-        #[arg(long = "sandbox")]
-        sandbox: bool,
-        /// FFI §4.4: a granular net carve-out: `--deny-net=external` (allow
-        /// loopback/private, block public) or `--deny-net=all`.
-        #[arg(long = "deny-net", value_name = "MODE")]
-        deny_net: Option<String>,
-        /// FFI §4.4: a granular fs carve-out: `--deny-fs=write` (reads allowed,
-        /// writes denied) or `--deny-fs=all`.
-        #[arg(long = "deny-fs", value_name = "MODE")]
-        deny_fs: Option<String>,
+        #[command(flatten)]
+        caps: CapFlags,
         /// DBG: run under the debugger — start a Debug Adapter Protocol (DAP) server
         /// over stdio for this program instead of running it normally. An editor's
         /// DAP client drives breakpoints/stepping/inspection. Requires the `dap`
@@ -99,6 +83,8 @@ enum Command {
         /// a clear error). Requires `--native`.
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
+        #[command(flatten)]
+        caps: CapFlags,
     },
     /// Start the interactive REPL
     Repl {
@@ -272,6 +258,34 @@ enum Command {
     /// Re-hash the cache store against the lock integrity (fail-closed).
     #[cfg(feature = "pkg")]
     Verify,
+}
+
+/// FFI §4.2/§4.4: the shared capability CLI flags, flattened into both the `run`
+/// and `build` subcommands (DRY — identical surface + help text by construction).
+/// `test` deliberately exposes only `--deny`/`--sandbox` (no granular carve-outs),
+/// so it keeps its own inline pair rather than flattening this.
+#[derive(clap::Args, Debug)]
+struct CapFlags {
+    /// FFI §4.2: deny capabilities for this run (comma-separated / repeatable:
+    /// fs, net, process, ffi, env), composed with any `ascript.toml
+    /// [capabilities]` (denial is monotone — the CLI cannot re-grant). For
+    /// `build`/`build --native` the composed set is additionally EMBEDDED in the
+    /// produced artifact and enforced at launch (further restrictable with
+    /// `ASCRIPT_DENY`); see the bundles docs.
+    #[arg(long = "deny", value_name = "CAP", value_delimiter = ',')]
+    deny: Vec<String>,
+    /// FFI §4.2: deny ALL five dangerous capabilities (fs, net, process, ffi,
+    /// env). Sugar for `--deny fs,net,process,ffi,env`.
+    #[arg(long = "sandbox")]
+    sandbox: bool,
+    /// FFI §4.4: a granular net carve-out: `--deny-net=external` (allow
+    /// loopback/private, block public) or `--deny-net=all`.
+    #[arg(long = "deny-net", value_name = "MODE")]
+    deny_net: Option<String>,
+    /// FFI §4.4: a granular fs carve-out: `--deny-fs=write` (reads allowed,
+    /// writes denied) or `--deny-fs=all`.
+    #[arg(long = "deny-fs", value_name = "MODE")]
+    deny_fs: Option<String>,
 }
 
 // SP3 §B: run the whole program on a worker thread with an enlarged
@@ -536,8 +550,11 @@ fn fix_edits_json(path: &str, edits: &[ascript::check::TextEdit]) -> String {
 ///
 /// Cost on the NON-bundle path (every normal launch): a `current_exe()` resolve + open +
 /// stat + a single `FOOTER_SIZE`-byte tail read — it never loads the whole image (Task 7).
-/// Any I/O failure is treated as "not a bundle" (fall through) — a bundle that cannot read
-/// its own payload is indistinguishable from a non-bundle and must not abort startup.
+/// Any I/O failure BEFORE footer confirmation (open / stat / footer read / `validate_footer`)
+/// is treated as "not a bundle" — it may be a plain `ascript` launch, so it falls through to
+/// `Cli::parse()`. Once the `ASCRIPTB` magic is confirmed, a payload-read failure is a
+/// REPORTED error (exit 1), NOT a silent fall-through — the binary IS a bundle, so a confusing
+/// clap "missing subcommand" error would be wrong.
 async fn try_run_embedded() -> Option<ExitCode> {
     use std::io::{Read, Seek, SeekFrom};
     const FOOTER_SIZE: usize = ascript::bundle::FOOTER_SIZE;
@@ -554,10 +571,18 @@ async fn try_run_embedded() -> Option<ExitCode> {
     f.read_exact(&mut footer).ok()?;
     let (offset, len) = ascript::bundle::validate_footer(&footer, exe_len)?;
 
-    // It IS a bundle — read the payload region and run it embedded.
-    f.seek(SeekFrom::Start(offset as u64)).ok()?;
+    // It IS a bundle (the `ASCRIPTB` magic is confirmed) — from here a read failure is a
+    // REPORTED error, NOT a silent fall-through to clap. A transient I/O error (e.g. EINTR
+    // under load) on the payload read used to `.ok()?` → `None` → `Cli::parse()` → clap's
+    // confusing "missing subcommand" usage error; the binary IS a bundle, so surface it.
     let mut payload = vec![0u8; len];
-    f.read_exact(&mut payload).ok()?;
+    if let Err(e) = f
+        .seek(SeekFrom::Start(offset as u64))
+        .and_then(|_| f.read_exact(&mut payload))
+    {
+        eprintln!("error: failed to read embedded program: {e}");
+        return Some(ExitCode::from(1));
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match ascript::run_embedded_aso(&payload, &args).await {
         Ok(code) => code,
@@ -580,10 +605,7 @@ async fn real_main() -> ExitCode {
         Command::Run {
             tree_walker,
             locked,
-            deny,
-            sandbox,
-            deny_net,
-            deny_fs,
+            caps: CapFlags { deny, sandbox, deny_net, deny_fs },
             inspect,
             profile,
             out,
@@ -724,6 +746,16 @@ async fn real_main() -> ExitCode {
                     ascript::diagnostics::report_all(&parse_errors);
                     return ExitCode::from(1);
                 }
+                // Shared BLOCKING semantic gate (both engines): reject statically-
+                // invalid programs the same way before EITHER engine runs — currently
+                // an or-pattern whose alternatives bind different name sets. Runs only
+                // on a clean parse; shares no state with the runner, so a valid program
+                // runs identically.
+                let blocking = ascript::collect_blocking_diagnostics(path);
+                if !blocking.is_empty() {
+                    ascript::diagnostics::report_all(&blocking);
+                    return ExitCode::from(1);
+                }
             }
             let result = if is_aso {
                 ascript::run_aso_file(path, &args, caps).await
@@ -748,13 +780,27 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
+            caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
             let out_path = out.as_deref().map(std::path::Path::new);
             let src = std::path::Path::new(&file);
+            // SELF-CONTAINED-BUNDLES (Task 3.1): compose the initial CapSet from the
+            // CLI flags + the nearest `ascript.toml` `[capabilities]` table (the SAME
+            // `compose_caps` the `run`/`test` commands use — single source of truth).
+            // `None` → all granted (the byte-identical default); `Some` → restricted.
+            // The composed set is EMBEDDED into the produced archive manifest (Task 3.2
+            // enforces it at runtime).
+            let caps = match compose_caps(src, &deny, sandbox, deny_net.as_deref(), deny_fs.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            };
             if native {
                 // BIN: bundle a self-contained native executable. `--target` is
                 // host-only in v1 (build_native returns the specific Tier-1 error).
-                match ascript::build_native(src, out_path, target.as_deref()) {
+                match ascript::build_native(src, out_path, target.as_deref(), caps) {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
                     Err(e) => {
                         ascript::diagnostics::report(&e);
@@ -762,7 +808,7 @@ async fn real_main() -> ExitCode {
                     }
                 }
             } else {
-                match ascript::build_file(src, out_path, !strip) {
+                match ascript::build_file(src, out_path, !strip, caps) {
                     Ok(written) => {
                         println!("compiled {} -> {}", file, written.display());
                         ExitCode::SUCCESS

@@ -153,7 +153,7 @@ let port = server.port   // the OS-assigned port
 
 A connected stream (from `connect` or `accept`) exposes:
 
-- `await stream.read(n?)` — reads up to `n` bytes (default 64 KiB if omitted). Returns **bytes**, or **`nil` at EOF**. `read(0)` returns empty bytes without touching the socket. A negative `n` is a Tier-2 panic.
+- `await stream.read(n?)` — reads up to `n` bytes (default 64 KiB if omitted). Returns **bytes**, or **`nil` at EOF**. `read(0)` returns empty bytes without touching the socket. `n` must be a finite, non-negative, in-range count: a negative, `Infinity`/`NaN`, or out-of-range `n` is a (recoverable) Tier-2 panic — the size is validated before any buffer is reserved, so it can never abort the host.
 - `await stream.readLine()` — reads a single line, stripping a trailing `\n` (and an optional preceding `\r`). Returns a **string**, or **`nil` at EOF**.
 - `await stream.readToEnd()` — reads to end-of-stream. Always returns **bytes** (empty if already drained); consumes and finalizes the stream.
 - `await stream.write(data)` — writes a string or bytes. Returns `[nil, err]` — a write to a closed stream returns `[nil, err]` rather than panicking.
@@ -372,7 +372,7 @@ let [resp, err] = await http.post("https://api.example.com/upload", {
 
 With `opts.stream: true`, the body is not buffered: `resp.body` is a reader handle that pulls chunks on demand (a slow consumer applies backpressure to the transfer). It supports the same reader idiom as a TCP stream:
 
-- `await resp.body.read(n?)` → a chunk (string or bytes per `opts.bodyMode`), or `nil` at EOF.
+- `await resp.body.read(n?)` → a chunk (string or bytes per `opts.bodyMode`), or `nil` at EOF. `n` must be a finite, non-negative, in-range count (same guard as `stream.read`); a pathological size is a recoverable Tier-2 panic, never a host abort.
 - `await resp.body.readLine()` → a line, or `nil` at EOF.
 - `await resp.body.readToEnd()` → the remainder (always in the body's mode).
 
@@ -540,7 +540,16 @@ A handler's return value is converted to a response:
 - **an object** `{status?, headers?, body?}` → as specified (defaults: status `200`, empty body). `body` may be a string or bytes; a `text/plain` content-type is added if none was set and the body is non-empty.
 - **a result pair** `[value, err]` → if `err` is non-nil, a `500` with the error message; otherwise the `value` is converted as above.
 
-> [!NOTE] A handler or middleware **panic** (Tier-2) or a `?`-propagated error never kills the server — it is caught and converted to a `500` (the message is included for dev-friendliness), and the accept loop keeps serving. An **unmatched route** falls through to a `404` (middleware still runs first, so it can authenticate). Oversized headers → `431`; an oversized declared body → `413`; a read timeout → `408`.
+> [!NOTE] A handler or middleware **panic** (Tier-2) or a `?`-propagated error never kills the server — it is caught and converted to a `500` (the message is included for dev-friendliness), and the accept loop keeps serving. An **unmatched route** falls through to a `404` (middleware still runs first, so it can authenticate). Oversized headers → `431`; an oversized declared body → `413`; a read timeout → `408`. The server speaks HTTP/1 with a fixed `Content-Length` body only: a request carrying a `Transfer-Encoding` header (e.g. `chunked`) is **not** decoded and gets a clean `501 Not Implemented` (it never silently reads an empty body), and a conflicting/duplicate `Content-Length` (differing values) or a non-numeric/negative one gets a `400 Bad Request` (identical duplicate `Content-Length` values are accepted as one).
+
+#### Response header validation (response-splitting guard)
+
+Every handler-supplied response header is validated **before** it is written to the wire:
+
+- a header **name** must be a non-empty HTTP token (RFC 7230 §3.2.6) — visible ASCII with no control characters, no separators (including `:`), and no spaces. Alphanumerics and `-` (the norm) are fine.
+- a header **value** must not contain a bare **CR (`\r`)** or **LF (`\n`)**.
+
+This closes **HTTP response splitting / header injection**: a handler that reflects untrusted input (a query param, a request header) straight into a response header value containing `\r\n` could otherwise inject extra headers or a whole second response. A handler that produces such a header **fails closed** — the request returns a `500` (a recoverable Tier-2 panic, caught like any other handler panic) and the malformed header never reaches the client; the response is never split. Validate or sanitize untrusted input before placing it in a header (or rely on this guard to reject it). See `examples/advanced/http_header_safety.as`.
 
 ### Example: middleware, params, and a JSON echo
 

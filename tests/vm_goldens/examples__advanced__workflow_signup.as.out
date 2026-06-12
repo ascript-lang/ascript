@@ -1,6 +1,0 @@
-# exit: none
-signup ok: true
-user: user-42, plan: pro, charged: 4200
-receipt present: true, timestamp present: true
-resume idempotent: true
-done

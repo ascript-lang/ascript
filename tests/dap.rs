@@ -732,6 +732,117 @@ fn dap_observation_contract_output_byte_identical() {
     let _ = std::fs::remove_file(&program);
 }
 
+/// Task 0.18 (1) — a `scopes` request with an EXTREME client `frameId` (`i64::MAX`)
+/// must NOT crash the adapter. Pre-fix, `frame_id + 1` overflowed (a debug-build panic
+/// → process abort; a release wrap to `i64::MIN`). The handler now `saturating_add`s and
+/// clamps, so the request returns a valid (well-formed) scopes response and the session
+/// keeps working (a follow-up `continue` still runs the program to completion).
+#[test]
+fn dap_scopes_extreme_frame_id_does_not_panic() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let program = temp_program("extreme_frame", PROGRAM);
+    let mut c = DapClient::spawn_inspect(&program);
+
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch = c.request("launch", json!({}));
+    c.read_response(launch, deadline);
+    c.read_event("stopped", deadline); // entry — a frame exists
+
+    // The hostile request: frameId = i64::MAX. This MUST come back as a successful,
+    // well-formed scopes response (a single Locals scope) rather than crash the adapter.
+    let sc = c.request("scopes", json!({ "frameId": i64::MAX }));
+    let sc_resp = c.read_response(sc, deadline);
+    assert_eq!(
+        sc_resp["success"], json!(true),
+        "extreme frameId yields a valid scopes response, no panic: {sc_resp}"
+    );
+    let scopes = sc_resp["body"]["scopes"].as_array().expect("scopes array");
+    assert_eq!(scopes.len(), 1, "one Locals scope even for an absurd frameId: {sc_resp}");
+    // The encoded var_ref must be a positive saturated value (no wrap to i64::MIN).
+    let var_ref = scopes[0]["variablesReference"].as_i64().expect("var ref");
+    assert!(var_ref > 0, "var_ref saturated positive, did not wrap: {var_ref}");
+
+    // A `variables` request on that absurd var_ref must ALSO not panic — it simply
+    // returns an empty list (no such frame).
+    let vr = c.request("variables", json!({ "variablesReference": var_ref }));
+    let vr_resp = c.read_response(vr, deadline);
+    assert_eq!(vr_resp["success"], json!(true), "variables ok on absurd ref: {vr_resp}");
+
+    // The adapter is still healthy: continue runs the program to completion.
+    let cont = c.request("continue", json!({ "threadId": 1 }));
+    c.read_response(cont, deadline);
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("5"), "program still completes after the hostile request: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+}
+
+/// Task 0.18 (2) — a SECOND `launch` while a session is live must reap the old session
+/// and start clean. Pre-fix, the old debuggee/pump join handles were silently
+/// overwritten; the detached old pump kept writing stale events into the SHARED state.
+/// Here we drive a full first session to a breakpoint (priming `frames`, `entry_reported`,
+/// and verified breakpoints), then re-`launch`. The re-launch must succeed, re-report a
+/// fresh `entry` stop (proving `entry_reported` was reset, not latched), and complete
+/// normally, with the stale first-session frames/pending state gone.
+#[test]
+fn dap_relaunch_resets_session_state() {
+    let _serial = dap_serial();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let program = temp_program("relaunch", PROGRAM);
+    let mut c = DapClient::spawn_inspect(&program);
+
+    // First session: initialize → launch → entry → breakpoint → stop inside add.
+    let init = c.request("initialize", json!({}));
+    c.read_response(init, deadline);
+    c.read_event("initialized", deadline);
+    let launch1 = c.request("launch", json!({}));
+    c.read_response(launch1, deadline);
+    let stopped1 = c.read_event("stopped", deadline);
+    assert_eq!(stopped1["body"]["reason"], json!("entry"), "first session entry: {stopped1}");
+
+    let sb = c.request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": program.to_string_lossy() },
+            "breakpoints": [ { "line": 2 } ],
+        }),
+    );
+    c.read_response(sb, deadline);
+    c.read_event("breakpoint", deadline);
+    let cd = c.request("configurationDone", json!({}));
+    c.read_response(cd, deadline);
+    let stopped_bp = c.read_event("stopped", deadline);
+    assert_eq!(stopped_bp["body"]["reason"], json!("breakpoint"), "first session bp: {stopped_bp}");
+
+    // Now the state is primed (frames cached, entry_reported latched). Re-launch.
+    let launch2 = c.request("launch", json!({}));
+    let relaunch_resp = c.read_response(launch2, deadline);
+    assert_eq!(relaunch_resp["success"], json!(true), "re-launch succeeds: {relaunch_resp}");
+
+    // The NEW session must report a fresh `entry` stop — proving `entry_reported` was
+    // reset by `reset_session` (a latched flag would have made this a `breakpoint`), and
+    // proving the old pump thread did not corrupt the new generation.
+    let stopped2 = c.read_event("stopped", deadline);
+    assert_eq!(
+        stopped2["body"]["reason"], json!("entry"),
+        "the re-launched session reports a FRESH entry stop (state was reset): {stopped2}"
+    );
+
+    // The fresh session runs to completion normally (no stale breakpoints carried over,
+    // no zombie thread interfering).
+    let cd2 = c.request("configurationDone", json!({}));
+    c.read_response(cd2, deadline);
+    let output = c.drain_output_until_terminated(deadline);
+    assert!(output.contains("5"), "the re-launched session completes cleanly: {output:?}");
+
+    c.close_stdin();
+    let _ = std::fs::remove_file(&program);
+}
+
 /// Test 3 — `ascript dap` (no pre-set program): the program comes from the `launch`
 /// request's `program` argument. A focused smoke test that the `dap` subcommand path
 /// also reaches a stop and terminates.

@@ -870,6 +870,38 @@ pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Contr
     }
 }
 
+/// A validated non-negative *count/size* drawn from a script number, checked
+/// BEFORE the `f64 → usize` cast so a pathological value (`Inf`, `NaN`, `1e30`)
+/// yields a clean AScript Tier-2 panic rather than a saturating cast that then
+/// drives an allocation (`vec![0; n]`, `String::repeat`, `Vec::reserve`,
+/// `take(n)`) into a host-aborting `capacity overflow` / OOM.
+///
+/// `max` is the inclusive upper bound (use `u32::MAX as f64` for a generic
+/// buffer/allocation size, mirroring `bytes::want_index`, or a tighter per-call
+/// cap). Fractional inputs TRUNCATE toward zero (matching the reader/`repeat`
+/// convention); only non-finite, negative, or over-cap values are rejected.
+pub(crate) fn want_count(v: &Value, span: Span, ctx: &str, max: f64) -> Result<usize, Control> {
+    let n = want_number(v, span, ctx)?;
+    if !n.is_finite() || n < 0.0 || n > max {
+        return Err(AsError::at(
+            format!(
+                "{}: expected a finite, in-range, non-negative count (got {})",
+                ctx, n
+            ),
+            span,
+        )
+        .into());
+    }
+    Ok(n as usize)
+}
+
+/// A generic upper bound for buffer/allocation sizes: `u32::MAX` (= 4 GiB − 1
+/// byte; "≈4 GiB" is the rounded user-facing label, so a value tested exactly at
+/// the boundary is `4_294_967_295`, not `4_294_967_296`), matching
+/// `bytes::want_index`. Large enough for any legitimate read/repeat, small enough
+/// that the allocation itself cannot abort the host.
+pub(crate) const MAX_ALLOC_COUNT: f64 = u32::MAX as f64;
+
 pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
     match v {
         Value::Str(s) => Ok(s.clone()),

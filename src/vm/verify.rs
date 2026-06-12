@@ -263,7 +263,13 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // ADT spread+named lockstep builder: each APPEND_*_ARG pops one value/operand,
         // leaving the two builder arrays it just appended to (net -1). CALL_NAMED_SPREAD
         // pops the callee + args array + names array, pushes 1 result (net -2).
-        AppendNamedArg | AppendPosArg | AppendSpreadArg => Effect::new(1, 0),
+        // Each pops the trailing `value`/`operand`, then `peek(1)`+`peek(0)`s the two
+        // builder arrays (`argsArray`, `namesArray`) it mutates in place — so the op
+        // REQUIRES depth >= 3 at runtime (`fiber.peek(1)` would panic below that),
+        // even though it only consumes one value (net -1, leaving the two arrays).
+        // `pops` doubles as the minimum-depth check, so it must be 3 (not 1); push the
+        // two arrays back → `pushes` 2 keeps the net at -1.
+        AppendNamedArg | AppendPosArg | AppendSpreadArg => Effect::new(3, 2),
         CallNamedSpread => Effect::new(3, 1),
         Return => Effect::new(1, 0),
 
@@ -339,10 +345,13 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 
         // DEFINE_GLOBAL pops the value and binds it as a module-scope user-global.
         DefineGlobal => Effect::new(1, 0),
-        // SET_GLOBAL stores TOS into an existing user-global but LEAVES it on the
-        // stack (an assignment is an expression yielding the assigned value), exactly
-        // like SET_LOCAL.
-        SetGlobal => Effect::new(0, 0),
+        // SET_GLOBAL `peek(0)`s TOS, stores it into an existing user-global, and
+        // LEAVES it on the stack (an assignment is an expression yielding the assigned
+        // value — UNLIKE SET_LOCAL, which pops). It is a "peek-and-keep" op: it
+        // REQUIRES depth >= 1 (the runtime `fiber.peek(0)` would otherwise panic) but
+        // is net-zero, so `pops` and `pushes` are both 1 (the `pops` field doubles as
+        // the minimum-depth requirement; see the `Effect` doc).
+        SetGlobal => Effect::new(1, 1),
         // METHOD attaches TOS closure onto the class below it, leaving the class.
         Method => Effect::new(2, 1),
         // INSTANCE_OF: inst cls -- bool.
@@ -371,16 +380,29 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 /// Returns `Ok(())` iff the chunk is structurally safe to run. Every chunk the
 /// compiler emits passes; only malformed/corrupt bytecode is rejected.
 pub fn verify(chunk: &Chunk) -> Result<(), VerifyError> {
-    verify_chunk(chunk)?;
+    // The top-level (entry) chunk has no params: it runs in a synthetic 0-arity frame,
+    // so any `CHECK_PARAM` here is already out of range (and the compiler never emits one
+    // at top level). `verify_proto_chunk` then recurses into each nested proto with its
+    // OWN param count, bounding that proto's `CHECK_PARAM` operands (they index
+    // `proto.params`, which lives on the FnProto, not the chunk — so the count must be
+    // threaded in explicitly at every depth).
+    verify_proto_chunk(chunk, 0)
+}
+
+/// Verify a chunk (bounding `CHECK_PARAM` operands by `params_len`), then recurse into
+/// every nested proto's chunk with that proto's own param count.
+fn verify_proto_chunk(chunk: &Chunk, params_len: usize) -> Result<(), VerifyError> {
+    verify_chunk(chunk, params_len)?;
     for proto in &chunk.protos {
-        verify(&proto.chunk)?;
+        verify_proto_chunk(&proto.chunk, proto.params.len())?;
     }
     Ok(())
 }
 
 /// Verify a single chunk's own code stream (does NOT recurse into protos — see
-/// [`verify`]).
-fn verify_chunk(chunk: &Chunk) -> Result<(), VerifyError> {
+/// [`verify`]). `params_len` bounds `CHECK_PARAM` operands (the param list lives on the
+/// owning [`FnProto`], so the count is threaded in by the caller).
+fn verify_chunk(chunk: &Chunk, params_len: usize) -> Result<(), VerifyError> {
     let code = &chunk.code;
     // An empty body is trivially valid (e.g. a class template chunk).
     if code.is_empty() {
@@ -418,7 +440,7 @@ fn verify_chunk(chunk: &Chunk) -> Result<(), VerifyError> {
 
     // ---- Pass 2: per-instruction operand-range checks + jump-target validation.
     for &(off, op, operand_at) in &instrs {
-        check_operands(chunk, off, op, operand_at, &boundaries)?;
+        check_operands(chunk, off, op, operand_at, &boundaries, params_len)?;
     }
 
     // ---- Pass 3: abstract stack-depth interpretation over the CFG. ----
@@ -433,6 +455,7 @@ fn check_operands(
     op: Op,
     operand_at: usize,
     boundaries: &[bool],
+    params_len: usize,
 ) -> Result<(), VerifyError> {
     use Op::*;
 
@@ -503,10 +526,34 @@ fn check_operands(
             check_name_const(chunk.read_u16(operand_at) as usize)?
         }
 
-        // ADT: MATCH_VARIANT references a 2-element `[variant, enumOrNil]` Array const;
-        // VARIANT_ELEM / MATCH_VARIANT_ARITY carry a numeric index/count (no table).
+        // ADT: MATCH_VARIANT references a 2-element `[variant, enumOrNil]` Array const.
         MatchVariant => check_const(chunk.read_u16(operand_at) as usize)?,
-        VariantElem | MatchVariantArity => { /* numeric operand; no table */ }
+
+        // ADT: VARIANT_ELEM carries a positional payload INDEX; MATCH_VARIANT_ARITY a
+        // payload field COUNT. Neither indexes a chunk table, so there is no companion
+        // length to range-check against AT THIS OP (the variant whose payload is indexed
+        // is a *runtime* value — `VariantElem` is preceded only by the bare index, never a
+        // const naming the enum/variant). Two facts make the bare operand safe regardless
+        // of what a crafted `.aso` plants here:
+        //
+        //   1. It is decoded via `read_u16`, so it is intrinsically in `0..=u16::MAX` —
+        //      there is no value the operand can hold that the decode does not already
+        //      bound. (This is the compiler's own ceiling too: positional variant-pattern
+        //      arity is bounded by `u16::try_from` in `src/compile/mod.rs`. A legitimately
+        //      compiled chunk DOES emit operands well above any "practical" small cap — a
+        //      300-field positional variant builds, verifies, and runs today, emitting
+        //      `VariantElem(0..=299)` / `MatchVariantArity(300)`. So a tighter constant cap
+        //      such as 255 would *over-reject* valid bytecode and is unsound.)
+        //   2. The run loop is independently out-of-bounds-safe: `VariantElem` reads the
+        //      payload with `.get(idx)` / `IndexMap::get_index(idx)` (→ `Value::Nil` when
+        //      out of range) and `MatchVariantArity` tests `payload_len == Some(n)` — a
+        //      false match, never an index panic. (The inline tests below assert a 0xFFFF
+        //      operand verifies, and `run.rs` asserts the run loop returns Nil/false for
+        //      an out-of-range operand on a real payload — no host panic.)
+        //
+        // So this arm intentionally stays a documented pass-through: the only sound bound
+        // is `u16::MAX`, which `read_u16` already guarantees.
+        VariantElem | MatchVariantArity => { /* numeric operand; u16-bounded by decode */ }
 
         // ---- CLASS: u16 class-proto-table index ----
         Class => {
@@ -560,6 +607,23 @@ fn check_operands(
 
         // ---- CHECK_LOCAL: u16 index into the type-const side-pool ----
         CheckLocal => check_type_const(chunk.read_u16(operand_at) as usize)?,
+
+        // ---- CHECK_PARAM: u16 PARAM index (default-value contract check). The run loop
+        //      indexes `closure.proto.params[param]` UNCONDITIONALLY (an unchecked slice
+        //      index), so a crafted `CHECK_PARAM(0xFFFF)` on a proto with fewer params
+        //      would panic the host. The param list lives on the owning FnProto (threaded
+        //      in as `params_len`), not the chunk, so it is range-checked here. ----
+        CheckParam => {
+            let idx = chunk.read_u16(operand_at) as usize;
+            if idx >= params_len {
+                return Err(VerifyError::OperandOutOfRange {
+                    offset: off,
+                    kind: "param",
+                    index: idx,
+                    len: params_len,
+                });
+            }
+        }
 
         // ---- local slot index ----
         GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | CloseUpvalue => {
@@ -813,15 +877,31 @@ fn count_operand(chunk: &Chunk, op: Op, operand_at: usize) -> usize {
 /// bound a computed-`const` initializer to its own statement) reuse one source of
 /// truth rather than re-deriving stack effects.
 pub(crate) fn op_stack_delta(chunk: &Chunk, op: Op, operand_at: usize) -> isize {
+    // Net is just pushes - pops over the ONE source of truth below (no second copy of
+    // the `Op::Class` special case).
+    let (pops, pushes) = op_stack_pops_pushes(chunk, op, operand_at);
+    pushes as isize - pops as isize
+}
+
+/// The `(pops, pushes)` of the instruction `op` at `operand_at` in `chunk` — the SINGLE
+/// authoritative source of stack effects ([`op_stack_delta`] just nets this), exposing
+/// both halves so a forward stack SIMULATION (the tree-shaker's namespace receiver
+/// tracker, which must know whether an op reaches DOWN to a specific stack slot, not
+/// just the net delta) can reuse it. The `Op::Class` pop count comes from the class
+/// proto (it pops `n_defaults + n_methods` closures + 1 superclass if `has_super`, and
+/// always pushes the one class value); on an out-of-range proto index — unreachable on
+/// VALID bytecode — we fall back to `(0, 1)`, the self-consistent "pushes one value"
+/// answer.
+pub(crate) fn op_stack_pops_pushes(chunk: &Chunk, op: Op, operand_at: usize) -> (usize, usize) {
     if op == Op::Class {
-        // CLASS pops n_defaults + n_methods (+1 superclass), pushes the class.
         if let Some(cp) = chunk.class_protos.get(chunk.read_u16(operand_at) as usize) {
             let pops = cp.default_fields.len() + cp.method_names.len() + usize::from(cp.has_super);
-            return 1 - pops as isize;
+            return (pops, 1);
         }
-        return 0;
+        return (0, 1);
     }
-    stack_effect(op, count_operand(chunk, op, operand_at)).net()
+    let e = stack_effect(op, count_operand(chunk, op, operand_at));
+    (e.pops, e.pushes)
 }
 
 /// Push a jump-target successor onto the worklist, validating it lands on a
@@ -924,6 +1004,62 @@ mod tests {
 
     fn s() -> Span {
         Span::new(0, 0)
+    }
+
+    /// Whether `target` appears as an opcode byte anywhere in `chunk.code`
+    /// (decoding linearly so an operand byte equal to the opcode is not mistaken
+    /// for the op). Only the top-level chunk is scanned.
+    fn find_op(chunk: &Chunk, target: Op) -> bool {
+        let mut ip = 0;
+        while ip < chunk.code.len() {
+            let Some(op) = Op::from_u8(chunk.code[ip]) else {
+                return false;
+            };
+            if op == target {
+                return true;
+            }
+            ip += 1 + op.operand_width();
+        }
+        false
+    }
+
+    /// Like [`find_op`] but recurses into every nested function proto's chunk — the
+    /// op may be emitted inside a `fn` body rather than the top-level chunk.
+    fn find_op_in_protos(chunk: &Chunk, target: Op) -> bool {
+        if find_op(chunk, target) {
+            return true;
+        }
+        chunk
+            .protos
+            .iter()
+            .any(|p| find_op_in_protos(&p.chunk, target))
+    }
+
+    /// Recursively locate the FIRST `target` op anywhere in `chunk` (or any nested proto,
+    /// at ANY depth) and rewrite its u16 operand to `new_operand`. Returns true iff one
+    /// was found and patched. Used to corrupt a single operand for a negative test.
+    fn patch_first_u16_operand(chunk: &mut Chunk, target: Op, new_operand: u16) -> bool {
+        let mut ip = 0;
+        while ip < chunk.code.len() {
+            let Some(op) = Op::from_u8(chunk.code[ip]) else {
+                break;
+            };
+            if op == target {
+                let [lo, hi] = new_operand.to_le_bytes();
+                chunk.code[ip + 1] = lo;
+                chunk.code[ip + 2] = hi;
+                return true;
+            }
+            ip += 1 + op.operand_width();
+        }
+        // Not in this chunk — recurse into nested protos (uniquely owned in a test chunk).
+        for proto in chunk.protos.iter_mut() {
+            let p = std::rc::Rc::get_mut(proto).expect("unique proto ref");
+            if patch_first_u16_operand(&mut p.chunk, target, new_operand) {
+                return true;
+            }
+        }
+        false
     }
 
     /// A spread of programs exercising every compiler feature; every one must
@@ -1103,12 +1239,80 @@ mod tests {
     }
 
     #[test]
+    fn set_global_on_empty_stack_rejected() {
+        // SET_GLOBAL `peek(0)`s its target value at RUNTIME (it leaves TOS on the
+        // stack — assignment is an expression). A crafted chunk that runs SET_GLOBAL
+        // at abstract stack depth 0 would `Fiber::peek(0)`-PANIC at runtime. The
+        // verifier's stack-effect for SET_GLOBAL therefore requires depth >= 1, so
+        // this malformed chunk must be REJECTED (was wrongly accepted when the effect
+        // was `(0, 0)`).
+        let mut c = Chunk::new();
+        let n = c.add_const(Value::Str("g".into())); // a valid name-const (Str)
+        c.emit_u16(Op::SetGlobal, n, s()); // depth 0 here -> underflow
+        c.emit(Op::Return, s());
+        match verify(&c) {
+            Err(VerifyError::StackUnderflow { offset }) => assert_eq!(offset, 0),
+            other => panic!("expected StackUnderflow for SET_GLOBAL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_arg_below_builder_depth_rejected() {
+        // BLAST-RADIUS sibling of SET_GLOBAL: APPEND_POS_ARG (and its NAMED/SPREAD
+        // kin) pop the trailing value, then `peek(1)`+`peek(0)` the two builder arrays
+        // it mutates — so it REQUIRES abstract depth >= 3. A crafted chunk that runs it
+        // with only one value present would `Fiber::peek(1)`-PANIC at runtime; the
+        // verifier must reject it (was wrongly accepted when the effect was `(1, 0)`).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s()); // depth 1 (just the "value"); the two builder arrays are absent
+        c.emit(Op::AppendPosArg, s()); // requires depth 3 -> underflow at this op
+        c.emit(Op::Return, s());
+        match verify(&c) {
+            Err(VerifyError::StackUnderflow { offset }) => assert_eq!(offset, 1),
+            other => panic!("expected StackUnderflow for APPEND_POS_ARG, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_spread_named_call_still_verifies() {
+        // POSITIVE control for the APPEND_*_ARG depth fix. A call MIXING a named arg
+        // with a `...spread` lowers to the lockstep builder (the only path that emits
+        // APPEND_*_ARG), with the two builder arrays already on the stack — it must
+        // still verify under the depth-3 requirement. The mix is a *runtime* error for
+        // ADT construction, but `verify` runs on the COMPILED chunk regardless: the
+        // point is only that the emitted bytecode is well-formed.
+        let chunk = compile(
+            "enum Shape { Rect(w: number, h: number) }\nlet extra = [2]\nlet r = Shape.Rect(w: 1, ...extra)\nprint(r)",
+        );
+        assert!(
+            find_op(&chunk, Op::AppendNamedArg) && find_op(&chunk, Op::AppendSpreadArg),
+            "expected the program to emit the APPEND_NAMED_ARG + APPEND_SPREAD_ARG builder ops"
+        );
+        verify(&chunk).expect("valid named+spread builder bytecode must verify");
+    }
+
+    #[test]
+    fn valid_global_assignment_still_verifies() {
+        // POSITIVE control: a real top-level reassignment lowers to SET_GLOBAL with the
+        // RHS value already on the stack — it must still verify OK after the depth-1
+        // requirement. (Also covered by `all_compiler_output_verifies_ok` via the
+        // `while (t < 5) { t = t + 1 }` program, but asserted directly here too.)
+        let chunk = compile("let t = 0\nt = t + 1\nprint(t)");
+        // sanity: the program actually emits a SET_GLOBAL
+        assert!(
+            find_op(&chunk, Op::SetGlobal),
+            "expected the program to emit SET_GLOBAL"
+        );
+        verify(&chunk).expect("valid global assignment must verify");
+    }
+
+    #[test]
     fn stack_join_mismatch_rejected() {
         // Build: NIL ; JUMP_IF_FALSE +k (pops the NIL) ; NIL ; <join> RETURN
         // The two edges into the join have different depths.
         let mut c = Chunk::new();
         c.emit(Op::Nil, s()); // off 0  depth 0 -> 1
-        let site = c.emit_jump(Op::JumpIfFalse, s()); // off 1, pops -> depth 0; operand at 2
+        let site = c.emit_jump(Op::JumpIfFalse, s()); // opcode at off 1; operand (site=2) -> depth 0 after pop
         c.emit(Op::Nil, s()); // off 4  depth 0 -> 1
         c.patch_jump(site); // target = current len (5) = the RETURN below
         c.emit(Op::Return, s()); // off 5: fall-through arrives depth 1; jump arrives 0
@@ -1159,5 +1363,133 @@ mod tests {
         let proto = std::rc::Rc::get_mut(&mut chunk.protos[0]).expect("unique proto ref");
         proto.chunk.code[0] = 0xFD;
         assert!(matches!(verify(&chunk), Err(VerifyError::BadOpcode { .. })));
+    }
+
+    // ---- ADT: VARIANT_ELEM / MATCH_VARIANT_ARITY operand bounds (Task 0.7) ----
+
+    #[test]
+    fn variant_elem_max_operand_verifies() {
+        // A bare `VariantElem(0xFFFF)` operand is in range (the operand is a u16, so
+        // 0xFFFF is its legitimate maximum — see the `check_operands` arm). A crafted
+        // chunk that plants it must VERIFY (it is well-formed bytecode), and the run
+        // loop is independently out-of-bounds-safe (see `run.rs`
+        // `variant_elem_oob_operand_is_nil_not_panic`). Stack-balanced: NIL pushes the
+        // subject (depth 1), VARIANT_ELEM is net-zero (pop subject / push element),
+        // RETURN consumes the element (RETURN needs depth >= 1).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s()); // subject (depth 0 -> 1)
+        c.emit_u16(Op::VariantElem, 0xFFFF, s()); // net 0 (depth stays 1)
+        c.emit(Op::Return, s()); // returns TOS
+        verify(&c).expect("VARIANT_ELEM(0xFFFF) is a valid u16 operand and must verify");
+    }
+
+    #[test]
+    fn match_variant_arity_max_operand_verifies() {
+        // Same shape for MATCH_VARIANT_ARITY (also net-zero: pop subject, push a bool).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s());
+        c.emit_u16(Op::MatchVariantArity, 0xFFFF, s()); // net 0 (depth stays 1)
+        c.emit(Op::Return, s()); // returns the pushed bool
+        verify(&c).expect("MATCH_VARIANT_ARITY(0xFFFF) is a valid u16 operand and must verify");
+    }
+
+    #[test]
+    fn wide_positional_variant_pattern_verifies() {
+        // REGRESSION GUARD against an unsound "practical" cap (e.g. 255): a positional
+        // variant declared with > 255 fields compiles to `VariantElem`/
+        // `MatchVariantArity` operands ABOVE 255, and that bytecode is legitimate — it
+        // must verify. (If a future change introduces a sub-`u16::MAX` operand cap here,
+        // this test fails, flagging the over-rejection of valid programs.)
+        let fields = vec!["int"; 300].join(", ");
+        let pats: Vec<String> = (0..300).map(|i| format!("x{i}")).collect();
+        let src = format!(
+            "enum Big {{ Wide({fields}) }}\n\
+             fn check(v) {{ return match v {{ Big.Wide({}) => x0, _ => -1 }} }}\n\
+             print(\"ok\")",
+            pats.join(", ")
+        );
+        let chunk = compile(&src);
+        // Sanity: the pattern path actually emitted the two ops we are bounding.
+        assert!(
+            find_op_in_protos(&chunk, Op::VariantElem),
+            "expected a VARIANT_ELEM somewhere in the compiled output"
+        );
+        assert!(
+            find_op_in_protos(&chunk, Op::MatchVariantArity),
+            "expected a MATCH_VARIANT_ARITY somewhere in the compiled output"
+        );
+        verify(&chunk)
+            .expect("a 300-field positional variant pattern is valid bytecode and must verify");
+    }
+
+    // ---- BLAST RADIUS: CHECK_PARAM operand bounds (unchecked param index → host panic).
+
+    #[test]
+    fn check_param_in_range_verifies() {
+        // POSITIVE control: a typed default parameter compiles to a `CHECK_PARAM` whose
+        // operand is a valid param index — the program must verify.
+        let chunk = compile("fn greet(name: string = \"guest\") { print(name) }\ngreet()");
+        assert!(
+            find_op_in_protos(&chunk, Op::CheckParam),
+            "expected a typed default param to emit CHECK_PARAM"
+        );
+        verify(&chunk).expect("a valid CHECK_PARAM param index must verify");
+    }
+
+    #[test]
+    fn check_param_out_of_range_rejected() {
+        // The run loop indexes `proto.params[param]` UNCONDITIONALLY (an unchecked slice
+        // index), so a crafted `.aso` with an out-of-range `CHECK_PARAM` operand would
+        // panic the host. Compile a real program, then corrupt the proto's CHECK_PARAM
+        // operand to 0xFFFF (far beyond its single param) and confirm verify REJECTS it.
+        let mut chunk = compile("fn greet(name: string = \"guest\") { print(name) }\ngreet()");
+        // Valid as compiled.
+        assert_eq!(verify(&chunk), Ok(()));
+        assert!(
+            patch_first_u16_operand(&mut chunk, Op::CheckParam, 0xFFFF),
+            "expected to find a CHECK_PARAM op to corrupt"
+        );
+        match verify(&chunk) {
+            Err(VerifyError::OperandOutOfRange { kind: "param", index, .. }) => {
+                assert_eq!(index, 0xFFFF);
+            }
+            other => panic!("expected OperandOutOfRange(param), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_param_out_of_range_rejected_in_nested_proto() {
+        // The `CHECK_PARAM` bound must be enforced at EVERY proto depth, not just depth 1
+        // — `verify_proto_chunk` recurses with each proto's own param count. Here the
+        // defaulted-param function is defined INSIDE another function (a depth-2 proto),
+        // so the corrupted operand lives two protos deep. `patch_first_u16_operand`
+        // recurses to find it; verify must still reject.
+        let mut chunk = compile(
+            "fn outer() {\n\
+            \x20 fn inner(name: string = \"guest\") { print(name) }\n\
+            \x20 inner()\n\
+            }\n\
+            outer()",
+        );
+        assert_eq!(verify(&chunk), Ok(()));
+        // Sanity: the CHECK_PARAM is genuinely nested (not in the top chunk).
+        assert!(
+            !find_op(&chunk, Op::CheckParam),
+            "the CHECK_PARAM should be inside a nested proto, not the top chunk"
+        );
+        assert!(
+            find_op_in_protos(&chunk, Op::CheckParam),
+            "expected the nested defaulted param to emit CHECK_PARAM"
+        );
+        assert!(
+            patch_first_u16_operand(&mut chunk, Op::CheckParam, 0xFFFF),
+            "expected to find a nested CHECK_PARAM op to corrupt"
+        );
+        match verify(&chunk) {
+            Err(VerifyError::OperandOutOfRange { kind: "param", index, .. }) => {
+                assert_eq!(index, 0xFFFF);
+            }
+            other => panic!("expected OperandOutOfRange(param) from a nested proto, got {other:?}"),
+        }
     }
 }

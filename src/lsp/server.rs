@@ -1565,7 +1565,11 @@ impl LanguageServer for Backend {
                 continue;
             };
             if let Ok(mut idx) = self.index.write() {
-                idx.files.remove(&workspace::canon(&old));
+                // Fully unindex the OLD path: `files` PLUS its contributions to
+                // `defs_by_name` / `import_edges` / `importers` (a bare
+                // `files.remove` leaves stale defs + reverse import edges that
+                // make go-to-def / workspace-symbols return the deleted path).
+                idx.fully_unindex(&workspace::canon(&old));
                 if let Ok(text) = std::fs::read_to_string(&new) {
                     idx.reindex_file(&new, &text);
                 }
@@ -1584,7 +1588,9 @@ impl LanguageServer for Backend {
             if is_as {
                 if change.typ == FileChangeType::DELETED {
                     if let Ok(mut idx) = self.index.write() {
-                        idx.files.remove(&workspace::canon(&path));
+                        // Same full-unindex as didRenameFiles: a bare
+                        // `files.remove` leaves stale defs + reverse import edges.
+                        idx.fully_unindex(&workspace::canon(&path));
                     }
                 } else if let Ok(text) = std::fs::read_to_string(&path) {
                     if let Ok(mut idx) = self.index.write() {

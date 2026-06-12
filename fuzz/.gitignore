@@ -37,3 +37,12 @@ corpus/parser/*
 corpus/worker_serialize/*
 !corpus/worker_serialize/ex_*
 !corpus/worker_serialize/bad_*
+
+# SELF-CONTAINED-BUNDLES Task 4.2 — the `archive_roundtrip` `ASCRIPTA` module-archive decoder
+# target: ignore the whole (nightly-GROWN, hash-named) corpus dir, then RE-INCLUDE only the
+# hand-curated seeds — the real `ex_multimodule` archive and the `bad_*` rejection seeds. The
+# `ex_*` seed is intentionally extension-LESS so the root `.gitignore`'s `*.aso` rule does not
+# shadow it; these two negations are what tracks the curated seeds.
+corpus/archive_roundtrip/*
+!corpus/archive_roundtrip/ex_*
+!corpus/archive_roundtrip/bad_*
