@@ -722,13 +722,20 @@ fn defer_stmt(p: &mut Parser) {
         // spec §2.1).  Events from cm.pos onward form the CallExpr subtree:
         // cm.pos is the Start{CallExpr} and its content (ArgList, NamedArg, …)
         // follows linearly up to the matching Finish.
+        //
+        // Only the deferred call's OWN named args are a Tier-1 error — a NESTED
+        // call's named args (`defer g(mk(w: 1))`) are fine.  Depth bookkeeping:
+        // the first event is Start{CallExpr} (depth 0→1), then its Start{ArgList}
+        // (depth 1→2); a NamedArg that is a DIRECT child of that ArgList is seen
+        // at depth EXACTLY 2.  A nested call re-opens CallExpr/ArgList, so its
+        // NamedArg arrives at depth 4, 6, … — those must NOT reject.
         let has_named = {
             let mut depth = 0i32;
             let mut found = false;
             for ev in &p.events[cm.pos..] {
                 match ev {
                     Event::Start { kind, .. } => {
-                        if depth > 0 && *kind == NamedArg {
+                        if depth == 2 && *kind == NamedArg {
                             found = true;
                             break;
                         }

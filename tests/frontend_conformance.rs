@@ -773,6 +773,19 @@ fn both_frontends_reject_defer_named_args() {
     both_reject("fn f() { defer g(x: 1) }");
 }
 
+/// Only the DEFERRED call's OWN named args are a Tier-1 error (§2.1). A NESTED
+/// call with named args (ADT-variant-style construction) inside a deferred call
+/// whose own args are positional is ACCEPTED on BOTH front-ends — the named-arg
+/// rejection must NOT fire on nested calls.
+#[test]
+fn both_frontends_accept_defer_with_nested_named_args() {
+    // The deferred call `g(...)` has a single POSITIONAL arg; `x:` belongs to
+    // the nested `inner(...)`.
+    both_accept("fn f() { defer g(inner(x: 1)) }");
+    // ADT-variant-style named construction nested inside a positional deferred call.
+    both_accept("fn f() { defer cleanup(Rect(w: 1, h: 2)) }");
+}
+
 /// `defer` is RESERVED — both front-ends reject its use as an identifier.
 #[test]
 fn both_frontends_reject_defer_as_identifier() {
