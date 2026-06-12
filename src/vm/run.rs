@@ -743,6 +743,93 @@ impl Vm {
         }
     }
 
+    /// **LANE Task 3** — shared plain synchronous closure call body.
+    ///
+    /// Used by both the async `Op::Call` arm (`run_loop`) and (from Task 4 on) the
+    /// sync `run_loop_sync` driver, ensuring byte-identical behavior across both lanes.
+    ///
+    /// Responsibilities (verbatim from the `Op::Call Value::Closure` plain arm):
+    /// 1. Pops `argc` args from `fiber.stack` (top = last arg) then pops the callee slot.
+    /// 2. Runs the SHARED `check_call_args` (arity + per-param contracts + rest
+    ///    collection) — a mismatch returns a `Control::Panic` anchored at `call_span`.
+    /// 3. Allocates cell slots, places bound params into their slots (cell or plain).
+    /// 4. Pushes a new `CallFrame` — ONE `enter_frame_depth` increment (SP3 §B;
+    ///    the matching decrement is in `return_from_frame`).
+    /// 5. Publishes the updated frame stack to an armed profiler (DBG Task 7; no-op
+    ///    zero-cost None-check when no profiler is attached).
+    ///
+    /// **No await** — this is a synchronous method. The run loop continues in the new
+    /// frame immediately after return.
+    fn push_closure_frame(
+        &self,
+        fiber: &mut Fiber,
+        callee: Cc<Closure>,
+        argc: usize,
+        callee_idx: usize,
+        call_span: Span,
+    ) -> Result<(), Control> {
+        // `what` mirrors the tree-walker's `func.name.as_deref().unwrap_or("function")`
+        // so the wording of arity/contract panics matches byte-for-byte.
+        let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
+        // Pop the `argc` args into an owned vec (top of stack is the LAST arg), then
+        // drop the callee value beneath them.
+        let mut args = vec![Value::Nil; argc];
+        for slot in args.iter_mut().rev() {
+            *slot = fiber.pop();
+        }
+        fiber.pop(); // the callee value at callee_idx
+                     // Arity + per-param contracts + rest collection, shared verbatim with
+                     // the tree-walker via `check_call_args`. On a mismatch this returns a
+                     // `Control::Panic` carrying the identical message anchored at `call_span`.
+        let bound = crate::interp::check_call_args(
+            &callee.proto.params,
+            args,
+            call_span,
+            what,
+            Some(&self.interp),
+            Some(&self.class_env()),
+        )?;
+        // The args/rest array are gone from the stack; the new frame's window starts
+        // where the callee value was.
+        let slot_base = callee_idx;
+        let slot_count = callee.proto.chunk.slot_count as usize;
+        // Allocate cells, then place each bound param into its slot (cell slot → cell;
+        // plain slot → stack). Reserve the remaining locals as Nil so the window is full.
+        let cells = super::fiber::alloc_cells(slot_count, &callee.proto.chunk.cell_slots);
+        fiber.stack.resize(slot_base + slot_count, Value::Nil);
+        let supplied = bound.supplied;
+        for (slot, v) in bound.values.into_iter().enumerate() {
+            if let Some(cell) = &cells[slot] {
+                *cell.borrow_mut() = v;
+            } else {
+                fiber.stack[slot_base + slot] = v;
+            }
+        }
+        // SP3 §B: one logical-call increment per frame push (matches the tree-walker's
+        // one-per-`run_body`); the matching decrement is in `return_from_frame`. Over the
+        // limit → the clean Tier-2 panic anchored at the call.
+        self.enter_frame_depth(call_span)?;
+        fiber.frames.push(super::fiber::CallFrame {
+            closure: callee,
+            ip: 0,
+            slot_base,
+            cells,
+            ret_span: call_span,
+            // A plain in-VM function/closure call is never a method frame; only
+            // `invoke_compiled_method` sets a `def_class` (so `super` is unavailable
+            // here, which is correct — `super` only appears in method bodies).
+            def_class: None,
+            argc: supplied,
+            defers: Vec::new(),
+        });
+        // DBG Task 7: publish the new (deeper) frame stack to an armed profiler.
+        // Zero-cost None-check when off.
+        self.publish_profile_frames(fiber);
+        // Continue the run loop in the new frame (the run loop reads `fiber.frame()`
+        // at the top of each iteration). RETURN pops this frame and restores the caller.
+        Ok(())
+    }
+
     /// Force a full cycle collection (V13-T3). Thin pass-through to
     /// [`crate::gc::collect`] so tests (V13-T4's soundness gate) can deterministically
     /// trigger trial-deletion at a known point and assert a cycle was reclaimed. The
@@ -1839,73 +1926,14 @@ impl Vm {
                             // The call-site span anchors arity/contract/return
                             // panics exactly where the tree-walker's do.
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            // `what` mirrors the tree-walker's `func.name.as_deref()
-                            // .unwrap_or("function")` so the wording matches.
-                            let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
-                            // Pop the `argc` args into an owned vec (top of stack is
-                            // the LAST arg), then drop the callee value beneath them.
-                            let mut args = vec![Value::Nil; argc];
-                            for slot in args.iter_mut().rev() {
-                                *slot = fiber.pop();
-                            }
-                            fiber.pop(); // the callee value at callee_idx
-                                         // Arity + per-param contracts + rest collection, shared
-                                         // verbatim with the tree-walker via `check_call_args`. On
-                                         // a mismatch this returns a `Control::Panic` carrying the
-                                         // identical message anchored at `call_span`.
-                            let bound = crate::interp::check_call_args(
-                                &callee.proto.params,
-                                args,
-                                call_span,
-                                what,
-                                Some(&self.interp),
-                                Some(&self.class_env()),
+                            // LANE Task 3: shared plain-call body (also used by
+                            // run_loop_sync). Pops args + callee, checks arity +
+                            // contracts, allocates cells, pushes the CallFrame (one
+                            // enter_frame_depth — SP3 §B), publishes profiler frames.
+                            self.push_closure_frame(
+                                fiber, callee, argc, callee_idx, call_span,
                             )?;
-                            // The args/rest array are gone from the stack; the new
-                            // frame's window starts where the callee value was.
-                            let slot_base = callee_idx;
-                            let slot_count = callee.proto.chunk.slot_count as usize;
-                            // Allocate cells, then place each bound param into its
-                            // slot (cell slot → cell; plain slot → stack). Reserve
-                            // the remaining locals as Nil so the window is full.
-                            let cells = super::fiber::alloc_cells(
-                                slot_count,
-                                &callee.proto.chunk.cell_slots,
-                            );
-                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
-                            let supplied = bound.supplied;
-                            for (slot, v) in bound.values.into_iter().enumerate() {
-                                if let Some(cell) = &cells[slot] {
-                                    *cell.borrow_mut() = v;
-                                } else {
-                                    fiber.stack[slot_base + slot] = v;
-                                }
-                            }
-                            // SP3 §B: one logical-call increment per frame push
-                            // (matches the tree-walker's one-per-`run_body`); the
-                            // matching decrement is in `return_from_frame`. Over the
-                            // limit → the clean Tier-2 panic anchored at the call.
-                            self.enter_frame_depth(call_span)?;
-                            fiber.frames.push(super::fiber::CallFrame {
-                                closure: callee,
-                                ip: 0,
-                                slot_base,
-                                cells,
-                                ret_span: call_span,
-                                // A plain in-VM function/closure call is never a
-                                // method frame; only `invoke_compiled_method` sets a
-                                // `def_class` (so `super` is unavailable here, which
-                                // is correct — `super` only appears in method bodies).
-                                def_class: None,
-                                argc: supplied,
-                                defers: Vec::new(),
-                            });
-                            // DBG Task 7: publish the new (deeper) frame stack to an
-                            // armed profiler. Zero-cost None-check when off.
-                            self.publish_profile_frames(fiber);
-                            // Continue the loop in the new frame (the run loop reads
-                            // `fiber.frame()` at the top of each iteration). RETURN
-                            // pops this frame and restores the caller.
+                            // Continue the loop in the new frame.
                         }
                         other => {
                             // Native callee (Builtin/Function/Class/BoundMethod/...):
