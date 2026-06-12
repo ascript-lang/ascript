@@ -19,10 +19,14 @@
 //       the stream was consumed.
 //
 // Uses std/fs temp files under /tmp so it runs everywhere. Fully deterministic
-// output — NOT in EXAMPLE_SKIPS (no server, no port, no external state).
+// output — NOT in EXAMPLE_SKIPS (no server, no port; §10 four-mode corpus mandate).
+// TMP is per-execution-unique (uuid suffix) so concurrent corpus runs (vm_differential
+// parallel test threads) never collide on the same path. The unique path is NEVER
+// printed, keeping stdout deterministic and the golden file stable.
 import * as fs from "std/fs"
+import * as uuid from "std/uuid"
 
-const TMP = "/tmp/ascript_defer_resources"
+const TMP = "/tmp/ascript_defer_resources_" + uuid.v4()
 
 // ---------------------------------------------------------------------------
 // §1  Multi-resource LIFO teardown
