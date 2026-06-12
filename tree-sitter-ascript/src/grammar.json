@@ -275,6 +275,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "defer_statement"
+        },
+        {
+          "type": "SYMBOL",
           "name": "block"
         },
         {
@@ -2035,6 +2039,47 @@
             "type": "SYMBOL",
             "name": "block"
           }
+        }
+      ]
+    },
+    "defer_statement": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "defer"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "await"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "FIELD",
+          "name": "call",
+          "content": {
+            "type": "SYMBOL",
+            "name": "call_expression"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": ";"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         }
       ]
     },
@@ -5306,6 +5351,10 @@
     [
       "_type",
       "union_type"
+    ],
+    [
+      "defer_statement",
+      "_postfix_expression"
     ]
   ],
   "precedences": [],

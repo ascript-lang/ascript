@@ -457,6 +457,85 @@ fn treesitter_disambiguates_explicit_type_args_vs_comparison() {
     }
 }
 
+/// Find the first node of a given kind, optionally requiring a named field child.
+fn find_node_with_field<'a>(
+    tree: &'a tree_sitter::Tree,
+    kind: &str,
+    field_name: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut cursor = tree.walk();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind && node.child_by_field_name(field_name).is_some() {
+            return Some(node);
+        }
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+#[test]
+fn treesitter_parses_defer_statement() {
+    // DEFER §2.1 / §2.4: accepted forms parse with zero ERROR nodes AND produce a
+    // `defer_statement` node containing a `call` field.
+    let accepted = [
+        "fn f() { defer g() }",
+        "fn f() { defer obj.close() }",
+        "fn f() { defer a?.flush() }",
+        "fn f() { defer (cond ? a : b)() }",
+        "fn f() { defer (() => { print(1) })() }",
+        "fn f() { defer g(...xs) }",
+        "fn f() { defer await g() }",
+        "defer g()",
+    ];
+    for src in &accepted {
+        let tree = {
+            let lang = language();
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&lang).expect("set_language");
+            parser.parse(src.as_bytes(), None).expect("parse")
+        };
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter ERROR node in accepted defer: {src}\n{}",
+            tree.root_node().to_sexp()
+        );
+        assert!(
+            find_node_with_field(&tree, "defer_statement", "call").is_some(),
+            "no defer_statement[call] in: {src}\n{}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    // Rejected forms: non-call operands must produce an ERROR node (the grammar
+    // restricts the operand to `call_expression`). `defer x` and `defer a + b`
+    // are not call expressions so they cannot parse as a `defer_statement`.
+    //
+    // NOTE: `let defer = 5` is rejected by both hand-written parsers (legacy and
+    // CST) because `defer` is a reserved keyword there. Tree-sitter's keyword
+    // extraction (via `word: $ => $.identifier`) reserves `defer` in parse states
+    // where the keyword and identifier lexings conflict, but tree-sitter's
+    // error-recovery engine can nonetheless accept `let defer = 5` by
+    // re-interpreting the token. This is a known tree-sitter limitation shared
+    // with ALL reserved keywords in this grammar (e.g. `let class = 5`,
+    // `let return = 5`). The hand-parser conformance in
+    // `interpreter_parser_accepts_all_examples` covers the full reservation
+    // check; here we only assert what tree-sitter's GLR actually enforces.
+    let rejected = [
+        "fn f() { defer x }",
+        "fn f() { defer a + b }",
+    ];
+    for src in &rejected {
+        let has_error = parse_has_error(src);
+        assert!(
+            has_error,
+            "tree-sitter did NOT produce an ERROR node for rejected defer: {src}"
+        );
+    }
+}
+
 /// Whether any node in `tree` has the given kind.
 fn tree_contains_kind(tree: &tree_sitter::Tree, kind: &str) -> bool {
     let mut cursor = tree.walk();

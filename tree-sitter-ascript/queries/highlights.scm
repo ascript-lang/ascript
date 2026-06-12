@@ -21,6 +21,7 @@
   "let" "const" "fn" "return"
   "if" "else" "while" "for" "of" "in" "match"
   "async" "await"
+  "defer"
   "class" "extends"
   "enum"
   "interface" "implements"
