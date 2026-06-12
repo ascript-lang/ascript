@@ -409,24 +409,24 @@ defer_await_cancelled_mid_drain: cancellation while a deferred await is suspende
 
 **Files:** `bench/DEFER_RESULTS.md`, `tests/vm_bench.rs` (standing gates)
 
-- [ ] **Step 1: Same-session A/B (Gate 16):** one session, one machine — `main` vs `feat/defer-statement`, the standing bench corpus (+ call-heavy workloads if LANE Task 0 merged), 5× medians, shipped profiler attribution. **Expectation stated, result measured:** defer-free delta ≈ 0 (the empty-`Vec` check + 24B frame growth must be noise); any measurable regression is a bug — fix the check placement, don't accept.
-- [ ] **Step 2:** Gate 17: `cargo test --test vm_bench` — spec/tw geomean ≥2× holds; the dispatch loop was touched → re-run `dbg_zero_cost_gate` (instrument==None ≈ armed-idle); record both numbers.
-- [ ] **Step 3:** Gate 18: peak RSS per workload (`/usr/bin/time -l`) before/after; a defer-HEAVY microbench (10k-iteration defer-in-loop) reported honestly (linear growth by design — the lint is the guard).
-- [ ] **Step 4:** Write `bench/DEFER_RESULTS.md` (numbers, machine, commits, the no-kill-switch rationale referenced from spec §5.5). **Commit.**
+- [x] **Step 1: Same-session A/B (Gate 16):** one session, one machine — `main` vs `feat/defer-statement`, the standing bench corpus (+ call-heavy workloads if LANE Task 0 merged), 5× medians, shipped profiler attribution. **Expectation stated, result measured:** defer-free delta ≈ 0 (the empty-`Vec` check + 24B frame growth must be noise); any measurable regression is a bug — fix the check placement, don't accept.
+- [x] **Step 2:** Gate 17: `cargo test --test vm_bench` — spec/tw geomean ≥2× holds; the dispatch loop was touched → re-run `dbg_zero_cost_gate` (instrument==None ≈ armed-idle); record both numbers.
+- [x] **Step 3:** Gate 18: peak RSS per workload (`/usr/bin/time -l`) before/after; a defer-HEAVY microbench (10k-iteration defer-in-loop) reported honestly (linear growth by design — the lint is the guard).
+- [x] **Step 4:** Write `bench/DEFER_RESULTS.md` (numbers, machine, commits, the no-kill-switch rationale referenced from spec §5.5). **Commit.**
 
 ### Task 6.2: full matrix
 
-- [ ] **Step 1:** `cargo test` — all binaries green, 0 failures.
-- [ ] **Step 2:** `cargo test --no-default-features` — green.
-- [ ] **Step 3:** `cargo clippy --all-targets` AND `cargo clippy --no-default-features --all-targets` — clean.
-- [ ] **Step 4:** `cargo test --test vm_differential` both configs — full corpus + goldens + every defer battery, four-mode byte-identical; the Task-3.4 coverage assertion nonzero.
-- [ ] **Step 5:** Conformance (frontend + treesitter), fmt idempotence, LSP suites, REPL pins, fuzz smoke — green; `cargo test --test cli` (exit-skip + panic-output cases) green.
+- [x] **Step 1:** `cargo test` — all binaries green, 0 failures.
+- [x] **Step 2:** `cargo test --no-default-features` — green.
+- [x] **Step 3:** `cargo clippy --all-targets` AND `cargo clippy --no-default-features --all-targets` — clean.
+- [x] **Step 4:** `cargo test --test vm_differential` both configs — full corpus + goldens + every defer battery, four-mode byte-identical; the Task-3.4 coverage assertion nonzero.
+- [x] **Step 5:** Conformance (frontend + treesitter), fmt idempotence, LSP suites, REPL pins, fuzz smoke — green; `cargo test --test cli` (exit-skip + panic-output cases) green.
 
 ### Task 6.3: whole-effort holistic review + merge
 
-- [ ] **Step 1:** Holistic-review subagent over the ENTIRE branch diff against the spec: a §-by-§ coverage table; zero TODO/placeholder (grep `not yet executable`, `TODO`, `unimplemented` in the diff → zero); every brief-mandated test present (defer-await ×4, bare-future message, LIFO mixed, capture interplay, rest/spread args, methods/init, recover combinations, loops, nested fns); the tree-walker remains the oracle (no relaxed assertion anywhere); invariants intact (`Value: !Send`, no borrow across await, native handles untraced, GC untouched).
-- [ ] **Step 2:** Every checkbox in this plan ticked; the Phase-0 sequencing line filled in.
-- [ ] **Step 3:** Merge `feat/defer-statement` → `main` with `--no-ff`; update `goal-perf.md` status (DEFER → ✅) in the merge commit.
+- [x] **Step 1:** Holistic-review subagent over the ENTIRE branch diff against the spec: a §-by-§ coverage table; zero TODO/placeholder (grep `not yet executable`, `TODO`, `unimplemented` in the diff → zero); every brief-mandated test present (defer-await ×4, bare-future message, LIFO mixed, capture interplay, rest/spread args, methods/init, recover combinations, loops, nested fns); the tree-walker remains the oracle (no relaxed assertion anywhere); invariants intact (`Value: !Send`, no borrow across await, native handles untraced, GC untouched).
+- [x] **Step 2:** Every checkbox in this plan ticked; the Phase-0 sequencing line filled in.
+- [x] **Step 3:** Merge `feat/defer-statement` → `main` with `--no-ff`; update `goal-perf.md` status (DEFER → ✅) in the merge commit.
 
 ---
 
