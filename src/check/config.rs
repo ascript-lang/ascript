@@ -65,6 +65,13 @@ pub const RULE_CODES: &[&str] = &[
     // FFI §7 — a foreign call inside a workflow/durable context is an opaque effect
     // seam; steer it into an `activity` (default Warning, like `workflow-determinism`).
     "ffi-nondeterminism",
+    // DEFER §6 — advisory lints for common defer misuse patterns.
+    // `defer-in-loop`: defer inside a loop registers one entry per iteration; they
+    //   all drain at function exit (Warning, default-on).
+    // `defer-async-call`: bare defer of an async fn will panic at runtime since the
+    //   future is dropped un-awaited; use `defer await` (Warning, default-on).
+    "defer-in-loop",
+    "defer-async-call",
 ];
 
 /// Per-code severity overrides plus global warning promotion.
