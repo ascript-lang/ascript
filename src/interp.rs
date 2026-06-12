@@ -14473,30 +14473,58 @@ print("after-drop")
 
     // §4.2 — task cancellation (cancel-on-drop) does NOT run defers.
     //
-    // An async fn with a defer is called but NOT awaited. Under M17 the future's
-    // handle is dropped at the end of the expression statement → task aborted →
-    // the body is dropped at its first suspension (the `await 0`) → defers DO NOT run.
-    // This is the "killed goroutine" analogy stated in §4.2.
+    // Variant 1 — un-held async call, handle dropped via going out of scope.
+    //
+    // NON-VACUOUS DESIGN: a bare `work()` whose future is dropped at the end of its
+    // expression statement is VACUOUS — the spawned task is never polled before the
+    // handle drops, so the body never even registers the defer (the absent marker is
+    // then trivially absent because the body never ran). To make this prove that
+    // cancellation suppresses a REGISTERED defer, we (1) hold the future in a local
+    // inside a helper fn, (2) drive the body — via a barrier channel — far enough to
+    // PROVABLY register its defer and print a positive control marker, then park on a
+    // never-signalled channel, and (3) let the helper fn return so the local handle
+    // drops while the body is parked → cancel-on-drop. The positive control
+    // ("work-reached-park") proves the body ran up to the park; the absent defer
+    // marker proves cancellation skipped the registered defer.
     #[tokio::test]
     async fn task_cancellation_does_not_run_defers() {
-        // Variant 1: unawaited call — handle dropped at end of expression statement.
+        // Variant 1: held-then-dropped — body provably parks before the handle drops.
         let out = run(r#"
-async fn work() {
-    defer print("MUST-NOT-APPEAR-cancel")
-    await 0   // first suspension — body aborted here on cancel-on-drop
-    print("body-completed")
+import * as sync from "std/sync"
+
+// barrier: work signals it AFTER registering its defer + reaching the park.
+// never:   work parks on this forever (nobody sends) so it is cancelled-on-drop.
+let barrier = sync.channel(1)
+let never   = sync.channel(0)
+
+async fn work(barrier, never) {
+    defer print("MUST-NOT-APPEAR-cancel")   // REGISTERED before the park
+    print("work-reached-park")               // positive control: body ran this far
+    sync.send(barrier, 1)                    // tell the driver we are parked
+    let _ = await sync.recv(never)            // park forever
+    print("work-body-completed")             // never reached
 }
 
-work()        // future dropped immediately → task cancelled
+async fn drive(barrier, never) {
+    let f = work(barrier, never)             // eagerly scheduled; held in `f`
+    let _ = await sync.recv(barrier)          // park driver until work is at its park
+    // `f` drops when `drive` returns here → work cancelled while parked.
+}
+
+await drive(barrier, never)
 print("main")
 "#).await;
         assert!(
-            !out.contains("MUST-NOT-APPEAR-cancel"),
-            "§4.2: cancelled task must NOT run defers; got: {out:?}"
+            out.contains("work-reached-park"),
+            "§4.2 non-vacuity: body must have run up to the park (registering the defer); got: {out:?}"
         );
         assert!(
-            !out.contains("body-completed"),
-            "body must not have run: {out:?}"
+            !out.contains("MUST-NOT-APPEAR-cancel"),
+            "§4.2: cancelled task must NOT run its REGISTERED defer; got: {out:?}"
+        );
+        assert!(
+            !out.contains("work-body-completed"),
+            "body must not have completed (it was cancelled at the park): {out:?}"
         );
         assert!(out.contains("main"), "main ran: {out:?}");
 
@@ -14581,5 +14609,146 @@ print(result)
             "§4.2: older defer must NOT run when mid-drain cancel occurs; got: {out:?}"
         );
         assert!(out.contains("fast-won"), "fast must win: {out:?}");
+    }
+
+    // §4.2 — task.timeout cancellation route: a defer in a timed-out async fn does
+    // NOT run. The third cancel route §4.2 names (race-loser + un-held are above).
+    //
+    // NON-FLAKY DESIGN: the body parks on a channel nobody ever signals, so the
+    // timeout ALWAYS fires regardless of the deadline (no race against real work).
+    // The positive control ("work-reached-park") proves the body registered its
+    // defer and reached the park before the timeout cancelled it; the absent defer
+    // marker proves cancellation skipped the registered defer.
+    #[tokio::test]
+    async fn defer_not_run_on_timeout_cancellation() {
+        let out = run(r#"
+import * as task from "std/task"
+import * as sync from "std/sync"
+
+// never: the body parks here forever; nobody sends, so timeout always fires.
+let never = sync.channel(0)
+
+async fn work(never) {
+    defer print("MUST-NOT-APPEAR-timeout")   // REGISTERED before the park
+    print("work-reached-park")                // positive control: body ran this far
+    let _ = await sync.recv(never)             // park forever → timeout cancels here
+    print("work-body-completed")              // never reached
+}
+
+let r = await task.timeout(20, work(never))
+print(r[0])           // nil (timed out)
+print(r[1].message)   // the timeout error
+"#).await;
+        assert!(
+            out.contains("work-reached-park"),
+            "§4.2 non-vacuity: body must have run up to the park (registering the defer); got: {out:?}"
+        );
+        assert!(
+            !out.contains("MUST-NOT-APPEAR-timeout"),
+            "§4.2: timed-out task must NOT run its REGISTERED defer; got: {out:?}"
+        );
+        assert!(
+            !out.contains("work-body-completed"),
+            "body must not have completed (cancelled by timeout at the park): {out:?}"
+        );
+        assert!(out.contains("timed out"), "timeout error surfaced: {out:?}");
+    }
+
+    // §4.3 — `async fn*` generator: completion (return after all yields) runs defers.
+    // §4.3 covers BOTH `fn*` and `async fn*`; this exercises the async variant whose
+    // body BOTH awaits internally AND yields.
+    #[tokio::test]
+    async fn async_generator_completion_runs_defers() {
+        let out = run(r#"
+async fn pick(n) { return n }
+
+async fn* gen() {
+    defer print("async-gen-defer")
+    let a = await pick(1)
+    yield a
+    let b = await pick(2)
+    yield b
+    // body completes here — defer must run before the final resume reports done
+}
+
+let it = gen()
+print(await it.next())
+print(await it.next())
+let done = await it.next()   // drives body to completion; defer runs here
+print("after-done")
+"#).await;
+        assert!(
+            out.contains("async-gen-defer"),
+            "§4.3: async fn* completion must run defers; got: {out:?}"
+        );
+        let defer_pos = out.find("async-gen-defer").unwrap();
+        let after_done_pos = out.find("after-done").unwrap();
+        assert!(
+            defer_pos < after_done_pos,
+            "async-gen-defer must appear before after-done: {out:?}"
+        );
+        assert!(out.contains("1\n2\n"), "yields must work: {out:?}");
+    }
+
+    // §4.3 — `async fn*` generator: close()/last-drop mid-suspend does NOT run defers.
+    #[tokio::test]
+    async fn async_generator_close_does_not_run_defers() {
+        // Variant 1: explicit close() while parked at a yield.
+        let out = run(r#"
+async fn pick(n) { return n }
+
+async fn* gen() {
+    defer print("MUST-NOT-APPEAR-async-close")
+    let a = await pick(1)
+    print("async-gen-reached-yield")   // positive control: body reached the yield
+    yield a
+    yield 2
+}
+
+let it = gen()
+print(await it.next())   // drives body to first yield (body now parked)
+it.close()               // drops body mid-suspend → defer must NOT run
+print("after-close")
+"#).await;
+        assert!(
+            out.contains("async-gen-reached-yield"),
+            "§4.3 non-vacuity: body must have reached the yield (registering the defer); got: {out:?}"
+        );
+        assert!(
+            !out.contains("MUST-NOT-APPEAR-async-close"),
+            "§4.3: async fn* close() must NOT run defers; got: {out:?}"
+        );
+        assert!(out.contains("after-close"), "program continued: {out:?}");
+
+        // Variant 2: last-handle drop (handle goes out of scope mid-suspend).
+        let out2 = run(r#"
+async fn pick(n) { return n }
+
+async fn* droppable() {
+    defer print("MUST-NOT-APPEAR-async-drop")
+    let a = await pick(1)
+    print("async-gen-drop-reached-yield")   // positive control
+    yield a
+    yield 2
+}
+
+async fn abandon() {
+    let it = droppable()
+    print(await it.next())   // drives body to first yield; body now parked
+    // `it` goes out of scope at end of `abandon` → body dropped mid-suspend
+}
+
+await abandon()
+print("after-drop")
+"#).await;
+        assert!(
+            out2.contains("async-gen-drop-reached-yield"),
+            "§4.3 non-vacuity: body must have reached the yield (registering the defer); got: {out2:?}"
+        );
+        assert!(
+            !out2.contains("MUST-NOT-APPEAR-async-drop"),
+            "§4.3: async fn* last-handle drop must NOT run defers; got: {out2:?}"
+        );
+        assert!(out2.contains("after-drop"), "program continued: {out2:?}");
     }
 }
