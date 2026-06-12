@@ -599,6 +599,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "match" => Tok::Match,
                     "class" => Tok::Class,
                     "interface" => Tok::Interface,
+                    "defer" => Tok::Defer,
                     "import" => Tok::Import,
                     "export" => Tok::Export,
                     "async" => Tok::Async,

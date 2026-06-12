@@ -393,6 +393,14 @@ pub enum Stmt {
         source: String,
     },
     Export(Box<Stmt>),
+    /// DEFER §2.1: `defer [await] <call>` — registers a call to run at enclosing
+    /// function-body exit (Go semantics, LIFO). `call` is guaranteed `ExprKind::Call`
+    /// by the parser. `awaited` records the `defer await` statement form.
+    Defer {
+        call: Expr,
+        awaited: bool,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug)]

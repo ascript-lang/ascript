@@ -3467,6 +3467,12 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::Defer { span, .. } => {
+                // DEFER Phase 2/3 will install the runtime defer stack.
+                // For now, any attempt to execute a defer statement is a loud
+                // Tier-2 panic so every commit stays compilable and green.
+                Err(AsError::at("defer is not yet executable (DEFER Phase 2/3)", *span).into())
+            }
         }
     }
 
