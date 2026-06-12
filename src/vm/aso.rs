@@ -164,7 +164,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   round-trip. Only the `EX_RANGE` byte stream grows (by one byte, plus the step
 ///   expr when present); every other layout is unchanged. Old readers must reject a
 ///   v27 chunk. (Bumped by reading the DBG-left v26 and adding one.)
-pub const ASO_FORMAT_VERSION: u32 = 27;
+pub const ASO_FORMAT_VERSION: u32 = 28;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -2621,22 +2621,22 @@ run()
         assert_eq!(run_chunk(compile(src)), run_chunk(back));
     }
 
-    /// (#5) The format version is the live value (27, the bundles range-step bump)
+    /// (#5) The format version is the live value (28, the DEFER opcodes bump)
     /// and a mismatched-version (here: one-older) buffer is rejected with the version
     /// error, never run.
     #[test]
     fn aso_version_is_current_and_mismatch_rejected() {
         assert_eq!(
-            ASO_FORMAT_VERSION, 27,
-            "the range-step field-default fix bumped the format version to 27"
+            ASO_FORMAT_VERSION, 28,
+            "the DEFER DeferPush/DeferPushMethod opcodes bumped the format version to 28"
         );
         let mut bytes = compile("print(1)").to_bytes().expect("serialize");
-        // Roll the version back one (simulating a v26 buffer).
+        // Roll the version back one (simulating a v27 buffer).
         bytes[4] = bytes[4].wrapping_sub(1);
         match Chunk::from_bytes(&bytes) {
             Err(AsoError::VersionMismatch { found, expected }) => {
-                assert_eq!(expected, 27);
-                assert_eq!(found, 26, "a one-older buffer reads as v26");
+                assert_eq!(expected, 28);
+                assert_eq!(found, 27, "a one-older buffer reads as v27");
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }

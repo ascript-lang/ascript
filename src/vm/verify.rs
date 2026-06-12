@@ -367,6 +367,12 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // placeholder is never consulted for CLASS.
         Class => Effect::new(0, 1),
 
+        // DEFER §5.2: DeferPush / DeferPushMethod — captured-call registration (no
+        // push; pops callee/recv + args). The exact pop count is argc-dependent and
+        // is handled by `op_stack_pops_pushes` before reaching here; this arm exists
+        // solely for `Op` match exhaustiveness (the verifier early-returns above).
+        DeferPush | DeferPushMethod => Effect::new(0, 0),
+
         // DBG: the breakpoint trap is NEVER compiler-emitted and NEVER serialized — it
         // exists only as a runtime byte patch. Pass 1 of `verify_chunk` rejects a
         // `Break` byte outright (`BreakInSerializedCode`), so this arm is unreachable in
@@ -899,6 +905,25 @@ pub(crate) fn op_stack_pops_pushes(chunk: &Chunk, op: Op, operand_at: usize) -> 
             return (pops, 1);
         }
         return (0, 1);
+    }
+    // DEFER §5.2: DeferPush pops callee + argc args (or callee + 1 spread array),
+    // pushes 0. DeferPushMethod pops recv + argc args (or recv + 1 spread array),
+    // pushes 0. Operand layout:
+    //   DeferPush:       u8 flags + u8 argc   (flags bit1 = spread)
+    //   DeferPushMethod: u16 name + u8 flags + u8 argc
+    if op == Op::DeferPush {
+        let flags = chunk.read_u8(operand_at);
+        let spread = (flags & 2) != 0;
+        let argc = chunk.read_u8(operand_at + 1) as usize;
+        let pops = if spread { 1 /*spread array*/ + 1 /*callee*/ } else { argc + 1 /*callee*/ };
+        return (pops, 0);
+    }
+    if op == Op::DeferPushMethod {
+        let flags = chunk.read_u8(operand_at + 2);
+        let spread = (flags & 2) != 0;
+        let argc = chunk.read_u8(operand_at + 3) as usize;
+        let pops = if spread { 1 /*spread array*/ + 1 /*recv*/ } else { argc + 1 /*recv*/ };
+        return (pops, 0);
     }
     let e = stack_effect(op, count_operand(chunk, op, operand_at));
     (e.pops, e.pushes)

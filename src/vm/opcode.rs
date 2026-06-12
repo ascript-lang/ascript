@@ -629,6 +629,23 @@ pub enum Op {
     /// valid. Appended at the END so existing opcode byte values are unchanged; it is
     /// never serialized (it exists only as a runtime patch), so no `.aso` bump.
     Break,
+
+    // ---- defer statement (DEFER §5.2) ------------------------------------
+    /// `DEFER_PUSH(u8 flags, u8 argc)` — DEFER §5.2: pop `argc + 1` values (or
+    /// 2 when bit1 is set — the spread form; stack is `[callee, argsArray]`),
+    /// build a `DeferEntry::Call` and append it to the CURRENT frame's `defers`
+    /// list. Flags: bit0 = `awaited` (`defer await f()`), bit1 = `spread`
+    /// (args were materialized into ONE array). Pushes 0 (no result on stack).
+    DeferPush,
+    /// `DEFER_PUSH_METHOD(u16 name, u8 flags, u8 argc)` — DEFER §5.2: pop `argc + 1`
+    /// values (or 2 when bit1 is set — spread; stack is `[recv, argsArray]`),
+    /// build a `DeferEntry::Method` with receiver + name from `consts[name]` (a
+    /// `Str`). The name-const is a `u16` operand; `flags` and `argc` are `u8`
+    /// (same layout as `CallMethod`'s `u16 name, u8 argc` + an extra `u8`).
+    /// Pushes 0. OptMember nil-skip is lowered by the compiler (dup + nil-test
+    /// jump that skips arg eval + push entirely, mirroring existing opt-chain
+    /// lowering), so the nil-receiver case never reaches this op.
+    DeferPushMethod,
 }
 
 impl Op {
@@ -778,6 +795,8 @@ impl Op {
             x if x == CallNamedSpread as u8 => CallNamedSpread,
 
             x if x == Break as u8 => Break,
+            x if x == DeferPush as u8 => DeferPush,
+            x if x == DeferPushMethod as u8 => DeferPushMethod,
 
             _ => return None,
         })
@@ -812,6 +831,11 @@ impl Op {
             // u16 + i16 operand op.
             // JUMP_IF_ARG_SUPPLIED: u16 param-index + i16 forward jump offset.
             JumpIfArgSupplied => 4,
+
+            // DEFER: DEFER_PUSH = u8 flags + u8 argc (2 bytes).
+            DeferPush => 2,
+            // DEFER: DEFER_PUSH_METHOD = u16 name + u8 flags + u8 argc (4 bytes).
+            DeferPushMethod => 4,
 
             // Zero-operand ops.
             Nil
@@ -1019,6 +1043,8 @@ mod tests {
         Op::AppendSpreadArg,
         Op::CallNamedSpread,
         Op::Break,
+        Op::DeferPush,
+        Op::DeferPushMethod,
     ];
 
     #[test]

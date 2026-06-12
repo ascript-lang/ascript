@@ -48,6 +48,10 @@ pub struct CallFrame {
     /// `0` for frames built without an arg count (the bottom script frame and any
     /// frame whose function declares no defaults — its prologue is empty).
     pub argc: usize,
+    /// DEFER §5.2: deferred calls registered by `defer` statements in this
+    /// activation. Allocation-free when empty (`Vec::new()` is heap-less).
+    /// Drained LIFO at frame exit (§3.3); each entry is a captured call.
+    pub(crate) defers: Vec<crate::interp::DeferEntry>,
 }
 
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
@@ -90,6 +94,7 @@ impl Fiber {
             ret_span: Span::new(0, 0),
             def_class: None,
             argc: 0,
+            defers: Vec::new(),
         };
         Fiber {
             frames: vec![frame],

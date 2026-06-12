@@ -8246,3 +8246,193 @@ async fn object_delete_invalidates_shape_for_warmed_property_ic() {
         print(last)";
     assert_four_way_run(src).await;
 }
+
+// ── DEFER §3.1–3.6: VM execution semantics ──────────────────────────────────
+// These tests assert four-mode byte-identity (tree-walker == specialized-VM ==
+// generic-VM == .aso round-trip) for every specified defer behaviour.
+
+/// §3.1 LIFO drain order: three plain defers run last-in first-out.
+#[tokio::test]
+async fn defer_lifo_order_four_way() {
+    let src = r#"
+fn run() {
+    defer print("first")
+    defer print("second")
+    defer print("third")
+}
+run()
+"#;
+    // Expected output: third\nsecond\nfirst\n
+    assert_four_way_run(src).await;
+}
+
+/// §3.1 Receiver captured at statement time: mutating `o.x` after the defer
+/// does NOT change what the defer sees.
+#[tokio::test]
+async fn defer_receiver_captured_at_statement_time_four_way() {
+    let src = r#"
+fn make_logger() {
+    let o = {x: 1}
+    defer print(o.x)   // captures o.x == 1
+    o.x = 99           // mutation after defer registration
+}
+make_logger()
+"#;
+    // Expected: 99 — because defer captures the VALUE `o` (the object reference),
+    // not a snapshot of `o.x`. When the defer runs, `o.x` is 99.
+    // (Spec §3.1: args evaluated at statement time; but `o` IS the arg, not `o.x`.)
+    assert_four_way_run(src).await;
+}
+
+/// §3.1 Argument values captured at statement time: `n` is 1 at the defer call
+/// site even though it's re-assigned to 42 afterward.
+#[tokio::test]
+async fn defer_args_captured_at_statement_time_four_way() {
+    let src = r#"
+fn test() {
+    let n = 1
+    defer print(n)  // n is captured as 1
+    n = 42          // mutation after defer registration
+}
+test()
+"#;
+    // Expected: 1 — the argument `n` was evaluated (and thus captured) at defer time.
+    assert_four_way_run(src).await;
+}
+
+/// §3.3 Defer drains on normal return: `defer print("bye")` runs even when
+/// the function returns early.
+#[tokio::test]
+async fn defer_drains_on_early_return_four_way() {
+    let src = r#"
+fn test(x) {
+    defer print("bye")
+    if (x > 0) {
+        return x
+    }
+    return -x
+}
+print(test(5))
+"#;
+    // Expected: "bye\n5\n"  — defer fires before the return value is delivered.
+    assert_four_way_run(src).await;
+}
+
+/// §3.3 Defer drains on `?` propagation: deferred call runs even when `?`
+/// causes an early return.
+#[tokio::test]
+async fn defer_drains_on_propagate_four_way() {
+    let src = r#"
+fn inner() {
+    defer print("cleanup")
+    let [v, e] = [nil, "err"]
+    // Use ? propagation
+    let r = [nil, e]?
+    print("unreachable")
+}
+let [val, err] = inner()
+print(err)
+"#;
+    // Expected: "cleanup\nerr\n"
+    assert_four_way_run(src).await;
+}
+
+/// §3.3 Defer drains on panic: deferred call runs even when body panics.
+/// Uses `recover` to catch the panic and observe the defer's side effect.
+/// Note: `recover(fn(){...})` is the known carry-forward bug (anonymous fn-expr
+/// in call arg fails in the legacy parser); use arrow `() => ...` form instead.
+#[tokio::test]
+async fn defer_drains_on_panic_four_way() {
+    let src = r#"
+let ran = false
+fn test() {
+    defer (() => { ran = true })()
+    assert(false, "boom")
+}
+let [_, err] = recover(() => { test() })
+print(ran)
+print(err.message)
+"#;
+    // Expected: "true\nboom\n"
+    assert_four_way_run(src).await;
+}
+
+/// §3.1 + §3.5 Method-receiver defer: `defer o.log(msg)` captures receiver
+/// and args at statement time.
+#[tokio::test]
+async fn defer_method_call_four_way() {
+    let src = r#"
+class Logger {
+    fn log(msg) {
+        print(msg)
+    }
+}
+fn test() {
+    let l = Logger()
+    defer l.log("cleanup")
+    print("working")
+}
+test()
+"#;
+    // Expected: "working\ncleanup\n"
+    assert_four_way_run(src).await;
+}
+
+/// §3.6 r1: ok outcome superseded by a defer panic → the defer panic propagates.
+/// Note: uses `assert(false, msg)` to raise a Tier-2 panic (AScript has no
+/// standalone `panic()` builtin); `recover(() => ...)` arrow form avoids the
+/// known anonymous-fn-expr bug in the legacy parser.
+#[tokio::test]
+async fn defer_panic_supersedes_ok_outcome_four_way() {
+    let src = r#"
+fn do_panic(msg) { assert(false, msg) }
+fn test() {
+    defer do_panic("defer-panic")
+    return 42
+}
+let [_, err] = recover(() => { test() })
+print(err.message)
+"#;
+    // Expected: "defer-panic\n"
+    assert_four_way_run(src).await;
+}
+
+/// §3.6 r3: panic + defer panic → original panic with suppressed note appended.
+/// Note: uses `assert(false, msg)` to raise Tier-2 panics; arrow `recover` form.
+#[tokio::test]
+async fn defer_panic_appended_to_body_panic_four_way() {
+    let src = r#"
+fn do_panic(msg) { assert(false, msg) }
+fn test() {
+    defer do_panic("second")
+    assert(false, "first")
+}
+let [_, err] = recover(() => { test() })
+print(err.message)
+"#;
+    // Expected: "first (suppressed panic in deferred call: second)\n"
+    assert_four_way_run(src).await;
+}
+
+/// Multiple defers with a mix of normal calls and method calls, exercising
+/// the full compilation path end-to-end.
+#[tokio::test]
+async fn defer_multiple_kinds_four_way() {
+    let src = r#"
+class C {
+    fn close() {
+        print("C.close")
+    }
+}
+fn run() {
+    defer print("last")
+    defer print("middle")
+    let c = C()
+    defer c.close()
+    print("first")
+}
+run()
+"#;
+    // Expected: "first\nC.close\nmiddle\nlast\n"
+    assert_four_way_run(src).await;
+}

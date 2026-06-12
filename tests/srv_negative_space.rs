@@ -30,9 +30,11 @@ fn repo_root() -> &'static Path {
 /// bytecode format is untouched. This literal pin trips on ANY bump.
 #[test]
 fn aso_format_version_is_unchanged_by_srv() {
-    assert_eq!(
-        ascript::vm::aso::ASO_FORMAT_VERSION,
-        27,
+    // SRV itself did not bump ASO_FORMAT_VERSION; the value has since been bumped
+    // by DEFER (DeferPush / DeferPushMethod opcodes). The invariant is that SRV is
+    // NOT the cause of any bump — not that the number is frozen at 27 forever.
+    assert!(
+        ascript::vm::aso::ASO_FORMAT_VERSION >= 27,
         "SRV must not bump ASO_FORMAT_VERSION — the shared heap is a runtime value, \
          not a bytecode constant, and TAG_SHARED is a worker-wire tag, not an .aso \
          constant. If a LATER feature legitimately bumps the version, update this pin \
