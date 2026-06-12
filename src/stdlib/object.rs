@@ -252,6 +252,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let key = want_string(&arg(args, 1), span, &ctx("delete"))?;
             // shift_remove preserves the order of the remaining keys.
             let existed = o.borrow_mut().shift_remove(key.as_ref()).is_some();
+            if existed {
+                // Removing a key shifts the remaining entries' indices, so any
+                // warmed shape — and the property ICs keyed on it — would keep
+                // serving the OLD slot index (a wrong-VALUE read, not a miss).
+                // Reset to shape 0 (unset): IC guards miss and reads fall back
+                // to the generic by-key lookup until a shape is re-derived.
+                o.shape.set(0);
+            }
             Ok(Value::Bool(existed))
         }
         "merge" => {

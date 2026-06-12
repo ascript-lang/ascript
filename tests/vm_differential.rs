@@ -8221,3 +8221,28 @@ async fn vm_propagate_then_map_literal_or_later_ternary_matches_treewalker() {
         assert_four_way_run(src).await;
     }
 }
+
+#[tokio::test]
+async fn object_delete_invalidates_shape_for_warmed_property_ic() {
+    // Wrong-value regression (found 2026-06-12 during SHAPE spec drafting):
+    // `object.delete` removed a key via `shift_remove` but left the object's
+    // shape id untouched. A property IC warmed to `Mono{shape, index}` on the
+    // pre-delete layout then kept serving the OLD slot index after the
+    // remaining entries shifted — the specialized VM printed `3` (the shifted
+    // `c` slot) for `o.b` where the tree-walker prints `2`. The fix resets the
+    // object to shape 0 (unset) on a successful delete so warmed ICs miss and
+    // reads fall back to the generic by-key lookup.
+    let src = "import * as object from \"std/object\"\n\
+        let o = {a: 1, b: 2, c: 3}\n\
+        let i = 0\n\
+        let last = 0\n\
+        while (i < 200) {\n\
+          if (i == 100) {\n\
+            object.delete(o, \"a\")\n\
+          }\n\
+          last = o.b\n\
+          i = i + 1\n\
+        }\n\
+        print(last)";
+    assert_four_way_run(src).await;
+}
