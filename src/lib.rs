@@ -649,8 +649,12 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     // (`let len = 5`) and import names that collide with builtins.
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
+    // DEFER §2.3: use `exec_program` (installs + drains the top-level defer frame)
+    // so top-level `defer` statements run at program end.
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(interp.exec(&program, &env)))
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
         .await;
     local.await; // drain spawned tasks — no-op until Phase 2
     match result {
@@ -687,8 +691,11 @@ pub async fn run_source_deterministic(src: &str, seed: u64) -> Result<String, As
     interp.enter_deterministic(seed);
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
+    // DEFER §2.3: exec_program installs the top-level defer frame.
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(interp.exec(&program, &env)))
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
         .await;
     local.await;
     match result {
@@ -717,7 +724,8 @@ pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), A
     let local = tokio::task::LocalSet::new();
     // Establish the root telemetry-span scope so top-level `telemetry.span` /
     // `startSpan` parenting works (per-task isolation; spec §9.3).
-    let root = crate::interp::telemetry_root_scope(interp.exec(&program, &env));
+    // DEFER §2.3: exec_program installs the top-level defer frame.
+    let root = crate::interp::telemetry_root_scope(interp.exec_program(&program, &env));
     let result = local.run_until(root).await;
     local.await;
     match result {
