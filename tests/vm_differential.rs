@@ -8889,3 +8889,59 @@ print(err != nil)
     // All four modes must agree.
     assert_four_way_run(src).await;
 }
+
+/// GATE-0 regression for the fuzz-found verifier bug (Task 4.4 / Gate 15).
+///
+/// The grammar-aware differential fuzzer surfaced a LATENT `.aso`-verifier bug: a
+/// `defer` INSIDE an `if`/`else` branch made the verifier's abstract stack-balance
+/// walk diverge. `DeferPush`/`DeferPushMethod` actually pop `argc + 1` values (or 2 in
+/// the spread variant), but `verify_stack_balance` was treating them as stack-NEUTRAL
+/// (`count_operand` returns 0 for unknown ops → `Effect::new(0,0)`). With the pop never
+/// subtracted, a defer leaves PHANTOM depth on the abstract stack; when two branches
+/// register DIFFERENT amounts of deferred work, their phantom depths differ, and the
+/// join after the if/else trips `StackJoinMismatch` at `.aso` BUILD time. (The exact
+/// fuzz repro: `stack depth mismatch at join offset N: 2 vs 4` — a 1-defer `then` vs a
+/// 2-defer `else`.) The 200-seed property test is statistical (a regressed fix can still
+/// leave `ENTRIES_PUSHED > 0` via defers NOT in branches, or via SYMMETRIC branches that
+/// leave equal phantom depth), so per CLAUDE.md's Gate-0 rule this is the permanent NAMED
+/// deterministic guard that pins the exact pattern through all four modes incl. `.aso`.
+///
+/// The branches are deliberately ASYMMETRIC (the shape that actually triggers the join
+/// mismatch — equal-count branches leave equal phantom depth and would NOT fail even with
+/// the bug) and between them exercise BOTH special-cased opcodes and the spread
+/// pop-count=2 path the fix specifically handles, all INSIDE branches; `run` is called
+/// with both inputs so every branch's defers actually register AND drain:
+///   - `then` branch: ONE plain-call defer (`Op::DeferPush`, pop 2 = callee + 1 arg),
+///   - `else` branch: a method-call defer (`Op::DeferPushMethod`) + a SPREAD-arg defer
+///     (`defer f(...arr)` → `Op::DeferPush` with the spread flag, pop 2 = callee + array)
+///     → asymmetric phantom depth 2 (then) vs 4 (else) under the bug.
+#[tokio::test]
+async fn defer_in_branch_aso_roundtrip_regression() {
+    let src = r#"
+class Logger {
+    fn log(msg) { print(msg) }
+}
+fn variadic_print(...args) {
+    for (a in args) { print(a) }
+}
+fn run(which) {
+    let l = Logger()
+    if (which) {
+        defer print("then-plain")            // Op::DeferPush (plain) — 1 defer in the branch
+    } else {
+        defer l.log("else-method")           // Op::DeferPushMethod — in the branch
+        defer variadic_print(...["e1", "e2"]) // Op::DeferPush + spread — in the branch
+    }
+    print("body")
+}
+run(true)
+print("---")
+run(false)
+"#;
+    // Expected (LIFO per branch; both branches taken):
+    //   body / then-plain / --- / body / e1 / e2 / else-method
+    // The load-bearing assertion is that the `.aso` build (the 4th mode inside
+    // `assert_four_way_run`) does not raise StackJoinMismatch on the asymmetric
+    // defer-in-branch bytecode — and that all four modes are byte-identical.
+    assert_four_way_run(src).await;
+}

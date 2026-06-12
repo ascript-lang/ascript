@@ -812,29 +812,19 @@ fn verify_stack_balance(
                 return Err(VerifyError::StackUnderflow { offset: off });
             }
             after + 1
-        } else if op == Op::DeferPush {
-            // DEFER §5.2: DeferPush — pops (callee + argc args), pushes nothing.
-            // Operand layout: u8 flags (bit1=spread) + u8 argc.
-            // Spread variant: compiler pushes callee + one spread-array → pops 2.
-            let flags = chunk.read_u8(operand_at);
-            let spread = (flags & 2) != 0;
-            let argc = if spread { 1 } else { chunk.read_u8(operand_at + 1) as isize };
-            let pops = 1 + argc; // callee/recv + args
+        } else if op == Op::DeferPush || op == Op::DeferPushMethod {
+            // DEFER §5.2: DeferPush / DeferPushMethod pop (argc + 1) values (callee/recv
+            // + argc args, or callee/recv + ONE spread array) and push nothing. The pop
+            // count is argc-/spread-dependent, so `count_operand` (0 for unknown ops)
+            // can't reach it — we DELEGATE to `op_stack_pops_pushes`, the single
+            // authoritative source of stack truth, rather than re-deriving the layout
+            // here (keeps the two sites from silently disagreeing on a future edit).
+            let (pops, pushes) = op_stack_pops_pushes(chunk, op, operand_at);
+            let pops = pops as isize;
             if depth_in < pops {
                 return Err(VerifyError::StackUnderflow { offset: off });
             }
-            depth_in - pops // pushes 0
-        } else if op == Op::DeferPushMethod {
-            // DEFER §5.2: DeferPushMethod — pops (recv + argc args), pushes nothing.
-            // Operand layout: u16 name_idx + u8 flags (bit1=spread) + u8 argc.
-            let flags = chunk.read_u8(operand_at + 2);
-            let spread = (flags & 2) != 0;
-            let argc = if spread { 1 } else { chunk.read_u8(operand_at + 3) as isize };
-            let pops = 1 + argc; // recv + args
-            if depth_in < pops {
-                return Err(VerifyError::StackUnderflow { offset: off });
-            }
-            depth_in - pops // pushes 0
+            depth_in - pops + pushes as isize // pushes 0, but keep the form explicit
         } else {
             let n = count_operand(chunk, op, operand_at);
             let eff = stack_effect(op, n);
@@ -923,11 +913,17 @@ fn count_operand(chunk: &Chunk, op: Op, operand_at: usize) -> usize {
 
 /// The NET operand-stack delta (`pushes - pops`) of the instruction `op` at
 /// `operand_at` in `chunk`, decoding its inline count operand and handling the
-/// `Op::Class` special case (whose pop count comes from its class-proto). This is the
-/// SAME authoritative table [`verify_stack_balance`] uses; it is exposed so other
-/// passes (e.g. the worker code-slice builder, which tracks top-level stack depth to
-/// bound a computed-`const` initializer to its own statement) reuse one source of
-/// truth rather than re-deriving stack effects.
+/// `Op::Class` special case (whose pop count comes from its class-proto). Shares the
+/// `op_stack_pops_pushes` table; it is exposed so other passes (e.g. the worker
+/// code-slice builder, which tracks top-level stack depth to bound a computed-`const`
+/// initializer to its own statement) reuse one source of truth rather than re-deriving
+/// stack effects.
+///
+/// Cross-reference: [`verify_stack_balance`] DELEGATES its `DeferPush`/`DeferPushMethod`
+/// arms to [`op_stack_pops_pushes`] (so the data-dependent defer pop counts have ONE
+/// home). It keeps its OWN inline `Op::Class` arm because it must emit a `StackUnderflow`
+/// at the right offset mid-walk; that arm and the `Op::Class` arm here must stay in
+/// lockstep — edit both if the class layout changes.
 pub(crate) fn op_stack_delta(chunk: &Chunk, op: Op, operand_at: usize) -> isize {
     // Net is just pushes - pops over the ONE source of truth below (no second copy of
     // the `Op::Class` special case).

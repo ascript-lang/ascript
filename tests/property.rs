@@ -1302,3 +1302,39 @@ proptest! {
     }
 }
 
+// ===========================================================================
+// Gate-0 — the curated differential corpus seed (defer-in-branch verifier bug)
+// ===========================================================================
+
+/// The committed `ex_defer_in_branch` seed under `fuzz/corpus/differential/` is the
+/// permanent libFuzzer starting point for the fuzz-found `.aso`-verifier bug (Task 4.4 /
+/// Gate 15): a `defer` nested inside an `if`/loop branch made `verify_stack_balance`
+/// trip `StackJoinMismatch` at `.aso` build time (the defer ops were treated as
+/// stack-neutral). The differential corpus stores RAW `arbitrary` byte seeds (the
+/// generator is bytes→program, with no source→bytes inverse), so this seed is a real
+/// generator-reachable byte string — NOT a hand-authored source file. This guard asserts
+/// (a) the seed is present and (b) it still decodes to a program with a NESTED defer (so
+/// a generator change that stopped reaching the defer-in-branch shape is caught here, not
+/// silently). The deterministic four-mode proof of the FIX lives in
+/// `tests/vm_differential.rs::defer_in_branch_aso_roundtrip_regression`.
+#[test]
+fn differential_defer_in_branch_seed_is_present_and_current() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fuzz/corpus/differential/ex_defer_in_branch");
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("missing curated seed {}: {e}", path.display()));
+    let src = fuzzgen::gen_program_from_bytes(&bytes).source;
+    assert!(
+        src.contains("defer "),
+        "ex_defer_in_branch must still generate a `defer` (generator drift?)"
+    );
+    let nested_defer = src.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("defer ") && (l.len() - t.len()) >= 8
+    });
+    assert!(
+        nested_defer,
+        "ex_defer_in_branch must still generate a NESTED (in-branch/loop) defer — \
+         the verifier-stressing shape (generator drift?)"
+    );
+}
