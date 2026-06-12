@@ -93,6 +93,35 @@ impl Backend {
         store.current_gen(uri).map(|g| g != gen).unwrap_or(true)
     }
 
+    /// Synchronously fold any pending (debounced) edit for `uri` into the document
+    /// store, so a position-sensitive request fired by a trigger character (`.` for
+    /// completion, `(` for signature help) in the same instant as its `didChange` is
+    /// served from text that INCLUDES the just-typed character instead of the stale
+    /// pre-edit model (the 40ms debounce window).
+    ///
+    /// The pending entry is deliberately PEEKED, not removed: the debounced
+    /// did_change task still finds its sequence number as the latest
+    /// (`still_latest`), removes the entry itself, and runs the full
+    /// `reindex_uri` + `analyze_and_publish` — so the diagnostics publish is never
+    /// eaten by a flush. Rebuilding here is idempotent with that later rebuild
+    /// (same text; `set_versioned` just stamps a fresh generation), and is skipped
+    /// when the store already holds the pending text.
+    ///
+    /// Lock order: `pending` → `documents` (nested), the same order `did_change`
+    /// established — never the reverse.
+    async fn flush_pending_for(&self, uri: &Url) {
+        let pending = self.pending.lock().await;
+        if let Some((text, version, _seq)) = pending.get(uri) {
+            let mut store = self.documents.lock().await;
+            // Already flushed by an earlier request against the same pending edit —
+            // skip the redundant rebuild (and generation churn).
+            if store.get(uri).map(|m| m.text.as_str()) == Some(text.as_str()) {
+                return;
+            }
+            store.set_versioned(uri.clone(), text.clone(), *version);
+        }
+    }
+
     /// Incrementally re-index the file behind `uri` (if it maps to a path).
     fn reindex_uri(&self, uri: &Url, text: &str) {
         if let Some(path) = url_to_canon(uri) {
@@ -515,29 +544,32 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.clone();
         let version = Some(params.text_document.version);
 
-        // Fold the ranged edits onto the latest known text (pending wins over the
-        // cached model so consecutive bursts stack correctly).
-        let base = {
-            let pending = self.pending.lock().await;
-            if let Some((t, _, _)) = pending.get(&uri) {
-                t.clone()
-            } else {
-                let store = self.documents.lock().await;
-                store.get(&uri).map(|m| m.text.clone()).unwrap_or_default()
-            }
-        };
-        let new_text = crate::lsp::model::apply_changes(&base, &params.content_changes);
-
-        // Correctness note: coalescing has no lost-edit race ONLY because (a) there is no
-        // .await between the fold-read and the pending insert (both synchronous), and (b) the
-        // server runs on a current_thread/LocalSet runtime so no other task interleaves in that
-        // window. Do NOT introduce an .await here, and revisit if the runtime ever becomes
-        // multi-threaded.
-        // Stamp this edit and record it as the latest pending text for the URI.
+        // Stamp this edit with a monotone sequence number.
         let seq = self.edit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Correctness invariant: the fold-read of the latest text AND the insert of the
+        // folded result happen inside ONE `pending` critical section. Two interleaved
+        // did_change tasks therefore serialize on the `pending` lock — the second task's
+        // fold-read is guaranteed to see the first task's insert, so an edit can never be
+        // folded from a stale base and silently dropped (the lost-edit race). The fold
+        // itself (`apply_changes`) is synchronous, so holding the lock across it adds no
+        // await point. The `documents` lock is only acquired NESTED inside `pending`
+        // (lock order pending → documents — the same order `flush_pending_for` uses),
+        // so no deadlock is possible.
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(uri.clone(), (new_text.clone(), version, seq));
+            // Fold base: pending text wins over the cached model so consecutive
+            // bursts stack correctly.
+            let base = match pending.get(&uri) {
+                Some((t, _, _)) => t.clone(),
+                None => {
+                    let store = self.documents.lock().await;
+                    store.get(&uri).map(|m| m.text.clone()).unwrap_or_default()
+                }
+            };
+            let new_text = crate::lsp::model::apply_changes(&base, &params.content_changes);
+            // Record the folded text as the latest pending text for the URI.
+            pending.insert(uri.clone(), (new_text, version, seq));
         }
 
         // Debounce: wait the window, then rebuild ONLY if no newer edit landed. The
@@ -565,6 +597,12 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
+        // Purge any pending debounced edit FIRST, so a still-sleeping did_change task
+        // cannot resurrect the closed document: its post-sleep `still_latest` check
+        // (`pending.get(&uri).map(|(_, _, s)| *s) == Some(seq)`) finds no entry —
+        // `None != Some(seq)` — and the task returns without re-inserting the model
+        // or re-publishing diagnostics for the closed file.
+        self.pending.lock().await.remove(&uri);
         self.documents.lock().await.remove(&uri);
         // Clear diagnostics for the closed document.
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
@@ -586,6 +624,9 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        // Hover while typing races the same debounce window — serve it from the
+        // freshest text (cheap: a no-op when nothing is pending).
+        self.flush_pending_for(&uri).await;
         let (gen, result) = {
             let store = self.documents.lock().await;
             let Some(model) = store.get(&uri) else {
@@ -609,6 +650,9 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        // A `.`-triggered completion races the 40ms-debounced rebuild; fold any
+        // pending edit in first so the member-access context sees the trigger char.
+        self.flush_pending_for(&uri).await;
         let (gen, items) = {
             let store = self.documents.lock().await;
             let Some(model) = store.get(&uri) else {
@@ -749,6 +793,9 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        // A `(`-triggered signature request races the 40ms-debounced rebuild; fold
+        // any pending edit in first so the call node exists in the model's tree.
+        self.flush_pending_for(&uri).await;
         let store = self.documents.lock().await;
         let Some(model) = store.get(&uri) else {
             return Ok(None);

@@ -2437,6 +2437,244 @@ fn lsp_did_you_mean_quickfix() {
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
+// ─── LSP audit fixes 1/2/9: didChange sync machinery (previously zero coverage) ──
+
+/// Audit FIX 1 (§4.2): a trigger-character completion fired in the SAME instant as
+/// its `didChange` must be served from text that includes the just-typed character,
+/// not the 40ms-debounce-stale model. didOpen WITHOUT the dot → didChange inserting
+/// `math.` → IMMEDIATE completion at the post-edit cursor → math members offered.
+///
+/// Before the fix (no `flush_pending_for` in the completion handler) this failed:
+/// the request landed inside the debounce window, the store model still lacked the
+/// `.`, so `member_access_alias` saw no member context and returned baseline items
+/// (no `sqrt`). Verified by running this test against the pre-fix handler.
+#[test]
+fn lsp_didchange_trigger_completion_sees_fresh_text() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://didchange_trigger.as";
+    // line 0: import * as math from "std/math"
+    // line 1: let y = math          <- the dot is typed via didChange
+    let text = "import * as math from \"std/math\"\nlet y = math\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text } }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // The editor types `.` after `math` on line 1 (char 12) and fires completion
+    // immediately (trigger character `.`), exactly like a real client.
+    client.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{
+                "range": { "start": { "line": 1, "character": 12 },
+                           "end":   { "line": 1, "character": 12 } },
+                "text": "."
+            }]
+        }),
+    );
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 13 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    // The MEMBER-ACCESS result is exports-only. Asserting bare `sqrt` presence is
+    // NOT enough: the stale-text BASELINE also contains a `sqrt` item via the
+    // auto-import flood (`detail: "auto-import from std/math"`), which is exactly
+    // how a weak assertion would mask the staleness bug. So pin the member
+    // context: a `sqrt` item with NO auto-import detail, and NO keyword items
+    // (the baseline's `let` would prove we were served the stale pre-dot model).
+    assert!(
+        items.iter().any(|i| i["label"].as_str() == Some("sqrt") && i["detail"].is_null()),
+        "completion right after the `.` didChange must offer the math MEMBER `sqrt` \
+         (pending edit flushed, not a stale-model auto-import item); got: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"let"),
+        "member-access completion must not be the stale-text baseline \
+         (keywords present means the pre-dot model was served): {labels:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Audit FIX 2 (§4.1): two back-to-back `didChange` notifications must BOTH fold
+/// into the rebuilt model — the lost-edit race (both tasks folding from the same
+/// base because fold-read and pending-insert sat in separate lock acquisitions)
+/// would silently drop the first edit. Each edit inserts a distinct binding; after
+/// the debounce window, completion must offer BOTH.
+#[test]
+fn lsp_didchange_back_to_back_edits_both_apply() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://didchange_fold.as";
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": "\n\n\n" } }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Edit 1 inserts `let alpha = 1` on line 0; edit 2 (immediately after, well
+    // inside the 40ms debounce window) inserts `let beta = 2` on line 1. Edit 2's
+    // range is relative to the post-edit-1 document, as a real client sends it.
+    client.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{
+                "range": { "start": { "line": 0, "character": 0 },
+                           "end":   { "line": 0, "character": 0 } },
+                "text": "let alpha = 1"
+            }]
+        }),
+    );
+    client.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 3 },
+            "contentChanges": [{
+                "range": { "start": { "line": 1, "character": 0 },
+                           "end":   { "line": 1, "character": 0 } },
+                "text": "let beta = 2"
+            }]
+        }),
+    );
+
+    // Wait out the debounce (40ms) so the coalesced rebuild lands deterministically.
+    std::thread::sleep(Duration::from_millis(80));
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 2, "character": 0 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"alpha"),
+        "the FIRST of two back-to-back edits must not be lost: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"beta"),
+        "the second edit must fold on top of the first: {labels:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Audit FIX 9 (§4.5): `didClose` right after a `didChange` must purge the URI's
+/// pending entry, so the still-sleeping debounce task no-ops (its `still_latest`
+/// seq lookup finds nothing) instead of resurrecting the closed document and
+/// re-publishing its diagnostics. After the debounce window, the ONLY
+/// publishDiagnostics ever seen for the URI besides didOpen's is the empty clear
+/// from didClose.
+#[test]
+fn lsp_didclose_purges_pending_no_ghost_republish() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://didclose_ghost.as";
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": "let x = 1\n" } }),
+    );
+    let open_note = client.read_notification("textDocument/publishDiagnostics", overall);
+    assert_eq!(open_note["params"]["uri"].as_str(), Some(uri));
+
+    // A didChange introducing a syntax error (so a ghost re-publish would be
+    // unmistakable: a non-empty diagnostics array), then an immediate didClose
+    // while the debounce task is still sleeping.
+    client.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "let = broken\n" }]
+        }),
+    );
+    client.notify(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    // Wait well past the debounce window so a buggy server would have re-published.
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Fence with a request: drain every notification ahead of the response and
+    // assert any publishDiagnostics for the closed URI is the empty clear.
+    client.request_no_params(99, "shutdown");
+    loop {
+        let msg = client
+            .next_message(overall, "shutdown response")
+            .expect("stream open until shutdown response");
+        if msg.get("id").and_then(Value::as_i64) == Some(99) {
+            break;
+        }
+        if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+            && msg["params"]["uri"].as_str() == Some(uri)
+        {
+            let diags = msg["params"]["diagnostics"]
+                .as_array()
+                .expect("diagnostics array");
+            assert!(
+                diags.is_empty(),
+                "closed document must never get diagnostics re-published \
+                 (ghost resurrection from a stale pending edit): {msg}"
+            );
+        }
+    }
+
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
 // ─── DX D3 Task 11: the LSP identity unification ─────────────────────────────
 //
 // These exercise `WorkspaceIndex` directly (in-process — no wire) to pin the

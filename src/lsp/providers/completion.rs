@@ -44,42 +44,15 @@ const TYPE_NAMES: &[&str] = &[
     "int", "float", "number", "string", "bool", "nil", "any", "object", "bytes", "regex", "error",
 ];
 
-/// The known stdlib module paths offered when completing an `import ... from "..."`
-/// string. Hardcoded (rather than derived from `std_module_exports`) so the list is
-/// stable regardless of which cargo features are enabled at build time — editors
-/// should see every documented module path. Kept in sync with `std_module_exports`
-/// in `src/stdlib/mod.rs`.
-const STD_MODULE_PATHS: &[&str] = &[
-    "std/string",
-    "std/array",
-    "std/object",
-    "std/map",
-    "std/shared",
-    "std/math",
-    "std/convert",
-    "std/json",
-    "std/regex",
-    "std/encoding",
-    "std/bytes",
-    "std/uuid",
-    "std/csv",
-    "std/toml",
-    "std/yaml",
-    "std/time",
-    "std/date",
-    "std/intl",
-    "std/env",
-    "std/fs",
-    "std/process",
-    "std/crypto",
-    "std/compress",
-    "std/sqlite",
-    "std/net/tcp",
-    "std/net/http",
-    "std/http/server",
-    "std/net/ws",
-    "std/tui",
-];
+/// The stdlib module paths offered when completing an `import ... from "..."`
+/// string and scanned for auto-import candidates. This IS the canonical,
+/// feature-independent `stdlib::STD_MODULES` list (a direct reuse, so the
+/// completion surface can never drift from the language's module set) — stable
+/// regardless of which cargo features are enabled at build time, so editors see
+/// every documented module path. A module whose exports are feature-gated out of
+/// this particular build simply yields no auto-import items
+/// (`std_module_exports` returns `None` and the caller skips it).
+use crate::stdlib::STD_MODULES as STD_MODULE_PATHS;
 
 /// A baseline completion item (keyword or builtin).
 fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
@@ -625,16 +598,62 @@ mod tests {
     }
 
     #[test]
-    fn std_module_paths_all_resolve_under_default_features() {
-        // Every advertised import path must be a real registered module, so the const
-        // can't silently drift from `std_module_exports`. (cargo test enables all
-        // default features, so every default-gated path resolves.)
+    fn std_module_paths_complete_against_std_modules() {
+        // COMPLETENESS: the completion list is the canonical feature-independent
+        // `stdlib::STD_MODULES` (a direct reuse — drift is impossible by
+        // construction; this guards against the reuse ever being replaced by a
+        // copy again). The old hardcoded list had 29 entries vs the canonical ~56,
+        // silently hiding std/task, std/os, std/log, std/schema, etc.
+        assert_eq!(STD_MODULE_PATHS, crate::stdlib::STD_MODULES);
+        // And every advertised path resolves under default features (cargo test
+        // enables all default features, so every default-gated module is present).
         for path in STD_MODULE_PATHS {
             assert!(
                 crate::stdlib::std_module_exports(path).is_some(),
                 "STD_MODULE_PATHS entry {path:?} is not a known stdlib module"
             );
         }
+    }
+
+    #[test]
+    fn newly_included_modules_complete_and_auto_import() {
+        // FIX 3 regression: modules the old hardcoded list omitted now surface in
+        // import-path completion…
+        let it = items("import { x } from \"std/");
+        let ls = labels(&it);
+        for expected in ["std/task", "std/os", "std/log", "std/schema", "std/net/udp"] {
+            assert!(
+                ls.contains(&expected),
+                "import ctx should offer {expected:?}: {ls:?}"
+            );
+        }
+        // …and their exports resolve, so auto-import path construction works for
+        // them (e.g. `task.spawn` from std/task, `os.platform` from std/os).
+        for (module, export) in [("std/task", "spawn"), ("std/os", "platform")] {
+            let exports = crate::stdlib::std_module_exports(module)
+                .unwrap_or_else(|| panic!("{module} must resolve under default features"));
+            assert!(
+                exports.iter().any(|(n, _)| n == export),
+                "{module} should export {export:?}"
+            );
+        }
+        // An export unique to a newly-included module is offered as an auto-import
+        // with the matching import edit.
+        let model = SemanticModel::build("sp\n".to_string(), None, &LintConfig::default());
+        let items = completions(&model, 2);
+        let spawn = items
+            .iter()
+            .find(|i| {
+                i.label == "spawn"
+                    && i.detail.as_deref() == Some("auto-import from std/task")
+            })
+            .expect("spawn auto-import from std/task offered");
+        let edits = spawn.additional_text_edits.as_ref().expect("has import edit");
+        assert!(
+            edits[0].new_text.contains("import { spawn } from \"std/task\""),
+            "import edit text: {:?}",
+            edits[0].new_text
+        );
     }
 
     #[test]
@@ -682,10 +701,14 @@ mod tests {
         let src = "ab\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let items = completions(&model, 2);
+        // `abs` is exported by more than one module (std/decimal AND std/math, both
+        // in the canonical list) — each gets its own auto-import item; pick math's.
         let abs = items
             .iter()
-            .find(|i| i.label == "abs")
-            .expect("abs auto-import offered");
+            .find(|i| {
+                i.label == "abs" && i.detail.as_deref() == Some("auto-import from std/math")
+            })
+            .expect("abs auto-import from std/math offered");
         let edits = abs.additional_text_edits.as_ref().expect("has import edit");
         assert_eq!(edits.len(), 1);
         assert!(
