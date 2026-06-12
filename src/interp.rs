@@ -14192,4 +14192,394 @@ print("done")
              (defer went to wrong frame). Output:\n{out}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // DEFER Task 2.3 — async / generator / cancellation matrix (§3.4 §4.1 §4.2 §4.3)
+    //
+    // These tests prove the hard async edges of the defer spec on the tree-walker.
+    // No VM / CST changes — tree-walker oracle only.
+    // -----------------------------------------------------------------------
+
+    // §3.4 §4.1 — defer await happy path: async cleanup fn completes before the
+    // caller's frame resolves.  The print order proves await drove the future.
+    #[tokio::test]
+    async fn defer_await_happy_path_async_cleanup() {
+        let out = run(r#"
+import * as sync from "std/sync"
+// A side-effect channel lets us prove ordering without relying on print order alone.
+let ch = sync.channel(1)
+
+async fn teardown(ch) {
+    sync.send(ch, "teardown-ran")
+}
+
+async fn work(ch) {
+    defer await teardown(ch)
+    print("body")
+}
+
+await work(ch)
+let result = await sync.recv(ch)
+print(result)
+"#).await;
+        // "body" from the work body; "teardown-ran" sent by teardown and then
+        // received AFTER work() resolved — proves teardown completed inside work.
+        assert_eq!(out.trim(), "body\nteardown-ran");
+    }
+
+    // §3.4 §4.1 — strict LIFO across mixed await and sync defers.
+    // Three defers: sync-A (oldest), await-B (middle), sync-C (newest).
+    // Drain order must be: C, then await B completes, then A.
+    #[tokio::test]
+    async fn defer_await_lifo_mixed_sync_and_await() {
+        let out = run(r#"
+async fn async_cleanup() { print("B-await") }
+
+async fn f() {
+    defer print("A-sync")         // oldest: runs last
+    defer await async_cleanup()   // middle: await completes before A
+    defer print("C-sync")         // newest: runs first
+    print("body")
+}
+
+await f()
+"#).await;
+        assert_eq!(out.trim(), "body\nC-sync\nB-await\nA-sync");
+    }
+
+    // §3.4 §4.1 §3.3 — defer await runs during ?-propagation unwind.
+    // The [nil, err] pair is delivered only AFTER the awaited defer completes.
+    #[tokio::test]
+    async fn defer_await_during_propagate_unwind() {
+        let out = run(r#"
+async fn async_close() { print("async-close") }
+
+async fn risky() {
+    defer await async_close()
+    return Err("oops")
+}
+
+fn caller() {
+    let v = (await risky())?
+    return Ok(v)
+}
+
+let r = caller()
+print(r[1].message)
+"#).await;
+        // async-close runs during the ?-unwind; the Err pair is delivered after.
+        assert_eq!(out.trim(), "async-close\noops");
+    }
+
+    // §3.4 §3.6 §4.1 — recover sees the panic only after the awaited defer completed.
+    #[tokio::test]
+    async fn defer_await_during_panic_to_recover() {
+        let out = run(r#"
+async fn async_cleanup() { print("cleanup-ran") }
+
+async fn boom() {
+    defer await async_cleanup()
+    assert(false, "original-panic")
+}
+
+let [_, e] = recover(() => await boom())
+print(e.message)
+"#).await;
+        assert_eq!(out.trim(), "cleanup-ran\noriginal-panic");
+    }
+
+    // §3.4 — bare defer of a future-returning call is an exact-message Tier-2 panic.
+    #[tokio::test]
+    async fn bare_future_defer_panics_with_exact_message() {
+        let err = run_err(r#"
+async fn async_cleanup() { print("cleanup") }
+
+fn f() {
+    defer async_cleanup()   // bare defer of an async fn — must panic at drain time
+}
+
+f()
+"#).await;
+        assert_eq!(
+            err.message,
+            "deferred call returned a future that would be cancelled on drop \
+             — use 'defer await f()' or do async cleanup before exit",
+            "exact §3.4 message mismatch: {}", err.message
+        );
+    }
+
+    // §3.4 — defer await on a sync call is the identity rule: no error, result discarded.
+    #[tokio::test]
+    async fn defer_await_on_sync_call_is_identity() {
+        let out = run(r#"
+fn sync_close() { print("sync-close") }
+
+fn f() {
+    defer await sync_close()   // await on a non-future is identity — must not error
+    print("body")
+}
+
+f()
+"#).await;
+        assert_eq!(out.trim(), "body\nsync-close");
+    }
+
+    // §4.1 — a defer registered BEFORE an await runs at body exit however many
+    // awaits later (the activation persists across awaits by construction).
+    #[tokio::test]
+    async fn async_fn_defers_persist_across_multiple_awaits() {
+        let out = run(r#"
+async fn step(n) { return n }
+
+async fn multi_await() {
+    defer print("deferred-cleanup")
+    print("before-awaits")
+    let a = await step(1)
+    let b = await step(2)
+    let c = await step(3)
+    print("after-awaits")
+    return a + b + c
+}
+
+let result = await multi_await()
+print(result)
+"#).await;
+        // deferred-cleanup must appear after the body completes (after "after-awaits")
+        // but before the caller's next statement.
+        assert!(out.contains("before-awaits"), "body start: {out:?}");
+        assert!(out.contains("after-awaits"), "body end: {out:?}");
+        assert!(out.contains("deferred-cleanup"), "defer ran: {out:?}");
+        assert!(out.contains("6"), "return value: {out:?}");
+        let cleanup_pos = out.find("deferred-cleanup").unwrap();
+        let after_pos = out.find("after-awaits").unwrap();
+        let result_pos = out.find('6').unwrap();
+        assert!(
+            after_pos < cleanup_pos,
+            "defer must run AFTER body completes: {out:?}"
+        );
+        assert!(
+            cleanup_pos < result_pos,
+            "defer must run BEFORE caller resumes: {out:?}"
+        );
+    }
+
+    // §4.3 — generator body completion (normal return after all yields) runs defers.
+    #[tokio::test]
+    async fn generator_completion_runs_defers() {
+        let out = run(r#"
+fn* gen() {
+    defer print("gen-defer")
+    yield 1
+    yield 2
+    // body completes here — defers must run before this resume reports done
+}
+
+let it = gen()
+print(it.next())
+print(it.next())
+let done = it.next()  // drives body to completion, defer runs here
+print("after-done")
+"#).await;
+        // gen-defer must appear before "after-done" (i.e., during the final resume
+        // that drives the body to completion).
+        assert!(out.contains("gen-defer"), "defer must run on completion: {out:?}");
+        let defer_pos = out.find("gen-defer").unwrap();
+        let after_done_pos = out.find("after-done").unwrap();
+        assert!(
+            defer_pos < after_done_pos,
+            "gen-defer must appear before after-done: {out:?}"
+        );
+        assert!(out.contains("1\n2\n"), "yields must work: {out:?}");
+    }
+
+    // §4.3 — generator panic unwind also runs defers.
+    #[tokio::test]
+    async fn generator_panic_runs_defers() {
+        let out = run(r#"
+fn* panicky() {
+    defer print("gen-panic-defer")
+    yield 1
+    assert(false, "gen-panic")
+}
+
+let it = panicky()
+print(it.next())   // yields 1 fine
+let [_, err] = recover(() => it.next())  // drives to panic; defer must run inside
+print(err.message)
+print("recovered")
+"#).await;
+        assert!(out.contains("gen-panic-defer"), "defer ran: {out:?}");
+        assert!(out.contains("gen-panic\n"), "panic message in output: {out:?}");
+        assert!(out.contains("recovered"), "recover worked: {out:?}");
+        let defer_pos = out.find("gen-panic-defer").unwrap();
+        // "gen-panic\n" is the standalone panic message line (not the "gen-panic-defer" line).
+        let panic_msg_pos = out.find("gen-panic\n").unwrap();
+        // The defer runs before the panic crosses the recover boundary.
+        assert!(
+            defer_pos < panic_msg_pos,
+            "defer runs before panic surfaces: {out:?}"
+        );
+    }
+
+    // §4.3 — gen.close() mid-suspend does NOT run defers (documented, soundness).
+    // Two variants: explicit close() and last-handle drop (let the generator go
+    // out of scope without driving to completion).
+    #[tokio::test]
+    async fn generator_close_does_not_run_defers() {
+        // Variant 1: explicit close() mid-suspend.
+        let out = run(r#"
+fn* gen() {
+    defer print("MUST-NOT-APPEAR-close")
+    yield 1
+    yield 2
+}
+
+let it = gen()
+print(it.next())   // yields 1 (body parked at yield 2)
+it.close()         // drops body mid-suspend — defer must NOT run
+print("after-close")
+"#).await;
+        assert!(
+            !out.contains("MUST-NOT-APPEAR-close"),
+            "§4.3: close() must NOT run defers; got: {out:?}"
+        );
+        assert!(out.contains("after-close"), "program continued: {out:?}");
+
+        // Variant 2: last-handle drop (generator abandoned after one yield).
+        // The generator's handle goes out of scope at end of the helper fn;
+        // the body is dropped mid-suspend (parked at the second yield).
+        let out2 = run(r#"
+fn* droppable() {
+    defer print("MUST-NOT-APPEAR-drop")
+    yield 1
+    yield 2
+}
+
+fn abandon() {
+    let it = droppable()
+    print(it.next())   // yields 1; body now parked at second yield
+    // `it` goes out of scope here — body dropped mid-suspend
+}
+
+abandon()
+print("after-drop")
+"#).await;
+        assert!(
+            !out2.contains("MUST-NOT-APPEAR-drop"),
+            "§4.3: last-handle drop must NOT run defers; got: {out2:?}"
+        );
+        assert!(out2.contains("after-drop"), "program continued: {out2:?}");
+    }
+
+    // §4.2 — task cancellation (cancel-on-drop) does NOT run defers.
+    //
+    // An async fn with a defer is called but NOT awaited. Under M17 the future's
+    // handle is dropped at the end of the expression statement → task aborted →
+    // the body is dropped at its first suspension (the `await 0`) → defers DO NOT run.
+    // This is the "killed goroutine" analogy stated in §4.2.
+    #[tokio::test]
+    async fn task_cancellation_does_not_run_defers() {
+        // Variant 1: unawaited call — handle dropped at end of expression statement.
+        let out = run(r#"
+async fn work() {
+    defer print("MUST-NOT-APPEAR-cancel")
+    await 0   // first suspension — body aborted here on cancel-on-drop
+    print("body-completed")
+}
+
+work()        // future dropped immediately → task cancelled
+print("main")
+"#).await;
+        assert!(
+            !out.contains("MUST-NOT-APPEAR-cancel"),
+            "§4.2: cancelled task must NOT run defers; got: {out:?}"
+        );
+        assert!(
+            !out.contains("body-completed"),
+            "body must not have run: {out:?}"
+        );
+        assert!(out.contains("main"), "main ran: {out:?}");
+
+        // Variant 2: race loser — task is cancelled when the winner resolves.
+        let out2 = run(r#"
+import * as task from "std/task"
+import * as sync from "std/sync"
+
+// `blocker` parks forever on a channel nobody signals, then has a defer.
+// `winner` signals ch_sync so we know blocker had a chance to park, then returns.
+let ch_park = sync.channel(0)   // capacity 0 → recv parks until someone sends
+let ch_sync = sync.channel(1)
+
+async fn blocker(ch_park, ch_sync) {
+    defer print("MUST-NOT-APPEAR-race")
+    sync.send(ch_sync, 1)           // tell winner we're parked
+    let _ = await sync.recv(ch_park)   // park forever (nobody sends)
+    print("blocker-body-done")
+}
+
+async fn winner(ch_sync) {
+    let _ = await sync.recv(ch_sync)  // wait until blocker is parked
+    return "won"
+}
+
+let result = await task.race([blocker(ch_park, ch_sync), winner(ch_sync)])
+print(result)
+"#).await;
+        assert!(
+            !out2.contains("MUST-NOT-APPEAR-race"),
+            "§4.2: race loser must NOT run defers; got: {out2:?}"
+        );
+        assert!(out2.contains("won"), "race winner: {out2:?}");
+    }
+
+    // §4.2 — cancellation while a deferred `await` is suspended: the body future is
+    // dropped mid-drain → the older defers DO NOT run.
+    //
+    // Setup:
+    //   - `slow` task: body completes immediately (no body awaits), registers two defers:
+    //       oldest = `print("older-defer-MUST-NOT-RUN")` (would print if drain finishes)
+    //       newest = `defer await never_recv()` (parks on ch_drain, never signaled)
+    //     Drain starts LIFO: newest runs first → parks on ch_drain. Slow is now
+    //     suspended mid-drain.
+    //   - `fast` task: parks on ch_sync until `slow`'s body is done and drain has started,
+    //     then returns, winning the race.
+    //   - `task.race` cancels `slow` while it is suspended in the deferred await.
+    //   - Older defer ("older-defer-MUST-NOT-RUN") must NOT appear.
+    #[tokio::test]
+    async fn defer_await_cancelled_mid_drain() {
+        let out = run(r#"
+import * as task from "std/task"
+import * as sync from "std/sync"
+
+// ch_drain: slow's defer await parks here; nobody sends → it blocks forever.
+// ch_sync:  slow sends here after registering its defers (body done); fast waits
+//           for it before returning to win the race.
+let ch_drain = sync.channel(0)
+let ch_sync  = sync.channel(1)
+
+async fn never_recv(ch) {
+    let _ = await sync.recv(ch)   // parks; nobody sends on ch_drain
+}
+
+async fn slow(ch_drain, ch_sync) {
+    defer print("older-defer-MUST-NOT-RUN")   // oldest: would run after defer-await
+    defer await never_recv(ch_drain)           // newest: runs first, parks forever
+    // body: signal fast that our body is done and drain is about to start
+    sync.send(ch_sync, 1)
+}
+
+async fn fast(ch_sync) {
+    let _ = await sync.recv(ch_sync)  // wait for slow's body to complete
+    return "fast-won"
+}
+
+let result = await task.race([slow(ch_drain, ch_sync), fast(ch_sync)])
+print(result)
+"#).await;
+        assert!(
+            !out.contains("older-defer-MUST-NOT-RUN"),
+            "§4.2: older defer must NOT run when mid-drain cancel occurs; got: {out:?}"
+        );
+        assert!(out.contains("fast-won"), "fast must win: {out:?}");
+    }
 }
