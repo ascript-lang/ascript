@@ -51,6 +51,46 @@ impl From<AsError> for Control {
     }
 }
 
+/// DEFER §3.1: what kind of deferred call to run at body exit.
+pub(crate) enum DeferKind {
+    /// A plain function call: `defer f(args)` or `defer (() => …)(args)`.
+    Call { callee: Value },
+    /// A method call on an already-evaluated receiver: `defer o.m(args)`.
+    /// Re-enters the member-call evaluator at drain time so schema/shared/workflow
+    /// call-position hooks fire (spec §3.1 — pre-binding via `read_member` would
+    /// silently skip them).
+    Method { recv: Value, name: Rc<str> },
+}
+
+/// DEFER §3.1: one registered deferred call (args captured at statement time).
+pub(crate) struct DeferEntry {
+    pub kind: DeferKind,
+    pub args: Vec<Value>,
+    /// Whether this is `defer await f()` (§3.4).
+    pub awaited: bool,
+    pub span: Span,
+}
+
+/// DEFER §3.6: fold a panic raised by a deferred call into the in-flight frame
+/// outcome. Rules (both engines share this helper — divergence is structurally
+/// impossible):
+/// - `Ok(_)` or `Propagate` → replaced by the new panic (r1/r2).
+/// - `Panic(orig)` → the orig message is preserved, the new panic appended as a
+///   suppressed note — exact format is LOCKED (r3).
+/// - `Exit` → unreachable (the drain never runs under `Control::Exit`).
+pub(crate) fn merge_defer_panic(pending: &mut Result<Value, Control>, new: AsError) {
+    match pending {
+        Ok(_) | Err(Control::Propagate(_)) => *pending = Err(Control::Panic(new)),
+        Err(Control::Panic(orig)) => {
+            orig.message = format!(
+                "{} (suppressed panic in deferred call: {})",
+                orig.message, new.message
+            );
+        }
+        Err(Control::Exit(_)) => unreachable!("defer drain must not run under Exit"),
+    }
+}
+
 #[cfg(feature = "telemetry")]
 tokio::task_local! {
     /// SP12: the CURRENT telemetry span context for THIS async task. A tokio
@@ -643,6 +683,14 @@ pub struct Interp {
     /// always call `set_snapshot_update`.
     #[allow(dead_code)]
     snapshots_touched: RefCell<std::collections::BTreeSet<PathBuf>>,
+    /// DEFER §2.3: a stack of active defer lists, one per live `run_body` frame
+    /// (plus the top-level driver frame). Each `run_body` call pushes a fresh
+    /// `Rc<RefCell<Vec<DeferEntry>>>` onto this stack on entry and pops it on exit;
+    /// `exec_stmt(Stmt::Defer)` peeks at the innermost layer and appends the captured
+    /// entry there. The lib.rs top-level driver pushes the program-level frame via
+    /// `exec_program`. Never held across an `.await` (short borrows only — `Cell`
+    /// discipline: take the value out, drop the borrow, then await).
+    defers: RefCell<Vec<Rc<RefCell<Vec<DeferEntry>>>>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1028,6 +1076,9 @@ impl Interp {
             // never overwrites a changed snapshot and never deletes an orphan.
             snapshot_update: Cell::new(false),
             snapshots_touched: RefCell::new(std::collections::BTreeSet::new()),
+            // DEFER §2.3: starts empty; the lib.rs top-level driver pushes the
+            // program-level frame via `exec_program`; `run_body` pushes per-call frames.
+            defers: RefCell::new(Vec::new()),
         }
     }
 
@@ -3467,11 +3518,74 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::Defer { span, .. } => {
-                // DEFER Phase 2/3 will install the runtime defer stack.
-                // For now, any attempt to execute a defer statement is a loud
-                // Tier-2 panic so every commit stays compilable and green.
-                Err(AsError::at("defer is not yet executable (DEFER Phase 2/3)", *span).into())
+            Stmt::Defer { call, awaited, span } => {
+                // DEFER §3.1: evaluate callee/receiver + args NOW (at the defer
+                // statement), then push the captured entry onto the innermost active
+                // defer list. The CALL ITSELF is deferred to body exit (LIFO).
+                //
+                // `call` is guaranteed `ExprKind::Call { callee, args }` by the parser.
+                // Never hold a `RefCell` borrow across `.await`.
+                let ExprKind::Call { callee, args } = &call.kind else {
+                    // Parser guarantee — structurally unreachable.
+                    return Err(AsError::at("defer: internal error: not a call", *span).into());
+                };
+                let entry = match &callee.kind {
+                    // `defer a?.m(args)` — optional-chain: nil receiver → no-op, per §3.1.
+                    ExprKind::OptMember { object, name } => {
+                        let recv = self.eval_expr(object, env).await?;
+                        if recv == Value::Nil {
+                            // Spec §3.1: nil opt-chain → whole defer is a no-op;
+                            // arg expressions are NOT evaluated.
+                            return Ok(Flow::Normal);
+                        }
+                        let call_args = self.eval_call_args(args, env).await?;
+                        DeferEntry {
+                            kind: DeferKind::Method {
+                                recv,
+                                name: name.as_str().into(),
+                            },
+                            args: call_args,
+                            awaited: *awaited,
+                            span: *span,
+                        }
+                    }
+                    // `defer o.m(args)` — method call; receiver captured at statement.
+                    ExprKind::Member { object, name } => {
+                        let recv = self.eval_expr(object, env).await?;
+                        let call_args = self.eval_call_args(args, env).await?;
+                        DeferEntry {
+                            kind: DeferKind::Method {
+                                recv,
+                                name: name.as_str().into(),
+                            },
+                            args: call_args,
+                            awaited: *awaited,
+                            span: *span,
+                        }
+                    }
+                    // `defer f(args)` — plain call; callee evaluated at statement.
+                    _ => {
+                        let callee_v = self.eval_expr(callee, env).await?;
+                        let call_args = self.eval_call_args(args, env).await?;
+                        DeferEntry {
+                            kind: DeferKind::Call { callee: callee_v },
+                            args: call_args,
+                            awaited: *awaited,
+                            span: *span,
+                        }
+                    }
+                };
+                // Push onto the innermost active defer list. Borrow must be released
+                // before any further `.await` — short-lived borrow, drop before return.
+                {
+                    let defers_borrow = self.defers.borrow();
+                    if let Some(list) = defers_borrow.last() {
+                        list.borrow_mut().push(entry);
+                    }
+                    // If no defer list is installed, the entry is silently dropped.
+                    // In practice exec_program/run_body always install one first.
+                }
+                Ok(Flow::Normal)
             }
         }
     }
@@ -5211,18 +5325,45 @@ impl Interp {
         // Grow the native stack per poll so deep recursion (functions / methods /
         // HOF callbacks) reaches the logical `MAX_CALL_DEPTH` cap cleanly instead of
         // SIGABRTing the native stack first — matching the VM's re-entry guards.
-        let result = match crate::vm::stack::grow_future(self.exec(body, call_env)).await {
-            Ok(Flow::Return(v)) => v,
-            Ok(Flow::Normal) => Value::Nil,
-            Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),
-            Ok(Flow::Continue) => {
-                return Err(AsError::at("'continue' outside of a loop", span).into())
-            }
-            Err(Control::Propagate(v)) => v,
-            Err(Control::Panic(e)) => return Err(Control::Panic(e)),
-            // exit() unwinds through function calls unchanged — re-propagate.
-            Err(Control::Exit(code)) => return Err(Control::Exit(code)),
-        };
+        //
+        // DEFER §2.3: install a fresh defer frame for this call activation. Any
+        // `defer` statement executed in the body appends to this frame's list.
+        let defer_list = self.push_defer_frame();
+        let mut outcome: Result<Value, Control> =
+            match crate::vm::stack::grow_future(self.exec(body, call_env)).await {
+                Ok(Flow::Return(v)) => Ok(v),
+                Ok(Flow::Normal) => Ok(Value::Nil),
+                Ok(Flow::Break) => {
+                    // Break outside a loop: pop the frame, then propagate the error.
+                    self.pop_defer_frame();
+                    return Err(AsError::at("'break' outside of a loop", span).into());
+                }
+                Ok(Flow::Continue) => {
+                    self.pop_defer_frame();
+                    return Err(AsError::at("'continue' outside of a loop", span).into());
+                }
+                // `?` propagation: function returns a `[nil, err]` pair. Store it as
+                // Ok so defers still run (spec §3.3).
+                Err(Control::Propagate(v)) => Ok(v),
+                Err(Control::Panic(e)) => Err(Control::Panic(e)),
+                // exit() skips defers — unwind immediately (spec §3.3).
+                Err(Control::Exit(code)) => {
+                    self.pop_defer_frame();
+                    return Err(Control::Exit(code));
+                }
+            };
+        // DEFER §3.3: pop and drain the defer frame (LIFO). `_depth` is still held
+        // here (spec §3.8) — the DepthGuard's Drop runs after this block. Panics from
+        // deferred calls are merged into `outcome` via `merge_defer_panic` (§3.6).
+        self.pop_defer_frame();
+        let entries = std::mem::take(&mut *defer_list.borrow_mut());
+        if !entries.is_empty() {
+            self.run_defers(entries, &mut outcome).await;
+        }
+        // DEFER §3.7: return-type contract check happens AFTER defers run, so a
+        // deferred call observes the function's final state first. Only runs when
+        // `outcome` is still an `Ok` value (no panic/propagate from a deferred call).
+        let result = outcome?;
         if let Some(ty) = ret {
             // IFACE: env-aware return-type contract (interface/class names resolve via
             // the callee frame's env chain → def env → module globals).
@@ -5231,6 +5372,201 @@ impl Interp {
             }
         }
         Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // DEFER §3.3–3.4: defer-frame lifecycle + drain helpers.
+    // -----------------------------------------------------------------------
+
+    /// Push a fresh, empty defer list onto the per-`Interp` stack, returning an
+    /// `Rc` to it. Called by `run_body` (and `exec_program`) BEFORE executing a body;
+    /// the SAME `Rc` is used to drain entries after the body finishes.
+    /// Never holds a borrow across `.await` (synchronous, drops immediately).
+    pub(crate) fn push_defer_frame(&self) -> Rc<RefCell<Vec<DeferEntry>>> {
+        let list = Rc::new(RefCell::new(Vec::<DeferEntry>::new()));
+        self.defers.borrow_mut().push(Rc::clone(&list));
+        list
+    }
+
+    /// Pop the innermost defer frame. Must be the one returned by the matching
+    /// `push_defer_frame`. Called by `run_body` / `exec_program` after the body runs.
+    pub(crate) fn pop_defer_frame(&self) {
+        self.defers.borrow_mut().pop();
+    }
+
+    /// Execute one [`DeferEntry`]: call the captured callee with the captured args.
+    /// For `DeferKind::Method` re-enters the member-call hook path so schema/shared/
+    /// workflow hooks fire (spec §3.1). For `awaited=true` drives a returned
+    /// `Value::Future` to completion; for `awaited=false` a `Value::Future` result is
+    /// the §3.4 Tier-2 error. A `Propagate` from the call is treated as discarded
+    /// (the result of a deferred call is discarded per §3.2). Never holds a `RefCell`
+    /// borrow across `.await`.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn exec_defer_entry(
+        &self,
+        entry: DeferEntry,
+    ) -> Result<(), Control> {
+        let result = match entry.kind {
+            DeferKind::Call { callee } => {
+                self.call_value(callee, entry.args, entry.span).await
+            }
+            DeferKind::Method { recv, name } => {
+                // Re-enter the member-call evaluator to preserve schema / shared /
+                // workflow call-position hooks (spec §3.1 — pre-binding via
+                // `read_member` would silently skip them).
+                self.call_method_recv(recv, &name, entry.args, entry.span).await
+            }
+        };
+        let result_v = match result {
+            Ok(v) => v,
+            // A Tier-1 `?`-propagation from a deferred call: the result is discarded
+            // per §3.2 (the deferred call's own `run_body` converts it to Ok already,
+            // but guard against other callee kinds).
+            Err(Control::Propagate(_)) => return Ok(()),
+            // Panic or Exit propagates up to `run_defers` for handling.
+            Err(e) => return Err(e),
+        };
+        if entry.awaited {
+            // `defer await f()` — if the call returned a future, drive it now (§3.4).
+            if let Value::Future(f) = result_v {
+                f.get().await.map(|_| ())?;
+            }
+            // Non-future + awaited is the identity rule (the language-wide rule).
+        } else if let Value::Future(_) = result_v {
+            // `defer f()` returned a future — §3.4 loud Tier-2 error.
+            return Err(Control::Panic(AsError::at(
+                "deferred call returned a future that would be cancelled on drop — use 'defer await f()' or do async cleanup before exit",
+                entry.span,
+            )));
+        }
+        // Non-future result is discarded (§3.2).
+        Ok(())
+    }
+
+    /// Execute a member call on an already-evaluated receiver, routing through all
+    /// call-position hooks (schema, workflow-ctx, worker-spawn, shared, actor) exactly
+    /// as `eval_chain`'s `ExprKind::Call { callee: Member { … } }` arm does. This is
+    /// the hook-preservation chokepoint for `DeferKind::Method` execution (spec §3.1
+    /// — "re-enter the member-call evaluator"). Both `eval_chain` and `exec_defer_entry`
+    /// call this so the hook logic has ONE location.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn call_method_recv(
+        &self,
+        recv: Value,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Schema fluent-chain hook (spec §3.1).
+        if crate::stdlib::schema::is_schema_value(&recv)
+            && crate::stdlib::schema::is_schema_method(name)
+        {
+            let mut sargs = Vec::with_capacity(args.len() + 1);
+            sargs.push(recv);
+            sargs.extend(args);
+            return self.call_schema(name, &sargs, span).await;
+        }
+        // Workflow ctx hook.
+        #[cfg(feature = "workflow")]
+        if crate::stdlib::workflow::is_ctx_value(&recv)
+            && crate::stdlib::workflow::is_ctx_method(name)
+        {
+            let mut wargs = Vec::with_capacity(args.len() + 1);
+            wargs.push(recv);
+            wargs.extend(args);
+            return self.call_workflow_ctx(name, &wargs, span).await;
+        }
+        // Worker-class `.spawn` hook.
+        if let Value::Class(ref c) = recv {
+            if c.is_worker && name == "spawn" {
+                return self.spawn_actor(c, args, span).await;
+            }
+        }
+        // Shared-value member-call hook.
+        if let Value::Shared(ref node) = recv {
+            return call_shared(node, name, &args, span);
+        }
+        // Actor-handle async method-call hook.
+        if let Value::Native(ref n) = recv {
+            if n.kind == crate::value::NativeKind::WorkerActor {
+                return self.actor_handle_call(n, name, args, span).await;
+            }
+        }
+        // Fallback: read the member first (may error), then call the resolved value.
+        let callee_v = self.read_member(&recv, name, span)?;
+        self.call_value(callee_v, args, span).await
+    }
+
+    /// Drain all entries in `entries` LIFO, folding any panics into `outcome` via
+    /// [`merge_defer_panic`] (spec §3.6 r1–r4). All entries run regardless of
+    /// individual panics (r4). `Control::Exit` inside an entry aborts the drain
+    /// and replaces `outcome` (§3.6 r5). Never holds a `RefCell` borrow across `.await`.
+    pub(crate) async fn run_defers(
+        &self,
+        entries: Vec<DeferEntry>,
+        outcome: &mut Result<Value, Control>,
+    ) {
+        // LIFO: entries were pushed in declaration order; drain in reverse.
+        for entry in entries.into_iter().rev() {
+            match self.exec_defer_entry(entry).await {
+                Ok(()) => {}
+                Err(Control::Exit(code)) => {
+                    // Exit is uncatchable and skips remaining defers.
+                    *outcome = Err(Control::Exit(code));
+                    return;
+                }
+                Err(Control::Panic(e)) => merge_defer_panic(outcome, e),
+                // A Propagate escaping exec_defer_entry (shouldn't happen — the
+                // deferred call's run_body converts it to Ok; guard for totality).
+                Err(Control::Propagate(_)) => {}
+            }
+        }
+    }
+
+    /// Like [`exec`] but installs + drains a top-level defer frame (spec §2.3).
+    /// Use this instead of `exec` at the program entry point so top-level `defer`
+    /// statements run at program end. `exec` is kept frame-free for `run_body`
+    /// (which manages its own frame) and for recursive sub-exec calls (blocks/loops)
+    /// that share the enclosing function's defer list. `Control::Exit` from the body
+    /// skips the drain.
+    pub async fn exec_program(
+        &self,
+        program: &[Stmt],
+        env: &Environment,
+    ) -> Result<Flow, Control> {
+        let defer_list = self.push_defer_frame();
+        let body_result = self.exec(program, env).await;
+        self.pop_defer_frame();
+        // Exit skips defers (spec §3.3).
+        if let Err(Control::Exit(code)) = body_result {
+            return Err(Control::Exit(code));
+        }
+        let mut outcome: Result<Value, Control> = match body_result {
+            Ok(Flow::Return(v)) => Ok(v),
+            Ok(Flow::Normal) => Ok(Value::Nil),
+            Ok(Flow::Break) => Err(Control::Panic(AsError::at(
+                "'break' outside of a loop",
+                Span::new(0, 0),
+            ))),
+            Ok(Flow::Continue) => Err(Control::Panic(AsError::at(
+                "'continue' outside of a loop",
+                Span::new(0, 0),
+            ))),
+            Err(Control::Propagate(v)) => Ok(v), // top-level `?` → treat as normal
+            Err(Control::Panic(e)) => Err(Control::Panic(e)),
+            Err(Control::Exit(_)) => unreachable!("handled above"),
+        };
+        let entries = std::mem::take(&mut *defer_list.borrow_mut());
+        if !entries.is_empty() {
+            self.run_defers(entries, &mut outcome).await;
+        }
+        // Convert back to the Flow shape the entry points expect.
+        match outcome {
+            Ok(_) => Ok(Flow::Normal),
+            Err(Control::Panic(e)) => Err(Control::Panic(e)),
+            Err(Control::Propagate(v)) => Err(Control::Propagate(v)),
+            Err(Control::Exit(code)) => Err(Control::Exit(code)),
+        }
     }
 
     #[async_recursion(?Send)]
@@ -8836,6 +9172,7 @@ mod tests {
     /// Lex+parse+exec a program string, returning its captured `print` output.
     /// Panics (test failure) on a lex/parse error or a runtime panic. Runs under a
     /// `LocalSet` (and drains it) so M17 async-fn tasks behave like a real program.
+    /// Uses `exec_program` so top-level `defer` statements drain at program end.
     async fn run(src: &str) -> String {
         let interp = std::rc::Rc::new(Interp::new());
         interp.install_self();
@@ -8844,7 +9181,7 @@ mod tests {
         let env = global_env().child();
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") })
+            .run_until(async { interp.exec_program(&stmts, &env).await.expect("program panicked") })
             .await;
         local.await; // drain spawned async-fn tasks
         interp.output()
@@ -8981,6 +9318,8 @@ log.info("saved", {level: "HACK", userId: 5})
     }
 
     /// Like `run`, but expects a runtime panic and returns its `AsError`.
+    /// Uses `exec_program` so top-level `defer` drains first (defers run before the panic
+    /// escapes, matching the four-mode behaviour).
     async fn run_err(src: &str) -> AsError {
         let interp = std::rc::Rc::new(Interp::new());
         interp.install_self();
@@ -8989,7 +9328,7 @@ log.info("saved", {level: "HACK", userId: 5})
         let env = global_env().child();
         let local = tokio::task::LocalSet::new();
         let r = local
-            .run_until(async { interp.exec(&stmts, &env).await })
+            .run_until(async { interp.exec_program(&stmts, &env).await })
             .await;
         local.await;
         match r {
@@ -13301,5 +13640,333 @@ print(many([File(), File()]))
         m.insert("passed".to_string(), Value::Int(1));
         // missing `failed` and `failures`
         assert!(TestSummary::from_value(&Value::object(m)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // DEFER §3 TDD tests — tree-walker oracle (Tasks 2.1/2.2)
+    // -----------------------------------------------------------------------
+
+    // §3.1: args evaluated at statement time (not at function exit)
+    #[tokio::test]
+    async fn defer_args_evaluated_at_statement() {
+        let out = run(r#"
+fn f() {
+    let x = 1
+    defer print(x)
+    x = 2
+    print("body")
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "body\n1");
+    }
+
+    // §3.2: LIFO drain order
+    #[tokio::test]
+    async fn defer_lifo_order() {
+        let out = run(r#"
+fn f() {
+    defer print(1)
+    defer print(2)
+    defer print(3)
+    print("body")
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "body\n3\n2\n1");
+    }
+
+    // §2.3: function-scoped, not block-scoped
+    #[tokio::test]
+    async fn defer_function_scoped_not_block() {
+        let out = run(r#"
+fn f() {
+    if (true) {
+        defer print("deferred")
+    }
+    print("body")
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "body\ndeferred");
+    }
+
+    // §2.3: defer in loop accumulates entries, all run LIFO at function exit
+    #[tokio::test]
+    async fn defer_in_loop_accumulates() {
+        let out = run(r#"
+fn f() {
+    for (i in 1..=3) {
+        defer print(i)
+    }
+    print("body")
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "body\n3\n2\n1");
+    }
+
+    // §3.1: closure captures by cell — sees mutation (by-cell capture semantics)
+    #[tokio::test]
+    async fn defer_closure_sees_mutation() {
+        let out = run(r#"
+fn f() {
+    let x = 1
+    defer (() => print(x))()
+    x = 2
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "2");
+    }
+
+    // §3.1: opt-chain nil receiver — no entry pushed, side effects NOT evaluated
+    #[tokio::test]
+    async fn defer_optchain_nil_no_side_effect() {
+        let out = run(r#"
+fn side() { print("side") return 1 }
+fn f() {
+    let a = nil
+    defer a?.m(side())
+    print("body")
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "body");
+    }
+
+    // §3.1: member receiver captured at statement time, not at exit
+    #[tokio::test]
+    async fn defer_member_recv_evaluated_at_statement() {
+        let out = run(r#"
+class A { fn show() { print("A") } }
+class B { fn show() { print("B") } }
+fn f() {
+    let o = A()
+    defer o.show()
+    o = B()
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "A");
+    }
+
+    // §3.1: spread args materialized at statement time (later mutation invisible)
+    #[tokio::test]
+    async fn defer_spread_materialized_at_statement() {
+        // §3.1: spread args are evaluated at the defer statement site, not at drain time.
+        // Reassigning xs after the defer stmt does NOT affect the captured args.
+        let out = run(r#"
+fn collect(...xs) { print(xs) }
+fn f() {
+    let xs = [1, 2]
+    defer collect(...xs)
+    xs = [1, 2, 9]
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "[1, 2]");
+    }
+
+    // §2.3: top-level defer runs at program end (before the process exits)
+    #[tokio::test]
+    async fn defer_top_level_runs_at_program_end() {
+        let out = run(r#"
+defer print("end")
+print("start")
+"#).await;
+        assert_eq!(out.trim(), "start\nend");
+    }
+
+    // §3.3: defers drain on normal return
+    #[tokio::test]
+    async fn defer_runs_on_return() {
+        let out = run(r#"
+fn f() {
+    defer print("deferred")
+    print("before return")
+    return 42
+    print("unreachable")
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "before return\ndeferred");
+    }
+
+    // §3.3: defers drain on ? propagation (the [nil, err] pair is the pending outcome)
+    #[tokio::test]
+    async fn defer_runs_on_propagate() {
+        let out = run(r#"
+fn inner() { return [nil, "err"] }
+fn f() {
+    defer print("deferred")
+    inner()?
+    print("unreachable")
+}
+let [_, e] = f()
+print(e)
+"#).await;
+        assert_eq!(out.trim(), "deferred\nerr");
+    }
+
+    // §3.3: defers drain on panic unwind, innermost-first
+    #[tokio::test]
+    async fn defer_runs_on_panic_unwind() {
+        let out = run(r#"
+fn inner() {
+    defer print("inner defer")
+    panic("boom")
+}
+fn outer() {
+    defer print("outer defer")
+    inner()
+}
+recover(() => outer())
+print("done")
+"#).await;
+        assert_eq!(out.trim(), "inner defer\nouter defer\ndone");
+    }
+
+    // §3.6 r1: defer panic replaces normal return value — caller sees the panic
+    #[tokio::test]
+    async fn defer_panic_replaces_return() {
+        let err = run_err(r#"
+fn f() {
+    defer assert(false, "cleanup failed")
+    return 42
+}
+f()
+"#).await;
+        assert!(err.message.contains("cleanup failed"), "got: {}", err.message);
+    }
+
+    // §3.6 r2: defer panic supersedes ? propagation
+    #[tokio::test]
+    async fn defer_panic_supersedes_propagate() {
+        let err = run_err(r#"
+fn inner() { return [nil, "orig err"] }
+fn f() {
+    defer assert(false, "cleanup failed")
+    inner()?
+}
+f()
+"#).await;
+        assert!(err.message.contains("cleanup failed"), "got: {}", err.message);
+        assert!(!err.message.contains("orig err"), "should not contain orig err, got: {}", err.message);
+    }
+
+    // §3.6 r3: defer panic during an in-flight panic appends the EXACT suppressed note
+    #[tokio::test]
+    async fn defer_panic_during_panic_appends_note() {
+        let err = run_err(r#"
+fn f() {
+    defer assert(false, "cleanup failed")
+    assert(false, "boom")
+}
+f()
+"#).await;
+        assert_eq!(
+            err.message,
+            "boom (suppressed panic in deferred call: cleanup failed)",
+            "got: {}",
+            err.message
+        );
+    }
+
+    // §3.6 r4: a panicking defer doesn't skip later (older) defers
+    #[tokio::test]
+    async fn defer_middle_panic_all_run() {
+        // §3.6 r4: a panicking defer does NOT skip later (older) defers.
+        // Defers run LIFO: print(3) first, then panicking defer, then print(1).
+        let out = run(r#"
+fn f() {
+    defer print(1)
+    defer assert(false, "mid panic")
+    defer print(3)
+    assert(false, "boom")
+}
+let [_, e] = recover(() => f())
+print(e.message)
+"#).await;
+        // All three defers ran: 3 then 1 printed; "mid panic" appended as suppressed note.
+        assert!(out.contains("3"), "should see 3 in output, got: {}", out);
+        assert!(out.contains("1"), "should see 1 in output, got: {}", out);
+        assert!(out.contains("boom"), "should see 'boom' in output, got: {}", out);
+    }
+
+    // §3.7: deferred print runs BEFORE the failing return-type contract panic
+    #[tokio::test]
+    async fn defer_runs_before_return_contract_panic() {
+        let out = run(r#"
+fn f(): string {
+    defer print("deferred ran")
+    return 42
+}
+recover(() => f())
+print("done")
+"#).await;
+        assert!(out.contains("deferred ran"), "defer should run before contract, got: {}", out);
+        assert!(out.contains("done"), "done should be printed, got: {}", out);
+    }
+
+    // §3.2: result of a deferred call is discarded (Tier-1 [nil,err] pair ignored)
+    #[tokio::test]
+    async fn defer_result_discarded() {
+        let out = run(r#"
+fn might_fail() { return [nil, "e"] }
+fn f() {
+    defer might_fail()
+    print("body")
+}
+f()
+"#).await;
+        assert_eq!(out.trim(), "body");
+    }
+
+    // §3.4: bare (non-awaited) defer of an async fn raises the exact Tier-2 message
+    #[tokio::test]
+    async fn defer_bare_future_panics() {
+        let err = run_err(r#"
+async fn cleanup() { }
+fn f() {
+    defer cleanup()
+    print("body")
+}
+f()
+"#).await;
+        assert!(
+            err.message.contains("deferred call returned a future"),
+            "got: {}",
+            err.message
+        );
+        assert!(err.message.contains("defer await"), "got: {}", err.message);
+    }
+
+    // §3.4: `defer await f()` drives the future to completion
+    #[tokio::test]
+    async fn defer_await_happy_path() {
+        let out = run(r#"
+async fn cleanup() { print("async cleanup") }
+async fn f() {
+    defer await cleanup()
+    print("body")
+}
+await f()
+"#).await;
+        assert_eq!(out.trim(), "body\nasync cleanup");
+    }
+
+    // recover() sees the panic only AFTER every frame's defers have run
+    #[tokio::test]
+    async fn defer_recover_sees_panic_after_defers() {
+        let out = run(r#"
+fn f() {
+    defer print("cleanup")
+    assert(false, "original")
+}
+let [_, e] = recover(() => f())
+print(e.message)
+"#).await;
+        assert_eq!(out.trim(), "cleanup\noriginal");
     }
 }
