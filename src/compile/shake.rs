@@ -40,13 +40,13 @@
 //! growth over a finite name set).
 //!
 //! The closure / def-discovery machinery is shared with the worker code-slice builder
-//! (`crate::worker::dispatch`) — we reuse its `pub(crate)` helpers rather than
-//! re-walking bytecode here.
+//! (`crate::worker::dispatch`) — both reuse the neutral `pub(crate)` bytecode-analysis
+//! helpers in `crate::vm::bcanalysis` rather than re-walking bytecode here.
 
 use crate::span::Span;
 use crate::vm::chunk::Chunk;
 use crate::vm::opcode::Op;
-use crate::worker::dispatch::{
+use crate::vm::bcanalysis::{
     collect_range_refs, compute_closure, top_level_defs, top_level_statement_starts, TopDef,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
