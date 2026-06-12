@@ -4658,6 +4658,35 @@ impl Vm {
         entry: crate::interp::DeferEntry,
     ) -> Result<(), crate::interp::Control> {
         use crate::interp::Control;
+        // DEFER §3.4 VM fix: a bare `defer async_fn()` must produce the §3.4 loud
+        // Tier-2 error on the VM exactly as on the tree-walker. On the tree-walker,
+        // `call_value` for an async fn returns `Value::Future`, and the check below
+        // (`else if let Value::Future(_)`) fires. On the VM, `Vm::call_value` runs the
+        // async body INLINE (a fresh fiber, no `spawn_local`) and returns the body
+        // result directly — so the result is `Value::Nil`, not `Value::Future`, and the
+        // check never fires. We detect the mismatch HERE, before calling, by inspecting
+        // whether the callee is a VM async closure: if it is and `!entry.awaited`, raise
+        // the §3.4 panic immediately (byte-identical to the tree-walker). The `awaited`
+        // path intentionally keeps the inline execution (running the body synchronously
+        // inside the drain is correct for `defer await` — the side effects must happen
+        // before the drain completes, and a `spawn_local` inside the panic-unwind path
+        // would race with the caller frame's teardown).
+        if !entry.awaited {
+            let is_vm_async_closure = match &entry.kind {
+                crate::interp::DeferKind::Call { callee } => match callee {
+                    Value::Closure(c) => c.proto.is_async && !c.proto.is_generator,
+                    _ => false,
+                },
+                crate::interp::DeferKind::Method { .. } => false,
+            };
+            if is_vm_async_closure {
+                return Err(Control::Panic(crate::AsError::at(
+                    "deferred call returned a future that would be cancelled on drop \
+                     — use 'defer await f()' or do async cleanup before exit",
+                    entry.span,
+                )));
+            }
+        }
         let result = match entry.kind {
             crate::interp::DeferKind::Call { callee } => {
                 // Route through the VM's call_value so VM-compiled BoundMethods
@@ -4687,6 +4716,9 @@ impl Vm {
                 f.get().await.map(|_| ())?;
             }
         } else if let Value::Future(_) = result_v {
+            // Non-VM-compiled callables (native fns, interp builtins) that return a
+            // future: the existing post-call check catches them (byte-identical to the
+            // tree-walker's path).
             return Err(Control::Panic(crate::AsError::at(
                 "deferred call returned a future that would be cancelled on drop \
                  — use 'defer await f()' or do async cleanup before exit",

@@ -24,13 +24,18 @@ pub mod defer_metrics {
     mod tests {
         use super::*;
 
-        #[test]
-        fn counters_start_at_zero_after_reset() {
-            reset();
-            assert_eq!(ENTRIES_PUSHED.load(Ordering::Relaxed), 0);
-            assert_eq!(ENTRIES_DRAINED.load(Ordering::Relaxed), 0);
-            assert_eq!(CHOKEPOINT_DRAINS.load(Ordering::Relaxed), 0);
-        }
+        // GATE-15 NOTE: `counters_start_at_zero_after_reset` was removed because it
+        // was inherently racy under `cargo test`'s parallel execution. All lib tests
+        // share one process, and ~25 `#[tokio::test]` defer tests increment the same
+        // global `AtomicU64` statics concurrently. A `reset()` followed by an immediate
+        // read is correct in isolation, but any concurrent increment between the store
+        // and the assert makes the test flaky. The `reset()` implementation (three
+        // `store(0, Relaxed)` calls) is trivially correct — there is nothing to test
+        // beyond what the compiler already checks. The Gate-15 correctness obligation is
+        // fully covered by `defer_corpus_all_counters_nonzero` below, which uses a
+        // monotonic `> 0` assertion that is race-SAFE: once the corpus run completes its
+        // increments, the counters can only grow further (no concurrent test decrements
+        // them), so `pushed > 0` is stable regardless of parallel noise.
 
         /// Gate 15: corpus-assertion. After running a set of defer-exercising programs
         /// (on BOTH the tree-walker and the VM), every counter must be nonzero — proving

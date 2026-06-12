@@ -8828,3 +8828,64 @@ fn defer_at_max_call_depth_message_three_way_identical() {
     // All three engines should agree: "maximum recursion depth exceeded" is the message.
     sp3_assert_three_way_identical(&src);
 }
+
+/// §3.4 bare-future exact message — four-mode (spec §8.1 requires four-mode coverage).
+/// A bare `defer asyncFn()` where the call returns a Future is a Tier-2 panic at drain
+/// time with the exact message. Wrapped in `recover` so the panic is captured as a value
+/// and `print(err.message)` is the observable output — four-way identical.
+#[tokio::test]
+async fn defer_bare_future_message_four_way() {
+    let src = r#"
+async fn async_cleanup() { print("cleanup") }
+fn f() {
+    defer async_cleanup()   // bare defer of an async fn — future returned, not awaited
+}
+let [_, err] = recover(() => { f() })
+print(err.message)
+"#;
+    // Verify the exact §3.4 message before running the four-way check.
+    let tw = ascript::run_source_exit(src).await.expect("tree-walker ok");
+    assert_eq!(
+        tw.0.trim(),
+        "deferred call returned a future that would be cancelled on drop \
+         — use 'defer await f()' or do async cleanup before exit",
+        "exact §3.4 message not found on tree-walker; got: {:?}", tw.0
+    );
+    assert_four_way_run(src).await;
+}
+
+/// §3.7 return-contract check happens AFTER defers run — four-mode (spec §8.2).
+/// A function with a `: string` return-type annotation returns `42` (an int, wrong type).
+/// It also has `defer print("deferred ran")`. The defer MUST run before the contract
+/// panic. Wrapping in `recover` lets us see both the deferred print and confirm the
+/// contract panic fires — four-way identical across all engines.
+#[tokio::test]
+async fn defer_return_contract_ordering_four_way() {
+    let src = r#"
+fn f(): string {
+    defer print("deferred ran")
+    return 42
+}
+let [_, err] = recover(() => { f() })
+print(err != nil)
+"#;
+    // First verify on tree-walker that the deferred print appears before the error.
+    let tw = ascript::run_source_exit(src).await.expect("tree-walker ok");
+    assert!(
+        tw.0.contains("deferred ran"),
+        "§3.7: defer must run before return-contract panic; got: {:?}", tw.0
+    );
+    assert!(
+        tw.0.contains("true"),
+        "§3.7: contract-mismatch error must be non-nil; got: {:?}", tw.0
+    );
+    // Verify the deferred print appears BEFORE the error flag line (LIFO + ordering).
+    let deferred_pos = tw.0.find("deferred ran").unwrap();
+    let true_pos = tw.0.find("true").unwrap();
+    assert!(
+        deferred_pos < true_pos,
+        "§3.7: 'deferred ran' must appear before 'true' (contract panic); got: {:?}", tw.0
+    );
+    // All four modes must agree.
+    assert_four_way_run(src).await;
+}
