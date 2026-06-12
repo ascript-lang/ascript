@@ -11,7 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-BENCHES=(async_inline async_concurrent json_roundtrip object_churn workflow_loop)
+BENCHES=(async_inline async_concurrent json_roundtrip object_churn workflow_loop \
+         func_pipeline call_heavy server_request)
 BIN=target/profiling/ascript
 OUT=bench/out
 mkdir -p "$OUT"

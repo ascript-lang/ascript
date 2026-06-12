@@ -60,3 +60,64 @@ speeds up only the part that's already small on real code.
 
 Memory is flat at ~11 MB across all workloads — no leak/bloat signal; cancel-on-drop
 structured concurrency is keeping task memory tight.
+
+---
+
+## Phase-0 extension (2026-06-13) — functional / call-heavy / server-request workloads
+
+Goal: extend the bench corpus with three workloads that expose PERF campaign blind spots not covered by
+the original five: closure/callback dispatch (functional pipelines), raw function-call overhead (call-heavy
+tight loops), and JSON glue with dynamic dispatch (request-shaped workloads).
+
+- Machine: macOS 25.5.0, arm64, Rust 1.96, `--profile profiling` (release codegen + debug symbols).
+- Tools: `/usr/bin/time -l` (RSS), in-program `time.monotonic()`.
+- Reproduce: `bench/profiling/run.sh`. Programs: `bench/profiling/{func_pipeline,call_heavy,server_request}.as`.
+- **This is the pre-LANE baseline every PERF spec A/Bs against.**
+
+### Headline timings (new workloads only)
+
+| workload | VM ms | tree-walker ms | VM/TW speedup | peak RSS |
+|---|---:|---:|---:|---:|
+| func_pipeline (2k records × 2k filter/map/reduce rounds) | 2928 | 6406 | **2.19×** | 14 MB |
+| call_heavy (2M iters, 3 nested fn calls each) | 1917 | 8480 | **4.42×** | 12 MB |
+| server_request (500k JSON parse/route/stringify) | 2143 | 3720 | **1.74×** | 13 MB |
+
+### Key takeaways
+
+- **call_heavy shows the strongest VM/TW gap (4.42×)** — raw function-call dispatch is where the bytecode
+  VM's frame-reuse and slot-based calling convention most outpaces the tree-walker's `Environment` chain.
+  This is the workload that will most visibly benefit from a two-lane engine that avoids per-call overhead.
+
+- **func_pipeline (2.19×)** — closure re-entry and per-element callback dispatch are well-accelerated by
+  the VM. The remaining cost is dominated by allocation pressure (building filtered/mapped temporary arrays
+  per round) and closure cell indirection, not dispatch itself.
+
+- **server_request (1.74×)** — JSON parse/stringify dominates (~70%+), similar to json_roundtrip. The
+  routing lookup (object index + ?? nil-coalescing) and function dispatch are cheap by comparison.
+
+### Idiom adjustments from spec
+
+The spec's `func_pipeline` used JavaScript-style method chaining (`.filter().map().reduce()`). AScript
+array methods are module functions (`array.filter`, `array.map`, `array.reduce`), not instance methods.
+The workload was rewritten using the standard `array.*` pattern while preserving the measured shape:
+three-stage functional pipeline over realistic records, closure dispatch per element.
+
+The spec's `server_request` used 150k iterations (644ms on VM — too short). Scaled to 500k to reach the
+1.5–6s target window (2.1s on VM).
+
+### Self-A/B noise floor (geomean ≈ 1.00x proves harness is sound)
+
+`bench/ab.sh target/profiling/ascript target/profiling/ascript 3` output:
+
+| bench | base ms | cand ms | speedup | baseMB | candMB |
+|---|---:|---:|---:|---:|---:|
+| async_inline | 5218 | 5272 | 0.990x | 12 | 12 |
+| async_concurrent | 3154 | 3152 | 1.001x | 12 | 12 |
+| json_roundtrip | 2688 | 2702 | 0.995x | 12 | 12 |
+| object_churn | 4869 | 4897 | 0.994x | 12 | 12 |
+| workflow_loop | 27489 | 27610 | 0.996x | 13 | 13 |
+| func_pipeline | 2906 | 2981 | 0.975x | 14 | 14 |
+| call_heavy | 1857 | 1859 | 0.999x | 12 | 12 |
+| server_request | 2128 | 2118 | 1.005x | 12 | 13 |
+
+**geomean speedup = 0.994x** — noise floor confirmed, harness is ready for LANE A/B comparisons.
