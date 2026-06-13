@@ -8239,6 +8239,119 @@ pub(crate) struct BoundArgs {
     pub defaults: std::ops::Range<usize>,
 }
 
+/// CALL §3.3: shared arity gate — the EXACT wording/branching used by both
+/// `check_call_args` and `check_call_args_in_place`. "expected N" for exact
+/// arity (no rest, no defaults), "at least N" or "at most N" otherwise.
+/// Extracted so both callers carry byte-identical messages by construction.
+fn check_call_arity(
+    params: &[crate::ast::Param],
+    n_positional: usize,
+    has_rest: bool,
+    min: usize,
+    n_args: usize,
+    span: Span,
+    what: &str,
+) -> Result<(), Control> {
+    // Too few arguments.
+    if n_args < min {
+        // Preserve the EXACT pre-existing wording so goldens stay byte-identical:
+        // exact-arity (no rest, no defaults → min == max == len) keeps the
+        // "expected N" message; everything else (rest or defaults) uses "at least min".
+        let msg = if !has_rest && min == params.len() {
+            format!(
+                "{} expected {} argument(s), got {}",
+                what,
+                params.len(),
+                n_args
+            )
+        } else {
+            format!(
+                "{} expected at least {} argument(s), got {}",
+                what, min, n_args
+            )
+        };
+        return Err(AsError::at(msg, span).into());
+    }
+    // Too many arguments (only possible without a rest param, which is unbounded).
+    if !has_rest && n_args > n_positional {
+        let msg = if min == params.len() {
+            // No defaults → exact arity; keep the existing wording.
+            format!(
+                "{} expected {} argument(s), got {}",
+                what,
+                params.len(),
+                n_args
+            )
+        } else {
+            format!(
+                "{} expected at most {} argument(s), got {}",
+                what, n_positional, n_args
+            )
+        };
+        return Err(AsError::at(msg, span).into());
+    }
+    Ok(())
+}
+
+/// CALL §3.3: shared per-arg contract gate — the env-aware `check_type_env` /
+/// `check_type` fallback + `contract_panic`. Extracted so both callers carry
+/// byte-identical checks by construction.  Synchronous; never awaits.
+fn check_param_contract(
+    p: &crate::ast::Param,
+    a: &Value,
+    span: Span,
+    interp: Option<&Interp>,
+    env: Option<&Environment>,
+) -> Result<(), Control> {
+    if let Some(ty) = &p.ty {
+        // IFACE: when the engine supplies its resolution env (BOTH engines do), a
+        // `Type::Named` resolves env-aware (interface → structural `conforms`,
+        // class → nominal); an env-less internal caller falls to the env-free
+        // `check_type`, the exact pre-IFACE behavior — byte-identical for
+        // non-interface code.
+        let ok = match (interp, env) {
+            (Some(itp), Some(e)) => itp.check_type_env(a, ty, e)?,
+            _ => check_type(a, ty),
+        };
+        if !ok {
+            return Err(contract_panic(ty, a, span));
+        }
+    }
+    Ok(())
+}
+
+/// CALL §3: the borrowing twin of [`check_call_args`] — IDENTICAL arity and
+/// contract checks over args already positioned on the operand stack, no Vec
+/// consumed or produced. Caller guarantees `!has_rest` (rest collection
+/// genuinely allocates a new tail array; those calls keep the Vec path).
+///
+/// Returns the **supplied** count (== `args.len()`, capped at `n_positional`).
+/// The callee prologue (`Op::JumpIfArgSupplied`) uses `frame.argc` (set from
+/// this value) to decide whether to evaluate each defaulted param.
+pub(crate) fn check_call_args_in_place(
+    params: &[crate::ast::Param],
+    args: &[Value],
+    span: Span,
+    what: &str,
+    interp: Option<&Interp>,
+    env: Option<&Environment>,
+) -> Result<usize, Control> {
+    // Caller guarantees this; catch bugs early in debug builds.
+    debug_assert!(!params.last().is_some_and(|p| p.rest));
+    let n_positional = params.len(); // has_rest == false, so all params are positional
+    let min = params
+        .iter()
+        .take_while(|p| p.default.is_none())
+        .count();
+    check_call_arity(params, n_positional, false, min, args.len(), span, what)?;
+    // Contract-check the supplied args (left-to-right, same order as check_call_args).
+    let supplied = args.len().min(n_positional);
+    for (p, a) in params[..supplied].iter().zip(args[..supplied].iter()) {
+        check_param_contract(p, a, span, interp, env)?;
+    }
+    Ok(supplied)
+}
+
 pub(crate) fn check_call_args(
     params: &[crate::ast::Param],
     args: Vec<Value>,
@@ -8269,47 +8382,8 @@ pub(crate) fn check_call_args(
         .take_while(|p| p.default.is_none())
         .count();
 
-    // Too few arguments.
-    if args.len() < min {
-        // Preserve the EXACT pre-existing wording so goldens stay byte-identical:
-        // exact-arity (no rest, no defaults → min == max == len) keeps the
-        // "expected N" message; everything else (rest or defaults) uses
-        // "at least min".
-        let msg = if !has_rest && min == params.len() {
-            format!(
-                "{} expected {} argument(s), got {}",
-                what,
-                params.len(),
-                args.len()
-            )
-        } else {
-            format!(
-                "{} expected at least {} argument(s), got {}",
-                what,
-                min,
-                args.len()
-            )
-        };
-        return Err(AsError::at(msg, span).into());
-    }
-    // Too many arguments (only possible without a rest param, which is unbounded).
-    if !has_rest && args.len() > n_positional {
-        let msg = if min == params.len() {
-            // No defaults → exact arity; keep the existing wording.
-            format!(
-                "{} expected {} argument(s), got {}",
-                what,
-                params.len(),
-                args.len()
-            )
-        } else {
-            format!(
-                "{} expected at most {} argument(s), got {}",
-                what, n_positional, args.len()
-            )
-        };
-        return Err(AsError::at(msg, span).into());
-    }
+    // Arity check — delegates to the shared core so both callers use identical wording.
+    check_call_arity(params, n_positional, has_rest, min, args.len(), span, what)?;
 
     let mut values: Vec<Value> = Vec::with_capacity(params.len());
     let mut it = args.into_iter();
@@ -8318,20 +8392,8 @@ pub(crate) fn check_call_args(
     let supplied = it.len().min(n_positional);
     for p in &params[..supplied] {
         let a = it.next().unwrap();
-        if let Some(ty) = &p.ty {
-            // IFACE: when the engine supplies its resolution env (BOTH engines do), a
-            // `Type::Named` resolves env-aware (interface → structural `conforms`,
-            // class → nominal); an env-less internal caller falls to the env-free
-            // `check_type`, the exact pre-IFACE behavior — byte-identical for
-            // non-interface code.
-            let ok = match (interp, env) {
-                (Some(itp), Some(e)) => itp.check_type_env(&a, ty, e)?,
-                _ => check_type(&a, ty),
-            };
-            if !ok {
-                return Err(contract_panic(ty, &a, span));
-            }
-        }
+        // Per-param contract check — delegates to the shared core.
+        check_param_contract(p, &a, span, interp, env)?;
         values.push(a);
     }
     // Placeholders for the omitted trailing defaulted positions (filled by the

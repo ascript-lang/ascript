@@ -62,17 +62,16 @@ fn slope(make_src: impl Fn(u64) -> String, call_fast: bool) -> f64 {
     (b.saturating_sub(a)) as f64 / N as f64
 }
 
-/// A1 (Task 2.1 gate): capture-free calls must show reduced per-call allocs
-/// after the empty-cells fast path lands. A1 is NOT gated on `call_fast` (it is
-/// behavior-invisible — an empty vec is indistinguishable from an all-None vec
-/// via `.get`), so BOTH `on` and `off` paths benefit. The assert therefore uses
-/// an absolute slope bound that proves the cells-vec alloc is gone: before A1
-/// the slope was ~3 (cells-vec + 2 arg Vecs); after A1 it is ~2.
+/// A1+A2 (Task 2.1/2.2 gate): capture-free calls must show reduced per-call allocs.
+/// A1 (empty-cells fast path) is always-on and benefits both call_fast=true and
+/// call_fast=false. A2 (in-place arg binding) is gated on call_fast=true and
+/// eliminates the 2 arg Vecs (the `vec![Value::Nil; argc]` in push_closure_frame
+/// and the `BoundArgs.values` Vec from check_call_args).
 ///
-/// The strict bound (`< 1.0`) is tightened in Task 2.2 once A2 (in-place arg
-/// binding, which eliminates the 2 arg Vecs and is gated on `call_fast`) lands.
+/// After A2: `call_fast=true` path should reach ~0 allocs/call (slope < 1.0).
+/// After A1 only: `call_fast=false` path is ~2 (cells-vec gone, 2 arg Vecs remain).
 #[test]
-fn capture_free_call_alloc_slope_drops_with_a1() {
+fn capture_free_call_alloc_slope_drops_with_a1_and_a2() {
     let mk = |n: u64| {
         format!(
             "fn f(a, b) {{ return a + b }}\nlet s = 0\nfor (i in 0..{n}) {{ s = f(s, 1) }}\nprint(s)"
@@ -81,22 +80,21 @@ fn capture_free_call_alloc_slope_drops_with_a1() {
     // `mk` is a non-capturing closure (Copy), so it can be passed by value twice.
     let on = slope(mk, true);
     let off = slope(mk, false);
-    // A1 removes the cells vector (1 allocation) from every capture-free call.
-    // Pre-A1 slope was ~3; post-A1 slope is ~2. Both on and off benefit since
-    // A1 is always-on. The bound proves the cells-vec is gone, not just noise.
+    // A2: with call_fast=true, in-place binding eliminates the 2 arg Vecs.
+    // Combined with A1 (cells-vec gone), the qualifying call shape allocates ~0.
     assert!(
-        on < 3.0,
-        "A1 post: per-call alloc slope should be below 3.0 (cells-vec removed), got on={on}"
+        on < 1.0,
+        "A2 post: per-call alloc slope should be below 1.0 (in-place binding), got on={on}"
     );
+    // A1 (no A2): call_fast=false still removes the cells-vec but keeps 2 arg Vecs.
+    // Slope should be below 3.0 (was ~3 pre-A1, now ~2).
     assert!(
         off < 3.0,
         "A1 post: per-call alloc slope should be below 3.0 (cells-vec removed), got off={off}"
     );
-    // Both paths are identical for A1 (not gated); the on/off delta proves
-    // no regression is introduced by the call_fast infrastructure.
-    let delta = (on - off).abs();
+    // The in-place path should be meaningfully faster than the fallback.
     assert!(
-        delta < 0.5,
-        "A1: call_fast on/off paths should be identical (A1 not gated), delta={delta} on={on} off={off}"
+        on < off,
+        "A2: call_fast=true slope {on} should be less than call_fast=false slope {off}"
     );
 }

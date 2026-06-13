@@ -122,3 +122,54 @@ async fn no_call_fast_mode_error_paths_identical() {
         assert_five_mode_identical(src).await;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Task 2.2 (A2): panic-wording parity battery
+//  (CALL §3.4 — the in-place path must be byte-identical across all five modes)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arity/contract panic wording is byte-identical across all five modes for
+/// every arg shape the in-place path touches (CALL §3.4). Covers the 7 cases
+/// enumerated in the spec: too-few, too-many, default referencing earlier param,
+/// too-few even with defaults, contract on 2nd arg, rest-fallback with contract
+/// violation, and rest-fallback success.
+#[tokio::test]
+async fn arg_panic_wording_parity() {
+    let cases = [
+        // 1. exact arity, too few
+        r#"fn f(a, b) {} f(1)"#,
+        // 2. exact arity, too many
+        r#"fn f(a, b) {} f(1, 2, 3)"#,
+        // 3. default referencing earlier param (succeeds, prints 6)
+        r#"fn f(a, b = a + 1) { print(b) } f(5)"#,
+        // 4. too few even with default (a is required → "at least 1")
+        r#"fn f(a, b = 1) {} f()"#,
+        // 5. contract on 2nd arg (left-to-right order)
+        r#"fn f(a: number, b: string) {} f(1, 2)"#,
+        // 6. rest param, falls back — contract violation on rest element
+        r#"fn f(a, ...rest: array<number>) { print(rest) } f(1, 2, "x")"#,
+        // 7. rest param, falls back — succeeds
+        r#"fn f(...rest) { print(rest) } f(1, 2, 3)"#,
+    ];
+    for src in cases {
+        assert_five_mode_identical(src).await;
+    }
+}
+
+/// A2 anti-false-green: `inplace_binds` counter must be > 0 after running
+/// call-heavy code on a specialized VM with `call_fast=true`. This proves
+/// the fast path actually fires, not just that the output is coincidentally
+/// identical (CALL §8.3).
+#[tokio::test]
+async fn inplace_binds_counter_is_nonzero() {
+    let src =
+        r#"fn f(a, b) { return a + b } let s = 0 for (i in 0..100) { s = f(s, 1) } print(s)"#;
+    let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("vm_run_source_call_fast_stats failed");
+    assert!(
+        stats.inplace_binds > 0,
+        "A2: inplace_binds should be > 0 after 100 qualifying calls, got {}",
+        stats.inplace_binds
+    );
+}

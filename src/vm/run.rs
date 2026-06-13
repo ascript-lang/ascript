@@ -3038,6 +3038,11 @@ impl Vm {
                             _ => unreachable!("already checked above"),
                         };
                         let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                        // CallSpread always goes through push_closure_frame (args were
+                        // already flattened onto the stack, so in-place applies, but
+                        // CallSpread is rare enough and rest-eligible that we keep the
+                        // simpler path for clarity; the A2 fast path targets the common
+                        // Op::Call shape where args are already individually on the stack).
                         self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
                     } else {
                         // Op::Call: argc is the static operand.
@@ -3061,7 +3066,53 @@ impl Vm {
                             _ => unreachable!("already checked above"),
                         };
                         let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                        // CALL §3 (A2): in-place arg binding fast path in the sync lane.
+                        // Same qualification and mechanism as the async arm above.
+                        if self.call_fast && !callee.proto.has_rest {
+                            let supplied = crate::interp::check_call_args_in_place(
+                                &callee.proto.params,
+                                &fiber.stack[callee_idx + 1..callee_idx + 1 + argc],
+                                call_span,
+                                callee.proto.chunk.name.as_deref().unwrap_or("function"),
+                                Some(&self.interp),
+                                Some(&self.class_env()),
+                            )?;
+                            fiber.stack.remove(callee_idx);
+                            let slot_base = callee_idx;
+                            let slot_count = callee.proto.chunk.slot_count as usize;
+                            let cells = super::fiber::alloc_cells(
+                                slot_count,
+                                &callee.proto.chunk.cell_slots,
+                            );
+                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                            if !cells.is_empty() {
+                                for slot in 0..supplied {
+                                    if let Some(cell) =
+                                        cells.get(slot).and_then(|c| c.as_ref())
+                                    {
+                                        *cell.borrow_mut() = std::mem::replace(
+                                            &mut fiber.stack[slot_base + slot],
+                                            Value::Nil,
+                                        );
+                                    }
+                                }
+                            }
+                            self.bump_stat(|s| s.inplace_binds += 1);
+                            self.enter_frame_depth(call_span)?;
+                            fiber.frames.push(super::fiber::CallFrame {
+                                closure: callee,
+                                ip: 0,
+                                slot_base,
+                                cells,
+                                ret_span: call_span,
+                                def_class: None,
+                                argc: supplied,
+                                defers: Vec::new(),
+                            });
+                            self.publish_profile_frames(fiber);
+                        } else {
+                            self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                        }
                     }
                     // Continue the loop in the new (or returned-to) frame.
                     *retired += 1;
@@ -3830,13 +3881,89 @@ impl Vm {
                             // The call-site span anchors arity/contract/return
                             // panics exactly where the tree-walker's do.
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            // LANE Task 3: shared plain-call body (also used by
-                            // run_loop_sync). Pops args + callee, checks arity +
-                            // contracts, allocates cells, pushes the CallFrame (one
-                            // enter_frame_depth — SP3 §B), publishes profiler frames.
-                            self.push_closure_frame(
-                                fiber, callee, argc, callee_idx, call_span,
-                            )?;
+                            // CALL §3 (A2): in-place arg binding fast path.
+                            //
+                            // Qualifies when:
+                            //   1. `call_fast` kill switch is on.
+                            //   2. `!has_rest` — rest collection genuinely allocates a
+                            //      new tail array; those calls keep the Vec path.
+                            //
+                            // The args already sit contiguously at
+                            // `stack[callee_idx+1 .. callee_idx+1+argc]`, one slot above
+                            // the new frame's window. `check_call_args_in_place` runs the
+                            // SAME shared cores (arity + per-param contracts) that
+                            // `check_call_args` uses — wording/order byte-identical by
+                            // construction (CALL §3.4). Defaults are NOT evaluated here;
+                            // the callee prologue (`Op::JumpIfArgSupplied`) reads
+                            // `frame.argc` (the supplied count) to decide per defaulted
+                            // param, and `resize` fills remaining slots with the same
+                            // `Nil` the `BoundArgs` placeholders carried — identical
+                            // layout, zero extra allocation.
+                            if self.call_fast && !callee.proto.has_rest {
+                                let supplied = crate::interp::check_call_args_in_place(
+                                    &callee.proto.params,
+                                    &fiber.stack[callee_idx + 1..callee_idx + 1 + argc],
+                                    call_span,
+                                    callee.proto.chunk.name.as_deref().unwrap_or("function"),
+                                    Some(&self.interp),
+                                    Some(&self.class_env()),
+                                )?;
+                                // Drop the callee value; the `argc` args shift down one
+                                // slot to start AT slot_base (an argc-element memmove,
+                                // zero allocation).
+                                fiber.stack.remove(callee_idx);
+                                let slot_base = callee_idx;
+                                let slot_count = callee.proto.chunk.slot_count as usize;
+                                let cells = super::fiber::alloc_cells(
+                                    slot_count,
+                                    &callee.proto.chunk.cell_slots,
+                                );
+                                // Extend to the full frame window; slots beyond `argc`
+                                // default to `Nil` (the same value the BoundArgs
+                                // placeholders carried for omitted defaulted params).
+                                fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                                // Rare: a param whose resolver-assigned slot is a cell
+                                // slot (a callback that captures AND mutates a param).
+                                // Move it from the window into its cell.
+                                if !cells.is_empty() {
+                                    for slot in 0..supplied {
+                                        if let Some(cell) =
+                                            cells.get(slot).and_then(|c| c.as_ref())
+                                        {
+                                            *cell.borrow_mut() = std::mem::replace(
+                                                &mut fiber.stack[slot_base + slot],
+                                                Value::Nil,
+                                            );
+                                        }
+                                    }
+                                }
+                                self.bump_stat(|s| s.inplace_binds += 1);
+                                // SP3 §B: one logical-call increment per frame push.
+                                self.enter_frame_depth(call_span)?;
+                                fiber.frames.push(super::fiber::CallFrame {
+                                    closure: callee,
+                                    ip: 0,
+                                    slot_base,
+                                    cells,
+                                    ret_span: call_span,
+                                    def_class: None,
+                                    argc: supplied,
+                                    defers: Vec::new(),
+                                });
+                                // DBG Task 7: publish the new frame stack to a profiler.
+                                self.publish_profile_frames(fiber);
+                            } else {
+                                // Fallback: pop-into-Vec + check_call_args (rest params,
+                                // or call_fast kill switch off). Behavior-identical to the
+                                // pre-A2 path.
+                                // LANE Task 3: shared plain-call body (also used by
+                                // run_loop_sync). Pops args + callee, checks arity +
+                                // contracts, allocates cells, pushes the CallFrame (one
+                                // enter_frame_depth — SP3 §B), publishes profiler frames.
+                                self.push_closure_frame(
+                                    fiber, callee, argc, callee_idx, call_span,
+                                )?;
+                            }
                             // Continue the loop in the new frame.
                         }
                         other => {
