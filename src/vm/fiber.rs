@@ -57,10 +57,24 @@ pub struct CallFrame {
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
 /// (every captured local). `slot_count` sizes the vector; each cell slot gets a
 /// fresh `Cc<RefCell<Value::Nil>>`, every other slot is `None`.
+///
+/// **CALL §2 — A1 empty-cells fast path:** when `cell_slots` is empty (the
+/// overwhelmingly common case — most functions capture nothing by reference),
+/// this returns `Vec::new()` which is **allocation-free** (no heap touch).
+/// Every consumer that indexes the returned vector uses `.get(slot)` so an
+/// empty vector is safe by construction and indistinguishable from an all-`None`
+/// vector. This is therefore **behavior-invisible** and is NOT gated on the
+/// `call_fast` flag; the differential is the correctness guard.
 pub(crate) fn alloc_cells(
     slot_count: usize,
     cell_slots: &[u32],
 ) -> Vec<Option<Cc<RefCell<Value>>>> {
+    // CALL §2: the overwhelmingly common case — this frame captures nothing by
+    // reference — allocates NOTHING. Every binding consumer uses `.get(slot)`
+    // so the empty vector is safe and behavior-identical to an all-`None` vec.
+    if cell_slots.is_empty() {
+        return Vec::new();
+    }
     let mut cells = vec![None; slot_count];
     for &slot in cell_slots {
         let idx = slot as usize;
@@ -323,5 +337,17 @@ mod tests {
         fiber.set_local(1, Value::Float(42.0));
         assert!(matches!(fiber.local(1), Value::Float(n) if *n == 42.0));
         assert!(matches!(fiber.local(0), Value::Nil));
+    }
+
+    #[test]
+    fn alloc_cells_is_allocation_free_when_no_cell_slots() {
+        // CALL §2: with no cell slots the returned Vec must be empty and heap-free.
+        let cells = alloc_cells(8, &[]);
+        assert!(cells.is_empty(), "no cell slots => empty Vec (capacity 0, no heap alloc)");
+        assert_eq!(cells.capacity(), 0);
+        // With cell slots the vector is still fully sized (unchanged behavior).
+        let cells = alloc_cells(3, &[1]);
+        assert_eq!(cells.len(), 3);
+        assert!(cells[1].is_some());
     }
 }
