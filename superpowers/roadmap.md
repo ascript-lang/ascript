@@ -550,6 +550,45 @@ dispatch driver over the existing `Fiber` without touching the tree-walker or `.
 - **Post-LANE re-profile + EXEC gate:** residual async share ≥70% on `async_inline`, ≥60% on
   `async_concurrent` — well above the ≥15% EXEC gate. **EXEC gate: OPEN.** EXEC remains #1 priority.
 
+## CALL — call-path allocation diet + callback trampoline ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-call-path-diet-design.md`, plan
+`…/plans/2026-06-12-call-path-diet.md`. The campaign's second engine spec — three allocation units
+plus a higher-order callback trampoline. Depends on LANE (Unit B uses `run_loop_sync`). VM-only;
+tree-walker untouched; no `.aso` change (`ASO_FORMAT_VERSION` 28 unchanged).
+
+- **Mechanism (A1–A3 + Unit B):** A1: `alloc_cells` returns `Vec::new()` when `cell_slots` is empty
+  — capture-free frames allocate no cells vector (always-on). A2: in-place argument binding over the
+  operand-stack window for the qualifying `Op::Call` plain-Closure arm (`call_fast=true`, `!has_rest`)
+  — eliminates the `vec![Value::Nil; argc]` and `BoundArgs.values` Vec allocations; combined with A1:
+  **0 allocs/qualifying call**. A3: fiber pool (`FIBER_POOL_MAX = 8`) at three re-entrant call
+  funnels; take=exclusive-ownership; return-only-on-`Done`; on `Err` fiber is dropped. Reset
+  allocates fresh cells per element (capture identity preserved). Generator/module/root fibers
+  never pooled. Unit B: `Value::Closure` callee detected by `CallbackTrampoline::arm`; the
+  higher-order stdlib builtins drive elements through ONE reused fiber on LANE's sync lane with
+  per-element escalation to the async driver on suspension.
+- **Kill switch:** `Vm.call_fast` (bool, default true) + env `ASCRIPT_NO_CALL_FAST=1`.
+  `Vm::new_generic` disables it. Cost-free when off.
+- **Differential:** five-way identity (tree-walker == specialized-on == specialized-off ==
+  generic-on == no-call-fast). `vm_run_source_no_call_fast` added to `vm_differential.rs` (both
+  feature configs). `tests/alloc_count.rs` slope harness. Coverage assertions:
+  `trampoline_calls`/`inplace_binds`/`trampoline_escalations` > 0. `vm_differential` **424/0**
+  both feature configs.
+- **Performance (`bench/CALL_RESULTS.md`, same-session A/B, Gate 16):** A/B geomean **1.000×**
+  (func_pipeline +1.1%, call_heavy +1.6%; non-functional workloads within ±1.1% noise). A1+A2
+  alloc slope **0.000/call** (< 1.0 budget). A3 alloc slope **15 vs 31/element** (on ≤ off+2).
+  Spec/tw geomean **4.05×**. DBG zero-cost gate **1.005×**. RSS: no regression.
+- **Post-CALL re-profile + lever re-rank:** Post-CALL profiling shows `func_pipeline`'s bottleneck
+  has shifted from call-path allocation (driven to ~0) to object hashing/storage (SipHash on IndexMap
+  in filter/map) and async dispatch overhead. Remaining levers re-ranked: EXEC (#1 — async tax, gate
+  OPEN), SHAPE (#2 — object hashing/storage, new func_pipeline ceiling), NANB (#3 — value rep),
+  DECODE (#4 — pre-decoded dispatch). CALL's primary win is structural: 0 allocs/qualifying call + 16
+  allocs/element saved (Gate 18); wall-clock (+1.1%) reflects fast-allocator amortisation on this
+  hardware.
+- **Spec deltas (recorded):** stream-stage trampoline is per-element (not cross-element — `Stage`
+  must be `Clone`; follow-up to DECODE); `Op::CallMethod` in-place binding deferred to DECODE;
+  smallvec alternative not needed (in-place binding sufficed).
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

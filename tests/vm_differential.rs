@@ -5619,26 +5619,30 @@ async fn ic_mixed_object_and_instance_same_site() {
 //  failure by relaxing the assertion: investigate the guard.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run `src` on all four engine modes and assert byte-identical outcomes:
-/// tree-walker == specialized-VM (lane-on) == generic-VM == specialized-VM (lane-off).
+/// Run `src` on all five engine modes and assert byte-identical outcomes:
+/// tree-walker == specialized-VM (lane-on) == generic-VM == specialized-VM
+/// (lane-off) == specialized-VM (no-call-fast).
 /// The outcome of each engine is normalized to `Ok((stdout, exit))` or
 /// `Err(rendered-message)`, so a faulting program (panic) compares too — a panic
 /// in one engine but not the others is itself a divergence and fails the assertion.
 ///
-/// LANE §6.1: the lane-off projection is added here so every call site that
-/// previously exercised three-way identity now exercises four-way identity for free.
+/// LANE §6.1: the lane-off projection was added here so every call site that
+/// previously exercised three-way identity now exercises four-way identity.
+/// CALL §8.1: the no-call-fast projection is the fifth mode — added in the SAME
+/// commit as the kill switch so coverage is wired before any fast path lands.
 async fn assert_three_way_matches(src: &str) {
     let tw = ascript::run_source_exit(src).await;
     let spec = ascript::vm_run_source(src).await;
     let generic = ascript::vm_run_source_generic(src).await;
     let nolane = ascript::vm_run_source_no_sync_lane(src).await;
+    let nocf = ascript::vm_run_source_no_call_fast(src).await;
 
     let norm = |r: &Result<(String, Option<i32>), ascript::error::AsError>| match r {
         Ok((out, code)) => Ok((out.clone(), *code)),
         Err(e) => Err(e.to_string()),
     };
-    let (tw_n, spec_n, gen_n, nolane_n) =
-        (norm(&tw), norm(&spec), norm(&generic), norm(&nolane));
+    let (tw_n, spec_n, gen_n, nolane_n, nocf_n) =
+        (norm(&tw), norm(&spec), norm(&generic), norm(&nolane), norm(&nocf));
 
     // The load-bearing assertion of the whole task: generic == specialized.
     assert_eq!(
@@ -5663,6 +5667,13 @@ async fn assert_three_way_matches(src: &str) {
         tw_n, nolane_n,
         "VM (lane-off) diverged from the tree-walker.\n  src: {src:?}\n  \
          tree-walker: {tw_n:?}\n  lane-off:    {nolane_n:?}"
+    );
+    // CALL §8.1: no-call-fast must be byte-identical to all other modes (the kill
+    // switch is INERT — no behavior change, only speed when the fast paths land).
+    assert_eq!(
+        tw_n, nocf_n,
+        "VM (no-call-fast) diverged from the tree-walker.\n  src: {src:?}\n  \
+         tree-walker:   {tw_n:?}\n  no-call-fast: {nocf_n:?}"
     );
 }
 

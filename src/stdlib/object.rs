@@ -349,14 +349,11 @@ impl Interp {
                 // borrow is held across any .await point.
                 let src = object_like_fields(&arg(args, 0), span, "object.mapValues")?;
                 let f = arg(args, 1);
+                let mut cb = self.callback_driver(f, span);
                 let mut out = IndexMap::new();
                 for (k, v) in src.iter() {
-                    let mapped = self
-                        .call_value(
-                            f.clone(),
-                            vec![v.clone(), Value::Str(k.as_str().into())],
-                            span,
-                        )
+                    let mapped = cb
+                        .call2(v.clone(), Value::Str(k.as_str().into()))
                         .await?;
                     out.insert(k.clone(), mapped);
                 }

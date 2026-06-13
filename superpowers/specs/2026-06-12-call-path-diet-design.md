@@ -1,6 +1,6 @@
 # Call-Path Allocation Diet + Higher-Order Callback Trampoline — Design (CALL)
 
-- **Status:** Draft for review
+- **Status:** Implemented (merged on feat/call-path-diet)
 - **Date:** 2026-06-12
 - **Code:** CALL (Performance & Memory campaign, `goal-perf.md` — Foundation wave, second spec)
 - **Depends on:** **LANE** (`superpowers/specs/2026-06-12-two-lane-engine-design.md`) — Unit B
@@ -19,6 +19,27 @@
   the callee is a VM `Value::Closure` (§5.1).
 - **Breaking:** **no.** No syntax change, no semantics change, no `.aso` change
   (`ASO_FORMAT_VERSION` untouched), no opcode change. Runtime-internal allocation shape only.
+
+### Implementation deltas (recorded against this spec, 2026-06-13)
+
+Three narrowings relative to the spec text, each documented and intentional:
+
+1. **Stream-stage trampoline is per-element, not cross-element.** The spec §5.3 sketched a
+   per-pipeline-stage trampoline reuse. The shipped implementation is per-element: a single
+   `CallbackTrampoline` fiber is taken from the pool at the start of each element and returned
+   on `Done`. Cross-element reuse across a `Stage` boundary was deferred because `Stage` must be
+   `Clone` but `CallbackTrampoline` is not (it owns a live `Fiber`). Documented as a follow-up
+   for DECODE (which may restructure the stage model). Behavior is byte-identical.
+
+2. **`Op::CallMethod` in-place binding deferred to DECODE.** The spec §3 listed in-place binding
+   for both `Op::Call` and `Op::CallMethod`. The shipped A2 covers only the `Op::Call`
+   plain-Closure arm (the dominant case). `Op::CallMethod` in-place binding is recorded as the
+   first DECODE task (§7 follow-up). The method-IC fast path was unchanged. Behavior and alloc
+   budget gates are met on the shipped subset.
+
+3. **`smallvec` alternative not needed.** The spec §3.5 recorded a `SmallVec<[Value; 4]>`
+   fallback for A2. In-place stack-window binding sufficed to reach 0 allocs/qualifying call —
+   the smallvec path was never exercised and is not shipped.
 
 ---
 

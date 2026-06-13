@@ -53,9 +53,10 @@ impl Interp {
                 let arr = want_array(&arg(args, 0), span, &ctx("map"))?;
                 let f = arg(args, 1);
                 let items = arr.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 let mut out = Vec::with_capacity(items.len());
                 for item in items.into_iter() {
-                    let v = self.call_value(f.clone(), vec![item], span).await?;
+                    let v = cb.call1(item).await?;
                     out.push(v);
                 }
                 Ok(Value::Array(crate::value::ArrayCell::new(out)))
@@ -64,9 +65,10 @@ impl Interp {
                 let arr = want_array(&arg(args, 0), span, &ctx("filter"))?;
                 let f = arg(args, 1);
                 let items = arr.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 let mut out = Vec::new();
                 for item in items.into_iter() {
-                    let keep = self.call_value(f.clone(), vec![item.clone()], span).await?;
+                    let keep = cb.call1(item.clone()).await?;
                     if keep.is_truthy() {
                         out.push(item);
                     }
@@ -78,8 +80,9 @@ impl Interp {
                 let f = arg(args, 1);
                 let mut acc = arg(args, 2);
                 let items = arr.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 for item in items.into_iter() {
-                    acc = self.call_value(f.clone(), vec![acc, item], span).await?;
+                    acc = cb.call2(acc, item).await?;
                 }
                 Ok(acc)
             }
@@ -145,15 +148,12 @@ impl Interp {
                         // async comparator). Stable: insertion stops at the first strictly
                         // negative compare, so equal-key elements keep their input order.
                         let mut sorted: Vec<Value> = Vec::with_capacity(items.len());
+                        let mut cb = self.callback_driver(f, span);
                         for item in items.into_iter() {
                             let mut lo = 0usize;
                             while lo < sorted.len() {
-                                let r = self
-                                    .call_value(
-                                        f.clone(),
-                                        vec![item.clone(), sorted[lo].clone()],
-                                        span,
-                                    )
+                                let r = cb
+                                    .call2(item.clone(), sorted[lo].clone())
                                     .await?;
                                 let n = match r.as_f64() {
                                     Some(n) => n,
@@ -184,12 +184,9 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("find"))?;
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 for item in items.into_iter() {
-                    if self
-                        .call_value(f.clone(), vec![item.clone()], span)
-                        .await?
-                        .is_truthy()
-                    {
+                    if cb.call1(item.clone()).await?.is_truthy() {
                         return Ok(item);
                     }
                 }
@@ -199,12 +196,9 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("findIndex"))?;
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 for (i, item) in items.into_iter().enumerate() {
-                    if self
-                        .call_value(f.clone(), vec![item], span)
-                        .await?
-                        .is_truthy()
-                    {
+                    if cb.call1(item).await?.is_truthy() {
                         // NUM §4: an index is an `Int`.
                         return Ok(Value::Int(i as i64));
                     }
@@ -215,12 +209,9 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("some"))?;
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 for item in items.into_iter() {
-                    if self
-                        .call_value(f.clone(), vec![item], span)
-                        .await?
-                        .is_truthy()
-                    {
+                    if cb.call1(item).await?.is_truthy() {
                         return Ok(Value::Bool(true));
                     }
                 }
@@ -230,12 +221,9 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("every"))?;
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 for item in items.into_iter() {
-                    if !self
-                        .call_value(f.clone(), vec![item], span)
-                        .await?
-                        .is_truthy()
-                    {
+                    if !cb.call1(item).await?.is_truthy() {
                         return Ok(Value::Bool(false));
                     }
                 }
@@ -272,9 +260,10 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("flatMap"))?;
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 let mut out = Vec::new();
                 for item in items.into_iter() {
-                    let mapped = self.call_value(f.clone(), vec![item], span).await?;
+                    let mapped = cb.call1(item).await?;
                     match mapped {
                         Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
                         other => out.push(other),
@@ -379,9 +368,10 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("groupBy"))?;
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 let mut groups: IndexMap<MapKey, Vec<Value>> = IndexMap::new();
                 for item in items.into_iter() {
-                    let key = self.call_value(f.clone(), vec![item.clone()], span).await?;
+                    let key = cb.call1(item.clone()).await?;
                     let mk = MapKey::from_value(&key).ok_or_else(|| -> Control {
                         AsError::at("array.groupBy key must be a string, number, or bool", span)
                             .into()
@@ -398,13 +388,10 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("partition"))?;
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
+                let mut cb = self.callback_driver(f, span);
                 let (mut pass, mut fail) = (Vec::new(), Vec::new());
                 for item in items.into_iter() {
-                    if self
-                        .call_value(f.clone(), vec![item.clone()], span)
-                        .await?
-                        .is_truthy()
-                    {
+                    if cb.call1(item.clone()).await?.is_truthy() {
                         pass.push(item);
                     } else {
                         fail.push(item);

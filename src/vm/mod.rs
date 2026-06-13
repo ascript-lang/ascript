@@ -18,6 +18,7 @@ pub mod instrument;
 pub mod opcode;
 pub mod run;
 pub mod shape;
+pub(crate) mod trampoline;
 pub mod stack;
 pub mod value_ext;
 pub mod verify;

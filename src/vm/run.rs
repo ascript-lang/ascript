@@ -68,6 +68,25 @@ pub(crate) enum SyncOutcome {
     NeedsAsync,
 }
 
+/// **CALL §8.3 — per-VM fast-path coverage counters.**
+///
+/// Bumped (via [`Vm::bump_stat`]) when a call-path fast path actually fires.
+/// All four counters start at 0 and stay 0 until the corresponding fast path
+/// is wired in Phase 2/3; Phase 1 ships the struct and accessor so the test
+/// scaffolding can compile.  Asserted `>0` over the functional corpus in
+/// `tests/call_fast.rs` as an anti-false-green gate.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CallFastStats {
+    /// A1+A2: calls that used in-place operand-stack argument binding (no Vec).
+    pub inplace_binds: u64,
+    /// A3: re-entrant `call_value` / method-dispatch calls that reused a pooled fiber.
+    pub pooled_fiber_reuses: u64,
+    /// B: callback elements dispatched through the `CallbackTrampoline` sync lane.
+    pub trampoline_calls: u64,
+    /// B: trampoline elements that escalated to the async driver (callback suspended).
+    pub trampoline_escalations: u64,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -225,6 +244,44 @@ pub struct Vm {
     /// the sync driver was entered (one burst = one uninterrupted run of the sync
     /// lane until a non-sync op is reached). Zero until Task 4.
     lane_bursts: std::cell::Cell<u64>,
+    /// **The CALL kill switch (CALL §8.1).** Gates EVERY call-path fast path this
+    /// spec adds: the empty-cells return (A1), in-place arg binding (A2), fiber
+    /// pooling (A3), and trampoline arming (B). Permanent, mirroring `specialize`;
+    /// `Vm::new_generic` sets BOTH false so the generic mode stays the complete
+    /// everything-off floor.
+    ///
+    /// NOTE: A1's empty-cells early-return is behavior-invisible and gated only by
+    /// the differential, not this flag; the flag gates new CONTROL FLOW (A2/A3/B).
+    call_fast: bool,
+    /// **CALL §8.3 coverage counters (anti-false-green).** Plain `Cell` bumps whose
+    /// cost is bounded by the Gate-17 zero-cost bench. Asserted >0 over the
+    /// functional corpus so the differential proves the fast paths actually ran.
+    call_fast_stats: std::cell::Cell<CallFastStats>,
+    /// **CALL §4 A3 — fiber pool for re-entrant calls.**
+    ///
+    /// Holds recycled [`Fiber`]s that `take_pooled_fiber` / `return_pooled_fiber`
+    /// manage. Every native→VM re-entry (`call_value`, `invoke_compiled_method`,
+    /// `invoke_compiled_static`) previously built a brand-new `Fiber` (two `Vec`s)
+    /// and dropped it; this pool amortises those allocations over repeated calls.
+    ///
+    /// **Protocol:**
+    /// * Take = exclusive ownership transfer (POP from the pool, call `Fiber::reset`
+    ///   on the popped fiber, and hand it to `run`). A nested re-entry that arrives
+    ///   while a fiber is mid-flight finds a different slot or allocates — safe by
+    ///   construction because removal happens before `run`.
+    /// * Return ONLY on `RunOutcome::Done`. On `Err` (panic/propagate) the fiber is
+    ///   DROPPED, never pooled — mid-flight state, fresh fibers have no old state.
+    /// * This field is a `RefCell` but every borrow is a short synchronous pop/push
+    ///   — NEVER held across an `.await`.
+    ///
+    /// Capacity is capped at [`FIBER_POOL_MAX`]. The pool only ever holds fibers
+    /// with `frames.is_empty()` (cleared before parking; take calls `reset` before
+    /// handing out).
+    ///
+    /// **Not used when `call_fast = false`** (the kill switch disables this path
+    /// exactly like A2's in-place binding, so the no-call-fast differential mode
+    /// stays the complete everything-off floor).
+    fiber_pool: RefCell<Vec<crate::vm::fiber::Fiber>>,
     /// DBG: the flattened proto tree of the program under inspection, for resolving a
     /// source (file, line) to a `(proto_id, offset)` to patch. Populated ONLY when a
     /// debugger arms breakpoints (empty otherwise → zero cost, NEVER read on the hot
@@ -252,18 +309,27 @@ impl Vm {
     /// (V11-T5). All inline-cache and adaptive fast paths are disabled; every
     /// dispatch takes the generic path. Used by `vm_run_source_generic` and the
     /// three-way differential to prove the fast paths never change a result.
+    ///
+    /// CALL §8.1: `new_generic` sets BOTH `specialize` AND `call_fast` to `false`,
+    /// keeping the generic mode as the complete everything-off floor.
     pub fn new_generic(interp: Rc<Interp>) -> Rc<Self> {
         Self::with_specialize(interp, false)
     }
 
     /// Shared constructor: build a VM with `specialize` set explicitly and install
     /// its self-`Weak` (mirroring [`Interp::install_self`]).
+    ///
+    /// CALL §8.1: delegates to [`with_flags`](Self::with_flags) with
+    /// `call_fast = specialize` — so `specialize = false` (generic) ⇒ both off.
     pub fn with_specialize(interp: Rc<Interp>, specialize: bool) -> Rc<Self> {
         // LANE §6.1: default sync_lane from the environment, exactly like
         // ASCRIPT_NO_SPECIALIZE does for `specialize`. The env default is what
         // lets worker isolates inherit the kill switch without explicit plumbing.
         let sync_lane = std::env::var("ASCRIPT_NO_SYNC_LANE").as_deref() != Ok("1");
-        Self::with_lanes(interp, specialize, sync_lane)
+        // CALL §8.1: call_fast defaults from the environment like specialize/sync_lane.
+        let call_fast = specialize
+            && std::env::var("ASCRIPT_NO_CALL_FAST").as_deref() != Ok("1");
+        Self::with_flags(interp, specialize, sync_lane, call_fast)
     }
 
     /// Build a VM with `specialize` and `sync_lane` set explicitly (LANE §6.1).
@@ -273,7 +339,26 @@ impl Vm {
     /// Used by the test entry points (`vm_run_source_no_sync_lane`,
     /// `vm_run_source_lane_stats`) so tests can toggle `sync_lane` without setting
     /// environment variables.
+    ///
+    /// CALL §8.1: `call_fast` mirrors `specialize` here (the same as the
+    /// `with_specialize` default). Use [`with_flags`](Self::with_flags) to set
+    /// `call_fast` independently (e.g. for `vm_run_source_no_call_fast`).
     pub fn with_lanes(interp: Rc<Interp>, specialize: bool, sync_lane: bool) -> Rc<Self> {
+        Self::with_flags(interp, specialize, sync_lane, specialize)
+    }
+
+    /// Build a VM with all three kill switches set explicitly (CALL §8.1).
+    ///
+    /// The lowest-level constructor: does NOT consult environment variables.
+    /// Used by test entry points that need independent control of each switch
+    /// (`vm_run_source_no_call_fast` sets `specialize=true, sync_lane=true,
+    /// call_fast=false` to isolate CALL divergences from IC/lane divergences).
+    pub fn with_flags(
+        interp: Rc<Interp>,
+        specialize: bool,
+        sync_lane: bool,
+        call_fast: bool,
+    ) -> Rc<Self> {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
@@ -298,6 +383,9 @@ impl Vm {
             sync_lane,
             lane_sync_ops: std::cell::Cell::new(0),
             lane_bursts: std::cell::Cell::new(0),
+            call_fast,
+            call_fast_stats: std::cell::Cell::new(CallFastStats::default()),
+            fiber_pool: RefCell::new(Vec::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -324,6 +412,109 @@ impl Vm {
     /// Always 0 until Task 4 wires up the burst driver.
     pub fn lane_bursts(&self) -> u64 {
         self.lane_bursts.get()
+    }
+
+    /// Whether the CALL fast paths are enabled (CALL §8.1). `true` = call-path
+    /// fast paths active (A2 in-place binding, A3 fiber pooling, B trampoline);
+    /// `false` = kill switch active, all CALL fast paths skip to the slow generic
+    /// path. Behavior is byte-identical regardless; only throughput differs.
+    pub fn call_fast(&self) -> bool {
+        self.call_fast
+    }
+
+    /// CALL §8.3 coverage counters (anti-false-green). All counters are 0 until
+    /// the corresponding fast paths are wired in Phase 2/3. `#[doc(hidden)]` test
+    /// API — not part of the public surface.
+    #[doc(hidden)]
+    pub fn call_fast_stats(&self) -> CallFastStats {
+        self.call_fast_stats.get()
+    }
+
+    /// CALL §8.3: bump one or more coverage counters atomically (a Cell, so this
+    /// is a synchronous `get → mutate → set` — never called across an `.await`).
+    /// Not yet called (Phase 1 is INERT); wired in Phase 2/3 when each fast path lands.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn bump_stat(&self, f: impl FnOnce(&mut CallFastStats)) {
+        let mut s = self.call_fast_stats.get();
+        f(&mut s);
+        self.call_fast_stats.set(s);
+    }
+
+    /// CALL §5 B: record one trampoline callback element dispatched on the sync lane.
+    /// Called from `trampoline.rs` (same crate, so `pub(crate)` suffices).
+    #[inline]
+    pub(crate) fn bump_trampoline_call(&self) {
+        self.bump_stat(|s| s.trampoline_calls += 1);
+    }
+
+    /// CALL §5 B: record one trampoline escalation to the async driver.
+    #[inline]
+    pub(crate) fn bump_trampoline_escalation(&self) {
+        self.bump_stat(|s| s.trampoline_escalations += 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // CALL §4 A3 — fiber pool
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Maximum number of idle [`Fiber`]s kept in the pool.
+    const FIBER_POOL_MAX: usize = 8;
+
+    /// **CALL §4 A3 — take a fiber from the pool (or allocate a fresh one).**
+    ///
+    /// POPs one fiber from `fiber_pool`, resets it for `top`, and returns it.
+    /// Because the pop REMOVES the fiber, a nested re-entrant call that arrives
+    /// while this fiber is mid-flight will take a DIFFERENT entry from the pool
+    /// (or allocate a fresh one if the pool is empty) — safe by construction.
+    ///
+    /// When `call_fast = false` the pool is bypassed entirely: always allocate a
+    /// fresh `Fiber::new(top)` (the kill switch keeps no-call-fast identical).
+    ///
+    /// # Await discipline
+    /// The `fiber_pool` `RefCell` borrow is held only for the synchronous pop —
+    /// it is NEVER held across an `.await`.
+    #[inline]
+    fn take_pooled_fiber(&self, top: gcmodule::Cc<crate::vm::value_ext::Closure>) -> crate::vm::fiber::Fiber {
+        if self.call_fast {
+            if let Some(mut fiber) = self.fiber_pool.borrow_mut().pop() {
+                fiber.reset(top);
+                self.bump_stat(|s| s.pooled_fiber_reuses += 1);
+                return fiber;
+            }
+        }
+        crate::vm::fiber::Fiber::new(top)
+    }
+
+    /// **CALL §4 A3 — return a fiber to the pool after clean completion.**
+    ///
+    /// Called ONLY after `RunOutcome::Done` — the fiber ran to completion and its
+    /// frame stack was popped to empty by the normal `return_from_frame` path.
+    /// Clears the stack, then pushes the fiber back if the pool is below
+    /// [`FIBER_POOL_MAX`] and `call_fast` is on.
+    ///
+    /// On `Err` (panic / propagate) the caller DROPS the fiber — this method is
+    /// NOT called — so stale mid-flight state can never enter the pool.
+    ///
+    /// # Await discipline
+    /// The `fiber_pool` `RefCell` borrow is held only for the synchronous push —
+    /// NEVER across an `.await`.
+    #[inline]
+    fn return_pooled_fiber(&self, mut fiber: crate::vm::fiber::Fiber) {
+        if !self.call_fast {
+            return;
+        }
+        let mut pool = self.fiber_pool.borrow_mut();
+        if pool.len() < Self::FIBER_POOL_MAX {
+            // Defensive: the fiber should already have an empty frame stack after
+            // `RunOutcome::Done` (the root `return_from_frame` pops it). Clear both
+            // vecs before parking to release any refs and keep the invariant:
+            // pooled fibers hold no live frame or stack data.
+            fiber.frames.clear();
+            fiber.stack.clear();
+            pool.push(fiber);
+        }
+        // If the pool is full, `fiber` simply drops here.
     }
 
     /// **DBG.** Build a specializing VM with an instrumentation payload installed
@@ -811,7 +1002,9 @@ impl Vm {
         fiber.stack.resize(slot_base + slot_count, Value::Nil);
         let supplied = bound.supplied;
         for (slot, v) in bound.values.into_iter().enumerate() {
-            if let Some(cell) = &cells[slot] {
+            // CALL §2 A1: cells may be empty (no cell slots); use .get so the
+            // empty-vec path is safe.
+            if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                 *cell.borrow_mut() = v;
             } else {
                 fiber.stack[slot_base + slot] = v;
@@ -854,7 +1047,7 @@ impl Vm {
     /// The shared `def_env` for VM-created classes (task #157), built lazily as a
     /// single child of `global_env()` and reused for every class. See the
     /// `class_env` field doc for why this mirrors the tree-walker's module env.
-    fn class_env(&self) -> crate::env::Environment {
+    pub(crate) fn class_env(&self) -> crate::env::Environment {
         let mut slot = self.class_env.borrow_mut();
         if slot.is_none() {
             // First build: seed with the module-scope user-globals already defined, so
@@ -1272,7 +1465,7 @@ impl Vm {
     /// Executes the suspension-free opcode subset in a tight loop until either the
     /// fiber finishes or an escalation op is reached. Counters are flushed once per
     /// call (not per instruction) so per-instruction counter traffic is avoided.
-    fn run_loop_sync(&self, fiber: &mut Fiber) -> Result<SyncOutcome, Control> {
+    pub(crate) fn run_loop_sync(&self, fiber: &mut Fiber) -> Result<SyncOutcome, Control> {
         let mut retired: u64 = 0;
         // Run the burst, capturing the result. Flush counters BEFORE returning r so
         // a mid-burst `Err(Control)` still records the ops completed up to the fault.
@@ -2044,8 +2237,10 @@ impl Vm {
                         }
                     };
                     // self = slot 0, read cell-aware (it is a cell slot whenever a
-                    // nested closure captured it).
-                    let receiver = match &fiber.frame().cells[0] {
+                    // nested closure captured it). CALL §2 A1: cells may be empty
+                    // when slot 0 is not captured; use .first so the empty-vec fast
+                    // path is safe.
+                    let receiver = match fiber.frame().cells.first().and_then(|c| c.as_ref()) {
                         Some(cell) => cell.borrow().clone(),
                         None => fiber.local(0).clone(),
                     };
@@ -2945,6 +3140,11 @@ impl Vm {
                             _ => unreachable!("already checked above"),
                         };
                         let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                        // CallSpread always goes through push_closure_frame (args were
+                        // already flattened onto the stack, so in-place applies, but
+                        // CallSpread is rare enough and rest-eligible that we keep the
+                        // simpler path for clarity; the A2 fast path targets the common
+                        // Op::Call shape where args are already individually on the stack).
                         self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
                     } else {
                         // Op::Call: argc is the static operand.
@@ -2968,7 +3168,53 @@ impl Vm {
                             _ => unreachable!("already checked above"),
                         };
                         let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                        // CALL §3 (A2): in-place arg binding fast path in the sync lane.
+                        // Same qualification and mechanism as the async arm above.
+                        if self.call_fast && !callee.proto.has_rest {
+                            let supplied = crate::interp::check_call_args_in_place(
+                                &callee.proto.params,
+                                &fiber.stack[callee_idx + 1..callee_idx + 1 + argc],
+                                call_span,
+                                callee.proto.chunk.name.as_deref().unwrap_or("function"),
+                                Some(&self.interp),
+                                Some(&self.class_env()),
+                            )?;
+                            fiber.stack.remove(callee_idx);
+                            let slot_base = callee_idx;
+                            let slot_count = callee.proto.chunk.slot_count as usize;
+                            let cells = super::fiber::alloc_cells(
+                                slot_count,
+                                &callee.proto.chunk.cell_slots,
+                            );
+                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                            if !cells.is_empty() {
+                                for slot in 0..supplied {
+                                    if let Some(cell) =
+                                        cells.get(slot).and_then(|c| c.as_ref())
+                                    {
+                                        *cell.borrow_mut() = std::mem::replace(
+                                            &mut fiber.stack[slot_base + slot],
+                                            Value::Nil,
+                                        );
+                                    }
+                                }
+                            }
+                            self.bump_stat(|s| s.inplace_binds += 1);
+                            self.enter_frame_depth(call_span)?;
+                            fiber.frames.push(super::fiber::CallFrame {
+                                closure: callee,
+                                ip: 0,
+                                slot_base,
+                                cells,
+                                ret_span: call_span,
+                                def_class: None,
+                                argc: supplied,
+                                defers: Vec::new(),
+                            });
+                            self.publish_profile_frames(fiber);
+                        } else {
+                            self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                        }
                     }
                     // Continue the loop in the new (or returned-to) frame.
                     *retired += 1;
@@ -3662,7 +3908,8 @@ impl Vm {
                             gfiber.frame_mut().argc = bound.supplied;
                             let cells = gfiber.frame().cells.clone();
                             for (slot, v) in bound.values.into_iter().enumerate() {
-                                if let Some(cell) = &cells[slot] {
+                                // CALL §2 A1: use .get so empty-vec is safe.
+                                if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                                     *cell.borrow_mut() = v;
                                 } else {
                                     gfiber.stack[slot] = v;
@@ -3736,13 +3983,89 @@ impl Vm {
                             // The call-site span anchors arity/contract/return
                             // panics exactly where the tree-walker's do.
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            // LANE Task 3: shared plain-call body (also used by
-                            // run_loop_sync). Pops args + callee, checks arity +
-                            // contracts, allocates cells, pushes the CallFrame (one
-                            // enter_frame_depth — SP3 §B), publishes profiler frames.
-                            self.push_closure_frame(
-                                fiber, callee, argc, callee_idx, call_span,
-                            )?;
+                            // CALL §3 (A2): in-place arg binding fast path.
+                            //
+                            // Qualifies when:
+                            //   1. `call_fast` kill switch is on.
+                            //   2. `!has_rest` — rest collection genuinely allocates a
+                            //      new tail array; those calls keep the Vec path.
+                            //
+                            // The args already sit contiguously at
+                            // `stack[callee_idx+1 .. callee_idx+1+argc]`, one slot above
+                            // the new frame's window. `check_call_args_in_place` runs the
+                            // SAME shared cores (arity + per-param contracts) that
+                            // `check_call_args` uses — wording/order byte-identical by
+                            // construction (CALL §3.4). Defaults are NOT evaluated here;
+                            // the callee prologue (`Op::JumpIfArgSupplied`) reads
+                            // `frame.argc` (the supplied count) to decide per defaulted
+                            // param, and `resize` fills remaining slots with the same
+                            // `Nil` the `BoundArgs` placeholders carried — identical
+                            // layout, zero extra allocation.
+                            if self.call_fast && !callee.proto.has_rest {
+                                let supplied = crate::interp::check_call_args_in_place(
+                                    &callee.proto.params,
+                                    &fiber.stack[callee_idx + 1..callee_idx + 1 + argc],
+                                    call_span,
+                                    callee.proto.chunk.name.as_deref().unwrap_or("function"),
+                                    Some(&self.interp),
+                                    Some(&self.class_env()),
+                                )?;
+                                // Drop the callee value; the `argc` args shift down one
+                                // slot to start AT slot_base (an argc-element memmove,
+                                // zero allocation).
+                                fiber.stack.remove(callee_idx);
+                                let slot_base = callee_idx;
+                                let slot_count = callee.proto.chunk.slot_count as usize;
+                                let cells = super::fiber::alloc_cells(
+                                    slot_count,
+                                    &callee.proto.chunk.cell_slots,
+                                );
+                                // Extend to the full frame window; slots beyond `argc`
+                                // default to `Nil` (the same value the BoundArgs
+                                // placeholders carried for omitted defaulted params).
+                                fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                                // Rare: a param whose resolver-assigned slot is a cell
+                                // slot (a callback that captures AND mutates a param).
+                                // Move it from the window into its cell.
+                                if !cells.is_empty() {
+                                    for slot in 0..supplied {
+                                        if let Some(cell) =
+                                            cells.get(slot).and_then(|c| c.as_ref())
+                                        {
+                                            *cell.borrow_mut() = std::mem::replace(
+                                                &mut fiber.stack[slot_base + slot],
+                                                Value::Nil,
+                                            );
+                                        }
+                                    }
+                                }
+                                self.bump_stat(|s| s.inplace_binds += 1);
+                                // SP3 §B: one logical-call increment per frame push.
+                                self.enter_frame_depth(call_span)?;
+                                fiber.frames.push(super::fiber::CallFrame {
+                                    closure: callee,
+                                    ip: 0,
+                                    slot_base,
+                                    cells,
+                                    ret_span: call_span,
+                                    def_class: None,
+                                    argc: supplied,
+                                    defers: Vec::new(),
+                                });
+                                // DBG Task 7: publish the new frame stack to a profiler.
+                                self.publish_profile_frames(fiber);
+                            } else {
+                                // Fallback: pop-into-Vec + check_call_args (rest params,
+                                // or call_fast kill switch off). Behavior-identical to the
+                                // pre-A2 path.
+                                // LANE Task 3: shared plain-call body (also used by
+                                // run_loop_sync). Pops args + callee, checks arity +
+                                // contracts, allocates cells, pushes the CallFrame (one
+                                // enter_frame_depth — SP3 §B), publishes profiler frames.
+                                self.push_closure_frame(
+                                    fiber, callee, argc, callee_idx, call_span,
+                                )?;
+                            }
                             // Continue the loop in the new frame.
                         }
                         other => {
@@ -5938,8 +6261,10 @@ impl Vm {
                         }
                     };
                     // self = slot 0, read cell-aware (it is a cell slot whenever a
-                    // nested closure captured it).
-                    let receiver = match &fiber.frame().cells[0] {
+                    // nested closure captured it). CALL §2 A1: cells may be empty
+                    // when slot 0 is not captured; use .first so the empty-vec fast
+                    // path is safe.
+                    let receiver = match fiber.frame().cells.first().and_then(|c| c.as_ref()) {
                         Some(cell) => cell.borrow().clone(),
                         None => fiber.local(0).clone(),
                     };
@@ -6707,7 +7032,8 @@ impl Vm {
                     gfiber.frame_mut().argc = bound.supplied;
                     let cells = gfiber.frame().cells.clone();
                     for (slot, v) in bound.values.into_iter().enumerate() {
-                        if let Some(cell) = &cells[slot] {
+                        // CALL §2 A1: use .get so empty-vec is safe.
+                        if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                             *cell.borrow_mut() = v;
                         } else {
                             gfiber.stack[slot] = v;
@@ -6725,19 +7051,19 @@ impl Vm {
                 // with the tree-walker and the `Op::Call` arm.
                 let bound =
                     crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
-                // Build a one-frame Fiber whose sole frame is the closure, then
-                // place the bound params into its slots (cell slot → cell, plain
-                // slot → stack). `Fiber::new` already reserved `slot_count` Nil
-                // locals and allocated the cell vector, so we only overwrite the
-                // param slots; the rest stay Nil.
-                let mut fiber = Fiber::new(closure);
+                // CALL §4 A3: take a pooled fiber (or allocate a fresh one when
+                // the pool is empty or call_fast=false). `take_pooled_fiber` pops
+                // the fiber from the pool so nested re-entrant calls grab a DIFFERENT
+                // entry — safe by construction.
+                let mut fiber = self.take_pooled_fiber(closure);
                 fiber.frame_mut().ret_span = span;
                 fiber.frame_mut().argc = bound.supplied;
                 // Snapshot the cell `Rc`s for the param slots so we don't hold a
                 // frame borrow while also writing `fiber.stack` (plain slots).
                 let cells = fiber.frame().cells.clone();
                 for (slot, v) in bound.values.into_iter().enumerate() {
-                    if let Some(cell) = &cells[slot] {
+                    // CALL §2 A1: use .get so empty-vec is safe.
+                    if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                         *cell.borrow_mut() = v;
                     } else {
                         fiber.stack[slot] = v;
@@ -6750,19 +7076,25 @@ impl Vm {
                 // owns exactly that unit. A `Cell`, never held as a RefCell borrow
                 // across the `.await`.
                 let _depth = self.interp.enter_call_depth_scoped(span)?;
-                // Drive the fresh fiber to completion. A top-level closure body
-                // cannot `yield` (yield is only valid inside a generator, which is
-                // driven differently), so `Done(v)` is the only outcome; a `yield`
-                // here would be a compiler bug.
+                // Drive the fiber to completion. A top-level closure body cannot
+                // `yield` (yield is only valid inside a generator, which is driven
+                // differently), so `Done(v)` is the only outcome; a `yield` here
+                // would be a compiler bug.
                 // SP9 §1: this is a native re-entry funnel for higher-order stdlib
                 // callbacks (`array.map`/`reduce`/comparators) — a deep `map`-of-`map`
                 // nests Rust frames here. Grow the native stack per poll so the
                 // re-entry reaches the logical cap cleanly instead of SIGABRTing.
-                match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
-                    RunOutcome::Done(v) => Ok(v),
-                    RunOutcome::Yielded(_) => {
+                // CALL §4 A3: return the fiber to the pool ONLY on Done; on Err
+                // the fiber is dropped (never pooled — mid-flight state).
+                match crate::vm::stack::grow_future(self.run(&mut fiber)).await {
+                    Ok(RunOutcome::Done(v)) => {
+                        self.return_pooled_fiber(fiber);
+                        Ok(v)
+                    }
+                    Ok(RunOutcome::Yielded(_)) => {
                         unreachable!("a closure called via Vm::call_value cannot yield")
                     }
+                    Err(e) => Err(e),
                 }
             }
             // A class constructor (V9): build an instance VM-side (defaults via
@@ -7153,8 +7485,9 @@ impl Vm {
                 let slot_count = closure.proto.chunk.slot_count as usize;
                 let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
                 fiber.stack.resize(slot_base + slot_count, Value::Nil);
-                // self -> slot 0 (cell-aware).
-                if let Some(cell) = &cells[0] {
+                // self -> slot 0 (cell-aware). CALL §2 A1: use .first so empty-vec
+                // is safe.
+                if let Some(cell) = cells.first().and_then(|c| c.as_ref()) {
                     *cell.borrow_mut() = recv;
                 } else {
                     fiber.stack[slot_base] = recv;
@@ -7163,7 +7496,8 @@ impl Vm {
                 let supplied = bound.supplied;
                 for (i, v) in bound.values.into_iter().enumerate() {
                     let slot = i + 1;
-                    if let Some(cell) = &cells[slot] {
+                    // CALL §2 A1: use .get so empty-vec is safe.
+                    if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                         *cell.borrow_mut() = v;
                     } else {
                         fiber.stack[slot_base + slot] = v;
@@ -7821,8 +8155,8 @@ impl Vm {
             gfiber.frame_mut().def_class = def_class;
             gfiber.frame_mut().argc = bound.supplied;
             let cells = gfiber.frame().cells.clone();
-            // self -> slot 0 (cell-aware).
-            if let Some(cell) = &cells[0] {
+            // self -> slot 0 (cell-aware). CALL §2 A1: use .first so empty-vec is safe.
+            if let Some(cell) = cells.first().and_then(|c| c.as_ref()) {
                 *cell.borrow_mut() = receiver;
             } else {
                 gfiber.stack[0] = receiver;
@@ -7830,7 +8164,8 @@ impl Vm {
             // bound args -> slots 1..n+1 (cell-aware).
             for (i, v) in bound.values.into_iter().enumerate() {
                 let slot = i + 1;
-                if let Some(cell) = &cells[slot] {
+                // CALL §2 A1: use .get so empty-vec is safe.
+                if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                     *cell.borrow_mut() = v;
                 } else {
                     gfiber.stack[slot] = v;
@@ -7840,7 +8175,10 @@ impl Vm {
                 crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
             return Ok(Value::Generator(Rc::new(handle)));
         }
-        let mut fiber = Fiber::new(closure);
+        // CALL §4 A3: take a pooled fiber (or allocate fresh when pool is empty /
+        // call_fast=false). Removal from pool means a nested re-entrant method
+        // call takes a different entry — safe by construction.
+        let mut fiber = self.take_pooled_fiber(closure);
         fiber.frame_mut().ret_span = span;
         // Record the DEFINING class so a `super.<name>` in this method body
         // (Op::GetSuper) resolves up from `def_class.superclass`, exactly like the
@@ -7849,7 +8187,8 @@ impl Vm {
         fiber.frame_mut().argc = bound.supplied;
         let cells = fiber.frame().cells.clone();
         // self -> slot 0 (cell-aware, in case a nested closure captured self).
-        if let Some(cell) = &cells[0] {
+        // CALL §2 A1: use .first so empty-vec is safe.
+        if let Some(cell) = cells.first().and_then(|c| c.as_ref()) {
             *cell.borrow_mut() = receiver;
         } else {
             fiber.stack[0] = receiver;
@@ -7857,7 +8196,8 @@ impl Vm {
         // bound args -> slots 1..n+1.
         for (i, v) in bound.values.into_iter().enumerate() {
             let slot = i + 1;
-            if let Some(cell) = &cells[slot] {
+            // CALL §2 A1: use .get so empty-vec is safe.
+            if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                 *cell.borrow_mut() = v;
             } else {
                 fiber.stack[slot] = v;
@@ -7870,11 +8210,16 @@ impl Vm {
         let _depth = self.interp.enter_call_depth_scoped(span)?;
         // SP9 §1: native re-entry funnel for non-IC method dispatch — grow the
         // native stack per poll (see `call_value`).
-        match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
-            RunOutcome::Done(v) => Ok(v),
-            RunOutcome::Yielded(_) => {
+        // CALL §4 A3: return fiber to pool ONLY on Done; drop on Err.
+        match crate::vm::stack::grow_future(self.run(&mut fiber)).await {
+            Ok(RunOutcome::Done(v)) => {
+                self.return_pooled_fiber(fiber);
+                Ok(v)
+            }
+            Ok(RunOutcome::Yielded(_)) => {
                 unreachable!("a non-generator method cannot yield")
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -7919,7 +8264,8 @@ impl Vm {
             gfiber.frame_mut().argc = bound.supplied;
             let cells = gfiber.frame().cells.clone();
             for (slot, v) in bound.values.into_iter().enumerate() {
-                if let Some(cell) = &cells[slot] {
+                // CALL §2 A1: use .get so empty-vec is safe.
+                if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                     *cell.borrow_mut() = v;
                 } else {
                     gfiber.stack[slot] = v;
@@ -7928,15 +8274,17 @@ impl Vm {
             let handle = crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
             return Ok(Value::Generator(Rc::new(handle)));
         }
-        // Plain sync static: run a fresh one-frame fiber to completion (args bound
-        // into slots 0.., no receiver) — mirrors `invoke_compiled_method`'s sync
-        // tail without the `self` slot.
-        let mut fiber = Fiber::new(closure);
+        // Plain sync static: run a fiber to completion (args bound into slots 0..,
+        // no receiver) — mirrors `invoke_compiled_method`'s sync tail without the
+        // `self` slot.
+        // CALL §4 A3: take a pooled fiber (or fresh if pool empty / call_fast=false).
+        let mut fiber = self.take_pooled_fiber(closure);
         fiber.frame_mut().ret_span = span;
         fiber.frame_mut().argc = bound.supplied;
         let cells = fiber.frame().cells.clone();
         for (slot, v) in bound.values.into_iter().enumerate() {
-            if let Some(cell) = &cells[slot] {
+            // CALL §2 A1: use .get so empty-vec is safe.
+            if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
                 *cell.borrow_mut() = v;
             } else {
                 fiber.stack[slot] = v;
@@ -7944,9 +8292,14 @@ impl Vm {
         }
         // SP9 §1: native re-entry funnel for static-method dispatch — grow the
         // native stack per poll (see `call_value`).
-        match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
-            RunOutcome::Done(v) => Ok(v),
-            RunOutcome::Yielded(_) => unreachable!("a non-generator static cannot yield"),
+        // CALL §4 A3: return fiber to pool ONLY on Done; drop on Err.
+        match crate::vm::stack::grow_future(self.run(&mut fiber)).await {
+            Ok(RunOutcome::Done(v)) => {
+                self.return_pooled_fiber(fiber);
+                Ok(v)
+            }
+            Ok(RunOutcome::Yielded(_)) => unreachable!("a non-generator static cannot yield"),
+            Err(e) => Err(e),
         }
     }
 

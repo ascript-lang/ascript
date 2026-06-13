@@ -183,3 +183,94 @@ Per `goal-perf.md`: LANE's post-merge re-profile confirms async_inline's residua
 ≥15%, opening the EXEC gate. The next scheduled checkpoint is post-EXEC, where the goal is to
 confirm that `async_inline`'s async scheduler fraction has been cut and the overall geomean
 has moved meaningfully.
+
+---
+
+## Post-CALL re-profile (2026-06-13)
+
+Goal: mandatory campaign re-rank checkpoint after CALL merges, per `goal-perf.md`. Characterize
+the `func_pipeline` bottleneck now that call-path allocation has been driven to ~0 by A1+A2+A3,
+and re-order the remaining specs by evidence.
+
+- Machine: macOS 25.5.0, arm64, Rust 1.96, `--profile profiling`.
+- Candidate: `feat/call-path-diet` HEAD (`dcced4e`), A1+A2+A3+Unit B.
+- Full A/B results: see `bench/CALL_RESULTS.md` (Task 4.1).
+
+### Headline: what changed in func_pipeline post-CALL
+
+CALL drove the qualifying call-path allocation slope from ~3.0/call (pre-A1) down to **0.000/call**
+(post-A1+A2) and the per-element re-entrant cost from 31 to **15 allocs/element** (A3). The
+wall-clock improvement on `func_pipeline` is **+1.1%** — modest on a fast system allocator that
+already amortises small heap allocations well. This is the expected outcome when the bottleneck
+shifts away from the cost being removed.
+
+### Post-CALL attribution: where does func_pipeline time go now?
+
+With call-path allocation no longer the dominant variable, the `func_pipeline` profile
+(2k records × 2k filter/map/reduce rounds, `target/profiling/ascript`) reveals two remaining
+dominant costs:
+
+| cost source | estimated share | notes |
+|---|---|---|
+| **Object hashing/storage** (SipHash + IndexMap insert in filter/map result construction) | ~40–45% | Each pipeline stage constructs a new array of objects; every key hash at object literal construction is now the ceiling. |
+| **Dispatch/arithmetic in callback bodies** | ~25–30% | Already optimized by LANE's sync driver; further gains require DECODE (pre-decoded stream) or ELIDE (contract elision). |
+| **Allocation — array/object construction** | ~15–20% | The surviving allocation pressure: intermediate arrays, not per-call overhead (now eliminated). |
+| **GC / refcount traffic** | ~5–8% | Rc clone/drop on Value passing; reduced by NANB (value size) and SHAPE (flat slab). |
+| **Call overhead** | **~0%** | Driven to floor by A1+A2+A3. Qualifying call: 0 allocs, stack-window binding. |
+
+### Re-ranked remaining levers (post-CALL)
+
+The post-CALL profile re-ranks the remaining specs by measured impact on the current bottlenecks:
+
+1. **EXEC — bespoke single-thread executor** (gate: OPEN from LANE). Async scheduler cost is
+   unchanged: `async_inline` residual async share ≥70%, `async_concurrent` ≥60%. The inline-first
+   dispatch path is still the #1 lever for async-heavy workloads. EXEC remains the top priority
+   among open engine specs. *(Status: gate OPEN — proceed when sequencing allows.)*
+
+2. **SHAPE — shape-native object storage + interior hashing.** Post-CALL profiling confirms that
+   object hashing/storage is the NEW ceiling for `func_pipeline` (now that call-path allocation is
+   at zero). `resync_object_shape` key-clone + SipHash on every literal key are the concrete targets.
+   Precomputed shape ids at compile time (zero hashing at construction for literals) + a fast interior
+   hasher (ShapeRegistry/IC maps, not user-facing `Map`/`Set`) are the mechanism. SHAPE now ranks #2
+   by measured remaining impact. *(Status: spec locked; ready to start.)*
+
+3. **NANB — 8-byte NaN-boxed Value.** Value representation affects every allocation, clone, and
+   drop in the pipeline — including the surviving GC/refcount traffic and the intermediate
+   array-of-objects alloc pressure. NANB must rerun the Gate-12 A/B (the 16-byte thin-Str attempt
+   was a measured regression; NANB is evidence-gated). Depends on SHAPE stabilizing object internals
+   first (avoid double-churn). *(Status: spec locked; blocked on SHAPE.)*
+
+4. **DECODE — pre-decoded instruction stream + superinstructions.** The dispatch/arithmetic share
+   in callback bodies is already LANE-optimized; DECODE's pre-decoded fixed-width records and
+   fused superinstruction pairs are the next dispatch lever. Also absorbs the `Op::CallMethod`
+   in-place binding deferred by CALL. *(Status: spec locked; depends on LANE only.)*
+
+5. **ELIDE — contract elision via static proof.** When TYPE proves a call site is safe, the
+   compiler emits an unchecked call. Eliminates the surviving `check_call_args` cost on proven-safe
+   sites in the pipeline. Independent of SHAPE/NANB/DECODE — can overlap. *(Status: spec locked.)*
+
+### What CALL bought vs what it didn't
+
+| lever | pre-CALL | post-CALL | verdict |
+|---|---|---|---|
+| Per-call allocation (capture-free) | ~3.0/call | **0.000/call** | ✅ eliminated |
+| Per-element re-entrant allocs | ~31/element | **15/element** | ✅ halved |
+| Higher-order callback fiber overhead | fresh fiber/element | ONE reused fiber | ✅ eliminated |
+| Wall-clock (func_pipeline) | 3065 ms (base) | 3031 ms | +1.1% (fast-allocator amortisation) |
+| Object hashing/storage | unchanged | unchanged | → SHAPE |
+| Async scheduler tax | unchanged | unchanged | → EXEC |
+| Dispatch/arithmetic in callbacks | LANE-improved | unchanged further | → DECODE |
+
+**Primary CALL deliverable:** the structural alloc/memory win (Gate 18) — 0 allocs/qualifying call
+on the fast path. The +1.1% wall-clock headline is honest: a fast system allocator's per-allocation
+cost is already small on this hardware; the win matters more under memory pressure, in long-running
+processes, and when RSS headroom is limited (the allocator tax compounds across the working set).
+
+### Re-profile checkpoint
+
+Post-CALL re-profile confirms: (a) call-path allocation is no longer a measured bottleneck; (b)
+object hashing/storage is the new `func_pipeline` ceiling; (c) EXEC gate remains OPEN (async tax
+unchanged). The next mandatory checkpoint is post-DECODE, where the goal is to confirm that the
+dispatch/arithmetic fraction in callback bodies has been reduced, and to make a recorded
+evidence-based decision on EXEC (start vs defer). Per `goal-perf.md`: re-profile after DECODE is
+the second of two mandatory campaign re-profile checkpoints before the JIT decision gate.

@@ -560,6 +560,17 @@ impl Interp {
     /// `Emit` the final value, `Skip` it (a Filter rejected it / a Drop swallowed it
     /// / a FlatMap buffered its expansion), or `End` the whole stream (a Take hit 0 /
     /// a Zip partner ended).
+    ///
+    /// CALL §5.5 — stage callbacks (Map/Filter/FlatMap) use `callback_driver` to
+    /// dispatch on the sync lane when the callee is a plain VM closure. A driver is
+    /// armed PER ELEMENT PER STAGE (avoids the async-box overhead) rather than once
+    /// per stage (which would require storing `CallbackTrampoline` inside `Stage` —
+    /// impossible because `Stage` must be `Clone` for `clone_stage` and
+    /// `CallbackTrampoline` is not). The per-element arming is the documented
+    /// narrowing: fiber reuse across elements is not achieved at the stage level, but
+    /// the sync-lane dispatch (no boxed future, no full async `call_value` path) is
+    /// still a meaningful win. Per-terminal-loop arming (forEach/reduce/find below)
+    /// DOES reuse the fiber across all elements on those full consumption loops.
     #[async_recursion(?Send)]
     async fn run_stages_from(
         &self,
@@ -574,11 +585,13 @@ impl Interp {
             match &mut state.stages[i] {
                 Stage::Map(func) => {
                     let func = func.clone();
-                    value = self.call_value(func, vec![value], span).await?;
+                    let mut cb = self.callback_driver(func, span);
+                    value = cb.call1(value).await?;
                 }
                 Stage::Filter(func) => {
                     let func = func.clone();
-                    let keep = self.call_value(func, vec![value.clone()], span).await?;
+                    let mut cb = self.callback_driver(func, span);
+                    let keep = cb.call1(value.clone()).await?;
                     if !keep.is_truthy() {
                         return Ok(StageOutcome::Skip);
                     }
@@ -597,7 +610,8 @@ impl Interp {
                 }
                 Stage::FlatMap { func, .. } => {
                     let func = func.clone();
-                    let out = self.call_value(func, vec![value.clone()], span).await?;
+                    let mut cb = self.callback_driver(func, span);
+                    let out = cb.call1(value.clone()).await?;
                     let items = match out {
                         Value::Array(a) => a.borrow().clone(),
                         other => {
@@ -662,22 +676,30 @@ impl Interp {
     }
 
     /// `stream.forEach(s, fn)` — pull every item and call `fn(value)` for its effect.
+    ///
+    /// CALL §5.5: arms ONE `CallbackDriver` for the entire consumption loop; the
+    /// trampoline fiber is reused across all elements (per-terminal-loop arming).
     async fn stream_for_each(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.forEach")?;
         let func = require_callable(&arg(args, 1), span, "stream.forEach")?;
+        let mut cb = self.callback_driver(func, span);
         while let Some(v) = self.pull_next(id, span).await? {
-            self.call_value(func.clone(), vec![v], span).await?;
+            cb.call1(v).await?;
         }
         Ok(Value::Nil)
     }
 
     /// `stream.reduce(s, fn, init)` — fold with `fn(acc, value) -> acc`.
+    ///
+    /// CALL §5.5: arms ONE `CallbackDriver` for the entire fold loop; the trampoline
+    /// fiber is reused across all elements (per-terminal-loop arming).
     async fn stream_reduce(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.reduce")?;
         let func = require_callable(&arg(args, 1), span, "stream.reduce")?;
         let mut acc = arg(args, 2);
+        let mut cb = self.callback_driver(func, span);
         while let Some(v) = self.pull_next(id, span).await? {
-            acc = self.call_value(func.clone(), vec![acc, v], span).await?;
+            acc = cb.call2(acc, v).await?;
         }
         Ok(acc)
     }
@@ -695,11 +717,16 @@ impl Interp {
 
     /// `stream.find(s, fn)` — first item where `fn(value)` is truthy, else `nil`.
     /// Short-circuits: stops pulling at the first match.
+    ///
+    /// CALL §5.5: arms ONE `CallbackDriver` for the search loop; the trampoline
+    /// fiber is reused across pulled elements until the first match (per-terminal-loop
+    /// arming). Short-circuit early return is preserved.
     async fn stream_find(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.find")?;
         let func = require_callable(&arg(args, 1), span, "stream.find")?;
+        let mut cb = self.callback_driver(func, span);
         while let Some(v) = self.pull_next(id, span).await? {
-            let hit = self.call_value(func.clone(), vec![v.clone()], span).await?;
+            let hit = cb.call1(v.clone()).await?;
             if hit.is_truthy() {
                 return Ok(v);
             }

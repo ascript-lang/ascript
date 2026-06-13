@@ -87,7 +87,7 @@ stated, results are measured.
   - Spec: `superpowers/specs/2026-06-12-two-lane-engine-design.md`
   - Plan: `superpowers/plans/2026-06-12-two-lane-engine.md`
 
-- 🔒 **CALL — Call-path allocation diet + higher-order callback trampoline.** Remove the ≥3
+- ✅ **CALL — Call-path allocation diet + higher-order callback trampoline.** Remove the ≥3
   allocations/call: empty-`cell_slots` fast path (no cells vector when nothing is captured
   by-reference), argument passing via the operand-stack window instead of `Vec` collection where
   the call shape allows, frame/fiber pooling. The trampoline: higher-order builtins
@@ -413,6 +413,61 @@ stated, results are measured.
     (inline-first dispatch; §4 zero-overhead trivial-async). After EXEC: allocation (#2 — json_roundtrip
     ~38% alloc; CALL/SHAPE/NANB); hashing (#3 — SipHash in object_churn 13%). JIT remains the LAST lever
     (only dispatch-dominated tight loops, and LANE+specialization already deliver 3–6× there).
+
+- **CALL** — ✅ MERGED to `main` (`--no-ff`). The campaign's call-path allocation diet: three allocation
+  units (A1/A2/A3) over `src/vm/{fiber,run}.rs` + a callback trampoline (Unit B) over the higher-order
+  stdlib builtins. **No grammar change, no semantics change, no `.aso` change** (`ASO_FORMAT_VERSION` 28
+  unchanged), no tree-walker change. VM-only throughout.
+  - **A1 (empty-cells fast path):** `alloc_cells` returns `Vec::new()` when `cell_slots` is empty —
+    capture-free frames allocate no cells vector. Always-on (not gated on `call_fast` — behavior-invisible).
+    Saves ~1 heap alloc per capture-free call. Alloc slope: pre-A1 ~3.0/call → post-A1 ~2.0/call.
+  - **A2 (in-place arg binding):** the qualifying `Op::Call` plain-Closure arm (`call_fast=true`,
+    `!has_rest`) runs `check_call_args_in_place` (borrows the operand-stack window, no `Vec`) then
+    `fiber.stack.remove(callee_idx)` + `resize` for defaults — eliminates the `vec![Value::Nil; argc]`
+    and `BoundArgs.values` Vec. Combined with A1: **0 allocs/qualifying call** (the per-call allocation
+    floor is reached). Shared arity + contract logic extracted into `check_call_arity`/`check_param_contract`
+    cores consumed by both paths — wording byte-identical by construction.
+  - **A3 (fiber pooling):** `fiber_pool: RefCell<Vec<Fiber>>` (cap `FIBER_POOL_MAX = 8`) on `Vm`;
+    take=exclusive-ownership (`take_pooled_fiber` pops + resets — fresh cells per element, capture
+    identity preserved); return-only-on-`RunOutcome::Done` (`return_pooled_fiber`); on `Err` the fiber
+    is dropped. Three re-entrant call funnels pooled: `call_value` plain-Closure arm,
+    `invoke_compiled_method`, `invoke_compiled_static`. Generator fibers, the module fiber, and the
+    program root are never pooled. Saves 2 Vec allocs per re-entry amortised; A3 alloc slope: 31→15
+    allocs/element (both within budget; `on ≤ off + 2`).
+  - **Unit B (trampoline):** `array.{map,filter,reduce,sort,find,findIndex,some,every,flatMap,groupBy,
+    partition}`, `object.mapValues`, and stream pipeline + terminals detect a `Value::Closure` callee
+    and drive all elements through ONE reused fiber on LANE's sync lane; per-element escalation to the
+    async driver when a callback suspends — never re-executing the element. Arming seam:
+    `CallbackTrampoline::arm` returns `Some` iff callee is `Value::Closure` (VM-only); `Value::Function`
+    (tree-walker) takes the unchanged generic path.
+  - **Kill switch:** `Vm.call_fast` (`bool`, default true; env `ASCRIPT_NO_CALL_FAST=1`);
+    `Vm::new_generic` disables it — generic path is the complete semantic floor. Cost-free when off
+    (kill-switch-off parity ≤1.006×).
+  - **Fifth differential mode:** `vm_run_source_no_call_fast` joins `vm_differential.rs` (both feature
+    configs). Alloc-count slope harness: `tests/alloc_count.rs`. Coverage assertions:
+    `trampoline_calls`, `inplace_binds`, `trampoline_escalations` > 0.
+  - **Gates:** `vm_differential` **424/0** both feature configs; spec/tw geomean **4.05×** (≥2×);
+    `dbg_zero_cost_gate` **1.005×** (≤1.05×); A/B geomean **1.000×** (func_pipeline +1.1%, call_heavy
+    +1.6% — modest on a fast-allocator machine; the alloc/memory win is the headline); A1+A2 alloc
+    slope **0.000/call** (< 1.0 budget); A3 alloc slope **15 vs 31/element** (on ≤ off+2; both < 50);
+    kill-switch-off parity ≤1.006×; RSS no regression; full suite + clippy clean both feature configs;
+    Gate-5 0 on `examples/**` both configs.
+  - **Spec deltas (recorded):** (1) stream-stage trampoline is per-element, not cross-element — `Stage`
+    must be `Clone` but `CallbackTrampoline` is not; deferred to DECODE; (2) `Op::CallMethod` in-place
+    binding deferred to DECODE (§7 follow-up; method-IC fast path unchanged); (3) smallvec alternative
+    not needed (in-place binding reached 0 allocs/call without it).
+  - **Post-CALL re-profile + remaining lever re-rank (mandatory campaign checkpoint):** Post-CALL
+    profiling of `func_pipeline` shows the bottleneck is NOT call-path allocation (driven to ~0 by
+    A1+A2+A3) but dispatch/arithmetic in callback bodies (already addressed by LANE) and **object
+    hashing/storage** — SipHash on IndexMap key insertion in the filter/map pass is the dominant
+    remaining cost. Re-ranked remaining levers: (1) **EXEC** (async scheduler tax — gate OPEN from
+    LANE, residual async share ≥70%/#1 unchanged); (2) **SHAPE** (object hashing/storage — the new
+    `func_pipeline` ceiling post-CALL); (3) **NANB** (value representation — enables SHAPE's flat
+    storage and is the JIT precondition); (4) **DECODE** (pre-decoded stream — CALL bought the
+    call-allocation lever, DECODE targets dispatch decode overhead). CALL's primary deliverable is the
+    **memory/alloc win** (Gate 18): 0 allocs/qualifying call + halved re-entrant allocs. The +1.1%
+    wall-clock headline reflects that a fast system allocator's amortised cost is already low on this
+    hardware; the structural allocation elimination matters more at scale and under memory pressure.
 
 ## Execution order
 

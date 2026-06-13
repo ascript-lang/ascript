@@ -1,0 +1,20 @@
+# exit: none
+=== 1. Escalation: map + async callback ===
+[30, 60, 90, 120, 150]
+
+=== 2. Panicking reduce, caught by recover ===
+  caught panic: index 999 out of bounds (len 0)
+  clean reduce: 15
+
+=== 3. ?-propagation through higher-order pipeline ===
+  good batch: [10, 20, 30, 40]
+  good error: nil
+  bad batch: nil
+  bad error: negative value: -3
+
+=== 4. Cell-capture freshness ===
+  adder outputs: [5, 15, 25, 35, 45]
+
+=== 5. Sort comparator panic, caught by recover ===
+  caught panic: index 999 out of bounds (len 0)
+  clean sort: [1, 1, 2, 3, 4, 5, 6, 9]
