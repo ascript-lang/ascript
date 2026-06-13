@@ -61,6 +61,140 @@ impl ObjectCell {
     pub fn freeze(&self) {
         self.frozen.set(true);
     }
+
+    // ── SHAPE Task 1.1 — mode-agnostic accessor API ───────────────────────────
+    // All accessors hold exactly ONE `RefCell` borrow internally and return an
+    // owned value (never a guard), so no caller can hold a borrow across `.await`
+    // — `clippy::await_holding_refcell_ref` stays structurally satisfied.
+    // Signatures are chosen so Phase 2 changes only the BODIES (not the call
+    // sites): when `ObjectStorage` replaces `IndexMap`, each accessor branches
+    // on `Slab` vs `Dict` internally, the public signatures remain identical.
+
+    /// Number of entries. §2.3 rows 1–14: every mode has a well-defined length.
+    pub fn len(&self) -> usize {
+        self.map.borrow().len()
+    }
+
+    /// `true` when the object has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.map.borrow().is_empty()
+    }
+
+    /// Return a clone of the value stored at `key`, or `None` if absent.
+    /// (`Value::clone` is an `Rc`-bump, not a deep copy.)
+    /// §2.3 rows 2–9: name-keyed reads for all registry-free consumers.
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.map.borrow().get(key).cloned()
+    }
+
+    /// `true` if `key` is present.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.borrow().contains_key(key)
+    }
+
+    /// Index (insertion-order position) of `key`, or `None`.
+    /// Used by the IC warmer to record the slot index at a `GET_PROP` site.
+    /// §2.3 rows 1–3: insertion order is canonical.
+    pub fn get_index_of(&self, key: &str) -> Option<usize> {
+        self.map.borrow().get_index_of(key)
+    }
+
+    /// Key + value at insertion-order position `i` (cloned).
+    /// Returns `None` when `i >= len()`.
+    /// Used for in-order iteration where both the key and the value are needed.
+    /// §2.3 rows 5–8, 11: ordered iteration across all registry-free consumers.
+    pub fn get_index(&self, i: usize) -> Option<(Rc<str>, Value)> {
+        self.map
+            .borrow()
+            .get_index(i)
+            .map(|(k, v)| (Rc::from(k.as_str()), v.clone()))
+    }
+
+    /// Value at insertion-order position `i` — the IC read primitive.
+    /// Returns `None` when `i >= len()` (the IC's out-of-range guard).
+    /// §2.3 rows 1–2: the IC hot path validates `shape == cached` then calls this.
+    pub fn value_at(&self, i: usize) -> Option<Value> {
+        self.map.borrow().get_index(i).map(|(_, v)| v.clone())
+    }
+
+    /// Overwrite the value at existing insertion-order slot `i`.
+    /// Returns `false` when `i >= len()` (slot doesn't exist — caller must insert
+    /// instead). This is the IC WRITE primitive: a known slot is updated in-place
+    /// with zero allocation.
+    /// §2.3 rows 1–2: in-place update for an existing key via a warmed IC.
+    pub fn set_value_at(&self, i: usize, v: Value) -> bool {
+        let mut m = self.map.borrow_mut();
+        if let Some((_, slot)) = m.get_index_mut(i) {
+            *slot = v;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Insert or overwrite `key → v`.
+    /// **IndexMap semantics:** if the key is already present its POSITION is kept
+    /// and only the value is updated (later-value-wins, first-position-kept).
+    /// A brand-new key is appended at the end.
+    /// §2.3 rows 1–3: the unified insert path for object literals and property sets.
+    pub fn insert(&self, key: &str, v: Value) {
+        self.map.borrow_mut().insert(key.to_string(), v);
+    }
+
+    /// Remove `key` while preserving the relative order of all other entries
+    /// (`IndexMap::shift_remove` semantics).
+    /// Returns the removed value, or `None` if the key was absent.
+    /// §2.3 row 4: `object.delete` — the only stdlib mutation that changes layout.
+    pub fn shift_remove(&self, key: &str) -> Option<Value> {
+        self.map.borrow_mut().shift_remove(key)
+    }
+
+    /// Snapshot all `(key, value)` pairs in insertion order.
+    /// Intended for sites that must hold the data across an `.await` point or
+    /// that alias the object during iteration (e.g. spread `{...o}` where `o`
+    /// is the object being built).
+    /// §2.3 rows 7–8: worker-airlock serialization and spread-snapshot.
+    pub fn entries(&self) -> Vec<(Rc<str>, Value)> {
+        self.map
+            .borrow()
+            .iter()
+            .map(|(k, v)| (Rc::from(k.as_str()), v.clone()))
+            .collect()
+    }
+
+    /// Call `f(key, value)` for every entry in insertion order.
+    /// Zero allocation — `f` receives references, not clones.
+    /// §2.3 rows 5–7, 11: `object.keys/values/entries`, `json.stringify`, `Display`.
+    pub fn for_each<F: FnMut(&str, &Value)>(&self, mut f: F) {
+        for (k, v) in self.map.borrow().iter() {
+            f(k.as_str(), v);
+        }
+    }
+
+    /// Like [`for_each`] but the visitor returns `Result`; iteration stops on the
+    /// first `Err` and that error is propagated.
+    /// Used by the serializers (`json`, `msgpack`, `cbor`) whose inner loops can
+    /// fail (e.g. a non-serializable value type).
+    /// §2.3 row 7: JSON/msgpack/cbor serialization.
+    pub fn try_for_each<E, F: FnMut(&str, &Value) -> Result<(), E>>(
+        &self,
+        mut f: F,
+    ) -> Result<(), E> {
+        for (k, v) in self.map.borrow().iter() {
+            f(k.as_str(), v)?;
+        }
+        Ok(())
+    }
+
+    /// Order-insensitive equality — same length AND every key's value is equal.
+    /// Replicates `IndexMap::eq` (which is itself order-insensitive), used for
+    /// the named-enum-payload structural comparison at `value.rs:1447`.
+    /// §2.3 row 12: `EnumVariant` named-payload `==` uses this, not pointer-eq.
+    pub fn content_eq(&self, other: &ObjectCell) -> bool {
+        let a = self.map.borrow();
+        let b = other.map.borrow();
+        *a == *b
+    }
 }
 
 /// The heap payload behind `Value::Array` (SP2 §4 / decision D3). Wraps the
@@ -2438,5 +2572,50 @@ mod tests {
             Value::Shared(Arc::new(SharedNode::Str("hi".into()))).to_string(),
             "hi"
         );
+    }
+
+    // ── SHAPE Task 1.1 ── ObjectCell accessor API ────────────────────────────
+    // Helper: build a plain `ObjectCell` (not `Cc`-wrapped) from `&[(key, int)]`.
+    // `ObjectCell::new` returns `Cc<ObjectCell>`; deref via `Cc::deref`.
+    fn obj(pairs: &[(&str, i64)]) -> Cc<ObjectCell> {
+        let mut m = IndexMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), Value::Int(*v));
+        }
+        ObjectCell::new(m)
+    }
+
+    #[test]
+    fn object_accessors_mirror_indexmap_semantics() {
+        let mut m = IndexMap::new();
+        m.insert("a".to_string(), Value::Int(1));
+        m.insert("b".to_string(), Value::Int(2));
+        let o = ObjectCell::new(m);
+        assert_eq!(o.len(), 2);
+        assert_eq!(o.get("a"), Some(Value::Int(1)));
+        assert_eq!(o.get_index_of("b"), Some(1));
+        o.insert("a", Value::Int(9)); // overwrite: position kept
+        assert_eq!(
+            o.get_index(0).map(|(k, _)| k.to_string()),
+            Some("a".into())
+        );
+        o.insert("c", Value::Int(3)); // new key: appended
+        let keys: Vec<String> = {
+            let mut v = vec![];
+            o.for_each(|k, _| v.push(k.to_string()));
+            v
+        };
+        assert_eq!(keys, ["a", "b", "c"]);
+        assert_eq!(o.shift_remove("b"), Some(Value::Int(2)));
+        assert_eq!(o.get_index_of("c"), Some(1)); // order preserved after removal
+    }
+
+    #[test]
+    fn object_content_eq_is_order_insensitive_like_indexmap_eq() {
+        // replicates IndexMap::eq for the named-enum-payload comparison (value.rs:1447)
+        let a = obj(&[("x", 1), ("y", 2)]);
+        let b = obj(&[("y", 2), ("x", 1)]);
+        assert!(a.content_eq(&b));
+        assert!(!a.content_eq(&obj(&[("x", 1)])));
     }
 }
