@@ -9412,6 +9412,63 @@ mod tests {
         assert_eq!(out, "0\n1\n2\n3\n4\n");
     }
 
+    // ── LANE §2.2: escalation leaves ip un-advanced ──────────────────────────
+
+    /// LANE §2.2 reviewer-mandated gate: when `sync_burst` encounters an op that
+    /// is NOT in the sync subset (e.g. `Op::Return`), it must return
+    /// `Ok(SyncOutcome::NeedsAsync)` **without advancing the fiber's `ip`**.
+    /// The async driver in `run_loop` re-decodes the same byte; if ip were
+    /// advanced the op would be silently skipped — a correctness hole.
+    ///
+    /// Construction: a chunk whose FIRST instruction is `Op::Return` (not in the
+    /// sync subset, zero operand bytes). Before calling `run_loop_sync` the fiber
+    /// is at `ip == 0`. After the call it must still be at `ip == 0`.
+    #[test]
+    fn escalation_leaves_ip_un_advanced() {
+        let mut c = Chunk::new();
+        // Op::Return is NOT in sync_lane_op — it will trigger NeedsAsync.
+        c.emit(Op::Return, s());
+
+        let proto = Rc::new(FnProto {
+            chunk: c,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+
+        // ip starts at 0.
+        assert_eq!(fiber.frame().ip, 0, "ip must start at 0");
+
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        // Use with_lanes so the sync_lane kill switch is explicitly ON.
+        let vm = Vm::with_lanes(interp, true, true);
+
+        // run_loop_sync must return NeedsAsync and leave ip == 0.
+        let outcome = vm
+            .run_loop_sync(&mut fiber)
+            .expect("run_loop_sync must not panic on an escalating op");
+
+        assert!(
+            matches!(outcome, SyncOutcome::NeedsAsync),
+            "expected NeedsAsync for a non-subset op, got Finished"
+        );
+        assert_eq!(
+            fiber.frame().ip,
+            0,
+            "ip must be un-advanced after escalation: async driver must re-decode the same byte"
+        );
+    }
+
     /// `expr?` where `expr` is not a 2-element array is a Tier-2 panic carrying
     /// the exact message and the PROPAGATE op's span (the `TryExpr`'s code span).
     #[test]
