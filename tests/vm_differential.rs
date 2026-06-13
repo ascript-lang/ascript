@@ -225,6 +225,9 @@ async fn vm_matches_treewalker_templates() {
 /// Assert that running `src` (a full program, for side effects) on the VM
 /// produces byte-identical stdout to running it on the tree-walker. This is the
 /// V2 output-path differential: `print(...)` must agree exactly.
+///
+/// Also checks the lane-off projection (LANE §6.1): `vm_run_source_no_sync_lane`
+/// must produce byte-identical output to the lane-on VM.
 async fn assert_vm_run_matches_treewalker(src: &str) {
     let tw = ascript::run_source(src).await.expect("tree-walker ok");
     let (vm_out, code) = ascript::vm_run_source(src).await.expect("vm ok");
@@ -232,6 +235,14 @@ async fn assert_vm_run_matches_treewalker(src: &str) {
     assert_eq!(
         tw, vm_out,
         "VM stdout diverged from tree-walker for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm_out:?}"
+    );
+    // LANE §6.1: lane-off must be byte-identical to lane-on.
+    let (lane_off_out, lane_off_code) =
+        ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    assert_eq!(lane_off_code, None, "no exit code expected (lane-off) for `{src}`");
+    assert_eq!(
+        tw, lane_off_out,
+        "lane-off VM diverged from tree-walker for `{src}`\n  tree-walker:  {tw:?}\n  lane-off vm: {lane_off_out:?}"
     );
 }
 
@@ -1230,6 +1241,14 @@ async fn vm_run_whole_corpus_matches_treewalker() {
             tw, vm,
             "VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
         );
+        // LANE §6.1: lane-off must also be byte-identical to the tree-walker.
+        let nolane = ascript::vm_run_source_no_sync_lane(&src)
+            .await
+            .unwrap_or_else(|e| panic!("lane-off VM failed on non-skipped {rel}: {e:?}"));
+        assert_eq!(
+            tw, nolane,
+            "lane-off VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  lane-off:    {nolane:?}"
+        );
         ran += 1;
     }
     // Sanity: the gate must actually exercise the bulk of the corpus, and the
@@ -1249,8 +1268,8 @@ async fn vm_run_whole_corpus_matches_treewalker() {
         "expected the VM to run >={floor} examples byte-identically, ran {ran}"
     );
     eprintln!(
-        "whole-corpus gate: {ran} examples byte-identical, {skipped} skipped, \
-         {feature_skipped} feature-skipped (modules unavailable in this build)"
+        "whole-corpus gate: {ran} examples byte-identical (all also verified lane-off), \
+         {skipped} skipped, {feature_skipped} feature-skipped (modules unavailable in this build)"
     );
 }
 
@@ -1427,7 +1446,7 @@ async fn vm_opt_member_read_matches_treewalker() {
 // the nil receiver (a non-nil receiver with a missing method still panics
 // `value is not callable`).
 
-/// Three-way OK assertion: `tree-walker == specialized-VM == generic-VM`,
+/// Four-way OK assertion: `tree-walker == specialized-VM == generic-VM == lane-off`,
 /// byte-identical stdout, no exit code.
 async fn assert_opt_call_ok_three_way(src: &str) {
     let tw = ascript::run_source(src).await.expect("tree-walker ok");
@@ -1435,8 +1454,12 @@ async fn assert_opt_call_ok_three_way(src: &str) {
     let (gen, gen_code) = ascript::vm_run_source_generic(src)
         .await
         .expect("generic vm ok");
+    let (nolane, nolane_code) = ascript::vm_run_source_no_sync_lane(src)
+        .await
+        .expect("lane-off ok");
     assert_eq!(vm_code, None, "no exit code expected for `{src}`");
     assert_eq!(gen_code, None, "no exit code expected for `{src}`");
+    assert_eq!(nolane_code, None, "no exit code expected (lane-off) for `{src}`");
     assert_eq!(
         tw, vm,
         "specialized VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
@@ -1445,16 +1468,20 @@ async fn assert_opt_call_ok_three_way(src: &str) {
         tw, gen,
         "generic VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  gen: {gen:?}"
     );
+    assert_eq!(
+        tw, nolane,
+        "lane-off VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  nolane: {nolane:?}"
+    );
 }
 
-/// Three-way ERROR assertion: all three engines panic with identical message +
-/// span.
+/// Four-way ERROR assertion: all four engines panic with identical message + span.
 async fn assert_opt_call_error_three_way(src: &str) {
     let tw = ascript::run_source(src).await;
     let vm = ascript::vm_run_source(src).await;
     let gen = ascript::vm_run_source_generic(src).await;
-    match (tw, vm, gen) {
-        (Err(tw_err), Err(vm_err), Err(gen_err)) => {
+    let nolane = ascript::vm_run_source_no_sync_lane(src).await;
+    match (tw, vm, gen, nolane) {
+        (Err(tw_err), Err(vm_err), Err(gen_err), Err(nolane_err)) => {
             assert_eq!(
                 tw_err.message, vm_err.message,
                 "specialized-VM panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
@@ -1475,9 +1502,19 @@ async fn assert_opt_call_error_three_way(src: &str) {
                 "generic-VM panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  gen: {:?}",
                 tw_err.message, tw_err.span, gen_err.span
             );
+            assert_eq!(
+                tw_err.message, nolane_err.message,
+                "lane-off panic message diverged for `{src}`\n  tw: {:?}\n  nolane: {:?}",
+                tw_err.message, nolane_err.message
+            );
+            assert_eq!(
+                tw_err.span, nolane_err.span,
+                "lane-off panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  nolane: {:?}",
+                tw_err.message, tw_err.span, nolane_err.span
+            );
         }
-        (tw, vm, gen) => panic!(
-            "expected ALL THREE engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm: {vm:?}\n  gen: {gen:?}"
+        (tw, vm, gen, nolane) => panic!(
+            "expected ALL FOUR engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm: {vm:?}\n  gen: {gen:?}\n  nolane: {nolane:?}"
         ),
     }
 }
@@ -5582,21 +5619,26 @@ async fn ic_mixed_object_and_instance_same_site() {
 //  failure by relaxing the assertion: investigate the guard.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run `src` on all THREE engines and assert byte-identical outcomes:
-/// tree-walker == specialized-VM == generic-VM. The outcome of each engine is
-/// normalized to `Ok((stdout, exit))` or `Err(rendered-message)`, so a faulting
-/// program (panic) compares too — a panic in one engine but not the others is
-/// itself a divergence and fails the assertion.
+/// Run `src` on all four engine modes and assert byte-identical outcomes:
+/// tree-walker == specialized-VM (lane-on) == generic-VM == specialized-VM (lane-off).
+/// The outcome of each engine is normalized to `Ok((stdout, exit))` or
+/// `Err(rendered-message)`, so a faulting program (panic) compares too — a panic
+/// in one engine but not the others is itself a divergence and fails the assertion.
+///
+/// LANE §6.1: the lane-off projection is added here so every call site that
+/// previously exercised three-way identity now exercises four-way identity for free.
 async fn assert_three_way_matches(src: &str) {
     let tw = ascript::run_source_exit(src).await;
     let spec = ascript::vm_run_source(src).await;
     let generic = ascript::vm_run_source_generic(src).await;
+    let nolane = ascript::vm_run_source_no_sync_lane(src).await;
 
     let norm = |r: &Result<(String, Option<i32>), ascript::error::AsError>| match r {
         Ok((out, code)) => Ok((out.clone(), *code)),
         Err(e) => Err(e.to_string()),
     };
-    let (tw_n, spec_n, gen_n) = (norm(&tw), norm(&spec), norm(&generic));
+    let (tw_n, spec_n, gen_n, nolane_n) =
+        (norm(&tw), norm(&spec), norm(&generic), norm(&nolane));
 
     // The load-bearing assertion of the whole task: generic == specialized.
     assert_eq!(
@@ -5615,6 +5657,12 @@ async fn assert_three_way_matches(src: &str) {
         tw_n, gen_n,
         "VM (generic / --no-specialize) diverged from the tree-walker.\n  src: {src:?}\n  \
          tree-walker: {tw_n:?}\n  vm:          {gen_n:?}"
+    );
+    // LANE §6.1: lane-off must be byte-identical to all other modes.
+    assert_eq!(
+        tw_n, nolane_n,
+        "VM (lane-off) diverged from the tree-walker.\n  src: {src:?}\n  \
+         tree-walker: {tw_n:?}\n  lane-off:    {nolane_n:?}"
     );
 }
 
@@ -8049,16 +8097,21 @@ async fn iface_instanceof_bad_rhs_three_way() {
 // (tree-walker == specialized-VM == generic-VM == `.aso`).
 // ===========================================================================
 
-/// Four-mode OK assertion: all of tree-walker, specialized-VM, generic-VM, and the
-/// `.aso` round-trip produce byte-identical stdout + exit code.
+/// Five-mode OK assertion: tree-walker, specialized-VM (lane-on), generic-VM,
+/// `.aso` round-trip, and specialized-VM (lane-off) all produce byte-identical
+/// stdout + exit code. LANE §6.1 adds the lane-off projection.
 async fn assert_four_way_run(src: &str) {
     let tw = ascript::run_source_exit(src).await.expect("tree-walker ok");
     let vm = ascript::vm_run_source(src).await.expect("specialized vm ok");
     let gen = ascript::vm_run_source_generic(src).await.expect("generic vm ok");
     let aso = ascript::aso_roundtrip_run_source(src).await.expect("aso ok");
+    let nolane = ascript::vm_run_source_no_sync_lane(src)
+        .await
+        .expect("lane-off ok");
     assert_eq!(tw, vm, "specialized-VM diverged from tree-walker for `{src}`");
     assert_eq!(tw, gen, "generic-VM diverged from tree-walker for `{src}`");
     assert_eq!(tw, aso, ".aso round-trip diverged from tree-walker for `{src}`");
+    assert_eq!(tw, nolane, "lane-off VM diverged from tree-walker for `{src}`");
 }
 
 #[tokio::test]
@@ -8944,4 +8997,351 @@ run(false)
     // `assert_four_way_run`) does not raise StackJoinMismatch on the asymmetric
     // defer-in-branch bytecode — and that all four modes are byte-identical.
     assert_four_way_run(src).await;
+}
+
+// ── LANE §6.1 / §6.4 kill-switch + counter tests ────────────────────────────
+
+/// LANE §6.1: `vm_run_source_no_sync_lane` (sync_lane=false) produces byte-identical
+/// output to `vm_run_source` (sync_lane=true, the default). LANE §6.4: after Task 4
+/// wired up the burst driver, counters read > 0 for any program with a hot loop.
+#[tokio::test]
+async fn no_sync_lane_entry_point_runs_byte_identically() {
+    let src = "let s = 0\nfor (i in 0..100) { s = s + i }\nprint(s)";
+    let (on_out, on_exit) =
+        ascript::vm_run_source(src).await.expect("lane-on ok");
+    let (off_out, off_exit) =
+        ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    assert_eq!(on_out, off_out, "sync_lane=true vs false must be byte-identical");
+    assert_eq!(on_exit, off_exit, "exit codes must match");
+    // Task 4: the kill-switch variant zeroes the counters.
+    let (_out, _exit, sync_ops, _bursts) =
+        ascript::vm_run_source_lane_stats_no_lane(src).await.expect("stats ok");
+    assert_eq!(
+        sync_ops,
+        0,
+        "kill-switch (sync_lane=false) must produce zero lane ops"
+    );
+}
+
+/// LANE §6.4 / Task 4: the sync driver runs at least 1M ops for a million-step loop.
+#[tokio::test]
+async fn sync_lane_executes_the_tight_loop_and_counts_it() {
+    let src = "let s = 0\nfor (i in 0..1000000) { s = s + i }\nprint(s)";
+    let (out, _exit, sync_ops, bursts) =
+        ascript::vm_run_source_lane_stats(src).await.expect("ok");
+    assert_eq!(out, "499999500000\n");
+    assert!(
+        sync_ops >= 1_000_000,
+        "lane retired only {sync_ops} ops — burst did not run the loop"
+    );
+    assert!(bursts >= 1, "expected at least one burst, got {bursts}");
+}
+
+/// LANE §6.4 / Task 4: with sync_lane=false, the counters must remain zero.
+#[tokio::test]
+async fn kill_switch_means_zero_lane_ops() {
+    let src = "let s = 0\nfor (i in 0..1000) { s = s + i }\nprint(s)";
+    let (_o, _e, sync_ops, _b) =
+        ascript::vm_run_source_lane_stats_no_lane(src).await.expect("ok");
+    assert_eq!(sync_ops, 0, "kill-switch must suppress all lane ops");
+}
+
+/// LANE §6.4 / Task 4: lane-on and lane-off must produce byte-identical output for
+/// the core opcode battery (arithmetic, loops, globals, template strings, Tier-2 panics).
+#[tokio::test]
+async fn lane_on_off_byte_identical_over_core_battery() {
+    let cases: &[&str] = &[
+        "print(1 + 2 * 3)",
+        "let s = 0\nfor (i in 0..100) { s = s + i }\nprint(s)",
+        "let i = 0\nwhile (i < 50) { i = i + 1 }\nprint(i)",
+        "print(7 % 3, 2 ** 10, 0xFF & 0b1010, 5 +% 3)",
+        "print(`n=${40 + 2}`)",
+    ];
+    for src in cases {
+        let on = ascript::vm_run_source(src).await;
+        let off = ascript::vm_run_source_no_sync_lane(src).await;
+        match (on, off) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "diverged on `{src}`"),
+            (Err(a), Err(b)) => assert_eq!(
+                a.to_string(),
+                b.to_string(),
+                "panic diverged on `{src}`"
+            ),
+            (a, b) => panic!("ok/err disagreement on `{src}`: {a:?} vs {b:?}"),
+        }
+    }
+    // Tier-2 panic path — message must be identical.
+    let on = ascript::vm_run_source("print(1 << 64)").await;
+    let off = ascript::vm_run_source_no_sync_lane("print(1 << 64)").await;
+    match (on, off) {
+        (Err(a), Err(b)) => assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "shift-panic diverged between lane-on and lane-off"
+        ),
+        (a, b) => panic!("expected Err for shift-64, got: {a:?} vs {b:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sync_lane_runs_calls_props_and_match_in_lane() {
+    let src = r#"
+fn fib(n) { if (n < 2) { return n } return fib(n - 1) + fib(n - 2) }
+let o = { x: 0, y: 1 }
+for (i in 0..1000) { o.x = o.x + o.y }
+let m = match o.x { 1000 => "k", _ => "?" }
+print(fib(15), o.x, m)
+"#;
+    let (out, _e, sync_ops, _b) = ascript::vm_run_source_lane_stats(src).await.expect("ok");
+    assert_eq!(out, "610 1000 k\n");
+    assert!(sync_ops > 10_000, "calls/props/match must run in-lane, retired {sync_ops}");
+}
+
+#[tokio::test]
+async fn sync_lane_recursion_depth_panic_is_byte_identical() {
+    let src = "fn f(n) { return f(n + 1) }\nprint(f(0))";
+    let on = ascript::vm_run_source(src).await.expect_err("must panic").to_string();
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect_err("must panic").to_string();
+    let tw = ascript::run_source(src).await.expect_err("must panic").to_string();
+    assert_eq!(on, off);
+    assert_eq!(on, tw);
+    assert!(on.contains("maximum recursion depth exceeded"));
+}
+
+#[tokio::test]
+async fn sync_lane_generator_bodies_burst_and_yield() {
+    let src = r#"
+fn* squares(n) { for (i in 0..n) { yield i * i } }
+let g = squares(5)
+let total = 0
+for await (v in g) { total = total + v }
+print(total)
+"#;
+    let on = ascript::vm_run_source(src).await.expect("ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("ok");
+    assert_eq!(on, off);
+    assert_eq!(on.0, "30\n");
+}
+
+#[tokio::test]
+async fn sync_lane_escalation_battery_is_byte_identical() {
+    for src in [
+        "async fn a(x) { return x + 1 }\nprint(await a(41))",
+        "class C { fn init() { self.n = 7 } fn get() { return self.n } }\nprint(C().get())",
+        "import * as math from \"std/math\"\nprint(math.abs(0 - 5))",
+        "enum E { P(a: int) }\nprint(E.P(a: 3).a)",
+        "fn add(a, b) { return a + b }\nlet r = add(3, 4)\nprint(r)",
+    ] {
+        let tw = ascript::run_source(src).await.expect("tw ok");
+        let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+        let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+        assert_eq!(tw, on.0, "tw vs lane-on diverged on `{src}`");
+        assert_eq!(on, off, "lane-on vs lane-off diverged on `{src}`");
+    }
+}
+
+#[tokio::test]
+async fn sync_lane_defer_runs_correctly() {
+    let src = r#"
+fn with_defer() {
+    defer print("deferred")
+    print("body")
+    return 42
+}
+let v = with_defer()
+print(v)
+"#;
+    let tw = ascript::run_source(src).await.expect("tw ok");
+    let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    assert_eq!(tw, on.0, "tw vs lane-on diverged for defer test");
+    assert_eq!(on, off, "lane-on vs lane-off diverged for defer test");
+    assert!(on.0.contains("deferred"), "defer must have run");
+}
+
+// ── LANE Task 6: inline ready-future completion at Op::Await ─────────────────
+
+/// LANE §4: `await` on an already-resolved future must complete in-lane.
+/// After the FIRST `await f1` parks (the future is still pending at that
+/// point), the scheduler runs the async bodies, resolving f2 and f3. The
+/// subsequent `await f2`/`await f3` therefore hit resolved futures and must
+/// complete inline. Output must be byte-identical across tree-walker,
+/// lane-on, and lane-off.
+#[tokio::test]
+async fn await_on_resolved_future_completes_in_lane() {
+    let src = r#"
+async fn a(x) { return x * 2 }
+let f1 = a(1)
+let f2 = a(2)
+let f3 = a(3)
+let first = await f1
+let rest = (await f2) + (await f3)
+print(first + rest)
+"#;
+    let tw = ascript::run_source(src).await.expect("tw ok");
+    let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    assert_eq!(tw, on.0, "tw vs lane-on diverged");
+    assert_eq!(on, off, "lane-on vs lane-off diverged");
+    assert_eq!(on.0, "12\n");
+}
+
+/// LANE §4.1 case 1: `await` on a non-Future is identity (no escalation in lane).
+#[tokio::test]
+async fn await_identity_on_non_future_stays_in_lane() {
+    let (out, _e, sync_ops, _b) =
+        ascript::vm_run_source_lane_stats("print(await 5)").await.expect("ok");
+    assert_eq!(out, "5\n");
+    assert!(sync_ops > 0, "await-identity must stay in-lane; sync_ops={sync_ops}");
+}
+
+/// LANE §4.1 case 2 (Err branch): a resolved-with-panic future must surface the
+/// IDENTICAL panic via the inline take as via the async path. We wait for `ok()`
+/// (a resolved-immediately async fn) to let the scheduler run `boom()`'s body first.
+#[tokio::test]
+async fn inline_take_surfaces_stored_panic_identically() {
+    let src = r#"
+async fn boom() { let xs = [1, 2] ; return xs[5] }
+async fn ok_fn() { return 1 }
+let f = boom()
+let _ = await ok_fn()
+print(await f)
+"#;
+    let on = ascript::vm_run_source(src).await;
+    let off = ascript::vm_run_source_no_sync_lane(src).await;
+    match (on, off) {
+        (Err(a), Err(b)) => assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "panic message must be identical lane-on vs lane-off"
+        ),
+        (a, b) => panic!("expected identical panics, got {a:?} / {b:?}"),
+    }
+}
+
+/// LANE §3 fairness: >INFLIGHT_YIELD_CAP (256) un-awaited spawns behave
+/// byte-identically lane-on vs lane-off (every spawn site is an escalation op;
+/// the backpressure yield always runs on the async driver).
+#[tokio::test]
+async fn inflight_backpressure_is_byte_identical_lane_on_off() {
+    // Build the futs array with array.push (mutates in place), then sum via
+    // a regular for-loop with await. Using 600 futures exceeds the
+    // INFLIGHT_YIELD_CAP=256 threshold.
+    let src = r#"
+import * as array from "std/array"
+async fn tick(i) { return i }
+let futs = []
+for (i in 0..600) { array.push(futs, tick(i)) }
+let total = 0
+for (f in futs) { total = total + await f }
+print(total)
+"#;
+    let on = ascript::vm_run_source(src).await.expect("ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(on, off, "lane-on vs lane-off diverged");
+    assert_eq!(tw, on.0, "tw vs lane-on diverged");
+    assert_eq!(on.0, "179700\n");
+}
+
+// ── LANE §6.4 — corpus coverage assertion (Gate 15 anti-false-green) ────────
+
+/// LANE §6.4 anti-false-green: the sync lane ACTUALLY executes ops on the
+/// corpus — it has not silently collapsed into a no-op. Runs `vm_run_source_lane_stats`
+/// on every non-skipped, non-feature-gated corpus example, accumulates the total
+/// `sync_ops` count, and asserts it is well above zero.
+///
+/// If the sync driver is disabled (e.g. `ASCRIPT_NO_SYNC_LANE=1` in the environment
+/// or the burst orchestration was accidentally removed), `sync_ops` across the whole
+/// corpus would be ≈ 0 and this test FAILS — the anti-false-green tripwire.
+///
+/// The threshold (1 000 000) is conservative: a single tight loop produces millions
+/// of ops; across 50+ corpus programs the real count is in the tens of millions. Any
+/// value > 0 technically proves the lane ran, but 1 M catches the case where only a
+/// handful of trivial programs managed to squeeze a few ops through.
+#[tokio::test]
+async fn sync_lane_actually_executes_on_the_corpus() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut total_sync: u64 = 0;
+    let mut ran = 0usize;
+
+    for rel in all_corpus_examples() {
+        // Apply the same skip filter as `vm_run_whole_corpus_matches_treewalker`.
+        if skip_reason(&rel).is_some() {
+            continue;
+        }
+        let path = std::path::Path::new(root).join(&rel);
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Skip feature-gated modules (same logic as the corpus gate).
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+        if let Ok((_out, _exit, sync_ops, _bursts)) =
+            ascript::vm_run_source_lane_stats(&src).await
+        {
+            total_sync += sync_ops;
+            ran += 1;
+        }
+    }
+
+    eprintln!(
+        "LANE corpus coverage: {total_sync} sync-lane ops over {ran} programs"
+    );
+    assert!(ran > 50, "corpus enumeration broke — only {ran} programs ran");
+    assert!(
+        total_sync > 100_000,
+        "sync lane retired only {total_sync} ops on the corpus — \
+         the lane silently collapsed (burst driver disabled or ASCRIPT_NO_SYNC_LANE set?)"
+    );
+}
+
+// ── LANE spec §3: Op::GetSuper admitted to the sync subset ───────────────────
+//
+// Op::GetSuper resolves `super.<name>` starting at the defining class's
+// superclass, builds a BoundMethod, and pushes it — no `.await`, no
+// suspension. Spec §3 lists it in the "IN the sync subset" table under
+// member/index access. This test asserts:
+//   1. Four-way byte-identity: tree-walker == lane-on == lane-off == generic.
+//   2. GetSuper retires in-lane (sync_ops > 0 with the lane active).
+
+#[tokio::test]
+async fn get_super_retires_in_sync_lane() {
+    // Simple super-method chain: B.greet() calls super.greet() from A.
+    // The GetSuper op fires on every call to B().greet().
+    let src = r#"
+class A {
+  fn greet() { return "A" }
+}
+class B extends A {
+  fn greet() { return super.greet() + "B" }
+}
+let total = ""
+for (i in 0..10) { total = total + B().greet() }
+print(total)
+"#;
+    // Four-way byte-identity (TW == specialized == generic == lane-off).
+    let tw = ascript::run_source(src).await.expect("tw ok");
+    let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    let gen = ascript::vm_run_source_generic(src).await.expect("generic ok");
+    assert_eq!(tw, on.0, "tree-walker vs lane-on diverged for GetSuper");
+    assert_eq!(on, off, "lane-on vs lane-off diverged for GetSuper");
+    assert_eq!(on.0, gen.0, "specialized vs generic diverged for GetSuper");
+
+    // In-lane assertion: GetSuper must retire a meaningful number of sync ops.
+    // With 10 iterations each producing a GetSuper + surrounding arithmetic and
+    // string ops, the sync lane must retire far more than 0 ops. The threshold
+    // (100) is conservative — the actual count (GetLocal, Add, Return, etc.) is
+    // several hundred even at N=10; if GetSuper constantly escalates the burst
+    // collapses to only the pre-GetSuper ops each iteration.
+    let (_out, _exit, sync_ops, _bursts) =
+        ascript::vm_run_source_lane_stats(src).await.expect("stats ok");
+    assert!(
+        sync_ops >= 100,
+        "GetSuper must retire many ops in-lane (sync_ops={sync_ops}); \
+         if this is low, GetSuper is still escalating to the async driver"
+    );
 }

@@ -75,7 +75,7 @@ stated, results are measured.
 
 ### Foundation — the async & call tax (the measured #1 and the largest constant factors)
 
-- 🔒 **LANE — Two-lane fiber engine + inline ready-future completion.** A synchronous dispatch
+- ✅ **LANE — Two-lane fiber engine + inline ready-future completion.** A synchronous dispatch
   driver (`run_loop_sync`, a plain non-async fn) executes the suspension-free opcode subset over
   the SAME `Fiber` state; the existing async `run_loop` becomes the orchestrator that bursts into
   the sync lane and takes over only at genuine suspension points (`Await` on a pending future,
@@ -390,6 +390,29 @@ stated, results are measured.
   §2.2.5/§8.4 — tree-sitter recovers a reserved keyword as an identifier name (true of every
   reserved word; the hand parsers are the reservation SoT) — a tooling-reality correction, no change
   to recorded language semantics.
+
+- **LANE** — ✅ MERGED to `main` (pending; on `feat/two-lane-engine`, holistic review complete). Two
+  drivers over the existing `Fiber`: `run_loop_sync` (plain non-async, tight-loop, suspension-free subset)
+  and `run_loop` demoted to an orchestrator that bursts into the sync driver and takes over only at genuine
+  suspension points. Per-op runtime escalation (`NeedsAsync` at un-advanced ip); `Op::Await` on an
+  already-resolved future taken inline via `SharedFuture::try_get`; `Op::DeferPush`/`Op::DeferPushMethod`
+  in-subset but frame-exit-with-non-empty-defers escalates. Kill switch: `Vm.sync_lane` +
+  `ASCRIPT_NO_SYNC_LANE=1`. **No grammar change, no semantics change, no `.aso` change.**
+  - **Gates:** four-way differential (tree-walker == specialized-lane-on == specialized-lane-off ==
+    generic-lane-on) + fuzz axis (`fuzz/fuzz_targets/differential.rs`) + corpus coverage assertion
+    (`lane_corpus_coverage_check`); `vm_differential` 423/0 BOTH feature configs; full suite + clippy clean
+    both configs; Gate-5 0 on `examples/**` both configs.
+  - **Performance (`bench/LANE_RESULTS.md`, same-session A/B, Gate 16):** A/B geomean **1.045×** (4.5%
+    faster); dispatch-bound workloads: `object_churn` +15%, `call_heavy` +21%. Async-scheduler-dominated
+    workloads within noise (kevent/park bottleneck unchanged). RSS: no regression (Gate 18). DBG zero-cost
+    gate: **1.006×** (≤1.05× threshold). Spec/tw geomean: **3.59×** (≥2× Gate 12/17 floor).
+  - **Post-LANE re-profile + EXEC gate verdict:** Residual async share on `async_inline` ≥70%, on
+    `async_concurrent` ≥60% — both well above the ≥15% EXEC gate threshold. The sync lane moved only
+    the VM-dispatch fraction (~9% of async_inline wall time); the scheduler round-trip on every pending
+    `await` (kevent/park/notify/SharedFuture) is untouched. **EXEC gate: OPEN.** EXEC stays #1 priority
+    (inline-first dispatch; §4 zero-overhead trivial-async). After EXEC: allocation (#2 — json_roundtrip
+    ~38% alloc; CALL/SHAPE/NANB); hashing (#3 — SipHash in object_churn 13%). JIT remains the LAST lever
+    (only dispatch-dominated tight loops, and LANE+specialization already deliver 3–6× there).
 
 ## Execution order
 

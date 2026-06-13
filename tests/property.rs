@@ -42,29 +42,32 @@ fn project(r: Result<(String, Option<i32>), ascript::error::AsError>) -> Outcome
     }
 }
 
-/// The four engine projections for one program: tree-walker, specialized-VM, generic-VM,
-/// `.aso` round-trip.
-type FourWay = (Outcome, Outcome, Outcome, Outcome);
+/// The five engine projections for one program: tree-walker, specialized-VM (lane-on),
+/// generic-VM, `.aso` round-trip, and specialized-VM (lane-off). LANE §6.1 adds the
+/// fifth axis so the proptest properties exercise all five modes on every generated program.
+type FourWay = (Outcome, Outcome, Outcome, Outcome, Outcome);
 
-/// Run `src` on all three engines (+ the `.aso` round-trip) on the worker stack and return
-/// their projected outcomes. Spawns ONE 512 MB worker thread per call — fine for a single
-/// program; for many programs prefer [`run_all_engines_batch`] to amortize the spawn.
+/// Run `src` on all five engines (+ the `.aso` round-trip + lane-off) on the worker stack
+/// and return their projected outcomes. Spawns ONE 512 MB worker thread per call — fine for
+/// a single program; for many programs prefer [`run_all_engines_batch`] to amortize the spawn.
 fn run_all_engines(src: &str) -> FourWay {
     let src = src.to_string();
     ascript::run_on_worker_stack(move || async move { run_four_way(&src).await })
 }
 
-/// The async core: run `src` on all four modes and project each outcome. Must be called on
+/// The async core: run `src` on all five modes and project each outcome. Must be called on
 /// the worker stack (the engines are `!Send` current-thread tokio with deep recursion).
 async fn run_four_way(src: &str) -> FourWay {
     let tw = project(ascript::run_source_exit(src).await);
     let vm = project(ascript::vm_run_source(src).await);
     let gen = project(ascript::vm_run_source_generic(src).await);
     let aso = project(ascript::aso_roundtrip_run_source(src).await);
-    (tw, vm, gen, aso)
+    // LANE §6.1: lane-off must be byte-identical to all other modes.
+    let nolane = project(ascript::vm_run_source_no_sync_lane(src).await);
+    (tw, vm, gen, aso, nolane)
 }
 
-/// Run a BATCH of programs through all four modes inside a SINGLE worker-stack thread,
+/// Run a BATCH of programs through all five modes inside a SINGLE worker-stack thread,
 /// returning one `FourWay` per program. Amortizes the (expensive) 512 MB worker-thread
 /// spawn across the whole batch — the fixed-seed batteries use this so they stay fast.
 fn run_all_engines_batch(srcs: Vec<String>) -> Vec<FourWay> {
@@ -116,7 +119,7 @@ proptest! {
     #[test]
     fn three_way_differential_over_generated_programs(bytes in prop::collection::vec(any::<u8>(), 64..768)) {
         let prog = fuzzgen::gen_program_from_bytes(&bytes);
-        let (tw, vm, gen, aso) = run_all_engines(&prog.source);
+        let (tw, vm, gen, aso, nolane) = run_all_engines(&prog.source);
         prop_assert_eq!(
             &tw, &vm,
             "specialized-VM diverged from tree-walker\n--- program ---\n{}\n--- tw: {:?}\n--- vm: {:?}",
@@ -132,18 +135,26 @@ proptest! {
             ".aso round-trip diverged from the in-memory VM\n--- program ---\n{}\n--- tw: {:?}\n--- aso: {:?}",
             prog.source, tw, aso
         );
+        // LANE §6.1: lane-off must be byte-identical to all other modes.
+        prop_assert_eq!(
+            &tw, &nolane,
+            "lane-off VM diverged from tree-walker\n--- program ---\n{}\n--- tw: {:?}\n--- nolane: {:?}",
+            prog.source, tw, nolane
+        );
     }
 
-    /// Expression-granularity differential: `print(<generated expr>)` agrees three-way.
-    /// Sharper at isolating an arithmetic/coercion/bitwise opcode divergence than the full
-    /// program generator (no surrounding control flow to mask it).
+    /// Expression-granularity differential: `print(<generated expr>)` agrees four-way
+    /// (tree-walker, specialized-VM, generic-VM, lane-off). Sharper at isolating an
+    /// arithmetic/coercion/bitwise opcode divergence than the full program generator.
     #[test]
     fn three_way_differential_over_generated_expressions(bytes in prop::collection::vec(any::<u8>(), 32..512)) {
         let mut u = arbitrary_unstructured(&bytes);
         let prog = fuzzgen::gen_expr_program(&mut u);
-        let (tw, vm, gen, _aso) = run_all_engines(&prog.source);
+        let (tw, vm, gen, _aso, nolane) = run_all_engines(&prog.source);
         prop_assert_eq!(&tw, &vm, "expr specialized-VM divergence\n{}\ntw {:?}\nvm {:?}", prog.source, tw, vm);
         prop_assert_eq!(&tw, &gen, "expr generic-VM divergence\n{}\ntw {:?}\ngen {:?}", prog.source, tw, gen);
+        // LANE §6.1: lane-off must be byte-identical.
+        prop_assert_eq!(&tw, &nolane, "expr lane-off divergence\n{}\ntw {:?}\nnolane {:?}", prog.source, tw, nolane);
     }
 }
 
@@ -167,7 +178,7 @@ fn three_way_differential_fixed_seed_battery() {
         })
         .collect();
     let results = run_all_engines_batch(progs.clone());
-    for (seed, ((tw, vm, gen, aso), src)) in results.iter().zip(progs.iter()).enumerate() {
+    for (seed, ((tw, vm, gen, aso, nolane), src)) in results.iter().zip(progs.iter()).enumerate() {
         assert_eq!(
             tw, vm,
             "FIXED-seed {seed}: specialized-VM divergence\n--- program ---\n{src}"
@@ -179,6 +190,11 @@ fn three_way_differential_fixed_seed_battery() {
         assert_eq!(
             tw, aso,
             "FIXED-seed {seed}: .aso round-trip divergence\n--- program ---\n{src}"
+        );
+        // LANE §6.1: lane-off must be byte-identical.
+        assert_eq!(
+            tw, nolane,
+            "FIXED-seed {seed}: lane-off divergence\n--- program ---\n{src}"
         );
     }
 }
@@ -211,8 +227,8 @@ fn defer_coverage_assertion_gate15() {
         .collect();
     // Run through all engines (amortized in one worker-stack thread).
     let results = run_all_engines_batch(progs.clone());
-    // Confirm no divergences (the defer axis must not introduce a bug).
-    for (seed, ((tw, vm, gen, aso), src)) in results.iter().zip(progs.iter()).enumerate() {
+    // Confirm no divergences (the defer axis must not introduce a bug; also checks lane-off).
+    for (seed, ((tw, vm, gen, aso, nolane), src)) in results.iter().zip(progs.iter()).enumerate() {
         assert_eq!(
             tw, vm,
             "Gate15 seed {seed}: specialized-VM divergence\n--- program ---\n{src}"
@@ -224,6 +240,11 @@ fn defer_coverage_assertion_gate15() {
         assert_eq!(
             tw, aso,
             "Gate15 seed {seed}: .aso round-trip divergence\n--- program ---\n{src}"
+        );
+        // LANE §6.1: lane-off must be byte-identical.
+        assert_eq!(
+            tw, nolane,
+            "Gate15 seed {seed}: lane-off divergence\n--- program ---\n{src}"
         );
     }
 
@@ -281,7 +302,7 @@ fn stress_differential_many_seeds() {
             })
             .collect();
         let results = run_all_engines_batch(progs.clone());
-        for (i, ((tw, vm, gen, aso), src)) in results.iter().zip(progs.iter()).enumerate() {
+        for (i, ((tw, vm, gen, aso, nolane), src)) in results.iter().zip(progs.iter()).enumerate() {
             let seed = start + i as u64;
             if tw != vm {
                 diverged += 1;
@@ -295,10 +316,15 @@ fn stress_differential_many_seeds() {
                 diverged += 1;
                 eprintln!("DIVERGENCE seed {seed} .aso\ntw {tw:?}\naso {aso:?}\n--- src ---\n{src}\n");
             }
+            // LANE §6.1: lane-off must be byte-identical.
+            if tw != nolane {
+                diverged += 1;
+                eprintln!("DIVERGENCE seed {seed} lane-off\ntw {tw:?}\nnolane {nolane:?}\n--- src ---\n{src}\n");
+            }
         }
         start = end;
     }
-    assert_eq!(diverged, 0, "{diverged} three-way divergences over {n} seeds (see stderr)");
+    assert_eq!(diverged, 0, "{diverged} five-way divergences over {n} seeds (see stderr)");
 }
 
 // ===========================================================================
@@ -334,10 +360,11 @@ fn saboteur_self_test_harness_can_fail() {
     let bytes = seed_bytes(12345, 512);
     let prog = fuzzgen::gen_program_from_bytes(&bytes);
 
-    // OFF (default): the real three engines agree — the harness reports NO divergence.
-    let (tw, vm, gen, _aso) = run_all_engines(&prog.source);
+    // OFF (default): the real engines agree — the harness reports NO divergence.
+    let (tw, vm, gen, _aso, nolane) = run_all_engines(&prog.source);
     assert_eq!(tw, vm, "saboteur OFF: real engines must agree (else a real bug)");
     assert_eq!(tw, gen, "saboteur OFF: real engines must agree (else a real bug)");
+    assert_eq!(tw, nolane, "saboteur OFF: lane-off must agree with tree-walker (else a real bug)");
 
     // ON: the saboteur engine MUST be flagged as divergent by the same comparison the
     // differential uses. If this assertion ever fails, the harness's divergence detection

@@ -59,6 +59,16 @@ impl ResultCell {
         }
     }
 
+    /// Non-blocking, non-consuming probe of the completion slot (LANE §4).
+    ///
+    /// Returns `Some(result)` if the slot is already filled, `None` if it is
+    /// still pending. Never blocks, never notifies, never touches any abort
+    /// handle. The result is cloned out of the slot so the cell stays filled
+    /// for all future callers (`get` / `try_get` / `resolve` are unaffected).
+    pub(crate) fn try_get(&self) -> Option<Result<Value, Control>> {
+        self.0.slot.borrow().as_ref().cloned()
+    }
+
     /// Await the cell's value, parking until it is resolved.
     async fn get(&self) -> Result<Value, Control> {
         loop {
@@ -127,6 +137,17 @@ impl SharedFuture {
         self.0.cell.resolve(result);
     }
 
+    /// Non-blocking, non-consuming probe of the backing cell (LANE §4).
+    ///
+    /// Returns `Some(result)` if the future is already resolved, `None` if it
+    /// is still pending. Never blocks the async executor, never notifies
+    /// waiters, and never touches the abort handle — cancel-on-drop semantics
+    /// are fully preserved. The result is cloned out so the slot stays live for
+    /// any subsequent `get`/`try_get` call.
+    pub fn try_get(&self) -> Option<Result<Value, Control>> {
+        self.0.cell.try_get()
+    }
+
     /// Await the cell's value, parking until it is resolved. Cloneable waiters all
     /// observe the same result.
     pub async fn get(&self) -> Result<Value, Control> {
@@ -169,6 +190,63 @@ impl Default for SharedFuture {
 mod tests {
     use super::*;
     use crate::error::AsError;
+
+    // ── LANE §4 tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_get_pending_is_none_resolved_is_some() {
+        let f = SharedFuture::new();
+        assert!(f.try_get().is_none(), "pending future must probe as None");
+        f.resolve(Ok(Value::Float(7.0)));
+        assert_eq!(f.try_get().unwrap().unwrap(), Value::Float(7.0));
+        assert_eq!(f.get().await.unwrap(), Value::Float(7.0));
+        // Still Some after get() consumed nothing:
+        assert_eq!(f.try_get().unwrap().unwrap(), Value::Float(7.0));
+    }
+
+    #[tokio::test]
+    async fn try_get_carries_stored_control() {
+        let f = SharedFuture::new();
+        f.resolve(Err(Control::Panic(AsError::new("boom"))));
+        match f.try_get().unwrap() {
+            Err(Control::Panic(e)) => assert_eq!(e.message, "boom"),
+            other => panic!("expected stored panic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_get_never_touches_the_abort_handle() {
+        // A try_get probe on a pending future must NOT abort the backing task:
+        // cancel-on-drop is only triggered by the LAST handle drop, never by
+        // a non-consuming probe.
+        use std::cell::Cell as StdCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let ran = Rc::new(StdCell::new(false));
+                let ran2 = ran.clone();
+                let f = SharedFuture::new();
+                let cell = f.cell();
+                let jh = tokio::task::spawn_local(async move {
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                    ran2.set(true);
+                    cell.resolve(Ok(Value::Float(1.0)));
+                });
+                f.set_abort(jh.abort_handle());
+                // Probe while still pending — must not abort:
+                assert!(f.try_get().is_none());
+                // Now drop the handle (last clone) — THIS triggers the abort:
+                drop(f);
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(!ran.get(), "cancel-on-drop must survive a try_get probe");
+            })
+            .await;
+    }
+
+    // ── end LANE §4 tests ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn resolves_once_and_get_returns_value() {

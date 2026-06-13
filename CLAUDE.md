@@ -349,6 +349,25 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   **`ASO_FORMAT_VERSION = 26`**. **PRIMARY GATE** (`tests/vm_bench.rs` `dbg_zero_cost_gate`, `#[ignore]`,
   release): instrument==None ≈ armed-idle (geomean 0.998×) AND spec/tw geomean ≥ 2× (2.95× ≥ pre-DBG 2.88×).
   Docs: `docs/content/tooling/debugging-profiling.md`.
+- **LANE — two-lane fiber engine** (VM-only; spec `superpowers/specs/2026-06-12-two-lane-engine-design.md`).
+  The VM runs two drivers over the SAME `Fiber` state (which externalizes ALL execution — frames/ip/stack
+  — so lane-switching is just choosing which driver polls). **`run_loop_sync`** is a plain non-async fn that
+  executes the suspension-free opcode subset in a tight loop; the async **`run_loop` is demoted to an
+  orchestrator** that bursts into the sync driver and takes over only at ops that can actually suspend —
+  non-plain callees (`Op::Call` non-`Closure`, all of `Op::CallMethod`/`CallMethodSpread` in v1),
+  `Op::Import`, `Op::Await` on a pending future, `Op::IterNext`, `Op::Break` (DBG). Per-op runtime
+  escalation: `NeedsAsync` returned with `ip` still pointing AT the escalating byte (the async driver
+  re-decodes it). **`Op::DeferPush`/`Op::DeferPushMethod`** are in-subset (they are pure stack pushes),
+  but a frame exit with a non-empty defer list escalates to the async driver (defer drain is async). **`Op::Await`
+  on an already-resolved future** is handled inline via `SharedFuture::try_get` — no reactor round-trip, no
+  leaving the sync lane. Kill switch: `Vm.sync_lane` (`bool`, default true; env `ASCRIPT_NO_SYNC_LANE=1`),
+  mirroring `--no-specialize`; when off, every burst falls through to the async driver. **The orchestrator
+  (`run_loop`) is the ONLY caller of `run_loop_sync`** — no other call site. Four-way differential identity:
+  tree-walker == specialized-lane-on == specialized-lane-off == generic-lane-on (the generic×lane combination
+  is covered by the differential). Fuzz axis and corpus coverage assertion (`lane_corpus_coverage_check`)
+  added in the same PR. **No tree-walker change, no `.aso` change, `ASO_FORMAT_VERSION` unchanged.** Headline
+  (`bench/LANE_RESULTS.md`): spec/tw geomean 3.59×; A/B geomean 1.045× (dispatch-bound +15–21%); RSS no
+  regression; `dbg_zero_cost_gate` 1.006×.
 
 ## Commands
 

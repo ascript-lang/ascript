@@ -56,6 +56,18 @@ enum StopOutcome {
     Evaluate { expr: String, frame_id: usize },
 }
 
+/// LANE §2.2: outcome of one synchronous dispatch burst in `run_loop_sync`.
+// `Finished` is not yet constructed in Task 4 (Return/Yield not in the Task-4
+// subset); it becomes live in Task 5.
+#[allow(dead_code)]
+pub(crate) enum SyncOutcome {
+    /// The fiber finished normally: root frame returned or a generator hit `Op::Yield`.
+    Finished(RunOutcome),
+    /// The burst stopped at an op outside the sync subset. The fiber's `ip` still
+    /// points AT the escalating opcode byte — the async driver re-decodes it.
+    NeedsAsync,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -195,6 +207,24 @@ pub struct Vm {
     /// zero-cost-when-off pattern of `specialize` and the SP9 determinism cell. See
     /// [`crate::vm::instrument`].
     instrument: RefCell<Option<Box<crate::vm::instrument::Instrumentation>>>,
+    /// **LANE — the sync-lane kill switch (LANE §6.1).** When `true` (the default),
+    /// the two-lane driver may run synchronous instruction bursts without suspending
+    /// to the async executor. When `false` (`ASCRIPT_NO_SYNC_LANE=1`), the sync lane
+    /// is entirely suppressed and every instruction goes through the async driver —
+    /// observable behavior is byte-identical; only throughput differs. Orthogonal to
+    /// `specialize` (IC/adaptive guards are inside shared helpers). Worker isolates
+    /// inherit this flag from the env at construction time.
+    sync_lane: bool,
+    /// **LANE — sync-lane ops counter (LANE §6.4).** Counts the total number of
+    /// bytecode instructions retired inside the sync lane across all bursts.
+    /// Incremented once per burst (flushed from a burst-local `u64` accumulator).
+    /// Read via `lane_sync_ops()`. Zero until Task 4 wires up the burst driver;
+    /// used by `vm_run_source_lane_stats` to assert coverage.
+    lane_sync_ops: std::cell::Cell<u64>,
+    /// **LANE — sync-lane burst counter (LANE §6.4).** Counts the number of times
+    /// the sync driver was entered (one burst = one uninterrupted run of the sync
+    /// lane until a non-sync op is reached). Zero until Task 4.
+    lane_bursts: std::cell::Cell<u64>,
     /// DBG: the flattened proto tree of the program under inspection, for resolving a
     /// source (file, line) to a `(proto_id, offset)` to patch. Populated ONLY when a
     /// debugger arms breakpoints (empty otherwise → zero cost, NEVER read on the hot
@@ -229,6 +259,21 @@ impl Vm {
     /// Shared constructor: build a VM with `specialize` set explicitly and install
     /// its self-`Weak` (mirroring [`Interp::install_self`]).
     pub fn with_specialize(interp: Rc<Interp>, specialize: bool) -> Rc<Self> {
+        // LANE §6.1: default sync_lane from the environment, exactly like
+        // ASCRIPT_NO_SPECIALIZE does for `specialize`. The env default is what
+        // lets worker isolates inherit the kill switch without explicit plumbing.
+        let sync_lane = std::env::var("ASCRIPT_NO_SYNC_LANE").as_deref() != Ok("1");
+        Self::with_lanes(interp, specialize, sync_lane)
+    }
+
+    /// Build a VM with `specialize` and `sync_lane` set explicitly (LANE §6.1).
+    ///
+    /// Unlike [`with_specialize`](Self::with_specialize), this constructor does NOT
+    /// consult the environment — the caller controls both kill switches directly.
+    /// Used by the test entry points (`vm_run_source_no_sync_lane`,
+    /// `vm_run_source_lane_stats`) so tests can toggle `sync_lane` without setting
+    /// environment variables.
+    pub fn with_lanes(interp: Rc<Interp>, specialize: bool, sync_lane: bool) -> Rc<Self> {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
@@ -250,6 +295,9 @@ impl Vm {
             last_fault_source: RefCell::new(None),
             instrument: RefCell::new(None),
             debug_protos: RefCell::new(Vec::new()),
+            sync_lane,
+            lane_sync_ops: std::cell::Cell::new(0),
+            lane_bursts: std::cell::Cell::new(0),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -258,6 +306,24 @@ impl Vm {
         // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
         vm.interp.set_vm(Rc::downgrade(&vm));
         vm
+    }
+
+    /// Whether the sync lane is enabled (LANE §6.1). `true` = sync bursts allowed;
+    /// `false` = kill switch active, every instruction takes the async driver.
+    pub fn sync_lane(&self) -> bool {
+        self.sync_lane
+    }
+
+    /// Total bytecode instructions retired inside the sync lane (LANE §6.4).
+    /// Always 0 until Task 4 wires up the burst driver.
+    pub fn lane_sync_ops(&self) -> u64 {
+        self.lane_sync_ops.get()
+    }
+
+    /// Number of sync-lane bursts entered (LANE §6.4).
+    /// Always 0 until Task 4 wires up the burst driver.
+    pub fn lane_bursts(&self) -> u64 {
+        self.lane_bursts.get()
     }
 
     /// **DBG.** Build a specializing VM with an instrumentation payload installed
@@ -689,6 +755,93 @@ impl Vm {
         }
     }
 
+    /// **LANE Task 3** — shared plain synchronous closure call body.
+    ///
+    /// Used by both the async `Op::Call` arm (`run_loop`) and (from Task 4 on) the
+    /// sync `run_loop_sync` driver, ensuring byte-identical behavior across both lanes.
+    ///
+    /// Responsibilities (verbatim from the `Op::Call Value::Closure` plain arm):
+    /// 1. Pops `argc` args from `fiber.stack` (top = last arg) then pops the callee slot.
+    /// 2. Runs the SHARED `check_call_args` (arity + per-param contracts + rest
+    ///    collection) — a mismatch returns a `Control::Panic` anchored at `call_span`.
+    /// 3. Allocates cell slots, places bound params into their slots (cell or plain).
+    /// 4. Pushes a new `CallFrame` — ONE `enter_frame_depth` increment (SP3 §B;
+    ///    the matching decrement is in `return_from_frame`).
+    /// 5. Publishes the updated frame stack to an armed profiler (DBG Task 7; no-op
+    ///    zero-cost None-check when no profiler is attached).
+    ///
+    /// **No await** — this is a synchronous method. The run loop continues in the new
+    /// frame immediately after return.
+    fn push_closure_frame(
+        &self,
+        fiber: &mut Fiber,
+        callee: Cc<Closure>,
+        argc: usize,
+        callee_idx: usize,
+        call_span: Span,
+    ) -> Result<(), Control> {
+        // `what` mirrors the tree-walker's `func.name.as_deref().unwrap_or("function")`
+        // so the wording of arity/contract panics matches byte-for-byte.
+        let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
+        // Pop the `argc` args into an owned vec (top of stack is the LAST arg), then
+        // drop the callee value beneath them.
+        let mut args = vec![Value::Nil; argc];
+        for slot in args.iter_mut().rev() {
+            *slot = fiber.pop();
+        }
+        fiber.pop(); // the callee value at callee_idx
+                     // Arity + per-param contracts + rest collection, shared verbatim with
+                     // the tree-walker via `check_call_args`. On a mismatch this returns a
+                     // `Control::Panic` carrying the identical message anchored at `call_span`.
+        let bound = crate::interp::check_call_args(
+            &callee.proto.params,
+            args,
+            call_span,
+            what,
+            Some(&self.interp),
+            Some(&self.class_env()),
+        )?;
+        // The args/rest array are gone from the stack; the new frame's window starts
+        // where the callee value was.
+        let slot_base = callee_idx;
+        let slot_count = callee.proto.chunk.slot_count as usize;
+        // Allocate cells, then place each bound param into its slot (cell slot → cell;
+        // plain slot → stack). Reserve the remaining locals as Nil so the window is full.
+        let cells = super::fiber::alloc_cells(slot_count, &callee.proto.chunk.cell_slots);
+        fiber.stack.resize(slot_base + slot_count, Value::Nil);
+        let supplied = bound.supplied;
+        for (slot, v) in bound.values.into_iter().enumerate() {
+            if let Some(cell) = &cells[slot] {
+                *cell.borrow_mut() = v;
+            } else {
+                fiber.stack[slot_base + slot] = v;
+            }
+        }
+        // SP3 §B: one logical-call increment per frame push (matches the tree-walker's
+        // one-per-`run_body`); the matching decrement is in `return_from_frame`. Over the
+        // limit → the clean Tier-2 panic anchored at the call.
+        self.enter_frame_depth(call_span)?;
+        fiber.frames.push(super::fiber::CallFrame {
+            closure: callee,
+            ip: 0,
+            slot_base,
+            cells,
+            ret_span: call_span,
+            // A plain in-VM function/closure call is never a method frame; only
+            // `invoke_compiled_method` sets a `def_class` (so `super` is unavailable
+            // here, which is correct — `super` only appears in method bodies).
+            def_class: None,
+            argc: supplied,
+            defers: Vec::new(),
+        });
+        // DBG Task 7: publish the new (deeper) frame stack to an armed profiler.
+        // Zero-cost None-check when off.
+        self.publish_profile_frames(fiber);
+        // Continue the run loop in the new frame (the run loop reads `fiber.frame()`
+        // at the top of each iteration). RETURN pops this frame and restores the caller.
+        Ok(())
+    }
+
     /// Force a full cycle collection (V13-T3). Thin pass-through to
     /// [`crate::gc::collect`] so tests (V13-T4's soundness gate) can deterministically
     /// trigger trial-deletion at a known point and assert a cycle was reclaimed. The
@@ -1102,6 +1255,1794 @@ impl Vm {
         result
     }
 
+    // ── LANE §2.2 — synchronous dispatch driver ──────────────────────────────
+    //
+    // `run_loop_sync` / `sync_burst` / `sync_lane_op` are PLAIN (non-async)
+    // functions. The compiler enforces this: a plain `fn` cannot contain `.await`.
+    //
+    // Correctness invariant: every arm in `sync_burst` is a byte-for-byte
+    // transcription of the corresponding arm in `run_loop`, delegating to the SAME
+    // shared helpers (`eval_binop_adaptive`, `apply_unop`, `materialize_range*`,
+    // `panic_at`, …). Where `run_loop` does `self.eval_binop_adaptive(…)` the
+    // sync arm does exactly the same call — both produce identical results because
+    // they share the helper's implementation.
+
+    /// LANE §2.2: run the sync-lane burst driver.
+    ///
+    /// Executes the suspension-free opcode subset in a tight loop until either the
+    /// fiber finishes or an escalation op is reached. Counters are flushed once per
+    /// call (not per instruction) so per-instruction counter traffic is avoided.
+    fn run_loop_sync(&self, fiber: &mut Fiber) -> Result<SyncOutcome, Control> {
+        let mut retired: u64 = 0;
+        // Run the burst, capturing the result. Flush counters BEFORE returning r so
+        // a mid-burst `Err(Control)` still records the ops completed up to the fault.
+        let r = self.sync_burst(fiber, &mut retired);
+        if retired > 0 {
+            self.lane_sync_ops.set(self.lane_sync_ops.get() + retired);
+            self.lane_bursts.set(self.lane_bursts.get() + 1);
+        }
+        r
+    }
+
+    /// Inner dispatch loop for the sync lane. Mutates `retired` on each completed op.
+    fn sync_burst(&self, fiber: &mut Fiber, retired: &mut u64) -> Result<SyncOutcome, Control> {
+        loop {
+            // Mirror run_loop exactly: capture fault_ip first.
+            let fault_ip = fiber.frame().ip;
+            // SP4 §3: refresh last_fault_source per instruction, identical to run_loop.
+            if let Some(src) = fiber.frame().closure.proto.chunk.source.borrow().as_ref() {
+                *self.last_fault_source.borrow_mut() = Some(src.clone());
+            }
+            let byte = fiber.frame().closure.proto.chunk.code[fault_ip];
+            let op = Op::from_u8(byte)
+                .unwrap_or_else(|| panic!("invalid opcode byte {byte:#x} at ip {fault_ip}"));
+
+            // LANE: check subset membership BEFORE advancing ip. If this op is
+            // not in the sync subset, return NeedsAsync with ip still at fault_ip
+            // so the async driver re-decodes and executes the same byte.
+            if !sync_lane_op(op) {
+                return Ok(SyncOutcome::NeedsAsync);
+            }
+
+            // Advance ip past the opcode byte and its inline operands — identical
+            // arithmetic to run_loop (operand_at = fault_ip + 1).
+            let operand_at = fault_ip + 1;
+            fiber.frame_mut().ip = operand_at + op.operand_width();
+
+            match op {
+                // ── consts / stack ────────────────────────────────────────────
+                Op::Const => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.frame().closure.proto.chunk.consts[idx].clone();
+                    fiber.push(v);
+                }
+                Op::Nil => fiber.push(Value::Nil),
+                Op::True => fiber.push(Value::Bool(true)),
+                Op::False => fiber.push(Value::Bool(false)),
+                Op::Pop => {
+                    fiber.pop();
+                }
+                Op::Dup => {
+                    let top = fiber.peek(0).clone();
+                    fiber.push(top);
+                }
+                Op::Swap => {
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    fiber.push(b);
+                    fiber.push(a);
+                }
+                Op::Rot3 => {
+                    let c = fiber.pop();
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    fiber.push(b);
+                    fiber.push(c);
+                    fiber.push(a);
+                }
+
+                // ── binop family (shared eval_binop_adaptive / apply_binop) ──
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Pow
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge
+                | Op::Eq
+                | Op::Ne
+                | Op::InstanceOf
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::WrapAdd
+                | Op::WrapSub
+                | Op::WrapMul
+                | Op::Range => {
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    let binop = binop_of(op);
+                    let v = self.eval_binop_adaptive(fiber, fault_ip, binop, a, b)?;
+                    fiber.push(v);
+                }
+
+                Op::InstanceOfType => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "INSTANCE_OF_TYPE name is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let yes = match crate::interp::instanceof_reserved_type(&subject, &name) {
+                        Some(b) => b,
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("INSTANCE_OF_TYPE unknown reserved type name '{name}'"),
+                            ))
+                        }
+                    };
+                    fiber.push(Value::Bool(yes));
+                }
+
+                // ── unary ops ────────────────────────────────────────────────
+                Op::Neg | Op::Not | Op::BitNot => {
+                    let a = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::apply_unop(unop_of(op), a, span)?;
+                    fiber.push(v);
+                }
+
+                // ── range ops ────────────────────────────────────────────────
+                Op::RangeInclusive => {
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::materialize_range(&a, &b, true, span)?;
+                    fiber.push(v);
+                }
+
+                Op::RangeStepValue => {
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
+                    let inclusive = (flags & 0b01) != 0;
+                    let present = (flags & 0b10) != 0;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let step = fiber.pop();
+                    let hi = fiber.pop();
+                    let lo = fiber.pop();
+                    let step_arg = if present { Some(&step) } else { None };
+                    let v = crate::interp::materialize_range_stepped(
+                        &lo, &hi, inclusive, step_arg, span,
+                    )?;
+                    fiber.push(v);
+                }
+
+                Op::RangeResolveStep => {
+                    let present =
+                        fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let step = fiber.pop();
+                    let hi_v = fiber.peek(0);
+                    let hi = match hi_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!(
+                            "RANGE_RESOLVE_STEP hi must be a number (CHECK_NUMBERS)"
+                        ),
+                    };
+                    let hi_int = hi_v.is_int_value();
+                    let lo_v = fiber.peek(1);
+                    let lo = match lo_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!(
+                            "RANGE_RESOLVE_STEP lo must be a number (CHECK_NUMBERS)"
+                        ),
+                    };
+                    let lo_int = lo_v.is_int_value();
+                    let (step_v, step_int) = if present {
+                        match step.as_f64() {
+                            Some(s) => (Some(s), step.is_int_value()),
+                            None => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    "for-range step must be a number".to_string(),
+                                ))
+                            }
+                        }
+                    } else {
+                        (None, true)
+                    };
+                    let resolved = crate::interp::resolve_step(lo, hi, step_v, span)?;
+                    let yields_int = lo_int && hi_int && step_int;
+                    fiber.push(crate::interp::range_counter_value(resolved, yields_int));
+                }
+
+                Op::RangeHasNext => {
+                    let inclusive =
+                        fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    let step = fiber.pop();
+                    let hi = fiber.pop();
+                    let i = fiber.pop();
+                    let ok = match (i.as_f64(), hi.as_f64(), step.as_f64()) {
+                        (Some(i), Some(hi), Some(step)) => {
+                            crate::interp::range_has_next(i, hi, step, inclusive)
+                        }
+                        _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::CheckNumbers => {
+                    let end_ok = fiber.peek(0).is_number();
+                    let start_ok = fiber.peek(1).is_number();
+                    if !(end_ok && start_ok) {
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            "for-range bounds must be numbers".to_string(),
+                        ));
+                    }
+                }
+
+                // ── locals / globals ─────────────────────────────────────────
+                Op::GetLocal => {
+                    let slot =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.local(slot).clone();
+                    fiber.push(v);
+                }
+                Op::SetLocal => {
+                    let slot =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.pop();
+                    fiber.set_local(slot, v);
+                }
+
+                Op::GetGlobal => {
+                    // Mirror run_loop's GET_GLOBAL exactly — same cache logic.
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "GET_GLOBAL operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let version = self.global_version();
+                    let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
+                    if self.specialize {
+                        if let Some(idx) = cache.get_index(self.struct_gen()) {
+                            fiber.push(self.user_global_value_at(idx));
+                            *retired += 1;
+                            continue;
+                        }
+                    }
+                    if let Some(v) = cache.get(version).filter(|_| self.specialize) {
+                        fiber.push(v);
+                    } else if let Some((idx, v)) = self.get_user_global_full(&name) {
+                        if self.specialize {
+                            fiber.frame().closure.proto.chunk.set_global_cache(
+                                fault_ip,
+                                crate::vm::adapt::GlobalCache::index_bound(
+                                    idx,
+                                    self.struct_gen(),
+                                ),
+                            );
+                        }
+                        fiber.push(v);
+                    } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
+                        let v = Value::Builtin(name);
+                        if self.specialize {
+                            fiber.frame().closure.proto.chunk.set_global_cache(
+                                fault_ip,
+                                crate::vm::adapt::GlobalCache::set(v.clone(), version),
+                            );
+                        }
+                        fiber.push(v);
+                    } else {
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("undefined variable '{name}'"),
+                        ));
+                    }
+                }
+
+                Op::DefineGlobal => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mutable =
+                        fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) != 0;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "DEFINE_GLOBAL operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let v = fiber.pop();
+                    if self.user_globals.borrow().contains_key(name.as_ref()) {
+                        return Err(Control::Panic(AsError::new(format!(
+                            "'{name}' is already defined in this scope"
+                        ))));
+                    }
+                    self.define_user_global(name, v, mutable);
+                }
+
+                Op::SetGlobal => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "SET_GLOBAL operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let v = fiber.peek(0).clone();
+                    let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
+                    if self.specialize {
+                        if let Some(idx) = cache.get_index(self.struct_gen()) {
+                            match self.set_user_global_at(idx, v.clone()) {
+                                Some(true) => {
+                                    *retired += 1;
+                                    continue;
+                                }
+                                Some(false) => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!(
+                                            "cannot assign to immutable binding '{name}'"
+                                        ),
+                                    ));
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    match self.user_global_mutable(name.as_ref()) {
+                        Some(true) => {
+                            self.update_user_global(&name, v);
+                            if self.specialize {
+                                if let Some((idx, _)) =
+                                    self.get_user_global_full(name.as_ref())
+                                {
+                                    fiber.frame().closure.proto.chunk.set_global_cache(
+                                        fault_ip,
+                                        crate::vm::adapt::GlobalCache::index_bound(
+                                            idx,
+                                            self.struct_gen(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Some(false) => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("cannot assign to immutable binding '{name}'"),
+                            ));
+                        }
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("cannot assign to undefined variable '{name}'"),
+                            ));
+                        }
+                    }
+                }
+
+                Op::ImmutableError => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "IMMUTABLE_ERROR operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        format!("cannot assign to immutable binding '{name}'"),
+                    ));
+                }
+
+                // ── jumps ─────────────────────────────────────────────────────
+                Op::Jump => {
+                    let disp =
+                        fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                    let base = fiber.frame().ip as isize;
+                    fiber.frame_mut().ip = (base + disp as isize) as usize;
+                }
+                Op::Loop => {
+                    let disp =
+                        fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                    let base = fiber.frame().ip as isize;
+                    fiber.frame_mut().ip = (base + disp as isize) as usize;
+                }
+                Op::JumpIfFalse => {
+                    let v = fiber.pop();
+                    if !v.is_truthy() {
+                        let disp =
+                            fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+                Op::JumpIfTrue => {
+                    let v = fiber.pop();
+                    if v.is_truthy() {
+                        let disp =
+                            fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+                Op::JumpIfNotNil => {
+                    let v = fiber.pop();
+                    if v != Value::Nil {
+                        let disp =
+                            fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+
+                // ── Template ──────────────────────────────────────────────────
+                Op::Template => {
+                    let n =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mut parts = vec![Value::Nil; n];
+                    for slot in parts.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let mut out = String::new();
+                    for v in &parts {
+                        out.push_str(&v.to_string());
+                    }
+                    fiber.push(Value::Str(out.into()));
+                }
+
+                // ── Return / Propagate / Unwrap / Yield ──────────────────────
+                Op::Return => {
+                    // DEFER GUARD: if defers are pending, we cannot drain them in the
+                    // sync lane (drain requires .await). Restore ip to fault_ip and
+                    // escalate to the async driver which will drain + return.
+                    if !fiber.frame().defers.is_empty() {
+                        fiber.frame_mut().ip = fault_ip;
+                        return Ok(SyncOutcome::NeedsAsync);
+                    }
+                    let result = fiber.pop();
+                    if let Some(outcome) = self.return_from_frame(fiber, result)? {
+                        return Ok(SyncOutcome::Finished(outcome));
+                    }
+                    // Non-root frame: return_from_frame pushed the result and popped
+                    // the frame; continue the loop in the caller's frame.
+                    *retired += 1;
+                    continue;
+                }
+
+                Op::Propagate => {
+                    // DEFER GUARD: pending defers require async drain on propagation.
+                    let v = fiber.pop();
+                    let (value, err) = match &v {
+                        Value::Array(a) if a.borrow().len() == 2 => {
+                            let b = a.borrow();
+                            (b[0].clone(), b[1].clone())
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "the ? operator requires a Result pair [value, err]".to_string(),
+                            ))
+                        }
+                    };
+                    if err == Value::Nil {
+                        fiber.push(value);
+                    } else {
+                        // Error path: need to drain defers (possibly async) and then
+                        // return. Restore ip so the async driver re-executes the op.
+                        // Re-push the pair so the stack is untouched from the caller's
+                        // perspective; actually the async path will re-pop it.
+                        // The cleanest approach: since we already popped `v`, just
+                        // restore ip and re-push v, then let async driver handle it.
+                        fiber.push(v);
+                        fiber.frame_mut().ip = fault_ip;
+                        return Ok(SyncOutcome::NeedsAsync);
+                    }
+                }
+
+                Op::Unwrap => {
+                    // No defer guard needed: Unwrap never drains defers (it either
+                    // pushes the value or raises a recoverable Panic — no unwind).
+                    let v = fiber.pop();
+                    let (value, err) = match &v {
+                        Value::Array(a) if a.borrow().len() == 2 => {
+                            let b = a.borrow();
+                            (b[0].clone(), b[1].clone())
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "the ! operator requires a Result pair [value, err]".to_string(),
+                            ))
+                        }
+                    };
+                    if err == Value::Nil {
+                        fiber.push(value);
+                    } else {
+                        return Err(self.panic_at(fiber, fault_ip, error_message(&err)));
+                    }
+                }
+
+                Op::Yield => {
+                    // Pop the yielded value, suspend the fiber, and return Yielded.
+                    // ip is already advanced past this op so the next resume continues
+                    // after the yield. The frame stack is left intact in the Fiber.
+                    let v = fiber.pop();
+                    fiber.state = crate::vm::FiberState::Suspended;
+                    return Ok(SyncOutcome::Finished(crate::vm::value_ext::RunOutcome::Yielded(v)));
+                }
+
+                // ── DeferPush / DeferPushMethod ───────────────────────────────
+                // These only CAPTURE callee + args onto the frame's defers list —
+                // no call, no await. The drain happens at Return/Propagate time
+                // (which escalates to async when defers are non-empty).
+                Op::DeferPush => {
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 1) as usize;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let awaited = (flags & 1) != 0;
+                    let spread = (flags & 2) != 0;
+                    let args: Vec<Value> = if spread {
+                        let arr = fiber.pop();
+                        match arr {
+                            Value::Array(a) => a.borrow().clone(),
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "defer spread requires an array, got {}",
+                                        crate::interp::type_name(&other)
+                                    ),
+                                ))
+                            }
+                        }
+                    } else {
+                        let mut v = vec![Value::Nil; argc];
+                        for slot in v.iter_mut().rev() {
+                            *slot = fiber.pop();
+                        }
+                        v
+                    };
+                    let callee = fiber.pop();
+                    fiber.frame_mut().defers.push(crate::interp::DeferEntry {
+                        kind: crate::interp::DeferKind::Call { callee },
+                        args,
+                        awaited,
+                        span,
+                    });
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    crate::vm::defer_metrics::defer_metrics::ENTRIES_PUSHED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                Op::DeferPushMethod => {
+                    let name_idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2);
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 3) as usize;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let awaited = (flags & 1) != 0;
+                    let spread = (flags & 2) != 0;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[name_idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "defer method name must be a string, got {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    };
+                    let args: Vec<Value> = if spread {
+                        let arr = fiber.pop();
+                        match arr {
+                            Value::Array(a) => a.borrow().clone(),
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "defer spread requires an array, got {}",
+                                        crate::interp::type_name(&other)
+                                    ),
+                                ))
+                            }
+                        }
+                    } else {
+                        let mut v = vec![Value::Nil; argc];
+                        for slot in v.iter_mut().rev() {
+                            *slot = fiber.pop();
+                        }
+                        v
+                    };
+                    let recv = fiber.pop();
+                    // Mirror run_loop: resolve non-hook receivers to BoundMethod now;
+                    // hook receivers keep DeferKind::Method so call-site hooks fire at
+                    // drain time (which happens async via run_loop's Op::Return path).
+                    let kind = if self.interp.member_call_is_hook(&recv, &name) {
+                        crate::interp::DeferKind::Method { recv, name }
+                    } else {
+                        let callee = self.vm_read_member(&recv, &name, span)?;
+                        crate::interp::DeferKind::Call { callee }
+                    };
+                    fiber.frame_mut().defers.push(crate::interp::DeferEntry {
+                        kind,
+                        args,
+                        awaited,
+                        span,
+                    });
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    crate::vm::defer_metrics::defer_metrics::ENTRIES_PUSHED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // ── GetIndex / SetIndex / GetProp / GetPropOpt / SetProp ───────
+                Op::GetIndex => {
+                    let idx = fiber.pop();
+                    let obj = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::index_get(&obj, &idx, span, span)?;
+                    fiber.push(v);
+                }
+
+                Op::SetIndex => {
+                    let val = fiber.pop();
+                    let idx = fiber.pop();
+                    let obj = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::index_set(&obj, &idx, val, span, span)?;
+                    if let Value::Object(cell) = &obj {
+                        self.resync_object_shape(cell);
+                    }
+                    fiber.push(v);
+                }
+
+                Op::GetProp | Op::GetPropOpt => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("GET_PROP operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let obj = fiber.pop();
+                    if op == Op::GetPropOpt && obj == Value::Nil {
+                        fiber.push(Value::Nil);
+                    } else {
+                        let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                        let proto = fiber.frame().closure.proto.clone();
+                        let cached = if self.specialize {
+                            self.ic_get_field(&proto.chunk, fault_ip, &obj, &name)
+                        } else {
+                            None
+                        };
+                        let v = match cached {
+                            Some(v) => v,
+                            None => self.vm_read_member(&obj, &name, span)?,
+                        };
+                        fiber.push(v);
+                    }
+                }
+
+                Op::SetProp => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("SET_PROP operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let value = fiber.pop();
+                    let obj = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let proto = fiber.frame().closure.proto.clone();
+                    let v = self.vm_set_prop(&proto.chunk, fault_ip, &obj, &name, value, span)?;
+                    fiber.push(v);
+                }
+
+                Op::GetSuper => {
+                    // `super.<name>` (V9-T2): resolve `name` starting at the CURRENT
+                    // method's DEFINING class's superclass, bound to `self` (slot 0).
+                    // Mirrors the tree-walker: `super` is a `Value::Super` whose
+                    // `start` is `defining_class.superclass`, and `read_member` on it
+                    // finds the method up that chain and produces a BoundMethod on
+                    // `self` (which the subsequent CALL invokes). The `defining_class`
+                    // we stamp onto the BoundMethod is the ANCESTOR that actually
+                    // declared the method, so a NESTED `super` resolves from the right
+                    // link too.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("GET_SUPER name is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    // The defining class of the running method (set by
+                    // `invoke_compiled_method`). Absent only if `super` somehow
+                    // appears outside a method frame — a compiler invariant violation.
+                    let def_class = match &fiber.frame().def_class {
+                        Some(c) => c.clone(),
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "'super' used outside of a method".to_string(),
+                            ))
+                        }
+                    };
+                    // self = slot 0, read cell-aware (it is a cell slot whenever a
+                    // nested closure captured it).
+                    let receiver = match &fiber.frame().cells[0] {
+                        Some(cell) => cell.borrow().clone(),
+                        None => fiber.local(0).clone(),
+                    };
+                    // Resolve up from the DEFINING class's superclass (NOT the
+                    // instance's class), matching `SuperRef { start: superclass }`.
+                    let start = def_class.superclass.clone();
+                    let bound = match start
+                        .as_ref()
+                        .and_then(|s| self.find_compiled_method(s, &name))
+                    {
+                        Some((_closure, found_class)) => {
+                            Value::BoundMethod(Rc::new(crate::value::BoundMethod {
+                                receiver,
+                                method: Rc::new(crate::value::Method {
+                                    params: Vec::new(),
+                                    ret: None,
+                                    body: Vec::new(),
+                                    is_async: false,
+                                    is_generator: false,
+                                    is_worker: false,
+                                }),
+                                defining_class: found_class,
+                                name: name.to_string(),
+                            }))
+                        }
+                        None => {
+                            // Mirror the tree-walker's `Value::Super` member-read
+                            // error wording (with/without a superclass).
+                            let msg = if start.is_some() {
+                                format!("no superclass method '{name}'")
+                            } else {
+                                format!("no superclass method '{name}' (no superclass)")
+                            };
+                            return Err(Control::Panic(AsError::at(msg, span)));
+                        }
+                    };
+                    fiber.push(bound);
+                }
+
+                // ── IterSnapshot ──────────────────────────────────────────────
+                Op::IterSnapshot => {
+                    let iterable = fiber.pop();
+                    let items: Vec<Value> = match iterable {
+                        Value::Array(arr) => arr.borrow().clone(),
+                        Value::Str(s) => s
+                            .chars()
+                            .map(|c| Value::Str(c.to_string().into()))
+                            .collect(),
+                        Value::Shared(ref node) => match crate::interp::shared_iter_values(node) {
+                            Some(items) => items,
+                            None => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "value of type {} is not iterable",
+                                        crate::interp::type_name(&iterable)
+                                    ),
+                                ))
+                            }
+                        },
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "value of type {} is not iterable",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    };
+                    fiber.push(Value::Array(crate::value::ArrayCell::new(items)));
+                }
+
+                Op::ArrayLen => {
+                    // Pop a (compiler-produced) snapshot array and push its element
+                    // count as a `Number`. The operand is never user input — the
+                    // compiler emits this only over an `IterSnapshot` result — so a
+                    // non-array is a compiler bug surfaced as a Tier-2 panic.
+                    let v = fiber.pop();
+                    match v {
+                        Value::Array(arr) => {
+                            let len = arr.borrow().len();
+                            fiber.push(Value::Float(len as f64));
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("ARRAY_LEN operand is not an array: {other:?}"),
+                            ))
+                        }
+                    }
+                }
+
+                // ── Builders ─────────────────────────────────────────────────
+                Op::NewArray => {
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mut values = vec![Value::Nil; n];
+                    for slot in values.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    fiber.push(Value::Array(crate::value::ArrayCell::new(values)));
+                }
+
+                Op::NewObject => {
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
+                    for slot in pairs.iter_mut().rev() {
+                        let value = fiber.pop();
+                        let key = match fiber.pop() {
+                            Value::Str(s) => s,
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("NEW_OBJECT key is not a string constant: {other:?}"),
+                                ))
+                            }
+                        };
+                        *slot = (key, value);
+                    }
+                    let mut map = indexmap::IndexMap::with_capacity(n);
+                    for (k, v) in pairs {
+                        map.insert(k.to_string(), v);
+                    }
+                    let cell = crate::value::ObjectCell::new(map);
+                    let shape = self.object_shape_for(cell.map.borrow().keys().map(|s| s.as_str()));
+                    cell.shape.set(shape);
+                    fiber.push(Value::Object(cell));
+                }
+
+                Op::NewMap => {
+                    let cell = crate::value::MapCell::new(indexmap::IndexMap::new());
+                    fiber.push(Value::Map(cell));
+                }
+
+                Op::MapEntry => {
+                    let val = fiber.pop();
+                    let key_val = fiber.pop();
+                    let key = match crate::value::MapKey::from_value(&key_val) {
+                        Some(k) => k,
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "cannot use {} as a map key",
+                                    crate::interp::type_name(&key_val)
+                                ),
+                            ))
+                        }
+                    };
+                    match fiber.peek(0) {
+                        Value::Map(m) => {
+                            m.borrow_mut().insert(key, val);
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "MAP_ENTRY target is not a map: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    }
+                }
+
+                Op::Spread | Op::SpreadArgs => {
+                    let operand = fiber.pop();
+                    match operand {
+                        Value::Array(src) => {
+                            let items: Vec<Value> = src.borrow().iter().cloned().collect();
+                            match fiber.peek(0) {
+                                Value::Array(arr) => arr.borrow_mut().extend(items),
+                                other => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!(
+                                            "SPREAD target is not an array: {}",
+                                            crate::interp::type_name(other)
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        other => {
+                            let msg = if matches!(op, Op::SpreadArgs) {
+                                format!(
+                                    "can only spread an array as call arguments, got {}",
+                                    crate::interp::type_name(&other)
+                                )
+                            } else {
+                                format!(
+                                    "can only spread an array into an array, got {}",
+                                    crate::interp::type_name(&other)
+                                )
+                            };
+                            return Err(self.panic_at(fiber, fault_ip, msg));
+                        }
+                    }
+                }
+
+                Op::AppendArray => {
+                    let item = fiber.pop();
+                    match fiber.peek(0) {
+                        Value::Array(arr) => arr.borrow_mut().push(item),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "APPEND_ARRAY target is not an array: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendObject => {
+                    let val = fiber.pop();
+                    let key = match fiber.pop() {
+                        Value::Str(s) => s,
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("APPEND_OBJECT key is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    match fiber.peek(0) {
+                        Value::Object(obj) => {
+                            obj.borrow_mut().insert(key.to_string(), val);
+                            let obj = obj.clone();
+                            self.resync_object_shape(&obj);
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "APPEND_OBJECT target is not an object: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    }
+                }
+
+                Op::SpreadObject => {
+                    let operand = fiber.pop();
+                    match operand {
+                        Value::Object(src) => {
+                            let entries: Vec<(String, Value)> = src
+                                .borrow()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            match fiber.peek(0) {
+                                Value::Object(obj) => {
+                                    {
+                                        let mut m = obj.borrow_mut();
+                                        for (k, v) in entries {
+                                            m.insert(k, v);
+                                        }
+                                    }
+                                    let obj = obj.clone();
+                                    self.resync_object_shape(&obj);
+                                }
+                                other => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!(
+                                            "SPREAD_OBJECT target is not an object: {}",
+                                            crate::interp::type_name(other)
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "can only spread an object into an object, got {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendNamedArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
+                    // `argsArray` (peek 1) and push the field name `consts[idx]` (a
+                    // `Str`) onto `namesArray` (peek 0).
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => Value::Str(s.clone()),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("APPEND_NAMED_ARG name operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let value = fiber.pop();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().push(value);
+                            names.borrow_mut().push(name);
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_NAMED_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendPosArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
+                    // `argsArray` and push `Nil` onto `namesArray` (a positional value).
+                    let value = fiber.pop();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().push(value);
+                            names.borrow_mut().push(Value::Nil);
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_POS_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendSpreadArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, operand]`: pop `operand` (MUST be an
+                    // Array), extend `argsArray` with its elements and push `Nil` ONCE
+                    // PER element onto `namesArray`.
+                    let operand = fiber.pop();
+                    let items: Vec<Value> = match operand {
+                        Value::Array(src) => src.borrow().iter().cloned().collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "can only spread an array as call arguments, got {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    };
+                    let n = items.len();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().extend(items);
+                            names.borrow_mut().extend(std::iter::repeat_n(Value::Nil, n));
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_SPREAD_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                // ── Destructure / match family ────────────────────────────────
+                Op::CheckArrayDestructure => {
+                    if !matches!(fiber.peek(0), Value::Array(_)) {
+                        let t = crate::interp::type_name(fiber.peek(0));
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("cannot destructure a non-array value of type {t}"),
+                        ));
+                    }
+                }
+
+                Op::CheckObjectDestructure => {
+                    if !matches!(fiber.peek(0), Value::Object(_) | Value::Instance(_)) {
+                        let t = crate::interp::type_name(fiber.peek(0));
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("cannot destructure a non-object value of type {t}"),
+                        ));
+                    }
+                }
+
+                Op::ArrayElem => {
+                    let index = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let src = fiber.pop();
+                    match src {
+                        Value::Array(arr) => {
+                            let v = arr.borrow().get(index).cloned().unwrap_or(Value::Nil);
+                            fiber.push(v);
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("ARRAY_ELEM operand is not an array: {other:?}"),
+                            ))
+                        }
+                    }
+                }
+
+                Op::ObjectKey => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("OBJECT_KEY operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let src = fiber.pop();
+                    let v = match src {
+                        Value::Object(o) => {
+                            o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                        }
+                        Value::Instance(i) => i
+                            .borrow()
+                            .fields
+                            .get(key.as_ref())
+                            .cloned()
+                            .unwrap_or(Value::Nil),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("OBJECT_KEY operand is not an object: {other:?}"),
+                            ))
+                        }
+                    };
+                    fiber.push(v);
+                }
+
+                Op::ArrayRest => {
+                    let start = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let src = fiber.pop();
+                    match src {
+                        Value::Array(arr) => {
+                            let tail: Vec<Value> =
+                                arr.borrow().iter().skip(start).cloned().collect();
+                            fiber.push(Value::Array(crate::value::ArrayCell::new(tail)));
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("ARRAY_REST operand is not an array: {other:?}"),
+                            ))
+                        }
+                    }
+                }
+
+                Op::ObjectRest => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let bound: std::collections::HashSet<Rc<str>> =
+                        match &fiber.frame().closure.proto.chunk.consts[idx] {
+                            Value::Array(keys) => keys
+                                .borrow()
+                                .iter()
+                                .filter_map(|v| match v {
+                                    Value::Str(s) => Some(s.clone()),
+                                    _ => None,
+                                })
+                                .collect(),
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "OBJECT_REST operand is not a key array: {other:?}"
+                                    ),
+                                ))
+                            }
+                        };
+                    let src = fiber.pop();
+                    let mut remaining: indexmap::IndexMap<String, Value> =
+                        indexmap::IndexMap::new();
+                    match src {
+                        Value::Object(o) => {
+                            for (k, v) in o.borrow().iter() {
+                                if !bound.contains(k.as_str()) {
+                                    remaining.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        Value::Instance(i) => {
+                            for (k, v) in i.borrow().fields.iter() {
+                                if !bound.contains(k.as_str()) {
+                                    remaining.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("OBJECT_REST operand is not an object: {other:?}"),
+                            ))
+                        }
+                    }
+                    fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                }
+
+                Op::MatchArray => {
+                    let len = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let exact = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) == 1;
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::Array(a) => {
+                            let n = a.borrow().len();
+                            if exact { n == len } else { n >= len }
+                        }
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchObject => {
+                    let subject = fiber.pop();
+                    let ok = matches!(subject, Value::Object(_) | Value::Instance(_));
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchHasKey => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "MATCH_HAS_KEY operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::Object(o) => o.borrow().contains_key(key.as_ref()),
+                        Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchVariant => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let (want_variant, want_enum) =
+                        match &fiber.frame().closure.proto.chunk.consts[idx] {
+                            Value::Array(a) => {
+                                let b = a.borrow();
+                                let v = match b.first() {
+                                    Some(Value::Str(s)) => s.clone(),
+                                    _ => {
+                                        return Err(self.panic_at(
+                                            fiber,
+                                            fault_ip,
+                                            "MATCH_VARIANT operand[0] is not a string"
+                                                .to_string(),
+                                        ))
+                                    }
+                                };
+                                let e = match b.get(1) {
+                                    Some(Value::Str(s)) => Some(s.clone()),
+                                    _ => None,
+                                };
+                                (v, e)
+                            }
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "MATCH_VARIANT operand is not an array: {other:?}"
+                                    ),
+                                ))
+                            }
+                        };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::EnumVariant(ev) if ev.payload.is_some() => {
+                            ev.name.as_str() == want_variant.as_ref()
+                                && want_enum
+                                    .as_ref()
+                                    .map(|e| ev.enum_name.as_str() == e.as_ref())
+                                    .unwrap_or(true)
+                        }
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchVariantArity => {
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let subject = fiber.pop();
+                    let len = variant_payload_len(&subject);
+                    fiber.push(Value::Bool(len == Some(n)));
+                }
+
+                Op::MatchVariantHasField => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "MATCH_VARIANT_HAS_FIELD operand is not a string: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().contains_key(key.as_ref())
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::VariantElem => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let subject = fiber.pop();
+                    let v = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Positional(a)) => {
+                                a.borrow().get(idx).cloned().unwrap_or(Value::Nil)
+                            }
+                            Some(crate::value::Payload::Named(o)) => o
+                                .borrow()
+                                .get_index(idx)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Value::Nil),
+                            None => Value::Nil,
+                        },
+                        _ => Value::Nil,
+                    };
+                    fiber.push(v);
+                }
+
+                Op::VariantField => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("VARIANT_FIELD operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let v = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                            }
+                            _ => Value::Nil,
+                        },
+                        _ => Value::Nil,
+                    };
+                    fiber.push(v);
+                }
+
+                Op::MatchRange => {
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
+                    let inclusive = (flags & 0b01) != 0;
+                    let present = (flags & 0b10) != 0;
+                    let step = fiber.pop();
+                    let hi = fiber.pop();
+                    let lo = fiber.pop();
+                    let subject = fiber.pop();
+                    let ok = match (subject.as_f64(), lo.as_f64(), hi.as_f64()) {
+                        (Some(n), Some(lo), Some(hi)) => {
+                            let step_v = if present {
+                                match step.as_f64() {
+                                    Some(s) => Some(s),
+                                    None => {
+                                        return Err(self.panic_at(
+                                            fiber,
+                                            fault_ip,
+                                            "range step must be a number".to_string(),
+                                        ))
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            if step_v.is_some() {
+                                let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                                crate::interp::resolve_step(lo, hi, step_v, span)?;
+                            }
+                            crate::interp::range_pattern_contains(n, lo, hi, step_v, inclusive)
+                        }
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchNoArm => {
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        "no matching arm in match expression".to_string(),
+                    ));
+                }
+
+                // ── Cells / upvalues / param-prologue ────────────────────────
+                Op::GetLocalCell => {
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.get_local_cell(slot);
+                    fiber.push(v);
+                }
+                Op::SetLocalCell => {
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.pop();
+                    fiber.set_local_cell(slot, v);
+                }
+                Op::FreshCell => {
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    fiber.fresh_cell(slot);
+                }
+
+                Op::GetUpvalue => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.frame().closure.upvalues[idx].borrow().clone();
+                    fiber.push(v);
+                }
+                Op::SetUpvalue => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.pop();
+                    *fiber.frame().closure.upvalues[idx].borrow_mut() = v;
+                }
+
+                Op::CheckParam => {
+                    let param = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let span = fiber.frame().ret_span;
+                    let ty = fiber.frame().closure.proto.params[param].ty.clone();
+                    if let Some(ty) = ty {
+                        let v = fiber.peek(0).clone();
+                        if !crate::interp::check_type(&v, &ty) {
+                            return Err(crate::interp::contract_panic(&ty, &v, span));
+                        }
+                    }
+                }
+
+                Op::CheckLocal => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let ty = match fiber.frame().closure.proto.chunk.type_consts.get(idx) {
+                        Some(ty) => ty.clone(),
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CHECK_LOCAL type-const index {idx} out of range"),
+                            ))
+                        }
+                    };
+                    let v = fiber.peek(0).clone();
+                    if !crate::interp::check_type(&v, &ty) {
+                        return Err(crate::interp::contract_panic(&ty, &v, span));
+                    }
+                }
+
+                Op::JumpIfArgSupplied => {
+                    let chunk = &fiber.frame().closure.proto.chunk;
+                    let param = chunk.read_u16(operand_at) as usize;
+                    let disp = chunk.read_i16(operand_at + 2);
+                    if fiber.frame().argc > param {
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+
+                // ── Closure ──────────────────────────────────────────────────
+                Op::Closure => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let proto = fiber.frame().closure.proto.chunk.protos[idx].clone();
+                    let mut upvalues = Vec::with_capacity(proto.chunk.upvalues.len());
+                    for desc in &proto.chunk.upvalues {
+                        let cell = match *desc {
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                                slot,
+                                by_value: false,
+                            } => fiber
+                                .frame()
+                                .cells
+                                .get(slot as usize)
+                                .and_then(|c| c.as_ref())
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "CLOSURE captures parent local slot {slot} that is not a cell (compiler/resolver bug)"
+                                    )
+                                })
+                                .clone(),
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                                slot,
+                                by_value: true,
+                            } => {
+                                let v = fiber.local(slot as usize).clone();
+                                gcmodule::Cc::new(std::cell::RefCell::new(v))
+                            }
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentUpvalue(up) => {
+                                fiber.frame().closure.upvalues[up as usize].clone()
+                            }
+                        };
+                        upvalues.push(cell);
+                    }
+                    let closure = crate::vm::value_ext::Closure::with_upvalues(proto, upvalues);
+                    fiber.push(Value::Closure(closure));
+                }
+
+                // ── Call / CallSpread (plain sync closure only) ───────────────
+                Op::Call | Op::CallSpread => {
+                    // For CallSpread: peek at the callee before popping the args array.
+                    // For Call: peek at the callee using the static argc operand.
+                    // If the callee is a plain (non-async, non-worker, non-generator)
+                    // closure: push a new CallFrame (sync, no await) and continue.
+                    // Any other callee kind: restore ip to fault_ip and escalate to async.
+                    //
+                    // INVARIANT: we must NOT pop anything from the stack before
+                    // confirming the callee is sync-eligible, so that escalation
+                    // leaves the stack completely untouched.
+                    if matches!(op, Op::CallSpread) {
+                        // Stack is `[..., callee, argsArray]`. Peek callee at index -2.
+                        let callee_ref = &fiber.stack[fiber.stack.len() - 2];
+                        let is_sync_closure = match callee_ref {
+                            Value::Closure(c) => {
+                                !c.proto.is_async && !c.proto.is_worker && !c.proto.is_generator
+                            }
+                            _ => false,
+                        };
+                        if !is_sync_closure {
+                            fiber.frame_mut().ip = fault_ip;
+                            return Ok(SyncOutcome::NeedsAsync);
+                        }
+                        // Pop the args array and flatten it, then dispatch.
+                        let args = match fiber.pop() {
+                            Value::Array(a) => a,
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "CALL_SPREAD args are not an array: {}",
+                                        crate::interp::type_name(&other)
+                                    ),
+                                ))
+                            }
+                        };
+                        let items: Vec<Value> = args.borrow().iter().cloned().collect();
+                        let argc = items.len();
+                        for v in items {
+                            fiber.push(v);
+                        }
+                        let callee_idx = fiber.stack.len() - argc - 1;
+                        let callee = match fiber.stack[callee_idx].clone() {
+                            Value::Closure(c) => c,
+                            _ => unreachable!("already checked above"),
+                        };
+                        let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                    } else {
+                        // Op::Call: argc is the static operand.
+                        let argc =
+                            fiber.frame().closure.proto.chunk.read_u8(operand_at) as usize;
+                        let callee_idx = fiber.stack.len() - argc - 1;
+                        let callee_ref = &fiber.stack[callee_idx];
+                        let is_sync_closure = match callee_ref {
+                            Value::Closure(c) => {
+                                !c.proto.is_async && !c.proto.is_worker && !c.proto.is_generator
+                            }
+                            _ => false,
+                        };
+                        if !is_sync_closure {
+                            // Restore ip (already advanced) before escalating.
+                            fiber.frame_mut().ip = fault_ip;
+                            return Ok(SyncOutcome::NeedsAsync);
+                        }
+                        let callee = match fiber.stack[callee_idx].clone() {
+                            Value::Closure(c) => c,
+                            _ => unreachable!("already checked above"),
+                        };
+                        let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                    }
+                    // Continue the loop in the new (or returned-to) frame.
+                    *retired += 1;
+                    continue;
+                }
+
+                // ── LANE §4: inline ready-future completion ──────────────────
+                //
+                // Peek-first to decide whether to stay in-lane or escalate:
+                //
+                //   1. Non-Future TOS → identity (await 5 == 5): pop + push back,
+                //      retire. Mirrors run_loop's `other => fiber.push(other)`.
+                //   2. Future with try_get() == Some(Ok(v)) → pop future, push v,
+                //      retire (the inline take).
+                //   3. Future with try_get() == Some(Err(c)) → pop future, return
+                //      Err(c): the stored Control surfaces with the IDENTICAL value
+                //      the async arm's `f.get().await?` would re-raise.
+                //   4. Future with try_get() == None (still pending) → un-advance ip
+                //      and return NeedsAsync: the async driver re-decodes Op::Await,
+                //      parks on f.get().await, and wakes when the future resolves.
+                //
+                // CRITICAL: no borrow is held while pushing to the fiber. We read
+                // `try_get` (which borrows the cell, then drops the borrow inside
+                // the call), clone the result out, then do the pop+push with NO
+                // borrow held. `try_get` is a plain synchronous call — ZERO awaits.
+                Op::Await => {
+                    // Peek TOS read-only before deciding whether to pop.
+                    let probe = match fiber.peek(0) {
+                        Value::Future(f) => {
+                            // try_get clones the result out; the slot borrow is
+                            // dropped before try_get returns — no borrow held.
+                            f.try_get()
+                        }
+                        _ => {
+                            // Case 1: non-Future → identity. Pop and push back.
+                            // ip is already advanced.
+                            let v = fiber.pop();
+                            fiber.push(v);
+                            // retire += 1 falls through at the end of the match.
+                            *retired += 1;
+                            continue;
+                        }
+                    };
+                    match probe {
+                        None => {
+                            // Case 4: future still pending — escalate.
+                            // ip was already advanced above; restore it so the
+                            // async driver re-decodes the same Op::Await byte.
+                            fiber.frame_mut().ip = fault_ip;
+                            return Ok(SyncOutcome::NeedsAsync);
+                        }
+                        Some(r) => {
+                            // Cases 2 and 3: future already resolved.
+                            // Pop the Future handle (one Rc decrement, no side
+                            // effect on cancel-on-drop — the future is resolved).
+                            fiber.pop();
+                            // Re-raise stored Control (Error branch → Err(c))
+                            // or push the value (Ok branch). `?` propagates the
+                            // same Control the async arm's `f.get().await?` would.
+                            let v = r?;
+                            fiber.push(v);
+                            // retire += 1 falls through at the end of the match.
+                        }
+                    }
+                }
+
+                _ => unreachable!(
+                    "sync_lane_op admitted an unimplemented op {op:?}"
+                ),
+            }
+            *retired += 1;
+        }
+    }
+
     /// The instruction-dispatch loop. Wrapped by [`run`] which binds the faulting
     /// module's source onto an escaping panic (SP4 §3 cross-module provenance).
     ///
@@ -1114,6 +3055,16 @@ impl Vm {
     /// table reached from the hot loop is a Gate-12 regression.
     async fn run_loop(&self, fiber: &mut Fiber) -> Result<RunOutcome, Control> {
         loop {
+            // LANE §2.3: burst through the suspension-free subset on the sync driver.
+            // `sync_lane == false` (the kill switch) skips straight to the
+            // pre-LANE async dispatch below — the permanent diagnostic mode.
+            if self.sync_lane {
+                match self.run_loop_sync(fiber)? {
+                    SyncOutcome::Finished(outcome) => return Ok(outcome),
+                    SyncOutcome::NeedsAsync => {} // fall through: async-execute ONE op
+                }
+            }
+
             // Capture the faulting ip (the opcode byte's offset) before advancing.
             let fault_ip = fiber.frame().ip;
             // SP4 §3: remember the source of the frame about to execute, so a panic
@@ -1785,73 +3736,14 @@ impl Vm {
                             // The call-site span anchors arity/contract/return
                             // panics exactly where the tree-walker's do.
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            // `what` mirrors the tree-walker's `func.name.as_deref()
-                            // .unwrap_or("function")` so the wording matches.
-                            let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
-                            // Pop the `argc` args into an owned vec (top of stack is
-                            // the LAST arg), then drop the callee value beneath them.
-                            let mut args = vec![Value::Nil; argc];
-                            for slot in args.iter_mut().rev() {
-                                *slot = fiber.pop();
-                            }
-                            fiber.pop(); // the callee value at callee_idx
-                                         // Arity + per-param contracts + rest collection, shared
-                                         // verbatim with the tree-walker via `check_call_args`. On
-                                         // a mismatch this returns a `Control::Panic` carrying the
-                                         // identical message anchored at `call_span`.
-                            let bound = crate::interp::check_call_args(
-                                &callee.proto.params,
-                                args,
-                                call_span,
-                                what,
-                                Some(&self.interp),
-                                Some(&self.class_env()),
+                            // LANE Task 3: shared plain-call body (also used by
+                            // run_loop_sync). Pops args + callee, checks arity +
+                            // contracts, allocates cells, pushes the CallFrame (one
+                            // enter_frame_depth — SP3 §B), publishes profiler frames.
+                            self.push_closure_frame(
+                                fiber, callee, argc, callee_idx, call_span,
                             )?;
-                            // The args/rest array are gone from the stack; the new
-                            // frame's window starts where the callee value was.
-                            let slot_base = callee_idx;
-                            let slot_count = callee.proto.chunk.slot_count as usize;
-                            // Allocate cells, then place each bound param into its
-                            // slot (cell slot → cell; plain slot → stack). Reserve
-                            // the remaining locals as Nil so the window is full.
-                            let cells = super::fiber::alloc_cells(
-                                slot_count,
-                                &callee.proto.chunk.cell_slots,
-                            );
-                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
-                            let supplied = bound.supplied;
-                            for (slot, v) in bound.values.into_iter().enumerate() {
-                                if let Some(cell) = &cells[slot] {
-                                    *cell.borrow_mut() = v;
-                                } else {
-                                    fiber.stack[slot_base + slot] = v;
-                                }
-                            }
-                            // SP3 §B: one logical-call increment per frame push
-                            // (matches the tree-walker's one-per-`run_body`); the
-                            // matching decrement is in `return_from_frame`. Over the
-                            // limit → the clean Tier-2 panic anchored at the call.
-                            self.enter_frame_depth(call_span)?;
-                            fiber.frames.push(super::fiber::CallFrame {
-                                closure: callee,
-                                ip: 0,
-                                slot_base,
-                                cells,
-                                ret_span: call_span,
-                                // A plain in-VM function/closure call is never a
-                                // method frame; only `invoke_compiled_method` sets a
-                                // `def_class` (so `super` is unavailable here, which
-                                // is correct — `super` only appears in method bodies).
-                                def_class: None,
-                                argc: supplied,
-                                defers: Vec::new(),
-                            });
-                            // DBG Task 7: publish the new (deeper) frame stack to an
-                            // armed profiler. Zero-cost None-check when off.
-                            self.publish_profile_frames(fiber);
-                            // Continue the loop in the new frame (the run loop reads
-                            // `fiber.frame()` at the top of each iteration). RETURN
-                            // pops this frame and restores the caller.
+                            // Continue the loop in the new frame.
                         }
                         other => {
                             // Native callee (Builtin/Function/Class/BoundMethod/...):
@@ -6221,6 +8113,148 @@ fn unop_of(op: Op) -> UnOp {
     }
 }
 
+/// LANE §3: returns `true` iff this opcode is in the Task-5 sync subset.
+/// An op NOT in this set causes the sync driver to return `NeedsAsync` (ip un-advanced).
+///
+/// Opcodes in the subset are: consts/stack, binop family (via eval_binop_adaptive),
+/// unary, range ops, locals/globals, jumps, Template, Return/Propagate/Unwrap/Yield
+/// (with defer guard), DeferPush/DeferPushMethod (capture only — no call), member/index
+/// access, IterSnapshot, builders (NewArray/NewObject/NewMap/MapEntry/Spread/SpreadArgs/
+/// AppendArray/AppendObject/SpreadObject/AppendNamedArg/AppendPosArg/AppendSpreadArg),
+/// destructure/match family, cells/upvalues/param-prologue, Closure, and Call/CallSpread
+/// (plain sync closure only — escalates for async/worker/generator/native).
+///
+/// NOT included (always async): Import, CallNamed, CallNamedSpread, Class,
+/// DefineInterface, Break (debug trap), GetIter, worker ops.
+/// Await IS included (conditional — escalates only if the future is still pending).
+fn sync_lane_op(op: Op) -> bool {
+    matches!(
+        op,
+        // consts / stack
+        Op::Const
+            | Op::Nil
+            | Op::True
+            | Op::False
+            | Op::Pop
+            | Op::Dup
+            | Op::Swap
+            | Op::Rot3
+            | Op::Template
+            // binop family
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::Pow
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::Eq
+            | Op::Ne
+            | Op::InstanceOf
+            | Op::InstanceOfType
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::WrapAdd
+            | Op::WrapSub
+            | Op::WrapMul
+            | Op::Range
+            // unary
+            | Op::Neg
+            | Op::Not
+            | Op::BitNot
+            // range ops
+            | Op::RangeInclusive
+            | Op::RangeStepValue
+            | Op::RangeResolveStep
+            | Op::RangeHasNext
+            | Op::CheckNumbers
+            // locals / globals
+            | Op::GetLocal
+            | Op::SetLocal
+            | Op::GetGlobal
+            | Op::DefineGlobal
+            | Op::SetGlobal
+            | Op::ImmutableError
+            // jumps
+            | Op::Jump
+            | Op::Loop
+            | Op::JumpIfFalse
+            | Op::JumpIfTrue
+            | Op::JumpIfNotNil
+            // return / propagate / unwrap / yield (defer guard applied in sync_burst)
+            | Op::Return
+            | Op::Propagate
+            | Op::Unwrap
+            | Op::Yield
+            // defer capture (no call, no await — pure stack mutation)
+            | Op::DeferPush
+            | Op::DeferPushMethod
+            // member / index access
+            | Op::GetIndex
+            | Op::SetIndex
+            | Op::GetProp
+            | Op::GetPropOpt
+            | Op::SetProp
+            | Op::GetSuper
+            // iter / for-of snapshot
+            | Op::IterSnapshot
+            | Op::ArrayLen
+            // builders
+            | Op::NewArray
+            | Op::NewObject
+            | Op::NewMap
+            | Op::MapEntry
+            | Op::Spread
+            | Op::SpreadArgs
+            | Op::AppendArray
+            | Op::AppendObject
+            | Op::SpreadObject
+            | Op::AppendNamedArg
+            | Op::AppendPosArg
+            | Op::AppendSpreadArg
+            // destructure / match family
+            | Op::CheckArrayDestructure
+            | Op::CheckObjectDestructure
+            | Op::ArrayElem
+            | Op::ObjectKey
+            | Op::ArrayRest
+            | Op::ObjectRest
+            | Op::MatchArray
+            | Op::MatchObject
+            | Op::MatchHasKey
+            | Op::MatchVariant
+            | Op::MatchVariantArity
+            | Op::MatchVariantHasField
+            | Op::VariantElem
+            | Op::VariantField
+            | Op::MatchRange
+            | Op::MatchNoArm
+            // cells / upvalues / param-prologue
+            | Op::GetLocalCell
+            | Op::SetLocalCell
+            | Op::FreshCell
+            | Op::GetUpvalue
+            | Op::SetUpvalue
+            | Op::CheckParam
+            | Op::CheckLocal
+            | Op::JumpIfArgSupplied
+            // closure construction
+            | Op::Closure
+            // call (plain sync closure only; escalates for async/worker/generator/native)
+            | Op::Call
+            | Op::CallSpread
+            // await (conditional — escalates only if the operand is a pending future;
+            // a non-future operand or a resolved future completes inline per LANE §4)
+            | Op::Await
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8737,6 +10771,131 @@ mod tests {
             })
         };
         assert_eq!(out, "0\n1\n2\n3\n4\n");
+    }
+
+    // ── LANE §2.2: escalation leaves ip un-advanced ──────────────────────────
+
+    /// LANE §2.2 reviewer-mandated gate: when `sync_burst` encounters an op that
+    /// is NOT in the sync subset, it must return `Ok(SyncOutcome::NeedsAsync)`
+    /// **without advancing the fiber's `ip`**. The async driver in `run_loop`
+    /// re-decodes the same byte; if ip were advanced the op would be silently
+    /// skipped — a correctness hole.
+    ///
+    /// Construction: a chunk whose FIRST instruction is `Op::Import` (not in the
+    /// sync subset, has a u16 operand). Before calling `run_loop_sync` the fiber
+    /// is at `ip == 0`. After the call it must still be at `ip == 0`.
+    ///
+    /// NOTE: `Op::Await` was previously used here but is now IN the sync subset
+    /// (LANE Task 6 §4); it completes inline for non-Future TOS and pending-future
+    /// TOS with a restored ip. `Op::Import` is the canonical always-async op.
+    #[test]
+    fn escalation_leaves_ip_un_advanced() {
+        let mut c = Chunk::new();
+        // Op::Import is NOT in sync_lane_op — it will trigger NeedsAsync immediately.
+        // We need a valid u16 import index operand (0); the burst checks membership
+        // before decoding operands, so the import table entry doesn't matter for
+        // this test (NeedsAsync fires before the operand is read).
+        c.emit_u16(Op::Import, 0, s());
+
+        let proto = Rc::new(FnProto {
+            chunk: c,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+
+        // ip starts at 0.
+        assert_eq!(fiber.frame().ip, 0, "ip must start at 0");
+
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        // Use with_lanes so the sync_lane kill switch is explicitly ON.
+        let vm = Vm::with_lanes(interp, true, true);
+
+        // run_loop_sync must return NeedsAsync and leave ip == 0.
+        let outcome = vm
+            .run_loop_sync(&mut fiber)
+            .expect("run_loop_sync must not panic on an escalating op");
+
+        assert!(
+            matches!(outcome, SyncOutcome::NeedsAsync),
+            "expected NeedsAsync for a non-subset op, got Finished"
+        );
+        assert_eq!(
+            fiber.frame().ip,
+            0,
+            "ip must be un-advanced after escalation: async driver must re-decode the same byte"
+        );
+    }
+
+    /// LANE §4.1 case 4: `Op::Await` on a PENDING `Value::Future` must escape
+    /// to the async driver with `ip` restored to the `Op::Await` byte. The async
+    /// driver re-decodes and parks on `f.get().await`. If ip were left advanced the
+    /// Await instruction would be silently skipped — a correctness hole.
+    ///
+    /// Construction: push a pending `Value::Future` onto the fiber's stack, then
+    /// place a single `Op::Await` instruction (ip == 0). After `run_loop_sync`
+    /// the ip must still be 0 and the future must still be on TOS.
+    #[test]
+    fn await_pending_future_escalates_with_ip_restored() {
+        use crate::task::SharedFuture;
+
+        let mut c = Chunk::new();
+        c.emit(Op::Await, s()); // ip 0, no operand bytes
+
+        let proto = Rc::new(FnProto {
+            chunk: c,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+
+        // Push a PENDING future onto TOS.
+        let pending = SharedFuture::new(); // not resolved — try_get() returns None
+        fiber.push(Value::Future(pending));
+
+        assert_eq!(fiber.frame().ip, 0, "ip must start at 0");
+
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        let vm = Vm::with_lanes(interp, true, true);
+
+        let outcome = vm
+            .run_loop_sync(&mut fiber)
+            .expect("run_loop_sync must not panic for a pending future await");
+
+        assert!(
+            matches!(outcome, SyncOutcome::NeedsAsync),
+            "a pending future must cause NeedsAsync, not Finished"
+        );
+        assert_eq!(
+            fiber.frame().ip,
+            0,
+            "ip must be restored to Op::Await after pending-future escalation"
+        );
+        // The future must still be on TOS (the burst peeked only — did not pop).
+        assert!(
+            matches!(fiber.peek(0), Value::Future(_)),
+            "pending future must remain on TOS after escalation"
+        );
     }
 
     /// `expr?` where `expr` is not a 2-element array is a Tier-2 panic carrying
