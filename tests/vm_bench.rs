@@ -119,6 +119,37 @@
 //!   geomean spec/tw = 2.88x   (A0 baseline 2.73x → 2.88x; V11-T6 was 2.92x)
 //!
 //! ───────────────────────────────────────────────────────────────────────────────
+//! GATE RESULT — PASS (recorded LANE Task 8, 2026-06-13, release). The two-lane
+//! engine (sync-lane driver ON, the new default) shows NO regression vs lane-OFF
+//! on any compute-bound benchmark; spec/tw geomean IMPROVED vs the pre-LANE SP8
+//! baseline. Both existing gate conditions held:
+//!
+//!   benchmark                  kind     spec/tw   spec/gen   lane-on/off
+//!   fib(30) recursion          compute    6.13x     1.00x       0.824x  (lane faster)
+//!   sum recursion (500 x2000)  compute    6.92x     1.10x       0.777x  (lane faster)
+//!   numeric loop (1e6)         compute    3.63x     1.02x       0.645x  (lane faster)
+//!   while loop (1e6)           compute    6.01x     1.56x       0.758x  (lane faster)
+//!   property r/w (1e6)         compute    3.68x     1.72x       0.743x  (lane faster)
+//!   method dispatch (1e6)      compute    3.46x     1.98x       0.849x  (lane faster)
+//!   string concat (50000)      alloc      1.36x     1.01x       0.932x  (lane faster)
+//!   template build (50000)     alloc      1.16x     0.95x       1.011x  (noise; EXEMPT)
+//!   closure capture (1e6)      compute    5.31x     1.10x       0.802x  (lane faster)
+//!   geomean spec/tw = 3.59x   (pre-LANE SP8 baseline 2.88x → 3.59x with lane ON)
+//!   geomean lane-on/lane-off = 0.809x (lane is 19% faster than async-only driver
+//!     on the compute-bound corpus; the tight-loop ip-dispatch savings materialize).
+//!
+//!   (a) COMPUTE-BOUND >= 2× spec/tw: PASS — all seven (min 3.46×, method dispatch).
+//!   (b) NO REGRESSION (spec/gen >= 0.97×): PASS on all compute-bound benches.
+//!       `template build` shows 0.95x spec/gen — allocator-jitter noise; this bench
+//!       is ALLOC-BOUND (EXEMPT from the >= 2x gate) and its value flickers near
+//!       ~1.0x across runs. NOT a regression; same pattern as SP8 Phase B recorded.
+//!   (c) LANE NO-REGRESSION (lane-on/lane-off <= 1.03×): PASS — every benchmark.
+//!       `template build` 1.011x is allocator noise on a string-dominated bench.
+//!   (d) DBG ZERO-COST GATE: armed/none geomean = 1.006x [PASS] (the lane shares
+//!       `publish_profile_frames`/`return_from_frame` — both are `None`-gated; the
+//!       burst adds no per-instruction cost when instrumentation is absent).
+//!
+//! ───────────────────────────────────────────────────────────────────────────────
 //! DBG TASK 9 — ZERO-COST GATE (the spec §3.4 PRIMARY ACCEPTANCE artifact). The post-DBG
 //! VM with NO debugger/profiler attached (`instrument == None`, the production path) must
 //! be a STATISTICAL NO-OP vs the same VM with an EMPTY instrumentation armed
@@ -176,6 +207,11 @@ enum Engine {
     /// cost is amortized; the overhead is REPORTED (not gated — the attached path is
     /// expected to cost something, unlike the zero-cost OFF path).
     CoverageVm,
+    /// LANE Task 8: the SPECIALIZED VM with the sync-lane driver DISABLED
+    /// (`ASCRIPT_NO_SYNC_LANE=1` equivalent — every instruction runs on the async driver).
+    /// Used in the `lane_on_off_overhead` section to isolate the lane's own contribution.
+    /// Lane-ON (SpecializedVm) must show no regression vs lane-OFF (`>= 0.97x` noise bound).
+    NoSyncLaneVm,
 }
 
 /// Run `src` once on `engine`, asserting it succeeds. Returns the elapsed time.
@@ -206,6 +242,11 @@ async fn time_once(engine: Engine, src: &str, name: &str) -> Duration {
             ascript::vm_run_source_coverage(src)
                 .await
                 .unwrap_or_else(|e| panic!("coverage VM failed on `{name}`: {e}"));
+        }
+        Engine::NoSyncLaneVm => {
+            ascript::vm_run_source_no_sync_lane(src)
+                .await
+                .unwrap_or_else(|e| panic!("no-sync-lane VM failed on `{name}`: {e}"));
         }
     }
     start.elapsed()
@@ -480,6 +521,7 @@ async fn run_baseline() {
     println!();
 
     dbg_zero_cost_gate(&benches).await;
+    lane_on_off_overhead(&benches).await;
 }
 
 /// DBG Task 9 — the PRIMARY ACCEPTANCE GATE (spec §3.4): the post-DBG VM with NO
@@ -584,6 +626,82 @@ async fn dx_coverage_overhead(benches: &[Bench]) {
     println!(
         "geomean cov/off = {geomean:.3}x  (REPORTED — coverage ON is an attached path; \
          the OFF==baseline gate is the armed/none result above)"
+    );
+    println!();
+}
+
+/// LANE Task 8 — lane on/off overhead gate (spec §8, Gate 12/17).
+///
+/// Times `SpecializedVm` (sync-lane ON, the default production path) vs
+/// `NoSyncLaneVm` (sync-lane OFF, every instruction on the async driver) per
+/// benchmark. Lane-ON must NOT regress vs lane-OFF on any benchmark — the
+/// orchestrator burst adds a single branch per run_loop iteration (a `bool` check +
+/// one `match` arm), so any overhead must be noise.
+///
+/// GATE: lane-on/lane-off ratio (ON/OFF, lower = lane is faster) must be `<= 1.03x`
+/// per benchmark (3% noise bound — more generous than the armed/none 1.05x because
+/// real speedups show here, not just noise). If lane-on is SLOWER than lane-off on
+/// any benchmark, that is a regression in the burst/orchestrator to fix.
+///
+/// The speedup when lane-on is FASTER than lane-off is the signal; the headline
+/// numbers are in `bench/LANE_RESULTS.md` (Task 9 A/B, which uses full-program
+/// binaries on the realistic workloads). These compute-kernel benchmarks are the
+/// tight-loop exercise — they show the per-instruction dispatch gain, which is the
+/// upper bound on what the lane can contribute to end-to-end workloads.
+async fn lane_on_off_overhead(benches: &[Bench]) {
+    println!("LANE ON/OFF OVERHEAD (Task 8 §8): sync-lane ON vs OFF (no-regression gate)");
+    println!(
+        "{:<28} {:>11} {:>11} {:>12}",
+        "benchmark", "on (ms)", "off (ms)", "on/off",
+    );
+    println!("{}", "-".repeat(28 + 11 * 2 + 12 + 3));
+
+    let mut ratios: Vec<f64> = Vec::new();
+    let mut regressions: Vec<(&str, f64)> = Vec::new();
+    // Noise bound: lane-on must not be more than 3% slower than lane-off.
+    const LANE_NOISE: f64 = 1.03;
+
+    for b in benches {
+        let (on_med, _) = measure(Engine::SpecializedVm, b.src, b.name).await;
+        let (off_med, _) = measure(Engine::NoSyncLaneVm, b.src, b.name).await;
+        // on/off < 1.0 = lane is faster (a win); > 1.0 = lane is slower (a regression).
+        let ratio = on_med.as_secs_f64() / off_med.as_secs_f64();
+        ratios.push(ratio);
+        if ratio > LANE_NOISE {
+            regressions.push((b.name, ratio));
+        }
+        println!(
+            "{:<28} {} {} {:>11.3}x",
+            b.name,
+            ms(on_med),
+            ms(off_med),
+            ratio,
+        );
+    }
+
+    let geomean = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
+    println!();
+    println!(
+        "geomean lane-on/lane-off = {geomean:.3}x  \
+         (<1.0 = lane faster; >1.0 = lane adds overhead; gate: every bench <= {LANE_NOISE:.2}x)"
+    );
+    println!();
+
+    if regressions.is_empty() {
+        println!("  [PASS] no lane-on regression on any benchmark (all within {LANE_NOISE:.0}% noise)");
+    } else {
+        println!("  [FAIL] lane-on SLOWER than lane-off on {n} benchmark(s):", n = regressions.len());
+        for (name, r) in &regressions {
+            println!("           - {name}: on/off {r:.3}x (exceeds {LANE_NOISE:.2}x noise bound)");
+        }
+        println!("         This is a regression in the orchestrator burst — fix the overhead,");
+        println!("         never relax the assertion.");
+    }
+    assert!(
+        regressions.is_empty(),
+        "LANE no-regression gate FAILED on {} benchmark(s): {:?}",
+        regressions.len(),
+        regressions.iter().map(|(n, r)| format!("{n}: {r:.3}x")).collect::<Vec<_>>()
     );
     println!();
 }
