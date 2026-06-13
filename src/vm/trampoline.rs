@@ -46,8 +46,6 @@ use std::rc::Rc;
 /// Lives for the duration of one builtin loop (e.g. the entire `array.map`
 /// call) — created by [`CallbackTrampoline::arm`], consumed by `call1`/`call2`
 /// via [`CallbackDriver`].
-// Task 3.2 wires this to the stdlib sites; until then, suppress dead_code.
-#[allow(dead_code)]
 pub(crate) struct CallbackTrampoline {
     vm: Rc<Vm>,
     closure: Cc<Closure>,
@@ -64,8 +62,6 @@ pub(crate) struct CallbackTrampoline {
 ///
 /// One enum so every stdlib site keeps a single loop regardless of which path
 /// is taken. Both arms produce the same observable results (CALL §8.1 gate).
-// Task 3.2 wires this to the stdlib sites; until then, suppress dead_code.
-#[allow(dead_code)]
 pub(crate) enum CallbackDriver<'i> {
     Tramp(CallbackTrampoline),
     Generic { interp: &'i Interp, f: Value, span: Span },
@@ -83,8 +79,6 @@ impl CallbackTrampoline {
     /// - The `Vm` weak reference has been dropped (should not happen during a
     ///   normal builtin call, but we handle it defensively).
     /// - The `call_fast` kill switch is off.
-    // Task 3.2 wires callers; suppress dead_code until then.
-    #[allow(dead_code)]
     pub(crate) fn arm(interp: &Interp, f: &Value, span: Span) -> Option<CallbackTrampoline> {
         let Value::Closure(c) = f else { return None };
         if c.proto.is_async || c.proto.is_generator || c.proto.is_worker {
@@ -106,8 +100,6 @@ impl CallbackTrampoline {
     /// On `Ok(v)` the fiber is retained for the next element (reset on entry).
     /// On `Err` the fiber is dropped (it contained mid-flight state that must not
     /// be reused — the next element gets a fresh `Fiber::new`).
-    // Task 3.2 wires callers; suppress dead_code until then.
-    #[allow(dead_code)]
     pub(crate) async fn call(&mut self, args: &mut [Value]) -> Result<Value, Control> {
         let what = self.closure.proto.chunk.name.as_deref().unwrap_or("function");
 
@@ -196,8 +188,6 @@ impl CallbackTrampoline {
 
 impl<'i> CallbackDriver<'i> {
     /// Invoke the callback with one argument.
-    // Task 3.2 wires callers; suppress dead_code until then.
-    #[allow(dead_code)]
     pub(crate) async fn call1(&mut self, a: Value) -> Result<Value, Control> {
         match self {
             Self::Tramp(t) => {
@@ -211,8 +201,6 @@ impl<'i> CallbackDriver<'i> {
     }
 
     /// Invoke the callback with two arguments.
-    // Task 3.2 wires callers; suppress dead_code until then.
-    #[allow(dead_code)]
     pub(crate) async fn call2(&mut self, a: Value, b: Value) -> Result<Value, Control> {
         match self {
             Self::Tramp(t) => {
@@ -233,8 +221,6 @@ impl Interp {
     /// trampoline can be armed for `f`, falling back to `CallbackDriver::Generic`
     /// (per-element `call_value`) otherwise. Both arms are byte-identical; only
     /// allocation/latency differs.
-    // Task 3.2 wires callers; suppress dead_code until then.
-    #[allow(dead_code)]
     pub(crate) fn callback_driver<'i>(&'i self, f: Value, span: Span) -> CallbackDriver<'i> {
         match CallbackTrampoline::arm(self, &f, span) {
             Some(t) => CallbackDriver::Tramp(t),

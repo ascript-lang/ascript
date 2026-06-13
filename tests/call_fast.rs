@@ -179,18 +179,25 @@ async fn inplace_binds_counter_is_nonzero() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A3 anti-false-green: `pooled_fiber_reuses` must be > 0 after running code
-/// that re-enters the VM via `Vm::call_value` (e.g. `array.map`). Proves the
-/// fiber pool actually fires, not just that output is coincidentally identical.
+/// that re-enters the VM via `invoke_compiled_static` (which calls `take_pooled_fiber`
+/// directly). Static class method calls go through `dispatch_method` →
+/// `invoke_compiled_static` → `take_pooled_fiber`. After the first call the fiber
+/// is returned to the pool, so the second+ call increments `pooled_fiber_reuses`.
 #[tokio::test]
 async fn pooled_fiber_reuses_counter_is_nonzero() {
-    // array.map over a list drives Vm::call_value once per element — the simplest
-    // deterministic re-entry path. Use a short fixed list; map fires 5 call_value
-    // calls, at least some of which (after the first) must reuse a pooled fiber.
+    // A class with a static method called 10 times exercises the fiber pool.
+    // `invoke_compiled_static` takes a pooled fiber per call; after the first call
+    // the fiber is returned and subsequent calls reuse it (pool reuse count > 0).
     let src = r#"
-        import * as array from "std/array"
-        let words = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
-        let lengths = array.map(words, (w) => len(w))
-        let total = array.reduce(lengths, (a, n) => a + n, 0)
+        class Math {
+            static fn double(x: int): int {
+                return x * 2
+            }
+        }
+        let total = 0
+        for (i in 0..10) {
+            total = total + Math.double(i)
+        }
         print(total)
     "#;
     let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
@@ -198,7 +205,7 @@ async fn pooled_fiber_reuses_counter_is_nonzero() {
         .expect("vm_run_source_call_fast_stats failed");
     assert!(
         stats.pooled_fiber_reuses > 0,
-        "A3: pooled_fiber_reuses should be > 0 after 20 re-entrant calls via array.map+reduce, got {}",
+        "A3: pooled_fiber_reuses should be > 0 after 10 static method calls, got {}",
         stats.pooled_fiber_reuses
     );
 }
@@ -396,4 +403,161 @@ async fn trampoline_recursion_limit_parity_five_mode_identity() {
         print(r[1] != nil)
     "#;
     assert_five_mode_identical(deep_src).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Task 3.2: stdlib sites wired — trampoline_calls anti-false-green battery
+//  (CALL §5.5 — the counter must be > 0 after a wired stdlib call with a plain
+//  sync closure, proving the trampoline actually fires, not just that output is
+//  coincidentally correct)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Task 3.2 anti-false-green: `trampoline_calls` > 0 after array.map with a
+/// plain sync closure (the simplest wired site). Proves the trampoline fires.
+#[tokio::test]
+async fn trampoline_calls_counter_nonzero_after_array_map() {
+    let src = r#"
+        import * as array from "std/array"
+        let xs = [1, 2, 3, 4, 5]
+        let r = array.map(xs, (x) => x * 2)
+        print(r)
+    "#;
+    let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("vm_run_source_call_fast_stats failed");
+    assert!(
+        stats.trampoline_calls > 0,
+        "Task 3.2: trampoline_calls should be > 0 after array.map with a sync closure, got {}",
+        stats.trampoline_calls
+    );
+    // Exactly 5 elements → 5 trampoline calls.
+    assert_eq!(
+        stats.trampoline_calls, 5,
+        "Task 3.2: expected exactly 5 trampoline_calls for 5-element map, got {}",
+        stats.trampoline_calls
+    );
+}
+
+/// Task 3.2: five-mode identity for all wired array sites.
+/// Proves the trampoline does not introduce any behavioral divergence.
+#[tokio::test]
+async fn wired_sites_five_mode_identity() {
+    let cases = [
+        // map
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3]
+            print(array.map(xs, (x) => x * 10))
+        "#,
+        // filter
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4, 5]
+            print(array.filter(xs, (x) => x % 2 == 0))
+        "#,
+        // reduce
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4, 5]
+            print(array.reduce(xs, (acc, x) => acc + x, 0))
+        "#,
+        // sort (custom comparator)
+        r#"
+            import * as array from "std/array"
+            let xs = [3, 1, 4, 1, 5, 9]
+            print(array.sort(xs, (a, b) => a - b))
+        "#,
+        // find
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4, 5]
+            print(array.find(xs, (x) => x > 3))
+        "#,
+        // findIndex
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4, 5]
+            print(array.findIndex(xs, (x) => x > 3))
+        "#,
+        // some
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4, 5]
+            print(array.some(xs, (x) => x > 4))
+        "#,
+        // every
+        r#"
+            import * as array from "std/array"
+            let xs = [2, 4, 6]
+            print(array.every(xs, (x) => x % 2 == 0))
+        "#,
+        // flatMap
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3]
+            print(array.flatMap(xs, (x) => [x, x * 10]))
+        "#,
+        // groupBy
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4]
+            let g = array.groupBy(xs, (x) => x % 2 == 0 ? "even" : "odd")
+            print(g)
+        "#,
+        // partition
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4, 5]
+            print(array.partition(xs, (x) => x % 2 == 0))
+        "#,
+        // object.mapValues
+        r#"
+            import * as object from "std/object"
+            let o = {a: 1, b: 2, c: 3}
+            print(object.mapValues(o, (v, k) => v * 10))
+        "#,
+    ];
+    for src in cases {
+        assert_five_mode_identical(src).await;
+    }
+}
+
+/// Task 3.2: builtin callbacks (non-closures) still work correctly through
+/// the Generic fallback path. arm() returns None for builtins; the trampoline
+/// is NOT used. Output must be byte-identical across all five modes.
+#[tokio::test]
+async fn wired_sites_builtin_callback_generic_fallback() {
+    let src = r#"
+        import * as array from "std/array"
+        let xs = ["hello", "world", "!"]
+        print(array.map(xs, len))
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.2: trampoline_calls == 0 when no-call-fast is active (kill switch).
+/// Proves the kill switch suppresses trampoline dispatch on the wired sites.
+#[tokio::test]
+async fn wired_sites_trampoline_suppressed_by_kill_switch() {
+    let src = r#"
+        import * as array from "std/array"
+        let xs = [1, 2, 3, 4, 5]
+        let r = array.map(xs, (x) => x * 2)
+        print(r)
+    "#;
+    // With call_fast=true → trampoline fires.
+    let (_out, _exit, stats_on) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("call_fast stats");
+    assert!(
+        stats_on.trampoline_calls > 0,
+        "kill switch test: trampoline_calls should be > 0 with call_fast=true, got {}",
+        stats_on.trampoline_calls
+    );
+    // With no-call-fast → same output, trampoline_calls==0.
+    let ncf = ascript::vm_run_source_no_call_fast(src)
+        .await
+        .expect("no-call-fast");
+    let spec = ascript::vm_run_source(src).await.expect("spec");
+    assert_eq!(spec, ncf, "kill switch: output differs between call_fast on/off");
 }

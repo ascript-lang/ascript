@@ -683,6 +683,14 @@ pub struct Interp {
     /// always call `set_snapshot_update`.
     #[allow(dead_code)]
     snapshots_touched: RefCell<std::collections::BTreeSet<PathBuf>>,
+    /// DEFER §2.3: a stack of active defer lists, one per live `run_body` frame
+    /// (plus the top-level driver frame). Each `run_body` call pushes a fresh
+    /// `Rc<RefCell<Vec<DeferEntry>>>` onto this stack on entry and pops it on exit;
+    /// `exec(Stmt::Defer)` peeks at the innermost layer and pushes the captured
+    /// entry there. `exec` at the TOP level (before the first `run_body`) uses
+    /// the list installed by the lib.rs driver (a top-level `defer` runs at
+    /// program end). Never held across an `.await` (short borrows only).
+    defers: RefCell<Vec<Rc<RefCell<Vec<DeferEntry>>>>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1068,6 +1076,9 @@ impl Interp {
             // never overwrites a changed snapshot and never deletes an orphan.
             snapshot_update: Cell::new(false),
             snapshots_touched: RefCell::new(std::collections::BTreeSet::new()),
+            // DEFER §2.3: starts empty; lib.rs drivers push the top-level frame,
+            // `run_body` pushes per-call frames.
+            defers: RefCell::new(Vec::new()),
         }
     }
 
@@ -6865,6 +6876,7 @@ impl Interp {
             .into()),
         }
     }
+
 }
 
 /// `object.freeze` (SP2 §4): guard a container mutation. If `v` is a frozen
