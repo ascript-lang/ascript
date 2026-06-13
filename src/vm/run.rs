@@ -1922,10 +1922,7 @@ impl Vm {
                     let kind = if self.interp.member_call_is_hook(&recv, &name) {
                         crate::interp::DeferKind::Method { recv, name }
                     } else {
-                        let callee = match self.vm_read_member(&recv, &name, span) {
-                            Ok(v) => v,
-                            Err(e) => return Err(e),
-                        };
+                        let callee = self.vm_read_member(&recv, &name, span)?;
                         crate::interp::DeferKind::Call { callee }
                     };
                     fiber.frame_mut().defers.push(crate::interp::DeferEntry {
@@ -2899,6 +2896,66 @@ impl Vm {
                     // Continue the loop in the new (or returned-to) frame.
                     *retired += 1;
                     continue;
+                }
+
+                // ── LANE §4: inline ready-future completion ──────────────────
+                //
+                // Peek-first to decide whether to stay in-lane or escalate:
+                //
+                //   1. Non-Future TOS → identity (await 5 == 5): pop + push back,
+                //      retire. Mirrors run_loop's `other => fiber.push(other)`.
+                //   2. Future with try_get() == Some(Ok(v)) → pop future, push v,
+                //      retire (the inline take).
+                //   3. Future with try_get() == Some(Err(c)) → pop future, return
+                //      Err(c): the stored Control surfaces with the IDENTICAL value
+                //      the async arm's `f.get().await?` would re-raise.
+                //   4. Future with try_get() == None (still pending) → un-advance ip
+                //      and return NeedsAsync: the async driver re-decodes Op::Await,
+                //      parks on f.get().await, and wakes when the future resolves.
+                //
+                // CRITICAL: no borrow is held while pushing to the fiber. We read
+                // `try_get` (which borrows the cell, then drops the borrow inside
+                // the call), clone the result out, then do the pop+push with NO
+                // borrow held. `try_get` is a plain synchronous call — ZERO awaits.
+                Op::Await => {
+                    // Peek TOS read-only before deciding whether to pop.
+                    let probe = match fiber.peek(0) {
+                        Value::Future(f) => {
+                            // try_get clones the result out; the slot borrow is
+                            // dropped before try_get returns — no borrow held.
+                            f.try_get()
+                        }
+                        _ => {
+                            // Case 1: non-Future → identity. Pop and push back.
+                            // ip is already advanced.
+                            let v = fiber.pop();
+                            fiber.push(v);
+                            // retire += 1 falls through at the end of the match.
+                            *retired += 1;
+                            continue;
+                        }
+                    };
+                    match probe {
+                        None => {
+                            // Case 4: future still pending — escalate.
+                            // ip was already advanced above; restore it so the
+                            // async driver re-decodes the same Op::Await byte.
+                            fiber.frame_mut().ip = fault_ip;
+                            return Ok(SyncOutcome::NeedsAsync);
+                        }
+                        Some(r) => {
+                            // Cases 2 and 3: future already resolved.
+                            // Pop the Future handle (one Rc decrement, no side
+                            // effect on cancel-on-drop — the future is resolved).
+                            fiber.pop();
+                            // Re-raise stored Control (Error branch → Err(c))
+                            // or push the value (Ok branch). `?` propagates the
+                            // same Control the async arm's `f.get().await?` would.
+                            let v = r?;
+                            fiber.push(v);
+                            // retire += 1 falls through at the end of the match.
+                        }
+                    }
                 }
 
                 _ => unreachable!(
@@ -7990,8 +8047,9 @@ fn unop_of(op: Op) -> UnOp {
 /// destructure/match family, cells/upvalues/param-prologue, Closure, and Call/CallSpread
 /// (plain sync closure only — escalates for async/worker/generator/native).
 ///
-/// NOT included (always async): Await, Import, CallNamed, CallNamedSpread, Class,
+/// NOT included (always async): Import, CallNamed, CallNamedSpread, Class,
 /// DefineInterface, GetSuper (escalates), Break (debug trap), GetIter, worker ops.
+/// Await IS included (conditional — escalates only if the future is still pending).
 fn sync_lane_op(op: Op) -> bool {
     matches!(
         op,
@@ -8113,6 +8171,9 @@ fn sync_lane_op(op: Op) -> bool {
             // call (plain sync closure only; escalates for async/worker/generator/native)
             | Op::Call
             | Op::CallSpread
+            // await (conditional — escalates only if the operand is a pending future;
+            // a non-future operand or a resolved future completes inline per LANE §4)
+            | Op::Await
     )
 }
 
@@ -10637,19 +10698,26 @@ mod tests {
     // ── LANE §2.2: escalation leaves ip un-advanced ──────────────────────────
 
     /// LANE §2.2 reviewer-mandated gate: when `sync_burst` encounters an op that
-    /// is NOT in the sync subset (e.g. `Op::Await`), it must return
-    /// `Ok(SyncOutcome::NeedsAsync)` **without advancing the fiber's `ip`**.
-    /// The async driver in `run_loop` re-decodes the same byte; if ip were
-    /// advanced the op would be silently skipped — a correctness hole.
+    /// is NOT in the sync subset, it must return `Ok(SyncOutcome::NeedsAsync)`
+    /// **without advancing the fiber's `ip`**. The async driver in `run_loop`
+    /// re-decodes the same byte; if ip were advanced the op would be silently
+    /// skipped — a correctness hole.
     ///
-    /// Construction: a chunk whose FIRST instruction is `Op::Await` (not in the
-    /// sync subset, zero operand bytes). Before calling `run_loop_sync` the fiber
+    /// Construction: a chunk whose FIRST instruction is `Op::Import` (not in the
+    /// sync subset, has a u16 operand). Before calling `run_loop_sync` the fiber
     /// is at `ip == 0`. After the call it must still be at `ip == 0`.
+    ///
+    /// NOTE: `Op::Await` was previously used here but is now IN the sync subset
+    /// (LANE Task 6 §4); it completes inline for non-Future TOS and pending-future
+    /// TOS with a restored ip. `Op::Import` is the canonical always-async op.
     #[test]
     fn escalation_leaves_ip_un_advanced() {
         let mut c = Chunk::new();
-        // Op::Await is NOT in sync_lane_op — it will trigger NeedsAsync immediately.
-        c.emit(Op::Await, s());
+        // Op::Import is NOT in sync_lane_op — it will trigger NeedsAsync immediately.
+        // We need a valid u16 import index operand (0); the burst checks membership
+        // before decoding operands, so the import table entry doesn't matter for
+        // this test (NeedsAsync fires before the operand is read).
+        c.emit_u16(Op::Import, 0, s());
 
         let proto = Rc::new(FnProto {
             chunk: c,
@@ -10688,6 +10756,67 @@ mod tests {
             fiber.frame().ip,
             0,
             "ip must be un-advanced after escalation: async driver must re-decode the same byte"
+        );
+    }
+
+    /// LANE §4.1 case 4: `Op::Await` on a PENDING `Value::Future` must escape
+    /// to the async driver with `ip` restored to the `Op::Await` byte. The async
+    /// driver re-decodes and parks on `f.get().await`. If ip were left advanced the
+    /// Await instruction would be silently skipped — a correctness hole.
+    ///
+    /// Construction: push a pending `Value::Future` onto the fiber's stack, then
+    /// place a single `Op::Await` instruction (ip == 0). After `run_loop_sync`
+    /// the ip must still be 0 and the future must still be on TOS.
+    #[test]
+    fn await_pending_future_escalates_with_ip_restored() {
+        use crate::task::SharedFuture;
+
+        let mut c = Chunk::new();
+        c.emit(Op::Await, s()); // ip 0, no operand bytes
+
+        let proto = Rc::new(FnProto {
+            chunk: c,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+
+        // Push a PENDING future onto TOS.
+        let pending = SharedFuture::new(); // not resolved — try_get() returns None
+        fiber.push(Value::Future(pending));
+
+        assert_eq!(fiber.frame().ip, 0, "ip must start at 0");
+
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        let vm = Vm::with_lanes(interp, true, true);
+
+        let outcome = vm
+            .run_loop_sync(&mut fiber)
+            .expect("run_loop_sync must not panic for a pending future await");
+
+        assert!(
+            matches!(outcome, SyncOutcome::NeedsAsync),
+            "a pending future must cause NeedsAsync, not Finished"
+        );
+        assert_eq!(
+            fiber.frame().ip,
+            0,
+            "ip must be restored to Op::Await after pending-future escalation"
+        );
+        // The future must still be on TOS (the burst peeked only — did not pop).
+        assert!(
+            matches!(fiber.peek(0), Value::Future(_)),
+            "pending future must remain on TOS after escalation"
         );
     }
 

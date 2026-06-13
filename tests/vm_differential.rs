@@ -9105,3 +9105,88 @@ print(v)
     assert_eq!(on, off, "lane-on vs lane-off diverged for defer test");
     assert!(on.0.contains("deferred"), "defer must have run");
 }
+
+// ── LANE Task 6: inline ready-future completion at Op::Await ─────────────────
+
+/// LANE §4: `await` on an already-resolved future must complete in-lane.
+/// After the FIRST `await f1` parks (the future is still pending at that
+/// point), the scheduler runs the async bodies, resolving f2 and f3. The
+/// subsequent `await f2`/`await f3` therefore hit resolved futures and must
+/// complete inline. Output must be byte-identical across tree-walker,
+/// lane-on, and lane-off.
+#[tokio::test]
+async fn await_on_resolved_future_completes_in_lane() {
+    let src = r#"
+async fn a(x) { return x * 2 }
+let f1 = a(1)
+let f2 = a(2)
+let f3 = a(3)
+let first = await f1
+let rest = (await f2) + (await f3)
+print(first + rest)
+"#;
+    let tw = ascript::run_source(src).await.expect("tw ok");
+    let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    assert_eq!(tw, on.0, "tw vs lane-on diverged");
+    assert_eq!(on, off, "lane-on vs lane-off diverged");
+    assert_eq!(on.0, "12\n");
+}
+
+/// LANE §4.1 case 1: `await` on a non-Future is identity (no escalation in lane).
+#[tokio::test]
+async fn await_identity_on_non_future_stays_in_lane() {
+    let (out, _e, sync_ops, _b) =
+        ascript::vm_run_source_lane_stats("print(await 5)").await.expect("ok");
+    assert_eq!(out, "5\n");
+    assert!(sync_ops > 0, "await-identity must stay in-lane; sync_ops={sync_ops}");
+}
+
+/// LANE §4.1 case 2 (Err branch): a resolved-with-panic future must surface the
+/// IDENTICAL panic via the inline take as via the async path. We wait for `ok()`
+/// (a resolved-immediately async fn) to let the scheduler run `boom()`'s body first.
+#[tokio::test]
+async fn inline_take_surfaces_stored_panic_identically() {
+    let src = r#"
+async fn boom() { let xs = [1, 2] ; return xs[5] }
+async fn ok_fn() { return 1 }
+let f = boom()
+let _ = await ok_fn()
+print(await f)
+"#;
+    let on = ascript::vm_run_source(src).await;
+    let off = ascript::vm_run_source_no_sync_lane(src).await;
+    match (on, off) {
+        (Err(a), Err(b)) => assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "panic message must be identical lane-on vs lane-off"
+        ),
+        (a, b) => panic!("expected identical panics, got {a:?} / {b:?}"),
+    }
+}
+
+/// LANE §3 fairness: >INFLIGHT_YIELD_CAP (256) un-awaited spawns behave
+/// byte-identically lane-on vs lane-off (every spawn site is an escalation op;
+/// the backpressure yield always runs on the async driver).
+#[tokio::test]
+async fn inflight_backpressure_is_byte_identical_lane_on_off() {
+    // Build the futs array with array.push (mutates in place), then sum via
+    // a regular for-loop with await. Using 600 futures exceeds the
+    // INFLIGHT_YIELD_CAP=256 threshold.
+    let src = r#"
+import * as array from "std/array"
+async fn tick(i) { return i }
+let futs = []
+for (i in 0..600) { array.push(futs, tick(i)) }
+let total = 0
+for (f in futs) { total = total + await f }
+print(total)
+"#;
+    let on = ascript::vm_run_source(src).await.expect("ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(on, off, "lane-on vs lane-off diverged");
+    assert_eq!(tw, on.0, "tw vs lane-on diverged");
+    assert_eq!(on.0, "179700\n");
+}
