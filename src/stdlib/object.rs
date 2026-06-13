@@ -209,10 +209,11 @@ fn object_like_fields(
     ctx: &str,
 ) -> Result<IndexMap<String, Value>, Control> {
     match v {
-        // SHAPE Task 1.3: migrate once Instance gets ObjectCell fields — the
-        // return type (IndexMap<String,Value>) ties both arms together; changing
-        // it requires updating pick/omit at the same time.
-        Value::Object(o) => Ok(o.borrow().clone()),
+        // SHAPE Task 1.3: ObjectCell arm routes through the accessor API.
+        // Instance.fields stays a pub IndexMap until Phase 3.4 migrates it;
+        // the return type (IndexMap<String,Value>) ties both arms together —
+        // changing it requires updating pick/omit/mapValues at the same time.
+        Value::Object(o) => Ok(o.to_index_map()),
         Value::Instance(i) => Ok(i.borrow().fields.clone()),
         _ => Err(AsError::at(format!("{} expects an object or instance", ctx), span).into()),
     }

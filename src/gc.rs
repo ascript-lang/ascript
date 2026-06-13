@@ -46,7 +46,7 @@
 //! The [`Trace`] impl on [`Value`] therefore visits ONLY the container variants
 //! and is a no-op for everything else.
 
-use crate::value::{ArrayCell, Instance, MapCell, MapKey, ObjectCell, SetCell, Value};
+use crate::value::{ArrayCell, Instance, MapCell, MapKey, SetCell, Value};
 use crate::vm::value_ext::Closure;
 use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
@@ -245,25 +245,9 @@ impl Trace for Value {
     }
 }
 
-/// The closure upvalue cell (`RefCell<Value>`) — gcmodule already provides
-/// `Trace for RefCell<T: Trace>`, so the `Value`-tracing path is covered by the
-/// blanket impl. This explicit helper exists only to document the cell as a
-/// traced node and is used by the V13-T1 unit test.
-impl Trace for ObjectCell {
-    fn trace(&self, tracer: &mut Tracer) {
-        // `map: RefCell<IndexMap<String, Value>>`. Avoid holding the borrow if
-        // it is already mutably borrowed (mirrors gcmodule's `RefCell` impl:
-        // an outstanding borrow implies an outstanding reference, so skipping
-        // is safe). `shape: Cell<u32>` and `frozen: Cell<bool>` are acyclic.
-        if let Ok(map) = self.map.try_borrow() {
-            trace_index_map(&map, tracer);
-        }
-    }
-
-    fn is_type_tracked() -> bool {
-        true
-    }
-}
+// `Trace for ObjectCell` is implemented in `src/value.rs` (co-located with the
+// struct definition) so the private `map` field is directly accessible.
+// See SHAPE Task 1.3 in `superpowers/plans/2026-06-12-shape-storage.md`.
 
 /// ADT §5.3: `EnumVariant` keeps its `Rc` wrapper, but the cycle-capable PAYLOAD
 /// must be traced (a recursive enum payload can self-reference). The backing
@@ -375,7 +359,7 @@ impl Trace for Closure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::MapKey;
+    use crate::value::{MapKey, ObjectCell};
     use crate::vm::chunk::{Chunk, FnProto};
     use gcmodule::{Trace, Tracer};
     use std::cell::Cell;

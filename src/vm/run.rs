@@ -2369,7 +2369,8 @@ impl Vm {
                         map.insert(k.to_string(), v);
                     }
                     let cell = crate::value::ObjectCell::new(map);
-                    let shape = self.object_shape_for(cell.map.borrow().keys().map(|s| s.as_str()));
+                    let keys = cell.keys_snapshot();
+                    let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
                     cell.shape.set(shape);
                     fiber.push(Value::Object(cell));
                 }
@@ -4567,7 +4568,8 @@ impl Vm {
                     // Assign the object's hidden-class shape from its final ordered
                     // keys (V11-T2). Pure metadata — does not change behavior.
                     let cell = crate::value::ObjectCell::new(map);
-                    let shape = self.object_shape_for(cell.map.borrow().keys().map(|s| s.as_str()));
+                    let keys = cell.keys_snapshot();
+                    let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
                     cell.shape.set(shape);
                     fiber.push(Value::Object(cell));
                 }
@@ -7289,21 +7291,18 @@ impl Vm {
                 // Cache hit: read the field directly by its stable index.
                 let ic = chunk.field_ic(op_off);
                 if let Some(idx) = ic.lookup(shape) {
-                    let map = cell.map.borrow();
                     // The index is keyed by shape (V11-T2: shape ⇒ key layout), so
                     // it is always in range for an object of that shape.
-                    if let Some((_k, v)) = map.get_index(idx as usize) {
-                        return Some(v.clone());
+                    if let Some(v) = cell.value_at(idx as usize) {
+                        return Some(v);
                     }
                     // Defensive: a stale/out-of-range index never feeds a wrong
                     // value — fall through to re-resolve generically below.
                 }
                 // Miss: resolve the field index generically and RECORD it.
-                let map = cell.map.borrow();
-                match map.get_index_of(name) {
+                match cell.get_index_of(name) {
                     Some(idx) => {
-                        let v = map.get_index(idx).map(|(_, v)| v.clone());
-                        drop(map);
+                        let v = cell.value_at(idx);
                         let mut ic = chunk.field_ic(op_off);
                         ic.record(shape, idx as u32);
                         chunk.set_field_ic(op_off, ic);
@@ -7910,7 +7909,7 @@ impl Vm {
     /// validity relies on). Walks the full key list through the transition tree;
     /// a no-op-cost path because shared prefixes are deduped.
     fn resync_object_shape(&self, obj: &Cc<crate::value::ObjectCell>) {
-        let keys: Vec<String> = obj.map.borrow().keys().cloned().collect();
+        let keys = obj.keys_snapshot();
         let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
         obj.shape.set(shape);
     }
@@ -7968,9 +7967,7 @@ impl Vm {
                 if self.specialize && shape != 0 && !crate::stdlib::schema::is_schema_value(obj) {
                     let ic = chunk.field_ic(op_off);
                     if let Some(idx) = ic.lookup(shape) {
-                        let mut map = cell.map.borrow_mut();
-                        if let Some((_k, slot)) = map.get_index_mut(idx as usize) {
-                            *slot = value.clone();
+                        if cell.set_value_at(idx as usize, value.clone()) {
                             return Ok(value);
                         }
                         // Defensive: stale index → fall through to generic set.
@@ -7982,7 +7979,7 @@ impl Vm {
                 let new_shape = cell.shape.get();
                 if self.specialize && new_shape != 0 && !crate::stdlib::schema::is_schema_value(obj)
                 {
-                    if let Some(idx) = cell.map.borrow().get_index_of(name) {
+                    if let Some(idx) = cell.get_index_of(name) {
                         let mut ic = chunk.field_ic(op_off);
                         ic.record(new_shape, idx as u32);
                         chunk.set_field_ic(op_off, ic);

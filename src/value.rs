@@ -4,7 +4,7 @@
 
 use crate::ast::Stmt;
 use crate::env::Environment;
-use gcmodule::Cc;
+use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
 use rust_decimal::Decimal;
 use std::cell::{Cell, Ref, RefCell, RefMut};
@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// `borrow`/`borrow_mut` helpers mirror the old `Rc<RefCell<IndexMap>>` API so the
 /// vast majority of access sites are unchanged.
 pub struct ObjectCell {
-    pub map: RefCell<IndexMap<String, Value>>,
+    map: RefCell<IndexMap<String, Value>>,
     pub shape: Cell<u32>,
     /// `object.freeze` flag (SP2 §4). Defaults `false`. A `Cell` (not `RefCell`)
     /// so a `&self` engine can set/read it without a borrow conflict and with no
@@ -194,6 +194,45 @@ impl ObjectCell {
         let a = self.map.borrow();
         let b = other.map.borrow();
         *a == *b
+    }
+
+    /// Snapshot the insertion-order key list as owned `String`s.
+    /// Used by `resync_object_shape` (which walks keys through the transition tree)
+    /// and `object_shape_for` (which accepts `impl Iterator<Item=&str>`).
+    // SHAPE: temporary — deleted in Phase 3 when `resync_object_shape` is removed.
+    pub fn keys_snapshot(&self) -> Vec<String> {
+        self.map.borrow().keys().cloned().collect()
+    }
+
+    /// Clone the whole entry map into a fresh `IndexMap`.
+    /// Used by `object_like_fields` in `src/stdlib/object.rs` which must return
+    /// an `IndexMap` shared with `Instance.fields` (until Phase 3.4 migrates
+    /// Instance). This is the one site that genuinely needs the raw map shape.
+    pub fn to_index_map(&self) -> IndexMap<String, Value> {
+        self.map.borrow().clone()
+    }
+}
+
+/// GC tracing for `ObjectCell` (V13-T1). Lives here (co-located with the struct)
+/// so the private `map` field is directly accessible without a public accessor.
+/// The impl was originally in `src/gc.rs`; it was moved here in SHAPE Task 1.3
+/// when `map` became private.
+impl Trace for ObjectCell {
+    fn trace(&self, tracer: &mut Tracer) {
+        // `map: RefCell<IndexMap<String, Value>>`. Avoid holding the borrow if
+        // it is already mutably borrowed (mirrors gcmodule's `RefCell` impl:
+        // an outstanding borrow implies an outstanding reference, so skipping
+        // is safe). `shape: Cell<u32>` and `frozen: Cell<bool>` are acyclic.
+        if let Ok(map) = self.map.try_borrow() {
+            for (k, v) in map.iter() {
+                k.trace(tracer);
+                v.trace(tracer);
+            }
+        }
+    }
+
+    fn is_type_tracked() -> bool {
+        true
     }
 }
 
