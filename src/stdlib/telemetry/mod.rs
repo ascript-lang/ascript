@@ -149,7 +149,7 @@ fn want_obj_or_nil<'a>(v: &'a Value, span: Span, ctx: &str) -> Result<Option<&'a
 /// Read a string field from an object (None if absent or non-string-nil).
 fn obj_str(obj: &Value, key: &str) -> Option<String> {
     if let Value::Object(o) = obj {
-        if let Some(Value::Str(s)) = o.borrow().get(key) {
+        if let Some(Value::Str(s)) = o.get(key) {
             return Some(s.to_string());
         }
     }
@@ -159,7 +159,7 @@ fn obj_str(obj: &Value, key: &str) -> Option<String> {
 /// Read a bool field from an object (default false).
 fn obj_bool(obj: &Value, key: &str) -> bool {
     if let Value::Object(o) = obj {
-        matches!(o.borrow().get(key), Some(Value::Bool(true)))
+        matches!(o.get(key), Some(Value::Bool(true)))
     } else {
         false
     }
@@ -168,11 +168,11 @@ fn obj_bool(obj: &Value, key: &str) -> bool {
 /// Read the `attributes`/`properties`/`headers` sub-object as ordered pairs.
 fn obj_pairs(obj: &Value, key: &str) -> Vec<(String, Value)> {
     if let Value::Object(o) = obj {
-        if let Some(Value::Object(inner)) = o.borrow().get(key) {
+        if let Some(Value::Object(inner)) = o.get(key) {
             return inner
-                .borrow()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .entries()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
                 .collect();
         }
     }
@@ -232,8 +232,8 @@ fn tagged_descriptor(kind: &str, args: &[Value], span: Span, ctx: &str) -> Resul
     let mut m: IndexMap<String, Value> = IndexMap::new();
     m.insert("__exporter".into(), Value::Str(kind.into()));
     if let Some(Value::Object(src)) = opts {
-        for (k, v) in src.borrow().iter() {
-            m.insert(k.clone(), v.clone());
+        for (k, v) in src.entries() {
+            m.insert(k.to_string(), v);
         }
     }
     Ok(Value::Object(crate::value::ObjectCell::new(m)))
@@ -288,7 +288,7 @@ async fn init(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Cont
     // Parse the exporters array.
     let mut exporters = Exporters::default();
     if let Value::Object(o) = &cfg_obj {
-        let exporters_val = o.borrow().get("exporters").cloned();
+        let exporters_val = o.get("exporters");
         if let Some(Value::Array(a)) = exporters_val {
             for d in a.borrow().iter() {
                 match parse_exporter(d, span)? {
@@ -515,7 +515,7 @@ async fn run_scoped_cb(interp: &Interp, cb: Value, span: Span) -> Result<Value, 
 /// Pull a human message out of an err value (`{message: ...}` or any value).
 fn pair_err_message(err: &Value) -> Option<String> {
     match err {
-        Value::Object(o) => match o.borrow().get("message") {
+        Value::Object(o) => match o.get("message") {
             Some(Value::Str(s)) => Some(s.to_string()),
             Some(other) => Some(other.to_string()),
             None => Some(err.to_string()),
@@ -575,11 +575,7 @@ fn identify(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Contro
     let props_val = super::arg(args, 1);
     want_obj_or_nil(&props_val, span, "telemetry.identify")?;
     let set_props: Vec<(String, Value)> = match &props_val {
-        Value::Object(o) => o
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        Value::Object(o) => o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         _ => Vec::new(),
     };
     interp.telemetry_enqueue_event(AnalyticsEvent {
@@ -636,11 +632,9 @@ fn span_method(
             // Allow a flat attributes object too: addEvent("x", {k:v}).
             let attrs = if attrs.is_empty() {
                 match &opts {
-                    Value::Object(o) => o
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
+                    Value::Object(o) => {
+                        o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+                    }
                     _ => Vec::new(),
                 }
             } else {
@@ -693,11 +687,9 @@ fn instrument_method(
             let attrs_val = super::arg(&args, 1);
             want_obj_or_nil(&attrs_val, span, "telemetry metric")?;
             let attrs: Vec<(String, Value)> = match &attrs_val {
-                Value::Object(o) => o
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+                Value::Object(o) => {
+                    o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+                }
                 _ => Vec::new(),
             };
             interp.telemetry_record_metric(id, method, amount, attrs);

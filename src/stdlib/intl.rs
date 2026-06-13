@@ -294,8 +294,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "formatDate" => {
             let o = want_object(&arg(args, 0), span, &ctx("formatDate"))?;
             let epoch_ms = {
-                let b = o.borrow();
-                match b.get("epochMs").and_then(|v| v.as_f64()) {
+                match o.get("epochMs").and_then(|v| v.as_f64()) {
                     Some(n) => n as i64,
                     _ => {
                         return Err(AsError::at(

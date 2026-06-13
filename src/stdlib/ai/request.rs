@@ -503,7 +503,7 @@ pub(crate) fn parse_gen_opts(opts: &Value) -> GenOpts {
 /// Read a field from an `Object` or `Instance`; `Nil` if absent / not a container.
 pub(crate) fn get_field(v: &Value, key: &str) -> Value {
     match v {
-        Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+        Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
         Value::Instance(i) => i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil),
         _ => Value::Nil,
     }

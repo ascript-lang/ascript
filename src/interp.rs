@@ -1681,10 +1681,10 @@ impl Interp {
                 for a in iter {
                     match a {
                         Value::Object(o) => {
-                            for (k, val) in o.borrow().iter() {
+                            for (k, val) in o.entries() {
                                 fields.insert(
-                                    k.clone(),
-                                    crate::stdlib::json::to_json_lossy(val, &mut Vec::new()),
+                                    k.to_string(),
+                                    crate::stdlib::json::to_json_lossy(&val, &mut Vec::new()),
                                 );
                             }
                         }
@@ -3071,7 +3071,7 @@ impl Interp {
                 }
                 let get = |key: &str| -> Value {
                     match &v {
-                        Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+                        Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
                         Value::Instance(i) => {
                             i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil)
                         }
@@ -3088,9 +3088,9 @@ impl Interp {
                     let mut remaining = indexmap::IndexMap::new();
                     match &v {
                         Value::Object(o) => {
-                            for (k, val) in o.borrow().iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), val.clone());
+                            for (k, val) in o.entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), val);
                                 }
                             }
                         }
@@ -3765,8 +3765,8 @@ impl Interp {
                             let v = self.eval_expr(x, env).await?;
                             match v {
                                 Value::Object(o) => {
-                                    for (k, val) in o.borrow().iter() {
-                                        map.insert(k.clone(), val.clone());
+                                    for (k, val) in o.entries() {
+                                        map.insert(k.to_string(), val);
                                     }
                                 }
                                 other => {
@@ -4080,7 +4080,11 @@ impl Interp {
             Pattern::Object(entries, rest) => {
                 // Snapshot the subject's fields (Object or Instance).
                 let fields: indexmap::IndexMap<String, Value> = match subject {
-                    Value::Object(o) => o.borrow().clone(),
+                    Value::Object(o) => o
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
                     Value::Instance(i) => i.borrow().fields.clone(),
                     _ => return Ok(false),
                 };
@@ -4170,7 +4174,7 @@ impl Interp {
                         a.borrow().iter().cloned().collect()
                     }
                     Some(crate::value::Payload::Named(o)) => {
-                        o.borrow().values().cloned().collect()
+                        o.entries().into_iter().map(|(_, v)| v).collect()
                     }
                     None => return Ok(false),
                 };
@@ -4187,13 +4191,13 @@ impl Interp {
             VariantPatFields::Named(entries) => {
                 // Snapshot the named payload's fields. A non-named payload cannot
                 // match a named pattern.
-                let map: indexmap::IndexMap<String, Value> = match &ev.payload {
-                    Some(crate::value::Payload::Named(o)) => o.borrow().clone(),
+                let payload_obj = match &ev.payload {
+                    Some(crate::value::Payload::Named(o)) => o.clone(),
                     _ => return Ok(false),
                 };
                 for (key, subpat) in entries {
-                    let field = match map.get(key.as_ref()) {
-                        Some(v) => v.clone(),
+                    let field = match payload_obj.get(key.as_ref()) {
+                        Some(v) => v,
                         None => return Ok(false),
                     };
                     match subpat {
@@ -4435,7 +4439,7 @@ impl Interp {
         span: Span,
     ) -> Result<Value, AsError> {
         match obj {
-            Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
+            Value::Object(map) => Ok(map.get(name).unwrap_or(Value::Nil)),
             Value::Enum(e) => {
                 let variant = e.variants.get(name).cloned().ok_or_else(|| {
                     AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)
@@ -4473,8 +4477,8 @@ impl Interp {
                 // named field directly off the payload Object.
                 other => {
                     if let Some(crate::value::Payload::Named(o)) = &v.payload {
-                        if let Some(fv) = o.borrow().get(other) {
-                            return Ok(fv.clone());
+                        if let Some(fv) = o.get(other) {
+                            return Ok(fv);
                         }
                     }
                     Err(AsError::at(
@@ -5802,7 +5806,7 @@ impl Interp {
             } else {
                 format!("{}.{}", path, fname)
             };
-            let raw = map.borrow().get(fname).cloned();
+            let raw = map.get(fname);
             let mut val = raw.unwrap_or(Value::Nil);
             if val == Value::Nil {
                 if let Some(def) = &fs.default {
@@ -5843,8 +5847,8 @@ impl Interp {
         }
 
         if strict {
-            for k in map.borrow().keys() {
-                if !schema.contains_key(k) {
+            for k in map.keys_snapshot() {
+                if !schema.contains_key(&k) {
                     return Err(AsError::at(
                         format!(
                             "unexpected key '{}' for {} (strict)",
@@ -6177,10 +6181,11 @@ impl Interp {
                 // parsed-JSON `map<K, Class>` field would otherwise be an Object
                 // and fail the `map<K,V>` contract.
                 Value::Object(o) => {
+                    // entries() works for both slab-mode and dict-mode objects.
                     let entries: Vec<(String, Value)> = o
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
                         .collect();
                     let out = crate::value::MapCell::new(indexmap::IndexMap::new());
                     for (k, v) in entries {
@@ -6445,8 +6450,8 @@ impl Interp {
             Value::Nil => return Ok(None),
             _ => return Ok(None),
         };
-        let caps_val = match opts_obj.borrow().get("caps") {
-            Some(v) => v.clone(),
+        let caps_val = match opts_obj.get("caps") {
+            Some(v) => v,
             None => return Ok(None),
         };
         let caps_obj = match &caps_val {
@@ -6463,7 +6468,7 @@ impl Interp {
         // Start from the CALLER's current caps (denial is monotone — a worker can only
         // ever be MORE restricted than its dispatcher), then subtract opts.caps.deny.
         let mut set = self.caps();
-        if let Some(Value::Array(deny)) = caps_obj.borrow().get("deny") {
+        if let Some(Value::Array(deny)) = caps_obj.get("deny") {
             for name in deny.borrow().iter() {
                 let name = match name {
                     Value::Str(s) => s.to_string(),
@@ -6589,7 +6594,7 @@ impl Interp {
                 let n = match &v {
                     Value::Str(s) => s.chars().count(),
                     Value::Array(a) => a.borrow().len(),
-                    Value::Object(o) => o.borrow().len(),
+                    Value::Object(o) => o.len(),
                     Value::Map(m) => m.borrow().len(),
                     Value::Set(s) => s.borrow().len(),
                     Value::Bytes(b) => b.borrow().len(),
@@ -7587,11 +7592,7 @@ pub(crate) fn index_get(
             })
         }
         Value::Object(map) => match idx {
-            Value::Str(key) => Ok(map
-                .borrow()
-                .get(key.as_ref())
-                .cloned()
-                .unwrap_or(Value::Nil)),
+            Value::Str(key) => Ok(map.get(key.as_ref()).unwrap_or(Value::Nil)),
             _ => Err(AsError::at("object index must be a string", index_span)),
         },
         // SRV §3.5: a frozen `Shared` indexes like the data it froze — an array by
@@ -8082,7 +8083,6 @@ pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'s
 pub(crate) fn error_message(err: &Value) -> String {
     match err {
         Value::Object(o) => o
-            .borrow()
             .get("message")
             .map(|m| m.to_string())
             .unwrap_or_else(|| err.to_string()),

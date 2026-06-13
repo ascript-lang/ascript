@@ -102,23 +102,24 @@ fn diff_inner(
             if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return;
             }
-            let (x, y) = (x.borrow(), y.borrow());
+            let xe = x.entries();
+            let ye = y.entries();
             // Removed / changed keys, in `a`'s insertion order.
-            for (k, va) in x.iter() {
-                match y.get(k) {
+            for (k, va) in &xe {
+                match y.get(k.as_ref()) {
                     Some(vb) => {
                         let base = path.len();
                         path.push('.');
-                        path.push_str(k);
-                        diff_inner(va, vb, path, depth + 1, seen, out);
+                        path.push_str(k.as_ref());
+                        diff_inner(&va, &vb, path, depth + 1, seen, out);
                         path.truncate(base);
                     }
                     None => out.push_str(&format!("- {}.{}: {}\n", path, k, va)),
                 }
             }
             // Added keys, in `b`'s insertion order.
-            for (k, vb) in y.iter() {
-                if !x.contains_key(k) {
+            for (k, vb) in &ye {
+                if !x.contains_key(k.as_ref()) {
                     out.push_str(&format!("+ {}.{}: {}\n", path, k, vb));
                 }
             }
@@ -537,7 +538,7 @@ impl Interp {
                     Value::Object(o) => {
                         // key presence — needle must be a string
                         match &needle {
-                            Value::Str(k) => o.borrow().contains_key(k.as_ref()),
+                            Value::Str(k) => o.contains_key(k.as_ref()),
                             _ => {
                                 return Err(AsError::at(
                                     format!(

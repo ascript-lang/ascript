@@ -63,8 +63,7 @@ fn make_instant(epoch_ms: i64) -> Value {
 /// Read the canonical `epochMs` field from an instant object (Tier-2 panic if absent).
 fn instant_epoch(v: &Value, span: Span, ctx: &str) -> Result<i64, Control> {
     let o = want_object(v, span, ctx)?;
-    let b = o.borrow();
-    match b.get("epochMs").and_then(|v| v.as_f64()) {
+    match o.get("epochMs").and_then(|v| v.as_f64()) {
         Some(n) => Ok(n as i64),
         _ => Err(AsError::at(
             format!(

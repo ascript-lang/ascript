@@ -143,8 +143,8 @@ fn descriptor(t: FfiType) -> Value {
 /// descriptor. The §3.3 "argtypes not `ffi.*` descriptors → Tier-2" check uses this.
 fn descriptor_type(v: &Value) -> Option<FfiType> {
     if let Value::Object(o) = v {
-        if let Some(Value::Str(tag)) = o.borrow().get("__ffi") {
-            return FfiType::from_tag(tag);
+        if let Some(Value::Str(tag)) = o.get("__ffi") {
+            return FfiType::from_tag(&tag);
         }
     }
     None
@@ -1047,7 +1047,7 @@ fn layout_field(
     ctx: &str,
 ) -> Result<(FfiType, usize), Control> {
     let obj = super::want_object(layout, span, ctx)?;
-    let fields = match obj.borrow().get("fields") {
+    let fields = match obj.get("fields") {
         Some(Value::Array(a)) => a.borrow().clone(),
         _ => {
             return Err(AsError::at(
@@ -1059,11 +1059,10 @@ fn layout_field(
     };
     for fd in &fields {
         if let Value::Object(o) = fd {
-            let o = o.borrow();
             if let Some(Value::Str(fname)) = o.get("name") {
-                if &**fname == name {
+                if fname.as_ref() == name {
                     let ty = match o.get("type") {
-                        Some(Value::Str(tag)) => FfiType::from_tag(tag),
+                        Some(Value::Str(tag)) => FfiType::from_tag(&tag),
                         _ => None,
                     }
                     .ok_or_else(|| {
@@ -1073,7 +1072,7 @@ fn layout_field(
                         ))
                     })?;
                     let off = match o.get("offset") {
-                        Some(Value::Int(n)) if *n >= 0 => *n as usize,
+                        Some(Value::Int(n)) if n >= 0 => n as usize,
                         _ => {
                             return Err(AsError::at(
                                 format!("{ctx}: field '{name}' has an invalid offset"),

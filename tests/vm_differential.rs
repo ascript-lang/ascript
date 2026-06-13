@@ -8311,6 +8311,75 @@ async fn object_delete_invalidates_shape_for_warmed_property_ic() {
     assert_four_way_run(src).await;
 }
 
+// ── SHAPE Phase 3.1 — slab construction + precise transitions ────────────────
+// Five-way byte-identity: tw == specialized-VM == generic-VM == lane-off == .aso
+// for every object construction / mutation path that Task 3.1 rewires.
+
+/// SHAPE 3.1: literal order, duplicate-key last-wins, spread merge later-wins
+/// first-position, self-spread, SET_INDEX add, and post-cap wide object.
+/// These scenarios exercised dict-mode before; they must produce IDENTICAL output
+/// after the slab-native rewrite — the corpus is the behaviour lock.
+#[tokio::test]
+async fn shape_slab_construction_and_mutation_five_way() {
+    // Literal order preserved.
+    assert_three_way_matches("let o = {a: 1, b: 2, c: 3}\nprint(o)\n").await;
+    // Duplicate key: last value wins, first position kept (IndexMap semantics).
+    assert_three_way_matches("let o = {a: 1, b: 9, a: 2}\nprint(o)\n").await;
+    // Spread merge: later-wins, first-position kept.
+    assert_three_way_matches(
+        "let base = {x: 1, y: 2}\nlet o = {...base, y: 99, z: 3}\nprint(o)\n",
+    )
+    .await;
+    // Self-spread (the object spreads into itself — a no-op value-wise, order kept).
+    assert_three_way_matches("let o = {a: 1, b: 2}\nlet o2 = {...o, ...o}\nprint(o2)\n").await;
+    // SET_INDEX add: adding a new key via `o[\"k\"] = v` must produce the same result.
+    assert_three_way_matches(
+        "let o = {a: 1}\no[\"b\"] = 2\no[\"c\"] = 3\nprint(o)\nprint(o.b)\nprint(o.c)\n",
+    )
+    .await;
+    // Post-cap wide object: building >64 keys via SET_PROP demotes to dict; order kept.
+    assert_three_way_matches(
+        "let o = {}\n\
+         let i = 0\n\
+         while (i < 70) {\n\
+           o[\"k\" + i] = i\n\
+           i = i + 1\n\
+         }\n\
+         print(o.k0)\n\
+         print(o.k69)\n\
+         print(o.k33)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.1: SET_PROP add on a function-site-warmed IC must keep producing
+/// the correct result (the IC sees a transitioned shape after the first add;
+/// subsequent same-key writes hit the IC; different-key writes miss and
+/// re-record — all must be byte-identical across every engine mode).
+#[tokio::test]
+async fn shape_set_prop_transition_five_way() {
+    assert_three_way_matches(
+        "fn build(x) {\n\
+           let o = {a: x}\n\
+           o.b = x + 1\n\
+           o.c = x + 2\n\
+           return o\n\
+         }\n\
+         print(build(1))\n\
+         print(build(10))\n\
+         print(build(100))\n",
+    )
+    .await;
+    // Overwrite an existing key (shape unchanged) after a previous warm.
+    assert_three_way_matches(
+        "fn bump(o) { o.x = o.x + 1 }\n\
+         let o = {x: 0}\n\
+         bump(o)\nbump(o)\nbump(o)\n\
+         print(o.x)\n",
+    )
+    .await;
+}
+
 // ── DEFER §3.1–3.6: VM execution semantics ──────────────────────────────────
 // These tests assert four-mode byte-identity (tree-walker == specialized-VM ==
 // generic-VM == .aso round-trip) for every specified defer behaviour.

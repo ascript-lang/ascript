@@ -159,6 +159,13 @@ impl ObjectCell {
     // All accessors branch on `Slab` vs `Dict`. Signatures are UNCHANGED from
     // Task 1.1. Dict mode replicates today's behavior exactly (424/0 differential).
 
+    /// `true` if the storage is in slab mode (shape-native). The VM uses this
+    /// to decide whether to attempt a registry transition even when shape == 0
+    /// (a freshly-built empty object literal is a slab at EMPTY_SHAPE). SHAPE Task 3.1.
+    pub fn is_slab(&self) -> bool {
+        matches!(&*self.storage.borrow(), ObjectStorage::Slab { .. })
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         match &*self.storage.borrow() {
@@ -406,8 +413,6 @@ impl ObjectCell {
     }
 
     /// Snapshot the insertion-order key list as owned `String`s.
-    /// Used by `resync_object_shape` (which walks keys through the transition tree).
-    // SHAPE: temporary — deleted in Phase 3 when `resync_object_shape` is removed.
     pub fn keys_snapshot(&self) -> Vec<String> {
         match &*self.storage.borrow() {
             ObjectStorage::Slab { keys, .. } => keys.iter().map(|k| k.to_string()).collect(),

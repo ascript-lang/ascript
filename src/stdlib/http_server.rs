@@ -175,7 +175,7 @@ fn route_schemas_from_arg(arg: &Value) -> Option<RouteSchemas> {
     // Options object: read params/query/body if each is a schema value.
     if let Value::Object(o) = arg {
         let pick = |key: &str| -> Option<Value> {
-            let v = o.borrow().get(key).cloned();
+            let v = o.get(key);
             match v {
                 Some(ref val) if schema_kind(val).is_some() => v,
                 _ => None,
@@ -269,7 +269,6 @@ impl ServeOpts {
             port: None,
         };
         if let Value::Object(obj) = arg(args, 0) {
-            let obj = obj.borrow();
             if let Some(n) = obj.get("maxRequests").and_then(|v| v.as_f64()) {
                 if n >= 0.0 {
                     o.max_requests = Some(n as usize);
@@ -297,7 +296,7 @@ impl ServeOpts {
             }
             if let Some(s) = obj.get("setup") {
                 if !matches!(s, Value::Nil) {
-                    o.setup_fn = Some(s.clone());
+                    o.setup_fn = Some(s);
                 }
             }
             if let Some(Value::Array(a)) = obj.get("args") {
@@ -724,7 +723,7 @@ fn validation_error_response(path: &str, message: &str, where_part: &str) -> Htt
 #[cfg(feature = "data")]
 fn read_request_field(request: &Value, key: &str) -> Value {
     match request {
-        Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+        Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
         _ => Value::Nil,
     }
 }
@@ -750,7 +749,7 @@ fn route_schema_failure(
         ParseFail::Mismatch(err_obj_val) => {
             let get = |k: &str| -> String {
                 match &err_obj_val {
-                    Value::Object(o) => match o.borrow().get(k) {
+                    Value::Object(o) => match o.get(k) {
                         Some(Value::Str(s)) => s.to_string(),
                         _ => String::new(),
                     },
@@ -862,19 +861,18 @@ fn value_to_response(v: &Value, span: Span) -> Result<HttpResponse, Control> {
             })
         }
         Value::Object(o) => {
-            let o = o.borrow();
             let status = match o.get("status").and_then(|v| v.as_f64()) {
                 Some(n) => n as u16,
                 _ => 200,
             };
             let mut headers: Vec<(String, String)> = Vec::new();
             if let Some(Value::Object(h)) = o.get("headers") {
-                for (k, val) in h.borrow().iter() {
+                for (k, val) in h.entries() {
                     let val = val.to_string();
                     // Reject CRLF in handler-supplied header names/values BEFORE they
                     // reach serialize_response (response-splitting guard).
-                    validate_header(k, &val, span)?;
-                    headers.push((k.clone(), val));
+                    validate_header(k.as_ref(), &val, span)?;
+                    headers.push((k.to_string(), val));
                 }
             }
             let body = match o.get("body") {
@@ -925,7 +923,7 @@ fn propagated_error(v: &Value) -> Value {
 /// Pull a human-readable message out of an error value (`{message}` object or string).
 fn error_message(err: &Value) -> String {
     match err {
-        Value::Object(o) => match o.borrow().get("message") {
+        Value::Object(o) => match o.get("message") {
             Some(Value::Str(s)) => s.to_string(),
             _ => err.to_string(),
         },

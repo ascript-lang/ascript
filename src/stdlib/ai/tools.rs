@@ -80,8 +80,8 @@ pub(crate) fn resolve_tools(
     tools_opt: &Value,
     span: Span,
 ) -> Result<Vec<ResolvedTool>, Control> {
-    let map = match tools_opt {
-        Value::Object(o) => o.borrow().clone(),
+    let entries = match tools_opt {
+        Value::Object(o) => o.entries(),
         Value::Nil => return Ok(Vec::new()),
         other => {
             return Err(AsError::at(
@@ -95,8 +95,8 @@ pub(crate) fn resolve_tools(
         }
     };
     let mut out = Vec::new();
-    for (name, tool_val) in map.iter() {
-        let n = match tool_val {
+    for (name, tool_val) in entries {
+        let n = match &tool_val {
             Value::Native(nat) if nat.kind == crate::value::NativeKind::AiTool => nat,
             other => {
                 return Err(AsError::at(
@@ -117,12 +117,12 @@ pub(crate) fn resolve_tools(
             _ => None,
         };
         let schema_json = interp.project_shape_json(&input_shape);
-        let mut tool = Tool::new(name.clone()).with_schema(schema_json);
+        let mut tool = Tool::new(name.as_ref()).with_schema(schema_json);
         if let Some(d) = description {
             tool = tool.with_description(d);
         }
         out.push(ResolvedTool {
-            name: name.clone(),
+            name: name.to_string(),
             tool,
             input_shape,
             execute,

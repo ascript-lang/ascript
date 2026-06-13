@@ -88,8 +88,8 @@ pub fn is_ctx_method(name: &str) -> bool {
 /// Read the `__kind` tag of an Object value, if it is one.
 fn tagged_kind(v: &Value) -> Option<&'static str> {
     if let Value::Object(o) = v {
-        if let Some(Value::Str(k)) = o.borrow().get("__kind") {
-            return match &**k {
+        if let Some(Value::Str(k)) = o.get("__kind") {
+            return match k.as_ref() {
                 CTX_KIND => Some(CTX_KIND),
                 ACTIVITY_KIND => Some(ACTIVITY_KIND),
                 _ => None,
@@ -374,8 +374,7 @@ fn read_options(opts: &Value, span: Span) -> Result<(String, bool), Control> {
         )
         .into());
     };
-    let m = o.borrow();
-    let log = match m.get("log") {
+    let log = match o.get("log") {
         Some(Value::Str(s)) => s.to_string(),
         _ => {
             return Err(AsError::at(
@@ -385,7 +384,7 @@ fn read_options(opts: &Value, span: Span) -> Result<(String, bool), Control> {
             .into())
         }
     };
-    let fsync = !matches!(m.get("durability"), Some(Value::Str(s)) if &**s == "buffered");
+    let fsync = !matches!(o.get("durability"), Some(Value::Str(s)) if s.as_ref() == "buffered");
     Ok((log, fsync))
 }
 
@@ -668,12 +667,11 @@ impl Interp {
 /// Extract `(name, fn)` from an activity tagged Object.
 fn activity_parts(activity: &Value) -> (String, Value) {
     if let Value::Object(o) = activity {
-        let m = o.borrow();
-        let name = match m.get("name") {
+        let name = match o.get("name") {
             Some(Value::Str(s)) => s.to_string(),
             _ => String::new(),
         };
-        let func = m.get("fn").cloned().unwrap_or(Value::Nil);
+        let func = o.get("fn").unwrap_or(Value::Nil);
         (name, func)
     } else {
         (String::new(), Value::Nil)

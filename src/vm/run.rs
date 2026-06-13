@@ -2140,14 +2140,42 @@ impl Vm {
                 }
 
                 Op::SetIndex => {
+                    // SHAPE Task 3.1: for Object receivers, bypass the shared
+                    // `index_set` (which calls borrow_mut() and panics on slab mode)
+                    // and use vm_object_insert directly. Array/error paths are
+                    // unchanged. The frozen check and error messages are preserved.
                     let val = fiber.pop();
                     let idx = fiber.pop();
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let v = crate::interp::index_set(&obj, &idx, val, span, span)?;
-                    if let Value::Object(cell) = &obj {
-                        self.resync_object_shape(cell);
-                    }
+                    let v = match &obj {
+                        Value::Object(cell) => {
+                            // Frozen guard (mirrors index_set's frozen_kind check).
+                            if let Some(kind) = crate::value::frozen_kind(&obj) {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("cannot mutate a frozen {kind}"),
+                                ));
+                            }
+                            match &idx {
+                                Value::Str(key) => {
+                                    let key = key.clone();
+                                    self.vm_object_insert(cell, &key, val.clone());
+                                    val
+                                }
+                                _ => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        "object index must be a string".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                        _ => crate::interp::index_set(&obj, &idx, val, span, span)
+                            .map_err(|e| Control::Panic(e))?,
+                    };
                     fiber.push(v);
                 }
 
@@ -2349,6 +2377,11 @@ impl Vm {
                 }
 
                 Op::NewObject => {
+                    // SHAPE Task 3.1: build slab-native on the GENERIC path (no
+                    // specialize gate — the representation is not toggleable).
+                    // Pop `n` (key, value) pairs in source order, fold duplicates
+                    // first-seen/later-wins (IndexMap semantics: first position kept,
+                    // later value wins), then intern via the shape registry.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
                     for slot in pairs.iter_mut().rev() {
@@ -2365,14 +2398,42 @@ impl Vm {
                         };
                         *slot = (key, value);
                     }
-                    let mut map = indexmap::IndexMap::with_capacity(n);
+                    // Fold duplicates into an ordered (key, value) sequence: first
+                    // occurrence wins position, last occurrence wins value — exactly
+                    // IndexMap::insert semantics.
+                    let mut order: Vec<Rc<str>> = Vec::with_capacity(n);
+                    let mut vals: indexmap::IndexMap<String, Value> =
+                        indexmap::IndexMap::with_capacity(n);
                     for (k, v) in pairs {
-                        map.insert(k.to_string(), v);
+                        let ks = k.to_string();
+                        if !vals.contains_key(&ks) {
+                            order.push(k);
+                        }
+                        vals.insert(ks, v);
                     }
-                    let cell = crate::value::ObjectCell::new(map);
-                    let keys = cell.keys_snapshot();
-                    let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
-                    cell.shape.set(shape);
+                    // Try slab mode: intern the ordered key sequence through the
+                    // registry. A cap refusal falls back to dict mode (shape 0).
+                    let cell = {
+                        let mut reg = self.shapes.borrow_mut();
+                        match reg.shape_for(order.iter().map(|k| k.as_ref())) {
+                            Some(shape) => {
+                                let keys = reg.keys_of(shape);
+                                drop(reg);
+                                let values: Vec<Value> =
+                                    order.iter().map(|k| vals.shift_remove(k.as_ref()).unwrap()).collect();
+                                crate::value::ObjectCell::new_slab(keys, values, shape)
+                            }
+                            None => {
+                                drop(reg);
+                                // Cap exceeded: fall back to dict mode (shape 0).
+                                let mut map = indexmap::IndexMap::with_capacity(order.len());
+                                for k in &order {
+                                    map.insert(k.to_string(), vals.shift_remove(k.as_ref()).unwrap());
+                                }
+                                crate::value::ObjectCell::new(map)
+                            }
+                        }
+                    };
                     fiber.push(Value::Object(cell));
                 }
 
@@ -2468,6 +2529,9 @@ impl Vm {
                 }
 
                 Op::AppendObject => {
+                    // SHAPE Task 3.1: use vm_object_insert so slab-mode builder
+                    // objects grow via precise registry transitions instead of
+                    // dict borrow_mut + resync. The key must be a string const.
                     let val = fiber.pop();
                     let key = match fiber.pop() {
                         Value::Str(s) => s,
@@ -2481,9 +2545,8 @@ impl Vm {
                     };
                     match fiber.peek(0) {
                         Value::Object(obj) => {
-                            obj.borrow_mut().insert(key.to_string(), val);
                             let obj = obj.clone();
-                            self.resync_object_shape(&obj);
+                            self.vm_object_insert(&obj, &key, val);
                         }
                         other => {
                             return Err(self.panic_at(
@@ -2499,24 +2562,20 @@ impl Vm {
                 }
 
                 Op::SpreadObject => {
+                    // SHAPE Task 3.1: snapshot source entries via the accessor
+                    // (works across slab and dict modes), then insert into the
+                    // builder object via vm_object_insert (precise transitions).
                     let operand = fiber.pop();
                     match operand {
                         Value::Object(src) => {
-                            let entries: Vec<(String, Value)> = src
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
+                            // Snapshot FIRST (avoids borrow conflict on self-spread).
+                            let entries = src.entries();
                             match fiber.peek(0) {
                                 Value::Object(obj) => {
-                                    {
-                                        let mut m = obj.borrow_mut();
-                                        for (k, v) in entries {
-                                            m.insert(k, v);
-                                        }
-                                    }
                                     let obj = obj.clone();
-                                    self.resync_object_shape(&obj);
+                                    for (k, v) in entries {
+                                        self.vm_object_insert(&obj, &k, v);
+                                    }
                                 }
                                 other => {
                                     return Err(self.panic_at(
@@ -2686,7 +2745,7 @@ impl Vm {
                     let src = fiber.pop();
                     let v = match src {
                         Value::Object(o) => {
-                            o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                            o.get(key.as_ref()).unwrap_or(Value::Nil)
                         }
                         Value::Instance(i) => i
                             .borrow()
@@ -2751,9 +2810,9 @@ impl Vm {
                         indexmap::IndexMap::new();
                     match src {
                         Value::Object(o) => {
-                            for (k, v) in o.borrow().iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in o.entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
@@ -2811,7 +2870,7 @@ impl Vm {
                     };
                     let subject = fiber.pop();
                     let ok = match &subject {
-                        Value::Object(o) => o.borrow().contains_key(key.as_ref()),
+                        Value::Object(o) => o.contains_key(key.as_ref()),
                         Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
                         _ => false,
                     };
@@ -2890,7 +2949,7 @@ impl Vm {
                     let ok = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().contains_key(key.as_ref())
+                                o.contains_key(key.as_ref())
                             }
                             _ => false,
                         },
@@ -2935,7 +2994,7 @@ impl Vm {
                     let v = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                                o.get(key.as_ref()).unwrap_or(Value::Nil)
                             }
                             _ => Value::Nil,
                         },
@@ -4539,13 +4598,12 @@ impl Vm {
                 }
 
                 Op::NewObject => {
-                    // Pop `n` (key, value) pairs. Each pair was pushed key-first
-                    // then value, and the pairs were pushed in source order, so
-                    // the stack top-down is: vN, kN, …, v1, k1. Pop into a
-                    // source-order list, then insert into an `IndexMap` in source
-                    // order — a later duplicate key overwrites the value but keeps
-                    // the first-seen position (IndexMap semantics), byte-identical
-                    // to the tree-walker's `ExprKind::Object`.
+                    // SHAPE Task 3.1: slab-native construction on the GENERIC path
+                    // (not specialize-gated — representation is not toggleable).
+                    // Pop `n` (key, value) pairs in source order (stack: vN,kN,…,v1,k1),
+                    // fold duplicates first-seen/later-wins (IndexMap semantics), then
+                    // intern via the shape registry. Byte-identical to the tree-walker's
+                    // `ExprKind::Object` (same order + duplicate-key semantics).
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
                     for slot in pairs.iter_mut().rev() {
@@ -4562,16 +4620,37 @@ impl Vm {
                         };
                         *slot = (key, value);
                     }
-                    let mut map = indexmap::IndexMap::with_capacity(n);
+                    // Fold duplicates: first position kept, last value wins.
+                    let mut order: Vec<Rc<str>> = Vec::with_capacity(n);
+                    let mut vals: indexmap::IndexMap<String, Value> =
+                        indexmap::IndexMap::with_capacity(n);
                     for (k, v) in pairs {
-                        map.insert(k.to_string(), v);
+                        let ks = k.to_string();
+                        if !vals.contains_key(&ks) {
+                            order.push(k);
+                        }
+                        vals.insert(ks, v);
                     }
-                    // Assign the object's hidden-class shape from its final ordered
-                    // keys (V11-T2). Pure metadata — does not change behavior.
-                    let cell = crate::value::ObjectCell::new(map);
-                    let keys = cell.keys_snapshot();
-                    let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
-                    cell.shape.set(shape);
+                    let cell = {
+                        let mut reg = self.shapes.borrow_mut();
+                        match reg.shape_for(order.iter().map(|k| k.as_ref())) {
+                            Some(shape) => {
+                                let keys = reg.keys_of(shape);
+                                drop(reg);
+                                let values: Vec<Value> =
+                                    order.iter().map(|k| vals.shift_remove(k.as_ref()).unwrap()).collect();
+                                crate::value::ObjectCell::new_slab(keys, values, shape)
+                            }
+                            None => {
+                                drop(reg);
+                                let mut map = indexmap::IndexMap::with_capacity(order.len());
+                                for k in &order {
+                                    map.insert(k.to_string(), vals.shift_remove(k.as_ref()).unwrap());
+                                }
+                                crate::value::ObjectCell::new(map)
+                            }
+                        }
+                    };
                     fiber.push(Value::Object(cell));
                 }
 
@@ -4686,9 +4765,10 @@ impl Vm {
                 }
 
                 Op::AppendObject => {
-                    // `[obj, key, val] -- [obj]` — insert `key -> val` into the
-                    // builder object `obj`. Later-wins + first-position (IndexMap
-                    // insert), byte-identical to the tree-walker's `ExprKind::Object`.
+                    // SHAPE Task 3.1: `[obj, key, val] -- [obj]` — insert via
+                    // vm_object_insert (precise registry transition, works in both
+                    // slab and dict mode). Later-wins + first-position, byte-identical
+                    // to the tree-walker's `ExprKind::Object`.
                     let val = fiber.pop();
                     let key = match fiber.pop() {
                         Value::Str(s) => s,
@@ -4702,10 +4782,8 @@ impl Vm {
                     };
                     match fiber.peek(0) {
                         Value::Object(obj) => {
-                            obj.borrow_mut().insert(key.to_string(), val);
-                            // A new key may have been added → resync the shape.
                             let obj = obj.clone();
-                            self.resync_object_shape(&obj);
+                            self.vm_object_insert(&obj, &key, val);
                         }
                         other => {
                             return Err(self.panic_at(
@@ -4721,31 +4799,22 @@ impl Vm {
                 }
 
                 Op::SpreadObject => {
-                    // `[obj, operand] -- [obj]` — merge the operand object's entries
-                    // into the builder object `obj`. Mirrors the tree-walker's
-                    // `ExprKind::Object` spread arm: a non-object is the SAME Tier-2
-                    // panic at this op's span; entries insert later-wins/first-pos.
+                    // SHAPE Task 3.1: `[obj, operand] -- [obj]` — snapshot source
+                    // entries via the accessor (works across slab/dict), then insert
+                    // each via vm_object_insert. The non-object spread is the SAME
+                    // Tier-2 panic, anchored at this op's span; entries insert
+                    // later-wins/first-pos — byte-identical to the tree-walker.
                     let operand = fiber.pop();
                     match operand {
                         Value::Object(src) => {
-                            // Snapshot the source entries FIRST (avoids a borrow
-                            // conflict if `obj` aliases `src` via a self-spread).
-                            let entries: Vec<(String, Value)> = src
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
+                            // Snapshot FIRST (avoids borrow conflict on self-spread).
+                            let entries = src.entries();
                             match fiber.peek(0) {
                                 Value::Object(obj) => {
-                                    {
-                                        let mut m = obj.borrow_mut();
-                                        for (k, v) in entries {
-                                            m.insert(k, v);
-                                        }
-                                    }
-                                    // The merge may have added keys → resync shape.
                                     let obj = obj.clone();
-                                    self.resync_object_shape(&obj);
+                                    for (k, v) in entries {
+                                        self.vm_object_insert(&obj, &k, v);
+                                    }
                                 }
                                 other => {
                                     return Err(self.panic_at(
@@ -4786,23 +4855,41 @@ impl Vm {
                 }
 
                 Op::SetIndex => {
-                    // `obj idx val -- val` — store `obj[idx] = val`. The operands
-                    // were pushed obj-then-idx-then-val, so pop val, idx, obj. The
-                    // shared `index_set` dispatch (with the tree-walker) anchors
-                    // every panic at the op's span; the VM has a single instruction
-                    // span, so it is passed for both the receiver-span and
-                    // index-span parameters. Leaves the assigned value on the stack
-                    // (assignment is an expression).
+                    // SHAPE Task 3.1: for Object receivers, use vm_object_insert
+                    // directly (avoids borrow_mut panic on slab mode). Array and
+                    // error paths stay on the shared index_set (dict-only objects
+                    // from the tree-walker). Frozen check and error messages are
+                    // preserved byte-for-byte.
                     let val = fiber.pop();
                     let idx = fiber.pop();
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let v = crate::interp::index_set(&obj, &idx, val, span, span)?;
-                    // Setting `obj[key] = v` on an object may have ADDED a key →
-                    // transition the shape (reassigning an existing key is a no-op).
-                    if let Value::Object(cell) = &obj {
-                        self.resync_object_shape(cell);
-                    }
+                    let v = match &obj {
+                        Value::Object(cell) => {
+                            // Frozen guard (mirrors index_set's frozen_kind check).
+                            if let Some(kind) = crate::value::frozen_kind(&obj) {
+                                return Err(Control::Panic(AsError::at(
+                                    format!("cannot mutate a frozen {kind}"),
+                                    span,
+                                )));
+                            }
+                            match &idx {
+                                Value::Str(key) => {
+                                    let key = key.clone();
+                                    self.vm_object_insert(cell, &key, val.clone());
+                                    val
+                                }
+                                _ => {
+                                    return Err(Control::Panic(AsError::at(
+                                        "object index must be a string",
+                                        span,
+                                    )));
+                                }
+                            }
+                        }
+                        _ => crate::interp::index_set(&obj, &idx, val, span, span)
+                            .map_err(Control::Panic)?,
+                    };
                     fiber.push(v);
                 }
 
@@ -5226,7 +5313,7 @@ impl Vm {
                     let src = fiber.pop();
                     let v = match src {
                         Value::Object(o) => {
-                            o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                            o.get(key.as_ref()).unwrap_or(Value::Nil)
                         }
                         Value::Instance(i) => i
                             .borrow()
@@ -5297,9 +5384,9 @@ impl Vm {
                         indexmap::IndexMap::new();
                     match src {
                         Value::Object(o) => {
-                            for (k, v) in o.borrow().iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in o.entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
@@ -5373,7 +5460,7 @@ impl Vm {
                     };
                     let subject = fiber.pop();
                     let ok = match &subject {
-                        Value::Object(o) => o.borrow().contains_key(key.as_ref()),
+                        Value::Object(o) => o.contains_key(key.as_ref()),
                         Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
                         _ => false,
                     };
@@ -5458,7 +5545,7 @@ impl Vm {
                     let ok = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().contains_key(key.as_ref())
+                                o.contains_key(key.as_ref())
                             }
                             _ => false,
                         },
@@ -5480,7 +5567,7 @@ impl Vm {
                                 a.borrow().get(idx).cloned().unwrap_or(Value::Nil)
                             }
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().get_index(idx).map(|(_, v)| v.clone()).unwrap_or(Value::Nil)
+                                o.get_index(idx).map(|(_, v)| v).unwrap_or(Value::Nil)
                             }
                             None => Value::Nil,
                         },
@@ -5507,7 +5594,7 @@ impl Vm {
                     let v = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                                o.get(key.as_ref()).unwrap_or(Value::Nil)
                             }
                             _ => Value::Nil,
                         },
@@ -7912,15 +7999,43 @@ impl Vm {
         crate::interp::apply_binop(op, a, b, span)
     }
 
-    /// Recompute and store the shape of `obj`'s ObjectCell from its CURRENT keys.
-    /// Called after a mutation that may have ADDED a key (reassigning an existing
-    /// key leaves the layout — and thus the shape — unchanged, which V11-T3's IC
-    /// validity relies on). Walks the full key list through the transition tree;
-    /// a no-op-cost path because shared prefixes are deduped.
-    fn resync_object_shape(&self, obj: &Cc<crate::value::ObjectCell>) {
-        let keys = obj.keys_snapshot();
-        let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
-        obj.shape.set(shape);
+    /// Store `name = value` on an Object cell, preserving exact IndexMap semantics:
+    /// - **Existing key:** overwrite in place (shape unchanged; position kept).
+    /// - **New key on slab:** one registry transition (`add_key`) + `slab_append`
+    ///   (shape transitions to the child). A cap refusal demotes to dict first.
+    /// - **New key on dict / already-demoted:** plain dict insert (shape stays 0).
+    ///
+    /// This replaces `set_member` + `resync_object_shape` for the Object case:
+    /// the shape is always exactly right AFTER this call — no re-walk needed.
+    /// The frozen check is the CALLER's responsibility (`vm_set_prop` / `SetIndex`
+    /// arm checks `check_not_frozen` before reaching here). SHAPE Task 3.1.
+    fn vm_object_insert(&self, cell: &Cc<crate::value::ObjectCell>, name: &str, value: Value) {
+        // Fast path: key already exists — overwrite in place, shape unchanged.
+        if let Some(i) = cell.get_index_of(name) {
+            cell.set_value_at(i, value);
+            return;
+        }
+        // New key. Try a registry transition from the current shape if the cell
+        // is in slab mode (shape 0 is valid for a freshly-built empty literal).
+        let shape = cell.shape.get();
+        if cell.is_slab() {
+            let mut reg = self.shapes.borrow_mut();
+            if let Some(child) = reg.add_key(shape, name) {
+                let child_keys = reg.keys_of(child);
+                drop(reg);
+                if cell.slab_append(child, child_keys, value.clone()) {
+                    return; // successful slab grow
+                }
+                // slab_append returning false means the cell is in dict mode
+                // (can't happen in practice; defensive fall-through to dict insert).
+            } else {
+                drop(reg);
+                // Cap exceeded: demote to dict then insert.
+                cell.demote_to_dict();
+            }
+        }
+        // Dict mode (or just demoted): plain insert, shape stays 0.
+        cell.insert(name, value);
     }
 
     /// Recompute and store an `Instance`'s `shape_id` from its CURRENT field keys.
@@ -7982,9 +8097,10 @@ impl Vm {
                         // Defensive: stale index → fall through to generic set.
                     }
                 }
-                // Generic store (may add a key), then resync shape + record index.
-                let v = self.interp.set_member(obj, name, value, span, span)?;
-                self.resync_object_shape(cell);
+                // SHAPE Task 3.1: generic store via vm_object_insert (precise
+                // registry transition; no resync needed — the shape is already
+                // up-to-date after the insert). Replaces set_member + resync.
+                self.vm_object_insert(cell, name, value.clone());
                 let new_shape = cell.shape.get();
                 if self.specialize && new_shape != 0 && !crate::stdlib::schema::is_schema_value(obj)
                 {
@@ -7994,7 +8110,7 @@ impl Vm {
                         chunk.set_field_ic(op_off, ic);
                     }
                 }
-                Ok(v)
+                Ok(value)
             }
             Value::Instance(inst) => {
                 // ALWAYS run the contract check via the shared `set_member`.
@@ -8389,7 +8505,7 @@ fn variant_payload_len(v: &Value) -> Option<usize> {
     match v {
         Value::EnumVariant(ev) => match &ev.payload {
             Some(crate::value::Payload::Positional(a)) => Some(a.borrow().len()),
-            Some(crate::value::Payload::Named(o)) => Some(o.borrow().len()),
+            Some(crate::value::Payload::Named(o)) => Some(o.len()),
             None => None,
         },
         _ => None,
@@ -10176,11 +10292,10 @@ mod tests {
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
             RunOutcome::Done(Value::Object(o)) => {
-                let b = o.borrow();
-                let keys: Vec<&str> = b.keys().map(|k| k.as_str()).collect();
+                let keys: Vec<String> = o.keys_snapshot();
                 assert_eq!(keys, vec!["a", "b"], "keys in insertion order");
-                assert_eq!(b.get("a"), Some(&Value::Float(1.0)));
-                assert_eq!(b.get("b"), Some(&Value::Float(2.0)));
+                assert_eq!(o.get("a"), Some(Value::Float(1.0)));
+                assert_eq!(o.get("b"), Some(Value::Float(2.0)));
             }
             other => panic!("expected Done(Object), got {other:?}"),
         }

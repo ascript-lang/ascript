@@ -269,7 +269,6 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
     let mut max_results: Option<usize> = None;
     let mut respect_gitignore = true;
     if let Value::Object(o) = arg(args, 2) {
-        let o = o.borrow();
         if let Some(Value::Str(g)) = o.get("glob") {
             glob = Some(g.to_string());
         }

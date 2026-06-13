@@ -724,9 +724,9 @@ impl Interp {
                         // Collect declared field names and schemas
                         let field_pairs: Vec<(String, Value)> = match &fields_schema {
                             Value::Object(fs) => fs
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .entries()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v))
                                 .collect(),
                             _ => {
                                 return Err(ParseFail::InvalidSchema(
@@ -739,8 +739,7 @@ impl Interp {
                         if is_strict {
                             let declared: std::collections::HashSet<&str> =
                                 field_pairs.iter().map(|(k, _)| k.as_str()).collect();
-                            let val_borrow = val_obj.borrow();
-                            for k in val_borrow.keys() {
+                            for k in val_obj.keys_snapshot() {
                                 if !declared.contains(k.as_str()) {
                                     let key_path = if path.is_empty() {
                                         k.clone()
@@ -759,9 +758,7 @@ impl Interp {
                         let mut out: IndexMap<String, Value> = IndexMap::new();
                         for (field_name, field_schema) in &field_pairs {
                             let field_val = val_obj
-                                .borrow()
                                 .get(field_name)
-                                .cloned()
                                 .unwrap_or(Value::Nil);
                             let field_path = if path.is_empty() {
                                 field_name.clone()
@@ -802,9 +799,9 @@ impl Interp {
                         .map(|(k, v)| (k.to_value(), v.clone()))
                         .collect(),
                     Value::Object(o) => o
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (Value::Str(k.as_str().into()), v.clone()))
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (Value::Str(k.as_ref().into()), v))
                         .collect(),
                     _ => {
                         return Err(ParseFail::Mismatch(err_obj(
@@ -1087,9 +1084,9 @@ impl Interp {
                     Value::Object(val_obj) => {
                         let field_pairs: Vec<(String, Value)> = match &fields_schema {
                             Value::Object(fs) => fs
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .entries()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v))
                                 .collect(),
                             _ => {
                                 return Err(ParseFail::InvalidSchema(
@@ -1102,14 +1099,11 @@ impl Interp {
                         if is_strict {
                             let declared: std::collections::HashSet<&str> =
                                 field_pairs.iter().map(|(k, _)| k.as_str()).collect();
-                            let extra: Vec<String> = {
-                                let val_borrow = val_obj.borrow();
-                                val_borrow
-                                    .keys()
-                                    .filter(|k| !declared.contains(k.as_str()))
-                                    .cloned()
-                                    .collect()
-                            };
+                            let extra: Vec<String> = val_obj
+                                .keys_snapshot()
+                                .into_iter()
+                                .filter(|k| !declared.contains(k.as_str()))
+                                .collect();
                             for k in extra {
                                 let key_path = if path.is_empty() {
                                     k.clone()
@@ -1126,9 +1120,7 @@ impl Interp {
                         let mut out: IndexMap<String, Value> = IndexMap::new();
                         for (field_name, field_schema) in &field_pairs {
                             let field_val = val_obj
-                                .borrow()
                                 .get(field_name)
-                                .cloned()
                                 .unwrap_or(Value::Nil);
                             let field_path = if path.is_empty() {
                                 field_name.clone()
@@ -1189,9 +1181,9 @@ impl Interp {
                         .map(|(k, v)| (k.to_value(), v.clone()))
                         .collect(),
                     Value::Object(o) => o
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (Value::Str(k.as_str().into()), v.clone()))
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (Value::Str(k.as_ref().into()), v))
                         .collect(),
                     _ => {
                         errors.push(err_obj(
@@ -1679,7 +1671,7 @@ mod tests {
     /// Get a named field from an Object Value.
     fn field(obj: &Value, key: &str) -> Value {
         match obj {
-            Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
             _ => panic!("not an object: {:?}", obj),
         }
     }

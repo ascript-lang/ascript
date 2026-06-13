@@ -25,7 +25,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "parse" => {
             let text = want_string(&arg(args, 0), span, &ctx("parse"))?;
-            let header = matches!(args.get(1), Some(Value::Object(o)) if matches!(o.borrow().get("header"), Some(Value::Bool(true))));
+            let header = matches!(args.get(1), Some(Value::Object(o)) if matches!(o.get("header"), Some(Value::Bool(true))));
             // parse is lenient — irregular quoting/ragged rows are coerced rather
             // than rejected; only genuine reader errors (I/O or UTF-8) reach the
             // Tier-1 err branch below. This matches the csv crate's permissive
@@ -86,7 +86,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             if as_objects {
                 // header = keys of the first object (insertion order)
                 let header: Vec<String> = match rows.first() {
-                    Some(Value::Object(o)) => o.borrow().keys().cloned().collect(),
+                    Some(Value::Object(o)) => o.keys_snapshot(),
                     _ => Vec::new(),
                 };
                 if wtr.write_record(&header).is_err() {
@@ -107,10 +107,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                             ))
                         }
                     };
-                    let ob = o.borrow();
                     let fields: Vec<String> = header
                         .iter()
-                        .map(|k| ob.get(k).map(|v| v.to_string()).unwrap_or_default())
+                        .map(|k| o.get(k).map(|v| v.to_string()).unwrap_or_default())
                         .collect();
                     let _ = wtr.write_record(&fields);
                 }

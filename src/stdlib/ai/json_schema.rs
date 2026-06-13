@@ -195,7 +195,7 @@ fn make_nullable(schema: &mut J) {
 /// the decode step re-validates.
 pub fn schema_value_to_json_schema(schema: &Value) -> J {
     let kind = match schema {
-        Value::Object(o) => match o.borrow().get("__kind") {
+        Value::Object(o) => match o.get("__kind") {
             Some(Value::Str(s)) => s.to_string(),
             _ => return json!({}),
         },
@@ -296,12 +296,12 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
 /// Is a `std/schema` value the `optional` kind (so its object field is not required)?
 fn schema_is_optional(schema: &Value) -> bool {
     matches!(schema, Value::Object(o)
-        if matches!(o.borrow().get("__kind"), Some(Value::Str(s)) if s.as_ref() == "optional"))
+        if matches!(o.get("__kind"), Some(Value::Str(s)) if s.as_ref() == "optional"))
 }
 
 fn field(v: &Value, key: &str) -> Option<Value> {
     match v {
-        Value::Object(o) => o.borrow().get(key).cloned(),
+        Value::Object(o) => o.get(key),
         _ => None,
     }
 }

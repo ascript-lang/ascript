@@ -187,32 +187,32 @@ fn parse_opts(v: Option<&Value>, span: Span) -> Result<Opts, Control> {
             .into())
         }
     };
-    for (k, val) in map.borrow().iter() {
-        match k.as_str() {
-            "cwd" => opts.cwd = Some(want_string(val, span, "process cwd")?.to_string()),
+    for (k, val) in map.entries() {
+        match k.as_ref() {
+            "cwd" => opts.cwd = Some(want_string(&val, span, "process cwd")?.to_string()),
             "capture" => {
-                opts.capture = Capture::parse(&want_string(val, span, "process capture")?, span)?
+                opts.capture = Capture::parse(&want_string(&val, span, "process capture")?, span)?
             }
             "shell" => opts.shell = val.is_truthy(),
             "clearEnv" => opts.clear_env = val.is_truthy(),
             "check" => opts.check = val.is_truthy(),
-            "stdin" => opts.stdin = Some(data_to_bytes(val, span, "process stdin")?),
+            "stdin" => opts.stdin = Some(data_to_bytes(&val, span, "process stdin")?),
             "timeout" => {
-                let ms = super::want_number(val, span, "process timeout")?;
+                let ms = super::want_number(&val, span, "process timeout")?;
                 if ms < 0.0 {
                     return Err(AsError::at("process timeout must be non-negative", span).into());
                 }
                 opts.timeout_ms = Some(ms as u64);
             }
             "env" => {
-                let env_obj = super::want_object(val, span, "process env")?;
-                for (ek, ev) in env_obj.borrow().iter() {
-                    match ev {
+                let env_obj = super::want_object(&val, span, "process env")?;
+                for (ek, ev) in env_obj.entries() {
+                    match &ev {
                         // A nil-valued key UNSETS the variable.
-                        Value::Nil => opts.env.push((ek.clone(), None)),
+                        Value::Nil => opts.env.push((ek.to_string(), None)),
                         other => opts
                             .env
-                            .push((ek.clone(), Some(value_as_env_string(other, span)?))),
+                            .push((ek.to_string(), Some(value_as_env_string(other, span)?))),
                     }
                 }
             }
