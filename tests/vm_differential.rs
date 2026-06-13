@@ -8380,6 +8380,253 @@ async fn shape_set_prop_transition_five_way() {
     .await;
 }
 
+// ── SHAPE Task 3.3 — slab IC polymorphism + post-demotion battery ─────────────
+// These tests are the CORRECTNESS LOCK for the slab-native field IC paths
+// (ic_get_field / vm_set_prop / vm_object_insert) that landed in Tasks 1.3 + 3.1.
+// Every scenario must produce BYTE-IDENTICAL output across all five modes:
+// tree-walker == specialized-VM == generic-VM == lane-off == no-call-fast.
+// A divergence means an IC guard is wrong — fix the engine, never weaken the check.
+
+/// SHAPE 3.3-A: poly-site (4 distinct shapes through one GET_PROP accessor).
+/// `fn get(o) { return o.x }` is called with objects whose `x` field sits at
+/// a different slab index for each shape. The IC must promote cold→mono→poly
+/// and serve the CORRECT per-shape index every time.
+#[tokio::test]
+async fn shape_ic_poly_read_four_shapes() {
+    // x at index 0, 1, 2, 3 depending on prefix padding.
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         print(get({x: 1}))\n\
+         print(get({a: 0, x: 2}))\n\
+         print(get({a: 0, b: 0, x: 3}))\n\
+         print(get({p: 0, q: 0, r: 0, x: 4}))\n",
+    )
+    .await;
+    // Run each shape many times so the IC fully warms, then interleave again.
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         let total = 0\n\
+         let i = 0\n\
+         while (i < 400) {\n\
+           let m = i % 4\n\
+           if (m == 0) { total = total + get({x: 1}) }\n\
+           else if (m == 1) { total = total + get({a: 0, x: 2}) }\n\
+           else if (m == 2) { total = total + get({a: 0, b: 0, x: 3}) }\n\
+           else { total = total + get({p: 0, q: 0, r: 0, x: 4}) }\n\
+           i = i + 1\n\
+         }\n\
+         print(total)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-B: poly-HIT ramp → mega-site. The IC must serve the right value at
+/// EVERY cache state, so the program RAMPS the distinct-shape count 1→2→3→4→5→6,
+/// reading each shape's site MULTIPLE times before introducing the next distinct
+/// shape. The repeated reads are genuine cache HITS at each level: the first read
+/// at a new shape RECORDS (cold→mono, then mono→poly2→poly3→poly4), and the
+/// subsequent reads HIT that recorded entry (the poly-hit path actually executes).
+/// The 5th distinct shape saturates the IC to Mega; thereafter all six shapes are
+/// re-read to confirm the post-mega generic path stays correct too.
+#[tokio::test]
+async fn shape_ic_mega_read_six_shapes() {
+    // POLY-HIT RAMP: introduce shape k, then read it+all earlier shapes again so
+    // the IC HITS its recorded entry for each at the current poly level. Reads sit
+    // at one GET_PROP site (`get`). x is at a different slab index per shape.
+    // After shape 5 the IC is Mega; shapes are re-read once more for the post-mega
+    // generic confirmation. Output is the running checksum (deterministic).
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         let s1 = {x: 1}\n\
+         let s2 = {a: 0, x: 2}\n\
+         let s3 = {a: 0, b: 0, x: 3}\n\
+         let s4 = {p: 0, q: 0, r: 0, x: 4}\n\
+         let s5 = {c1: 0, c2: 0, c3: 0, c4: 0, x: 5}\n\
+         let s6 = {d1: 0, d2: 0, d3: 0, d4: 0, d5: 0, x: 6}\n\
+         let total = 0\n\
+         // mono: record s1, then HIT s1 twice.\n\
+         total = total + get(s1) + get(s1) + get(s1)\n\
+         // poly2: record s2, then HIT both s1 and s2 (poly-hit path).\n\
+         total = total + get(s2) + get(s1) + get(s2)\n\
+         // poly3: record s3, then HIT s1/s2/s3.\n\
+         total = total + get(s3) + get(s1) + get(s2) + get(s3)\n\
+         // poly4 (POLY_MAX): record s4, then HIT all four.\n\
+         total = total + get(s4) + get(s1) + get(s2) + get(s3) + get(s4)\n\
+         // 5th distinct shape → IC saturates to Mega.\n\
+         total = total + get(s5)\n\
+         // post-mega: every shape now takes the generic path; still correct.\n\
+         total = total + get(s1) + get(s2) + get(s3) + get(s4) + get(s5) + get(s6)\n\
+         print(total)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-C: write poly-site — `fn set(o, v) { o.x = v }` applied to
+/// objects of distinct shapes. Covers both existing-field overwrite (shape
+/// unchanged, IC fast-path) and new-field add (shape transition, IC re-records).
+#[tokio::test]
+async fn shape_ic_poly_write_distinct_shapes() {
+    // Overwrite `x` on several differently-shaped objects, then read back.
+    assert_three_way_matches(
+        "fn set(o, v) { o.x = v }\n\
+         let o1 = {x: 0}\n\
+         let o2 = {a: 1, x: 0}\n\
+         let o3 = {a: 1, b: 2, x: 0}\n\
+         let i = 0\n\
+         while (i < 300) {\n\
+           let m = i % 3\n\
+           if (m == 0) { set(o1, i) }\n\
+           else if (m == 1) { set(o2, i) }\n\
+           else { set(o3, i) }\n\
+           i = i + 1\n\
+         }\n\
+         print(o1.x)\n\
+         print(o2.x)\n\
+         print(o3.x)\n",
+    )
+    .await;
+    // Add a new key `x` to shapes that don't have it yet (triggers shape transition).
+    assert_three_way_matches(
+        "fn add_x(o, v) { o.x = v }\n\
+         let o1 = {a: 1}\n\
+         let o2 = {b: 2, c: 3}\n\
+         let o3 = {p: 9, q: 8, r: 7}\n\
+         add_x(o1, 10)\n\
+         add_x(o2, 20)\n\
+         add_x(o3, 30)\n\
+         print(o1.x)\n\
+         print(o2.x)\n\
+         print(o3.x)\n\
+         add_x(o1, 100)\n\
+         add_x(o2, 200)\n\
+         add_x(o3, 300)\n\
+         print(o1.x)\n\
+         print(o2.x)\n\
+         print(o3.x)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-D: reads after demotion — build an object past the 64-key slab cap
+/// (slab→dict, shape→0), then read fields through previously-warmed IC sites.
+/// The IC must MISS on shape 0 and resolve generically (no stale-index read).
+/// Also covers: delete mid-loop then read/add (the Phase-0 regression locked by
+/// `object_delete_invalidates_shape_for_warmed_property_ic`).
+#[tokio::test]
+async fn shape_ic_reads_after_demotion() {
+    // Build past the 64-key cap: the object demotes to dict, shape→0.
+    // NOTE: keys are built with a TEMPLATE string (`k${i}`), NOT `\"k\" + i` —
+    // in AScript `string + int` is a Tier-2 panic (only string+string concats),
+    // so the `+` form would error before reaching 64 keys and never demote.
+    //
+    // The object starts as a 3-key SLAB {k0, kEnd, mid} with `mid` at slab index 2
+    // (a NON-zero slot). We WARM `get_mid` in a HOT LOOP while the object is still
+    // a slab — the first read RECORDS (shape S, index 2) and every later read HITS
+    // that entry at index 2 (so a `value_at(0)`-style hit-arm bug reads the WRONG
+    // slot here). THEN we grow PAST SLAB_MAX_KEYS=64 so the object demotes slab→dict
+    // (shape→0) AND the add-driven layout shifts `mid` away from index 2 (the loop
+    // inserts k1..k60 BEFORE more keys, so `mid`'s absolute position changes). After
+    // demotion every read of the SAME warmed `get_mid` site must MISS the IC
+    // (receiver is now shape 0 → IC bypassed) and resolve `mid` generically. If
+    // demotion failed to reset the shape to 0, the warmed index-2 entry would
+    // stale-HIT and read the wrong value (whatever now sits at slab/dict index 2).
+    assert_three_way_matches(
+        "fn get_mid(o) { return o.mid }\n\
+         fn get_k0(o) { return o.k0 }\n\
+         let o = {k0: 0, kend: -7, mid: 42}\n\
+         let w = 0\n\
+         let j = 0\n\
+         while (j < 50) {\n\
+           w = w + get_mid(o)\n\
+           j = j + 1\n\
+         }\n\
+         print(w)\n\
+         print(get_mid(o))\n\
+         let i = 1\n\
+         while (i < 70) {\n\
+           o[`k${i}`] = i\n\
+           i = i + 1\n\
+         }\n\
+         print(get_mid(o))\n\
+         print(get_k0(o))\n\
+         print(o.kend)\n\
+         print(o.k69)\n",
+    )
+    .await;
+    // Warm an IC on shape S, delete a key mid-loop (→ shape 0), then read the
+    // same field and also add a new key: all must be byte-identical.
+    assert_three_way_matches(
+        "import * as object from \"std/object\"\n\
+         fn get_b(o) { return o.b }\n\
+         let o = {a: 1, b: 2, c: 3}\n\
+         let i = 0\n\
+         while (i < 200) {\n\
+           if (i == 100) {\n\
+             object.delete(o, \"a\")\n\
+           }\n\
+           let _ = get_b(o)\n\
+           i = i + 1\n\
+         }\n\
+         print(get_b(o))\n\
+         o.d = 99\n\
+         print(o.d)\n\
+         print(o.b)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-E: stale-index guard — warm an IC site on shape S1, then feed an
+/// object of a DIFFERENT shape S2 through the SAME site, then back to S1.
+/// The polymorphic IC must serve the correct index for each shape and must never
+/// return the S1 index when the receiver has shape S2.
+#[tokio::test]
+async fn shape_ic_no_stale_index_across_shape_switch() {
+    // Shape A: {x: val} — x at index 0.
+    // Shape B: {prefix: 0, x: val} — x at index 1.
+    // Alternate rapidly so the IC sees both shapes in both read and write positions.
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         fn set(o, v) { o.x = v }\n\
+         let a = {x: 10}\n\
+         let b = {prefix: 0, x: 20}\n\
+         let i = 0\n\
+         let total = 0\n\
+         while (i < 200) {\n\
+           if (i % 2 == 0) {\n\
+             set(a, i)\n\
+             total = total + get(a)\n\
+           } else {\n\
+             set(b, i)\n\
+             total = total + get(b)\n\
+           }\n\
+           i = i + 1\n\
+         }\n\
+         print(total)\n\
+         print(a.x)\n\
+         print(b.x)\n",
+    )
+    .await;
+    // Three shapes interleaved: ensures IC promotes through mono→poly, and
+    // each slot returns the value that was actually WRITTEN to that shape.
+    assert_three_way_matches(
+        "fn read(o) { return o.val }\n\
+         let o1 = {val: 1}\n\
+         let o2 = {z: 0, val: 2}\n\
+         let o3 = {z: 0, y: 0, val: 3}\n\
+         let i = 0\n\
+         while (i < 30) {\n\
+           o1.val = o1.val + 1\n\
+           o2.val = o2.val + 2\n\
+           o3.val = o3.val + 3\n\
+           i = i + 1\n\
+         }\n\
+         print(read(o1))\n\
+         print(read(o2))\n\
+         print(read(o3))\n",
+    )
+    .await;
+}
+
 // ── DEFER §3.1–3.6: VM execution semantics ──────────────────────────────────
 // These tests assert four-mode byte-identity (tree-walker == specialized-VM ==
 // generic-VM == .aso round-trip) for every specified defer behaviour.
