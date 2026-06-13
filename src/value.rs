@@ -1579,7 +1579,7 @@ impl PartialEq for Value {
                                     *xa.borrow() == *xb.borrow()
                                 }
                                 (Payload::Named(oa), Payload::Named(ob)) => {
-                                    *oa.borrow() == *ob.borrow()
+                                    oa.content_eq(ob)
                                 }
                                 _ => false,
                             }
@@ -1637,7 +1637,7 @@ impl fmt::Debug for Value {
             }
             Value::Closure(_) => write!(f, "Closure(<anonymous>)"),
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
-            Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
+            Value::Object(o) => write!(f, "Object(len {})", o.len()),
             Value::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
             Value::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
             Value::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
@@ -1741,7 +1741,8 @@ impl Value {
                 }
                 seen.push(ptr);
                 write!(f, "{{")?;
-                for (i, (k, v)) in o.borrow().iter().enumerate() {
+                let entries = o.entries();
+                for (i, (k, v)) in entries.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
@@ -1824,7 +1825,8 @@ impl Value {
                     }
                     seen.push(ptr);
                     write!(f, "{}.{}(", v.enum_name, v.name)?;
-                    for (i, (k, val)) in o.borrow().iter().enumerate() {
+                    let entries = o.entries();
+                    for (i, (k, val)) in entries.iter().enumerate() {
                         if i > 0 {
                             write!(f, ", ")?;
                         }

@@ -203,9 +203,10 @@ fn check_inner(
             if seen.insert(id, ()).is_some() {
                 return Ok(());
             }
-            for (k, val) in o.borrow().iter() {
+            let entries = o.entries();
+            for (k, val) in &entries {
                 let len = path.len();
-                push_member(path, k);
+                push_member(path, k.as_ref());
                 check_inner(val, path, seen)?;
                 path.truncate(len);
             }
@@ -270,10 +271,11 @@ fn check_inner(
                     if seen.insert(id, ()).is_some() {
                         return Ok(());
                     }
-                    for (k, val) in o.borrow().iter() {
+                    let entries = o.entries();
+                    for (k, val) in &entries {
                         let len = path.len();
                         path.push_str(".payload");
-                        push_member(path, k);
+                        push_member(path, k.as_ref());
                         check_inner(val, path, seen)?;
                         path.truncate(len);
                     }
@@ -487,14 +489,10 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             Ok(id) => {
                 w.u8(TAG_OBJECT);
                 w.u32(id);
-                let entries: Vec<(String, Value)> = o
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let entries = o.entries();
                 w.u32(entries.len() as u32);
                 for (k, val) in &entries {
-                    w.str(k);
+                    w.str(k.as_ref());
                     encode_value(val, w, ids);
                 }
             }
@@ -684,7 +682,7 @@ fn decode_value(
             for _ in 0..len {
                 let k = r.str()?;
                 let v = decode_value(r, table, shared, interp)?;
-                cell.borrow_mut().insert(k, v);
+                cell.insert(&k, v);
             }
             Ok(value)
         }

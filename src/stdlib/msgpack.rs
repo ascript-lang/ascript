@@ -81,9 +81,10 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
             }
             seen.push(ptr);
             let mut pairs = Vec::new();
-            for (k, val) in o.borrow().iter() {
-                pairs.push((Mp::String(k.clone().into()), to_mp(val, seen)?));
-            }
+            o.try_for_each::<String, _>(|k, val| {
+                pairs.push((Mp::String(k.to_string().into()), to_mp(val, seen)?));
+                Ok(())
+            })?;
             seen.pop();
             Ok(Mp::Map(pairs))
         }

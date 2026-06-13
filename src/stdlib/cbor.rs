@@ -70,9 +70,10 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
             }
             seen.push(ptr);
             let mut pairs = Vec::new();
-            for (k, val) in o.borrow().iter() {
-                pairs.push((Cb::Text(k.clone()), to_cbor(val, seen)?));
-            }
+            o.try_for_each::<String, _>(|k, val| {
+                pairs.push((Cb::Text(k.to_string()), to_cbor(val, seen)?));
+                Ok(())
+            })?;
             seen.pop();
             Ok(Cb::Map(pairs))
         }
