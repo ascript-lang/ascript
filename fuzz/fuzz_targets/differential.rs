@@ -1,18 +1,22 @@
 //! FUZZ Task 7 — the differential program fuzzer (the headline target).
 //!
 //! `arbitrary` bytes → the grammar-aware generator (`ascript::fuzzgen`) → a VALID,
-//! deterministic, run-to-completion AScript program → run on ALL THREE engines and assert
-//! they agree on the deterministic projection. This is the SAME three-way differential
+//! deterministic, run-to-completion AScript program → run on ALL FOUR engine modes and assert
+//! they agree on the deterministic projection. This is the SAME four-way differential
 //! `tests/vm_differential.rs` enforces over a fixed corpus, turned into a continuous
 //! generator-driven oracle:
 //!
-//!   `run(tree-walker, P) == run(specialized-VM, P) == run(generic-VM, P)`
+//!   `run(tree-walker, P) == run(specialized-VM, P) == run(generic-VM, P) == run(lane-off, P)`
 //!
 //! compared on `(captured stdout, exit code)` on success or the Tier-2 panic MESSAGE on
 //! failure (the SP1 caret-column offset between front-ends is excluded — message only). ANY
 //! disagreement is a GUARANTEED bug: a compiler / VM-opcode / specialization-guard
-//! (generic ≠ specialized) / oracle bug. A divergence is a libFuzzer crash (we `panic!` with
-//! the program + both outcomes so the saved input is a ready reproducer).
+//! (generic ≠ specialized) / lane divergence / oracle bug. A divergence is a libFuzzer crash
+//! (we `panic!` with the program + both outcomes so the saved input is a ready reproducer).
+//!
+//! LANE §6.1: the lane-off projection (`vm_run_source_no_sync_lane`) is the fourth axis
+//! added by Gate 15 — it proves that the sync-lane burst driver produces byte-identical
+//! results across the entire fuzz input space.
 //!
 //! The generator is reached via `ascript::fuzzgen` — the `fuzz/` crate enables the
 //! `fuzzgen` feature on its `ascript` dep, which exposes `pub mod fuzzgen` (the SAME single
@@ -69,19 +73,22 @@ fuzz_target!(|data: &[u8]| {
     let prog = ascript::fuzzgen::gen_program_from_bytes(data);
     let src = prog.source;
 
-    // Run all three engines on the 512 MB worker stack and project each outcome. The owned
-    // `String` is moved into the `Send` closure (no borrow of the libFuzzer buffer crosses).
-    let (tw, vm, gen) = ascript::run_on_worker_stack({
+    // Run all four engine modes on the 512 MB worker stack and project each outcome. The
+    // owned `String` is moved into the `Send` closure (no borrow of the libFuzzer buffer
+    // crosses). LANE §6.1: the lane-off projection is the fourth axis (Gate 15).
+    let (tw, vm, gen, nolane) = ascript::run_on_worker_stack({
         let src = src.clone();
         move || async move {
             let tw = project(ascript::run_source_exit(&src).await);
             let vm = project(ascript::vm_run_source(&src).await);
             let gen = project(ascript::vm_run_source_generic(&src).await);
-            (tw, vm, gen)
+            // LANE §6.1: lane-off must be byte-identical to all other modes.
+            let nolane = project(ascript::vm_run_source_no_sync_lane(&src).await);
+            (tw, vm, gen, nolane)
         }
     });
 
-    // THE ORACLE: all three must agree. A panic here is a libFuzzer crash carrying a ready
+    // THE ORACLE: all four must agree. A panic here is a libFuzzer crash carrying a ready
     // reproducer. Fix the ENGINE, never relax this assertion (Gate 0).
     assert_eq!(
         tw, vm,
@@ -90,5 +97,10 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         tw, gen,
         "generic-VM diverged from tree-walker (a wrong specialization guard)\n--- program ---\n{src}\n--- tw: {tw:?}\n--- gen: {gen:?}"
+    );
+    // LANE §6.1 / Gate 15: lane-off must be byte-identical to tree-walker.
+    assert_eq!(
+        tw, nolane,
+        "lane-off VM diverged from tree-walker\n--- program ---\n{src}\n--- tw: {tw:?}\n--- nolane: {nolane:?}"
     );
 });
