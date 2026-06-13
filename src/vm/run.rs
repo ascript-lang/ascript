@@ -18,6 +18,7 @@ use crate::span::Span;
 use crate::value::Value;
 use crate::vm::fiber::Fiber;
 use crate::vm::opcode::Op;
+use crate::vm::shape::EMPTY_SHAPE;
 use crate::vm::value_ext::{Closure, RunOutcome};
 use gcmodule::Cc;
 use std::cell::RefCell;
@@ -7632,7 +7633,10 @@ impl Vm {
         let schema = crate::value::merged_field_schema(class);
         let shape = {
             let mut reg = self.shapes.borrow_mut();
+            // Phase 2.1: caps are far above corpus reach; None → fall back to
+            // shape 0 (Phase 3 will wire the real demotion path).
             reg.shape_for(schema.keys().map(|k| k.as_str()))
+                .unwrap_or(EMPTY_SHAPE)
         };
         self.class_base_shapes.borrow_mut().insert(key, shape);
         shape
@@ -7645,7 +7649,12 @@ impl Vm {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        self.shapes.borrow_mut().shape_for(keys)
+        // Phase 2.1: caps are far above corpus reach; None → fall back to
+        // EMPTY_SHAPE (Phase 3 will wire the real demotion path).
+        self.shapes
+            .borrow_mut()
+            .shape_for(keys)
+            .unwrap_or(EMPTY_SHAPE)
     }
 
     /// The current global-table version (V11-T4). Bumped on every user-global
