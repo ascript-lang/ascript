@@ -695,3 +695,188 @@ async fn wired_sites_trampoline_suppressed_by_kill_switch() {
     let spec = ascript::vm_run_source(src).await.expect("spec");
     assert_eq!(spec, ncf, "kill switch: output differs between call_fast on/off");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Task 3.4 — escalation & control-flow edge battery (CALL Gates 9/15)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Task 3.4 edge 1: a panicking callback (out-of-bounds array index) produces
+/// the IDENTICAL panic message on all five modes. Proves the trampoline's
+/// reset-after-panic and §3.4 byte-identity invariant.
+#[tokio::test]
+async fn panicking_callback_message_parity() {
+    // A map callback that panics partway through.  The panic must surface
+    // with the same message regardless of whether the trampoline fired.
+    let src = r#"
+        import * as array from "std/array"
+        let [r, e] = recover(() => {
+            return array.map([1, 2, 3], (x) => {
+                if (x == 2) { [][999] }
+                return x * 10
+            })
+        })
+        if (e != nil) {
+            print(e.message)
+        } else {
+            print(r)
+        }
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.4 edge 2: recover around a panicking reduce catches the SAME error
+/// on all five modes — the trampoline's Err path must produce an identical
+/// Control::Panic value.
+#[tokio::test]
+async fn recover_catches_panicking_reduce_identically() {
+    let src = r#"
+        import * as array from "std/array"
+        let data = [1, 2, 3, -1, 5]
+        let [result, err] = recover(() => {
+            return array.reduce(data, (acc, x) => {
+                if (x < 0) { [][999] }
+                return acc + x
+            }, 0)
+        })
+        if (err != nil) {
+            print(err.message)
+        } else {
+            print(result)
+        }
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.4 edge 3: ?-propagation out of a higher-order pipeline — the
+/// [value, err] pair produced must be byte-identical across all five modes.
+#[tokio::test]
+async fn propagation_through_higher_order_pipeline_parity() {
+    let src = r#"
+        import * as array from "std/array"
+        fn validate(n) {
+            if (n < 0) { return Err("negative") }
+            return Ok(n * 2)
+        }
+        fn processBatch(items) {
+            let pairs = array.map(items, (n) => validate(n))
+            let results = []
+            for (pair of pairs) {
+                let v = pair?
+                results = results + [v]
+            }
+            return Ok(results)
+        }
+        let good = processBatch([1, 2, 3])
+        print(good[0], good[1])
+        let bad = processBatch([1, -1, 3])
+        print(bad[0], bad[1].message)
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.4 edge 4: recursion-limit parity through a trampolined callback —
+/// the depth guard fires at the IDENTICAL depth across all five modes
+/// (CALL §5.6, SP3 exactly-once).  Uses a module-top-level recursive fn so
+/// the name lookup is identical on the VM and the tree-walker.
+#[tokio::test]
+async fn recursion_limit_through_trampoline_parity() {
+    // `recurse` is a top-level fn so both engines look it up identically.
+    // The map callback calls it; the depth guard fires after exactly
+    // MAX_CALL_DEPTH calls regardless of whether the trampoline armed.
+    let src = r#"
+        import * as array from "std/array"
+        fn recurse(n) {
+            return recurse(n + 1)
+        }
+        let [r, e] = recover(() => {
+            return array.map([1], (x) => recurse(x))
+        })
+        if (e != nil) {
+            print(e.message)
+        } else {
+            print(r)
+        }
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.4 escalation coverage (anti-false-green for the escalation ARM,
+/// CALL §8.3): a callback that `await`s an async fn forces NeedsAsync on the
+/// sync lane; the trampoline must escalate and record the count.
+/// Asserts trampoline_escalations > 0 — proves the escalation code path
+/// actually fired, not just that nothing crashed.
+#[tokio::test]
+async fn trampoline_escalation_fires_on_async_awaiting_callback() {
+    let src = r#"
+        import * as array from "std/array"
+        async fn asyncDouble(x) {
+            return x * 2
+        }
+        // A plain (non-async) closure that awaits an async fn — the sync lane
+        // hits the await op and returns NeedsAsync; the trampoline escalates.
+        let result = array.map([1, 2, 3, 4, 5], (x) => await asyncDouble(x))
+        print(result)
+    "#;
+    // Coverage assertion: the escalation arm must have fired at least once.
+    let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("vm_run_source_call_fast_stats");
+    assert!(
+        stats.trampoline_escalations > 0,
+        "trampoline_escalations == 0 — escalation arm never fired (false green); \
+         expected >=1 for a map over a callback that awaits an async fn. \
+         trampoline_calls={}, inplace_binds={}, pooled_fiber_reuses={}",
+        stats.trampoline_calls,
+        stats.inplace_binds,
+        stats.pooled_fiber_reuses
+    );
+    // Also verify byte-identity across all modes.
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.4: the two corpus examples (`functional_pipelines.as` and
+/// `advanced/callback_escalation.as`) run correctly and produce non-empty
+/// output in the specialized VM.  Four-mode byte-identity is proved by the
+/// differential corpus runner; this test guards the examples are not
+/// accidentally skip-listed and actually run to completion.
+#[tokio::test]
+async fn corpus_examples_run_to_completion() {
+    // functional_pipelines.as — all sections must print
+    let pipelines_src = include_str!("../examples/functional_pipelines.as");
+    let (out, exit, _) = ascript::vm_run_source_call_fast_stats(pipelines_src)
+        .await
+        .expect("functional_pipelines.as");
+    assert_eq!(exit, None, "functional_pipelines.as exited with non-zero code");
+    assert!(
+        out.contains("=== Enriched"),
+        "functional_pipelines.as missing expected output"
+    );
+    assert!(
+        out.contains("=== Stream:"),
+        "functional_pipelines.as missing stream section"
+    );
+
+    // callback_escalation.as — all sections must print
+    let escalation_src = include_str!("../examples/advanced/callback_escalation.as");
+    let (out2, exit2, stats) = ascript::vm_run_source_call_fast_stats(escalation_src)
+        .await
+        .expect("callback_escalation.as");
+    assert_eq!(exit2, None, "callback_escalation.as exited with non-zero code");
+    assert!(
+        out2.contains("Escalation:"),
+        "callback_escalation.as missing escalation section"
+    );
+    assert!(
+        out2.contains("caught panic:"),
+        "callback_escalation.as missing recover section"
+    );
+    // The escalation example must have fired the escalation arm.
+    assert!(
+        stats.trampoline_escalations > 0,
+        "callback_escalation.as: trampoline_escalations == 0 — escalation arm never \
+         fired (false green); expected >=1. \
+         trampoline_calls={}, inplace_binds={}",
+        stats.trampoline_calls,
+        stats.inplace_binds
+    );
+}

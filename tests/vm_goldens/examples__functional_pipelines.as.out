@@ -1,0 +1,41 @@
+# exit: none
+=== Enriched (first 3) ===
+  Widget A: revenue=150000
+  Widget B: revenue=24000
+  Gadget C: revenue=284943
+
+=== Sold products: 7 of 8 ===
+  Widget A (120 units)
+  Widget B (30 units)
+  Gadget C (57 units)
+  Sprocket E (88 units)
+  Gizmo F (15 units)
+  Module G (200 units)
+  Bolt H (500 units)
+
+=== Top sellers by revenue ===
+  Sprocket E: 871200
+  Module G: 399800
+  Gadget C: 284943
+  Widget A: 150000
+  Bolt H: 87500
+  Gizmo F: 33000
+  Widget B: 24000
+
+=== Totals ===
+  revenue: 1850443
+  units:   1010
+
+=== By category ===
+  hardware: 4 products
+  software: 3 products
+
+=== Volume partition ===
+  high-volume (>=50): 5
+  low-volume  (<50):  2
+
+=== Stream: sum of even squares 0..20 ===
+  result: 1140
+
+=== Hardware revenue (sold only) ===
+  294500
