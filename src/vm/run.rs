@@ -2008,6 +2008,83 @@ impl Vm {
                     fiber.push(v);
                 }
 
+                Op::GetSuper => {
+                    // `super.<name>` (V9-T2): resolve `name` starting at the CURRENT
+                    // method's DEFINING class's superclass, bound to `self` (slot 0).
+                    // Mirrors the tree-walker: `super` is a `Value::Super` whose
+                    // `start` is `defining_class.superclass`, and `read_member` on it
+                    // finds the method up that chain and produces a BoundMethod on
+                    // `self` (which the subsequent CALL invokes). The `defining_class`
+                    // we stamp onto the BoundMethod is the ANCESTOR that actually
+                    // declared the method, so a NESTED `super` resolves from the right
+                    // link too.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("GET_SUPER name is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    // The defining class of the running method (set by
+                    // `invoke_compiled_method`). Absent only if `super` somehow
+                    // appears outside a method frame — a compiler invariant violation.
+                    let def_class = match &fiber.frame().def_class {
+                        Some(c) => c.clone(),
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "'super' used outside of a method".to_string(),
+                            ))
+                        }
+                    };
+                    // self = slot 0, read cell-aware (it is a cell slot whenever a
+                    // nested closure captured it).
+                    let receiver = match &fiber.frame().cells[0] {
+                        Some(cell) => cell.borrow().clone(),
+                        None => fiber.local(0).clone(),
+                    };
+                    // Resolve up from the DEFINING class's superclass (NOT the
+                    // instance's class), matching `SuperRef { start: superclass }`.
+                    let start = def_class.superclass.clone();
+                    let bound = match start
+                        .as_ref()
+                        .and_then(|s| self.find_compiled_method(s, &name))
+                    {
+                        Some((_closure, found_class)) => {
+                            Value::BoundMethod(Rc::new(crate::value::BoundMethod {
+                                receiver,
+                                method: Rc::new(crate::value::Method {
+                                    params: Vec::new(),
+                                    ret: None,
+                                    body: Vec::new(),
+                                    is_async: false,
+                                    is_generator: false,
+                                    is_worker: false,
+                                }),
+                                defining_class: found_class,
+                                name: name.to_string(),
+                            }))
+                        }
+                        None => {
+                            // Mirror the tree-walker's `Value::Super` member-read
+                            // error wording (with/without a superclass).
+                            let msg = if start.is_some() {
+                                format!("no superclass method '{name}'")
+                            } else {
+                                format!("no superclass method '{name}' (no superclass)")
+                            };
+                            return Err(Control::Panic(AsError::at(msg, span)));
+                        }
+                    };
+                    fiber.push(bound);
+                }
+
                 // ── IterSnapshot ──────────────────────────────────────────────
                 Op::IterSnapshot => {
                     let iterable = fiber.pop();
@@ -8048,7 +8125,7 @@ fn unop_of(op: Op) -> UnOp {
 /// (plain sync closure only — escalates for async/worker/generator/native).
 ///
 /// NOT included (always async): Import, CallNamed, CallNamedSpread, Class,
-/// DefineInterface, GetSuper (escalates), Break (debug trap), GetIter, worker ops.
+/// DefineInterface, Break (debug trap), GetIter, worker ops.
 /// Await IS included (conditional — escalates only if the future is still pending).
 fn sync_lane_op(op: Op) -> bool {
     matches!(
@@ -8124,6 +8201,7 @@ fn sync_lane_op(op: Op) -> bool {
             | Op::GetProp
             | Op::GetPropOpt
             | Op::SetProp
+            | Op::GetSuper
             // iter / for-of snapshot
             | Op::IterSnapshot
             | Op::ArrayLen

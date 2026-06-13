@@ -9297,3 +9297,51 @@ async fn sync_lane_actually_executes_on_the_corpus() {
          the lane silently collapsed (burst driver disabled or ASCRIPT_NO_SYNC_LANE set?)"
     );
 }
+
+// ── LANE spec §3: Op::GetSuper admitted to the sync subset ───────────────────
+//
+// Op::GetSuper resolves `super.<name>` starting at the defining class's
+// superclass, builds a BoundMethod, and pushes it — no `.await`, no
+// suspension. Spec §3 lists it in the "IN the sync subset" table under
+// member/index access. This test asserts:
+//   1. Four-way byte-identity: tree-walker == lane-on == lane-off == generic.
+//   2. GetSuper retires in-lane (sync_ops > 0 with the lane active).
+
+#[tokio::test]
+async fn get_super_retires_in_sync_lane() {
+    // Simple super-method chain: B.greet() calls super.greet() from A.
+    // The GetSuper op fires on every call to B().greet().
+    let src = r#"
+class A {
+  fn greet() { return "A" }
+}
+class B extends A {
+  fn greet() { return super.greet() + "B" }
+}
+let total = ""
+for (i in 0..10) { total = total + B().greet() }
+print(total)
+"#;
+    // Four-way byte-identity (TW == specialized == generic == lane-off).
+    let tw = ascript::run_source(src).await.expect("tw ok");
+    let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    let gen = ascript::vm_run_source_generic(src).await.expect("generic ok");
+    assert_eq!(tw, on.0, "tree-walker vs lane-on diverged for GetSuper");
+    assert_eq!(on, off, "lane-on vs lane-off diverged for GetSuper");
+    assert_eq!(on.0, gen.0, "specialized vs generic diverged for GetSuper");
+
+    // In-lane assertion: GetSuper must retire a meaningful number of sync ops.
+    // With 10 iterations each producing a GetSuper + surrounding arithmetic and
+    // string ops, the sync lane must retire far more than 0 ops. The threshold
+    // (100) is conservative — the actual count (GetLocal, Add, Return, etc.) is
+    // several hundred even at N=10; if GetSuper constantly escalates the burst
+    // collapses to only the pre-GetSuper ops each iteration.
+    let (_out, _exit, sync_ops, _bursts) =
+        ascript::vm_run_source_lane_stats(src).await.expect("stats ok");
+    assert!(
+        sync_ops >= 100,
+        "GetSuper must retire many ops in-lane (sync_ops={sync_ops}); \
+         if this is low, GetSuper is still escalating to the async driver"
+    );
+}
