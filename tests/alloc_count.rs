@@ -78,8 +78,9 @@ fn capture_free_call_alloc_slope_drops_with_a1() {
             "fn f(a, b) {{ return a + b }}\nlet s = 0\nfor (i in 0..{n}) {{ s = f(s, 1) }}\nprint(s)"
         )
     };
-    let on = slope(&mk, true);
-    let off = slope(&mk, false);
+    // `mk` is a non-capturing closure (Copy), so it can be passed by value twice.
+    let on = slope(mk, true);
+    let off = slope(mk, false);
     // A1 removes the cells vector (1 allocation) from every capture-free call.
     // Pre-A1 slope was ~3; post-A1 slope is ~2. Both on and off benefit since
     // A1 is always-on. The bound proves the cells-vec is gone, not just noise.

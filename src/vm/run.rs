@@ -2136,9 +2136,9 @@ impl Vm {
                     };
                     // self = slot 0, read cell-aware (it is a cell slot whenever a
                     // nested closure captured it). CALL §2 A1: cells may be empty
-                    // when slot 0 is not captured; use .get so the empty-vec fast
+                    // when slot 0 is not captured; use .first so the empty-vec fast
                     // path is safe.
-                    let receiver = match fiber.frame().cells.get(0).and_then(|c| c.as_ref()) {
+                    let receiver = match fiber.frame().cells.first().and_then(|c| c.as_ref()) {
                         Some(cell) => cell.borrow().clone(),
                         None => fiber.local(0).clone(),
                     };
@@ -6033,9 +6033,9 @@ impl Vm {
                     };
                     // self = slot 0, read cell-aware (it is a cell slot whenever a
                     // nested closure captured it). CALL §2 A1: cells may be empty
-                    // when slot 0 is not captured; use .get so the empty-vec fast
+                    // when slot 0 is not captured; use .first so the empty-vec fast
                     // path is safe.
-                    let receiver = match fiber.frame().cells.get(0).and_then(|c| c.as_ref()) {
+                    let receiver = match fiber.frame().cells.first().and_then(|c| c.as_ref()) {
                         Some(cell) => cell.borrow().clone(),
                         None => fiber.local(0).clone(),
                     };
@@ -7251,9 +7251,9 @@ impl Vm {
                 let slot_count = closure.proto.chunk.slot_count as usize;
                 let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
                 fiber.stack.resize(slot_base + slot_count, Value::Nil);
-                // self -> slot 0 (cell-aware). CALL §2 A1: use .get so empty-vec
+                // self -> slot 0 (cell-aware). CALL §2 A1: use .first so empty-vec
                 // is safe.
-                if let Some(cell) = cells.get(0).and_then(|c| c.as_ref()) {
+                if let Some(cell) = cells.first().and_then(|c| c.as_ref()) {
                     *cell.borrow_mut() = recv;
                 } else {
                     fiber.stack[slot_base] = recv;
@@ -7921,8 +7921,8 @@ impl Vm {
             gfiber.frame_mut().def_class = def_class;
             gfiber.frame_mut().argc = bound.supplied;
             let cells = gfiber.frame().cells.clone();
-            // self -> slot 0 (cell-aware). CALL §2 A1: use .get so empty-vec is safe.
-            if let Some(cell) = cells.get(0).and_then(|c| c.as_ref()) {
+            // self -> slot 0 (cell-aware). CALL §2 A1: use .first so empty-vec is safe.
+            if let Some(cell) = cells.first().and_then(|c| c.as_ref()) {
                 *cell.borrow_mut() = receiver;
             } else {
                 gfiber.stack[0] = receiver;
@@ -7950,8 +7950,8 @@ impl Vm {
         fiber.frame_mut().argc = bound.supplied;
         let cells = fiber.frame().cells.clone();
         // self -> slot 0 (cell-aware, in case a nested closure captured self).
-        // CALL §2 A1: use .get so empty-vec is safe.
-        if let Some(cell) = cells.get(0).and_then(|c| c.as_ref()) {
+        // CALL §2 A1: use .first so empty-vec is safe.
+        if let Some(cell) = cells.first().and_then(|c| c.as_ref()) {
             *cell.borrow_mut() = receiver;
         } else {
             fiber.stack[0] = receiver;
