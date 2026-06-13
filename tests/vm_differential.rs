@@ -9029,3 +9029,79 @@ async fn lane_on_off_byte_identical_over_core_battery() {
         (a, b) => panic!("expected Err for shift-64, got: {a:?} vs {b:?}"),
     }
 }
+
+#[tokio::test]
+async fn sync_lane_runs_calls_props_and_match_in_lane() {
+    let src = r#"
+fn fib(n) { if (n < 2) { return n } return fib(n - 1) + fib(n - 2) }
+let o = { x: 0, y: 1 }
+for (i in 0..1000) { o.x = o.x + o.y }
+let m = match o.x { 1000 => "k", _ => "?" }
+print(fib(15), o.x, m)
+"#;
+    let (out, _e, sync_ops, _b) = ascript::vm_run_source_lane_stats(src).await.expect("ok");
+    assert_eq!(out, "610 1000 k\n");
+    assert!(sync_ops > 10_000, "calls/props/match must run in-lane, retired {sync_ops}");
+}
+
+#[tokio::test]
+async fn sync_lane_recursion_depth_panic_is_byte_identical() {
+    let src = "fn f(n) { return f(n + 1) }\nprint(f(0))";
+    let on = ascript::vm_run_source(src).await.expect_err("must panic").to_string();
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect_err("must panic").to_string();
+    let tw = ascript::run_source(src).await.expect_err("must panic").to_string();
+    assert_eq!(on, off);
+    assert_eq!(on, tw);
+    assert!(on.contains("maximum recursion depth exceeded"));
+}
+
+#[tokio::test]
+async fn sync_lane_generator_bodies_burst_and_yield() {
+    let src = r#"
+fn* squares(n) { for (i in 0..n) { yield i * i } }
+let g = squares(5)
+let total = 0
+for await (v in g) { total = total + v }
+print(total)
+"#;
+    let on = ascript::vm_run_source(src).await.expect("ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("ok");
+    assert_eq!(on, off);
+    assert_eq!(on.0, "30\n");
+}
+
+#[tokio::test]
+async fn sync_lane_escalation_battery_is_byte_identical() {
+    for src in [
+        "async fn a(x) { return x + 1 }\nprint(await a(41))",
+        "class C { fn init() { self.n = 7 } fn get() { return self.n } }\nprint(C().get())",
+        "import * as math from \"std/math\"\nprint(math.abs(0 - 5))",
+        "enum E { P(a: int) }\nprint(E.P(a: 3).a)",
+        "fn add(a, b) { return a + b }\nlet r = add(3, 4)\nprint(r)",
+    ] {
+        let tw = ascript::run_source(src).await.expect("tw ok");
+        let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+        let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+        assert_eq!(tw, on.0, "tw vs lane-on diverged on `{src}`");
+        assert_eq!(on, off, "lane-on vs lane-off diverged on `{src}`");
+    }
+}
+
+#[tokio::test]
+async fn sync_lane_defer_runs_correctly() {
+    let src = r#"
+fn with_defer() {
+    defer print("deferred")
+    print("body")
+    return 42
+}
+let v = with_defer()
+print(v)
+"#;
+    let tw = ascript::run_source(src).await.expect("tw ok");
+    let on = ascript::vm_run_source(src).await.expect("lane-on ok");
+    let off = ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
+    assert_eq!(tw, on.0, "tw vs lane-on diverged for defer test");
+    assert_eq!(on, off, "lane-on vs lane-off diverged for defer test");
+    assert!(on.0.contains("deferred"), "defer must have run");
+}
