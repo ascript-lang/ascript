@@ -1,7 +1,7 @@
 # Two-Lane Engine (LANE) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to
-> implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every task
+> implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking. Every task
 > is executed by a **fresh implementer subagent**, then verified by an **independent reviewer
 > subagent** that runs the commands and probes edges before acceptance. A final **holistic
 > review** covers the whole branch before merge. A task is closed only when every box under it
@@ -79,7 +79,7 @@ differential.rs`, `bench/profiling/` + the new `bench/ab.sh`.
   `bench/profiling/server_request.as`, `bench/ab.sh`
 - Modify: `bench/profiling/run.sh`, `bench/PROFILING_RESULTS.md`
 
-- [ ] **Step 1: Write the three workloads** (style mirrors the existing `bench/profiling/*.as`:
+- [x] **Step 1: Write the three workloads** (style mirrors the existing `bench/profiling/*.as`:
   `std/time` monotonic timing, deterministic, prints `name: …=… elapsed_ms=…`, runs to
   completion on both engines). Verify each runs on VM and `--tree-walker` with identical
   non-timing output.
@@ -165,7 +165,7 @@ print(`server_request: bytes=${bytes} elapsed_ms=${t1 - t0}`)
   Tune iteration counts so each lands in the 1.5–6 s range on the dev machine, matching the
   existing workloads.)
 
-- [ ] **Step 2: Write `bench/ab.sh`** — the same-session A/B harness (the SRV MINOR-2 lesson:
+- [x] **Step 2: Write `bench/ab.sh`** — the same-session A/B harness (the SRV MINOR-2 lesson:
   baseline and candidate in ONE invocation on one machine):
 
 ```bash
@@ -203,19 +203,19 @@ done
 awk -v t="$total_ln" -v n="$n" 'BEGIN {printf "geomean speedup = %.3fx\n", exp(t / n)}'
 ```
 
-- [ ] **Step 3:** `chmod +x bench/ab.sh`; add the three workloads to `BENCHES` in
+- [x] **Step 3:** `chmod +x bench/ab.sh`; add the three workloads to `BENCHES` in
   `bench/profiling/run.sh`.
-- [ ] **Step 4: Re-baseline.** `cargo build --profile profiling && bench/profiling/run.sh`
+- [x] **Step 4: Re-baseline.** `cargo build --profile profiling && bench/profiling/run.sh`
   (expect the table to now include the three new rows) and
   `bench/ab.sh target/profiling/ascript target/profiling/ascript` (self-A/B sanity: geomean
   ≈ 1.00x, proving the harness's noise floor). Record both outputs.
-- [ ] **Step 5:** Append a dated section to `bench/PROFILING_RESULTS.md`:
+- [x] **Step 5:** Append a dated section to `bench/PROFILING_RESULTS.md`:
   `## Phase-0 extension (2026-06-XX) — functional / call-heavy / server-request workloads`
   with the headline-timings table (VM ms, tree-walker ms, speedup, peak RSS) for the three new
   workloads + the bucket attribution from `parse_sample.py`, and a note that this is the
   pre-LANE baseline every PERF spec A/Bs against.
-- [ ] **Step 6: Commit** — `bench: Phase-0 corpus extension (func/call/server workloads) + same-session A/B harness` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer re-runs `run.sh` + the self-A/B, confirms the three
+- [x] **Step 6: Commit** — `bench: Phase-0 corpus extension (func/call/server workloads) + same-session A/B harness` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer re-runs `run.sh` + the self-A/B, confirms the three
   workloads are deterministic (two runs, identical non-timing output), VM == tree-walker output,
   and the PROFILING_RESULTS section matches the actual numbers.
 
@@ -225,7 +225,7 @@ awk -v t="$total_ln" -v n="$n" 'BEGIN {printf "geomean speedup = %.3fx\n", exp(t
 - Modify: `src/task.rs`
 - Test: inline `#[tokio::test]`s in `src/task.rs`
 
-- [ ] **Step 1: Write the failing tests** (in the existing `mod tests`):
+- [x] **Step 1: Write the failing tests** (in the existing `mod tests`):
 
 ```rust
 #[tokio::test]
@@ -275,15 +275,15 @@ async fn try_get_never_touches_the_abort_handle() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (no `try_get`): `cargo test --lib task::tests`
-- [ ] **Step 3: Implement** — on `ResultCell`: `fn try_get(&self) -> Option<Result<Value,
+- [x] **Step 2: Run — expect FAIL** (no `try_get`): `cargo test --lib task::tests`
+- [x] **Step 3: Implement** — on `ResultCell`: `fn try_get(&self) -> Option<Result<Value,
   Control>> { self.0.slot.borrow().as_ref().cloned() }`; on `SharedFuture`:
   `pub fn try_get(&self) -> Option<Result<Value, Control>> { self.0.cell.try_get() }` with a doc
   comment stating the §4 contract (non-blocking, non-consuming, never notifies, never touches
   the abort handle).
-- [ ] **Step 4: Run — expect PASS**; `cargo clippy --all-targets` clean.
-- [ ] **Step 5: Commit** — `feat(task): SharedFuture::try_get non-blocking resolved-slot probe (LANE §4)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer confirms `try_get` cannot deadlock with `get()`'s borrow
+- [x] **Step 4: Run — expect PASS**; `cargo clippy --all-targets` clean.
+- [x] **Step 5: Commit** — `feat(task): SharedFuture::try_get non-blocking resolved-slot probe (LANE §4)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer confirms `try_get` cannot deadlock with `get()`'s borrow
   (scoped borrow, no await), and that no other code path was touched.
 
 ## Task 2: `Vm.sync_lane` kill switch + lane counters + entry points (no dispatch change yet)
@@ -292,7 +292,7 @@ async fn try_get_never_touches_the_abort_handle() {
 - Modify: `src/vm/run.rs` (Vm struct + constructors), `src/lib.rs`
 - Test: `tests/vm_differential.rs` (new test) + inline unit test in `src/vm/run.rs`
 
-- [ ] **Step 1: Write the failing test** (in `tests/vm_differential.rs`):
+- [x] **Step 1: Write the failing test** (in `tests/vm_differential.rs`):
 
 ```rust
 #[tokio::test]
@@ -309,9 +309,9 @@ async fn no_sync_lane_entry_point_runs_byte_identically() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (entry points don't exist):
+- [x] **Step 2: Run — expect FAIL** (entry points don't exist):
   `cargo test --test vm_differential no_sync_lane_entry_point`
-- [ ] **Step 3: Implement:**
+- [x] **Step 3: Implement:**
   - `Vm` fields (beside `specialize`, `src/vm/run.rs:117`):
     `sync_lane: bool`, `lane_sync_ops: Cell<u64>`, `lane_bursts: Cell<u64>`; accessors
     `pub fn lane_sync_ops(&self) -> u64` / `pub fn lane_bursts(&self) -> u64`.
@@ -326,10 +326,10 @@ async fn no_sync_lane_entry_point_runs_byte_identically() {
     u64, u64), AsError>` (the latter returns `(output, exit, vm.lane_sync_ops(),
     vm.lane_bursts())`). Mention `ASCRIPT_NO_SYNC_LANE` beside the existing
     `ASCRIPT_NO_SPECIALIZE` comment in the CLI `run` path (`lib.rs:2060–2067`).
-- [ ] **Step 4: Run — expect PASS.** Then both clippy configs + `cargo test --test
+- [x] **Step 4: Run — expect PASS.** Then both clippy configs + `cargo test --test
   vm_differential` (full file) — green.
-- [ ] **Step 5: Commit** — `feat(vm/lane): sync_lane kill switch + lane counters + test entry points (inert)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer greps that NO dispatch-loop line changed yet (the flag is
+- [x] **Step 5: Commit** — `feat(vm/lane): sync_lane kill switch + lane counters + test entry points (inert)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer greps that NO dispatch-loop line changed yet (the flag is
   inert), confirms env-var handling matches the `ASCRIPT_NO_SPECIALIZE` precedent, and that
   parallel tests never read the env.
 
@@ -339,7 +339,7 @@ async fn no_sync_lane_entry_point_runs_byte_identically() {
 - Modify: `src/vm/run.rs` (the `Op::Call` `Value::Closure` plain arm, `run.rs:1757–1827`)
 - Test: existing suites are the guard (refactor task — no new behavior)
 
-- [ ] **Step 1: Extract** the plain-closure call body into one shared, plain (non-async) method:
+- [x] **Step 1: Extract** the plain-closure call body into one shared, plain (non-async) method:
 
 ```rust
 /// LANE Task 3 (shared by the async `Op::Call` arm and `run_loop_sync`): the
@@ -361,10 +361,10 @@ fn push_closure_frame(
   The async `Op::Call` arm's `Value::Closure(callee) => { ... }` plain case becomes a single
   call to this helper. **Nothing else moves** (the async/worker/generator callee cases stay
   inline in the arm).
-- [ ] **Step 2: Prove behavior-preserving:** `cargo test --test vm_differential` (both feature
+- [x] **Step 2: Prove behavior-preserving:** `cargo test --test vm_differential` (both feature
   configs) — green; `cargo test` (full, both configs) — green; clippy both configs — clean.
-- [ ] **Step 3: Commit** — `refactor(vm): extract push_closure_frame — the shared plain-call body (LANE Task 3)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer diffs the extracted body against the pre-move arm
+- [x] **Step 3: Commit** — `refactor(vm): extract push_closure_frame — the shared plain-call body (LANE Task 3)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer diffs the extracted body against the pre-move arm
   line-by-line (must be verbatim: same `check_call_args` call shape, ONE `enter_frame_depth`,
   `publish_profile_frames` after the push) and re-runs the corpus differential.
 
@@ -374,7 +374,7 @@ fn push_closure_frame(
 - Modify: `src/vm/run.rs` (+ `pub(crate) enum SyncOutcome`)
 - Test: `tests/vm_differential.rs`
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
 
 ```rust
 #[tokio::test]
@@ -419,8 +419,8 @@ async fn lane_on_off_byte_identical_over_core_battery() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (counters stay 0; no driver).
-- [ ] **Step 3: Implement the skeleton** (spec §2.2–2.3):
+- [x] **Step 2: Run — expect FAIL** (counters stay 0; no driver).
+- [x] **Step 3: Implement the skeleton** (spec §2.2–2.3):
 
 ```rust
 pub(crate) enum SyncOutcome { Finished(RunOutcome), NeedsAsync }
@@ -471,10 +471,10 @@ fn sync_burst(&self, fiber: &mut Fiber, retired: &mut u64) -> Result<SyncOutcome
   (spec §2.3) — `if self.sync_lane { match self.run_loop_sync(fiber)? { Finished(o) => return
   Ok(o), NeedsAsync => {} } }`. **No async arm changes.** NOTE: `Return` is NOT yet in the
   subset, so Task-4 bursts end at frame boundaries — fine, the async arm handles them.
-- [ ] **Step 4: Run — expect PASS** on all three new tests; then the FULL differential file +
+- [x] **Step 4: Run — expect PASS** on all three new tests; then the FULL differential file +
   `cargo test` both configs + clippy both configs.
-- [ ] **Step 5: Commit** — `feat(vm/lane): run_loop_sync core subset + orchestrator burst (LANE §2–3)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer verifies (a) escalation leaves `ip` un-advanced (add a
+- [x] **Step 5: Commit** — `feat(vm/lane): run_loop_sync core subset + orchestrator burst (LANE §2–3)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer verifies (a) escalation leaves `ip` un-advanced (add a
   unit test driving a fiber whose next op escalates and asserting `frame().ip` unchanged after
   `run_loop_sync`), (b) the transcribed arms match `run_loop`'s byte-for-byte in effect
   (spot-diff), (c) `last_fault_source` handling is identical, (d) counters flush on the `Err`
@@ -486,7 +486,7 @@ fn sync_burst(&self, fiber: &mut Fiber, retired: &mut u64) -> Result<SyncOutcome
 - Modify: `src/vm/run.rs` (`sync_lane_op` + `sync_burst` arms)
 - Test: `tests/vm_differential.rs`
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
 
 ```rust
 #[tokio::test]
@@ -553,8 +553,8 @@ async fn sync_lane_escalation_battery_is_byte_identical() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (subset too small; calls escalate).
-- [ ] **Step 3: Implement** — grow `sync_lane_op` + arms to the full spec-§3 subset, in this
+- [x] **Step 2: Run — expect FAIL** (subset too small; calls escalate).
+- [x] **Step 3: Implement** — grow `sync_lane_op` + arms to the full spec-§3 subset, in this
   order (each sub-group followed by a full `vm_differential` run before the next):
   1. `Return` / `Propagate` / `Unwrap` / `Yield` (shared `return_from_frame`; `Yield` →
      `Finished(RunOutcome::Yielded(v))` after setting `FiberState::Suspended`; **DEFER guard:**
@@ -576,12 +576,12 @@ async fn sync_lane_escalation_battery_is_byte_identical() {
      !is_worker && !is_generator`) routes through the Task-3 `push_closure_frame`; **every
      other callee kind returns `NeedsAsync` before any pop** (the async arm re-decodes and does
      the popping itself — stack untouched is the invariant).
-- [ ] **Step 4: Run — expect PASS** on all four tests; full `cargo test` + clippy, both configs;
+- [x] **Step 4: Run — expect PASS** on all four tests; full `cargo test` + clippy, both configs;
   `cargo test --test vm_differential` both configs (the whole-corpus gate now runs with the
   lane ON by default — any corpus divergence is a Task-5 bug to fix here).
-- [ ] **Step 5: Commit** (one commit per sub-group is encouraged; final:
+- [x] **Step 5: Commit** (one commit per sub-group is encouraged; final:
   `feat(vm/lane): full sync subset — calls, props, match, builders, returns (LANE §3)`, house trailer).
-- [ ] **Reviewer checkpoint:** reviewer audits the `CallSpread` peek math (off-by-one between
+- [x] **Reviewer checkpoint:** reviewer audits the `CallSpread` peek math (off-by-one between
   `Call`'s static argc and `CallSpread`'s args-array TOS is the likeliest bug), confirms no pop
   precedes any escalation return, re-runs the corpus differential in BOTH feature configs, and
   fuzzes ad hoc (`cargo fuzz run differential -- -max_total_time=300` if cargo-fuzz is set up
@@ -593,7 +593,7 @@ async fn sync_lane_escalation_battery_is_byte_identical() {
 - Modify: `src/vm/run.rs` (`sync_burst` Await handling; `sync_lane_op` admits `Await`)
 - Test: `tests/vm_differential.rs`
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
 
 ```rust
 #[tokio::test]
@@ -668,18 +668,18 @@ print(total)
   (Implementer: validate each test program against real corpus idioms before relying on it —
   e.g. `futs.concat`, the settle idiom — and adjust syntax to what `examples/**` actually uses.
   The four ASSERTIONS are the contract; the programs may be reshaped.)
-- [ ] **Step 2: Run — expect FAIL** (Await escalates always → the lane-stats assertions and the
+- [x] **Step 2: Run — expect FAIL** (Await escalates always → the lane-stats assertions and the
   in-lane expectations fail; the identity assertions should already pass — if any identity
   assertion fails BEFORE the feature, that is a pre-existing bug: stop and fix it first per the
   production-grade mandate).
-- [ ] **Step 3: Implement** (spec §4.1): in `sync_burst`, admit `Op::Await` with peek-first
+- [x] **Step 3: Implement** (spec §4.1): in `sync_burst`, admit `Op::Await` with peek-first
   handling — peek TOS; non-future → pop/push-back identity (advance ip, retire); `Value::Future`
   with `try_get() == Some(r)` → pop, then `let v = r?` push `v` (advance ip, retire); pending →
   `return Ok(SyncOutcome::NeedsAsync)` with ip un-advanced and the future still on TOS.
-- [ ] **Step 4: Run — expect PASS**; full suite + clippy both configs; corpus differential both
+- [x] **Step 4: Run — expect PASS**; full suite + clippy both configs; corpus differential both
   configs (the async examples in `examples/**` are the real exercise).
-- [ ] **Step 5: Commit** — `feat(vm/lane): inline ready-future completion at Op::Await (LANE §4)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer specifically probes: a future awaited TWICE (second await
+- [x] **Step 5: Commit** — `feat(vm/lane): inline ready-future completion at Op::Await (LANE §4)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer specifically probes: a future awaited TWICE (second await
   inline — same value); `race`/`gather` examples from the corpus; a `Propagate`-carrying pair
   through `?` after an inline take; and reads the `try_get` call site to confirm no borrow is
   held while pushing to the fiber.
@@ -690,13 +690,13 @@ print(total)
 - Modify: `tests/vm_differential.rs`, `fuzz/fuzz_targets/differential.rs`, `tests/property.rs`
 - Test: these ARE the tests
 
-- [ ] **Step 1: Extend the three-way gate to four-way.** In `tests/vm_differential.rs`, every
+- [x] **Step 1: Extend the three-way gate to four-way.** In `tests/vm_differential.rs`, every
   place the three-way identity runs (`run_source` == `vm_run_source` == `vm_run_source_generic`
   — the expression batteries, the program batteries, the goldens, the whole-corpus gate), add
   the `vm_run_source_no_sync_lane` projection with the same byte-identical assertion. Follow the
   existing helper-fn structure (extend `assert_vm_matches_treewalker` /
   `assert_vm_run_matches_treewalker` and the corpus runner rather than duplicating loops).
-- [ ] **Step 2: Add the corpus coverage assertion** (spec §6.4 — the anti-false-green rule):
+- [x] **Step 2: Add the corpus coverage assertion** (spec §6.4 — the anti-false-green rule):
 
 ```rust
 #[tokio::test]
@@ -722,16 +722,16 @@ async fn sync_lane_actually_executes_on_the_corpus() {
 ```
 
   (Reuse the whole-corpus gate's file enumeration + skip-list — do not invent a second list.)
-- [ ] **Step 3: Fuzz axis, same PR.** `fuzz/fuzz_targets/differential.rs`: add
+- [x] **Step 3: Fuzz axis, same PR.** `fuzz/fuzz_targets/differential.rs`: add
   `let nolane = project(ascript::vm_run_source_no_sync_lane(&src).await);` to the per-input run
   and include it in the equality assertion + the panic report. Mirror in
   `tests/property.rs::three_way_differential_over_generated_programs` (now four-way) and the
   fixed-seed battery. `cargo build` the fuzz crate (`cd fuzz && cargo build`) to prove it
   compiles even where cargo-fuzz isn't run.
-- [ ] **Step 4: Run** — `cargo test --test vm_differential` (BOTH configs; expect the corpus
+- [x] **Step 4: Run** — `cargo test --test vm_differential` (BOTH configs; expect the corpus
   gate + coverage assertion green) and `cargo test --test property` (both configs).
-- [ ] **Step 5: Commit** — `test(lane): four-way differential mode + fuzz axis + corpus coverage assertion (Gate 15)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer runs the property suite with a bumped case count, runs
+- [x] **Step 5: Commit** — `test(lane): four-way differential mode + fuzz axis + corpus coverage assertion (Gate 15)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer runs the property suite with a bumped case count, runs
   the fuzzer for ≥10 minutes where available, and **sabotage-tests the coverage assertion**:
   temporarily hard-code `sync_lane_op` to `false` and confirm the coverage test FAILS (then
   revert) — proving the anti-false-green tripwire actually trips.
@@ -742,21 +742,21 @@ async fn sync_lane_actually_executes_on_the_corpus() {
 - Modify: `tests/vm_bench.rs`
 - Test: the harness run itself (`--ignored`, release)
 
-- [ ] **Step 1: Add the lane engine + section.** New `Engine::NoSyncLaneVm` wired to
+- [x] **Step 1: Add the lane engine + section.** New `Engine::NoSyncLaneVm` wired to
   `ascript::vm_run_source_no_sync_lane`; after `dbg_zero_cost_gate`, add a
   `lane_on_off_overhead` section that times `SpecializedVm` (lane ON, the default) vs
   `NoSyncLaneVm` per benchmark and prints lane-on/lane-off speedups + geomean. GATE: lane-on
   must show **no regression** on any benchmark (`>= 0.97x` noise bound, the existing
   convention); the speedup itself is REPORTED (Task 9's A/B is the headline instrument).
-- [ ] **Step 2: Run the full harness** —
+- [x] **Step 2: Run the full harness** —
   `cargo test --release --test vm_bench -- --ignored --nocapture`. Expected output: the standing
   table + `geomean spec/tw = ≥2.0x` `[PASS]` (Gate 12/17 floor), `dbg_zero_cost_gate` geomean
   `<= 1.05x` `[PASS]` (the lane shares `publish_profile_frames`/`return_from_frame`, so
   armed-idle must stay free), and the new lane section with no `[FAIL]` rows.
-- [ ] **Step 3: Record the results** in the `vm_bench.rs` header doc-comment (the GATE RESULT
+- [x] **Step 3: Record the results** in the `vm_bench.rs` header doc-comment (the GATE RESULT
   convention — append a dated `LANE` block with the actual numbers).
-- [ ] **Step 4: Commit** — `bench(lane): lane on/off section + Gate-12/17 re-run results (geomean recorded)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer re-runs the harness independently; if ANY benchmark
+- [x] **Step 4: Commit** — `bench(lane): lane on/off section + Gate-12/17 re-run results (geomean recorded)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer re-runs the harness independently; if ANY benchmark
   regresses lane-on vs lane-off beyond noise, that is a bug in the burst/orchestrator overhead —
   fixed here, not accepted. Reviewer also re-runs with `ASCRIPT_NO_SPECIALIZE=1`-equivalent
   generic mode mentally checked: the generic×lane combination is covered by the differential;
@@ -768,28 +768,28 @@ async fn sync_lane_actually_executes_on_the_corpus() {
 - Create: `bench/LANE_RESULTS.md`
 - Modify: `bench/PROFILING_RESULTS.md`
 
-- [ ] **Step 1: Build the two binaries in one session** — baseline = `main` at the merge-base
+- [x] **Step 1: Build the two binaries in one session** — baseline = `main` at the merge-base
   (`git worktree add /tmp/lane-base $(git merge-base HEAD main)` + build), candidate = this
   branch; both `cargo build --profile profiling`.
-- [ ] **Step 2: Run the A/B** — `bench/ab.sh /tmp/lane-base/target/profiling/ascript
+- [x] **Step 2: Run the A/B** — `bench/ab.sh /tmp/lane-base/target/profiling/ascript
   target/profiling/ascript 7` over the full 8-workload corpus. Also run the candidate with
   `ASCRIPT_NO_SYNC_LANE=1` through `ab.sh` against itself-lane-on (isolates the lane's own
   contribution from anything else on the branch).
-- [ ] **Step 3: Re-profile the async corpus** — `bench/profiling/run.sh` on the candidate;
+- [x] **Step 3: Re-profile the async corpus** — `bench/profiling/run.sh` on the candidate;
   capture the bucket attribution for `async_inline`/`async_concurrent` (the **EXEC gate input**:
   is the residual async tax still ≥15%?). Profile at least one workload with the shipped
   profiler (`target/profiling/ascript run --profile cpu bench/profiling/call_heavy.as`) —
   dogfooding is part of Gate 16.
-- [ ] **Step 4: Write `bench/LANE_RESULTS.md`** — machine/date/methodology header, the A/B
+- [x] **Step 4: Write `bench/LANE_RESULTS.md`** — machine/date/methodology header, the A/B
   table (per-workload medians, speedups, geomean), peak RSS per workload base-vs-candidate
   (Gate 18 — any RSS regression is a bug to fix before merge), the lane-on-vs-lane-off
   isolation table, the async-corpus bucket re-attribution, and an explicit **EXEC gate
   verdict paragraph** (residual async share, with the spec-§8 honesty about
   `async_inline`'s pending-await shape).
-- [ ] **Step 5: Append the post-LANE section** to `bench/PROFILING_RESULTS.md` (dated, with the
+- [x] **Step 5: Append the post-LANE section** to `bench/PROFILING_RESULTS.md` (dated, with the
   re-ranked remaining-spec implications per `goal-perf.md`'s "re-profile checkpoints" rule).
-- [ ] **Step 6: Commit** — `bench(lane): same-session A/B + RSS report + post-LANE re-profile (Gates 16/18)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer audits that baseline and candidate ran interleaved in one
+- [x] **Step 6: Commit** — `bench(lane): same-session A/B + RSS report + post-LANE re-profile (Gates 16/18)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer audits that baseline and candidate ran interleaved in one
   session (the script guarantees it; check the doc says so), numbers in the .md match the raw
   output, RSS did not regress, and the EXEC verdict paragraph follows from the data shown.
 
@@ -799,7 +799,7 @@ async fn sync_lane_actually_executes_on_the_corpus() {
 - Modify: `CLAUDE.md`, `goal-perf.md`, `superpowers/roadmap.md`,
   `superpowers/specs/2026-06-12-two-lane-engine-design.md` (status header)
 
-- [ ] **Step 1: Docs/status updates:**
+- [x] **Step 1: Docs/status updates:**
   - `CLAUDE.md`: a LANE paragraph in the architecture notes (two drivers over one Fiber; the
     sync subset + escalation; `ASCRIPT_NO_SYNC_LANE` beside `--no-specialize`; the
     four-way differential identity; "the orchestrator is the only caller of `run_loop_sync`").
@@ -810,34 +810,34 @@ async fn sync_lane_actually_executes_on_the_corpus() {
     recorded if any (no silent deviation).
   - User-facing `docs/`: no page change required (engine-internal; no surface change) —
     confirm and record that this was checked, per Gate 13.
-- [ ] **Step 2: FINAL GATES CHECKLIST** (every box requires pasted command output in the task
+- [x] **Step 2: FINAL GATES CHECKLIST** (every box requires pasted command output in the task
   log — evidence before assertions):
-  - [ ] `cargo clippy --all-targets` clean AND `cargo clippy --no-default-features
+  - [x] `cargo clippy --all-targets` clean AND `cargo clippy --no-default-features
         --all-targets` clean.
-  - [ ] `cargo test` green AND `cargo test --no-default-features` green.
-  - [ ] `cargo test --test vm_differential` green in BOTH configs (four-way identity + corpus
+  - [x] `cargo test` green AND `cargo test --no-default-features` green.
+  - [x] `cargo test --test vm_differential` green in BOTH configs (four-way identity + corpus
         + coverage assertion).
-  - [ ] `cargo test --test property` green in both configs; fuzz target compiles
+  - [x] `cargo test --test property` green in both configs; fuzz target compiles
         (`cd fuzz && cargo build`); a ≥10-min `cargo fuzz run differential` session where
         available, no findings (or findings fixed in-branch with regression tests).
-  - [ ] `cargo test --release --test vm_bench -- --ignored --nocapture`: spec/tw geomean ≥2×,
+  - [x] `cargo test --release --test vm_bench -- --ignored --nocapture`: spec/tw geomean ≥2×,
         `dbg_zero_cost_gate` ≤1.05×, lane section no-regression — all `[PASS]`.
-  - [ ] `bench/LANE_RESULTS.md` + post-LANE `PROFILING_RESULTS.md` sections committed; RSS
+  - [x] `bench/LANE_RESULTS.md` + post-LANE `PROFILING_RESULTS.md` sections committed; RSS
         reported, no regression.
-  - [ ] No `.aso` change: `git diff main -- src/vm/aso.rs src/vm/verify.rs` is empty and
+  - [x] No `.aso` change: `git diff main -- src/vm/aso.rs src/vm/verify.rs` is empty and
         `ASO_FORMAT_VERSION` unchanged.
-  - [ ] Tree-walker untouched: `git diff main -- src/interp.rs` contains no behavioral change
+  - [x] Tree-walker untouched: `git diff main -- src/interp.rs` contains no behavioral change
         (test-only/doc-only diffs justified line-by-line).
-  - [ ] No new `unwrap/expect/panic!` reachable from user input in the touched code
+  - [x] No new `unwrap/expect/panic!` reachable from user input in the touched code
         (reviewer grep + justification list for VM-bug-invariant panics, which mirror existing
         ones).
-- [ ] **Step 3: Holistic review** — a fresh reviewer subagent reviews the WHOLE branch diff
+- [x] **Step 3: Holistic review** — a fresh reviewer subagent reviews the WHOLE branch diff
   against the spec: subset table vs `sync_lane_op` (exact match), escalation-stack-untouched
   invariant, SP3 depth accounting, instrument parity, the §4.2 identity argument vs the
   implemented `try_get` path, and hunts latent bugs in neighbors (e.g. `CallSpread` arithmetic,
   `Yield` state handling, counter flush on panic). All findings fixed in-branch with
   regression tests before merge.
-- [ ] **Step 4: Merge** — `git checkout main && git merge --no-ff feat/two-lane-engine` with a
+- [x] **Step 4: Merge** — `git checkout main && git merge --no-ff feat/two-lane-engine` with a
   summary merge message (house trailer). Update `goal-perf.md` status table post-merge.
 
 ---
