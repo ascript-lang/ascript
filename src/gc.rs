@@ -617,6 +617,64 @@ mod tests {
         );
     }
 
+    // ──────────── SHAPE Task 2.3 — SLAB-MODE CYCLE RECLAMATION ────────────
+    //
+    // A `Value::Object` backed by `ObjectStorage::Slab` (not a Dict) participates
+    // in a reference cycle through its `values` vector. The `Trace for ObjectCell`
+    // slab arm must reach those values so the Bacon–Rajan collector can break the
+    // cycle. If the slab arm is a no-op the cycle leaks (the self-edge keeps the
+    // `Cc` refcount ≥ 1 after the external handle is dropped).
+
+    /// SHAPE Task 2.3: a slab-mode object whose `values[0]` is an array that
+    /// contains the object itself forms a true GC cycle. Mirroring
+    /// `collect_reclaims_a_reference_cycle` (the self-referential array test),
+    /// this proves that `Trace for ObjectCell`'s slab arm visits `values` and
+    /// that the cycle collector can therefore reclaim the cycle.
+    #[test]
+    fn slab_object_self_cycle_is_reclaimed() {
+        use crate::vm::shape::ShapeRegistry;
+
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        // Build a slab-mode object with one field "next".
+        let mut reg = ShapeRegistry::new();
+        let shape = reg.shape_for(["next"]).unwrap();
+        let keys = reg.keys_of(shape);
+
+        // Create an empty array first; we will push the object into it to form the
+        // cycle: obj.next = [obj]  →  obj → array → obj.
+        let arr = crate::value::ArrayCell::new(Vec::new());
+        let arr_val = Value::Array(arr.clone());
+
+        // Build the slab object with values[0] = arr_val (not yet cyclic).
+        let obj = crate::value::ObjectCell::new_slab(keys, vec![arr_val], shape);
+        let obj_val = Value::Object(obj);
+
+        // Now close the cycle: push the object into the array.
+        arr.borrow_mut().push(obj_val.clone());
+
+        // Drop both external handles — the cycle keeps refcounts alive.
+        drop(obj_val);
+        drop(arr); // arr Cc already cloned inside ArrayCell::new; drop our Cc copy
+
+        // Refcounting alone cannot reclaim (internal edges keep refcounts ≥ 1).
+        // The cycle collector must break it via the slab-values trace.
+        let reclaimed = super::collect();
+        assert!(
+            reclaimed >= 1,
+            "slab-mode object cycle must be reclaimed by the cycle collector \
+             (got {reclaimed})"
+        );
+
+        let after = gcmodule::count_thread_tracked();
+        assert_eq!(
+            after, before,
+            "tracked-object count must return to baseline after reclaiming the \
+             slab-mode object cycle"
+        );
+    }
+
     // ──────────────────────── V13-T4 SOUNDNESS GATE ────────────────────────
     //
     // Prove every cycle CLASS is actually reclaimed (not merely that ONE cycle is,

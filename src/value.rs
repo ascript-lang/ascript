@@ -431,23 +431,36 @@ impl ObjectCell {
     }
 }
 
-/// GC tracing for `ObjectCell` (V13-T1 / SHAPE Task 2.2). Lives here (co-located
-/// with the struct) so the private `storage` field is directly accessible.
+/// GC tracing for `ObjectCell` (V13-T1 / SHAPE Task 2.2 + Task 2.3). Lives here
+/// (co-located with the struct) so the private `storage` field is directly accessible.
+///
+/// # Invariant (§7)
+/// - The slab is traced **exactly as the `IndexMap` values were**: every `Value` in
+///   `values` is visited; nothing else.
+/// - `keys: Rc<[Rc<str>]>` is acyclic immutable string data (the `MapKey` no-op-trace
+///   rationale) owned by the `ShapeRegistry` on the `Vm` (a GC root). It holds NO
+///   `Value`/`Cc`, so it is **NOT traced**.
+/// - `Cell<u32>` (`shape`) and `Cell<bool>` (`frozen`) are scalar, non-edge fields —
+///   NOT traced.
+/// - Native resource handles never enter object storage, so the native-handle
+///   no-trace rule is untouched.
 impl Trace for ObjectCell {
     fn trace(&self, tracer: &mut Tracer) {
-        // Avoid holding the borrow if already mutably borrowed (mirrors gcmodule's
-        // `RefCell` impl: an outstanding borrow implies a live reference, so skipping
-        // is safe). `shape: Cell<u32>` and `frozen: Cell<bool>` are acyclic.
+        // `try_borrow` discipline: skip if already mutably borrowed (mirrors gcmodule's
+        // `RefCell` blanket impl — an outstanding borrow implies a live reference, so
+        // it is safe to skip; the collector will revisit on the next cycle).
         if let Ok(storage) = self.storage.try_borrow() {
             match &*storage {
                 ObjectStorage::Slab { keys: _, values } => {
-                    // `keys: Rc<[Rc<str>]>` — Rc<str> contains no GC edges; skip.
-                    // values may contain cycle-capable containers.
+                    // keys: Rc<[Rc<str>]> — acyclic, no GC edges — NOT traced.
+                    // values: Vec<Value> — trace every element (identical to the Dict path).
                     for v in values.iter() {
                         v.trace(tracer);
                     }
                 }
                 ObjectStorage::Dict(m) => {
+                    // Equivalent to gc::trace_index_map (private there; inlined here).
+                    // String keys are acyclic; their trace() call is a no-op.
                     for (k, v) in m.iter() {
                         k.trace(tracer);
                         v.trace(tracer);
