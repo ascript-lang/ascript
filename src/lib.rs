@@ -825,6 +825,21 @@ pub async fn vm_run_source_no_sync_lane(src: &str) -> Result<(String, Option<i32
     vm_run_source_cfg(src, true, false, false, false).await
 }
 
+/// Like [`vm_run_source`] but with the CALL fast paths DISABLED — the
+/// `ASCRIPT_NO_CALL_FAST=1` kill switch (CALL §8.1). All CALL fast paths
+/// (A2 in-place binding, A3 fiber pooling, B trampoline) are suppressed;
+/// specialization and the sync lane remain active so this isolates a CALL
+/// divergence from an IC/adaptive or lane divergence. Observable behavior is
+/// byte-identical to [`vm_run_source`]; only throughput differs.
+///
+/// Used by the differential test (`no_call_fast_mode_runs_byte_identically`)
+/// and the fifth differential mode. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_no_call_fast(src: &str) -> Result<(String, Option<i32>), AsError> {
+    // specialize=true, armed=false, coverage=false, sync_lane=true, call_fast=false
+    vm_run_source_cfg_call_fast(src, true, false, false, true, false).await
+}
+
 /// Like [`vm_run_source`] but also returns the LANE counters (LANE §6.4).
 ///
 /// Returns `(output, exit_code, lane_sync_ops, lane_bursts)`.
@@ -840,7 +855,7 @@ pub async fn vm_run_source_no_sync_lane(src: &str) -> Result<(String, Option<i32
 pub async fn vm_run_source_lane_stats(
     src: &str,
 ) -> Result<(String, Option<i32>, u64, u64), AsError> {
-    vm_run_source_cfg_stats(src, true, false, false, true).await
+    vm_run_source_cfg_stats(src, true, false, false, true, true).await
 }
 
 /// Like [`vm_run_source_lane_stats`] but with `sync_lane = false` (LANE §6.4).
@@ -851,7 +866,7 @@ pub async fn vm_run_source_lane_stats(
 pub async fn vm_run_source_lane_stats_no_lane(
     src: &str,
 ) -> Result<(String, Option<i32>, u64, u64), AsError> {
-    vm_run_source_cfg_stats(src, true, false, false, false).await
+    vm_run_source_cfg_stats(src, true, false, false, false, true).await
 }
 
 /// FUZZ `.aso` round-trip seam (`#[doc(hidden)]` test API, not a stable surface):
@@ -2327,9 +2342,11 @@ pub async fn vm_run_source_coverage(src: &str) -> Result<(String, Option<i32>), 
 /// - `armed`:      DBG zero-cost bench — attach an empty instrumentation payload.
 /// - `coverage`:   DX D2 Task 7 — arm line coverage (patches breakpoints).
 /// - `sync_lane`:  LANE §6.1 kill switch — when `false`, sync-lane driver is suppressed.
+/// - `call_fast`:  CALL §8.1 kill switch — when `false`, all CALL fast paths skipped.
 ///   NOTE: `armed`/`coverage` force the instrumentation path which uses
 ///   `Vm::with_instrument` (always specialize=true, sync_lane from env). When
-///   `armed` or `coverage` is true, `sync_lane` is irrelevant (instrument path).
+///   `armed` or `coverage` is true, `sync_lane` and `call_fast` are irrelevant
+///   (instrumentation path uses its own constructor).
 async fn vm_run_source_cfg(
     src: &str,
     specialize: bool,
@@ -2337,8 +2354,20 @@ async fn vm_run_source_cfg(
     coverage: bool,
     sync_lane: bool,
 ) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_cfg_call_fast(src, specialize, armed, coverage, sync_lane, specialize).await
+}
+
+/// Like [`vm_run_source_cfg`] but with explicit `call_fast` control (CALL §8.1).
+async fn vm_run_source_cfg_call_fast(
+    src: &str,
+    specialize: bool,
+    armed: bool,
+    coverage: bool,
+    sync_lane: bool,
+    call_fast: bool,
+) -> Result<(String, Option<i32>), AsError> {
     let (output, exit, _, _) =
-        vm_run_source_cfg_stats(src, specialize, armed, coverage, sync_lane).await?;
+        vm_run_source_cfg_stats(src, specialize, armed, coverage, sync_lane, call_fast).await?;
     Ok((output, exit))
 }
 
@@ -2350,6 +2379,7 @@ async fn vm_run_source_cfg_stats(
     armed: bool,
     coverage: bool,
     sync_lane: bool,
+    call_fast: bool,
 ) -> Result<(String, Option<i32>, u64, u64), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -2396,8 +2426,9 @@ async fn vm_run_source_cfg_stats(
     } else if armed {
         Vm::with_instrument(interp.clone(), crate::vm::instrument::Instrumentation::empty())
     } else {
-        // LANE §6.1: use with_lanes so sync_lane is set explicitly (no env re-read).
-        Vm::with_lanes(interp.clone(), specialize, sync_lane)
+        // LANE §6.1 / CALL §8.1: use with_flags so both lane and call_fast kill
+        // switches are set explicitly (no env re-read for test entry points).
+        Vm::with_flags(interp.clone(), specialize, sync_lane, call_fast)
     };
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 

@@ -68,6 +68,25 @@ pub(crate) enum SyncOutcome {
     NeedsAsync,
 }
 
+/// **CALL §8.3 — per-VM fast-path coverage counters.**
+///
+/// Bumped (via [`Vm::bump_stat`]) when a call-path fast path actually fires.
+/// All four counters start at 0 and stay 0 until the corresponding fast path
+/// is wired in Phase 2/3; Phase 1 ships the struct and accessor so the test
+/// scaffolding can compile.  Asserted `>0` over the functional corpus in
+/// `tests/call_fast.rs` as an anti-false-green gate.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CallFastStats {
+    /// A1+A2: calls that used in-place operand-stack argument binding (no Vec).
+    pub inplace_binds: u64,
+    /// A3: re-entrant `call_value` / method-dispatch calls that reused a pooled fiber.
+    pub pooled_fiber_reuses: u64,
+    /// B: callback elements dispatched through the `CallbackTrampoline` sync lane.
+    pub trampoline_calls: u64,
+    /// B: trampoline elements that escalated to the async driver (callback suspended).
+    pub trampoline_escalations: u64,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -225,6 +244,19 @@ pub struct Vm {
     /// the sync driver was entered (one burst = one uninterrupted run of the sync
     /// lane until a non-sync op is reached). Zero until Task 4.
     lane_bursts: std::cell::Cell<u64>,
+    /// **The CALL kill switch (CALL §8.1).** Gates EVERY call-path fast path this
+    /// spec adds: the empty-cells return (A1), in-place arg binding (A2), fiber
+    /// pooling (A3), and trampoline arming (B). Permanent, mirroring `specialize`;
+    /// `Vm::new_generic` sets BOTH false so the generic mode stays the complete
+    /// everything-off floor.
+    ///
+    /// NOTE: A1's empty-cells early-return is behavior-invisible and gated only by
+    /// the differential, not this flag; the flag gates new CONTROL FLOW (A2/A3/B).
+    call_fast: bool,
+    /// **CALL §8.3 coverage counters (anti-false-green).** Plain `Cell` bumps whose
+    /// cost is bounded by the Gate-17 zero-cost bench. Asserted >0 over the
+    /// functional corpus so the differential proves the fast paths actually ran.
+    call_fast_stats: std::cell::Cell<CallFastStats>,
     /// DBG: the flattened proto tree of the program under inspection, for resolving a
     /// source (file, line) to a `(proto_id, offset)` to patch. Populated ONLY when a
     /// debugger arms breakpoints (empty otherwise → zero cost, NEVER read on the hot
@@ -252,18 +284,27 @@ impl Vm {
     /// (V11-T5). All inline-cache and adaptive fast paths are disabled; every
     /// dispatch takes the generic path. Used by `vm_run_source_generic` and the
     /// three-way differential to prove the fast paths never change a result.
+    ///
+    /// CALL §8.1: `new_generic` sets BOTH `specialize` AND `call_fast` to `false`,
+    /// keeping the generic mode as the complete everything-off floor.
     pub fn new_generic(interp: Rc<Interp>) -> Rc<Self> {
         Self::with_specialize(interp, false)
     }
 
     /// Shared constructor: build a VM with `specialize` set explicitly and install
     /// its self-`Weak` (mirroring [`Interp::install_self`]).
+    ///
+    /// CALL §8.1: delegates to [`with_flags`](Self::with_flags) with
+    /// `call_fast = specialize` — so `specialize = false` (generic) ⇒ both off.
     pub fn with_specialize(interp: Rc<Interp>, specialize: bool) -> Rc<Self> {
         // LANE §6.1: default sync_lane from the environment, exactly like
         // ASCRIPT_NO_SPECIALIZE does for `specialize`. The env default is what
         // lets worker isolates inherit the kill switch without explicit plumbing.
         let sync_lane = std::env::var("ASCRIPT_NO_SYNC_LANE").as_deref() != Ok("1");
-        Self::with_lanes(interp, specialize, sync_lane)
+        // CALL §8.1: call_fast defaults from the environment like specialize/sync_lane.
+        let call_fast = specialize
+            && std::env::var("ASCRIPT_NO_CALL_FAST").as_deref() != Ok("1");
+        Self::with_flags(interp, specialize, sync_lane, call_fast)
     }
 
     /// Build a VM with `specialize` and `sync_lane` set explicitly (LANE §6.1).
@@ -273,7 +314,26 @@ impl Vm {
     /// Used by the test entry points (`vm_run_source_no_sync_lane`,
     /// `vm_run_source_lane_stats`) so tests can toggle `sync_lane` without setting
     /// environment variables.
+    ///
+    /// CALL §8.1: `call_fast` mirrors `specialize` here (the same as the
+    /// `with_specialize` default). Use [`with_flags`](Self::with_flags) to set
+    /// `call_fast` independently (e.g. for `vm_run_source_no_call_fast`).
     pub fn with_lanes(interp: Rc<Interp>, specialize: bool, sync_lane: bool) -> Rc<Self> {
+        Self::with_flags(interp, specialize, sync_lane, specialize)
+    }
+
+    /// Build a VM with all three kill switches set explicitly (CALL §8.1).
+    ///
+    /// The lowest-level constructor: does NOT consult environment variables.
+    /// Used by test entry points that need independent control of each switch
+    /// (`vm_run_source_no_call_fast` sets `specialize=true, sync_lane=true,
+    /// call_fast=false` to isolate CALL divergences from IC/lane divergences).
+    pub fn with_flags(
+        interp: Rc<Interp>,
+        specialize: bool,
+        sync_lane: bool,
+        call_fast: bool,
+    ) -> Rc<Self> {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
@@ -298,6 +358,8 @@ impl Vm {
             sync_lane,
             lane_sync_ops: std::cell::Cell::new(0),
             lane_bursts: std::cell::Cell::new(0),
+            call_fast,
+            call_fast_stats: std::cell::Cell::new(CallFastStats::default()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -324,6 +386,33 @@ impl Vm {
     /// Always 0 until Task 4 wires up the burst driver.
     pub fn lane_bursts(&self) -> u64 {
         self.lane_bursts.get()
+    }
+
+    /// Whether the CALL fast paths are enabled (CALL §8.1). `true` = call-path
+    /// fast paths active (A2 in-place binding, A3 fiber pooling, B trampoline);
+    /// `false` = kill switch active, all CALL fast paths skip to the slow generic
+    /// path. Behavior is byte-identical regardless; only throughput differs.
+    pub fn call_fast(&self) -> bool {
+        self.call_fast
+    }
+
+    /// CALL §8.3 coverage counters (anti-false-green). All counters are 0 until
+    /// the corresponding fast paths are wired in Phase 2/3. `#[doc(hidden)]` test
+    /// API — not part of the public surface.
+    #[doc(hidden)]
+    pub fn call_fast_stats(&self) -> CallFastStats {
+        self.call_fast_stats.get()
+    }
+
+    /// CALL §8.3: bump one or more coverage counters atomically (a Cell, so this
+    /// is a synchronous `get → mutate → set` — never called across an `.await`).
+    /// Not yet called (Phase 1 is INERT); wired in Phase 2/3 when each fast path lands.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn bump_stat(&self, f: impl FnOnce(&mut CallFastStats)) {
+        let mut s = self.call_fast_stats.get();
+        f(&mut s);
+        self.call_fast_stats.set(s);
     }
 
     /// **DBG.** Build a specializing VM with an instrumentation payload installed

@@ -1,12 +1,12 @@
 //! FUZZ Task 7 — the differential program fuzzer (the headline target).
 //!
 //! `arbitrary` bytes → the grammar-aware generator (`ascript::fuzzgen`) → a VALID,
-//! deterministic, run-to-completion AScript program → run on ALL FOUR engine modes and assert
-//! they agree on the deterministic projection. This is the SAME four-way differential
+//! deterministic, run-to-completion AScript program → run on ALL FIVE engine modes and assert
+//! they agree on the deterministic projection. This is the SAME five-way differential
 //! `tests/vm_differential.rs` enforces over a fixed corpus, turned into a continuous
 //! generator-driven oracle:
 //!
-//!   `run(tree-walker, P) == run(specialized-VM, P) == run(generic-VM, P) == run(lane-off, P)`
+//!   `run(tree-walker, P) == run(specialized-VM, P) == run(generic-VM, P) == run(lane-off, P) == run(no-call-fast, P)`
 //!
 //! compared on `(captured stdout, exit code)` on success or the Tier-2 panic MESSAGE on
 //! failure (the SP1 caret-column offset between front-ends is excluded — message only). ANY
@@ -73,10 +73,11 @@ fuzz_target!(|data: &[u8]| {
     let prog = ascript::fuzzgen::gen_program_from_bytes(data);
     let src = prog.source;
 
-    // Run all four engine modes on the 512 MB worker stack and project each outcome. The
+    // Run all five engine modes on the 512 MB worker stack and project each outcome. The
     // owned `String` is moved into the `Send` closure (no borrow of the libFuzzer buffer
     // crosses). LANE §6.1: the lane-off projection is the fourth axis (Gate 15).
-    let (tw, vm, gen, nolane) = ascript::run_on_worker_stack({
+    // CALL §8.1: the no-call-fast projection is the fifth axis (Gate 15).
+    let (tw, vm, gen, nolane, nocf) = ascript::run_on_worker_stack({
         let src = src.clone();
         move || async move {
             let tw = project(ascript::run_source_exit(&src).await);
@@ -84,11 +85,13 @@ fuzz_target!(|data: &[u8]| {
             let gen = project(ascript::vm_run_source_generic(&src).await);
             // LANE §6.1: lane-off must be byte-identical to all other modes.
             let nolane = project(ascript::vm_run_source_no_sync_lane(&src).await);
-            (tw, vm, gen, nolane)
+            // CALL §8.1: no-call-fast must be byte-identical to all other modes.
+            let nocf = project(ascript::vm_run_source_no_call_fast(&src).await);
+            (tw, vm, gen, nolane, nocf)
         }
     });
 
-    // THE ORACLE: all four must agree. A panic here is a libFuzzer crash carrying a ready
+    // THE ORACLE: all five must agree. A panic here is a libFuzzer crash carrying a ready
     // reproducer. Fix the ENGINE, never relax this assertion (Gate 0).
     assert_eq!(
         tw, vm,
@@ -102,5 +105,10 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         tw, nolane,
         "lane-off VM diverged from tree-walker\n--- program ---\n{src}\n--- tw: {tw:?}\n--- nolane: {nolane:?}"
+    );
+    // CALL §8.1 / Gate 15: no-call-fast must be byte-identical to tree-walker.
+    assert_eq!(
+        tw, nocf,
+        "no-call-fast VM diverged from tree-walker\n--- program ---\n{src}\n--- tw: {tw:?}\n--- nocf: {nocf:?}"
     );
 });
