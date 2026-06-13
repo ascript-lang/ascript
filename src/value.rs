@@ -25,6 +25,8 @@ pub enum ObjectStorage {
     },
     /// Dictionary fallback — insertion order preserved.
     /// Always `cell.shape == 0` (the EMPTY_SHAPE sentinel; ICs never cache shape-0).
+    // SipHash is load-bearing here (hash-flooding DoS resistance, SHAPE §6.2) — do NOT
+    // "optimize" to FxHash. This is the demotion target for hostile-key objects.
     Dict(IndexMap<String, Value>),
 }
 
@@ -636,6 +638,8 @@ impl ArrayCell {
 /// collector still reaches the contained `Value`s. `Deref`s to the inner
 /// `RefCell` so every `m.borrow()`/`m.borrow_mut()` access site is unchanged.
 pub struct MapCell {
+    // SipHash is load-bearing here (hash-flooding DoS resistance, SHAPE §6.2) — do NOT
+    // "optimize" to FxHash. These keys are attacker-controlled (user `Map` insertion).
     pub map: RefCell<IndexMap<MapKey, Value>>,
     /// `object.freeze` flag (SP2 §4). Defaults `false`. See [`ObjectCell::frozen`].
     pub frozen: Cell<bool>,
@@ -672,6 +676,8 @@ impl std::ops::Deref for MapCell {
 /// newtype over `RefCell<IndexSet<…>>` so it can carry a `Trace` impl (foreign
 /// `IndexSet` cannot) and `Cc<SetCell>` satisfies `T: Trace`.
 pub struct SetCell {
+    // SipHash is load-bearing here (hash-flooding DoS resistance, SHAPE §6.2) — do NOT
+    // "optimize" to FxHash. These keys are attacker-controlled (user `Set` insertion).
     pub set: RefCell<IndexSet<MapKey>>,
     /// `object.freeze` flag (SP2 §4). Defaults `false`. See [`ObjectCell::frozen`].
     pub frozen: Cell<bool>,
@@ -2397,6 +2403,51 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SHAPE §6.2 tripwire: `Map` and `Set` keys are attacker-controlled, so their
+    // backing `IndexMap`/`IndexSet` MUST keep the default randomized SipHash hasher
+    // (`std::collections::hash_map::RandomState`) — NOT FxHash. This is a
+    // compile-time + type-level proof: `MapCell`/`SetCell` are constructed from a
+    // DEFAULT-hasher `IndexMap`/`IndexSet` (so the field type cannot have been
+    // narrowed to a non-default hasher), and we assert the field's hasher type is
+    // exactly `RandomState`. If anyone "optimizes" these to FxHash, this fails.
+    #[test]
+    fn map_and_set_keep_siphash_random_state() {
+        use std::any::TypeId;
+        type SipState = std::collections::hash_map::RandomState;
+
+        // Constructing from a default-hasher container compiles ONLY because the
+        // field type uses the default hasher (a narrowed Fx field would reject this).
+        let map = MapCell::new(IndexMap::<MapKey, Value>::new());
+        let set = SetCell::new(IndexSet::<MapKey>::new());
+
+        // Type-level: the stored map/set hasher is SipHash's RandomState.
+        fn hasher_type_of_map(_m: &IndexMap<MapKey, Value>) -> TypeId {
+            TypeId::of::<SipState>()
+        }
+        fn hasher_type_of_set(_s: &IndexSet<MapKey>) -> TypeId {
+            TypeId::of::<SipState>()
+        }
+        // These calls only typecheck if the borrowed field is the DEFAULT hasher.
+        assert_eq!(hasher_type_of_map(&map.borrow()), TypeId::of::<SipState>());
+        assert_eq!(hasher_type_of_set(&set.borrow()), TypeId::of::<SipState>());
+    }
+
+    // SHAPE §6.2: the demoted hostile-key object dict also keeps SipHash.
+    #[test]
+    fn object_dict_storage_keeps_siphash_random_state() {
+        use std::any::TypeId;
+        type SipState = std::collections::hash_map::RandomState;
+        let dict = ObjectStorage::Dict(IndexMap::<String, Value>::new());
+        if let ObjectStorage::Dict(m) = &dict {
+            fn hasher_type_of(_m: &IndexMap<String, Value>) -> TypeId {
+                TypeId::of::<SipState>()
+            }
+            assert_eq!(hasher_type_of(m), TypeId::of::<SipState>());
+        } else {
+            unreachable!()
+        }
+    }
 
     // Task 0.1 regression: `i64::MAX as f64` rounds UP to 2^63 (out of i64 range),
     // so a `<=` upper bound wrongly admitted 2^63 across equality, MapKey folding,

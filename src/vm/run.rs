@@ -20,6 +20,7 @@ use crate::vm::fiber::Fiber;
 use crate::vm::opcode::Op;
 use crate::vm::value_ext::{Closure, RunOutcome};
 use gcmodule::Cc;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
@@ -124,17 +125,26 @@ pub struct Vm {
     /// closure. A class's `Value::Class.methods` map is left empty; method dispatch
     /// goes through this table (`compiled_method`). The key is stable because the
     /// `Rc<Class>` is created once at compile time and shared by every instance.
-    class_methods: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
+    // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
+    // never attacker-scaled, iteration order never observed (see audit) — this table is
+    // accessed only via get/insert/contains_key, never iterated into output.
+    class_methods: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-class STATIC method table (SP1 §3): class `Rc` identity → static name →
     /// compiled closure. A SEPARATE namespace from `class_methods`; a static is
     /// called as `C.name(args)` with NO receiver (a plain `Value::Closure` call),
     /// resolved up the superclass chain by `find_compiled_static_method`.
-    class_static_methods: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
+    // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
+    // never attacker-scaled, iteration order never observed (see audit) — get/insert only.
+    class_static_methods: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-class field-default thunk table (V9): class `Rc` identity → field name →
     /// a zero-arg closure that produces the field's default value. Run once per
     /// constructed instance (so a mutable default yields a fresh value each time,
     /// matching the tree-walker's per-construct default eval).
-    class_defaults: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
+    // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
+    // never attacker-scaled, iteration order never observed (see audit). The inner map is
+    // consulted only via `contains_key`/`get`; the order it is walked in comes from
+    // `Class.fields.keys()` (declared schema order), NOT from this table's hash order.
+    class_defaults: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-VM hidden-class registry (V11-T2). Assigns a `shape_id` to every
     /// object/instance key-LAYOUT via a transition tree; V11-T3 inline caches key
     /// on these ids. Only VM code paths touch it (the tree-walker leaves shapes 0).
@@ -211,7 +221,13 @@ pub struct Vm {
     /// REPL's cross-line persistence: one `Vm` kept alive across lines carries its
     /// globals forward. (A file module's exports use the separate `module_exports`
     /// path; only the entry chunk defines into this table.)
-    user_globals: RefCell<indexmap::IndexMap<Rc<str>, GlobalSlot>>,
+    // SHAPE §6.1: Fx — bounded inflow (source identifiers), never attacker-scaled. This
+    // table IS iterated (def-env rebuild at ~1107/~6657) and index-cached
+    // (`GlobalCache::IndexBound`), but `IndexMap` iteration is INSERTION-ordered and its
+    // indices are STABLE regardless of hasher — so Fx changes neither the observable order
+    // nor cache validity. The two iteration sites only build a flat (order-independent)
+    // binding env; no hash-order leaks to output.
+    user_globals: RefCell<indexmap::IndexMap<Rc<str>, GlobalSlot, FxBuildHasher>>,
     /// Monotonic version counter, bumped on every global (re)definition or
     /// assignment. The V11-T4 GET_GLOBAL inline cache (`adapt::GlobalCache`) guards
     /// its cached value with this version: a cache entry recorded at version V is
@@ -384,9 +400,9 @@ impl Vm {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
-            class_methods: RefCell::new(HashMap::new()),
-            class_static_methods: RefCell::new(HashMap::new()),
-            class_defaults: RefCell::new(HashMap::new()),
+            class_methods: RefCell::new(FxHashMap::default()),
+            class_static_methods: RefCell::new(FxHashMap::default()),
+            class_defaults: RefCell::new(FxHashMap::default()),
             shapes: RefCell::new(crate::vm::shape::ShapeRegistry::new()),
             class_env: RefCell::new(None),
             specialize,
@@ -395,7 +411,7 @@ impl Vm {
             module_dir: RefCell::new(std::env::current_dir().unwrap_or_else(|_| ".".into())),
             module_archive: RefCell::new(None),
             module_logical_dir: RefCell::new(String::new()),
-            user_globals: RefCell::new(indexmap::IndexMap::new()),
+            user_globals: RefCell::new(indexmap::IndexMap::with_hasher(FxBuildHasher)),
             global_version: std::cell::Cell::new(0),
             struct_gen: std::cell::Cell::new(0),
             last_fault_source: RefCell::new(None),
@@ -6147,7 +6163,7 @@ impl Vm {
                         let _ = def_env.assign(&class.name, Value::Class(class.clone()));
                     }
                     let key = Rc::as_ptr(&class) as usize;
-                    let mut method_map: HashMap<String, Cc<Closure>> = HashMap::new();
+                    let mut method_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (name, mv) in cp.method_names.iter().zip(methods) {
                         match mv {
                             Value::Closure(c) => {
@@ -6162,7 +6178,7 @@ impl Vm {
                             }
                         }
                     }
-                    let mut default_map: HashMap<String, Cc<Closure>> = HashMap::new();
+                    let mut default_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (i, (name, dv)) in cp.default_fields.iter().zip(defaults).enumerate() {
                         match dv {
                             Value::Closure(c) => {
@@ -6202,7 +6218,7 @@ impl Vm {
                             }
                         }
                     }
-                    let mut static_map: HashMap<String, Cc<Closure>> = HashMap::new();
+                    let mut static_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (name, sv) in cp.static_method_names.iter().zip(statics) {
                         match sv {
                             Value::Closure(c) => {
