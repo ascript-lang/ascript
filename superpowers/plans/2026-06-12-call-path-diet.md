@@ -1,7 +1,7 @@
 # Call-Path Allocation Diet + Callback Trampoline (CALL) — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to
-> implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every task
+> implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking. Every task
 > is executed by a **fresh implementer subagent**, then verified by an **independent reviewer
 > subagent** that runs the commands and probes edges before acceptance. At the end of each
 > phase, a **holistic per-phase review subagent** reviews the phase's combined changes before
@@ -77,24 +77,24 @@ task with the house trailer:
 
 **Files:** create `bench/CALL_RESULTS.md` (baseline section), `bench/run_call_bench.sh`.
 
-- [ ] **Step 1:** Verify LANE is merged at the branch base: `grep -n "fn run_loop_sync"
+- [x] **Step 1:** Verify LANE is merged at the branch base: `grep -n "fn run_loop_sync"
   src/vm/run.rs`
   and `grep -rn "NeedsAsync" src/vm/` succeed; `ls bench/profiling/ | grep -i
   "callback\|functional\|pipeline"` shows LANE Task 0's functional-idiom workloads. **If any of
   these fail, STOP — this plan is blocked on LANE; escalate to the owner.** Confirm the LANE
   symbol names as shipped (`Vm::run_loop_sync`, `SyncOutcome::{Finished(RunOutcome),
   NeedsAsync}` — the names this plan uses throughout).
-- [ ] **Step 2:** Write `bench/run_call_bench.sh` (mirrors `bench/run_shared_heap_bench.sh`):
+- [x] **Step 2:** Write `bench/run_call_bench.sh` (mirrors `bench/run_shared_heap_bench.sh`):
   builds `--release`, runs the functional-idiom + object_churn workloads under
   `/usr/bin/time -l` capturing wall time + `maximum resident set size`, prints a table. Run it
   on the UNMODIFIED branch base and paste the output into `bench/CALL_RESULTS.md` under
   `## Baseline (pre-CALL, same session)`. Also record `ascript run --profile cpu` output paths
   for the two headline workloads (the shipped profiler is the instrument, Gate 16).
-- [ ] **Step 3:** Commit — `git commit -m "bench(call): baseline harness + pre-CALL numbers"`.
+- [x] **Step 3:** Commit — `git commit -m "bench(call): baseline harness + pre-CALL numbers"`.
 
 ### Task 0.2: Phase 0 review
 
-- [ ] **Step 1:** Independent reviewer confirms: LANE symbols recorded accurately, baseline
+- [x] **Step 1:** Independent reviewer confirms: LANE symbols recorded accurately, baseline
   numbers are real captured output (not invented), script is re-runnable.
 
 ---
@@ -106,7 +106,7 @@ task with the house trailer:
 **Files:** modify `src/vm/run.rs`, `src/lib.rs`, `tests/vm_differential.rs`,
 `tests/property.rs`, `fuzz/fuzz_targets/differential.rs`; create `tests/call_fast.rs`.
 
-- [ ] **Step 1: Write the failing test** — in `tests/call_fast.rs`:
+- [x] **Step 1: Write the failing test** — in `tests/call_fast.rs`:
 
 ```rust
 //! CALL — kill-switch + coverage scaffolding. The `no_call_fast` mode must run the
@@ -130,8 +130,8 @@ fn no_call_fast_mode_runs_byte_identically() {
   (Check how existing integration tests drive the `!Send` runtime — `tests/vm_differential.rs`
   uses a current-thread runtime helper; copy that idiom exactly rather than inventing
   `run_on_worker_stack` usage if it differs.)
-- [ ] **Step 2: Run it — expect FAIL** (compile error: `vm_run_source_no_call_fast` missing).
-- [ ] **Step 3: Implement** —
+- [x] **Step 2: Run it — expect FAIL** (compile error: `vm_run_source_no_call_fast` missing).
+- [x] **Step 3: Implement** —
   - `src/vm/run.rs`: beside `specialize` (`run.rs:117`) add:
 
 ```rust
@@ -180,18 +180,18 @@ pub async fn vm_run_source_no_call_fast(src: &str) -> Result<(String, Option<i32
 }
 ```
 
-- [ ] **Step 4: Run it — expect PASS.**
-- [ ] **Step 5: Wire the fourth mode/axis the same PR (Gate 15):**
+- [x] **Step 4: Run it — expect PASS.**
+- [x] **Step 5: Wire the fourth mode/axis the same PR (Gate 15):**
   - `tests/vm_differential.rs`: in the corpus-runner helper that already runs tw/spec/generic,
     add the `vm_run_source_no_call_fast` run + equality assertion (find the single summarize/
     compare funnel — grep `vm_run_source_generic` — and extend it there, NOT per-test).
   - `tests/property.rs::three_way_differential_over_generated_programs` → four-way.
   - `fuzz/fuzz_targets/differential.rs`: add the fourth projection + `assert_eq!` (mirror the
     existing `gen` arm).
-- [ ] **Step 6:** `cargo test --test vm_differential` (both configs) + `cargo test --test
+- [x] **Step 6:** `cargo test --test vm_differential` (both configs) + `cargo test --test
   call_fast` + clippy both configs — green (the flag is inert; identity is trivially true).
-- [ ] **Step 7: Commit** — `git commit -m "feat(vm/call): call_fast kill switch + stats + fourth differential mode/fuzz axis (CALL §8)"`.
-- [ ] **Step 8: Independent review** — reviewer confirms: generic mode sets `call_fast=false`;
+- [x] **Step 7: Commit** — `git commit -m "feat(vm/call): call_fast kill switch + stats + fourth differential mode/fuzz axis (CALL §8)"`.
+- [x] **Step 8: Independent review** — reviewer confirms: generic mode sets `call_fast=false`;
   the fuzz target builds (`cargo fuzz build differential` if cargo-fuzz available, else
   `cargo check` under the fuzz workspace); no behavior change (spot-diff a corpus run).
 
@@ -203,7 +203,7 @@ pub async fn vm_run_source_no_call_fast(src: &str) -> Result<(String, Option<i32
 
 **Files:** modify `src/vm/fiber.rs`, `src/vm/run.rs`; create `tests/alloc_count.rs`.
 
-- [ ] **Step 1: Write the failing tests** —
+- [x] **Step 1: Write the failing tests** —
   (a) unit, in `src/vm/fiber.rs` tests:
 
 ```rust
@@ -275,8 +275,8 @@ fn capture_free_call_alloc_slope_drops_with_call_fast() {
 
   (For Task 2.1 alone, assert a weaker interim bound — `on < off` and `on <= off - 0.9`
   (one allocation removed per call); tighten to the final bound in Task 2.2.)
-- [ ] **Step 2: Run — expect FAIL** (`capacity == 0` fails; slope unchanged).
-- [ ] **Step 3: Implement** —
+- [x] **Step 2: Run — expect FAIL** (`capacity == 0` fails; slope unchanged).
+- [x] **Step 3: Implement** —
   - `src/vm/fiber.rs::alloc_cells` (`fiber.rs:56`):
 
 ```rust
@@ -319,12 +319,12 @@ if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
     behavior-invisible (an all-`None` vector and an empty vector are indistinguishable to
     `.get`-based consumers), so A1 is gated only by the differential, not the flag; the flag
     gates paths with new CONTROL FLOW (A2/A3/B). Document this in the `call_fast` doc-comment.
-- [ ] **Step 4: Run — expect PASS** (unit + interim slope). `cargo test --test vm_differential`
+- [x] **Step 4: Run — expect PASS** (unit + interim slope). `cargo test --test vm_differential`
   both configs — byte-identical.
-- [ ] **Step 5: Measure item A1 individually:** run `bench/run_call_bench.sh`, append an
+- [x] **Step 5: Measure item A1 individually:** run `bench/run_call_bench.sh`, append an
   `### A1` row (time + RSS + slope numbers) to `bench/CALL_RESULTS.md`.
-- [ ] **Step 6: Commit** — `git commit -m "perf(vm/call): A1 — empty-cells fast path, .get-based binding loops (CALL §2)"`.
-- [ ] **Step 7: Independent review** — reviewer greps for any remaining direct `cells[` index
+- [x] **Step 6: Commit** — `git commit -m "perf(vm/call): A1 — empty-cells fast path, .get-based binding loops (CALL §2)"`.
+- [x] **Step 7: Independent review** — reviewer greps for any remaining direct `cells[` index
   on a binding path, probes a closure-capturing program (`let fs = []; for i in 0..3 {
   fs.push(() => i) }`; per-iteration freshness) across all four modes, and re-runs the
   differential.
@@ -334,7 +334,7 @@ if let Some(cell) = cells.get(slot).and_then(|c| c.as_ref()) {
 **Files:** modify `src/interp.rs`, `src/vm/run.rs`; extend `tests/call_fast.rs`,
 `tests/alloc_count.rs`.
 
-- [ ] **Step 1: Write the failing tests** — in `tests/call_fast.rs`, a panic-wording parity
+- [x] **Step 1: Write the failing tests** — in `tests/call_fast.rs`, a panic-wording parity
   battery (these must pass BEFORE and AFTER — write them first against today's behavior, then
   they guard the refactor):
 
@@ -362,9 +362,9 @@ fn arg_panic_wording_parity() {
 ```
 
   and the tightened alloc slope from Task 2.1 Step 1 (`on < 1.0`).
-- [ ] **Step 2: Run — expect** the parity battery PASSES already (it pins today's wording);
+- [x] **Step 2: Run — expect** the parity battery PASSES already (it pins today's wording);
   the tightened slope FAILS.
-- [ ] **Step 3: Implement** —
+- [x] **Step 3: Implement** —
   - `src/interp.rs`: extract the shared cores from `check_call_args` (`interp.rs:7898`) with
     NO wording/order change:
 
@@ -471,11 +471,11 @@ Value::Closure(callee) => {
 }
 ```
 
-- [ ] **Step 4: Run — expect PASS**: parity battery (all four modes), tightened slope, full
+- [x] **Step 4: Run — expect PASS**: parity battery (all four modes), tightened slope, full
   `cargo test --test vm_differential` both configs, `cargo test` default config.
-- [ ] **Step 5: Measure item A2 individually** → `### A2` row in `bench/CALL_RESULTS.md`.
-- [ ] **Step 6: Commit** — `git commit -m "perf(vm/call): A2 — in-place arg binding over the operand-stack window (CALL §3)"`.
-- [ ] **Step 7: Independent review** — reviewer probes: defaults referencing earlier params
+- [x] **Step 5: Measure item A2 individually** → `### A2` row in `bench/CALL_RESULTS.md`.
+- [x] **Step 6: Commit** — `git commit -m "perf(vm/call): A2 — in-place arg binding over the operand-stack window (CALL §3)"`.
+- [x] **Step 7: Independent review** — reviewer probes: defaults referencing earlier params
   (`fn f(a, b = a * 2)`), a default that itself calls a function, contract panic on arg 3 of 3
   (order), `CallSpread` through the same arm (`f(...[1,2])`), a cell-slot param
   (`fn f(x) { let g = () => { x = x + 1; return x }; g(); return x }` called via the VM),
@@ -487,7 +487,7 @@ Value::Closure(callee) => {
 **Files:** modify `src/vm/fiber.rs` (`Fiber::reset`), `src/vm/run.rs`; extend
 `tests/call_fast.rs`, `tests/alloc_count.rs`.
 
-- [ ] **Step 1: Write the failing tests** —
+- [x] **Step 1: Write the failing tests** —
   (a) `tests/alloc_count.rs`: re-entrant call slope (each element of a `map` over a NON-closure
   path is Phase 3; here use `recover`/method dispatch — simplest deterministic re-entry is a
   bound-method call through `call_value`):
@@ -534,8 +534,8 @@ fn reset_reestablishes_the_one_frame_invariant() {
 ```
 
   (verify `Cc::ptr_eq` exists — if not, compare via `cc_addr`/raw pointer like `gc::cc_addr`).
-- [ ] **Step 2: Run — expect FAIL** (no `reset`, no pool).
-- [ ] **Step 3: Implement** —
+- [x] **Step 2: Run — expect FAIL** (no `reset`, no pool).
+- [x] **Step 3: Implement** —
   - `src/vm/fiber.rs`:
 
 ```rust
@@ -601,19 +601,19 @@ fn return_pooled_fiber(&self, mut fiber: Fiber) {
     a fiber (read it; adopt only if it is a run-to-completion fiber). **Do NOT touch** the
     generator builds (`run.rs:1682/4512` — the handle owns those fibers), the module fiber
     (`:987`), or the program root.
-- [ ] **Step 4: Run — expect PASS** + `vm_differential` both configs + the existing
+- [x] **Step 4: Run — expect PASS** + `vm_differential` both configs + the existing
   `call_value_invokes_a_closure_repeatedly_each_on_its_own_fiber` unit (`run.rs:7701` — read
   it; if it asserts fiber NON-reuse it documents the OLD contract and must be updated to
   assert the new pooled contract with the kill switch off variant preserved — record this as a
   deliberate contract change in the commit message).
-- [ ] **Step 5: Probe tests (add to `tests/call_fast.rs`):** deep nested re-entrancy
+- [x] **Step 5: Probe tests (add to `tests/call_fast.rs`):** deep nested re-entrancy
   (`map` inside `map` inside `map` — distinct fibers live simultaneously), a panicking callee
   (fiber dropped, pool not poisoned — next call still correct), a generator + `for await`
   interleaved with pooled calls, all four-mode identical.
-- [ ] **Step 6: Measure item A3 individually** → `### A3` row in `bench/CALL_RESULTS.md`
+- [x] **Step 6: Measure item A3 individually** → `### A3` row in `bench/CALL_RESULTS.md`
   (include retained-pool memory note: ≤8 fibers/isolate).
-- [ ] **Step 7: Commit** — `git commit -m "perf(vm/call): A3 — fiber pooling at the re-entrant call funnels (CALL §4)"`.
-- [ ] **Step 8: Independent review** — reviewer hunts double-live hazards (a pooled fiber
+- [x] **Step 7: Commit** — `git commit -m "perf(vm/call): A3 — fiber pooling at the re-entrant call funnels (CALL §4)"`.
+- [x] **Step 8: Independent review** — reviewer hunts double-live hazards (a pooled fiber
   reachable twice), audits every `return_pooled_fiber` call dominates a `Done` (never an
   `Err`/`Yielded`), confirms no borrow of `fiber_pool` crosses an await (clippy
   `await_holding_refcell_ref` is the backstop but eyeball it), and stress-runs the workers
@@ -621,13 +621,13 @@ fn return_pooled_fiber(&self, mut fiber: Fiber) {
 
 ### Task 2.4: Phase 2 holistic review
 
-- [ ] **Step 1:** Holistic-review subagent over the combined Unit A diff: A1/A2/A3 compose
+- [x] **Step 1:** Holistic-review subagent over the combined Unit A diff: A1/A2/A3 compose
   (in-place binding + empty cells + pooling on one call), per-item bench rows are real, the
   differential + fuzz axis green both configs, clippy clean both configs, `cargo test` +
   `cargo test --no-default-features` green.
-- [ ] **Step 2:** Re-run `tests/vm_bench.rs` — spec/tw geomean still ≥2× and no
+- [x] **Step 2:** Re-run `tests/vm_bench.rs` — spec/tw geomean still ≥2× and no
   spec-vs-generic regression; record interim numbers in `bench/CALL_RESULTS.md`.
-- [ ] **Step 3:** Any finding becomes a tracked fix in this phase before Phase 3 starts.
+- [x] **Step 3:** Any finding becomes a tracked fix in this phase before Phase 3 starts.
 
 ---
 
@@ -638,7 +638,7 @@ fn return_pooled_fiber(&self, mut fiber: Fiber) {
 **Files:** create `src/vm/trampoline.rs`; modify `src/vm/mod.rs` (declare), `src/vm/run.rs`
 (make `run_loop_sync` reachable if LANE left it private); extend `tests/call_fast.rs`.
 
-- [ ] **Step 1: Write the failing tests** (Rust harness in `src/vm/trampoline.rs` tests +
+- [x] **Step 1: Write the failing tests** (Rust harness in `src/vm/trampoline.rs` tests +
   `tests/call_fast.rs`): build a Vm, compile a source defining a callback, fetch the closure
   value, arm a trampoline, and assert —
   (a) three sequential `call1` invocations return correct results (the same fiber reused —
@@ -652,8 +652,8 @@ fn return_pooled_fiber(&self, mut fiber: Fiber) {
   (d) `call_depth` exactly-once: a self-recursive callback trips
   `maximum recursion depth exceeded` at the identical depth under trampoline-on and
   trampoline-off (compare the two entry points' outputs).
-- [ ] **Step 2: Run — expect FAIL** (module missing).
-- [ ] **Step 3: Implement `src/vm/trampoline.rs`:**
+- [x] **Step 2: Run — expect FAIL** (module missing).
+- [x] **Step 3: Implement `src/vm/trampoline.rs`:**
 
 ```rust
 //! CALL §5 — the higher-order callback trampoline. ONE reused fiber drives a plain
@@ -813,11 +813,11 @@ impl Interp {
   `call` lazily rebuilds via `Fiber::new` — correct (reset would also be correct, but
   drop-on-err matches the pool discipline and keeps the invariant trivially provable). Add a
   unit test pinning exactly that sequence (b above).
-- [ ] **Step 4: Run — expect PASS** (a)–(d); clippy both configs (watch
+- [x] **Step 4: Run — expect PASS** (a)–(d); clippy both configs (watch
   `await_holding_refcell_ref`: `class_env()` returns an owned/cloned env — verify, don't hold
   a borrow across `t.call(...).await` in the tests).
-- [ ] **Step 5: Commit** — `git commit -m "feat(vm/call): CallbackTrampoline + CallbackDriver — one reused fiber on the sync lane, per-element escalation (CALL §5)"`.
-- [ ] **Step 6: Independent review** — reviewer probes the reset invariant adversarially
+- [x] **Step 5: Commit** — `git commit -m "feat(vm/call): CallbackTrampoline + CallbackDriver — one reused fiber on the sync lane, per-element escalation (CALL §5)"`.
+- [x] **Step 6: Independent review** — reviewer probes the reset invariant adversarially
   (panic at different depths inside the callback, propagate (`?`) inside the callback body,
   a callback that spawns an un-awaited async fn — inflight accounting unchanged), and
   verifies the escalation path against a callback that awaits a TIMER (a genuinely pending
@@ -827,7 +827,7 @@ impl Interp {
 
 **Files:** modify `src/stdlib/array.rs`, `src/stdlib/object.rs`; extend `tests/call_fast.rs`.
 
-- [ ] **Step 1: Write the failing test** — the coverage (anti-false-green) assertion:
+- [x] **Step 1: Write the failing test** — the coverage (anti-false-green) assertion:
 
 ```rust
 #[test]
@@ -850,8 +850,8 @@ fn trampoline_actually_runs_on_array_builtins() {
 
   (The `run_with_stats` helper needs a `#[doc(hidden)]` lib entry that returns the Vm's
   `call_fast_stats` alongside output — add it in this task, mirroring `vm_run_source_cfg`.)
-- [ ] **Step 2: Run — expect FAIL** (`trampoline_calls == 0` — sites not wired).
-- [ ] **Step 3: Implement** — adopt `callback_driver` at each §5.5 array/object site keeping
+- [x] **Step 2: Run — expect FAIL** (`trampoline_calls == 0` — sites not wired).
+- [x] **Step 3: Implement** — adopt `callback_driver` at each §5.5 array/object site keeping
   ONE loop per site. `map` becomes (pattern for all 11 + mapValues):
 
 ```rust
@@ -879,11 +879,11 @@ fn trampoline_actually_runs_on_array_builtins() {
   `cb.call2(v.clone(), Value::Str(k.as_str().into()))`. **Behavioral rule:** argument values,
   clone placement, truthiness checks, error messages (`array.sort comparator must return a
   number, got ...`) are untouched — only the call ceremony changes.
-- [ ] **Step 4: Run — expect PASS**; full `vm_differential` both configs (the corpus is rich
+- [x] **Step 4: Run — expect PASS**; full `vm_differential` both configs (the corpus is rich
   in map/filter/reduce — this IS the main guard); `cargo test --no-default-features` (array/
   object are core — must build & pass).
-- [ ] **Step 5: Commit** — `git commit -m "perf(stdlib/call): trampoline array.* + object.mapValues iteration sites (CALL §5.5)"`.
-- [ ] **Step 6: Independent review** — reviewer diffs each site against `main` asserting
+- [x] **Step 5: Commit** — `git commit -m "perf(stdlib/call): trampoline array.* + object.mapValues iteration sites (CALL §5.5)"`.
+- [x] **Step 6: Independent review** — reviewer diffs each site against `main` asserting
   ONLY the ceremony changed (clones/truthiness/messages identical), runs the tree-walker over
   the same corpus (`Value::Function` callbacks — `cargo test --test vm_differential` covers,
   plus an explicit `ASCRIPT_ENGINE=tree-walker` example run), and probes: empty arrays
@@ -895,24 +895,24 @@ fn trampoline_actually_runs_on_array_builtins() {
 
 **Files:** modify `src/stdlib/stream.rs`; extend `tests/call_fast.rs`.
 
-- [ ] **Step 1: Write the failing test** — a stream pipeline
+- [x] **Step 1: Write the failing test** — a stream pipeline
   (`stream.range(0, 1000).map(f).filter(g)` consumed via `each`/`reduce`/`find`) asserting
   stats moved + four-mode identity (same shape as Task 3.2's).
-- [ ] **Step 2: Run — expect FAIL** (stats zero on stream ops).
-- [ ] **Step 3: Implement** — read `stream.rs:560-710` first: the pipeline stage calls
+- [x] **Step 2: Run — expect FAIL** (stats zero on stream ops).
+- [x] **Step 3: Implement** — read `stream.rs:560-710` first: the pipeline stage calls
   (`:577/581/600`) live inside the per-pull driver and the terminal loops (`each` `:669`,
   `reduce` `:680`, `find` `:702`). Arm ONE driver per stage function at pipeline-drive setup
   (the stage fns are fixed for the pipeline's life), falling back per the same rule. If the
   stage storage makes holding a `CallbackDriver` across pulls awkward (lifetimes through the
   stream state machine), arm per terminal-loop instead and record the narrowing in the code
   comment + spec deviation note — do NOT contort the stream engine.
-- [ ] **Step 4: Run — expect PASS** + differential both configs.
-- [ ] **Step 5:** Add the §5.5 non-wired decision table as a module comment in
+- [x] **Step 4: Run — expect PASS** + differential both configs.
+- [x] **Step 5:** Add the §5.5 non-wired decision table as a module comment in
   `src/vm/trampoline.rs` (events/sync/task/timers/bench/assert/schema/net_http/workflow/
   http_server: single-shot sites, generic path, still benefit from A1/A3 — documented
   decision, not a deferral).
-- [ ] **Step 6: Commit** — `git commit -m "perf(stdlib/call): trampoline stream pipeline sites; record non-wired decision table (CALL §5.5)"`.
-- [ ] **Step 7: Independent review** — reviewer probes async stage fns in a stream (must take
+- [x] **Step 6: Commit** — `git commit -m "perf(stdlib/call): trampoline stream pipeline sites; record non-wired decision table (CALL §5.5)"`.
+- [x] **Step 7: Independent review** — reviewer probes async stage fns in a stream (must take
   the generic path), `for await` over a wired stream, backpressure unchanged.
 
 ### Task 3.4: escalation & control-flow edge battery + examples
@@ -920,39 +920,39 @@ fn trampoline_actually_runs_on_array_builtins() {
 **Files:** create `examples/functional_pipelines.as`, `examples/advanced/callback_escalation.as`;
 extend `tests/call_fast.rs`, `tests/vm_differential.rs` (corpus registration if not automatic).
 
-- [ ] **Step 1:** Write `examples/functional_pipelines.as` (intro; Gate 9 happy path):
+- [x] **Step 1:** Write `examples/functional_pipelines.as` (intro; Gate 9 happy path):
   map/filter/reduce/sort/groupBy/partition pipelines over real data, `stream.range` pipeline,
   deterministic printed output. Verify with `target/release/ascript run` and `ascript fmt`
   idempotence.
-- [ ] **Step 2:** Write `examples/advanced/callback_escalation.as` (Gate 9 edge cases,
+- [x] **Step 2:** Write `examples/advanced/callback_escalation.as` (Gate 9 edge cases,
   production-shaped, fully error-handled): a map whose callback awaits an `async fn`
   (escalation per element); a `recover`-wrapped reduce whose callback panics mid-fold; a
   filter using `?`-propagation out through the enclosing function returning `[value, err]`;
   a callback closing over a mutated local (cell capture freshness across elements); a sort
   comparator that throws on a poisoned element, recovered. Deterministic output; runs to
   completion (NOT skip-listed).
-- [ ] **Step 3:** Add the focused four-mode tests in `tests/call_fast.rs` mirroring each edge
+- [x] **Step 3:** Add the focused four-mode tests in `tests/call_fast.rs` mirroring each edge
   (panic message parity, recover catches the same `Control::Panic`, `?` carries the same pair,
   recursion-limit parity through a trampolined callback) and assert
   `trampoline_escalations > 0` on the escalation example (coverage of the fallback itself —
   anti-false-green for the escalation arm).
-- [ ] **Step 4:** Run the examples in all four modes + `.aso` (`build` then `run file.aso`) —
+- [x] **Step 4:** Run the examples in all four modes + `.aso` (`build` then `run file.aso`) —
   byte-identical; corpus tests green both configs.
-- [ ] **Step 5: Commit** — `git commit -m "examples(call): functional pipelines + escalation edge corpus (CALL Gates 9/15)"`.
-- [ ] **Step 6: Independent review** — reviewer runs both examples under
+- [x] **Step 5: Commit** — `git commit -m "examples(call): functional pipelines + escalation edge corpus (CALL Gates 9/15)"`.
+- [x] **Step 6: Independent review** — reviewer runs both examples under
   `--tree-walker`, the VM, generic, no-call-fast, AND compiled `.aso`; runs
   `ascript check` (0 diagnostics); probes one extra edge of their choosing (e.g. a worker-fn
   value passed to `map` — must dispatch to the pool, not trampoline).
 
 ### Task 3.5: Phase 3 holistic review
 
-- [ ] **Step 1:** Holistic-review subagent over the combined Unit B diff: the seam claim
+- [x] **Step 1:** Holistic-review subagent over the combined Unit B diff: the seam claim
   (tree-walker untouched — `git diff` shows no tree-walker-path behavior change; stdlib diffs
   are ceremony-only), reset invariant tests adversarially re-probed, escalation never
   re-executes an element (read the code path; confirm no `call_value` re-dispatch exists in
   the escalation arm), SP3 exactly-once audited at every increment site, clippy + full suite
   both configs.
-- [ ] **Step 2:** Findings fixed in-phase before Phase 4.
+- [x] **Step 2:** Findings fixed in-phase before Phase 4.
 
 ---
 
@@ -963,92 +963,92 @@ extend `tests/call_fast.rs`, `tests/vm_differential.rs` (corpus registration if 
 **Files:** modify `bench/CALL_RESULTS.md`; no production code (unless a gate fails — then fix
 in-branch, failing-test-first).
 
-- [ ] **Step 1:** Same-session A/B (Gate 16): in ONE session, run `bench/run_call_bench.sh`
+- [x] **Step 1:** Same-session A/B (Gate 16): in ONE session, run `bench/run_call_bench.sh`
   on `main` (worktree or stash) and on the branch head; record both tables in
   `bench/CALL_RESULTS.md` — functional-idiom workloads (the headline), object_churn,
   json_roundtrip, async workloads (expect ~no change), with wall time AND peak RSS per
   workload. Profile the headline workload with the shipped profiler
   (`ascript run --profile cpu`) before/after; paste the attribution deltas.
-- [ ] **Step 2:** Allocation counts (Gate 18): record the `tests/alloc_count.rs` slopes
+- [x] **Step 2:** Allocation counts (Gate 18): record the `tests/alloc_count.rs` slopes
   (per-call, per-element, re-entrant; on vs off) in the report. Memory regression anywhere =
   a bug to fix, never a tradeoff.
-- [ ] **Step 3:** Re-run `tests/vm_bench.rs` fully: spec/tw geomean ≥2× (Gate 17 floor) AND
+- [x] **Step 3:** Re-run `tests/vm_bench.rs` fully: spec/tw geomean ≥2× (Gate 17 floor) AND
   `dbg_zero_cost_gate` (the call path is touched — instrument==None ≈ armed-idle must hold);
   record both numbers.
-- [ ] **Step 4:** Kill-switch-off parity timing: `no_call_fast` mode within noise of
+- [x] **Step 4:** Kill-switch-off parity timing: `no_call_fast` mode within noise of
   pre-CALL `main` (the off path must cost nothing new).
-- [ ] **Step 5: Commit** — `git commit -m "bench(call): same-session A/B + allocation slopes + RSS + zero-cost gates (CALL §6/§8.4)"`.
+- [x] **Step 5: Commit** — `git commit -m "bench(call): same-session A/B + allocation slopes + RSS + zero-cost gates (CALL §6/§8.4)"`.
 
 ### Task 4.2: docs + status updates
 
 **Files:** modify `CLAUDE.md`, `superpowers/roadmap.md`, `goal-perf.md`,
 `bench/PROFILING_RESULTS.md`.
 
-- [ ] **Step 1:** `CLAUDE.md`: add a condensed CALL entry under the campaign subsystems
+- [x] **Step 1:** `CLAUDE.md`: add a condensed CALL entry under the campaign subsystems
   (the `call_fast` kill switch + fourth differential mode, the trampoline seam
   (`Value::Closure`-only ⇒ VM-only), the fiber-pool lifecycle rule (take=ownership,
   return-only-on-Done, generators never pooled), the reset invariant, and the
   alloc-count slope harness). No user-facing docs change (no API/syntax change — Gate 13
   satisfied by bench + repo docs; state this explicitly in the commit).
-- [ ] **Step 2:** `goal-perf.md`: flip CALL's status to ✅ with a one-line result summary
+- [x] **Step 2:** `goal-perf.md`: flip CALL's status to ✅ with a one-line result summary
   (measured numbers, not adjectives); add the post-CALL re-profile snapshot reference. Append
   the post-CALL section to `bench/PROFILING_RESULTS.md` (the mandatory re-profile checkpoint
   that re-ranks the remaining specs).
-- [ ] **Step 3:** `superpowers/roadmap.md`: the milestone record entry.
-- [ ] **Step 4: Commit** — `git commit -m "docs(call): CLAUDE.md/roadmap/goal-perf status + post-CALL profile snapshot"`.
+- [x] **Step 3:** `superpowers/roadmap.md`: the milestone record entry.
+- [x] **Step 4: Commit** — `git commit -m "docs(call): CLAUDE.md/roadmap/goal-perf status + post-CALL profile snapshot"`.
 
 ### Task 4.3: full matrix + Definition of Done (the gates checklist — goal.md 1–14 + goal-perf 15–18)
 
 **Files:** none (verification; fixes spawn tracked tasks).
 
-- [ ] **Gate 1 (four-mode byte-identity):** `cargo test --test vm_differential` green in BOTH
+- [x] **Gate 1 (four-mode byte-identity):** `cargo test --test vm_differential` green in BOTH
   feature configs; examples identical on tree-walker / specialized / generic / no-call-fast /
   `.aso`-compiled.
-- [ ] **Gate 2 (clippy):** `cargo clippy --all-targets` AND
+- [x] **Gate 2 (clippy):** `cargo clippy --all-targets` AND
   `cargo clippy --no-default-features --all-targets` clean.
-- [ ] **Gate 3 (tests):** `cargo test` AND `cargo test --no-default-features` green
+- [x] **Gate 3 (tests):** `cargo test` AND `cargo test --no-default-features` green
   (including `tests/alloc_count.rs`, `tests/call_fast.rs`).
-- [ ] **Gate 4 (no borrow across await):** audited — `fiber_pool`/trampoline borrows are
+- [x] **Gate 4 (no borrow across await):** audited — `fiber_pool`/trampoline borrows are
   synchronous; clippy `await_holding_refcell_ref` clean.
-- [ ] **Gate 5 (zero `type-*` corpus FPs):** `ascript check` over `examples/**` emits 0
+- [x] **Gate 5 (zero `type-*` corpus FPs):** `ascript check` over `examples/**` emits 0
   type/exhaustiveness diagnostics in both configs (the new examples included).
-- [ ] **Gate 6 (no placeholders/silent deferrals):** the non-wired callback sites and the
+- [x] **Gate 6 (no placeholders/silent deferrals):** the non-wired callback sites and the
   CallMethod in-place follow-up are DOCUMENTED decisions (§7/§5.5), not silent drops; grep for
   TODO/unimplemented in the diff.
-- [ ] **Gate 7 (corpus migrated, never deleted):** no example/golden removed.
-- [ ] **Gate 8 (continuous infra):** the differential fuzzer (fourth axis) + `tests/property.rs`
+- [x] **Gate 7 (corpus migrated, never deleted):** no example/golden removed.
+- [x] **Gate 8 (continuous infra):** the differential fuzzer (fourth axis) + `tests/property.rs`
   four-way + CI fuzz smoke green.
-- [ ] **Gate 9 (examples happy+edge):** `functional_pipelines.as` +
+- [x] **Gate 9 (examples happy+edge):** `functional_pipelines.as` +
   `advanced/callback_escalation.as` runnable, fmt-idempotent, four-mode tested.
-- [ ] **Gate 10 (unit tests happy+edge):** reset invariant, panic/propagate/recover,
+- [x] **Gate 10 (unit tests happy+edge):** reset invariant, panic/propagate/recover,
   recursion-limit parity, empty-input, rest/defaults/contract shapes, pool re-entrancy — all
   present and green both configs.
-- [ ] **Gate 11 (tooling parity):** no syntax/surface change ⇒ no grammar/LSP/fmt/REPL change;
+- [x] **Gate 11 (tooling parity):** no syntax/surface change ⇒ no grammar/LSP/fmt/REPL change;
   CONFIRM by running `tests/treesitter_conformance.rs` + `tests/frontend_conformance.rs` +
   `tests/lsp.rs` (green, untouched) and a REPL smoke (`map` over a closure in the REPL session
   Vm — the persistent-Vm path uses the same call paths).
-- [ ] **Gate 12/17 (zero perf regression + the floor):** spec/tw geomean ≥2× holds;
+- [x] **Gate 12/17 (zero perf regression + the floor):** spec/tw geomean ≥2× holds;
   `dbg_zero_cost_gate` re-run green; no-call-fast mode at parity with pre-CALL baseline
   (recorded Task 4.1).
-- [ ] **Gate 13 (docs):** Task 4.2 landed; bench report complete; no stale doc claims.
-- [ ] **Gate 14 (production-grade, zero lingering bugs):** every bug found en route fixed
+- [x] **Gate 13 (docs):** Task 4.2 landed; bench report complete; no stale doc claims.
+- [x] **Gate 14 (production-grade, zero lingering bugs):** every bug found en route fixed
   in-branch with a failing-test-first regression guard (list them in the PR description);
   independent reviewers' open findings all closed.
-- [ ] **Gate 15 (new config = differential mode + fuzz axis, with coverage):** the
+- [x] **Gate 15 (new config = differential mode + fuzz axis, with coverage):** the
   no-call-fast mode + fuzz axis landed in the SAME PR as the first fast path (Phase 1 before
   Phase 2 — verify commit order); coverage assertions (`trampoline_calls > 0`,
   `inplace_binds > 0`, `trampoline_escalations > 0` on the escalation example) green —
   anti-false-green proven.
-- [ ] **Gate 16 (same-session A/B):** `bench/CALL_RESULTS.md` baseline and candidate measured
+- [x] **Gate 16 (same-session A/B):** `bench/CALL_RESULTS.md` baseline and candidate measured
   in one session on one machine, shipped profiler used.
-- [ ] **Gate 18 (memory measured):** allocation slopes + peak RSS recorded before/after; no
+- [x] **Gate 18 (memory measured):** allocation slopes + peak RSS recorded before/after; no
   regression unexplained.
-- [ ] **Final holistic review (whole-effort):** a fresh subagent over the ENTIRE branch diff —
+- [x] **Final holistic review (whole-effort):** a fresh subagent over the ENTIRE branch diff —
   spec §1–§9 coverage table, every plan checkbox ticked, zero open deferrals beyond the two
   recorded follow-ups (CallMethod in-place → DECODE; smallvec alternative → recorded decision),
   cross-phase composition probe (a functional pipeline inside a worker isolate inside a
   recovered panic, four-mode identical).
-- [ ] **Merge:** `--no-ff` to `main` once everything above is green.
+- [x] **Merge:** `--no-ff` to `main` once everything above is green.
 
 ---
 
