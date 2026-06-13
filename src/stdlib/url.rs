@@ -274,7 +274,7 @@ mod tests {
     /// Pull a named field from a `Value::Object`.
     fn field(obj: &Value, key: &str) -> Value {
         match obj {
-            Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
             _ => panic!("not an object: {:?}", obj),
         }
     }
@@ -349,9 +349,8 @@ mod tests {
         let obj = call("parseQuery", &[s("a=1&b=2&a=3")], sp()).unwrap();
         match &obj {
             Value::Object(o) => {
-                let borrow = o.borrow();
-                assert_eq!(borrow.get("a"), Some(&s("3")));
-                assert_eq!(borrow.get("b"), Some(&s("2")));
+                assert_eq!(o.get("a"), Some(s("3")));
+                assert_eq!(o.get("b"), Some(s("2")));
             }
             _ => panic!("expected object, got {:?}", obj),
         }
@@ -368,7 +367,7 @@ mod tests {
     fn parse_query_empty() {
         let obj = call("parseQuery", &[s("")], sp()).unwrap();
         match &obj {
-            Value::Object(o) => assert!(o.borrow().is_empty()),
+            Value::Object(o) => assert!(o.is_empty()),
             _ => panic!("expected object"),
         }
     }

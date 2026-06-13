@@ -513,9 +513,8 @@ mod tests {
                         let rs = rs.borrow();
                         assert_eq!(rs.len(), 1, "one row expected");
                         if let Value::Object(o) = &rs[0] {
-                            let o = o.borrow();
-                            assert_eq!(o.get("id"), Some(&Value::Int(1)));
-                            assert_eq!(o.get("name"), Some(&Value::Str("ada".into())));
+                            assert_eq!(o.get("id"), Some(Value::Int(1)));
+                            assert_eq!(o.get("name"), Some(Value::Str("ada".into())));
                         }
                     }
                 }

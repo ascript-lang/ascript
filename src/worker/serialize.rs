@@ -1057,7 +1057,7 @@ mod tests {
             .insert("self".to_string(), Value::Object(o.clone()));
         let back = rt(&Value::Object(o));
         if let Value::Object(obj) = &back {
-            let inner = obj.borrow().get("self").cloned().unwrap();
+            let inner = obj.get("self").unwrap();
             assert!(matches!(&inner, Value::Object(i) if crate::gc::cc_ptr_eq(obj, i)));
         } else {
             panic!("expected object");
@@ -1176,7 +1176,7 @@ mod tests {
         // Objects are identity-equal containers, so compare the nested variant (which
         // IS structural). The decoded object must hold an equal `Circle(radius: 1.5)`.
         if let Value::Object(ob) = &back {
-            let inner = ob.borrow().get("shape").cloned().expect("shape field");
+            let inner = ob.get("shape").expect("shape field");
             assert_eq!(inner, circle);
         } else {
             panic!("expected an object");
@@ -1447,9 +1447,8 @@ mod tests {
         let back = decode_with_shared(&bytes, &shared, &interp).unwrap();
         match back {
             Value::Object(o) => {
-                let b = o.borrow();
-                assert!(matches!(b.get("cfg"), Some(Value::Shared(_))));
-                assert_eq!(b.get("n"), Some(&Value::Int(1)));
+                assert!(matches!(o.get("cfg"), Some(Value::Shared(_))));
+                assert_eq!(o.get("n"), Some(Value::Int(1)));
             }
             _ => panic!(),
         }

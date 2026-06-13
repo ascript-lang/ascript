@@ -111,7 +111,7 @@ fn diff_inner(
                         let base = path.len();
                         path.push('.');
                         path.push_str(k.as_ref());
-                        diff_inner(&va, &vb, path, depth + 1, seen, out);
+                        diff_inner(va, &vb, path, depth + 1, seen, out);
                         path.truncate(base);
                     }
                     None => out.push_str(&format!("- {}.{}: {}\n", path, k, va)),

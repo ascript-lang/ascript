@@ -204,7 +204,7 @@ mod tests {
             Value::Array(arr) => {
                 let b = arr.borrow();
                 match &b[1] {
-                    Value::Object(o) => match o.borrow().get("message") {
+                    Value::Object(o) => match o.get("message") {
                         Some(Value::Str(s)) => assert!(s.contains("a.c"), "msg: {}", s),
                         _ => panic!("no message"),
                     },

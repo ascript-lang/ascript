@@ -300,14 +300,13 @@ mod tests {
         let v = call("memory", &[], sp()).unwrap();
         match v {
             Value::Object(o) => {
-                let map = o.borrow();
-                let total = match map.get("total") {
-                    Some(Value::Float(n)) => *n,
+                let total = match o.get("total") {
+                    Some(Value::Float(n)) => n,
                     other => panic!("memory().total should be a Number, got {:?}", other),
                 };
                 assert!(total > 0.0, "memory().total should be > 0, got {}", total);
-                let used = match map.get("used") {
-                    Some(Value::Float(n)) => *n,
+                let used = match o.get("used") {
+                    Some(Value::Float(n)) => n,
                     other => panic!("memory().used should be a Number, got {:?}", other),
                 };
                 assert!(
@@ -317,11 +316,8 @@ mod tests {
                     total
                 );
                 // Check all four keys exist
-                assert!(map.contains_key("free"), "memory() missing 'free'");
-                assert!(
-                    map.contains_key("available"),
-                    "memory() missing 'available'"
-                );
+                assert!(o.contains_key("free"), "memory() missing 'free'");
+                assert!(o.contains_key("available"), "memory() missing 'available'");
             }
             other => panic!("memory() should return an Object, got {:?}", other),
         }
@@ -333,14 +329,13 @@ mod tests {
         let v = call("swap", &[], sp()).unwrap();
         match v {
             Value::Object(o) => {
-                let map = o.borrow();
-                let total = match map.get("total") {
-                    Some(Value::Float(n)) => *n,
+                let total = match o.get("total") {
+                    Some(Value::Float(n)) => n,
                     other => panic!("swap().total should be a Number, got {:?}", other),
                 };
                 assert!(total >= 0.0, "swap().total should be >= 0, got {}", total);
-                assert!(map.contains_key("used"), "swap() missing 'used'");
-                assert!(map.contains_key("free"), "swap() missing 'free'");
+                assert!(o.contains_key("used"), "swap() missing 'used'");
+                assert!(o.contains_key("free"), "swap() missing 'free'");
             }
             other => panic!("swap() should return an Object, got {:?}", other),
         }
@@ -352,11 +347,10 @@ mod tests {
         let v = call("loadAvg", &[], sp()).unwrap();
         match v {
             Value::Object(o) => {
-                let map = o.borrow();
                 for key in &["one", "five", "fifteen"] {
-                    match map.get(*key) {
+                    match o.get(key) {
                         Some(Value::Float(n)) => {
-                            assert!(*n >= 0.0, "loadAvg().{} should be >= 0, got {}", key, n)
+                            assert!(n >= 0.0, "loadAvg().{} should be >= 0, got {}", key, n)
                         }
                         other => panic!("loadAvg().{} should be a Number, got {:?}", key, other),
                     }
@@ -377,12 +371,11 @@ mod tests {
                 for item in items.iter() {
                     match item {
                         Value::Object(o) => {
-                            let map = o.borrow();
-                            assert!(map.contains_key("mount"), "disk entry missing 'mount'");
-                            assert!(map.contains_key("total"), "disk entry missing 'total'");
-                            assert!(map.contains_key("free"), "disk entry missing 'free'");
+                            assert!(o.contains_key("mount"), "disk entry missing 'mount'");
+                            assert!(o.contains_key("total"), "disk entry missing 'total'");
+                            assert!(o.contains_key("free"), "disk entry missing 'free'");
                             assert!(
-                                map.contains_key("available"),
+                                o.contains_key("available"),
                                 "disk entry missing 'available'"
                             );
                         }
@@ -415,13 +408,12 @@ mod tests {
                 for item in items.iter() {
                     match item {
                         Value::Object(o) => {
-                            let map = o.borrow();
-                            assert!(map.contains_key("name"), "interface entry missing 'name'");
+                            assert!(o.contains_key("name"), "interface entry missing 'name'");
                             assert!(
-                                map.contains_key("addresses"),
+                                o.contains_key("addresses"),
                                 "interface entry missing 'addresses'"
                             );
-                            match map.get("addresses") {
+                            match o.get("addresses") {
                                 Some(Value::Array(_)) => {}
                                 other => {
                                     panic!("interface.addresses should be Array, got {:?}", other)

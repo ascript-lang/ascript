@@ -1495,7 +1495,7 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object: {:?}", v)
         };
-        match o.borrow().get(key) {
+        match o.get(key) {
             Some(Value::Str(s)) => s.to_string(),
             other => panic!("field {} not a string: {:?}", key, other),
         }
@@ -1504,8 +1504,8 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object")
         };
-        match o.borrow().get(key) {
-            Some(Value::Bool(b)) => *b,
+        match o.get(key) {
+            Some(Value::Bool(b)) => b,
             other => panic!("field {} not a bool: {:?}", key, other),
         }
     }
@@ -1513,7 +1513,7 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object")
         };
-        match o.borrow().get(key).map(|v| (v.as_f64(), v.clone())) {
+        match o.get(key).map(|v| (v.as_f64(), v)) {
             Some((Some(n), _)) => n,
             other => panic!("field {} not a number: {:?}", key, other),
         }
@@ -1522,7 +1522,7 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object")
         };
-        matches!(o.borrow().get(key), Some(Value::Nil) | None)
+        matches!(o.get(key), Some(Value::Nil) | None)
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Event {

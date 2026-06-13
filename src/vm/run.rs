@@ -2174,7 +2174,7 @@ impl Vm {
                             }
                         }
                         _ => crate::interp::index_set(&obj, &idx, val, span, span)
-                            .map_err(|e| Control::Panic(e))?,
+                            .map_err(Control::Panic)?,
                     };
                     fiber.push(v);
                 }

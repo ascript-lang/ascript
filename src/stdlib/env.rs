@@ -133,7 +133,7 @@ mod tests {
             Value::Object(o) => o.clone(),
             other => panic!("vars() should return an object, got {:?}", other),
         };
-        assert_eq!(obj.borrow().get(key), Some(&s("present")));
+        assert_eq!(obj.get(key), Some(s("present")));
         call("unset", &[s(key)], sp()).unwrap();
     }
 

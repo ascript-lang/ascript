@@ -284,9 +284,8 @@ mod tests {
         let out = roundtrip(obj);
         match out {
             Value::Object(o) => {
-                let b = o.borrow();
-                assert_eq!(b.get("name"), Some(&Value::Str("Ada".into())));
-                match b.get("nums") {
+                assert_eq!(o.get("name"), Some(Value::Str("Ada".into())));
+                match o.get("nums") {
                     Some(Value::Array(a)) => assert_eq!(a.borrow().len(), 2),
                     other => panic!("nums not an array: {:?}", other),
                 }
@@ -340,7 +339,7 @@ mod tests {
             let b = a.borrow();
             match &b[0] {
                 Value::Object(o) => {
-                    assert_eq!(o.borrow().get("a"), Some(&Value::Float(1.0)))
+                    assert_eq!(o.get("a"), Some(Value::Float(1.0)))
                 }
                 other => panic!("expected object, got {:?}", other),
             }

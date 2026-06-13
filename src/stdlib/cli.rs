@@ -930,7 +930,7 @@ mod tests {
 
     fn get_field(v: &Value, key: &str) -> Value {
         match v {
-            Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
             _ => Value::Nil,
         }
     }

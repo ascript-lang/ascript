@@ -1010,7 +1010,7 @@ fn align_up(offset: usize, align: usize) -> usize {
 /// You pass it as a `ffi.ptr` out-param, then read fields back with `ffi.get`.
 fn ffi_alloc(args: &[Value], span: Span) -> Result<Value, Control> {
     let layout = super::want_object(&super::arg(args, 0), span, "ffi.alloc")?;
-    let size = match layout.borrow().get("size") {
+    let size = match layout.get("size").as_ref() {
         // Bound the size before the `vec![0u8; size]` allocation: a crafted layout
         // object with a huge `size` (`i64::MAX`) would otherwise OOM-abort the host.
         // The cap is `u32::MAX` (= 4 GiB − 1 byte; "4 GiB" below is the rounded
@@ -1278,7 +1278,7 @@ mod tests {
 
     /// A Tier-1 error value is `{message: <Str>}` (via `make_error`).
     fn is_error_object(v: &Value) -> bool {
-        matches!(v, Value::Object(o) if matches!(o.borrow().get("message"), Some(Value::Str(_))))
+        matches!(v, Value::Object(o) if matches!(o.get("message"), Some(Value::Str(_))))
     }
 
     /// Open a library and resolve a symbol, unwrapping the Tier-1 `[value, err]`.
@@ -1517,18 +1517,17 @@ mod tests {
         )
         .unwrap();
         if let Value::Object(o) = layout {
-            let o = o.borrow();
-            assert_eq!(o.get("size"), Some(&Value::Int(16)));
-            assert_eq!(o.get("align"), Some(&Value::Int(8)));
+            assert_eq!(o.get("size"), Some(Value::Int(16)));
+            assert_eq!(o.get("align"), Some(Value::Int(8)));
             if let Some(Value::Array(fields)) = o.get("fields") {
                 let fields = fields.borrow();
                 // x@0
                 if let Value::Object(f0) = &fields[0] {
-                    assert_eq!(f0.borrow().get("offset"), Some(&Value::Int(0)));
+                    assert_eq!(f0.get("offset"), Some(Value::Int(0)));
                 }
                 // y@8
                 if let Value::Object(f1) = &fields[1] {
-                    assert_eq!(f1.borrow().get("offset"), Some(&Value::Int(8)));
+                    assert_eq!(f1.get("offset"), Some(Value::Int(8)));
                 }
             } else {
                 panic!("no fields");
@@ -1635,6 +1634,27 @@ mod tests {
         assert!(want_int_in_range(&Value::Int(-1), 0, u8::MAX as i64, "u8", 0, span()).is_err());
         assert!(want_int(&Value::Int(-1), "u64", 0, span()).is_ok());
         let _ = interp; // keep an interp to mirror the other tests' shape
+    }
+
+    // ── SHAPE Task 3.1 slab-mode regression test ──────────────────────────────
+    // Before the fix, `ffi_alloc` called `.borrow()` on the user-supplied layout
+    // object.  On the VM every object literal is a slab-mode object, so this path
+    // panicked with "ObjectCell::borrow() called on a slab-mode object".
+    // This test uses `vm_run_source` to build a real slab layout and call
+    // `ffi.alloc`, reproducing the panic before the fix.
+
+    #[tokio::test]
+    async fn vm_ffi_alloc_with_slab_layout_object() {
+        let src = r#"
+import { alloc } from "std/ffi"
+let layout = { size: 16, align: 8 }
+let buf = alloc(layout)
+print(buf != nil)
+"#;
+        let (out, _) = crate::vm_run_source(src)
+            .await
+            .expect("ffi.alloc with slab layout object must not panic");
+        assert_eq!(out.trim(), "true");
     }
 
     // ───────────────────────── FFI Task 10 — SP9 determinism seam ─────────────

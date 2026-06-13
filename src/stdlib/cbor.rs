@@ -250,8 +250,7 @@ mod tests {
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         match roundtrip(obj) {
             Value::Object(o) => {
-                let b = o.borrow();
-                assert_eq!(b.get("ok"), Some(&Value::Bool(true)));
+                assert_eq!(o.get("ok"), Some(Value::Bool(true)));
             }
             other => panic!("expected object, got {:?}", other),
         }
@@ -294,7 +293,7 @@ mod tests {
         if let Value::Array(a) = pair {
             let b = a.borrow();
             match &b[0] {
-                Value::Object(o) => assert_eq!(o.borrow().get("a"), Some(&Value::Float(1.0))),
+                Value::Object(o) => assert_eq!(o.get("a"), Some(Value::Float(1.0))),
                 other => panic!("expected object, got {:?}", other),
             }
         }

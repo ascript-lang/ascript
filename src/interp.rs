@@ -966,36 +966,33 @@ impl TestSummary {
     /// result is a clean error at the call site, never a panic).
     pub fn from_value(v: &Value) -> Option<TestSummary> {
         let obj = v.as_object()?;
-        let map = obj.borrow();
-        let passed = match map.get("passed")? {
-            Value::Int(n) if *n >= 0 => *n as usize,
+        let passed = match obj.get("passed")? {
+            Value::Int(n) if n >= 0 => n as usize,
             _ => return None,
         };
-        let failed = match map.get("failed")? {
-            Value::Int(n) if *n >= 0 => *n as usize,
+        let failed = match obj.get("failed")? {
+            Value::Int(n) if n >= 0 => n as usize,
             _ => return None,
         };
         // DX D2 Task 10: `filtered` is tolerated-absent (default 0) for forward/back
         // compatibility of the airlock shape.
-        let filtered = match map.get("filtered") {
-            Some(Value::Int(n)) if *n >= 0 => *n as usize,
+        let filtered = match obj.get("filtered") {
+            Some(Value::Int(n)) if n >= 0 => n as usize,
             Some(_) => return None,
             None => 0,
         };
-        let failures_val = map.get("failures")?;
-        let arr = match failures_val {
-            Value::Array(a) => a.borrow(),
+        let arr = match obj.get("failures")? {
+            Value::Array(a) => a.borrow().clone(),
             _ => return None,
         };
         let mut failures = Vec::with_capacity(arr.len());
         for entry in arr.iter() {
             let fobj = entry.as_object()?;
-            let fmap = fobj.borrow();
-            let name = match fmap.get("name")? {
+            let name = match fobj.get("name")? {
                 Value::Str(s) => s.to_string(),
                 _ => return None,
             };
-            let message = match fmap.get("message")? {
+            let message = match fobj.get("message")? {
                 Value::Str(s) => s.to_string(),
                 _ => return None,
             };

@@ -465,18 +465,18 @@ mod tests {
         let st = call("stat", &[s(&f)], sp()).unwrap();
         let o = unwrap_pair_ok(&st);
         let o = match &o {
-            Value::Object(o) => o.borrow(),
+            Value::Object(o) => o,
             other => panic!("expected object, got {:?}", other),
         };
-        assert_eq!(o.get("size"), Some(&Value::Int(5)));
-        assert_eq!(o.get("isFile"), Some(&Value::Bool(true)));
-        assert_eq!(o.get("isDir"), Some(&Value::Bool(false)));
+        assert_eq!(o.get("size"), Some(Value::Int(5)));
+        assert_eq!(o.get("isFile"), Some(Value::Bool(true)));
+        assert_eq!(o.get("isDir"), Some(Value::Bool(false)));
         assert!(matches!(o.get("modifiedMs"), Some(Value::Float(_))));
         // and a directory
         let st_dir = call("stat", &[s(&path_str(&dir))], sp()).unwrap();
         let od = unwrap_pair_ok(&st_dir);
         if let Value::Object(o) = &od {
-            assert_eq!(o.borrow().get("isDir"), Some(&Value::Bool(true)));
+            assert_eq!(o.get("isDir"), Some(Value::Bool(true)));
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -644,7 +644,6 @@ mod tests {
             .iter()
             .map(|m| match m {
                 Value::Object(o) => {
-                    let o = o.borrow();
                     let line = o.get("line").and_then(|v| v.as_f64()).unwrap_or(-1.0);
                     let col = o.get("column").and_then(|v| v.as_f64()).unwrap_or(-1.0);
                     let text = o.get("text").map(|t| t.to_string()).unwrap_or_default();
