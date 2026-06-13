@@ -389,13 +389,13 @@ impl Interp {
                         .into());
                     }
                 },
-                Value::Instance(inst) => match inst.borrow().fields.get("kind") {
+                Value::Instance(inst) => match inst.borrow().get("kind") {
                     Some(Value::Str(s)) => s.clone(),
                     Some(other) => {
                         return Err(AsError::at(
                             format!(
                                 "task.pipe: yielded item's 'kind' field must be a string, got {}",
-                                crate::interp::type_name(other)
+                                crate::interp::type_name(&other)
                             ),
                             span,
                         )

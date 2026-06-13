@@ -325,9 +325,22 @@ impl Trace for SetCell {
 
 impl Trace for Instance {
     fn trace(&self, tracer: &mut Tracer) {
-        // `class: Rc<Class>` is acyclic (no cycle-capable Values), `shape_id` is
-        // a Cell<u32>. Only `fields: IndexMap<String, Value>` can hold cycles.
-        trace_index_map(&self.fields, tracer);
+        // `class: Rc<Class>` is acyclic (no cycle-capable Values), `shape_id`/
+        // `frozen` are scalar Cells. Only the field VALUES can hold cycles. SHAPE
+        // Task 3.4: `fields` is now `ObjectStorage` — trace it exactly as the
+        // `ObjectCell` two-arm trace does (the slab `keys: Rc<[Rc<str>]>` are
+        // acyclic immutable string data owned by the Vm's ShapeRegistry, NOT
+        // traced; in dict mode the String keys' trace() is a no-op).
+        match &self.fields {
+            crate::value::ObjectStorage::Slab { keys: _, values } => {
+                for v in values.iter() {
+                    v.trace(tracer);
+                }
+            }
+            crate::value::ObjectStorage::Dict(m) => {
+                trace_index_map(m, tracer);
+            }
+        }
     }
 
     fn is_type_tracked() -> bool {
@@ -774,18 +787,16 @@ mod tests {
         let mut held_inst = Vec::with_capacity(N);
         for _ in 0..N {
             let mk = || {
-                Value::Instance(Cc::new(RefCell::new(Instance {
-                    class: class.clone(),
-                    fields: IndexMap::new(),
-                    shape_id: Cell::new(0),
-                    frozen: Cell::new(false),
-                })))
+                Value::Instance(Cc::new(RefCell::new(Instance::from_dict(
+                    class.clone(),
+                    IndexMap::new(),
+                ))))
             };
             let a = mk();
             let b = mk();
             if let (Value::Instance(ia), Value::Instance(ib)) = (&a, &b) {
-                ia.borrow_mut().fields.insert("other".into(), b.clone());
-                ib.borrow_mut().fields.insert("other".into(), a.clone());
+                ia.borrow_mut().insert("other", b.clone());
+                ib.borrow_mut().insert("other", a.clone());
             }
             held_inst.push((a, b));
         }

@@ -236,8 +236,8 @@ fn check_inner(
             if seen.insert(id, ()).is_some() {
                 return Ok(());
             }
-            let borrow = inst.borrow();
-            for (k, val) in borrow.fields.iter() {
+            let entries = inst.borrow().entries();
+            for (k, val) in &entries {
                 let len = path.len();
                 push_member(path, k);
                 check_inner(val, path, seen)?;
@@ -562,9 +562,9 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
                 let borrow = inst.borrow();
                 w.str(&borrow.class.name);
                 let fields: Vec<(String, Value)> = borrow
-                    .fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .entries()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
                     .collect();
                 drop(borrow);
                 w.u32(fields.len() as u32);
@@ -827,19 +827,18 @@ fn decode_value(
             // Allocate the empty instance and register it BEFORE reading fields so a
             // self-referential field resolves to the same handle.
             let class = resolve_class(interp, &class_name);
-            let cell = gcmodule::Cc::new(std::cell::RefCell::new(crate::value::Instance {
-                class,
-                fields: indexmap::IndexMap::new(),
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            }));
+            // The airlock rebuilds instances in DICT mode (shape 0) — the receiving
+            // isolate's VM grows shapes on its OWN writes (SHAPE Task 3.4).
+            let cell = gcmodule::Cc::new(std::cell::RefCell::new(
+                crate::value::Instance::from_dict(class, indexmap::IndexMap::new()),
+            ));
             let value = Value::Instance(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
                 let k = r.str()?;
                 let v = decode_value(r, table, shared, interp)?;
-                cell.borrow_mut().fields.insert(k, v);
+                cell.borrow_mut().insert(&k, v);
             }
             Ok(value)
         }
@@ -1081,19 +1080,16 @@ mod tests {
         let mut fields = IndexMap::new();
         fields.insert("x".to_string(), num(1.0));
         fields.insert("y".to_string(), num(2.0));
-        let inst = Value::Instance(gcmodule::Cc::new(RefCell::new(crate::value::Instance {
-            class,
-            fields,
-            shape_id: std::cell::Cell::new(0),
-            frozen: std::cell::Cell::new(false),
-        })));
+        let inst = Value::Instance(gcmodule::Cc::new(RefCell::new(
+            crate::value::Instance::from_dict(class, fields),
+        )));
         let back = rt(&inst);
         assert_eq!(format!("{back}"), format!("{inst}"));
         if let Value::Instance(i) = &back {
             let b = i.borrow();
             assert_eq!(b.class.name, "P");
-            assert_eq!(b.fields.get("x"), Some(&num(1.0)));
-            assert_eq!(b.fields.get("y"), Some(&num(2.0)));
+            assert_eq!(b.get("x"), Some(num(1.0)));
+            assert_eq!(b.get("y"), Some(num(2.0)));
         } else {
             panic!("expected instance");
         }

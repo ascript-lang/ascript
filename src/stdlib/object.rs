@@ -92,11 +92,9 @@ fn deep_equal_inner(
             }
             let (x, y) = (x.borrow(), y.borrow());
             Rc::ptr_eq(&x.class, &y.class)
-                && x.fields.len() == y.fields.len()
-                && x.fields.iter().all(|(k, v)| {
-                    y.fields
-                        .get(k)
-                        .is_some_and(|w| deep_equal_inner(v, w, seen))
+                && x.len() == y.len()
+                && x.entries().iter().all(|(k, v)| {
+                    y.get(k).is_some_and(|w| deep_equal_inner(v, &w, seen))
                 })
         }
         // Identity equality for regex/native/enum/function/future/generator/etc.
@@ -175,20 +173,20 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             }
             let (class, fields) = {
                 let src = rc.borrow();
-                (src.class.clone(), src.fields.clone())
+                (src.class.clone(), src.entries())
             };
-            let out = gcmodule::Cc::new(RefCell::new(Instance {
+            // Deep clones build a fresh DICT-mode instance (shape 0), matching every
+            // other non-VM construction path (SHAPE Task 3.4).
+            let out = gcmodule::Cc::new(RefCell::new(Instance::from_dict(
                 class,
-                fields: IndexMap::new(),
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            }));
+                IndexMap::new(),
+            )));
             let cloned = Value::Instance(out.clone());
             seen.insert(key, cloned.clone());
             {
                 let mut dst = out.borrow_mut();
-                for (k, val) in fields.iter() {
-                    dst.fields.insert(k.clone(), deep_clone(val, seen));
+                for (k, val) in &fields {
+                    dst.insert(k.as_ref(), deep_clone(val, seen));
                 }
             }
             cloned
@@ -209,12 +207,12 @@ fn object_like_fields(
     ctx: &str,
 ) -> Result<IndexMap<String, Value>, Control> {
     match v {
-        // SHAPE Task 1.3: ObjectCell arm routes through the accessor API.
-        // Instance.fields stays a pub IndexMap until Phase 3.4 migrates it;
-        // the return type (IndexMap<String,Value>) ties both arms together —
-        // changing it requires updating pick/omit/mapValues at the same time.
+        // SHAPE Tasks 1.3 / 3.4: both arms route through the shared `to_index_map`
+        // accessor (Object and Instance now use `ObjectStorage`). The return type
+        // (IndexMap<String,Value>) ties both arms together — changing it requires
+        // updating pick/omit/mapValues at the same time.
         Value::Object(o) => Ok(o.to_index_map()),
-        Value::Instance(i) => Ok(i.borrow().fields.clone()),
+        Value::Instance(i) => Ok(i.borrow().to_index_map()),
         _ => Err(AsError::at(format!("{} expects an object or instance", ctx), span).into()),
     }
 }

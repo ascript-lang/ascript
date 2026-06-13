@@ -3070,7 +3070,7 @@ impl Interp {
                     match &v {
                         Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
                         Value::Instance(i) => {
-                            i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil)
+                            i.borrow().get(key).unwrap_or(Value::Nil)
                         }
                         _ => Value::Nil,
                     }
@@ -3092,9 +3092,9 @@ impl Interp {
                             }
                         }
                         Value::Instance(i) => {
-                            for (k, val) in i.borrow().fields.iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), val.clone());
+                            for (k, val) in i.borrow().entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), val);
                                 }
                             }
                         }
@@ -4082,7 +4082,7 @@ impl Interp {
                         .into_iter()
                         .map(|(k, v)| (k.to_string(), v))
                         .collect(),
-                    Value::Instance(i) => i.borrow().fields.clone(),
+                    Value::Instance(i) => i.borrow().to_index_map(),
                     _ => return Ok(false),
                 };
                 for entry in entries {
@@ -4486,8 +4486,8 @@ impl Interp {
             },
             Value::Instance(inst) => {
                 let b = inst.borrow();
-                if let Some(v) = b.fields.get(name) {
-                    return Ok(v.clone());
+                if let Some(v) = b.get(name) {
+                    return Ok(v);
                 }
                 match crate::value::find_method(&b.class, name) {
                     Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(
@@ -5715,12 +5715,9 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let instance = gcmodule::Cc::new(std::cell::RefCell::new(crate::value::Instance {
-            class: class.clone(),
-            fields: indexmap::IndexMap::new(),
-            shape_id: std::cell::Cell::new(0),
-            frozen: std::cell::Cell::new(false),
-        }));
+        let instance = gcmodule::Cc::new(std::cell::RefCell::new(
+            crate::value::Instance::from_dict(class.clone(), indexmap::IndexMap::new()),
+        ));
         let inst_val = Value::Instance(instance.clone());
         // Pre-populate declared-field defaults (merged base-class first so a
         // subclass default overrides). `init` may then override; `.from` (Task 4)
@@ -5736,7 +5733,7 @@ impl Interp {
                 if !self.check_type_env(&dv, &schema.ty, &def_class.def_env)? {
                     return Err(contract_panic(&schema.ty, &dv, span));
                 }
-                instance.borrow_mut().fields.insert(fname.clone(), dv);
+                instance.borrow_mut().insert(&fname, dv);
             }
         }
         match crate::value::find_method(&class, "init") {
@@ -5761,7 +5758,7 @@ impl Interp {
                 let fields = crate::value::merged_field_schema(&class);
                 let bindings = auto_init_bindings(&fields, &class.name, args, span)?;
                 for (fname, v) in bindings {
-                    instance.borrow_mut().fields.insert(fname, v);
+                    instance.borrow_mut().insert(&fname, v);
                 }
             }
         }
@@ -5859,12 +5856,7 @@ impl Interp {
         }
 
         Ok(Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
-            crate::value::Instance {
-                class: class.clone(),
-                fields: inst_fields,
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            },
+            crate::value::Instance::from_dict(class.clone(), inst_fields),
         ))))
     }
 
@@ -6810,6 +6802,30 @@ impl Interp {
         }
     }
 
+    /// Run the declared field-type CONTRACT for an instance field write (SHAPE Task
+    /// 3.4). The SINGLE source of truth both engines reach: the tree-walker via
+    /// `set_member` (above) and the VM via `vm_set_prop` (which performs the slab
+    /// transition itself but routes the contract through HERE), so the contract
+    /// verdict + the `contract_panic` message/span are byte-identical by
+    /// construction. A no-op when `name` is not a declared field (undeclared adds
+    /// carry no contract).
+    pub(crate) fn check_instance_field_contract(
+        &self,
+        class: &std::rc::Rc<crate::value::Class>,
+        name: &str,
+        value: &Value,
+        value_span: Span,
+    ) -> Result<(), Control> {
+        if let Some(schema) = lookup_field_schema(class, name) {
+            // IFACE: env-aware against the class's def env so an interface-typed
+            // field assignment validates structurally.
+            if !self.check_type_env(value, &schema.ty, &class.def_env)? {
+                return Err(contract_panic(&schema.ty, value, value_span));
+            }
+        }
+        Ok(())
+    }
+
     /// Set a member `obj.<name> = value`, applying a declared field-type contract
     /// on an `Instance` field. Shared by the tree-walker's `assign_to` `Member` arm
     /// and the bytecode VM's `Op::SetProp` so the two engines apply the field
@@ -6833,16 +6849,16 @@ impl Interp {
             Value::Instance(inst) => {
                 check_not_frozen(obj, value_span)?;
                 let class = inst.borrow().class.clone();
-                if let Some(schema) = lookup_field_schema(&class, name) {
-                    // IFACE: env-aware against the class's def env so an interface-typed
-                    // field assignment validates structurally.
-                    if !self.check_type_env(&value, &schema.ty, &class.def_env)? {
-                        return Err(contract_panic(&schema.ty, &value, value_span));
-                    }
-                }
-                inst.borrow_mut()
-                    .fields
-                    .insert(name.to_string(), value.clone());
+                // The field-type CONTRACT chokepoint — SHARED by the tree-walker
+                // (here) and the VM (`vm_set_prop`, which calls this same helper),
+                // so the panic message/span are byte-identical by construction.
+                self.check_instance_field_contract(&class, name, &value, value_span)?;
+                // The tree-walker's instances are always DICT (shape 0), so `insert`
+                // is the plain dict path (a new key appends; an existing key updates
+                // in place). The VM never reaches THIS write for a slab instance — it
+                // runs the contract above via `vm_set_prop`, then performs the precise
+                // slab transition itself (`vm_instance_insert`).
+                inst.borrow_mut().insert(name, value.clone());
                 Ok(value)
             }
             // SRV §3.8: a member-assign to a frozen `Shared` is the shipped
@@ -13115,12 +13131,7 @@ print(n?.m())
     /// A bare instance of a class (no fields).
     fn iface_instance(class: std::rc::Rc<crate::value::Class>) -> Value {
         Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
-            crate::value::Instance {
-                class,
-                fields: IndexMap::new(),
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            },
+            crate::value::Instance::from_dict(class, IndexMap::new()),
         )))
     }
 

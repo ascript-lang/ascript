@@ -234,9 +234,9 @@ impl Freezer {
                 let borrow = inst.borrow();
                 let class_name: Arc<str> = Arc::from(borrow.class.name.as_str());
                 let fields: Vec<(String, Value)> = borrow
-                    .fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .entries()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
                     .collect();
                 drop(borrow);
                 let mut frozen: crate::value::SharedMap = Vec::with_capacity(fields.len());

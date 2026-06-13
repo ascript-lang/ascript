@@ -504,7 +504,7 @@ pub(crate) fn parse_gen_opts(opts: &Value) -> GenOpts {
 pub(crate) fn get_field(v: &Value, key: &str) -> Value {
     match v {
         Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
-        Value::Instance(i) => i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil),
+        Value::Instance(i) => i.borrow().get(key).unwrap_or(Value::Nil),
         _ => Value::Nil,
     }
 }

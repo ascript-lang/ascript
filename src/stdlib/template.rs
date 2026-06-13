@@ -101,7 +101,7 @@ fn resolve_path(data: &Value, path: &str) -> Result<Value, String> {
 fn lookup(v: &Value, key: &str) -> Option<Value> {
     match v {
         Value::Object(o) => o.get(key),
-        Value::Instance(inst) => inst.borrow().fields.get(key).cloned(),
+        Value::Instance(inst) => inst.borrow().get(key),
         Value::Map(m) => {
             let mk = MapKey::from_value(&Value::Str(key.into()))?;
             m.borrow().get(&mk).cloned()

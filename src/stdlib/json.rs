@@ -243,8 +243,9 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             }
             seen.push(ptr);
             let mut m = serde_json::Map::new();
-            for (k, val) in i.borrow().fields.iter() {
-                m.insert(k.clone(), to_json_lossy(val, seen));
+            let entries = i.borrow().entries();
+            for (k, val) in entries {
+                m.insert(k.to_string(), to_json_lossy(&val, seen));
             }
             seen.pop();
             J::Object(m)

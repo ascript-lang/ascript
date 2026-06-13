@@ -9672,3 +9672,225 @@ print(total)
          if this is low, GetSuper is still escalating to the async driver"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SHAPE Task 3.4 — INSTANCE fields on shape-native slab storage.
+//
+//  These programs exercise every instance-construction and instance-write path
+//  affected by migrating `Instance.fields` from an IndexMap to `ObjectStorage`
+//  (slab/dict). All five modes (tree-walker == specialized-VM == generic-VM ==
+//  lane-off == no-call-fast) MUST agree byte-for-byte, including field ITERATION
+//  ORDER (via json.stringify), declared-field-type contract panics, undeclared
+//  field growth (shape transition), demotion past SLAB_MAX_KEYS, and the
+//  `C.from` / instanceof / method-dispatch paths.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn vm_instance_declared_defaulted_inherited_field_order() {
+    // Declared + defaulted + inherited fields must serialize in merged-schema
+    // (base-class-first, declaration) order — the same order the IndexMap kept.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Base { a: int\n b: string = \"bee\" }\n\
+class Mid extends Base { c: int\n d: float = 1.5 }\n\
+class Leaf extends Mid { e: bool = true }\n\
+let x = Leaf(1, 2)\n\
+print(json.stringify(x)!)\n\
+print(x.a)\n\
+print(x.b)\n\
+print(x.c)\n\
+print(x.d)\n\
+print(x.e)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_init_assigns_declared_fields() {
+    // `init` assigning declared fields in a non-schema order; serialization order
+    // must match what each engine produces (insertion order under init writes).
+    let src = "\
+import * as json from \"std/json\"\n\
+class Point {\n\
+  x: int\n\
+  y: int\n\
+  fn init(a, b) { self.y = b\n self.x = a }\n\
+}\n\
+let p = Point(3, 4)\n\
+print(json.stringify(p)!)\n\
+print(p.x + p.y)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_init_wrong_type_field_panics_identically() {
+    // A wrong-TYPE assignment inside init must panic byte-identically (same
+    // message + span) across all five modes — the contract chokepoint.
+    let src = "\
+class Box {\n\
+  n: int\n\
+  fn init(v) { self.n = v }\n\
+}\n\
+let b = Box(\"not an int\")\n\
+print(\"unreachable\")\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_undeclared_field_add_in_init() {
+    // `init` adding an UNDECLARED field (shape transition), then reading it back.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Bag {\n\
+  a: int\n\
+  fn init(v) { self.a = v\n self.extra = v * 2\n self.tag = \"t\" }\n\
+}\n\
+let g = Bag(5)\n\
+print(json.stringify(g)!)\n\
+print(g.a)\n\
+print(g.extra)\n\
+print(g.tag)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_post_construction_undeclared_add_and_overwrite() {
+    // A post-construction undeclared add (shape transition) plus an existing-key
+    // overwrite (shape unchanged). Reads of all fields must agree.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Thing { id: int = 0 }\n\
+let t = Thing()\n\
+t.id = 7\n\
+t.name = \"hello\"\n\
+t.id = 9\n\
+t.flag = true\n\
+print(json.stringify(t)!)\n\
+print(t.id)\n\
+print(t.name)\n\
+print(t.flag)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_grown_past_slab_max_keys_demotes() {
+    // A class instance grown past SLAB_MAX_KEYS = 64 undeclared fields must demote
+    // to dict storage and remain correct (all reads + full serialization order).
+    // We generate 80 undeclared `f0..f79` writes programmatically into the source.
+    let mut writes = String::new();
+    let mut reads = String::new();
+    for i in 0..80 {
+        writes.push_str(&format!("o.f{i} = {i}\n"));
+        reads.push_str(&format!("print(o.f{i})\n"));
+    }
+    let src = format!(
+        "import * as json from \"std/json\"\n\
+class Wide {{ base: int = 0 }}\n\
+let o = Wide()\n\
+{writes}\
+print(json.stringify(o)!)\n\
+{reads}"
+    );
+    assert_three_way_matches(&src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_from_dict_path_instanceof_and_methods() {
+    // `C.from({...})` builds an instance via the Dict path; instanceof + method
+    // dispatch must be unaffected, and field reads must work.
+    let src = "\
+import * as json from \"std/json\"\n\
+class User {\n\
+  name: string\n\
+  age: int = 0\n\
+  fn greet() { return \"hi \" + self.name }\n\
+}\n\
+let u = User.from({ name: \"Ada\", age: 36 })\n\
+print(json.stringify(u)!)\n\
+print(u instanceof User)\n\
+print(u.greet())\n\
+print(u.name)\n\
+print(u.age)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_method_dispatch_after_field_growth() {
+    // Method dispatch keys on class identity, not field shape: growing undeclared
+    // fields must not disturb method resolution.
+    let src = "\
+class Counter {\n\
+  n: int = 0\n\
+  fn bump() { self.n = self.n + 1\n return self.n }\n\
+}\n\
+let c = Counter()\n\
+c.extra = 100\n\
+print(c.bump())\n\
+print(c.bump())\n\
+c.another = 200\n\
+print(c.bump())\n\
+print(c.extra + c.another)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_destructuring_and_object_helpers() {
+    // Object destructuring over an instance + object.keys/values must see fields
+    // in the right order across all modes.
+    let src = "\
+import * as object from \"std/object\"\n\
+class Rec { a: int\n b: int\n c: int }\n\
+let r = Rec(1, 2, 3)\n\
+let { a, c } = r\n\
+print(a)\n\
+print(c)\n\
+print(object.keys(r))\n\
+print(object.values(r))\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_no_init_zero_field_and_defaults_only() {
+    // Zero-field class (no init, no args) and a defaults-only class — both build
+    // empty or default-populated instances; serialization order must agree.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Empty {}\n\
+class Defaults { x: int = 1\n y: string = \"y\"\n z: bool = false }\n\
+let e = Empty()\n\
+let d = Defaults()\n\
+print(json.stringify(e)!)\n\
+print(json.stringify(d)!)\n\
+print(d.x)\n\
+print(d.z)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_field_ic_warms_over_repeated_reads() {
+    // Read instance fields in a HOT LOOP so the GET_PROP field IC at each site
+    // warms (records a shape→index entry, then serves hits). If a NEW-key shape
+    // transition were skipped (leaving a stale shape), a warmed IC would serve a
+    // WRONG index — this test would then diverge. Two instances with DIFFERENT
+    // undeclared-field layouts share the same site, forcing the IC to track shape.
+    let src = "\
+class P { a: int\n b: int }\n\
+let p = P(10, 20)\n\
+p.c = 30\n\
+let q = P(40, 50)\n\
+q.d = 60\n\
+let arr = [p, q]\n\
+let total = 0\n\
+for (i of 0..1000) {\n\
+  for (x of arr) {\n\
+    total = total + x.a + x.b\n\
+  }\n\
+}\n\
+print(total)\n\
+print(p.a)\n\
+print(p.b)\n\
+print(p.c)\n\
+print(q.a)\n\
+print(q.b)\n\
+print(q.d)\n";
+    assert_three_way_matches(src).await;
+}

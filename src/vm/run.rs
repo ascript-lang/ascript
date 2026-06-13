@@ -18,7 +18,6 @@ use crate::span::Span;
 use crate::value::Value;
 use crate::vm::fiber::Fiber;
 use crate::vm::opcode::Op;
-use crate::vm::shape::EMPTY_SHAPE;
 use crate::vm::value_ext::{Closure, RunOutcome};
 use gcmodule::Cc;
 use std::cell::RefCell;
@@ -118,10 +117,6 @@ pub struct Vm {
     /// object/instance key-LAYOUT via a transition tree; V11-T3 inline caches key
     /// on these ids. Only VM code paths touch it (the tree-walker leaves shapes 0).
     shapes: RefCell<crate::vm::shape::ShapeRegistry>,
-    /// Cache of each class's BASE shape (its declared-field layout, declaration
-    /// order), keyed by the class's `Rc` identity (`Rc::as_ptr`) like the method
-    /// tables. Computed once per class so every instance shares the same base id.
-    class_base_shapes: RefCell<HashMap<usize, u32>>,
     /// A shared `def_env` for every VM-created class (task #157). The compiler
     /// leaves `Class.def_env` as an inert `global_env()` placeholder because the VM
     /// has no tree-walker Environment; but the SHARED `Interp::validate_into`
@@ -367,7 +362,6 @@ impl Vm {
             class_static_methods: RefCell::new(HashMap::new()),
             class_defaults: RefCell::new(HashMap::new()),
             shapes: RefCell::new(crate::vm::shape::ShapeRegistry::new()),
-            class_base_shapes: RefCell::new(HashMap::new()),
             class_env: RefCell::new(None),
             specialize,
             module_exports: RefCell::new(Rc::new(RefCell::new(indexmap::IndexMap::new()))),
@@ -2696,9 +2690,7 @@ impl Vm {
                         }
                         Value::Instance(i) => i
                             .borrow()
-                            .fields
                             .get(key.as_ref())
-                            .cloned()
                             .unwrap_or(Value::Nil),
                         other => {
                             return Err(self.panic_at(
@@ -2764,9 +2756,9 @@ impl Vm {
                             }
                         }
                         Value::Instance(i) => {
-                            for (k, v) in i.borrow().fields.iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in i.borrow().entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
@@ -2818,7 +2810,7 @@ impl Vm {
                     let subject = fiber.pop();
                     let ok = match &subject {
                         Value::Object(o) => o.contains_key(key.as_ref()),
-                        Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
+                        Value::Instance(i) => i.borrow().contains_key(key.as_ref()),
                         _ => false,
                     };
                     fiber.push(Value::Bool(ok));
@@ -5216,9 +5208,7 @@ impl Vm {
                         }
                         Value::Instance(i) => i
                             .borrow()
-                            .fields
                             .get(key.as_ref())
-                            .cloned()
                             .unwrap_or(Value::Nil),
                         other => {
                             return Err(self.panic_at(
@@ -5290,9 +5280,9 @@ impl Vm {
                             }
                         }
                         Value::Instance(i) => {
-                            for (k, v) in i.borrow().fields.iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in i.borrow().entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
@@ -5360,7 +5350,7 @@ impl Vm {
                     let subject = fiber.pop();
                     let ok = match &subject {
                         Value::Object(o) => o.contains_key(key.as_ref()),
-                        Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
+                        Value::Instance(i) => i.borrow().contains_key(key.as_ref()),
                         _ => false,
                     };
                     fiber.push(Value::Bool(ok));
@@ -7308,17 +7298,17 @@ impl Vm {
                 // Cache hit: read the field directly by its stable index.
                 let ic = chunk.field_ic(op_off);
                 if let Some(idx) = ic.lookup(shape) {
-                    if let Some((_k, v)) = b.fields.get_index(idx as usize) {
-                        return Some(v.clone());
+                    if let Some(v) = b.value_at(idx as usize) {
+                        return Some(v);
                     }
                     // Defensive fall-through (see Object arm).
                 }
                 // Miss: resolve generically and record IF it is a FIELD. A
                 // method-named access yields `None` here → generic path →
                 // BoundMethod (never cached, never mis-answered).
-                match b.fields.get_index_of(name) {
+                match b.get_index_of(name) {
                     Some(idx) => {
-                        let v = b.fields.get_index(idx).map(|(_, v)| v.clone());
+                        let v = b.value_at(idx);
                         drop(b);
                         let mut ic = chunk.field_ic(op_off);
                         ic.record(shape, idx as u32);
@@ -7542,7 +7532,7 @@ impl Vm {
         // not a method dispatch; the generic path reads the field instead).
         let (class, has_field) = {
             let b = inst.borrow();
-            (b.class.clone(), b.fields.contains_key(name))
+            (b.class.clone(), b.contains_key(name))
         };
         if has_field {
             return None;
@@ -7565,7 +7555,7 @@ impl Vm {
         if let Value::Instance(inst) = obj {
             let (class, has_field) = {
                 let b = inst.borrow();
-                (b.class.clone(), b.fields.contains_key(name))
+                (b.class.clone(), b.contains_key(name))
             };
             if !has_field {
                 // Walk the chain so an INHERITED method binds with the ANCESTOR
@@ -7605,42 +7595,6 @@ impl Vm {
         self.interp
             .read_member(obj, name, span)
             .map_err(Control::from)
-    }
-
-    /// The BASE shape for `class`'s instances — the declared-field key layout in
-    /// declaration order, MERGED base-class first (mirrors `merged_field_schema`,
-    /// which is the order `vm_construct`/`construct` populate fields). Cached per
-    /// class by `Rc` identity so every instance of one class shares the same id.
-    fn class_base_shape(&self, class: &Rc<crate::value::Class>) -> u32 {
-        let key = Rc::as_ptr(class) as usize;
-        if let Some(&s) = self.class_base_shapes.borrow().get(&key) {
-            return s;
-        }
-        let schema = crate::value::merged_field_schema(class);
-        let shape = {
-            let mut reg = self.shapes.borrow_mut();
-            // Phase 2.1: caps are far above corpus reach; None → fall back to
-            // shape 0 (Phase 3 will wire the real demotion path).
-            reg.shape_for(schema.keys().map(|k| k.as_str()))
-                .unwrap_or(EMPTY_SHAPE)
-        };
-        self.class_base_shapes.borrow_mut().insert(key, shape);
-        shape
-    }
-
-    /// The shape id for an object literal's final ordered key list. Used by the
-    /// VM's `NEW_OBJECT`/`APPEND_OBJECT`/`SPREAD_OBJECT` arms once the entry map is
-    /// fully built.
-    fn object_shape_for<'a, I>(&self, keys: I) -> u32
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        // Phase 2.1: caps are far above corpus reach; None → fall back to
-        // EMPTY_SHAPE (Phase 3 will wire the real demotion path).
-        self.shapes
-            .borrow_mut()
-            .shape_for(keys)
-            .unwrap_or(EMPTY_SHAPE)
     }
 
     /// The current global-table version (V11-T4). Bumped on every user-global
@@ -7937,17 +7891,54 @@ impl Vm {
         cell.insert(name, value);
     }
 
-    /// Recompute and store an `Instance`'s `shape_id` from its CURRENT field keys.
-    /// Called after a `SET_PROP` that may have ADDED an (undeclared) field — which
-    /// the runtime allows (`set_member` inserts unconditionally). Re-deriving the
-    /// shape keeps the GET_PROP/SET_PROP field IC sound: a changed field LAYOUT
-    /// yields a changed shape, so any cache entry keyed by the OLD shape simply
-    /// MISSES (and re-resolves) instead of reading a stale index. Reassigning an
-    /// existing field leaves the layout — and thus the shape — unchanged.
-    fn resync_instance_shape(&self, inst: &Cc<RefCell<crate::value::Instance>>) {
-        let keys: Vec<String> = inst.borrow().fields.keys().cloned().collect();
-        let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
-        inst.borrow().shape_id.set(shape);
+    /// Store `inst.<name> = value` into a VM (slab) instance with the PRECISE
+    /// registry transition (SHAPE Task 3.4) — the instance flavor of
+    /// `vm_object_insert`. Does NO contract check (the caller runs it via the shared
+    /// `check_instance_field_contract` before calling this). Behavior:
+    ///
+    /// - **Existing key:** overwrite in place via `set_value_at`; shape unchanged.
+    /// - **New key, slab mode:** mint/follow the registry edge (`add_key`) and grow
+    ///   the slab (`slab_append`), transitioning `shape_id` to the child shape.
+    /// - **New key, cap exceeded:** demote to dict (shape → 0), then dict-insert.
+    /// - **New key, dict mode:** plain dict insert (shape stays 0).
+    ///
+    /// Replaces the old `resync_instance_shape` full re-derive — each write
+    /// transitions precisely (analogous to the object path), so the GET/SET field IC
+    /// stays sound with no re-derive.
+    fn vm_instance_insert(
+        &self,
+        inst: &Cc<RefCell<crate::value::Instance>>,
+        name: &str,
+        value: Value,
+    ) {
+        // Fast path: key already exists — overwrite in place, shape unchanged.
+        let existing = inst.borrow().get_index_of(name);
+        if let Some(i) = existing {
+            inst.borrow_mut().set_value_at(i, value);
+            return;
+        }
+        // New key. Try a registry transition from the current shape if slab mode.
+        let (is_slab, shape) = {
+            let b = inst.borrow();
+            (b.is_slab(), b.shape_id.get())
+        };
+        if is_slab {
+            let mut reg = self.shapes.borrow_mut();
+            if let Some(child) = reg.add_key(shape, name) {
+                let child_keys = reg.keys_of(child);
+                drop(reg);
+                if inst.borrow_mut().slab_append(child, child_keys, value.clone()) {
+                    return; // successful slab grow
+                }
+                // slab_append false ⇒ not slab (can't happen here); fall through.
+            } else {
+                drop(reg);
+                // Cap exceeded: demote to dict (shape → 0) then dict-insert.
+                inst.borrow_mut().demote_to_dict();
+            }
+        }
+        // Dict mode (or just demoted): plain insert, shape stays 0.
+        inst.borrow_mut().insert(name, value);
     }
 
     /// `SET_PROP` with the field inline cache (V11-T3). Stores `obj.<name> = value`
@@ -8012,17 +8003,23 @@ impl Vm {
                 Ok(value)
             }
             Value::Instance(inst) => {
-                // ALWAYS run the contract check via the shared `set_member`.
-                let v = self.interp.set_member(obj, name, value, span, span)?;
-                // A set may have added an undeclared field → re-derive the shape so
-                // the field IC stays sound, then record this field's index.
-                self.resync_instance_shape(inst);
+                // SHAPE Task 3.4: run the declared field-type CONTRACT via the SHARED
+                // chokepoint (`check_instance_field_contract`, the same code the
+                // tree-walker's `set_member` reaches) — byte-identical panic
+                // message/span. The frozen guard already ran at the top of this fn.
+                let class = inst.borrow().class.clone();
+                self.interp
+                    .check_instance_field_contract(&class, name, &value, span)?;
+                // Then do ONE precise registry transition / demotion (existing key →
+                // overwrite in place, shape unchanged; new key → slab grow or
+                // demote). Replaces set_member + the old full re-derive resync.
+                self.vm_instance_insert(inst, name, value.clone());
                 // KILL SWITCH (V11-T5): only record the field IC when specialize ON.
                 let recorded = self.specialize.then(|| {
                     let b = inst.borrow();
                     let new_shape = b.shape_id.get();
                     (new_shape != 0)
-                        .then(|| b.fields.get_index_of(name).map(|idx| (new_shape, idx)))
+                        .then(|| b.get_index_of(name).map(|idx| (new_shape, idx)))
                         .flatten()
                 });
                 if let Some(Some((new_shape, idx))) = recorded {
@@ -8030,7 +8027,7 @@ impl Vm {
                     ic.record(new_shape, idx as u32);
                     chunk.set_field_ic(op_off, ic);
                 }
-                Ok(v)
+                Ok(value)
             }
             // Non-settable receiver: shared Tier-2 panic (byte-identical).
             _ => self.interp.set_member(obj, name, value, span, span),
@@ -8050,14 +8047,14 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let instance = Cc::new(RefCell::new(crate::value::Instance {
-            class: class.clone(),
-            fields: indexmap::IndexMap::new(),
-            // Give the instance its class's BASE shape (the declared-field layout,
-            // in declaration order). V11-T3 inline caches key on this.
-            shape_id: std::cell::Cell::new(self.class_base_shape(&class)),
-            frozen: std::cell::Cell::new(false),
-        }));
+        // SHAPE Task 3.4: build the instance's fields as an EMPTY slab at
+        // EMPTY_SHAPE (shape 0). Each default / init-assigned / auto-init field is
+        // inserted through the precise registry transition (`vm_instance_insert`),
+        // so the FINAL shape reflects the ACTUAL field layout in insertion order —
+        // identical to the old "IndexMap then resync" end state, but transitioned
+        // precisely (no trailing full re-derive). Mirrors the object path.
+        let instance =
+            Cc::new(RefCell::new(crate::value::Instance::new_empty_slab(class.clone())));
         let inst_val = Value::Instance(instance.clone());
 
         // Apply field defaults BASE-CLASS FIRST so a subclass default overrides a
@@ -8106,7 +8103,7 @@ impl Vm {
                         return Err(crate::interp::contract_panic(&schema.ty, &dv, span));
                     }
                 }
-                instance.borrow_mut().fields.insert(fname, dv);
+                self.vm_instance_insert(&instance, &fname, dv);
             }
         }
 
@@ -8127,16 +8124,13 @@ impl Vm {
             let fields = crate::value::merged_field_schema(&class);
             let bindings = crate::interp::auto_init_bindings(&fields, &class.name, args, span)?;
             for (fname, v) in bindings {
-                instance.borrow_mut().fields.insert(fname, v);
+                self.vm_instance_insert(&instance, &fname, v);
             }
         }
-        // Re-derive the shape from the instance's ACTUAL fields now that defaults +
-        // `init` have populated them. The base shape set above reflects the FULL
-        // declared schema, but `fields` only holds what was actually inserted (and
-        // in insertion order), so a field IC keying on `shape_id` must see the real
-        // layout — otherwise two instances sharing the base shape but with different
-        // actual layouts could read a wrong index. (V11-T3 IC soundness.)
-        self.resync_instance_shape(&instance);
+        // SHAPE Task 3.4: NO trailing resync — each `vm_instance_insert` above (and
+        // any `self.f = …` inside `init`, routed through `vm_set_prop` →
+        // `vm_instance_insert`) transitions the shape PRECISELY, so `shape_id`
+        // already reflects the real insertion-order layout. (V11-T3 IC soundness.)
         Ok(inst_val)
     }
 
