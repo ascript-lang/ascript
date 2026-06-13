@@ -781,6 +781,7 @@ fn read_chunk(r: &mut Reader, with_debug: bool) -> Result<Chunk, AsoError> {
     debug_assert!(c.method_ics.borrow().is_empty());
     debug_assert!(c.arith_caches.borrow().is_empty());
     debug_assert!(c.global_caches.borrow().is_empty());
+    debug_assert!(c.lit_shapes.borrow().is_empty());
     Ok(c)
 }
 

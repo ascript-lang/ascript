@@ -420,6 +420,17 @@ impl ObjectCell {
         }
     }
 
+    /// Clone the slab's canonical key list `Rc` (shared per layout) when in slab
+    /// mode, else `None` (dict mode). Cloning the `Rc` is a refcount bump, not a
+    /// copy — two objects of the same shape return `Rc::ptr_eq`-equal handles.
+    /// SHAPE Task 3.2 — used by the per-site cache tests to prove key sharing.
+    pub fn slab_keys(&self) -> Option<Rc<[Rc<str>]>> {
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, .. } => Some(keys.clone()),
+            ObjectStorage::Dict(_) => None,
+        }
+    }
+
     /// Clone the whole entry map into a fresh `IndexMap`.
     /// Used by `object_like_fields` in `src/stdlib/object.rs`.
     pub fn to_index_map(&self) -> IndexMap<String, Value> {

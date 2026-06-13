@@ -2377,64 +2377,11 @@ impl Vm {
                 }
 
                 Op::NewObject => {
-                    // SHAPE Task 3.1: build slab-native on the GENERIC path (no
-                    // specialize gate — the representation is not toggleable).
-                    // Pop `n` (key, value) pairs in source order, fold duplicates
-                    // first-seen/later-wins (IndexMap semantics: first position kept,
-                    // later value wins), then intern via the shape registry.
+                    // SHAPE Task 3.1/3.2: shared body for both lanes (see
+                    // `exec_new_object`). `fault_ip` is the op offset (cache key +
+                    // panic span); the operand at `operand_at` is the pair count.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
-                    for slot in pairs.iter_mut().rev() {
-                        let value = fiber.pop();
-                        let key = match fiber.pop() {
-                            Value::Str(s) => s,
-                            other => {
-                                return Err(self.panic_at(
-                                    fiber,
-                                    fault_ip,
-                                    format!("NEW_OBJECT key is not a string constant: {other:?}"),
-                                ))
-                            }
-                        };
-                        *slot = (key, value);
-                    }
-                    // Fold duplicates into an ordered (key, value) sequence: first
-                    // occurrence wins position, last occurrence wins value — exactly
-                    // IndexMap::insert semantics.
-                    let mut order: Vec<Rc<str>> = Vec::with_capacity(n);
-                    let mut vals: indexmap::IndexMap<String, Value> =
-                        indexmap::IndexMap::with_capacity(n);
-                    for (k, v) in pairs {
-                        let ks = k.to_string();
-                        if !vals.contains_key(&ks) {
-                            order.push(k);
-                        }
-                        vals.insert(ks, v);
-                    }
-                    // Try slab mode: intern the ordered key sequence through the
-                    // registry. A cap refusal falls back to dict mode (shape 0).
-                    let cell = {
-                        let mut reg = self.shapes.borrow_mut();
-                        match reg.shape_for(order.iter().map(|k| k.as_ref())) {
-                            Some(shape) => {
-                                let keys = reg.keys_of(shape);
-                                drop(reg);
-                                let values: Vec<Value> =
-                                    order.iter().map(|k| vals.shift_remove(k.as_ref()).unwrap()).collect();
-                                crate::value::ObjectCell::new_slab(keys, values, shape)
-                            }
-                            None => {
-                                drop(reg);
-                                // Cap exceeded: fall back to dict mode (shape 0).
-                                let mut map = indexmap::IndexMap::with_capacity(order.len());
-                                for k in &order {
-                                    map.insert(k.to_string(), vals.shift_remove(k.as_ref()).unwrap());
-                                }
-                                crate::value::ObjectCell::new(map)
-                            }
-                        }
-                    };
-                    fiber.push(Value::Object(cell));
+                    self.exec_new_object(fiber, fault_ip, n)?;
                 }
 
                 Op::NewMap => {
@@ -4598,60 +4545,12 @@ impl Vm {
                 }
 
                 Op::NewObject => {
-                    // SHAPE Task 3.1: slab-native construction on the GENERIC path
-                    // (not specialize-gated — representation is not toggleable).
-                    // Pop `n` (key, value) pairs in source order (stack: vN,kN,…,v1,k1),
-                    // fold duplicates first-seen/later-wins (IndexMap semantics), then
-                    // intern via the shape registry. Byte-identical to the tree-walker's
-                    // `ExprKind::Object` (same order + duplicate-key semantics).
+                    // SHAPE Task 3.1/3.2: shared body for both lanes (see
+                    // `exec_new_object`) — byte-identical to the sync lane and to
+                    // the tree-walker's `ExprKind::Object`. `fault_ip` is the op
+                    // offset; the operand is the pair count.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
-                    for slot in pairs.iter_mut().rev() {
-                        let value = fiber.pop();
-                        let key = match fiber.pop() {
-                            Value::Str(s) => s,
-                            other => {
-                                return Err(self.panic_at(
-                                    fiber,
-                                    fault_ip,
-                                    format!("NEW_OBJECT key is not a string constant: {other:?}"),
-                                ))
-                            }
-                        };
-                        *slot = (key, value);
-                    }
-                    // Fold duplicates: first position kept, last value wins.
-                    let mut order: Vec<Rc<str>> = Vec::with_capacity(n);
-                    let mut vals: indexmap::IndexMap<String, Value> =
-                        indexmap::IndexMap::with_capacity(n);
-                    for (k, v) in pairs {
-                        let ks = k.to_string();
-                        if !vals.contains_key(&ks) {
-                            order.push(k);
-                        }
-                        vals.insert(ks, v);
-                    }
-                    let cell = {
-                        let mut reg = self.shapes.borrow_mut();
-                        match reg.shape_for(order.iter().map(|k| k.as_ref())) {
-                            Some(shape) => {
-                                let keys = reg.keys_of(shape);
-                                drop(reg);
-                                let values: Vec<Value> =
-                                    order.iter().map(|k| vals.shift_remove(k.as_ref()).unwrap()).collect();
-                                crate::value::ObjectCell::new_slab(keys, values, shape)
-                            }
-                            None => {
-                                drop(reg);
-                                let mut map = indexmap::IndexMap::with_capacity(order.len());
-                                for k in &order {
-                                    map.insert(k.to_string(), vals.shift_remove(k.as_ref()).unwrap());
-                                }
-                                crate::value::ObjectCell::new(map)
-                            }
-                        }
-                    };
-                    fiber.push(Value::Object(cell));
+                    self.exec_new_object(fiber, fault_ip, n)?;
                 }
 
                 Op::NewMap => {
@@ -8442,6 +8341,196 @@ impl Vm {
         }
     }
 
+    /// SHAPE Task 3.1/3.2 — shared `Op::NewObject` body for BOTH the sync and
+    /// async lanes (the single source of truth so the two drivers cannot diverge;
+    /// the four/five-mode differential enforces it). `fault_ip` is the op's
+    /// bytecode offset (both the `lit_shapes` cache key and the panic span); `n`
+    /// is the pair count. Pops `n` (key, value) pairs (stack top-down is
+    /// vN,kN,…,v1,k1) and pushes the constructed `Value::Object`.
+    ///
+    /// On the SPECIALIZED path a warm `lit_shapes` entry skips the registry probe
+    /// and IndexMap fold; a cold pass runs the generic build and records the
+    /// result. On the GENERIC path (`!specialize`) the cache is NEVER read or
+    /// written — the generic slab/dict build runs unconditionally. Both produce
+    /// byte-identical objects.
+    fn exec_new_object(&self, fiber: &mut Fiber, fault_ip: usize, n: usize) -> Result<(), Control> {
+        if self.specialize {
+            // Consult the per-site cache.
+            let cached = fiber
+                .frame()
+                .closure
+                .proto
+                .chunk
+                .lit_shape(fault_ip);
+            match cached {
+                Some(crate::vm::chunk::LitShapeCache::Warm {
+                    shape,
+                    keys,
+                    slot_of_pair,
+                }) => {
+                    // Warm hit: pop `n` (value, key) pairs straight into slots,
+                    // discarding the key constants (already validated when this
+                    // site was first recorded). Build a pre-sized values vector.
+                    let slot_count = keys.len();
+                    let mut values: Vec<Value> = vec![Value::Nil; slot_count];
+                    match &slot_of_pair {
+                        // Identity case: pair `i` → slot `i`, no dups, popped
+                        // order is reverse source order so write directly by
+                        // index. slot_count == n here.
+                        None => {
+                            for slot in (0..n).rev() {
+                                let value = fiber.pop();
+                                let _key = fiber.pop(); // discard the key const
+                                values[slot] = value;
+                            }
+                        }
+                        // Remap / dup-fold case. We pop in REVERSE source order
+                        // (last source pair first), so to honor later-source-wins
+                        // we must NOT let an earlier (later-popped) pair overwrite
+                        // a slot a later (earlier-popped) pair already filled.
+                        // Track filled slots and write only the first arrival in
+                        // pop order (= the latest source position for that slot).
+                        Some(sop) => {
+                            let mut filled = vec![false; slot_count];
+                            for src_idx in (0..n).rev() {
+                                let value = fiber.pop();
+                                let _key = fiber.pop(); // discard the key const
+                                let slot = sop[src_idx] as usize;
+                                if !filled[slot] {
+                                    values[slot] = value;
+                                    filled[slot] = true;
+                                }
+                            }
+                        }
+                    }
+                    let cell = crate::value::ObjectCell::new_slab(keys, values, shape);
+                    fiber.push(Value::Object(cell));
+                    return Ok(());
+                }
+                Some(crate::vm::chunk::LitShapeCache::Negative) => {
+                    // Cap-refused site: skip the registry probe, build a dict.
+                    return self.new_object_generic(fiber, fault_ip, n, false);
+                }
+                None => {
+                    // Cold: build generically AND record the per-site cache.
+                    return self.new_object_generic(fiber, fault_ip, n, true);
+                }
+            }
+        }
+        // Generic / kill-switch path: never touch the cache.
+        self.new_object_generic(fiber, fault_ip, n, false)
+    }
+
+    /// The generic (registry-probe + IndexMap-fold) `NewObject` build, shared by
+    /// both lanes and reused on every cold/Negative/`--no-specialize` path. When
+    /// `record` is true (the specialized COLD pass) it writes the resulting
+    /// `lit_shapes` entry for the site at `fault_ip`. Byte-identical to the
+    /// tree-walker's `ExprKind::Object` (same order + duplicate-key semantics).
+    fn new_object_generic(
+        &self,
+        fiber: &mut Fiber,
+        fault_ip: usize,
+        n: usize,
+        record: bool,
+    ) -> Result<(), Control> {
+        // Pop `n` (key, value) pairs in source order (stack: vN,kN,…,v1,k1).
+        let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
+        for slot in pairs.iter_mut().rev() {
+            let value = fiber.pop();
+            let key = match fiber.pop() {
+                Value::Str(s) => s,
+                other => {
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        format!("NEW_OBJECT key is not a string constant: {other:?}"),
+                    ))
+                }
+            };
+            *slot = (key, value);
+        }
+        // Fold duplicates into an ordered (key, value) sequence: first occurrence
+        // wins position, last occurrence wins value — exactly IndexMap::insert.
+        // `slot_of_src[i]` is the final slab slot for the i-th SOURCE pair.
+        let mut order: Vec<Rc<str>> = Vec::with_capacity(n);
+        let mut vals: indexmap::IndexMap<String, Value> = indexmap::IndexMap::with_capacity(n);
+        let mut slot_of_src: Vec<u16> = Vec::with_capacity(n);
+        let mut had_dup = false;
+        for (k, v) in &pairs {
+            let ks = k.to_string();
+            let slot = match vals.get_full(&ks) {
+                Some((idx, _, _)) => {
+                    had_dup = true;
+                    idx
+                }
+                None => {
+                    let idx = order.len();
+                    order.push(k.clone());
+                    idx
+                }
+            };
+            slot_of_src.push(slot as u16);
+            vals.insert(ks, v.clone());
+        }
+        // Try slab mode: intern the ordered key sequence through the registry. A
+        // cap refusal falls back to dict mode (shape 0).
+        let cell = {
+            let mut reg = self.shapes.borrow_mut();
+            match reg.shape_for(order.iter().map(|k| k.as_ref())) {
+                Some(shape) => {
+                    let keys = reg.keys_of(shape);
+                    drop(reg);
+                    let values: Vec<Value> = order
+                        .iter()
+                        .map(|k| vals.shift_remove(k.as_ref()).unwrap())
+                        .collect();
+                    if record {
+                        // Identity fast case: no dups AND popped order already
+                        // equals the slab order (slot_of_src is 0,1,2,…).
+                        let identity = !had_dup
+                            && slot_of_src
+                                .iter()
+                                .enumerate()
+                                .all(|(i, &s)| s as usize == i);
+                        let slot_of_pair: Option<Rc<[u16]>> = if identity {
+                            None
+                        } else {
+                            Some(Rc::from(slot_of_src.as_slice()))
+                        };
+                        fiber.frame().closure.proto.chunk.set_lit_shape(
+                            fault_ip,
+                            crate::vm::chunk::LitShapeCache::Warm {
+                                shape,
+                                keys: keys.clone(),
+                                slot_of_pair,
+                            },
+                        );
+                    }
+                    crate::value::ObjectCell::new_slab(keys, values, shape)
+                }
+                None => {
+                    drop(reg);
+                    // Cap exceeded: fall back to dict mode (shape 0).
+                    let mut map = indexmap::IndexMap::with_capacity(order.len());
+                    for k in &order {
+                        map.insert(k.to_string(), vals.shift_remove(k.as_ref()).unwrap());
+                    }
+                    if record {
+                        fiber
+                            .frame()
+                            .closure
+                            .proto
+                            .chunk
+                            .set_lit_shape(fault_ip, crate::vm::chunk::LitShapeCache::Negative);
+                    }
+                    crate::value::ObjectCell::new(map)
+                }
+            }
+        };
+        fiber.push(Value::Object(cell));
+        Ok(())
+    }
+
     /// Unwind ONE call frame, returning `value` from it.
     ///
     /// Shared by `Op::Return` (a normal `return v`) and `Op::Propagate` (a `?`
@@ -10298,6 +10387,154 @@ mod tests {
                 assert_eq!(o.get("b"), Some(Value::Float(2.0)));
             }
             other => panic!("expected Done(Object), got {other:?}"),
+        }
+    }
+
+    /// Like `run_chunk`, but returns the surviving `Rc<FnProto>` alongside the
+    /// outcome so a test can inspect the chunk's runtime side tables (the
+    /// IC-style `lit_shapes` cache) AFTER the run. The fiber is built fresh from
+    /// a clone of the proto so the original `Rc<FnProto>` (and thus the chunk)
+    /// outlives the VM. `specialize` toggles the kill switch.
+    fn run_chunk_retain(
+        chunk: Chunk,
+        specialize: bool,
+    ) -> (Result<RunOutcome, Control>, Rc<FnProto>) {
+        let proto = Rc::new(FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let closure = Closure::new(proto.clone());
+        let mut fiber = Fiber::new(closure);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let local = LocalSet::new();
+        let outcome = local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = if specialize {
+                Vm::new(interp)
+            } else {
+                Vm::new_generic(interp)
+            };
+            vm.run(&mut fiber).await
+        });
+        (outcome, proto)
+    }
+
+    #[test]
+    fn new_object_warms_per_site_lit_shape_cache() {
+        // SHAPE Task 3.2: after running a `NewObject 2` site the per-site
+        // `lit_shapes` entry is Warm with the right shape id and keys.
+        let mut c = Chunk::new();
+        for (k, v) in [("a", 1.0), ("b", 2.0)] {
+            let ki = c.add_const(Value::Str(Rc::from(k)));
+            c.emit_u16(Op::Const, ki, s());
+            let vi = c.add_const(Value::Float(v));
+            c.emit_u16(Op::Const, vi, s());
+        }
+        let site_off = c.code.len(); // the NewObject op offset
+        c.emit_u16(Op::NewObject, 2, s());
+        c.emit(Op::Return, s());
+
+        let (outcome, proto) = run_chunk_retain(c, true);
+        let obj1 = match outcome.expect("run ok") {
+            RunOutcome::Done(Value::Object(o)) => o,
+            other => panic!("expected Done(Object), got {other:?}"),
+        };
+        let entry = proto
+            .chunk
+            .lit_shape(site_off)
+            .expect("lit_shape recorded after a NewObject run");
+        match &entry {
+            crate::vm::chunk::LitShapeCache::Warm { shape, keys, .. } => {
+                assert_eq!(
+                    keys.iter().map(|k| k.as_ref()).collect::<Vec<_>>(),
+                    vec!["a", "b"],
+                    "cached keys in insertion order"
+                );
+                assert_eq!(*shape, obj1.shape.get(), "cached shape matches the object");
+            }
+            other => panic!("expected Warm lit_shape, got {other:?}"),
+        }
+
+        // Two objects from the SAME shape share their keys Rc and shape id.
+        let mut c2 = Chunk::new();
+        for _ in 0..2 {
+            for (k, v) in [("a", 1.0), ("b", 2.0)] {
+                let ki = c2.add_const(Value::Str(Rc::from(k)));
+                c2.emit_u16(Op::Const, ki, s());
+                let vi = c2.add_const(Value::Float(v));
+                c2.emit_u16(Op::Const, vi, s());
+            }
+            c2.emit_u16(Op::NewObject, 2, s());
+        }
+        c2.emit_u16(Op::NewArray, 2, s());
+        c2.emit(Op::Return, s());
+        let (out2, _p2) = run_chunk_retain(c2, true);
+        match out2.expect("run ok") {
+            RunOutcome::Done(Value::Array(a)) => {
+                let a = a.borrow();
+                let (o1, o2) = match (&a[0], &a[1]) {
+                    (Value::Object(o1), Value::Object(o2)) => (o1.clone(), o2.clone()),
+                    other => panic!("expected two objects, got {other:?}"),
+                };
+                assert_eq!(o1.shape.get(), o2.shape.get(), "same shape id");
+                assert!(
+                    Rc::ptr_eq(&o1.slab_keys().unwrap(), &o2.slab_keys().unwrap()),
+                    "two objects from the same shape share their keys Rc"
+                );
+            }
+            other => panic!("expected Done(Array), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_object_duplicate_key_site_records_slot_of_pair() {
+        // SHAPE Task 3.2: a duplicate-key site `{a: 1, a: 2}` (constants
+        // ["a","a"]) folds to {a: 2} (later source position wins) and records a
+        // `slot_of_pair = Some([0, 0])` (both source pairs map to slot 0).
+        let mut c = Chunk::new();
+        for v in [1.0, 2.0] {
+            let ki = c.add_const(Value::Str(Rc::from("a")));
+            c.emit_u16(Op::Const, ki, s());
+            let vi = c.add_const(Value::Float(v));
+            c.emit_u16(Op::Const, vi, s());
+        }
+        let site_off = c.code.len();
+        c.emit_u16(Op::NewObject, 2, s());
+        c.emit(Op::Return, s());
+        let (outcome, proto) = run_chunk_retain(c, true);
+        match outcome.expect("run ok") {
+            RunOutcome::Done(Value::Object(o)) => {
+                assert_eq!(o.keys_snapshot(), vec!["a"], "duplicate key folded");
+                assert_eq!(
+                    o.get("a"),
+                    Some(Value::Float(2.0)),
+                    "later source position wins"
+                );
+            }
+            other => panic!("expected Done(Object), got {other:?}"),
+        }
+        match proto.chunk.lit_shape(site_off).expect("warm") {
+            crate::vm::chunk::LitShapeCache::Warm { slot_of_pair, .. } => {
+                let sop = slot_of_pair.expect("duplicate site has an explicit slot_of_pair");
+                assert_eq!(
+                    sop.iter().copied().collect::<Vec<u16>>(),
+                    vec![0u16, 0u16],
+                    "both source pairs map to slot 0"
+                );
+            }
+            other => panic!("expected Warm, got {other:?}"),
         }
     }
 

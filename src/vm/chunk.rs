@@ -98,6 +98,31 @@ impl Hasher for OffsetHasher {
 /// A `HashMap<usize, V>` keyed by bytecode offset, hashed by [`OffsetHasher`].
 type OffsetMap<V> = HashMap<usize, V, BuildHasherDefault<OffsetHasher>>;
 
+/// SHAPE Task 3.2 — per-site literal-shape cache for `Op::NewObject`.
+///
+/// An IC-style runtime side table (sibling of [`Chunk::field_ics`]): keyed by the
+/// `NewObject` op's bytecode offset, populated on the COLD (first) execution and
+/// consulted on warm passes to skip the registry hash-probe and the IndexMap
+/// duplicate-fold. **Runtime-only** — NEVER serialized into `.aso` (like the inline
+/// caches; resets to empty on load). `--no-specialize` must NEVER read or write it.
+#[derive(Debug, Clone)]
+pub enum LitShapeCache {
+    /// The site interns to a slab. `keys` is the registry's canonical key `Rc`
+    /// for `shape`. `slot_of_pair[i]` is the final slab-values slot for the i-th
+    /// SOURCE pair (in source order). It is `None` for the fast identity case —
+    /// no duplicate keys AND the popped/source order already equals the slab key
+    /// order, so pair `i` simply lands in slot `i`. `Some` only when a remap or a
+    /// duplicate-fold is needed (later-source-position wins on a duplicate).
+    Warm {
+        shape: u32,
+        keys: Rc<[Rc<str>]>,
+        slot_of_pair: Option<Rc<[u16]>>,
+    },
+    /// The site is cap-refused (builds a dict): don't re-probe the registry, go
+    /// straight to the generic dict build.
+    Negative,
+}
+
 /// A compiled class definition referenced by an `Op::Class` operand.
 ///
 /// The compiler builds the [`crate::value::Class`] (name, superclass, field
@@ -433,6 +458,13 @@ pub struct Chunk {
     /// bytecode offset (V11-T4). Caches the resolved builtin value guarded by the
     /// global-table version. Lazily populated; a missing entry is `Cold`.
     pub global_caches: RefCell<OffsetMap<GlobalCache>>,
+    /// Per-site literal-shape cache (`Op::NewObject`), keyed by the op's bytecode
+    /// offset (SHAPE Task 3.2). Lazily populated on the cold pass and consulted on
+    /// warm passes to construct slab objects without a registry probe or
+    /// duplicate-fold. Same offset-keyed runtime side-map pattern as the inline
+    /// caches → bytecode/disassembly stay byte-identical, and it is NEVER
+    /// serialized into `.aso` (reset to empty on load). `--no-specialize` skips it.
+    pub lit_shapes: RefCell<OffsetMap<LitShapeCache>>,
     /// Import descriptors referenced by `IMPORT` operands (V12). Each `Op::Import`
     /// carries a u16 index into this table; the run loop reads the descriptor to
     /// resolve the `std/*` module and bind its exports into the recorded slots.
@@ -819,6 +851,19 @@ impl Chunk {
     /// Store the updated field IC for the op at bytecode offset `op_off`.
     pub fn set_field_ic(&self, op_off: usize, ic: InlineCache) {
         self.field_ics.borrow_mut().insert(op_off, ic);
+    }
+
+    /// The per-site literal-shape cache for the `NewObject` op at bytecode offset
+    /// `op_off`, cloned out (no borrow held). A never-run site reads as `None`.
+    /// SHAPE Task 3.2.
+    pub fn lit_shape(&self, op_off: usize) -> Option<LitShapeCache> {
+        self.lit_shapes.borrow().get(&op_off).cloned()
+    }
+
+    /// Record the per-site literal-shape cache for the `NewObject` op at offset
+    /// `op_off`. SHAPE Task 3.2.
+    pub fn set_lit_shape(&self, op_off: usize, c: LitShapeCache) {
+        self.lit_shapes.borrow_mut().insert(op_off, c);
     }
 
     /// The current method IC for the `CALL_METHOD` op at bytecode offset
