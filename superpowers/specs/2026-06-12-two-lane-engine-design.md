@@ -1,6 +1,6 @@
 # AScript Two-Lane Fiber Engine + Inline Ready-Future Completion — Design (LANE)
 
-- **Status:** Draft for review
+- **Status:** Implemented (merged on feat/two-lane-engine)
 - **Date:** 2026-06-12
 - **Code:** LANE (the first engine spec of the PERF campaign — see `goal-perf.md`)
 - **Depends on:** **DEFER** (`2026-06-12-defer-statement-design.md`) — merged FIRST per owner
@@ -16,6 +16,17 @@
   byte-identity oracle (`goal.md` pillar 1). Both VM lanes must equal it, always.
 - **Breaking:** **no.** No syntax change, no semantics change, no opcode change, no `.aso` change
   (`ASO_FORMAT_VERSION` untouched). Runtime-only: a second *driver* over the same `Fiber` state.
+- **Implementation deltas from spec (recorded; no silent deviation):**
+  1. **`Op::CallMethod` / `Op::CallMethodSpread` always escalate in v1** — the spec states this
+     explicitly (§2.2, §3) as a deliberate conservative choice: even the IC-resolved property-read
+     before the method dispatch touches the async call path. This is confirmed as-shipped; it is
+     a documented scope boundary, not a regression. CALL's trampoline will lift plain method calls
+     into the sync lane.
+  2. **`last_fault_source` refresh** is NOT hoisted in v1 (spec §2.2 note: "no hoisting in v1;
+     the async driver refreshes it before each escalating op identically to `run.rs:1092–1096`").
+     Confirmed as-shipped.
+  3. No other known deltas. The four-way differential (423/0 both feature configs) + fuzz axis
+     provide the empirical confirmation that no behavioral deviation exists.
 
 ---
 

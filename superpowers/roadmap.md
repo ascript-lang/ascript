@@ -522,6 +522,34 @@ silently skip manual cleanup below them.
 - **Docs:** "Cleanup with `defer`" section in `docs/content/language/errors.md`; async/cancellation
   rules in `docs/content/language/modules-async.md`; statement form in `syntax.md`.
 
+## LANE — two-lane fiber engine ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-two-lane-engine-design.md`, plan
+`…/plans/2026-06-12-two-lane-engine.md`. The campaign's first engine spec — a synchronous
+dispatch driver over the existing `Fiber` without touching the tree-walker or `.aso` format.
+
+- **Mechanism:** Two drivers over the SAME `Fiber` state. `run_loop_sync` (plain non-async fn)
+  executes the suspension-free opcode subset in a tight loop; `run_loop` is demoted to an
+  orchestrator that bursts into the sync driver and escalates only at genuine suspension points
+  (non-plain `Op::Call` callees, all `Op::CallMethod`/`CallMethodSpread` in v1, `Op::Import`,
+  `Op::Await` on a pending future, `Op::IterNext`, `Op::Break`). The orchestrator is the ONLY
+  caller of `run_loop_sync`. Per-op runtime escalation: `SyncOutcome::NeedsAsync` returned with
+  `ip` still AT the escalating byte. `Op::Await` on an already-resolved future taken inline via
+  `SharedFuture::try_get`. `Op::DeferPush`/`Op::DeferPushMethod` in-subset; frame exit with a
+  non-empty defer list escalates.
+- **Kill switch:** `Vm.sync_lane` (bool, default true) + env `ASCRIPT_NO_SYNC_LANE=1`, mirroring
+  `--no-specialize`. Permanent, not bring-up scaffolding.
+- **Engines:** VM only. Tree-walker untouched (permanent oracle). **No grammar change, no
+  semantics change, no opcode change, no `.aso` change (`ASO_FORMAT_VERSION` unchanged at 28).**
+- **Differential:** four-way identity (tree-walker == specialized-lane-on == specialized-lane-off ==
+  generic-lane-on). Fuzz axis added to `fuzz/fuzz_targets/differential.rs`. Corpus coverage
+  assertion (`lane_corpus_coverage_check`). `vm_differential` 423/0 both feature configs.
+- **Performance (`bench/LANE_RESULTS.md`, same-session A/B):** geomean **1.045×**; dispatch-bound:
+  `object_churn` +15%, `call_heavy` +21%. Spec/tw geomean **3.59×**. DBG zero-cost gate **1.006×**.
+  RSS: no regression.
+- **Post-LANE re-profile + EXEC gate:** residual async share ≥70% on `async_inline`, ≥60% on
+  `async_concurrent` — well above the ≥15% EXEC gate. **EXEC gate: OPEN.** EXEC remains #1 priority.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred
