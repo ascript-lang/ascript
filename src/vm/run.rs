@@ -56,6 +56,18 @@ enum StopOutcome {
     Evaluate { expr: String, frame_id: usize },
 }
 
+/// LANE §2.2: outcome of one synchronous dispatch burst in `run_loop_sync`.
+// `Finished` is not yet constructed in Task 4 (Return/Yield not in the Task-4
+// subset); it becomes live in Task 5.
+#[allow(dead_code)]
+pub(crate) enum SyncOutcome {
+    /// The fiber finished normally: root frame returned or a generator hit `Op::Yield`.
+    Finished(RunOutcome),
+    /// The burst stopped at an op outside the sync subset. The fiber's `ip` still
+    /// points AT the escalating opcode byte — the async driver re-decodes it.
+    NeedsAsync,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -1243,6 +1255,504 @@ impl Vm {
         result
     }
 
+    // ── LANE §2.2 — synchronous dispatch driver ──────────────────────────────
+    //
+    // `run_loop_sync` / `sync_burst` / `sync_lane_op` are PLAIN (non-async)
+    // functions. The compiler enforces this: a plain `fn` cannot contain `.await`.
+    //
+    // Correctness invariant: every arm in `sync_burst` is a byte-for-byte
+    // transcription of the corresponding arm in `run_loop`, delegating to the SAME
+    // shared helpers (`eval_binop_adaptive`, `apply_unop`, `materialize_range*`,
+    // `panic_at`, …). Where `run_loop` does `self.eval_binop_adaptive(…)` the
+    // sync arm does exactly the same call — both produce identical results because
+    // they share the helper's implementation.
+
+    /// LANE §2.2: run the sync-lane burst driver.
+    ///
+    /// Executes the suspension-free opcode subset in a tight loop until either the
+    /// fiber finishes or an escalation op is reached. Counters are flushed once per
+    /// call (not per instruction) so per-instruction counter traffic is avoided.
+    fn run_loop_sync(&self, fiber: &mut Fiber) -> Result<SyncOutcome, Control> {
+        let mut retired: u64 = 0;
+        // Run the burst, capturing the result. Flush counters BEFORE returning r so
+        // a mid-burst `Err(Control)` still records the ops completed up to the fault.
+        let r = self.sync_burst(fiber, &mut retired);
+        if retired > 0 {
+            self.lane_sync_ops.set(self.lane_sync_ops.get() + retired);
+            self.lane_bursts.set(self.lane_bursts.get() + 1);
+        }
+        r
+    }
+
+    /// Inner dispatch loop for the sync lane. Mutates `retired` on each completed op.
+    fn sync_burst(&self, fiber: &mut Fiber, retired: &mut u64) -> Result<SyncOutcome, Control> {
+        loop {
+            // Mirror run_loop exactly: capture fault_ip first.
+            let fault_ip = fiber.frame().ip;
+            // SP4 §3: refresh last_fault_source per instruction, identical to run_loop.
+            if let Some(src) = fiber.frame().closure.proto.chunk.source.borrow().as_ref() {
+                *self.last_fault_source.borrow_mut() = Some(src.clone());
+            }
+            let byte = fiber.frame().closure.proto.chunk.code[fault_ip];
+            let op = Op::from_u8(byte)
+                .unwrap_or_else(|| panic!("invalid opcode byte {byte:#x} at ip {fault_ip}"));
+
+            // LANE: check subset membership BEFORE advancing ip. If this op is
+            // not in the sync subset, return NeedsAsync with ip still at fault_ip
+            // so the async driver re-decodes and executes the same byte.
+            if !sync_lane_op(op) {
+                return Ok(SyncOutcome::NeedsAsync);
+            }
+
+            // Advance ip past the opcode byte and its inline operands — identical
+            // arithmetic to run_loop (operand_at = fault_ip + 1).
+            let operand_at = fault_ip + 1;
+            fiber.frame_mut().ip = operand_at + op.operand_width();
+
+            match op {
+                // ── consts / stack ────────────────────────────────────────────
+                Op::Const => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.frame().closure.proto.chunk.consts[idx].clone();
+                    fiber.push(v);
+                }
+                Op::Nil => fiber.push(Value::Nil),
+                Op::True => fiber.push(Value::Bool(true)),
+                Op::False => fiber.push(Value::Bool(false)),
+                Op::Pop => {
+                    fiber.pop();
+                }
+                Op::Dup => {
+                    let top = fiber.peek(0).clone();
+                    fiber.push(top);
+                }
+                Op::Swap => {
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    fiber.push(b);
+                    fiber.push(a);
+                }
+                Op::Rot3 => {
+                    let c = fiber.pop();
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    fiber.push(b);
+                    fiber.push(c);
+                    fiber.push(a);
+                }
+
+                // ── binop family (shared eval_binop_adaptive / apply_binop) ──
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Pow
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge
+                | Op::Eq
+                | Op::Ne
+                | Op::InstanceOf
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::WrapAdd
+                | Op::WrapSub
+                | Op::WrapMul
+                | Op::Range => {
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    let binop = binop_of(op);
+                    let v = self.eval_binop_adaptive(fiber, fault_ip, binop, a, b)?;
+                    fiber.push(v);
+                }
+
+                Op::InstanceOfType => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "INSTANCE_OF_TYPE name is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let yes = match crate::interp::instanceof_reserved_type(&subject, &name) {
+                        Some(b) => b,
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("INSTANCE_OF_TYPE unknown reserved type name '{name}'"),
+                            ))
+                        }
+                    };
+                    fiber.push(Value::Bool(yes));
+                }
+
+                // ── unary ops ────────────────────────────────────────────────
+                Op::Neg | Op::Not | Op::BitNot => {
+                    let a = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::apply_unop(unop_of(op), a, span)?;
+                    fiber.push(v);
+                }
+
+                // ── range ops ────────────────────────────────────────────────
+                Op::RangeInclusive => {
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::materialize_range(&a, &b, true, span)?;
+                    fiber.push(v);
+                }
+
+                Op::RangeStepValue => {
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
+                    let inclusive = (flags & 0b01) != 0;
+                    let present = (flags & 0b10) != 0;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let step = fiber.pop();
+                    let hi = fiber.pop();
+                    let lo = fiber.pop();
+                    let step_arg = if present { Some(&step) } else { None };
+                    let v = crate::interp::materialize_range_stepped(
+                        &lo, &hi, inclusive, step_arg, span,
+                    )?;
+                    fiber.push(v);
+                }
+
+                Op::RangeResolveStep => {
+                    let present =
+                        fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let step = fiber.pop();
+                    let hi_v = fiber.peek(0);
+                    let hi = match hi_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!(
+                            "RANGE_RESOLVE_STEP hi must be a number (CHECK_NUMBERS)"
+                        ),
+                    };
+                    let hi_int = hi_v.is_int_value();
+                    let lo_v = fiber.peek(1);
+                    let lo = match lo_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!(
+                            "RANGE_RESOLVE_STEP lo must be a number (CHECK_NUMBERS)"
+                        ),
+                    };
+                    let lo_int = lo_v.is_int_value();
+                    let (step_v, step_int) = if present {
+                        match step.as_f64() {
+                            Some(s) => (Some(s), step.is_int_value()),
+                            None => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    "for-range step must be a number".to_string(),
+                                ))
+                            }
+                        }
+                    } else {
+                        (None, true)
+                    };
+                    let resolved = crate::interp::resolve_step(lo, hi, step_v, span)?;
+                    let yields_int = lo_int && hi_int && step_int;
+                    fiber.push(crate::interp::range_counter_value(resolved, yields_int));
+                }
+
+                Op::RangeHasNext => {
+                    let inclusive =
+                        fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    let step = fiber.pop();
+                    let hi = fiber.pop();
+                    let i = fiber.pop();
+                    let ok = match (i.as_f64(), hi.as_f64(), step.as_f64()) {
+                        (Some(i), Some(hi), Some(step)) => {
+                            crate::interp::range_has_next(i, hi, step, inclusive)
+                        }
+                        _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::CheckNumbers => {
+                    let end_ok = fiber.peek(0).is_number();
+                    let start_ok = fiber.peek(1).is_number();
+                    if !(end_ok && start_ok) {
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            "for-range bounds must be numbers".to_string(),
+                        ));
+                    }
+                }
+
+                // ── locals / globals ─────────────────────────────────────────
+                Op::GetLocal => {
+                    let slot =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.local(slot).clone();
+                    fiber.push(v);
+                }
+                Op::SetLocal => {
+                    let slot =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.pop();
+                    fiber.set_local(slot, v);
+                }
+
+                Op::GetGlobal => {
+                    // Mirror run_loop's GET_GLOBAL exactly — same cache logic.
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "GET_GLOBAL operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let version = self.global_version();
+                    let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
+                    if self.specialize {
+                        if let Some(idx) = cache.get_index(self.struct_gen()) {
+                            fiber.push(self.user_global_value_at(idx));
+                            *retired += 1;
+                            continue;
+                        }
+                    }
+                    if let Some(v) = cache.get(version).filter(|_| self.specialize) {
+                        fiber.push(v);
+                    } else if let Some((idx, v)) = self.get_user_global_full(&name) {
+                        if self.specialize {
+                            fiber.frame().closure.proto.chunk.set_global_cache(
+                                fault_ip,
+                                crate::vm::adapt::GlobalCache::index_bound(
+                                    idx,
+                                    self.struct_gen(),
+                                ),
+                            );
+                        }
+                        fiber.push(v);
+                    } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
+                        let v = Value::Builtin(name);
+                        if self.specialize {
+                            fiber.frame().closure.proto.chunk.set_global_cache(
+                                fault_ip,
+                                crate::vm::adapt::GlobalCache::set(v.clone(), version),
+                            );
+                        }
+                        fiber.push(v);
+                    } else {
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("undefined variable '{name}'"),
+                        ));
+                    }
+                }
+
+                Op::DefineGlobal => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mutable =
+                        fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) != 0;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "DEFINE_GLOBAL operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let v = fiber.pop();
+                    if self.user_globals.borrow().contains_key(name.as_ref()) {
+                        return Err(Control::Panic(AsError::new(format!(
+                            "'{name}' is already defined in this scope"
+                        ))));
+                    }
+                    self.define_user_global(name, v, mutable);
+                }
+
+                Op::SetGlobal => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "SET_GLOBAL operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    let v = fiber.peek(0).clone();
+                    let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
+                    if self.specialize {
+                        if let Some(idx) = cache.get_index(self.struct_gen()) {
+                            match self.set_user_global_at(idx, v.clone()) {
+                                Some(true) => {
+                                    *retired += 1;
+                                    continue;
+                                }
+                                Some(false) => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!(
+                                            "cannot assign to immutable binding '{name}'"
+                                        ),
+                                    ));
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    match self.user_global_mutable(name.as_ref()) {
+                        Some(true) => {
+                            self.update_user_global(&name, v);
+                            if self.specialize {
+                                if let Some((idx, _)) =
+                                    self.get_user_global_full(name.as_ref())
+                                {
+                                    fiber.frame().closure.proto.chunk.set_global_cache(
+                                        fault_ip,
+                                        crate::vm::adapt::GlobalCache::index_bound(
+                                            idx,
+                                            self.struct_gen(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Some(false) => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("cannot assign to immutable binding '{name}'"),
+                            ));
+                        }
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("cannot assign to undefined variable '{name}'"),
+                            ));
+                        }
+                    }
+                }
+
+                Op::ImmutableError => {
+                    let idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "IMMUTABLE_ERROR operand is not a string constant: {other:?}"
+                                ),
+                            ))
+                        }
+                    };
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        format!("cannot assign to immutable binding '{name}'"),
+                    ));
+                }
+
+                // ── jumps ─────────────────────────────────────────────────────
+                Op::Jump => {
+                    let disp =
+                        fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                    let base = fiber.frame().ip as isize;
+                    fiber.frame_mut().ip = (base + disp as isize) as usize;
+                }
+                Op::Loop => {
+                    let disp =
+                        fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                    let base = fiber.frame().ip as isize;
+                    fiber.frame_mut().ip = (base + disp as isize) as usize;
+                }
+                Op::JumpIfFalse => {
+                    let v = fiber.pop();
+                    if !v.is_truthy() {
+                        let disp =
+                            fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+                Op::JumpIfTrue => {
+                    let v = fiber.pop();
+                    if v.is_truthy() {
+                        let disp =
+                            fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+                Op::JumpIfNotNil => {
+                    let v = fiber.pop();
+                    if v != Value::Nil {
+                        let disp =
+                            fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+
+                // ── Template ──────────────────────────────────────────────────
+                Op::Template => {
+                    let n =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mut parts = vec![Value::Nil; n];
+                    for slot in parts.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let mut out = String::new();
+                    for v in &parts {
+                        out.push_str(&v.to_string());
+                    }
+                    fiber.push(Value::Str(out.into()));
+                }
+
+                _ => unreachable!(
+                    "sync_lane_op admitted an unimplemented op {op:?}"
+                ),
+            }
+            *retired += 1;
+        }
+    }
+
     /// The instruction-dispatch loop. Wrapped by [`run`] which binds the faulting
     /// module's source onto an escaping panic (SP4 §3 cross-module provenance).
     ///
@@ -1255,6 +1765,16 @@ impl Vm {
     /// table reached from the hot loop is a Gate-12 regression.
     async fn run_loop(&self, fiber: &mut Fiber) -> Result<RunOutcome, Control> {
         loop {
+            // LANE §2.3: burst through the suspension-free subset on the sync driver.
+            // `sync_lane == false` (the kill switch) skips straight to the
+            // pre-LANE async dispatch below — the permanent diagnostic mode.
+            if self.sync_lane {
+                match self.run_loop_sync(fiber)? {
+                    SyncOutcome::Finished(outcome) => return Ok(outcome),
+                    SyncOutcome::NeedsAsync => {} // fall through: async-execute ONE op
+                }
+            }
+
             // Capture the faulting ip (the opcode byte's offset) before advancing.
             let fault_ip = fiber.frame().ip;
             // SP4 §3: remember the source of the frame about to execute, so a panic
@@ -6301,6 +6821,77 @@ fn unop_of(op: Op) -> UnOp {
         Op::BitNot => UnOp::BitNot,
         _ => unreachable!("unop_of called with non-unary opcode {op:?}"),
     }
+}
+
+/// LANE §3: returns `true` iff this opcode is in the Task-4 sync subset.
+/// An op NOT in this set causes the sync driver to return `NeedsAsync` (ip un-advanced).
+///
+/// Opcodes in the subset are: consts/stack, binop family (via eval_binop_adaptive),
+/// unary, range ops, locals/globals, jumps, and Template.
+///
+/// NOT yet included (Task 5+): Return/Propagate/Yield/Unwrap (frame exit), calls,
+/// member/index access, destructure/match, cells/upvalues, closures, Await.
+fn sync_lane_op(op: Op) -> bool {
+    matches!(
+        op,
+        // consts / stack
+        Op::Const
+            | Op::Nil
+            | Op::True
+            | Op::False
+            | Op::Pop
+            | Op::Dup
+            | Op::Swap
+            | Op::Rot3
+            | Op::Template
+            // binop family
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::Pow
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::Eq
+            | Op::Ne
+            | Op::InstanceOf
+            | Op::InstanceOfType
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::WrapAdd
+            | Op::WrapSub
+            | Op::WrapMul
+            | Op::Range
+            // unary
+            | Op::Neg
+            | Op::Not
+            | Op::BitNot
+            // range ops
+            | Op::RangeInclusive
+            | Op::RangeStepValue
+            | Op::RangeResolveStep
+            | Op::RangeHasNext
+            | Op::CheckNumbers
+            // locals / globals
+            | Op::GetLocal
+            | Op::SetLocal
+            | Op::GetGlobal
+            | Op::DefineGlobal
+            | Op::SetGlobal
+            | Op::ImmutableError
+            // jumps
+            | Op::Jump
+            | Op::Loop
+            | Op::JumpIfFalse
+            | Op::JumpIfTrue
+            | Op::JumpIfNotNil
+    )
 }
 
 #[cfg(test)]

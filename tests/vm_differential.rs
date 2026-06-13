@@ -8949,9 +8949,8 @@ run(false)
 // ── LANE §6.1 / §6.4 kill-switch + counter tests ────────────────────────────
 
 /// LANE §6.1: `vm_run_source_no_sync_lane` (sync_lane=false) produces byte-identical
-/// output to `vm_run_source` (sync_lane=true, the default). LANE §6.4: the lane
-/// counters read 0 before Task 4 wires up the burst driver, so no false-green
-/// assertions fire yet.
+/// output to `vm_run_source` (sync_lane=true, the default). LANE §6.4: after Task 4
+/// wired up the burst driver, counters read > 0 for any program with a hot loop.
 #[tokio::test]
 async fn no_sync_lane_entry_point_runs_byte_identically() {
     let src = "let s = 0\nfor (i in 0..100) { s = s + i }\nprint(s)";
@@ -8961,11 +8960,72 @@ async fn no_sync_lane_entry_point_runs_byte_identically() {
         ascript::vm_run_source_no_sync_lane(src).await.expect("lane-off ok");
     assert_eq!(on_out, off_out, "sync_lane=true vs false must be byte-identical");
     assert_eq!(on_exit, off_exit, "exit codes must match");
-    let (_out, _exit, sync_ops, bursts) =
-        ascript::vm_run_source_lane_stats(src).await.expect("stats ok");
+    // Task 4: the kill-switch variant zeroes the counters.
+    let (_out, _exit, sync_ops, _bursts) =
+        ascript::vm_run_source_lane_stats_no_lane(src).await.expect("stats ok");
     assert_eq!(
-        (sync_ops, bursts),
-        (0, 0),
-        "no driver yet — counters must read 0 before Task 4 wires the burst driver"
+        sync_ops,
+        0,
+        "kill-switch (sync_lane=false) must produce zero lane ops"
     );
+}
+
+/// LANE §6.4 / Task 4: the sync driver runs at least 1M ops for a million-step loop.
+#[tokio::test]
+async fn sync_lane_executes_the_tight_loop_and_counts_it() {
+    let src = "let s = 0\nfor (i in 0..1000000) { s = s + i }\nprint(s)";
+    let (out, _exit, sync_ops, bursts) =
+        ascript::vm_run_source_lane_stats(src).await.expect("ok");
+    assert_eq!(out, "499999500000\n");
+    assert!(
+        sync_ops >= 1_000_000,
+        "lane retired only {sync_ops} ops — burst did not run the loop"
+    );
+    assert!(bursts >= 1, "expected at least one burst, got {bursts}");
+}
+
+/// LANE §6.4 / Task 4: with sync_lane=false, the counters must remain zero.
+#[tokio::test]
+async fn kill_switch_means_zero_lane_ops() {
+    let src = "let s = 0\nfor (i in 0..1000) { s = s + i }\nprint(s)";
+    let (_o, _e, sync_ops, _b) =
+        ascript::vm_run_source_lane_stats_no_lane(src).await.expect("ok");
+    assert_eq!(sync_ops, 0, "kill-switch must suppress all lane ops");
+}
+
+/// LANE §6.4 / Task 4: lane-on and lane-off must produce byte-identical output for
+/// the core opcode battery (arithmetic, loops, globals, template strings, Tier-2 panics).
+#[tokio::test]
+async fn lane_on_off_byte_identical_over_core_battery() {
+    let cases: &[&str] = &[
+        "print(1 + 2 * 3)",
+        "let s = 0\nfor (i in 0..100) { s = s + i }\nprint(s)",
+        "let i = 0\nwhile (i < 50) { i = i + 1 }\nprint(i)",
+        "print(7 % 3, 2 ** 10, 0xFF & 0b1010, 5 +% 3)",
+        "print(`n=${40 + 2}`)",
+    ];
+    for src in cases {
+        let on = ascript::vm_run_source(src).await;
+        let off = ascript::vm_run_source_no_sync_lane(src).await;
+        match (on, off) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "diverged on `{src}`"),
+            (Err(a), Err(b)) => assert_eq!(
+                a.to_string(),
+                b.to_string(),
+                "panic diverged on `{src}`"
+            ),
+            (a, b) => panic!("ok/err disagreement on `{src}`: {a:?} vs {b:?}"),
+        }
+    }
+    // Tier-2 panic path — message must be identical.
+    let on = ascript::vm_run_source("print(1 << 64)").await;
+    let off = ascript::vm_run_source_no_sync_lane("print(1 << 64)").await;
+    match (on, off) {
+        (Err(a), Err(b)) => assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "shift-panic diverged between lane-on and lane-off"
+        ),
+        (a, b) => panic!("expected Err for shift-64, got: {a:?} vs {b:?}"),
+    }
 }
