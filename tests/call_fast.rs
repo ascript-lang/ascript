@@ -173,3 +173,117 @@ async fn inplace_binds_counter_is_nonzero() {
         stats.inplace_binds
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Task 2.3 (A3): fiber pooling — anti-false-green + probe tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A3 anti-false-green: `pooled_fiber_reuses` must be > 0 after running code
+/// that re-enters the VM via `Vm::call_value` (e.g. `array.map`). Proves the
+/// fiber pool actually fires, not just that output is coincidentally identical.
+#[tokio::test]
+async fn pooled_fiber_reuses_counter_is_nonzero() {
+    // array.map over a list drives Vm::call_value once per element — the simplest
+    // deterministic re-entry path. Use a short fixed list; map fires 5 call_value
+    // calls, at least some of which (after the first) must reuse a pooled fiber.
+    let src = r#"
+        import * as array from "std/array"
+        let words = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+        let lengths = array.map(words, (w) => len(w))
+        let total = array.reduce(lengths, (a, n) => a + n, 0)
+        print(total)
+    "#;
+    let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("vm_run_source_call_fast_stats failed");
+    assert!(
+        stats.pooled_fiber_reuses > 0,
+        "A3: pooled_fiber_reuses should be > 0 after 20 re-entrant calls via array.map+reduce, got {}",
+        stats.pooled_fiber_reuses
+    );
+}
+
+/// A3 probe: deeply nested re-entrancy (map-inside-map) must produce correct results.
+/// Distinct fibers must be used simultaneously — the pool is not shared across
+/// two concurrent `call_value` invocations (take removes from pool).
+#[tokio::test]
+async fn nested_reentrant_calls_are_correct() {
+    let src = r#"
+        import * as array from "std/array"
+        let xs = [1, 2, 3]
+        let ys = [10, 20, 30]
+        let result = array.map(xs, (x) => {
+            let inner = array.map(ys, (y) => x + y)
+            return array.reduce(inner, (acc, v) => acc + v, 0)
+        })
+        print(result)
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// A3 probe: a panicking callee must NOT poison the pool. After a panic, the
+/// fiber is dropped (never pooled); subsequent successful calls must still work.
+#[tokio::test]
+async fn panicking_callee_does_not_poison_pool() {
+    let src = r#"
+        import * as array from "std/array"
+        fn bad(x) {
+            if (x == 2) { let _ = nil + 1 }
+            return x * 10
+        }
+        // The first call (x=1) succeeds, x=2 panics — recover, then x=3 succeeds.
+        let r1 = recover(() => bad(1))
+        let r2 = recover(() => bad(2))
+        let r3 = recover(() => bad(3))
+        print([r1[0], r2[1] != nil, r3[0]])
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// A3 probe: generator + `for await` interleaved with pooled re-entrant calls.
+/// The generator fiber is NOT pooled; it must coexist with pooled call fibers.
+#[tokio::test]
+async fn generator_and_pooled_fibers_coexist() {
+    let src = r#"
+        import * as array from "std/array"
+        fn* gen(n) {
+            for (i in 0..n) { yield i }
+        }
+        let g = gen(5)
+        let items = []
+        for await (v in g) {
+            // Call via array.map inside the for-await body — pooled re-entry.
+            let doubled = array.map([v], (x) => x * 2)
+            items = items + doubled
+        }
+        print(items)
+    "#;
+    assert_five_mode_identical(src).await;
+}
+
+/// A3 probe: `call_fast=false` (pool disabled) must produce byte-identical output.
+/// No new divergence from A3 itself — the kill switch must fully suppress pooling.
+#[tokio::test]
+async fn a3_pool_off_still_byte_identical() {
+    let cases = [
+        // map over a closure
+        r#"
+            import * as array from "std/array"
+            let xs = [1, 2, 3, 4, 5]
+            let r = array.map(xs, (x) => x * x)
+            print(r)
+        "#,
+        // class method call via invoke_compiled_method
+        r#"
+            class Adder {
+                fn add(a, b) { return a + b }
+            }
+            let adder = Adder()
+            let r = adder.add(3, 4)
+            print(r)
+        "#,
+    ];
+    for src in cases {
+        assert_five_mode_identical(src).await;
+    }
+}

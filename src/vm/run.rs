@@ -257,6 +257,31 @@ pub struct Vm {
     /// cost is bounded by the Gate-17 zero-cost bench. Asserted >0 over the
     /// functional corpus so the differential proves the fast paths actually ran.
     call_fast_stats: std::cell::Cell<CallFastStats>,
+    /// **CALL §4 A3 — fiber pool for re-entrant calls.**
+    ///
+    /// Holds recycled [`Fiber`]s that `take_pooled_fiber` / `return_pooled_fiber`
+    /// manage. Every native→VM re-entry (`call_value`, `invoke_compiled_method`,
+    /// `invoke_compiled_static`) previously built a brand-new `Fiber` (two `Vec`s)
+    /// and dropped it; this pool amortises those allocations over repeated calls.
+    ///
+    /// **Protocol:**
+    /// * Take = exclusive ownership transfer (POP from the pool, call `Fiber::reset`
+    ///   on the popped fiber, and hand it to `run`). A nested re-entry that arrives
+    ///   while a fiber is mid-flight finds a different slot or allocates — safe by
+    ///   construction because removal happens before `run`.
+    /// * Return ONLY on `RunOutcome::Done`. On `Err` (panic/propagate) the fiber is
+    ///   DROPPED, never pooled — mid-flight state, fresh fibers have no old state.
+    /// * This field is a `RefCell` but every borrow is a short synchronous pop/push
+    ///   — NEVER held across an `.await`.
+    ///
+    /// Capacity is capped at [`FIBER_POOL_MAX`]. The pool only ever holds fibers
+    /// with `frames.is_empty()` (cleared before parking; take calls `reset` before
+    /// handing out).
+    ///
+    /// **Not used when `call_fast = false`** (the kill switch disables this path
+    /// exactly like A2's in-place binding, so the no-call-fast differential mode
+    /// stays the complete everything-off floor).
+    fiber_pool: RefCell<Vec<crate::vm::fiber::Fiber>>,
     /// DBG: the flattened proto tree of the program under inspection, for resolving a
     /// source (file, line) to a `(proto_id, offset)` to patch. Populated ONLY when a
     /// debugger arms breakpoints (empty otherwise → zero cost, NEVER read on the hot
@@ -360,6 +385,7 @@ impl Vm {
             lane_bursts: std::cell::Cell::new(0),
             call_fast,
             call_fast_stats: std::cell::Cell::new(CallFastStats::default()),
+            fiber_pool: RefCell::new(Vec::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -413,6 +439,69 @@ impl Vm {
         let mut s = self.call_fast_stats.get();
         f(&mut s);
         self.call_fast_stats.set(s);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // CALL §4 A3 — fiber pool
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Maximum number of idle [`Fiber`]s kept in the pool.
+    const FIBER_POOL_MAX: usize = 8;
+
+    /// **CALL §4 A3 — take a fiber from the pool (or allocate a fresh one).**
+    ///
+    /// POPs one fiber from `fiber_pool`, resets it for `top`, and returns it.
+    /// Because the pop REMOVES the fiber, a nested re-entrant call that arrives
+    /// while this fiber is mid-flight will take a DIFFERENT entry from the pool
+    /// (or allocate a fresh one if the pool is empty) — safe by construction.
+    ///
+    /// When `call_fast = false` the pool is bypassed entirely: always allocate a
+    /// fresh `Fiber::new(top)` (the kill switch keeps no-call-fast identical).
+    ///
+    /// # Await discipline
+    /// The `fiber_pool` `RefCell` borrow is held only for the synchronous pop —
+    /// it is NEVER held across an `.await`.
+    #[inline]
+    fn take_pooled_fiber(&self, top: gcmodule::Cc<crate::vm::value_ext::Closure>) -> crate::vm::fiber::Fiber {
+        if self.call_fast {
+            if let Some(mut fiber) = self.fiber_pool.borrow_mut().pop() {
+                fiber.reset(top);
+                self.bump_stat(|s| s.pooled_fiber_reuses += 1);
+                return fiber;
+            }
+        }
+        crate::vm::fiber::Fiber::new(top)
+    }
+
+    /// **CALL §4 A3 — return a fiber to the pool after clean completion.**
+    ///
+    /// Called ONLY after `RunOutcome::Done` — the fiber ran to completion and its
+    /// frame stack was popped to empty by the normal `return_from_frame` path.
+    /// Clears the stack, then pushes the fiber back if the pool is below
+    /// [`FIBER_POOL_MAX`] and `call_fast` is on.
+    ///
+    /// On `Err` (panic / propagate) the caller DROPS the fiber — this method is
+    /// NOT called — so stale mid-flight state can never enter the pool.
+    ///
+    /// # Await discipline
+    /// The `fiber_pool` `RefCell` borrow is held only for the synchronous push —
+    /// NEVER across an `.await`.
+    #[inline]
+    fn return_pooled_fiber(&self, mut fiber: crate::vm::fiber::Fiber) {
+        if !self.call_fast {
+            return;
+        }
+        let mut pool = self.fiber_pool.borrow_mut();
+        if pool.len() < Self::FIBER_POOL_MAX {
+            // Defensive: the fiber should already have an empty frame stack after
+            // `RunOutcome::Done` (the root `return_from_frame` pops it). Clear both
+            // vecs before parking to release any refs and keep the invariant:
+            // pooled fibers hold no live frame or stack data.
+            fiber.frames.clear();
+            fiber.stack.clear();
+            pool.push(fiber);
+        }
+        // If the pool is full, `fiber` simply drops here.
     }
 
     /// **DBG.** Build a specializing VM with an instrumentation payload installed
@@ -6949,12 +7038,11 @@ impl Vm {
                 // with the tree-walker and the `Op::Call` arm.
                 let bound =
                     crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
-                // Build a one-frame Fiber whose sole frame is the closure, then
-                // place the bound params into its slots (cell slot → cell, plain
-                // slot → stack). `Fiber::new` already reserved `slot_count` Nil
-                // locals and allocated the cell vector, so we only overwrite the
-                // param slots; the rest stay Nil.
-                let mut fiber = Fiber::new(closure);
+                // CALL §4 A3: take a pooled fiber (or allocate a fresh one when
+                // the pool is empty or call_fast=false). `take_pooled_fiber` pops
+                // the fiber from the pool so nested re-entrant calls grab a DIFFERENT
+                // entry — safe by construction.
+                let mut fiber = self.take_pooled_fiber(closure);
                 fiber.frame_mut().ret_span = span;
                 fiber.frame_mut().argc = bound.supplied;
                 // Snapshot the cell `Rc`s for the param slots so we don't hold a
@@ -6975,19 +7063,25 @@ impl Vm {
                 // owns exactly that unit. A `Cell`, never held as a RefCell borrow
                 // across the `.await`.
                 let _depth = self.interp.enter_call_depth_scoped(span)?;
-                // Drive the fresh fiber to completion. A top-level closure body
-                // cannot `yield` (yield is only valid inside a generator, which is
-                // driven differently), so `Done(v)` is the only outcome; a `yield`
-                // here would be a compiler bug.
+                // Drive the fiber to completion. A top-level closure body cannot
+                // `yield` (yield is only valid inside a generator, which is driven
+                // differently), so `Done(v)` is the only outcome; a `yield` here
+                // would be a compiler bug.
                 // SP9 §1: this is a native re-entry funnel for higher-order stdlib
                 // callbacks (`array.map`/`reduce`/comparators) — a deep `map`-of-`map`
                 // nests Rust frames here. Grow the native stack per poll so the
                 // re-entry reaches the logical cap cleanly instead of SIGABRTing.
-                match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
-                    RunOutcome::Done(v) => Ok(v),
-                    RunOutcome::Yielded(_) => {
+                // CALL §4 A3: return the fiber to the pool ONLY on Done; on Err
+                // the fiber is dropped (never pooled — mid-flight state).
+                match crate::vm::stack::grow_future(self.run(&mut fiber)).await {
+                    Ok(RunOutcome::Done(v)) => {
+                        self.return_pooled_fiber(fiber);
+                        Ok(v)
+                    }
+                    Ok(RunOutcome::Yielded(_)) => {
                         unreachable!("a closure called via Vm::call_value cannot yield")
                     }
+                    Err(e) => Err(e),
                 }
             }
             // A class constructor (V9): build an instance VM-side (defaults via
@@ -8068,7 +8162,10 @@ impl Vm {
                 crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
             return Ok(Value::Generator(Rc::new(handle)));
         }
-        let mut fiber = Fiber::new(closure);
+        // CALL §4 A3: take a pooled fiber (or allocate fresh when pool is empty /
+        // call_fast=false). Removal from pool means a nested re-entrant method
+        // call takes a different entry — safe by construction.
+        let mut fiber = self.take_pooled_fiber(closure);
         fiber.frame_mut().ret_span = span;
         // Record the DEFINING class so a `super.<name>` in this method body
         // (Op::GetSuper) resolves up from `def_class.superclass`, exactly like the
@@ -8100,11 +8197,16 @@ impl Vm {
         let _depth = self.interp.enter_call_depth_scoped(span)?;
         // SP9 §1: native re-entry funnel for non-IC method dispatch — grow the
         // native stack per poll (see `call_value`).
-        match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
-            RunOutcome::Done(v) => Ok(v),
-            RunOutcome::Yielded(_) => {
+        // CALL §4 A3: return fiber to pool ONLY on Done; drop on Err.
+        match crate::vm::stack::grow_future(self.run(&mut fiber)).await {
+            Ok(RunOutcome::Done(v)) => {
+                self.return_pooled_fiber(fiber);
+                Ok(v)
+            }
+            Ok(RunOutcome::Yielded(_)) => {
                 unreachable!("a non-generator method cannot yield")
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -8159,10 +8261,11 @@ impl Vm {
             let handle = crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
             return Ok(Value::Generator(Rc::new(handle)));
         }
-        // Plain sync static: run a fresh one-frame fiber to completion (args bound
-        // into slots 0.., no receiver) — mirrors `invoke_compiled_method`'s sync
-        // tail without the `self` slot.
-        let mut fiber = Fiber::new(closure);
+        // Plain sync static: run a fiber to completion (args bound into slots 0..,
+        // no receiver) — mirrors `invoke_compiled_method`'s sync tail without the
+        // `self` slot.
+        // CALL §4 A3: take a pooled fiber (or fresh if pool empty / call_fast=false).
+        let mut fiber = self.take_pooled_fiber(closure);
         fiber.frame_mut().ret_span = span;
         fiber.frame_mut().argc = bound.supplied;
         let cells = fiber.frame().cells.clone();
@@ -8176,9 +8279,14 @@ impl Vm {
         }
         // SP9 §1: native re-entry funnel for static-method dispatch — grow the
         // native stack per poll (see `call_value`).
-        match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
-            RunOutcome::Done(v) => Ok(v),
-            RunOutcome::Yielded(_) => unreachable!("a non-generator static cannot yield"),
+        // CALL §4 A3: return fiber to pool ONLY on Done; drop on Err.
+        match crate::vm::stack::grow_future(self.run(&mut fiber)).await {
+            Ok(RunOutcome::Done(v)) => {
+                self.return_pooled_fiber(fiber);
+                Ok(v)
+            }
+            Ok(RunOutcome::Yielded(_)) => unreachable!("a non-generator static cannot yield"),
+            Err(e) => Err(e),
         }
     }
 

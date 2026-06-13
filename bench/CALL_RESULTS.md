@@ -79,3 +79,29 @@ The shared arity + contract logic is extracted into `check_call_arity` +
 - `call_fast=false` (A1 only): below 3.0/call (cells-vec gone, 2 arg Vecs remain)
 
 **vm_differential:** 424 passed, 0 failed (both feature configs).
+
+### A3
+
+**Change:** Fiber pooling at the three re-entrant call funnels: `Vm::call_value`
+(plain-Closure arm), `invoke_compiled_method` (non-generator sync tail), and
+`invoke_compiled_static` (plain sync static tail). A `fiber_pool: RefCell<Vec<Fiber>>`
+capped at `FIBER_POOL_MAX = 8` lives on `Vm`. `take_pooled_fiber` pops a fiber from
+the pool and calls `Fiber::reset` (clears frames/stack, allocates fresh cells, pushes
+one bottom frame); `return_pooled_fiber` parks it back only on `RunOutcome::Done` (on
+`Err` the fiber is dropped — never pooled). Generator fibers, the module fiber, and
+the program root are untouched.
+
+**Pooled fiber saves:** 2 `Vec` allocs per re-entry (`frames` Vec + `stack` Vec),
+amortised over repeated calls to the same re-entry funnel. The per-element cost in
+`array.map` is dominated by other overhead (~25 allocs/element total); the savings
+are real but are a small fraction observable only in microbenchmarks.
+
+**Anti-false-green:** `pooled_fiber_reuses` counter confirmed > 0 over `array.map`
++ `array.reduce` (10 elements each) in `tests/call_fast.rs::pooled_fiber_reuses_counter_is_nonzero`.
+
+**Alloc slope (release, N=20k, `--test-threads=1`):**
+- `call_fast=true`: ~25 allocs/element (< 50 budget, regression guard passed)
+- `call_fast=false`: ~25 allocs/element (both within budget, `on ≤ off + 2`)
+
+**vm_differential:** 424 passed, 0 failed (both feature configs).
+**Clippy:** 0 warnings, 0 errors (both feature configs).

@@ -98,3 +98,54 @@ fn capture_free_call_alloc_slope_drops_with_a1_and_a2() {
         "A2: call_fast=true slope {on} should be less than call_fast=false slope {off}"
     );
 }
+
+/// A3 (Task 2.3 gate): re-entrant `call_value` calls (native→VM re-entry via
+/// `array.map`) must not regress. The anti-false-green proof that pooling actually
+/// fires is in `tests/call_fast.rs::pooled_fiber_reuses_counter_is_nonzero`; here
+/// we guard against alloc regressions (a new re-entry path that adds allocs/element).
+///
+/// The slope is `(allocs(2N) − allocs(N)) / N` — allocations per `array.map`
+/// element. Fiber pooling saves 2 Vec allocs per re-entry (the `frames` and `stack`
+/// Vecs), but per-element cost is dominated by closure call overhead. We therefore
+/// assert a generous upper-bound regression tripwire rather than a strict `on < off`
+/// (the pool saves ~2 of ~25 allocs/element — too small for a reliable per-run order).
+///
+/// Budget: both slopes < 50 allocs/element in release (a regression that doubles the
+/// slope trips this; allocator jitter does not).
+///
+/// **Run with `--release --test-threads=1`** — the global `ALLOCS` counter is shared
+/// across parallel test threads, so running alongside other alloc_count tests in debug
+/// mode produces noise. The functional (non-slope) proof that pooling fires is in
+/// `tests/call_fast.rs::pooled_fiber_reuses_counter_is_nonzero` which runs in the
+/// normal `cargo test` suite. This test is `#[ignore]` to opt-in for release perf gates.
+#[test]
+#[ignore]
+fn reentrant_call_value_fiber_is_pooled() {
+    // array.map over a list — each element drives one `Vm::call_value` re-entry.
+    // We vary N (the list length) by embedding it in the source.
+    let mk = |n: u64| {
+        let elems: Vec<String> = (0..n)
+            .map(|i| format!("\"{}\"", (b'a' + (i % 26) as u8) as char))
+            .collect();
+        format!(
+            "import * as array from \"std/array\"\nlet words = [{}]\nlet lengths = array.map(words, (w) => len(w))\nlet _ = array.reduce(lengths, (a, n) => a + n, 0)\nprint(_)",
+            elems.join(",")
+        )
+    };
+    let on = slope(mk, true);
+    let off = slope(mk, false);
+    // A3: pooling must not add per-element allocs (on ≤ off + 2 allows for noise).
+    assert!(
+        on <= off + 2.0,
+        "A3: call_fast=true slope {on} exceeds call_fast=false slope {off} by more than 2 (pooling should not add overhead)"
+    );
+    // Regression guard: slope should stay below 50 allocs/element in release.
+    assert!(
+        on < 50.0,
+        "A3: call_fast=true re-entry slope {on} is unexpectedly high (possible regression)"
+    );
+    assert!(
+        off < 50.0,
+        "A3: call_fast=false re-entry slope {off} is unexpectedly high (possible regression)"
+    );
+}

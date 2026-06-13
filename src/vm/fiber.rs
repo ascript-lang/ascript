@@ -240,6 +240,49 @@ impl Fiber {
             .expect("Fiber::fresh_cell on a non-cell slot (compiler/resolver bug)");
         *slot_cell = Cc::new(RefCell::new(Value::Nil));
     }
+
+    /// **CALL §4 A3 — fiber pool reset.**
+    ///
+    /// Recycle this fiber for `top`, clearing mid-flight state so it can be reused
+    /// by a re-entrant call. The returned fiber is in the exact same state as
+    /// `Fiber::new(top)` — one bottom frame at `ip 0`, stack pre-filled with
+    /// `Value::Nil` for all locals, fresh cells, state `Running`.
+    ///
+    /// Cell freshness is load-bearing: cells are `Cc` handles captured by closures
+    /// that this call creates. Reusing the old `Cc` would let a previously-returned
+    /// closure read/write this invocation's locals — structural aliasing that
+    /// `Fiber::new` naturally avoids. We therefore ALWAYS allocate fresh cells on
+    /// reset, even if `top` is the same proto. This mirrors the spec note:
+    /// "per-call cells pooling was evaluated and rejected".
+    ///
+    /// # Safety / invariant
+    /// The caller is responsible for ensuring the fiber is NOT mid-flight (i.e. not
+    /// currently owned by a running `run` call). The fiber-pool take/return protocol
+    /// guarantees this: a fiber is removed from the pool before being handed to
+    /// `run`, and only returned after `RunOutcome::Done`.
+    pub fn reset(&mut self, top: Cc<Closure>) {
+        let slot_count = top.proto.chunk.slot_count as usize;
+        // Drop all existing frame state (releases old cell Cc refs and closure refs).
+        self.frames.clear();
+        // Resize the stack to exactly `slot_count` Nils — clearing any mid-flight
+        // operand pushes and resizing for the new proto's local window.
+        self.stack.clear();
+        self.stack.resize(slot_count, Value::Nil);
+        // Fresh cells — NEVER reuse old Cc handles (see doc comment above).
+        let cells = alloc_cells(slot_count, &top.proto.chunk.cell_slots);
+        let frame = CallFrame {
+            closure: top,
+            ip: 0,
+            slot_base: 0,
+            cells,
+            ret_span: Span::new(0, 0),
+            def_class: None,
+            argc: 0,
+            defers: Vec::new(),
+        };
+        self.frames.push(frame);
+        self.state = FiberState::Running;
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +392,62 @@ mod tests {
         let cells = alloc_cells(3, &[1]);
         assert_eq!(cells.len(), 3);
         assert!(cells[1].is_some());
+    }
+
+    /// CALL §4 A3: `Fiber::reset` must restore the fiber to exactly the state that
+    /// `Fiber::new(top)` would produce: one bottom frame at ip 0, stack all Nil,
+    /// fresh cells (new Cc allocations, not the old ones), state Running.
+    #[test]
+    fn reset_reestablishes_the_one_frame_invariant() {
+        // Build a closure with 3 slots, slot 1 is a cell slot.
+        let top = closure_with_cell_slots(3, vec![1]);
+
+        // Create and put the fiber into mid-flight state.
+        let mut fiber = Fiber::new(top.clone());
+        // Clone the old cell's Cc to keep it alive during reset — otherwise
+        // `frames.clear()` drops the sole strong ref, the allocator reclaims the
+        // memory, and the next `alloc_cells` may reuse the same address, making
+        // the pointer-identity check vacuously pass. By holding `_old_cell` here
+        // we keep the old allocation live until after the assertion.
+        let _old_cell = fiber.frame().cells[1].clone();
+        let old_cell_ptr = _old_cell.as_ref().map(crate::gc::cc_addr);
+        // Simulate in-flight: write locals + push some operands, change state.
+        fiber.stack[0] = Value::Bool(true);
+        fiber.stack[1] = Value::Bool(false);
+        fiber.push(Value::Bool(true)); // operand above locals
+        fiber.state = FiberState::Done;
+
+        // Reset.
+        fiber.reset(top);
+
+        // Frame invariants.
+        assert_eq!(fiber.frames.len(), 1, "exactly one frame after reset");
+        assert_eq!(fiber.frame().ip, 0);
+        assert_eq!(fiber.frame().slot_base, 0);
+        assert_eq!(fiber.frame().argc, 0);
+        assert!(fiber.frame().def_class.is_none());
+        assert!(fiber.frame().defers.is_empty());
+
+        // Stack invariants: exactly slot_count Nils, no leftover operands.
+        assert_eq!(fiber.stack.len(), 3, "stack len == slot_count");
+        for (i, v) in fiber.stack.iter().enumerate() {
+            assert!(matches!(v, Value::Nil), "stack[{i}] must be Nil after reset");
+        }
+
+        // State invariant.
+        assert_eq!(fiber.state, FiberState::Running);
+
+        // Cell freshness: the new cell at slot 1 must be a NEW Cc allocation.
+        // `_old_cell` keeps the original alive so the addresses are guaranteed distinct.
+        let new_cell_ptr = fiber.frame().cells[1]
+            .as_ref()
+            .map(crate::gc::cc_addr);
+        assert!(
+            old_cell_ptr != new_cell_ptr,
+            "reset must allocate FRESH cells, not reuse old Cc handles"
+        );
+
+        // Non-cell slot is still None.
+        assert!(fiber.frame().cells[0].is_none(), "slot 0 is still a plain slot");
     }
 }
