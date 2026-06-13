@@ -368,6 +368,35 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   added in the same PR. **No tree-walker change, no `.aso` change, `ASO_FORMAT_VERSION` unchanged.** Headline
   (`bench/LANE_RESULTS.md`): spec/tw geomean 3.59×; A/B geomean 1.045× (dispatch-bound +15–21%); RSS no
   regression; `dbg_zero_cost_gate` 1.006×.
+- **CALL — call-path allocation diet + higher-order callback trampoline** (VM-only; spec
+  `superpowers/specs/2026-06-12-call-path-diet-design.md`). Three allocation units (A1/A2/A3) plus
+  a callback trampoline (Unit B), all VM-only — tree-walker untouched, no `.aso` change
+  (`ASO_FORMAT_VERSION` 28 unchanged), no semantics change. **A1:** `alloc_cells` returns
+  `Vec::new()` when `cell_slots` is empty (capture-free frames allocate no cells vector — always-on,
+  not gated on `call_fast`). **A2:** in-place argument binding over the operand-stack window for the
+  qualifying `Op::Call` plain-Closure arm (`call_fast=true`, `!has_rest`): `check_call_args_in_place`
+  borrows the existing stack window, eliminating the `vec![Value::Nil; argc]` and `BoundArgs.values`
+  allocations — the qualifying call shape reaches **0 allocs/call**. The shared arity +
+  contract logic is extracted into `check_call_arity`/`check_param_contract` cores consumed by both
+  paths — wording byte-identical by construction. **A3:** fiber pooling at three re-entrant call
+  funnels (`call_value` plain-Closure arm, `invoke_compiled_method`, `invoke_compiled_static`):
+  `fiber_pool: RefCell<Vec<Fiber>>` capped at `FIBER_POOL_MAX = 8`; `take_pooled_fiber` pops and
+  resets (fresh cells per element — capture identity preserved); `return_pooled_fiber` parks back
+  only on `RunOutcome::Done`; on `Err` the fiber is dropped, never pooled. Generator fibers, the
+  module fiber, and the program root are never pooled. **Unit B (trampoline):** higher-order builtins
+  (`array.{map,filter,reduce,sort,find,findIndex,some,every,flatMap,groupBy,partition}`,
+  `object.mapValues`, stream pipeline + terminals) detect a `Value::Closure` callee and drive it
+  through ONE reused fiber on LANE's sync lane with per-element escalation to the async driver when a
+  callback suspends — never re-executing the element. Arming requires a `Value::Closure` (VM-only);
+  `Value::Function` (tree-walker) callbacks take the unchanged generic path. **Kill switch:**
+  `Vm.call_fast` (`bool`, default true; env `ASCRIPT_NO_CALL_FAST=1`); `Vm::new_generic` disables it
+  — the generic path is the complete semantic floor. **Fifth differential mode:**
+  `vm_run_source_no_call_fast` joins `vm_differential.rs` (both feature configs); alloc-count slope
+  harness in `tests/alloc_count.rs`. **No user-facing docs change** (no API/syntax/opcode surface —
+  Gate 13 satisfied by bench + repo docs). Headline (`bench/CALL_RESULTS.md`): A1+A2 → 0
+  allocs/qualifying call; A3 → 31→15 allocs/element; spec/tw geomean **4.05×**; A/B geomean
+  **1.000×** (func_pipeline +1.1%, call_heavy +1.6%); `dbg_zero_cost_gate` **1.005×**; RSS no
+  regression.
 
 ## Commands
 
