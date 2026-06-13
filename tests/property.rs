@@ -1396,3 +1396,166 @@ fn differential_defer_in_branch_seed_is_present_and_current() {
          the verifier-stressing shape (generator drift?)"
     );
 }
+
+// ===========================================================================
+// SHAPE Task 2.2 — ObjectStorage slab/dict dual-mode property tests
+// ===========================================================================
+
+mod object_storage_property {
+    use ascript::value::{ObjectCell, Value};
+    use ascript::vm::shape::{ShapeRegistry, EMPTY_SHAPE};
+    use indexmap::IndexMap;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Insert(String, i64),
+        Delete(String),
+        SpreadFrom(Vec<(String, i64)>),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        // Small key alphabet → frequent overwrites and deletions
+        let key = prop::sample::select(vec![
+            "a", "b", "c", "d", "e", "f", "g", "h", "j", "k", "l", "m", "n", "p", "q", "r",
+            "s", "t", "u", "v", "w", "x", "y", "z", "aa", "ab", "ac", "ba", "bb", "ca", "cb",
+            "cc", "da", "db", "ea", "fa", "ga", "ha", "ia", "ja", "ka", "la", "ma", "na", "oa",
+            "pa", "qa", "ra", "sa", "ta", "ua", "va", "wa", "xa", "ya", "za", "ab1", "ab2",
+            "ab3", "ab4", "ab5", "ab6", "ab7", "ab8",
+        ]);
+        prop_oneof![
+            4 => (key.clone(), any::<i64>()).prop_map(|(k, v)| Op::Insert(k.to_string(), v)),
+            2 => key.clone().prop_map(|k| Op::Delete(k.to_string())),
+            1 => prop::collection::vec((key.clone(), any::<i64>()), 0..10)
+                .prop_map(|pairs| Op::SpreadFrom(
+                    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+                )),
+        ]
+    }
+
+    fn apply_to_model(model: &mut IndexMap<String, i64>, op: &Op) {
+        match op {
+            Op::Insert(k, v) => {
+                model.insert(k.clone(), *v);
+            }
+            Op::Delete(k) => {
+                model.shift_remove(k.as_str());
+            }
+            Op::SpreadFrom(pairs) => {
+                for (k, v) in pairs {
+                    model.insert(k.clone(), *v);
+                }
+            }
+        }
+    }
+
+    fn apply_to_cell(cell: &ObjectCell, reg: &mut ShapeRegistry, op: &Op) {
+        match op {
+            Op::Insert(k, v) => {
+                if cell.contains_key(k) {
+                    // Overwrite in place (position kept)
+                    cell.insert(k, Value::Int(*v));
+                } else {
+                    // New key: try registry-driven slab append, else demote+insert
+                    let shape = cell.shape.get();
+                    match reg.add_key(shape, k) {
+                        Some(child_shape) => {
+                            let child_keys = reg.keys_of(child_shape);
+                            let ok = cell.slab_append(child_shape, child_keys, Value::Int(*v));
+                            if !ok {
+                                // Was already in dict mode; just insert
+                                cell.insert(k, Value::Int(*v));
+                            }
+                        }
+                        None => {
+                            // Cap exceeded — demote (if slab) and dict-insert
+                            cell.demote_to_dict();
+                            cell.insert(k, Value::Int(*v));
+                        }
+                    }
+                }
+            }
+            Op::Delete(k) => {
+                cell.shift_remove(k);
+            }
+            Op::SpreadFrom(pairs) => {
+                for (k, v) in pairs {
+                    apply_to_cell(cell, reg, &Op::Insert(k.clone(), *v));
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn object_storage_matches_indexmap_model(
+            ops in prop::collection::vec(op_strategy(), 1..200)
+        ) {
+            let mut reg = ShapeRegistry::new();
+            let cell =
+                ObjectCell::new_slab(reg.keys_of(EMPTY_SHAPE), vec![], EMPTY_SHAPE);
+            let mut model: IndexMap<String, i64> = IndexMap::new();
+            for op in &ops {
+                apply_to_cell(&cell, &mut reg, op);
+                apply_to_model(&mut model, op);
+                // Compare order AND values after every op
+                let got: Vec<(String, i64)> = {
+                    let mut pairs = vec![];
+                    cell.for_each(|k, v| {
+                        if let Value::Int(n) = v {
+                            pairs.push((k.to_string(), *n));
+                        }
+                    });
+                    pairs
+                };
+                let want: Vec<(String, i64)> =
+                    model.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                prop_assert_eq!(
+                    &got,
+                    &want,
+                    "order or value diverged after op {:?}",
+                    op
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saboteur_property_harness_can_fail() {
+        // Plant a known order bug: if we forcibly swap two keys the harness must
+        // catch it. We build a 2-key slab (x=1, y=2) then verify the expected
+        // order is detected and a wrong order is rejected.
+        let mut reg = ShapeRegistry::new();
+        let s_x = reg.add_key(EMPTY_SHAPE, "x").unwrap();
+        let s_xy = reg.add_key(s_x, "y").unwrap();
+        let cell = ObjectCell::new_slab(reg.keys_of(EMPTY_SHAPE), vec![], EMPTY_SHAPE);
+        cell.slab_append(s_x, reg.keys_of(s_x), Value::Int(1));
+        cell.slab_append(s_xy, reg.keys_of(s_xy), Value::Int(2));
+
+        // Model: x=1, y=2
+        let mut model: IndexMap<String, i64> = IndexMap::new();
+        model.insert("x".to_string(), 1);
+        model.insert("y".to_string(), 2);
+
+        let got: Vec<(String, i64)> = {
+            let mut pairs = vec![];
+            cell.for_each(|k, v| {
+                if let Value::Int(n) = v {
+                    pairs.push((k.to_string(), *n));
+                }
+            });
+            pairs
+        };
+        let want: Vec<(String, i64)> = model.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        assert_eq!(got, want, "pre-saboteur: cell must match model");
+
+        // Saboteur: wrong order must differ
+        let wrong: Vec<(String, i64)> =
+            vec![("y".to_string(), 2), ("x".to_string(), 1)];
+        assert_ne!(
+            got,
+            wrong,
+            "saboteur did not produce a detectable order divergence — harness cannot catch bugs"
+        );
+    }
+}

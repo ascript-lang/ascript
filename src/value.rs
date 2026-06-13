@@ -12,17 +12,32 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The heap payload behind `Value::Object`. Wraps the insertion-ordered key→value
-/// map together with a `shape` id (V11-T2 hidden classes). The `shape` identifies
-/// the object's key-LAYOUT in the VM's per-VM `ShapeRegistry`; V11-T3 inline caches
-/// validate `obj.shape == cached_shape` then read a value by index.
+/// The interior storage of `ObjectCell`. Two modes:
+/// - `Slab`: shape-native, values indexed by position in the registry's canonical key list.
+/// - `Dict`: dictionary fallback (IndexMap representation). Always shape 0.
+pub enum ObjectStorage {
+    /// Shape-native mode. `keys` is the registry's canonical `Rc<[Rc<str>]>` for this
+    /// shape (shared, immutable — one allocation per LAYOUT, not per object);
+    /// `values[i]` is the value of `keys[i]`. Invariant: `keys.len() == values.len()`.
+    Slab {
+        keys: Rc<[Rc<str>]>,
+        values: Vec<Value>,
+    },
+    /// Dictionary fallback — insertion order preserved.
+    /// Always `cell.shape == 0` (the EMPTY_SHAPE sentinel; ICs never cache shape-0).
+    Dict(IndexMap<String, Value>),
+}
+
+/// The heap payload behind `Value::Object`. Wraps an `ObjectStorage` (slab or dict)
+/// together with a `shape` id (hidden classes) and a `frozen` flag.
 ///
-/// `shape` defaults to `0` (the empty/unset layout). The TREE-WALKER never reads or
-/// writes it (its objects keep shape 0); only VM code paths assign shapes. The
-/// `borrow`/`borrow_mut` helpers mirror the old `Rc<RefCell<IndexMap>>` API so the
-/// vast majority of access sites are unchanged.
+/// `shape` defaults to `0` (EMPTY_SHAPE). The TREE-WALKER never reads or writes it
+/// (its objects keep shape 0); only VM code paths assign shapes. The `borrow`/
+/// `borrow_mut` helpers are kept for legacy call-sites; they panic on `Slab` mode
+/// (the VM never calls them on slab objects — pre-Phase-3 all corpus objects are
+/// dict-built so the panic is unreachable in practice).
 pub struct ObjectCell {
-    map: RefCell<IndexMap<String, Value>>,
+    storage: RefCell<ObjectStorage>,
     pub shape: Cell<u32>,
     /// `object.freeze` flag (SP2 §4). Defaults `false`. A `Cell` (not `RefCell`)
     /// so a `&self` engine can set/read it without a borrow conflict and with no
@@ -32,24 +47,102 @@ pub struct ObjectCell {
 }
 
 impl ObjectCell {
-    /// Wrap an `IndexMap` into a shared `ObjectCell` with shape `0` (unset),
-    /// unfrozen.
+    /// Wrap an `IndexMap` into a shared `ObjectCell` with shape `0` (EMPTY_SHAPE),
+    /// unfrozen. **Signature unchanged** — all 167 call sites are unaffected.
     pub fn new(map: IndexMap<String, Value>) -> Cc<ObjectCell> {
         Cc::new(ObjectCell {
-            map: RefCell::new(map),
+            storage: RefCell::new(ObjectStorage::Dict(map)),
             shape: Cell::new(0),
             frozen: Cell::new(false),
         })
     }
 
-    /// Immutable borrow of the entry map (drop-in for the old `Rc<RefCell<…>>`).
-    pub fn borrow(&self) -> Ref<'_, IndexMap<String, Value>> {
-        self.map.borrow()
+    /// Build a slab-mode `ObjectCell` with the given canonical key list and values.
+    /// The caller (VM opcode or unit test) supplies the registry's `keys_of(shape)`.
+    ///
+    /// # Panics (debug)
+    /// Panics in debug builds if `keys.len() != values.len()`.
+    pub fn new_slab(keys: Rc<[Rc<str>]>, values: Vec<Value>, shape: u32) -> Cc<ObjectCell> {
+        debug_assert_eq!(
+            keys.len(),
+            values.len(),
+            "ObjectCell::new_slab: keys.len()={} != values.len()={}",
+            keys.len(),
+            values.len()
+        );
+        Cc::new(ObjectCell {
+            storage: RefCell::new(ObjectStorage::Slab { keys, values }),
+            shape: Cell::new(shape),
+            frozen: Cell::new(false),
+        })
     }
 
-    /// Mutable borrow of the entry map (drop-in for the old `Rc<RefCell<…>>`).
+    /// Demote from slab mode to dict mode (one-way, order-preserving).
+    /// Materialises `(key, value)` pairs from the slab IN ORDER into a fresh `IndexMap`,
+    /// replaces storage with `Dict`, and sets `shape` to `0` (EMPTY_SHAPE).
+    /// No-op if already in dict mode.
+    pub fn demote_to_dict(&self) {
+        let mut storage = self.storage.borrow_mut();
+        if let ObjectStorage::Slab { keys, values } = &*storage {
+            let mut map = IndexMap::with_capacity(keys.len());
+            for (k, v) in keys.iter().zip(values.iter()) {
+                map.insert(k.to_string(), v.clone());
+            }
+            *storage = ObjectStorage::Dict(map);
+        }
+        drop(storage);
+        // Shape 0 = EMPTY_SHAPE — ICs will miss forever on this object.
+        self.shape.set(0);
+    }
+
+    /// VM-only: append a new value under the newly-minted `child_shape`, whose
+    /// canonical key list is `child_keys` (caller already called `reg.add_key`).
+    ///
+    /// Returns `true` on success (we were in slab mode and the append was performed).
+    /// Returns `false` if we are not in slab mode (caller should demote then insert).
+    ///
+    /// # Panics (debug)
+    /// Panics if the resulting `values.len()` would not equal `child_keys.len()`.
+    pub fn slab_append(&self, child_shape: u32, child_keys: Rc<[Rc<str>]>, v: Value) -> bool {
+        let mut storage = self.storage.borrow_mut();
+        if let ObjectStorage::Slab { keys, values } = &mut *storage {
+            values.push(v);
+            *keys = child_keys;
+            debug_assert_eq!(
+                keys.len(),
+                values.len(),
+                "slab_append invariant violated: keys={} values={}",
+                keys.len(),
+                values.len()
+            );
+            drop(storage);
+            self.shape.set(child_shape);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Immutable borrow of the dict map (legacy shim for sites that existed before
+    /// the accessor API). **Panics in slab mode** — the VM must not call this on a
+    /// slab object; only tree-walker / stdlib dict-built paths use it.
+    pub fn borrow(&self) -> Ref<'_, IndexMap<String, Value>> {
+        Ref::map(self.storage.borrow(), |s| match s {
+            ObjectStorage::Dict(m) => m,
+            ObjectStorage::Slab { .. } => {
+                panic!("ObjectCell::borrow() called on a slab-mode object — use accessors")
+            }
+        })
+    }
+
+    /// Mutable borrow of the dict map (legacy shim). **Panics in slab mode.**
     pub fn borrow_mut(&self) -> RefMut<'_, IndexMap<String, Value>> {
-        self.map.borrow_mut()
+        RefMut::map(self.storage.borrow_mut(), |s| match s {
+            ObjectStorage::Dict(m) => m,
+            ObjectStorage::Slab { .. } => {
+                panic!("ObjectCell::borrow_mut() called on a slab-mode object — use accessors")
+            }
+        })
     }
 
     /// Whether this object has been frozen by `object.freeze`.
@@ -62,171 +155,304 @@ impl ObjectCell {
         self.frozen.set(true);
     }
 
-    // ── SHAPE Task 1.1 — mode-agnostic accessor API ───────────────────────────
-    // All accessors hold exactly ONE `RefCell` borrow internally and return an
-    // owned value (never a guard), so no caller can hold a borrow across `.await`
-    // — `clippy::await_holding_refcell_ref` stays structurally satisfied.
-    // Signatures are chosen so Phase 2 changes only the BODIES (not the call
-    // sites): when `ObjectStorage` replaces `IndexMap`, each accessor branches
-    // on `Slab` vs `Dict` internally, the public signatures remain identical.
+    // ── SHAPE Task 2.2 — mode-branching accessor bodies ─────────────────────
+    // All accessors branch on `Slab` vs `Dict`. Signatures are UNCHANGED from
+    // Task 1.1. Dict mode replicates today's behavior exactly (424/0 differential).
 
-    /// Number of entries. §2.3 rows 1–14: every mode has a well-defined length.
+    /// Number of entries.
     pub fn len(&self) -> usize {
-        self.map.borrow().len()
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { values, .. } => values.len(),
+            ObjectStorage::Dict(m) => m.len(),
+        }
     }
 
     /// `true` when the object has no entries.
     pub fn is_empty(&self) -> bool {
-        self.map.borrow().is_empty()
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { values, .. } => values.is_empty(),
+            ObjectStorage::Dict(m) => m.is_empty(),
+        }
     }
 
     /// Return a clone of the value stored at `key`, or `None` if absent.
     /// (`Value::clone` is an `Rc`-bump, not a deep copy.)
-    /// §2.3 rows 2–9: name-keyed reads for all registry-free consumers.
     pub fn get(&self, key: &str) -> Option<Value> {
-        self.map.borrow().get(key).cloned()
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, values } => {
+                keys.iter().position(|k| k.as_ref() == key).map(|i| values[i].clone())
+            }
+            ObjectStorage::Dict(m) => m.get(key).cloned(),
+        }
     }
 
     /// `true` if `key` is present.
     pub fn contains_key(&self, key: &str) -> bool {
-        self.map.borrow().contains_key(key)
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, .. } => keys.iter().any(|k| k.as_ref() == key),
+            ObjectStorage::Dict(m) => m.contains_key(key),
+        }
     }
 
     /// Index (insertion-order position) of `key`, or `None`.
     /// Used by the IC warmer to record the slot index at a `GET_PROP` site.
-    /// §2.3 rows 1–3: insertion order is canonical.
     pub fn get_index_of(&self, key: &str) -> Option<usize> {
-        self.map.borrow().get_index_of(key)
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, .. } => keys.iter().position(|k| k.as_ref() == key),
+            ObjectStorage::Dict(m) => m.get_index_of(key),
+        }
     }
 
     /// Key + value at insertion-order position `i` (cloned).
     /// Returns `None` when `i >= len()`.
-    /// Used for in-order iteration where both the key and the value are needed.
-    /// §2.3 rows 5–8, 11: ordered iteration across all registry-free consumers.
     pub fn get_index(&self, i: usize) -> Option<(Rc<str>, Value)> {
-        self.map
-            .borrow()
-            .get_index(i)
-            .map(|(k, v)| (Rc::from(k.as_str()), v.clone()))
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, values } => {
+                if i < values.len() {
+                    Some((keys[i].clone(), values[i].clone()))
+                } else {
+                    None
+                }
+            }
+            ObjectStorage::Dict(m) => {
+                m.get_index(i).map(|(k, v)| (Rc::from(k.as_str()), v.clone()))
+            }
+        }
     }
 
     /// Value at insertion-order position `i` — the IC read primitive.
     /// Returns `None` when `i >= len()` (the IC's out-of-range guard).
-    /// §2.3 rows 1–2: the IC hot path validates `shape == cached` then calls this.
     pub fn value_at(&self, i: usize) -> Option<Value> {
-        self.map.borrow().get_index(i).map(|(_, v)| v.clone())
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { values, .. } => values.get(i).cloned(),
+            ObjectStorage::Dict(m) => m.get_index(i).map(|(_, v)| v.clone()),
+        }
     }
 
     /// Overwrite the value at existing insertion-order slot `i`.
-    /// Returns `false` when `i >= len()` (slot doesn't exist — caller must insert
-    /// instead). This is the IC WRITE primitive: a known slot is updated in-place
-    /// with zero allocation.
-    /// §2.3 rows 1–2: in-place update for an existing key via a warmed IC.
+    /// Returns `false` when `i >= len()`.
     pub fn set_value_at(&self, i: usize, v: Value) -> bool {
-        let mut m = self.map.borrow_mut();
-        if let Some((_, slot)) = m.get_index_mut(i) {
-            *slot = v;
-            true
-        } else {
-            false
+        match &mut *self.storage.borrow_mut() {
+            ObjectStorage::Slab { values, .. } => {
+                if i < values.len() {
+                    values[i] = v;
+                    true
+                } else {
+                    false
+                }
+            }
+            ObjectStorage::Dict(m) => {
+                if let Some((_, slot)) = m.get_index_mut(i) {
+                    *slot = v;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
     /// Insert or overwrite `key → v`.
-    /// **IndexMap semantics:** if the key is already present its POSITION is kept
-    /// and only the value is updated (later-value-wins, first-position-kept).
-    /// A brand-new key is appended at the end.
-    /// §2.3 rows 1–3: the unified insert path for object literals and property sets.
+    /// **IndexMap semantics:** existing key → position kept, value updated.
+    /// New key on Slab (no registry at hand) → demote to dict, then dict insert.
+    /// New key on Dict → append.
     pub fn insert(&self, key: &str, v: Value) {
-        self.map.borrow_mut().insert(key.to_string(), v);
+        // Check if key exists in current mode (returns existing index if present).
+        let existing_idx = match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, .. } => keys.iter().position(|k| k.as_ref() == key),
+            ObjectStorage::Dict(m) => m.get_index_of(key),
+        };
+        if let Some(i) = existing_idx {
+            // Overwrite in place — position kept in both modes.
+            self.set_value_at(i, v);
+        } else {
+            // New key: on Slab, demote then dict-insert; on Dict, direct append.
+            let is_slab = matches!(&*self.storage.borrow(), ObjectStorage::Slab { .. });
+            if is_slab {
+                self.demote_to_dict();
+            }
+            // Now definitely in Dict mode.
+            match &mut *self.storage.borrow_mut() {
+                ObjectStorage::Dict(m) => {
+                    m.insert(key.to_string(), v);
+                }
+                ObjectStorage::Slab { .. } => unreachable!("just demoted"),
+            }
+        }
     }
 
-    /// Remove `key` while preserving the relative order of all other entries
-    /// (`IndexMap::shift_remove` semantics).
-    /// Returns the removed value, or `None` if the key was absent.
-    /// §2.3 row 4: `object.delete` — the only stdlib mutation that changes layout.
+    /// Remove `key` while preserving the relative order of all other entries.
+    /// Slab → demote to dict first (sets shape 0, order-preserving), then shift_remove.
     pub fn shift_remove(&self, key: &str) -> Option<Value> {
-        self.map.borrow_mut().shift_remove(key)
+        // Demote if slab (sets shape 0, order-preserving).
+        let is_slab = matches!(&*self.storage.borrow(), ObjectStorage::Slab { .. });
+        if is_slab {
+            self.demote_to_dict();
+        }
+        match &mut *self.storage.borrow_mut() {
+            ObjectStorage::Dict(m) => m.shift_remove(key),
+            ObjectStorage::Slab { .. } => unreachable!("just demoted"),
+        }
     }
 
     /// Snapshot all `(key, value)` pairs in insertion order.
     /// Intended for sites that must hold the data across an `.await` point or
-    /// that alias the object during iteration (e.g. spread `{...o}` where `o`
-    /// is the object being built).
-    /// §2.3 rows 7–8: worker-airlock serialization and spread-snapshot.
+    /// that alias the object during iteration.
     pub fn entries(&self) -> Vec<(Rc<str>, Value)> {
-        self.map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (Rc::from(k.as_str()), v.clone()))
-            .collect()
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, values } => {
+                keys.iter().zip(values.iter()).map(|(k, v)| (k.clone(), v.clone())).collect()
+            }
+            ObjectStorage::Dict(m) => {
+                m.iter().map(|(k, v)| (Rc::from(k.as_str()), v.clone())).collect()
+            }
+        }
     }
 
     /// Call `f(key, value)` for every entry in insertion order.
     /// Zero allocation — `f` receives references, not clones.
-    /// §2.3 rows 5–7, 11: `object.keys/values/entries`, `json.stringify`, `Display`.
     pub fn for_each<F: FnMut(&str, &Value)>(&self, mut f: F) {
-        for (k, v) in self.map.borrow().iter() {
-            f(k.as_str(), v);
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, values } => {
+                for (k, v) in keys.iter().zip(values.iter()) {
+                    f(k.as_ref(), v);
+                }
+            }
+            ObjectStorage::Dict(m) => {
+                for (k, v) in m.iter() {
+                    f(k.as_str(), v);
+                }
+            }
         }
     }
 
     /// Like [`for_each`] but the visitor returns `Result`; iteration stops on the
     /// first `Err` and that error is propagated.
-    /// Used by the serializers (`json`, `msgpack`, `cbor`) whose inner loops can
-    /// fail (e.g. a non-serializable value type).
-    /// §2.3 row 7: JSON/msgpack/cbor serialization.
     pub fn try_for_each<E, F: FnMut(&str, &Value) -> Result<(), E>>(
         &self,
         mut f: F,
     ) -> Result<(), E> {
-        for (k, v) in self.map.borrow().iter() {
-            f(k.as_str(), v)?;
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, values } => {
+                for (k, v) in keys.iter().zip(values.iter()) {
+                    f(k.as_ref(), v)?;
+                }
+            }
+            ObjectStorage::Dict(m) => {
+                for (k, v) in m.iter() {
+                    f(k.as_str(), v)?;
+                }
+            }
         }
         Ok(())
     }
 
     /// Order-insensitive equality — same length AND every key's value is equal.
+    /// Works across mode pairs (slab vs dict).
     /// Replicates `IndexMap::eq` (which is itself order-insensitive), used for
-    /// the named-enum-payload structural comparison at `value.rs:1447`.
-    /// §2.3 row 12: `EnumVariant` named-payload `==` uses this, not pointer-eq.
+    /// the named-enum-payload structural comparison.
     pub fn content_eq(&self, other: &ObjectCell) -> bool {
-        let a = self.map.borrow();
-        let b = other.map.borrow();
-        *a == *b
+        let a = self.storage.borrow();
+        let b = other.storage.borrow();
+        let len_a = match &*a {
+            ObjectStorage::Slab { values, .. } => values.len(),
+            ObjectStorage::Dict(m) => m.len(),
+        };
+        let len_b = match &*b {
+            ObjectStorage::Slab { values, .. } => values.len(),
+            ObjectStorage::Dict(m) => m.len(),
+        };
+        if len_a != len_b {
+            return false;
+        }
+        // For every key in `a`, check `b` has the same value.
+        match &*a {
+            ObjectStorage::Slab { keys, values } => {
+                for (k, v) in keys.iter().zip(values.iter()) {
+                    let bv = match &*b {
+                        ObjectStorage::Slab { keys: bkeys, values: bvals } => {
+                            bkeys
+                                .iter()
+                                .position(|bk| bk.as_ref() == k.as_ref())
+                                .map(|i| &bvals[i])
+                        }
+                        ObjectStorage::Dict(m) => m.get(k.as_ref()),
+                    };
+                    match bv {
+                        Some(bv) if bv == v => {}
+                        _ => return false,
+                    }
+                }
+            }
+            ObjectStorage::Dict(m) => {
+                for (k, v) in m.iter() {
+                    let bv = match &*b {
+                        ObjectStorage::Slab { keys: bkeys, values: bvals } => {
+                            bkeys
+                                .iter()
+                                .position(|bk| bk.as_ref() == k.as_str())
+                                .map(|i| &bvals[i])
+                        }
+                        ObjectStorage::Dict(m2) => m2.get(k.as_str()),
+                    };
+                    match bv {
+                        Some(bv) if bv == v => {}
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Snapshot the insertion-order key list as owned `String`s.
-    /// Used by `resync_object_shape` (which walks keys through the transition tree)
-    /// and `object_shape_for` (which accepts `impl Iterator<Item=&str>`).
+    /// Used by `resync_object_shape` (which walks keys through the transition tree).
     // SHAPE: temporary — deleted in Phase 3 when `resync_object_shape` is removed.
     pub fn keys_snapshot(&self) -> Vec<String> {
-        self.map.borrow().keys().cloned().collect()
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, .. } => keys.iter().map(|k| k.to_string()).collect(),
+            ObjectStorage::Dict(m) => m.keys().cloned().collect(),
+        }
     }
 
     /// Clone the whole entry map into a fresh `IndexMap`.
-    /// Used by `object_like_fields` in `src/stdlib/object.rs` which must return
-    /// an `IndexMap` shared with `Instance.fields` (until Phase 3.4 migrates
-    /// Instance). This is the one site that genuinely needs the raw map shape.
+    /// Used by `object_like_fields` in `src/stdlib/object.rs`.
     pub fn to_index_map(&self) -> IndexMap<String, Value> {
-        self.map.borrow().clone()
+        match &*self.storage.borrow() {
+            ObjectStorage::Slab { keys, values } => {
+                let mut m = IndexMap::with_capacity(keys.len());
+                for (k, v) in keys.iter().zip(values.iter()) {
+                    m.insert(k.to_string(), v.clone());
+                }
+                m
+            }
+            ObjectStorage::Dict(m) => m.clone(),
+        }
     }
 }
 
-/// GC tracing for `ObjectCell` (V13-T1). Lives here (co-located with the struct)
-/// so the private `map` field is directly accessible without a public accessor.
-/// The impl was originally in `src/gc.rs`; it was moved here in SHAPE Task 1.3
-/// when `map` became private.
+/// GC tracing for `ObjectCell` (V13-T1 / SHAPE Task 2.2). Lives here (co-located
+/// with the struct) so the private `storage` field is directly accessible.
 impl Trace for ObjectCell {
     fn trace(&self, tracer: &mut Tracer) {
-        // `map: RefCell<IndexMap<String, Value>>`. Avoid holding the borrow if
-        // it is already mutably borrowed (mirrors gcmodule's `RefCell` impl:
-        // an outstanding borrow implies an outstanding reference, so skipping
+        // Avoid holding the borrow if already mutably borrowed (mirrors gcmodule's
+        // `RefCell` impl: an outstanding borrow implies a live reference, so skipping
         // is safe). `shape: Cell<u32>` and `frozen: Cell<bool>` are acyclic.
-        if let Ok(map) = self.map.try_borrow() {
-            for (k, v) in map.iter() {
-                k.trace(tracer);
-                v.trace(tracer);
+        if let Ok(storage) = self.storage.try_borrow() {
+            match &*storage {
+                ObjectStorage::Slab { keys: _, values } => {
+                    // `keys: Rc<[Rc<str>]>` — Rc<str> contains no GC edges; skip.
+                    // values may contain cycle-capable containers.
+                    for v in values.iter() {
+                        v.trace(tracer);
+                    }
+                }
+                ObjectStorage::Dict(m) => {
+                    for (k, v) in m.iter() {
+                        k.trace(tracer);
+                        v.trace(tracer);
+                    }
+                }
             }
         }
     }
@@ -2658,5 +2884,157 @@ mod tests {
         let b = obj(&[("y", 2), ("x", 1)]);
         assert!(a.content_eq(&b));
         assert!(!a.content_eq(&obj(&[("x", 1)])));
+    }
+
+    // ── SHAPE Task 2.2 — accessor battery on SLAB-mode cells ────────────────
+
+    /// Build a slab `ObjectCell` by appending each key via the registry.
+    fn slab_obj(pairs: &[(&str, i64)]) -> Cc<ObjectCell> {
+        use crate::vm::shape::{ShapeRegistry, EMPTY_SHAPE};
+        let mut reg = ShapeRegistry::new();
+        let mut shape = EMPTY_SHAPE;
+        for (k, _) in pairs {
+            shape = reg.add_key(shape, k).expect("test slab: add_key");
+        }
+        let mut values = Vec::with_capacity(pairs.len());
+        for (_, v) in pairs {
+            values.push(Value::Int(*v));
+        }
+        ObjectCell::new_slab(reg.keys_of(shape), values, shape)
+    }
+
+    #[test]
+    fn slab_mode_accessor_battery() {
+        use crate::vm::shape::{ShapeRegistry, EMPTY_SHAPE};
+        let mut reg = ShapeRegistry::new();
+
+        // Build a 3-key slab: {a:1, b:2, c:3}
+        let s_a = reg.add_key(EMPTY_SHAPE, "a").unwrap();
+        let s_ab = reg.add_key(s_a, "b").unwrap();
+        let s_abc = reg.add_key(s_ab, "c").unwrap();
+        let cell = ObjectCell::new_slab(reg.keys_of(EMPTY_SHAPE), vec![], EMPTY_SHAPE);
+        cell.slab_append(s_a, reg.keys_of(s_a), Value::Int(1));
+        cell.slab_append(s_ab, reg.keys_of(s_ab), Value::Int(2));
+        cell.slab_append(s_abc, reg.keys_of(s_abc), Value::Int(3));
+
+        // len / is_empty
+        assert_eq!(cell.len(), 3);
+        assert!(!cell.is_empty());
+
+        // get
+        assert_eq!(cell.get("a"), Some(Value::Int(1)));
+        assert_eq!(cell.get("b"), Some(Value::Int(2)));
+        assert_eq!(cell.get("c"), Some(Value::Int(3)));
+        assert_eq!(cell.get("z"), None);
+
+        // contains_key
+        assert!(cell.contains_key("a"));
+        assert!(!cell.contains_key("z"));
+
+        // get_index_of
+        assert_eq!(cell.get_index_of("a"), Some(0));
+        assert_eq!(cell.get_index_of("b"), Some(1));
+        assert_eq!(cell.get_index_of("c"), Some(2));
+        assert_eq!(cell.get_index_of("z"), None);
+
+        // get_index
+        assert_eq!(cell.get_index(0), Some((Rc::from("a"), Value::Int(1))));
+        assert_eq!(cell.get_index(2), Some((Rc::from("c"), Value::Int(3))));
+        assert_eq!(cell.get_index(3), None);
+
+        // value_at
+        assert_eq!(cell.value_at(0), Some(Value::Int(1)));
+        assert_eq!(cell.value_at(3), None);
+
+        // set_value_at
+        assert!(cell.set_value_at(1, Value::Int(99)));
+        assert_eq!(cell.value_at(1), Some(Value::Int(99)));
+        assert!(!cell.set_value_at(5, Value::Int(0)));
+
+        // entries order
+        let entries: Vec<(String, i64)> = cell
+            .entries()
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    if let Value::Int(n) = v { n } else { panic!("expected Int") },
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [("a".to_string(), 1), ("b".to_string(), 99), ("c".to_string(), 3)]
+        );
+
+        // for_each order
+        let mut keys = vec![];
+        cell.for_each(|k, _| keys.push(k.to_string()));
+        assert_eq!(keys, ["a", "b", "c"]);
+
+        // try_for_each
+        let mut keys2 = vec![];
+        cell.try_for_each::<(), _>(|k, _| {
+            keys2.push(k.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(keys2, ["a", "b", "c"]);
+
+        // insert existing key — position kept, still in slab mode
+        cell.insert("a", Value::Int(42));
+        assert_eq!(cell.get_index_of("a"), Some(0)); // position 0 preserved
+        assert_eq!(cell.value_at(0), Some(Value::Int(42)));
+        // shape must be non-zero (still slab)
+        assert_ne!(cell.shape.get(), 0);
+
+        // insert new key on slab — demotes to dict
+        cell.insert("d", Value::Int(4));
+        assert_eq!(cell.shape.get(), 0); // demoted → shape 0
+        assert_eq!(cell.get("d"), Some(Value::Int(4)));
+
+        // keys_snapshot (post-demotion, dict mode)
+        let ks = cell.keys_snapshot();
+        assert_eq!(ks, ["a", "b", "c", "d"]);
+
+        // to_index_map
+        let m = cell.to_index_map();
+        assert_eq!(m.len(), 4);
+    }
+
+    #[test]
+    fn slab_shift_remove_demotes() {
+        let o = slab_obj(&[("x", 10), ("y", 20), ("z", 30)]);
+        assert_ne!(o.shape.get(), 0); // starts in slab mode
+        let removed = o.shift_remove("x");
+        assert_eq!(removed, Some(Value::Int(10)));
+        assert_eq!(o.shape.get(), 0); // demoted
+        // remaining order: y, z
+        let mut keys = vec![];
+        o.for_each(|k, _| keys.push(k.to_string()));
+        assert_eq!(keys, ["y", "z"]);
+        assert_eq!(o.get_index_of("y"), Some(0));
+        assert_eq!(o.get_index_of("z"), Some(1));
+    }
+
+    #[test]
+    fn slab_content_eq_across_modes() {
+        let slab = slab_obj(&[("a", 1), ("b", 2)]);
+        // dict with same content, different insertion order → content_eq is order-insensitive
+        let mut m = IndexMap::new();
+        m.insert("b".to_string(), Value::Int(2));
+        m.insert("a".to_string(), Value::Int(1));
+        let dict = ObjectCell::new(m);
+        assert!(slab.content_eq(&dict));
+        assert!(dict.content_eq(&slab));
+    }
+
+    #[test]
+    fn demote_to_dict_is_noop_on_dict() {
+        let o = obj(&[("a", 1), ("b", 2)]);
+        assert_eq!(o.shape.get(), 0);
+        o.demote_to_dict(); // no-op
+        assert_eq!(o.len(), 2);
+        assert_eq!(o.shape.get(), 0);
     }
 }
