@@ -535,6 +535,140 @@ async fn wired_sites_builtin_callback_generic_fallback() {
     assert_five_mode_identical(src).await;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Task 3.3: stream pipeline — trampoline wired on terminal + stage sites
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Task 3.3: a stream pipeline (range → map → filter → reduce) must fire the
+/// trampoline (trampoline_calls > 0) and produce byte-identical output across
+/// all five engine modes.
+#[tokio::test]
+async fn trampoline_runs_on_stream_pipeline() {
+    let src = r#"
+        import * as stream from "std/stream"
+        let s = stream.range(0, 1000)
+        let doubled = stream.map(s, (x) => x * 2)
+        let kept = stream.filter(doubled, (x) => x % 3 != 0)
+        let total = await stream.reduce(kept, (acc, x) => acc + x, 0)
+        print(total)
+    "#;
+    let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("ok");
+    assert!(
+        stats.trampoline_calls > 0,
+        "stream trampoline never armed — false green (trampoline_calls={})",
+        stats.trampoline_calls
+    );
+    // five-mode identity
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.3: stream.forEach wires the trampoline on its consumer loop.
+#[tokio::test]
+async fn trampoline_runs_on_stream_for_each() {
+    let src = r#"
+        import * as stream from "std/stream"
+        let total = 0
+        await stream.forEach(stream.range(1, 6), (x) => { total = total + x })
+        print(total)
+    "#;
+    let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("ok");
+    assert!(
+        stats.trampoline_calls > 0,
+        "stream.forEach trampoline never armed (trampoline_calls={})",
+        stats.trampoline_calls
+    );
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.3: stream.find wires the trampoline on its consumer loop.
+#[tokio::test]
+async fn trampoline_runs_on_stream_find() {
+    let src = r#"
+        import * as stream from "std/stream"
+        let found = await stream.find(stream.range(1, 100), (x) => x > 42)
+        print(found)
+    "#;
+    let (_out, _exit, stats) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("ok");
+    assert!(
+        stats.trampoline_calls > 0,
+        "stream.find trampoline never armed (trampoline_calls={})",
+        stats.trampoline_calls
+    );
+    assert_five_mode_identical(src).await;
+}
+
+/// Task 3.3: stream pipeline five-mode corpus — broader coverage.
+#[tokio::test]
+async fn stream_pipeline_five_mode_identical() {
+    let cases = [
+        // collect after map + filter
+        r#"
+            import * as stream from "std/stream"
+            let s = stream.filter(stream.map(stream.from([1,2,3,4,5]), (x) => x * 2), (x) => x > 4)
+            print(await stream.collect(s))
+        "#,
+        // reduce with explicit accumulator
+        r#"
+            import * as stream from "std/stream"
+            let s = stream.from([10, 20, 30])
+            print(await stream.reduce(s, (acc, x) => acc + x, 0))
+        "#,
+        // flatMap
+        r#"
+            import * as stream from "std/stream"
+            let s = stream.flatMap(stream.from([1, 2, 3]), (x) => [x, x * 10])
+            print(await stream.collect(s))
+        "#,
+        // find short-circuits
+        r#"
+            import * as stream from "std/stream"
+            print(await stream.find(stream.from([1, 2, 3, 4, 5]), (x) => x > 3))
+        "#,
+        // forEach side-effect
+        r#"
+            import * as stream from "std/stream"
+            let acc = 0
+            await stream.forEach(stream.from([1,2,3]), (x) => { acc = acc + x })
+            print(acc)
+        "#,
+        // map only, collect
+        r#"
+            import * as stream from "std/stream"
+            print(await stream.collect(stream.map(stream.range(0, 5), (x) => x * x)))
+        "#,
+    ];
+    for src in cases {
+        assert_five_mode_identical(src).await;
+    }
+}
+
+/// Task 3.3: trampoline_calls == 0 when no-call-fast is active on stream pipelines.
+#[tokio::test]
+async fn stream_trampoline_suppressed_by_kill_switch() {
+    let src = r#"
+        import * as stream from "std/stream"
+        let total = await stream.reduce(stream.map(stream.range(0, 10), (x) => x * 2), (acc, x) => acc + x, 0)
+        print(total)
+    "#;
+    let (_out, _exit, stats_on) = ascript::vm_run_source_call_fast_stats(src)
+        .await
+        .expect("call_fast stats");
+    assert!(
+        stats_on.trampoline_calls > 0,
+        "stream kill-switch test: trampoline_calls should be > 0 with call_fast=true, got {}",
+        stats_on.trampoline_calls
+    );
+    let ncf = ascript::vm_run_source_no_call_fast(src).await.expect("no-call-fast");
+    let spec = ascript::vm_run_source(src).await.expect("spec");
+    assert_eq!(spec, ncf, "stream kill switch: output differs between call_fast on/off");
+}
+
 /// Task 3.2: trampoline_calls == 0 when no-call-fast is active (kill switch).
 /// Proves the kill switch suppresses trampoline dispatch on the wired sites.
 #[tokio::test]

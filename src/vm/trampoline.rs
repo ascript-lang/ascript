@@ -6,30 +6,44 @@
 //! (never re-executed). The tree-walker is untouched by construction: arming
 //! requires a `Value::Closure`, which only the VM produces.
 //!
-//! # Non-wired sites (§5.5 decision table)
+//! # Non-wired sites (§5.5 decision table — CALL Task 3.3)
 //!
 //! The following stdlib callback sites remain on the generic (per-element
-//! `call_value`) path. They are DOCUMENTED decisions, not deferrals:
+//! `call_value`) path. They are DOCUMENTED decisions, not deferrals. Every
+//! one is a single-shot or per-event invocation with no element loop to
+//! amortize over — wiring them would add arming cost without fiber reuse.
 //!
-//! - `std/events` (`emit`, `on`, `once`, `off`) — single-shot or subscription;
-//!   no inner element loop, no meaningful trampoline surface.
-//! - `std/sync` (`task.spawn`, `task.race`, `task.gather`, `task.timeout`,
-//!   `task.retry`) — async-first by design; callbacks are async, escalation
-//!   would always fire.
-//! - `std/timers` (`setTimeout`, `setInterval`) — single-shot callbacks, no
-//!   inner loop.
-//! - `std/bench` / `std/assert` — single-shot; the overhead is not on the hot
-//!   path.
-//! - `std/schema` — the fluent-chain hook is a synchronous per-call-site
-//!   dispatch; no inner loop.
-//! - `std/net` / `std/http_server` — callbacks are async; escalation would
-//!   always fire.
-//! - `std/workflow` — determinism-critical; the async driver is required.
+//! | Site | File:approx-line | Reason |
+//! |---|---|---|
+//! | `events` listener dispatch | `src/stdlib/events.rs:165` | Single-shot per event; no inner loop. |
+//! | `sync` task combinators | `src/stdlib/sync.rs:576` | Async-first; escalation would always fire. |
+//! | `task` spawn/retry | `src/stdlib/task_mod.rs:92/275` | Async by design; no per-element loop. |
+//! | `timers` setTimeout/setInterval | `src/stdlib/time_timers.rs:255/324` | Single-shot callbacks. |
+//! | `bench` runner | `src/stdlib/bench.rs:69` | Single-shot; overhead not on hot path. |
+//! | `assert` callbacks | `src/stdlib/assert_mod.rs:634/680` | Single-shot; not on hot path. |
+//! | `schema` refiner chain | `src/stdlib/schema.rs:935` | Per-call-site dispatch; no inner loop. |
+//! | `net` HTTP callbacks | `src/stdlib/net_http.rs:1319` | Callbacks are async; escalation fires always. |
+//! | `workflow` replay | `src/stdlib/workflow.rs:489/642` | Determinism-critical; async driver required. |
+//! | `http_server` handler/middleware | `src/stdlib/http_server.rs:437/2053/2077` | Handlers are async; escalation fires always. |
 //!
 //! All of these still benefit from Unit A (A1 empty-cells fast path, A3 fiber
 //! pooling) via the generic `call_value` path. The trampoline is only for the
 //! tight inner loops (`array.*`, `object.mapValues`, `stream.*`) where the
-//! per-element async ceremony dominates.
+//! per-element async ceremony dominates. If a future profile shows one of these
+//! single-shot sites is hot, wiring it is a one-line `CallbackDriver` adoption.
+//!
+//! ## Stream-specific narrowing (Task 3.3)
+//!
+//! For `stream.*` pipeline stages (Map/Filter/FlatMap inside
+//! `Interp::run_stages_from`), each stage callback is stored as a `Value` inside
+//! `Stage` — and `Stage` must be clonable (`clone_stage` for combinators). Since
+//! `CallbackTrampoline` is NOT `Clone` (it owns a live `Fiber`), per-stage
+//! trampolines CANNOT be stored in `StreamState` to achieve cross-element fiber
+//! reuse. The adopted narrowing: stage callbacks arm a `CallbackDriver`
+//! per-element (avoids the `call_value` async-box overhead, runs on the sync
+//! lane, but does not reuse the fiber across elements). The three terminal loops
+//! (`forEach`/`reduce`/`find`) arm ONE driver for their entire consumption loop
+//! and DO reuse the fiber across all elements.
 
 use crate::interp::{Control, Interp};
 use crate::span::Span;
