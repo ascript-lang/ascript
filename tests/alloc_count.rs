@@ -80,6 +80,7 @@ fn capture_free_call_alloc_slope_drops_with_a1_and_a2() {
     // `mk` is a non-capturing closure (Copy), so it can be passed by value twice.
     let on = slope(mk, true);
     let off = slope(mk, false);
+    println!("A1+A2 capture_free slope: call_fast=true → {on:.3}/call, call_fast=false → {off:.3}/call");
     // A2: with call_fast=true, in-place binding eliminates the 2 arg Vecs.
     // Combined with A1 (cells-vec gone), the qualifying call shape allocates ~0.
     assert!(
@@ -134,6 +135,7 @@ fn reentrant_call_value_fiber_is_pooled() {
     };
     let on = slope(mk, true);
     let off = slope(mk, false);
+    println!("A3 re-entrant slope: call_fast=true → {on:.3}/element, call_fast=false → {off:.3}/element");
     // A3: pooling must not add per-element allocs (on ≤ off + 2 allows for noise).
     assert!(
         on <= off + 2.0,
