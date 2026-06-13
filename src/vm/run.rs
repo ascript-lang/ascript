@@ -87,6 +87,28 @@ pub struct CallFastStats {
     pub trampoline_escalations: u64,
 }
 
+/// **SHAPE §3.5 — per-VM storage-mode coverage counters (anti-false-green Gate 15).**
+///
+/// Compiled only under `#[cfg(any(test, feature = "fuzzgen", fuzzing))]` so
+/// production builds carry zero overhead.  `cargo test` enables the `fuzzgen`
+/// feature (via the self-dev-dependency), so the counters are live in every test
+/// run.  Asserted `> 0` over the functional corpus in `tests/vm_differential.rs`
+/// as Gate 15.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ShapeStats {
+    /// Every fresh `ObjectStorage::Slab` construction — `Op::NewObject` warm-hit
+    /// path, `new_object_generic` slab arm, and instance construction.
+    pub obj_slab_constructed: u64,
+    /// Every fresh `ObjectStorage::Dict` construction on the VM — the
+    /// `new_object_generic` cap-refused arm, the `Op::ObjectRest` rest-collector
+    /// (both lanes), the namespace-import build, and each slab→dict demotion (a
+    /// demotion materializes a fresh dict). Covers every `ObjectCell::new(map)` site.
+    pub obj_dict_constructed: u64,
+    /// Every `demote_to_dict()` call (both object and instance insert paths).
+    pub obj_demotions: u64,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -253,6 +275,10 @@ pub struct Vm {
     /// cost is bounded by the Gate-17 zero-cost bench. Asserted >0 over the
     /// functional corpus so the differential proves the fast paths actually ran.
     call_fast_stats: std::cell::Cell<CallFastStats>,
+    /// **SHAPE §3.5 coverage counters (anti-false-green Gate 15).** Compiled only
+    /// under test/fuzzgen/fuzzing so production carries zero overhead.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    shape_stats: std::cell::Cell<ShapeStats>,
     /// **CALL §4 A3 — fiber pool for re-entrant calls.**
     ///
     /// Holds recycled [`Fiber`]s that `take_pooled_fiber` / `return_pooled_fiber`
@@ -380,6 +406,8 @@ impl Vm {
             lane_bursts: std::cell::Cell::new(0),
             call_fast,
             call_fast_stats: std::cell::Cell::new(CallFastStats::default()),
+            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+            shape_stats: std::cell::Cell::new(ShapeStats::default()),
             fiber_pool: RefCell::new(Vec::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
@@ -447,6 +475,30 @@ impl Vm {
     #[inline]
     pub(crate) fn bump_trampoline_escalation(&self) {
         self.bump_stat(|s| s.trampoline_escalations += 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // SHAPE §3.5 — storage-mode coverage counters
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// SHAPE §3.5: return the three storage-mode counters as `(slab, dict, demote)`.
+    /// `#[doc(hidden)]` — test API only; not a stable public surface.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    #[doc(hidden)]
+    pub fn obj_mode_stats(&self) -> (u64, u64, u64) {
+        let s = self.shape_stats.get();
+        (s.obj_slab_constructed, s.obj_dict_constructed, s.obj_demotions)
+    }
+
+    /// SHAPE §3.5: bump one or more shape-stats counters (Cell, never held across
+    /// `.await`).  Compiled only under test/fuzzgen/fuzzing — the call sites are
+    /// individually gated with `#[cfg(any(test, feature = "fuzzgen", fuzzing))]`.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    #[inline]
+    pub(crate) fn bump_shape_stat(&self, f: impl FnOnce(&mut ShapeStats)) {
+        let mut s = self.shape_stats.get();
+        f(&mut s);
+        self.shape_stats.set(s);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -2771,6 +2823,9 @@ impl Vm {
                         }
                     }
                     fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                    // SHAPE §3.5: count this fresh-dict OBJECT_REST build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                 }
 
                 Op::MatchArray => {
@@ -5096,6 +5151,9 @@ impl Vm {
                         } => {
                             let map = exports.borrow().clone();
                             let ns = Value::Object(crate::value::ObjectCell::new(map));
+                            // SHAPE §3.5: count this fresh-dict namespace-import build.
+                            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                            self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                             if is_global {
                                 // A namespace alias is an IMMUTABLE module global.
                                 self.define_user_global(Rc::from(alias.as_str()), ns, false);
@@ -5295,6 +5353,9 @@ impl Vm {
                         }
                     }
                     fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                    // SHAPE §3.5: count this fresh-dict OBJECT_REST build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                 }
 
                 Op::MatchArray => {
@@ -7885,6 +7946,12 @@ impl Vm {
                 drop(reg);
                 // Cap exceeded: demote to dict then insert.
                 cell.demote_to_dict();
+                // SHAPE §3.5: a demotion IS a fresh dict construction — bump both.
+                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                self.bump_shape_stat(|s| {
+                    s.obj_demotions += 1;
+                    s.obj_dict_constructed += 1;
+                });
             }
         }
         // Dict mode (or just demoted): plain insert, shape stays 0.
@@ -7935,6 +8002,12 @@ impl Vm {
                 drop(reg);
                 // Cap exceeded: demote to dict (shape → 0) then dict-insert.
                 inst.borrow_mut().demote_to_dict();
+                // SHAPE §3.5: a demotion IS a fresh dict construction — bump both.
+                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                self.bump_shape_stat(|s| {
+                    s.obj_demotions += 1;
+                    s.obj_dict_constructed += 1;
+                });
             }
         }
         // Dict mode (or just demoted): plain insert, shape stays 0.
@@ -8056,6 +8129,9 @@ impl Vm {
         let instance =
             Cc::new(RefCell::new(crate::value::Instance::new_empty_slab(class.clone())));
         let inst_val = Value::Instance(instance.clone());
+        // SHAPE §3.5: count every fresh instance slab construction.
+        #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+        self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
 
         // Apply field defaults BASE-CLASS FIRST so a subclass default overrides a
         // base one with the same name (mirrors the tree-walker's `construct`, which
@@ -8398,6 +8474,9 @@ impl Vm {
                         }
                     }
                     let cell = crate::value::ObjectCell::new_slab(keys, values, shape);
+                    // SHAPE §3.5: count this warm-hit slab build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
                     fiber.push(Value::Object(cell));
                     return Ok(());
                 }
@@ -8500,6 +8579,9 @@ impl Vm {
                             },
                         );
                     }
+                    // SHAPE §3.5: count this generic-path slab build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
                     crate::value::ObjectCell::new_slab(keys, values, shape)
                 }
                 None => {
@@ -8517,6 +8599,9 @@ impl Vm {
                             .chunk
                             .set_lit_shape(fault_ip, crate::vm::chunk::LitShapeCache::Negative);
                     }
+                    // SHAPE §3.5: count this fresh-dict build (cap refused).
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                     crate::value::ObjectCell::new(map)
                 }
             }

@@ -893,6 +893,62 @@ pub async fn vm_run_source_call_fast_stats(
     Ok((pair.0, pair.1, stats))
 }
 
+/// SHAPE §3.5: like [`vm_run_source`] but also returns the storage-mode counters
+/// `(slab_constructed, dict_constructed, demotions)` after the run completes.
+/// Used by `tests/vm_differential.rs` to assert Gate 15 (both modes + demotion
+/// exercised over the corpus — anti-false-green).  `#[doc(hidden)]` — not a
+/// stable API.  Compiled only under `test`/`fuzzgen`/`fuzzing`.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_obj_mode_stats(
+    src: &str,
+) -> Result<(String, Option<i32>, (u64, u64, u64)), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // specialize=true, sync_lane=true, call_fast=true — the production path so
+    // the slab warm-hit path (`exec_new_object` lit_shapes) actually fires.
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    let mode_stats = vm.obj_mode_stats();
+    let pair = match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }?;
+    Ok((pair.0, pair.1, mode_stats))
+}
+
 /// Like [`vm_run_source`] but also returns the LANE counters (LANE §6.4).
 ///
 /// Returns `(output, exit_code, lane_sync_ops, lane_bursts)`.

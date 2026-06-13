@@ -9894,3 +9894,97 @@ print(q.b)\n\
 print(q.d)\n";
     assert_three_way_matches(src).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SHAPE §3.5 — storage-mode coverage counters + corpus anti-false-green gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run every deterministically-completing corpus example through the in-process
+/// stats entry point, accumulating (slab_constructed, dict_constructed, demotions)
+/// across all files.  Then also run a small explicit driver that GUARANTEES each
+/// mode is exercised — the demotion driver is necessary until Phase 5 order-stress
+/// examples land in the corpus.
+///
+/// Returns `(slab, dict, demote)` totals.
+async fn run_corpus_collecting_mode_stats() -> (u64, u64, u64) {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let (mut slab, mut dict, mut demote) = (0u64, 0u64, 0u64);
+
+    // ── 1. Corpus examples (same enumeration + skip logic as the whole-corpus gate)
+    for rel in all_corpus_examples() {
+        if skip_reason(&rel).is_some() {
+            continue;
+        }
+        let path = std::path::Path::new(root).join(&rel);
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Skip feature-unavailable examples (same as the whole-corpus gate).
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+        if let Ok((_out, _exit, (s, d, dm))) =
+            ascript::vm_run_source_obj_mode_stats(&src).await
+        {
+            slab += s;
+            dict += d;
+            demote += dm;
+        }
+    }
+
+    // ── 2. Explicit mode driver — guarantees all three counters are non-zero
+    //    even before Phase-5 order-stress examples land in the corpus.
+    //    Uses only CORE-language constructs (runs under --no-default-features).
+
+    // 2a. Slab mode: a small literal (always a slab).
+    let slab_src = r#"let o = {a: 1, b: 2, c: 3} print(o.a)"#;
+    if let Ok((_out, _exit, (s, d, dm))) =
+        ascript::vm_run_source_obj_mode_stats(slab_src).await
+    {
+        slab += s;
+        dict += d;
+        demote += dm;
+    }
+
+    // 2b. Slab→dict demotion: grow an object past SLAB_MAX_KEYS (64) via dynamic
+    //     inserts — starts as a slab, demotes to dict on the 65th key.
+    //     The `obj_demotions` counter is bumped inside `demote_to_dict()`.
+    //     This is the deterministic demotion source until Phase-5 order-stress
+    //     examples land in the corpus.  The resulting dict-mode object also bumps
+    //     `obj_dict_constructed` (it is a fresh Dict after demotion).
+    let demote_src = r#"
+let o = {}
+let i = 0
+while (i < 70) {
+    o[`k${i}`] = i
+    i = i + 1
+}
+print(i)
+"#;
+    if let Ok((_out, _exit, (s, d, dm))) =
+        ascript::vm_run_source_obj_mode_stats(demote_src).await
+    {
+        slab += s;
+        dict += d;
+        demote += dm;
+    }
+
+    (slab, dict, demote)
+}
+
+/// SHAPE §3.5 coverage Gate 15: running the corpus + explicit mode driver must
+/// construct BOTH storage modes and take at least one slab→dict demotion.
+/// A zero in any column means the corresponding code path silently stopped
+/// executing (anti-false-green).
+#[tokio::test]
+async fn shape_storage_corpus_exercises_both_modes_and_demotion() {
+    let (slab, dict, demote) = run_corpus_collecting_mode_stats().await;
+    assert!(slab > 0,   "no slab-mode object constructed on the corpus (obj_slab_constructed == 0)");
+    assert!(dict > 0,   "no dictionary-mode object constructed on the corpus (obj_dict_constructed == 0)");
+    assert!(demote > 0, "no slab→dict demotion exercised on the corpus (obj_demotions == 0)");
+    eprintln!(
+        "SHAPE Gate 15: slab_constructed={slab}, dict_constructed={dict}, demotions={demote} \
+         (corpus + explicit driver; demotion guaranteed by 70-key dynamic-insert driver)"
+    );
+}
