@@ -441,6 +441,19 @@ impl Vm {
         self.call_fast_stats.set(s);
     }
 
+    /// CALL §5 B: record one trampoline callback element dispatched on the sync lane.
+    /// Called from `trampoline.rs` (same crate, so `pub(crate)` suffices).
+    #[inline]
+    pub(crate) fn bump_trampoline_call(&self) {
+        self.bump_stat(|s| s.trampoline_calls += 1);
+    }
+
+    /// CALL §5 B: record one trampoline escalation to the async driver.
+    #[inline]
+    pub(crate) fn bump_trampoline_escalation(&self) {
+        self.bump_stat(|s| s.trampoline_escalations += 1);
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // CALL §4 A3 — fiber pool
     // ──────────────────────────────────────────────────────────────────────────
@@ -1034,7 +1047,7 @@ impl Vm {
     /// The shared `def_env` for VM-created classes (task #157), built lazily as a
     /// single child of `global_env()` and reused for every class. See the
     /// `class_env` field doc for why this mirrors the tree-walker's module env.
-    fn class_env(&self) -> crate::env::Environment {
+    pub(crate) fn class_env(&self) -> crate::env::Environment {
         let mut slot = self.class_env.borrow_mut();
         if slot.is_none() {
             // First build: seed with the module-scope user-globals already defined, so
@@ -1452,7 +1465,7 @@ impl Vm {
     /// Executes the suspension-free opcode subset in a tight loop until either the
     /// fiber finishes or an escalation op is reached. Counters are flushed once per
     /// call (not per instruction) so per-instruction counter traffic is avoided.
-    fn run_loop_sync(&self, fiber: &mut Fiber) -> Result<SyncOutcome, Control> {
+    pub(crate) fn run_loop_sync(&self, fiber: &mut Fiber) -> Result<SyncOutcome, Control> {
         let mut retired: u64 = 0;
         // Run the burst, capturing the result. Flush counters BEFORE returning r so
         // a mid-burst `Err(Control)` still records the ops completed up to the fault.
