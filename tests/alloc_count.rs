@@ -32,13 +32,6 @@ static A: Counting = Counting;
 /// `vm_run_source_no_call_fast` (call_fast=false) on a worker-stack
 /// current-thread runtime — the exact `!Send` idiom the differential uses.
 fn run_program(src: &str, call_fast: bool) {
-    // DECODE Unit C: disable speculative global-fn INLINING for these probes. Unit C
-    // would inline the very hot capture-free call this gate measures, making it
-    // VANISH (0 allocs in BOTH call_fast modes) — defeating the A1/A2 call-path
-    // measurement, which is what this gate is about. Inlining's own allocation
-    // behavior is covered by the DECODE bench; here we measure the CALL path with the
-    // call actually performed. (`vm_run_source` reads this env at Vm construction.)
-    std::env::set_var("ASCRIPT_NO_DECODE_INLINE", "1");
     ascript::run_on_worker_stack({
         let src = src.to_string();
         move || async move {

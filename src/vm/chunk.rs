@@ -514,16 +514,6 @@ pub struct Chunk {
     /// `decode_threshold` the chunk decodes and installs `Some(decoded)`. Defaults
     /// to 0; inert until Task 4 consults it.
     pub decode_warmth: std::cell::Cell<u16>,
-    /// DECODE §6.1: whether the ONE-SHOT inline RE-DECODE has been attempted. The
-    /// first decode of a proto can race ahead of the top-level `DefineGlobal`s that
-    /// install the very fns it calls (notably the ENTRY chunk under a forced
-    /// threshold-0 decode: it decodes at ip 0, before any `fn f(){…}` define ran),
-    /// so a `GET_GLOBAL f` candidate resolves to nothing and no inline segment is
-    /// built. After the first burst the defines have run, so the NEXT selection
-    /// re-decodes ONCE (only when `decode_inline` is on AND the prior stream had zero
-    /// inline segments) — giving late-bound top-level calls a chance to inline.
-    /// Bounded (one retry); runtime-only (NOT serialized); defaults to false.
-    pub decode_inline_retried: std::cell::Cell<bool>,
     /// The MODULE source (`path` + full text) this chunk's spans index, for
     /// cross-module diagnostic provenance (SP4 §3). Set at compile/load time on a
     /// module's whole proto tree (see [`Chunk::set_module_source`]); read by the
