@@ -41,15 +41,18 @@ async fn decode_entry_points_exist_and_are_byte_identical() {
     assert_eq!(on, off, "decode-off must be byte-identical to default");
     assert_eq!(on, forced, "decode-forced must be byte-identical to default");
     // Task 4: the FORCED stats entry point (threshold 0) retires records, so the
-    // wired counters are positive; the Unit B/C/D counters stay 0.
+    // wired counters are positive. Task 8 (Unit B): the loop body
+    // (`s = s + i`) contains a `GetLocal; ...; Add`-style accumulate shape, so
+    // fusion fires → `fused_ops > 0`. The Unit C/D counters stay 0.
     let st = ascript::vm_run_source_decode_stats(src).await.expect("stats ok");
     assert!(st.decoded_ops > 0, "RecordSource must retire records under forced decode");
     assert!(st.decoded_bytes > 0, "memory accounting must report");
     assert!(st.stack_ops > 0, "stack-traffic gate input must count from the first record");
+    assert!(st.fused_ops > 0, "Unit B fusion must fire on the accumulate loop");
     assert_eq!(
-        (st.fused_ops, st.inline_hits, st.inline_misses, st.tos_ops),
-        (0, 0, 0, 0),
-        "Unit B/C/D counters stay 0 until their tasks land"
+        (st.inline_hits, st.inline_misses, st.tos_ops),
+        (0, 0, 0),
+        "Unit C/D counters stay 0 until their tasks land"
     );
 }
 
@@ -168,6 +171,81 @@ async fn cross_module_panic_provenance_survives_the_hoisted_source_refresh() {
         other => panic!("expected both to panic, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODE §5 (Unit B / Task 8) — fused superinstructions: the peephole + arms
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// §5: the numeric-loop shape must produce fused records (a local+local /
+/// local+const arithmetic loop is in every realistic census set), and the result
+/// must be correct + byte-identical.
+#[tokio::test]
+async fn fused_records_execute_and_are_counted() {
+    let st = ascript::vm_run_source_decode_stats(
+        "let s = 0\nfor (i in 0..1000000) { s = s + i }\nprint(s)")
+        .await
+        .expect("ok");
+    assert_eq!(st.output, "499999500000\n");
+    assert!(st.fused_ops > 0, "no fused records retired — the peephole is dead");
+}
+
+/// §5.3: an overflow inside a fused arithmetic record — message AND rendered span
+/// must equal the unfused (no-decode) run and the tree-walker. The WHOLE rendered
+/// error is compared (the span is the contract, not just the message).
+#[tokio::test]
+async fn fused_panic_attributes_to_the_faulting_component() {
+    let src = "let x = 9223372036854775807\nlet y = 1\nfor (i in 0..20) { y = x + y }\nprint(y)";
+    let tw = ascript::run_source(src).await.expect_err("panics");
+    let on = ascript::vm_run_source_decoded_forced(src).await.expect_err("panics");
+    let off = ascript::vm_run_source_no_decode(src).await.expect_err("panics");
+    assert_eq!(on.to_string(), off.to_string());
+    assert_eq!(on.to_string(), tw.to_string());
+}
+
+/// §5.3: a fused GetProp/Add component passes the SAME fault offset to the field-IC
+/// and the adaptive-arith path that the unfused arm would, so a field-read /
+/// arithmetic loop is byte-identical (incl. the IC/adaptive warm path) decoded-and-
+/// fused vs unfused. Drives the `GetLocal->GetProp->Add` triple + `GetProp->Add`
+/// pair hard (the field-read-then-use spine, census triple rank 1).
+#[tokio::test]
+async fn fused_field_read_then_arith_is_byte_identical() {
+    for src in [
+        // self.field accumulate (GetLocal self; GetProp; Add) in a hot method loop.
+        "class C { fn init() { self.n = 0 } fn step(x) { self.n = self.n + x } }\n\
+         let c = C()\nfor (i in 0..5000) { c.step(i) }\nprint(c.n)",
+        // object field arithmetic: o.x = o.x + o.y (GetLocal o; GetProp x; ... ).
+        "let o = { x: 0, y: 3 }\nfor (i in 0..5000) { o.x = o.x + o.y }\nprint(o.x)",
+        // local+const / const+local staging into a binop, plus local+local.
+        "let a = 1\nlet b = 2\nlet s = 0\nfor (i in 0..5000) { s = a + b + s + i }\nprint(s)",
+    ] {
+        let tw = ascript::run_source(src).await.expect("tw ok");
+        let on = ascript::vm_run_source_decoded_forced(src).await.expect("decoded ok");
+        let off = ascript::vm_run_source_no_decode(src).await.expect("byte ok");
+        assert_eq!(tw, on.0, "tw vs decoded+fused `{src}`");
+        assert_eq!(on, off, "decoded+fused vs byte `{src}`");
+    }
+}
+
+/// DECODE §7.3 (Unit D gate input): record the post-fusion RESIDUAL stack-traffic
+/// share (`stack_ops / decoded_ops`) for the dispatch-bound trio. Run with
+/// `--ignored --nocapture`; the printed ratios are folded into
+/// `bench/DECODE_RESULTS.md`. To see the fusion delta, empty `FUSION_CANDIDATES`
+/// and re-run (a local one-off, not a shipped switch).
+#[tokio::test]
+#[ignore]
+async fn decode_residual_stack_traffic_share() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    for name in ["object_churn", "call_heavy", "func_pipeline"] {
+        let path = std::path::Path::new(root).join("bench/profiling").join(format!("{name}.as"));
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        let st = ascript::vm_run_source_decode_stats(&src).await.expect("ok");
+        let ratio = st.stack_ops as f64 / st.decoded_ops.max(1) as f64;
+        println!(
+            "DECODE §7.3 residual: {name:<14} decoded_ops={:>10} fused_ops={:>10} stack_ops={:>10} stack/decoded={ratio:.3}",
+            st.decoded_ops, st.fused_ops, st.stack_ops
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

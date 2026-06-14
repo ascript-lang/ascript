@@ -1312,6 +1312,7 @@ async fn decoded_dispatch_actually_executes_on_the_corpus() {
     let root = env!("CARGO_MANIFEST_DIR");
     let mut total_records: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut total_fused: u64 = 0;
     let mut ran = 0usize;
     for rel in all_corpus_examples() {
         // The SAME enumeration + skip list as oracle #1.
@@ -1326,13 +1327,24 @@ async fn decoded_dispatch_actually_executes_on_the_corpus() {
         if let Ok(st) = ascript::vm_run_source_decode_stats(&src).await {
             total_records += st.decoded_ops;
             total_bytes += st.decoded_bytes;
+            total_fused += st.fused_ops;
             ran += 1;
         }
     }
     println!(
-        "DECODE corpus coverage: {total_records} records / {total_bytes} decoded bytes over {ran} programs"
+        "DECODE corpus coverage: {total_records} records / {total_bytes} decoded bytes \
+         / {total_fused} fused over {ran} programs"
     );
     assert!(ran > 30, "corpus enumeration broke (only {ran} programs ran)");
+    // DECODE §5 (Unit B, Gate 15): fusion must actually FIRE over the corpus — the
+    // peephole is not dead and fused arms execute. A fused record retires
+    // (`fused_ops`) on the dominant local/field/arith staging shapes, which the
+    // corpus exercises pervasively. Floor far above 0 (the silent-no-fusion value),
+    // well below the observed count, config-independent (fusion is CORE).
+    assert!(
+        total_fused > 1_000,
+        "Unit B fusion never fired over the corpus ({total_fused} fused records) — the peephole is dead or unwired"
+    );
     // Anti-false-green floor. The corpus is overwhelmingly short, run-to-
     // completion examples (no million-iteration hot loops), so the observed
     // retirement is ~150K records / ~104 programs in BOTH feature configs (the

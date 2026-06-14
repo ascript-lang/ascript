@@ -50,14 +50,137 @@ pub(crate) struct DecodedInstr {
 }
 
 /// The decoded operation. `Base` is a pass-through of the real ISA; the fused
-/// (Unit B, Task 8) and inline (Unit C, Task 9) variants land later and exist
-/// ONLY in the decoded stream — never in `Chunk.code`, never serialized,
-/// invisible to the verifier and the disassembler.
+/// (Unit B, Task 8) variant exists ONLY in the decoded stream — never in
+/// `Chunk.code`, never serialized, invisible to the verifier and the
+/// disassembler. (Unit C inlining, Task 9, lands later.)
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DOp {
     /// A 1:1 decoded base instruction (operands widened into a/b).
     Base(Op),
+    /// DECODE §5 (Unit B): a fused superinstruction — N consecutive base ops
+    /// executed in ONE dispatch. The [`FusedKind`] names the exact op sequence
+    /// (so the record driver runs the right composition of shared helpers); the
+    /// per-component operands are packed into the record's `a` field by the
+    /// peephole (`decode_fused.rs`). The record's `off` is the FIRST component's
+    /// byte offset; the driver reconstructs each later component's byte offset by
+    /// adding the (compile-time-constant) component widths, so each component
+    /// attributes its span / adaptive-cache key at its OWN byte offset —
+    /// byte-identical to executing the components separately.
+    Fused(FusedKind),
 }
+
+/// DECODE §5 (Unit B): the REVIEWED fused-superinstruction kinds. Each variant is
+/// a fixed op sequence selected from the committed dynamic-adjacency census
+/// (`bench/DECODE_PAIR_CENSUS.md`) — never guessed. The variant ITSELF encodes the
+/// op sequence (no per-record op storage); the packed operands ride the record's
+/// `a` field. Every component executes via the SAME shared helper the single-op
+/// `sync_burst` arm calls (`fiber.local`, `vm_read_member`/`ic_get_field`,
+/// `eval_binop_adaptive`), so a fused arm is byte-identical to the unfused
+/// sequence by construction.
+///
+/// Operand packing in `DecodedInstr.a` (all base operands are ≤ `u16`, two pack
+/// per `u32` — spec §2.1): the FIRST component's u16 operand in the low half, the
+/// SECOND component's u16 operand (when it has one) in the high half. A third
+/// component (the triple) carries no inline operand of its own (`Add` is
+/// zero-operand), so two halves suffice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FusedKind {
+    /// `GetLocal s; GetProp name` — census PAIR rank 1 (8.405%). `a = s | name<<16`.
+    /// The dominant field-read-after-local shape. GetProp can panic ⇒ its fault
+    /// offset (= `off + 3`) is reconstructed by the driver.
+    GetLocalGetProp,
+    /// `GetLocal s1; GetLocal s2` — census PAIR rank 2 (7.320%). `a = s1 | s2<<16`.
+    /// Two adjacent local reads (operand-stack staging). Pure pushes — no fault.
+    GetLocalGetLocal,
+    /// `GetLocal s; Const k` — census PAIR rank 3 (5.765%). `a = s | k<<16`.
+    /// Local-then-const staging into a binop. Pure pushes — no fault.
+    GetLocalConst,
+    /// `GetProp name; Add` — census PAIR rank 4 (5.691%). `a = name`. Field-read
+    /// feeding arithmetic. BOTH components can panic (GetProp read, Add arith).
+    GetPropAdd,
+    /// `Const k; GetLocal s` — census PAIR rank 5 (5.547%). `a = k | s<<16`.
+    /// Const-then-local staging into a binop. Pure pushes — no fault.
+    ConstGetLocal,
+    /// `GetLocal s; GetProp name; Add` — census TRIPLE rank 1 (5.691%).
+    /// `a = s | name<<16`. The field-read-then-use spine. GetProp + Add can panic.
+    GetLocalGetPropAdd,
+}
+
+impl FusedKind {
+    /// The component ops in execution order. Used by the peephole to verify a
+    /// match and by the driver-arm fault-offset reconstruction (the widths come
+    /// from `op.operand_width()`).
+    pub(crate) fn components(self) -> &'static [Op] {
+        match self {
+            FusedKind::GetLocalGetProp => &[Op::GetLocal, Op::GetProp],
+            FusedKind::GetLocalGetLocal => &[Op::GetLocal, Op::GetLocal],
+            FusedKind::GetLocalConst => &[Op::GetLocal, Op::Const],
+            FusedKind::GetPropAdd => &[Op::GetProp, Op::Add],
+            FusedKind::ConstGetLocal => &[Op::Const, Op::GetLocal],
+            FusedKind::GetLocalGetPropAdd => &[Op::GetLocal, Op::GetProp, Op::Add],
+        }
+    }
+}
+
+/// DECODE §5: a fusion candidate — a fixed op sequence and the [`FusedKind`] the
+/// peephole rewrites it to. The op sequence is matched against the 1:1 records
+/// left-to-right (greedy longest-match), subject to the legality rules in
+/// [`fuse_records`] (no component but the first may be a jump target; the whole
+/// run stays within one basic block).
+pub(crate) struct FusedForm {
+    /// The base-op sequence (length 2 or 3) this candidate matches.
+    pub seq: &'static [Op],
+    /// The fused kind the matched run rewrites to.
+    pub kind: FusedKind,
+}
+
+/// DECODE §5: the REVIEWED fusion set. Each entry cites its census line
+/// (`bench/DECODE_PAIR_CENSUS.md`, run of 2026-06-14) and is chosen by dynamic
+/// frequency, payload fit (every base operand ≤ `u16`, two packable per `u32`),
+/// and shared-helper composability (no candidate needs reimplemented semantics).
+/// Changing this set requires a refreshed census commit.
+///
+/// **Selection (top of the measured ranking, ≤ 8 forms):**
+/// - `GetLocal -> GetProp`        — PAIR rank 1, 8.405%.
+/// - `GetLocal -> GetLocal`       — PAIR rank 2, 7.320%.
+/// - `GetLocal -> Const`          — PAIR rank 3, 5.765%.
+/// - `GetProp -> Add`             — PAIR rank 4, 5.691%.
+/// - `Const -> GetLocal`          — PAIR rank 5, 5.547%.
+/// - `GetLocal -> GetProp -> Add` — TRIPLE rank 1, 5.691% (greedy longest-match
+///   subsumes the `GetLocal -> GetProp` pair where an `Add` follows in-block).
+///
+/// **Recorded-and-REJECTED (high-frequency but not shippable here):**
+/// - `Const -> Const` (PAIR rank 8, 3.314%): two const pushes is a legal, no-fault
+///   pair, but adds a third "both-operands-from-const" shape with no field/arith
+///   helper reuse beyond `Const`'s one-line body; deferred — the local-staging
+///   forms above already cover the dispatch-dense staging shapes.
+/// - `Pop -> GetLocal` (rank 6) / `Add -> GetLocal` (rank 7): `Pop`/`Add` as the
+///   FIRST component would fuse a stack-clearing/arith retire with a following
+///   read; legal, but the win is dispatch-only (no stack-traffic removal) and the
+///   `GetLocal`-first staging forms already capture the same following reads.
+/// - `SetLocal -> GetGlobal` (rank 9): `GetGlobal` carries cache-mutation +
+///   builtin-fallback control flow (multiple `continue` exits in its single-op
+///   arm) that does NOT compose as a straight helper call — REIMPLEMENTED
+///   semantics, rejected per §5.3.
+/// - `RangeHasNext -> JumpIfFalse` (rank 18): the for-range loop spine, but
+///   `JumpIfFalse` is a BASIC-BLOCK TERMINATOR / control-transfer op — a fused
+///   middle/tail jump would need the post-fusion jump-target machinery AND its
+///   target is by definition a block boundary; rejected (terminators never fuse).
+/// - `SetLocal -> Loop` (rank ~14): same terminator rejection (`Loop` is a jump).
+///
+/// The peephole NEVER fuses a candidate whose later component is a jump target or
+/// a basic-block boundary (see [`fuse_records`]); the rejected control-flow forms
+/// above could not pass that gate regardless.
+pub(crate) const FUSION_CANDIDATES: &[FusedForm] = &[
+    // Greedy longest-match: the TRIPLE must precede the pair it extends so a
+    // `GetLocal; GetProp; Add` run fuses to the triple, not the pair + a stray Add.
+    FusedForm { seq: &[Op::GetLocal, Op::GetProp, Op::Add], kind: FusedKind::GetLocalGetPropAdd },
+    FusedForm { seq: &[Op::GetLocal, Op::GetProp], kind: FusedKind::GetLocalGetProp },
+    FusedForm { seq: &[Op::GetLocal, Op::GetLocal], kind: FusedKind::GetLocalGetLocal },
+    FusedForm { seq: &[Op::GetLocal, Op::Const], kind: FusedKind::GetLocalConst },
+    FusedForm { seq: &[Op::GetProp, Op::Add], kind: FusedKind::GetPropAdd },
+    FusedForm { seq: &[Op::Const, Op::GetLocal], kind: FusedKind::ConstGetLocal },
+];
 
 /// The per-`FnProto` decoded side representation (the `arith_cache` precedent:
 /// runtime-only, lazily built, never serialized, droppable at any time).
@@ -130,8 +253,8 @@ impl fmt::Debug for DecodedChunk {
 /// DECODE configuration (spec §2.2). In Task 3 only `plain()` (no fusion, no
 /// inlining) exists; Task 8/9 add the fuse/inline knobs.
 pub(crate) struct DecodeCfg {
-    /// Unit B (Task 8): peephole-fuse the census set. Off in Task 3/4.
-    #[allow(dead_code)]
+    /// Unit B (Task 8): peephole-fuse the census set. ON whenever decode is on
+    /// (fusion rides the master `decode` switch — no separate toggle).
     pub fuse: bool,
     /// Unit C (Task 9): inline small callees. Off in Task 3/4.
     #[allow(dead_code)]
@@ -139,9 +262,19 @@ pub(crate) struct DecodeCfg {
 }
 
 impl DecodeCfg {
-    /// A 1:1 decode: no fusion, no inlining (Task 3).
+    /// A 1:1 decode: no fusion, no inlining (Task 3). Now used ONLY by the decode
+    /// unit tests that assert the unfused 1:1 record shape (the production path
+    /// always fuses via [`fused`](Self::fused)).
+    #[cfg(test)]
     pub fn plain() -> Self {
         DecodeCfg { fuse: false, inline: false }
+    }
+
+    /// Unit B (Task 8): a fusing decode — the peephole rewrites the census set
+    /// into superinstructions. The production decode path (`select_record_source`)
+    /// builds with this so fusion is active whenever the `decode` switch is on.
+    pub fn fused() -> Self {
+        DecodeCfg { fuse: true, inline: false }
     }
 }
 
@@ -155,7 +288,7 @@ impl DecodeCfg {
 /// Reads the CURRENT bytes: a byte patched to `Op::Break` decodes as a
 /// `Base(Break)` record (an escalation record, spec §4.3). `own_epoch` is read
 /// AFTER the walk so it conservatively reflects the bytes that were decoded.
-pub(crate) fn decode_chunk(chunk: &Chunk, _cfg: &DecodeCfg) -> Option<std::rc::Rc<DecodedChunk>> {
+pub(crate) fn decode_chunk(chunk: &Chunk, cfg: &DecodeCfg) -> Option<std::rc::Rc<DecodedChunk>> {
     let code: &[u8] = &chunk.code;
 
     // ---- Pass 1: walk the byte stream, one record per instruction. ----------
@@ -191,24 +324,49 @@ pub(crate) fn decode_chunk(chunk: &Chunk, _cfg: &DecodeCfg) -> Option<std::rc::R
     // `patch_jump`/`emit_loop`: `from = site + width_of_disp`); the target byte
     // must land on an instruction boundary (a key in `index_of`) or the stream
     // is corrupt → None (permanent byte-dispatch fallback).
+    //
+    // DECODE §5.2: collect the JUMP-TARGET record-index set as we resolve. The
+    // peephole (`fuse_records`) consults it to keep a jump destination a SEPARATE
+    // instruction — a record that is a jump target must remain the FIRST component
+    // of any fused run (never swallowed into a fused middle/tail), because the
+    // record driver re-derives its cursor from the canonical BYTE ip on every
+    // taken jump (`byte_to_record`), which can only land on a record's own `off`.
+    let mut jump_targets: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for (rec_idx, target_byte) in jump_fixups {
         if target_byte < 0 || target_byte > u32::MAX as i64 {
             return None;
         }
         let target_rec = *index_of.get(&(target_byte as u32))?;
+        jump_targets.insert(target_rec);
         // The jump op's resolved record index lives in `a` for the i16 jumps and
         // in `b` for `JumpIfArgSupplied` (u16 + i16). `decode_operands` stashed
         // the raw displacement in the right field and recorded which via the op.
         let rec = &mut records[rec_idx];
         match rec.op {
             DOp::Base(Op::JumpIfArgSupplied) => rec.b = target_rec,
-            DOp::Base(_) => rec.a = target_rec,
+            // The fixup runs over the 1:1 stream — the peephole (which is the only
+            // producer of `DOp::Fused`) runs AFTER this loop, so a fused record can
+            // never appear here; the catch-all keeps the match total.
+            DOp::Base(_) | DOp::Fused(_) => rec.a = target_rec,
         }
     }
 
-    // ---- entry_index: sorted (byte_off, record_idx) for every record. -------
-    // Emission is monotonic so `records` is already off-ascending; build the
-    // pairs directly.
+    // ---- Unit B (Task 8): the decode-time PEEPHOLE (only when fusion is on). --
+    // Rewrites consecutive base records into fused superinstructions, within basic
+    // blocks only, never swallowing a jump target. `entry_index` is rebuilt over
+    // the post-fusion record vector. When `cfg.fuse` is off this is a no-op and the
+    // stream stays 1:1 (the pre-Task-8 behavior, byte-identical).
+    let records = if cfg.fuse {
+        fuse_records(records, &jump_targets)
+    } else {
+        records
+    };
+
+    // ---- entry_index: sorted (byte_off, record_idx) for every (post-fusion)
+    // record. Emission is monotonic so `records` is already off-ascending; build
+    // the pairs directly. A swallowed component's byte off is NOT an entry (it can
+    // never be a jump target — the peephole guaranteed it), so the driver's
+    // byte→record resync over jump targets still lands exactly on a record `off`.
     let entry_index: Vec<(u32, u32)> =
         records.iter().enumerate().map(|(i, r)| (r.off, i as u32)).collect();
 
@@ -288,6 +446,153 @@ fn decode_operands(
             _ => return None,
         },
     })
+}
+
+/// DECODE §5.2 (Unit B): the decode-time PEEPHOLE. A single left-to-right pass over
+/// the 1:1 `records`, greedy-longest-matching each position against
+/// [`FUSION_CANDIDATES`] and rewriting a matched run into ONE [`DOp::Fused`]
+/// record. Returns the rewritten record vector (shorter than the input when any
+/// fusion fired).
+///
+/// **Legality (the load-bearing correctness rules — a violation is a real bug):**
+/// - **No jump target swallowed.** Only the FIRST component of a fused run may be a
+///   jump target; if ANY later component's record index is in `jump_targets`, the
+///   match is refused. The driver re-derives its record cursor from the canonical
+///   BYTE ip on every taken jump (`byte_to_record`), which can only land on a
+///   surviving record's `off` — a swallowed jump-target byte would resync-miss and
+///   silently fall back to byte dispatch (correct but dark) or, worse, mis-land.
+///   Keeping every jump target a first-component `off` makes the post-fusion
+///   `entry_index` contain every legal jump destination.
+/// - **One basic block.** A candidate's sequence is matched ONLY against
+///   consecutive records; the census already counted pairs/triples within basic
+///   blocks, but the peephole re-checks structurally: every component but the last
+///   must be a NON-terminator (a terminator op mid-run would mean the run crossed a
+///   block boundary). All shipped candidates' non-final components
+///   (`GetLocal`/`GetProp`/`Const`) are non-terminators, so this holds by
+///   construction; the check is kept defensive.
+/// - **Operand fit.** Every component operand is a `u16` (slot / const index),
+///   packed two-per-`u32` into the fused record's `a` (low = first, high = second).
+///
+/// The fused record's `off` is the FIRST component's byte offset (the ip↔record
+/// bridge anchor); the driver reconstructs each later component's byte offset by
+/// adding the compile-time component widths, so spans / adaptive-cache keys are
+/// attributed at each component's OWN byte offset — byte-identical to the unfused
+/// sequence.
+pub(crate) fn fuse_records(
+    records: Vec<DecodedInstr>,
+    jump_targets: &std::collections::HashSet<u32>,
+) -> Vec<DecodedInstr> {
+    let mut out: Vec<DecodedInstr> = Vec::with_capacity(records.len());
+    let n = records.len();
+    let mut i = 0usize;
+    while i < n {
+        // Greedy LONGEST-match: FUSION_CANDIDATES is ordered longest-first, so the
+        // first candidate whose whole sequence matches here is the longest legal one.
+        let mut fused = None;
+        for form in FUSION_CANDIDATES {
+            let len = form.seq.len();
+            if i + len > n {
+                continue;
+            }
+            if try_match(&records, i, form, jump_targets) {
+                fused = Some((form, len));
+                break;
+            }
+        }
+        match fused {
+            Some((form, len)) => {
+                out.push(make_fused(&records[i..i + len], form.kind));
+                i += len;
+            }
+            None => {
+                out.push(records[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `true` iff `form.seq` matches the `len` records starting at `start`, AND the
+/// match is LEGAL: no component but the first is a jump target, and no component
+/// but the last is a basic-block terminator (a within-block run only). The records
+/// must already be `Base` ops (the peephole runs over the 1:1 stream — there is no
+/// pre-existing fusion to nest).
+fn try_match(
+    records: &[DecodedInstr],
+    start: usize,
+    form: &FusedForm,
+    jump_targets: &std::collections::HashSet<u32>,
+) -> bool {
+    let len = form.seq.len();
+    for (k, &want) in form.seq.iter().enumerate() {
+        let idx = start + k;
+        // The component op must match exactly (1:1 base records only).
+        match records[idx].op {
+            DOp::Base(op) if op == want => {}
+            _ => return false,
+        }
+        // No component PAST THE FIRST may be a jump target — it must stay a
+        // separate, byte-addressable record (a surviving `off`).
+        if k > 0 && jump_targets.contains(&(idx as u32)) {
+            return false;
+        }
+        // No component but the last may be a basic-block terminator (a run that
+        // crossed a block boundary). All shipped candidates satisfy this; kept
+        // defensive so a future candidate cannot silently fuse across a block.
+        if k + 1 < len && is_block_terminator_op(want) {
+            return false;
+        }
+    }
+    true
+}
+
+/// DECODE §5.2: pack a matched run of base records into one fused record. The
+/// fused record's `off` is the first component's `off`; operands are packed
+/// two-per-`u32` into `a` (low half = first component's u16 operand, high half =
+/// second component's u16 operand, or 0 when the component is zero-operand). The
+/// triple's third component (`Add`) is zero-operand, so two halves suffice.
+fn make_fused(run: &[DecodedInstr], kind: FusedKind) -> DecodedInstr {
+    let off = run[0].off;
+    // Each base record stashed its (first) u16 operand in `a` during the 1:1
+    // decode (slot for GetLocal, const-idx for Const/GetProp). A zero-operand
+    // component (`Add`) has `a == 0`.
+    let lo = run[0].a & 0xffff;
+    let hi = if run.len() >= 2 { run[1].a & 0xffff } else { 0 };
+    DecodedInstr { op: DOp::Fused(kind), a: lo | (hi << 16), b: 0, off }
+}
+
+/// DECODE §5.2: `true` iff `op` is a basic-block terminator for the peephole's
+/// legality check. Mirrors the census's `op_is_block_terminator` set (control
+/// flow + control-leaving + call/suspension) so the peephole never fuses across a
+/// boundary the census could not have counted across. Available in ALL builds (the
+/// census helper is feature-gated; this one rides the always-compiled peephole).
+fn is_block_terminator_op(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Jump
+            | Op::JumpIfFalse
+            | Op::JumpIfTrue
+            | Op::JumpIfNotNil
+            | Op::Loop
+            | Op::JumpIfArgSupplied
+            | Op::Return
+            | Op::Propagate
+            | Op::Yield
+            | Op::Unwrap
+            | Op::MatchNoArm
+            | Op::Call
+            | Op::CallSpread
+            | Op::CallMethod
+            | Op::CallMethodSpread
+            | Op::CallNamed
+            | Op::CallNamedSpread
+            | Op::Await
+            | Op::IterNext
+            | Op::GetIter
+            | Op::Import
+            | Op::Break
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -621,5 +926,108 @@ mod tests {
         assert!(matches!(d.records[0].op, DOp::Base(Op::JumpIfArgSupplied)));
         assert_eq!(d.records[0].a, 7, "param-index widened into a");
         assert_eq!(d.records[0].b, 2, "i16 jump (second word) pre-resolved into b");
+    }
+
+    // ── DECODE §5 (Unit B / Task 8): the peephole + fusion ──────────────────────
+
+    /// A straight-line `GetLocal s; GetProp name` (no jump target on the GetProp)
+    /// fuses to ONE `DOp::Fused(GetLocalGetProp)` record, packing slot|name<<16,
+    /// keeping the FIRST component's off, and dropping a record.
+    #[test]
+    fn peephole_fuses_a_simple_pair() {
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str("field".into()));
+        c.emit_u16(Op::GetLocal, 3, s(0, 1)); // rec 0
+        c.emit_u16(Op::GetProp, name, s(1, 2)); // rec 1 (swallowed)
+        c.emit(Op::Return, s(2, 3)); // rec 2 → record 1 after fusion
+        let unfused = decode_chunk(&c, &DecodeCfg::plain()).unwrap();
+        assert_eq!(unfused.records.len(), 3, "1:1 keeps all three records");
+        let d = decode_chunk(&c, &DecodeCfg::fused()).unwrap();
+        assert_eq!(d.records.len(), 2, "the pair fused → one fewer record");
+        assert!(matches!(d.records[0].op, DOp::Fused(FusedKind::GetLocalGetProp)));
+        assert_eq!(d.records[0].a, 3 | ((name as u32) << 16), "slot|name<<16 packed");
+        assert_eq!(d.records[0].off, 0, "fused off = first component's off");
+        assert!(matches!(d.records[1].op, DOp::Base(Op::Return)));
+        // The swallowed component's byte off is NOT an entry; the survivors are.
+        assert_eq!(byte_to_record(&d, 0), Some(0), "head off is an entry");
+        assert_eq!(byte_to_record(&d, 1), None, "swallowed GetProp off is no longer an entry");
+    }
+
+    /// Greedy LONGEST-match: `GetLocal; GetProp; Add` fuses to the TRIPLE
+    /// (`GetLocalGetPropAdd`), not the `GetLocalGetProp` pair plus a stray `Add`.
+    #[test]
+    fn peephole_prefers_the_triple_over_the_pair() {
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str("v".into()));
+        c.emit_u16(Op::GetLocal, 1, s(0, 1));
+        c.emit_u16(Op::GetProp, name, s(1, 2));
+        c.emit(Op::Add, s(2, 3));
+        c.emit(Op::Return, s(3, 4));
+        let d = decode_chunk(&c, &DecodeCfg::fused()).unwrap();
+        assert_eq!(d.records.len(), 2, "the 3-op run fused to one record");
+        assert!(matches!(d.records[0].op, DOp::Fused(FusedKind::GetLocalGetPropAdd)));
+        assert_eq!(d.records[0].a, 1 | ((name as u32) << 16));
+    }
+
+    /// §5.2 (the load-bearing legality rule): a record that is a JUMP TARGET must
+    /// never be a fused MIDDLE. Build a loop whose back-edge targets a `GetProp`
+    /// that WOULD otherwise fuse with the preceding `GetLocal`; assert the records
+    /// around the target stay 1:1 and `entry_index` still contains the target's off.
+    #[test]
+    fn peephole_never_fuses_across_an_entry_point() {
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str("f".into()));
+        // Layout (byte offsets):
+        //   0: GetLocal 0        (3 bytes) — would be the pair HEAD
+        //   3: GetProp name      (3 bytes) — the loop back-edge TARGET
+        //   6: Pop               (1 byte)
+        //   7: Loop -> 3         (3 bytes) — back-edge to the GetProp at byte 3
+        //  10: Return            (1 byte)
+        c.emit_u16(Op::GetLocal, 0, s(0, 1)); // byte 0
+        let target = c.code.len(); // byte 3 — the GetProp
+        c.emit_u16(Op::GetProp, name, s(1, 2)); // byte 3
+        c.emit(Op::Pop, s(2, 3)); // byte 6
+        c.emit_loop(Op::Loop, target, s(3, 4)); // byte 7 → byte 3
+        c.emit(Op::Return, s(4, 5)); // byte 10
+        let d = decode_chunk(&c, &DecodeCfg::fused()).unwrap();
+        // The GetProp is a jump target → it MUST stay a separate Base record (never
+        // swallowed into a fused middle). So no `GetLocalGetProp` fusion happened.
+        assert!(
+            d.records.iter().all(|r| !matches!(r.op, DOp::Fused(_))),
+            "no fusion may swallow the jump-target GetProp"
+        );
+        assert!(
+            matches!(d.records[1].op, DOp::Base(Op::GetProp)),
+            "the GetProp stays a standalone record"
+        );
+        // The target byte (3) is still a record boundary the driver can resync to.
+        assert_eq!(byte_to_record(&d, 3), Some(1), "the jump target's off is a live entry");
+    }
+
+    /// §5.2: a `GetProp` that is itself a HEAD (first component) of a fused pair may
+    /// be a jump target — only LATER components are forbidden from being targets.
+    /// `GetProp name; Add` with a back-edge onto the GetProp must STILL fuse.
+    #[test]
+    fn peephole_fuses_when_the_jump_target_is_the_fused_head() {
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str("f".into()));
+        //   0: Nil               (1)
+        //   1: GetProp name      (3) — back-edge TARGET, but the fused HEAD
+        //   4: Add               (1)
+        //   5: Loop -> 1         (3)
+        //   8: Return            (1)
+        c.emit(Op::Nil, s(0, 1)); // byte 0
+        let target = c.code.len(); // byte 1
+        c.emit_u16(Op::GetProp, name, s(1, 2)); // byte 1
+        c.emit(Op::Add, s(2, 3)); // byte 4
+        c.emit_loop(Op::Loop, target, s(3, 4)); // byte 5 → byte 1
+        c.emit(Op::Return, s(4, 5)); // byte 8
+        let d = decode_chunk(&c, &DecodeCfg::fused()).unwrap();
+        // The GetProp is the fused HEAD (first component) — a legal jump target.
+        assert!(
+            matches!(d.records[1].op, DOp::Fused(FusedKind::GetPropAdd)),
+            "GetProp;Add fuses even though GetProp is a jump target (it is the head)"
+        );
+        assert_eq!(byte_to_record(&d, 1), Some(1), "the head's off stays a live entry");
     }
 }

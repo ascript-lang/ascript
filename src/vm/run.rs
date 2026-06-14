@@ -85,10 +85,19 @@ pub(crate) enum BurstExit {
 /// DECODE §2.4: one fetched instruction — the op plus the byte offsets the
 /// verbatim arm bodies read operands from (`operand_at`) and anchor spans/panics
 /// at (`fault_ip`). For both sources `operand_at == fault_ip + 1`.
+///
+/// DECODE §5 (Unit B): `fused` is `Some((kind, packed_a))` when the record source
+/// fetched a FUSED superinstruction — `kind` names the op sequence and `packed_a`
+/// is the record's `a` field (the two component u16 operands, low/high). `op` is
+/// then the FIRST component's op (for the subset/canonical-ip prologue), and
+/// `sync_burst` dispatches the whole fused run in one dedicated block (advancing
+/// the canonical ip past ALL components). The byte source never fuses
+/// (`fused == None` always).
 struct Fetched {
     op: Op,
     fault_ip: usize,
     operand_at: usize,
+    fused: Option<(crate::vm::decode::FusedKind, u32)>,
 }
 
 /// DECODE §2.4: the per-burst instruction source. Two monomorphized impls — the
@@ -136,7 +145,7 @@ impl InstrSource for ByteSource {
         let byte = fiber.frame().closure.proto.chunk.code[fault_ip];
         let op = Op::from_u8(byte)
             .unwrap_or_else(|| panic!("invalid opcode byte {byte:#x} at ip {fault_ip}"));
-        Some(Fetched { op, fault_ip, operand_at: fault_ip + 1 })
+        Some(Fetched { op, fault_ip, operand_at: fault_ip + 1, fused: None })
     }
 
     #[inline]
@@ -284,17 +293,29 @@ impl InstrSource for RecordSource {
             return None;
         }
         let rec = self.d.records[self.idx as usize];
-        let crate::vm::decode::DOp::Base(op) = rec.op;
+        let (op, fused) = match rec.op {
+            crate::vm::decode::DOp::Base(op) => (op, None),
+            // DECODE §5 (Unit B): a fused record. `op` is the FIRST component (the
+            // subset check + the canonical-ip prologue see the head op); the whole
+            // run is dispatched + the ip advanced past ALL components by the fused
+            // block in `sync_burst`.
+            crate::vm::decode::DOp::Fused(kind) => {
+                (crate::vm::decode::FusedKind::components(kind)[0], Some((kind, rec.a)))
+            }
+        };
         Some(Fetched {
             op,
             fault_ip: rec.off as usize,
             operand_at: rec.off as usize + 1,
+            fused,
         })
     }
 
     #[inline]
     fn advance(&mut self, fiber: &mut Fiber, op: Op, operand_at: usize) {
-        // Canonical ip forward, exactly like the byte source.
+        // Canonical ip forward, exactly like the byte source — for a fused record
+        // `sync_burst` overrides this with the full multi-component width before
+        // dispatching (so the head op's width here is harmless: it is recomputed).
         fiber.frame_mut().ip = operand_at + op.operand_width();
         // Step the record cursor to the next record (sequential). A non-sequential
         // continuation (jump / frame change) is caught + resynced at the next fetch.
@@ -2212,7 +2233,13 @@ impl Vm {
         }
         // At/over the threshold: decode now (or permanently-byte on a `None` —
         // a structural anomaly the decoder refused; never retry it).
-        let built = crate::vm::decode::decode_chunk(chunk, &crate::vm::decode::DecodeCfg::plain());
+        // DECODE §5 (Unit B, Task 8): fusion rides the master `decode` switch —
+        // build the stream with the peephole active so hot protos retire fused
+        // superinstructions. The fused arms are byte-identical to the unfused
+        // sequence (the same shared helpers); emptying `FUSION_CANDIDATES` reverts
+        // to a 1:1 stream (the §5 sabotage / Unit-D delta measurement).
+        let built =
+            crate::vm::decode::decode_chunk(chunk, &crate::vm::decode::DecodeCfg::fused());
         match built {
             Some(d) => {
                 #[cfg(any(test, feature = "fuzzgen", fuzzing))]
@@ -2258,14 +2285,17 @@ impl Vm {
             // able to escalate with the ip un-advanced. A `None` is the record
             // source signalling it can no longer fetch (frame transition into an
             // un-decoded callee); the burst falls back to byte dispatch.
-            let Fetched { op, fault_ip, operand_at } = match source.fetch(self, fiber) {
+            let Fetched { op, fault_ip, operand_at, fused } = match source.fetch(self, fiber) {
                 Some(f) => f,
                 None => return Ok(BurstExit::FellBack),
             };
 
             // LANE: check subset membership BEFORE advancing ip. If this op is
             // not in the sync subset, return NeedsAsync with ip still at fault_ip
-            // so the async driver re-decodes and executes the same byte.
+            // so the async driver re-decodes and executes the same byte. (For a
+            // fused record `op` is the head component; all shipped candidates'
+            // components are in-subset, so this never escalates a fused record —
+            // but the check is honored for the head op regardless.)
             if !sync_lane_op(op) {
                 return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
             }
@@ -2274,6 +2304,24 @@ impl Vm {
             // identical canonical-ip arithmetic to run_loop (ip = operand_at +
             // width); the record source also steps its `idx` to the next record.
             source.advance(fiber, op, operand_at);
+
+            // ── DECODE §5 (Unit B): FUSED SUPERINSTRUCTION dispatch ─────────────
+            // A fused record runs N components in ONE dispatch. `advance` already
+            // stepped the record cursor (idx += 1) but set the canonical ip past
+            // only the HEAD op's width; the fused executor finishes the work and
+            // sets the ip past ALL components. Each component runs the SAME shared
+            // helper its single-op arm calls, at its OWN reconstructed byte offset
+            // (so spans / adaptive-cache keys are byte-identical to the unfused
+            // sequence). A fused record never escalates (its components are the
+            // straight-line subset), so it always falls through to `note_retired`.
+            if let Some((kind, packed)) = fused {
+                self.exec_fused(fiber, fault_ip, kind, packed)?;
+                *retired += 1;
+                source.note_retired(self, op);
+                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                self.bump_decode_stat(|s| s.fused_ops = s.fused_ops.saturating_add(1));
+                continue;
+            }
 
             match op {
                 // ── consts / stack ────────────────────────────────────────────
@@ -8540,6 +8588,145 @@ impl Vm {
     /// specialization can never change a result or a diagnostic; it only skips the
     /// generic dispatch when the kinds match. The whole-corpus differential and
     /// goldens stay byte-identical.
+    /// DECODE §5 (Unit B): execute a FUSED superinstruction — N components in one
+    /// dispatch. `head_off` is the fused record's `off` (= the FIRST component's
+    /// byte offset); `packed` is the record's `a` (low u16 = first component's
+    /// operand, high u16 = second's). Each component runs the SAME shared helper
+    /// its single-op `sync_burst` arm calls, AT ITS OWN reconstructed byte offset
+    /// (so a span / a panic / an adaptive-cache key is attributed identically to
+    /// the unfused sequence). The caller has already advanced the record cursor
+    /// (`idx += 1`); THIS sets the canonical byte ip past ALL components.
+    ///
+    /// Byte-identity is structural: each block below is a transcription of the
+    /// single-op arm (`GetLocal`/`Const`/`GetProp`/`Add`) it stands in for —
+    /// same operand source (the packed u16 == the byte the arm would read), same
+    /// helper call, same fault offset, same stack effect.
+    #[inline]
+    fn exec_fused(
+        &self,
+        fiber: &mut Fiber,
+        head_off: usize,
+        kind: crate::vm::decode::FusedKind,
+        packed: u32,
+    ) -> Result<(), Control> {
+        use crate::vm::decode::FusedKind;
+        let lo = (packed & 0xffff) as usize; // first component's u16 operand
+        let hi = ((packed >> 16) & 0xffff) as usize; // second component's u16 operand
+        // Component byte offsets (the ip↔record bridge): comp0 at head_off, each
+        // later component after the previous op's (1 + operand_width) bytes. The
+        // component widths are compile-time constants per kind.
+        let comps = kind.components();
+        // off of component 1 (the second op) = head + 1 + width(comp0).
+        let comp1_off = head_off + 1 + comps[0].operand_width();
+        // off of component 2 (the third op, triples only).
+        let comp2_off = comp1_off + 1 + comps.get(1).map_or(0, |o| o.operand_width());
+        // Each arm returns the LAST component's byte offset (the canonical-ip anchor).
+        let last_off = match kind {
+            // ── GetLocal s; GetProp name ───────────────────────────────────────
+            FusedKind::GetLocalGetProp => {
+                // GetLocal s: read the local (no push — fed straight to GetProp). lo
+                // = slot. GetProp name: the obj is the value GetLocal produced, fed
+                // directly (the single-op pair pushes then pops it). hi = name const
+                // idx; fault offset = the GetProp component's byte off.
+                let lv = fiber.local(lo).clone();
+                let v = self.fused_get_prop(fiber, comp1_off, hi, lv)?;
+                fiber.push(v);
+                comp1_off
+            }
+            // ── GetLocal s1; GetLocal s2 ───────────────────────────────────────
+            FusedKind::GetLocalGetLocal => {
+                let v1 = fiber.local(lo).clone();
+                let v2 = fiber.local(hi).clone();
+                fiber.push(v1);
+                fiber.push(v2);
+                comp1_off
+            }
+            // ── GetLocal s; Const k ────────────────────────────────────────────
+            FusedKind::GetLocalConst => {
+                let v1 = fiber.local(lo).clone();
+                let v2 = fiber.frame().closure.proto.chunk.consts[hi].clone();
+                fiber.push(v1);
+                fiber.push(v2);
+                comp1_off
+            }
+            // ── GetProp name; Add ──────────────────────────────────────────────
+            FusedKind::GetPropAdd => {
+                // GetProp name: pops the obj (top of stack), produces the field. lo =
+                // name idx; fault = head_off (the GetProp component).
+                let obj = fiber.pop();
+                let field = self.fused_get_prop(fiber, head_off, lo, obj)?;
+                // Add: pops the operand below it, combines with the field, pushes the
+                // sum. The Add component's byte off = comp1_off (so its adaptive-cache
+                // key is unchanged). a = the lower operand, b = field (stack order).
+                let a = fiber.pop();
+                let v = self.eval_binop_adaptive(fiber, comp1_off, BinOp::Add, a, field)?;
+                fiber.push(v);
+                comp1_off
+            }
+            // ── Const k; GetLocal s ────────────────────────────────────────────
+            FusedKind::ConstGetLocal => {
+                let v1 = fiber.frame().closure.proto.chunk.consts[lo].clone();
+                let v2 = fiber.local(hi).clone();
+                fiber.push(v1);
+                fiber.push(v2);
+                comp1_off
+            }
+            // ── GetLocal s; GetProp name; Add (triple) ─────────────────────────
+            FusedKind::GetLocalGetPropAdd => {
+                // GetLocal s; GetProp name → the field value (fed `lv` directly).
+                let lv = fiber.local(lo).clone();
+                let field = self.fused_get_prop(fiber, comp1_off, hi, lv)?;
+                // Add: pops the operand below + the field. fault = comp2_off.
+                let a = fiber.pop();
+                let v = self.eval_binop_adaptive(fiber, comp2_off, BinOp::Add, a, field)?;
+                fiber.push(v);
+                comp2_off
+            }
+        };
+        // Canonical ip past the LAST component (its off + 1 + its operand width).
+        let last = comps[comps.len() - 1];
+        fiber.frame_mut().ip = last_off + 1 + last.operand_width();
+        Ok(())
+    }
+
+    /// DECODE §5 (Unit B): the `GetProp`-component body shared by every fused arm
+    /// that reads a field — a transcription of the single-op `Op::GetProp` arm
+    /// (NON-opt form; the peephole only fuses `Op::GetProp`, never `GetPropOpt`).
+    /// `name_idx` is the field-name const index; `prop_off` is the GetProp
+    /// component's byte offset (span anchor + IC key); `obj` is the receiver
+    /// (already popped / read by the caller). Calls the SAME `ic_get_field` /
+    /// `vm_read_member` the single-op arm calls → byte-identical.
+    #[inline]
+    fn fused_get_prop(
+        &self,
+        fiber: &Fiber,
+        prop_off: usize,
+        name_idx: usize,
+        obj: Value,
+    ) -> Result<Value, Control> {
+        let name = match &fiber.frame().closure.proto.chunk.consts[name_idx] {
+            Value::Str(s) => s.clone(),
+            other => {
+                return Err(self.panic_at(
+                    fiber,
+                    prop_off,
+                    format!("GET_PROP operand is not a string constant: {other:?}"),
+                ))
+            }
+        };
+        let span = fiber.frame().closure.proto.chunk.span_at(prop_off);
+        let proto = fiber.frame().closure.proto.clone();
+        let cached = if self.specialize {
+            self.ic_get_field(&proto.chunk, prop_off, &obj, &name)
+        } else {
+            None
+        };
+        match cached {
+            Some(v) => Ok(v),
+            None => self.vm_read_member(&obj, &name, span),
+        }
+    }
+
     fn eval_binop_adaptive(
         &self,
         fiber: &Fiber,
