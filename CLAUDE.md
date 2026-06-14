@@ -69,8 +69,8 @@ Several rules recur for ANY change to the grammar/AST. Do all that apply:
   (`src/vm/aso.rs`) and may need a `src/vm/verify.rs` update.
 - **Publishing the grammar** (whenever you touch `tree-sitter-ascript/**`): run `./scripts/sync-grammar.sh`
   (subtree-splits + pushes to the `ascript-lang/tree-sitter-ascript` mirror, prints the new SHA), then bump
-  that SHA in `editors/zed/extension.toml` (`commit`) and `editors/nvim/lua/ascript/treesitter.lua`
-  (`revision`). CI `mirror-grammar.yml` also auto-mirrors, but the editor-pin bump is manual. See
+  that SHA in `editors/zed/extension.toml` (`rev` — Zed's grammar table requires `rev`, not `commit`) and
+  `editors/nvim/lua/ascript/treesitter.lua` (`revision`). CI `mirror-grammar.yml` also auto-mirrors, but the editor-pin bump is manual. See
   `CONTRIBUTING.md`. **After a sync, verify BOTH editor pins were bumped to the new mirror SHA** — pin
   currency against the mirror is a manual check (network/another repo; not CI-testable in-repo); pin
   mutual consistency (Zed == Nvim) IS enforced by `tests/docs_drift.rs` (tripwire 6).
