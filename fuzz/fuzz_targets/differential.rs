@@ -1,12 +1,13 @@
 //! FUZZ Task 7 — the differential program fuzzer (the headline target).
 //!
 //! `arbitrary` bytes → the grammar-aware generator (`ascript::fuzzgen`) → a VALID,
-//! deterministic, run-to-completion AScript program → run on ALL FIVE engine modes and assert
-//! they agree on the deterministic projection. This is the SAME five-way differential
+//! deterministic, run-to-completion AScript program → run on ALL SEVEN engine modes and assert
+//! they agree on the deterministic projection. This is the SAME N-way differential
 //! `tests/vm_differential.rs` enforces over a fixed corpus, turned into a continuous
 //! generator-driven oracle:
 //!
-//!   `run(tree-walker, P) == run(specialized-VM, P) == run(generic-VM, P) == run(lane-off, P) == run(no-call-fast, P)`
+//!   `run(tree-walker, P) == run(specialized-VM, P) == run(generic-VM, P) == run(lane-off, P)
+//!    == run(no-call-fast, P) == run(decoded-forced, P) == run(no-decode, P)`
 //!
 //! compared on `(captured stdout, exit code)` on success or the Tier-2 panic MESSAGE on
 //! failure (the SP1 caret-column offset between front-ends is excluded — message only). ANY
@@ -73,11 +74,12 @@ fuzz_target!(|data: &[u8]| {
     let prog = ascript::fuzzgen::gen_program_from_bytes(data);
     let src = prog.source;
 
-    // Run all five engine modes on the 512 MB worker stack and project each outcome. The
+    // Run all seven engine modes on the 512 MB worker stack and project each outcome. The
     // owned `String` is moved into the `Send` closure (no borrow of the libFuzzer buffer
     // crosses). LANE §6.1: the lane-off projection is the fourth axis (Gate 15).
     // CALL §8.1: the no-call-fast projection is the fifth axis (Gate 15).
-    let (tw, vm, gen, nolane, nocf) = ascript::run_on_worker_stack({
+    // DECODE §8.3: the decoded-forced + no-decode projections are the sixth + seventh axes (Gate 15).
+    let (tw, vm, gen, nolane, nocf, decfwd, nodec) = ascript::run_on_worker_stack({
         let src = src.clone();
         move || async move {
             let tw = project(ascript::run_source_exit(&src).await);
@@ -87,11 +89,14 @@ fuzz_target!(|data: &[u8]| {
             let nolane = project(ascript::vm_run_source_no_sync_lane(&src).await);
             // CALL §8.1: no-call-fast must be byte-identical to all other modes.
             let nocf = project(ascript::vm_run_source_no_call_fast(&src).await);
-            (tw, vm, gen, nolane, nocf)
+            // DECODE §8.3: decoded-forced (threshold 0) + no-decode must be byte-identical.
+            let decfwd = project(ascript::vm_run_source_decoded_forced(&src).await);
+            let nodec = project(ascript::vm_run_source_no_decode(&src).await);
+            (tw, vm, gen, nolane, nocf, decfwd, nodec)
         }
     });
 
-    // THE ORACLE: all five must agree. A panic here is a libFuzzer crash carrying a ready
+    // THE ORACLE: all seven must agree. A panic here is a libFuzzer crash carrying a ready
     // reproducer. Fix the ENGINE, never relax this assertion (Gate 0).
     assert_eq!(
         tw, vm,
@@ -110,5 +115,15 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         tw, nocf,
         "no-call-fast VM diverged from tree-walker\n--- program ---\n{src}\n--- tw: {tw:?}\n--- nocf: {nocf:?}"
+    );
+    // DECODE §8.3 / Gate 15: decoded-forced must be byte-identical (a real DECODE bug otherwise).
+    assert_eq!(
+        tw, decfwd,
+        "decoded-forced VM diverged from tree-walker\n--- program ---\n{src}\n--- tw: {tw:?}\n--- decfwd: {decfwd:?}"
+    );
+    // DECODE §8.3 / Gate 15: no-decode must be byte-identical to tree-walker.
+    assert_eq!(
+        tw, nodec,
+        "no-decode VM diverged from tree-walker\n--- program ---\n{src}\n--- tw: {tw:?}\n--- nodec: {nodec:?}"
     );
 });
