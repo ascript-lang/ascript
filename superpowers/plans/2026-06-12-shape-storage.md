@@ -518,32 +518,19 @@ async fn shape_storage_corpus_exercises_both_modes_and_demotion() {
 - Create: `bench/SHAPE_RESULTS.md`
 - Test: `tests/vm_bench.rs` (the standing gates)
 
-- [ ] **Step 1: Same-session A/B (Gate 16):** in ONE session on one machine, build `main` and `feat/shape-storage` (`--profile profiling`), run `bench/profiling/run.sh` workloads (`json_roundtrip`, `object_churn`; plus the LANE Task-0 functional corpus if merged by now) 5× each, record medians; profile both with the shipped profiler (`ascript run --profile cpu`) and capture the hashing/allocation attribution deltas.
-- [ ] **Step 2: Gate 18:** record allocation counts + peak RSS per workload (`/usr/bin/time -l`, plus a `count_allocations`-style harness run if available). A memory regression is a bug to fix in this task, not a tradeoff.
-- [ ] **Step 3: Tune the tunables:** sweep `SLAB_MAX_KEYS ∈ {32, 64, 128}` × `SHAPE_FANOUT_MAX ∈ {64, 128, 256}` on `object_churn` + the order-stress examples; record the sweep table; keep the spec defaults unless the data says otherwise (then update spec + constants together).
-- [ ] **Step 4: Gate 12 + DBG:** `cargo test --test vm_bench` — spec/tw geomean ≥ 2× holds; the dispatch loop was touched (`NewObject`/prop arms) so **re-run `dbg_zero_cost_gate`** (instrument==None ≈ armed-idle, bound 1.05×) and record both numbers.
-- [ ] **Step 5:** Write `bench/SHAPE_RESULTS.md`: headline table (before/after per workload: time, alloc count, peak RSS, hashing% from the profiler), the honest `json_roundtrip` bound (decoded objects are born dict — SipHash kept by design, spec §9), the cap sweep, the Gate-12/DBG numbers, machine/date/commit hashes. **Expectations were stated, results are measured — if a number disappoints, the report says so and why.**
-- [ ] **Step 6: Commit** — `git commit -m "bench(shape): same-session A/B + allocation/RSS report + cap tuning" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Steps 1–6 DONE (`1c03782`):** Same-session A/B (Gate 16) via `bench/ab.sh` (ONE target/, no worktree): **object_churn 1.77×, geomean 1.089×**; json_roundtrip 0.99× flat AS DESIGNED (decode-born dict keeps SipHash, spec §9). **Gate 18 alloc: 13.0→2.0/object (6.5×)** via `tests/alloc_count.rs::object_construction_alloc_slope` (bound tightened `<50`→`<6.0` per review so it guards the slab invariant); no RSS regression. Cap sweep 9-combo → kept defaults 64/128 (zero sensitivity). Gate-12 spec/tw **4.20×** (≥2×); **dbg_zero_cost 0.994×** (≤1.05×). Profiler: object_churn hashing 14%→0%, alloc 17.6%→5.7%. `bench/SHAPE_RESULTS.md` written (honest; machine/date/commits recorded). Opus reviewer reproduced all standing gates + verified alloc probe non-vacuous + report honesty + caps restored + no worktree.
 
 ### Task 6.2: docs + status
 
 **Files:**
 - Modify: `CLAUDE.md` (the "Object/instance SHAPES" bullet → describe slab/dict storage, the demotion rules, the lit_shapes side table, the delete-bug lesson), `superpowers/roadmap.md` (the SHAPE entry), `goal-perf.md` (status table 🏗️ → ✅ at merge), `docs/content/language/values-types.md` (one user-visible note: object key order is guaranteed and unchanged; no new page → no `NAV` change).
 
-- [ ] **Step 1:** Write the updates; serve the docs site (`cd docs && python3 -m http.server`) and sanity-check the edited page renders.
-- [ ] **Step 2: Commit** — `git commit -m "docs(shape): CLAUDE.md storage model, roadmap, goal-perf status, values-types note" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 1–2 DONE (`efda226`):** CLAUDE.md "Object/instance SHAPES" bullet rewritten (slab/dict, registry caps, demotion, lit_shapes, delete-bug lesson, FxHash/SipHash boundary, no-.aso-change, headline perf); roadmap.md SHAPE entry; values-types.md key-insertion-order NOTE (no new page → no NAV change). Every claim code-verified with citations. goal-perf status flip deferred to merge (6.3).
 
 ### Task 6.3: full matrix + whole-effort holistic review (Definition of Done)
 
-- [ ] **Step 1:** `cargo test` (default) — ALL test binaries green, 0 failures.
-- [ ] **Step 2:** `cargo test --no-default-features` — green.
-- [ ] **Step 3:** `cargo clippy --all-targets` AND `cargo clippy --no-default-features --all-targets` — clean.
-- [ ] **Step 4:** `cargo test --test vm_differential` both configs — full corpus + goldens + the new batteries, byte-identical four-mode.
-- [ ] **Step 5:** Coverage assertion (3.5) all-nonzero; property suite + saboteur green; fuzz smoke (if available) zero divergences; negative-space green.
-- [ ] **Step 6:** Gate 12 (≥2× geomean) + `dbg_zero_cost_gate` numbers recorded in `bench/SHAPE_RESULTS.md`; Gate 18 alloc/RSS recorded; no unexplained regression.
-- [ ] **Step 7:** Tooling parity confirmed-working: no grammar/syntax change (no tree-sitter regen, no editor-pin bump), `fmt` idempotent over the new examples, REPL session sanity (objects across lines), LSP suite green.
-- [ ] **Step 8:** Whole-effort holistic-review subagent over the ENTIRE branch diff: spec §1–§10 coverage table; zero TODO/placeholder/silent deferral; every discovered bug (incl. Phase 0) has a failing-test-first regression guard; the tree-walker diff is ZERO behavior lines (accessor renames only — verify `interp.rs` semantics untouched by reading the diff); invariants intact (`Value: !Send` assertion, no borrow across await, native handles untraced).
-- [ ] **Step 9:** Every checkbox in this plan ticked. Merge `feat/shape-storage` → `main` with `--no-ff`; update `goal-perf.md` status table (SHAPE → ✅) in the merge; NANB is now unblocked.
+- [x] **Steps 1–8 DONE — whole-effort holistic returned GO (opus, 54 tool-uses, live runs).** Full matrix BOTH configs: `cargo test` 39 binaries 0 failures (default + `--no-default-features`); clippy 0/0 both; `vm_differential` **443/0** both (four/five-mode byte-identical); property 27/0 (incl. the coverage assertion) + shape_negative_space 3/0 + alloc-slope 1.997/object (<6.0 guard); vm_bench spec/tw **4.31×** (≥2×) + dbg_zero_cost **0.996×** (≤1.05×); ASO 28. **Parity (gate 20):** grammar/lexer/token/ast/parser/syntax/fmt diff vs main EMPTY; fmt idempotent + check clean on both new examples; LSP 35/0. **Holistic:** spec §1–§10 all landed (incl. §10 rejections — no `Value` variant, no `.aso` change, no tree-walker behavior change, no dict→slab re-promotion); 0 new TODO/placeholder; tree-walker `interp.rs` diff is accessor-rename/Dict-construction/shared-contract only (ZERO oracle semantic change); invariants intact (`Value: !Send` assert, GC two-arm trace, native handles untraced, no borrow-across-await in `vm_object_insert`/`vm_instance_insert`); every discovered bug has a failing-test-first guard.
+- [x] **Step 9:** Every checkbox in this plan ticked. Merge `feat/shape-storage` → `main` with `--no-ff`; update `goal-perf.md` status table (SHAPE → ✅) in the merge; NANB is now unblocked.
 
 ---
 
