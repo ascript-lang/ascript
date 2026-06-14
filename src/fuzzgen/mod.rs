@@ -57,9 +57,17 @@
 //! didn't stop at a statement keyword).
 //!
 //! STILL NOT EMITTED (the next breadth follow-up; the differential cannot fuzz what it never
-//! generates): interfaces + structural-`instanceof`; destructuring/spread/rest in let/params;
-//! async/await/spawn/workers (deferred — nondeterministic scheduling, see spec §6); try/recover
-//! (the `recover(fn(){…})` carry-forward bug); generators `fn*`/`yield`.
+//! generates): interfaces + structural-`instanceof`; async/await/spawn/workers (deferred —
+//! nondeterministic scheduling, see spec §6); try/recover (the `recover(fn(){…})` carry-forward
+//! bug); generators `fn*`/`yield`.
+//!
+//! SHAPE (Task 5.2) ADDED: **object spread**, **`object.delete` + member-read**, **rest
+//! destructuring** (arrow IIFE), and a **loop-built wide-object** (the demotion driver: inserting
+//! more than 64 keys via a `for` loop + template-string key). The wide-object production is the
+//! ONLY one that crosses the slab-to-dict demotion boundary; the others exercise slab-mode ICs.
+//! The `generator_crosses_both_storage_modes_and_demotion` test in `tests/property.rs` asserts
+//! all three counters (slab, dict, demote) are nonzero after a 200-seed batch — the regression
+//! guard.
 //!
 //! Known BLIND SPOT (tracked): class/enum/`fn` declarations are emitted TOP-LEVEL only — the
 //! generator cannot nest a declaration INSIDE a loop body. That pattern hid a real closure
@@ -264,14 +272,16 @@ impl<'a, 'b> Gen<'a, 'b> {
 
     fn program(&mut self) {
         // Stdlib imports the broadened generator relies on (decimal arithmetic, array/map/
-        // set construction + access). Always emitted so any later production can reference
-        // them; an unused import is a lint Warning, never a runtime error, so this keeps the
-        // generated source valid + deterministic regardless of which productions fire.
+        // set construction + access, object spread/delete). Always emitted so any later
+        // production can reference them; an unused import is a lint Warning, never a runtime
+        // error, so this keeps the generated source valid + deterministic regardless of which
+        // productions fire.
         for (alias, module) in [
             ("decimal", "std/decimal"),
             ("array", "std/array"),
             ("map", "std/map"),
             ("set", "std/set"),
+            ("object", "std/object"),
         ] {
             let _ = writeln!(self.out, "import * as {alias} from \"{module}\"");
             let _ = alias;
@@ -473,6 +483,9 @@ impl<'a, 'b> Gen<'a, 'b> {
         // gated on legality; we re-roll to a safe default when illegal.
         // Choices 13..15 are the DEFER axis (Gate 15): a modest weight (~3/16) so other
         // statements still dominate and the generator explores a broad surface.
+        // Choice 12 (previously a `_` fall-through to print_stmt) is now the SHAPE
+        // wide-object demotion driver (Task 5.2) — keeping `choice(16)` unchanged so
+        // the curated seed→program mapping is not perturbed.
         let pick = self.choice(16);
         match pick {
             0 | 1 => self.let_stmt(depth),
@@ -486,6 +499,10 @@ impl<'a, 'b> Gen<'a, 'b> {
             9 if self.in_fn => self.propagate_stmt(depth), // `?` inside a fn body
             10 => self.closure_capture_stmt(depth),
             11 => self.loop_closure_stmt(depth),
+            // SHAPE Task 5.2 — wide-object demotion driver: builds >SLAB_MAX_KEYS (64)
+            // entries via a loop + template-string keys (`k${i}`), forcing the slab→dict
+            // demotion. Gated at depth == 0 to avoid a deeply-nested quadratic loop.
+            12 if depth == 0 => self.wide_object_stmt(depth),
             // DEFER axis — three shapes covering §3.3's matrix:
             //   13: plain `defer <print_fn>(arg)` — drain ORDER is observable
             //   14: defer arrow-IIFE touching a mutable local (capture-by-value)
@@ -1358,8 +1375,14 @@ impl<'a, 'b> Gen<'a, 'b> {
     /// integral-float-folds-to-int via numeric keys), and the `len`/`set.size`/`map.get`
     /// native paths. The observable is always a deterministic scalar `int` so output stays
     /// a pure function of source (never an unordered map/set print).
+    ///
+    /// SHAPE (Task 5.2) — three additional productions that cross SHAPE storage modes:
+    ///   7: object SPREAD `({...{a,b},c}).c` — exercises the spread IC path.
+    ///   8: `object.delete` + member read after delete — exercises the IC reset on delete.
+    ///   9: rest destructuring IIFE — `(() => { let {a,...rest}={a,b,c}; return len(rest) })()`
+    ///      exercises the OBJECT_REST opcode (dict-mode object build, counted separately).
     fn composite_expr(&mut self, _depth: u32) -> String {
-        match self.choice(7) {
+        match self.choice(10) {
             // Object literal: member read of a known key.
             0 => {
                 let a = self.int_atom();
@@ -1405,12 +1428,67 @@ impl<'a, 'b> Gen<'a, 'b> {
                 format!("[{a}, {b}, {c}][{idx}]")
             }
             // Set construction + size (dedup edge: `set.from` over a literal array).
-            _ => {
+            6 => {
                 let a = self.int_atom();
                 let b = self.int_atom();
                 format!("set.size(set.from([{a}, {b}, {a}]))")
             }
+            // SHAPE Task 5.2 — Object SPREAD: later-wins; pick the value at a spread-in key.
+            // `({...{a: A, b: B}, c: C}).c` → C (the override wins over the spread).
+            // Exercises the spread IC path in the VM's slab mode.
+            7 => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                let c = self.int_atom();
+                format!("({{...{{a: {a}, b: {b}}}, c: {c}}}).c")
+            }
+            // SHAPE Task 5.2 — `object.delete` (mutates in-place, resets shape to 0) +
+            // member read after delete. `object.delete(o, "b")` removes "b"; then `o.a`
+            // exercises the reshaped IC (which must fall back to a generic lookup after
+            // the shape reset). Observable: `o.a` == A, a deterministic int.
+            8 => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                let c = self.int_atom();
+                // Use an IIFE so `o` is a local (avoids naming conflicts at expression depth).
+                format!("(() => {{ let o = {{a: {a}, b: {b}, c: {c}}}; object.delete(o, \"b\"); return o.a }})() ")
+            }
+            // SHAPE Task 5.2 — Object REST destructuring IIFE. `let {{a, ...rest}} = {{a,b,c}}`
+            // exercises Op::OBJECT_REST (builds a fresh dict-mode object for `rest`).
+            // Observable: `len(rest)` == 2 (b and c survive after a is extracted).
+            _ => {
+                let a = self.int_atom();
+                let b = self.int_atom();
+                let c = self.int_atom();
+                format!("(() => {{ let {{a, ...rest}} = {{a: {a}, b: {b}, c: {c}}}; return len(rest) }})()")
+            }
         }
+    }
+
+    /// SHAPE Task 5.2 — the DEMOTION driver. Builds an object with >64 keys via a `for` loop
+    /// using template-string keys (`k${i}`), which forces the slab→dict demotion at key 65.
+    /// NOTE: `"k" + i` (string + int) is a Tier-2 PANIC — template strings MUST be used.
+    /// Observable: prints `len(o)` (= `WIDE_KEYS`) and `o.k5` (= 5) — both deterministic ints.
+    fn wide_object_stmt(&mut self, depth: u32) {
+        // Use a key count safely above SLAB_MAX_KEYS (64) to reliably trigger demotion.
+        const WIDE_KEYS: usize = 70;
+        let oname = self.fresh("wo");
+        let iname = self.fresh("wi");
+        self.indent(depth);
+        let _ = writeln!(self.out, "let {oname} = {{}}");
+        self.declare(&oname, true);
+        self.indent(depth);
+        let _ = writeln!(self.out, "for ({iname} in 0..{WIDE_KEYS}) {{");
+        self.indent(depth + 1);
+        // Template string key: `k${i}` — avoids the "string + int = Tier-2 panic" trap.
+        let _ = writeln!(self.out, "{oname}[`k${{{iname}}}`] = {iname}");
+        self.indent(depth);
+        self.out.push_str("}\n");
+        // Two deterministic observables: total key count and a spot-check at index 5.
+        self.indent(depth);
+        let _ = writeln!(self.out, "print(len({oname}))");
+        self.indent(depth);
+        let _ = writeln!(self.out, "print({oname}[\"k5\"])");
     }
 }
 

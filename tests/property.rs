@@ -302,6 +302,70 @@ fn defer_coverage_assertion_gate15() {
     );
 }
 
+/// SHAPE Task 5.2 — storage-mode coverage assertion (anti-false-green). After running a
+/// 200-seed batch through `vm_run_source_obj_mode_stats`, ALL THREE counters — slab, dict,
+/// and demote — MUST be > 0:
+///   - `slab > 0`: at least one object was constructed in slab mode (the common path for
+///     small literals).
+///   - `dict > 0`: at least one object was constructed directly in dict mode (e.g. via
+///     `Op::OBJECT_REST`, the spread rest-destructuring opcode, or a large literal cap-refused).
+///   - `demote > 0`: at least one object was demoted slab→dict via incremental insert past
+///     `SLAB_MAX_KEYS` (64). This is the ONLY counter driven by the wide-object demotion
+///     production in `wide_object_stmt`.
+///
+/// Fixed seeds (deterministic, reproducible) — the same batch always runs, so this is also
+/// a regression guard: a generator change that accidentally removes a production is caught here.
+///
+/// Uses `vm_run_source_obj_mode_stats` (compiled under `#[cfg(any(test, feature="fuzzgen"))]`),
+/// which returns `(output, exit, (slab, dict, demote))` for each run. Runs in-process on the
+/// worker stack (the VM is `!Send` current-thread tokio with deep recursion).
+#[test]
+fn generator_crosses_both_storage_modes_and_demotion() {
+    let n = 200u64;
+    let progs: Vec<String> = (0..n)
+        .map(|seed| {
+            let bytes = seed_bytes(seed.wrapping_mul(0xA24BAED4963EE407).wrapping_add(7), 768);
+            fuzzgen::gen_program_from_bytes(&bytes).source
+        })
+        .collect();
+
+    let (total_slab, total_dict, total_demote) =
+        ascript::run_on_worker_stack(move || async move {
+            let mut slab = 0u64;
+            let mut dict = 0u64;
+            let mut demote = 0u64;
+            for src in &progs {
+                if let Ok((_, _, (s, d, dm))) =
+                    ascript::vm_run_source_obj_mode_stats(src).await
+                {
+                    slab += s;
+                    dict += d;
+                    demote += dm;
+                }
+            }
+            (slab, dict, demote)
+        });
+
+    assert!(
+        total_slab > 0,
+        "SHAPE Gate: slab_constructed == 0 after 200 seeds — \
+         the generator is not producing small-object programs. \
+         Check that composite_expr / class_expr / object literals fire."
+    );
+    assert!(
+        total_dict > 0,
+        "SHAPE Gate: dict_constructed == 0 after 200 seeds — \
+         the generator is not reaching the dict-mode build path. \
+         Check that composite_expr production 9 (rest destructuring / OBJECT_REST) fires."
+    );
+    assert!(
+        total_demote > 0,
+        "SHAPE Gate: obj_demotions == 0 after 200 seeds — \
+         the demotion driver (wide_object_stmt, >64 keys via for-loop) is not firing. \
+         Check that stmt() emits wide_object_stmt at depth==0 and that the seed range hits it."
+    );
+}
+
 /// HIGH-VOLUME stress differential (FUZZ Unit 2). `#[ignore]` by default (it runs many
 /// thousands of programs through four engine modes — too slow for the default `cargo test`),
 /// but it is the breadth net used when broadening the generator: run with
