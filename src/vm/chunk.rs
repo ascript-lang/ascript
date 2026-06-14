@@ -485,6 +485,16 @@ pub struct Chunk {
     /// `None` for every valid (sub-65535) module — the placeholder is never
     /// executed because compile aborts the moment the flag is observed set.
     pub overflow: std::cell::Cell<Option<ChunkLimit>>,
+    /// DECODE §4.1: the byte-patch invalidation epoch. Bumped INSIDE
+    /// [`Chunk::patch_byte`] on EVERY call — both the DBG breakpoint SET (writing
+    /// `Op::Break`) and its RESTORE (un-patching back to the original opcode), since
+    /// an un-patch also stales any decoded/compiled artifact that baked the `Break`.
+    /// Any such artifact records the epoch it was built at; a later read compares and
+    /// rebuilds when stale. Runtime-only / write-only until the decoded stream lands
+    /// (a later DECODE task): NOT serialized to `.aso` (a runtime side-table like
+    /// `field_ics`/`arith_caches`), defaults to 0. Single-threaded (`!Send`), so a
+    /// plain `Cell` suffices.
+    pub patch_epoch: std::cell::Cell<u64>,
     /// The MODULE source (`path` + full text) this chunk's spans index, for
     /// cross-module diagnostic provenance (SP4 §3). Set at compile/load time on a
     /// module's whole proto tree (see [`Chunk::set_module_source`]); read by the
@@ -827,6 +837,11 @@ impl Chunk {
     /// would be undefined behavior. Off-path readers and the hot fetch pay nothing.
     #[inline]
     pub fn patch_byte(&self, off: usize, b: u8) {
+        // DECODE §4.1: the invalidation chokepoint. Bump the epoch on EVERY call —
+        // both the breakpoint SET and the RESTORE/un-patch — BEFORE the raw write, so
+        // any decoded/compiled artifact recording an older epoch is provably stale.
+        // `saturating_add` so a pathological breakpoint-churn run can never wrap.
+        self.patch_epoch.set(self.patch_epoch.get().saturating_add(1));
         self.code.patch_byte(off, b);
     }
 
@@ -1103,6 +1118,23 @@ mod tests {
     fn patch_byte_out_of_bounds_panics() {
         let code: Code = vec![Op::Nil as u8].into();
         code.patch_byte(5, Op::Break as u8);
+    }
+
+    /// DECODE §4.1: `Chunk::patch_byte` is the byte-patch invalidation chokepoint —
+    /// EVERY call (the DBG breakpoint SET *and* its RESTORE) bumps `patch_epoch`, so
+    /// any decoded/compiled artifact recording an older epoch is provably stale.
+    #[test]
+    fn patch_byte_bumps_the_patch_epoch_on_set_and_restore() {
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s(0, 1));
+        c.emit(Op::Add, s(2, 3));
+        assert_eq!(c.patch_epoch.get(), 0, "fresh chunk starts at epoch 0");
+        // Set (the DBG breakpoint write) bumps…
+        c.patch_byte(1, Op::Break as u8);
+        assert_eq!(c.patch_epoch.get(), 1);
+        // …and RESTORE bumps too (an un-patch also stales any stream that baked the Break).
+        c.patch_byte(1, Op::Add as u8);
+        assert_eq!(c.patch_epoch.get(), 2);
     }
 
     #[test]
