@@ -41,6 +41,9 @@ durable workflows, plus **shared-nothing workers** for multi-core parallelism �
   `](../language/syntax)`), not absolute-from-root. The language-guide pages are
   `docs/content/language/{syntax,values-types,classes-enums,type-contracts,errors,modules-async}.md`
   (note: `match`/generators/concurrency live inside those pages, not separate files).
+  `tests/docs_drift.rs` is the campaign-gate enforcement (gate 19) for ALL doc-currency invariants:
+  CLI-surface⊆cli.md, env-var coverage, module→page mapping, NAV⇄files bijection, in-content links,
+  and editor-pin consistency — if any of these six tripwires is RED, CI fails.
 - **`README.md`** is the repo front door (install, CLI, stdlib table, links into `docs/`).
 - **Runnable examples:** `examples/*.as` (introductory; exercised by the conformance tests) and
   `examples/advanced/*.as` (production-shaped, fully error-handled). Verify with
