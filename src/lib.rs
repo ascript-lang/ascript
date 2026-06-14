@@ -2516,6 +2516,88 @@ pub async fn run_file_on_vm_with_packages(
     }
 }
 
+/// DECODE Task 4 (cross-module provenance test): run a `.as` FILE with an
+/// explicit decode kill-switch + warmth threshold, returning the same exit/error
+/// shape as [`run_file_on_vm_with_packages`]. Lets the §2.4 `last_fault_source`
+/// hoisting be asserted across a real module boundary (forced-decode vs byte).
+/// `#[doc(hidden)]` — test API only.
+#[doc(hidden)]
+pub async fn run_file_decode_cfg(
+    path: &Path,
+    decode: bool,
+    decode_threshold: u16,
+) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    chunk.set_module_source(&src_info);
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_worker_source(&src);
+    interp.install_self();
+    // Build a specialized VM, then override the decode kill switch + threshold so
+    // the test can FORCE decode (threshold 0) or DISABLE it independent of env.
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, true, true, decode_threshold);
+    if let Some(dir) = path.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
+    local.run_until(interp.telemetry_flush_on_exit()).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(0),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(0),
+        Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
+/// DECODE Task 4: run a `.as` FILE with decode DISABLED (byte dispatch). See
+/// [`run_file_decode_cfg`]. `#[doc(hidden)]` — test API only.
+#[doc(hidden)]
+pub async fn run_file_no_decode(path: &Path) -> Result<i32, AsError> {
+    use crate::vm::Vm;
+    run_file_decode_cfg(path, false, Vm::DECODE_THRESHOLD).await
+}
+
+/// DECODE Task 4: run a `.as` FILE with decode FORCED on (threshold 0). See
+/// [`run_file_decode_cfg`]. `#[doc(hidden)]` — test API only.
+#[doc(hidden)]
+pub async fn run_file_decoded_forced(path: &Path) -> Result<i32, AsError> {
+    run_file_decode_cfg(path, true, 0).await
+}
+
 /// DBG Task 7: configuration for a CPU-profiled run, assembled from the
 /// `--profile`/`--profile-hz`/`--profile-format`/`-o` CLI flags.
 #[cfg(feature = "profile")]

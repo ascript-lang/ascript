@@ -148,6 +148,175 @@ impl InstrSource for ByteSource {
     fn note_retired(&mut self, _vm: &Vm, _op: Op) {}
 }
 
+/// DECODE §2.4: the record instruction source — fetches from a valid
+/// [`DecodedChunk`](crate::vm::decode::DecodedChunk), skipping the per-instruction
+/// `Op::from_u8` decode + `operand_width` walk. The arm bodies still read operands
+/// from `chunk.read_*(operand_at)` (1:1 decode keeps the bytes the source of truth
+/// for operand VALUES — fusion/inline that consult the widened `a`/`b` land in
+/// Tasks 8/9); the record source's win here is the cursor: a hot straight-line run
+/// advances `idx += 1` instead of decoding a byte.
+struct RecordSource {
+    /// The decoded chunk of the frame `idx` indexes (resynced on a frame change).
+    d: std::rc::Rc<crate::vm::decode::DecodedChunk>,
+    /// Record cursor into `d.records` — the NEXT record to fetch.
+    idx: u32,
+    /// The `fiber.frames.len()` this `(d, idx)` is valid for. A change means a
+    /// frame push/pop happened and the cursor must re-derive from the new frame.
+    frames_len: usize,
+    /// Identity of the chunk `d` decodes (`Rc::as_ptr`), to detect a frame change
+    /// even when `frames.len()` coincidentally matches (a pop-then-push could).
+    chunk_ptr: *const crate::vm::chunk::Chunk,
+}
+
+impl RecordSource {
+    /// DECODE §3.1 (entry: byte → record): position a record source at the entry
+    /// frame's current byte ip. `None` if the ip is not a record boundary (a stale
+    /// stream or a foreign ip) — the caller then runs on bytes.
+    fn at_entry(
+        vm: &Vm,
+        fiber: &Fiber,
+        d: std::rc::Rc<crate::vm::decode::DecodedChunk>,
+    ) -> Option<Self> {
+        let chunk = &fiber.frame().closure.proto.chunk;
+        let idx = crate::vm::decode::byte_to_record(&d, fiber.frame().ip as u32)?;
+        // SP4 §3 (hoisted per §2.4): refresh last_fault_source at frame entry —
+        // the cell's value is the per-chunk constant (the chunk's module source),
+        // so refreshing where the chunk changes is observationally identical to
+        // the byte path's per-instruction refresh.
+        if let Some(src) = chunk.source.borrow().as_ref() {
+            *vm.last_fault_source.borrow_mut() = Some(src.clone());
+        }
+        Some(RecordSource {
+            d,
+            idx,
+            frames_len: fiber.frames.len(),
+            chunk_ptr: chunk as *const crate::vm::chunk::Chunk,
+        })
+    }
+
+    /// DECODE §3.1: re-derive `(d, idx)` from the CURRENT frame's canonical byte
+    /// ip. Called when the cursor detects a discontinuity (a frame change, or the
+    /// ip moved off the sequential record). `false` ⇒ cannot fetch from records
+    /// (the new frame has no valid decoded stream, or the ip is not a record
+    /// boundary) — the burst falls back to byte dispatch.
+    fn resync(&mut self, vm: &Vm, fiber: &Fiber) -> bool {
+        let chunk = &fiber.frame().closure.proto.chunk;
+        let cur_ptr = chunk as *const crate::vm::chunk::Chunk;
+        if cur_ptr != self.chunk_ptr {
+            // Frame changed to a different chunk: consult ITS decoded stream.
+            let slot = chunk.decoded.borrow();
+            let d = match slot.as_ref() {
+                Some(d) if d.own_epoch == chunk.patch_epoch.get() => d.clone(),
+                _ => return false, // un-decoded / stale callee → byte fallback
+            };
+            drop(slot);
+            let idx = match crate::vm::decode::byte_to_record(&d, fiber.frame().ip as u32) {
+                Some(i) => i,
+                None => return false,
+            };
+            self.d = d;
+            self.chunk_ptr = cur_ptr;
+            self.idx = idx;
+            self.frames_len = fiber.frames.len();
+            // Hoisted last_fault_source refresh at the chunk boundary (§2.4).
+            if let Some(src) = chunk.source.borrow().as_ref() {
+                *vm.last_fault_source.borrow_mut() = Some(src.clone());
+            }
+            true
+        } else {
+            // Same chunk, but the ip moved off the sequential record (a taken jump
+            // within the frame). Re-derive idx; the stream identity is unchanged.
+            match crate::vm::decode::byte_to_record(&self.d, fiber.frame().ip as u32) {
+                Some(i) => {
+                    self.idx = i;
+                    self.frames_len = fiber.frames.len();
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+impl InstrSource for RecordSource {
+    #[inline]
+    fn fetch(&mut self, vm: &Vm, fiber: &mut Fiber) -> Option<Fetched> {
+        let frame_ip = fiber.frame().ip as u32;
+        // Fast path: same frame, same chunk, and `idx` still points at the record
+        // whose off equals the canonical ip (sequential fall-through). Otherwise a
+        // discontinuity (jump / frame push-pop) happened → resync.
+        let need_resync = fiber.frames.len() != self.frames_len
+            || (self.idx as usize) >= self.d.records.len()
+            || self.d.records[self.idx as usize].off != frame_ip;
+        if need_resync && !self.resync(vm, fiber) {
+            return None;
+        }
+        let rec = self.d.records[self.idx as usize];
+        let crate::vm::decode::DOp::Base(op) = rec.op;
+        Some(Fetched {
+            op,
+            fault_ip: rec.off as usize,
+            operand_at: rec.off as usize + 1,
+        })
+    }
+
+    #[inline]
+    fn advance(&mut self, fiber: &mut Fiber, op: Op, operand_at: usize) {
+        // Canonical ip forward, exactly like the byte source.
+        fiber.frame_mut().ip = operand_at + op.operand_width();
+        // Step the record cursor to the next record (sequential). A non-sequential
+        // continuation (jump / frame change) is caught + resynced at the next fetch.
+        self.idx += 1;
+    }
+
+    #[inline]
+    fn note_retired(&mut self, vm: &Vm, op: Op) {
+        #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+        vm.bump_decode_stat(|s| {
+            s.decoded_ops = s.decoded_ops.saturating_add(1);
+            // §7.3 gate input: fiber-stack pushes+pops this record retired. A
+            // well-defined per-op magnitude (the operand-stack traffic), so it
+            // EXISTS from the first record; Unit B/D measure its reduction.
+            s.stack_ops = s.stack_ops.saturating_add(op_stack_traffic(op));
+        });
+        #[cfg(not(any(test, feature = "fuzzgen", fuzzing)))]
+        {
+            let _ = (vm, op);
+        }
+    }
+}
+
+/// DECODE §7.3: the operand-stack traffic (pushes + pops) of one `op`, the
+/// `stack_ops` gate input. A static per-op magnitude — the exact count for the
+/// common ops, a conservative lower bound for the rare variadic builders (whose
+/// width is a runtime operand). Used ONLY for the coverage counter (never on the
+/// production hot path).
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+fn op_stack_traffic(op: Op) -> u64 {
+    match op {
+        // pure pushes (no pop)
+        Op::Const | Op::Nil | Op::True | Op::False | Op::GetLocal | Op::GetGlobal
+        | Op::Closure => 1,
+        // pop-only
+        Op::Pop | Op::SetLocal | Op::SetGlobal => 1,
+        // dup: 1 read + 1 push
+        Op::Dup => 2,
+        // binary: 2 pops + 1 push
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Lt | Op::Le
+        | Op::Gt | Op::Ge | Op::Eq | Op::Ne | Op::InstanceOf | Op::InstanceOfType
+        | Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::WrapAdd
+        | Op::WrapSub | Op::WrapMul | Op::Range | Op::GetIndex => 3,
+        // unary: 1 pop + 1 push
+        Op::Neg | Op::Not | Op::BitNot => 2,
+        // conditional jumps pop their test
+        Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNotNil => 1,
+        // everything else: a conservative 1 (it touched the stack at least once,
+        // or — for pure control flow like Op::Jump/Loop — count it as a unit so
+        // the gate input is monotone with record count).
+        _ => 1,
+    }
+}
+
 /// **CALL §8.3 — per-VM fast-path coverage counters.**
 ///
 /// Bumped (via [`Vm::bump_stat`]) when a call-path fast path actually fires.
@@ -1824,16 +1993,84 @@ impl Vm {
         fiber: &mut Fiber,
         retired: &mut u64,
     ) -> Result<SyncOutcome, Control> {
-        // DECODE Task 4a ships the genericization with the byte source ONLY. The
-        // record branch (RecordSource selection) is wired in Task 4b, once the
-        // genericization is proven behavior-preserving by the full differential.
-        //
+        // DECODE §2.4 (Task 4b): when decode is enabled and the entry frame has a
+        // valid decoded stream (building it lazily at the warmth threshold), run the
+        // burst on `RecordSource`. A `None` from `select_record_source` means "run on
+        // bytes" (cold / disabled / structural anomaly). A `FellBack` mid-burst means
+        // the record source could no longer fetch (a frame transition into an
+        // un-decoded callee) — the canonical ip is exact, so the byte burst below
+        // continues seamlessly from where records stopped.
+        if self.decode {
+            if let Some(mut src) = self.select_record_source(fiber) {
+                match self.sync_burst(fiber, retired, &mut src)? {
+                    BurstExit::Sync(outcome) => return Ok(outcome),
+                    BurstExit::FellBack => {}
+                }
+            }
+        }
         // Byte dispatch — LANE's shipped behavior (DECODE Task 4a monomorphization).
         let mut src = ByteSource;
         match self.sync_burst(fiber, retired, &mut src)? {
             BurstExit::Sync(outcome) => Ok(outcome),
             // The byte source never falls back (it is always able to fetch).
             BurstExit::FellBack => unreachable!("ByteSource never returns FellBack"),
+        }
+    }
+
+    /// DECODE §2.4/§4.2: select a [`RecordSource`] for the entry frame, or `None` to
+    /// run on bytes. Bumps `decode_warmth` and lazily decodes at the threshold.
+    ///
+    /// Validity (§4.2): a cached decoded stream is consulted ONLY when its `own_epoch`
+    /// equals the chunk's current `patch_epoch` (a DBG `patch_byte` bumps the epoch —
+    /// a stale stream is dropped, never executed). Deps + the §6.6 instrument rule are
+    /// trivially satisfied until Task 9; the epoch consult is the live guard here.
+    fn select_record_source(&self, fiber: &Fiber) -> Option<RecordSource> {
+        let chunk = &fiber.frame().closure.proto.chunk;
+        // Consult an already-built stream first (the warm path).
+        {
+            let slot = chunk.decoded.borrow();
+            if let Some(d) = slot.as_ref() {
+                if d.own_epoch == chunk.patch_epoch.get() {
+                    return RecordSource::at_entry(self, fiber, d.clone());
+                }
+            }
+        }
+        // No (or stale) stream. Drop a stale one, then warm + maybe decode.
+        {
+            let mut slot = chunk.decoded.borrow_mut();
+            if slot.as_ref().is_some_and(|d| d.own_epoch != chunk.patch_epoch.get()) {
+                *slot = None;
+            }
+        }
+        let warmth = chunk.decode_warmth.get().saturating_add(1);
+        chunk.decode_warmth.set(warmth);
+        if warmth < self.decode_threshold {
+            return None;
+        }
+        // At/over the threshold: decode now (or permanently-byte on a `None` —
+        // a structural anomaly the decoder refused; never retry it).
+        let built = crate::vm::decode::decode_chunk(chunk, &crate::vm::decode::DecodeCfg::plain());
+        match built {
+            Some(d) => {
+                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                self.bump_decode_stat(|s| {
+                    // Memory accounting (§7.3 gate input): record bytes occupied.
+                    s.decoded_bytes = s
+                        .decoded_bytes
+                        .saturating_add((d.records.len() * std::mem::size_of::<
+                            crate::vm::decode::DecodedInstr,
+                        >()) as u64);
+                });
+                *chunk.decoded.borrow_mut() = Some(d.clone());
+                RecordSource::at_entry(self, fiber, d)
+            }
+            None => {
+                // Permanently byte: park the warmth at the threshold so we do not
+                // re-attempt decode every burst (a sticky "do not decode" marker
+                // would be cleaner; pinning warmth is sufficient and side-effect-free).
+                chunk.decode_warmth.set(self.decode_threshold);
+                None
+            }
         }
     }
 

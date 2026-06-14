@@ -13,11 +13,11 @@
 //! a run yet (Task 4 wires the record-source driver). So behavior is unchanged
 //! and the four/five-mode differential is untouched.
 
-// DECODE Task 3: the decoder is built but not yet consumed (Task 4 wires the
-// record-source driver into `run_loop_sync`). Every item below is exercised by
-// this module's own unit tests but is dead from the production graph until then;
-// this blanket allow is REMOVED in Task 4 when the driver consumes it.
-#![allow(dead_code)]
+// DECODE Task 4 consumes the decoder (the record-source driver in `run_loop.rs`
+// fetches from these records). A few forward-declared fields/knobs stay unused
+// until Units B/C land (Tasks 8/9) — `deps`/`inline_segments`/`InlineSegment` and
+// the `fuse`/`inline` cfg knobs; they carry a targeted `#[allow(dead_code)]` at
+// their definition rather than a blanket module allow.
 
 use crate::vm::chunk::Chunk;
 use crate::vm::opcode::Op;
@@ -74,16 +74,20 @@ pub(crate) struct DecodedChunk {
     /// stale `own_epoch` rebuilds (Task 4/6). Stale ⇒ drop, never edit.
     pub own_epoch: u64,
     /// Task 9 fills: one `(foreign-chunk identity, epoch)` entry per chunk whose
-    /// records were embedded by inlining. Empty until then.
+    /// records were embedded by inlining. Empty until then (read by the §4.2
+    /// deps-validity consult in Task 9).
+    #[allow(dead_code)]
     pub deps: Vec<(std::rc::Rc<crate::vm::chunk::FnProto>, u64)>,
     /// Task 9 fills: the inline-segment table for span/source attribution. Empty
     /// until then.
+    #[allow(dead_code)]
     pub inline_segments: Vec<InlineSegment>,
 }
 
 /// Task 9 (Unit C): a span of records embedded from a foreign (inlined) chunk.
-/// Empty/unused in Task 3 — declared so the `DecodedChunk` shape Task 4/9 were
+/// Empty/unused in Task 3/4 — declared so the `DecodedChunk` shape Task 4/9 were
 /// written against compiles.
+#[allow(dead_code)]
 pub(crate) struct InlineSegment {
     /// Record-index range `[start, end)` of the inlined body.
     pub start: u32,
@@ -102,9 +106,11 @@ impl fmt::Debug for DecodedChunk {
 /// DECODE configuration (spec §2.2). In Task 3 only `plain()` (no fusion, no
 /// inlining) exists; Task 8/9 add the fuse/inline knobs.
 pub(crate) struct DecodeCfg {
-    /// Unit B (Task 8): peephole-fuse the census set. Off in Task 3.
+    /// Unit B (Task 8): peephole-fuse the census set. Off in Task 3/4.
+    #[allow(dead_code)]
     pub fuse: bool,
-    /// Unit C (Task 9): inline small callees. Off in Task 3.
+    /// Unit C (Task 9): inline small callees. Off in Task 3/4.
+    #[allow(dead_code)]
     pub inline: bool,
 }
 
