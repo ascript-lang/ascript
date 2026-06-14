@@ -393,7 +393,7 @@ source.
 - Modify: `src/vm/run.rs`, `src/vm/decode.rs`
 - Test: `tests/vm_decode.rs`, `tests/vm_differential.rs`
 
-- [ ] **Step 1 (4a): Extract `run_loop_sync`'s burst loop body as `sync_burst`, generic over
+- [x] **Step 1 (4a): Extract `run_loop_sync`'s burst loop body as `sync_burst`, generic over
   `InstrSource`** (spec §2.4 — `sync_burst` is DECODE's name; reuse LANE's inner helper if Task
   0 found one): extract the
   fetch/advance/jump mechanics behind the trait; `ByteSource` reproduces LANE's exact behavior
@@ -402,7 +402,7 @@ source.
   configs + `cargo test --test vm_differential` both configs + a `vm_bench` spot-run showing
   no regression vs Task 0's baseline. Commit separately:
   `refactor(vm/lane): sync_burst generic over InstrSource — byte source only, behavior-preserving` (house trailer).
-- [ ] **Step 2: Write the failing tests (4b):**
+- [x] **Step 2: Write the failing tests (4b):**
 
 ```rust
 #[tokio::test]
@@ -471,8 +471,8 @@ async fn cross_module_panic_provenance_survives_the_hoisted_source_refresh() {
 }
 ```
 
-- [ ] **Step 3: Run — expect FAIL** (no record source).
-- [ ] **Step 4: Implement (4b):**
+- [x] **Step 3: Run — expect FAIL** (no record source).
+- [x] **Step 4: Implement (4b):**
   - `RecordSource<'a>` over `Rc<DecodedChunk>` + burst-local `idx: u32`: `fetch` reads
     `records[idx]` (subset check on `DOp::Base(op)` via the shared `sync_lane_op`; out-of-subset
     or pending-await ⇒ `sync_ip` writes `records[idx].off` and escalates); `jump` is
@@ -488,9 +488,9 @@ async fn cross_module_panic_provenance_survives_the_hoisted_source_refresh() {
     the record driver) counts in the same burst-local way — it is Unit D's §7.3 gate input,
     so it exists from the first record executed.
   - Stats entries wired (`vm_run_source_decode_stats*` set threshold 0 + return the counters).
-- [ ] **Step 5: Run — expect PASS**; then the FULL differential + property suite + clippy, both
+- [x] **Step 5: Run — expect PASS**; then the FULL differential + property suite + clippy, both
   configs.
-- [ ] **Step 6: Commit** — `feat(vm/decode): RecordSource — the sync driver executes pre-decoded records (DECODE §2.4-§2.5, §3)` (house trailer).
+- [x] **Step 6: Commit** — `feat(vm/decode): RecordSource — the sync driver executes pre-decoded records (DECODE §2.4-§2.5, §3)` (house trailer).
 - [ ] **Reviewer checkpoint:** reviewer (a) audits every `sync_ip` call site — escalation,
   finish, `Err`, frame push — and constructs a test where a burst escalates at a record whose
   PREVIOUS record was a jump (the likeliest off-by-one); (b) confirms `fiber.frame().ip` after
