@@ -1102,6 +1102,16 @@ pub async fn vm_run_source_decode_stats_no_inline(src: &str) -> Result<DecodeSta
     vm_run_source_decode_stats_cfg(src, true, false, true, 0).await
 }
 
+/// DECODE §8.3 variant (Unit D): like [`vm_run_source_decode_stats`] but with the
+/// TOS register cache OFF (`decode_tos = false`). Proves `tos_ops == 0` while
+/// `decoded_ops > 0` — the no-tos kill switch disables ONLY Unit D.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_decode_stats_no_tos(src: &str) -> Result<DecodeStats, AsError> {
+    vm_run_source_decode_stats_cfg(src, true, true, false, 0).await
+}
+
 /// **DECODE §5.1 (Unit B part 1): run `src` in CENSUS mode** — DECODE FORCED
 /// (threshold = 0, every proto decoded so the real record stream is seen) with the
 /// pair/triple census armed. Returns `(counts, total_records)` where a PAIR key is

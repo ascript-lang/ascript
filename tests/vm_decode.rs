@@ -43,16 +43,19 @@ async fn decode_entry_points_exist_and_are_byte_identical() {
     // Task 4: the FORCED stats entry point (threshold 0) retires records, so the
     // wired counters are positive. Task 8 (Unit B): the loop body
     // (`s = s + i`) contains a `GetLocal; ...; Add`-style accumulate shape, so
-    // fusion fires → `fused_ops > 0`. The Unit C/D counters stay 0.
+    // fusion fires → `fused_ops > 0`. Task 10 (Unit D): every record retired with
+    // the TOS cache active → `tos_ops > 0`. The Unit C inline counters stay 0
+    // (no global fn to inline here).
     let st = ascript::vm_run_source_decode_stats(src).await.expect("stats ok");
     assert!(st.decoded_ops > 0, "RecordSource must retire records under forced decode");
     assert!(st.decoded_bytes > 0, "memory accounting must report");
     assert!(st.stack_ops > 0, "stack-traffic gate input must count from the first record");
     assert!(st.fused_ops > 0, "Unit B fusion must fire on the accumulate loop");
+    assert!(st.tos_ops > 0, "Unit D TOS cache must fire under forced decode");
     assert_eq!(
-        (st.inline_hits, st.inline_misses, st.tos_ops),
-        (0, 0, 0),
-        "Unit C/D counters stay 0 until their tasks land"
+        (st.inline_hits, st.inline_misses),
+        (0, 0),
+        "Unit C inline counters stay 0 (no inlinable global fn in this program)"
     );
 }
 
@@ -291,6 +294,196 @@ async fn coverage_over_a_decode_hot_loop_is_byte_identical_to_a_plain_run() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DECODE Task 10 — Unit D: top-of-stack register cache + flush-edge battery (§7)
+//
+// One named test per §7.2 flush edge, each engineered to cross its edge with a
+// LIVE cached TOS, asserting decoded-forced (TOS active) == decoded-no-tos ==
+// tree-walker. A missed flush is a wrong-VALUE bug (not a crash) — exactly the
+// class these tests + the per-edge sabotage (Task 10 Step 4) exist to catch.
+// The dap/profile breakpoint edge (edge 1 × the §8.4 battery) lives in-crate
+// (`src/vm/run.rs`) because it drives `pub(crate)` machinery.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tos_cached_bursts_execute_and_are_counted() {
+    // Anti-false-green (spec §8.3e): TOS-cached records must actually retire.
+    let st = ascript::vm_run_source_decode_stats(
+        "let s = 0\nfor (i in 0..1000000) { s = s + i }\nprint(s)")
+        .await
+        .expect("ok");
+    assert_eq!(st.output, "499999500000\n");
+    assert!(st.tos_ops > 0, "no TOS-cached records retired — Unit D is dead");
+    // The dedicated kill switch kills EXACTLY Unit D:
+    let st2 = ascript::vm_run_source_decode_stats_no_tos(
+        "let s = 0\nfor (i in 0..1000000) { s = s + i }\nprint(s)")
+        .await
+        .expect("ok");
+    assert_eq!(st2.output, st.output);
+    assert_eq!(st2.tos_ops, 0);
+    assert!(st2.decoded_ops > 0, "no-tos must not kill decoding");
+}
+
+/// §8.3e: the no-tos differential mode joins the batteries — `decoded_no_tos`
+/// retires records (`decoded_ops > 0`) but caches no TOS (`tos_ops == 0`), while
+/// forced-with-TOS retires the SAME records with the cache active (`tos_ops > 0`).
+#[tokio::test]
+async fn decoded_no_tos_disables_only_the_tos_cache() {
+    let src = "let s = 0\nfor (i in 0..10000) { s = s + i * 2 }\nprint(s)";
+    // Stats with TOS active (forced, threshold 0).
+    let on = ascript::vm_run_source_decode_stats(src).await.expect("ok");
+    assert!(on.decoded_ops > 0 && on.tos_ops > 0, "TOS active: {on:?}");
+    // Output equivalence across the three TOS-relevant modes.
+    let forced = ascript::vm_run_source_decoded_forced(src).await.expect("ok");
+    let no_tos = ascript::vm_run_source_decoded_no_tos(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(forced, no_tos, "TOS on vs off");
+    assert_eq!(tw, forced.0, "tree-walker vs decoded");
+}
+
+#[tokio::test]
+async fn flush_edge_1_escalation_mid_expression() {
+    // Edge 1 (escalation): a pending await whose Future is itself the cached TOS.
+    // `await f` reads the local `f` into TOS, then the burst escalates (the future
+    // is pending) — the async driver re-decodes Op::Await and must re-peek the
+    // future on fiber.stack. A missed flush strands it in the cache. The `total +`
+    // keeps another operand live below. Holding `f` across an awaited gap (a real
+    // async fn) forces the pending branch.
+    let src = r#"
+async fn slow(x) { return x * 2 }
+let total = 0
+for (i in 0..200) {
+  let f = slow(i)
+  total = total + await f
+}
+print(total)
+"#;
+    let on = ascript::vm_run_source_decoded_forced(src).await.expect("ok");
+    let off = ascript::vm_run_source_decoded_no_tos(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(on, off);
+    assert_eq!(tw, on.0);
+}
+
+#[tokio::test]
+async fn flush_edge_2_yield_suspends_with_a_complete_stack() {
+    // Edge 2: a generator yielding mid-expression-rich body; the suspended fiber
+    // is re-entered by resume — its stack must be complete.
+    let src = r#"
+fn* squares(n) { for (i in 0..n) { yield i * i + (i + 1) } }
+let total = 0
+for await (v in squares(50)) { total = total + v }
+print(total)
+"#;
+    let on = ascript::vm_run_source_decoded_forced(src).await.expect("ok");
+    let off = ascript::vm_run_source_decoded_no_tos(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(on, off);
+    assert_eq!(tw, on.0);
+}
+
+#[tokio::test]
+async fn flush_edge_3_fused_record_reads_under_a_cached_tos() {
+    // Edge 3: a FUSED field-read-then-add (`GetProp v; Add`) runs while a PRIOR
+    // value (`acc`) is cached in TOS. `exec_fused` pops its operands DIRECTLY off
+    // `fiber.stack`; the flush before it must spill the cached operand or the fused
+    // executor reads a stale stack (the per-edge sabotage strands `acc` in the cache
+    // → a wrong sum). `acc = acc + o.v + i` keeps `acc` hot and fuses the field read.
+    // Byte-identical: decoded-forced (TOS on) == no-tos == tree-walker.
+    let src = r#"
+let o = { v: 1000000 }
+let acc = 5
+for (i in 0..30) { acc = acc + o.v + i }
+print(acc)
+"#;
+    let on = ascript::vm_run_source_decoded_forced(src).await.expect("ok");
+    let off = ascript::vm_run_source_decoded_no_tos(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(on, off);
+    assert_eq!(tw, on.0);
+
+    // The panic-in-a-fused-record half: an i64 overflow INSIDE the fused field-add,
+    // recovered — the rendered error must also be byte-identical across modes.
+    let panic_src = r#"
+fn run() {
+  let o = { v: 9223372036854775807 }
+  let acc = 5
+  for (i in 0..40) { acc = acc + o.v + i }
+  return acc
+}
+let [v, e] = recover(() => run())
+print(v, e)
+"#;
+    let pon = ascript::vm_run_source_decoded_forced(panic_src).await.expect("ok");
+    let poff = ascript::vm_run_source_decoded_no_tos(panic_src).await.expect("ok");
+    let ptw = ascript::run_source(panic_src).await.expect("ok");
+    assert_eq!(pon, poff);
+    assert_eq!(ptw, pon.0);
+}
+
+#[tokio::test]
+async fn flush_edge_4_call_at_cached_tos_state() {
+    // Edge 4: a plain call whose LAST ARG is the cached TOS — check_call_args and
+    // the callee window must see it physically on the stack. Also covers
+    // InlineEnter (the inlined variant of the same callee).
+    let src = r#"
+fn add(a, b) { return a + b }
+let s = 0
+for (i in 0..100000) { s = add(s, i * 2 + 1) }
+print(s)
+"#;
+    let on = ascript::vm_run_source_decoded_forced(src).await.expect("ok");
+    let off = ascript::vm_run_source_decoded_no_tos(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(on, off);
+    assert_eq!(tw, on.0);
+}
+
+#[tokio::test]
+async fn flush_edge_5_return_into_a_caller_mid_expression() {
+    // Edge 5 (frame push/pop): the caller holds a cached partial (`1000 + …`) in TOS
+    // while the small global fn `f` is dispatched (inlined → the InlineEnter frame
+    // push/pop path that runs the spliced body + returns its result on the same
+    // lane). The flush before the inline dispatch must spill the caller's cached
+    // partial so the callee's GET_GLOBAL + args window onto the right stack and the
+    // returned result composes with the caller's flushed cache; the per-edge sabotage
+    // strands the cached `1000` → a wrong sum. Byte-identical across modes.
+    let src = r#"
+fn f(n) { return n * 3 }
+let total = 0
+for (i in 0..100000) { total = total + (1000 + f(i)) }
+print(total)
+"#;
+    let on = ascript::vm_run_source_decoded_forced(src).await.expect("ok");
+    let off = ascript::vm_run_source_decoded_no_tos(src).await.expect("ok");
+    let tw = ascript::run_source(src).await.expect("ok");
+    assert_eq!(on, off);
+    assert_eq!(tw, on.0);
+}
+
+/// Under-TOS arms (the `peek(1)`-class builder/swap family) must read through the
+/// accessor correctly when TOS is occupied: array/object/map builders, spreads,
+/// SetIndex, and the Swap/Rot3 stack shuffles — all with a live cached operand.
+#[tokio::test]
+async fn under_tos_builder_and_shuffle_arms_are_byte_identical() {
+    for src in [
+        // AppendArray with a live TOS underneath (the array), spread of an array.
+        "let base = 7\nlet a = [base, base + 1, base * 2]\nlet b = [...a, base + 3]\nprint(a, b)",
+        // MapEntry / object builder with computed values under a cached operand.
+        "let k = 2\nlet m = { x: k + 1, y: k * 10 }\nlet o = { ...m, z: k }\nprint(m, o)",
+        // SetIndex with the value cached as TOS over the index+obj below.
+        "let arr = [0, 0, 0]\nfor (i in 0..3) { arr[i] = i * i + 1 }\nprint(arr)",
+        // Swap/Rot3-heavy: chained comparisons + index assignment in a loop.
+        "let g = { c: 0 }\nfor (i in 0..50) { g.c = g.c + (i % 3) }\nprint(g.c)",
+    ] {
+        let on = ascript::vm_run_source_decoded_forced(src).await.expect("ok");
+        let off = ascript::vm_run_source_decoded_no_tos(src).await.expect("ok");
+        let tw = ascript::run_source(src).await.expect("ok");
+        assert_eq!(on, off, "TOS on vs off `{src}`");
+        assert_eq!(tw, on.0, "tree-walker vs decoded `{src}`");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DECODE §4.1 — the invalidation chokepoint structural guard (Task 1)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -417,3 +610,10 @@ async fn panic_inside_an_inlined_body_keeps_the_callee_span_and_source() {
     let off = ascript::vm_run_source_no_decode(src).await.expect_err("panics");
     assert_eq!(on.to_string(), off.to_string());
 }
+
+
+
+
+
+
+

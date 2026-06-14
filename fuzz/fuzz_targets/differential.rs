@@ -92,6 +92,15 @@ fuzz_target!(|data: &[u8]| {
             // DECODE §8.3: decoded-forced (threshold 0) + no-decode must be byte-identical.
             let decfwd = project(ascript::vm_run_source_decoded_forced(&src).await);
             let nodec = project(ascript::vm_run_source_no_decode(&src).await);
+            // DECODE §8.3 — Unit D no-tos projection: the TOS register cache OFF must be
+            // byte-identical to decoded-forced (TOS on). A mismatch is a flush-edge bug;
+            // panic LOUDLY (a libFuzzer crash with a reproducer). Transitively
+            // `notos == decfwd == tw` once the outer oracle asserts `decfwd == tw`.
+            let notos = project(ascript::vm_run_source_decoded_no_tos(&src).await);
+            assert_eq!(
+                decfwd, notos,
+                "DECODE Unit D: no-tos diverged from decoded-forced (a TOS flush-edge bug)\n--- program ---\n{src}\n--- decfwd: {decfwd:?}\n--- notos: {notos:?}"
+            );
             (tw, vm, gen, nolane, nocf, decfwd, nodec)
         }
     });

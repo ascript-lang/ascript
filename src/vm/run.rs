@@ -148,6 +148,37 @@ trait InstrSource {
     /// resume at the record AFTER the retained `Call` on a hit, or AT it on a miss).
     /// No-op for the byte source (which never produces an `InlineEnter`).
     fn seek_record(&mut self, idx: u32);
+
+    // ── DECODE §7.1 (Unit D): the burst-local operand-stack ACCESSOR LAYER ──────
+    // Every operand-stack touch inside the shared `sync_burst` arm bodies routes
+    // through these (NOT through `Fiber`'s methods directly), so the record source
+    // can hold the TOP value in a Rust local (`tos`) while the byte source passes
+    // STRAIGHT THROUGH to `fiber.stack` — the complete semantic floor, byte-for-byte
+    // LANE's shipped behavior. The arm bodies stay the single source of truth.
+
+    /// Push `v` onto the operand stack (§7.1). Byte source: `fiber.push`. Record
+    /// source: spill any cached TOS to `fiber.stack`, then cache `v`.
+    fn push(&mut self, fiber: &mut Fiber, v: Value);
+
+    /// Pop the top operand (§7.1). Byte source: `fiber.pop`. Record source:
+    /// `tos.take()`, or `fiber.stack.pop()` when the cache is empty (deeper operands
+    /// stay on the fiber stack exactly as today).
+    fn pop(&mut self, fiber: &mut Fiber) -> Value;
+
+    /// Peek `n` entries from the top (§7.1); `peek(0)` is the top of stack.
+    /// Byte source: `fiber.peek(n)`. Record source: depth-adjusted by whether `tos`
+    /// is occupied — `peek(0)` reads the cached local, deeper reads index
+    /// `fiber.stack` one shallower. The under-TOS builder/shuffle arms read through
+    /// HERE, so under-TOS access is correct by the accessor layer, not per-arm.
+    fn peek<'a>(&'a self, fiber: &'a Fiber, n: usize) -> &'a Value;
+
+    /// DECODE §7.2 (Unit D): THE FLUSH. Spill any cached TOS back to `fiber.stack`
+    /// (idempotent — `Option::take`, so a double flush is a no-op, never a duplicate)
+    /// so `fiber.stack` is byte-for-byte what byte dispatch would have left. Called at
+    /// EVERY edge where control leaves the burst loop or code outside the accessor
+    /// layer can observe `fiber.stack` (escalation, finish, error unwind, frame
+    /// push/pop, instrumentation). Byte source: a no-op (it never caches).
+    fn flush(&mut self, fiber: &mut Fiber);
 }
 
 /// DECODE §2.4: the byte instruction source — LANE's shipped behavior, made a
@@ -180,6 +211,26 @@ impl InstrSource for ByteSource {
 
     #[inline]
     fn seek_record(&mut self, _idx: u32) {}
+
+    // DECODE §7.1: the byte source carries NO TOS cache — every accessor is a
+    // direct `fiber.stack` op (LANE's shipped path, instruction for instruction).
+    #[inline]
+    fn push(&mut self, fiber: &mut Fiber, v: Value) {
+        fiber.push(v);
+    }
+
+    #[inline]
+    fn pop(&mut self, fiber: &mut Fiber) -> Value {
+        fiber.pop()
+    }
+
+    #[inline]
+    fn peek<'a>(&'a self, fiber: &'a Fiber, n: usize) -> &'a Value {
+        fiber.peek(n)
+    }
+
+    #[inline]
+    fn flush(&mut self, _fiber: &mut Fiber) {}
 }
 
 /// DECODE §2.4: the record instruction source — fetches from a valid
@@ -200,6 +251,20 @@ struct RecordSource {
     /// Identity of the chunk `d` decodes (`Rc::as_ptr`), to detect a frame change
     /// even when `frames.len()` coincidentally matches (a pop-then-push could).
     chunk_ptr: *const crate::vm::chunk::Chunk,
+    /// **DECODE §7.1 (Unit D): the one-register top-of-stack cache.** The operand
+    /// stack's TOP value held in a Rust local instead of `fiber.stack`'s last slot,
+    /// so the hot produce→consume chain keeps its intermediate where the optimizer
+    /// can see it (zero `Vec` traffic). `None` ⇒ the real top is on `fiber.stack`
+    /// (or the stack is empty). The burst-local accessor layer (`push`/`pop`/`peek`)
+    /// is the SINGLE place this is read/written; every edge leaving the burst (§7.2)
+    /// `flush`es it back to `fiber.stack` first. Always `None` when `decode_tos` is
+    /// off (the accessors degenerate to plain `fiber.stack` ops — the Unit A/B path).
+    tos: Option<Value>,
+    /// **DECODE §7.4: the Unit D kill switch.** `false` (`ASCRIPT_NO_DECODE_TOS=1`)
+    /// ⇒ the accessors operate directly on `fiber.stack` (no `tos` local) — the
+    /// shipped Unit A/B path, untouched. A/B-isolatable + droppable independent of
+    /// Units A–C (campaign Gate 15).
+    decode_tos: bool,
     /// **DECODE §5.1 census (feature-gated): the burst-local predecessor op.** The
     /// op discriminant of the IMMEDIATELY PRECEDING record retired IN THE SAME basic
     /// block, or `None` at a block boundary. Reset to `None` whenever `fetch` detects
@@ -239,6 +304,11 @@ impl RecordSource {
             idx,
             frames_len: fiber.frames.len(),
             chunk_ptr: chunk as *const crate::vm::chunk::Chunk,
+            // DECODE §7.1 (Unit D): a fresh burst starts with an empty TOS cache
+            // (the entry frame's stack is the canonical state) and inherits the VM's
+            // Unit-D toggle. When off, the accessors pass straight through.
+            tos: None,
+            decode_tos: vm.decode_tos(),
             // DECODE §5.1: a fresh source begins a basic block (the entry point is a
             // boundary) — no in-block predecessor yet.
             #[cfg(feature = "decode-census")]
@@ -364,13 +434,23 @@ impl InstrSource for RecordSource {
     #[inline]
     fn note_retired(&mut self, vm: &Vm, op: Op) {
         #[cfg(any(test, feature = "fuzzgen", fuzzing))]
-        vm.bump_decode_stat(|s| {
-            s.decoded_ops = s.decoded_ops.saturating_add(1);
-            // §7.3 gate input: fiber-stack pushes+pops this record retired. A
-            // well-defined per-op magnitude (the operand-stack traffic), so it
-            // EXISTS from the first record; Unit B/D measure its reduction.
-            s.stack_ops = s.stack_ops.saturating_add(op_stack_traffic(op));
-        });
+        {
+            let tos_active = self.decode_tos;
+            vm.bump_decode_stat(|s| {
+                s.decoded_ops = s.decoded_ops.saturating_add(1);
+                // §7.3 gate input: fiber-stack pushes+pops this record retired. A
+                // well-defined per-op magnitude (the operand-stack traffic), so it
+                // EXISTS from the first record; Unit B/D measure its reduction.
+                s.stack_ops = s.stack_ops.saturating_add(op_stack_traffic(op));
+                // §8.3e (Unit D) coverage: a record retired with the TOS cache active.
+                // Counts EVERY record retired through the accessor layer while Unit D
+                // is on (the toggle is per-burst, not per-op) — non-vacuous proof the
+                // cache is live; `decode_tos == false` ⇒ stays 0.
+                if tos_active {
+                    s.tos_ops = s.tos_ops.saturating_add(1);
+                }
+            });
+        }
         #[cfg(not(any(test, feature = "fuzzgen", fuzzing)))]
         {
             let _ = (vm, op);
@@ -413,6 +493,60 @@ impl InstrSource for RecordSource {
         {
             self.prev = None;
             self.prev2 = None;
+        }
+    }
+
+    // ── DECODE §7.1 (Unit D): the record source's TOS-caching accessor layer ────
+    // When `decode_tos` is OFF, every method degenerates to a plain `fiber.stack`
+    // op (the `tos` local is then permanently `None` — never written), so the
+    // shipped Unit A/B path is byte-for-byte untouched.
+
+    #[inline]
+    fn push(&mut self, fiber: &mut Fiber, v: Value) {
+        if !self.decode_tos {
+            fiber.push(v);
+            return;
+        }
+        // §7.1: if `tos` is `Some(old)`, spill `old` to `fiber.stack`; cache `v`.
+        if let Some(old) = self.tos.replace(v) {
+            fiber.stack.push(old);
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self, fiber: &mut Fiber) -> Value {
+        if !self.decode_tos {
+            return fiber.pop();
+        }
+        // §7.1: `tos.take()`, or `fiber.stack.pop()` when the cache is empty (the
+        // underflow-into-deeper-slots path — deeper operands stay on the fiber stack).
+        match self.tos.take() {
+            Some(v) => v,
+            None => fiber.pop(),
+        }
+    }
+
+    #[inline]
+    fn peek<'a>(&'a self, fiber: &'a Fiber, n: usize) -> &'a Value {
+        if !self.decode_tos {
+            return fiber.peek(n);
+        }
+        // §7.1: depth-adjusted by whether `tos` is occupied. `peek(0)` reads the
+        // cached local; a deeper read with `tos` occupied is one shallower on the
+        // fiber stack (the cached value occupies logical depth 0).
+        match &self.tos {
+            Some(top) if n == 0 => top,
+            Some(_) => fiber.peek(n - 1),
+            None => fiber.peek(n),
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self, fiber: &mut Fiber) {
+        // §7.2 THE FLUSH: spill any cached TOS back to `fiber.stack` so it is
+        // byte-for-byte what byte dispatch would have left. Idempotent (`take`).
+        if let Some(v) = self.tos.take() {
+            fiber.stack.push(v);
         }
     }
 }
@@ -2461,7 +2595,15 @@ impl Vm {
             let Fetched { op, fault_ip, operand_at, fused, inline } = match source.fetch(self, fiber)
             {
                 Some(f) => f,
-                None => return Ok(BurstExit::FellBack),
+                None => {
+                    // §7.2: the record source can no longer fetch (a frame transition
+                    // into an un-decoded callee) — the burst falls back to BYTE dispatch,
+                    // which reads `fiber.stack` directly. Flush so a cached TOS is visible
+                    // to the byte source (normally a no-op: a Call/Return already flushed
+                    // at its edge, so the cache is empty at a fetch boundary).
+                    source.flush(fiber);
+                    return Ok(BurstExit::FellBack);
+                }
             };
 
             // ── DECODE §6 (Unit C): GUARDED INLINE dispatch ─────────────────────
@@ -2473,6 +2615,11 @@ impl Vm {
             // leaf, no suspension), a MISS seeks to the retained `Base(Call)` for the
             // byte-identical generic dispatch. The fetched `fault_ip` is the CALL off.
             if let Some((d, seg_idx, fallback_idx)) = inline {
+                // §7.2 edge 4 (frame push / InlineEnter): the GET_GLOBAL + arg records
+                // ran through the accessor (the last arg may sit in the TOS cache);
+                // flush so `exec_inline_enter`'s guard read + the callee window see the
+                // callee value + args PHYSICALLY on `fiber.stack` before windowing.
+                source.flush(fiber);
                 let next_idx =
                     self.exec_inline_enter(fiber, &d, seg_idx, fallback_idx, fault_ip)?;
                 source.seek_record(next_idx);
@@ -2487,6 +2634,11 @@ impl Vm {
             // components are in-subset, so this never escalates a fused record —
             // but the check is honored for the head op regardless.)
             if !sync_lane_op(op) {
+                // §7.2 edge 1 (escalation): flush BEFORE returning — the async driver
+                // re-decodes the same byte and must see `fiber.stack` byte-for-byte
+                // what byte dispatch would have left (the parked debugger's frame /
+                // variable snapshots also read it). The ip is still at `fault_ip`.
+                source.flush(fiber);
                 return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
             }
 
@@ -2505,6 +2657,13 @@ impl Vm {
             // sequence). A fused record never escalates (its components are the
             // straight-line subset), so it always falls through to `note_retired`.
             if let Some((kind, packed)) = fused {
+                // §7.2: `exec_fused` reads/writes operands directly on `fiber.stack`
+                // (its components keep their intermediates in Rust locals — §7.3 — so
+                // it needs no TOS). Flush before it so the operands it pops are
+                // physically present (a fused record's faulting component then renders
+                // its panic over the canonical stack — §7.2 edge 3); its result lands
+                // on `fiber.stack`, and the next record's accessor `pop` finds it.
+                source.flush(fiber);
                 self.exec_fused(fiber, fault_ip, kind, packed)?;
                 *retired += 1;
                 source.note_retired(self, op);
@@ -2519,31 +2678,31 @@ impl Vm {
                     let idx =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.frame().closure.proto.chunk.consts[idx].clone();
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
-                Op::Nil => fiber.push(Value::Nil),
-                Op::True => fiber.push(Value::Bool(true)),
-                Op::False => fiber.push(Value::Bool(false)),
+                Op::Nil => source.push(fiber, Value::Nil),
+                Op::True => source.push(fiber, Value::Bool(true)),
+                Op::False => source.push(fiber, Value::Bool(false)),
                 Op::Pop => {
-                    fiber.pop();
+                    source.pop(fiber);
                 }
                 Op::Dup => {
-                    let top = fiber.peek(0).clone();
-                    fiber.push(top);
+                    let top = source.peek(fiber, 0).clone();
+                    source.push(fiber, top);
                 }
                 Op::Swap => {
-                    let b = fiber.pop();
-                    let a = fiber.pop();
-                    fiber.push(b);
-                    fiber.push(a);
+                    let b = source.pop(fiber);
+                    let a = source.pop(fiber);
+                    source.push(fiber, b);
+                    source.push(fiber, a);
                 }
                 Op::Rot3 => {
-                    let c = fiber.pop();
-                    let b = fiber.pop();
-                    let a = fiber.pop();
-                    fiber.push(b);
-                    fiber.push(c);
-                    fiber.push(a);
+                    let c = source.pop(fiber);
+                    let b = source.pop(fiber);
+                    let a = source.pop(fiber);
+                    source.push(fiber, b);
+                    source.push(fiber, c);
+                    source.push(fiber, a);
                 }
 
                 // ── binop family (shared eval_binop_adaptive / apply_binop) ──
@@ -2569,11 +2728,11 @@ impl Vm {
                 | Op::WrapSub
                 | Op::WrapMul
                 | Op::Range => {
-                    let b = fiber.pop();
-                    let a = fiber.pop();
+                    let b = source.pop(fiber);
+                    let a = source.pop(fiber);
                     let binop = binop_of(op);
                     let v = self.eval_binop_adaptive(fiber, fault_ip, binop, a, b)?;
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::InstanceOfType => {
@@ -2591,7 +2750,7 @@ impl Vm {
                             ))
                         }
                     };
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let yes = match crate::interp::instanceof_reserved_type(&subject, &name) {
                         Some(b) => b,
                         None => {
@@ -2602,24 +2761,24 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(Value::Bool(yes));
+                    source.push(fiber, Value::Bool(yes));
                 }
 
                 // ── unary ops ────────────────────────────────────────────────
                 Op::Neg | Op::Not | Op::BitNot => {
-                    let a = fiber.pop();
+                    let a = source.pop(fiber);
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = crate::interp::apply_unop(unop_of(op), a, span)?;
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 // ── range ops ────────────────────────────────────────────────
                 Op::RangeInclusive => {
-                    let b = fiber.pop();
-                    let a = fiber.pop();
+                    let b = source.pop(fiber);
+                    let a = source.pop(fiber);
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = crate::interp::materialize_range(&a, &b, true, span)?;
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::RangeStepValue => {
@@ -2627,22 +2786,22 @@ impl Vm {
                     let inclusive = (flags & 0b01) != 0;
                     let present = (flags & 0b10) != 0;
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let step = fiber.pop();
-                    let hi = fiber.pop();
-                    let lo = fiber.pop();
+                    let step = source.pop(fiber);
+                    let hi = source.pop(fiber);
+                    let lo = source.pop(fiber);
                     let step_arg = if present { Some(&step) } else { None };
                     let v = crate::interp::materialize_range_stepped(
                         &lo, &hi, inclusive, step_arg, span,
                     )?;
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::RangeResolveStep => {
                     let present =
                         fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let step = fiber.pop();
-                    let hi_v = fiber.peek(0);
+                    let step = source.pop(fiber);
+                    let hi_v = source.peek(fiber, 0);
                     let hi = match hi_v.as_f64() {
                         Some(n) => n,
                         None => unreachable!(
@@ -2650,7 +2809,7 @@ impl Vm {
                         ),
                     };
                     let hi_int = hi_v.is_int_value();
-                    let lo_v = fiber.peek(1);
+                    let lo_v = source.peek(fiber, 1);
                     let lo = match lo_v.as_f64() {
                         Some(n) => n,
                         None => unreachable!(
@@ -2674,27 +2833,32 @@ impl Vm {
                     };
                     let resolved = crate::interp::resolve_step(lo, hi, step_v, span)?;
                     let yields_int = lo_int && hi_int && step_int;
-                    fiber.push(crate::interp::range_counter_value(resolved, yields_int));
+                    source.push(fiber, crate::interp::range_counter_value(resolved, yields_int));
                 }
 
                 Op::RangeHasNext => {
                     let inclusive =
                         fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
-                    let step = fiber.pop();
-                    let hi = fiber.pop();
-                    let i = fiber.pop();
+                    let step = source.pop(fiber);
+                    let hi = source.pop(fiber);
+                    let i = source.pop(fiber);
                     let ok = match (i.as_f64(), hi.as_f64(), step.as_f64()) {
                         (Some(i), Some(hi), Some(step)) => {
                             crate::interp::range_has_next(i, hi, step, inclusive)
                         }
                         _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
                     };
-                    fiber.push(Value::Bool(ok));
+                    source.push(fiber, Value::Bool(ok));
                 }
 
                 Op::CheckNumbers => {
-                    let end_ok = fiber.peek(0).is_number();
-                    let start_ok = fiber.peek(1).is_number();
+                    // §7.2 edge 3: a validation arm that PEEKS the (possibly cached)
+                    // operands and may `return Err` while they sit there. Flush first so
+                    // the peek reads `fiber.stack` and the error path leaves it canonical
+                    // for recover / provenance / debugger inspection.
+                    source.flush(fiber);
+                    let end_ok = source.peek(fiber, 0).is_number();
+                    let start_ok = source.peek(fiber, 1).is_number();
                     if !(end_ok && start_ok) {
                         return Err(self.panic_at(
                             fiber,
@@ -2709,12 +2873,12 @@ impl Vm {
                     let slot =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.local(slot).clone();
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
                 Op::SetLocal => {
                     let slot =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     fiber.set_local(slot, v);
                 }
 
@@ -2738,14 +2902,14 @@ impl Vm {
                     let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
                     if self.specialize {
                         if let Some(idx) = cache.get_index(self.struct_gen()) {
-                            fiber.push(self.user_global_value_at(idx));
+                            source.push(fiber, self.user_global_value_at(idx));
                             *retired += 1;
                             source.note_retired(self, op);
                             continue;
                         }
                     }
                     if let Some(v) = cache.get(version).filter(|_| self.specialize) {
-                        fiber.push(v);
+                        source.push(fiber, v);
                     } else if let Some((idx, v)) = self.get_user_global_full(&name) {
                         if self.specialize {
                             fiber.frame().closure.proto.chunk.set_global_cache(
@@ -2756,7 +2920,7 @@ impl Vm {
                                 ),
                             );
                         }
-                        fiber.push(v);
+                        source.push(fiber, v);
                     } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
                         let v = Value::Builtin(name);
                         if self.specialize {
@@ -2765,7 +2929,7 @@ impl Vm {
                                 crate::vm::adapt::GlobalCache::set(v.clone(), version),
                             );
                         }
-                        fiber.push(v);
+                        source.push(fiber, v);
                     } else {
                         return Err(self.panic_at(
                             fiber,
@@ -2792,7 +2956,7 @@ impl Vm {
                             ))
                         }
                     };
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     if self.user_globals.borrow().contains_key(name.as_ref()) {
                         return Err(Control::Panic(AsError::new(format!(
                             "'{name}' is already defined in this scope"
@@ -2816,7 +2980,7 @@ impl Vm {
                             ))
                         }
                     };
-                    let v = fiber.peek(0).clone();
+                    let v = source.peek(fiber, 0).clone();
                     let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
                     if self.specialize {
                         if let Some(idx) = cache.get_index(self.struct_gen()) {
@@ -2932,13 +3096,19 @@ impl Vm {
                             if want {
                                 ch.decode_inline_retried.set(true);
                                 self.build_and_store_decoded(ch);
+                                // §7.2: Reselect ends this burst (a fresh RecordSource is
+                                // built with an empty cache) — flush so no cached TOS is
+                                // dropped across the boundary (a loop back-edge stack is
+                                // balanced, so this is normally a no-op, but the invariant
+                                // is "every burst exit is flush-preceded").
+                                source.flush(fiber);
                                 return Ok(BurstExit::Reselect);
                             }
                         }
                     }
                 }
                 Op::JumpIfFalse => {
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     if !v.is_truthy() {
                         let disp =
                             fiber.frame().closure.proto.chunk.read_i16(operand_at);
@@ -2947,7 +3117,7 @@ impl Vm {
                     }
                 }
                 Op::JumpIfTrue => {
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     if v.is_truthy() {
                         let disp =
                             fiber.frame().closure.proto.chunk.read_i16(operand_at);
@@ -2956,7 +3126,7 @@ impl Vm {
                     }
                 }
                 Op::JumpIfNotNil => {
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     if v != Value::Nil {
                         let disp =
                             fiber.frame().closure.proto.chunk.read_i16(operand_at);
@@ -2971,13 +3141,13 @@ impl Vm {
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let mut parts = vec![Value::Nil; n];
                     for slot in parts.iter_mut().rev() {
-                        *slot = fiber.pop();
+                        *slot = source.pop(fiber);
                     }
                     let mut out = String::new();
                     for v in &parts {
                         out.push_str(&v.to_string());
                     }
-                    fiber.push(Value::Str(out.into()));
+                    source.push(fiber, Value::Str(out.into()));
                 }
 
                 // ── Return / Propagate / Unwrap / Yield ──────────────────────
@@ -2986,9 +3156,22 @@ impl Vm {
                     // sync lane (drain requires .await). Restore ip to fault_ip and
                     // escalate to the async driver which will drain + return.
                     if !fiber.frame().defers.is_empty() {
+                        // §7.2 edge 1 (escalation): the return value is still the cached
+                        // TOS and the async driver re-decodes this Op::Return — flush so
+                        // it (and the defer drain) sees the value on `fiber.stack`.
+                        source.flush(fiber);
                         fiber.frame_mut().ip = fault_ip;
                         return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                     }
+                    // §7.2 edge 5 (frame pop): FLUSH the cache back to `fiber.stack`
+                    // FIRST so the return value is physically the top slot, THEN pop it
+                    // off the real stack and hand it to `return_from_frame` (which
+                    // truncates to `slot_base` + pushes the result). Flush-then-pop makes
+                    // the flush LOAD-BEARING (a missed flush strands the value in `tos`
+                    // and pops the wrong slot — caught by the per-edge sabotage). A
+                    // root-frame finish hands the outcome to ANY driver; a non-root pop
+                    // resumes the caller with an empty cache.
+                    source.flush(fiber);
                     let result = fiber.pop();
                     if let Some(outcome) = self.return_from_frame(fiber, result)? {
                         return Ok(BurstExit::Sync(SyncOutcome::Finished(outcome)));
@@ -3002,7 +3185,7 @@ impl Vm {
 
                 Op::Propagate => {
                     // DEFER GUARD: pending defers require async drain on propagation.
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     let (value, err) = match &v {
                         Value::Array(a) if a.borrow().len() == 2 => {
                             let b = a.borrow();
@@ -3017,7 +3200,7 @@ impl Vm {
                         }
                     };
                     if err == Value::Nil {
-                        fiber.push(value);
+                        source.push(fiber, value);
                     } else {
                         // Error path: need to drain defers (possibly async) and then
                         // return. Restore ip so the async driver re-executes the op.
@@ -3025,7 +3208,10 @@ impl Vm {
                         // perspective; actually the async path will re-pop it.
                         // The cleanest approach: since we already popped `v`, just
                         // restore ip and re-push v, then let async driver handle it.
-                        fiber.push(v);
+                        source.push(fiber, v);
+                        // §7.2 edge 1 (escalation): re-cached `v` would be invisible to
+                        // the async driver's re-pop — flush it back onto `fiber.stack`.
+                        source.flush(fiber);
                         fiber.frame_mut().ip = fault_ip;
                         return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                     }
@@ -3034,7 +3220,7 @@ impl Vm {
                 Op::Unwrap => {
                     // No defer guard needed: Unwrap never drains defers (it either
                     // pushes the value or raises a recoverable Panic — no unwind).
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     let (value, err) = match &v {
                         Value::Array(a) if a.borrow().len() == 2 => {
                             let b = a.borrow();
@@ -3049,7 +3235,7 @@ impl Vm {
                         }
                     };
                     if err == Value::Nil {
-                        fiber.push(value);
+                        source.push(fiber, value);
                     } else {
                         return Err(self.panic_at(fiber, fault_ip, error_message(&err)));
                     }
@@ -3059,6 +3245,12 @@ impl Vm {
                     // Pop the yielded value, suspend the fiber, and return Yielded.
                     // ip is already advanced past this op so the next resume continues
                     // after the yield. The frame stack is left intact in the Fiber.
+                    // §7.2 edge 2 (Yield finish): FLUSH the cache to `fiber.stack` FIRST
+                    // so the suspended fiber's stack is complete (it is re-entered later
+                    // by ANY driver via resume), THEN pop the yielded value off the real
+                    // stack. Flush-then-pop makes the flush LOAD-BEARING (a stranded `tos`
+                    // would yield the wrong value — caught by the per-edge sabotage).
+                    source.flush(fiber);
                     let v = fiber.pop();
                     fiber.state = crate::vm::FiberState::Suspended;
                     return Ok(BurstExit::Sync(SyncOutcome::Finished(crate::vm::value_ext::RunOutcome::Yielded(v))));
@@ -3075,7 +3267,7 @@ impl Vm {
                     let awaited = (flags & 1) != 0;
                     let spread = (flags & 2) != 0;
                     let args: Vec<Value> = if spread {
-                        let arr = fiber.pop();
+                        let arr = source.pop(fiber);
                         match arr {
                             Value::Array(a) => a.borrow().clone(),
                             other => {
@@ -3092,11 +3284,11 @@ impl Vm {
                     } else {
                         let mut v = vec![Value::Nil; argc];
                         for slot in v.iter_mut().rev() {
-                            *slot = fiber.pop();
+                            *slot = source.pop(fiber);
                         }
                         v
                     };
-                    let callee = fiber.pop();
+                    let callee = source.pop(fiber);
                     fiber.frame_mut().defers.push(crate::interp::DeferEntry {
                         kind: crate::interp::DeferKind::Call { callee },
                         args,
@@ -3130,7 +3322,7 @@ impl Vm {
                         }
                     };
                     let args: Vec<Value> = if spread {
-                        let arr = fiber.pop();
+                        let arr = source.pop(fiber);
                         match arr {
                             Value::Array(a) => a.borrow().clone(),
                             other => {
@@ -3147,11 +3339,11 @@ impl Vm {
                     } else {
                         let mut v = vec![Value::Nil; argc];
                         for slot in v.iter_mut().rev() {
-                            *slot = fiber.pop();
+                            *slot = source.pop(fiber);
                         }
                         v
                     };
-                    let recv = fiber.pop();
+                    let recv = source.pop(fiber);
                     // Mirror run_loop: resolve non-hook receivers to BoundMethod now;
                     // hook receivers keep DeferKind::Method so call-site hooks fire at
                     // drain time (which happens async via run_loop's Op::Return path).
@@ -3174,11 +3366,11 @@ impl Vm {
 
                 // ── GetIndex / SetIndex / GetProp / GetPropOpt / SetProp ───────
                 Op::GetIndex => {
-                    let idx = fiber.pop();
-                    let obj = fiber.pop();
+                    let idx = source.pop(fiber);
+                    let obj = source.pop(fiber);
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = crate::interp::index_get(&obj, &idx, span, span)?;
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::SetIndex => {
@@ -3186,9 +3378,9 @@ impl Vm {
                     // `index_set` (which calls borrow_mut() and panics on slab mode)
                     // and use vm_object_insert directly. Array/error paths are
                     // unchanged. The frozen check and error messages are preserved.
-                    let val = fiber.pop();
-                    let idx = fiber.pop();
-                    let obj = fiber.pop();
+                    let val = source.pop(fiber);
+                    let idx = source.pop(fiber);
+                    let obj = source.pop(fiber);
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = match &obj {
                         Value::Object(cell) => {
@@ -3218,7 +3410,7 @@ impl Vm {
                         _ => crate::interp::index_set(&obj, &idx, val, span, span)
                             .map_err(Control::Panic)?,
                     };
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::GetProp | Op::GetPropOpt => {
@@ -3233,9 +3425,9 @@ impl Vm {
                             ))
                         }
                     };
-                    let obj = fiber.pop();
+                    let obj = source.pop(fiber);
                     if op == Op::GetPropOpt && obj == Value::Nil {
-                        fiber.push(Value::Nil);
+                        source.push(fiber, Value::Nil);
                     } else {
                         let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                         let proto = fiber.frame().closure.proto.clone();
@@ -3248,7 +3440,7 @@ impl Vm {
                             Some(v) => v,
                             None => self.vm_read_member(&obj, &name, span)?,
                         };
-                        fiber.push(v);
+                        source.push(fiber, v);
                     }
                 }
 
@@ -3264,12 +3456,12 @@ impl Vm {
                             ))
                         }
                     };
-                    let value = fiber.pop();
-                    let obj = fiber.pop();
+                    let value = source.pop(fiber);
+                    let obj = source.pop(fiber);
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let proto = fiber.frame().closure.proto.clone();
                     let v = self.vm_set_prop(&proto.chunk, fault_ip, &obj, &name, value, span)?;
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::GetSuper => {
@@ -3348,12 +3540,12 @@ impl Vm {
                             return Err(Control::Panic(AsError::at(msg, span)));
                         }
                     };
-                    fiber.push(bound);
+                    source.push(fiber, bound);
                 }
 
                 // ── IterSnapshot ──────────────────────────────────────────────
                 Op::IterSnapshot => {
-                    let iterable = fiber.pop();
+                    let iterable = source.pop(fiber);
                     let items: Vec<Value> = match iterable {
                         Value::Array(arr) => arr.borrow().clone(),
                         Value::Str(s) => s
@@ -3384,7 +3576,7 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(Value::Array(crate::value::ArrayCell::new(items)));
+                    source.push(fiber, Value::Array(crate::value::ArrayCell::new(items)));
                 }
 
                 Op::ArrayLen => {
@@ -3392,11 +3584,11 @@ impl Vm {
                     // count as a `Number`. The operand is never user input — the
                     // compiler emits this only over an `IterSnapshot` result — so a
                     // non-array is a compiler bug surfaced as a Tier-2 panic.
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     match v {
                         Value::Array(arr) => {
                             let len = arr.borrow().len();
-                            fiber.push(Value::Float(len as f64));
+                            source.push(fiber, Value::Float(len as f64));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -3413,27 +3605,31 @@ impl Vm {
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let mut values = vec![Value::Nil; n];
                     for slot in values.iter_mut().rev() {
-                        *slot = fiber.pop();
+                        *slot = source.pop(fiber);
                     }
-                    fiber.push(Value::Array(crate::value::ArrayCell::new(values)));
+                    source.push(fiber, Value::Array(crate::value::ArrayCell::new(values)));
                 }
 
                 Op::NewObject => {
                     // SHAPE Task 3.1/3.2: shared body for both lanes (see
                     // `exec_new_object`). `fault_ip` is the op offset (cache key +
                     // panic span); the operand at `operand_at` is the pair count.
+                    // §7.2: `exec_new_object` consumes the `n` key/value pairs DIRECTLY
+                    // off `fiber.stack` — flush so the (possibly cached) top pair is
+                    // physically present before it pops.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    source.flush(fiber);
                     self.exec_new_object(fiber, fault_ip, n)?;
                 }
 
                 Op::NewMap => {
                     let cell = crate::value::MapCell::new(indexmap::IndexMap::new());
-                    fiber.push(Value::Map(cell));
+                    source.push(fiber, Value::Map(cell));
                 }
 
                 Op::MapEntry => {
-                    let val = fiber.pop();
-                    let key_val = fiber.pop();
+                    let val = source.pop(fiber);
+                    let key_val = source.pop(fiber);
                     let key = match crate::value::MapKey::from_value(&key_val) {
                         Some(k) => k,
                         None => {
@@ -3447,7 +3643,7 @@ impl Vm {
                             ))
                         }
                     };
-                    match fiber.peek(0) {
+                    match source.peek(fiber, 0) {
                         Value::Map(m) => {
                             m.borrow_mut().insert(key, val);
                         }
@@ -3465,11 +3661,11 @@ impl Vm {
                 }
 
                 Op::Spread | Op::SpreadArgs => {
-                    let operand = fiber.pop();
+                    let operand = source.pop(fiber);
                     match operand {
                         Value::Array(src) => {
                             let items: Vec<Value> = src.borrow().iter().cloned().collect();
-                            match fiber.peek(0) {
+                            match source.peek(fiber, 0) {
                                 Value::Array(arr) => arr.borrow_mut().extend(items),
                                 other => {
                                     return Err(self.panic_at(
@@ -3501,8 +3697,8 @@ impl Vm {
                 }
 
                 Op::AppendArray => {
-                    let item = fiber.pop();
-                    match fiber.peek(0) {
+                    let item = source.pop(fiber);
+                    match source.peek(fiber, 0) {
                         Value::Array(arr) => arr.borrow_mut().push(item),
                         other => {
                             return Err(self.panic_at(
@@ -3521,8 +3717,8 @@ impl Vm {
                     // SHAPE Task 3.1: use vm_object_insert so slab-mode builder
                     // objects grow via precise registry transitions instead of
                     // dict borrow_mut + resync. The key must be a string const.
-                    let val = fiber.pop();
-                    let key = match fiber.pop() {
+                    let val = source.pop(fiber);
+                    let key = match source.pop(fiber) {
                         Value::Str(s) => s,
                         other => {
                             return Err(self.panic_at(
@@ -3532,7 +3728,7 @@ impl Vm {
                             ))
                         }
                     };
-                    match fiber.peek(0) {
+                    match source.peek(fiber, 0) {
                         Value::Object(obj) => {
                             let obj = obj.clone();
                             self.vm_object_insert(&obj, &key, val);
@@ -3554,12 +3750,12 @@ impl Vm {
                     // SHAPE Task 3.1: snapshot source entries via the accessor
                     // (works across slab and dict modes), then insert into the
                     // builder object via vm_object_insert (precise transitions).
-                    let operand = fiber.pop();
+                    let operand = source.pop(fiber);
                     match operand {
                         Value::Object(src) => {
                             // Snapshot FIRST (avoids borrow conflict on self-spread).
                             let entries = src.entries();
-                            match fiber.peek(0) {
+                            match source.peek(fiber, 0) {
                                 Value::Object(obj) => {
                                     let obj = obj.clone();
                                     for (k, v) in entries {
@@ -3607,8 +3803,8 @@ impl Vm {
                             ))
                         }
                     };
-                    let value = fiber.pop();
-                    match (fiber.peek(1), fiber.peek(0)) {
+                    let value = source.pop(fiber);
+                    match (source.peek(fiber, 1), source.peek(fiber, 0)) {
                         (Value::Array(args), Value::Array(names)) => {
                             args.borrow_mut().push(value);
                             names.borrow_mut().push(name);
@@ -3627,8 +3823,8 @@ impl Vm {
                     // ADT §3.2 (spread+named lockstep builder). Stack
                     // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
                     // `argsArray` and push `Nil` onto `namesArray` (a positional value).
-                    let value = fiber.pop();
-                    match (fiber.peek(1), fiber.peek(0)) {
+                    let value = source.pop(fiber);
+                    match (source.peek(fiber, 1), source.peek(fiber, 0)) {
                         (Value::Array(args), Value::Array(names)) => {
                             args.borrow_mut().push(value);
                             names.borrow_mut().push(Value::Nil);
@@ -3648,7 +3844,7 @@ impl Vm {
                     // `[..., argsArray, namesArray, operand]`: pop `operand` (MUST be an
                     // Array), extend `argsArray` with its elements and push `Nil` ONCE
                     // PER element onto `namesArray`.
-                    let operand = fiber.pop();
+                    let operand = source.pop(fiber);
                     let items: Vec<Value> = match operand {
                         Value::Array(src) => src.borrow().iter().cloned().collect(),
                         other => {
@@ -3663,7 +3859,7 @@ impl Vm {
                         }
                     };
                     let n = items.len();
-                    match (fiber.peek(1), fiber.peek(0)) {
+                    match (source.peek(fiber, 1), source.peek(fiber, 0)) {
                         (Value::Array(args), Value::Array(names)) => {
                             args.borrow_mut().extend(items);
                             names.borrow_mut().extend(std::iter::repeat_n(Value::Nil, n));
@@ -3680,8 +3876,11 @@ impl Vm {
 
                 // ── Destructure / match family ────────────────────────────────
                 Op::CheckArrayDestructure => {
-                    if !matches!(fiber.peek(0), Value::Array(_)) {
-                        let t = crate::interp::type_name(fiber.peek(0));
+                    // §7.2 edge 3: peek-and-maybe-`return Err` — flush so the canonical
+                    // stack survives the error (see CheckNumbers).
+                    source.flush(fiber);
+                    if !matches!(source.peek(fiber, 0), Value::Array(_)) {
+                        let t = crate::interp::type_name(source.peek(fiber, 0));
                         return Err(self.panic_at(
                             fiber,
                             fault_ip,
@@ -3691,8 +3890,10 @@ impl Vm {
                 }
 
                 Op::CheckObjectDestructure => {
-                    if !matches!(fiber.peek(0), Value::Object(_) | Value::Instance(_)) {
-                        let t = crate::interp::type_name(fiber.peek(0));
+                    // §7.2 edge 3: peek-and-maybe-`return Err` — flush (see CheckNumbers).
+                    source.flush(fiber);
+                    if !matches!(source.peek(fiber, 0), Value::Object(_) | Value::Instance(_)) {
+                        let t = crate::interp::type_name(source.peek(fiber, 0));
                         return Err(self.panic_at(
                             fiber,
                             fault_ip,
@@ -3703,11 +3904,11 @@ impl Vm {
 
                 Op::ArrayElem => {
                     let index = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let src = fiber.pop();
+                    let src = source.pop(fiber);
                     match src {
                         Value::Array(arr) => {
                             let v = arr.borrow().get(index).cloned().unwrap_or(Value::Nil);
-                            fiber.push(v);
+                            source.push(fiber, v);
                         }
                         other => {
                             return Err(self.panic_at(
@@ -3731,7 +3932,7 @@ impl Vm {
                             ))
                         }
                     };
-                    let src = fiber.pop();
+                    let src = source.pop(fiber);
                     let v = match src {
                         Value::Object(o) => {
                             o.get(key.as_ref()).unwrap_or(Value::Nil)
@@ -3748,17 +3949,17 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::ArrayRest => {
                     let start = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let src = fiber.pop();
+                    let src = source.pop(fiber);
                     match src {
                         Value::Array(arr) => {
                             let tail: Vec<Value> =
                                 arr.borrow().iter().skip(start).cloned().collect();
-                            fiber.push(Value::Array(crate::value::ArrayCell::new(tail)));
+                            source.push(fiber, Value::Array(crate::value::ArrayCell::new(tail)));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -3792,7 +3993,7 @@ impl Vm {
                                 ))
                             }
                         };
-                    let src = fiber.pop();
+                    let src = source.pop(fiber);
                     let mut remaining: indexmap::IndexMap<String, Value> =
                         indexmap::IndexMap::new();
                     match src {
@@ -3818,7 +4019,7 @@ impl Vm {
                             ))
                         }
                     }
-                    fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                    source.push(fiber, Value::Object(crate::value::ObjectCell::new(remaining)));
                     // SHAPE §3.5: count this fresh-dict OBJECT_REST build.
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                     self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
@@ -3827,7 +4028,7 @@ impl Vm {
                 Op::MatchArray => {
                     let len = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let exact = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) == 1;
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let ok = match &subject {
                         Value::Array(a) => {
                             let n = a.borrow().len();
@@ -3835,13 +4036,13 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    source.push(fiber, Value::Bool(ok));
                 }
 
                 Op::MatchObject => {
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let ok = matches!(subject, Value::Object(_) | Value::Instance(_));
-                    fiber.push(Value::Bool(ok));
+                    source.push(fiber, Value::Bool(ok));
                 }
 
                 Op::MatchHasKey => {
@@ -3858,13 +4059,13 @@ impl Vm {
                             ))
                         }
                     };
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let ok = match &subject {
                         Value::Object(o) => o.contains_key(key.as_ref()),
                         Value::Instance(i) => i.borrow().contains_key(key.as_ref()),
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    source.push(fiber, Value::Bool(ok));
                 }
 
                 Op::MatchVariant => {
@@ -3900,7 +4101,7 @@ impl Vm {
                                 ))
                             }
                         };
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let ok = match &subject {
                         Value::EnumVariant(ev) if ev.payload.is_some() => {
                             ev.name.as_str() == want_variant.as_ref()
@@ -3911,14 +4112,14 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    source.push(fiber, Value::Bool(ok));
                 }
 
                 Op::MatchVariantArity => {
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let len = variant_payload_len(&subject);
-                    fiber.push(Value::Bool(len == Some(n)));
+                    source.push(fiber, Value::Bool(len == Some(n)));
                 }
 
                 Op::MatchVariantHasField => {
@@ -3935,7 +4136,7 @@ impl Vm {
                             ))
                         }
                     };
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let ok = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
@@ -3945,12 +4146,12 @@ impl Vm {
                         },
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    source.push(fiber, Value::Bool(ok));
                 }
 
                 Op::VariantElem => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let v = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Positional(a)) => {
@@ -3965,7 +4166,7 @@ impl Vm {
                         },
                         _ => Value::Nil,
                     };
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::VariantField => {
@@ -3980,7 +4181,7 @@ impl Vm {
                             ))
                         }
                     };
-                    let subject = fiber.pop();
+                    let subject = source.pop(fiber);
                     let v = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
@@ -3990,17 +4191,17 @@ impl Vm {
                         },
                         _ => Value::Nil,
                     };
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
 
                 Op::MatchRange => {
                     let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
                     let inclusive = (flags & 0b01) != 0;
                     let present = (flags & 0b10) != 0;
-                    let step = fiber.pop();
-                    let hi = fiber.pop();
-                    let lo = fiber.pop();
-                    let subject = fiber.pop();
+                    let step = source.pop(fiber);
+                    let hi = source.pop(fiber);
+                    let lo = source.pop(fiber);
+                    let subject = source.pop(fiber);
                     let ok = match (subject.as_f64(), lo.as_f64(), hi.as_f64()) {
                         (Some(n), Some(lo), Some(hi)) => {
                             let step_v = if present {
@@ -4025,7 +4226,7 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    source.push(fiber, Value::Bool(ok));
                 }
 
                 Op::MatchNoArm => {
@@ -4040,11 +4241,11 @@ impl Vm {
                 Op::GetLocalCell => {
                     let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.get_local_cell(slot);
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
                 Op::SetLocalCell => {
                     let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     fiber.set_local_cell(slot, v);
                 }
                 Op::FreshCell => {
@@ -4055,20 +4256,24 @@ impl Vm {
                 Op::GetUpvalue => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.frame().closure.upvalues[idx].borrow().clone();
-                    fiber.push(v);
+                    source.push(fiber, v);
                 }
                 Op::SetUpvalue => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let v = fiber.pop();
+                    let v = source.pop(fiber);
                     *fiber.frame().closure.upvalues[idx].borrow_mut() = v;
                 }
 
                 Op::CheckParam => {
+                    // §7.2 edge 3: a contract check that peeks the (possibly cached) TOS
+                    // and `return Err(contract_panic)` on a mismatch — flush so the value
+                    // is on `fiber.stack` for recover / the SP4 provenance binder.
+                    source.flush(fiber);
                     let param = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let span = fiber.frame().ret_span;
                     let ty = fiber.frame().closure.proto.params[param].ty.clone();
                     if let Some(ty) = ty {
-                        let v = fiber.peek(0).clone();
+                        let v = source.peek(fiber, 0).clone();
                         if !crate::interp::check_type(&v, &ty) {
                             return Err(crate::interp::contract_panic(&ty, &v, span));
                         }
@@ -4076,6 +4281,9 @@ impl Vm {
                 }
 
                 Op::CheckLocal => {
+                    // §7.2 edge 3: peek-and-maybe-`return Err(contract_panic)` — flush
+                    // so the canonical stack survives the error (see CheckParam).
+                    source.flush(fiber);
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let ty = match fiber.frame().closure.proto.chunk.type_consts.get(idx) {
@@ -4088,7 +4296,7 @@ impl Vm {
                             ))
                         }
                     };
-                    let v = fiber.peek(0).clone();
+                    let v = source.peek(fiber, 0).clone();
                     if !crate::interp::check_type(&v, &ty) {
                         return Err(crate::interp::contract_panic(&ty, &v, span));
                     }
@@ -4139,7 +4347,7 @@ impl Vm {
                         upvalues.push(cell);
                     }
                     let closure = crate::vm::value_ext::Closure::with_upvalues(proto, upvalues);
-                    fiber.push(Value::Closure(closure));
+                    source.push(fiber, Value::Closure(closure));
                 }
 
                 // ── Call / CallSpread (plain sync closure only) ───────────────
@@ -4153,6 +4361,15 @@ impl Vm {
                     // INVARIANT: we must NOT pop anything from the stack before
                     // confirming the callee is sync-eligible, so that escalation
                     // leaves the stack completely untouched.
+                    //
+                    // §7.2 edge 4 (frame push) — THE load-bearing call flush. This arm
+                    // reads `fiber.stack` BY INDEX (`stack[len-2]`, `callee_idx`,
+                    // `stack.remove`/`resize`) and windows args into the callee frame; a
+                    // cached TOS (the last arg) would desync every index. Flush FIRST so
+                    // the callee + args are PHYSICALLY on `fiber.stack` before the call
+                    // mechanics — covers both push_closure_frame and the A2 in-place bind,
+                    // and leaves the stack untouched-from-the-caller's-view on escalation.
+                    source.flush(fiber);
                     if matches!(op, Op::CallSpread) {
                         // Stack is `[..., callee, argsArray]`. Peek callee at index -2.
                         let callee_ref = &fiber.stack[fiber.stack.len() - 2];
@@ -4166,7 +4383,10 @@ impl Vm {
                             fiber.frame_mut().ip = fault_ip;
                             return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                         }
-                        // Pop the args array and flatten it, then dispatch.
+                        // §7.2 edge 4: the cache was flushed at the arm top, so this
+                        // branch operates DIRECTLY on the physical `fiber.stack` (it
+                        // reads `callee_idx` by index below) — use `fiber.pop`/`fiber.push`
+                        // here, NOT the accessor (a cached push would desync the index).
                         let args = match fiber.pop() {
                             Value::Array(a) => a,
                             other => {
@@ -4278,7 +4498,7 @@ impl Vm {
                 // Peek-first to decide whether to stay in-lane or escalate:
                 //
                 //   1. Non-Future TOS → identity (await 5 == 5): pop + push back,
-                //      retire. Mirrors run_loop's `other => fiber.push(other)`.
+                //      retire. Mirrors run_loop's `other => source.push(fiber, other)`.
                 //   2. Future with try_get() == Some(Ok(v)) → pop future, push v,
                 //      retire (the inline take).
                 //   3. Future with try_get() == Some(Err(c)) → pop future, return
@@ -4294,7 +4514,7 @@ impl Vm {
                 // borrow held. `try_get` is a plain synchronous call — ZERO awaits.
                 Op::Await => {
                     // Peek TOS read-only before deciding whether to pop.
-                    let probe = match fiber.peek(0) {
+                    let probe = match source.peek(fiber, 0) {
                         Value::Future(f) => {
                             // try_get clones the result out; the slot borrow is
                             // dropped before try_get returns — no borrow held.
@@ -4303,8 +4523,8 @@ impl Vm {
                         _ => {
                             // Case 1: non-Future → identity. Pop and push back.
                             // ip is already advanced.
-                            let v = fiber.pop();
-                            fiber.push(v);
+                            let v = source.pop(fiber);
+                            source.push(fiber, v);
                             // retire += 1 falls through at the end of the match.
                             *retired += 1;
                             source.note_retired(self, op);
@@ -4314,6 +4534,10 @@ impl Vm {
                     match probe {
                         None => {
                             // Case 4: future still pending — escalate.
+                            // §7.2 edge 1: the awaited Future is the cached TOS (peeked,
+                            // not popped) — flush so the async driver re-decoding this
+                            // Op::Await re-peeks it on `fiber.stack`.
+                            source.flush(fiber);
                             // ip was already advanced above; restore it so the
                             // async driver re-decodes the same Op::Await byte.
                             fiber.frame_mut().ip = fault_ip;
@@ -4323,12 +4547,12 @@ impl Vm {
                             // Cases 2 and 3: future already resolved.
                             // Pop the Future handle (one Rc decrement, no side
                             // effect on cancel-on-drop — the future is resolved).
-                            fiber.pop();
+                            source.pop(fiber);
                             // Re-raise stored Control (Error branch → Err(c))
                             // or push the value (Ok branch). `?` propagates the
                             // same Control the async arm's `f.get().await?` would.
                             let v = r?;
-                            fiber.push(v);
+                            source.push(fiber, v);
                             // retire += 1 falls through at the end of the match.
                         }
                     }
@@ -11736,6 +11960,126 @@ mod tests {
         assert_eq!(warm_out, "1225\n", "warmup output");
         assert_eq!(run2_out, "1225\n", "the trapped run's output is byte-identical");
         assert_eq!(run3_out, "1225\n", "the cleared run's output is byte-identical");
+    }
+
+    #[test]
+    fn flush_edge_1_breakpoint_patched_mid_hot_loop_sees_the_flushed_stack() {
+        // DECODE §7.2 edge 1 × the §8.4 battery (Unit D). Warm a loop with an
+        // expression-rich body (the accumulator `s` is hot TOS), set a breakpoint on
+        // the loop body line, hit it, and at the PARK EVALUATE a local (`build_frame_
+        // snapshots`/`eval_in_paused_frame` read `fiber.stack`). A missed flush at the
+        // escalation edge would show a wrong/missing operand in the paused frame. The
+        // evaluated value + the full-run output must be byte-identical to a NO-TOS run
+        // (decode_tos off) — proving the flush-edge contract, not just no-crash.
+        use crate::vm::instrument::{
+            DebugCommand, DebugEvent, DebuggerHook, Instrumentation,
+        };
+
+        // `s` accumulates across the loop; at line 3 (`s = s + i * 2`) the body is
+        // expression-rich (a fused/cached accumulate). We park there and evaluate `s`.
+        let src = "let s = 0\nfor (i in 0..30) {\n  s = s + i * 2\n}\nprint(s)\n";
+
+        // Run the SAME program with a breakpoint, once with decode_tos ON and once
+        // OFF; both must STOP, evaluate `s` to the same display, and finish with the
+        // same output (0+2+4+..+58 = 870).
+        fn run_with_bp(src: &'static str, decode_tos: bool) -> (String, String) {
+            with_watchdog(20, move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                let local = LocalSet::new();
+                local.block_on(&rt, async move {
+                    let interp = Rc::new(Interp::new());
+                    interp.install_self();
+
+                    // WARMUP (no instrument) so the chunk decodes under the chosen
+                    // decode_tos flag — the TOS cache is hot before the breakpoint.
+                    let warm_vm = Vm::with_all_flags(
+                        interp.clone(), true, true, true, true, true, decode_tos, 0,
+                    );
+                    let (entry, _s) = compile_and_register(src, &warm_vm);
+                    {
+                        let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                        let outcome = warm_vm.run(&mut fiber).await;
+                        assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "warmup ran");
+                    }
+                    let warm_out = interp.output();
+
+                    // PATCH a breakpoint on the loop body (line 3, `s = s + i * 2`).
+                    let bp = warm_vm
+                        .resolve_line_breakpoint("prog.as", 3)
+                        .expect("loop body line 3 resolves");
+                    let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+                    hook.set_breakpoint_shared(bp.0, bp.1, &entry.chunk);
+
+                    // Controller: on the FIRST stop, request Evaluate("s") in the
+                    // innermost frame, capture the EvaluateResult, then Continue (and
+                    // auto-continue any further stops).
+                    let (eval_tx, eval_rx) = std::sync::mpsc::channel::<String>();
+                    let controller = std::thread::spawn(move || {
+                        let mut stops = 0usize;
+                        let mut sent_eval = false;
+                        while let Ok(evt) = evt_rx.recv() {
+                            match evt {
+                                DebugEvent::Stopped { .. } => {
+                                    stops += 1;
+                                    if stops == 1 && !sent_eval {
+                                        sent_eval = true;
+                                        let _ = cmd_tx.send(DebugCommand::Evaluate {
+                                            expr: "s".into(),
+                                            frame_id: 0,
+                                        });
+                                        // The EvaluateResult arrives next; Continue after.
+                                    } else {
+                                        let _ = cmd_tx.send(DebugCommand::Continue);
+                                    }
+                                }
+                                DebugEvent::EvaluateResult { display, .. } => {
+                                    let _ = eval_tx.send(display);
+                                    let _ = cmd_tx.send(DebugCommand::Continue);
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+
+                    // Run VM: FORCED decode (threshold 0), the requested decode_tos
+                    // flag, and the debugger hook installed.
+                    let run_vm = Vm::with_all_flags(
+                        interp.clone(), true, true, true, true, true, decode_tos, 0,
+                    );
+                    *run_vm.instrument.borrow_mut() = Some(Box::new(Instrumentation {
+                        breakpoints: Some(hook),
+                        profiler: None,
+                        coverage: None,
+                    }));
+                    run_vm.register_debug_protos(&entry);
+                    {
+                        let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                        let outcome = run_vm.run(&mut fiber).await;
+                        assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "trapped run: {outcome:?}");
+                    }
+                    let run_out = interp.output()[warm_out.len()..].to_string();
+                    let mut hook = run_vm.take_debugger_hook().expect("hook armed");
+                    let _ = hook.drain_breakpoints();
+                    drop(hook);
+                    controller.join().expect("controller");
+                    let eval = eval_rx.recv().unwrap_or_else(|_| "<no-eval>".into());
+                    (run_out, eval)
+                })
+            })
+        }
+
+        let (out_on, eval_on) = run_with_bp(src, true);
+        let (out_off, eval_off) = run_with_bp(src, false);
+        assert_eq!(out_on, "870\n", "decode_tos ON: full output byte-identical");
+        assert_eq!(out_off, "870\n", "decode_tos OFF: full output byte-identical");
+        assert_eq!(out_on, out_off, "TOS on vs off output");
+        // The parked evaluate of `s` read `fiber.stack` (the locals region) at the
+        // trap; the flushed stack makes it identical across the modes.
+        assert_eq!(
+            eval_on, eval_off,
+            "the parked evaluate of `s` is identical with TOS on vs off (flush honored)"
+        );
+        assert_ne!(eval_on, "<no-eval>", "the evaluate actually ran at the park");
     }
 
     #[test]
