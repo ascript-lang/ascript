@@ -135,13 +135,11 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
             .into());
         }
     };
-    let obj = obj.borrow();
-
     // headers: object of string→string.
     if let Some(h) = obj.get("headers") {
         let map = match h {
             Value::Object(o) => o,
-            other => {
+            ref other => {
                 return Err(AsError::at(
                     format!(
                         "net/ws.connect headers expects an object, got {}",
@@ -152,9 +150,9 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
                 .into());
             }
         };
-        for (k, v) in map.borrow().iter() {
-            let vs = want_string(v, span, "net/ws.connect header value")?;
-            out.push((k.clone(), vs.to_string()));
+        for (k, v) in map.entries() {
+            let vs = want_string(&v, span, "net/ws.connect header value")?;
+            out.push((k.to_string(), vs.to_string()));
         }
     }
 
@@ -162,7 +160,7 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
     if let Some(a) = obj.get("auth") {
         let ao = match a {
             Value::Object(o) => o,
-            other => {
+            ref other => {
                 return Err(AsError::at(
                     format!(
                         "net/ws.connect auth expects an object, got {}",
@@ -173,12 +171,11 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
                 .into());
             }
         };
-        let ao = ao.borrow();
         if let Some(tok) = ao.get("bearer") {
-            let tok = want_string(tok, span, "net/ws.connect auth.bearer")?;
+            let tok = want_string(&tok, span, "net/ws.connect auth.bearer")?;
             out.push(("Authorization".to_string(), format!("Bearer {}", tok)));
         } else if let Some(basic) = ao.get("basic") {
-            let arr = want_array(basic, span, "net/ws.connect auth.basic")?;
+            let arr = want_array(&basic, span, "net/ws.connect auth.basic")?;
             let arr = arr.borrow();
             let user = want_string(
                 arr.first().unwrap_or(&Value::Nil),

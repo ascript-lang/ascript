@@ -20,6 +20,7 @@ use crate::vm::fiber::Fiber;
 use crate::vm::opcode::Op;
 use crate::vm::value_ext::{Closure, RunOutcome};
 use gcmodule::Cc;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
@@ -87,6 +88,28 @@ pub struct CallFastStats {
     pub trampoline_escalations: u64,
 }
 
+/// **SHAPE §3.5 — per-VM storage-mode coverage counters (anti-false-green Gate 15).**
+///
+/// Compiled only under `#[cfg(any(test, feature = "fuzzgen", fuzzing))]` so
+/// production builds carry zero overhead.  `cargo test` enables the `fuzzgen`
+/// feature (via the self-dev-dependency), so the counters are live in every test
+/// run.  Asserted `> 0` over the functional corpus in `tests/vm_differential.rs`
+/// as Gate 15.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ShapeStats {
+    /// Every fresh `ObjectStorage::Slab` construction — `Op::NewObject` warm-hit
+    /// path, `new_object_generic` slab arm, and instance construction.
+    pub obj_slab_constructed: u64,
+    /// Every fresh `ObjectStorage::Dict` construction on the VM — the
+    /// `new_object_generic` cap-refused arm, the `Op::ObjectRest` rest-collector
+    /// (both lanes), the namespace-import build, and each slab→dict demotion (a
+    /// demotion materializes a fresh dict). Covers every `ObjectCell::new(map)` site.
+    pub obj_dict_constructed: u64,
+    /// Every `demote_to_dict()` call (both object and instance insert paths).
+    pub obj_demotions: u64,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -102,25 +125,30 @@ pub struct Vm {
     /// closure. A class's `Value::Class.methods` map is left empty; method dispatch
     /// goes through this table (`compiled_method`). The key is stable because the
     /// `Rc<Class>` is created once at compile time and shared by every instance.
-    class_methods: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
+    // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
+    // never attacker-scaled, iteration order never observed (see audit) — this table is
+    // accessed only via get/insert/contains_key, never iterated into output.
+    class_methods: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-class STATIC method table (SP1 §3): class `Rc` identity → static name →
     /// compiled closure. A SEPARATE namespace from `class_methods`; a static is
     /// called as `C.name(args)` with NO receiver (a plain `Value::Closure` call),
     /// resolved up the superclass chain by `find_compiled_static_method`.
-    class_static_methods: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
+    // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
+    // never attacker-scaled, iteration order never observed (see audit) — get/insert only.
+    class_static_methods: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-class field-default thunk table (V9): class `Rc` identity → field name →
     /// a zero-arg closure that produces the field's default value. Run once per
     /// constructed instance (so a mutable default yields a fresh value each time,
     /// matching the tree-walker's per-construct default eval).
-    class_defaults: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
+    // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
+    // never attacker-scaled, iteration order never observed (see audit). The inner map is
+    // consulted only via `contains_key`/`get`; the order it is walked in comes from
+    // `Class.fields.keys()` (declared schema order), NOT from this table's hash order.
+    class_defaults: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-VM hidden-class registry (V11-T2). Assigns a `shape_id` to every
     /// object/instance key-LAYOUT via a transition tree; V11-T3 inline caches key
     /// on these ids. Only VM code paths touch it (the tree-walker leaves shapes 0).
     shapes: RefCell<crate::vm::shape::ShapeRegistry>,
-    /// Cache of each class's BASE shape (its declared-field layout, declaration
-    /// order), keyed by the class's `Rc` identity (`Rc::as_ptr`) like the method
-    /// tables. Computed once per class so every instance shares the same base id.
-    class_base_shapes: RefCell<HashMap<usize, u32>>,
     /// A shared `def_env` for every VM-created class (task #157). The compiler
     /// leaves `Class.def_env` as an inert `global_env()` placeholder because the VM
     /// has no tree-walker Environment; but the SHARED `Interp::validate_into`
@@ -193,7 +221,13 @@ pub struct Vm {
     /// REPL's cross-line persistence: one `Vm` kept alive across lines carries its
     /// globals forward. (A file module's exports use the separate `module_exports`
     /// path; only the entry chunk defines into this table.)
-    user_globals: RefCell<indexmap::IndexMap<Rc<str>, GlobalSlot>>,
+    // SHAPE §6.1: Fx — bounded inflow (source identifiers), never attacker-scaled. This
+    // table IS iterated (def-env rebuild at ~1107/~6657) and index-cached
+    // (`GlobalCache::IndexBound`), but `IndexMap` iteration is INSERTION-ordered and its
+    // indices are STABLE regardless of hasher — so Fx changes neither the observable order
+    // nor cache validity. The two iteration sites only build a flat (order-independent)
+    // binding env; no hash-order leaks to output.
+    user_globals: RefCell<indexmap::IndexMap<Rc<str>, GlobalSlot, FxBuildHasher>>,
     /// Monotonic version counter, bumped on every global (re)definition or
     /// assignment. The V11-T4 GET_GLOBAL inline cache (`adapt::GlobalCache`) guards
     /// its cached value with this version: a cache entry recorded at version V is
@@ -257,6 +291,10 @@ pub struct Vm {
     /// cost is bounded by the Gate-17 zero-cost bench. Asserted >0 over the
     /// functional corpus so the differential proves the fast paths actually ran.
     call_fast_stats: std::cell::Cell<CallFastStats>,
+    /// **SHAPE §3.5 coverage counters (anti-false-green Gate 15).** Compiled only
+    /// under test/fuzzgen/fuzzing so production carries zero overhead.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    shape_stats: std::cell::Cell<ShapeStats>,
     /// **CALL §4 A3 — fiber pool for re-entrant calls.**
     ///
     /// Holds recycled [`Fiber`]s that `take_pooled_fiber` / `return_pooled_fiber`
@@ -362,11 +400,10 @@ impl Vm {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
-            class_methods: RefCell::new(HashMap::new()),
-            class_static_methods: RefCell::new(HashMap::new()),
-            class_defaults: RefCell::new(HashMap::new()),
+            class_methods: RefCell::new(FxHashMap::default()),
+            class_static_methods: RefCell::new(FxHashMap::default()),
+            class_defaults: RefCell::new(FxHashMap::default()),
             shapes: RefCell::new(crate::vm::shape::ShapeRegistry::new()),
-            class_base_shapes: RefCell::new(HashMap::new()),
             class_env: RefCell::new(None),
             specialize,
             module_exports: RefCell::new(Rc::new(RefCell::new(indexmap::IndexMap::new()))),
@@ -374,7 +411,7 @@ impl Vm {
             module_dir: RefCell::new(std::env::current_dir().unwrap_or_else(|_| ".".into())),
             module_archive: RefCell::new(None),
             module_logical_dir: RefCell::new(String::new()),
-            user_globals: RefCell::new(indexmap::IndexMap::new()),
+            user_globals: RefCell::new(indexmap::IndexMap::with_hasher(FxBuildHasher)),
             global_version: std::cell::Cell::new(0),
             struct_gen: std::cell::Cell::new(0),
             last_fault_source: RefCell::new(None),
@@ -385,6 +422,8 @@ impl Vm {
             lane_bursts: std::cell::Cell::new(0),
             call_fast,
             call_fast_stats: std::cell::Cell::new(CallFastStats::default()),
+            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+            shape_stats: std::cell::Cell::new(ShapeStats::default()),
             fiber_pool: RefCell::new(Vec::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
@@ -452,6 +491,30 @@ impl Vm {
     #[inline]
     pub(crate) fn bump_trampoline_escalation(&self) {
         self.bump_stat(|s| s.trampoline_escalations += 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // SHAPE §3.5 — storage-mode coverage counters
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// SHAPE §3.5: return the three storage-mode counters as `(slab, dict, demote)`.
+    /// `#[doc(hidden)]` — test API only; not a stable public surface.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    #[doc(hidden)]
+    pub fn obj_mode_stats(&self) -> (u64, u64, u64) {
+        let s = self.shape_stats.get();
+        (s.obj_slab_constructed, s.obj_dict_constructed, s.obj_demotions)
+    }
+
+    /// SHAPE §3.5: bump one or more shape-stats counters (Cell, never held across
+    /// `.await`).  Compiled only under test/fuzzgen/fuzzing — the call sites are
+    /// individually gated with `#[cfg(any(test, feature = "fuzzgen", fuzzing))]`.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    #[inline]
+    pub(crate) fn bump_shape_stat(&self, f: impl FnOnce(&mut ShapeStats)) {
+        let mut s = self.shape_stats.get();
+        f(&mut s);
+        self.shape_stats.set(s);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -2139,14 +2202,42 @@ impl Vm {
                 }
 
                 Op::SetIndex => {
+                    // SHAPE Task 3.1: for Object receivers, bypass the shared
+                    // `index_set` (which calls borrow_mut() and panics on slab mode)
+                    // and use vm_object_insert directly. Array/error paths are
+                    // unchanged. The frozen check and error messages are preserved.
                     let val = fiber.pop();
                     let idx = fiber.pop();
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let v = crate::interp::index_set(&obj, &idx, val, span, span)?;
-                    if let Value::Object(cell) = &obj {
-                        self.resync_object_shape(cell);
-                    }
+                    let v = match &obj {
+                        Value::Object(cell) => {
+                            // Frozen guard (mirrors index_set's frozen_kind check).
+                            if let Some(kind) = crate::value::frozen_kind(&obj) {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("cannot mutate a frozen {kind}"),
+                                ));
+                            }
+                            match &idx {
+                                Value::Str(key) => {
+                                    let key = key.clone();
+                                    self.vm_object_insert(cell, &key, val.clone());
+                                    val
+                                }
+                                _ => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        "object index must be a string".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                        _ => crate::interp::index_set(&obj, &idx, val, span, span)
+                            .map_err(Control::Panic)?,
+                    };
                     fiber.push(v);
                 }
 
@@ -2348,30 +2439,11 @@ impl Vm {
                 }
 
                 Op::NewObject => {
+                    // SHAPE Task 3.1/3.2: shared body for both lanes (see
+                    // `exec_new_object`). `fault_ip` is the op offset (cache key +
+                    // panic span); the operand at `operand_at` is the pair count.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
-                    for slot in pairs.iter_mut().rev() {
-                        let value = fiber.pop();
-                        let key = match fiber.pop() {
-                            Value::Str(s) => s,
-                            other => {
-                                return Err(self.panic_at(
-                                    fiber,
-                                    fault_ip,
-                                    format!("NEW_OBJECT key is not a string constant: {other:?}"),
-                                ))
-                            }
-                        };
-                        *slot = (key, value);
-                    }
-                    let mut map = indexmap::IndexMap::with_capacity(n);
-                    for (k, v) in pairs {
-                        map.insert(k.to_string(), v);
-                    }
-                    let cell = crate::value::ObjectCell::new(map);
-                    let shape = self.object_shape_for(cell.map.borrow().keys().map(|s| s.as_str()));
-                    cell.shape.set(shape);
-                    fiber.push(Value::Object(cell));
+                    self.exec_new_object(fiber, fault_ip, n)?;
                 }
 
                 Op::NewMap => {
@@ -2466,6 +2538,9 @@ impl Vm {
                 }
 
                 Op::AppendObject => {
+                    // SHAPE Task 3.1: use vm_object_insert so slab-mode builder
+                    // objects grow via precise registry transitions instead of
+                    // dict borrow_mut + resync. The key must be a string const.
                     let val = fiber.pop();
                     let key = match fiber.pop() {
                         Value::Str(s) => s,
@@ -2479,9 +2554,8 @@ impl Vm {
                     };
                     match fiber.peek(0) {
                         Value::Object(obj) => {
-                            obj.borrow_mut().insert(key.to_string(), val);
                             let obj = obj.clone();
-                            self.resync_object_shape(&obj);
+                            self.vm_object_insert(&obj, &key, val);
                         }
                         other => {
                             return Err(self.panic_at(
@@ -2497,24 +2571,20 @@ impl Vm {
                 }
 
                 Op::SpreadObject => {
+                    // SHAPE Task 3.1: snapshot source entries via the accessor
+                    // (works across slab and dict modes), then insert into the
+                    // builder object via vm_object_insert (precise transitions).
                     let operand = fiber.pop();
                     match operand {
                         Value::Object(src) => {
-                            let entries: Vec<(String, Value)> = src
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
+                            // Snapshot FIRST (avoids borrow conflict on self-spread).
+                            let entries = src.entries();
                             match fiber.peek(0) {
                                 Value::Object(obj) => {
-                                    {
-                                        let mut m = obj.borrow_mut();
-                                        for (k, v) in entries {
-                                            m.insert(k, v);
-                                        }
-                                    }
                                     let obj = obj.clone();
-                                    self.resync_object_shape(&obj);
+                                    for (k, v) in entries {
+                                        self.vm_object_insert(&obj, &k, v);
+                                    }
                                 }
                                 other => {
                                     return Err(self.panic_at(
@@ -2684,13 +2754,11 @@ impl Vm {
                     let src = fiber.pop();
                     let v = match src {
                         Value::Object(o) => {
-                            o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                            o.get(key.as_ref()).unwrap_or(Value::Nil)
                         }
                         Value::Instance(i) => i
                             .borrow()
-                            .fields
                             .get(key.as_ref())
-                            .cloned()
                             .unwrap_or(Value::Nil),
                         other => {
                             return Err(self.panic_at(
@@ -2749,16 +2817,16 @@ impl Vm {
                         indexmap::IndexMap::new();
                     match src {
                         Value::Object(o) => {
-                            for (k, v) in o.borrow().iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in o.entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
                         Value::Instance(i) => {
-                            for (k, v) in i.borrow().fields.iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in i.borrow().entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
@@ -2771,6 +2839,9 @@ impl Vm {
                         }
                     }
                     fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                    // SHAPE §3.5: count this fresh-dict OBJECT_REST build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                 }
 
                 Op::MatchArray => {
@@ -2809,8 +2880,8 @@ impl Vm {
                     };
                     let subject = fiber.pop();
                     let ok = match &subject {
-                        Value::Object(o) => o.borrow().contains_key(key.as_ref()),
-                        Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
+                        Value::Object(o) => o.contains_key(key.as_ref()),
+                        Value::Instance(i) => i.borrow().contains_key(key.as_ref()),
                         _ => false,
                     };
                     fiber.push(Value::Bool(ok));
@@ -2888,7 +2959,7 @@ impl Vm {
                     let ok = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().contains_key(key.as_ref())
+                                o.contains_key(key.as_ref())
                             }
                             _ => false,
                         },
@@ -2933,7 +3004,7 @@ impl Vm {
                     let v = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                                o.get(key.as_ref()).unwrap_or(Value::Nil)
                             }
                             _ => Value::Nil,
                         },
@@ -4537,39 +4608,12 @@ impl Vm {
                 }
 
                 Op::NewObject => {
-                    // Pop `n` (key, value) pairs. Each pair was pushed key-first
-                    // then value, and the pairs were pushed in source order, so
-                    // the stack top-down is: vN, kN, …, v1, k1. Pop into a
-                    // source-order list, then insert into an `IndexMap` in source
-                    // order — a later duplicate key overwrites the value but keeps
-                    // the first-seen position (IndexMap semantics), byte-identical
-                    // to the tree-walker's `ExprKind::Object`.
+                    // SHAPE Task 3.1/3.2: shared body for both lanes (see
+                    // `exec_new_object`) — byte-identical to the sync lane and to
+                    // the tree-walker's `ExprKind::Object`. `fault_ip` is the op
+                    // offset; the operand is the pair count.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
-                    for slot in pairs.iter_mut().rev() {
-                        let value = fiber.pop();
-                        let key = match fiber.pop() {
-                            Value::Str(s) => s,
-                            other => {
-                                return Err(self.panic_at(
-                                    fiber,
-                                    fault_ip,
-                                    format!("NEW_OBJECT key is not a string constant: {other:?}"),
-                                ))
-                            }
-                        };
-                        *slot = (key, value);
-                    }
-                    let mut map = indexmap::IndexMap::with_capacity(n);
-                    for (k, v) in pairs {
-                        map.insert(k.to_string(), v);
-                    }
-                    // Assign the object's hidden-class shape from its final ordered
-                    // keys (V11-T2). Pure metadata — does not change behavior.
-                    let cell = crate::value::ObjectCell::new(map);
-                    let shape = self.object_shape_for(cell.map.borrow().keys().map(|s| s.as_str()));
-                    cell.shape.set(shape);
-                    fiber.push(Value::Object(cell));
+                    self.exec_new_object(fiber, fault_ip, n)?;
                 }
 
                 Op::NewMap => {
@@ -4683,9 +4727,10 @@ impl Vm {
                 }
 
                 Op::AppendObject => {
-                    // `[obj, key, val] -- [obj]` — insert `key -> val` into the
-                    // builder object `obj`. Later-wins + first-position (IndexMap
-                    // insert), byte-identical to the tree-walker's `ExprKind::Object`.
+                    // SHAPE Task 3.1: `[obj, key, val] -- [obj]` — insert via
+                    // vm_object_insert (precise registry transition, works in both
+                    // slab and dict mode). Later-wins + first-position, byte-identical
+                    // to the tree-walker's `ExprKind::Object`.
                     let val = fiber.pop();
                     let key = match fiber.pop() {
                         Value::Str(s) => s,
@@ -4699,10 +4744,8 @@ impl Vm {
                     };
                     match fiber.peek(0) {
                         Value::Object(obj) => {
-                            obj.borrow_mut().insert(key.to_string(), val);
-                            // A new key may have been added → resync the shape.
                             let obj = obj.clone();
-                            self.resync_object_shape(&obj);
+                            self.vm_object_insert(&obj, &key, val);
                         }
                         other => {
                             return Err(self.panic_at(
@@ -4718,31 +4761,22 @@ impl Vm {
                 }
 
                 Op::SpreadObject => {
-                    // `[obj, operand] -- [obj]` — merge the operand object's entries
-                    // into the builder object `obj`. Mirrors the tree-walker's
-                    // `ExprKind::Object` spread arm: a non-object is the SAME Tier-2
-                    // panic at this op's span; entries insert later-wins/first-pos.
+                    // SHAPE Task 3.1: `[obj, operand] -- [obj]` — snapshot source
+                    // entries via the accessor (works across slab/dict), then insert
+                    // each via vm_object_insert. The non-object spread is the SAME
+                    // Tier-2 panic, anchored at this op's span; entries insert
+                    // later-wins/first-pos — byte-identical to the tree-walker.
                     let operand = fiber.pop();
                     match operand {
                         Value::Object(src) => {
-                            // Snapshot the source entries FIRST (avoids a borrow
-                            // conflict if `obj` aliases `src` via a self-spread).
-                            let entries: Vec<(String, Value)> = src
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
+                            // Snapshot FIRST (avoids borrow conflict on self-spread).
+                            let entries = src.entries();
                             match fiber.peek(0) {
                                 Value::Object(obj) => {
-                                    {
-                                        let mut m = obj.borrow_mut();
-                                        for (k, v) in entries {
-                                            m.insert(k, v);
-                                        }
-                                    }
-                                    // The merge may have added keys → resync shape.
                                     let obj = obj.clone();
-                                    self.resync_object_shape(&obj);
+                                    for (k, v) in entries {
+                                        self.vm_object_insert(&obj, &k, v);
+                                    }
                                 }
                                 other => {
                                     return Err(self.panic_at(
@@ -4783,23 +4817,41 @@ impl Vm {
                 }
 
                 Op::SetIndex => {
-                    // `obj idx val -- val` — store `obj[idx] = val`. The operands
-                    // were pushed obj-then-idx-then-val, so pop val, idx, obj. The
-                    // shared `index_set` dispatch (with the tree-walker) anchors
-                    // every panic at the op's span; the VM has a single instruction
-                    // span, so it is passed for both the receiver-span and
-                    // index-span parameters. Leaves the assigned value on the stack
-                    // (assignment is an expression).
+                    // SHAPE Task 3.1: for Object receivers, use vm_object_insert
+                    // directly (avoids borrow_mut panic on slab mode). Array and
+                    // error paths stay on the shared index_set (dict-only objects
+                    // from the tree-walker). Frozen check and error messages are
+                    // preserved byte-for-byte.
                     let val = fiber.pop();
                     let idx = fiber.pop();
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let v = crate::interp::index_set(&obj, &idx, val, span, span)?;
-                    // Setting `obj[key] = v` on an object may have ADDED a key →
-                    // transition the shape (reassigning an existing key is a no-op).
-                    if let Value::Object(cell) = &obj {
-                        self.resync_object_shape(cell);
-                    }
+                    let v = match &obj {
+                        Value::Object(cell) => {
+                            // Frozen guard (mirrors index_set's frozen_kind check).
+                            if let Some(kind) = crate::value::frozen_kind(&obj) {
+                                return Err(Control::Panic(AsError::at(
+                                    format!("cannot mutate a frozen {kind}"),
+                                    span,
+                                )));
+                            }
+                            match &idx {
+                                Value::Str(key) => {
+                                    let key = key.clone();
+                                    self.vm_object_insert(cell, &key, val.clone());
+                                    val
+                                }
+                                _ => {
+                                    return Err(Control::Panic(AsError::at(
+                                        "object index must be a string",
+                                        span,
+                                    )));
+                                }
+                            }
+                        }
+                        _ => crate::interp::index_set(&obj, &idx, val, span, span)
+                            .map_err(Control::Panic)?,
+                    };
                     fiber.push(v);
                 }
 
@@ -5115,6 +5167,9 @@ impl Vm {
                         } => {
                             let map = exports.borrow().clone();
                             let ns = Value::Object(crate::value::ObjectCell::new(map));
+                            // SHAPE §3.5: count this fresh-dict namespace-import build.
+                            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                            self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                             if is_global {
                                 // A namespace alias is an IMMUTABLE module global.
                                 self.define_user_global(Rc::from(alias.as_str()), ns, false);
@@ -5223,13 +5278,11 @@ impl Vm {
                     let src = fiber.pop();
                     let v = match src {
                         Value::Object(o) => {
-                            o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                            o.get(key.as_ref()).unwrap_or(Value::Nil)
                         }
                         Value::Instance(i) => i
                             .borrow()
-                            .fields
                             .get(key.as_ref())
-                            .cloned()
                             .unwrap_or(Value::Nil),
                         other => {
                             return Err(self.panic_at(
@@ -5294,16 +5347,16 @@ impl Vm {
                         indexmap::IndexMap::new();
                     match src {
                         Value::Object(o) => {
-                            for (k, v) in o.borrow().iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in o.entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
                         Value::Instance(i) => {
-                            for (k, v) in i.borrow().fields.iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), v.clone());
+                            for (k, v) in i.borrow().entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
@@ -5316,6 +5369,9 @@ impl Vm {
                         }
                     }
                     fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                    // SHAPE §3.5: count this fresh-dict OBJECT_REST build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                 }
 
                 Op::MatchArray => {
@@ -5370,8 +5426,8 @@ impl Vm {
                     };
                     let subject = fiber.pop();
                     let ok = match &subject {
-                        Value::Object(o) => o.borrow().contains_key(key.as_ref()),
-                        Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
+                        Value::Object(o) => o.contains_key(key.as_ref()),
+                        Value::Instance(i) => i.borrow().contains_key(key.as_ref()),
                         _ => false,
                     };
                     fiber.push(Value::Bool(ok));
@@ -5455,7 +5511,7 @@ impl Vm {
                     let ok = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().contains_key(key.as_ref())
+                                o.contains_key(key.as_ref())
                             }
                             _ => false,
                         },
@@ -5477,7 +5533,7 @@ impl Vm {
                                 a.borrow().get(idx).cloned().unwrap_or(Value::Nil)
                             }
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().get_index(idx).map(|(_, v)| v.clone()).unwrap_or(Value::Nil)
+                                o.get_index(idx).map(|(_, v)| v).unwrap_or(Value::Nil)
                             }
                             None => Value::Nil,
                         },
@@ -5504,7 +5560,7 @@ impl Vm {
                     let v = match &subject {
                         Value::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                                o.get(key.as_ref()).unwrap_or(Value::Nil)
                             }
                             _ => Value::Nil,
                         },
@@ -6107,7 +6163,7 @@ impl Vm {
                         let _ = def_env.assign(&class.name, Value::Class(class.clone()));
                     }
                     let key = Rc::as_ptr(&class) as usize;
-                    let mut method_map: HashMap<String, Cc<Closure>> = HashMap::new();
+                    let mut method_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (name, mv) in cp.method_names.iter().zip(methods) {
                         match mv {
                             Value::Closure(c) => {
@@ -6122,7 +6178,7 @@ impl Vm {
                             }
                         }
                     }
-                    let mut default_map: HashMap<String, Cc<Closure>> = HashMap::new();
+                    let mut default_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (i, (name, dv)) in cp.default_fields.iter().zip(defaults).enumerate() {
                         match dv {
                             Value::Closure(c) => {
@@ -6162,7 +6218,7 @@ impl Vm {
                             }
                         }
                     }
-                    let mut static_map: HashMap<String, Cc<Closure>> = HashMap::new();
+                    let mut static_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (name, sv) in cp.static_method_names.iter().zip(statics) {
                         match sv {
                             Value::Closure(c) => {
@@ -7289,21 +7345,18 @@ impl Vm {
                 // Cache hit: read the field directly by its stable index.
                 let ic = chunk.field_ic(op_off);
                 if let Some(idx) = ic.lookup(shape) {
-                    let map = cell.map.borrow();
                     // The index is keyed by shape (V11-T2: shape ⇒ key layout), so
                     // it is always in range for an object of that shape.
-                    if let Some((_k, v)) = map.get_index(idx as usize) {
-                        return Some(v.clone());
+                    if let Some(v) = cell.value_at(idx as usize) {
+                        return Some(v);
                     }
                     // Defensive: a stale/out-of-range index never feeds a wrong
                     // value — fall through to re-resolve generically below.
                 }
                 // Miss: resolve the field index generically and RECORD it.
-                let map = cell.map.borrow();
-                match map.get_index_of(name) {
+                match cell.get_index_of(name) {
                     Some(idx) => {
-                        let v = map.get_index(idx).map(|(_, v)| v.clone());
-                        drop(map);
+                        let v = cell.value_at(idx);
                         let mut ic = chunk.field_ic(op_off);
                         ic.record(shape, idx as u32);
                         chunk.set_field_ic(op_off, ic);
@@ -7322,17 +7375,17 @@ impl Vm {
                 // Cache hit: read the field directly by its stable index.
                 let ic = chunk.field_ic(op_off);
                 if let Some(idx) = ic.lookup(shape) {
-                    if let Some((_k, v)) = b.fields.get_index(idx as usize) {
-                        return Some(v.clone());
+                    if let Some(v) = b.value_at(idx as usize) {
+                        return Some(v);
                     }
                     // Defensive fall-through (see Object arm).
                 }
                 // Miss: resolve generically and record IF it is a FIELD. A
                 // method-named access yields `None` here → generic path →
                 // BoundMethod (never cached, never mis-answered).
-                match b.fields.get_index_of(name) {
+                match b.get_index_of(name) {
                     Some(idx) => {
-                        let v = b.fields.get_index(idx).map(|(_, v)| v.clone());
+                        let v = b.value_at(idx);
                         drop(b);
                         let mut ic = chunk.field_ic(op_off);
                         ic.record(shape, idx as u32);
@@ -7556,7 +7609,7 @@ impl Vm {
         // not a method dispatch; the generic path reads the field instead).
         let (class, has_field) = {
             let b = inst.borrow();
-            (b.class.clone(), b.fields.contains_key(name))
+            (b.class.clone(), b.contains_key(name))
         };
         if has_field {
             return None;
@@ -7579,7 +7632,7 @@ impl Vm {
         if let Value::Instance(inst) = obj {
             let (class, has_field) = {
                 let b = inst.borrow();
-                (b.class.clone(), b.fields.contains_key(name))
+                (b.class.clone(), b.contains_key(name))
             };
             if !has_field {
                 // Walk the chain so an INHERITED method binds with the ANCESTOR
@@ -7619,34 +7672,6 @@ impl Vm {
         self.interp
             .read_member(obj, name, span)
             .map_err(Control::from)
-    }
-
-    /// The BASE shape for `class`'s instances — the declared-field key layout in
-    /// declaration order, MERGED base-class first (mirrors `merged_field_schema`,
-    /// which is the order `vm_construct`/`construct` populate fields). Cached per
-    /// class by `Rc` identity so every instance of one class shares the same id.
-    fn class_base_shape(&self, class: &Rc<crate::value::Class>) -> u32 {
-        let key = Rc::as_ptr(class) as usize;
-        if let Some(&s) = self.class_base_shapes.borrow().get(&key) {
-            return s;
-        }
-        let schema = crate::value::merged_field_schema(class);
-        let shape = {
-            let mut reg = self.shapes.borrow_mut();
-            reg.shape_for(schema.keys().map(|k| k.as_str()))
-        };
-        self.class_base_shapes.borrow_mut().insert(key, shape);
-        shape
-    }
-
-    /// The shape id for an object literal's final ordered key list. Used by the
-    /// VM's `NEW_OBJECT`/`APPEND_OBJECT`/`SPREAD_OBJECT` arms once the entry map is
-    /// fully built.
-    fn object_shape_for<'a, I>(&self, keys: I) -> u32
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        self.shapes.borrow_mut().shape_for(keys)
     }
 
     /// The current global-table version (V11-T4). Bumped on every user-global
@@ -7904,28 +7929,105 @@ impl Vm {
         crate::interp::apply_binop(op, a, b, span)
     }
 
-    /// Recompute and store the shape of `obj`'s ObjectCell from its CURRENT keys.
-    /// Called after a mutation that may have ADDED a key (reassigning an existing
-    /// key leaves the layout — and thus the shape — unchanged, which V11-T3's IC
-    /// validity relies on). Walks the full key list through the transition tree;
-    /// a no-op-cost path because shared prefixes are deduped.
-    fn resync_object_shape(&self, obj: &Cc<crate::value::ObjectCell>) {
-        let keys: Vec<String> = obj.map.borrow().keys().cloned().collect();
-        let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
-        obj.shape.set(shape);
+    /// Store `name = value` on an Object cell, preserving exact IndexMap semantics:
+    /// - **Existing key:** overwrite in place (shape unchanged; position kept).
+    /// - **New key on slab:** one registry transition (`add_key`) + `slab_append`
+    ///   (shape transitions to the child). A cap refusal demotes to dict first.
+    /// - **New key on dict / already-demoted:** plain dict insert (shape stays 0).
+    ///
+    /// This replaces `set_member` + `resync_object_shape` for the Object case:
+    /// the shape is always exactly right AFTER this call — no re-walk needed.
+    /// The frozen check is the CALLER's responsibility (`vm_set_prop` / `SetIndex`
+    /// arm checks `check_not_frozen` before reaching here). SHAPE Task 3.1.
+    fn vm_object_insert(&self, cell: &Cc<crate::value::ObjectCell>, name: &str, value: Value) {
+        // Fast path: key already exists — overwrite in place, shape unchanged.
+        if let Some(i) = cell.get_index_of(name) {
+            cell.set_value_at(i, value);
+            return;
+        }
+        // New key. Try a registry transition from the current shape if the cell
+        // is in slab mode (shape 0 is valid for a freshly-built empty literal).
+        let shape = cell.shape.get();
+        if cell.is_slab() {
+            let mut reg = self.shapes.borrow_mut();
+            if let Some(child) = reg.add_key(shape, name) {
+                let child_keys = reg.keys_of(child);
+                drop(reg);
+                if cell.slab_append(child, child_keys, value.clone()) {
+                    return; // successful slab grow
+                }
+                // slab_append returning false means the cell is in dict mode
+                // (can't happen in practice; defensive fall-through to dict insert).
+            } else {
+                drop(reg);
+                // Cap exceeded: demote to dict then insert.
+                cell.demote_to_dict();
+                // SHAPE §3.5: a demotion IS a fresh dict construction — bump both.
+                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                self.bump_shape_stat(|s| {
+                    s.obj_demotions += 1;
+                    s.obj_dict_constructed += 1;
+                });
+            }
+        }
+        // Dict mode (or just demoted): plain insert, shape stays 0.
+        cell.insert(name, value);
     }
 
-    /// Recompute and store an `Instance`'s `shape_id` from its CURRENT field keys.
-    /// Called after a `SET_PROP` that may have ADDED an (undeclared) field — which
-    /// the runtime allows (`set_member` inserts unconditionally). Re-deriving the
-    /// shape keeps the GET_PROP/SET_PROP field IC sound: a changed field LAYOUT
-    /// yields a changed shape, so any cache entry keyed by the OLD shape simply
-    /// MISSES (and re-resolves) instead of reading a stale index. Reassigning an
-    /// existing field leaves the layout — and thus the shape — unchanged.
-    fn resync_instance_shape(&self, inst: &Cc<RefCell<crate::value::Instance>>) {
-        let keys: Vec<String> = inst.borrow().fields.keys().cloned().collect();
-        let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
-        inst.borrow().shape_id.set(shape);
+    /// Store `inst.<name> = value` into a VM (slab) instance with the PRECISE
+    /// registry transition (SHAPE Task 3.4) — the instance flavor of
+    /// `vm_object_insert`. Does NO contract check (the caller runs it via the shared
+    /// `check_instance_field_contract` before calling this). Behavior:
+    ///
+    /// - **Existing key:** overwrite in place via `set_value_at`; shape unchanged.
+    /// - **New key, slab mode:** mint/follow the registry edge (`add_key`) and grow
+    ///   the slab (`slab_append`), transitioning `shape_id` to the child shape.
+    /// - **New key, cap exceeded:** demote to dict (shape → 0), then dict-insert.
+    /// - **New key, dict mode:** plain dict insert (shape stays 0).
+    ///
+    /// Replaces the old `resync_instance_shape` full re-derive — each write
+    /// transitions precisely (analogous to the object path), so the GET/SET field IC
+    /// stays sound with no re-derive.
+    fn vm_instance_insert(
+        &self,
+        inst: &Cc<RefCell<crate::value::Instance>>,
+        name: &str,
+        value: Value,
+    ) {
+        // Fast path: key already exists — overwrite in place, shape unchanged.
+        let existing = inst.borrow().get_index_of(name);
+        if let Some(i) = existing {
+            inst.borrow_mut().set_value_at(i, value);
+            return;
+        }
+        // New key. Try a registry transition from the current shape if slab mode.
+        let (is_slab, shape) = {
+            let b = inst.borrow();
+            (b.is_slab(), b.shape_id.get())
+        };
+        if is_slab {
+            let mut reg = self.shapes.borrow_mut();
+            if let Some(child) = reg.add_key(shape, name) {
+                let child_keys = reg.keys_of(child);
+                drop(reg);
+                if inst.borrow_mut().slab_append(child, child_keys, value.clone()) {
+                    return; // successful slab grow
+                }
+                // slab_append false ⇒ not slab (can't happen here); fall through.
+            } else {
+                drop(reg);
+                // Cap exceeded: demote to dict (shape → 0) then dict-insert.
+                inst.borrow_mut().demote_to_dict();
+                // SHAPE §3.5: a demotion IS a fresh dict construction — bump both.
+                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                self.bump_shape_stat(|s| {
+                    s.obj_demotions += 1;
+                    s.obj_dict_constructed += 1;
+                });
+            }
+        }
+        // Dict mode (or just demoted): plain insert, shape stays 0.
+        inst.borrow_mut().insert(name, value);
     }
 
     /// `SET_PROP` with the field inline cache (V11-T3). Stores `obj.<name> = value`
@@ -7968,40 +8070,45 @@ impl Vm {
                 if self.specialize && shape != 0 && !crate::stdlib::schema::is_schema_value(obj) {
                     let ic = chunk.field_ic(op_off);
                     if let Some(idx) = ic.lookup(shape) {
-                        let mut map = cell.map.borrow_mut();
-                        if let Some((_k, slot)) = map.get_index_mut(idx as usize) {
-                            *slot = value.clone();
+                        if cell.set_value_at(idx as usize, value.clone()) {
                             return Ok(value);
                         }
                         // Defensive: stale index → fall through to generic set.
                     }
                 }
-                // Generic store (may add a key), then resync shape + record index.
-                let v = self.interp.set_member(obj, name, value, span, span)?;
-                self.resync_object_shape(cell);
+                // SHAPE Task 3.1: generic store via vm_object_insert (precise
+                // registry transition; no resync needed — the shape is already
+                // up-to-date after the insert). Replaces set_member + resync.
+                self.vm_object_insert(cell, name, value.clone());
                 let new_shape = cell.shape.get();
                 if self.specialize && new_shape != 0 && !crate::stdlib::schema::is_schema_value(obj)
                 {
-                    if let Some(idx) = cell.map.borrow().get_index_of(name) {
+                    if let Some(idx) = cell.get_index_of(name) {
                         let mut ic = chunk.field_ic(op_off);
                         ic.record(new_shape, idx as u32);
                         chunk.set_field_ic(op_off, ic);
                     }
                 }
-                Ok(v)
+                Ok(value)
             }
             Value::Instance(inst) => {
-                // ALWAYS run the contract check via the shared `set_member`.
-                let v = self.interp.set_member(obj, name, value, span, span)?;
-                // A set may have added an undeclared field → re-derive the shape so
-                // the field IC stays sound, then record this field's index.
-                self.resync_instance_shape(inst);
+                // SHAPE Task 3.4: run the declared field-type CONTRACT via the SHARED
+                // chokepoint (`check_instance_field_contract`, the same code the
+                // tree-walker's `set_member` reaches) — byte-identical panic
+                // message/span. The frozen guard already ran at the top of this fn.
+                let class = inst.borrow().class.clone();
+                self.interp
+                    .check_instance_field_contract(&class, name, &value, span)?;
+                // Then do ONE precise registry transition / demotion (existing key →
+                // overwrite in place, shape unchanged; new key → slab grow or
+                // demote). Replaces set_member + the old full re-derive resync.
+                self.vm_instance_insert(inst, name, value.clone());
                 // KILL SWITCH (V11-T5): only record the field IC when specialize ON.
                 let recorded = self.specialize.then(|| {
                     let b = inst.borrow();
                     let new_shape = b.shape_id.get();
                     (new_shape != 0)
-                        .then(|| b.fields.get_index_of(name).map(|idx| (new_shape, idx)))
+                        .then(|| b.get_index_of(name).map(|idx| (new_shape, idx)))
                         .flatten()
                 });
                 if let Some(Some((new_shape, idx))) = recorded {
@@ -8009,7 +8116,7 @@ impl Vm {
                     ic.record(new_shape, idx as u32);
                     chunk.set_field_ic(op_off, ic);
                 }
-                Ok(v)
+                Ok(value)
             }
             // Non-settable receiver: shared Tier-2 panic (byte-identical).
             _ => self.interp.set_member(obj, name, value, span, span),
@@ -8029,15 +8136,18 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let instance = Cc::new(RefCell::new(crate::value::Instance {
-            class: class.clone(),
-            fields: indexmap::IndexMap::new(),
-            // Give the instance its class's BASE shape (the declared-field layout,
-            // in declaration order). V11-T3 inline caches key on this.
-            shape_id: std::cell::Cell::new(self.class_base_shape(&class)),
-            frozen: std::cell::Cell::new(false),
-        }));
+        // SHAPE Task 3.4: build the instance's fields as an EMPTY slab at
+        // EMPTY_SHAPE (shape 0). Each default / init-assigned / auto-init field is
+        // inserted through the precise registry transition (`vm_instance_insert`),
+        // so the FINAL shape reflects the ACTUAL field layout in insertion order —
+        // identical to the old "IndexMap then resync" end state, but transitioned
+        // precisely (no trailing full re-derive). Mirrors the object path.
+        let instance =
+            Cc::new(RefCell::new(crate::value::Instance::new_empty_slab(class.clone())));
         let inst_val = Value::Instance(instance.clone());
+        // SHAPE §3.5: count every fresh instance slab construction.
+        #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+        self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
 
         // Apply field defaults BASE-CLASS FIRST so a subclass default overrides a
         // base one with the same name (mirrors the tree-walker's `construct`, which
@@ -8085,7 +8195,7 @@ impl Vm {
                         return Err(crate::interp::contract_panic(&schema.ty, &dv, span));
                     }
                 }
-                instance.borrow_mut().fields.insert(fname, dv);
+                self.vm_instance_insert(&instance, &fname, dv);
             }
         }
 
@@ -8106,16 +8216,13 @@ impl Vm {
             let fields = crate::value::merged_field_schema(&class);
             let bindings = crate::interp::auto_init_bindings(&fields, &class.name, args, span)?;
             for (fname, v) in bindings {
-                instance.borrow_mut().fields.insert(fname, v);
+                self.vm_instance_insert(&instance, &fname, v);
             }
         }
-        // Re-derive the shape from the instance's ACTUAL fields now that defaults +
-        // `init` have populated them. The base shape set above reflects the FULL
-        // declared schema, but `fields` only holds what was actually inserted (and
-        // in insertion order), so a field IC keying on `shape_id` must see the real
-        // layout — otherwise two instances sharing the base shape but with different
-        // actual layouts could read a wrong index. (V11-T3 IC soundness.)
-        self.resync_instance_shape(&instance);
+        // SHAPE Task 3.4: NO trailing resync — each `vm_instance_insert` above (and
+        // any `self.f = …` inside `init`, routed through `vm_set_prop` →
+        // `vm_instance_insert`) transitions the shape PRECISELY, so `shape_id`
+        // already reflects the real insertion-order layout. (V11-T3 IC soundness.)
         Ok(inst_val)
     }
 
@@ -8320,6 +8427,205 @@ impl Vm {
         }
     }
 
+    /// SHAPE Task 3.1/3.2 — shared `Op::NewObject` body for BOTH the sync and
+    /// async lanes (the single source of truth so the two drivers cannot diverge;
+    /// the four/five-mode differential enforces it). `fault_ip` is the op's
+    /// bytecode offset (both the `lit_shapes` cache key and the panic span); `n`
+    /// is the pair count. Pops `n` (key, value) pairs (stack top-down is
+    /// vN,kN,…,v1,k1) and pushes the constructed `Value::Object`.
+    ///
+    /// On the SPECIALIZED path a warm `lit_shapes` entry skips the registry probe
+    /// and IndexMap fold; a cold pass runs the generic build and records the
+    /// result. On the GENERIC path (`!specialize`) the cache is NEVER read or
+    /// written — the generic slab/dict build runs unconditionally. Both produce
+    /// byte-identical objects.
+    fn exec_new_object(&self, fiber: &mut Fiber, fault_ip: usize, n: usize) -> Result<(), Control> {
+        if self.specialize {
+            // Consult the per-site cache.
+            let cached = fiber
+                .frame()
+                .closure
+                .proto
+                .chunk
+                .lit_shape(fault_ip);
+            match cached {
+                Some(crate::vm::chunk::LitShapeCache::Warm {
+                    shape,
+                    keys,
+                    slot_of_pair,
+                }) => {
+                    // Warm hit: pop `n` (value, key) pairs straight into slots,
+                    // discarding the key constants (already validated when this
+                    // site was first recorded). Build a pre-sized values vector.
+                    let slot_count = keys.len();
+                    let mut values: Vec<Value> = vec![Value::Nil; slot_count];
+                    match &slot_of_pair {
+                        // Identity case: pair `i` → slot `i`, no dups, popped
+                        // order is reverse source order so write directly by
+                        // index. slot_count == n here.
+                        None => {
+                            for slot in (0..n).rev() {
+                                let value = fiber.pop();
+                                let _key = fiber.pop(); // discard the key const
+                                values[slot] = value;
+                            }
+                        }
+                        // Remap / dup-fold case. We pop in REVERSE source order
+                        // (last source pair first), so to honor later-source-wins
+                        // we must NOT let an earlier (later-popped) pair overwrite
+                        // a slot a later (earlier-popped) pair already filled.
+                        // Track filled slots and write only the first arrival in
+                        // pop order (= the latest source position for that slot).
+                        Some(sop) => {
+                            let mut filled = vec![false; slot_count];
+                            for src_idx in (0..n).rev() {
+                                let value = fiber.pop();
+                                let _key = fiber.pop(); // discard the key const
+                                let slot = sop[src_idx] as usize;
+                                if !filled[slot] {
+                                    values[slot] = value;
+                                    filled[slot] = true;
+                                }
+                            }
+                        }
+                    }
+                    let cell = crate::value::ObjectCell::new_slab(keys, values, shape);
+                    // SHAPE §3.5: count this warm-hit slab build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
+                    fiber.push(Value::Object(cell));
+                    return Ok(());
+                }
+                Some(crate::vm::chunk::LitShapeCache::Negative) => {
+                    // Cap-refused site: skip the registry probe, build a dict.
+                    return self.new_object_generic(fiber, fault_ip, n, false);
+                }
+                None => {
+                    // Cold: build generically AND record the per-site cache.
+                    return self.new_object_generic(fiber, fault_ip, n, true);
+                }
+            }
+        }
+        // Generic / kill-switch path: never touch the cache.
+        self.new_object_generic(fiber, fault_ip, n, false)
+    }
+
+    /// The generic (registry-probe + IndexMap-fold) `NewObject` build, shared by
+    /// both lanes and reused on every cold/Negative/`--no-specialize` path. When
+    /// `record` is true (the specialized COLD pass) it writes the resulting
+    /// `lit_shapes` entry for the site at `fault_ip`. Byte-identical to the
+    /// tree-walker's `ExprKind::Object` (same order + duplicate-key semantics).
+    fn new_object_generic(
+        &self,
+        fiber: &mut Fiber,
+        fault_ip: usize,
+        n: usize,
+        record: bool,
+    ) -> Result<(), Control> {
+        // Pop `n` (key, value) pairs in source order (stack: vN,kN,…,v1,k1).
+        let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
+        for slot in pairs.iter_mut().rev() {
+            let value = fiber.pop();
+            let key = match fiber.pop() {
+                Value::Str(s) => s,
+                other => {
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        format!("NEW_OBJECT key is not a string constant: {other:?}"),
+                    ))
+                }
+            };
+            *slot = (key, value);
+        }
+        // Fold duplicates into an ordered (key, value) sequence: first occurrence
+        // wins position, last occurrence wins value — exactly IndexMap::insert.
+        // `slot_of_src[i]` is the final slab slot for the i-th SOURCE pair.
+        let mut order: Vec<Rc<str>> = Vec::with_capacity(n);
+        let mut vals: indexmap::IndexMap<String, Value> = indexmap::IndexMap::with_capacity(n);
+        let mut slot_of_src: Vec<u16> = Vec::with_capacity(n);
+        let mut had_dup = false;
+        for (k, v) in &pairs {
+            let ks = k.to_string();
+            let slot = match vals.get_full(&ks) {
+                Some((idx, _, _)) => {
+                    had_dup = true;
+                    idx
+                }
+                None => {
+                    let idx = order.len();
+                    order.push(k.clone());
+                    idx
+                }
+            };
+            slot_of_src.push(slot as u16);
+            vals.insert(ks, v.clone());
+        }
+        // Try slab mode: intern the ordered key sequence through the registry. A
+        // cap refusal falls back to dict mode (shape 0).
+        let cell = {
+            let mut reg = self.shapes.borrow_mut();
+            match reg.shape_for(order.iter().map(|k| k.as_ref())) {
+                Some(shape) => {
+                    let keys = reg.keys_of(shape);
+                    drop(reg);
+                    let values: Vec<Value> = order
+                        .iter()
+                        .map(|k| vals.shift_remove(k.as_ref()).unwrap())
+                        .collect();
+                    if record {
+                        // Identity fast case: no dups AND popped order already
+                        // equals the slab order (slot_of_src is 0,1,2,…).
+                        let identity = !had_dup
+                            && slot_of_src
+                                .iter()
+                                .enumerate()
+                                .all(|(i, &s)| s as usize == i);
+                        let slot_of_pair: Option<Rc<[u16]>> = if identity {
+                            None
+                        } else {
+                            Some(Rc::from(slot_of_src.as_slice()))
+                        };
+                        fiber.frame().closure.proto.chunk.set_lit_shape(
+                            fault_ip,
+                            crate::vm::chunk::LitShapeCache::Warm {
+                                shape,
+                                keys: keys.clone(),
+                                slot_of_pair,
+                            },
+                        );
+                    }
+                    // SHAPE §3.5: count this generic-path slab build.
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
+                    crate::value::ObjectCell::new_slab(keys, values, shape)
+                }
+                None => {
+                    drop(reg);
+                    // Cap exceeded: fall back to dict mode (shape 0).
+                    let mut map = indexmap::IndexMap::with_capacity(order.len());
+                    for k in &order {
+                        map.insert(k.to_string(), vals.shift_remove(k.as_ref()).unwrap());
+                    }
+                    if record {
+                        fiber
+                            .frame()
+                            .closure
+                            .proto
+                            .chunk
+                            .set_lit_shape(fault_ip, crate::vm::chunk::LitShapeCache::Negative);
+                    }
+                    // SHAPE §3.5: count this fresh-dict build (cap refused).
+                    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                    self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
+                    crate::value::ObjectCell::new(map)
+                }
+            }
+        };
+        fiber.push(Value::Object(cell));
+        Ok(())
+    }
+
     /// Unwind ONE call frame, returning `value` from it.
     ///
     /// Shared by `Op::Return` (a normal `return v`) and `Op::Propagate` (a `?`
@@ -8383,7 +8689,7 @@ fn variant_payload_len(v: &Value) -> Option<usize> {
     match v {
         Value::EnumVariant(ev) => match &ev.payload {
             Some(crate::value::Payload::Positional(a)) => Some(a.borrow().len()),
-            Some(crate::value::Payload::Named(o)) => Some(o.borrow().len()),
+            Some(crate::value::Payload::Named(o)) => Some(o.len()),
             None => None,
         },
         _ => None,
@@ -10170,13 +10476,160 @@ mod tests {
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
             RunOutcome::Done(Value::Object(o)) => {
-                let b = o.borrow();
-                let keys: Vec<&str> = b.keys().map(|k| k.as_str()).collect();
+                let keys: Vec<String> = o.keys_snapshot();
                 assert_eq!(keys, vec!["a", "b"], "keys in insertion order");
-                assert_eq!(b.get("a"), Some(&Value::Float(1.0)));
-                assert_eq!(b.get("b"), Some(&Value::Float(2.0)));
+                assert_eq!(o.get("a"), Some(Value::Float(1.0)));
+                assert_eq!(o.get("b"), Some(Value::Float(2.0)));
             }
             other => panic!("expected Done(Object), got {other:?}"),
+        }
+    }
+
+    /// Like `run_chunk`, but returns the surviving `Rc<FnProto>` alongside the
+    /// outcome so a test can inspect the chunk's runtime side tables (the
+    /// IC-style `lit_shapes` cache) AFTER the run. The fiber is built fresh from
+    /// a clone of the proto so the original `Rc<FnProto>` (and thus the chunk)
+    /// outlives the VM. `specialize` toggles the kill switch.
+    fn run_chunk_retain(
+        chunk: Chunk,
+        specialize: bool,
+    ) -> (Result<RunOutcome, Control>, Rc<FnProto>) {
+        let proto = Rc::new(FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let closure = Closure::new(proto.clone());
+        let mut fiber = Fiber::new(closure);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let local = LocalSet::new();
+        let outcome = local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = if specialize {
+                Vm::new(interp)
+            } else {
+                Vm::new_generic(interp)
+            };
+            vm.run(&mut fiber).await
+        });
+        (outcome, proto)
+    }
+
+    #[test]
+    fn new_object_warms_per_site_lit_shape_cache() {
+        // SHAPE Task 3.2: after running a `NewObject 2` site the per-site
+        // `lit_shapes` entry is Warm with the right shape id and keys.
+        let mut c = Chunk::new();
+        for (k, v) in [("a", 1.0), ("b", 2.0)] {
+            let ki = c.add_const(Value::Str(Rc::from(k)));
+            c.emit_u16(Op::Const, ki, s());
+            let vi = c.add_const(Value::Float(v));
+            c.emit_u16(Op::Const, vi, s());
+        }
+        let site_off = c.code.len(); // the NewObject op offset
+        c.emit_u16(Op::NewObject, 2, s());
+        c.emit(Op::Return, s());
+
+        let (outcome, proto) = run_chunk_retain(c, true);
+        let obj1 = match outcome.expect("run ok") {
+            RunOutcome::Done(Value::Object(o)) => o,
+            other => panic!("expected Done(Object), got {other:?}"),
+        };
+        let entry = proto
+            .chunk
+            .lit_shape(site_off)
+            .expect("lit_shape recorded after a NewObject run");
+        match &entry {
+            crate::vm::chunk::LitShapeCache::Warm { shape, keys, .. } => {
+                assert_eq!(
+                    keys.iter().map(|k| k.as_ref()).collect::<Vec<_>>(),
+                    vec!["a", "b"],
+                    "cached keys in insertion order"
+                );
+                assert_eq!(*shape, obj1.shape.get(), "cached shape matches the object");
+            }
+            other => panic!("expected Warm lit_shape, got {other:?}"),
+        }
+
+        // Two objects from the SAME shape share their keys Rc and shape id.
+        let mut c2 = Chunk::new();
+        for _ in 0..2 {
+            for (k, v) in [("a", 1.0), ("b", 2.0)] {
+                let ki = c2.add_const(Value::Str(Rc::from(k)));
+                c2.emit_u16(Op::Const, ki, s());
+                let vi = c2.add_const(Value::Float(v));
+                c2.emit_u16(Op::Const, vi, s());
+            }
+            c2.emit_u16(Op::NewObject, 2, s());
+        }
+        c2.emit_u16(Op::NewArray, 2, s());
+        c2.emit(Op::Return, s());
+        let (out2, _p2) = run_chunk_retain(c2, true);
+        match out2.expect("run ok") {
+            RunOutcome::Done(Value::Array(a)) => {
+                let a = a.borrow();
+                let (o1, o2) = match (&a[0], &a[1]) {
+                    (Value::Object(o1), Value::Object(o2)) => (o1.clone(), o2.clone()),
+                    other => panic!("expected two objects, got {other:?}"),
+                };
+                assert_eq!(o1.shape.get(), o2.shape.get(), "same shape id");
+                assert!(
+                    Rc::ptr_eq(&o1.slab_keys().unwrap(), &o2.slab_keys().unwrap()),
+                    "two objects from the same shape share their keys Rc"
+                );
+            }
+            other => panic!("expected Done(Array), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_object_duplicate_key_site_records_slot_of_pair() {
+        // SHAPE Task 3.2: a duplicate-key site `{a: 1, a: 2}` (constants
+        // ["a","a"]) folds to {a: 2} (later source position wins) and records a
+        // `slot_of_pair = Some([0, 0])` (both source pairs map to slot 0).
+        let mut c = Chunk::new();
+        for v in [1.0, 2.0] {
+            let ki = c.add_const(Value::Str(Rc::from("a")));
+            c.emit_u16(Op::Const, ki, s());
+            let vi = c.add_const(Value::Float(v));
+            c.emit_u16(Op::Const, vi, s());
+        }
+        let site_off = c.code.len();
+        c.emit_u16(Op::NewObject, 2, s());
+        c.emit(Op::Return, s());
+        let (outcome, proto) = run_chunk_retain(c, true);
+        match outcome.expect("run ok") {
+            RunOutcome::Done(Value::Object(o)) => {
+                assert_eq!(o.keys_snapshot(), vec!["a"], "duplicate key folded");
+                assert_eq!(
+                    o.get("a"),
+                    Some(Value::Float(2.0)),
+                    "later source position wins"
+                );
+            }
+            other => panic!("expected Done(Object), got {other:?}"),
+        }
+        match proto.chunk.lit_shape(site_off).expect("warm") {
+            crate::vm::chunk::LitShapeCache::Warm { slot_of_pair, .. } => {
+                let sop = slot_of_pair.expect("duplicate site has an explicit slot_of_pair");
+                assert_eq!(
+                    sop.iter().copied().collect::<Vec<u16>>(),
+                    vec![0u16, 0u16],
+                    "both source pairs map to slot 0"
+                );
+            }
+            other => panic!("expected Warm, got {other:?}"),
         }
     }
 

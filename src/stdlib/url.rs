@@ -121,8 +121,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "buildQuery" => {
             let o = want_object(&arg(args, 0), span, &ctx("buildQuery"))?;
             let mut ser = ::url::form_urlencoded::Serializer::new(String::new());
-            for (k, v) in o.borrow().iter() {
-                let val = match v {
+            for (k, v) in o.entries() {
+                let val = match &v {
                     Value::Str(s) => s.to_string(),
                     // NUM §4: an `Int` formats without a decimal point.
                     Value::Int(_) => v.to_string(),
@@ -147,7 +147,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         .into())
                     }
                 };
-                ser.append_pair(k, &val);
+                ser.append_pair(k.as_ref(), &val);
             }
             Ok(Value::Str(ser.finish().into()))
         }
@@ -157,16 +157,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         // output).  Tier-1 result — invalid components produce an error.
         "build" => {
             let o = want_object(&arg(args, 0), span, &ctx("build"))?;
-            let borrow = o.borrow();
             let get_str = |key: &str| -> Option<String> {
-                match borrow.get(key) {
+                match o.get(key) {
                     Some(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
                     _ => None,
                 }
             };
             let get_num = |key: &str| -> Option<f64> {
                 // NUM §4: accept BOTH numeric subtypes.
-                borrow.get(key).and_then(|v| v.as_f64())
+                o.get(key).and_then(|v| v.as_f64())
             };
 
             let scheme = match get_str("scheme") {
@@ -275,7 +274,7 @@ mod tests {
     /// Pull a named field from a `Value::Object`.
     fn field(obj: &Value, key: &str) -> Value {
         match obj {
-            Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
             _ => panic!("not an object: {:?}", obj),
         }
     }
@@ -350,9 +349,8 @@ mod tests {
         let obj = call("parseQuery", &[s("a=1&b=2&a=3")], sp()).unwrap();
         match &obj {
             Value::Object(o) => {
-                let borrow = o.borrow();
-                assert_eq!(borrow.get("a"), Some(&s("3")));
-                assert_eq!(borrow.get("b"), Some(&s("2")));
+                assert_eq!(o.get("a"), Some(s("3")));
+                assert_eq!(o.get("b"), Some(s("2")));
             }
             _ => panic!("expected object, got {:?}", obj),
         }
@@ -369,7 +367,7 @@ mod tests {
     fn parse_query_empty() {
         let obj = call("parseQuery", &[s("")], sp()).unwrap();
         match &obj {
-            Value::Object(o) => assert!(o.borrow().is_empty()),
+            Value::Object(o) => assert!(o.is_empty()),
             _ => panic!("expected object"),
         }
     }

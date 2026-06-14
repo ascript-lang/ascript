@@ -99,7 +99,7 @@ stated, results are measured.
 
 ### Representation — where allocation & hashing go to die
 
-- 🔒 **SHAPE — Shape-native object storage + interior hashing.** Shapes stop being an id beside
+- ✅ **SHAPE — Shape-native object storage + interior hashing.** Shapes stop being an id beside
   an `IndexMap` and become the OWNER of the key→index layout; object/instance storage becomes a
   flat values slab. Object literals get compile-time-precomputed shape ids (zero hashing at
   construction); `resync_object_shape` loses its key-clone. Interior hash tables that never see
@@ -108,6 +108,7 @@ stated, results are measured.
   preserve today's semantics exactly (insertion order, deletion, dynamic keys).
   - Spec: `superpowers/specs/2026-06-12-shape-storage-design.md`
   - Plan: `superpowers/plans/2026-06-12-shape-storage.md`
+  - **MERGED to `main` (`--no-ff`).** See EXECUTION LOG. NANB is now unblocked.
 
 - 🔒 **NANB — 8-byte NaN-boxed `Value`.** The representation endgame VAL §3.2 sanctioned but
   parked: `Value` becomes a single 8-byte NaN-boxed word (inline `float`; tagged inline `int`
@@ -468,6 +469,41 @@ stated, results are measured.
     **memory/alloc win** (Gate 18): 0 allocs/qualifying call + halved re-entrant allocs. The +1.1%
     wall-clock headline reflects that a fast system allocator's amortised cost is already low on this
     hardware; the structural allocation elimination matters more at scale and under memory pressure.
+
+- **SHAPE** — ✅ MERGED to `main` (`--no-ff`). Shape-native object/instance storage: `ObjectCell` and
+  `Instance.fields` now hold an `ObjectStorage::{Slab{keys: Rc<[Rc<str>]>, values: Vec<Value>} | Dict(IndexMap)}`
+  behind SEALED accessors (the legacy `borrow()` shim panics on a slab). The VM builds slabs; the
+  tree-walker builds Dict (shape 0) — the oracle is unchanged, which the four/five-mode differential proves.
+  - **Phases:** 0 (the live `object.delete` stale-shape IC bug, fixed first on the old representation);
+    1 (mechanical accessor-API migration + sealing `map` private — ~48 files); 2 (`ShapeRegistry` v2 with
+    canonical key-lists + Fx borrowed probes + caps `SLAB_MAX_KEYS=64`/`SHAPE_FANOUT_MAX=128`, the
+    `ObjectStorage` slab/dict dual mode, GC two-arm trace + slab-cycle reclamation); 3 (VM wiring —
+    slab-native `Op::NewObject`, the per-site `lit_shapes` cache, IC read/write over the slab, instance
+    fields on the slab via `vm_instance_insert`, fuzzgen-gated mode counters; `resync_object_shape` +
+    `resync_instance_shape` + `class_base_shape`/`object_shape_for` all DELETED in favor of precise per-key
+    transitions); 4 (FxHash on the bounded VM interior tables — `class_methods`/`class_static_methods`/
+    `class_defaults`/`user_globals` + registry — with `Map`/`Set`/dict-mode objects/decode paths KEEPING
+    SipHash, §6.2 hash-flooding-DoS decision; `tests/shape_security.rs` 100k-hostile-key bound + Map-SipHash
+    type proof); 5 (order-stress examples intro+advanced, fuzzer axis spread/delete/rest/wide-object +
+    coverage assertion slab>0∧dict>0∧demote>0, negative-space `.aso`-unchanged guard); 6 (A/B + docs + merge).
+  - **Field-type contract** for instances hoisted to the single shared `Interp::check_instance_field_contract`
+    (byte-identical message/span on both engines).
+  - **Performance (`bench/SHAPE_RESULTS.md`, same-session A/B, Gate 16):** **per-object alloc 13.0 → 2.0
+    (6.5×, Gate 18)** — the mechanical core; `object_churn` **1.77×**; A/B geomean **1.089×**; peak RSS no
+    regression; profiler object_churn hashing **14% → 0%**, alloc 17.6% → 5.7%. `json_roundtrip` **flat by
+    design** (decode-born objects stay Dict/SipHash, spec §9 — recorded honestly, not hidden). Cap sweep
+    (9 combos) showed zero sensitivity → kept defaults 64/128. Gate-12 spec/tw **4.2–4.3×** (≥2×);
+    `dbg_zero_cost_gate` **0.994×** (≤1.05× — the dispatch loop's `NewObject`/prop arms changed).
+  - **No grammar change, no `.aso`/opcode change** (`ASO_FORMAT_VERSION` stays **28**; guarded by
+    `tests/shape_negative_space.rs` — version pin + `from_u8`-count Op-variant pin + round-trip; the
+    `git diff main` audit shows only a +1 non-serializing `debug_assert` in `aso.rs`). No new `Value`
+    variant; no tree-walker behavior change; demotion is one-way (no dict→slab re-promotion).
+  - **Four/five-mode byte-identical** (tree-walker == specialized == generic == no-sync-lane == no-call-fast
+    == `.aso`) over the full corpus + goldens, BOTH feature configs (443/0). Whole-effort holistic: GO.
+  - **Bugs fixed in-branch failing-test-first:** Phase-0 `object.delete` stale-shape IC (four-way regression);
+    3 production slab-panic stdlib sites (compress `entry_name_data`/`build_zip`, `ffi.alloc`) + 1 more found
+    in review (`ai/json_schema`) + `interp.rs TestSummary::from_value`; 2 vacuous IC tests caught + fixed;
+    the Op-count append blind-spot in the negative-space guard. NANB is now unblocked (SHAPE+CALL done).
 
 ## Execution order
 

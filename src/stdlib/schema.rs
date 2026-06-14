@@ -149,7 +149,7 @@ fn err_obj(path: &str, message: String) -> Value {
 /// `json.parse(text, schema)` without importing the entire engine.
 pub(crate) fn schema_kind(schema: &Value) -> Option<Rc<str>> {
     match schema {
-        Value::Object(o) => match o.borrow().get("__kind") {
+        Value::Object(o) => match o.get("__kind") {
             Some(Value::Str(s)) => Some(s.clone()),
             _ => None,
         },
@@ -214,7 +214,7 @@ pub(crate) fn is_schema_method(name: &str) -> bool {
 /// Get a field from a `Value::Object`.
 fn obj_field(obj: &Value, key: &str) -> Option<Value> {
     match obj {
-        Value::Object(o) => o.borrow().get(key).cloned(),
+        Value::Object(o) => o.get(key),
         _ => None,
     }
 }
@@ -724,9 +724,9 @@ impl Interp {
                         // Collect declared field names and schemas
                         let field_pairs: Vec<(String, Value)> = match &fields_schema {
                             Value::Object(fs) => fs
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .entries()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v))
                                 .collect(),
                             _ => {
                                 return Err(ParseFail::InvalidSchema(
@@ -739,8 +739,7 @@ impl Interp {
                         if is_strict {
                             let declared: std::collections::HashSet<&str> =
                                 field_pairs.iter().map(|(k, _)| k.as_str()).collect();
-                            let val_borrow = val_obj.borrow();
-                            for k in val_borrow.keys() {
+                            for k in val_obj.keys_snapshot() {
                                 if !declared.contains(k.as_str()) {
                                     let key_path = if path.is_empty() {
                                         k.clone()
@@ -759,9 +758,7 @@ impl Interp {
                         let mut out: IndexMap<String, Value> = IndexMap::new();
                         for (field_name, field_schema) in &field_pairs {
                             let field_val = val_obj
-                                .borrow()
                                 .get(field_name)
-                                .cloned()
                                 .unwrap_or(Value::Nil);
                             let field_path = if path.is_empty() {
                                 field_name.clone()
@@ -802,9 +799,9 @@ impl Interp {
                         .map(|(k, v)| (k.to_value(), v.clone()))
                         .collect(),
                     Value::Object(o) => o
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (Value::Str(k.as_str().into()), v.clone()))
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (Value::Str(k.as_ref().into()), v))
                         .collect(),
                     _ => {
                         return Err(ParseFail::Mismatch(err_obj(
@@ -1087,9 +1084,9 @@ impl Interp {
                     Value::Object(val_obj) => {
                         let field_pairs: Vec<(String, Value)> = match &fields_schema {
                             Value::Object(fs) => fs
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .entries()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v))
                                 .collect(),
                             _ => {
                                 return Err(ParseFail::InvalidSchema(
@@ -1102,14 +1099,11 @@ impl Interp {
                         if is_strict {
                             let declared: std::collections::HashSet<&str> =
                                 field_pairs.iter().map(|(k, _)| k.as_str()).collect();
-                            let extra: Vec<String> = {
-                                let val_borrow = val_obj.borrow();
-                                val_borrow
-                                    .keys()
-                                    .filter(|k| !declared.contains(k.as_str()))
-                                    .cloned()
-                                    .collect()
-                            };
+                            let extra: Vec<String> = val_obj
+                                .keys_snapshot()
+                                .into_iter()
+                                .filter(|k| !declared.contains(k.as_str()))
+                                .collect();
                             for k in extra {
                                 let key_path = if path.is_empty() {
                                     k.clone()
@@ -1126,9 +1120,7 @@ impl Interp {
                         let mut out: IndexMap<String, Value> = IndexMap::new();
                         for (field_name, field_schema) in &field_pairs {
                             let field_val = val_obj
-                                .borrow()
                                 .get(field_name)
-                                .cloned()
                                 .unwrap_or(Value::Nil);
                             let field_path = if path.is_empty() {
                                 field_name.clone()
@@ -1189,9 +1181,9 @@ impl Interp {
                         .map(|(k, v)| (k.to_value(), v.clone()))
                         .collect(),
                     Value::Object(o) => o
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (Value::Str(k.as_str().into()), v.clone()))
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (Value::Str(k.as_ref().into()), v))
                         .collect(),
                     _ => {
                         errors.push(err_obj(
@@ -1333,7 +1325,8 @@ impl Interp {
                         // Clone the fields, set strict:true
                         match &obj_schema {
                             Value::Object(o) => {
-                                let mut m: IndexMap<String, Value> = o.borrow().clone();
+                                let mut m: IndexMap<String, Value> =
+                                    o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                                 m.insert("strict".to_string(), Value::Bool(true));
                                 Ok(Value::Object(crate::value::ObjectCell::new(m)))
                             }
@@ -1396,7 +1389,8 @@ impl Interp {
                 let n = arg(args, 1);
                 match &s {
                     Value::Object(o) => {
-                        let mut m = o.borrow().clone();
+                        let mut m: IndexMap<String, Value> =
+                            o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         m.insert("min".to_string(), n);
                         Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
@@ -1414,7 +1408,8 @@ impl Interp {
                 let n = arg(args, 1);
                 match &s {
                     Value::Object(o) => {
-                        let mut m = o.borrow().clone();
+                        let mut m: IndexMap<String, Value> =
+                            o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         m.insert("max".to_string(), n);
                         Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
@@ -1432,7 +1427,8 @@ impl Interp {
                 let n = arg(args, 1);
                 match &s {
                     Value::Object(o) => {
-                        let mut m = o.borrow().clone();
+                        let mut m: IndexMap<String, Value> =
+                            o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         m.insert("minLength".to_string(), n);
                         Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
@@ -1450,7 +1446,8 @@ impl Interp {
                 let n = arg(args, 1);
                 match &s {
                     Value::Object(o) => {
-                        let mut m = o.borrow().clone();
+                        let mut m: IndexMap<String, Value> =
+                            o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         m.insert("maxLength".to_string(), n);
                         Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
@@ -1472,7 +1469,8 @@ impl Interp {
                 let pat = arg(args, 1);
                 match &s {
                     Value::Object(o) => {
-                        let mut m = o.borrow().clone();
+                        let mut m: IndexMap<String, Value> =
+                            o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         m.insert("pattern".to_string(), pat);
                         Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
@@ -1497,7 +1495,8 @@ impl Interp {
                 let msg = arg(args, 2);
                 match &s {
                     Value::Object(o) => {
-                        let mut m = o.borrow().clone();
+                        let mut m: IndexMap<String, Value> =
+                            o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         m.insert("refine".to_string(), f);
                         m.insert("refineMessage".to_string(), msg);
                         Ok(Value::Object(crate::value::ObjectCell::new(m)))
@@ -1519,7 +1518,8 @@ impl Interp {
                 let v = arg(args, 1);
                 match &s {
                     Value::Object(o) => {
-                        let mut m = o.borrow().clone();
+                        let mut m: IndexMap<String, Value> =
+                            o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
                         m.insert("default".to_string(), v);
                         Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
@@ -1540,7 +1540,7 @@ impl Interp {
                 // base-kind check (see parse_value coercion table in module doc).
                 let coerce = match args.get(2) {
                     Some(Value::Object(o)) => {
-                        matches!(o.borrow().get("coerce"), Some(Value::Bool(true)))
+                        matches!(o.get("coerce"), Some(Value::Bool(true)))
                     }
                     _ => false,
                 };
@@ -1570,7 +1570,7 @@ impl Interp {
                 let value = arg(args, 1);
                 let coerce = match args.get(2) {
                     Some(Value::Object(o)) => {
-                        matches!(o.borrow().get("coerce"), Some(Value::Bool(true)))
+                        matches!(o.get("coerce"), Some(Value::Bool(true)))
                     }
                     _ => false,
                 };
@@ -1671,7 +1671,7 @@ mod tests {
     /// Get a named field from an Object Value.
     fn field(obj: &Value, key: &str) -> Value {
         match obj {
-            Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
             _ => panic!("not an object: {:?}", obj),
         }
     }

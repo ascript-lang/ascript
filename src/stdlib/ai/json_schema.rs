@@ -195,7 +195,7 @@ fn make_nullable(schema: &mut J) {
 /// the decode step re-validates.
 pub fn schema_value_to_json_schema(schema: &Value) -> J {
     let kind = match schema {
-        Value::Object(o) => match o.borrow().get("__kind") {
+        Value::Object(o) => match o.get("__kind") {
             Some(Value::Str(s)) => s.to_string(),
             _ => return json!({}),
         },
@@ -253,12 +253,12 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
             let mut properties = Map::new();
             let mut required: Vec<J> = Vec::new();
             if let Some(Value::Object(fields)) = field(schema, "fields") {
-                for (name, fschema) in fields.borrow().iter() {
-                    let js = schema_value_to_json_schema(fschema);
-                    let optional = schema_is_optional(fschema);
-                    properties.insert(name.clone(), js);
+                for (name, fschema) in fields.entries() {
+                    let js = schema_value_to_json_schema(&fschema);
+                    let optional = schema_is_optional(&fschema);
+                    properties.insert(name.to_string(), js);
                     if !optional {
-                        required.push(J::String(name.clone()));
+                        required.push(J::String(name.to_string()));
                     }
                 }
             }
@@ -296,12 +296,12 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
 /// Is a `std/schema` value the `optional` kind (so its object field is not required)?
 fn schema_is_optional(schema: &Value) -> bool {
     matches!(schema, Value::Object(o)
-        if matches!(o.borrow().get("__kind"), Some(Value::Str(s)) if s.as_ref() == "optional"))
+        if matches!(o.get("__kind"), Some(Value::Str(s)) if s.as_ref() == "optional"))
 }
 
 fn field(v: &Value, key: &str) -> Option<Value> {
     match v {
-        Value::Object(o) => o.borrow().get(key).cloned(),
+        Value::Object(o) => o.get(key),
         _ => None,
     }
 }
@@ -519,5 +519,39 @@ mod tests {
         let mjs = schema_value_to_json_schema(&map_s);
         assert_eq!(mjs["type"], "object");
         assert_eq!(mjs["additionalProperties"]["type"], "number");
+    }
+
+    /// SHAPE slab-mode regression: `schema.object({...})` stores the user's `{...}`
+    /// literal verbatim, and on the VM that literal is a SLAB. The `"object"` arm of
+    /// `schema_value_to_json_schema` iterated the `fields` object with `.borrow()`
+    /// (the legacy shim) → panicked at value.rs with "called on a slab-mode object".
+    /// This drives the real projection path (`Interp::project_shape_json`) over a
+    /// slab schema built by `vm_eval_source`; the dict-built helper objects in the
+    /// other tests can't catch it.
+    #[tokio::test]
+    async fn vm_schema_object_fields_slab_projects() {
+        // The trailing expression is a `schema.object({...})` whose `fields` is a
+        // VM slab object — exactly what the AI shape/tool-input path projects.
+        let schema = crate::vm_eval_source(
+            r#"
+import { object, string, number } from "std/schema"
+object({ name: string(), age: number() })
+"#,
+        )
+        .await
+        .expect("schema.object program should run");
+
+        let interp = crate::interp::Interp::new();
+        let js = interp.project_shape_json(&schema);
+        assert_eq!(js["type"], "object");
+        assert_eq!(js["properties"]["name"]["type"], "string");
+        assert_eq!(js["properties"]["age"]["type"], "number");
+        let req: Vec<&str> = js["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(req, vec!["name", "age"]);
     }
 }

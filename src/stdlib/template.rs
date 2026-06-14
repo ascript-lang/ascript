@@ -100,8 +100,8 @@ fn resolve_path(data: &Value, path: &str) -> Result<Value, String> {
 /// Look up a single key on an Object, Instance, or Map; `None` if absent.
 fn lookup(v: &Value, key: &str) -> Option<Value> {
     match v {
-        Value::Object(o) => o.borrow().get(key).cloned(),
-        Value::Instance(inst) => inst.borrow().fields.get(key).cloned(),
+        Value::Object(o) => o.get(key),
+        Value::Instance(inst) => inst.borrow().get(key),
         Value::Map(m) => {
             let mk = MapKey::from_value(&Value::Str(key.into()))?;
             m.borrow().get(&mk).cloned()
@@ -204,7 +204,7 @@ mod tests {
             Value::Array(arr) => {
                 let b = arr.borrow();
                 match &b[1] {
-                    Value::Object(o) => match o.borrow().get("message") {
+                    Value::Object(o) => match o.get("message") {
                         Some(Value::Str(s)) => assert!(s.contains("a.c"), "msg: {}", s),
                         _ => panic!("no message"),
                     },

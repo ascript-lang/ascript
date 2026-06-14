@@ -966,36 +966,33 @@ impl TestSummary {
     /// result is a clean error at the call site, never a panic).
     pub fn from_value(v: &Value) -> Option<TestSummary> {
         let obj = v.as_object()?;
-        let map = obj.borrow();
-        let passed = match map.get("passed")? {
-            Value::Int(n) if *n >= 0 => *n as usize,
+        let passed = match obj.get("passed")? {
+            Value::Int(n) if n >= 0 => n as usize,
             _ => return None,
         };
-        let failed = match map.get("failed")? {
-            Value::Int(n) if *n >= 0 => *n as usize,
+        let failed = match obj.get("failed")? {
+            Value::Int(n) if n >= 0 => n as usize,
             _ => return None,
         };
         // DX D2 Task 10: `filtered` is tolerated-absent (default 0) for forward/back
         // compatibility of the airlock shape.
-        let filtered = match map.get("filtered") {
-            Some(Value::Int(n)) if *n >= 0 => *n as usize,
+        let filtered = match obj.get("filtered") {
+            Some(Value::Int(n)) if n >= 0 => n as usize,
             Some(_) => return None,
             None => 0,
         };
-        let failures_val = map.get("failures")?;
-        let arr = match failures_val {
-            Value::Array(a) => a.borrow(),
+        let arr = match obj.get("failures")? {
+            Value::Array(a) => a.borrow().clone(),
             _ => return None,
         };
         let mut failures = Vec::with_capacity(arr.len());
         for entry in arr.iter() {
             let fobj = entry.as_object()?;
-            let fmap = fobj.borrow();
-            let name = match fmap.get("name")? {
+            let name = match fobj.get("name")? {
                 Value::Str(s) => s.to_string(),
                 _ => return None,
             };
-            let message = match fmap.get("message")? {
+            let message = match fobj.get("message")? {
                 Value::Str(s) => s.to_string(),
                 _ => return None,
             };
@@ -1681,10 +1678,10 @@ impl Interp {
                 for a in iter {
                     match a {
                         Value::Object(o) => {
-                            for (k, val) in o.borrow().iter() {
+                            for (k, val) in o.entries() {
                                 fields.insert(
-                                    k.clone(),
-                                    crate::stdlib::json::to_json_lossy(val, &mut Vec::new()),
+                                    k.to_string(),
+                                    crate::stdlib::json::to_json_lossy(&val, &mut Vec::new()),
                                 );
                             }
                         }
@@ -3071,9 +3068,9 @@ impl Interp {
                 }
                 let get = |key: &str| -> Value {
                     match &v {
-                        Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+                        Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
                         Value::Instance(i) => {
-                            i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil)
+                            i.borrow().get(key).unwrap_or(Value::Nil)
                         }
                         _ => Value::Nil,
                     }
@@ -3088,16 +3085,16 @@ impl Interp {
                     let mut remaining = indexmap::IndexMap::new();
                     match &v {
                         Value::Object(o) => {
-                            for (k, val) in o.borrow().iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), val.clone());
+                            for (k, val) in o.entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), val);
                                 }
                             }
                         }
                         Value::Instance(i) => {
-                            for (k, val) in i.borrow().fields.iter() {
-                                if !bound.contains(k.as_str()) {
-                                    remaining.insert(k.clone(), val.clone());
+                            for (k, val) in i.borrow().entries() {
+                                if !bound.contains(k.as_ref()) {
+                                    remaining.insert(k.to_string(), val);
                                 }
                             }
                         }
@@ -3765,8 +3762,8 @@ impl Interp {
                             let v = self.eval_expr(x, env).await?;
                             match v {
                                 Value::Object(o) => {
-                                    for (k, val) in o.borrow().iter() {
-                                        map.insert(k.clone(), val.clone());
+                                    for (k, val) in o.entries() {
+                                        map.insert(k.to_string(), val);
                                     }
                                 }
                                 other => {
@@ -4080,8 +4077,12 @@ impl Interp {
             Pattern::Object(entries, rest) => {
                 // Snapshot the subject's fields (Object or Instance).
                 let fields: indexmap::IndexMap<String, Value> = match subject {
-                    Value::Object(o) => o.borrow().clone(),
-                    Value::Instance(i) => i.borrow().fields.clone(),
+                    Value::Object(o) => o
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                    Value::Instance(i) => i.borrow().to_index_map(),
                     _ => return Ok(false),
                 };
                 for entry in entries {
@@ -4170,7 +4171,7 @@ impl Interp {
                         a.borrow().iter().cloned().collect()
                     }
                     Some(crate::value::Payload::Named(o)) => {
-                        o.borrow().values().cloned().collect()
+                        o.entries().into_iter().map(|(_, v)| v).collect()
                     }
                     None => return Ok(false),
                 };
@@ -4187,13 +4188,13 @@ impl Interp {
             VariantPatFields::Named(entries) => {
                 // Snapshot the named payload's fields. A non-named payload cannot
                 // match a named pattern.
-                let map: indexmap::IndexMap<String, Value> = match &ev.payload {
-                    Some(crate::value::Payload::Named(o)) => o.borrow().clone(),
+                let payload_obj = match &ev.payload {
+                    Some(crate::value::Payload::Named(o)) => o.clone(),
                     _ => return Ok(false),
                 };
                 for (key, subpat) in entries {
-                    let field = match map.get(key.as_ref()) {
-                        Some(v) => v.clone(),
+                    let field = match payload_obj.get(key.as_ref()) {
+                        Some(v) => v,
                         None => return Ok(false),
                     };
                     match subpat {
@@ -4435,7 +4436,7 @@ impl Interp {
         span: Span,
     ) -> Result<Value, AsError> {
         match obj {
-            Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
+            Value::Object(map) => Ok(map.get(name).unwrap_or(Value::Nil)),
             Value::Enum(e) => {
                 let variant = e.variants.get(name).cloned().ok_or_else(|| {
                     AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)
@@ -4473,8 +4474,8 @@ impl Interp {
                 // named field directly off the payload Object.
                 other => {
                     if let Some(crate::value::Payload::Named(o)) = &v.payload {
-                        if let Some(fv) = o.borrow().get(other) {
-                            return Ok(fv.clone());
+                        if let Some(fv) = o.get(other) {
+                            return Ok(fv);
                         }
                     }
                     Err(AsError::at(
@@ -4485,8 +4486,8 @@ impl Interp {
             },
             Value::Instance(inst) => {
                 let b = inst.borrow();
-                if let Some(v) = b.fields.get(name) {
-                    return Ok(v.clone());
+                if let Some(v) = b.get(name) {
+                    return Ok(v);
                 }
                 match crate::value::find_method(&b.class, name) {
                     Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(
@@ -5714,12 +5715,9 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let instance = gcmodule::Cc::new(std::cell::RefCell::new(crate::value::Instance {
-            class: class.clone(),
-            fields: indexmap::IndexMap::new(),
-            shape_id: std::cell::Cell::new(0),
-            frozen: std::cell::Cell::new(false),
-        }));
+        let instance = gcmodule::Cc::new(std::cell::RefCell::new(
+            crate::value::Instance::from_dict(class.clone(), indexmap::IndexMap::new()),
+        ));
         let inst_val = Value::Instance(instance.clone());
         // Pre-populate declared-field defaults (merged base-class first so a
         // subclass default overrides). `init` may then override; `.from` (Task 4)
@@ -5735,7 +5733,7 @@ impl Interp {
                 if !self.check_type_env(&dv, &schema.ty, &def_class.def_env)? {
                     return Err(contract_panic(&schema.ty, &dv, span));
                 }
-                instance.borrow_mut().fields.insert(fname.clone(), dv);
+                instance.borrow_mut().insert(&fname, dv);
             }
         }
         match crate::value::find_method(&class, "init") {
@@ -5760,7 +5758,7 @@ impl Interp {
                 let fields = crate::value::merged_field_schema(&class);
                 let bindings = auto_init_bindings(&fields, &class.name, args, span)?;
                 for (fname, v) in bindings {
-                    instance.borrow_mut().fields.insert(fname, v);
+                    instance.borrow_mut().insert(&fname, v);
                 }
             }
         }
@@ -5802,7 +5800,7 @@ impl Interp {
             } else {
                 format!("{}.{}", path, fname)
             };
-            let raw = map.borrow().get(fname).cloned();
+            let raw = map.get(fname);
             let mut val = raw.unwrap_or(Value::Nil);
             if val == Value::Nil {
                 if let Some(def) = &fs.default {
@@ -5843,8 +5841,8 @@ impl Interp {
         }
 
         if strict {
-            for k in map.borrow().keys() {
-                if !schema.contains_key(k) {
+            for k in map.keys_snapshot() {
+                if !schema.contains_key(&k) {
                     return Err(AsError::at(
                         format!(
                             "unexpected key '{}' for {} (strict)",
@@ -5858,12 +5856,7 @@ impl Interp {
         }
 
         Ok(Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
-            crate::value::Instance {
-                class: class.clone(),
-                fields: inst_fields,
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            },
+            crate::value::Instance::from_dict(class.clone(), inst_fields),
         ))))
     }
 
@@ -6177,10 +6170,11 @@ impl Interp {
                 // parsed-JSON `map<K, Class>` field would otherwise be an Object
                 // and fail the `map<K,V>` contract.
                 Value::Object(o) => {
+                    // entries() works for both slab-mode and dict-mode objects.
                     let entries: Vec<(String, Value)> = o
-                        .borrow()
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
                         .collect();
                     let out = crate::value::MapCell::new(indexmap::IndexMap::new());
                     for (k, v) in entries {
@@ -6445,8 +6439,8 @@ impl Interp {
             Value::Nil => return Ok(None),
             _ => return Ok(None),
         };
-        let caps_val = match opts_obj.borrow().get("caps") {
-            Some(v) => v.clone(),
+        let caps_val = match opts_obj.get("caps") {
+            Some(v) => v,
             None => return Ok(None),
         };
         let caps_obj = match &caps_val {
@@ -6463,7 +6457,7 @@ impl Interp {
         // Start from the CALLER's current caps (denial is monotone — a worker can only
         // ever be MORE restricted than its dispatcher), then subtract opts.caps.deny.
         let mut set = self.caps();
-        if let Some(Value::Array(deny)) = caps_obj.borrow().get("deny") {
+        if let Some(Value::Array(deny)) = caps_obj.get("deny") {
             for name in deny.borrow().iter() {
                 let name = match name {
                     Value::Str(s) => s.to_string(),
@@ -6589,7 +6583,7 @@ impl Interp {
                 let n = match &v {
                     Value::Str(s) => s.chars().count(),
                     Value::Array(a) => a.borrow().len(),
-                    Value::Object(o) => o.borrow().len(),
+                    Value::Object(o) => o.len(),
                     Value::Map(m) => m.borrow().len(),
                     Value::Set(s) => s.borrow().len(),
                     Value::Bytes(b) => b.borrow().len(),
@@ -6808,6 +6802,30 @@ impl Interp {
         }
     }
 
+    /// Run the declared field-type CONTRACT for an instance field write (SHAPE Task
+    /// 3.4). The SINGLE source of truth both engines reach: the tree-walker via
+    /// `set_member` (above) and the VM via `vm_set_prop` (which performs the slab
+    /// transition itself but routes the contract through HERE), so the contract
+    /// verdict + the `contract_panic` message/span are byte-identical by
+    /// construction. A no-op when `name` is not a declared field (undeclared adds
+    /// carry no contract).
+    pub(crate) fn check_instance_field_contract(
+        &self,
+        class: &std::rc::Rc<crate::value::Class>,
+        name: &str,
+        value: &Value,
+        value_span: Span,
+    ) -> Result<(), Control> {
+        if let Some(schema) = lookup_field_schema(class, name) {
+            // IFACE: env-aware against the class's def env so an interface-typed
+            // field assignment validates structurally.
+            if !self.check_type_env(value, &schema.ty, &class.def_env)? {
+                return Err(contract_panic(&schema.ty, value, value_span));
+            }
+        }
+        Ok(())
+    }
+
     /// Set a member `obj.<name> = value`, applying a declared field-type contract
     /// on an `Instance` field. Shared by the tree-walker's `assign_to` `Member` arm
     /// and the bytecode VM's `Op::SetProp` so the two engines apply the field
@@ -6831,16 +6849,16 @@ impl Interp {
             Value::Instance(inst) => {
                 check_not_frozen(obj, value_span)?;
                 let class = inst.borrow().class.clone();
-                if let Some(schema) = lookup_field_schema(&class, name) {
-                    // IFACE: env-aware against the class's def env so an interface-typed
-                    // field assignment validates structurally.
-                    if !self.check_type_env(&value, &schema.ty, &class.def_env)? {
-                        return Err(contract_panic(&schema.ty, &value, value_span));
-                    }
-                }
-                inst.borrow_mut()
-                    .fields
-                    .insert(name.to_string(), value.clone());
+                // The field-type CONTRACT chokepoint — SHARED by the tree-walker
+                // (here) and the VM (`vm_set_prop`, which calls this same helper),
+                // so the panic message/span are byte-identical by construction.
+                self.check_instance_field_contract(&class, name, &value, value_span)?;
+                // The tree-walker's instances are always DICT (shape 0), so `insert`
+                // is the plain dict path (a new key appends; an existing key updates
+                // in place). The VM never reaches THIS write for a slab instance — it
+                // runs the contract above via `vm_set_prop`, then performs the precise
+                // slab transition itself (`vm_instance_insert`).
+                inst.borrow_mut().insert(name, value.clone());
                 Ok(value)
             }
             // SRV §3.8: a member-assign to a frozen `Shared` is the shipped
@@ -7587,11 +7605,7 @@ pub(crate) fn index_get(
             })
         }
         Value::Object(map) => match idx {
-            Value::Str(key) => Ok(map
-                .borrow()
-                .get(key.as_ref())
-                .cloned()
-                .unwrap_or(Value::Nil)),
+            Value::Str(key) => Ok(map.get(key.as_ref()).unwrap_or(Value::Nil)),
             _ => Err(AsError::at("object index must be a string", index_span)),
         },
         // SRV §3.5: a frozen `Shared` indexes like the data it froze — an array by
@@ -8082,7 +8096,6 @@ pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'s
 pub(crate) fn error_message(err: &Value) -> String {
     match err {
         Value::Object(o) => o
-            .borrow()
             .get("message")
             .map(|m| m.to_string())
             .unwrap_or_else(|| err.to_string()),
@@ -13118,12 +13131,7 @@ print(n?.m())
     /// A bare instance of a class (no fields).
     fn iface_instance(class: std::rc::Rc<crate::value::Class>) -> Value {
         Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
-            crate::value::Instance {
-                class,
-                fields: IndexMap::new(),
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            },
+            crate::value::Instance::from_dict(class, IndexMap::new()),
         )))
     }
 

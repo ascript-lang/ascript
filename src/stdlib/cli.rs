@@ -84,12 +84,9 @@ struct SubcommandSpec {
 
 /// Extract a string field from an object. Returns `""` when absent/nil. Tier-2
 /// panics if the field is present but not a string.
-fn str_field(
-    obj: &IndexMap<String, Value>,
-    key: &str,
-    ctx: &str,
-    span: Span,
-) -> Result<String, Control> {
+type ObjCell = gcmodule::Cc<crate::value::ObjectCell>;
+
+fn str_field(obj: &ObjCell, key: &str, ctx: &str, span: Span) -> Result<String, Control> {
     match obj.get(key) {
         None | Some(Value::Nil) => Ok(String::new()),
         Some(Value::Str(s)) => Ok(s.to_string()),
@@ -98,7 +95,7 @@ fn str_field(
                 "cli.parse spec: {}.{} must be a string, got {}",
                 ctx,
                 key,
-                crate::interp::type_name(other)
+                crate::interp::type_name(&other)
             ),
             span,
         )
@@ -108,21 +105,16 @@ fn str_field(
 
 /// Extract a bool field from an object. Returns `false` when absent/nil. Tier-2
 /// panic if present but not a bool.
-fn bool_field(
-    obj: &IndexMap<String, Value>,
-    key: &str,
-    ctx: &str,
-    span: Span,
-) -> Result<bool, Control> {
+fn bool_field(obj: &ObjCell, key: &str, ctx: &str, span: Span) -> Result<bool, Control> {
     match obj.get(key) {
         None | Some(Value::Nil) => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::Bool(b)) => Ok(b),
         Some(other) => Err(AsError::at(
             format!(
                 "cli.parse spec: {}.{} must be a bool, got {}",
                 ctx,
                 key,
-                crate::interp::type_name(other)
+                crate::interp::type_name(&other)
             ),
             span,
         )
@@ -132,7 +124,7 @@ fn bool_field(
 
 fn parse_flag_spec(v: &Value, span: Span) -> Result<FlagSpec, Control> {
     let obj = match v {
-        Value::Object(o) => o.borrow().clone(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -164,7 +156,7 @@ fn parse_flag_spec(v: &Value, span: Span) -> Result<FlagSpec, Control> {
 
 fn parse_option_spec(v: &Value, span: Span) -> Result<OptionSpec, Control> {
     let obj = match v {
-        Value::Object(o) => o.borrow().clone(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -211,7 +203,7 @@ fn parse_option_spec(v: &Value, span: Span) -> Result<OptionSpec, Control> {
 
 fn parse_positional_spec(v: &Value, span: Span) -> Result<PositionalSpec, Control> {
     let obj = match v {
-        Value::Object(o) => o.borrow().clone(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -241,7 +233,7 @@ fn parse_positional_spec(v: &Value, span: Span) -> Result<PositionalSpec, Contro
 }
 
 fn parse_array_of<T>(
-    obj: &IndexMap<String, Value>,
+    obj: &ObjCell,
     key: &str,
     span: Span,
     parse_fn: impl Fn(&Value, Span) -> Result<T, Control>,
@@ -256,7 +248,7 @@ fn parse_array_of<T>(
             format!(
                 "cli.parse spec: '{}' must be an array, got {}",
                 key,
-                crate::interp::type_name(other)
+                crate::interp::type_name(&other)
             ),
             span,
         )
@@ -266,7 +258,7 @@ fn parse_array_of<T>(
 
 fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
     let obj = match spec_val {
-        Value::Object(o) => o.borrow().clone(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -293,7 +285,7 @@ fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
                 .iter()
                 .map(|v| -> Result<SubcommandSpec, Control> {
                     let sub_obj = match v {
-                        Value::Object(o) => o.borrow().clone(),
+                        Value::Object(o) => o.clone(),
                         other => {
                             return Err(AsError::at(
                                 format!(
@@ -330,7 +322,7 @@ fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
             return Err(AsError::at(
                 format!(
                     "cli.parse spec: 'subcommands' must be an array, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(&other)
                 ),
                 span,
             )
@@ -938,7 +930,7 @@ mod tests {
 
     fn get_field(v: &Value, key: &str) -> Value {
         match v {
-            Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
             _ => Value::Nil,
         }
     }

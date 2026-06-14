@@ -140,10 +140,11 @@ impl Freezer {
                 if let Some(reused) = self.enter(ptr, path, span)? {
                     return Ok(reused);
                 }
+                // Use entries() — works for both slab-mode and dict-mode objects.
                 let entries: Vec<(String, Value)> = o
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .entries()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
                     .collect();
                 let mut frozen: crate::value::SharedMap = Vec::with_capacity(entries.len());
                 for (k, val) in &entries {
@@ -233,9 +234,9 @@ impl Freezer {
                 let borrow = inst.borrow();
                 let class_name: Arc<str> = Arc::from(borrow.class.name.as_str());
                 let fields: Vec<(String, Value)> = borrow
-                    .fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .entries()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
                     .collect();
                 drop(borrow);
                 let mut frozen: crate::value::SharedMap = Vec::with_capacity(fields.len());

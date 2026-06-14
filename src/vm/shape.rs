@@ -16,22 +16,56 @@
 //! The registry is **per-VM** (isolate-friendly): it lives on the `Vm` behind a
 //! `RefCell` and is only ever touched by VM code paths. The tree-walker never
 //! consults it — its objects keep shape `0`.
+//!
+//! ## SHAPE v2 changes (Task 2.1)
+//!
+//! - The registry now **owns** the canonical key list for every shape id
+//!   (`keys: Vec<Rc<[Rc<str>]>>`), making it the layout authority for Phase 2.2.
+//! - Transitions are stored as a two-level `FxHashMap<u32, FxHashMap<Box<str>, u32>>`
+//!   so probes use a borrowed `&str` — zero allocation on the hot path.
+//! - Two caps guard against pathological fan-out and very-wide objects:
+//!   `SLAB_MAX_KEYS` (key-count cap) and `SHAPE_FANOUT_MAX` (transition fan-out cap).
+//!   Both caps are far above anything the current corpus hits, so all existing
+//!   callers stay behaviorally identical; the corpus differential remains 424/0.
 
-use std::collections::HashMap;
+use std::rc::Rc;
+
+use rustc_hash::FxHashMap;
 
 /// The empty layout (no keys). Every fresh object/instance starts here; the
 /// tree-walker leaves all of its objects at this id.
 pub const EMPTY_SHAPE: u32 = 0;
 
+/// Maximum number of keys a shaped slab may hold (V8 fast-properties precedent).
+/// A `shape_for`/`add_key` that would push a shape past this limit returns `None`.
+pub const SLAB_MAX_KEYS: usize = 64;
+
+/// Maximum number of distinct child transitions a single parent shape may have.
+/// Exceeding this returns `None` (caller demotes to unshaped / shape 0).
+/// An ALREADY-MINTED edge always resolves even after the cap is hit (memoized).
+pub const SHAPE_FANOUT_MAX: usize = 128;
+
 /// Assigns shape ids to key-layouts via a transition tree. Memoized so the same
 /// insertion-ordered key sequence always yields the same id.
+///
+/// ## Internal layout
+///
+/// ```text
+/// transitions: parent_id → { key → child_id }
+/// keys[id]:   the canonical ordered key list for that id
+/// ```
+///
+/// `keys[0]` is always the empty slice (EMPTY_SHAPE). `keys` is dense and
+/// id-indexed (id == index), so a `keys_of` lookup is a single slice dereference.
 pub struct ShapeRegistry {
-    /// `(parent_shape, key) → child_shape`. The single source of truth; an entry
-    /// exists iff that transition has been taken at least once.
-    transitions: HashMap<(u32, Box<str>), u32>,
-    /// The next shape id to hand out. Starts at 1 because `0` is the reserved
-    /// empty shape.
-    next_id: u32,
+    /// `parent_shape → (key → child_shape)`. Two-level so a lookup probes with a
+    /// borrowed `&str` (via `Borrow<str>` on `Box<str>` keys) — kills the
+    /// per-probe `Box::from(key)` allocation of the v1 design.
+    transitions: FxHashMap<u32, FxHashMap<Box<str>, u32>>,
+    /// `shape_id → canonical ordered key list`. Dense, id-indexed.
+    /// `keys[0]` = the empty slice (EMPTY_SHAPE). Shared via `Rc` so multiple
+    /// callers calling `keys_of` for the same id get the exact same allocation.
+    keys: Vec<Rc<[Rc<str>]>>,
 }
 
 impl Default for ShapeRegistry {
@@ -44,37 +78,77 @@ impl ShapeRegistry {
     /// A fresh registry holding only the empty shape (`0`).
     pub fn new() -> Self {
         ShapeRegistry {
-            transitions: HashMap::new(),
-            next_id: 1,
+            transitions: FxHashMap::default(),
+            // Slot 0 = EMPTY_SHAPE → empty key list.
+            keys: vec![Rc::from([])],
         }
     }
 
-    /// Transition `shape` by adding `key`, returning the child shape id.
+    /// Transition `shape` by adding `key`, returning `Some(child_shape_id)`.
     ///
-    /// Memoized: the first time a given `(shape, key)` edge is requested a NEW id
-    /// is minted; every later request for that same edge returns the same id. So
-    /// two objects that insert the same keys in the same order converge on one id.
-    pub fn add_key(&mut self, shape: u32, key: &str) -> u32 {
-        if let Some(&child) = self.transitions.get(&(shape, Box::from(key))) {
-            return child;
+    /// Returns `None` when either cap would be exceeded:
+    /// - the new child's key list would exceed `SLAB_MAX_KEYS`, OR
+    /// - the parent's fan-out would exceed `SHAPE_FANOUT_MAX`.
+    ///
+    /// An already-minted edge ALWAYS resolves (memoized), even after the parent
+    /// hit its fan-out cap. Only inserting a NEW edge is subject to the caps.
+    ///
+    /// **Probe path allocates nothing**: the inner map's `Box<str>` keys implement
+    /// `Borrow<str>`, so `.get(key)` where `key: &str` resolves with no allocation.
+    pub fn add_key(&mut self, shape: u32, key: &str) -> Option<u32> {
+        // 1. Probe with borrowed &str — no allocation on the hot path.
+        if let Some(child) = self
+            .transitions
+            .get(&shape)
+            .and_then(|inner| inner.get(key))
+            .copied()
+        {
+            return Some(child);
         }
-        let child = self.next_id;
-        self.next_id += 1;
-        self.transitions.insert((shape, Box::from(key)), child);
-        child
+
+        // 2. Cap checks before minting a new edge.
+        let parent_key_count = self.keys[shape as usize].len();
+        if parent_key_count + 1 > SLAB_MAX_KEYS {
+            return None; // key-count cap
+        }
+        let fan_out = self.transitions.get(&shape).map_or(0, |m| m.len());
+        if fan_out >= SHAPE_FANOUT_MAX {
+            return None; // fan-out cap
+        }
+
+        // 3. Mint a new shape id and build its canonical key list.
+        let child_id = self.keys.len() as u32;
+        let parent_keys = &self.keys[shape as usize];
+        let mut new_keys: Vec<Rc<str>> = Vec::with_capacity(parent_keys.len() + 1);
+        new_keys.extend_from_slice(parent_keys);
+        new_keys.push(Rc::from(key));
+        self.keys.push(Rc::from(new_keys.as_slice()));
+
+        // 4. Insert the edge (only NOW allocate a Box<str> for the map key).
+        self.transitions
+            .entry(shape)
+            .or_default()
+            .insert(Box::from(key), child_id);
+
+        Some(child_id)
     }
 
     /// The shape id for an ordered sequence of keys, walking from the empty shape.
+    ///
+    /// Returns `None` if any step along the chain hits a cap (key-count or fan-out).
     /// Used to derive an object-literal's final shape and a class's base shape.
-    pub fn shape_for<'a, I>(&mut self, keys: I) -> u32
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
+    pub fn shape_for<'a>(&mut self, keys: impl IntoIterator<Item = &'a str>) -> Option<u32> {
         let mut shape = EMPTY_SHAPE;
         for k in keys {
-            shape = self.add_key(shape, k);
+            shape = self.add_key(shape, k)?;
         }
-        shape
+        Some(shape)
+    }
+
+    /// The canonical ordered key list for `shape`. Returns an `Rc`-shared slice —
+    /// all callers for the same id share one allocation (verified by `Rc::ptr_eq`).
+    pub fn keys_of(&self, shape: u32) -> Rc<[Rc<str>]> {
+        self.keys[shape as usize].clone()
     }
 }
 
@@ -82,18 +156,67 @@ impl ShapeRegistry {
 mod tests {
     use super::*;
 
+    // ── v2 tests (Task 2.1) ──────────────────────────────────────────────────
+
+    #[test]
+    fn keys_of_returns_canonical_shared_list() {
+        let mut reg = ShapeRegistry::new();
+        let ab = reg.shape_for(["a", "b"]).unwrap();
+        let k1 = reg.keys_of(ab);
+        let k2 = reg.keys_of(ab);
+        assert!(Rc::ptr_eq(&k1, &k2), "one allocation per LAYOUT, shared");
+        assert_eq!(&*k1[0], "a");
+        assert_eq!(&*k1[1], "b");
+        assert_eq!(reg.keys_of(EMPTY_SHAPE).len(), 0);
+    }
+
+    #[test]
+    fn caps_refuse_instead_of_minting() {
+        let mut reg = ShapeRegistry::new();
+        // Fan-out cap: mint exactly SHAPE_FANOUT_MAX children from EMPTY_SHAPE.
+        for i in 0..SHAPE_FANOUT_MAX {
+            assert!(
+                reg.add_key(EMPTY_SHAPE, &format!("k{i}")).is_some(),
+                "edge {i} should mint"
+            );
+        }
+        // The next NEW key from EMPTY_SHAPE is refused.
+        assert_eq!(
+            reg.add_key(EMPTY_SHAPE, "one_too_many"),
+            None,
+            "fan-out cap must refuse"
+        );
+        // An already-minted edge still resolves (memoized, never refused).
+        assert!(
+            reg.add_key(EMPTY_SHAPE, "k0").is_some(),
+            "already-minted edge resolves even after cap"
+        );
+
+        // Key-count cap: shape_for a sequence longer than SLAB_MAX_KEYS must fail.
+        let labels: Vec<String> = (0..=SLAB_MAX_KEYS).map(|i| format!("c{i}")).collect();
+        assert!(
+            reg.shape_for(labels.iter().map(|s| s.as_str())).is_none(),
+            "key-count cap must refuse"
+        );
+    }
+
+    // ── existing v1 tests (adapted: add .unwrap() where add_key / shape_for return Option) ──
+
     #[test]
     fn empty_object_is_shape_zero() {
         let mut reg = ShapeRegistry::new();
-        assert_eq!(reg.shape_for(std::iter::empty::<&str>()), EMPTY_SHAPE);
+        assert_eq!(
+            reg.shape_for(std::iter::empty::<&str>()).unwrap(),
+            EMPTY_SHAPE
+        );
         assert_eq!(EMPTY_SHAPE, 0);
     }
 
     #[test]
     fn same_keys_same_shape() {
         let mut reg = ShapeRegistry::new();
-        let a = reg.shape_for(["a", "b"]);
-        let b = reg.shape_for(["a", "b"]);
+        let a = reg.shape_for(["a", "b"]).unwrap();
+        let b = reg.shape_for(["a", "b"]).unwrap();
         assert_eq!(a, b, "two objects with keys [a,b] must share a shape");
         assert_ne!(a, EMPTY_SHAPE);
     }
@@ -101,34 +224,34 @@ mod tests {
     #[test]
     fn key_order_matters() {
         let mut reg = ShapeRegistry::new();
-        let ab = reg.shape_for(["a", "b"]);
-        let ba = reg.shape_for(["b", "a"]);
+        let ab = reg.shape_for(["a", "b"]).unwrap();
+        let ba = reg.shape_for(["b", "a"]).unwrap();
         assert_ne!(ab, ba, "[a,b] and [b,a] are different layouts");
     }
 
     #[test]
     fn adding_a_key_transitions_to_a_child_shape() {
         let mut reg = ShapeRegistry::new();
-        let a = reg.shape_for(["a"]);
-        let ab = reg.add_key(a, "b");
+        let a = reg.shape_for(["a"]).unwrap();
+        let ab = reg.add_key(a, "b").unwrap();
         assert_ne!(a, ab, "adding a key must transition to a new shape");
         // The transition is memoized: re-adding from the same parent is stable.
-        assert_eq!(reg.add_key(a, "b"), ab);
+        assert_eq!(reg.add_key(a, "b").unwrap(), ab);
         // And `{a,b}` reached via shape_for equals the same child (shared prefix).
-        assert_eq!(reg.shape_for(["a", "b"]), ab);
+        assert_eq!(reg.shape_for(["a", "b"]).unwrap(), ab);
     }
 
     #[test]
     fn shared_prefix_reuses_ancestor() {
         let mut reg = ShapeRegistry::new();
-        let a = reg.shape_for(["a"]);
-        let ab = reg.shape_for(["a", "b"]);
-        let ac = reg.shape_for(["a", "c"]);
+        let a = reg.shape_for(["a"]).unwrap();
+        let ab = reg.shape_for(["a", "b"]).unwrap();
+        let ac = reg.shape_for(["a", "c"]).unwrap();
         // Both branch off the SAME `{a}` parent, so they differ from each other
         // but each is a direct child of `a`.
         assert_ne!(ab, ac);
-        assert_eq!(reg.add_key(a, "b"), ab);
-        assert_eq!(reg.add_key(a, "c"), ac);
+        assert_eq!(reg.add_key(a, "b").unwrap(), ab);
+        assert_eq!(reg.add_key(a, "c").unwrap(), ac);
     }
 
     #[test]
@@ -136,9 +259,9 @@ mod tests {
         let mut reg = ShapeRegistry::new();
         // Each genuinely-new edge mints the next id; the empty shape is excluded.
         let ids = [
-            reg.add_key(EMPTY_SHAPE, "x"),
-            reg.add_key(EMPTY_SHAPE, "y"),
-            reg.add_key(EMPTY_SHAPE, "z"),
+            reg.add_key(EMPTY_SHAPE, "x").unwrap(),
+            reg.add_key(EMPTY_SHAPE, "y").unwrap(),
+            reg.add_key(EMPTY_SHAPE, "z").unwrap(),
         ];
         assert_eq!(ids, [1, 2, 3]);
     }

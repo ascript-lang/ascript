@@ -48,6 +48,11 @@ gcmodule = "0.3"
 # core count (overridable via $ASCRIPT_WORKERS). CORE/unconditional — the worker
 # subsystem is not feature-gated, so this must build under --no-default-features.
 num_cpus = "1"
+# ShapeRegistry v2 uses FxHashMap for zero-allocation borrowed-str probes on the
+# transition tree hot path. rustc-hash is already in the production graph via
+# cstree; this direct dep makes the usage explicit and ensures it doesn't vanish
+# if cstree is ever replaced.
+rustc-hash = "2"
 cstree = { version = "0.14", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.6"

@@ -46,7 +46,7 @@
 //! The [`Trace`] impl on [`Value`] therefore visits ONLY the container variants
 //! and is a no-op for everything else.
 
-use crate::value::{ArrayCell, Instance, MapCell, MapKey, ObjectCell, SetCell, Value};
+use crate::value::{ArrayCell, Instance, MapCell, MapKey, SetCell, Value};
 use crate::vm::value_ext::Closure;
 use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
@@ -245,25 +245,9 @@ impl Trace for Value {
     }
 }
 
-/// The closure upvalue cell (`RefCell<Value>`) — gcmodule already provides
-/// `Trace for RefCell<T: Trace>`, so the `Value`-tracing path is covered by the
-/// blanket impl. This explicit helper exists only to document the cell as a
-/// traced node and is used by the V13-T1 unit test.
-impl Trace for ObjectCell {
-    fn trace(&self, tracer: &mut Tracer) {
-        // `map: RefCell<IndexMap<String, Value>>`. Avoid holding the borrow if
-        // it is already mutably borrowed (mirrors gcmodule's `RefCell` impl:
-        // an outstanding borrow implies an outstanding reference, so skipping
-        // is safe). `shape: Cell<u32>` and `frozen: Cell<bool>` are acyclic.
-        if let Ok(map) = self.map.try_borrow() {
-            trace_index_map(&map, tracer);
-        }
-    }
-
-    fn is_type_tracked() -> bool {
-        true
-    }
-}
+// `Trace for ObjectCell` is implemented in `src/value.rs` (co-located with the
+// struct definition) so the private `map` field is directly accessible.
+// See SHAPE Task 1.3 in `superpowers/plans/2026-06-12-shape-storage.md`.
 
 /// ADT §5.3: `EnumVariant` keeps its `Rc` wrapper, but the cycle-capable PAYLOAD
 /// must be traced (a recursive enum payload can self-reference). The backing
@@ -341,9 +325,22 @@ impl Trace for SetCell {
 
 impl Trace for Instance {
     fn trace(&self, tracer: &mut Tracer) {
-        // `class: Rc<Class>` is acyclic (no cycle-capable Values), `shape_id` is
-        // a Cell<u32>. Only `fields: IndexMap<String, Value>` can hold cycles.
-        trace_index_map(&self.fields, tracer);
+        // `class: Rc<Class>` is acyclic (no cycle-capable Values), `shape_id`/
+        // `frozen` are scalar Cells. Only the field VALUES can hold cycles. SHAPE
+        // Task 3.4: `fields` is now `ObjectStorage` — trace it exactly as the
+        // `ObjectCell` two-arm trace does (the slab `keys: Rc<[Rc<str>]>` are
+        // acyclic immutable string data owned by the Vm's ShapeRegistry, NOT
+        // traced; in dict mode the String keys' trace() is a no-op).
+        match &self.fields {
+            crate::value::ObjectStorage::Slab { keys: _, values } => {
+                for v in values.iter() {
+                    v.trace(tracer);
+                }
+            }
+            crate::value::ObjectStorage::Dict(m) => {
+                trace_index_map(m, tracer);
+            }
+        }
     }
 
     fn is_type_tracked() -> bool {
@@ -375,7 +372,7 @@ impl Trace for Closure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::MapKey;
+    use crate::value::{MapKey, ObjectCell};
     use crate::vm::chunk::{Chunk, FnProto};
     use gcmodule::{Trace, Tracer};
     use std::cell::Cell;
@@ -633,6 +630,64 @@ mod tests {
         );
     }
 
+    // ──────────── SHAPE Task 2.3 — SLAB-MODE CYCLE RECLAMATION ────────────
+    //
+    // A `Value::Object` backed by `ObjectStorage::Slab` (not a Dict) participates
+    // in a reference cycle through its `values` vector. The `Trace for ObjectCell`
+    // slab arm must reach those values so the Bacon–Rajan collector can break the
+    // cycle. If the slab arm is a no-op the cycle leaks (the self-edge keeps the
+    // `Cc` refcount ≥ 1 after the external handle is dropped).
+
+    /// SHAPE Task 2.3: a slab-mode object whose `values[0]` is an array that
+    /// contains the object itself forms a true GC cycle. Mirroring
+    /// `collect_reclaims_a_reference_cycle` (the self-referential array test),
+    /// this proves that `Trace for ObjectCell`'s slab arm visits `values` and
+    /// that the cycle collector can therefore reclaim the cycle.
+    #[test]
+    fn slab_object_self_cycle_is_reclaimed() {
+        use crate::vm::shape::ShapeRegistry;
+
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        // Build a slab-mode object with one field "next".
+        let mut reg = ShapeRegistry::new();
+        let shape = reg.shape_for(["next"]).unwrap();
+        let keys = reg.keys_of(shape);
+
+        // Create an empty array first; we will push the object into it to form the
+        // cycle: obj.next = [obj]  →  obj → array → obj.
+        let arr = crate::value::ArrayCell::new(Vec::new());
+        let arr_val = Value::Array(arr.clone());
+
+        // Build the slab object with values[0] = arr_val (not yet cyclic).
+        let obj = crate::value::ObjectCell::new_slab(keys, vec![arr_val], shape);
+        let obj_val = Value::Object(obj);
+
+        // Now close the cycle: push the object into the array.
+        arr.borrow_mut().push(obj_val.clone());
+
+        // Drop both external handles — the cycle keeps refcounts alive.
+        drop(obj_val);
+        drop(arr); // arr Cc already cloned inside ArrayCell::new; drop our Cc copy
+
+        // Refcounting alone cannot reclaim (internal edges keep refcounts ≥ 1).
+        // The cycle collector must break it via the slab-values trace.
+        let reclaimed = super::collect();
+        assert!(
+            reclaimed >= 1,
+            "slab-mode object cycle must be reclaimed by the cycle collector \
+             (got {reclaimed})"
+        );
+
+        let after = gcmodule::count_thread_tracked();
+        assert_eq!(
+            after, before,
+            "tracked-object count must return to baseline after reclaiming the \
+             slab-mode object cycle"
+        );
+    }
+
     // ──────────────────────── V13-T4 SOUNDNESS GATE ────────────────────────
     //
     // Prove every cycle CLASS is actually reclaimed (not merely that ONE cycle is,
@@ -732,18 +787,16 @@ mod tests {
         let mut held_inst = Vec::with_capacity(N);
         for _ in 0..N {
             let mk = || {
-                Value::Instance(Cc::new(RefCell::new(Instance {
-                    class: class.clone(),
-                    fields: IndexMap::new(),
-                    shape_id: Cell::new(0),
-                    frozen: Cell::new(false),
-                })))
+                Value::Instance(Cc::new(RefCell::new(Instance::from_dict(
+                    class.clone(),
+                    IndexMap::new(),
+                ))))
             };
             let a = mk();
             let b = mk();
             if let (Value::Instance(ia), Value::Instance(ib)) = (&a, &b) {
-                ia.borrow_mut().fields.insert("other".into(), b.clone());
-                ib.borrow_mut().fields.insert("other".into(), a.clone());
+                ia.borrow_mut().insert("other", b.clone());
+                ib.borrow_mut().insert("other", a.clone());
             }
             held_inst.push((a, b));
         }

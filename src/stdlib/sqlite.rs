@@ -281,14 +281,14 @@ fn parse_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Params, Cont
         }
         Some(Value::Object(o)) => {
             let mut out = Vec::new();
-            for (k, val) in o.borrow().iter() {
+            for (k, val) in o.entries() {
                 // Accept both ":name" and "name" keys; rusqlite wants the ":" form.
                 let key = if k.starts_with(':') {
-                    k.clone()
+                    k.to_string()
                 } else {
                     format!(":{}", k)
                 };
-                out.push((key, to_sql(val, span, ctx)?));
+                out.push((key, to_sql(&val, span, ctx)?));
             }
             Ok(Params::Named(out))
         }

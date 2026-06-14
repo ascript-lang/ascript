@@ -70,9 +70,10 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
             }
             seen.push(ptr);
             let mut pairs = Vec::new();
-            for (k, val) in o.borrow().iter() {
-                pairs.push((Cb::Text(k.clone()), to_cbor(val, seen)?));
-            }
+            o.try_for_each::<String, _>(|k, val| {
+                pairs.push((Cb::Text(k.to_string()), to_cbor(val, seen)?));
+                Ok(())
+            })?;
             seen.pop();
             Ok(Cb::Map(pairs))
         }
@@ -249,8 +250,7 @@ mod tests {
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         match roundtrip(obj) {
             Value::Object(o) => {
-                let b = o.borrow();
-                assert_eq!(b.get("ok"), Some(&Value::Bool(true)));
+                assert_eq!(o.get("ok"), Some(Value::Bool(true)));
             }
             other => panic!("expected object, got {:?}", other),
         }
@@ -293,7 +293,7 @@ mod tests {
         if let Value::Array(a) = pair {
             let b = a.borrow();
             match &b[0] {
-                Value::Object(o) => assert_eq!(o.borrow().get("a"), Some(&Value::Float(1.0))),
+                Value::Object(o) => assert_eq!(o.get("a"), Some(Value::Float(1.0))),
                 other => panic!("expected object, got {:?}", other),
             }
         }

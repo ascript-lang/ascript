@@ -224,7 +224,6 @@ fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<
             ))
         }
     };
-    let obj = obj.borrow();
     let name = match obj.get("name") {
         Some(Value::Str(s)) => s.to_string(),
         other => {
@@ -233,7 +232,7 @@ fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<
                     format!(
                         "compress.{} entry.name must be a string, got {}",
                         ctx,
-                        crate::interp::type_name(other.unwrap_or(&Value::Nil))
+                        crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
                     ),
                     span,
                 )
@@ -250,7 +249,7 @@ fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<
                     format!(
                         "compress.{} entry.data must be bytes or a string, got {}",
                         ctx,
-                        crate::interp::type_name(other.unwrap_or(&Value::Nil))
+                        crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
                     ),
                     span,
                 )
@@ -334,7 +333,6 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
                 ))
             }
         };
-        let obj = obj.borrow();
         let name = match obj.get("name") {
             Some(Value::Str(s)) => s.to_string(),
             other => {
@@ -342,7 +340,7 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
                     AsError::at(
                         format!(
                             "compress.zipCreate entry.name must be a string, got {}",
-                            crate::interp::type_name(other.unwrap_or(&Value::Nil))
+                            crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
                         ),
                         span,
                     )
@@ -358,7 +356,7 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
                     AsError::at(
                         format!(
                             "compress.zipCreate entry.data must be bytes or a string, got {}",
-                            crate::interp::type_name(other.unwrap_or(&Value::Nil))
+                            crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
                         ),
                         span,
                     )
@@ -510,7 +508,7 @@ mod tests {
         assert_eq!(arr.len(), 2);
         let get = |v: &Value, k: &str| -> Value {
             match v {
-                Value::Object(o) => o.borrow().get(k).cloned().unwrap(),
+                Value::Object(o) => o.get(k).unwrap(),
                 _ => panic!("expected object"),
             }
         };
@@ -637,7 +635,7 @@ mod tests {
         assert_eq!(arr.len(), 2);
         let get = |v: &Value, k: &str| -> Value {
             match v {
-                Value::Object(o) => o.borrow().get(k).cloned().unwrap(),
+                Value::Object(o) => o.get(k).unwrap(),
                 _ => panic!("expected object"),
             }
         };
@@ -674,5 +672,44 @@ print(text)
 "#;
         let out = crate::run_source(src).await.expect("program should run");
         assert_eq!(out, "nil\nhello compress world\n");
+    }
+
+    // ── SHAPE Task 3.1 slab-mode regression tests ─────────────────────────────
+    // The VM builds object literals as slab-mode objects; these tests reproduce the
+    // panic that occurred when `entry_name_data`/`build_zip` called `.borrow()` on
+    // a user-supplied slab object. They MUST use `vm_run_source` (not `run_source`)
+    // to exercise the slab code path; dict-mode objects (built by `ObjectCell::new`)
+    // would falsely pass even before the fix.
+
+    #[tokio::test]
+    async fn vm_zip_create_with_slab_objects() {
+        // The VM produces slab-mode objects for `{ name: ..., data: ... }` literals.
+        // Before the fix, `build_zip` called `.borrow()` on the slab → panic.
+        let src = r#"
+import { zipCreate, zipExtract } from "std/compress"
+let entries = [{ name: "f.txt", data: "hello" }]
+let [zipped, ze] = zipCreate(entries)
+print(zipped != nil)
+"#;
+        let (out, _) = crate::vm_run_source(src)
+            .await
+            .expect("zipCreate with slab objects must not panic");
+        assert_eq!(out.trim(), "true");
+    }
+
+    #[tokio::test]
+    async fn vm_tar_create_with_slab_objects() {
+        // `entry_name_data` (used by `tarCreate`) also called `.borrow()` on the
+        // user-supplied entry object → slab panic before the fix.
+        let src = r#"
+import { tarCreate, tarExtract } from "std/compress"
+let entries = [{ name: "f.txt", data: "hello" }]
+let [tarred, te] = tarCreate(entries)
+print(tarred != nil)
+"#;
+        let (out, _) = crate::vm_run_source(src)
+            .await
+            .expect("tarCreate with slab objects must not panic");
+        assert_eq!(out.trim(), "true");
     }
 }

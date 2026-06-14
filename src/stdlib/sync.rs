@@ -609,9 +609,8 @@ impl Interp {
         let opts = arg(args, 0);
         let (count, window_ms) = match &opts {
             Value::Object(obj) => {
-                let o = obj.borrow();
-                if let Some(ps) = o.get("perSecond") {
-                    let n = want_number(ps, span, "sync.rateLimiter perSecond")?;
+                if let Some(ps) = obj.get("perSecond") {
+                    let n = want_number(&ps, span, "sync.rateLimiter perSecond")?;
                     if n < 1.0 || n.fract() != 0.0 {
                         return Err(AsError::at(
                             "sync.rateLimiter: perSecond must be a positive integer",
@@ -621,8 +620,8 @@ impl Interp {
                     }
                     (n as usize, 1000u64)
                 } else {
-                    let count_v = o.get("count").cloned().unwrap_or(Value::Nil);
-                    let window_v = o.get("windowMs").cloned().unwrap_or(Value::Nil);
+                    let count_v = obj.get("count").unwrap_or(Value::Nil);
+                    let window_v = obj.get("windowMs").unwrap_or(Value::Nil);
                     let c = want_number(&count_v, span, "sync.rateLimiter count")?;
                     let w = want_number(&window_v, span, "sync.rateLimiter windowMs")?;
                     if c < 1.0 || c.fract() != 0.0 {

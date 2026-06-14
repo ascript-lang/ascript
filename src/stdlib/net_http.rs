@@ -410,7 +410,7 @@ struct RetryConfig {
 }
 
 /// Read a numeric field from an object, if present and a number.
-fn num_field(o: &IndexMap<String, Value>, key: &str) -> Option<f64> {
+fn num_field(o: &crate::value::ObjectCell, key: &str) -> Option<f64> {
     // NUM §4: accept BOTH numeric subtypes (`Int` and `Float`).
     o.get(key).and_then(|v| v.as_f64())
 }
@@ -419,20 +419,20 @@ fn num_field(o: &IndexMap<String, Value>, key: &str) -> Option<f64> {
 /// absent or nil, and a Tier-2 type error (`"<ctx> expects a number"`) for any
 /// other present type. Used where a wrong type must fail loudly (not coerce).
 fn strict_num_field(
-    o: &IndexMap<String, Value>,
+    o: &crate::value::ObjectCell,
     key: &str,
     ctx: &str,
     span: Span,
 ) -> Result<Option<f64>, Control> {
     match o.get(key) {
         // NUM §4: accept BOTH numeric subtypes (`Int` and `Float`).
-        Some(v) if v.is_number() => Ok(v.as_f64().map(Some).unwrap_or(None)),
+        Some(v) if v.is_number() => Ok(v.as_f64()),
         Some(Value::Nil) | None => Ok(None),
         Some(other) => Err(AsError::at(
             format!(
                 "net/http {} expects a number, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(&other)
             ),
             span,
         )
@@ -462,7 +462,7 @@ fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control>
         None => return Ok(None),
     };
     let o = match &r {
-        Value::Object(o) => o.borrow(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -520,7 +520,7 @@ fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control>
             return Err(AsError::at(
                 format!(
                     "net/http retry.retryOn expects an array of numbers, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(&other)
                 ),
                 span,
             )
@@ -574,7 +574,7 @@ fn build_client_inner(
     // `total` is not itself set); the connect timeout is applied independently.
     if let Some(t) = opt_field(opts, "timeout") {
         let o = match &t {
-            Value::Object(o) => o.borrow(),
+            Value::Object(o) => o.clone(),
             other => {
                 return Err(AsError::at(
                     format!(
@@ -606,12 +606,11 @@ fn build_client_inner(
         let policy = match &r {
             Value::Str(s) if s.as_ref() == "none" => reqwest::redirect::Policy::none(),
             Value::Object(o) => {
-                let o = o.borrow();
                 let follow = !matches!(o.get("follow"), Some(Value::Bool(false)));
                 if !follow {
                     reqwest::redirect::Policy::none()
                 } else {
-                    let max = num_field(&o, "max").unwrap_or(10.0).max(0.0) as usize;
+                    let max = num_field(o, "max").unwrap_or(10.0).max(0.0) as usize;
                     reqwest::redirect::Policy::limited(max)
                 }
             }
@@ -706,7 +705,7 @@ fn apply_tls(
     span: Span,
 ) -> Result<reqwest::ClientBuilder, Control> {
     let o = match tls {
-        Value::Object(o) => o.borrow(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -720,7 +719,7 @@ fn apply_tls(
     };
     // caBundle: a PEM string or a path to a PEM file → an extra trusted root.
     if let Some(ca) = o.get("caBundle") {
-        let ca = want_string(ca, span, "net/http tls.caBundle")?;
+        let ca = want_string(&ca, span, "net/http tls.caBundle")?;
         let pem = read_pem_or_inline(&ca, "tls.caBundle", span)?;
         let cert = reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
             Control::from(AsError::at(format!("net/http tls.caBundle: {}", e), span))
@@ -729,7 +728,7 @@ fn apply_tls(
     }
     // clientCert: a PEM string (cert + private key) → a client identity (mTLS).
     if let Some(cc) = o.get("clientCert") {
-        let cc = want_string(cc, span, "net/http tls.clientCert")?;
+        let cc = want_string(&cc, span, "net/http tls.clientCert")?;
         let pem = read_pem_or_inline(&cc, "tls.clientCert", span)?;
         let id = reqwest::Identity::from_pem(pem.as_bytes()).map_err(|e| {
             Control::from(AsError::at(format!("net/http tls.clientCert: {}", e), span))
@@ -738,7 +737,7 @@ fn apply_tls(
     }
     // minVersion: "1.2" | "1.3".
     if let Some(mv) = o.get("minVersion") {
-        let mv = want_string(mv, span, "net/http tls.minVersion")?;
+        let mv = want_string(&mv, span, "net/http tls.minVersion")?;
         let v = match mv.as_ref() {
             "1.2" => reqwest::tls::Version::TLS_1_2,
             "1.3" => reqwest::tls::Version::TLS_1_3,
@@ -757,7 +756,7 @@ fn apply_tls(
     }
     // sni: toggle TLS SNI (default on).
     if let Some(Value::Bool(sni)) = o.get("sni") {
-        b = b.tls_sni(*sni);
+        b = b.tls_sni(sni);
     }
     // insecure: disable certificate verification (flagged above).
     if matches!(o.get("insecure"), Some(Value::Bool(true))) {
@@ -814,9 +813,9 @@ fn obj(map: IndexMap<String, Value>) -> Value {
 /// Pull `opts.<key>` (an object) when present and non-nil.
 fn opt_field(opts: &Value, key: &str) -> Option<Value> {
     match opts {
-        Value::Object(o) => match o.borrow().get(key) {
+        Value::Object(o) => match o.get(key) {
             Some(Value::Nil) | None => None,
-            Some(v) => Some(v.clone()),
+            Some(v) => Some(v),
         },
         _ => None,
     }
@@ -844,14 +843,14 @@ fn value_to_query_pairs(
         }
     };
     let mut pairs = Vec::new();
-    for (k, val) in o.borrow().iter() {
-        match val {
+    for (k, val) in o.entries() {
+        match &val {
             Value::Array(a) => {
                 for item in a.borrow().iter() {
-                    pairs.push((k.clone(), scalar_to_string(item, span, ctx)?));
+                    pairs.push((k.to_string(), scalar_to_string(item, span, ctx)?));
                 }
             }
-            _ => pairs.push((k.clone(), scalar_to_string(val, span, ctx)?)),
+            _ => pairs.push((k.to_string(), scalar_to_string(&val, span, ctx)?)),
         }
     }
     Ok(pairs)
@@ -977,9 +976,9 @@ impl Interp {
                     .into())
                 }
             };
-            for (k, v) in map.borrow().iter() {
-                let vs = scalar_to_string(v, span, "net/http header")?;
-                rb = rb.header(k.as_str(), vs);
+            for (k, v) in map.entries() {
+                let vs = scalar_to_string(&v, span, "net/http header")?;
+                rb = rb.header(k.as_ref(), vs);
             }
         }
 
@@ -1129,13 +1128,12 @@ impl Interp {
                 .into())
             }
         };
-        let o = o.borrow();
         if let Some(tok) = o.get("bearer") {
-            let tok = want_string(tok, span, "net/http auth.bearer")?;
+            let tok = want_string(&tok, span, "net/http auth.bearer")?;
             return Ok(rb.bearer_auth(tok.to_string()));
         }
         if let Some(basic) = o.get("basic") {
-            let arr = super::want_array(basic, span, "net/http auth.basic")?;
+            let arr = super::want_array(&basic, span, "net/http auth.basic")?;
             let arr = arr.borrow();
             let user = want_string(
                 arr.first().unwrap_or(&Value::Nil),
@@ -1167,17 +1165,14 @@ impl Interp {
             Value::Str(s) => Ok(rb.body(s.to_string())),
             Value::Bytes(b) => Ok(rb.body(b.borrow().clone())),
             Value::Object(o) => {
-                // Pull out the single recognized shape WITHOUT holding the borrow
-                // across an await (the {stream} path can call back into the interp).
-                let (jv, form, mp, stream) = {
-                    let o = o.borrow();
-                    (
-                        o.get("json").cloned(),
-                        o.get("form").cloned(),
-                        o.get("multipart").cloned(),
-                        o.get("stream").cloned(),
-                    )
-                };
+                // Pull out the single recognized shape upfront (accessor API returns owned
+                // Values so no borrow held across the {stream} await path).
+                let (jv, form, mp, stream) = (
+                    o.get("json"),
+                    o.get("form"),
+                    o.get("multipart"),
+                    o.get("stream"),
+                );
                 if let Some(jv) = jv {
                     let json =
                         crate::stdlib::json::from_ascript(&jv, &mut Vec::new()).map_err(|m| {
@@ -1952,8 +1947,8 @@ fn sse_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>, Contro
                 .into())
             }
         };
-        for (k, v) in map.borrow().iter() {
-            out.push((k.clone(), scalar_to_string(v, span, "net/http sse header")?));
+        for (k, v) in map.entries() {
+            out.push((k.to_string(), scalar_to_string(&v, span, "net/http sse header")?));
         }
     }
     Ok(out)
@@ -1967,7 +1962,7 @@ fn sse_auth(opts: &Value, span: Span) -> Result<Option<SseAuth>, Control> {
         None => return Ok(None),
     };
     let o = match &a {
-        Value::Object(o) => o.borrow(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -1980,11 +1975,11 @@ fn sse_auth(opts: &Value, span: Span) -> Result<Option<SseAuth>, Control> {
         }
     };
     if let Some(tok) = o.get("bearer") {
-        let tok = want_string(tok, span, "net/http sse auth.bearer")?;
+        let tok = want_string(&tok, span, "net/http sse auth.bearer")?;
         return Ok(Some(SseAuth::Bearer(tok.to_string())));
     }
     if let Some(basic) = o.get("basic") {
-        let arr = super::want_array(basic, span, "net/http sse auth.basic")?;
+        let arr = super::want_array(&basic, span, "net/http sse auth.basic")?;
         let arr = arr.borrow();
         let user = want_string(
             arr.first().unwrap_or(&Value::Nil),
@@ -2068,9 +2063,8 @@ fn build_multipart(mp: &Value, span: Span) -> Result<reqwest::multipart::Form, C
                 .into())
             }
         };
-        let o = o.borrow();
         let name = match o.get("name") {
-            Some(n) => want_string(n, span, "net/http multipart part.name")?.to_string(),
+            Some(n) => want_string(&n, span, "net/http multipart part.name")?.to_string(),
             None => return Err(AsError::at("net/http multipart part requires a name", span).into()),
         };
         if let Some(data) = o.get("data") {
@@ -2081,7 +2075,7 @@ fn build_multipart(mp: &Value, span: Span) -> Result<reqwest::multipart::Form, C
                     return Err(AsError::at(
                         format!(
                             "net/http multipart data must be string/bytes, got {}",
-                            crate::interp::type_name(other)
+                            crate::interp::type_name(&other)
                         ),
                         span,
                     )
@@ -2090,11 +2084,11 @@ fn build_multipart(mp: &Value, span: Span) -> Result<reqwest::multipart::Form, C
             };
             let mut part = reqwest::multipart::Part::bytes(bytes);
             if let Some(fname) = o.get("filename") {
-                let fname = want_string(fname, span, "net/http multipart part.filename")?;
+                let fname = want_string(&fname, span, "net/http multipart part.filename")?;
                 part = part.file_name(fname.to_string());
             }
             if let Some(ct) = o.get("contentType") {
-                let ct = want_string(ct, span, "net/http multipart part.contentType")?;
+                let ct = want_string(&ct, span, "net/http multipart part.contentType")?;
                 part = part.mime_str(&ct).map_err(|e| {
                     Control::from(AsError::at(
                         format!("net/http multipart contentType: {}", e),
@@ -2104,7 +2098,7 @@ fn build_multipart(mp: &Value, span: Span) -> Result<reqwest::multipart::Form, C
             }
             form = form.part(name, part);
         } else if let Some(value) = o.get("value") {
-            let value = scalar_to_string(value, span, "net/http multipart part.value")?;
+            let value = scalar_to_string(&value, span, "net/http multipart part.value")?;
             form = form.text(name, value);
         } else {
             return Err(

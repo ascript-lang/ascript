@@ -525,12 +525,27 @@ with `len(x)`).
   but a `Some(payload)` IS traced — its `Payload::Positional(Vec<Value>)` / `Payload::Named(Cc<ObjectCell>)`
   can hold cycle-capable containers (e.g. a recursive `Json.Arr(items)`), so `EnumVariant` is in the
   `Value::trace` set and the `gc.rs` doc-comment no longer lists it under "immutable/acyclic … stay on Rc".
-- **Object/instance SHAPES (hidden classes).** `Value::Object` is `Rc<ObjectCell { map, shape: Cell<u32> }>`
-  carrying a shape id beside the entry map; `Instance` has `shape_id`. A shape identifies an ordered
-  key-layout; the per-`Vm` `ShapeRegistry` (`src/vm/shape.rs`) assigns ids via a memoized transition tree.
-  The VM assigns shapes (literals, instances by class, `resync_object_shape` on a new key); the tree-walker
-  never touches the registry (its objects stay shape 0). Additive/behavior-preserving — the inline caches
-  rely on it.
+- **Object/instance SHAPES (hidden classes) — SHAPE spec, `feat/shape-storage`.** `ObjectCell` and
+  `Instance.fields` now hold an `ObjectStorage` enum: **`Slab { keys: Rc<[Rc<str>]>, values: Vec<Value> }`**
+  (the common case — key list shared per shape via the registry, values inline, zero per-object key alloc)
+  **| `Dict(IndexMap<String, Value>)`** (fallback; always shape 0). All access goes through sealed accessors;
+  the legacy `borrow()` shim **panics on Slab** — use accessors only. **The VM builds slabs**; the
+  **tree-walker builds Dict (shape 0)** — the oracle is unchanged, as the four-mode differential proves.
+  The per-`Vm` `ShapeRegistry` (`src/vm/shape.rs`, `FxHashMap`-backed) interns key-lists → shape ids via a
+  memoized transition tree; caps: `SLAB_MAX_KEYS = 64`, `SHAPE_FANOUT_MAX = 128`. A slab that grows past
+  either cap **demotes to Dict (one-way, shape 0)**. The per-site **`lit_shapes` cache** (`Chunk.lit_shapes`,
+  specialize-gated, runtime-only — NOT serialized into `.aso`) lets a warm `NewObject` site skip the registry
+  probe; `--no-specialize` still builds slabs (representation is not toggleable). Construction/mutation go
+  through `vm_object_insert`/`vm_instance_insert` (precise per-key registry transitions); the old
+  `resync_object_shape`/`resync_instance_shape` full-re-derive functions were **deleted**. Delete-bug lesson
+  (Phase 0): `object.delete` demotes slab → Dict and resets shape to 0 before the `shift_remove`, so stale
+  inline caches cannot read wrong slot offsets. **Hashing boundary (security):** VM interior tables
+  (`class_methods`/`class_static_methods`/`class_defaults`/`user_globals` + shape registry) use **FxHash**
+  (bounded, non-adversarial keys); **`Map`/`Set`/dict-mode objects/decode paths keep SipHash** (hash-flooding
+  DoS resistance — do not "optimize"). **No `.aso`/opcode change** — SHAPE is purely runtime
+  (`ASO_FORMAT_VERSION` unchanged at 28; guarded by `tests/shape_negative_space.rs`).
+  Performance: `object_churn` **1.77×** speedup; per-object alloc slope **13 → 2 (6.5× reduction)**;
+  `json_roundtrip` flat by design (decode-born objects stay Dict/SipHash per spec §9).
 - **VM module-scope user-globals.** A direct-child top-level `let`/`const`/`fn`/`class`/`enum`/`import` is a
   module-scope user-global (NOT a frame slot-local), mirroring the tree-walker's shared late-bound module
   `Environment`. Storage is on `Vm`: `user_globals: RefCell<IndexMap<Rc<str>, GlobalSlot{value, mutable}>>`

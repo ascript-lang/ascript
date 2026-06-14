@@ -100,6 +100,39 @@ fn capture_free_call_alloc_slope_drops_with_a1_and_a2() {
     );
 }
 
+/// SHAPE (Task 6.1 probe): per-object construction allocation slope. Each loop
+/// iteration builds a fresh 4-field object literal and reads its fields — the
+/// `object_churn` shape. SHAPE's slab construction aims to cut the per-object
+/// allocation count vs the old IndexMap. The slope `(allocs(2N)−allocs(N))/N`
+/// isolates the per-object cost. Run on BOTH base and candidate (same source)
+/// to read the delta.
+#[test]
+#[ignore]
+fn object_construction_alloc_slope() {
+    let mk = |n: u64| {
+        format!(
+            "let total = 0\nfor (i in 0..{n}) {{ let o = {{ id: i, name: \"node\", x: i * 2, y: i + 1 }}\n total = total + o.x + o.y + o.id }}\nprint(total)"
+        )
+    };
+    let on = slope(mk, true);
+    let off = slope(mk, false);
+    println!("SHAPE object_construction slope: call_fast=true → {on:.3}/object, call_fast=false → {off:.3}/object");
+    // Slab construction of this 4-key object is ~2 allocs/object; the OLD IndexMap
+    // dict path was ~13. The bound is 6.0 — ~3× headroom above the measured ~2.0 for
+    // allocator noise, but it TRIPS on a silent regression back to the dict path
+    // (~13). (An earlier `< 50.0` bound passed at both 2 AND 13 → it only caught a
+    // catastrophic blowup, not a demotion to dict — tightened per the Phase-6 review.)
+    assert!(
+        on < 6.0,
+        "object construction slope {on}/object regressed toward the IndexMap dict path \
+         (slab construction should be ~2/object; >6 suggests a demotion to dict)"
+    );
+    assert!(
+        off < 6.0,
+        "object construction slope {off}/object (call_fast off) regressed toward dict"
+    );
+}
+
 /// A3 (Task 2.3 gate): re-entrant `call_value` calls (native→VM re-entry via
 /// `array.map`) must not regress. The anti-false-green proof that pooling actually
 /// fires is in `tests/call_fast.rs::pooled_fiber_reuses_counter_is_nonzero`; here

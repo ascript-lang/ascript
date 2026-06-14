@@ -203,9 +203,10 @@ fn check_inner(
             if seen.insert(id, ()).is_some() {
                 return Ok(());
             }
-            for (k, val) in o.borrow().iter() {
+            let entries = o.entries();
+            for (k, val) in &entries {
                 let len = path.len();
-                push_member(path, k);
+                push_member(path, k.as_ref());
                 check_inner(val, path, seen)?;
                 path.truncate(len);
             }
@@ -235,8 +236,8 @@ fn check_inner(
             if seen.insert(id, ()).is_some() {
                 return Ok(());
             }
-            let borrow = inst.borrow();
-            for (k, val) in borrow.fields.iter() {
+            let entries = inst.borrow().entries();
+            for (k, val) in &entries {
                 let len = path.len();
                 push_member(path, k);
                 check_inner(val, path, seen)?;
@@ -270,10 +271,11 @@ fn check_inner(
                     if seen.insert(id, ()).is_some() {
                         return Ok(());
                     }
-                    for (k, val) in o.borrow().iter() {
+                    let entries = o.entries();
+                    for (k, val) in &entries {
                         let len = path.len();
                         path.push_str(".payload");
-                        push_member(path, k);
+                        push_member(path, k.as_ref());
                         check_inner(val, path, seen)?;
                         path.truncate(len);
                     }
@@ -487,14 +489,10 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             Ok(id) => {
                 w.u8(TAG_OBJECT);
                 w.u32(id);
-                let entries: Vec<(String, Value)> = o
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let entries = o.entries();
                 w.u32(entries.len() as u32);
                 for (k, val) in &entries {
-                    w.str(k);
+                    w.str(k.as_ref());
                     encode_value(val, w, ids);
                 }
             }
@@ -564,9 +562,9 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
                 let borrow = inst.borrow();
                 w.str(&borrow.class.name);
                 let fields: Vec<(String, Value)> = borrow
-                    .fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .entries()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
                     .collect();
                 drop(borrow);
                 w.u32(fields.len() as u32);
@@ -684,7 +682,7 @@ fn decode_value(
             for _ in 0..len {
                 let k = r.str()?;
                 let v = decode_value(r, table, shared, interp)?;
-                cell.borrow_mut().insert(k, v);
+                cell.insert(&k, v);
             }
             Ok(value)
         }
@@ -829,19 +827,18 @@ fn decode_value(
             // Allocate the empty instance and register it BEFORE reading fields so a
             // self-referential field resolves to the same handle.
             let class = resolve_class(interp, &class_name);
-            let cell = gcmodule::Cc::new(std::cell::RefCell::new(crate::value::Instance {
-                class,
-                fields: indexmap::IndexMap::new(),
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            }));
+            // The airlock rebuilds instances in DICT mode (shape 0) — the receiving
+            // isolate's VM grows shapes on its OWN writes (SHAPE Task 3.4).
+            let cell = gcmodule::Cc::new(std::cell::RefCell::new(
+                crate::value::Instance::from_dict(class, indexmap::IndexMap::new()),
+            ));
             let value = Value::Instance(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
                 let k = r.str()?;
                 let v = decode_value(r, table, shared, interp)?;
-                cell.borrow_mut().fields.insert(k, v);
+                cell.borrow_mut().insert(&k, v);
             }
             Ok(value)
         }
@@ -1059,7 +1056,7 @@ mod tests {
             .insert("self".to_string(), Value::Object(o.clone()));
         let back = rt(&Value::Object(o));
         if let Value::Object(obj) = &back {
-            let inner = obj.borrow().get("self").cloned().unwrap();
+            let inner = obj.get("self").unwrap();
             assert!(matches!(&inner, Value::Object(i) if crate::gc::cc_ptr_eq(obj, i)));
         } else {
             panic!("expected object");
@@ -1083,19 +1080,16 @@ mod tests {
         let mut fields = IndexMap::new();
         fields.insert("x".to_string(), num(1.0));
         fields.insert("y".to_string(), num(2.0));
-        let inst = Value::Instance(gcmodule::Cc::new(RefCell::new(crate::value::Instance {
-            class,
-            fields,
-            shape_id: std::cell::Cell::new(0),
-            frozen: std::cell::Cell::new(false),
-        })));
+        let inst = Value::Instance(gcmodule::Cc::new(RefCell::new(
+            crate::value::Instance::from_dict(class, fields),
+        )));
         let back = rt(&inst);
         assert_eq!(format!("{back}"), format!("{inst}"));
         if let Value::Instance(i) = &back {
             let b = i.borrow();
             assert_eq!(b.class.name, "P");
-            assert_eq!(b.fields.get("x"), Some(&num(1.0)));
-            assert_eq!(b.fields.get("y"), Some(&num(2.0)));
+            assert_eq!(b.get("x"), Some(num(1.0)));
+            assert_eq!(b.get("y"), Some(num(2.0)));
         } else {
             panic!("expected instance");
         }
@@ -1178,7 +1172,7 @@ mod tests {
         // Objects are identity-equal containers, so compare the nested variant (which
         // IS structural). The decoded object must hold an equal `Circle(radius: 1.5)`.
         if let Value::Object(ob) = &back {
-            let inner = ob.borrow().get("shape").cloned().expect("shape field");
+            let inner = ob.get("shape").expect("shape field");
             assert_eq!(inner, circle);
         } else {
             panic!("expected an object");
@@ -1449,9 +1443,8 @@ mod tests {
         let back = decode_with_shared(&bytes, &shared, &interp).unwrap();
         match back {
             Value::Object(o) => {
-                let b = o.borrow();
-                assert!(matches!(b.get("cfg"), Some(Value::Shared(_))));
-                assert_eq!(b.get("n"), Some(&Value::Int(1)));
+                assert!(matches!(o.get("cfg"), Some(Value::Shared(_))));
+                assert_eq!(o.get("n"), Some(Value::Int(1)));
             }
             _ => panic!(),
         }

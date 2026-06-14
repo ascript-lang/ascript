@@ -1,0 +1,47 @@
+# exit: none
+--- 1. literal order ---
+{a: 1, b: 2, c: 3}
+{a: 2, b: 9}
+--- 2. add-order dot and bracket ---
+{x: 10, y: 20, z: 30}
+--- 3. spread merge ---
+{a: 1, b: 99, c: 3}
+{a: 1, b: 2, z: 0}
+--- 4. rest collection ---
+1
+{b: 2, c: 3, d: 4}
+--- 5. delete + re-add ---
+{x: 10, z: 30}
+{x: 10, z: 30, y: 99}
+10
+30
+99
+--- 6. entries round-trip ---
+{first: 1, second: 2, third: 3}
+["first", "second", "third"]
+--- 7. 70-key object (slab -> dict demotion) ---
+70
+0
+69
+k0
+k10
+k64
+k69
+--- 8. keys / values / entries ---
+["alpha", "beta", "gamma"]
+[1, 2, 3]
+["alpha", 1]
+["beta", 2]
+["gamma", 3]
+--- 9. class instances ---
+<Widget instance>
+1
+btn
+base_default
+nil
+added_in_init
+post
+<Widget instance>
+{id: 1, label: "btn", inherited: "base_default", extra: "added_in_init", dynamic: "post"}
+["id", "label", "inherited", "extra", "dynamic"]
+object_order_stress: all done

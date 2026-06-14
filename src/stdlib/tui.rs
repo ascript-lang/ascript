@@ -852,18 +852,18 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
 /// One boolean style flag from a style object: a `bool`, or absent (→ `false`).
 /// A present-but-non-bool value is a Tier-2 panic.
 fn parse_flag(
-    map: &indexmap::IndexMap<String, Value>,
+    map: &crate::value::ObjectCell,
     key: &str,
     span: Span,
 ) -> Result<bool, Control> {
     match map.get(key) {
         None | Some(Value::Nil) => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::Bool(b)) => Ok(b),
         Some(other) => Err(AsError::at(
             format!(
                 "terminal style: '{}' must be a boolean, got {}",
                 key,
-                crate::interp::type_name(other)
+                crate::interp::type_name(&other)
             ),
             span,
         )
@@ -878,7 +878,7 @@ pub fn parse_style(v: &Value, span: Span) -> Result<Style, Control> {
     let mut style = Style::default();
     let map = match v {
         Value::Nil => return Ok(style),
-        Value::Object(o) => o.borrow(),
+        Value::Object(o) => o.clone(),
         other => {
             return Err(AsError::at(
                 format!(
@@ -891,10 +891,10 @@ pub fn parse_style(v: &Value, span: Span) -> Result<Style, Control> {
         }
     };
     if let Some(fg) = map.get("fg").filter(|v| !matches!(v, Value::Nil)) {
-        style.fg = parse_color(fg, span, "fg")?;
+        style.fg = parse_color(&fg, span, "fg")?;
     }
     if let Some(bg) = map.get("bg").filter(|v| !matches!(v, Value::Nil)) {
-        style.bg = parse_color(bg, span, "bg")?;
+        style.bg = parse_color(&bg, span, "bg")?;
     }
     style.attrs.bold = parse_flag(&map, "bold", span)?;
     style.attrs.underline = parse_flag(&map, "underline", span)?;
@@ -1495,7 +1495,7 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object: {:?}", v)
         };
-        match o.borrow().get(key) {
+        match o.get(key) {
             Some(Value::Str(s)) => s.to_string(),
             other => panic!("field {} not a string: {:?}", key, other),
         }
@@ -1504,8 +1504,8 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object")
         };
-        match o.borrow().get(key) {
-            Some(Value::Bool(b)) => *b,
+        match o.get(key) {
+            Some(Value::Bool(b)) => b,
             other => panic!("field {} not a bool: {:?}", key, other),
         }
     }
@@ -1513,7 +1513,7 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object")
         };
-        match o.borrow().get(key).map(|v| (v.as_f64(), v.clone())) {
+        match o.get(key).map(|v| (v.as_f64(), v)) {
             Some((Some(n), _)) => n,
             other => panic!("field {} not a number: {:?}", key, other),
         }
@@ -1522,7 +1522,7 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object")
         };
-        matches!(o.borrow().get(key), Some(Value::Nil) | None)
+        matches!(o.get(key), Some(Value::Nil) | None)
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Event {

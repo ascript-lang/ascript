@@ -106,7 +106,7 @@ impl Interp {
     async fn bench_compare(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let map_val = arg(args, 0);
         let entries = match &map_val {
-            Value::Object(o) => o.borrow().clone(),
+            Value::Object(o) => o.entries(),
             _ => {
                 return Err(AsError::at(
                     format!(
@@ -122,17 +122,16 @@ impl Interp {
         let iterations_arg = arg(args, 1);
         let mut results: Vec<(String, f64, f64)> = Vec::new(); // (name, avgMs, opsPerSec)
 
-        for (name, callee) in entries.iter() {
+        for (name, callee) in &entries {
             let measure_args = match &iterations_arg {
                 Value::Nil => vec![callee.clone()],
                 it => vec![callee.clone(), it.clone()],
             };
             let stats = self.bench_measure(&measure_args, span).await?;
             if let Value::Object(o) = &stats {
-                let o = o.borrow();
                 let avg_ms = o.get("avgMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let ops = o.get("opsPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                results.push((name.clone(), avg_ms, ops));
+                results.push((name.to_string(), avg_ms, ops));
             }
         }
 

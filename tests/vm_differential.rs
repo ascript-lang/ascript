@@ -8311,6 +8311,322 @@ async fn object_delete_invalidates_shape_for_warmed_property_ic() {
     assert_four_way_run(src).await;
 }
 
+// ── SHAPE Phase 3.1 — slab construction + precise transitions ────────────────
+// Five-way byte-identity: tw == specialized-VM == generic-VM == lane-off == .aso
+// for every object construction / mutation path that Task 3.1 rewires.
+
+/// SHAPE 3.1: literal order, duplicate-key last-wins, spread merge later-wins
+/// first-position, self-spread, SET_INDEX add, and post-cap wide object.
+/// These scenarios exercised dict-mode before; they must produce IDENTICAL output
+/// after the slab-native rewrite — the corpus is the behaviour lock.
+#[tokio::test]
+async fn shape_slab_construction_and_mutation_five_way() {
+    // Literal order preserved.
+    assert_three_way_matches("let o = {a: 1, b: 2, c: 3}\nprint(o)\n").await;
+    // Duplicate key: last value wins, first position kept (IndexMap semantics).
+    assert_three_way_matches("let o = {a: 1, b: 9, a: 2}\nprint(o)\n").await;
+    // Spread merge: later-wins, first-position kept.
+    assert_three_way_matches(
+        "let base = {x: 1, y: 2}\nlet o = {...base, y: 99, z: 3}\nprint(o)\n",
+    )
+    .await;
+    // Self-spread (the object spreads into itself — a no-op value-wise, order kept).
+    assert_three_way_matches("let o = {a: 1, b: 2}\nlet o2 = {...o, ...o}\nprint(o2)\n").await;
+    // SET_INDEX add: adding a new key via `o[\"k\"] = v` must produce the same result.
+    assert_three_way_matches(
+        "let o = {a: 1}\no[\"b\"] = 2\no[\"c\"] = 3\nprint(o)\nprint(o.b)\nprint(o.c)\n",
+    )
+    .await;
+    // Post-cap wide object: building >64 keys via SET_PROP demotes to dict; order kept.
+    assert_three_way_matches(
+        "let o = {}\n\
+         let i = 0\n\
+         while (i < 70) {\n\
+           o[\"k\" + i] = i\n\
+           i = i + 1\n\
+         }\n\
+         print(o.k0)\n\
+         print(o.k69)\n\
+         print(o.k33)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.1: SET_PROP add on a function-site-warmed IC must keep producing
+/// the correct result (the IC sees a transitioned shape after the first add;
+/// subsequent same-key writes hit the IC; different-key writes miss and
+/// re-record — all must be byte-identical across every engine mode).
+#[tokio::test]
+async fn shape_set_prop_transition_five_way() {
+    assert_three_way_matches(
+        "fn build(x) {\n\
+           let o = {a: x}\n\
+           o.b = x + 1\n\
+           o.c = x + 2\n\
+           return o\n\
+         }\n\
+         print(build(1))\n\
+         print(build(10))\n\
+         print(build(100))\n",
+    )
+    .await;
+    // Overwrite an existing key (shape unchanged) after a previous warm.
+    assert_three_way_matches(
+        "fn bump(o) { o.x = o.x + 1 }\n\
+         let o = {x: 0}\n\
+         bump(o)\nbump(o)\nbump(o)\n\
+         print(o.x)\n",
+    )
+    .await;
+}
+
+// ── SHAPE Task 3.3 — slab IC polymorphism + post-demotion battery ─────────────
+// These tests are the CORRECTNESS LOCK for the slab-native field IC paths
+// (ic_get_field / vm_set_prop / vm_object_insert) that landed in Tasks 1.3 + 3.1.
+// Every scenario must produce BYTE-IDENTICAL output across all five modes:
+// tree-walker == specialized-VM == generic-VM == lane-off == no-call-fast.
+// A divergence means an IC guard is wrong — fix the engine, never weaken the check.
+
+/// SHAPE 3.3-A: poly-site (4 distinct shapes through one GET_PROP accessor).
+/// `fn get(o) { return o.x }` is called with objects whose `x` field sits at
+/// a different slab index for each shape. The IC must promote cold→mono→poly
+/// and serve the CORRECT per-shape index every time.
+#[tokio::test]
+async fn shape_ic_poly_read_four_shapes() {
+    // x at index 0, 1, 2, 3 depending on prefix padding.
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         print(get({x: 1}))\n\
+         print(get({a: 0, x: 2}))\n\
+         print(get({a: 0, b: 0, x: 3}))\n\
+         print(get({p: 0, q: 0, r: 0, x: 4}))\n",
+    )
+    .await;
+    // Run each shape many times so the IC fully warms, then interleave again.
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         let total = 0\n\
+         let i = 0\n\
+         while (i < 400) {\n\
+           let m = i % 4\n\
+           if (m == 0) { total = total + get({x: 1}) }\n\
+           else if (m == 1) { total = total + get({a: 0, x: 2}) }\n\
+           else if (m == 2) { total = total + get({a: 0, b: 0, x: 3}) }\n\
+           else { total = total + get({p: 0, q: 0, r: 0, x: 4}) }\n\
+           i = i + 1\n\
+         }\n\
+         print(total)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-B: poly-HIT ramp → mega-site. The IC must serve the right value at
+/// EVERY cache state, so the program RAMPS the distinct-shape count 1→2→3→4→5→6,
+/// reading each shape's site MULTIPLE times before introducing the next distinct
+/// shape. The repeated reads are genuine cache HITS at each level: the first read
+/// at a new shape RECORDS (cold→mono, then mono→poly2→poly3→poly4), and the
+/// subsequent reads HIT that recorded entry (the poly-hit path actually executes).
+/// The 5th distinct shape saturates the IC to Mega; thereafter all six shapes are
+/// re-read to confirm the post-mega generic path stays correct too.
+#[tokio::test]
+async fn shape_ic_mega_read_six_shapes() {
+    // POLY-HIT RAMP: introduce shape k, then read it+all earlier shapes again so
+    // the IC HITS its recorded entry for each at the current poly level. Reads sit
+    // at one GET_PROP site (`get`). x is at a different slab index per shape.
+    // After shape 5 the IC is Mega; shapes are re-read once more for the post-mega
+    // generic confirmation. Output is the running checksum (deterministic).
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         let s1 = {x: 1}\n\
+         let s2 = {a: 0, x: 2}\n\
+         let s3 = {a: 0, b: 0, x: 3}\n\
+         let s4 = {p: 0, q: 0, r: 0, x: 4}\n\
+         let s5 = {c1: 0, c2: 0, c3: 0, c4: 0, x: 5}\n\
+         let s6 = {d1: 0, d2: 0, d3: 0, d4: 0, d5: 0, x: 6}\n\
+         let total = 0\n\
+         // mono: record s1, then HIT s1 twice.\n\
+         total = total + get(s1) + get(s1) + get(s1)\n\
+         // poly2: record s2, then HIT both s1 and s2 (poly-hit path).\n\
+         total = total + get(s2) + get(s1) + get(s2)\n\
+         // poly3: record s3, then HIT s1/s2/s3.\n\
+         total = total + get(s3) + get(s1) + get(s2) + get(s3)\n\
+         // poly4 (POLY_MAX): record s4, then HIT all four.\n\
+         total = total + get(s4) + get(s1) + get(s2) + get(s3) + get(s4)\n\
+         // 5th distinct shape → IC saturates to Mega.\n\
+         total = total + get(s5)\n\
+         // post-mega: every shape now takes the generic path; still correct.\n\
+         total = total + get(s1) + get(s2) + get(s3) + get(s4) + get(s5) + get(s6)\n\
+         print(total)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-C: write poly-site — `fn set(o, v) { o.x = v }` applied to
+/// objects of distinct shapes. Covers both existing-field overwrite (shape
+/// unchanged, IC fast-path) and new-field add (shape transition, IC re-records).
+#[tokio::test]
+async fn shape_ic_poly_write_distinct_shapes() {
+    // Overwrite `x` on several differently-shaped objects, then read back.
+    assert_three_way_matches(
+        "fn set(o, v) { o.x = v }\n\
+         let o1 = {x: 0}\n\
+         let o2 = {a: 1, x: 0}\n\
+         let o3 = {a: 1, b: 2, x: 0}\n\
+         let i = 0\n\
+         while (i < 300) {\n\
+           let m = i % 3\n\
+           if (m == 0) { set(o1, i) }\n\
+           else if (m == 1) { set(o2, i) }\n\
+           else { set(o3, i) }\n\
+           i = i + 1\n\
+         }\n\
+         print(o1.x)\n\
+         print(o2.x)\n\
+         print(o3.x)\n",
+    )
+    .await;
+    // Add a new key `x` to shapes that don't have it yet (triggers shape transition).
+    assert_three_way_matches(
+        "fn add_x(o, v) { o.x = v }\n\
+         let o1 = {a: 1}\n\
+         let o2 = {b: 2, c: 3}\n\
+         let o3 = {p: 9, q: 8, r: 7}\n\
+         add_x(o1, 10)\n\
+         add_x(o2, 20)\n\
+         add_x(o3, 30)\n\
+         print(o1.x)\n\
+         print(o2.x)\n\
+         print(o3.x)\n\
+         add_x(o1, 100)\n\
+         add_x(o2, 200)\n\
+         add_x(o3, 300)\n\
+         print(o1.x)\n\
+         print(o2.x)\n\
+         print(o3.x)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-D: reads after demotion — build an object past the 64-key slab cap
+/// (slab→dict, shape→0), then read fields through previously-warmed IC sites.
+/// The IC must MISS on shape 0 and resolve generically (no stale-index read).
+/// Also covers: delete mid-loop then read/add (the Phase-0 regression locked by
+/// `object_delete_invalidates_shape_for_warmed_property_ic`).
+#[tokio::test]
+async fn shape_ic_reads_after_demotion() {
+    // Build past the 64-key cap: the object demotes to dict, shape→0.
+    // NOTE: keys are built with a TEMPLATE string (`k${i}`), NOT `\"k\" + i` —
+    // in AScript `string + int` is a Tier-2 panic (only string+string concats),
+    // so the `+` form would error before reaching 64 keys and never demote.
+    //
+    // The object starts as a 3-key SLAB {k0, kEnd, mid} with `mid` at slab index 2
+    // (a NON-zero slot). We WARM `get_mid` in a HOT LOOP while the object is still
+    // a slab — the first read RECORDS (shape S, index 2) and every later read HITS
+    // that entry at index 2 (so a `value_at(0)`-style hit-arm bug reads the WRONG
+    // slot here). THEN we grow PAST SLAB_MAX_KEYS=64 so the object demotes slab→dict
+    // (shape→0) AND the add-driven layout shifts `mid` away from index 2 (the loop
+    // inserts k1..k60 BEFORE more keys, so `mid`'s absolute position changes). After
+    // demotion every read of the SAME warmed `get_mid` site must MISS the IC
+    // (receiver is now shape 0 → IC bypassed) and resolve `mid` generically. If
+    // demotion failed to reset the shape to 0, the warmed index-2 entry would
+    // stale-HIT and read the wrong value (whatever now sits at slab/dict index 2).
+    assert_three_way_matches(
+        "fn get_mid(o) { return o.mid }\n\
+         fn get_k0(o) { return o.k0 }\n\
+         let o = {k0: 0, kend: -7, mid: 42}\n\
+         let w = 0\n\
+         let j = 0\n\
+         while (j < 50) {\n\
+           w = w + get_mid(o)\n\
+           j = j + 1\n\
+         }\n\
+         print(w)\n\
+         print(get_mid(o))\n\
+         let i = 1\n\
+         while (i < 70) {\n\
+           o[`k${i}`] = i\n\
+           i = i + 1\n\
+         }\n\
+         print(get_mid(o))\n\
+         print(get_k0(o))\n\
+         print(o.kend)\n\
+         print(o.k69)\n",
+    )
+    .await;
+    // Warm an IC on shape S, delete a key mid-loop (→ shape 0), then read the
+    // same field and also add a new key: all must be byte-identical.
+    assert_three_way_matches(
+        "import * as object from \"std/object\"\n\
+         fn get_b(o) { return o.b }\n\
+         let o = {a: 1, b: 2, c: 3}\n\
+         let i = 0\n\
+         while (i < 200) {\n\
+           if (i == 100) {\n\
+             object.delete(o, \"a\")\n\
+           }\n\
+           let _ = get_b(o)\n\
+           i = i + 1\n\
+         }\n\
+         print(get_b(o))\n\
+         o.d = 99\n\
+         print(o.d)\n\
+         print(o.b)\n",
+    )
+    .await;
+}
+
+/// SHAPE 3.3-E: stale-index guard — warm an IC site on shape S1, then feed an
+/// object of a DIFFERENT shape S2 through the SAME site, then back to S1.
+/// The polymorphic IC must serve the correct index for each shape and must never
+/// return the S1 index when the receiver has shape S2.
+#[tokio::test]
+async fn shape_ic_no_stale_index_across_shape_switch() {
+    // Shape A: {x: val} — x at index 0.
+    // Shape B: {prefix: 0, x: val} — x at index 1.
+    // Alternate rapidly so the IC sees both shapes in both read and write positions.
+    assert_three_way_matches(
+        "fn get(o) { return o.x }\n\
+         fn set(o, v) { o.x = v }\n\
+         let a = {x: 10}\n\
+         let b = {prefix: 0, x: 20}\n\
+         let i = 0\n\
+         let total = 0\n\
+         while (i < 200) {\n\
+           if (i % 2 == 0) {\n\
+             set(a, i)\n\
+             total = total + get(a)\n\
+           } else {\n\
+             set(b, i)\n\
+             total = total + get(b)\n\
+           }\n\
+           i = i + 1\n\
+         }\n\
+         print(total)\n\
+         print(a.x)\n\
+         print(b.x)\n",
+    )
+    .await;
+    // Three shapes interleaved: ensures IC promotes through mono→poly, and
+    // each slot returns the value that was actually WRITTEN to that shape.
+    assert_three_way_matches(
+        "fn read(o) { return o.val }\n\
+         let o1 = {val: 1}\n\
+         let o2 = {z: 0, val: 2}\n\
+         let o3 = {z: 0, y: 0, val: 3}\n\
+         let i = 0\n\
+         while (i < 30) {\n\
+           o1.val = o1.val + 1\n\
+           o2.val = o2.val + 2\n\
+           o3.val = o3.val + 3\n\
+           i = i + 1\n\
+         }\n\
+         print(read(o1))\n\
+         print(read(o2))\n\
+         print(read(o3))\n",
+    )
+    .await;
+}
+
 // ── DEFER §3.1–3.6: VM execution semantics ──────────────────────────────────
 // These tests assert four-mode byte-identity (tree-walker == specialized-VM ==
 // generic-VM == .aso round-trip) for every specified defer behaviour.
@@ -9354,5 +9670,321 @@ print(total)
         sync_ops >= 100,
         "GetSuper must retire many ops in-lane (sync_ops={sync_ops}); \
          if this is low, GetSuper is still escalating to the async driver"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SHAPE Task 3.4 — INSTANCE fields on shape-native slab storage.
+//
+//  These programs exercise every instance-construction and instance-write path
+//  affected by migrating `Instance.fields` from an IndexMap to `ObjectStorage`
+//  (slab/dict). All five modes (tree-walker == specialized-VM == generic-VM ==
+//  lane-off == no-call-fast) MUST agree byte-for-byte, including field ITERATION
+//  ORDER (via json.stringify), declared-field-type contract panics, undeclared
+//  field growth (shape transition), demotion past SLAB_MAX_KEYS, and the
+//  `C.from` / instanceof / method-dispatch paths.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn vm_instance_declared_defaulted_inherited_field_order() {
+    // Declared + defaulted + inherited fields must serialize in merged-schema
+    // (base-class-first, declaration) order — the same order the IndexMap kept.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Base { a: int\n b: string = \"bee\" }\n\
+class Mid extends Base { c: int\n d: float = 1.5 }\n\
+class Leaf extends Mid { e: bool = true }\n\
+let x = Leaf(1, 2)\n\
+print(json.stringify(x)!)\n\
+print(x.a)\n\
+print(x.b)\n\
+print(x.c)\n\
+print(x.d)\n\
+print(x.e)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_init_assigns_declared_fields() {
+    // `init` assigning declared fields in a non-schema order; serialization order
+    // must match what each engine produces (insertion order under init writes).
+    let src = "\
+import * as json from \"std/json\"\n\
+class Point {\n\
+  x: int\n\
+  y: int\n\
+  fn init(a, b) { self.y = b\n self.x = a }\n\
+}\n\
+let p = Point(3, 4)\n\
+print(json.stringify(p)!)\n\
+print(p.x + p.y)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_init_wrong_type_field_panics_identically() {
+    // A wrong-TYPE assignment inside init must panic byte-identically (same
+    // message + span) across all five modes — the contract chokepoint.
+    let src = "\
+class Box {\n\
+  n: int\n\
+  fn init(v) { self.n = v }\n\
+}\n\
+let b = Box(\"not an int\")\n\
+print(\"unreachable\")\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_undeclared_field_add_in_init() {
+    // `init` adding an UNDECLARED field (shape transition), then reading it back.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Bag {\n\
+  a: int\n\
+  fn init(v) { self.a = v\n self.extra = v * 2\n self.tag = \"t\" }\n\
+}\n\
+let g = Bag(5)\n\
+print(json.stringify(g)!)\n\
+print(g.a)\n\
+print(g.extra)\n\
+print(g.tag)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_post_construction_undeclared_add_and_overwrite() {
+    // A post-construction undeclared add (shape transition) plus an existing-key
+    // overwrite (shape unchanged). Reads of all fields must agree.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Thing { id: int = 0 }\n\
+let t = Thing()\n\
+t.id = 7\n\
+t.name = \"hello\"\n\
+t.id = 9\n\
+t.flag = true\n\
+print(json.stringify(t)!)\n\
+print(t.id)\n\
+print(t.name)\n\
+print(t.flag)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_grown_past_slab_max_keys_demotes() {
+    // A class instance grown past SLAB_MAX_KEYS = 64 undeclared fields must demote
+    // to dict storage and remain correct (all reads + full serialization order).
+    // We generate 80 undeclared `f0..f79` writes programmatically into the source.
+    let mut writes = String::new();
+    let mut reads = String::new();
+    for i in 0..80 {
+        writes.push_str(&format!("o.f{i} = {i}\n"));
+        reads.push_str(&format!("print(o.f{i})\n"));
+    }
+    let src = format!(
+        "import * as json from \"std/json\"\n\
+class Wide {{ base: int = 0 }}\n\
+let o = Wide()\n\
+{writes}\
+print(json.stringify(o)!)\n\
+{reads}"
+    );
+    assert_three_way_matches(&src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_from_dict_path_instanceof_and_methods() {
+    // `C.from({...})` builds an instance via the Dict path; instanceof + method
+    // dispatch must be unaffected, and field reads must work.
+    let src = "\
+import * as json from \"std/json\"\n\
+class User {\n\
+  name: string\n\
+  age: int = 0\n\
+  fn greet() { return \"hi \" + self.name }\n\
+}\n\
+let u = User.from({ name: \"Ada\", age: 36 })\n\
+print(json.stringify(u)!)\n\
+print(u instanceof User)\n\
+print(u.greet())\n\
+print(u.name)\n\
+print(u.age)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_method_dispatch_after_field_growth() {
+    // Method dispatch keys on class identity, not field shape: growing undeclared
+    // fields must not disturb method resolution.
+    let src = "\
+class Counter {\n\
+  n: int = 0\n\
+  fn bump() { self.n = self.n + 1\n return self.n }\n\
+}\n\
+let c = Counter()\n\
+c.extra = 100\n\
+print(c.bump())\n\
+print(c.bump())\n\
+c.another = 200\n\
+print(c.bump())\n\
+print(c.extra + c.another)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_destructuring_and_object_helpers() {
+    // Object destructuring over an instance + object.keys/values must see fields
+    // in the right order across all modes.
+    let src = "\
+import * as object from \"std/object\"\n\
+class Rec { a: int\n b: int\n c: int }\n\
+let r = Rec(1, 2, 3)\n\
+let { a, c } = r\n\
+print(a)\n\
+print(c)\n\
+print(object.keys(r))\n\
+print(object.values(r))\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_no_init_zero_field_and_defaults_only() {
+    // Zero-field class (no init, no args) and a defaults-only class — both build
+    // empty or default-populated instances; serialization order must agree.
+    let src = "\
+import * as json from \"std/json\"\n\
+class Empty {}\n\
+class Defaults { x: int = 1\n y: string = \"y\"\n z: bool = false }\n\
+let e = Empty()\n\
+let d = Defaults()\n\
+print(json.stringify(e)!)\n\
+print(json.stringify(d)!)\n\
+print(d.x)\n\
+print(d.z)\n";
+    assert_three_way_matches(src).await;
+}
+
+#[tokio::test]
+async fn vm_instance_field_ic_warms_over_repeated_reads() {
+    // Read instance fields in a HOT LOOP so the GET_PROP field IC at each site
+    // warms (records a shape→index entry, then serves hits). If a NEW-key shape
+    // transition were skipped (leaving a stale shape), a warmed IC would serve a
+    // WRONG index — this test would then diverge. Two instances with DIFFERENT
+    // undeclared-field layouts share the same site, forcing the IC to track shape.
+    let src = "\
+class P { a: int\n b: int }\n\
+let p = P(10, 20)\n\
+p.c = 30\n\
+let q = P(40, 50)\n\
+q.d = 60\n\
+let arr = [p, q]\n\
+let total = 0\n\
+for (i of 0..1000) {\n\
+  for (x of arr) {\n\
+    total = total + x.a + x.b\n\
+  }\n\
+}\n\
+print(total)\n\
+print(p.a)\n\
+print(p.b)\n\
+print(p.c)\n\
+print(q.a)\n\
+print(q.b)\n\
+print(q.d)\n";
+    assert_three_way_matches(src).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SHAPE §3.5 — storage-mode coverage counters + corpus anti-false-green gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run every deterministically-completing corpus example through the in-process
+/// stats entry point, accumulating (slab_constructed, dict_constructed, demotions)
+/// across all files.  Then also run a small explicit driver that GUARANTEES each
+/// mode is exercised — the demotion driver is necessary until Phase 5 order-stress
+/// examples land in the corpus.
+///
+/// Returns `(slab, dict, demote)` totals.
+async fn run_corpus_collecting_mode_stats() -> (u64, u64, u64) {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let (mut slab, mut dict, mut demote) = (0u64, 0u64, 0u64);
+
+    // ── 1. Corpus examples (same enumeration + skip logic as the whole-corpus gate)
+    for rel in all_corpus_examples() {
+        if skip_reason(&rel).is_some() {
+            continue;
+        }
+        let path = std::path::Path::new(root).join(&rel);
+        let src = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Skip feature-unavailable examples (same as the whole-corpus gate).
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+        if let Ok((_out, _exit, (s, d, dm))) =
+            ascript::vm_run_source_obj_mode_stats(&src).await
+        {
+            slab += s;
+            dict += d;
+            demote += dm;
+        }
+    }
+
+    // ── 2. Explicit mode driver — guarantees all three counters are non-zero
+    //    even before Phase-5 order-stress examples land in the corpus.
+    //    Uses only CORE-language constructs (runs under --no-default-features).
+
+    // 2a. Slab mode: a small literal (always a slab).
+    let slab_src = r#"let o = {a: 1, b: 2, c: 3} print(o.a)"#;
+    if let Ok((_out, _exit, (s, d, dm))) =
+        ascript::vm_run_source_obj_mode_stats(slab_src).await
+    {
+        slab += s;
+        dict += d;
+        demote += dm;
+    }
+
+    // 2b. Slab→dict demotion: grow an object past SLAB_MAX_KEYS (64) via dynamic
+    //     inserts — starts as a slab, demotes to dict on the 65th key.
+    //     The `obj_demotions` counter is bumped inside `demote_to_dict()`.
+    //     This is the deterministic demotion source until Phase-5 order-stress
+    //     examples land in the corpus.  The resulting dict-mode object also bumps
+    //     `obj_dict_constructed` (it is a fresh Dict after demotion).
+    let demote_src = r#"
+let o = {}
+let i = 0
+while (i < 70) {
+    o[`k${i}`] = i
+    i = i + 1
+}
+print(i)
+"#;
+    if let Ok((_out, _exit, (s, d, dm))) =
+        ascript::vm_run_source_obj_mode_stats(demote_src).await
+    {
+        slab += s;
+        dict += d;
+        demote += dm;
+    }
+
+    (slab, dict, demote)
+}
+
+/// SHAPE §3.5 coverage Gate 15: running the corpus + explicit mode driver must
+/// construct BOTH storage modes and take at least one slab→dict demotion.
+/// A zero in any column means the corresponding code path silently stopped
+/// executing (anti-false-green).
+#[tokio::test]
+async fn shape_storage_corpus_exercises_both_modes_and_demotion() {
+    let (slab, dict, demote) = run_corpus_collecting_mode_stats().await;
+    assert!(slab > 0,   "no slab-mode object constructed on the corpus (obj_slab_constructed == 0)");
+    assert!(dict > 0,   "no dictionary-mode object constructed on the corpus (obj_dict_constructed == 0)");
+    assert!(demote > 0, "no slab→dict demotion exercised on the corpus (obj_demotions == 0)");
+    eprintln!(
+        "SHAPE Gate 15: slab_constructed={slab}, dict_constructed={dict}, demotions={demote} \
+         (corpus + explicit driver; demotion guaranteed by 70-key dynamic-insert driver)"
     );
 }

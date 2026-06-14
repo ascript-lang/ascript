@@ -208,10 +208,9 @@ impl Interp {
         let (attempts, base_ms, max_ms, jitter) = match &opts {
             Value::Nil => (3usize, 100u64, None::<u64>, false),
             Value::Object(o) => {
-                let o = o.borrow();
                 let attempts = match o.get("attempts") {
                     Some(v) => {
-                        let n = super::want_number(v, span, "task.retry attempts")?;
+                        let n = super::want_number(&v, span, "task.retry attempts")?;
                         if n < 1.0 || n.fract() != 0.0 {
                             return Err(AsError::at(
                                 "task.retry: attempts must be a positive integer",
@@ -225,7 +224,7 @@ impl Interp {
                 };
                 let base_ms = match o.get("baseMs") {
                     Some(v) => {
-                        let n = super::want_number(v, span, "task.retry baseMs")?;
+                        let n = super::want_number(&v, span, "task.retry baseMs")?;
                         if n < 0.0 {
                             return Err(AsError::at(
                                 "task.retry: baseMs must be non-negative",
@@ -239,7 +238,7 @@ impl Interp {
                 };
                 let max_ms = match o.get("maxMs") {
                     Some(v) => {
-                        let n = super::want_number(v, span, "task.retry maxMs")?;
+                        let n = super::want_number(&v, span, "task.retry maxMs")?;
                         if n < 0.0 {
                             return Err(AsError::at(
                                 "task.retry: maxMs must be non-negative",
@@ -370,9 +369,9 @@ impl Interp {
 
             // Extract e.kind — must be a string field on an Object.
             let kind: std::rc::Rc<str> = match &item {
-                Value::Object(o) => match o.borrow().get("kind") {
+                Value::Object(o) => match o.get("kind") {
                     Some(Value::Str(s)) => s.clone(),
-                    Some(other) => {
+                    Some(ref other) => {
                         return Err(AsError::at(
                             format!(
                                 "task.pipe: yielded item's 'kind' field must be a string, got {}",
@@ -390,13 +389,13 @@ impl Interp {
                         .into());
                     }
                 },
-                Value::Instance(inst) => match inst.borrow().fields.get("kind") {
+                Value::Instance(inst) => match inst.borrow().get("kind") {
                     Some(Value::Str(s)) => s.clone(),
                     Some(other) => {
                         return Err(AsError::at(
                             format!(
                                 "task.pipe: yielded item's 'kind' field must be a string, got {}",
-                                crate::interp::type_name(other)
+                                crate::interp::type_name(&other)
                             ),
                             span,
                         )

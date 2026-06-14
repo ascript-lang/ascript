@@ -60,10 +60,13 @@ fn deep_equal_inner(
             if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return true;
             }
-            let (x, y) = (x.borrow(), y.borrow());
-            x.len() == y.len()
-                && x.iter()
-                    .all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
+            if x.len() != y.len() {
+                return false;
+            }
+            let entries = x.entries();
+            entries.iter().all(|(k, v)| {
+                y.get(k.as_ref()).is_some_and(|w| deep_equal_inner(v, &w, seen))
+            })
         }
         (Value::Map(x), Value::Map(y)) => {
             if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
@@ -89,11 +92,9 @@ fn deep_equal_inner(
             }
             let (x, y) = (x.borrow(), y.borrow());
             Rc::ptr_eq(&x.class, &y.class)
-                && x.fields.len() == y.fields.len()
-                && x.fields.iter().all(|(k, v)| {
-                    y.fields
-                        .get(k)
-                        .is_some_and(|w| deep_equal_inner(v, w, seen))
+                && x.len() == y.len()
+                && x.entries().iter().all(|(k, v)| {
+                    y.get(k).is_some_and(|w| deep_equal_inner(v, &w, seen))
                 })
         }
         // Identity equality for regex/native/enum/function/future/generator/etc.
@@ -131,12 +132,9 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             let out = crate::value::ObjectCell::new(IndexMap::new());
             let cloned = Value::Object(out.clone());
             seen.insert(key, cloned.clone());
-            let src = rc.borrow().clone();
-            {
-                let mut dst = out.borrow_mut();
-                for (k, val) in src.iter() {
-                    dst.insert(k.clone(), deep_clone(val, seen));
-                }
+            let src = rc.entries();
+            for (k, val) in &src {
+                out.insert(k.as_ref(), deep_clone(val, seen));
             }
             cloned
         }
@@ -175,20 +173,20 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             }
             let (class, fields) = {
                 let src = rc.borrow();
-                (src.class.clone(), src.fields.clone())
+                (src.class.clone(), src.entries())
             };
-            let out = gcmodule::Cc::new(RefCell::new(Instance {
+            // Deep clones build a fresh DICT-mode instance (shape 0), matching every
+            // other non-VM construction path (SHAPE Task 3.4).
+            let out = gcmodule::Cc::new(RefCell::new(Instance::from_dict(
                 class,
-                fields: IndexMap::new(),
-                shape_id: std::cell::Cell::new(0),
-                frozen: std::cell::Cell::new(false),
-            }));
+                IndexMap::new(),
+            )));
             let cloned = Value::Instance(out.clone());
             seen.insert(key, cloned.clone());
             {
                 let mut dst = out.borrow_mut();
-                for (k, val) in fields.iter() {
-                    dst.fields.insert(k.clone(), deep_clone(val, seen));
+                for (k, val) in &fields {
+                    dst.insert(k.as_ref(), deep_clone(val, seen));
                 }
             }
             cloned
@@ -209,8 +207,12 @@ fn object_like_fields(
     ctx: &str,
 ) -> Result<IndexMap<String, Value>, Control> {
     match v {
-        Value::Object(o) => Ok(o.borrow().clone()),
-        Value::Instance(i) => Ok(i.borrow().fields.clone()),
+        // SHAPE Tasks 1.3 / 3.4: both arms route through the shared `to_index_map`
+        // accessor (Object and Instance now use `ObjectStorage`). The return type
+        // (IndexMap<String,Value>) ties both arms together — changing it requires
+        // updating pick/omit/mapValues at the same time.
+        Value::Object(o) => Ok(o.to_index_map()),
+        Value::Instance(i) => Ok(i.borrow().to_index_map()),
         _ => Err(AsError::at(format!("{} expects an object or instance", ctx), span).into()),
     }
 }
@@ -220,44 +222,40 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "keys" => {
             let o = want_object(&arg(args, 0), span, &ctx("keys"))?;
-            let keys: Vec<Value> = o
-                .borrow()
-                .keys()
-                .map(|k| Value::Str(k.as_str().into()))
-                .collect();
+            let mut keys: Vec<Value> = Vec::new();
+            o.for_each(|k, _| keys.push(Value::Str(k.into())));
             Ok(arr(keys))
         }
         "values" => {
             let o = want_object(&arg(args, 0), span, &ctx("values"))?;
-            let vals: Vec<Value> = o.borrow().values().cloned().collect();
+            let mut vals: Vec<Value> = Vec::new();
+            o.for_each(|_, v| vals.push(v.clone()));
             Ok(arr(vals))
         }
         "entries" => {
             let o = want_object(&arg(args, 0), span, &ctx("entries"))?;
-            let entries: Vec<Value> = o
-                .borrow()
-                .iter()
-                .map(|(k, v)| arr(vec![Value::Str(k.as_str().into()), v.clone()]))
-                .collect();
+            let mut entries: Vec<Value> = Vec::new();
+            o.for_each(|k, v| entries.push(arr(vec![Value::Str(k.into()), v.clone()])));
             Ok(arr(entries))
         }
         "has" => {
             let o = want_object(&arg(args, 0), span, &ctx("has"))?;
             let key = want_string(&arg(args, 1), span, &ctx("has"))?;
-            let has = o.borrow().contains_key(key.as_ref());
+            let has = o.contains_key(key.as_ref());
             Ok(Value::Bool(has))
         }
         "delete" => {
             let o = want_object(&arg(args, 0), span, &ctx("delete"))?;
             let key = want_string(&arg(args, 1), span, &ctx("delete"))?;
             // shift_remove preserves the order of the remaining keys.
-            let existed = o.borrow_mut().shift_remove(key.as_ref()).is_some();
+            let existed = o.shift_remove(key.as_ref()).is_some();
             if existed {
                 // Removing a key shifts the remaining entries' indices, so any
                 // warmed shape — and the property ICs keyed on it — would keep
                 // serving the OLD slot index (a wrong-VALUE read, not a miss).
                 // Reset to shape 0 (unset): IC guards miss and reads fall back
                 // to the generic by-key lookup until a shape is re-derived.
+                // SHAPE Phase 2 absorbs this into shift_remove's slab demotion.
                 o.shape.set(0);
             }
             Ok(Value::Bool(existed))
@@ -266,9 +264,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mut out: IndexMap<String, Value> = IndexMap::new();
             for (i, v) in args.iter().enumerate() {
                 let o = want_object(v, span, &format!("{} (argument {})", ctx("merge"), i + 1))?;
-                for (k, val) in o.borrow().iter() {
-                    out.insert(k.clone(), val.clone());
-                }
+                o.for_each(|k, val| { out.insert(k.to_string(), val.clone()); });
             }
             Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }

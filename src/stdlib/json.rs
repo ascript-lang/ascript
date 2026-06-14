@@ -129,9 +129,10 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             }
             seen.push(ptr);
             let mut map = serde_json::Map::new();
-            for (k, val) in o.borrow().iter() {
-                map.insert(k.clone(), from_ascript(val, seen)?);
-            }
+            o.try_for_each::<String, _>(|k, val| {
+                map.insert(k.to_string(), from_ascript(val, seen)?);
+                Ok(())
+            })?;
             seen.pop();
             Ok(serde_json::Value::Object(map))
         }
@@ -231,9 +232,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             }
             seen.push(ptr);
             let mut m = serde_json::Map::new();
-            for (k, val) in o.borrow().iter() {
-                m.insert(k.clone(), to_json_lossy(val, seen));
-            }
+            o.for_each(|k, val| { m.insert(k.to_string(), to_json_lossy(val, seen)); });
             seen.pop();
             J::Object(m)
         }
@@ -244,8 +243,9 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             }
             seen.push(ptr);
             let mut m = serde_json::Map::new();
-            for (k, val) in i.borrow().fields.iter() {
-                m.insert(k.clone(), to_json_lossy(val, seen));
+            let entries = i.borrow().entries();
+            for (k, val) in entries {
+                m.insert(k.to_string(), to_json_lossy(&val, seen));
             }
             seen.pop();
             J::Object(m)

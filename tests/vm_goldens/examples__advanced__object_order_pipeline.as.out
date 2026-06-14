@@ -1,0 +1,14 @@
+# exit: none
+ok: spread preserves id as first key
+ok: all three records validated via Class.from
+ok: field default 'active' applied
+ok: optional _raw carried through
+ok: shape mismatch is a recoverable panic
+ok: transient _raw absent from ship object
+ok: ship object key order is id, name, status, address
+ok: json round-trip preserves key order
+ok: worker airlock preserved key order for all records
+ok: worker result[0] identity preserved
+ok: checksum non-zero (1206)
+ok: 70-key object insertion order preserved across slab->dict demotion
+object_order_pipeline: all checks passed
