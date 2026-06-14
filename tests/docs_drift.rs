@@ -24,10 +24,8 @@ fn read(rel: &str) -> String {
 /// never from parsing main.rs or --help text. Under --no-default-features the
 /// cfg-gated subcommands vanish from the surface — the subset assertion stays valid.
 ///
-/// RED today: ~27 flags + `ascript dap` + 7 pkg subcommands are undocumented.
-/// REMOVE #[ignore] in Phase 2 Task 2.1 when docs/content/cli.md is brought to parity.
+/// Phase 2 Task 2.1 complete: cli.md brought to full parity.
 #[test]
-#[ignore = "RED until Phase 2 Task 2.1: cli.md missing ~27 flags + dap + pkg subcommands"]
 fn every_cli_subcommand_and_long_flag_is_documented() {
     /// Owner-justified exemptions (spec §5.1: starts EMPTY; an entry needs a
     /// justification comment or the reviewer rejects it).
@@ -104,10 +102,8 @@ fn ascript_env_vars_in(text: &str) -> Vec<String> {
 /// Tripwire 2 (spec §5.2): every ASCRIPT_* env var named in src/ appears in
 /// docs/content/cli.md (the Environment variables section) unless allowlisted.
 ///
-/// RED today: 9 user-facing vars are absent from cli.md.
-/// REMOVE #[ignore] in Phase 2 Task 2.2 when the env-var table is added to cli.md.
+/// Phase 2 Task 2.2 complete: env-var table added to cli.md.
 #[test]
-#[ignore = "RED until Phase 2 Task 2.2: cli.md missing all 9 ASCRIPT_* env vars"]
 fn every_env_var_in_src_is_documented_in_cli_md() {
     // Owner-justified allowlist (spec §5.2). The three prefixes are RESERVED for
     // test fixtures — a user-facing var must never use them (it would hide here).

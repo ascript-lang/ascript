@@ -20,6 +20,39 @@ error) prints a diagnostic with a source span and exits with a non-zero status.
 Pass `--tree-walker` (before the file) to run on the legacy tree-walker engine instead — a debugging
 and differential aid; see [Compilation & runtime](runtime).
 
+Trailing arguments after the file are forwarded to the script as `env.args()`. Hyphen-prefixed values
+(e.g. `--flag`) are also captured, so `ascript run app.as -- --verbose 3` is not needed; just
+`ascript run app.as --verbose 3` works.
+
+### Capability flags
+
+`run` accepts four flags that restrict the program's access to OS resources. The flags compose
+additively (denial is monotone); any `[capabilities]` table in the nearest `ascript.toml` is also
+applied (the CLI can only tighten further, never re-grant what the manifest denied). See
+[Capabilities](stdlib/caps) for the full permission model.
+
+| Flag | Effect |
+|---|---|
+| `--deny <CAP>` | Deny one or more capabilities for this run (comma-separated or repeatable). Names: `fs`, `net`, `process`, `ffi`, `env`. |
+| `--sandbox` | Deny all five dangerous capabilities at once. Sugar for `--deny fs,net,process,ffi,env`. |
+| `--deny-net=<MODE>` | Granular net carve-out: `external` (allow loopback/private, block public) or `all`. |
+| `--deny-fs=<MODE>` | Granular fs carve-out: `write` (reads allowed, writes denied) or `all`. |
+
+### Debugging and profiling flags
+
+| Flag | Effect |
+|---|---|
+| `--inspect` | Run under the DAP debugger instead of normally. Starts a Debug Adapter Protocol server over stdio; an editor's DAP client drives breakpoints and inspection. See [Debugging & profiling](tooling/debugging-profiling). |
+| `--profile <MODE>` | Run under the CPU profiler (v1: `cpu` is the only mode). Writes a profile artifact on exit; program output is byte-identical. Requires the `profile` feature (default-on). See [Debugging & profiling](tooling/debugging-profiling). |
+| `-o <FILE>` / `--out <FILE>` | Profile output path (default `profile.json`, or `profile.txt` for the `collapsed` format). Only meaningful with `--profile`. |
+| `--profile-hz <N>` | Profiler wall-clock sample rate in samples/second (default 1000, i.e. ~1 ms). Only meaningful with `--profile`. |
+| `--profile-format <FMT>` | Profile artifact format: `speedscope` (default, opens at speedscope.app), `collapsed` (Brendan-Gregg folded stacks), or the golden-stable `deterministic-speedscope` / `deterministic-collapsed` variants (inline clock, no wall-clock thread). Only meaningful with `--profile`. |
+
+### Package flag
+
+`--locked` — resolve dependencies exactly from `ascript.lock` (no network). Fails on any drift,
+missing lock, or integrity mismatch. For CI and air-gapped environments. See [Packages](packages).
+
 ## `ascript build`
 
 Compile a `.as` program to a `.aso` bytecode file, then run the artifact with no compile step.
@@ -32,6 +65,20 @@ ascript run program.aso               # run the compiled bytecode
 
 `.aso` is a versioned, verified compilation cache — see [Compilation & runtime](runtime) for what it
 is, when to use it, and why it is not a stable cross-version format.
+
+### Build-specific flags
+
+| Flag | Effect |
+|---|---|
+| `-o <FILE>` / `--out <FILE>` | Output path (defaults to `<stem>.aso`, or the bare `<stem>` executable with `--native`). |
+| `--strip` | Omit the optional debug section (module source + per-function line/variable tables). The default includes debug info for use with `--inspect`. |
+| `--native` | Produce a self-contained native executable instead of a `.aso` — the full runtime plus the compiled program appended to a copy of the running binary. Bundling, not AOT: the embedded VM still interprets. Host architecture only in v1. See [Bundles](language/bundles). |
+| `--target <TRIPLE>` | Target triple for `--native` (requires `--native`). Host-only in v1 — accepted but rejected with a clear error. |
+
+The four capability flags (`--deny`, `--sandbox`, `--deny-net`, `--deny-fs`) are also accepted on
+`build` and on `build --native`. The composed capability set is **embedded** in the produced
+artifact and enforced at launch — you can further restrict it at run time with `ASCRIPT_DENY`, but
+you can never widen it past what was baked in. See [Capabilities](stdlib/caps).
 
 ## `ascript repl`
 
@@ -75,58 +122,6 @@ ascript fmt src/main.as src/util.as
 
 The formatter is built on the same parser as the runtime, so formatting never changes a program's
 meaning — only its layout.
-
-## `ascript test`
-
-Run the test cases registered by `test(name, fn)` across one or more files. Each test runs under an
-internal [`recover`](language/errors) boundary, so a failing assertion reports as a failure rather
-than aborting the run.
-
-```ascript
-// math_test.as
-import * as math from "std/math"
-
-test("abs of a negative", () => {
-  assert(math.abs(-5) == 5, "abs should be 5")
-})
-
-test("max picks the largest", () => {
-  assert(math.max(1, 9, 4) == 9)
-})
-```
-
-```text
-ascript test math_test.as
-```
-
-```text
-ok. 2 passed; 0 failed
-```
-
-A non-zero exit status indicates at least one failure, which makes `ascript test` suitable for CI.
-
-### Rich assertions with std/assert
-
-For test bodies that need deep equality, container membership, approximate equality, or panic
-capture, import [`std/assert`](stdlib/assert):
-
-```ascript
-import * as assert from "std/assert"
-
-test("deep array equality", () => {
-  assert.eq([1, [2, 3]], [1, [2, 3]])         // deep structural equality
-  assert.contains("hello world", "world")      // substring check
-  assert.approxEq(0.1 + 0.2, 0.3)             // float tolerance (1e-9)
-})
-
-test("expected error is thrown", () => {
-  let e = assert.throws(() => assert.eq(1, 99))
-  assert.contains(e.message, "assert.eq failed")
-})
-```
-
-`std/assert` is distinct from the global `assert(cond, msg?)` builtin — both work in test bodies,
-and they can coexist (import under a different alias if needed: `import * as A from "std/assert"`).
 
 ## `ascript check`
 
@@ -193,6 +188,97 @@ default to **Warning**, all configurable via `--deny`/`--warn`/`--allow` or the 
 - **`super-misuse`** — `super` used in a class that has no superclass.
 - **`field-default-type`** — a class field's literal default contradicts its declared type.
 
+## `ascript doc`
+
+Generate API documentation from your `///` and `//!` doc-comments — a self-contained HTML site
+(default) or Markdown — with no external toolchain.
+
+```text
+ascript doc                       # document the current project (HTML → target/doc/)
+ascript doc lib.as --format md    # Markdown to stdout
+ascript doc --check               # CI gate: exit non-zero if any public symbol is undocumented
+```
+
+`///` documents the item below it (`fn`/`class`/`enum`/field/method); `//!` documents the module.
+Bodies are Markdown. By default only the exported public API is documented (`--private` includes
+the rest). See the [doc-generation reference](tooling/doc-generation) for the full convention,
+formats, and the `--check` documentation gate.
+
+Additional `doc` flags:
+
+| Flag | Effect |
+|---|---|
+| `--out <DIR>` | Output directory (default `target/doc/`). |
+| `--format <FMT>` | Output format: `html` (default, a self-contained directory tree) or `md` (Markdown to stdout or `--out`). |
+| `--private` | Include non-exported declarations alongside the public API. |
+| `--open` | Open the generated `index.html` in the default browser after writing (best-effort; requires the `sys` feature). |
+| `--check` | Write nothing; exit non-zero if any public declaration lacks a doc-comment. |
+
+## `ascript test`
+
+Run the test cases registered by `test(name, fn)` across one or more files. Each test runs under an
+internal [`recover`](language/errors) boundary, so a failing assertion reports as a failure rather
+than aborting the run.
+
+```ascript
+// math_test.as
+import * as math from "std/math"
+
+test("abs of a negative", () => {
+  assert(math.abs(-5) == 5, "abs should be 5")
+})
+
+test("max picks the largest", () => {
+  assert(math.max(1, 9, 4) == 9)
+})
+```
+
+```text
+ascript test math_test.as
+```
+
+```text
+ok. 2 passed; 0 failed
+```
+
+A non-zero exit status indicates at least one failure, which makes `ascript test` suitable for CI.
+
+### Rich assertions with std/assert
+
+For test bodies that need deep equality, container membership, approximate equality, or panic
+capture, import [`std/assert`](stdlib/assert):
+
+```ascript
+import * as assert from "std/assert"
+
+test("deep array equality", () => {
+  assert.eq([1, [2, 3]], [1, [2, 3]])         // deep structural equality
+  assert.contains("hello world", "world")      // substring check
+  assert.approxEq(0.1 + 0.2, 0.3)             // float tolerance (1e-9)
+})
+
+test("expected error is thrown", () => {
+  let e = assert.throws(() => assert.eq(1, 99))
+  assert.contains(e.message, "assert.eq failed")
+})
+```
+
+`std/assert` is distinct from the global `assert(cond, msg?)` builtin — both work in test bodies,
+and they can coexist (import under a different alias if needed: `import * as A from "std/assert"`).
+
+### Test runner flags
+
+| Flag | Effect |
+|---|---|
+| `--parallel[=N]` | Run each test file in its own shared-nothing worker isolate, in parallel. Bare `--parallel` uses `num_cpus` isolates; `--parallel=N` caps at N (further clamped by `$ASCRIPT_WORKERS`). Absent = serial (the default). A single file degrades to the serial path. The aggregated result and exit code are deterministic regardless of completion order. |
+| `--coverage[=FORMAT]` | Record line coverage for the test run on the bytecode VM and emit a report. Bare `--coverage` prints a text summary; `--coverage=lcov` emits LCOV; `--coverage=html` writes a self-contained `target/coverage/` tree. Coverage is VM-only (the tree-walker is the oracle, not instrumented). Program output is byte-identical. |
+| `--watch` | Re-run the affected tests on file change, scoped by the workspace import graph (only files whose import closure touched the changed file re-run). Runs until interrupted (Ctrl-C). Requires the `sys` feature (file watching). |
+| `--filter <PATTERN>` | Run only tests whose name matches PATTERN — a substring by default, or a regex when written `/regex/`. Prunes which registered tests run and (when no test in a file matches) which files contribute. A skipped test is reported as "filtered", never pass/fail. A malformed regex is a clean error. |
+| `--update-snapshots` | Re-baseline all snapshots this run (`jest -u`-style): a changed `assert.snapshot` value overwrites the stored baseline and **passes**, and orphan snapshot files (no matching assertion this run) are deleted. Without the flag a changed snapshot fails and orphans are only reported. |
+| `--locked` | Resolve dependencies exactly from `ascript.lock` (no network). See [Packages](packages). |
+| `--deny <CAP>` | Deny capabilities for the test run (same names as `run --deny`). |
+| `--sandbox` | Deny all five dangerous capabilities for the test run. |
+
 ## `ascript lsp`
 
 Run the language server over stdio (the LSP protocol). Point your editor's generic LSP client at
@@ -240,6 +326,9 @@ files degrade gracefully (`semanticTokens/full` goes range-only and inlay hints 
 `semanticTokens/range` is always served to keep the visible viewport colored) while diagnostics and
 navigation always run.
 
+`--stdio` is accepted for compatibility with LSP clients that pass it (e.g. some VS Code configs).
+stdio is the only transport, so the flag is a no-op.
+
 See [editor setup](tooling/editor-setup) for VS Code, Zed, and Neovim configuration, and the
 [LSP capability reference](tooling/lsp-capabilities) for every method the server answers.
 
@@ -247,18 +336,57 @@ See [editor setup](tooling/editor-setup) for VS Code, Zed, and Neovim configurat
 > source to produce diagnostics and navigation; it never runs the interpreter, so the whole layer
 > stays `Send + Sync` and free of runtime state.
 
-## `ascript doc`
+## `ascript dap`
 
-Generate API documentation from your `///` and `//!` doc-comments — a self-contained HTML site
-(default) or Markdown — with no external toolchain.
+Run a standalone Debug Adapter Protocol server over stdio. An editor's DAP client connects to the
+process and drives `launch`, breakpoints, stepping, and inspection. The program to debug comes from
+the editor's `launch` request.
 
 ```text
-ascript doc                       # document the current project (HTML → target/doc/)
-ascript doc lib.as --format md    # Markdown to stdout
-ascript doc --check               # CI gate: exit non-zero if any public symbol is undocumented
+ascript dap
 ```
 
-`///` documents the item below it (`fn`/`class`/`enum`/field/method); `//!` documents the module.
-Bodies are Markdown. By default only the exported public API is documented (`--private` includes
-the rest). See the [doc-generation reference](tooling/doc-generation) for the full convention,
-formats, and the `--check` documentation gate.
+`--stdio` is accepted for compatibility with DAP clients that pass it; stdio is the only transport,
+so it is a no-op.
+
+`ascript dap` takes no capability sandbox flags — the program path is not known at server start. If
+you need a sandboxed debug session, use `ascript run --inspect --sandbox <file>` instead: that path
+pre-sets the program AND composes the capability set before the DAP server starts (the same flags
+that restrict a normal run restrict the debugged run).
+
+For quick in-editor setup, use `ascript run --inspect <file>` to pre-set the program from the CLI.
+See [Debugging & profiling](tooling/debugging-profiling) for the full setup guide and VS Code
+launch configuration.
+
+## Package management
+
+When a project has an `ascript.toml` with `[dependencies]`, use the `ascript` package subcommands
+to manage them. See [Packages](packages) for the full workflow, manifest format, and lockfile
+semantics.
+
+| Subcommand | Effect |
+|---|---|
+| `ascript add <SPEC>` | Add a dependency to `ascript.toml` and update the lock. The spec selects the source: a git URL with optional tag/rev, an archive URL, or a local path. |
+| `ascript remove <NAME>` | Remove a named dependency from `ascript.toml` and re-lock. |
+| `ascript install [--locked]` | Resolve + fetch all dependencies and write/verify `ascript.lock`. `--locked` installs exactly from the existing lock (no network); fails on any drift. |
+| `ascript update [NAME]` | Raise version pins and re-lock. Pass a name to update a single dependency; omit to update all. |
+| `ascript lock` | (Re)generate `ascript.lock` from the manifest without fetching. |
+| `ascript tree` | Print the resolved dependency graph. |
+| `ascript verify` | Re-hash the cache store against the lock integrity records; fails closed on any mismatch. |
+
+## Environment variables
+
+The runtime and CLI read a small set of `ASCRIPT_*` environment variables. These are debugging,
+configuration, and CI knobs — most programs never need them.
+
+| Variable | Effect |
+|---|---|
+| `ASCRIPT_CACHE` | Override the cache root for the package store (default: a platform-specific user cache directory). See [Packages](packages). |
+| `ASCRIPT_DENY` | Comma-separated capability deny list applied to every embedded-binary run (equivalent to embedding `--deny` in a native bundle). For runtime sandbox enforcement. See [Capabilities](stdlib/caps). |
+| `ASCRIPT_ENGINE` | Set to `tree-walker` to select the legacy tree-walker engine for `run` and `repl` instead of the bytecode VM. The `--tree-walker` flag takes precedence. Primarily a debugging and differential-oracle knob. |
+| `ASCRIPT_LOG` | Log level for `std/log` output (`debug`, `info`, `warn`, `error`). Sets the filter threshold; messages below the level are dropped before any formatting. See [log](stdlib/log). |
+| `ASCRIPT_NO_CALL_FAST` | Set to `1` to disable the CALL fast-path optimizations (in-place arg binding, fiber pooling, and the higher-order callback trampoline). Behavior is byte-identical to the default; only allocation counts and throughput differ. A debugging and benchmarking knob — equivalent to `--no-specialize` for the call path. |
+| `ASCRIPT_NO_SPECIALIZE` | Set to `1` to disable every VM specialization (field/method inline caches, adaptive arithmetic, the global cache). Behavior is byte-identical to the default; only speed differs. Useful for isolating a performance regression or verifying that the generic and specialized paths agree. |
+| `ASCRIPT_NO_SYNC_LANE` | Set to `1` to disable the two-lane fiber engine's synchronous fast lane. The VM falls back to the async driver for every burst. Behavior is byte-identical; a debugging knob for isolating lane-related issues. |
+| `ASCRIPT_UPDATE_SNAPSHOTS` | Set to `1` to re-baseline all `assert.snapshot` calls, equivalent to `ascript test --update-snapshots`. Useful in CI scripts that want to update snapshots unconditionally. See [assert](stdlib/assert). |
+| `ASCRIPT_WORKERS` | Maximum number of worker isolates for the pooled `worker fn` pool and `ascript test --parallel`. Defaults to `num_cpus`. See [Workers & parallelism](../language/workers). |
