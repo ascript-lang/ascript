@@ -69,6 +69,85 @@ pub(crate) enum SyncOutcome {
     NeedsAsync,
 }
 
+/// DECODE §2.4/§3.1: how a `sync_burst<S>` returns. The byte source always
+/// produces `Sync`; the record source produces `FellBack` when it can no longer
+/// fetch from records (a frame transition into an un-decoded/stale callee), at
+/// which point `run_loop_sync` continues the same burst on the byte source — the
+/// canonical ip is exact, so the byte burst resumes exactly where records stopped.
+pub(crate) enum BurstExit {
+    /// The burst reached a normal sync-driver exit edge (finished or escalation).
+    Sync(SyncOutcome),
+    /// The record source gave up mid-burst; fall back to byte dispatch (record
+    /// source only — `ByteSource::fetch` never returns `None`).
+    FellBack,
+}
+
+/// DECODE §2.4: one fetched instruction — the op plus the byte offsets the
+/// verbatim arm bodies read operands from (`operand_at`) and anchor spans/panics
+/// at (`fault_ip`). For both sources `operand_at == fault_ip + 1`.
+struct Fetched {
+    op: Op,
+    fault_ip: usize,
+    operand_at: usize,
+}
+
+/// DECODE §2.4: the per-burst instruction source. Two monomorphized impls — the
+/// [`ByteSource`] (LANE's shipped behavior: decode `code[ip]`, walk by
+/// `operand_width`) and the [`RecordSource`] (read `records[idx]`). The shared
+/// `sync_burst<S>` arm bodies are THE single source of truth for sync-subset
+/// semantics; only fetch/advance mechanics differ per source.
+///
+/// CANONICAL IP INVARIANT (§3): `fiber.frame().ip` is the byte ip at all times.
+/// Both sources read/write it identically; the record source additionally tracks
+/// a burst-local record cursor that it resyncs from the canonical ip whenever the
+/// ip moved non-sequentially (a taken jump or an escalation restore) or the active
+/// frame changed (a push/pop) — so the arm bodies need ZERO source-aware edits.
+trait InstrSource {
+    /// Fetch the next instruction WITHOUT advancing the cursor (so the subset
+    /// check can escalate with the ip un-advanced). Refreshes `last_fault_source`
+    /// as appropriate. `None` ⇒ the record source can no longer fetch (frame
+    /// transition into an un-decoded/stale callee) — the burst falls back to byte
+    /// dispatch (`ByteSource` never returns `None`).
+    fn fetch(&mut self, vm: &Vm, fiber: &mut Fiber) -> Option<Fetched>;
+
+    /// Advance the cursor past `op` (whose operands begin at `operand_at`): write
+    /// the canonical byte ip forward and, for the record source, step `idx`.
+    fn advance(&mut self, fiber: &mut Fiber, op: Op, operand_at: usize);
+
+    /// DECODE §8.3 coverage: a record fully retired. The record source bumps
+    /// `decoded_ops`/`stack_ops`; the byte source is a no-op.
+    fn note_retired(&mut self, vm: &Vm, op: Op);
+}
+
+/// DECODE §2.4: the byte instruction source — LANE's shipped behavior, made a
+/// monomorphization of the generic burst. Carries no state: the canonical
+/// `fiber.frame().ip` IS its cursor.
+struct ByteSource;
+
+impl InstrSource for ByteSource {
+    #[inline]
+    fn fetch(&mut self, vm: &Vm, fiber: &mut Fiber) -> Option<Fetched> {
+        // Mirror run_loop exactly: capture fault_ip first, refresh last_fault_source
+        // per instruction, decode the opcode byte.
+        let fault_ip = fiber.frame().ip;
+        if let Some(src) = fiber.frame().closure.proto.chunk.source.borrow().as_ref() {
+            *vm.last_fault_source.borrow_mut() = Some(src.clone());
+        }
+        let byte = fiber.frame().closure.proto.chunk.code[fault_ip];
+        let op = Op::from_u8(byte)
+            .unwrap_or_else(|| panic!("invalid opcode byte {byte:#x} at ip {fault_ip}"));
+        Some(Fetched { op, fault_ip, operand_at: fault_ip + 1 })
+    }
+
+    #[inline]
+    fn advance(&mut self, fiber: &mut Fiber, op: Op, operand_at: usize) {
+        fiber.frame_mut().ip = operand_at + op.operand_width();
+    }
+
+    #[inline]
+    fn note_retired(&mut self, _vm: &Vm, _op: Op) {}
+}
+
 /// **CALL §8.3 — per-VM fast-path coverage counters.**
 ///
 /// Bumped (via [`Vm::bump_stat`]) when a call-path fast path actually fires.
@@ -1692,17 +1771,45 @@ impl Vm {
     // `panic_at`, …). Where `run_loop` does `self.eval_binop_adaptive(…)` the
     // sync arm does exactly the same call — both produce identical results because
     // they share the helper's implementation.
+    //
+    // ── DECODE §2.4 — `sync_burst` is generic over the instruction SOURCE ─────
+    //
+    // The burst loop body (every arm) is THE single source of truth for sync-subset
+    // semantics. To execute hot code from a pre-decoded record stream WITHOUT a second
+    // transcription of the arms (a drift surface the differential would have to police
+    // forever), the prologue mechanics — fetch the op + operand offset, advance the
+    // cursor — are extracted behind the [`InstrSource`] trait. Two monomorphizations:
+    //
+    //   * [`ByteSource`] — today's LANE behavior: decode `code[ip]`, walk by
+    //     `operand_width`. Proven behavior-preserving by the full differential before
+    //     any record code lands (DECODE Task 4a).
+    //   * [`RecordSource`] — read `records[idx]` from a valid [`DecodedChunk`]; skip
+    //     the per-instruction `Op::from_u8` decode + width walk (DECODE Task 4b).
+    //
+    // CANONICAL IP INVARIANT (DECODE §3): `fiber.frame().ip` is ALWAYS the byte ip,
+    // updated by EVERY arm exactly as byte dispatch does (jumps write it, escalations
+    // restore it). The record cursor `idx` is a burst-local TRANSIENT that the record
+    // source resyncs from the canonical ip on any discontinuity (a taken jump, an
+    // escalation restore, a frame push/pop) — so the verbatim arm bodies need ZERO
+    // edits: they keep reading operands via `chunk.read_*(operand_at)` and writing
+    // `fiber.frame_mut().ip`, and the record source merely observes the ip it left.
 
     /// LANE §2.2: run the sync-lane burst driver.
     ///
     /// Executes the suspension-free opcode subset in a tight loop until either the
     /// fiber finishes or an escalation op is reached. Counters are flushed once per
     /// call (not per instruction) so per-instruction counter traffic is avoided.
+    ///
+    /// DECODE §2.4: picks the instruction source for the *entry* frame. When
+    /// `self.decode` and the frame's chunk has a **valid** decoded stream (§4.2 —
+    /// `own_epoch == patch_epoch`), the burst runs on [`RecordSource`]; otherwise it
+    /// bumps `decode_warmth`, possibly lazily decodes at the threshold, and runs on
+    /// [`ByteSource`]. If a record burst can no longer fetch from records mid-burst
+    /// (a frame transition into an un-decoded/stale callee), it falls back to a byte
+    /// burst that seamlessly continues from the canonical ip.
     pub(crate) fn run_loop_sync(&self, fiber: &mut Fiber) -> Result<SyncOutcome, Control> {
         let mut retired: u64 = 0;
-        // Run the burst, capturing the result. Flush counters BEFORE returning r so
-        // a mid-burst `Err(Control)` still records the ops completed up to the fault.
-        let r = self.sync_burst(fiber, &mut retired);
+        let r = self.run_loop_sync_inner(fiber, &mut retired);
         if retired > 0 {
             self.lane_sync_ops.set(self.lane_sync_ops.get() + retired);
             self.lane_bursts.set(self.lane_bursts.get() + 1);
@@ -1710,30 +1817,63 @@ impl Vm {
         r
     }
 
-    /// Inner dispatch loop for the sync lane. Mutates `retired` on each completed op.
-    fn sync_burst(&self, fiber: &mut Fiber, retired: &mut u64) -> Result<SyncOutcome, Control> {
+    /// Source selection + the byte-fallback continuation (DECODE §2.4). Flushing
+    /// lives in [`run_loop_sync`] so a mid-burst `Err` still records progress.
+    fn run_loop_sync_inner(
+        &self,
+        fiber: &mut Fiber,
+        retired: &mut u64,
+    ) -> Result<SyncOutcome, Control> {
+        // DECODE Task 4a ships the genericization with the byte source ONLY. The
+        // record branch (RecordSource selection) is wired in Task 4b, once the
+        // genericization is proven behavior-preserving by the full differential.
+        //
+        // Byte dispatch — LANE's shipped behavior (DECODE Task 4a monomorphization).
+        let mut src = ByteSource;
+        match self.sync_burst(fiber, retired, &mut src)? {
+            BurstExit::Sync(outcome) => Ok(outcome),
+            // The byte source never falls back (it is always able to fetch).
+            BurstExit::FellBack => unreachable!("ByteSource never returns FellBack"),
+        }
+    }
+
+    /// Inner dispatch loop for the sync lane, generic over the instruction
+    /// [`InstrSource`]. Mutates `retired` on each completed op.
+    ///
+    /// DECODE §2.4: the arm bodies below are byte-for-byte the LANE transcription —
+    /// only the per-instruction PROLOGUE (fetch op + operand offset, subset check,
+    /// advance the cursor) routes through `source`. Operand reads stay
+    /// `chunk.read_*(operand_at)`; jumps and escalation ip-restores write
+    /// `fiber.frame_mut().ip` exactly as before (the record source resyncs `idx`
+    /// from the canonical ip on the next fetch).
+    fn sync_burst<S: InstrSource>(
+        &self,
+        fiber: &mut Fiber,
+        retired: &mut u64,
+        source: &mut S,
+    ) -> Result<BurstExit, Control> {
         loop {
-            // Mirror run_loop exactly: capture fault_ip first.
-            let fault_ip = fiber.frame().ip;
-            // SP4 §3: refresh last_fault_source per instruction, identical to run_loop.
-            if let Some(src) = fiber.frame().closure.proto.chunk.source.borrow().as_ref() {
-                *self.last_fault_source.borrow_mut() = Some(src.clone());
-            }
-            let byte = fiber.frame().closure.proto.chunk.code[fault_ip];
-            let op = Op::from_u8(byte)
-                .unwrap_or_else(|| panic!("invalid opcode byte {byte:#x} at ip {fault_ip}"));
+            // DECODE §2.4: fetch the next instruction (op + byte off + operand off)
+            // from the source WITHOUT advancing — the subset check below must be
+            // able to escalate with the ip un-advanced. A `None` is the record
+            // source signalling it can no longer fetch (frame transition into an
+            // un-decoded callee); the burst falls back to byte dispatch.
+            let Fetched { op, fault_ip, operand_at } = match source.fetch(self, fiber) {
+                Some(f) => f,
+                None => return Ok(BurstExit::FellBack),
+            };
 
             // LANE: check subset membership BEFORE advancing ip. If this op is
             // not in the sync subset, return NeedsAsync with ip still at fault_ip
             // so the async driver re-decodes and executes the same byte.
             if !sync_lane_op(op) {
-                return Ok(SyncOutcome::NeedsAsync);
+                return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
             }
 
-            // Advance ip past the opcode byte and its inline operands — identical
-            // arithmetic to run_loop (operand_at = fault_ip + 1).
-            let operand_at = fault_ip + 1;
-            fiber.frame_mut().ip = operand_at + op.operand_width();
+            // Advance the cursor past the opcode byte and its inline operands —
+            // identical canonical-ip arithmetic to run_loop (ip = operand_at +
+            // width); the record source also steps its `idx` to the next record.
+            source.advance(fiber, op, operand_at);
 
             match op {
                 // ── consts / stack ────────────────────────────────────────────
@@ -1962,6 +2102,7 @@ impl Vm {
                         if let Some(idx) = cache.get_index(self.struct_gen()) {
                             fiber.push(self.user_global_value_at(idx));
                             *retired += 1;
+                            source.note_retired(self, op);
                             continue;
                         }
                     }
@@ -2044,6 +2185,7 @@ impl Vm {
                             match self.set_user_global_at(idx, v.clone()) {
                                 Some(true) => {
                                     *retired += 1;
+                                    source.note_retired(self, op);
                                     continue;
                                 }
                                 Some(false) => {
@@ -2178,15 +2320,16 @@ impl Vm {
                     // escalate to the async driver which will drain + return.
                     if !fiber.frame().defers.is_empty() {
                         fiber.frame_mut().ip = fault_ip;
-                        return Ok(SyncOutcome::NeedsAsync);
+                        return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                     }
                     let result = fiber.pop();
                     if let Some(outcome) = self.return_from_frame(fiber, result)? {
-                        return Ok(SyncOutcome::Finished(outcome));
+                        return Ok(BurstExit::Sync(SyncOutcome::Finished(outcome)));
                     }
                     // Non-root frame: return_from_frame pushed the result and popped
                     // the frame; continue the loop in the caller's frame.
                     *retired += 1;
+                    source.note_retired(self, op);
                     continue;
                 }
 
@@ -2217,7 +2360,7 @@ impl Vm {
                         // restore ip and re-push v, then let async driver handle it.
                         fiber.push(v);
                         fiber.frame_mut().ip = fault_ip;
-                        return Ok(SyncOutcome::NeedsAsync);
+                        return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                     }
                 }
 
@@ -2251,7 +2394,7 @@ impl Vm {
                     // after the yield. The frame stack is left intact in the Fiber.
                     let v = fiber.pop();
                     fiber.state = crate::vm::FiberState::Suspended;
-                    return Ok(SyncOutcome::Finished(crate::vm::value_ext::RunOutcome::Yielded(v)));
+                    return Ok(BurstExit::Sync(SyncOutcome::Finished(crate::vm::value_ext::RunOutcome::Yielded(v))));
                 }
 
                 // ── DeferPush / DeferPushMethod ───────────────────────────────
@@ -3354,7 +3497,7 @@ impl Vm {
                         };
                         if !is_sync_closure {
                             fiber.frame_mut().ip = fault_ip;
-                            return Ok(SyncOutcome::NeedsAsync);
+                            return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                         }
                         // Pop the args array and flatten it, then dispatch.
                         let args = match fiber.pop() {
@@ -3402,7 +3545,7 @@ impl Vm {
                         if !is_sync_closure {
                             // Restore ip (already advanced) before escalating.
                             fiber.frame_mut().ip = fault_ip;
-                            return Ok(SyncOutcome::NeedsAsync);
+                            return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                         }
                         let callee = match fiber.stack[callee_idx].clone() {
                             Value::Closure(c) => c,
@@ -3459,6 +3602,7 @@ impl Vm {
                     }
                     // Continue the loop in the new (or returned-to) frame.
                     *retired += 1;
+                    source.note_retired(self, op);
                     continue;
                 }
 
@@ -3496,6 +3640,7 @@ impl Vm {
                             fiber.push(v);
                             // retire += 1 falls through at the end of the match.
                             *retired += 1;
+                            source.note_retired(self, op);
                             continue;
                         }
                     };
@@ -3505,7 +3650,7 @@ impl Vm {
                             // ip was already advanced above; restore it so the
                             // async driver re-decodes the same Op::Await byte.
                             fiber.frame_mut().ip = fault_ip;
-                            return Ok(SyncOutcome::NeedsAsync);
+                            return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                         }
                         Some(r) => {
                             // Cases 2 and 3: future already resolved.
@@ -3527,6 +3672,11 @@ impl Vm {
                 ),
             }
             *retired += 1;
+            // DECODE §8.3: a record fully retired (anti-false-green coverage). The
+            // record source bumps `decoded_ops`/`stack_ops`; the byte source is a
+            // no-op. Bounded by the Gate-17 zero-cost bench; compiled only under
+            // test/fuzzgen/fuzzing.
+            source.note_retired(self, op);
         }
     }
 
