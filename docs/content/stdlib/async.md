@@ -112,6 +112,19 @@ let result = await task.retry(flaky, {attempts: 5, baseMs: 1})
 print(result)   // "ok"  — succeeded on attempt 3
 ```
 
+### `task.pipe`
+
+```ascript
+await task.pipe(gen, bus)
+```
+
+Bridges a **worker generator stream** onto a local `std/events` bus. Drives the generator
+`gen` one step at a time and fans each yielded event object onto `bus` by its `kind` field.
+Returns when the generator is exhausted. Use this to connect a `worker fn*` streaming generator
+(which runs on a separate isolate) to local event-based consumers without manually driving the
+pull loop. See [Workers & parallelism](../language/workers) for the full inter-isolate streaming
+pattern.
+
 ## `std/sync` — channels, semaphores, and rate limiters
 
 `std/sync` provides primitives for coordinating between concurrent tasks. No feature gate —
