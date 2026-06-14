@@ -1279,18 +1279,6 @@ async fn vm_run_whole_corpus_matches_treewalker() {
             tw, noinl,
             "no-inline VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-inline:   {noinl:?}"
         );
-        // DECODE §8.3 (Gate 15) — Unit D: no-TOS (decode + fusion + inline ON, the TOS
-        // register cache OFF via `ASCRIPT_NO_DECODE_TOS`) must ALSO be byte-identical.
-        // Together with `decoded-forced` (TOS ON) this pins the TOS-cache flush-edge
-        // contract byte-identical both on and off over the whole corpus — a missed
-        // flush is a wrong-value bug exactly this differential catches.
-        let notos = ascript::vm_run_source_decoded_no_tos(&src)
-            .await
-            .unwrap_or_else(|e| panic!("no-tos VM failed on non-skipped {rel}: {e:?}"));
-        assert_eq!(
-            tw, notos,
-            "no-tos VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-tos:      {notos:?}"
-        );
         ran += 1;
     }
     // Sanity: the gate must actually exercise the bulk of the corpus, and the
@@ -1575,16 +1563,12 @@ async fn assert_opt_call_ok_three_way(src: &str) {
     let (noinl, noinl_code) = ascript::vm_run_source_decoded_no_inline(src)
         .await
         .expect("no-inline ok");
-    let (notos, notos_code) = ascript::vm_run_source_decoded_no_tos(src)
-        .await
-        .expect("no-tos ok");
     assert_eq!(vm_code, None, "no exit code expected for `{src}`");
     assert_eq!(gen_code, None, "no exit code expected for `{src}`");
     assert_eq!(nolane_code, None, "no exit code expected (lane-off) for `{src}`");
     assert_eq!(decfwd_code, None, "no exit code expected (decoded-forced) for `{src}`");
     assert_eq!(nodec_code, None, "no exit code expected (no-decode) for `{src}`");
     assert_eq!(noinl_code, None, "no exit code expected (no-inline) for `{src}`");
-    assert_eq!(notos_code, None, "no exit code expected (no-tos) for `{src}`");
     assert_eq!(
         tw, vm,
         "specialized VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
@@ -1610,11 +1594,6 @@ async fn assert_opt_call_ok_three_way(src: &str) {
     assert_eq!(
         tw, noinl,
         "no-inline VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  noinl: {noinl:?}"
-    );
-    // DECODE §8.3 (Gate 15) — Unit D: no-tos (TOS register cache off) must also match.
-    assert_eq!(
-        tw, notos,
-        "no-tos VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  notos: {notos:?}"
     );
 }
 

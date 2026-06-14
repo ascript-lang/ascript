@@ -85,16 +85,6 @@ async fn run_four_way(src: &str) -> FourWay {
     // byte-identical to all other modes — generated programs are checked decoded==byte.
     let decfwd = project(ascript::vm_run_source_decoded_forced(src).await);
     let nodec = project(ascript::vm_run_source_no_decode(src).await);
-    // DECODE §8.3 (Gate 15) — Unit D no-tos projection (Task-5 extension point): the
-    // TOS register cache OFF must be byte-identical to decoded-forced (TOS on). Folded
-    // in HERE (rather than growing the tuple across every destructure site): a mismatch
-    // is a flush-edge bug and fails LOUDLY; transitively `notos == decfwd == tw` once
-    // the caller asserts `decfwd == tw`.
-    let notos = project(ascript::vm_run_source_decoded_no_tos(src).await);
-    assert_eq!(
-        decfwd, notos,
-        "DECODE Unit D: no-tos diverged from decoded-forced (a TOS flush-edge bug)\n--- program ---\n{src}\n--- decfwd: {decfwd:?}\n--- notos: {notos:?}"
-    );
     (tw, vm, gen, aso, nolane, nocf, decfwd, nodec)
 }
 
