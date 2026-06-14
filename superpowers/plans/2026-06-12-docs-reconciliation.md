@@ -1,7 +1,7 @@
 # Documentation Reconciliation + Permanent Drift Tripwires (DOCS) — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to
-> implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every task
+> implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking. Every task
 > is executed by a **fresh implementer subagent**, then verified by an **independent reviewer
 > subagent** that runs the commands and probes edges before acceptance. At the end of each
 > phase, a **holistic per-phase review subagent** reviews the phase's combined changes before
@@ -84,7 +84,7 @@ task with the house trailer:
 
 **Files:** none (verification only; findings recorded in the task log).
 
-- [ ] **Step 1 — citation re-grep** (line numbers may have drifted since spec time; record
+- [x] **Step 1 — citation re-grep** (line numbers may have drifted since spec time; record
   ACTUAL numbers and use them throughout):
   `grep -n "enum Command" src/main.rs` (expect ~`:14`); `grep -n "struct CapFlags" src/main.rs`
   (~`:267`); `grep -n "pub const STD_MODULES" src/stdlib/mod.rs` (~`:221`, count the entries —
@@ -94,23 +94,23 @@ task with the house trailer:
   `grep -n 'rev = ' editors/zed/extension.toml` + `grep -n 'GRAMMAR_REV' editors/nvim/lua/ascript/treesitter.lua`;
   `grep -n "stdlib reference pages mirror" CLAUDE.md` (~`:31`);
   `grep -n "fn server_capabilities" src/lsp/server.rs` (~`:224`).
-- [ ] **Step 2 — confirm the known gaps still hold** (they are the TDD-red targets): for each
+- [x] **Step 2 — confirm the known gaps still hold** (they are the TDD-red targets): for each
   of `--strip --native --parallel --coverage --filter --update-snapshots --inspect --profile
   --locked --sandbox --deny-net --deny-fs`, confirm zero literal occurrences in
   `docs/content/cli.md`; confirm `ascript dap` absent; confirm `ASCRIPT_NO_SPECIALIZE` has
   zero hits under `docs/` and `README.md`; confirm `task.pipe` absent from
   `docs/content/stdlib/async.md`. If any was fixed since spec time, record it and drop the
   corresponding Phase-2 sub-item (never re-add prose that exists).
-- [ ] **Step 3 — baseline runs:** `cargo test` green; `cargo test --no-default-features`
+- [x] **Step 3 — baseline runs:** `cargo test` green; `cargo test --no-default-features`
   green; `cargo clippy --all-targets` + `cargo clippy --no-default-features --all-targets`
   clean; `cargo test --test vm_differential` green (the BEFORE half of the
   no-engine-surface proof). Save `target/debug/ascript --help` and every
   `ascript <sub> --help` output to the task log (the §4.1 identity baseline).
-- [ ] **Step 4:** create the feature branch `feat/docs-drift-tripwires` off `main`.
+- [x] **Step 4:** create the feature branch `feat/docs-drift-tripwires` off `main`.
 
 ### Task 0.2: Phase 0 review
 
-- [ ] **Step 1:** Independent reviewer re-runs Steps 1–3, confirms recorded numbers match the
+- [x] **Step 1:** Independent reviewer re-runs Steps 1–3, confirms recorded numbers match the
   tree and the gap list is current. Any mismatch corrected in the task log before Phase 1.
 
 ---
@@ -121,7 +121,7 @@ task with the house trailer:
 
 **Files:** create `src/cli_surface.rs`; modify `src/main.rs`, `src/lib.rs`.
 
-- [ ] **Step 1: Write the failing test** — in `src/cli_surface.rs` (fails to compile until
+- [x] **Step 1: Write the failing test** — in `src/cli_surface.rs` (fails to compile until
   the module exists; that IS the red step for a pure move):
 
 ```rust
@@ -148,7 +148,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Implement the move.** Cut `Cli` (`src/main.rs:7-12`), `Command`
+- [x] **Step 2: Implement the move.** Cut `Cli` (`src/main.rs:7-12`), `Command`
   (`:14-261`), and `CapFlags` (`:267-289`) **verbatim** — including every doc comment and
   every `#[cfg(feature = …)]` attribute — into `src/cli_surface.rs` with a module doc
   explaining the seam (single source of truth for the CLI surface; consumed by `main.rs`
@@ -168,16 +168,16 @@ pub fn cli_command() -> clap::Command {
   `use ascript::cli_surface::{CapFlags, Cli, Command};` — `compose_caps`, `run_profiled`,
   `try_run_embedded`, `real_main`, and all handlers stay in `main.rs` untouched
   (`src/pkg/` stays binary-side per SP6; the pkg enum variants carry only `String`s).
-- [ ] **Step 3: Run — green:** `cargo test cli_surface` passes; the whole suite + clippy
+- [x] **Step 3: Run — green:** `cargo test cli_surface` passes; the whole suite + clippy
   green in BOTH feature configs (the cfg-gated variants must compile under
   `--no-default-features` from the lib too — if a variant references a binary-only type,
   that is a design break: STOP and re-verify §4.1's claim that none do).
-- [ ] **Step 4: Identity proof:** diff `ascript --help` and every `ascript <sub> --help`
+- [x] **Step 4: Identity proof:** diff `ascript --help` and every `ascript <sub> --help`
   against the Task 0.1 Step-3 baseline — **byte-identical**. Record the diff (empty) in
   the task log.
-- [ ] **Step 5:** Commit: `refactor(cli): extract clap surface into src/cli_surface.rs
+- [x] **Step 5:** Commit: `refactor(cli): extract clap surface into src/cli_surface.rs
   (introspection seam for docs tripwires, behavior-identical)`.
-- [ ] **Step 6 — independent review:** reviewer re-runs Steps 3–4, additionally probes
+- [x] **Step 6 — independent review:** reviewer re-runs Steps 3–4, additionally probes
   `ascript run --help` under `--no-default-features` build (the smaller tree parses), and
   confirms `git diff` shows a pure move (no logic edits inside the derive types).
 
@@ -185,7 +185,7 @@ pub fn cli_command() -> clap::Command {
 
 **Files:** create `tests/docs_drift.rs`.
 
-- [ ] **Step 1: Write the tripwire** (real code; the file's shared helpers are born here):
+- [x] **Step 1: Write the tripwire** (real code; the file's shared helpers are born here):
 
 ```rust
 //! DOCS — permanent docs-drift tripwires (spec: 2026-06-12-docs-reconciliation-design.md §5).
@@ -250,19 +250,19 @@ fn every_cli_subcommand_and_long_flag_is_documented() {
 }
 ```
 
-- [ ] **Step 2: Run — expect RED.** `cargo test --test docs_drift
+- [x] **Step 2: Run — expect RED.** `cargo test --test docs_drift
   every_cli_subcommand_and_long_flag_is_documented` fails. Verify the failure lists
   EXACTLY the spec §1.1 inventory (the 27 flags across run/build/test/lsp + `--stdio` on
   dap, the `ascript dap` subcommand, and the 7 pkg subcommands; `doc --open` if Step 0.1
   confirmed it). Paste the full failure output into the task log — this is the audit's
   finding reproduced mechanically.
-- [ ] **Step 3:** Run the same under `--no-default-features` (`cargo test
+- [x] **Step 3:** Run the same under `--no-default-features` (`cargo test
   --no-default-features --test docs_drift …`) — still red (the core subcommands' flags
   alone are missing), proving the tripwire is feature-config-safe.
-- [ ] **Step 4:** Commit (red on this test only, per the red-branch discipline):
+- [x] **Step 4:** Commit (red on this test only, per the red-branch discipline):
   `test(docs): tripwire 1 — clap surface ⊆ cli.md (RED: 27 flags + dap + pkg subcommands
   undocumented)`.
-- [ ] **Step 5 — independent review:** reviewer confirms the red list matches §1.1 item for
+- [x] **Step 5 — independent review:** reviewer confirms the red list matches §1.1 item for
   item; probes that adding a fake flag to a scratch build would be caught (mental or local
   experiment); confirms no allowlist entries snuck in.
 
@@ -270,7 +270,7 @@ fn every_cli_subcommand_and_long_flag_is_documented() {
 
 **Files:** modify `tests/docs_drift.rs`.
 
-- [ ] **Step 1: Write the tripwire:**
+- [x] **Step 1: Write the tripwire:**
 
 ```rust
 /// Recursively collect .rs files under src/ (dependency-free walkdir).
@@ -344,18 +344,18 @@ fn every_env_var_in_src_is_documented_in_cli_md() {
 }
 ```
 
-- [ ] **Step 2: Run — expect RED** listing exactly `ASCRIPT_CACHE`, `ASCRIPT_DENY`,
+- [x] **Step 2: Run — expect RED** listing exactly `ASCRIPT_CACHE`, `ASCRIPT_DENY`,
   `ASCRIPT_ENGINE`, `ASCRIPT_LOG`, `ASCRIPT_NO_SPECIALIZE`, `ASCRIPT_UPDATE_SNAPSHOTS`,
   `ASCRIPT_WORKERS` (spec §1.2). Note: under `--no-default-features` `src/pkg/` is still
   scanned (the grep is textual, not cfg-aware — by design, §5.2), so the list is identical
   in both configs. Paste the output into the task log.
-- [ ] **Step 3:** Unit-test the extractor in the same file (it is a pure helper):
+- [x] **Step 3:** Unit-test the extractor in the same file (it is a pure helper):
   `ascript_env_vars_in("x ASCRIPT_FOO_BAR=1 ASCRIPT_TEST_ENV_ y")` →
   `["ASCRIPT_FOO_BAR", "ASCRIPT_TEST_ENV"]` (trailing `_` trimmed — fixture prefixes in
   source often end with `_`-joined suffixes). Green.
-- [ ] **Step 4:** Commit: `test(docs): tripwire 2 — ASCRIPT_* env vars ⊆ cli.md (RED: 7
+- [x] **Step 4:** Commit: `test(docs): tripwire 2 — ASCRIPT_* env vars ⊆ cli.md (RED: 7
   user-facing vars uncentralized; ASCRIPT_NO_SPECIALIZE documented nowhere)`.
-- [ ] **Step 5 — independent review:** reviewer re-runs both configs; verifies the
+- [x] **Step 5 — independent review:** reviewer re-runs both configs; verifies the
   allowlist justifications against the actual read sites (each cited file:line must be
   inside `mod tests`); confirms the extractor handles an `ASCRIPT_` at end-of-file.
 
@@ -363,7 +363,7 @@ fn every_env_var_in_src_is_documented_in_cli_md() {
 
 **Files:** modify `tests/docs_drift.rs`.
 
-- [ ] **Step 1: Write the mapping + checker + tests** (the mapping is the spec §5.3 table —
+- [x] **Step 1: Write the mapping + checker + tests** (the mapping is the spec §5.3 table —
   re-derive against the Task 0.1 `STD_MODULES` count if it changed):
 
 ```rust
@@ -506,16 +506,16 @@ fn module_page_checker_catches_each_violation_class() {
 }
 ```
 
-- [ ] **Step 2: Run.** The self-test is the red→green TDD half (write it first, watch it
+- [x] **Step 2: Run.** The self-test is the red→green TDD half (write it first, watch it
   fail against a stub checker returning `vec![]`, then implement). The main test must be
   **GREEN at birth** (spec §1.5/§5.3) — if it is red, the mapping is wrong or the tree
   moved: re-derive (the §4.3 sweep methodology) and fix the MAPPING, never weaken the
   checker.
-- [ ] **Step 3:** Both feature configs green (`STD_MODULES` is feature-independent,
+- [x] **Step 3:** Both feature configs green (`STD_MODULES` is feature-independent,
   `src/stdlib/mod.rs:282-284` doc).
-- [ ] **Step 4:** Commit: `test(docs): tripwire 3 — STD_MODULES ⇄ stdlib pages mapping
+- [x] **Step 4:** Commit: `test(docs): tripwire 3 — STD_MODULES ⇄ stdlib pages mapping
   (green baseline + mutation self-test)`.
-- [ ] **Step 5 — independent review:** reviewer spot-verifies 5 random mapping rows against
+- [x] **Step 5 — independent review:** reviewer spot-verifies 5 random mapping rows against
   page content; temporarily appends a fake module to a local `STD_MODULES` copy…—
   impractical; instead runs the self-test and verifies all four violation classes are
   individually exercised (comment one assertion's setup out → that assertion fails).
@@ -524,7 +524,7 @@ fn module_page_checker_catches_each_violation_class() {
 
 **Files:** modify `tests/docs_drift.rs`.
 
-- [ ] **Step 1: Write it** — pure parser + checker + self-test + the real test:
+- [x] **Step 1: Write it** — pure parser + checker + self-test + the real test:
 
 ```rust
 /// Tolerant NAV slug extraction (spec §5.4): the text between `const NAV = [` and
@@ -593,10 +593,10 @@ fn nav_parser_catches_a_missing_slug() {
   (The bijection self-test is the parser test plus the trivially-verifiable set-diff —
   exercise BOTH failure directions through `check`-style assertions on synthetic inputs
   if the reviewer asks; the parser is the fragile part.)
-- [ ] **Step 2: Run — green at birth** (40 ⇄ 40, spec §1.5). Self-test green.
-- [ ] **Step 3:** Commit: `test(docs): tripwire 4 — NAV ⇄ docs/content bijection (automates
+- [x] **Step 2: Run — green at birth** (40 ⇄ 40, spec §1.5). Self-test green.
+- [x] **Step 3:** Commit: `test(docs): tripwire 4 — NAV ⇄ docs/content bijection (automates
   the CLAUDE.md manual rule)`.
-- [ ] **Step 4 — independent review:** reviewer temporarily creates
+- [x] **Step 4 — independent review:** reviewer temporarily creates
   `docs/content/scratch.md` locally → test fails with the orphan message; deletes it;
   confirms the tolerant parse survives an `app.js` reformat (e.g. extra whitespace).
 
@@ -604,7 +604,7 @@ fn nav_parser_catches_a_missing_slug() {
 
 **Files:** modify `tests/docs_drift.rs`.
 
-- [ ] **Step 1: Write it** — resolution per the documented rule (CLAUDE.md:36-37;
+- [x] **Step 1: Write it** — resolution per the documented rule (CLAUDE.md:36-37;
   `app.js` `resolveDocHref:81-85` — relative to the current page's directory, leading `/`
   = content-root-absolute):
 
@@ -683,11 +683,11 @@ fn link_resolution_follows_the_documented_rule() {
 }
 ```
 
-- [ ] **Step 2: Run — green at birth** (134 links, 0 broken — spec §1.5; if red, a link
+- [x] **Step 2: Run — green at birth** (134 links, 0 broken — spec §1.5; if red, a link
   broke since spec time: FIX THE LINK, record it). Self-test green.
-- [ ] **Step 3:** Commit: `test(docs): tripwire 5 — in-content relative link checker
+- [x] **Step 3:** Commit: `test(docs): tripwire 5 — in-content relative link checker
   (per the documented relative-to-page rule)`.
-- [ ] **Step 4 — independent review:** reviewer plants a bogus link locally → named in the
+- [x] **Step 4 — independent review:** reviewer plants a bogus link locally → named in the
   failure; checks an anchor-bearing link (`](workflow#activities)`) and a root-absolute
   link still pass; confirms the rule test matches `resolveDocHref` semantics
   (`docs/assets/app.js:81-85`).
@@ -697,7 +697,7 @@ fn link_resolution_follows_the_documented_rule() {
 **Files:** modify `tests/docs_drift.rs` (the CONTRIBUTING/CLAUDE.md prose lands in
 Phase 2 — Task 2.5).
 
-- [ ] **Step 1: Write it:**
+- [x] **Step 1: Write it:**
 
 ```rust
 /// Tripwire 6 (spec §5.6): the zed and nvim grammar pins must agree. Pin CURRENCY
@@ -729,21 +729,21 @@ fn editor_grammar_pins_agree() {
 }
 ```
 
-- [ ] **Step 2: Run — green at birth** (both pins `7227fb7f…`, spec §1.5). Probe the
+- [x] **Step 2: Run — green at birth** (both pins `7227fb7f…`, spec §1.5). Probe the
   extractor against a mutated local copy (mismatched SHA → red) and revert.
-- [ ] **Step 3:** Commit: `test(docs): tripwire 6 — zed/nvim grammar pin consistency
+- [x] **Step 3:** Commit: `test(docs): tripwire 6 — zed/nvim grammar pin consistency
   (mirror currency stays a documented manual checklist item)`.
-- [ ] **Step 4 — independent review:** reviewer verifies both quoted_after key strings
+- [x] **Step 4 — independent review:** reviewer verifies both quoted_after key strings
   against the actual files; confirms the test message points at the checklist.
 
 ### Task 1.8: Phase 1 holistic review
 
-- [ ] **Step 1:** Holistic reviewer runs `cargo test --test docs_drift` in both feature
+- [x] **Step 1:** Holistic reviewer runs `cargo test --test docs_drift` in both feature
   configs: tripwires 3–6 + all self-tests green; tripwires 1–2 red with EXACTLY the spec
   §1.1/§1.2 inventories (no more, no less — an unexpected extra red line means the tree
   moved or the tripwire over-matches; resolve before Phase 2). Everything else in the
   suite green; clippy clean both configs.
-- [ ] **Step 2:** Confirm `tests/docs_drift.rs` has zero feature-gated code and zero new
+- [x] **Step 2:** Confirm `tests/docs_drift.rs` has zero feature-gated code and zero new
   dependencies (`git diff main -- Cargo.toml` shows nothing).
 
 ---
@@ -754,11 +754,11 @@ fn editor_grammar_pins_agree() {
 
 **Files:** `docs/content/cli.md`.
 
-- [ ] **Step 1:** Restructure per spec §4.2: per-command sections in `Command`-enum order
+- [x] **Step 1:** Restructure per spec §4.2: per-command sections in `Command`-enum order
   (`run`, `build`, `repl`, `fmt`, `check`, `doc`, `test`, `lsp`, `dap`, "Package
   management"). Preserve the page's existing good prose (the repl/check/lsp sections are
   accurate — extend, don't rewrite for its own sake).
-- [ ] **Step 2:** Document the §1.1 inventory, each flag with 1–3 lines of curated prose
+- [x] **Step 2:** Document the §1.1 inventory, each flag with 1–3 lines of curated prose
   (NEVER paste clap help verbatim — prose quality is why generation was rejected, §2)
   and a depth cross-link instead of duplicated depth:
   - **run:** `--locked` (→ `packages`), `--deny`/`--sandbox`/`--deny-net`/`--deny-fs`
@@ -783,13 +783,13 @@ fn editor_grammar_pins_agree() {
   - **Package management:** one sentence per subcommand
     (`add`/`remove`/`install [--locked]`/`update`/`lock`/`tree`/`verify`),
     cross-link `packages` for everything deeper.
-- [ ] **Step 3: Run tripwire 1 — expect GREEN** in both feature configs. If anything is
+- [x] **Step 3: Run tripwire 1 — expect GREEN** in both feature configs. If anything is
   still listed, document it (no allowlisting to make the bar).
-- [ ] **Step 4:** Served-site sanity: `cd docs && python3 -m http.server` and load the CLI
+- [x] **Step 4:** Served-site sanity: `cd docs && python3 -m http.server` and load the CLI
   page (the renderer fetches Markdown — check tables/callouts render).
-- [ ] **Step 5:** Commit: `docs(cli): full CLI parity — every subcommand + long flag
+- [x] **Step 5:** Commit: `docs(cli): full CLI parity — every subcommand + long flag
   documented (tripwire 1 green)`.
-- [ ] **Step 6 — independent review:** reviewer cross-reads each new flag description
+- [x] **Step 6 — independent review:** reviewer cross-reads each new flag description
   against the `src/main.rs` doc comment for semantic fidelity (e.g. `--parallel`'s
   `default_missing_value` auto-N behavior; `--coverage` formats; `--deny-net` modes);
   re-runs tripwire 1; spot-renders the served page.
@@ -798,7 +798,7 @@ fn editor_grammar_pins_agree() {
 
 **Files:** `docs/content/cli.md`.
 
-- [ ] **Step 1:** Append the "Environment variables" section (spec §4.2 item 4): a table of
+- [x] **Step 1:** Append the "Environment variables" section (spec §4.2 item 4): a table of
   the 7 user-facing vars — `ASCRIPT_ENGINE` (→ `runtime`), `ASCRIPT_WORKERS`
   (→ `language/workers`), `ASCRIPT_LOG` (→ `stdlib/log`), `ASCRIPT_CACHE` (→ `packages`),
   `ASCRIPT_DENY` (→ `language/bundles`), `ASCRIPT_UPDATE_SNAPSHOTS` (→ `stdlib/assert`),
@@ -806,11 +806,11 @@ fn editor_grammar_pins_agree() {
   switch (`=1` disables every VM fast path; behavior byte-identical, speed only — a
   debugging/benchmarking knob presented like `--tree-walker`, grounded on
   `src/lib.rs:2060-2066`). Existing in-context mentions on other pages STAY.
-- [ ] **Step 2: Run tripwire 2 — expect GREEN** (both configs). Tripwire 5 still green
+- [x] **Step 2: Run tripwire 2 — expect GREEN** (both configs). Tripwire 5 still green
   (the new cross-links resolve).
-- [ ] **Step 3:** Commit: `docs(cli): consolidated environment-variable reference
+- [x] **Step 3:** Commit: `docs(cli): consolidated environment-variable reference
   (tripwire 2 green; first docs for ASCRIPT_NO_SPECIALIZE)`.
-- [ ] **Step 4 — independent review:** reviewer verifies each row against its read site
+- [x] **Step 4 — independent review:** reviewer verifies each row against its read site
   (spec §1.2 table); confirms `ASCRIPT_NO_SPECIALIZE` wording matches the code (value
   `"1"` exactly, `src/lib.rs:2066`).
 
@@ -818,7 +818,7 @@ fn editor_grammar_pins_agree() {
 
 **Files:** `docs/content/stdlib/async.md` (+ any page the re-run implicates).
 
-- [ ] **Step 1: Re-run the sweep** (spec §4.3 methodology — the tree may have moved since
+- [x] **Step 1: Re-run the sweep** (spec §4.3 methodology — the tree may have moved since
   spec time). Build release, then for each of the 57 modules:
 
 ```bash
@@ -834,7 +834,7 @@ target/release/ascript run /tmp/intro.as
   styles (`mod.key`, backticked heading, named-import example, table row). **Verify every
   candidate miss manually** before calling it a gap (spec §1.3: five of six audit-era
   candidates were style false positives).
-- [ ] **Step 2: Fill the verified gap(s).** Known from the spec-time sweep: add
+- [x] **Step 2: Fill the verified gap(s).** Known from the spec-time sweep: add
   **`task.pipe(gen, bus)`** to `async.md`'s `std/task` section, in the page's existing
   style (Style-2 backticked heading like `task.retry`), with a one-line description
   (bridges a worker generator stream onto a local `std/events` bus) and a cross-link to
@@ -842,10 +842,10 @@ target/release/ascript run /tmp/intro.as
   task the same way — list each in the task log with its verification evidence.
   **Do not add signature-table-grade detail** — existence + one line + link (SIG owns
   signatures, see the plan header boundary).
-- [ ] **Step 3:** Tripwires 3 + 5 still green; served-site spot-render of each touched page.
-- [ ] **Step 4:** Commit: `docs(stdlib): member sweep — task.pipe into the std/task
+- [x] **Step 3:** Tripwires 3 + 5 still green; served-site spot-render of each touched page.
+- [x] **Step 4:** Commit: `docs(stdlib): member sweep — task.pipe into the std/task
   reference (+ re-run findings)`.
-- [ ] **Step 5 — independent review:** reviewer independently re-runs the sweep for 6
+- [x] **Step 5 — independent review:** reviewer independently re-runs the sweep for 6
   randomly-chosen modules including std/task; confirms zero unverified misses remain;
   confirms the new entry's style matches its siblings (SIG-matcher compatibility).
 
@@ -853,7 +853,7 @@ target/release/ascript run /tmp/intro.as
 
 **Files:** `CLAUDE.md`.
 
-- [ ] **Step 1:** Rewrite the `CLAUDE.md:31` sentence per spec §4.4: the stdlib reference
+- [x] **Step 1:** Rewrite the `CLAUDE.md:31` sentence per spec §4.4: the stdlib reference
   is **domain-grouped** (22 pages ⊃ 57 modules — e.g. `collections.md` owns
   string/array/object/map/set/math/convert/bytes); the authoritative module→page mapping
   is `MODULE_PAGES` in `tests/docs_drift.rs` (tripwire-validated both directions); a
@@ -861,9 +861,9 @@ target/release/ascript run /tmp/intro.as
   section + a mapping entry or CI fails. Keep the adjacent NAV-orphan guidance
   (`CLAUDE.md:32-35`) and append "(now enforced by `tests/docs_drift.rs`)"; same note on
   the relative-link rule (`:36-37`).
-- [ ] **Step 2:** Commit: `docs(claude): fix stdlib-docs meta-drift — domain-grouped pages
+- [x] **Step 2:** Commit: `docs(claude): fix stdlib-docs meta-drift — domain-grouped pages
   + the tripwire-validated mapping as the lookup`.
-- [ ] **Step 3 — independent review:** reviewer reads the new wording as a fresh
+- [x] **Step 3 — independent review:** reviewer reads the new wording as a fresh
   contributor would ("I changed `std/math` — where do I edit?") and confirms it answers in
   one hop; checks no other `CLAUDE.md` sentence still implies per-module pages.
 
@@ -872,40 +872,40 @@ target/release/ascript run /tmp/intro.as
 **Files:** `docs/content/tooling/{lsp-capabilities,debugging-profiling,editor-setup}.md`,
 `README.md`, `docs/content/getting-started.md`, `CONTRIBUTING.md`, `CLAUDE.md` (one line).
 
-- [ ] **Step 1 — lsp-capabilities:** walk `server_capabilities()`
+- [x] **Step 1 — lsp-capabilities:** walk `server_capabilities()`
   (`src/lsp/server.rs:224` through the workspace caps `:331+`) field by field against the
   page's method tables; fix any mismatch (none expected, spec §1.5/§4.5). Record the walk
   in the task log either way.
-- [ ] **Step 2 — debugging-profiling:** confirm the page states: `--profile` v1 = `cpu`
+- [x] **Step 2 — debugging-profiling:** confirm the page states: `--profile` v1 = `cpu`
   only (`src/main.rs:423-426`); the four `--profile-format` values incl. `deterministic-*`
   (`:431-441`); the `.aso`/tree-walker refusal (`:696-700`); default out paths
   `profile.json`/`profile.txt` (`:458-464`); the `dap` no-sandbox-flags posture
   (`:1191-1196`). Fix what's missing.
-- [ ] **Step 3 — editor-setup:** confirm the page describes (not embeds) the pin and the
+- [x] **Step 3 — editor-setup:** confirm the page describes (not embeds) the pin and the
   described install flows match `editors/zed/extension.toml` +
   `editors/nvim/lua/ascript/treesitter.lua`.
-- [ ] **Step 4 — the manual checklist item (spec §5.6):** in `CONTRIBUTING.md`'s
+- [x] **Step 4 — the manual checklist item (spec §5.6):** in `CONTRIBUTING.md`'s
   grammar-publishing steps (`CONTRIBUTING.md:46-49`) and `CLAUDE.md`'s "Publishing the
   grammar" bullet, add the explicit line: after a sync, verify BOTH editor pins were
   bumped to the new mirror SHA — pin **currency vs the mirror** is a manual check
   (network/another repo; not CI-testable in-repo); pin **mutual consistency** is enforced
   by `tests/docs_drift.rs`.
-- [ ] **Step 5 — README + getting-started:** re-run the spec §1.5 spot-checks
+- [x] **Step 5 — README + getting-started:** re-run the spec §1.5 spot-checks
   (`README.md:107-111,126,152,161`); reconcile anything the cli.md rewrite revealed
   (e.g. if README names a flag with different semantics). Tripwire 5 still green.
-- [ ] **Step 6:** Commit: `docs(tooling): re-verify lsp-capabilities/debugging-profiling/
+- [x] **Step 6:** Commit: `docs(tooling): re-verify lsp-capabilities/debugging-profiling/
   editor-setup + README; editor-pin manual checklist item`.
-- [ ] **Step 7 — independent review:** reviewer re-walks `server_capabilities()` against
+- [x] **Step 7 — independent review:** reviewer re-walks `server_capabilities()` against
   the page independently; verifies the checklist line appears in BOTH files; re-runs the
   full `docs_drift` suite — **all six tripwires green** in both feature configs.
 
 ### Task 2.6: Phase 2 holistic review
 
-- [ ] **Step 1:** Holistic reviewer: `cargo test --test docs_drift` fully green, both
+- [x] **Step 1:** Holistic reviewer: `cargo test --test docs_drift` fully green, both
   configs — the TDD loop is closed (red Phase-1 outputs in the task logs, green now).
-- [ ] **Step 2:** Full read of the new `cli.md` for prose quality (the anti-generation
+- [x] **Step 2:** Full read of the new `cli.md` for prose quality (the anti-generation
   bar): no clap-help verbatim dumps, every cross-link sensible, the page still teaches.
-- [ ] **Step 3:** Served-site pass over every touched page
+- [x] **Step 3:** Served-site pass over every touched page
   (`cd docs && python3 -m http.server`).
 
 ---
@@ -916,37 +916,37 @@ target/release/ascript run /tmp/intro.as
 
 **Files:** `goal-perf.md`, `superpowers/roadmap.md`, `CLAUDE.md`.
 
-- [ ] **Step 1:** `goal-perf.md`: add gate **19** to §"Gates" (the spec §6 text verbatim:
+- [x] **Step 1:** `goal-perf.md`: add gate **19** to §"Gates" (the spec §6 text verbatim:
   docs drift tripwires stay green in CI; same-PR docs changes; owner-justified allowlist
   additions only). Add DOCS to the §"Developer-experience track" beside SIG (status ✅ on
   merge; record that SIG/DOCS are mutually independent, boundary per the DOCS spec §3) and
   to the execution-order note ("DOCS — independent; executed as part of the docs-currency
   push, owner-decided").
-- [ ] **Step 2:** `superpowers/roadmap.md`: the DOCS milestone entry (findings closed,
+- [x] **Step 2:** `superpowers/roadmap.md`: the DOCS milestone entry (findings closed,
   tripwires live, gate added).
-- [ ] **Step 3:** `CLAUDE.md` docs guidance: one sentence naming `tests/docs_drift.rs` as
+- [x] **Step 3:** `CLAUDE.md` docs guidance: one sentence naming `tests/docs_drift.rs` as
   the enforcement for CLI/env-var/module/NAV/link/pin currency (the §4.4/§4.5 edits
   already reference it; this is the campaign-gate cross-link).
-- [ ] **Step 4:** Commit: `docs(campaign): gate 19 — docs drift tripwires stay green in CI;
+- [x] **Step 4:** Commit: `docs(campaign): gate 19 — docs drift tripwires stay green in CI;
   DOCS status`.
 
 ### Task 3.2: full-gate verification + merge
 
-- [ ] **Step 1:** `cargo test` green; `cargo test --no-default-features` green (incl.
+- [x] **Step 1:** `cargo test` green; `cargo test --no-default-features` green (incl.
   `--test docs_drift` explicitly in both).
-- [ ] **Step 2:** `cargo clippy --all-targets` + `cargo clippy --no-default-features
+- [x] **Step 2:** `cargo clippy --all-targets` + `cargo clippy --no-default-features
   --all-targets` clean.
-- [ ] **Step 3:** `cargo test --test vm_differential` green — with Task 0.1's baseline,
+- [x] **Step 3:** `cargo test --test vm_differential` green — with Task 0.1's baseline,
   the AFTER half of the no-engine-surface proof (DOCS touched `main.rs`/`cli_surface.rs`
   only as a move; the differential proves the engines untouched).
-- [ ] **Step 4:** Help-output identity re-check (`ascript --help` + per-sub) against the
+- [x] **Step 4:** Help-output identity re-check (`ascript --help` + per-sub) against the
   Task 0.1 baseline — still byte-identical.
-- [ ] **Step 5:** Served-site final sanity; tripwire suite green one last time.
-- [ ] **Step 6 — independent final review:** reviewer probes edges: adds a scratch flag to
+- [x] **Step 5:** Served-site final sanity; tripwire suite green one last time.
+- [x] **Step 6 — independent final review:** reviewer probes edges: adds a scratch flag to
   `cli_surface.rs` locally → tripwire 1 red (revert); adds a scratch `ASCRIPT_SCRATCH`
   read → tripwire 2 red (revert); confirms allowlists carry justifications; confirms
   every plan checkbox is ticked.
-- [ ] **Step 7:** Merge `feat/docs-drift-tripwires` into `main` with `--no-ff`; update the
+- [x] **Step 7:** Merge `feat/docs-drift-tripwires` into `main` with `--no-ff`; update the
   `goal-perf.md` status table to ✅ in the merge commit.
 
 ---

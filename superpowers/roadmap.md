@@ -589,6 +589,29 @@ tree-walker untouched; no `.aso` change (`ASO_FORMAT_VERSION` 28 unchanged).
   must be `Clone`; follow-up to DECODE); `Op::CallMethod` in-place binding deferred to DECODE;
   smallvec alternative not needed (in-place binding sufficed).
 
+## DOCS — documentation reconciliation + drift tripwires ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-docs-reconciliation-design.md`, plan
+`…/plans/2026-06-12-docs-reconciliation.md`. DX-track campaign spec — no engine change, no `.aso`
+change, `ASO_FORMAT_VERSION` unchanged; `vm_differential` proves the engines untouched. Independent of
+all engine specs and mutually independent of SIG.
+
+- **Unit A (one-time reconciliation):** `docs/content/cli.md` brought to full parity — 27 previously
+  missing flags, `ascript dap` subcommand, all 7 `pkg` subcommands (`add`/`remove`/`install`/`update`/
+  `lock`/`tree`/`verify`); env-var section covering all 9 `ASCRIPT_*` vars including the three kill
+  switches (`ASCRIPT_NO_SPECIALIZE`/`ASCRIPT_NO_SYNC_LANE`/`ASCRIPT_NO_CALL_FAST`) that were documented
+  nowhere before DOCS; `task.pipe` added to `stdlib/async.md`; CLAUDE.md meta-drift corrected
+  ("stdlib pages mirror the source modules" → domain-grouped). **Phase-0 re-verify** caught that the
+  env-var count was 9, not the spec's 7 — LANE's and CALL's kill switches had drifted.
+- **Unit B (6 permanent drift tripwires in `tests/docs_drift.rs`):** (1) CLI-surface⊆cli.md
+  (clap-introspected via `src/cli_surface.rs`); (2) env-var coverage; (3) module→page mapping
+  (`MODULE_PAGES`, validated both directions); (4) NAV⇄files bijection; (5) in-content link checker;
+  (6) editor-pin consistency. Four tripwires green-at-birth with self-test mutation guards; two (CLI +
+  env-var) were RED and turned green by Unit A. All six form **gate 19**.
+- **Seam:** clap surface extracted to `src/cli_surface.rs` (behavior-identical; the introspection seam
+  that enables tripwire 1). Boundary with SIG: SIG owns per-function stdlib signature consistency; DOCS
+  owns existence/claiming/CLI/env/NAV/links.
+
 ## SHAPE — shape-native object/instance storage ✅ MERGED
 
 Spec `superpowers/specs/2026-06-12-shape-storage-design.md`, plan

@@ -207,20 +207,21 @@ stated, results are measured.
 
 ### Developer-experience track (owner-sequenced relative to the engine waves)
 
-- 🔒 **DOCS — documentation reconciliation + permanent drift tripwires.** The 2026-06-12
+- ✅ **DOCS — documentation reconciliation + permanent drift tripwires.** The 2026-06-12
   docs-vs-reality audit (re-verified during spec drafting) found `docs/content/cli.md` missing
   **27 CLI flags, the `ascript dap` subcommand, and all 7 `pkg` subcommands** (e.g. `build
   --native` is documented only on `language/bundles.md`, never on the CLI reference page), all
-  7 user-facing `ASCRIPT_*` env vars undocumented there (`ASCRIPT_NO_SPECIALIZE` documented
-  nowhere), one stdlib member gap (`task.pipe` absent from `stdlib/async.md`), and a
-  CLAUDE.md meta-drift ("stdlib pages mirror the source modules" — they are domain-grouped).
+  9 user-facing `ASCRIPT_*` env vars undocumented there (`ASCRIPT_NO_SPECIALIZE`,
+  `ASCRIPT_NO_SYNC_LANE`, and `ASCRIPT_NO_CALL_FAST` — the three kill switches — documented
+  nowhere before DOCS), one stdlib member gap (`task.pipe` absent from `stdlib/async.md`), and
+  a CLAUDE.md meta-drift ("stdlib pages mirror the source modules" — they are domain-grouped).
   Unit A is the one-time reconciliation sweep; Unit B is the durable value: six in-tree drift
   TRIPWIRES (clap-introspected CLI-surface ⊆ cli.md; env-var coverage; a validated
   module→page claiming table; NAV ⇄ files bijection; in-content link checker; editor-pin
-  manual checklist) written failing-first against today's gaps, then kept green in CI —
-  proposed as gate 19. Boundary with SIG: SIG owns per-function stdlib *signature*
-  consistency; DOCS owns existence/claiming/CLI/env/NAV/links. Independent of all engine
-  specs; mutually independent of SIG.
+  manual checklist) written failing-first against today's gaps, then kept green in CI — gate 19.
+  Boundary with SIG: SIG owns per-function stdlib *signature* consistency; DOCS owns
+  existence/claiming/CLI/env/NAV/links. Independent of all engine specs; mutually independent
+  of SIG. **MERGED to `main` (`--no-ff`).**
   - Spec: `superpowers/specs/2026-06-12-docs-reconciliation-design.md`
   - Plan: `superpowers/plans/2026-06-12-docs-reconciliation.md`
 
@@ -505,6 +506,23 @@ stated, results are measured.
     in review (`ai/json_schema`) + `interp.rs TestSummary::from_value`; 2 vacuous IC tests caught + fixed;
     the Op-count append blind-spot in the negative-space guard. NANB is now unblocked (SHAPE+CALL done).
 
+- **DOCS** — ✅ MERGED to `main` (`--no-ff`). Documentation reconciliation + permanent drift tripwires.
+  **Unit B (6 permanent drift tripwires in `tests/docs_drift.rs`):** (1) CLI-surface⊆cli.md
+  (clap-introspected; 4 were RED-at-birth, turned green by Unit A); (2) env-var coverage (9 `ASCRIPT_*`
+  vars — spec had 7; Phase-0 re-verify caught LANE's `ASCRIPT_NO_SYNC_LANE` and CALL's
+  `ASCRIPT_NO_CALL_FAST` as drift, both added by Unit A); (3) module→page mapping (`MODULE_PAGES` table,
+  validated both directions); (4) NAV⇄files bijection (no orphan pages, no missing NAV entries); (5)
+  in-content link checker; (6) editor-pin consistency (zed/nvim tree-sitter SHA manual checklist) — 4
+  tripwires green-at-birth with self-test mutation guards, 2 were RED (CLI-surface + env-var) and turned
+  green by Unit A. **Unit A (one-time reconciliation):** `docs/content/cli.md` brought to full CLI parity
+  — 27 previously undocumented flags, `ascript dap` subcommand, all 7 `pkg` subcommands; env-var section
+  covering all 9 `ASCRIPT_*` vars incl. the 3 kill switches (`ASCRIPT_NO_SPECIALIZE` /
+  `ASCRIPT_NO_SYNC_LANE` / `ASCRIPT_NO_CALL_FAST`) that were documented nowhere before DOCS;
+  `task.pipe` added to `stdlib/async.md`; CLAUDE.md meta-drift fix ("stdlib pages mirror the source
+  modules" → corrected to domain-grouped). **Seam:** clap CLI surface extracted to `src/cli_surface.rs`
+  (behavior-identical move — the introspection seam for tripwire 1; vm_differential proves engines
+  untouched). Gate 19 added. No engine change, no `.aso` change, `ASO_FORMAT_VERSION` unchanged.
+
 ## Execution order
 
 ```
@@ -580,8 +598,10 @@ Campaign-specific additions:
     time; an allocation-discipline spec (CALL, SHAPE, NANB, REGION) additionally reports
     allocation counts (e.g. via the existing bench harness + `/usr/bin/time -l` or an allocation
     counter), and a memory regression is a bug to fix, never a tradeoff to accept silently.
-19. **Docs drift tripwires stay green in CI** once DOCS lands (the gate the DOCS spec proposes;
-    reserved here so the number is stable).
+19. **Docs drift tripwires (`tests/docs_drift.rs`) stay green in CI.** Doc changes ship in the same
+    PR as the surface they describe; allowlist additions are owner-justified. (DOCS campaign gate — tripwires
+    cover CLI-surface⊆cli.md, env-var coverage, module→page mapping, NAV⇄files bijection, in-content links,
+    and editor-pin consistency.)
 20. **Tree-sitter / LSP / formatter parity is explicit per spec, never assumed.** Three tiers,
     each enforced by something that FAILS, not by convention: (a) a spec that touches grammar
     (this campaign: DEFER only) pays the FULL syntax checklist from `CLAUDE.md` — both parsers,

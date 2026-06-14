@@ -1,6 +1,10 @@
 pub mod ast;
 pub mod bundle;
 pub mod check;
+/// The clap derive types (`Cli`, `Command`, `CapFlags`) + `cli_command()` —
+/// the single source of truth for the CLI surface. Consumed by `src/main.rs`
+/// for parsing and by `tests/docs_drift.rs` for drift introspection (spec §4.1).
+pub mod cli_surface;
 pub mod compile;
 pub mod coro;
 // DBG Task 5b: the Debug Adapter Protocol (DAP) server over stdio. Feature-gated
