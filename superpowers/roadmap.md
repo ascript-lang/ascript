@@ -589,6 +589,30 @@ tree-walker untouched; no `.aso` change (`ASO_FORMAT_VERSION` 28 unchanged).
   must be `Clone`; follow-up to DECODE); `Op::CallMethod` in-place binding deferred to DECODE;
   smallvec alternative not needed (in-place binding sufficed).
 
+## SHAPE — shape-native object/instance storage ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-shape-storage-design.md`, plan
+`…/plans/2026-06-12-shape-storage.md`. VM-only; tree-walker untouched; no `.aso` change
+(`ASO_FORMAT_VERSION` 28 unchanged, guarded by `tests/shape_negative_space.rs`).
+
+- **Mechanism:** `ObjectCell` and `Instance.fields` replace the per-object `IndexMap` with
+  `ObjectStorage { Slab { keys: Rc<[Rc<str>]>, values: Vec<Value> } | Dict(IndexMap<…>) }`.
+  The VM builds slabs (zero per-object key alloc, zero SipHash on construction); the tree-walker
+  keeps Dict (shape 0) — four-mode byte-identical. Per-`Vm` `ShapeRegistry` (`FxHashMap`-backed)
+  interns key-lists → shape ids; caps `SLAB_MAX_KEYS = 64` / `SHAPE_FANOUT_MAX = 128` — exceed
+  either → demote to Dict (one-way, shape 0). Decode-born objects (`json.parse`, dynamic keys)
+  stay Dict/SipHash by design (spec §9). `vm_object_insert`/`vm_instance_insert` drive precise
+  per-key transitions; `resync_object_shape`/`resync_instance_shape` deleted. Per-site
+  `lit_shapes` cache (`Chunk.lit_shapes`, specialize-gated, NOT serialized) warms hot literal
+  sites. `object.delete` demotes slab → Dict + resets shape 0 before `shift_remove` (inline-cache
+  safety). VM interior tables use **FxHash**; `Map`/`Set`/dict-mode/decode paths keep **SipHash**
+  (DoS resistance).
+- **Performance (`bench/SHAPE_RESULTS.md`, Gate 16, same-session A/B):** `object_churn`
+  **1.77×** (14.0% hashing → 0.0%, 17.6% alloc → 5.7%); per-object alloc slope **13 → 2
+  (6.5× reduction)**; `json_roundtrip` **flat by design**; A/B geomean **1.089×**; spec/tw
+  geomean **4.20×**; DBG zero-cost gate **0.994×**; RSS: no regression.
+- **Differential:** `vm_differential` **443/0** (both feature configs). Four-mode identical.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

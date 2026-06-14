@@ -164,6 +164,12 @@ quoted strings, and member access uses `.` or `["key"]`. A **map** (from [`std/m
 is a general collection whose keys may be `nil`, `bool`, `number`, or `string`. Reach for an object
 for record-like data with known fields, and a map when keys are dynamic or non-string.
 
+> [!NOTE] **Key insertion order is guaranteed and preserved.** Object fields maintain their declaration
+> order across construction, mutation, spread, key deletion, and JSON round-trip. Code that iterates
+> `object.keys(o)`, `object.values(o)`, or `object.entries(o)` always sees fields in the order they
+> were added. This guarantee holds whether an object was created as a literal, built incrementally, or
+> decoded from JSON.
+
 ```ascript
 let point = { x: 1, y: 2 }      // object
 print(point.x)                  // 1
