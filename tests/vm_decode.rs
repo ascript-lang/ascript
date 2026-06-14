@@ -171,6 +171,48 @@ async fn cross_module_panic_provenance_survives_the_hoisted_source_refresh() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DECODE §8.4 — the invalidation battery (the JIT-contract proof)
+//
+// The BEHAVIORAL halves of the battery (a breakpoint set after warmup must fire
+// through an invalidated+rebuilt decoded stream; coverage over decoded execution
+// is byte-identical + complete; the epoch/deps validity unit tests) live in the
+// CRATE, not here, because they drive `pub(crate)` machinery — the in-crate
+// `DebuggerHook` + command channel, `Vm::arm_coverage`, and `DecodedChunk`'s
+// epoch/deps fields:
+//   - `src/vm/run.rs` → `breakpoint_set_mid_hot_loop_invalidates_the_decoded_stream_and_fires`
+//     (§8.4 #1) and `coverage_over_decoded_execution_is_byte_identical_and_complete` (§8.4 #3)
+//   - `src/vm/decode.rs` → `decoded_chunk_validity_unit_tests` (§8.4 #4: own_epoch
+//     invalid after set AND restore; a stale `deps` epoch invalidates a caller
+//     stream whose own bytes are untouched — the cross-proto Unit-C hole)
+// This file carries the PUBLIC-surface guards: the chokepoint source scan (below)
+// and a coverage-over-a-decode-hot-loop black-box equivalence (a `--coverage`
+// run patches `Op::Break` per line — bumping `patch_epoch` — so decode must
+// invalidate + rebuild; the trap+un-patch+re-decode cycle must leave output
+// byte-identical to an un-instrumented run).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// §8.4 #3 (public-surface black box): `--coverage` of a loop hot enough to decode
+/// must produce output byte-identical to a plain VM run. Coverage patches each
+/// line's first byte to `Op::Break` (each bumps `patch_epoch`); the decoded stream
+/// is invalidated + rebuilt around every set/restore, and the observation-only
+/// trap leaves stdout untouched. (The covered-set completeness + the decoded_ops>0
+/// anti-false-green live in the in-crate `coverage_over_decoded_execution_*` test;
+/// here we assert the public contract: coverage never changes what the program
+/// prints, even when decode is engaged.)
+#[tokio::test]
+async fn coverage_over_a_decode_hot_loop_is_byte_identical_to_a_plain_run() {
+    let src = "fn sq(n) {\n  return n * n\n}\nlet total = 0\n\
+               for (i in 0..200) {\n  total = total + sq(i)\n}\nprint(total)\n";
+    let plain = ascript::vm_run_source(src).await.expect("plain ok");
+    let covered = ascript::vm_run_source_coverage(src).await.expect("coverage ok");
+    assert_eq!(
+        plain, covered,
+        "coverage stdout is byte-identical to a plain run even when the loop decodes"
+    );
+    assert_eq!(plain.0, "2646700\n", "sum of i*i for i in 0..200");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DECODE §4.1 — the invalidation chokepoint structural guard (Task 1)
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -206,7 +206,8 @@ impl RecordSource {
             // Frame changed to a different chunk: consult ITS decoded stream.
             let slot = chunk.decoded.borrow();
             let d = match slot.as_ref() {
-                Some(d) if d.own_epoch == chunk.patch_epoch.get() => d.clone(),
+                // §4.2 validity (own_epoch + deps) — the single SoT in `is_valid`.
+                Some(d) if d.is_valid(chunk) => d.clone(),
                 _ => return false, // un-decoded / stale callee → byte fallback
             };
             drop(slot);
@@ -2030,7 +2031,8 @@ impl Vm {
         {
             let slot = chunk.decoded.borrow();
             if let Some(d) = slot.as_ref() {
-                if d.own_epoch == chunk.patch_epoch.get() {
+                // §4.2 validity (own_epoch + deps) — the single SoT in `is_valid`.
+                if d.is_valid(chunk) {
                     return RecordSource::at_entry(self, fiber, d.clone());
                 }
             }
@@ -2038,7 +2040,7 @@ impl Vm {
         // No (or stale) stream. Drop a stale one, then warm + maybe decode.
         {
             let mut slot = chunk.decoded.borrow_mut();
-            if slot.as_ref().is_some_and(|d| d.own_epoch != chunk.patch_epoch.get()) {
+            if slot.as_ref().is_some_and(|d| !d.is_valid(chunk)) {
                 *slot = None;
             }
         }
@@ -10593,6 +10595,282 @@ mod tests {
         let f = &files[0];
         // Line 2 (f's body) is covered.
         assert!(!f.uncovered_lines().contains(&2), "f's body line 2 covered");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DECODE §8.4 — the invalidation battery (the JIT-contract proof).
+    //
+    // A `DecodedChunk` caches `own_epoch = chunk.patch_epoch` at build time. A DBG
+    // breakpoint / coverage trap is installed by `Chunk::patch_byte`-ing an
+    // `Op::Break` into `Chunk.code`, which BUMPS `patch_epoch` (the Task-1
+    // chokepoint). A previously-built decoded stream is therefore STALE
+    // (`own_epoch != patch_epoch`); the Task-4 consult MUST drop it and rebuild
+    // from the now-patched bytes (which decode the `Op::Break` as an escalation
+    // record) so the trap actually fires. Without the invalidation, the cached
+    // records would execute the OLD (un-patched) instruction and the breakpoint
+    // would be silently missed — a debugger correctness bug AND the JIT-staleness
+    // hazard. These tests prove the consult is sound; the structural chokepoint
+    // guard lives in `tests/vm_decode.rs`, the epoch unit tests in `decode.rs`.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Build a FORCED-decode VM (`decode_threshold = 0` → the entry chunk decodes
+    /// on its first burst) and install `inst` as its instrumentation. The forced
+    /// threshold is the in-crate analogue of `vm_run_source_decoded_forced`; the
+    /// instrument is layered on AFTER construction (the production constructors
+    /// keep their default threshold). Returns the VM.
+    fn forced_decode_vm_with_instrument(
+        interp: Rc<Interp>,
+        inst: crate::vm::instrument::Instrumentation,
+    ) -> Rc<Vm> {
+        // specialize/sync_lane/call_fast all on; decode + inline + tos on; threshold 0.
+        let vm = Vm::with_all_flags(interp, true, true, true, true, true, true, 0);
+        *vm.instrument.borrow_mut() = Some(Box::new(inst));
+        vm
+    }
+
+    #[test]
+    fn breakpoint_set_mid_hot_loop_invalidates_the_decoded_stream_and_fires() {
+        // §8.4 #1 (THE mandatory test). Warm a loop until its proto decodes
+        // (forced threshold 0 → the first run installs the decoded stream and
+        // `decoded_ops` rises), THEN patch a breakpoint on a line ALREADY in the
+        // decoded stream (epoch bumps → the cached stream is stale), run again on
+        // the SAME persisted proto + VM — the trap MUST fire (a stale stream would
+        // sail straight past it). Then clear (another epoch bump) + re-run → no
+        // phantom trap, output byte-identical to an uninstrumented run, and the
+        // stream re-decodes (decoded_ops keeps rising). One program text, run
+        // three times on one VM (the REPL-style persistence the consult relies on).
+        use crate::vm::instrument::{
+            DebugCommand, DebuggerHook, Instrumentation,
+        };
+
+        // A loop whose body has a clear, breakpoint-able line (`s = s + i`, line 2).
+        let src = "let s = 0\nfor (i in 0..50) { s = s + i }\nprint(s)\n";
+
+        let (ok, hits_run2, hits_run3, decoded_after_warm, decoded_after_run3, out_seq) =
+            with_watchdog(15, move || {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                let local = LocalSet::new();
+                local.block_on(&rt, async move {
+                    let interp = Rc::new(Interp::new());
+                    interp.install_self();
+
+                    // ── WARMUP: forced-decode VM, NO instrument, run once. ───────
+                    let warm_vm =
+                        Vm::with_all_flags(interp.clone(), true, true, true, true, true, true, 0);
+                    let (entry, _src) = compile_and_register(src, &warm_vm);
+                    {
+                        let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                        let outcome = warm_vm.run(&mut fiber).await;
+                        assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "warmup ran");
+                    }
+                    // The cumulative capture buffer is sliced per-run (Interp has no
+                    // reset_output); each run appends its own line.
+                    let warm_out = interp.output();
+                    // The entry chunk decoded (the stream is installed) and records retired.
+                    let decoded_after_warm = entry.chunk.decoded.borrow().is_some()
+                        && warm_vm.decode_stats_inner().decoded_ops > 0;
+                    let warm_epoch = entry.chunk.patch_epoch.get();
+
+                    // ── PATCH: set a breakpoint on the loop body (line 2), which is
+                    //    already present in the decoded stream. This bumps the chunk's
+                    //    patch_epoch → the cached decoded stream is now STALE.
+                    let bp = warm_vm
+                        .resolve_line_breakpoint("prog.as", 2)
+                        .expect("loop body line 2 resolves to a breakpoint");
+                    // The breakpoint must land in the ENTRY chunk (the warmed proto), so
+                    // its already-built decoded stream is the one under test.
+                    let entry_id = Rc::as_ptr(&entry) as *const () as usize;
+                    assert_eq!(bp.0, entry_id, "the loop-body bp binds the warmed entry proto");
+
+                    let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+                    hook.set_breakpoint_shared(bp.0, bp.1, &entry.chunk);
+                    assert_ne!(
+                        warm_epoch,
+                        entry.chunk.patch_epoch.get(),
+                        "patch_byte bumped the epoch — the cached decoded stream is now stale"
+                    );
+
+                    // Auto-continue controller: count Stopped events (the breakpoint hits).
+                    let controller = std::thread::spawn(move || {
+                        let mut hits = 0usize;
+                        while evt_rx.recv().is_ok() {
+                            hits += 1;
+                            if cmd_tx.send(DebugCommand::Continue).is_err() {
+                                break;
+                            }
+                        }
+                        hits
+                    });
+
+                    // ── RUN 2: same proto + a debugger hook, on a fresh forced-decode
+                    //    VM that SHARES the same already-decoded chunk (the proto carries
+                    //    `chunk.decoded`). The stale stream must be DROPPED + rebuilt from
+                    //    the patched bytes so the Break record escalates and the trap fires.
+                    let run_vm = forced_decode_vm_with_instrument(
+                        interp.clone(),
+                        Instrumentation {
+                            breakpoints: Some(hook),
+                            profiler: None,
+                            coverage: None,
+                        },
+                    );
+                    run_vm.register_debug_protos(&entry);
+                    {
+                        let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                        let outcome = run_vm.run(&mut fiber).await;
+                        assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "run 2 completed");
+                    }
+                    // Slice this run's contribution off the cumulative buffer.
+                    let run2_out = interp.output()[warm_out.len()..].to_string();
+                    // Reclaim the hook, drain its breakpoints for the clear step, then
+                    // DROP it (dropping the event Sender) so the controller loop ends
+                    // before we join it (else `evt_rx.recv()` blocks forever).
+                    let mut hook = run_vm.take_debugger_hook().expect("debugger hook armed");
+                    // The v1 un-patch-on-hit model already restored the loop byte after the
+                    // single trap; drain whatever remains (idempotent for the clear step).
+                    let remaining = hook.drain_breakpoints();
+                    drop(hook);
+                    let hits_run2 = controller.join().expect("controller thread");
+
+                    // ── CLEAR: ensure the original byte is restored (un-patch → another
+                    //    epoch bump → stale again) and run a third time with NO live
+                    //    breakpoint. No phantom trap; the stream re-decodes (decoded_ops
+                    //    keeps rising).
+                    for ((pid, off), original) in remaining {
+                        assert_eq!(pid, bp.0);
+                        entry.chunk.patch_byte(off, original);
+                    }
+                    // A FRESH forced-decode VM (no instrument) for run 3 — a top-level
+                    // `let s` would redeclare on a second run of the SAME Vm's
+                    // user_globals, so each run uses its own Vm; the shared proto carries
+                    // `chunk.decoded` across all of them (that is the unit under test).
+                    let run3_vm =
+                        Vm::with_all_flags(interp.clone(), true, true, true, true, true, true, 0);
+                    {
+                        let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                        let outcome = run3_vm.run(&mut fiber).await;
+                        assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "run 3 completed: {outcome:?}");
+                    }
+                    let cumulative = interp.output();
+                    let run3_out = cumulative[warm_out.len() + run2_out.len()..].to_string();
+                    let decoded_after_run3 = entry.chunk.decoded.borrow().is_some()
+                        && run3_vm.decode_stats_inner().decoded_ops > 0;
+                    // run 3 must NOT trap (the hook has no live breakpoints; the byte is
+                    // restored). hits_run3 measured via a quick byte-comparison: the byte
+                    // at the bp offset is the original, not Op::Break.
+                    let hits_run3 = if entry.chunk.code[bp.1] == crate::vm::opcode::Op::Break as u8 {
+                        1
+                    } else {
+                        0
+                    };
+
+                    let outcome_ok = true;
+                    (
+                        outcome_ok,
+                        hits_run2,
+                        hits_run3,
+                        decoded_after_warm,
+                        decoded_after_run3,
+                        (warm_out, run2_out, run3_out),
+                    )
+                })
+            });
+
+        assert!(ok, "all three runs completed");
+        let (warm_out, run2_out, run3_out) = out_seq;
+        assert!(
+            decoded_after_warm,
+            "the warmup decoded the entry chunk and retired records (decoded_ops > 0)"
+        );
+        assert_eq!(
+            hits_run2, 1,
+            "the breakpoint set AFTER warmup fired — the stale decoded stream was \
+             invalidated + rebuilt, not executed (a stale stream would miss the trap)"
+        );
+        assert_eq!(hits_run3, 0, "after clear, the byte is restored — no phantom Break");
+        assert!(
+            decoded_after_run3,
+            "after the un-patch the stream re-decodes (decoded_ops rises again)"
+        );
+        // All three runs produce identical, uninstrumented output (0+1+..+49 = 1225).
+        assert_eq!(warm_out, "1225\n", "warmup output");
+        assert_eq!(run2_out, "1225\n", "the trapped run's output is byte-identical");
+        assert_eq!(run3_out, "1225\n", "the cleared run's output is byte-identical");
+    }
+
+    #[test]
+    fn coverage_over_decoded_execution_is_byte_identical_and_complete() {
+        // §8.4 #3: --coverage of a hot-loop program under FORCED decode. arm_coverage
+        // patches every line start to Op::Break (each patch bumps patch_epoch) BEFORE
+        // the run, so the very first decode reads the PATCHED bytes (Break records that
+        // escalate + trap on byte dispatch); after a line traps once it un-patches
+        // (another epoch bump) and the now-hot loop re-decodes + runs from records.
+        // Assert: program output == a no-decode coverage run, AND the covered line set
+        // == the no-decode covered set. (Decode must not change WHICH lines coverage
+        // sees nor WHAT the program prints.)
+        use crate::vm::instrument::{CoverageTable, Instrumentation};
+
+        let src = "fn sq(n) {\n  return n * n\n}\nlet total = 0\n\
+                   for (i in 1..6) {\n  total = total + sq(i)\n}\nprint(total)\n";
+
+        // A by-file covered view: `(path, [(line_1based, covered)])`.
+        type CoveredSet = Vec<(String, Vec<(u32, bool)>)>;
+
+        /// Run `src` under coverage with `decode_threshold` (0 = forced decode,
+        /// `DECODE_THRESHOLD` = the production warmth) and return
+        /// (covered set, output, decoded_ops).
+        fn cov_run(src: &str, decode_threshold: u16) -> (CoveredSet, String, u64) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let mut inst = Instrumentation::empty();
+                inst.coverage = Some(CoverageTable::new());
+                let vm = Vm::with_all_flags(
+                    interp.clone(),
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    decode_threshold,
+                );
+                *vm.instrument.borrow_mut() = Some(Box::new(inst));
+                let (entry, _src) = compile_and_register(src, &vm);
+                vm.arm_coverage(&entry);
+                let mut fiber = Fiber::new(Closure::new(entry));
+                let outcome = vm.run(&mut fiber).await;
+                assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "ran: {outcome:?}");
+                let table = vm.take_coverage().expect("coverage armed");
+                let covered: CoveredSet = table
+                    .by_file()
+                    .into_iter()
+                    .map(|f| (f.path, f.lines))
+                    .collect();
+                (covered, interp.output(), vm.decode_stats_inner().decoded_ops)
+            })
+        }
+
+        let (cov_decoded, out_decoded, decoded_ops) = cov_run(src, 0); // forced decode
+        let (cov_bytes, out_bytes, _) = cov_run(src, Vm::DECODE_THRESHOLD); // never decodes (short prog)
+
+        // The forced run genuinely decoded + executed records (else this is a vacuous
+        // equality of two byte-dispatch runs — anti-false-green, spec §8.3a).
+        assert!(
+            decoded_ops > 0,
+            "the forced-decode coverage run must retire records (it ran {decoded_ops})"
+        );
+        assert_eq!(
+            out_decoded, out_bytes,
+            "coverage stdout is byte-identical decode-on vs decode-off"
+        );
+        assert_eq!(out_decoded, "55\n", "1+4+9+16+25 = 55");
+        assert_eq!(
+            cov_decoded, cov_bytes,
+            "the covered/instrumented line set is identical decode-on vs decode-off"
+        );
     }
 
     #[test]

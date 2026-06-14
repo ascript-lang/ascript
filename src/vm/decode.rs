@@ -74,9 +74,8 @@ pub(crate) struct DecodedChunk {
     /// stale `own_epoch` rebuilds (Task 4/6). Stale ⇒ drop, never edit.
     pub own_epoch: u64,
     /// Task 9 fills: one `(foreign-chunk identity, epoch)` entry per chunk whose
-    /// records were embedded by inlining. Empty until then (read by the §4.2
-    /// deps-validity consult in Task 9).
-    #[allow(dead_code)]
+    /// records were embedded by inlining. Empty until then; consulted by the §4.2
+    /// deps-validity check ([`DecodedChunk::is_valid`]).
     pub deps: Vec<(std::rc::Rc<crate::vm::chunk::FnProto>, u64)>,
     /// Task 9 fills: the inline-segment table for span/source attribution. Empty
     /// until then.
@@ -92,6 +91,31 @@ pub(crate) struct InlineSegment {
     /// Record-index range `[start, end)` of the inlined body.
     pub start: u32,
     pub end: u32,
+}
+
+impl DecodedChunk {
+    /// DECODE §4.2: the validity predicate — the SINGLE source of truth the
+    /// `select_record_source`/`resync` consults reach (the JIT-staleness contract).
+    /// A cached stream is valid iff (a) its `own_epoch` still equals the OWNING
+    /// chunk's current `patch_epoch` (a DBG `Chunk::patch_byte` of an `Op::Break`
+    /// bumps it — set AND restore both invalidate), AND (b) every `deps` entry's
+    /// stored epoch still matches its foreign chunk's current `patch_epoch` (the
+    /// cross-proto Unit-C hole: a breakpoint patched into an INLINED callee must
+    /// drop the CALLER's stream even though the caller's own bytes are untouched).
+    /// `deps` is empty until Task 9, so (b) is trivially true today — but the check
+    /// is here, exercised by the §8.4 unit battery, so Unit C inherits a proven
+    /// invalidation seam rather than re-deriving one.
+    ///
+    /// Stale ⇒ the consult DROPS the stream and rebuilds from the (now-patched)
+    /// bytes; it NEVER edits a cached stream in place.
+    pub(crate) fn is_valid(&self, own_chunk: &Chunk) -> bool {
+        if self.own_epoch != own_chunk.patch_epoch.get() {
+            return false;
+        }
+        self.deps
+            .iter()
+            .all(|(proto, epoch)| proto.chunk.patch_epoch.get() == *epoch)
+    }
 }
 
 impl fmt::Debug for DecodedChunk {
@@ -403,6 +427,94 @@ mod tests {
         assert!(c.decoded.borrow().is_none());
         assert_eq!(c.decode_warmth.get(), 0);
         assert_eq!(c.patch_epoch.get(), 0);
+    }
+
+    /// DECODE §8.4 #4 — the epoch/deps validity unit battery (the JIT-contract
+    /// proof, the pure-unit half; the behavioral DAP/coverage halves live in
+    /// `run.rs`'s test module, the chokepoint scan in `tests/vm_decode.rs`).
+    ///
+    /// (a) a stream built at epoch N is valid at N, INVALID after one `patch_byte`
+    /// (a breakpoint SET, N→N+1), and INVALID again after the restore (N+1→N+2 —
+    /// the epoch is monotonic, never compared by value); (b) a `deps` entry whose
+    /// stored epoch goes stale invalidates the stream EVEN WHEN `own_epoch` still
+    /// matches (the cross-proto Unit-C hole — a breakpoint in an inlined callee must
+    /// drop the caller's stream though the caller's own bytes are untouched).
+    #[test]
+    fn decoded_chunk_validity_unit_tests() {
+        // ── (a) own_epoch: built at N, invalid after set AND after restore. ──────
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s(0, 1));
+        c.emit(Op::Add, s(1, 2));
+        c.emit(Op::Return, s(2, 3));
+        let d = decode_chunk(&c, &DecodeCfg::plain()).expect("decodes");
+        assert_eq!(d.own_epoch, 0, "fresh chunk decoded at epoch 0");
+        assert!(d.is_valid(&c), "valid at the epoch it was built");
+
+        // A breakpoint SET (patch_byte of Op::Break) bumps the epoch → stale.
+        let original = c.code[1];
+        c.patch_byte(1, Op::Break as u8);
+        assert_eq!(c.patch_epoch.get(), 1, "patch_byte bumped to N+1");
+        assert!(!d.is_valid(&c), "the N-stamped stream is stale after the set");
+
+        // The RESTORE (another patch_byte) bumps AGAIN → still stale (the value
+        // returning to the pre-patch byte does NOT make the old stream valid; the
+        // epoch is a monotonic generation counter, never compared by content).
+        c.patch_byte(1, original);
+        assert_eq!(c.patch_epoch.get(), 2, "the restore bumped to N+2");
+        assert!(!d.is_valid(&c), "the N-stamped stream is still stale after the restore");
+
+        // A freshly re-decoded stream (reads the restored bytes) is valid again.
+        let d2 = decode_chunk(&c, &DecodeCfg::plain()).expect("re-decodes");
+        assert_eq!(d2.own_epoch, 2);
+        assert!(d2.is_valid(&c), "the rebuilt stream is valid at the current epoch");
+
+        // ── (b) deps: a stale foreign-chunk epoch invalidates even when own matches.
+        // Build a tiny foreign proto whose chunk records its epoch at "embed" time,
+        // then bump the FOREIGN chunk's epoch (a breakpoint in the inlined callee).
+        let mut fc = Chunk::new();
+        fc.emit(Op::Return, s(0, 1));
+        let foreign = std::rc::Rc::new(crate::vm::chunk::FnProto {
+            chunk: fc,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+        });
+        let embed_epoch = foreign.chunk.patch_epoch.get();
+
+        // A caller stream whose own_epoch matches its own chunk, but which embedded
+        // the foreign proto at `embed_epoch` (hand-built deps vec — testable now per
+        // the plan, before Unit C populates deps for real).
+        let caller_with_deps = std::rc::Rc::new(DecodedChunk {
+            records: d2.records.clone(),
+            entry_index: d2.entry_index.clone(),
+            own_epoch: c.patch_epoch.get(), // own matches the (restored) caller chunk
+            deps: vec![(foreign.clone(), embed_epoch)],
+            inline_segments: Vec::new(),
+        });
+        assert!(
+            caller_with_deps.is_valid(&c),
+            "own_epoch + dep epoch both current ⇒ valid"
+        );
+
+        // Patch a breakpoint into the INLINED callee's chunk: own_epoch is untouched,
+        // but the dep epoch goes stale → the caller's stream must be dropped.
+        foreign.chunk.patch_byte(0, Op::Break as u8);
+        assert_eq!(
+            caller_with_deps.own_epoch,
+            c.patch_epoch.get(),
+            "the caller's own bytes (and epoch) are untouched"
+        );
+        assert!(
+            !caller_with_deps.is_valid(&c),
+            "a stale DEP epoch invalidates the caller stream even when own_epoch matches"
+        );
     }
 
     #[test]

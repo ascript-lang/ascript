@@ -552,7 +552,7 @@ async fn decoded_dispatch_actually_executes_on_the_corpus() {
   `parked_clear_breakpoints_restores_the_original_byte` test (`run.rs:7206`) — drive
   `DebuggerHook` + command channel directly, no editor needed.
 
-- [ ] **Step 1: Write the failing tests** (spec §8.4 — items 2 and 5 land with Task 9/Task 1
+- [x] **Step 1: Write the failing tests** (spec §8.4 — items 2 and 5 land with Task 9/Task 1
   respectively; here: 1, 3, 4):
 
 ```rust
@@ -591,13 +591,13 @@ fn decoded_chunk_validity_unit_tests() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL or PASS-for-the-wrong-reason** — verify each test FAILS when
+- [x] **Step 2: Run — expect FAIL or PASS-for-the-wrong-reason** — verify each test FAILS when
   the validity check is stubbed to `true` (sabotage first, then implement/confirm the real
   check makes it pass; this battery must be demonstrably capable of catching the bug it
   guards).
-- [ ] **Step 3:** Fix anything the battery surfaces (failing-test-first; in-branch).
-- [ ] **Step 4: Run — expect PASS**; full suite both configs.
-- [ ] **Step 5: Commit** — `test(decode): the byte-patch invalidation battery — breakpoints/coverage vs decoded streams (DECODE §4, §8.4)` (house trailer).
+- [x] **Step 3:** Fix anything the battery surfaces (failing-test-first; in-branch).
+- [x] **Step 4: Run — expect PASS**; full suite both configs.
+- [x] **Step 5: Commit** — `test(decode): the byte-patch invalidation battery — breakpoints/coverage vs decoded streams (DECODE §4, §8.4)` (house trailer).
 - [ ] **Reviewer checkpoint:** reviewer probes the edges: set a breakpoint on the SAME offset
   twice (idempotent set — one epoch bump per patch call, side table keeps the true original);
   clear-all while parked (`apply_clear_breakpoints` restores N bytes = N bumps); break-on-entry
