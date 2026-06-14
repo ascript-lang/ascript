@@ -28,11 +28,17 @@ durable workflows, plus **shared-nothing workers** for multi-core parallelism �
   `docs/content/` (language guide + per-domain stdlib reference). `app.js` `fetch`es the Markdown, so the
   site must be **served**, not opened from `file://` (`cd docs && python3 -m http.server`). The Markdown
   is also readable straight from the repo.
-- The stdlib reference pages mirror the source modules; if you change a `std/*` API, update the matching
-  `docs/content/stdlib/*.md` page. **Adding a NEW page** means adding its slug to the `NAV` array in
-  `docs/assets/app.js` — the sidebar AND the cmd-K search both derive from `NAV`, so a page with no entry
-  is unreachable (no link, no search hit). In-content links are resolved relative to the current page's
-  directory (`](workflow)`, `](../language/syntax)`), not absolute-from-root. The language-guide pages are
+- The stdlib reference pages are **domain-grouped** (22 pages covering 57 modules — e.g.
+  `collections.md` owns `std/string`, `std/array`, `std/object`, `std/map`, `std/set`, `std/math`,
+  `std/convert`, and `std/bytes`). The authoritative module→page mapping is `MODULE_PAGES` in
+  `tests/docs_drift.rs` (tripwire-validated both directions, now enforced by `tests/docs_drift.rs`).
+  If you change a `std/*` API, update the module's **owning page** per that mapping. A **NEW std
+  module** needs a reference section on its owning page (or a new page) PLUS a `MODULE_PAGES` entry
+  — CI fails if either is missing. **Adding a NEW page** means adding its slug to the `NAV` array in
+  `docs/assets/app.js` (now enforced by `tests/docs_drift.rs`) — the sidebar AND the cmd-K search
+  both derive from `NAV`, so a page with no entry is unreachable (no link, no search hit).
+  In-content links are resolved relative to the current page's directory (`](workflow)`,
+  `](../language/syntax)`), not absolute-from-root. The language-guide pages are
   `docs/content/language/{syntax,values-types,classes-enums,type-contracts,errors,modules-async}.md`
   (note: `match`/generators/concurrency live inside those pages, not separate files).
 - **`README.md`** is the repo front door (install, CLI, stdlib table, links into `docs/`).
@@ -65,7 +71,9 @@ Several rules recur for ANY change to the grammar/AST. Do all that apply:
   (subtree-splits + pushes to the `ascript-lang/tree-sitter-ascript` mirror, prints the new SHA), then bump
   that SHA in `editors/zed/extension.toml` (`commit`) and `editors/nvim/lua/ascript/treesitter.lua`
   (`revision`). CI `mirror-grammar.yml` also auto-mirrors, but the editor-pin bump is manual. See
-  `CONTRIBUTING.md`.
+  `CONTRIBUTING.md`. **After a sync, verify BOTH editor pins were bumped to the new mirror SHA** — pin
+  currency against the mirror is a manual check (network/another repo; not CI-testable in-repo); pin
+  mutual consistency (Zed == Nvim) IS enforced by `tests/docs_drift.rs` (tripwire 6).
 
 ## Language features — gotchas & where they live
 
