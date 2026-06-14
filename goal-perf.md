@@ -523,6 +523,44 @@ stated, results are measured.
   (behavior-identical move — the introspection seam for tripwire 1; vm_differential proves engines
   untouched). Gate 19 added. No engine change, no `.aso` change, `ASO_FORMAT_VERSION` unchanged.
 
+- **DECODE** — 🏗️ on `feat/decoded-dispatch`; **Task-11 evidence gate executed — DOUBLE DROP by
+  measurement.** Pre-decoded instruction stream (Unit A) + data-driven superinstruction fusion (Unit B)
+  ship for their **invalidation contract** (the byte-patch→drop-decoded-code deps-epoch machinery — the
+  JIT prerequisite), NOT for a measured end-to-end speedup. The two speculative units BOTH failed their
+  evidence gate and were reverted on their own same-session A/B data (`bench/DECODE_RESULTS.md`, Apple M4,
+  env-toggle A/B on ONE binary, 7 runs/median, 8-workload profiling corpus). **No grammar change, no
+  semantics change, `ASO_FORMAT_VERSION` unchanged at 28.**
+  - **Units A+B (kept) — `ASCRIPT_NO_DECODE=1` vs default, isolated:** geomean **0.977×** (decode-on is
+    ~2.3% SLOWER on the realistic corpus; worst `func_pipeline` −6.7%, `server_request` −5.0%). The
+    pre-decode warm-up + frame-entry validity-check cost is not repaid by the flatter record stream at
+    whole-program scale here. RSS flat (12–14 MB, no Gate-18 regression). Kept anyway: the deps-epoch
+    invalidation contract + byte-patch battery (`tests/vm_decode.rs`) are the JIT precondition and are
+    proven; the dispatch *speedup* a JIT would build on did not materialize from interpretation-level
+    pre-decode.
+  - **UNIT-C VERDICT (§6.7) — DROP.** Isolated speculative-inline win (`ASCRIPT_NO_DECODE_INLINE=1` vs
+    default) = **+0.45% geomean on the call-heavy corpus** (`func_pipeline` +0.1%, `call_heavy` +0.8%;
+    `object_churn` −2.7%) — **< 2% ship gate ⇒ DROPPED.** Reverted Task-9 feature commit `bd95cd7`
+    (revert `6fa54d3`); KEPT the deps-epoch machinery + battery (Unit A §4's, verified present). Clean
+    revert, zero conflicts.
+  - **UNIT-D VERDICT (§7.5) — RECORD-REJECT.** Isolated TOS-cache win (`ASCRIPT_NO_DECODE_TOS=1` vs
+    default) on the dispatch-bound trio = **−1.6% geomean** (object_churn **−3.2%, regresses past the
+    0.97 bound**, func_pipeline −1.8%, call_heavy +0.1%) — fails BOTH ship conditions (≥2% AND no
+    regression) ⇒ **RECORD-REJECT.** Reverted Task-10 feature commit `4611291` (revert `2065217`); the
+    `stack_ops`/`tos_ops` census counters stay as evidence. The Task-8 residual `stack/decoded` of >1.2
+    (object_churn) / ~1.5 (func_pipeline) was a real but non-sufficient signal — eliminating the residual
+    push/pop did not pay against the per-edge flush bookkeeping + accessor indirection on this M4.
+  - **Threshold A/B (§2.3):** thresholds 0/8/32 all within noise (0→8 = 1.001×, 32→8 = 0.999×) — **kept
+    `DECODE_THRESHOLD = 8`** (no winner, placeholder stands).
+  - **Gates (post-revert, branch green):** spec/tw geomean **3.41–3.47×** (≥2× Gate 12/17);
+    `dbg_zero_cost_gate` **0.898×** (≤1.05×); `vm_differential` **444/0** BOTH feature configs; `vm_decode`
+    12/0 (kept battery); `property` 27/0; full suite + clippy clean BOTH configs; `ASO_FORMAT_VERSION` 28.
+  - **JIT-gate verdict (mandatory re-rank):** the Phase-0 ranking holds — `async_*` reactor/park-bound
+    (~70%+), `json_roundtrip` alloc/hash-bound, `workflow_loop` fsync-bound (96%), the dispatch-bound trio
+    already within a small constant of generic. Dispatch does NOT dominate whole-program time on the
+    realistic corpus, and interpretation-level pre-decode did not move it. The JIT precondition DECODE
+    delivers is the *invalidation contract* (shipped + proven), not a dispatch speedup; the JIT decision
+    remains evidence-gated downstream.
+
 ## Execution order
 
 ```
