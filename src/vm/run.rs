@@ -166,6 +166,20 @@ struct RecordSource {
     /// Identity of the chunk `d` decodes (`Rc::as_ptr`), to detect a frame change
     /// even when `frames.len()` coincidentally matches (a pop-then-push could).
     chunk_ptr: *const crate::vm::chunk::Chunk,
+    /// **DECODE §5.1 census (feature-gated): the burst-local predecessor op.** The
+    /// op discriminant of the IMMEDIATELY PRECEDING record retired IN THE SAME basic
+    /// block, or `None` at a block boundary. Reset to `None` whenever `fetch` detects
+    /// a discontinuity (a taken jump or a frame push/pop → `resync`) and at burst
+    /// entry (a fresh `RecordSource` per burst → escalations/fallbacks reset too), so
+    /// a pair/triple is NEVER counted across a boundary a fused superinstruction could
+    /// not legally cross. FULLY `#[cfg(feature = "decode-census")]`.
+    #[cfg(feature = "decode-census")]
+    prev: Option<u16>,
+    /// **DECODE §5.1 census (feature-gated): the second burst-local predecessor.**
+    /// The op two records back, in-block. `Some` only when BOTH it and `prev` are
+    /// in the same basic block — reset to `None` alongside `prev` at every boundary.
+    #[cfg(feature = "decode-census")]
+    prev2: Option<u16>,
 }
 
 impl RecordSource {
@@ -191,6 +205,12 @@ impl RecordSource {
             idx,
             frames_len: fiber.frames.len(),
             chunk_ptr: chunk as *const crate::vm::chunk::Chunk,
+            // DECODE §5.1: a fresh source begins a basic block (the entry point is a
+            // boundary) — no in-block predecessor yet.
+            #[cfg(feature = "decode-census")]
+            prev: None,
+            #[cfg(feature = "decode-census")]
+            prev2: None,
         })
     }
 
@@ -200,6 +220,17 @@ impl RecordSource {
     /// (the new frame has no valid decoded stream, or the ip is not a record
     /// boundary) — the burst falls back to byte dispatch.
     fn resync(&mut self, vm: &Vm, fiber: &Fiber) -> bool {
+        // DECODE §5.1 census: a resync is the load-bearing BASIC-BLOCK BOUNDARY
+        // signal — `fetch` calls it ONLY on a discontinuity (a taken jump, or a
+        // frame push/pop). Reset the in-block predecessors HERE (before either
+        // branch) so the next retired op opens a fresh basic block and no pair/triple
+        // is counted across the boundary. Whether the resync ultimately succeeds or
+        // falls back, the predecessors must NOT carry over the jump/frame edge.
+        #[cfg(feature = "decode-census")]
+        {
+            self.prev = None;
+            self.prev2 = None;
+        }
         let chunk = &fiber.frame().closure.proto.chunk;
         let cur_ptr = chunk as *const crate::vm::chunk::Chunk;
         if cur_ptr != self.chunk_ptr {
@@ -284,6 +315,26 @@ impl InstrSource for RecordSource {
         {
             let _ = (vm, op);
         }
+        // DECODE §5.1 census (feature-gated): record this retired op against the
+        // in-block predecessors, then advance the burst-local window. The reset of
+        // `prev`/`prev2` at jump/frame boundaries happens in `fetch`→`resync`; HERE we
+        // additionally treat a CONTROL-FLOW op as a block TERMINATOR (a conditional
+        // jump ends a basic block even on the not-taken fall-through, where `fetch`
+        // would NOT resync) — so the op AFTER a terminator opens a fresh block and no
+        // pair/triple straddles a boundary a fused superinstruction could not cross.
+        #[cfg(feature = "decode-census")]
+        {
+            vm.census_record(self.prev2, self.prev, op as u8 as u16);
+            if op_is_block_terminator(op) {
+                // This op ends the block — the next record begins a new block.
+                self.prev = None;
+                self.prev2 = None;
+            } else {
+                // Shift the window: prev2 ← prev, prev ← this op.
+                self.prev2 = self.prev;
+                self.prev = Some(op as u8 as u16);
+            }
+        }
     }
 }
 
@@ -316,6 +367,54 @@ fn op_stack_traffic(op: Op) -> u64 {
         // the gate input is monotone with record count).
         _ => 1,
     }
+}
+
+/// DECODE §5.1 census (feature-gated): `true` iff `op` ENDS a basic block — the
+/// op AFTER it begins a fresh block, so a fused superinstruction must not span the
+/// boundary. The set is the union of:
+/// - the control-flow ops (every jump/branch/loop + the arg-supplied prologue
+///   jump): a conditional branch ends a block on BOTH edges, including the
+///   not-taken fall-through where `fetch` would NOT resync, so the reset MUST be
+///   driven here;
+/// - the control-LEAVING ops (`Return`/`Propagate`/`Yield`/`Unwrap`/`MatchNoArm`):
+///   they transfer control out of the current straight-line region;
+/// - the CALL family + suspension points (`Await`/`IterNext`/`Break`): they hand
+///   control to a callee frame / the reactor / the debugger; the next in-lane op
+///   begins a new region.
+///
+/// Conservative by construction: over-marking an op as a terminator only SUPPRESSES
+/// a pair/triple (never invents one across a real boundary), which is the safe
+/// direction — Task 8 must only ever fuse pairs proven legal.
+#[cfg(feature = "decode-census")]
+fn op_is_block_terminator(op: Op) -> bool {
+    matches!(
+        op,
+        // control flow
+        Op::Jump
+            | Op::JumpIfFalse
+            | Op::JumpIfTrue
+            | Op::JumpIfNotNil
+            | Op::Loop
+            | Op::JumpIfArgSupplied
+            // control-leaving
+            | Op::Return
+            | Op::Propagate
+            | Op::Yield
+            | Op::Unwrap
+            | Op::MatchNoArm
+            // calls + suspension points (frame/reactor/debugger transfer)
+            | Op::Call
+            | Op::CallSpread
+            | Op::CallMethod
+            | Op::CallMethodSpread
+            | Op::CallNamed
+            | Op::CallNamedSpread
+            | Op::Await
+            | Op::IterNext
+            | Op::GetIter
+            | Op::Import
+            | Op::Break
+    )
 }
 
 /// **CALL §8.3 — per-VM fast-path coverage counters.**
@@ -613,6 +712,18 @@ pub struct Vm {
     /// See [`DecodeStatsInner`] for field semantics.
     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
     decode_stats: std::cell::Cell<crate::vm::run::DecodeStatsInner>,
+    /// **DECODE §5.1 (Unit B part 1): the pair/triple census table.** FULLY
+    /// `#[cfg(feature = "decode-census")]` — the field DOES NOT EXIST in a default
+    /// build (the JIT-spec §2.1 "not there" discipline; zero Gate-12 exposure). It
+    /// is also flag-gated: `None` (the default) ⇒ the census is INERT even when the
+    /// feature is on (the record driver's `note_retired` only records when this is
+    /// `Some`). Armed ONLY by `tests/decode_census.rs` via [`Vm::arm_census`], which
+    /// runs the corpus in forced-decode mode; the ranked table the harness prints is
+    /// the MEASURED data Task 8 fuses. A `RefCell` because the table accumulates; the
+    /// borrow is a short synchronous bump in `note_retired`, never held across
+    /// `.await`.
+    #[cfg(feature = "decode-census")]
+    census: RefCell<Option<crate::vm::decode::DecodeCensus>>,
     /// **CALL §4 A3 — fiber pool for re-entrant calls.**
     ///
     /// Holds recycled [`Fiber`]s that `take_pooled_fiber` / `return_pooled_fiber`
@@ -690,7 +801,14 @@ impl Vm {
         let decode = std::env::var("ASCRIPT_NO_DECODE").as_deref() != Ok("1");
         let decode_inline = std::env::var("ASCRIPT_NO_DECODE_INLINE").as_deref() != Ok("1");
         let decode_tos = std::env::var("ASCRIPT_NO_DECODE_TOS").as_deref() != Ok("1");
-        let decode_threshold = Self::DECODE_THRESHOLD;
+        // DECODE §2.3: the warmth threshold A/B knob (documented in `docs/content/cli.md`).
+        // Defaults to `DECODE_THRESHOLD`; a parseable `ASCRIPT_DECODE_THRESHOLD` overrides
+        // it (0 = decode immediately). Threshold only affects WHEN a proto decodes, never
+        // observable behavior — the four/seven-mode byte-identity is unaffected.
+        let decode_threshold = std::env::var("ASCRIPT_DECODE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(Self::DECODE_THRESHOLD);
         Self::with_all_flags(interp, specialize, sync_lane, call_fast, decode, decode_inline, decode_tos, decode_threshold)
     }
 
@@ -789,6 +907,8 @@ impl Vm {
             decode_threshold,
             #[cfg(any(test, feature = "fuzzgen", fuzzing))]
             decode_stats: std::cell::Cell::new(DecodeStatsInner::default()),
+            #[cfg(feature = "decode-census")]
+            census: RefCell::new(None),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -934,6 +1054,47 @@ impl Vm {
         let mut s = self.decode_stats.get();
         f(&mut s);
         self.decode_stats.set(s);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // DECODE §5.1 (Unit B part 1) — the pair/triple census (feature-gated)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// **DECODE §5.1: arm the pair/triple census.** After this call the record
+    /// driver's `note_retired` records `(prev, op)` pairs and `(prev2, prev, op)`
+    /// triples WITHIN BASIC BLOCKS (the burst-local `prev`/`prev2` reset at every
+    /// jump/escalation/entry, so no record straddles a boundary a fused
+    /// superinstruction could not legally cross). FULLY `#[cfg(feature =
+    /// "decode-census")]` — never present in a default build. Used ONLY by
+    /// `tests/decode_census.rs`.
+    #[cfg(feature = "decode-census")]
+    pub fn arm_census(&self) {
+        *self.census.borrow_mut() = Some(crate::vm::decode::DecodeCensus::default());
+    }
+
+    /// **DECODE §5.1: drain the census table.** Returns `(counts, total_records)`
+    /// where a pair key is `(CENSUS_NO_PREV, prev, op)` and a triple key is
+    /// `(prev2, prev, op)`. `None` if the census was never armed. The harness
+    /// merges per-program drains into a global aggregate before ranking.
+    #[cfg(feature = "decode-census")]
+    pub fn take_census(&self) -> Option<(crate::vm::decode::CensusCounts, u64)> {
+        self.census
+            .borrow_mut()
+            .take()
+            .map(|c| (c.counts, c.total_records))
+    }
+
+    /// **DECODE §5.1: record one retired op into the census** (if armed). Given the
+    /// burst-local `(prev2, prev)` predecessors — each `Some` ONLY when the
+    /// predecessor is in the SAME basic block (the [`RecordSource`] resets them to
+    /// `None` at every boundary). A no-op (a single `Option` borrow + early return)
+    /// when the census is not armed; the whole method is gated out of default builds.
+    #[cfg(feature = "decode-census")]
+    #[inline]
+    pub(crate) fn census_record(&self, prev2: Option<u16>, prev: Option<u16>, op: u16) {
+        if let Some(c) = self.census.borrow_mut().as_mut() {
+            c.record(prev2, prev, op);
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────

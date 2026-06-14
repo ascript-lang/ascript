@@ -1093,6 +1093,73 @@ pub async fn vm_run_source_decode_stats_no_inline(src: &str) -> Result<DecodeSta
     vm_run_source_decode_stats_cfg(src, true, false, true, 0).await
 }
 
+/// **DECODE §5.1 (Unit B part 1): run `src` in CENSUS mode** — DECODE FORCED
+/// (threshold = 0, every proto decoded so the real record stream is seen) with the
+/// pair/triple census armed. Returns `(counts, total_records)` where a PAIR key is
+/// `(CENSUS_NO_PREV, prev, op)` and a TRIPLE key is `(prev2, prev, op)`; the harness
+/// (`tests/decode_census.rs`) merges per-program drains into a global aggregate and
+/// ranks them. FULLY `#[cfg(feature = "decode-census")]` — this entry point and the
+/// whole counting apparatus DO NOT EXIST in a default build (the JIT-spec §2.1
+/// "not there" discipline). `#[doc(hidden)]` — not a stable API.
+/// **DECODE §5.1: the PAIR sentinel** — the first key-slot value that marks a census
+/// entry as a 2-gram `(prev, op)` rather than a 3-gram `(prev2, prev, op)`. Re-exported
+/// for `tests/decode_census.rs` (the only consumer). `#[doc(hidden)]`.
+#[cfg(feature = "decode-census")]
+#[doc(hidden)]
+pub const CENSUS_NO_PREV: u16 = crate::vm::decode::CENSUS_NO_PREV;
+
+#[cfg(feature = "decode-census")]
+#[doc(hidden)]
+pub async fn vm_run_source_census(
+    src: &str,
+) -> Result<(crate::vm::decode::CensusCounts, u64), AsError> {
+    use crate::vm::value_ext::RunOutcome;
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(crate::vm::chunk::FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = crate::vm::value_ext::Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // decode FORCED on (threshold = 0): every proto decodes immediately so the
+    // record driver sees the real stream the census counts.
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, true, true, true, 0);
+    vm.arm_census();
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    // Surface a program error so the harness can SKIP the file (e.g. a feature-
+    // unavailable import) without aborting the whole census run.
+    match result {
+        Ok(RunOutcome::Done(_)) => {}
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => return Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => {}
+        Err(crate::interp::Control::Exit(_)) => {}
+    }
+    Ok(vm.take_census().unwrap_or_default())
+}
+
 /// Shared body for the DECODE test entries: runs `src` with explicit decode
 /// kill-switch values, no instrumentation (decode paths are orthogonal to DBG),
 /// and returns the plain `(output, exit_code)` pair.

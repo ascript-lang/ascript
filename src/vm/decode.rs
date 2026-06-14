@@ -290,6 +290,66 @@ fn decode_operands(
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODE §5.1 (Unit B part 1): the PAIR/TRIPLE census (FULLY feature-gated).
+//
+// The whole counting apparatus below is `#[cfg(feature = "decode-census")]`, so a
+// default `cargo build`/`cargo test` compiles NONE of it — the JIT-spec §2.1
+// "not there" discipline (zero Gate-12 hot-path exposure). It exists ONLY to feed
+// the `tests/decode_census.rs` harness, whose ranked output (committed verbatim to
+// `bench/DECODE_PAIR_CENSUS.md`) is the MEASURED data Task 8 fuses into
+// superinstructions — the spec mandates fusion pairs be chosen from data, never
+// guessed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The sentinel `prev` value used as the FIRST key slot of a PAIR record, so a
+/// single `HashMap` holds both pairs (`(SENTINEL, prev, op)`) and triples
+/// (`(prev2, prev, op)`). `u16::MAX` is unreachable as a real `Op` discriminant
+/// (`Op` is `#[repr(u8)]` ⇒ every real discriminant is ≤ 255), so a pair key can
+/// never collide with a triple key.
+#[cfg(feature = "decode-census")]
+pub(crate) const CENSUS_NO_PREV: u16 = u16::MAX;
+
+/// DECODE §5.1: the dynamic pair/triple frequency census. Keyed by `Op`
+/// discriminants (`op as u8` widened to `u16`). A PAIR `(prev, op)` is stored at
+/// `(CENSUS_NO_PREV, prev, op)`; a TRIPLE `(prev2, prev, op)` at `(prev2, prev,
+/// op)`. `total_records` counts every record retired in census mode (the
+/// denominator for the "% of total records" column). Burst-local `prev`/`prev2`
+/// live on the [`RecordSource`](crate::vm::run) and reset at every basic-block
+/// boundary, so NO pair/triple is ever counted across a jump/escalation/entry — a
+/// fused superinstruction could not legally cross such a boundary.
+/// DECODE §5.1: the census count table — `(slot0, prev, op)` → dynamic count, where
+/// slot0 = [`CENSUS_NO_PREV`] marks a PAIR and any other value marks a TRIPLE.
+#[cfg(feature = "decode-census")]
+pub(crate) type CensusCounts = std::collections::HashMap<(u16, u16, u16), u64>;
+
+#[cfg(feature = "decode-census")]
+#[derive(Default)]
+pub(crate) struct DecodeCensus {
+    /// `(slot0, prev, op)` → dynamic count. Pairs key slot0 = `CENSUS_NO_PREV`.
+    pub counts: CensusCounts,
+    /// Total records retired in census mode (the % denominator).
+    pub total_records: u64,
+}
+
+#[cfg(feature = "decode-census")]
+impl DecodeCensus {
+    /// Record one retired op given the burst-local `(prev2, prev)` predecessors
+    /// (each `Some` only when the predecessor is IN THE SAME basic block — the
+    /// caller resets them at every boundary). Bumps `total_records`, the
+    /// `(prev, op)` pair (when `prev` is in-block), and the `(prev2, prev, op)`
+    /// triple (when BOTH predecessors are in-block).
+    pub(crate) fn record(&mut self, prev2: Option<u16>, prev: Option<u16>, op: u16) {
+        self.total_records += 1;
+        if let Some(p) = prev {
+            *self.counts.entry((CENSUS_NO_PREV, p, op)).or_insert(0) += 1;
+            if let Some(p2) = prev2 {
+                *self.counts.entry((p2, p, op)).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
 /// Binary-search the byte offset `off` to its record index in `d` (the
 /// `entry_index` is sorted ascending by byte offset). `None` if `off` is not a
 /// record boundary.
@@ -514,6 +574,38 @@ mod tests {
         assert!(
             !caller_with_deps.is_valid(&c),
             "a stale DEP epoch invalidates the caller stream even when own_epoch matches"
+        );
+    }
+
+    /// DECODE §5.1: the census `record` helper. A pair is counted only when `prev`
+    /// is in-block (`Some`); a triple only when BOTH predecessors are in-block. A
+    /// `None` predecessor (the basic-block reset signal the caller passes at a
+    /// boundary) suppresses the corresponding pair/triple — so no record straddles
+    /// a boundary a fused superinstruction could not legally cross.
+    #[cfg(feature = "decode-census")]
+    #[test]
+    fn census_record_counts_pairs_and_triples_only_within_block() {
+        let mut c = DecodeCensus::default();
+        // First op of a block: no predecessor → no pair, no triple, but a record.
+        c.record(None, None, 10);
+        // Second op: prev=10 in-block → a pair (10,11); no triple (prev2 None).
+        c.record(None, Some(10), 11);
+        // Third op: prev2=10, prev=11 both in-block → a pair AND a triple.
+        c.record(Some(10), Some(11), 12);
+        assert_eq!(c.total_records, 3, "every record bumps the denominator");
+        assert_eq!(c.counts.get(&(CENSUS_NO_PREV, 10, 11)), Some(&1), "pair (10,11)");
+        assert_eq!(c.counts.get(&(CENSUS_NO_PREV, 11, 12)), Some(&1), "pair (11,12)");
+        assert_eq!(c.counts.get(&(10, 11, 12)), Some(&1), "triple (10,11,12)");
+        // The FIRST op recorded no pair (prev was None — a block boundary).
+        assert!(
+            !c.counts.keys().any(|&(s, p, o)| s == CENSUS_NO_PREV && p == CENSUS_NO_PREV && o == 10),
+            "the block's first op emits no pair (the reset suppressed it)"
+        );
+        // A boundary mid-stream: prev reset to None suppresses the pair across it.
+        c.record(None, None, 13); // new block head after a reset
+        assert!(
+            !c.counts.contains_key(&(CENSUS_NO_PREV, 12, 13)),
+            "no pair (12,13) was counted across the reset boundary"
         );
     }
 
