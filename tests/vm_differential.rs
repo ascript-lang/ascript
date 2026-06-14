@@ -1268,6 +1268,17 @@ async fn vm_run_whole_corpus_matches_treewalker() {
             tw, nodec,
             "no-decode VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-decode:   {nodec:?}"
         );
+        // DECODE §8.3 (Gate 15) — Unit C: no-INLINE (decode + fusion ON, inlining OFF
+        // via `ASCRIPT_NO_DECODE_INLINE`) must ALSO be byte-identical. Together with
+        // `decoded-forced` (inlining ON) this pins the inline transform byte-identical
+        // both on and off over the whole corpus.
+        let noinl = ascript::vm_run_source_decoded_no_inline(&src)
+            .await
+            .unwrap_or_else(|e| panic!("no-inline VM failed on non-skipped {rel}: {e:?}"));
+        assert_eq!(
+            tw, noinl,
+            "no-inline VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-inline:   {noinl:?}"
+        );
         ran += 1;
     }
     // Sanity: the gate must actually exercise the bulk of the corpus, and the
@@ -1549,11 +1560,15 @@ async fn assert_opt_call_ok_three_way(src: &str) {
     let (nodec, nodec_code) = ascript::vm_run_source_no_decode(src)
         .await
         .expect("no-decode ok");
+    let (noinl, noinl_code) = ascript::vm_run_source_decoded_no_inline(src)
+        .await
+        .expect("no-inline ok");
     assert_eq!(vm_code, None, "no exit code expected for `{src}`");
     assert_eq!(gen_code, None, "no exit code expected for `{src}`");
     assert_eq!(nolane_code, None, "no exit code expected (lane-off) for `{src}`");
     assert_eq!(decfwd_code, None, "no exit code expected (decoded-forced) for `{src}`");
     assert_eq!(nodec_code, None, "no exit code expected (no-decode) for `{src}`");
+    assert_eq!(noinl_code, None, "no exit code expected (no-inline) for `{src}`");
     assert_eq!(
         tw, vm,
         "specialized VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
@@ -1574,6 +1589,11 @@ async fn assert_opt_call_ok_three_way(src: &str) {
     assert_eq!(
         tw, nodec,
         "no-decode VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  nodec: {nodec:?}"
+    );
+    // DECODE §8.3 (Gate 15) — Unit C: no-inline must also match.
+    assert_eq!(
+        tw, noinl,
+        "no-inline VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  noinl: {noinl:?}"
     );
 }
 

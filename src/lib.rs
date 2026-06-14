@@ -1024,6 +1024,15 @@ pub struct DecodeStats {
     pub tos_ops: u64,
 }
 
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+impl DecodeStats {
+    /// The `(output, exit_code)` pair, for differential comparison against
+    /// [`vm_run_source_no_decode`] / [`vm_run_source_decoded_forced`] (DECODE Task 9).
+    pub fn output_exit(&self) -> (String, Option<i32>) {
+        (self.output.clone(), self.exit_code)
+    }
+}
+
 /// Like [`vm_run_source`] but with DECODE DISABLED — the `ASCRIPT_NO_DECODE=1`
 /// kill switch (DECODE Task 2). Observable behavior is byte-identical to
 /// [`vm_run_source`]; only throughput may differ once Task 4 wires up the driver.

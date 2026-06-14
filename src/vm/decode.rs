@@ -67,6 +67,25 @@ pub(crate) enum DOp {
     /// attributes its span / adaptive-cache key at its OWN byte offset —
     /// byte-identical to executing the components separately.
     Fused(FusedKind),
+    /// DECODE §6 (Unit C): the guarded entry of an inlined small global-fn call.
+    /// Decoded-stream-ONLY (never a real `Op`, never in `Chunk.code`, never
+    /// serialized). `a` = the [`InlineSegment`] index in `inline_segments`
+    /// (carrying the recorded `global_idx`, `recorded_struct_gen`, the callee proto
+    /// `Rc` for the `Rc::ptr_eq` identity leg, the body record range, the callee
+    /// `slot_count`, and `argc`); `b` = the FALLBACK record index — the untouched
+    /// `Base(Op::Call)` site reached on a guard MISS (single-branch deopt, §6.2).
+    /// On a HIT the driver windows the callee frame in-place (no `CallFrame`),
+    /// executes the spliced body records [start, end), and the matching
+    /// [`InlineExit`](DOp::InlineExit) restores. The body records keep their CALLEE
+    /// byte offsets (span/source provenance, §6.4).
+    InlineEnter,
+    /// DECODE §6 (Unit C): the rewrite of the inlined body's terminal `Return`.
+    /// `a` = the owning [`InlineSegment`] index (symmetry / span anchor). Pops the
+    /// return value, truncates the window back to `inline_base`,
+    /// `leave_frame_depth`, pushes the value, restores `last_fault_source` — the
+    /// `return_from_frame` effect minus the frame pop and the (predicate-excluded)
+    /// return contract.
+    InlineExit,
 }
 
 /// DECODE §5 (Unit B): the REVIEWED fused-superinstruction kinds. Each variant is
@@ -200,20 +219,44 @@ pub(crate) struct DecodedChunk {
     /// records were embedded by inlining. Empty until then; consulted by the §4.2
     /// deps-validity check ([`DecodedChunk::is_valid`]).
     pub deps: Vec<(std::rc::Rc<crate::vm::chunk::FnProto>, u64)>,
-    /// Task 9 fills: the inline-segment table for span/source attribution. Empty
-    /// until then.
-    #[allow(dead_code)]
+    /// DECODE §6 (Unit C): the inline-segment table — one row per inlined site,
+    /// indexed by an `InlineEnter` record's `a`. Empty unless `cfg.inline` ran and
+    /// at least one site qualified. Non-empty ⇒ the §6.6 validity rule forbids
+    /// executing this stream while any instrumentation is armed.
     pub inline_segments: Vec<InlineSegment>,
 }
 
-/// Task 9 (Unit C): a span of records embedded from a foreign (inlined) chunk.
-/// Empty/unused in Task 3/4 — declared so the `DecodedChunk` shape Task 4/9 were
-/// written against compiles.
-#[allow(dead_code)]
+/// DECODE §6 (Unit C): one inlined small-global-fn call site. Carries everything
+/// the `InlineEnter` driver arm needs that does not fit in the `Copy`
+/// [`DecodedInstr`] (the callee proto `Rc` for the identity guard + span/source
+/// attribution). One row per inlined site, indexed by the `InlineEnter` record's
+/// `a` field.
 pub(crate) struct InlineSegment {
-    /// Record-index range `[start, end)` of the inlined body.
+    /// Record-index range `[start, end)` of the inlined body records (the callee's
+    /// 1:1-decoded straight-line body, EXCLUDING its terminal `Return`, which became
+    /// the [`InlineExit`](DOp::InlineExit) record at index `end`). The body records
+    /// keep their CALLEE byte offsets in `off` (span/source provenance, §6.4).
     pub start: u32,
     pub end: u32,
+    /// §6.2 guard leg 1: the stable `user_globals` index recorded at decode time.
+    /// The guard checks `vm.struct_gen() == recorded_gen` first, then that the slot
+    /// at this index still holds the recorded callee.
+    pub global_idx: u32,
+    /// §6.2 guard leg 1: the `struct_gen` snapshot at decode time. A later
+    /// `define_user_global` bumps it → the guard misses (the recorded index may have
+    /// shifted) → single-branch deopt.
+    pub recorded_gen: u64,
+    /// §6.2 guard leg 2: the callee proto identity. The guard requires the value at
+    /// `user_globals[global_idx]` to be a `Value::Closure` whose proto is
+    /// `Rc::ptr_eq` to this — catching a mutable-`let` rebind (which does NOT bump
+    /// `struct_gen`). Also the SoT for the body's span/source attribution (§6.4) and
+    /// the §4.2 `deps`-epoch validity leg.
+    pub callee: std::rc::Rc<crate::vm::chunk::FnProto>,
+    /// The callee's `slot_count` — the inline window size padded with `Nil` at entry.
+    pub slot_count: u16,
+    /// The call's argument count (== the callee arity, statically; the predicate
+    /// refuses `argc != arity`). The window base is `stack.len() - argc - 1` at entry.
+    pub argc: u8,
 }
 
 impl DecodedChunk {
@@ -256,8 +299,11 @@ pub(crate) struct DecodeCfg {
     /// Unit B (Task 8): peephole-fuse the census set. ON whenever decode is on
     /// (fusion rides the master `decode` switch — no separate toggle).
     pub fuse: bool,
-    /// Unit C (Task 9): inline small callees. Off in Task 3/4.
-    #[allow(dead_code)]
+    /// Unit C (Task 9): inline small callees. Gated by `Vm.decode_inline`
+    /// (`ASCRIPT_NO_DECODE_INLINE`). When on, [`decode_chunk`] runs the §6 inline
+    /// predicate + transform after fusion (it needs a [`DecodeResolver`] callback to
+    /// resolve a `GET_GLOBAL` candidate to its callee proto — `decode.rs` stays
+    /// Vm-free / pure-analysis).
     pub inline: bool,
 }
 
@@ -276,6 +322,26 @@ impl DecodeCfg {
     pub fn fused() -> Self {
         DecodeCfg { fuse: true, inline: false }
     }
+
+    /// Units B+C (Task 9): a fusing + inlining decode — the production path when
+    /// `Vm.decode_inline` is on. Fusion runs first (the peephole), then the §6 inline
+    /// predicate/transform splices qualifying small global-fn calls.
+    pub fn fused_inline() -> Self {
+        DecodeCfg { fuse: true, inline: true }
+    }
+}
+
+/// DECODE §6.1: the Vm-supplied resolution callback. `decode.rs` is pure-analysis
+/// and Vm-free; the inline predicate needs to resolve a `GET_GLOBAL name` candidate
+/// to its `(global_idx, struct_gen, callee proto)` at decode time. The Vm closure
+/// reads `get_user_global_full` + `struct_gen` (mirroring the guard the
+/// `InlineEnter` arm re-checks at runtime). Returns `None` when the name does not
+/// resolve to a `Value::Closure` user-global (late-binding-correct: an undefined /
+/// non-closure global simply never inlines).
+pub(crate) struct InlineResolution {
+    pub global_idx: u32,
+    pub struct_gen: u64,
+    pub callee: std::rc::Rc<crate::vm::chunk::FnProto>,
 }
 
 /// Decode `chunk` 1:1 into fixed-width records with jump targets pre-resolved to
@@ -289,6 +355,20 @@ impl DecodeCfg {
 /// `Base(Break)` record (an escalation record, spec §4.3). `own_epoch` is read
 /// AFTER the walk so it conservatively reflects the bytes that were decoded.
 pub(crate) fn decode_chunk(chunk: &Chunk, cfg: &DecodeCfg) -> Option<std::rc::Rc<DecodedChunk>> {
+    decode_chunk_resolved(chunk, cfg, None)
+}
+
+/// DECODE §6: like [`decode_chunk`] but with the Vm-supplied inline resolver. The
+/// resolver maps a `GET_GLOBAL` const-name index to an [`InlineResolution`] (the
+/// callee proto + the recorded guard stamp) at decode time. `None` ⇒ no inlining is
+/// attempted (the pre-Unit-C path); `cfg.inline` must also be on for the transform
+/// to run. The resolver keeps `decode.rs` Vm-free: it is the ONLY way decode reads
+/// the live `user_globals`.
+pub(crate) fn decode_chunk_resolved(
+    chunk: &Chunk,
+    cfg: &DecodeCfg,
+    resolver: Option<&dyn Fn(u32) -> Option<InlineResolution>>,
+) -> Option<std::rc::Rc<DecodedChunk>> {
     let code: &[u8] = &chunk.code;
 
     // ---- Pass 1: walk the byte stream, one record per instruction. ----------
@@ -344,10 +424,12 @@ pub(crate) fn decode_chunk(chunk: &Chunk, cfg: &DecodeCfg) -> Option<std::rc::Rc
         let rec = &mut records[rec_idx];
         match rec.op {
             DOp::Base(Op::JumpIfArgSupplied) => rec.b = target_rec,
-            // The fixup runs over the 1:1 stream — the peephole (which is the only
-            // producer of `DOp::Fused`) runs AFTER this loop, so a fused record can
-            // never appear here; the catch-all keeps the match total.
-            DOp::Base(_) | DOp::Fused(_) => rec.a = target_rec,
+            // The fixup runs over the 1:1 stream — the peephole (DOp::Fused) and the
+            // inline transform (DOp::InlineEnter/Exit) BOTH run AFTER this loop, so
+            // only `Base` records appear here; the catch-all keeps the match total.
+            DOp::Base(_) | DOp::Fused(_) | DOp::InlineEnter | DOp::InlineExit => {
+                rec.a = target_rec
+            }
         }
     }
 
@@ -362,13 +444,40 @@ pub(crate) fn decode_chunk(chunk: &Chunk, cfg: &DecodeCfg) -> Option<std::rc::Rc
         records
     };
 
-    // ---- entry_index: sorted (byte_off, record_idx) for every (post-fusion)
-    // record. Emission is monotonic so `records` is already off-ascending; build
-    // the pairs directly. A swallowed component's byte off is NOT an entry (it can
-    // never be a jump target — the peephole guaranteed it), so the driver's
-    // byte→record resync over jump targets still lands exactly on a record `off`.
-    let entry_index: Vec<(u32, u32)> =
-        records.iter().enumerate().map(|(i, r)| (r.off, i as u32)).collect();
+    // ---- Unit C (Task 9): the §6 INLINE transform (only when inlining is on AND a
+    // resolver is supplied). Splices qualifying small global-fn calls
+    // (`GET_GLOBAL f; args; CALL argc`) into the caller stream between an
+    // `InlineEnter`/`InlineExit` pair; collects `inline_segments` + `deps`. When off
+    // (or no site qualifies) the stream is unchanged and the tables stay empty.
+    let (records, inline_segments, deps) = match (cfg.inline, resolver) {
+        (true, Some(resolve)) => inline_calls(chunk, records, &jump_targets, resolve),
+        _ => (records, Vec::new(), Vec::new()),
+    };
+
+    // ---- entry_index: sorted (byte_off, record_idx). Emission is monotonic so the
+    // CALLER records are off-ascending; build the pairs directly. TWO offs are NOT
+    // entries: (a) a fused component swallowed by the peephole (never a jump target),
+    // and (b) an INLINED BODY record (it carries a CALLEE-chunk off — §2.5: "only
+    // CALLER-chunk records are entered"; the body is reached only by sequential
+    // `idx += 1` from `InlineEnter`, never by a byte→record resync). The driver's
+    // resync over caller jump targets / frame entries thus still lands exactly on a
+    // surviving CALLER record `off`. We carry an explicit in-segment mask to exclude
+    // body offs (their byte values could otherwise collide with caller offs).
+    let mut in_segment = vec![false; records.len()];
+    for seg in &inline_segments {
+        for r in seg.start..=seg.end {
+            // [start, end] inclusive: the body records AND the InlineExit at `end`.
+            if let Some(slot) = in_segment.get_mut(r as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let entry_index: Vec<(u32, u32)> = records
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !in_segment[*i])
+        .map(|(i, r)| (r.off, i as u32))
+        .collect();
 
     // own_epoch read AFTER pass 1 (single-threaded: no patch can interleave, but
     // read-late is the conservative order — spec §2.2).
@@ -378,8 +487,8 @@ pub(crate) fn decode_chunk(chunk: &Chunk, cfg: &DecodeCfg) -> Option<std::rc::Rc
         records,
         entry_index,
         own_epoch,
-        deps: Vec::new(),
-        inline_segments: Vec::new(),
+        deps,
+        inline_segments,
     }))
 }
 
@@ -593,6 +702,363 @@ fn is_block_terminator_op(op: Op) -> bool {
             | Op::Import
             | Op::Break
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODE §6 (Unit C): speculative inlining of small hot global fns.
+//
+// The transform runs over the post-fusion CALLER records. For each `GET_GLOBAL f;
+// args; CALL argc` site whose resolved callee passes the §6.1 predicate, it splices
+// the callee's own (fused) body records between an `InlineEnter`/`InlineExit` pair
+// and RETAINS the original `Base(Call)` record as the single-branch deopt target.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// §6.1: max callee slots (window size) an inline segment may build.
+const INLINE_MAX_SLOTS: u16 = 8;
+/// §6.1: max body records (after the callee's own fusion, excluding the terminal
+/// `Return`) an inline segment may splice.
+const INLINE_MAX_RECORDS: usize = 16;
+
+/// DECODE §6.1: is `op` allowed inside an inlined STRAIGHT-LINE LEAF body? The body
+/// is dispatched by [`crate::vm::run::Vm::exec_inline_body`] (a bounded executor
+/// reusing the same shared helpers the single-op arms call), so the admissible set
+/// is exactly what that executor implements: the arithmetic/stack/local/const
+/// sync-subset plus read-only field/global reads — and NOTHING that transfers
+/// control (jumps/calls/defer/await/yield/return-mid-body) or needs a frame
+/// (`GetSuper`, cells). A body op outside this set ⇒ the site is NOT inlined
+/// (decodes 1:1, panics/calls generically). Conservative by construction — adding a
+/// body op here requires a matching `exec_inline_body` arm + a differential proof.
+fn inline_body_op_ok(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Const
+            | Op::Nil
+            | Op::True
+            | Op::False
+            | Op::Pop
+            | Op::Dup
+            | Op::Swap
+            | Op::Rot3
+            | Op::GetLocal
+            | Op::SetLocal
+            | Op::GetGlobal
+            | Op::GetProp
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::Pow
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::Eq
+            | Op::Ne
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::WrapAdd
+            | Op::WrapSub
+            | Op::WrapMul
+            | Op::Neg
+            | Op::Not
+            | Op::BitNot
+    )
+}
+
+/// DECODE §6.1: the inline PREDICATE over a resolved callee proto + the static
+/// `argc`. Returns `Some(body_records)` (the callee's fused, 1:1-decoded body
+/// EXCLUDING its terminal `Return`) iff EVERY clause holds; `None` (refuse → decode
+/// the site 1:1) otherwise. Table-driven: each `return None` is a labelled refusal
+/// clause the reviewer probes.
+fn inline_predicate(
+    callee: &std::rc::Rc<crate::vm::chunk::FnProto>,
+    argc: u8,
+) -> Option<Vec<DecodedInstr>> {
+    // Clause: never async / generator / worker (a frame-bound suspension model).
+    if callee.is_async || callee.is_generator || callee.is_worker {
+        return None;
+    }
+    // Clause: no captures, no cell slots (a capture-free leaf — the window is a flat
+    // slice of the operand stack, no upvalue cells to allocate).
+    if !callee.chunk.upvalues.is_empty() || !callee.chunk.cell_slots.is_empty() {
+        return None;
+    }
+    // Clause: every param untyped, no rest, no defaults. A typed/defaulted param
+    // makes `check_call_args` more than the exact-arity check the decoder performs
+    // statically; a rest param collects a tail. (Defaults compile to a
+    // `JumpIfArgSupplied` prologue, caught by the straight-line check below too, but
+    // the param scan is the direct clause.)
+    if callee.has_rest {
+        return None;
+    }
+    for p in &callee.params {
+        if p.ty.is_some() || p.rest {
+            return None;
+        }
+    }
+    // Clause: no return-type contract (no exit check to run).
+    if callee.ret.is_some() {
+        return None;
+    }
+    // Clause: exact-arity match — argc == arity (else the generic path raises the
+    // byte-identical arity panic at runtime; never inline a mismatched site).
+    if argc as usize != callee.params.len() || argc as u16 != callee.arity as u16 {
+        return None;
+    }
+    // Clause: window size bound.
+    if callee.chunk.slot_count > INLINE_MAX_SLOTS {
+        return None;
+    }
+    // Decode the callee body (FUSED, like the production stream) so the spliced
+    // records match what the callee would retire on its own. A structural anomaly
+    // (None) ⇒ refuse. (Depth-1: the callee is decoded WITHOUT inlining — `fused()`,
+    // not `fused_inline()` — so an inline segment is never built from a stream that
+    // itself contains inline segments.)
+    let body = decode_chunk(&callee.chunk, &DecodeCfg::fused())?;
+    // The body must end in exactly one `Return` and be otherwise straight-line leaf:
+    // no jumps/jump-targets, no call-class/defer/suspension ops, only the admissible
+    // body subset. Walk every record.
+    let recs = &body.records;
+    if recs.is_empty() {
+        return None;
+    }
+    // The body is STRAIGHT-LINE (no jumps — enforced below), so the FIRST `Return` is
+    // the single reachable exit; anything after it is dead epilogue (the compiler
+    // appends an implicit `Nil; Return` to every function body). The records BEFORE
+    // that first Return are the real body (the inline segment); the first Return
+    // becomes the `InlineExit`; the dead tail is dropped.
+    let first_return = recs.iter().position(|r| matches!(r.op, DOp::Base(Op::Return)))?;
+    let body_recs = &recs[..first_return];
+    // Every body record must be an admissible op (Base, or a Fused whose components
+    // are all admissible) — in particular NO jump/call/return/suspension (a jump would
+    // mean the body is not straight-line, breaking the linear executor + the
+    // single-exit assumption).
+    for rec in body_recs {
+        match rec.op {
+            DOp::Base(op) => {
+                if !inline_body_op_ok(op) {
+                    return None;
+                }
+            }
+            DOp::Fused(kind) => {
+                if !kind.components().iter().all(|&c| inline_body_op_ok(c)) {
+                    return None;
+                }
+            }
+            // The callee was decoded with `fused()` (inline off) ⇒ no nested
+            // InlineEnter/InlineExit can appear. Defensive refuse.
+            DOp::InlineEnter | DOp::InlineExit => return None,
+        }
+    }
+    // Body record budget (excluding the terminal Return).
+    if body_recs.len() > INLINE_MAX_RECORDS {
+        return None;
+    }
+    // Return the body records BEFORE the first Return (which becomes InlineExit).
+    Some(body_recs.to_vec())
+}
+
+/// DECODE §6.1/§6.2 (the transform): splice every qualifying `GET_GLOBAL f; args;
+/// CALL argc` site. Returns `(records, inline_segments, deps)`.
+///
+/// Layout per inlined site (record order):
+/// ```text
+///   … GET_GLOBAL f; <arg records> …      (caller records, kept verbatim)
+///   InlineEnter   (off = CALL off; a = seg idx; b = fallback rec idx)
+///   <body records>                         (callee offs; run on a guard HIT)
+///   InlineExit    (off = CALL off; a = seg idx)
+///   Base(Call) argc (off = CALL off)       (the RETAINED single-branch deopt target)
+///   … caller records after the call …
+/// ```
+/// On HIT the driver runs the body + seeks the cursor PAST the retained `Call`; on
+/// MISS it seeks to the retained `Call` and dispatches it generically (§6.2). Only
+/// the `InlineEnter` of the trio is an `entry_index` boundary; the body offs are
+/// callee-chunk and excluded.
+///
+/// The result: the rewritten records, the inline-segment table, and the §4.2 deps.
+type InlineTransform =
+    (Vec<DecodedInstr>, Vec<InlineSegment>, Vec<(std::rc::Rc<crate::vm::chunk::FnProto>, u64)>);
+
+fn inline_calls(
+    chunk: &Chunk,
+    records: Vec<DecodedInstr>,
+    jump_targets: &std::collections::HashSet<u32>,
+    resolve: &dyn Fn(u32) -> Option<InlineResolution>,
+) -> InlineTransform {
+    let n = records.len();
+    let mut out: Vec<DecodedInstr> = Vec::with_capacity(n);
+    let mut segments: Vec<InlineSegment> = Vec::new();
+    let mut deps: Vec<(std::rc::Rc<crate::vm::chunk::FnProto>, u64)> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        // A candidate HEAD is a `Base(GetGlobal)` whose name resolves to a closure
+        // user-global, followed (somewhere ahead, after a straight-line arg region)
+        // by a `Base(Call)` with argc == the args between them.
+        if let Some(splice) = try_inline_site(&records, i, jump_targets, resolve) {
+            let SiteMatch { call_rec_idx, argc, res } = splice;
+            // Predicate over the resolved callee.
+            if let Some(body) = inline_predicate(&res.callee, argc) {
+                let call_off = records[call_rec_idx].off;
+                // Emit the caller records from `i` up to and INCLUDING the last arg
+                // record (everything before the CALL record) verbatim.
+                for r in &records[i..call_rec_idx] {
+                    out.push(*r);
+                }
+                // InlineEnter at the CALL off.
+                let seg_idx = segments.len() as u32;
+                let enter_idx = out.len() as u32;
+                out.push(DecodedInstr {
+                    op: DOp::InlineEnter,
+                    a: seg_idx,
+                    b: 0, // patched below to the retained-Call record index
+                    off: call_off,
+                });
+                // Body records (callee offs), verbatim.
+                let body_start = out.len() as u32;
+                for r in &body {
+                    out.push(*r);
+                }
+                let body_end = out.len() as u32; // == index of the InlineExit
+                out.push(DecodedInstr { op: DOp::InlineExit, a: seg_idx, b: 0, off: call_off });
+                // The RETAINED original Call record (the single-branch deopt target).
+                let fallback_idx = out.len() as u32;
+                out.push(records[call_rec_idx]);
+                // Patch InlineEnter.b = the fallback (retained Call) record index.
+                out[enter_idx as usize].b = fallback_idx;
+                segments.push(InlineSegment {
+                    start: body_start,
+                    end: body_end, // the InlineExit index; entry-mask covers [start, end]
+                    global_idx: res.global_idx,
+                    recorded_gen: res.struct_gen,
+                    callee: res.callee.clone(),
+                    slot_count: res.callee.chunk.slot_count,
+                    argc,
+                });
+                // §4.2 deps: the caller stream now embeds the callee's bytes — a
+                // breakpoint patched into the callee bumps its epoch → this caller
+                // stream must drop. Record once per distinct callee.
+                let ep = res.callee.chunk.patch_epoch.get();
+                if !deps.iter().any(|(p, _)| std::rc::Rc::ptr_eq(p, &res.callee)) {
+                    deps.push((res.callee.clone(), ep));
+                }
+                i = call_rec_idx + 1;
+                continue;
+            }
+        }
+        out.push(records[i]);
+        i += 1;
+    }
+    let _ = chunk;
+    (out, segments, deps)
+}
+
+/// A matched inline site: the retained `Call` record index, its static `argc`, and
+/// the resolved callee.
+struct SiteMatch {
+    call_rec_idx: usize,
+    argc: u8,
+    res: InlineResolution,
+}
+
+/// DECODE §6.1: try to match a `GET_GLOBAL f; <argc straight-line arg records>;
+/// CALL argc` site STARTING at record `start`. The arg region must be straight-line
+/// (no jump targets inside, no terminators) and must push exactly `argc` values
+/// (one record per pushed value, counting a fused record by its NET push). For the
+/// shapes the predicate admits this is the common `GET_GLOBAL; (GetLocal|Const|…)×argc;
+/// CALL argc`. Returns `None` if `start` is not a resolvable-closure `GET_GLOBAL`
+/// head, or the following region is not a clean straight-line call.
+fn try_inline_site(
+    records: &[DecodedInstr],
+    start: usize,
+    jump_targets: &std::collections::HashSet<u32>,
+    resolve: &dyn Fn(u32) -> Option<InlineResolution>,
+) -> Option<SiteMatch> {
+    // Head must be Base(GetGlobal); its `a` is the const-name index.
+    let name_idx = match records.get(start)?.op {
+        DOp::Base(Op::GetGlobal) => records[start].a,
+        _ => return None,
+    };
+    // Resolve the name → a closure user-global (else: not inlineable, late binding
+    // preserved — an undefined / non-closure global never inlines).
+    let res = resolve(name_idx)?;
+    // Walk forward over the straight-line arg region until the matching CALL. Track
+    // the net operand-stack push so we can match it against the CALL's argc. The arg
+    // region must not contain a jump target, a terminator, or a nested call.
+    let mut j = start + 1;
+    let mut pushed: i64 = 0;
+    while j < records.len() {
+        // No record past the head may be a jump TARGET (a back-edge into the arg
+        // region would make the linear scan unsound).
+        if jump_targets.contains(&(j as u32)) {
+            return None;
+        }
+        match records[j].op {
+            DOp::Base(Op::Call) => {
+                let argc = records[j].a;
+                if argc > u8::MAX as u32 {
+                    return None;
+                }
+                // The arg region must have pushed exactly `argc` values atop the
+                // callee (the callee value itself was pushed by GET_GLOBAL).
+                if pushed != argc as i64 {
+                    return None;
+                }
+                return Some(SiteMatch { call_rec_idx: j, argc: argc as u8, res });
+            }
+            DOp::Base(op) => {
+                // Only a straight-line arg-staging op is allowed in the region. Reuse
+                // the same admissible body subset (a superset-safe gate: these all
+                // have a well-defined net push and never transfer control). A
+                // `SetLocal`/`Pop` is admissible BUT pops — see the `pushed < 0` guard.
+                if !inline_body_op_ok(op) {
+                    return None;
+                }
+                pushed += net_push_base(op);
+            }
+            DOp::Fused(kind) => {
+                pushed += net_push_fused(kind);
+            }
+            DOp::InlineEnter | DOp::InlineExit => return None,
+        }
+        // CRITICAL SOUNDNESS: the CALLEE value pushed by the head `GET_GLOBAL f` sits
+        // at the BOTTOM of the arg region's window; it must remain the value the CALL
+        // dispatches. If `pushed` ever goes NEGATIVE, an arg-region op popped BELOW the
+        // region baseline — i.e. it consumed the callee (e.g. `GET_GLOBAL f; SetLocal 0;
+        // GetLocal 0; CALL` stores f into a local and calls the local, NOT the global f
+        // the resolver/guard recorded). REFUSE — the recorded callee identity would not
+        // match the value actually called. (This is the bug a net-push-only count
+        // missed: the final `pushed == argc` can hold even after the callee was popped.)
+        if pushed < 0 {
+            return None;
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Net operand-stack push (pushes − pops) of an admissible straight-line base op.
+/// Used to count the arg region against the CALL's argc.
+fn net_push_base(op: Op) -> i64 {
+    match op {
+        Op::Const | Op::Nil | Op::True | Op::False | Op::GetLocal | Op::GetGlobal => 1,
+        Op::Pop | Op::SetLocal => -1,
+        Op::Dup => 1,
+        Op::Swap | Op::Rot3 => 0,
+        // unary: pop 1, push 1
+        Op::Neg | Op::Not | Op::BitNot => 0,
+        Op::GetProp => 0, // pop obj, push field
+        // binary: pop 2, push 1
+        _ => -1,
+    }
+}
+
+/// Net operand-stack push of a fused record (the sum of its components' net pushes).
+fn net_push_fused(kind: FusedKind) -> i64 {
+    kind.components().iter().map(|&c| net_push_base(c)).sum()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

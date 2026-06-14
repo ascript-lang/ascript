@@ -80,6 +80,14 @@ pub(crate) enum BurstExit {
     /// The record source gave up mid-burst; fall back to byte dispatch (record
     /// source only — `ByteSource::fetch` never returns `None`).
     FellBack,
+    /// DECODE §6.1: a loop back-edge requested a one-shot inline RE-DECODE (the
+    /// chunk decoded before its callees were defined). The chunk has been re-decoded
+    /// in place and the canonical ip is AT the loop target (an `entry_index`
+    /// boundary). `run_loop_sync_inner` re-SELECTS a record source from the current
+    /// ip and continues — so the loop body runs on the freshly-inlined stream WITHOUT
+    /// the async driver advancing the ip into a mid-record byte. Behavior-identical to
+    /// a plain burst boundary.
+    Reselect,
 }
 
 /// DECODE §2.4: one fetched instruction — the op plus the byte offsets the
@@ -98,6 +106,14 @@ struct Fetched {
     fault_ip: usize,
     operand_at: usize,
     fused: Option<(crate::vm::decode::FusedKind, u32)>,
+    /// DECODE §6 (Unit C): `Some((d, seg_idx, fallback_idx))` when the record source
+    /// fetched an `InlineEnter` — the whole guarded inline call is dispatched by
+    /// `sync_burst`'s inline block (guard, body sub-loop or single-branch deopt),
+    /// which then seeks the source cursor. The decoded chunk `d` carries the body
+    /// records + the `inline_segments` row at `seg_idx`. `op` is a placeholder
+    /// (`Op::Nop`) for the prologue; the inline block runs BEFORE the subset check.
+    /// The byte source never inlines (`inline == None` always).
+    inline: Option<(std::rc::Rc<crate::vm::decode::DecodedChunk>, u32, u32)>,
 }
 
 /// DECODE §2.4: the per-burst instruction source. Two monomorphized impls — the
@@ -126,6 +142,12 @@ trait InstrSource {
     /// DECODE §8.3 coverage: a record fully retired. The record source bumps
     /// `decoded_ops`/`stack_ops`; the byte source is a no-op.
     fn note_retired(&mut self, vm: &Vm, op: Op);
+
+    /// DECODE §6 (Unit C): seek the record cursor to `idx` after an inline
+    /// HIT/MISS (the inline block dispatched the whole guarded call; the cursor must
+    /// resume at the record AFTER the retained `Call` on a hit, or AT it on a miss).
+    /// No-op for the byte source (which never produces an `InlineEnter`).
+    fn seek_record(&mut self, idx: u32);
 }
 
 /// DECODE §2.4: the byte instruction source — LANE's shipped behavior, made a
@@ -145,7 +167,7 @@ impl InstrSource for ByteSource {
         let byte = fiber.frame().closure.proto.chunk.code[fault_ip];
         let op = Op::from_u8(byte)
             .unwrap_or_else(|| panic!("invalid opcode byte {byte:#x} at ip {fault_ip}"));
-        Some(Fetched { op, fault_ip, operand_at: fault_ip + 1, fused: None })
+        Some(Fetched { op, fault_ip, operand_at: fault_ip + 1, fused: None, inline: None })
     }
 
     #[inline]
@@ -155,6 +177,9 @@ impl InstrSource for ByteSource {
 
     #[inline]
     fn note_retired(&mut self, _vm: &Vm, _op: Op) {}
+
+    #[inline]
+    fn seek_record(&mut self, _idx: u32) {}
 }
 
 /// DECODE §2.4: the record instruction source — fetches from a valid
@@ -246,9 +271,11 @@ impl RecordSource {
             // Frame changed to a different chunk: consult ITS decoded stream.
             let slot = chunk.decoded.borrow();
             let d = match slot.as_ref() {
-                // §4.2 validity (own_epoch + deps) — the single SoT in `is_valid`.
-                Some(d) if d.is_valid(chunk) => d.clone(),
-                _ => return false, // un-decoded / stale callee → byte fallback
+                // §4.2 validity (own_epoch + deps) — the single SoT in `is_valid` —
+                // AND §6.6: an inline-segment stream may run only with no instrument
+                // armed (else the byte fallback continues, which keeps callee frames).
+                Some(d) if d.is_valid(chunk) && vm.inline_stream_runnable(d) => d.clone(),
+                _ => return false, // un-decoded / stale / instrument-disabled → byte fallback
             };
             drop(slot);
             let idx = match crate::vm::decode::byte_to_record(&d, fiber.frame().ip as u32) {
@@ -293,21 +320,33 @@ impl InstrSource for RecordSource {
             return None;
         }
         let rec = self.d.records[self.idx as usize];
-        let (op, fused) = match rec.op {
-            crate::vm::decode::DOp::Base(op) => (op, None),
+        let (op, fused, inline) = match rec.op {
+            crate::vm::decode::DOp::Base(op) => (op, None, None),
             // DECODE §5 (Unit B): a fused record. `op` is the FIRST component (the
             // subset check + the canonical-ip prologue see the head op); the whole
             // run is dispatched + the ip advanced past ALL components by the fused
             // block in `sync_burst`.
             crate::vm::decode::DOp::Fused(kind) => {
-                (crate::vm::decode::FusedKind::components(kind)[0], Some((kind, rec.a)))
+                (crate::vm::decode::FusedKind::components(kind)[0], Some((kind, rec.a)), None)
             }
+            // DECODE §6 (Unit C): an `InlineEnter` — the whole guarded inline call is
+            // dispatched by `sync_burst`'s inline block. `a` = segment index, `b` =
+            // the retained-Call fallback record index. `op` is a placeholder
+            // (`Op::Pop`, never dispatched — the inline block `continue`s first).
+            crate::vm::decode::DOp::InlineEnter => {
+                (Op::Pop, None, Some((self.d.clone(), rec.a, rec.b)))
+            }
+            // An `InlineExit` is never reached via `fetch`: the inline block runs the
+            // body sub-loop and seeks PAST it. If one is fetched, the stream is
+            // malformed — fall back to byte dispatch (defensive, never expected).
+            crate::vm::decode::DOp::InlineExit => return None,
         };
         Some(Fetched {
             op,
             fault_ip: rec.off as usize,
             operand_at: rec.off as usize + 1,
             fused,
+            inline,
         })
     }
 
@@ -355,6 +394,25 @@ impl InstrSource for RecordSource {
                 self.prev2 = self.prev;
                 self.prev = Some(op as u8 as u16);
             }
+        }
+    }
+
+    #[inline]
+    fn seek_record(&mut self, idx: u32) {
+        // DECODE §6: the inline block dispatched the whole guarded call and set the
+        // canonical ip itself; resume the cursor at `idx` AUTHORITATIVELY (the record
+        // AFTER the retained Call on a HIT, or AT it on a MISS). We do NOT force a
+        // resync: the retained-Call record's `off` is the CALL off (NOT an
+        // `entry_index` boundary — that off belongs to the InlineEnter), so a
+        // byte→record resync of the MISS case would wrongly re-land on InlineEnter and
+        // loop. The inline handler guarantees `frame().ip` matches `records[idx].off`,
+        // so the next `fetch`'s sequential check passes without resyncing.
+        self.idx = idx;
+        // A jump/inline edge ends the census basic block (a fresh region begins).
+        #[cfg(feature = "decode-census")]
+        {
+            self.prev = None;
+            self.prev2 = None;
         }
     }
 }
@@ -865,14 +923,20 @@ impl Vm {
         sync_lane: bool,
         call_fast: bool,
     ) -> Rc<Self> {
+        // DECODE §6: respect the `ASCRIPT_NO_DECODE_INLINE` kill switch on this path
+        // (the default test/REPL entry point) — so a probe that needs the CALL path
+        // intact (e.g. the CALL alloc-slope gate, which Unit C inlining would
+        // otherwise make vanish) can disable inlining via the documented env var.
+        // The differential modes set `decode_inline` EXPLICITLY via `with_all_flags`.
+        let decode_inline = std::env::var("ASCRIPT_NO_DECODE_INLINE").as_deref() != Ok("1");
         Self::with_all_flags(
             interp,
             specialize,
             sync_lane,
             call_fast,
-            true,  // decode = on
-            true,  // decode_inline = on
-            true,  // decode_tos = on
+            true,           // decode = on
+            decode_inline,  // decode_inline = env-gated
+            true,           // decode_tos = on
             Self::DECODE_THRESHOLD,
         )
     }
@@ -2183,20 +2247,29 @@ impl Vm {
         // the record source could no longer fetch (a frame transition into an
         // un-decoded callee) — the canonical ip is exact, so the byte burst below
         // continues seamlessly from where records stopped.
-        if self.decode {
-            if let Some(mut src) = self.select_record_source(fiber) {
-                match self.sync_burst(fiber, retired, &mut src)? {
-                    BurstExit::Sync(outcome) => return Ok(outcome),
-                    BurstExit::FellBack => {}
+        // The loop handles `BurstExit::Reselect` (a §6.1 one-shot inline re-decode at a
+        // loop back-edge): re-select a record source from the current (loop-target) ip
+        // and continue. A record `FellBack`/byte `Reselect` both loop here.
+        loop {
+            if self.decode {
+                if let Some(mut src) = self.select_record_source(fiber) {
+                    match self.sync_burst(fiber, retired, &mut src)? {
+                        BurstExit::Sync(outcome) => return Ok(outcome),
+                        BurstExit::FellBack => {}
+                        BurstExit::Reselect => continue,
+                    }
                 }
             }
-        }
-        // Byte dispatch — LANE's shipped behavior (DECODE Task 4a monomorphization).
-        let mut src = ByteSource;
-        match self.sync_burst(fiber, retired, &mut src)? {
-            BurstExit::Sync(outcome) => Ok(outcome),
-            // The byte source never falls back (it is always able to fetch).
-            BurstExit::FellBack => unreachable!("ByteSource never returns FellBack"),
+            // Byte dispatch — LANE's shipped behavior (DECODE Task 4a monomorphization).
+            let mut src = ByteSource;
+            match self.sync_burst(fiber, retired, &mut src)? {
+                BurstExit::Sync(outcome) => return Ok(outcome),
+                // The byte source never falls back (it is always able to fetch).
+                BurstExit::FellBack => unreachable!("ByteSource never returns FellBack"),
+                // A byte burst requested a re-decode at a loop back-edge: loop back to
+                // re-select the (now inlined) record source from the loop-target ip.
+                BurstExit::Reselect => continue,
+            }
         }
     }
 
@@ -2213,9 +2286,31 @@ impl Vm {
         {
             let slot = chunk.decoded.borrow();
             if let Some(d) = slot.as_ref() {
-                // §4.2 validity (own_epoch + deps) — the single SoT in `is_valid`.
                 if d.is_valid(chunk) {
-                    return RecordSource::at_entry(self, fiber, d.clone());
+                    // DECODE §6.1 one-shot inline RE-DECODE: if inlining is on but this
+                    // valid stream has NO inline segments AND we have not retried yet,
+                    // the first decode likely raced ahead of the top-level defines.
+                    // Drop + rebuild ONCE now (defines have since run) so late-bound
+                    // top-level calls can inline. Only when no instrument is armed
+                    // (else an inline stream could not run anyway, §6.6).
+                    let want_retry = self.decode_inline
+                        && d.inline_segments.is_empty()
+                        && !chunk.decode_inline_retried.get()
+                        && self.instrument.borrow().is_none();
+                    if !want_retry {
+                        // §4.2 validity + §6.6: a stream WITH inline segments may run
+                        // only while NO instrumentation is armed. A segment-free stream
+                        // is unaffected.
+                        if self.inline_stream_runnable(d) {
+                            return RecordSource::at_entry(self, fiber, d.clone());
+                        }
+                        // Instrument armed over an inline stream: run on bytes this
+                        // burst WITHOUT dropping the (still-valid) stream.
+                        return None;
+                    }
+                    // Consume the one-shot retry (so a chunk with genuinely no inlinable
+                    // call rebuilds at most ONCE), then fall through to the rebuild path.
+                    chunk.decode_inline_retried.set(true);
                 }
             }
         }
@@ -2231,29 +2326,9 @@ impl Vm {
         if warmth < self.decode_threshold {
             return None;
         }
-        // At/over the threshold: decode now (or permanently-byte on a `None` —
-        // a structural anomaly the decoder refused; never retry it).
-        // DECODE §5 (Unit B, Task 8): fusion rides the master `decode` switch —
-        // build the stream with the peephole active so hot protos retire fused
-        // superinstructions. The fused arms are byte-identical to the unfused
-        // sequence (the same shared helpers); emptying `FUSION_CANDIDATES` reverts
-        // to a 1:1 stream (the §5 sabotage / Unit-D delta measurement).
-        let built =
-            crate::vm::decode::decode_chunk(chunk, &crate::vm::decode::DecodeCfg::fused());
-        match built {
-            Some(d) => {
-                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
-                self.bump_decode_stat(|s| {
-                    // Memory accounting (§7.3 gate input): record bytes occupied.
-                    s.decoded_bytes = s
-                        .decoded_bytes
-                        .saturating_add((d.records.len() * std::mem::size_of::<
-                            crate::vm::decode::DecodedInstr,
-                        >()) as u64);
-                });
-                *chunk.decoded.borrow_mut() = Some(d.clone());
-                RecordSource::at_entry(self, fiber, d)
-            }
+        // At/over the threshold: decode now (or permanently-byte on a `None`).
+        match self.build_and_store_decoded(chunk) {
+            Some(d) => RecordSource::at_entry(self, fiber, d),
             None => {
                 // Permanently byte: park the warmth at the threshold so we do not
                 // re-attempt decode every burst (a sticky "do not decode" marker
@@ -2262,6 +2337,104 @@ impl Vm {
                 None
             }
         }
+    }
+
+    /// DECODE §5/§6: decode `chunk` (fused, + inlined when `decode_inline` is on and
+    /// no instrument is armed) and STORE it into `chunk.decoded`, returning the new
+    /// stream (or `None` on a structural anomaly). The single build site shared by
+    /// `select_record_source` (threshold reach) and the `resync` one-shot inline
+    /// re-decode (the loop back-edge after the top-level defines have run).
+    fn build_and_store_decoded(
+        &self,
+        chunk: &crate::vm::chunk::Chunk,
+    ) -> Option<std::rc::Rc<crate::vm::decode::DecodedChunk>> {
+        // DECODE §5 (Unit B): fusion rides the master `decode` switch. DECODE §6
+        // (Unit C): inlining additionally rides `decode_inline` — build with the
+        // resolver so qualifying small global-fn calls splice. The fused/inlined arms
+        // are byte-identical to the unfused/uninlined sequence (the same shared
+        // helpers); `ASCRIPT_NO_DECODE_INLINE=1` (→ `decode_inline=false`) reverts to a
+        // fused-only stream.
+        let built = if self.decode_inline && self.instrument.borrow().is_none() {
+            // §6.6: do NOT build inline segments while instrumentation is armed (the
+            // resulting non-empty-segments stream could not run anyway). Build a
+            // fused-only stream instead so the proto still decodes + runs.
+            let resolve = |name_idx: u32| -> Option<crate::vm::decode::InlineResolution> {
+                self.resolve_inline_global(chunk, name_idx)
+            };
+            crate::vm::decode::decode_chunk_resolved(
+                chunk,
+                &crate::vm::decode::DecodeCfg::fused_inline(),
+                Some(&resolve),
+            )
+        } else {
+            crate::vm::decode::decode_chunk(chunk, &crate::vm::decode::DecodeCfg::fused())
+        };
+        let d = built?;
+        #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+        self.bump_decode_stat(|s| {
+            // Memory accounting (§7.3 gate input): record bytes occupied.
+            s.decoded_bytes = s.decoded_bytes.saturating_add(
+                (d.records.len() * std::mem::size_of::<crate::vm::decode::DecodedInstr>()) as u64,
+            );
+        });
+        *chunk.decoded.borrow_mut() = Some(d.clone());
+        Some(d)
+    }
+
+    /// DECODE §6.1: should the loop back-edge ESCALATE to trigger a one-shot inline
+    /// re-decode of `chunk`? True iff a VALID decoded stream exists with NO inline
+    /// segments and no instrument is armed — i.e. the chunk decoded (likely before its
+    /// own callees were defined) and a re-decode now might splice inline segments. An
+    /// un-decoded chunk returns false (nothing to upgrade; it decodes via the normal
+    /// warmth path). One-shot is enforced by the caller's `decode_inline_retried` guard
+    /// + the `decode_inline_retried` set on the subsequent re-decode.
+    fn want_inline_redecode(&self, chunk: &crate::vm::chunk::Chunk) -> bool {
+        if self.instrument.borrow().is_some() {
+            return false;
+        }
+        let slot = chunk.decoded.borrow();
+        match slot.as_ref() {
+            Some(d) => d.is_valid(chunk) && d.inline_segments.is_empty(),
+            None => false,
+        }
+    }
+
+    /// DECODE §6.6: may this decoded stream RUN now? A stream with NO inline segments
+    /// always may (the pre-Unit-C rule). A stream WITH inline segments may run ONLY
+    /// while no instrumentation is armed — a profiler/debugger must observe callee
+    /// frames, which inlining elides. A single `None`-check borrow when segments are
+    /// empty (the common case): zero-cost for non-inlined protos.
+    #[inline]
+    fn inline_stream_runnable(&self, d: &crate::vm::decode::DecodedChunk) -> bool {
+        d.inline_segments.is_empty() || self.instrument.borrow().is_none()
+    }
+
+    /// DECODE §6.1: the Vm-side inline RESOLVER passed to the decoder. Given a
+    /// `GET_GLOBAL` const-name index into `chunk`, resolve the name to a closure
+    /// user-global and return the recorded guard stamp (stable index, `struct_gen`,
+    /// callee proto). `None` when the const is not a string, the global is undefined,
+    /// or it is not a `Value::Closure` (late-binding-correct: such a site never
+    /// inlines). This is the ONLY place decode reads the live `user_globals` — keeping
+    /// `decode.rs` Vm-free.
+    fn resolve_inline_global(
+        &self,
+        chunk: &crate::vm::chunk::Chunk,
+        name_idx: u32,
+    ) -> Option<crate::vm::decode::InlineResolution> {
+        let name = match chunk.consts.get(name_idx as usize)? {
+            Value::Str(s) => s.clone(),
+            _ => return None,
+        };
+        let (global_idx, value) = self.get_user_global_full(&name)?;
+        let callee = match value {
+            Value::Closure(c) => c.proto.clone(),
+            _ => return None,
+        };
+        Some(crate::vm::decode::InlineResolution {
+            global_idx: global_idx as u32,
+            struct_gen: self.struct_gen(),
+            callee,
+        })
     }
 
     /// Inner dispatch loop for the sync lane, generic over the instruction
@@ -2285,10 +2458,27 @@ impl Vm {
             // able to escalate with the ip un-advanced. A `None` is the record
             // source signalling it can no longer fetch (frame transition into an
             // un-decoded callee); the burst falls back to byte dispatch.
-            let Fetched { op, fault_ip, operand_at, fused } = match source.fetch(self, fiber) {
+            let Fetched { op, fault_ip, operand_at, fused, inline } = match source.fetch(self, fiber)
+            {
                 Some(f) => f,
                 None => return Ok(BurstExit::FellBack),
             };
+
+            // ── DECODE §6 (Unit C): GUARDED INLINE dispatch ─────────────────────
+            // An `InlineEnter` fetch dispatches the WHOLE guarded global-fn call here
+            // (before the subset check / arm match — the `op` is a placeholder). The
+            // guard (struct_gen + Rc::ptr_eq identity) decides HIT vs MISS; either way
+            // the inline handler sets the canonical ip and returns the record cursor
+            // to seek to. A HIT runs the spliced body sub-loop on this same lane (a
+            // leaf, no suspension), a MISS seeks to the retained `Base(Call)` for the
+            // byte-identical generic dispatch. The fetched `fault_ip` is the CALL off.
+            if let Some((d, seg_idx, fallback_idx)) = inline {
+                let next_idx =
+                    self.exec_inline_enter(fiber, &d, seg_idx, fallback_idx, fault_ip)?;
+                source.seek_record(next_idx);
+                *retired += 1;
+                continue;
+            }
 
             // LANE: check subset membership BEFORE advancing ip. If this op is
             // not in the sync subset, return NeedsAsync with ip still at fault_ip
@@ -2717,6 +2907,35 @@ impl Vm {
                         fiber.frame().closure.proto.chunk.read_i16(operand_at);
                     let base = fiber.frame().ip as isize;
                     fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    // DECODE §6.1 loop-back-edge DECODE/RE-DECODE trigger. Frame-entry
+                    // warmth never decodes a chunk that is entered ONCE but loops HOT
+                    // (the ENTRY chunk; a callee whose body loops — its `run_loop_sync`
+                    // is never re-entered because a sync-lane call stays in-burst). The
+                    // back-edge is the hotness signal: when the body is hot and either
+                    // (a) the chunk is not decoded yet, or (b) it decoded before its
+                    // callees were defined so its inlined stream is empty, (re-)decode it
+                    // WITH inlining and `Reselect` — the canonical ip is AT the loop
+                    // target (an `entry_index` boundary), so `run_loop_sync_inner` picks
+                    // up the new stream from there WITHOUT the async driver advancing the
+                    // ip into a mid-record byte. One-shot per chunk (the rebuild sets
+                    // `decode_inline_retried`); behavior-identical (a plain burst seam).
+                    if self.decode && self.decode_inline {
+                        let proto = fiber.frame().closure.proto.clone();
+                        let ch = &proto.chunk;
+                        if !ch.decode_inline_retried.get() && self.instrument.borrow().is_none() {
+                            // Bump back-edge warmth and decide if hot enough to (re)decode.
+                            let warmth = ch.decode_warmth.get().saturating_add(1);
+                            ch.decode_warmth.set(warmth);
+                            let undecoded = ch.decoded.borrow().is_none();
+                            let want = (undecoded && warmth >= self.decode_threshold)
+                                || self.want_inline_redecode(ch);
+                            if want {
+                                ch.decode_inline_retried.set(true);
+                                self.build_and_store_decoded(ch);
+                                return Ok(BurstExit::Reselect);
+                            }
+                        }
+                    }
                 }
                 Op::JumpIfFalse => {
                     let v = fiber.pop();
@@ -8689,6 +8908,359 @@ impl Vm {
         Ok(())
     }
 
+    /// DECODE §6 (Unit C): dispatch a guarded inlined global-fn call. Returns the
+    /// record cursor index to seek to: `fallback_idx + 1` (PAST the retained Call) on
+    /// a guard HIT, `fallback_idx` (the retained Call) on a MISS. `call_off` is the
+    /// CALL site's byte offset (the caller-chunk span anchor for the depth panic).
+    ///
+    /// The GET_GLOBAL + arg records ALREADY ran before this (the callee value sits at
+    /// `stack[len - argc - 1]`, the args above it), so the MISS path needs no state
+    /// reconstruction — it just seeks to the retained `Base(Call)` and the generic
+    /// dispatch pops them byte-identically (§6.2).
+    fn exec_inline_enter(
+        &self,
+        fiber: &mut Fiber,
+        d: &std::rc::Rc<crate::vm::decode::DecodedChunk>,
+        seg_idx: u32,
+        fallback_idx: u32,
+        call_off: usize,
+    ) -> Result<u32, Control> {
+        let seg = &d.inline_segments[seg_idx as usize];
+        // ── The TWO-PART guard (§6.2). Leg 1 (struct_gen) FIRST — cheap, and it
+        //    guarantees the recorded index is still valid before we read it.
+        let hit = self.struct_gen() == seg.recorded_gen
+            && match self.user_globals.borrow().get_index(seg.global_idx as usize) {
+                // Leg 2: identity — the slot must hold a Closure whose proto is the
+                // SAME `Rc` recorded at decode time (catches a mutable-`let` rebind
+                // that does NOT bump struct_gen — run.rs `update_user_global`).
+                Some((_k, slot)) => match &slot.value {
+                    Value::Closure(c) => std::rc::Rc::ptr_eq(&c.proto, &seg.callee),
+                    _ => false,
+                },
+                None => false,
+            };
+        if !hit {
+            // MISS → single-branch deopt to the retained Call. Counter bump; the
+            // canonical ip stays at `call_off` (the retained Call's own off), so the
+            // next fetch dispatches it without a resync.
+            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+            self.bump_decode_stat(|s| s.inline_misses = s.inline_misses.saturating_add(1));
+            return Ok(fallback_idx);
+        }
+        // ── HIT — window the callee frame in-place, minus the CallFrame (§6.3). ───
+        let argc = seg.argc as usize;
+        let slot_count = seg.slot_count as usize;
+        let callee_idx = fiber.stack.len() - argc - 1;
+        let call_span = fiber.frame().closure.proto.chunk.span_at(call_off);
+        // SP3 §B: ONE logical-call increment per inlined call (matching the generic
+        // frame push). Over the limit → the byte-identical Tier-2 panic at the call.
+        // On a panic INSIDE the body the increment is not unwound here — matching the
+        // real engine (the `recover`/`call_value` DepthGuard boundary restores it).
+        self.enter_frame_depth(call_span)?;
+        // Drop the callee value beneath the args, so the args occupy
+        // `stack[callee_idx .. callee_idx + argc]`; pad Nil up to `slot_count` — the
+        // callee's locals now live at window base `callee_idx`.
+        fiber.stack.remove(callee_idx);
+        fiber.stack.resize(callee_idx + slot_count, Value::Nil);
+        let inline_base = callee_idx;
+        // §6.4: swap `last_fault_source` to the CALLEE's module source for the body
+        // (a panic inside anchors in the callee's source); restore at exit.
+        let saved_source = self.last_fault_source.borrow().clone();
+        if let Some(src) = seg.callee.chunk.source.borrow().as_ref() {
+            *self.last_fault_source.borrow_mut() = Some(src.clone());
+        }
+        // Run the spliced body records [start, end). A leaf, straight-line, sync-only
+        // ⇒ the only exits are the terminal value-on-top or an `Err`.
+        let body_result =
+            self.exec_inline_body(fiber, d, seg.start, seg.end, inline_base, &seg.callee);
+        match body_result {
+            Ok(()) => {
+                // ── InlineExit (§6.3): pop the return value, truncate the window back
+                //    to `inline_base`, `leave_frame_depth`, push the value, restore
+                //    `last_fault_source` — `return_from_frame`'s effect minus the frame
+                //    pop and the (predicate-excluded) return contract.
+                let ret = fiber.pop();
+                fiber.stack.truncate(inline_base);
+                self.leave_frame_depth();
+                fiber.push(ret);
+                *self.last_fault_source.borrow_mut() = saved_source;
+                #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+                self.bump_decode_stat(|s| s.inline_hits = s.inline_hits.saturating_add(1));
+                // Canonical ip PAST the original Call (a u8-operand op, width 1).
+                fiber.frame_mut().ip = call_off + 2;
+                Ok(fallback_idx + 1)
+            }
+            Err(e) => {
+                // A panic inside the body. `last_fault_source` is the callee's (the
+                // caret renders in the callee's source — §6.4). The depth increment is
+                // NOT unwound (the recover/DepthGuard boundary owns that, byte-identical
+                // to the real engine's panicking frame). Leave the stack as-is; the
+                // panic unwinds the whole burst.
+                Err(e)
+            }
+        }
+    }
+
+    /// DECODE §6.3/§6.4: execute the spliced inline-body records `[start, end)` of
+    /// `d` (the CALLER's decoded chunk; the body records were copied from the callee
+    /// with their callee-chunk offsets intact). A bounded straight-line LEAF executor
+    /// reusing the SAME shared helpers the single-op `sync_burst` arms call
+    /// (`eval_binop_adaptive`, `apply_unop`, `fused_get_prop`, …) — byte-identical to
+    /// the callee running on its own frame, EXCEPT local access resolves against
+    /// `inline_base` (the in-place window) and operand/const reads use the CALLEE
+    /// chunk. No jumps/calls/suspension by predicate; the only exits are the terminal
+    /// value left on the operand stack or an `Err` (a panic, anchored in the callee).
+    fn exec_inline_body(
+        &self,
+        fiber: &mut Fiber,
+        d: &std::rc::Rc<crate::vm::decode::DecodedChunk>,
+        start: u32,
+        end: u32,
+        inline_base: usize,
+        callee: &std::rc::Rc<crate::vm::chunk::FnProto>,
+    ) -> Result<(), Control> {
+        use crate::vm::decode::DOp;
+        let cc = &callee.chunk;
+        let mut idx = start;
+        while idx < end {
+            let rec = d.records[idx as usize];
+            idx += 1;
+            match rec.op {
+                DOp::Base(op) => self.exec_inline_base_op(fiber, op, &rec, inline_base, cc)?,
+                DOp::Fused(kind) => {
+                    self.exec_inline_fused(fiber, kind, rec.a, rec.off as usize, inline_base, cc)?
+                }
+                // The predicate forbids nested inline segments in a body.
+                DOp::InlineEnter | DOp::InlineExit => unreachable!(
+                    "inline predicate guarantees a body has no nested inline segments"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// DECODE §6: one inline-body BASE op. Mirrors the corresponding `sync_burst` arm
+    /// EXACTLY (same shared helpers), but locals window on `inline_base` and operands
+    /// read from the CALLEE chunk `cc` via the record's widened `a`/`b` (the bytes are
+    /// the callee's). The op set is the `inline_body_op_ok` whitelist; anything else is
+    /// unreachable by predicate.
+    fn exec_inline_base_op(
+        &self,
+        fiber: &mut Fiber,
+        op: Op,
+        rec: &crate::vm::decode::DecodedInstr,
+        inline_base: usize,
+        cc: &crate::vm::chunk::Chunk,
+    ) -> Result<(), Control> {
+        let fault_ip = rec.off as usize;
+        match op {
+            Op::Const => {
+                let v = cc.consts[rec.a as usize].clone();
+                fiber.push(v);
+            }
+            Op::Nil => fiber.push(Value::Nil),
+            Op::True => fiber.push(Value::Bool(true)),
+            Op::False => fiber.push(Value::Bool(false)),
+            Op::Pop => {
+                fiber.pop();
+            }
+            Op::Dup => {
+                let top = fiber.peek(0).clone();
+                fiber.push(top);
+            }
+            Op::Swap => {
+                let b = fiber.pop();
+                let a = fiber.pop();
+                fiber.push(b);
+                fiber.push(a);
+            }
+            Op::Rot3 => {
+                let c = fiber.pop();
+                let b = fiber.pop();
+                let a = fiber.pop();
+                fiber.push(b);
+                fiber.push(c);
+                fiber.push(a);
+            }
+            Op::GetLocal => {
+                let v = fiber.stack[inline_base + rec.a as usize].clone();
+                fiber.push(v);
+            }
+            Op::SetLocal => {
+                let v = fiber.pop();
+                fiber.stack[inline_base + rec.a as usize] = v;
+            }
+            Op::GetGlobal => {
+                // Read-only global read (no IC mutation needed — correctness only;
+                // the inline body is rare relative to the GET_GLOBAL fast path). Mirror
+                // the generic resolution order: user-globals first, then builtins.
+                let name = match &cc.consts[rec.a as usize] {
+                    Value::Str(s) => s.clone(),
+                    other => {
+                        return Err(self.panic_at_off(
+                            fiber,
+                            fault_ip,
+                            cc,
+                            format!("GET_GLOBAL operand is not a string constant: {other:?}"),
+                        ))
+                    }
+                };
+                // Mirror the generic GET_GLOBAL resolution ORDER + outcomes exactly:
+                // user-global first, then a builtin name, else undefined. (No IC write:
+                // an inlined body is rare relative to the GET_GLOBAL fast path; the
+                // result + panic are byte-identical regardless of caching.)
+                let v = if let Some((_idx, v)) = self.get_user_global_full(&name) {
+                    v
+                } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
+                    Value::Builtin(name)
+                } else {
+                    return Err(self.panic_at_off(
+                        fiber,
+                        fault_ip,
+                        cc,
+                        format!("undefined variable '{name}'"),
+                    ));
+                };
+                fiber.push(v);
+            }
+            Op::GetProp => {
+                let obj = fiber.pop();
+                let v = self.inline_get_prop(fiber, fault_ip, cc, rec.a as usize, obj)?;
+                fiber.push(v);
+            }
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Lt | Op::Le
+            | Op::Gt | Op::Ge | Op::Eq | Op::Ne | Op::BitAnd | Op::BitOr | Op::BitXor
+            | Op::Shl | Op::Shr | Op::WrapAdd | Op::WrapSub | Op::WrapMul => {
+                let b = fiber.pop();
+                let a = fiber.pop();
+                let binop = binop_of(op);
+                // The adaptive-arith cache is keyed by the CALLEE chunk + the callee
+                // byte offset (the SAME key the callee uses on its own frame) →
+                // byte-identical specialization. eval_binop_adaptive reads the chunk
+                // off `fiber.frame()`, so call the off-explicit core directly.
+                let v = self.eval_binop_adaptive_in(fiber, cc, fault_ip, binop, a, b)?;
+                fiber.push(v);
+            }
+            Op::Neg | Op::Not | Op::BitNot => {
+                let a = fiber.pop();
+                let span = cc.span_at(fault_ip);
+                let v = crate::interp::apply_unop(unop_of(op), a, span)?;
+                fiber.push(v);
+            }
+            other => unreachable!("inline body op not in whitelist: {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// DECODE §6: one inline-body FUSED record (the callee's own fusion survives into
+    /// the splice). Delegates to the SAME fused composition as `exec_fused`, but with
+    /// the local window on `inline_base` and operands from the CALLEE chunk `cc`.
+    fn exec_inline_fused(
+        &self,
+        fiber: &mut Fiber,
+        kind: crate::vm::decode::FusedKind,
+        packed: u32,
+        head_off: usize,
+        inline_base: usize,
+        cc: &crate::vm::chunk::Chunk,
+    ) -> Result<(), Control> {
+        use crate::vm::decode::FusedKind;
+        let lo = (packed & 0xffff) as usize;
+        let hi = ((packed >> 16) & 0xffff) as usize;
+        let comps = kind.components();
+        let comp1_off = head_off + 1 + comps[0].operand_width();
+        let comp2_off = comp1_off + 1 + comps.get(1).map_or(0, |o| o.operand_width());
+        match kind {
+            FusedKind::GetLocalGetProp => {
+                let lv = fiber.stack[inline_base + lo].clone();
+                let v = self.inline_get_prop(fiber, comp1_off, cc, hi, lv)?;
+                fiber.push(v);
+            }
+            FusedKind::GetLocalGetLocal => {
+                let v1 = fiber.stack[inline_base + lo].clone();
+                let v2 = fiber.stack[inline_base + hi].clone();
+                fiber.push(v1);
+                fiber.push(v2);
+            }
+            FusedKind::GetLocalConst => {
+                let v1 = fiber.stack[inline_base + lo].clone();
+                let v2 = cc.consts[hi].clone();
+                fiber.push(v1);
+                fiber.push(v2);
+            }
+            FusedKind::GetPropAdd => {
+                let obj = fiber.pop();
+                let field = self.inline_get_prop(fiber, head_off, cc, lo, obj)?;
+                let a = fiber.pop();
+                let v = self.eval_binop_adaptive_in(fiber, cc, comp1_off, BinOp::Add, a, field)?;
+                fiber.push(v);
+            }
+            FusedKind::ConstGetLocal => {
+                let v1 = cc.consts[lo].clone();
+                let v2 = fiber.stack[inline_base + hi].clone();
+                fiber.push(v1);
+                fiber.push(v2);
+            }
+            FusedKind::GetLocalGetPropAdd => {
+                let lv = fiber.stack[inline_base + lo].clone();
+                let field = self.inline_get_prop(fiber, comp1_off, cc, hi, lv)?;
+                let a = fiber.pop();
+                let v = self.eval_binop_adaptive_in(fiber, cc, comp2_off, BinOp::Add, a, field)?;
+                fiber.push(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// DECODE §6: the `GetProp` body for an inlined record — a `fused_get_prop` clone
+    /// using an EXPLICIT chunk `cc` (the callee's) for the const-name + IC key instead
+    /// of `fiber.frame().closure.proto.chunk`. Byte-identical to the callee's own
+    /// `Op::GetProp` (same `ic_get_field` / `vm_read_member`, same IC key = callee
+    /// chunk + callee off).
+    #[inline]
+    fn inline_get_prop(
+        &self,
+        _fiber: &Fiber,
+        prop_off: usize,
+        cc: &crate::vm::chunk::Chunk,
+        name_idx: usize,
+        obj: Value,
+    ) -> Result<Value, Control> {
+        let name = match &cc.consts[name_idx] {
+            Value::Str(s) => s.clone(),
+            other => {
+                return Err(crate::interp::Control::Panic(crate::error::AsError::at(
+                    format!("GET_PROP operand is not a string constant: {other:?}"),
+                    cc.span_at(prop_off),
+                )))
+            }
+        };
+        let span = cc.span_at(prop_off);
+        let cached = if self.specialize {
+            self.ic_get_field(cc, prop_off, &obj, &name)
+        } else {
+            None
+        };
+        match cached {
+            Some(v) => Ok(v),
+            None => self.vm_read_member(&obj, &name, span),
+        }
+    }
+
+    /// DECODE §6: a `panic_at` variant anchored at an explicit chunk `cc` (the callee's
+    /// for an inlined body) so the caret renders in the callee's source — byte-identical
+    /// to a panic raised one frame down. `last_fault_source` is already the callee's
+    /// (set at inline entry).
+    fn panic_at_off(
+        &self,
+        _fiber: &Fiber,
+        off: usize,
+        cc: &crate::vm::chunk::Chunk,
+        msg: String,
+    ) -> Control {
+        Control::Panic(crate::error::AsError::at(msg, cc.span_at(off)))
+    }
+
     /// DECODE §5 (Unit B): the `GetProp`-component body shared by every fused arm
     /// that reads a field — a transcription of the single-op `Op::GetProp` arm
     /// (NON-opt form; the peephole only fuses `Op::GetProp`, never `GetPropOpt`).
@@ -8735,9 +9307,29 @@ impl Vm {
         a: Value,
         b: Value,
     ) -> Result<Value, Control> {
+        // The adaptive cache + spans live on the CURRENT frame's chunk; the body is
+        // shared with `eval_binop_adaptive_in` (DECODE §6: an inlined body passes the
+        // CALLEE chunk so the cache key + span match the callee's own frame).
+        let chunk = fiber.frame().closure.proto.clone();
+        self.eval_binop_adaptive_in(fiber, &chunk.chunk, fault_ip, op, a, b)
+    }
+
+    /// DECODE §6: `eval_binop_adaptive` with an EXPLICIT chunk (the adaptive-cache map
+    /// plus span pool the op keys against). The single-op `sync_burst` arms pass the
+    /// current frame's chunk (via `eval_binop_adaptive`); an inlined body passes the
+    /// CALLEE chunk so its arith cache key (chunk + callee byte off) is byte-identical
+    /// to the callee running on its own frame.
+    fn eval_binop_adaptive_in(
+        &self,
+        _fiber: &Fiber,
+        chunk: &crate::vm::chunk::Chunk,
+        fault_ip: usize,
+        op: BinOp,
+        a: Value,
+        b: Value,
+    ) -> Result<Value, Control> {
         use crate::vm::adapt::{ArithCache, ArithKind};
 
-        let chunk = &fiber.frame().closure.proto.chunk;
         // IFACE §5.2: `instanceof` routes through the shared `&self`
         // `Interp::eval_instanceof` (class → nominal `is_instance_of`; interface →
         // structural `conforms`) — the SAME path the tree-walker takes. It needs the
@@ -11219,6 +11811,164 @@ mod tests {
             cov_decoded, cov_bytes,
             "the covered/instrumented line set is identical decode-on vs decode-off"
         );
+    }
+
+    #[test]
+    fn profiler_armed_disables_inline_segments_only() {
+        // DECODE §6.6: with a profiler armed, a stream WITH inline segments must NOT
+        // run (the callee frame would be elided from the deterministic sample set —
+        // a golden-visible difference). Instead inlining is disabled while armed, so
+        // the callee `leaf` appears in the samples exactly as in a no-decode run, and
+        // plain (segment-free) decoded records still execute (`decoded_ops > 0`).
+        use crate::vm::instrument::{Instrumentation, ProfileMode, ProfilerHook};
+        use std::time::Duration;
+
+        // `deep` is a real recursive frame that inlines `leaf` when uninstrumented;
+        // under a profiler, `leaf` must be a real frame (visible in the sample set).
+        let src = "fn leaf(a) { return a + 1 }\n\
+                   fn run(n) {\n  let s = 0\n  for (i in 0..n) { s = leaf(s) }\n  return s\n}\n\
+                   print(run(3000))\n";
+
+        let (samples, output, decoded_ops) = with_watchdog(15, move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+                let mut inst = Instrumentation::empty();
+                inst.profiler =
+                    Some(ProfilerHook::new(ProfileMode::Deterministic, Duration::from_millis(1)));
+                let vm = forced_decode_vm_with_instrument(interp.clone(), inst);
+                let (entry, _s) = compile_and_register(src, &vm);
+                let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                let outcome = vm.run(&mut fiber).await;
+                assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "ran: {outcome:?}");
+                let prof = vm.take_profiler().expect("profiler armed");
+                let samples = prof.finish();
+                (samples, interp.output(), vm.decode_stats_inner().decoded_ops)
+            })
+        });
+
+        assert_eq!(output, "3000\n", "program output");
+        // Plain decoded records still ran (anti-false-green: the profiler did not
+        // collapse decode entirely).
+        assert!(decoded_ops > 0, "plain decoded records still ran ({decoded_ops})");
+        // `leaf` MUST appear in the sample set (it ran as a real frame, NOT inlined) —
+        // exactly as an un-inlined run would show it.
+        let saw_leaf = samples.iter().any(|s| s.iter().any(|f| f.contains("leaf")));
+        assert!(saw_leaf, "callee `leaf` must appear in the profiler samples (inlining disabled while armed): {samples:?}");
+    }
+
+    #[test]
+    fn breakpoint_inside_an_inlined_callee_fires_and_is_byte_identical() {
+        // DECODE §8.4 #2 — the deps-epoch + §6.6 proof. Warm `run` until it inlines
+        // `leaf` (uninstrumented forced decode → inline_hits > 0). THEN set a
+        // breakpoint on a line INSIDE `leaf` (patches leaf's chunk → leaf.patch_epoch
+        // bumps; the caller `run`'s own_epoch is untouched) and run again with a
+        // debugger armed: the trap MUST fire in leaf's REAL frame (the caller's inlined
+        // stream is invalidated via §6.6 instrument-armed AND its `deps`-epoch), and
+        // the output is byte-identical to an uninstrumented run.
+        use crate::vm::instrument::{DebugCommand, DebuggerHook, Instrumentation};
+
+        let src = "fn leaf(a) {\n  return a + 1\n}\n\
+                   fn run(n) {\n  let s = 0\n  for (i in 0..n) { s = leaf(s) }\n  return s\n}\n\
+                   print(run(3000))\n";
+
+        let (inline_hits_warm, hits_run2, run2_out, warm_out) = with_watchdog(20, move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            local.block_on(&rt, async move {
+                let interp = Rc::new(Interp::new());
+                interp.install_self();
+
+                // ── WARMUP: forced-decode VM, NO instrument → `run` inlines `leaf`. ──
+                let warm_vm =
+                    Vm::with_all_flags(interp.clone(), true, true, true, true, true, true, 0);
+                let (entry, _src) = compile_and_register(src, &warm_vm);
+                {
+                    let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                    let outcome = warm_vm.run(&mut fiber).await;
+                    assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "warmup ran");
+                }
+                let warm_out = interp.output();
+                let inline_hits_warm = warm_vm.decode_stats_inner().inline_hits;
+
+                // ── PATCH: a breakpoint on line 2 (`return a + 1`), INSIDE `leaf`. This
+                //    bumps LEAF's chunk patch_epoch — the caller `run`'s inlined stream
+                //    carries `leaf` in its `deps`, so that stream is now invalid (and
+                //    §6.6 disables inline streams while the debugger is armed anyway).
+                let bp = warm_vm
+                    .resolve_line_breakpoint("prog.as", 2)
+                    .expect("leaf body line 2 resolves to a breakpoint");
+                let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
+                // The bp's proto_id is the chunk pointer of `leaf`. Find leaf's chunk in
+                // the proto tree (the entry chunk + its nested protos), then patch it.
+                fn find_chunk_by_id(
+                    chunk: &crate::vm::chunk::Chunk,
+                    id: usize,
+                ) -> Option<&crate::vm::chunk::Chunk> {
+                    if chunk as *const _ as *const () as usize == id {
+                        return Some(chunk);
+                    }
+                    for p in &chunk.protos {
+                        if let Some(c) = find_chunk_by_id(&p.chunk, id) {
+                            return Some(c);
+                        }
+                    }
+                    None
+                }
+                let leaf_chunk = find_chunk_by_id(&entry.chunk, bp.0).expect("leaf chunk found");
+                let leaf_epoch_before = leaf_chunk.patch_epoch.get();
+                hook.set_breakpoint_shared(bp.0, bp.1, leaf_chunk);
+                assert_ne!(
+                    leaf_epoch_before,
+                    leaf_chunk.patch_epoch.get(),
+                    "patching leaf bumped ITS chunk epoch (the caller's deps go stale)"
+                );
+
+                let controller = std::thread::spawn(move || {
+                    let mut hits = 0usize;
+                    while evt_rx.recv().is_ok() {
+                        hits += 1;
+                        if cmd_tx.send(DebugCommand::Continue).is_err() {
+                            break;
+                        }
+                    }
+                    hits
+                });
+
+                // ── RUN 2: same protos + a debugger hook (a fresh forced-decode VM
+                //    sharing the persisted proto tree). The caller's inlined stream must
+                //    NOT run `leaf` inline (the trap must fire in leaf's real frame).
+                let run_vm = forced_decode_vm_with_instrument(
+                    interp.clone(),
+                    Instrumentation { breakpoints: Some(hook), profiler: None, coverage: None },
+                );
+                run_vm.register_debug_protos(&entry);
+                {
+                    let mut fiber = Fiber::new(Closure::new(entry.clone()));
+                    let outcome = run_vm.run(&mut fiber).await;
+                    assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "run 2 completed: {outcome:?}");
+                }
+                let run2_out = interp.output()[warm_out.len()..].to_string();
+                let mut hook = run_vm.take_debugger_hook().expect("debugger hook armed");
+                let _ = hook.drain_breakpoints();
+                drop(hook);
+                let hits_run2 = controller.join().expect("controller thread");
+                (inline_hits_warm, hits_run2, run2_out, warm_out)
+            })
+        });
+
+        assert!(
+            inline_hits_warm > 0,
+            "the warmup must actually inline `leaf` (inline_hits {inline_hits_warm}) — else the deps/instrument legs are untested"
+        );
+        assert!(
+            hits_run2 >= 1,
+            "the breakpoint inside the (previously-inlined) callee fired in its real frame"
+        );
+        assert_eq!(warm_out, "3000\n", "warmup output");
+        assert_eq!(run2_out, "3000\n", "the trapped run's output is byte-identical");
     }
 
     #[test]
