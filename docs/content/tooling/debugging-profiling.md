@@ -27,7 +27,7 @@ There are two entry points:
 | Command | Use |
 |---|---|
 | `ascript run --inspect <file>` | The program is pre-set from the CLI. Capability flags (`--sandbox`, `--deny …`) are honored — a debugged program is sandboxed exactly like a normal run. |
-| `ascript dap` | A bare DAP server; the program path comes from the editor's `launch` request. |
+| `ascript dap` | A bare DAP server; the program path comes from the editor's `launch` request. Takes no capability sandbox flags — if you need a sandboxed debug session, use `ascript run --inspect --sandbox <file>` instead. |
 
 ### VS Code
 
@@ -86,17 +86,23 @@ function-level call tree, and the result is written out. The program's own outpu
 | Flag | Meaning |
 |---|---|
 | `--profile cpu` | Enable CPU sampling (the only mode in v1). |
-| `-o <file>` | Output path (default `profile.json`). |
-| `--profile-hz <N>` | Sample rate in Hz (default ~1000). |
-| `--profile-format <fmt>` | `speedscope` (default) or `collapsed`. |
+| `-o <file>` | Output path (default `profile.json` for `speedscope`, `profile.txt` for `collapsed`). |
+| `--profile-hz <N>` | Sample rate in Hz (default 1000, i.e. ~1 ms). |
+| `--profile-format <fmt>` | `speedscope` (default) or `collapsed` — see below. |
+
+`--profile` is only supported for `.as` files on the bytecode VM. It is not available for `.aso`
+compiled programs or with the `--tree-walker` engine.
 
 ### Output formats
 
 - **`speedscope`** — JSON you can open at [speedscope.app](https://www.speedscope.app/)
-  for an interactive flame graph.
+  for an interactive flame graph. Default output path: `profile.json`.
 - **`collapsed`** — Brendan-Gregg folded stacks (`a;b;c <count>` per line), the input
   format for [FlameGraph](https://github.com/brendangregg/FlameGraph) and many other
-  tools.
+  tools. Default output path: `profile.txt`.
+- **`deterministic-speedscope`** / **`deterministic-collapsed`** — the same formats but
+  using an inline, call-structure-driven clock instead of the wall-clock sampler thread.
+  Golden-stable (no timing variance between runs), used for tests and snapshot assertions.
 
 ```bash
 # Folded stacks for a flame graph:

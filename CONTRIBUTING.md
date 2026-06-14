@@ -49,6 +49,12 @@ Two equivalent paths:
   `editors/zed/extension.toml` (`commit = "…"`) and
   `editors/nvim/lua/ascript/treesitter.lua` (`revision = "…"`).
 
+  > **Manual checklist after a sync:** verify that BOTH editor pins were bumped to the new mirror
+  > SHA — pin **currency against the mirror** is a manual check (it requires network access to the
+  > `ascript-lang/tree-sitter-ascript` repo and cannot be asserted in-repo). Pin **mutual
+  > consistency** (Zed pin == Nvim pin) IS enforced automatically by `tests/docs_drift.rs`
+  > (tripwire 6); a half-done bump will fail CI.
+
 - **Automatic (CI):** `.github/workflows/mirror-grammar.yml` mirrors the grammar to the standalone
   repo whenever `tree-sitter-ascript/**` changes on `main`. It is **dormant until you add a secret**
   (one-time setup below). You still bump the editor pins yourself.
