@@ -8956,7 +8956,7 @@ fn unop_of(op: Op) -> UnOp {
 /// NOT included (always async): Import, CallNamed, CallNamedSpread, Class,
 /// DefineInterface, Break (debug trap), GetIter, worker ops.
 /// Await IS included (conditional — escalates only if the future is still pending).
-fn sync_lane_op(op: Op) -> bool {
+pub(crate) fn sync_lane_op(op: Op) -> bool {
     matches!(
         op,
         // consts / stack

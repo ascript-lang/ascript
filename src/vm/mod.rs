@@ -11,6 +11,7 @@ pub mod defer_metrics;
 pub(crate) mod bcanalysis;
 pub mod chunk;
 pub mod coverage_report;
+pub(crate) mod decode;
 pub mod disasm;
 pub mod fiber;
 pub mod ic;

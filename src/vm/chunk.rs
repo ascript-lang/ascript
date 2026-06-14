@@ -495,6 +495,25 @@ pub struct Chunk {
     /// `field_ics`/`arith_caches`), defaults to 0. Single-threaded (`!Send`), so a
     /// plain `Cell` suffices.
     pub patch_epoch: std::cell::Cell<u64>,
+    /// DECODE §2.2: the lazily-built decoded side-representation (the
+    /// `arith_caches`/`field_ics` precedent — runtime-only, never serialized to
+    /// `.aso`, droppable at any time, invisible to the verifier/disassembler).
+    /// `None` until the proto warms past `decode_threshold`
+    /// ([`decode_warmth`](Chunk::decode_warmth)); a `patch_byte` bump stales it
+    /// (the recorded [`own_epoch`](crate::vm::decode::DecodedChunk::own_epoch)
+    /// diverges from [`patch_epoch`](Chunk::patch_epoch)). NOT consulted during a
+    /// run until DECODE Task 4 lands the record-source driver; built-but-inert
+    /// here.
+    ///
+    /// DECODE Task 3: written (in tests) but not yet READ from production — the
+    /// record-source driver (Task 4) is the first reader, which removes this
+    /// allow.
+    #[allow(dead_code)]
+    pub(crate) decoded: RefCell<Option<std::rc::Rc<crate::vm::decode::DecodedChunk>>>,
+    /// DECODE §2.3: per-proto frame-entry decode warmth (saturating). At
+    /// `decode_threshold` the chunk decodes and installs `Some(decoded)`. Defaults
+    /// to 0; inert until Task 4 consults it.
+    pub decode_warmth: std::cell::Cell<u16>,
     /// The MODULE source (`path` + full text) this chunk's spans index, for
     /// cross-module diagnostic provenance (SP4 §3). Set at compile/load time on a
     /// module's whole proto tree (see [`Chunk::set_module_source`]); read by the
