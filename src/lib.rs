@@ -982,6 +982,237 @@ pub async fn vm_run_source_lane_stats_no_lane(
     vm_run_source_cfg_stats(src, true, false, false, false, true).await
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODE Task 2 — public wrapper struct + five test entry points
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **DECODE §8.3 — per-run stat bundle returned by the decode-stats test entries.**
+///
+/// All counter fields start at 0 and stay 0 until the corresponding DECODE task
+/// wires them up:
+/// - Task 4 (RecordSource driver): `decoded_ops`, `decoded_bytes`, `stack_ops`
+/// - Task 8 (Unit B fusion):       `fused_ops`
+/// - Task 9 (Unit C inlining):     `inline_hits`, `inline_misses`
+/// - Task 10 (Unit D TOS cache):   `tos_ops`
+///
+/// The `output` and `exit_code` fields carry the program's normal result so the
+/// test can assert correctness while also inspecting the counters.
+///
+/// `#[doc(hidden)]` — test API only; not a stable public surface.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct DecodeStats {
+    /// Captured stdout of the program run.
+    pub output: String,
+    /// Process exit code, or `None` for a normal return.
+    pub exit_code: Option<i32>,
+    /// Total records retired by the `RecordSource` driver.
+    pub decoded_ops: u64,
+    /// Fused superinstruction records retired (Unit B).
+    pub fused_ops: u64,
+    /// `InlineEnter` guard hits (Unit C).
+    pub inline_hits: u64,
+    /// `InlineEnter` guard misses (Unit C).
+    pub inline_misses: u64,
+    /// Total bytes of decoded record streams resident in memory at end-of-run.
+    pub decoded_bytes: u64,
+    /// Fiber-stack push + pop operations retired by the record driver (Unit D gate
+    /// input).
+    pub stack_ops: u64,
+    /// Records retired with the TOS register cache active (Unit D).
+    pub tos_ops: u64,
+}
+
+/// Like [`vm_run_source`] but with DECODE DISABLED — the `ASCRIPT_NO_DECODE=1`
+/// kill switch (DECODE Task 2). Observable behavior is byte-identical to
+/// [`vm_run_source`]; only throughput may differ once Task 4 wires up the driver.
+///
+/// Used by the differential test (`decode_entry_points_exist_and_are_inert_pre_driver`)
+/// and the DECODE-mode differential batteries. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_no_decode(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::Vm;
+    // specialize=true, sync_lane=true, call_fast=true; decode=OFF.
+    vm_run_source_decode_cfg(src, false, true, true, Vm::DECODE_THRESHOLD).await
+}
+
+/// Like [`vm_run_source`] but with DECODE FORCED on with threshold=0 — every
+/// proto is decoded immediately, regardless of warmth, so even short programs
+/// exercise the record driver once Task 4 lands. Pre-driver (INERT), this is
+/// byte-identical to [`vm_run_source`]. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_decoded_forced(src: &str) -> Result<(String, Option<i32>), AsError> {
+    // decode=ON, threshold=0 (always decode immediately).
+    vm_run_source_decode_cfg(src, true, true, true, 0).await
+}
+
+/// Like [`vm_run_source_decoded_forced`] but with DECODE INLINE DISABLED — Unit C
+/// inlining suppressed while decoding + Unit B fusion remain active.
+/// INERT until Task 9. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_decoded_no_inline(src: &str) -> Result<(String, Option<i32>), AsError> {
+    // decode=ON, threshold=0, decode_inline=OFF.
+    vm_run_source_decode_cfg(src, true, false, true, 0).await
+}
+
+/// Like [`vm_run_source_decoded_forced`] but with DECODE TOS CACHE DISABLED — Unit D
+/// TOS caching suppressed while decoding + fusion + inlining remain active.
+/// INERT until Task 10. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_decoded_no_tos(src: &str) -> Result<(String, Option<i32>), AsError> {
+    // decode=ON, threshold=0, decode_tos=OFF.
+    vm_run_source_decode_cfg(src, true, true, false, 0).await
+}
+
+/// DECODE §8.3: run `src` on the VM with DECODE FORCED (threshold=0) and return
+/// a [`DecodeStats`] bundle containing the program output + all stat counters.
+/// All counters are 0 until the corresponding task wires them up (INERT until
+/// Task 4). `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_decode_stats(src: &str) -> Result<DecodeStats, AsError> {
+    vm_run_source_decode_stats_cfg(src, true, true, true, 0).await
+}
+
+/// DECODE §8.3 variant: like [`vm_run_source_decode_stats`] but with DECODE OFF.
+/// Used to prove `decoded_ops == 0` when the kill switch is active.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_decode_stats_no_decode(src: &str) -> Result<DecodeStats, AsError> {
+    use crate::vm::Vm;
+    vm_run_source_decode_stats_cfg(src, false, true, true, Vm::DECODE_THRESHOLD).await
+}
+
+/// DECODE §8.3 variant: like [`vm_run_source_decode_stats`] but with inline OFF.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_decode_stats_no_inline(src: &str) -> Result<DecodeStats, AsError> {
+    vm_run_source_decode_stats_cfg(src, true, false, true, 0).await
+}
+
+/// Shared body for the DECODE test entries: runs `src` with explicit decode
+/// kill-switch values, no instrumentation (decode paths are orthogonal to DBG),
+/// and returns the plain `(output, exit_code)` pair.
+async fn vm_run_source_decode_cfg(
+    src: &str,
+    decode: bool,
+    decode_inline: bool,
+    decode_tos: bool,
+    decode_threshold: u16,
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::value_ext::RunOutcome;
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(crate::vm::chunk::FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = crate::vm::value_ext::Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // specialize=true, sync_lane=true, call_fast=true (production defaults);
+    // decode flags and threshold set explicitly — no env read (parallel-test hygiene).
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, decode_inline, decode_tos, decode_threshold);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    let pair = match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }?;
+    Ok(pair)
+}
+
+/// Shared body for the DECODE stats test entries: runs `src` with explicit decode
+/// flags and returns a [`DecodeStats`] bundle. Compiled only under
+/// `#[cfg(any(test, feature = "fuzzgen", fuzzing))]`.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+async fn vm_run_source_decode_stats_cfg(
+    src: &str,
+    decode: bool,
+    decode_inline: bool,
+    decode_tos: bool,
+    decode_threshold: u16,
+) -> Result<DecodeStats, AsError> {
+    use crate::vm::value_ext::RunOutcome;
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(crate::vm::chunk::FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = crate::vm::value_ext::Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, decode_inline, decode_tos, decode_threshold);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    // Read the DECODE stat counters before consuming result (they are already
+    // stable: the run is complete, no borrow outstanding).
+    let inner = vm.decode_stats_inner();
+    let pair = match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }?;
+    Ok(DecodeStats {
+        output: pair.0,
+        exit_code: pair.1,
+        decoded_ops: inner.decoded_ops,
+        fused_ops: inner.fused_ops,
+        inline_hits: inner.inline_hits,
+        inline_misses: inner.inline_misses,
+        decoded_bytes: inner.decoded_bytes,
+        stack_ops: inner.stack_ops,
+        tos_ops: inner.tos_ops,
+    })
+}
+
 /// FUZZ `.aso` round-trip seam (`#[doc(hidden)]` test API, not a stable surface):
 /// compile `src` to a [`Chunk`], serialize it to `.aso` bytes ([`vm::Chunk::to_bytes`]),
 /// deserialize + verify them back ([`vm::Chunk::from_bytes_verified`]), then run the

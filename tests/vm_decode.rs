@@ -23,6 +23,39 @@ fn visit(dir: &Path, f: &mut dyn FnMut(&Path, &str)) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODE Task 2 — kill switches + stat counters + entry points (inert)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DECODE Task 2: the three kill switches and the stats test entry point exist,
+/// their outputs are byte-identical to the default VM, and all stat counters are
+/// 0 before Task 4 wires up the RecordSource driver.
+///
+/// This test is the INERT scaffolding gate — it must stay green at every future
+/// task boundary until Task 4 lands (at which point `decoded_ops` rises above 0
+/// and the Task-4 anti-false-green test takes over).
+#[tokio::test]
+async fn decode_entry_points_exist_and_are_inert_pre_driver() {
+    let src = "let s = 0\nfor (i in 0..100) { s = s + i }\nprint(s)";
+    let on = ascript::vm_run_source(src).await.expect("default ok");
+    let off = ascript::vm_run_source_no_decode(src).await.expect("no-decode ok");
+    let forced = ascript::vm_run_source_decoded_forced(src).await.expect("forced ok");
+    assert_eq!(on, off, "decode-off must be byte-identical to default");
+    assert_eq!(on, forced, "decode-forced must be byte-identical to default");
+    // Pre-driver, every counter reads 0 in every mode.
+    let st = ascript::vm_run_source_decode_stats(src).await.expect("stats ok");
+    assert_eq!(
+        (st.decoded_ops, st.fused_ops, st.inline_hits, st.inline_misses,
+         st.decoded_bytes, st.stack_ops, st.tos_ops),
+        (0, 0, 0, 0, 0, 0, 0),
+        "all DECODE counters must be 0 pre-Task-4"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODE §4.1 — the invalidation chokepoint structural guard (Task 1)
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// DECODE §4.1: `Code::patch_byte` (the raw UnsafeCell write) must be reachable
 /// ONLY through `Chunk::patch_byte` (which bumps `patch_epoch`). A future patch
 /// site calling the raw Code method would silently skip invalidation — this

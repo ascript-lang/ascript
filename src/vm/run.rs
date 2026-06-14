@@ -110,6 +110,40 @@ pub struct ShapeStats {
     pub obj_demotions: u64,
 }
 
+/// **DECODE — per-VM stat counters (anti-false-green, DECODE §8.3).**
+///
+/// Compiled only under `#[cfg(any(test, feature = "fuzzgen", fuzzing))]` so
+/// the production build carries zero overhead. All fields start at 0 and stay 0
+/// until the corresponding DECODE task wires them up:
+/// - Task 4 (RecordSource): `decoded_ops`, `decoded_bytes`, `stack_ops`
+/// - Task 8 (Unit B fusion): `fused_ops`
+/// - Task 9 (Unit C inline): `inline_hits`, `inline_misses`
+/// - Task 10 (Unit D TOS):   `tos_ops`
+///
+/// The public wrapper is [`DecodeStats`] in `lib.rs`, which bundles the counters
+/// together with the program output for the test entry points.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DecodeStatsInner {
+    /// Total records retired by the `RecordSource` driver across all bursts.
+    pub decoded_ops: u64,
+    /// Fused superinstruction records retired (Unit B, Task 8).
+    pub fused_ops: u64,
+    /// `InlineEnter` guard hits — the inlined body ran (Unit C, Task 9).
+    pub inline_hits: u64,
+    /// `InlineEnter` guard misses — fell back to the real `Op::Call` (Unit C, Task 9).
+    pub inline_misses: u64,
+    /// Total bytes occupied by decoded record streams at the end of the run
+    /// (memory accounting gate input, Task 4+).
+    pub decoded_bytes: u64,
+    /// Fiber-stack push + pop operations retired by the record driver — the
+    /// Unit-D §7.3 gate input (starts counting in Task 4, Task 8 sees the
+    /// post-fusion reduction, Task 10 sees the post-TOS residual).
+    pub stack_ops: u64,
+    /// Records retired with the TOS register cache active (Unit D, Task 10).
+    pub tos_ops: u64,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -295,6 +329,41 @@ pub struct Vm {
     /// under test/fuzzgen/fuzzing so production carries zero overhead.
     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
     shape_stats: std::cell::Cell<ShapeStats>,
+    // ──────────────────────────────────────────────────────────────────────────
+    // DECODE — kill switches + stat counters (DECODE Task 2, inert until Task 4)
+    // ──────────────────────────────────────────────────────────────────────────
+    /// **DECODE master kill switch.** When `true` (the default), the VM is
+    /// PERMITTED to lazily decode `FnProto` chunks into fixed-width record
+    /// streams and execute from them. When `false` (`ASCRIPT_NO_DECODE=1`),
+    /// the VM always executes from `Chunk.code` bytes — byte-identical to the
+    /// on path; only throughput may differ. Worker isolates inherit this flag
+    /// from the environment at construction time. INERT until Task 4 wires up
+    /// the `RecordSource` driver.
+    decode: bool,
+    /// **DECODE Unit-C kill switch.** When `true` (the default), decoded
+    /// execution may speculatively inline small hot global fns behind the
+    /// `struct_gen` + identity guard. When `false` (`ASCRIPT_NO_DECODE_INLINE=1`),
+    /// inlining is suppressed — decoding continues, inline segments are skipped.
+    /// INERT until Task 9.
+    decode_inline: bool,
+    /// **DECODE Unit-D kill switch.** When `true` (the default), the record
+    /// burst may cache the top-of-stack in a Rust local (§7.2 flush-edge
+    /// contract). When `false` (`ASCRIPT_NO_DECODE_TOS=1`), TOS caching is
+    /// suppressed — the accessors pass straight through to `fiber.stack`. INERT
+    /// until Task 10.
+    decode_tos: bool,
+    /// **DECODE warmth threshold (Task-11 A/B knob).** A proto must be entered
+    /// at least this many times before its chunk is decoded. Production default
+    /// = `DECODE_THRESHOLD` (placeholder 8, pinned by Task-11 A/B data).
+    /// Test entry points set this to 0 so decoding triggers immediately. INERT
+    /// until Task 4 consults it.
+    decode_threshold: u16,
+    /// **DECODE stat counters (anti-false-green, DECODE §8.3).** All counters are
+    /// 0 until Task 4 (records retired), Task 8 (fused), Task 9 (inline), and
+    /// Task 10 (tos) wire them up. Compiled only under test/fuzzgen/fuzzing.
+    /// See [`DecodeStatsInner`] for field semantics.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    decode_stats: std::cell::Cell<crate::vm::run::DecodeStatsInner>,
     /// **CALL §4 A3 — fiber pool for re-entrant calls.**
     ///
     /// Holds recycled [`Fiber`]s that `take_pooled_fiber` / `return_pooled_fiber`
@@ -367,7 +436,13 @@ impl Vm {
         // CALL §8.1: call_fast defaults from the environment like specialize/sync_lane.
         let call_fast = specialize
             && std::env::var("ASCRIPT_NO_CALL_FAST").as_deref() != Ok("1");
-        Self::with_flags(interp, specialize, sync_lane, call_fast)
+        // DECODE Task 2: decode flags default from the environment (worker-isolate
+        // inheritance — the same pattern as ASCRIPT_NO_SYNC_LANE / ASCRIPT_NO_CALL_FAST).
+        let decode = std::env::var("ASCRIPT_NO_DECODE").as_deref() != Ok("1");
+        let decode_inline = std::env::var("ASCRIPT_NO_DECODE_INLINE").as_deref() != Ok("1");
+        let decode_tos = std::env::var("ASCRIPT_NO_DECODE_TOS").as_deref() != Ok("1");
+        let decode_threshold = Self::DECODE_THRESHOLD;
+        Self::with_all_flags(interp, specialize, sync_lane, call_fast, decode, decode_inline, decode_tos, decode_threshold)
     }
 
     /// Build a VM with `specialize` and `sync_lane` set explicitly (LANE §6.1).
@@ -385,17 +460,51 @@ impl Vm {
         Self::with_flags(interp, specialize, sync_lane, specialize)
     }
 
-    /// Build a VM with all three kill switches set explicitly (CALL §8.1).
+    /// Build a VM with all three legacy kill switches set explicitly (CALL §8.1).
     ///
-    /// The lowest-level constructor: does NOT consult environment variables.
-    /// Used by test entry points that need independent control of each switch
-    /// (`vm_run_source_no_call_fast` sets `specialize=true, sync_lane=true,
+    /// The lowest-level constructor (CALL era): does NOT consult environment
+    /// variables. Used by test entry points that need independent control of each
+    /// switch (`vm_run_source_no_call_fast` sets `specialize=true, sync_lane=true,
     /// call_fast=false` to isolate CALL divergences from IC/lane divergences).
+    ///
+    /// DECODE Task 2: delegates to [`with_all_flags`](Self::with_all_flags) with
+    /// `decode = true` (on), `decode_inline = true`, `decode_tos = true`, and
+    /// `decode_threshold = DECODE_THRESHOLD` so this constructor keeps its
+    /// existing callers working without change.
     pub fn with_flags(
         interp: Rc<Interp>,
         specialize: bool,
         sync_lane: bool,
         call_fast: bool,
+    ) -> Rc<Self> {
+        Self::with_all_flags(
+            interp,
+            specialize,
+            sync_lane,
+            call_fast,
+            true,  // decode = on
+            true,  // decode_inline = on
+            true,  // decode_tos = on
+            Self::DECODE_THRESHOLD,
+        )
+    }
+
+    /// **The lowest-level constructor (DECODE Task 2).** Accepts all kill
+    /// switches (specialize, sync_lane, call_fast, decode, decode_inline,
+    /// decode_tos) and the warmth threshold explicitly. Does NOT consult
+    /// environment variables — all test entry points that need DECODE-specific
+    /// control use this constructor so tests never set env vars (parallel-test
+    /// hygiene, the LANE/CALL pattern).
+    #[allow(clippy::too_many_arguments)] // DECODE adds 4 flags; a builder struct is overkill for an internal-only constructor
+    pub fn with_all_flags(
+        interp: Rc<Interp>,
+        specialize: bool,
+        sync_lane: bool,
+        call_fast: bool,
+        decode: bool,
+        decode_inline: bool,
+        decode_tos: bool,
+        decode_threshold: u16,
     ) -> Rc<Self> {
         let vm = Rc::new(Vm {
             interp,
@@ -425,6 +534,12 @@ impl Vm {
             #[cfg(any(test, feature = "fuzzgen", fuzzing))]
             shape_stats: std::cell::Cell::new(ShapeStats::default()),
             fiber_pool: RefCell::new(Vec::new()),
+            decode,
+            decode_inline,
+            decode_tos,
+            decode_threshold,
+            #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+            decode_stats: std::cell::Cell::new(DecodeStatsInner::default()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -515,6 +630,61 @@ impl Vm {
         let mut s = self.shape_stats.get();
         f(&mut s);
         self.shape_stats.set(s);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // DECODE — kill switches + stat counters (DECODE Task 2)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// **DECODE §2.3 — warmth threshold.** A proto must be entered at least this
+    /// many times before its chunk is decoded into a fixed-width record stream.
+    /// Placeholder value 8 — pinned by Task-11 threshold A/B data.
+    /// Test entry points override it to 0 so decoding triggers immediately.
+    /// INERT until Task 4 consults it; declared here so Task 4's `decode_threshold`
+    /// field initializer and the `ASCRIPT_DECODE_THRESHOLD` env knob reference a
+    /// single constant.
+    pub(crate) const DECODE_THRESHOLD: u16 = 8;
+
+    /// Whether the DECODE fast path is enabled. `true` = lazy decode + record
+    /// execution permitted; `false` = always byte-dispatch (INERT until Task 4).
+    pub fn decode(&self) -> bool {
+        self.decode
+    }
+
+    /// Whether DECODE Unit-C speculative inlining is enabled. INERT until Task 9.
+    pub fn decode_inline(&self) -> bool {
+        self.decode_inline
+    }
+
+    /// Whether DECODE Unit-D TOS caching is enabled. INERT until Task 10.
+    pub fn decode_tos(&self) -> bool {
+        self.decode_tos
+    }
+
+    /// The current DECODE warmth threshold. INERT until Task 4.
+    pub fn decode_threshold(&self) -> u16 {
+        self.decode_threshold
+    }
+
+    /// **DECODE §8.3 coverage counters.** Returns the raw `DecodeStatsInner`.
+    /// All fields are 0 until the corresponding task wires them up.
+    /// `#[doc(hidden)]` — test API only; not a stable surface.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    #[doc(hidden)]
+    pub fn decode_stats_inner(&self) -> DecodeStatsInner {
+        self.decode_stats.get()
+    }
+
+    /// **DECODE §8.3: bump one or more DECODE stat counters** (Cell, never held
+    /// across `.await`). Compiled only under test/fuzzgen/fuzzing. Not yet called
+    /// (INERT); wired in Task 4+ when each path lands.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn bump_decode_stat(&self, f: impl FnOnce(&mut DecodeStatsInner)) {
+        let mut s = self.decode_stats.get();
+        f(&mut s);
+        self.decode_stats.set(s);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
