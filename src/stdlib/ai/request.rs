@@ -17,7 +17,7 @@ use genai::{Client, ModelIden, ServiceTarget};
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 
 thread_local! {
     /// Fixture-replay seam (tests only). When `Some(base_url)`, the genai client's
@@ -228,8 +228,8 @@ fn default_endpoint_for(adapter: AdapterKind) -> Endpoint {
 /// var (when no explicit key) is NOT checked here — it surfaces as a Tier-1 error at
 /// call time (see `credential_missing_error`).
 pub(crate) fn resolve_model(model: &Value, span: Span) -> Result<ResolvedModel, Control> {
-    match model {
-        Value::Str(s) => {
+    match model.kind() {
+        ValueKind::Str(s) => {
             let s = s.as_ref();
             let Some((tag, name)) = s.split_once(':') else {
                 return Err(AsError::at(
@@ -253,7 +253,7 @@ pub(crate) fn resolve_model(model: &Value, span: Span) -> Result<ResolvedModel, 
                 api_version: None,
             })
         }
-        Value::Native(n) if n.kind == crate::value::NativeKind::AiModel => {
+        ValueKind::Native(n) if n.kind == crate::value::NativeKind::AiModel => {
             let tag = field_str(n, "provider").unwrap_or_default();
             let adapter = adapter_for(&tag).ok_or_else(|| {
                 Control::from(AsError::at(format!("ai: unknown provider '{}'", tag), span))
@@ -267,10 +267,10 @@ pub(crate) fn resolve_model(model: &Value, span: Span) -> Result<ResolvedModel, 
                 api_version: field_str(n, "apiVersion"),
             })
         }
-        other => Err(AsError::at(
+        _ => Err(AsError::at(
             format!(
                 "ai: 'model' must be a 'provider:model' string or a provider.model(...) handle, got {}",
-                crate::interp::type_name(other)
+                crate::interp::type_name(model)
             ),
             span,
         )
@@ -279,8 +279,8 @@ pub(crate) fn resolve_model(model: &Value, span: Span) -> Result<ResolvedModel, 
 }
 
 fn field_str(n: &crate::value::NativeObject, key: &str) -> Option<String> {
-    match n.fields.get(key) {
-        Some(Value::Str(s)) => Some(s.to_string()),
+    match n.fields.get(key).map(|v| v.kind()) {
+        Some(ValueKind::Str(s)) => Some(s.to_string()),
         _ => None,
     }
 }
@@ -304,8 +304,8 @@ pub(crate) fn credential_missing_error(m: &ResolvedModel) -> Option<Value> {
     if std::env::var(env_name).is_ok() {
         return None;
     }
-    Some(crate::interp::make_error(Value::Str(
-        format!("no credential for provider '{}'", m.provider_tag).into(),
+    Some(crate::interp::make_error(Value::str(
+        format!("no credential for provider '{}'", m.provider_tag),
     )))
 }
 
@@ -327,8 +327,8 @@ pub(crate) fn build_chat_request(opts: &Value, span: Span) -> Result<ChatRequest
     let messages = get_field(opts, "messages");
     let system = get_field(opts, "system");
 
-    let has_prompt = !matches!(prompt, Value::Nil);
-    let has_messages = !matches!(messages, Value::Nil);
+    let has_prompt = !matches!(prompt.kind(), ValueKind::Nil);
+    let has_messages = !matches!(messages.kind(), ValueKind::Nil);
     if has_prompt && has_messages {
         return Err(AsError::at(
             "ai.generate: 'prompt' and 'messages' are mutually exclusive — set only one",
@@ -342,13 +342,13 @@ pub(crate) fn build_chat_request(opts: &Value, span: Span) -> Result<ChatRequest
 
     let mut chat_messages: Vec<ChatMessage> = Vec::new();
     if has_prompt {
-        let p = match &prompt {
-            Value::Str(s) => s.to_string(),
-            other => {
+        let p = match prompt.kind() {
+            ValueKind::Str(s) => s.to_string(),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "ai.generate: 'prompt' must be a string, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&prompt)
                     ),
                     span,
                 )
@@ -357,13 +357,13 @@ pub(crate) fn build_chat_request(opts: &Value, span: Span) -> Result<ChatRequest
         };
         chat_messages.push(ChatMessage::user(p));
     } else {
-        let arr = match &messages {
-            Value::Array(a) => a.borrow().clone(),
-            other => {
+        let arr = match messages.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "ai.generate: 'messages' must be an array, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&messages)
                     ),
                     span,
                 )
@@ -376,7 +376,7 @@ pub(crate) fn build_chat_request(opts: &Value, span: Span) -> Result<ChatRequest
     }
 
     let mut req = ChatRequest::new(chat_messages);
-    if let Value::Str(s) = &system {
+    if let ValueKind::Str(s) = system.kind() {
         req = req.with_system(s.to_string());
     }
     Ok(req)
@@ -385,8 +385,8 @@ pub(crate) fn build_chat_request(opts: &Value, span: Span) -> Result<ChatRequest
 /// Build one genai `ChatMessage` from a `{role, content}` object. `content` is a
 /// string (text shorthand) or an array of typed parts (`text`/`image`/`file`).
 fn build_message(msg: &Value, span: Span) -> Result<ChatMessage, Control> {
-    let role_str = match get_field(msg, "role") {
-        Value::Str(s) => s.to_string(),
+    let role_str = match get_field(msg, "role").kind() {
+        ValueKind::Str(s) => s.to_string(),
         _ => {
             return Err(AsError::at(
                 "ai.generate: each message needs a string 'role'",
@@ -414,9 +414,9 @@ fn build_message(msg: &Value, span: Span) -> Result<ChatMessage, Control> {
 }
 
 fn build_content(content: &Value, span: Span) -> Result<MessageContent, Control> {
-    match content {
-        Value::Str(s) => Ok(MessageContent::from(s.to_string())),
-        Value::Array(a) => {
+    match content.kind() {
+        ValueKind::Str(s) => Ok(MessageContent::from(s.to_string())),
+        ValueKind::Array(a) => {
             let parts = a.borrow().clone();
             let mut out: Vec<ContentPart> = Vec::with_capacity(parts.len());
             for part in &parts {
@@ -424,10 +424,10 @@ fn build_content(content: &Value, span: Span) -> Result<MessageContent, Control>
             }
             Ok(MessageContent::from(out))
         }
-        other => Err(AsError::at(
+        _ => Err(AsError::at(
             format!(
                 "ai.generate: message 'content' must be a string or array of parts, got {}",
-                crate::interp::type_name(other)
+                crate::interp::type_name(content)
             ),
             span,
         )
@@ -436,13 +436,13 @@ fn build_content(content: &Value, span: Span) -> Result<MessageContent, Control>
 }
 
 fn build_content_part(part: &Value, span: Span) -> Result<ContentPart, Control> {
-    let ty = match get_field(part, "type") {
-        Value::Str(s) => s.to_string(),
+    let ty = match get_field(part, "type").kind() {
+        ValueKind::Str(s) => s.to_string(),
         _ => "text".to_string(),
     };
     match ty.as_str() {
-        "text" => match get_field(part, "text") {
-            Value::Str(s) => Ok(ContentPart::from_text(s.to_string())),
+        "text" => match get_field(part, "text").kind() {
+            ValueKind::Str(s) => Ok(ContentPart::from_text(s.to_string())),
             _ => Err(AsError::at("ai.generate: text part needs a string 'text'", span).into()),
         },
         "image" => build_binary_part(part, "image", span),
@@ -456,8 +456,8 @@ fn build_content_part(part: &Value, span: Span) -> Result<ContentPart, Control> 
 }
 
 fn build_binary_part(part: &Value, kind: &str, span: Span) -> Result<ContentPart, Control> {
-    let media_type = match get_field(part, "mediaType") {
-        Value::Str(s) => s.to_string(),
+    let media_type = match get_field(part, "mediaType").kind() {
+        ValueKind::Str(s) => s.to_string(),
         _ => {
             return Err(AsError::at(
                 format!("ai.generate: {} part needs a string 'mediaType'", kind),
@@ -467,9 +467,9 @@ fn build_binary_part(part: &Value, kind: &str, span: Span) -> Result<ContentPart
         }
     };
     // A URL string ('data' is a string) or raw bytes ('data' is Bytes).
-    match get_field(part, "data") {
-        Value::Str(url) => Ok(ContentPart::from_binary_url(media_type, url.to_string(), None)),
-        Value::Bytes(b) => {
+    match get_field(part, "data").kind() {
+        ValueKind::Str(url) => Ok(ContentPart::from_binary_url(media_type, url.to_string(), None)),
+        ValueKind::Bytes(b) => {
             use base64::Engine;
             let encoded = base64::engine::general_purpose::STANDARD.encode(b.borrow().as_slice());
             Ok(ContentPart::from_binary_base64(media_type, encoded, None))
@@ -502,10 +502,10 @@ pub(crate) fn parse_gen_opts(opts: &Value) -> GenOpts {
 
 /// Read a field from an `Object` or `Instance`; `Nil` if absent / not a container.
 pub(crate) fn get_field(v: &Value, key: &str) -> Value {
-    match v {
-        Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
-        Value::Instance(i) => i.borrow().get(key).unwrap_or(Value::Nil),
-        _ => Value::Nil,
+    match v.kind() {
+        ValueKind::Object(o) => o.get(key).unwrap_or(Value::nil()),
+        ValueKind::Instance(i) => i.borrow().get(key).unwrap_or(Value::nil()),
+        _ => Value::nil(),
     }
 }
 
@@ -518,8 +518,8 @@ pub(crate) fn make_provider(
     args: &[Value],
     span: Span,
 ) -> Result<Value, Control> {
-    let kind = match args.first() {
-        Some(Value::Str(s)) => s.to_string(),
+    let kind = match args.first().map(|v| v.kind()) {
+        Some(ValueKind::Str(s)) => s.to_string(),
         _ => {
             return Err(AsError::at(
                 "ai.provider(kind, config?): 'kind' must be a string",
@@ -532,11 +532,11 @@ pub(crate) fn make_provider(
         return Err(AsError::at(format!("ai: unknown provider '{}'", kind), span).into());
     }
     let mut fields = indexmap::IndexMap::new();
-    fields.insert("kind".to_string(), Value::Str(kind.clone().into()));
+    fields.insert("kind".to_string(), Value::str(kind.clone()));
     if let Some(cfg) = args.get(1) {
         for key in ["baseUrl", "apiKey", "apiVersion"] {
-            if let Value::Str(s) = get_field(cfg, key) {
-                fields.insert(key.to_string(), Value::Str(s));
+            if let OwnedKind::Str(s) = get_field(cfg, key).into_kind() {
+                fields.insert(key.to_string(), Value::str(s));
             }
         }
     }
@@ -552,11 +552,11 @@ pub(crate) fn make_model_from_provider(
 ) -> Value {
     let mut fields = indexmap::IndexMap::new();
     let kind = field_str(provider, "kind").unwrap_or_default();
-    fields.insert("provider".to_string(), Value::Str(kind.into()));
-    fields.insert("model".to_string(), Value::Str(model_id.into()));
+    fields.insert("provider".to_string(), Value::str(kind));
+    fields.insert("model".to_string(), Value::str(model_id));
     for key in ["baseUrl", "apiKey", "apiVersion"] {
         if let Some(v) = field_str(provider, key) {
-            fields.insert(key.to_string(), Value::Str(v.into()));
+            fields.insert(key.to_string(), Value::str(v));
         }
     }
     interp.make_native_data(crate::value::NativeKind::AiModel, fields)

@@ -13,7 +13,7 @@ use super::{arg, bi, want_number};
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 use indexmap::IndexMap;
 use std::time::Instant;
 
@@ -49,10 +49,11 @@ impl Interp {
     /// iteration. Timing wraps the entire loop with a monotonic `Instant`.
     async fn bench_measure(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let callee = arg(args, 0);
-        let iterations: u64 = match arg(args, 1) {
-            Value::Nil => DEFAULT_ITERATIONS,
-            v => {
-                let n = want_number(&v, span, "bench.measure iterations")?;
+        let iters_arg = arg(args, 1);
+        let iterations: u64 = match iters_arg.kind() {
+            ValueKind::Nil => DEFAULT_ITERATIONS,
+            _ => {
+                let n = want_number(&iters_arg, span, "bench.measure iterations")?;
                 if n < 1.0 || n.fract() != 0.0 {
                     return Err(AsError::at(
                         "bench.measure: iterations must be a positive integer",
@@ -68,7 +69,7 @@ impl Interp {
         for _ in 0..iterations {
             let result = self.call_value(callee.clone(), vec![], span).await?;
             // Drive any returned Future to completion (async fn path).
-            if let Value::Future(f) = result {
+            if let OwnedKind::Future(f) = result.into_kind() {
                 f.get().await?;
             }
         }
@@ -86,17 +87,17 @@ impl Interp {
 
         let mut obj = IndexMap::new();
         // NUM §4: an iteration count is an `int`; timings stay `float`.
-        obj.insert("iterations".to_string(), Value::Int(iterations as i64));
-        obj.insert("totalMs".to_string(), Value::Float(total_ms));
-        obj.insert("avgMs".to_string(), Value::Float(avg_ms));
+        obj.insert("iterations".to_string(), Value::int(iterations as i64));
+        obj.insert("totalMs".to_string(), Value::float(total_ms));
+        obj.insert("avgMs".to_string(), Value::float(avg_ms));
         // Cap opsPerSec at a very large but representable number if infinite.
         let ops = if ops_per_sec.is_infinite() {
             1e15_f64
         } else {
             ops_per_sec
         };
-        obj.insert("opsPerSec".to_string(), Value::Float(ops));
-        Ok(Value::Object(crate::value::ObjectCell::new(obj)))
+        obj.insert("opsPerSec".to_string(), Value::float(ops));
+        Ok(Value::object(obj))
     }
 
     /// `bench.compare({name: fn, ...}, iterations?) -> array<{name, avgMs, opsPerSec}>`
@@ -105,8 +106,8 @@ impl Interp {
     /// by avgMs ascending (fastest first).
     async fn bench_compare(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let map_val = arg(args, 0);
-        let entries = match &map_val {
-            Value::Object(o) => o.entries(),
+        let entries = match map_val.kind() {
+            ValueKind::Object(o) => o.entries(),
             _ => {
                 return Err(AsError::at(
                     format!(
@@ -123,12 +124,12 @@ impl Interp {
         let mut results: Vec<(String, f64, f64)> = Vec::new(); // (name, avgMs, opsPerSec)
 
         for (name, callee) in &entries {
-            let measure_args = match &iterations_arg {
-                Value::Nil => vec![callee.clone()],
-                it => vec![callee.clone(), it.clone()],
+            let measure_args = match iterations_arg.kind() {
+                ValueKind::Nil => vec![callee.clone()],
+                _ => vec![callee.clone(), iterations_arg.clone()],
             };
             let stats = self.bench_measure(&measure_args, span).await?;
-            if let Value::Object(o) = &stats {
+            if let ValueKind::Object(o) = stats.kind() {
                 let avg_ms = o.get("avgMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let ops = o.get("opsPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 results.push((name.to_string(), avg_ms, ops));
@@ -142,14 +143,14 @@ impl Interp {
             .into_iter()
             .map(|(name, avg_ms, ops_per_sec)| {
                 let mut obj = IndexMap::new();
-                obj.insert("name".to_string(), Value::Str(name.into()));
-                obj.insert("avgMs".to_string(), Value::Float(avg_ms));
-                obj.insert("opsPerSec".to_string(), Value::Float(ops_per_sec));
-                Value::Object(crate::value::ObjectCell::new(obj))
+                obj.insert("name".to_string(), Value::str(name));
+                obj.insert("avgMs".to_string(), Value::float(avg_ms));
+                obj.insert("opsPerSec".to_string(), Value::float(ops_per_sec));
+                Value::object(obj)
             })
             .collect();
 
-        Ok(Value::Array(crate::value::ArrayCell::new(out)))
+        Ok(Value::array(out))
     }
 }
 

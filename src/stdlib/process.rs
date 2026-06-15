@@ -9,7 +9,7 @@
 //!   permission denied, timeout) is the `err`; `check: true` flips a non-zero exit
 //!   into an err. `result = {stdout, stderr, stderrText, code, signal, success}`.
 //! - `spawn(cmd, args, opts?) -> [child, err]` — streaming: returns a
-//!   `Value::Native(kind=ChildProcess)` with `fields = {pid}` and methods `stdin`
+//!   `Value::native(kind=ChildProcess)` with `fields = {pid}` and methods `stdin`
 //!   (→ a Writer native), `stdout`/`stderr` (→ Reader natives), `wait()`, `kill(sig?)`.
 //!   The child + its piped stdio live in the interp `resources` table.
 //!
@@ -22,7 +22,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use std::cell::RefCell;
 use std::process::Stdio;
 use std::rc::Rc;
@@ -119,11 +119,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn obj(map: indexmap::IndexMap<String, Value>) -> Value {
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object(map)
 }
 
 /// Parsed, validated options shared by `run` and `spawn`.
@@ -156,14 +156,14 @@ impl Default for Opts {
 
 /// Pull a string/bytes value into raw bytes (for `stdin` / writer `write`).
 fn data_to_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
-    match v {
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
-        Value::Bytes(b) => Ok(b.borrow().clone()),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
+        ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+        _ => Err(AsError::at(
             format!(
                 "{} expects a string or bytes, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -174,18 +174,21 @@ fn data_to_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
 fn parse_opts(v: Option<&Value>, span: Span) -> Result<Opts, Control> {
     let mut opts = Opts::default();
     let map = match v {
-        None | Some(Value::Nil) => return Ok(opts),
-        Some(Value::Object(o)) => o.clone(),
-        Some(other) => {
-            return Err(AsError::at(
-                format!(
-                    "process options must be an object, got {}",
-                    crate::interp::type_name(other)
-                ),
-                span,
-            )
-            .into())
-        }
+        None => return Ok(opts),
+        Some(other) => match other.kind() {
+            ValueKind::Nil => return Ok(opts),
+            ValueKind::Object(o) => o.clone(),
+            _ => {
+                return Err(AsError::at(
+                    format!(
+                        "process options must be an object, got {}",
+                        crate::interp::type_name(other)
+                    ),
+                    span,
+                )
+                .into())
+            }
+        },
     };
     for (k, val) in map.entries() {
         match k.as_ref() {
@@ -207,12 +210,12 @@ fn parse_opts(v: Option<&Value>, span: Span) -> Result<Opts, Control> {
             "env" => {
                 let env_obj = super::want_object(&val, span, "process env")?;
                 for (ek, ev) in env_obj.entries() {
-                    match &ev {
+                    match ev.kind() {
                         // A nil-valued key UNSETS the variable.
-                        Value::Nil => opts.env.push((ek.to_string(), None)),
-                        other => opts
+                        ValueKind::Nil => opts.env.push((ek.to_string(), None)),
+                        _ => opts
                             .env
-                            .push((ek.to_string(), Some(value_as_env_string(other, span)?))),
+                            .push((ek.to_string(), Some(value_as_env_string(&ev, span)?))),
                     }
                 }
             }
@@ -225,13 +228,13 @@ fn parse_opts(v: Option<&Value>, span: Span) -> Result<Opts, Control> {
 
 /// env values: accept strings (and numbers/bools, coerced via display) as values.
 fn value_as_env_string(v: &Value, span: Span) -> Result<String, Control> {
-    match v {
-        Value::Str(s) => Ok(s.to_string()),
-        Value::Float(_) | Value::Bool(_) => Ok(v.to_string()),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.to_string()),
+        ValueKind::Float(_) | ValueKind::Bool(_) => Ok(v.to_string()),
+        _ => Err(AsError::at(
             format!(
                 "process env values must be strings, got {}",
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -314,12 +317,12 @@ fn status_fields(status: std::process::ExitStatus) -> (Value, Value, bool) {
 
     // NUM §4: an exit code is an `Int`.
     let code_v = match code {
-        Some(c) => Value::Int(c as i64),
-        None => Value::Nil,
+        Some(c) => Value::int(c as i64),
+        None => Value::nil(),
     };
     let signal_v = match signal {
-        Some(s) => Value::Str(s.into()),
-        None => Value::Nil,
+        Some(s) => Value::str(s),
+        None => Value::nil(),
     };
     let success = code == Some(0);
     (code_v, signal_v, success)
@@ -344,16 +347,16 @@ fn status_object(code: Value, signal: Value, success: bool) -> Value {
     let mut m = indexmap::IndexMap::new();
     m.insert("code".to_string(), code);
     m.insert("signal".to_string(), signal);
-    m.insert("success".to_string(), Value::Bool(success));
+    m.insert("success".to_string(), Value::bool_(success));
     obj(m)
 }
 
 /// Wrap captured bytes as Str (lossy) or Bytes per `capture`.
 fn captured_value(bytes: Vec<u8>, capture: Capture) -> Value {
     match capture {
-        Capture::Bytes => Value::Bytes(Rc::new(RefCell::new(bytes))),
+        Capture::Bytes => Value::bytes_rc(Rc::new(RefCell::new(bytes))),
         // Str/Inherit/Null: Inherit & Null produce empty buffers; decode lossily.
-        _ => Value::Str(String::from_utf8_lossy(&bytes).into_owned().into()),
+        _ => Value::str(String::from_utf8_lossy(&bytes).into_owned()),
     }
 }
 
@@ -374,14 +377,15 @@ impl Interp {
 
     async fn process_run(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let cmd = want_string(&arg(args, 0), span, "process.run")?;
-        let arg_list = match arg(args, 1) {
-            Value::Nil => Vec::new(),
-            Value::Array(a) => a.borrow().clone(),
-            other => {
+        let arg1 = arg(args, 1);
+        let arg_list = match arg1.kind() {
+            ValueKind::Nil => Vec::new(),
+            ValueKind::Array(a) => a.borrow().clone(),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "process.run args must be an array, got {}",
-                        crate::interp::type_name(&other)
+                        crate::interp::type_name(&arg1)
                     ),
                     span,
                 )
@@ -469,23 +473,24 @@ impl Interp {
         let mut result = indexmap::IndexMap::new();
         result.insert("stdout".to_string(), stdout_v);
         result.insert("stderr".to_string(), stderr_v);
-        result.insert("stderrText".to_string(), Value::Str(stderr_text.into()));
+        result.insert("stderrText".to_string(), Value::str(stderr_text));
         result.insert("code".to_string(), code);
         result.insert("signal".to_string(), signal);
-        result.insert("success".to_string(), Value::Bool(success));
-        Ok(make_pair(obj(result), Value::Nil))
+        result.insert("success".to_string(), Value::bool_(success));
+        Ok(make_pair(obj(result), Value::nil()))
     }
 
     async fn process_spawn(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let cmd = want_string(&arg(args, 0), span, "process.spawn")?;
-        let arg_list = match arg(args, 1) {
-            Value::Nil => Vec::new(),
-            Value::Array(a) => a.borrow().clone(),
-            other => {
+        let arg1 = arg(args, 1);
+        let arg_list = match arg1.kind() {
+            ValueKind::Nil => Vec::new(),
+            ValueKind::Array(a) => a.borrow().clone(),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "process.spawn args must be an array, got {}",
-                        crate::interp::type_name(&other)
+                        crate::interp::type_name(&arg1)
                     ),
                     span,
                 )
@@ -546,7 +551,7 @@ impl Interp {
         let mut fields = indexmap::IndexMap::new();
         fields.insert(
             "pid".to_string(),
-            pid.map(|p| Value::Int(p as i64)).unwrap_or(Value::Nil),
+            pid.map(|p| Value::int(p as i64)).unwrap_or(Value::nil()),
         );
         // Stash the child-stream handles so `child.stdin`/`stdout`/`stderr` return them.
         if let Some(h) = stdin_id {
@@ -564,7 +569,7 @@ impl Interp {
             fields,
             ResourceState::ChildProcess(child),
         );
-        Ok(make_pair(handle, Value::Nil))
+        Ok(make_pair(handle, Value::nil()))
     }
 
     /// Dispatch a method on a process child / reader / writer handle.
@@ -601,7 +606,7 @@ impl Interp {
                 .fields
                 .get(m.method.as_str())
                 .cloned()
-                .unwrap_or(Value::Nil)),
+                .unwrap_or(Value::nil())),
             "wait" => {
                 // `wait` consumes the child: take it so the resource is gone afterward.
                 let mut child = match self.take_resource(id) {
@@ -617,7 +622,8 @@ impl Interp {
                 // afterward returns nil (drain BEFORE wait — the normal pattern);
                 // a writer used after wait degrades to a use-after-close panic.
                 for name in ["stdin", "stdout", "stderr"] {
-                    if let Some(Value::Native(n)) = m.receiver.fields.get(name) {
+                    if let Some(ValueKind::Native(n)) = m.receiver.fields.get(name).map(|x| x.kind())
+                    {
                         self.take_resource(n.id);
                     }
                 }
@@ -631,8 +637,11 @@ impl Interp {
             }
             "kill" => {
                 let sig = match args.first() {
-                    None | Some(Value::Nil) => "KILL".to_string(),
-                    Some(v) => want_string(v, span, "child.kill")?.to_string(),
+                    None => "KILL".to_string(),
+                    Some(v) => match v.kind() {
+                        ValueKind::Nil => "KILL".to_string(),
+                        _ => want_string(v, span, "child.kill")?.to_string(),
+                    },
                 };
                 // `kill_child` is synchronous; take the child out, signal it, and put
                 // it back so a later `wait()` can still reap the (now-dying) process.
@@ -643,7 +652,7 @@ impl Interp {
                 let res = kill_child(&mut child, &sig, span);
                 self.return_resource(id, ResourceState::ChildProcess(child));
                 res?;
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => {
                 Err(AsError::at(format!("childProcess has no method '{}'", other), span).into())
@@ -661,12 +670,13 @@ impl Interp {
         match method {
             "read" => {
                 let n = match args.first() {
-                    None | Some(Value::Nil) => DEFAULT_CHUNK,
+                    None => DEFAULT_CHUNK,
                     // Guard before the cast: an `Inf`/`NaN`/out-of-range `n` would cast
                     // to `usize::MAX` and abort the host via `buf.reserve(n)`.
-                    Some(v) => {
-                        super::want_count(v, span, "reader.read", super::MAX_ALLOC_COUNT)?
-                    }
+                    Some(v) => match v.kind() {
+                        ValueKind::Nil => DEFAULT_CHUNK,
+                        _ => super::want_count(v, span, "reader.read", super::MAX_ALLOC_COUNT)?,
+                    },
                 };
                 // read(0) is a no-op: return an empty chunk WITHOUT touching the
                 // resource. (An empty read buffer yields Ok(0), which the match below
@@ -678,7 +688,7 @@ impl Interp {
                     });
                     return match capture {
                         Some(capture) => Ok(captured_value(Vec::new(), capture)),
-                        None => Ok(Value::Nil), // gone → EOF
+                        None => Ok(Value::nil()), // gone → EOF
                     };
                 }
                 // A Reader degrades to EOF (nil) once its resource is gone, rather
@@ -690,12 +700,12 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(Value::Nil);
+                        return Ok(Value::nil());
                     }
                 };
                 let mut buf = Vec::new();
                 match reader.read_upto(n, &mut buf).await {
-                    Ok(0) => Ok(Value::Nil), // EOF: drop the reader
+                    Ok(0) => Ok(Value::nil()), // EOF: drop the reader
                     Ok(_) => {
                         self.return_resource(id, ResourceState::Reader { reader, capture });
                         Ok(captured_value(buf, capture))
@@ -710,12 +720,12 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(Value::Nil); // gone → EOF
+                        return Ok(Value::nil()); // gone → EOF
                     }
                 };
                 let mut buf = Vec::new();
                 match reader.read_line_bytes(&mut buf).await {
-                    Ok(0) => Ok(Value::Nil), // EOF: drop the reader
+                    Ok(0) => Ok(Value::nil()), // EOF: drop the reader
                     Ok(_) => {
                         // Strip a single trailing '\n' and an optional preceding '\r'.
                         if buf.last() == Some(&b'\n') {
@@ -743,7 +753,7 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(Value::Nil); // gone → EOF
+                        return Ok(Value::nil()); // gone → EOF
                     }
                 };
                 let mut buf = Vec::new();
@@ -781,7 +791,7 @@ impl Interp {
                 let res = writer.write_all(&data).await;
                 self.return_resource(id, ResourceState::Writer(writer));
                 match res {
-                    Ok(_) => Ok(Value::Nil),
+                    Ok(_) => Ok(Value::nil()),
                     Err(e) => Err(AsError::at(format!("writer.write failed: {}", e), span).into()),
                 }
             }
@@ -790,7 +800,7 @@ impl Interp {
                 match self.take_resource(id) {
                     Some(ResourceState::Writer(mut w)) => {
                         let _ = w.shutdown().await;
-                        Ok(Value::Nil)
+                        Ok(Value::nil())
                     }
                     _ => Err(use_after_close(span)),
                 }

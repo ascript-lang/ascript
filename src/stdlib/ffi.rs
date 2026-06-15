@@ -17,7 +17,7 @@
 //! before it.
 //!
 //! **Sized C ints marshal OVER `int`** (NUM §10): `i8`…`u64`/`size` exist only at the
-//! C-ABI boundary, described as `ffi.i32` etc. and carried in/out over `Value::Int`
+//! C-ABI boundary, described as `ffi.i32` etc. and carried in/out over `Value::int`
 //! (i64). There is NO new `Value` kind. Narrowing is CHECKED (a too-large value → a
 //! Tier-2 panic), except `u64`/`size`, which take the i64 **bit pattern** with no
 //! sign check (§3.3).
@@ -31,7 +31,9 @@
 use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, Value};
+use crate::value::{NativeKind, Value, ValueKind};
+#[cfg(test)]
+use crate::value::OwnedKind;
 use libffi::middle::{Arg, Cif, CodePtr, Type};
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -122,12 +124,12 @@ impl FfiType {
 
 /// Build the Tier-1 ok pair `[value, nil]` (`ffi.open`/`lib.symbol` success).
 fn ok_pair(value: Value) -> Value {
-    crate::interp::make_pair(value, Value::Nil)
+    crate::interp::make_pair(value, Value::nil())
 }
 
 /// Build the Tier-1 err pair `[nil, {message}]` (recoverable open/symbol failure).
 fn err_pair(msg: Value) -> Value {
-    crate::interp::make_pair(Value::Nil, crate::interp::make_error(msg))
+    crate::interp::make_pair(Value::nil(), crate::interp::make_error(msg))
 }
 
 /// Build a `ffi.<t>` descriptor: a tagged Object `{__ffi: "<tag>"}` — NOT a new
@@ -135,16 +137,18 @@ fn err_pair(msg: Value) -> Value {
 /// static checker (synths as `Unknown`).
 fn descriptor(t: FfiType) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("__ffi".to_string(), Value::Str(t.tag().into()));
-    Value::Object(crate::value::ObjectCell::new(m))
+    m.insert("__ffi".to_string(), Value::str(t.tag()));
+    Value::object_cell(crate::value::ObjectCell::new(m))
 }
 
 /// Read the `FfiType` out of a `ffi.<t>` descriptor Object, or `None` if `v` is not a
 /// descriptor. The §3.3 "argtypes not `ffi.*` descriptors → Tier-2" check uses this.
 fn descriptor_type(v: &Value) -> Option<FfiType> {
-    if let Value::Object(o) = v {
-        if let Some(Value::Str(tag)) = o.get("__ffi") {
-            return FfiType::from_tag(&tag);
+    if let ValueKind::Object(o) = v.kind() {
+        if let Some(tag_v) = o.get("__ffi") {
+            if let ValueKind::Str(tag) = tag_v.kind() {
+                return FfiType::from_tag(tag);
+            }
         }
     }
     None
@@ -230,12 +234,22 @@ impl Interp {
             "cstr" => ffi_cstr(args, span),
             // `read_cstr` works on either a Bytes buffer (resolved here) or a
             // ForeignPtr (needs the resource table → the interp-aware path).
-            "read_cstr" => match super::arg(args, 0) {
-                Value::Native(n) if n.kind == NativeKind::ForeignPtr => {
-                    self.ffi_read_cstr_ptr(n.id, span)
+            "read_cstr" => {
+                let a0 = super::arg(args, 0);
+                let foreign_ptr_id = if let ValueKind::Native(n) = a0.kind() {
+                    if n.kind == NativeKind::ForeignPtr {
+                        Some(n.id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match foreign_ptr_id {
+                    Some(id) => self.ffi_read_cstr_ptr(id, span),
+                    None => ffi_read_cstr(&[a0], span),
                 }
-                other => ffi_read_cstr(&[other], span),
-            },
+            }
             "alloc" => ffi_alloc(args, span),
             "get" => ffi_get(args, span),
             "set" => ffi_set(args, span),
@@ -276,7 +290,7 @@ impl Interp {
                 Ok(ok_pair(handle))
             }
             Err(e) => Ok(err_pair(
-                Value::Str(format!("ffi.open: {e}").into()),
+                Value::str(format!("ffi.open: {e}")),
             )),
         }
     }
@@ -334,16 +348,16 @@ impl Interp {
                     *sym
                 }
                 Err(e) => {
-                    return Ok(err_pair(Value::Str(
-                        format!("lib.symbol: {e}").into(),
+                    return Ok(err_pair(Value::str(
+                        format!("lib.symbol: {e}"),
                     )))
                 }
             }
         };
 
         if addr.is_null() {
-            return Ok(err_pair(Value::Str(
-                format!("lib.symbol: symbol '{name}' resolved to a null address").into(),
+            return Ok(err_pair(Value::str(
+                format!("lib.symbol: symbol '{name}' resolved to a null address"),
             )));
         }
 
@@ -410,8 +424,8 @@ impl Interp {
 /// Validate that `v` is an array of `ffi.*` type descriptors and collect them. A
 /// non-array or a non-descriptor element is a Tier-2 panic (§3.3 malformed signature).
 fn parse_argtypes(v: &Value, span: Span) -> Result<Vec<FfiType>, Control> {
-    let arr = match v {
-        Value::Array(a) => a.borrow().clone(),
+    let arr = match v.kind() {
+        ValueKind::Array(a) => a.borrow().clone(),
         _ => {
             return Err(AsError::at(
                 "lib.symbol: argtypes must be an array of ffi.* type descriptors".to_string(),
@@ -591,9 +605,9 @@ fn invoke_symbol(
             FfiType::Ptr => {
                 let p = marshal_ptr(interp, val, i, span, &mut bytes_guards)?;
                 // FFI Task 10: track ptr args for the determinism out-param seam.
-                match val {
-                    Value::Bytes(b) => ptr_bytes_args.push((i, b.clone())),
-                    Value::Native(nk) if nk.kind == NativeKind::ForeignPtr => {
+                match val.kind() {
+                    ValueKind::Bytes(b) => ptr_bytes_args.push((i, b.clone())),
+                    ValueKind::Native(nk) if nk.kind == NativeKind::ForeignPtr => {
                         has_foreign_ptr_arg = true;
                     }
                     _ => {}
@@ -703,22 +717,22 @@ fn invoke_symbol(
         match sym.ret {
             // Signed sub-register ints: call at i64 register width, then narrow to the
             // declared width's value (sign-correct via the intermediate cast).
-            FfiType::I8 => Value::Int(sym.cif.call::<i64>(code, &ffi_args) as i8 as i64),
-            FfiType::I16 => Value::Int(sym.cif.call::<i64>(code, &ffi_args) as i16 as i64),
-            FfiType::I32 => Value::Int(sym.cif.call::<i64>(code, &ffi_args) as i32 as i64),
-            FfiType::I64 => Value::Int(sym.cif.call::<i64>(code, &ffi_args)),
+            FfiType::I8 => Value::int(sym.cif.call::<i64>(code, &ffi_args) as i8 as i64),
+            FfiType::I16 => Value::int(sym.cif.call::<i64>(code, &ffi_args) as i16 as i64),
+            FfiType::I32 => Value::int(sym.cif.call::<i64>(code, &ffi_args) as i32 as i64),
+            FfiType::I64 => Value::int(sym.cif.call::<i64>(code, &ffi_args)),
             // Unsigned sub-register ints: call at u64 register width, mask to the
             // declared width (zero-extended), then carry over `int`.
-            FfiType::U8 => Value::Int((sym.cif.call::<u64>(code, &ffi_args) as u8) as i64),
-            FfiType::U16 => Value::Int((sym.cif.call::<u64>(code, &ffi_args) as u16) as i64),
-            FfiType::U32 => Value::Int((sym.cif.call::<u64>(code, &ffi_args) as u32) as i64),
+            FfiType::U8 => Value::int((sym.cif.call::<u64>(code, &ffi_args) as u8) as i64),
+            FfiType::U16 => Value::int((sym.cif.call::<u64>(code, &ffi_args) as u16) as i64),
+            FfiType::U32 => Value::int((sym.cif.call::<u64>(code, &ffi_args) as u32) as i64),
             // §3.3 output asymmetry: a u64/size whose top bit is set comes back as the
             // two's-complement bit pattern (a negative `int`); bit-identical round-trip.
             // u64/usize are register-width — no narrowing.
-            FfiType::U64 => Value::Int(sym.cif.call::<u64>(code, &ffi_args) as i64),
-            FfiType::Size => Value::Int(sym.cif.call::<usize>(code, &ffi_args) as i64),
-            FfiType::F32 => Value::Float(sym.cif.call::<f32>(code, &ffi_args) as f64),
-            FfiType::F64 => Value::Float(sym.cif.call::<f64>(code, &ffi_args)),
+            FfiType::U64 => Value::int(sym.cif.call::<u64>(code, &ffi_args) as i64),
+            FfiType::Size => Value::int(sym.cif.call::<usize>(code, &ffi_args) as i64),
+            FfiType::F32 => Value::float(sym.cif.call::<f32>(code, &ffi_args) as f64),
+            FfiType::F64 => Value::float(sym.cif.call::<f64>(code, &ffi_args)),
             FfiType::Ptr => {
                 let p: *mut c_void = sym.cif.call::<*mut c_void>(code, &ffi_args);
                 // A returned pointer becomes an opaque ForeignPtr handle. (Unreachable
@@ -731,7 +745,7 @@ fn invoke_symbol(
             }
             FfiType::Void => {
                 sym.cif.call::<()>(code, &ffi_args);
-                Value::Nil
+                Value::nil()
             }
         }
     };
@@ -758,9 +772,9 @@ fn invoke_symbol(
 /// return is refused before recording, §7B), so the catch-all is `Void`.
 fn value_to_ffi_ret(v: &Value) -> crate::det::FfiRet {
     use crate::det::FfiRet;
-    match v {
-        Value::Int(n) => FfiRet::Int(*n),
-        Value::Float(f) => FfiRet::Float(*f),
+    match v.kind() {
+        ValueKind::Int(n) => FfiRet::Int(n),
+        ValueKind::Float(f) => FfiRet::Float(f),
         _ => FfiRet::Void,
     }
 }
@@ -770,9 +784,9 @@ fn value_to_ffi_ret(v: &Value) -> crate::det::FfiRet {
 fn ffi_ret_to_value(_interp: &Interp, ret: crate::det::FfiRet) -> Value {
     use crate::det::FfiRet;
     match ret {
-        FfiRet::Int(n) => Value::Int(n),
-        FfiRet::Float(f) => Value::Float(f),
-        FfiRet::Void => Value::Nil,
+        FfiRet::Int(n) => Value::int(n),
+        FfiRet::Float(f) => Value::float(f),
+        FfiRet::Void => Value::nil(),
     }
 }
 
@@ -787,13 +801,13 @@ fn marshal_ptr(
     span: Span,
     bytes_guards: &mut Vec<Rc<std::cell::RefCell<Vec<u8>>>>,
 ) -> Result<*mut c_void, Control> {
-    match val {
-        Value::Bytes(b) => {
+    match val.kind() {
+        ValueKind::Bytes(b) => {
             let ptr = b.borrow().as_ptr() as *mut c_void;
             bytes_guards.push(b.clone());
             Ok(ptr)
         }
-        Value::Native(n) if n.kind == NativeKind::ForeignPtr => {
+        ValueKind::Native(n) if n.kind == NativeKind::ForeignPtr => {
             let addr = interp.with_resource(n.id, |r| match r {
                 Some(ResourceState::ForeignPtr(addr)) => Some(*addr),
                 _ => None,
@@ -807,11 +821,11 @@ fn marshal_ptr(
                 .into()),
             }
         }
-        Value::Nil => Ok(std::ptr::null_mut()),
-        other => Err(AsError::at(
+        ValueKind::Nil => Ok(std::ptr::null_mut()),
+        _ => Err(AsError::at(
             format!(
                 "ffi: arg {i} for ffi.ptr must be Bytes, a foreign pointer, or nil (got {})",
-                crate::interp::type_name(other)
+                crate::interp::type_name(val)
             ),
             span,
         )
@@ -881,7 +895,7 @@ fn ffi_cstr(args: &[Value], span: Span) -> Result<Value, Control> {
     }
     let mut bytes = s.as_bytes().to_vec();
     bytes.push(0);
-    Ok(Value::Bytes(Rc::new(std::cell::RefCell::new(bytes))))
+    Ok(Value::bytes_rc(Rc::new(std::cell::RefCell::new(bytes))))
 }
 
 /// `ffi.read_cstr(ptr) -> string` — copy from a `ForeignPtr` (or a `Bytes` buffer)
@@ -889,19 +903,20 @@ fn ffi_cstr(args: &[Value], span: Span) -> Result<Value, Control> {
 /// inherently `unsafe` (the C library owns the buffer's validity); a `ForeignPtr` from
 /// a prior call is assumed live by the script's contract (documented §3.4).
 fn ffi_read_cstr(args: &[Value], span: Span) -> Result<Value, Control> {
-    match super::arg(args, 0) {
-        Value::Bytes(b) => {
+    let a0 = super::arg(args, 0);
+    match a0.kind() {
+        ValueKind::Bytes(b) => {
             let buf = b.borrow();
             let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
             let s = String::from_utf8_lossy(&buf[..end]).into_owned();
-            Ok(Value::Str(s.into()))
+            Ok(Value::str(s))
         }
         // A ForeignPtr is dispatched to `ffi_read_cstr_ptr` (the interp-aware path) by
         // `call_ffi` BEFORE reaching here, so this free fn only sees Bytes / others.
-        other => Err(AsError::at(
+        _ => Err(AsError::at(
             format!(
                 "ffi.read_cstr expects Bytes or a foreign pointer, got {}",
-                crate::interp::type_name(&other)
+                crate::interp::type_name(&a0)
             ),
             span,
         )
@@ -922,8 +937,8 @@ fn ffi_struct(args: &[Value], span: Span) -> Result<Value, Control> {
     let mut field_descs: Vec<Value> = Vec::with_capacity(fields_arr.len());
 
     for (i, entry) in fields_arr.iter().enumerate() {
-        let pair = match entry {
-            Value::Array(a) => a.borrow().clone(),
+        let pair = match entry.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
             _ => {
                 return Err(AsError::at(
                     format!("ffi.struct: field {i} must be [name, ffi.<type>]"),
@@ -939,8 +954,8 @@ fn ffi_struct(args: &[Value], span: Span) -> Result<Value, Control> {
             )
             .into());
         }
-        let name = match &pair[0] {
-            Value::Str(s) => s.to_string(),
+        let name = match pair[0].kind() {
+            ValueKind::Str(s) => s.to_string(),
             _ => {
                 return Err(AsError::at(
                     format!("ffi.struct: field {i} name must be a string"),
@@ -968,24 +983,24 @@ fn ffi_struct(args: &[Value], span: Span) -> Result<Value, Control> {
         max_align = max_align.max(align);
 
         let mut fd = indexmap::IndexMap::new();
-        fd.insert("name".to_string(), Value::Str(name.into()));
-        fd.insert("type".to_string(), Value::Str(ty.tag().into()));
-        fd.insert("offset".to_string(), Value::Int(offset as i64));
-        field_descs.push(Value::Object(crate::value::ObjectCell::new(fd)));
+        fd.insert("name".to_string(), Value::str(name));
+        fd.insert("type".to_string(), Value::str(ty.tag()));
+        fd.insert("offset".to_string(), Value::int(offset as i64));
+        field_descs.push(Value::object_cell(crate::value::ObjectCell::new(fd)));
 
         offset += size;
     }
     let total = align_up(offset, max_align);
 
     let mut layout = indexmap::IndexMap::new();
-    layout.insert("__ffi_struct".to_string(), Value::Bool(true));
-    layout.insert("size".to_string(), Value::Int(total as i64));
-    layout.insert("align".to_string(), Value::Int(max_align as i64));
+    layout.insert("__ffi_struct".to_string(), Value::bool_(true));
+    layout.insert("size".to_string(), Value::int(total as i64));
+    layout.insert("align".to_string(), Value::int(max_align as i64));
     layout.insert(
         "fields".to_string(),
-        Value::Array(crate::value::ArrayCell::new(field_descs)),
+        Value::array_cell(crate::value::ArrayCell::new(field_descs)),
     );
-    Ok(Value::Object(crate::value::ObjectCell::new(layout)))
+    Ok(Value::object_cell(crate::value::ObjectCell::new(layout)))
 }
 
 /// The size + alignment (bytes) of a scalar C type for struct layout.
@@ -1010,25 +1025,34 @@ fn align_up(offset: usize, align: usize) -> usize {
 /// You pass it as a `ffi.ptr` out-param, then read fields back with `ffi.get`.
 fn ffi_alloc(args: &[Value], span: Span) -> Result<Value, Control> {
     let layout = super::want_object(&super::arg(args, 0), span, "ffi.alloc")?;
-    let size = match layout.get("size").as_ref() {
+    let size = match layout.get("size") {
         // Bound the size before the `vec![0u8; size]` allocation: a crafted layout
         // object with a huge `size` (`i64::MAX`) would otherwise OOM-abort the host.
         // The cap is `u32::MAX` (= 4 GiB − 1 byte; "4 GiB" below is the rounded
         // user-facing label) — far beyond any legitimate C struct.
-        Some(Value::Int(n)) if *n >= 0 && *n <= u32::MAX as i64 => *n as usize,
-        Some(Value::Int(n)) if *n < 0 => {
-            return Err(
-                AsError::at(format!("ffi.alloc: layout size {} is negative", n), span).into(),
-            )
-        }
-        Some(Value::Int(n)) if *n > u32::MAX as i64 => {
-            return Err(AsError::at(
-                format!("ffi.alloc: layout size {} exceeds the maximum (4 GiB)", n),
-                span,
-            )
-            .into())
-        }
-        _ => {
+        Some(v) => match v.kind() {
+            ValueKind::Int(n) if n >= 0 && n <= u32::MAX as i64 => n as usize,
+            ValueKind::Int(n) if n < 0 => {
+                return Err(
+                    AsError::at(format!("ffi.alloc: layout size {} is negative", n), span).into(),
+                )
+            }
+            ValueKind::Int(n) if n > u32::MAX as i64 => {
+                return Err(AsError::at(
+                    format!("ffi.alloc: layout size {} exceeds the maximum (4 GiB)", n),
+                    span,
+                )
+                .into())
+            }
+            _ => {
+                return Err(AsError::at(
+                    "ffi.alloc: argument is not a ffi.struct layout".to_string(),
+                    span,
+                )
+                .into())
+            }
+        },
+        None => {
             return Err(AsError::at(
                 "ffi.alloc: argument is not a ffi.struct layout".to_string(),
                 span,
@@ -1036,7 +1060,7 @@ fn ffi_alloc(args: &[Value], span: Span) -> Result<Value, Control> {
             .into())
         }
     };
-    Ok(Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; size]))))
+    Ok(Value::bytes_rc(Rc::new(std::cell::RefCell::new(vec![0u8; size]))))
 }
 
 /// Resolve a `(FfiType, offset)` for field `name` in `layout`, or a Tier-2 panic.
@@ -1047,8 +1071,9 @@ fn layout_field(
     ctx: &str,
 ) -> Result<(FfiType, usize), Control> {
     let obj = super::want_object(layout, span, ctx)?;
-    let fields = match obj.get("fields") {
-        Some(Value::Array(a)) => a.borrow().clone(),
+    let fields_field = obj.get("fields");
+    let fields = match fields_field.as_ref().map(|v| v.kind()) {
+        Some(ValueKind::Array(a)) => a.borrow().clone(),
         _ => {
             return Err(AsError::at(
                 format!("{ctx}: argument is not a ffi.struct layout"),
@@ -1058,30 +1083,44 @@ fn layout_field(
         }
     };
     for fd in &fields {
-        if let Value::Object(o) = fd {
-            if let Some(Value::Str(fname)) = o.get("name") {
-                if fname.as_ref() == name {
-                    let ty = match o.get("type") {
-                        Some(Value::Str(tag)) => FfiType::from_tag(&tag),
-                        _ => None,
-                    }
-                    .ok_or_else(|| {
-                        Control::Panic(AsError::at(
-                            format!("{ctx}: field '{name}' has an invalid type tag"),
-                            span,
-                        ))
-                    })?;
-                    let off = match o.get("offset") {
-                        Some(Value::Int(n)) if n >= 0 => n as usize,
-                        _ => {
-                            return Err(AsError::at(
-                                format!("{ctx}: field '{name}' has an invalid offset"),
-                                span,
-                            )
-                            .into())
+        if let ValueKind::Object(o) = fd.kind() {
+            if let Some(fname_v) = o.get("name") {
+                if let ValueKind::Str(fname) = fname_v.kind() {
+                    if fname.as_ref() == name {
+                        let ty = match o.get("type") {
+                            Some(tag_v) => match tag_v.kind() {
+                                ValueKind::Str(tag) => FfiType::from_tag(tag),
+                                _ => None,
+                            },
+                            _ => None,
                         }
-                    };
-                    return Ok((ty, off));
+                        .ok_or_else(|| {
+                            Control::Panic(AsError::at(
+                                format!("{ctx}: field '{name}' has an invalid type tag"),
+                                span,
+                            ))
+                        })?;
+                        let off = match o.get("offset") {
+                            Some(n_v) => match n_v.kind() {
+                                ValueKind::Int(n) if n >= 0 => n as usize,
+                                _ => {
+                                    return Err(AsError::at(
+                                        format!("{ctx}: field '{name}' has an invalid offset"),
+                                        span,
+                                    )
+                                    .into())
+                                }
+                            },
+                            _ => {
+                                return Err(AsError::at(
+                                    format!("{ctx}: field '{name}' has an invalid offset"),
+                                    span,
+                                )
+                                .into())
+                            }
+                        };
+                        return Ok((ty, off));
+                    }
                 }
             }
         }
@@ -1129,7 +1168,7 @@ fn ffi_set(args: &[Value], span: Span) -> Result<Value, Control> {
         .into());
     }
     buf[off..off + size].copy_from_slice(&encoded);
-    Ok(Value::Nil)
+    Ok(Value::nil())
 }
 
 /// Read a scalar C value from `bytes` (native-endian) into a `Value` (§3.3 marshal-out).
@@ -1142,19 +1181,19 @@ fn read_scalar(ty: FfiType, bytes: &[u8]) -> Value {
         }};
     }
     match ty {
-        FfiType::I8 => Value::Int(bytes[0] as i8 as i64),
-        FfiType::U8 => Value::Int(bytes[0] as i64),
-        FfiType::I16 => Value::Int(le!(i16) as i64),
-        FfiType::U16 => Value::Int(le!(u16) as i64),
-        FfiType::I32 => Value::Int(le!(i32) as i64),
-        FfiType::U32 => Value::Int(le!(u32) as i64),
-        FfiType::I64 => Value::Int(le!(i64)),
-        FfiType::U64 => Value::Int(le!(u64) as i64),
-        FfiType::Size => Value::Int(le!(usize) as i64),
-        FfiType::F32 => Value::Float(le!(f32) as f64),
-        FfiType::F64 => Value::Float(le!(f64)),
-        FfiType::Ptr => Value::Int(le!(usize) as i64),
-        FfiType::Void => Value::Nil,
+        FfiType::I8 => Value::int(bytes[0] as i8 as i64),
+        FfiType::U8 => Value::int(bytes[0] as i64),
+        FfiType::I16 => Value::int(le!(i16) as i64),
+        FfiType::U16 => Value::int(le!(u16) as i64),
+        FfiType::I32 => Value::int(le!(i32) as i64),
+        FfiType::U32 => Value::int(le!(u32) as i64),
+        FfiType::I64 => Value::int(le!(i64)),
+        FfiType::U64 => Value::int(le!(u64) as i64),
+        FfiType::Size => Value::int(le!(usize) as i64),
+        FfiType::F32 => Value::float(le!(f32) as f64),
+        FfiType::F64 => Value::float(le!(f64)),
+        FfiType::Ptr => Value::int(le!(usize) as i64),
+        FfiType::Void => Value::nil(),
     }
 }
 
@@ -1243,7 +1282,7 @@ impl Interp {
                 .to_string_lossy()
                 .into_owned()
         };
-        Ok(Value::Str(s.into()))
+        Ok(Value::str(s))
     }
 }
 
@@ -1278,7 +1317,7 @@ mod tests {
 
     /// A Tier-1 error value is `{message: <Str>}` (via `make_error`).
     fn is_error_object(v: &Value) -> bool {
-        matches!(v, Value::Object(o) if matches!(o.get("message"), Some(Value::Str(_))))
+        matches!(v.kind(), ValueKind::Object(o) if matches!(o.get("message").map(|m| m.into_kind()), Some(OwnedKind::Str(_))))
     }
 
     /// Open a library and resolve a symbol, unwrapping the Tier-1 `[value, err]`.
@@ -1290,7 +1329,7 @@ mod tests {
         ret: FfiType,
     ) -> u64 {
         let lib_pair = interp
-            .ffi_open(&[Value::Str(lib.into())], span())
+            .ffi_open(&[Value::str(lib)], span())
             .unwrap();
         let lib_id = pair_ok_native_id(&lib_pair);
         let argtype_vals: Vec<Value> = argtypes.iter().map(|t| descriptor(*t)).collect();
@@ -1298,8 +1337,8 @@ mod tests {
             .ffi_lib_symbol(
                 lib_id,
                 &[
-                    Value::Str(name.into()),
-                    Value::Array(crate::value::ArrayCell::new(argtype_vals)),
+                    Value::str(name),
+                    Value::array_cell(crate::value::ArrayCell::new(argtype_vals)),
                     descriptor(ret),
                 ],
                 span(),
@@ -1310,11 +1349,11 @@ mod tests {
 
     /// Extract the native handle id from a Tier-1 `[Native, nil]` ok pair.
     fn pair_ok_native_id(v: &Value) -> u64 {
-        if let Value::Array(a) = v {
+        if let ValueKind::Array(a) = v.kind() {
             let b = a.borrow();
             assert_eq!(b.len(), 2, "Tier-1 pair");
-            assert_eq!(b[1], Value::Nil, "expected ok pair, got err: {:?}", b[1]);
-            if let Value::Native(n) = &b[0] {
+            assert_eq!(b[1], Value::nil(), "expected ok pair, got err: {:?}", b[1]);
+            if let ValueKind::Native(n) = b[0].kind() {
                 return n.id;
             }
         }
@@ -1329,11 +1368,11 @@ mod tests {
         let r = interp
             .ffi_symbol_call(
                 sqrt,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::Float(2.0)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(2.0)]))],
                 span(),
             )
             .unwrap();
-        if let Value::Float(f) = r {
+        if let ValueKind::Float(f) = r.kind() {
             assert!((f - 2.0_f64.sqrt()).abs() < 1e-12, "sqrt(2) = {f}");
         } else {
             panic!("sqrt returned {r:?}");
@@ -1343,11 +1382,11 @@ mod tests {
         let r = interp
             .ffi_symbol_call(
                 cos,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::Float(0.0)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(0.0)]))],
                 span(),
             )
             .unwrap();
-        assert_eq!(r, Value::Float(1.0));
+        assert_eq!(r, Value::float(1.0));
     }
 
     #[tokio::test]
@@ -1357,38 +1396,38 @@ mod tests {
         let r = interp
             .ffi_symbol_call(
                 abs,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::Int(-5)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(-5)]))],
                 span(),
             )
             .unwrap();
-        assert_eq!(r, Value::Int(5));
+        assert_eq!(r, Value::int(5));
     }
 
     #[tokio::test]
     async fn libc_strlen_via_cstr() {
         let interp = Interp::new();
         let strlen = open_symbol(&interp, libc_name(), "strlen", vec![FfiType::Ptr], FfiType::Size);
-        let cstr = ffi_cstr(&[Value::Str("hello".into())], span()).unwrap();
+        let cstr = ffi_cstr(&[Value::str("hello")], span()).unwrap();
         let r = interp
             .ffi_symbol_call(
                 strlen,
-                &[Value::Array(crate::value::ArrayCell::new(vec![cstr]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![cstr]))],
                 span(),
             )
             .unwrap();
-        assert_eq!(r, Value::Int(5));
+        assert_eq!(r, Value::int(5));
     }
 
     #[test]
     fn cstr_is_nul_terminated() {
-        let b = ffi_cstr(&[Value::Str("hi".into())], span()).unwrap();
-        if let Value::Bytes(b) = b {
+        let b = ffi_cstr(&[Value::str("hi")], span()).unwrap();
+        if let ValueKind::Bytes(b) = b.kind() {
             assert_eq!(&*b.borrow(), &[b'h', b'i', 0]);
         } else {
             panic!("cstr not Bytes");
         }
         // Interior NUL → Tier-2 panic.
-        assert!(ffi_cstr(&[Value::Str("a\0b".into())], span()).is_err());
+        assert!(ffi_cstr(&[Value::str("a\0b")], span()).is_err());
     }
 
     #[tokio::test]
@@ -1401,7 +1440,7 @@ mod tests {
         let err = interp
             .ffi_symbol_call(
                 sym,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::Int(300)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(300)]))],
                 span(),
             )
             .unwrap_err();
@@ -1423,7 +1462,7 @@ mod tests {
         let err = interp
             .ffi_symbol_call(
                 abs,
-                &[Value::Array(crate::value::ArrayCell::new(vec![]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![]))],
                 span(),
             )
             .unwrap_err();
@@ -1439,11 +1478,11 @@ mod tests {
     async fn open_missing_library_is_tier1() {
         let interp = Interp::new();
         let pair = interp
-            .ffi_open(&[Value::Str("/no/such/library.so.999".into())], span())
+            .ffi_open(&[Value::str("/no/such/library.so.999")], span())
             .unwrap();
-        if let Value::Array(a) = pair {
+        if let ValueKind::Array(a) = pair.kind() {
             let b = a.borrow();
-            assert_eq!(b[0], Value::Nil, "value is nil on open failure");
+            assert_eq!(b[0], Value::nil(), "value is nil on open failure");
             assert!(is_error_object(&b[1]), "err is an error object");
         } else {
             panic!("ffi.open should return a Tier-1 pair");
@@ -1454,23 +1493,23 @@ mod tests {
     async fn missing_symbol_is_tier1() {
         let interp = Interp::new();
         let lib_pair = interp
-            .ffi_open(&[Value::Str(libc_name().into())], span())
+            .ffi_open(&[Value::str(libc_name())], span())
             .unwrap();
         let lib_id = pair_ok_native_id(&lib_pair);
         let sym_pair = interp
             .ffi_lib_symbol(
                 lib_id,
                 &[
-                    Value::Str("definitely_not_a_real_symbol_xyz".into()),
-                    Value::Array(crate::value::ArrayCell::new(vec![])),
+                    Value::str("definitely_not_a_real_symbol_xyz"),
+                    Value::array_cell(crate::value::ArrayCell::new(vec![])),
                     descriptor(FfiType::I32),
                 ],
                 span(),
             )
             .unwrap();
-        if let Value::Array(a) = sym_pair {
+        if let ValueKind::Array(a) = sym_pair.kind() {
             let b = a.borrow();
-            assert_eq!(b[0], Value::Nil, "missing symbol → nil value");
+            assert_eq!(b[0], Value::nil(), "missing symbol → nil value");
             assert!(is_error_object(&b[1]), "err is an error object");
         } else {
             panic!("lib.symbol should return a Tier-1 pair");
@@ -1481,7 +1520,7 @@ mod tests {
     async fn bad_signature_is_tier2() {
         let interp = Interp::new();
         let lib_pair = interp
-            .ffi_open(&[Value::Str(libc_name().into())], span())
+            .ffi_open(&[Value::str(libc_name())], span())
             .unwrap();
         let lib_id = pair_ok_native_id(&lib_pair);
         // argtypes is not an array of descriptors → Tier-2 panic.
@@ -1489,8 +1528,8 @@ mod tests {
             .ffi_lib_symbol(
                 lib_id,
                 &[
-                    Value::Str("abs".into()),
-                    Value::Int(42), // not an array
+                    Value::str("abs"),
+                    Value::int(42), // not an array
                     descriptor(FfiType::I32),
                 ],
                 span(),
@@ -1503,31 +1542,32 @@ mod tests {
     fn struct_layout_offsets_and_size() {
         // struct { i32 x; f64 y; } → x@0, y@8 (8-aligned), size 16.
         let layout = ffi_struct(
-            &[Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Array(crate::value::ArrayCell::new(vec![
-                    Value::Str("x".into()),
+            &[Value::array_cell(crate::value::ArrayCell::new(vec![
+                Value::array_cell(crate::value::ArrayCell::new(vec![
+                    Value::str("x"),
                     descriptor(FfiType::I32),
                 ])),
-                Value::Array(crate::value::ArrayCell::new(vec![
-                    Value::Str("y".into()),
+                Value::array_cell(crate::value::ArrayCell::new(vec![
+                    Value::str("y"),
                     descriptor(FfiType::F64),
                 ])),
             ]))],
             span(),
         )
         .unwrap();
-        if let Value::Object(o) = layout {
-            assert_eq!(o.get("size"), Some(Value::Int(16)));
-            assert_eq!(o.get("align"), Some(Value::Int(8)));
-            if let Some(Value::Array(fields)) = o.get("fields") {
+        if let ValueKind::Object(o) = layout.kind() {
+            assert_eq!(o.get("size"), Some(Value::int(16)));
+            assert_eq!(o.get("align"), Some(Value::int(8)));
+            let fields_v = o.get("fields");
+            if let Some(ValueKind::Array(fields)) = fields_v.as_ref().map(|v| v.kind()) {
                 let fields = fields.borrow();
                 // x@0
-                if let Value::Object(f0) = &fields[0] {
-                    assert_eq!(f0.get("offset"), Some(Value::Int(0)));
+                if let ValueKind::Object(f0) = fields[0].kind() {
+                    assert_eq!(f0.get("offset"), Some(Value::int(0)));
                 }
                 // y@8
-                if let Value::Object(f1) = &fields[1] {
-                    assert_eq!(f1.get("offset"), Some(Value::Int(8)));
+                if let ValueKind::Object(f1) = fields[1].kind() {
+                    assert_eq!(f1.get("offset"), Some(Value::int(8)));
                 }
             } else {
                 panic!("no fields");
@@ -1540,13 +1580,13 @@ mod tests {
     #[test]
     fn struct_alloc_set_get_round_trip() {
         let layout = ffi_struct(
-            &[Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Array(crate::value::ArrayCell::new(vec![
-                    Value::Str("x".into()),
+            &[Value::array_cell(crate::value::ArrayCell::new(vec![
+                Value::array_cell(crate::value::ArrayCell::new(vec![
+                    Value::str("x"),
                     descriptor(FfiType::I32),
                 ])),
-                Value::Array(crate::value::ArrayCell::new(vec![
-                    Value::Str("y".into()),
+                Value::array_cell(crate::value::ArrayCell::new(vec![
+                    Value::str("y"),
                     descriptor(FfiType::F64),
                 ])),
             ]))],
@@ -1555,28 +1595,28 @@ mod tests {
         .unwrap();
         // alloc → zeroed Bytes of size 16.
         let buf = ffi_alloc(std::slice::from_ref(&layout), span()).unwrap();
-        if let Value::Bytes(b) = &buf {
+        if let ValueKind::Bytes(b) = buf.kind() {
             assert_eq!(b.borrow().len(), 16);
         }
         // set x=3, y=2.5; read them back.
         ffi_set(
-            &[layout.clone(), buf.clone(), Value::Str("x".into()), Value::Int(3)],
+            &[layout.clone(), buf.clone(), Value::str("x"), Value::int(3)],
             span(),
         )
         .unwrap();
         ffi_set(
-            &[layout.clone(), buf.clone(), Value::Str("y".into()), Value::Float(2.5)],
+            &[layout.clone(), buf.clone(), Value::str("y"), Value::float(2.5)],
             span(),
         )
         .unwrap();
         let x = ffi_get(
-            &[layout.clone(), buf.clone(), Value::Str("x".into())],
+            &[layout.clone(), buf.clone(), Value::str("x")],
             span(),
         )
         .unwrap();
-        assert_eq!(x, Value::Int(3));
-        let y = ffi_get(&[layout, buf, Value::Str("y".into())], span()).unwrap();
-        assert_eq!(y, Value::Float(2.5));
+        assert_eq!(x, Value::int(3));
+        let y = ffi_get(&[layout, buf, Value::str("y")], span()).unwrap();
+        assert_eq!(y, Value::float(2.5));
     }
 
     // ── ffi.alloc: the layout-size allocation guards are Tier-2 panics ─────────
@@ -1586,13 +1626,13 @@ mod tests {
         // `vec![0u8; size]` allocation directly — exercise each guard arm.
         let layout_with_size = |n: i64| -> Value {
             let mut m = indexmap::IndexMap::new();
-            m.insert("size".to_string(), Value::Int(n));
-            m.insert("align".to_string(), Value::Int(1));
-            Value::Object(crate::value::ObjectCell::new(m))
+            m.insert("size".to_string(), Value::int(n));
+            m.insert("align".to_string(), Value::int(1));
+            Value::object_cell(crate::value::ObjectCell::new(m))
         };
         // A sane size succeeds.
         let ok = ffi_alloc(&[layout_with_size(8)], span()).unwrap();
-        if let Value::Bytes(b) = &ok {
+        if let ValueKind::Bytes(b) = ok.kind() {
             assert_eq!(b.borrow().len(), 8);
         } else {
             panic!("expected Bytes");
@@ -1631,8 +1671,8 @@ mod tests {
         let interp = Interp::new();
         // strlen takes a ptr; bind a u64 ptr-less check is awkward — instead assert the
         // range helpers directly.
-        assert!(want_int_in_range(&Value::Int(-1), 0, u8::MAX as i64, "u8", 0, span()).is_err());
-        assert!(want_int(&Value::Int(-1), "u64", 0, span()).is_ok());
+        assert!(want_int_in_range(&Value::int(-1), 0, u8::MAX as i64, "u8", 0, span()).is_err());
+        assert!(want_int(&Value::int(-1), "u64", 0, span()).is_ok());
         let _ = interp; // keep an interp to mirror the other tests' shape
     }
 
@@ -1667,7 +1707,7 @@ print(buf != nil)
         use crate::det::{DeterminismContext, FfiRet};
 
         fn arr(vals: Vec<Value>) -> Value {
-            Value::Array(crate::value::ArrayCell::new(vals))
+            Value::array_cell(crate::value::ArrayCell::new(vals))
         }
 
         /// INERT by default: with NO determinism context, `sym.call` runs normally and
@@ -1677,9 +1717,9 @@ print(buf != nil)
             let interp = Interp::new();
             let abs = open_symbol(&interp, libc_name(), "abs", vec![FfiType::I32], FfiType::I32);
             let r = interp
-                .ffi_symbol_call(abs, &[arr(vec![Value::Int(-7)])], span())
+                .ffi_symbol_call(abs, &[arr(vec![Value::int(-7)])], span())
                 .unwrap();
-            assert_eq!(r, Value::Int(7));
+            assert_eq!(r, Value::int(7));
             // No context installed → determinism_mode is None (the byte-identical path).
             assert!(interp.determinism_mode().is_none());
         }
@@ -1694,9 +1734,9 @@ print(buf != nil)
             interp.install_determinism(DeterminismContext::record(1, 0.0));
             let abs = open_symbol(&interp, libc_name(), "abs", vec![FfiType::I32], FfiType::I32);
             let rec = interp
-                .ffi_symbol_call(abs, &[arr(vec![Value::Int(-9)])], span())
+                .ffi_symbol_call(abs, &[arr(vec![Value::int(-9)])], span())
                 .unwrap();
-            assert_eq!(rec, Value::Int(9));
+            assert_eq!(rec, Value::int(9));
             let events = interp.take_determinism().unwrap().events;
             assert_eq!(events.len(), 1, "one FfiCall recorded");
 
@@ -1706,9 +1746,9 @@ print(buf != nil)
             interp2.install_determinism(DeterminismContext::replay(1, 0.0, events));
             let abs2 = open_symbol(&interp2, libc_name(), "abs", vec![FfiType::I32], FfiType::I32);
             let replayed = interp2
-                .ffi_symbol_call(abs2, &[arr(vec![Value::Int(9999)])], span())
+                .ffi_symbol_call(abs2, &[arr(vec![Value::int(9999)])], span())
                 .unwrap();
-            assert_eq!(replayed, Value::Int(9), "replay returns the RECORDED value");
+            assert_eq!(replayed, Value::int(9), "replay returns the RECORDED value");
         }
 
         /// [SECURITY — out-param fidelity §7A]: a C call that writes a `ffi.ptr` `Bytes`
@@ -1729,15 +1769,15 @@ print(buf != nil)
                 FfiType::Void,
             );
             // A 4-byte buffer; memset it to 'A' (65).
-            let buf = Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
+            let buf = Value::bytes_rc(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
             let _ = interp
                 .ffi_symbol_call(
                     memset,
-                    &[arr(vec![buf.clone(), Value::Int(65), Value::Int(4)])],
+                    &[arr(vec![buf.clone(), Value::int(65), Value::int(4)])],
                     span(),
                 )
                 .unwrap();
-            if let Value::Bytes(b) = &buf {
+            if let ValueKind::Bytes(b) = buf.kind() {
                 assert_eq!(&*b.borrow(), &[65u8, 65, 65, 65], "memset wrote AAAA");
             }
             let events = interp.take_determinism().unwrap().events;
@@ -1754,15 +1794,15 @@ print(buf != nil)
                 vec![FfiType::Ptr, FfiType::I32, FfiType::Size],
                 FfiType::Void,
             );
-            let buf2 = Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
+            let buf2 = Value::bytes_rc(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
             let _ = interp2
                 .ffi_symbol_call(
                     memset2,
-                    &[arr(vec![buf2.clone(), Value::Int(0), Value::Int(4)])],
+                    &[arr(vec![buf2.clone(), Value::int(0), Value::int(4)])],
                     span(),
                 )
                 .unwrap();
-            if let Value::Bytes(b) = &buf2 {
+            if let ValueKind::Bytes(b) = buf2.kind() {
                 assert_eq!(
                     &*b.borrow(),
                     &[65u8, 65, 65, 65],
@@ -1780,9 +1820,9 @@ print(buf != nil)
             // is allowed), then enter a determinism context and pass it as a ptr arg.
             let malloc = open_symbol(&interp, libc_name(), "malloc", vec![FfiType::Size], FfiType::Ptr);
             let p = interp
-                .ffi_symbol_call(malloc, &[arr(vec![Value::Int(8)])], span())
+                .ffi_symbol_call(malloc, &[arr(vec![Value::int(8)])], span())
                 .unwrap();
-            assert!(matches!(&p, Value::Native(n) if n.kind == NativeKind::ForeignPtr));
+            assert!(matches!(p.kind(), ValueKind::Native(n) if n.kind == NativeKind::ForeignPtr));
 
             interp.install_determinism(DeterminismContext::record(3, 0.0));
             // strlen(ptr) — pass the ForeignPtr as the ffi.ptr out-param.
@@ -1808,7 +1848,7 @@ print(buf != nil)
             interp.install_determinism(DeterminismContext::record(4, 0.0));
             let malloc = open_symbol(&interp, libc_name(), "malloc", vec![FfiType::Size], FfiType::Ptr);
             let err = interp
-                .ffi_symbol_call(malloc, &[arr(vec![Value::Int(8)])], span())
+                .ffi_symbol_call(malloc, &[arr(vec![Value::int(8)])], span())
                 .unwrap_err();
             match err {
                 Control::Panic(e) => assert!(
@@ -1823,9 +1863,9 @@ print(buf != nil)
         /// The recorded `FfiRet` projects each marshalled return faithfully.
         #[test]
         fn ffi_ret_projection() {
-            assert_eq!(value_to_ffi_ret(&Value::Int(42)), FfiRet::Int(42));
-            assert_eq!(value_to_ffi_ret(&Value::Float(2.5)), FfiRet::Float(2.5));
-            assert_eq!(value_to_ffi_ret(&Value::Nil), FfiRet::Void);
+            assert_eq!(value_to_ffi_ret(&Value::int(42)), FfiRet::Int(42));
+            assert_eq!(value_to_ffi_ret(&Value::float(2.5)), FfiRet::Float(2.5));
+            assert_eq!(value_to_ffi_ret(&Value::nil()), FfiRet::Void);
         }
     }
 }

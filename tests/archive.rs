@@ -461,7 +461,7 @@ async fn non_archive_multifile_still_loads_from_disk() {
 /// proto debug-names (which would false-positive a class METHOD's name as a global). A
 /// dropped `fn`/`let` emits no `DEFINE_GLOBAL`, so its name is absent here.
 fn module_defined_names(arch: &ModuleArchive, key: &str) -> std::collections::HashSet<String> {
-    use ascript::value::Value;
+    use ascript::value::ValueKind;
     use ascript::vm::opcode::Op;
     let bytes = arch.get(key).unwrap_or_else(|| panic!("module {key} present; keys present"));
     let chunk = Chunk::from_bytes_verified(bytes)
@@ -473,7 +473,7 @@ fn module_defined_names(arch: &ModuleArchive, key: &str) -> std::collections::Ha
         let Some(op) = Op::from_u8(code[ip]) else { break };
         if op == Op::DefineGlobal && ip + 2 < code.len() {
             let idx = chunk.read_u16(ip + 1) as usize;
-            if let Some(Value::Str(name)) = chunk.consts.get(idx) {
+            if let Some(ValueKind::Str(name)) = chunk.consts.get(idx).map(|v| v.kind()) {
                 names.insert(name.to_string());
             }
         }

@@ -101,12 +101,12 @@ pub mod yaml;
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use std::rc::Rc;
 
 /// A native builtin value with a qualified name (`"math.abs"`).
 pub(crate) fn bi(qualified: &str) -> Value {
-    Value::Builtin(qualified.into())
+    Value::builtin(qualified)
 }
 
 /// The export list (binding name → value) for a `std/*` module path, or `None`
@@ -299,8 +299,8 @@ fn fs_path_arg<'a>(func: &str, args: &'a [Value]) -> Option<(&'a str, bool)> {
         // Pure path-string ops (join/dirname/basename/extname/isAbsolute) — no fs access.
         _ => return None,
     };
-    match args.first() {
-        Some(Value::Str(s)) => Some((s.as_ref(), is_write)),
+    match args.first().map(Value::kind) {
+        Some(ValueKind::Str(s)) => Some((s.as_ref(), is_write)),
         _ => None,
     }
 }
@@ -407,11 +407,11 @@ impl Interp {
         #[cfg(feature = "data")]
         if func == "parse" && matches!(module, "json" | "toml" | "yaml") {
             if let Some(type_arg) = args.get(1) {
-                let is_class = matches!(type_arg, Value::Class(_));
+                let is_class = matches!(type_arg.kind(), ValueKind::Class(_));
                 let is_schema = schema::schema_kind(type_arg).is_some();
                 if is_class || is_schema {
                     // `json.parse(text, Class, strict?)` — optional trailing bool.
-                    let strict = matches!(args.get(2), Some(Value::Bool(true)));
+                    let strict = matches!(args.get(2).map(Value::kind), Some(ValueKind::Bool(true)));
                     // Module-specific 1-arg decode → [val, err].
                     let parsed = match module {
                         "json" => json::call(func, &args[..1], span)?,
@@ -429,7 +429,7 @@ impl Interp {
         #[cfg(feature = "binary")]
         if func == "decode" && matches!(module, "msgpack" | "cbor") {
             if let Some(type_arg) = args.get(1) {
-                let is_class = matches!(type_arg, Value::Class(_));
+                let is_class = matches!(type_arg.kind(), ValueKind::Class(_));
                 let is_schema = schema::schema_kind(type_arg).is_some();
                 if is_class || is_schema {
                     let parsed = match module {
@@ -447,7 +447,7 @@ impl Interp {
         #[cfg(feature = "data")]
         if module == "csv" && func == "parse" {
             if let Some(type_arg) = args.get(1) {
-                let is_class = matches!(type_arg, Value::Class(_));
+                let is_class = matches!(type_arg.kind(), ValueKind::Class(_));
                 let is_schema = schema::schema_kind(type_arg).is_some();
                 if is_class || is_schema {
                     // Decode rows with the original args MINUS the type arg, so any
@@ -623,29 +623,29 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         // `parsed` is a [val, err] pair from the module's 1-arg parse.
-        let (val, err) = match &parsed {
-            Value::Array(a) if a.borrow().len() == 2 => {
+        let (val, err) = match parsed.kind() {
+            ValueKind::Array(a) if a.borrow().len() == 2 => {
                 let b = a.borrow();
                 (b[0].clone(), b[1].clone())
             }
             // Defensive: a non-pair decode result is treated as the raw value.
-            other => (other.clone(), Value::Nil),
+            _ => (parsed.clone(), Value::nil()),
         };
-        if err != Value::Nil {
+        if err != Value::nil() {
             return Ok(parsed); // decode error stays in the err channel
         }
-        match type_arg {
-            Value::Class(c) => match self.validate_into(c, &val, strict, path, span).await {
-                Ok(inst) => Ok(crate::interp::make_pair(inst, Value::Nil)),
+        match type_arg.kind() {
+            ValueKind::Class(c) => match self.validate_into(c, &val, strict, path, span).await {
+                Ok(inst) => Ok(crate::interp::make_pair(inst, Value::nil())),
                 Err(e) => Ok(crate::interp::make_pair(
-                    Value::Nil,
-                    crate::interp::make_error(Value::Str(e.message.into())),
+                    Value::nil(),
+                    crate::interp::make_error(Value::str(e.message)),
                 )),
             },
             _ => match self.parse_value(type_arg, &val, path, false, span).await {
-                Ok(v) => Ok(crate::interp::make_pair(v, Value::Nil)),
+                Ok(v) => Ok(crate::interp::make_pair(v, Value::nil())),
                 Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
-                    Ok(crate::interp::make_pair(Value::Nil, e))
+                    Ok(crate::interp::make_pair(Value::nil(), e))
                 }
                 Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
                     Err(crate::error::AsError::at(msg, span).into())
@@ -666,23 +666,23 @@ impl Interp {
         type_arg: &Value,
         span: Span,
     ) -> Result<Value, Control> {
-        let (rows_val, err) = match &parsed {
-            Value::Array(a) if a.borrow().len() == 2 => {
+        let (rows_val, err) = match parsed.kind() {
+            ValueKind::Array(a) if a.borrow().len() == 2 => {
                 let b = a.borrow();
                 (b[0].clone(), b[1].clone())
             }
-            other => (other.clone(), Value::Nil),
+            _ => (parsed.clone(), Value::nil()),
         };
-        if err != Value::Nil {
+        if err != Value::nil() {
             return Ok(parsed); // decode error stays in the err channel
         }
-        let rows: Vec<Value> = match &rows_val {
-            Value::Array(a) => a.borrow().clone(),
+        let rows: Vec<Value> = match rows_val.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
             _ => {
                 return Ok(crate::interp::make_pair(
-                    Value::Nil,
-                    crate::interp::make_error(Value::Str(
-                        "csv.parse typed: expected an array of rows".into(),
+                    Value::nil(),
+                    crate::interp::make_error(Value::str(
+                        "csv.parse typed: expected an array of rows",
                     )),
                 ))
             }
@@ -692,8 +692,8 @@ impl Interp {
         // derive its object schema (the same `fromClass` mapping) and coerce-parse
         // the row, then validate_into the coerced object to build the Instance. For
         // a tagged schema, coerce-parse directly.
-        let class_schema: Option<Value> = match type_arg {
-            Value::Class(_) => {
+        let class_schema: Option<Value> = match type_arg.kind() {
+            ValueKind::Class(_) => {
                 Some(self.call_schema("fromClass", std::slice::from_ref(type_arg), span).await?)
             }
             _ => None,
@@ -701,14 +701,14 @@ impl Interp {
         let mut out: Vec<Value> = Vec::with_capacity(rows.len());
         for (i, row) in rows.iter().enumerate() {
             let path = format!("row[{}]", i);
-            match type_arg {
-                Value::Class(c) => {
+            match type_arg.kind() {
+                ValueKind::Class(c) => {
                     // Step 1: coerce the row against the class-derived schema.
                     let schema = class_schema.as_ref().expect("class schema present");
                     let coerced = match self.parse_value(schema, row, &path, true, span).await {
                         Ok(v) => v,
                         Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
-                            return Ok(crate::interp::make_pair(Value::Nil, e));
+                            return Ok(crate::interp::make_pair(Value::nil(), e));
                         }
                         Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
                             return Err(crate::error::AsError::at(msg, span).into());
@@ -720,8 +720,8 @@ impl Interp {
                         Ok(inst) => out.push(inst),
                         Err(e) => {
                             return Ok(crate::interp::make_pair(
-                                Value::Nil,
-                                crate::interp::make_error(Value::Str(e.message.into())),
+                                Value::nil(),
+                                crate::interp::make_error(Value::str(e.message)),
                             ))
                         }
                     }
@@ -729,7 +729,7 @@ impl Interp {
                 _ => match self.parse_value(type_arg, row, &path, true, span).await {
                     Ok(v) => out.push(v),
                     Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
-                        return Ok(crate::interp::make_pair(Value::Nil, e));
+                        return Ok(crate::interp::make_pair(Value::nil(), e));
                     }
                     Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
                         return Err(crate::error::AsError::at(msg, span).into());
@@ -738,10 +738,7 @@ impl Interp {
                 },
             }
         }
-        Ok(crate::interp::make_pair(
-            Value::Array(crate::value::ArrayCell::new(out)),
-            Value::Nil,
-        ))
+        Ok(crate::interp::make_pair(Value::array(out), Value::nil()))
     }
 
     /// `std/time` dispatch. `sleep` is async (the first async stdlib fn) and is
@@ -760,10 +757,10 @@ impl Interp {
         // `time::call` keeps its real-clock arms for any direct callers.
         if self.is_deterministic() {
             match func {
-                "now" => return Ok(Value::Float(self.clock_now_ms())),
+                "now" => return Ok(Value::float(self.clock_now_ms())),
                 "monotonic" => {
                     let real = time::real_monotonic_ms();
-                    return Ok(Value::Float(self.clock_monotonic_ms(real)));
+                    return Ok(Value::float(self.clock_monotonic_ms(real)));
                 }
                 _ => {}
             }
@@ -785,12 +782,12 @@ impl Interp {
                 })
                 .is_some()
             {
-                return Ok(Value::Nil);
+                return Ok(Value::nil());
             }
             // `ms as u64` truncates toward zero: a fractional `sleep(20.7)`
             // sleeps for 20 whole milliseconds.
             tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
-            return Ok(Value::Nil);
+            return Ok(Value::nil());
         }
         if func == "interval" {
             return time_timers::create_interval(self, args, span);
@@ -830,7 +827,7 @@ impl Interp {
             // Second measurement (delta).
             sys.refresh_cpu_usage();
             let pct = sys.global_cpu_usage() as f64;
-            return Ok(Value::Float(pct.clamp(0.0, 100.0)));
+            return Ok(Value::float(pct.clamp(0.0, 100.0)));
         }
         os::call(func, args, span)
     }
@@ -839,7 +836,7 @@ impl Interp {
 // ---- shared argument helpers (Tier-2 panic on type misuse, spec §11.3) ----
 
 pub(crate) fn arg(args: &[Value], i: usize) -> Value {
-    args.get(i).cloned().unwrap_or(Value::Nil)
+    args.get(i).cloned().unwrap_or(Value::nil())
 }
 
 /// Type name for a "got X" mismatch message. A frozen `Value::Shared` reports its
@@ -849,8 +846,8 @@ pub(crate) fn arg(args: &[Value], i: usize) -> Value {
 /// mutable one in a free-function like `array.push(frozen, …)` — the method form
 /// `x.push(…)` already reports the canonical "cannot mutate a frozen array".
 pub(crate) fn got_type_name(v: &Value) -> String {
-    match v {
-        Value::Shared(_) => format!("frozen {}", crate::interp::type_name(v)),
+    match v.kind() {
+        ValueKind::Shared(_) => format!("frozen {}", crate::interp::type_name(v)),
         _ => crate::interp::type_name(v).to_string(),
     }
 }
@@ -903,8 +900,8 @@ pub(crate) fn want_count(v: &Value, span: Span, ctx: &str, max: f64) -> Result<u
 pub(crate) const MAX_ALLOC_COUNT: f64 = u32::MAX as f64;
 
 pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
-    match v {
-        Value::Str(s) => Ok(s.clone()),
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.clone()),
         _ => Err(AsError::at(
             format!(
                 "{} expects a string, got {}",
@@ -922,8 +919,8 @@ pub(crate) fn want_array(
     span: Span,
     ctx: &str,
 ) -> Result<gcmodule::Cc<crate::value::ArrayCell>, Control> {
-    match v {
-        Value::Array(a) => Ok(a.clone()),
+    match v.kind() {
+        ValueKind::Array(a) => Ok(a.clone()),
         _ => Err(AsError::at(
             format!("{} expects an array, got {}", ctx, got_type_name(v)),
             span,
@@ -939,8 +936,8 @@ pub(crate) fn want_object(
     span: Span,
     ctx: &str,
 ) -> Result<gcmodule::Cc<crate::value::ObjectCell>, Control> {
-    match v {
-        Value::Object(o) => Ok(o.clone()),
+    match v.kind() {
+        ValueKind::Object(o) => Ok(o.clone()),
         _ => Err(AsError::at(
             format!("{} expects an object, got {}", ctx, got_type_name(v)),
             span,
@@ -954,8 +951,8 @@ pub(crate) fn want_bytes(
     span: Span,
     ctx: &str,
 ) -> Result<Rc<std::cell::RefCell<Vec<u8>>>, Control> {
-    match v {
-        Value::Bytes(b) => Ok(b.clone()),
+    match v.kind() {
+        ValueKind::Bytes(b) => Ok(b.clone()),
         _ => Err(AsError::at(
             format!("{} expects bytes, got {}", ctx, got_type_name(v)),
             span,
@@ -1159,7 +1156,7 @@ mod want_helpers_tests {
     #[test]
     fn want_array_reports_frozen_in_got_position() {
         let sp = Span::new(0, 0);
-        let live = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(1)]));
+        let live = Value::array(vec![Value::int(1)]);
         let frozen = match crate::stdlib::shared::freeze(&live, sp) {
             Ok(v) => v,
             Err(_) => panic!("freeze failed"),
@@ -1172,7 +1169,7 @@ mod want_helpers_tests {
         );
         // A LIVE non-array still reports its plain kind (no spurious "frozen").
         assert_eq!(
-            mismatch_msg(&Value::Int(3), "array.push"),
+            mismatch_msg(&Value::int(3), "array.push"),
             "array.push expects an array, got int"
         );
     }

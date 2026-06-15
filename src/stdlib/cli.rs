@@ -30,7 +30,7 @@ use super::{arg, bi};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use indexmap::IndexMap;
 
 // ── public exports ────────────────────────────────────────────────────────────
@@ -87,15 +87,16 @@ struct SubcommandSpec {
 type ObjCell = gcmodule::Cc<crate::value::ObjectCell>;
 
 fn str_field(obj: &ObjCell, key: &str, ctx: &str, span: Span) -> Result<String, Control> {
-    match obj.get(key) {
-        None | Some(Value::Nil) => Ok(String::new()),
-        Some(Value::Str(s)) => Ok(s.to_string()),
-        Some(other) => Err(AsError::at(
+    let got = obj.get(key);
+    match got.as_ref().map(|v| v.kind()) {
+        None | Some(ValueKind::Nil) => Ok(String::new()),
+        Some(ValueKind::Str(s)) => Ok(s.to_string()),
+        Some(_) => Err(AsError::at(
             format!(
                 "cli.parse spec: {}.{} must be a string, got {}",
                 ctx,
                 key,
-                crate::interp::type_name(&other)
+                crate::interp::type_name(got.as_ref().unwrap())
             ),
             span,
         )
@@ -106,15 +107,16 @@ fn str_field(obj: &ObjCell, key: &str, ctx: &str, span: Span) -> Result<String, 
 /// Extract a bool field from an object. Returns `false` when absent/nil. Tier-2
 /// panic if present but not a bool.
 fn bool_field(obj: &ObjCell, key: &str, ctx: &str, span: Span) -> Result<bool, Control> {
-    match obj.get(key) {
-        None | Some(Value::Nil) => Ok(false),
-        Some(Value::Bool(b)) => Ok(b),
-        Some(other) => Err(AsError::at(
+    let got = obj.get(key);
+    match got.as_ref().map(|v| v.kind()) {
+        None | Some(ValueKind::Nil) => Ok(false),
+        Some(ValueKind::Bool(b)) => Ok(b),
+        Some(_) => Err(AsError::at(
             format!(
                 "cli.parse spec: {}.{} must be a bool, got {}",
                 ctx,
                 key,
-                crate::interp::type_name(&other)
+                crate::interp::type_name(got.as_ref().unwrap())
             ),
             span,
         )
@@ -123,13 +125,13 @@ fn bool_field(obj: &ObjCell, key: &str, ctx: &str, span: Span) -> Result<bool, C
 }
 
 fn parse_flag_spec(v: &Value, span: Span) -> Result<FlagSpec, Control> {
-    let obj = match v {
-        Value::Object(o) => o.clone(),
-        other => {
+    let obj = match v.kind() {
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "cli.parse spec: flags entry must be an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(v)
                 ),
                 span,
             )
@@ -155,13 +157,13 @@ fn parse_flag_spec(v: &Value, span: Span) -> Result<FlagSpec, Control> {
 }
 
 fn parse_option_spec(v: &Value, span: Span) -> Result<OptionSpec, Control> {
-    let obj = match v {
-        Value::Object(o) => o.clone(),
-        other => {
+    let obj = match v.kind() {
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "cli.parse spec: options entry must be an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(v)
                 ),
                 span,
             )
@@ -185,8 +187,8 @@ fn parse_option_spec(v: &Value, span: Span) -> Result<OptionSpec, Control> {
     let default_raw = str_field(&obj, "default", "option", span)?;
     let default = if default_raw.is_empty() {
         // also allow explicit nil → no default
-        match obj.get("default") {
-            None | Some(Value::Nil) => None,
+        match obj.get("default").as_ref().map(|v| v.kind()) {
+            None | Some(ValueKind::Nil) => None,
             _ => Some(default_raw),
         }
     } else {
@@ -202,13 +204,13 @@ fn parse_option_spec(v: &Value, span: Span) -> Result<OptionSpec, Control> {
 }
 
 fn parse_positional_spec(v: &Value, span: Span) -> Result<PositionalSpec, Control> {
-    let obj = match v {
-        Value::Object(o) => o.clone(),
-        other => {
+    let obj = match v.kind() {
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "cli.parse spec: positionals entry must be an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(v)
                 ),
                 span,
             )
@@ -238,17 +240,18 @@ fn parse_array_of<T>(
     span: Span,
     parse_fn: impl Fn(&Value, Span) -> Result<T, Control>,
 ) -> Result<Vec<T>, Control> {
-    match obj.get(key) {
-        None | Some(Value::Nil) => Ok(Vec::new()),
-        Some(Value::Array(a)) => {
+    let got = obj.get(key);
+    match got.as_ref().map(|v| v.kind()) {
+        None | Some(ValueKind::Nil) => Ok(Vec::new()),
+        Some(ValueKind::Array(a)) => {
             let items = a.borrow().clone();
             items.iter().map(|v| parse_fn(v, span)).collect()
         }
-        Some(other) => Err(AsError::at(
+        Some(_) => Err(AsError::at(
             format!(
                 "cli.parse spec: '{}' must be an array, got {}",
                 key,
-                crate::interp::type_name(&other)
+                crate::interp::type_name(got.as_ref().unwrap())
             ),
             span,
         )
@@ -257,13 +260,13 @@ fn parse_array_of<T>(
 }
 
 fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
-    let obj = match spec_val {
-        Value::Object(o) => o.clone(),
-        other => {
+    let obj = match spec_val.kind() {
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "cli.parse: spec must be an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(spec_val)
                 ),
                 span,
             )
@@ -277,20 +280,21 @@ fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
     let positionals = parse_array_of(&obj, "positionals", span, parse_positional_spec)?;
 
     // Parse subcommands
-    let subcommands = match obj.get("subcommands") {
-        None | Some(Value::Nil) => Vec::new(),
-        Some(Value::Array(a)) => {
+    let subcommands_field = obj.get("subcommands");
+    let subcommands = match subcommands_field.as_ref().map(|v| v.kind()) {
+        None | Some(ValueKind::Nil) => Vec::new(),
+        Some(ValueKind::Array(a)) => {
             let items = a.borrow().clone();
             items
                 .iter()
                 .map(|v| -> Result<SubcommandSpec, Control> {
-                    let sub_obj = match v {
-                        Value::Object(o) => o.clone(),
-                        other => {
+                    let sub_obj = match v.kind() {
+                        ValueKind::Object(o) => o.clone(),
+                        _ => {
                             return Err(AsError::at(
                                 format!(
                                     "cli.parse spec: subcommands entry must be an object, got {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(v)
                                 ),
                                 span,
                             )
@@ -318,11 +322,11 @@ fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         }
-        Some(other) => {
+        Some(_) => {
             return Err(AsError::at(
                 format!(
                     "cli.parse spec: 'subcommands' must be an array, got {}",
-                    crate::interp::type_name(&other)
+                    crate::interp::type_name(subcommands_field.as_ref().unwrap())
                 ),
                 span,
             )
@@ -456,13 +460,13 @@ fn parse_args_against_spec(
 
     // Initialize all flags to false
     for f in flags {
-        flag_map.insert(f.name.clone(), Value::Bool(false));
+        flag_map.insert(f.name.clone(), Value::bool_(false));
     }
     // Initialize all options to their default (or nil)
     for o in options {
         let val = match &o.default {
-            Some(d) => Value::Str(d.as_str().into()),
-            None => Value::Nil,
+            Some(d) => Value::str(d.as_str()),
+            None => Value::nil(),
         };
         option_map.insert(o.name.clone(), val);
     }
@@ -499,7 +503,7 @@ fn parse_args_against_spec(
                 if inline_val.is_some() {
                     return Err(format!("flag '--{}' does not take a value", f.name));
                 }
-                flag_map.insert(f.name.clone(), Value::Bool(true));
+                flag_map.insert(f.name.clone(), Value::bool_(true));
                 i += 1;
             } else if let Some(o) = options.iter().find(|o| o.name == key) {
                 let val = if let Some(v) = inline_val {
@@ -511,7 +515,7 @@ fn parse_args_against_spec(
                     }
                     args[i].clone()
                 };
-                option_map.insert(o.name.clone(), Value::Str(val.into()));
+                option_map.insert(o.name.clone(), Value::str(val));
                 i += 1;
             } else {
                 return Err(format!("unknown option '--{}'", key));
@@ -521,7 +525,7 @@ fn parse_args_against_spec(
             let short_key = &tok[1..];
 
             if let Some(f) = flags.iter().find(|f| f.short.as_deref() == Some(short_key)) {
-                flag_map.insert(f.name.clone(), Value::Bool(true));
+                flag_map.insert(f.name.clone(), Value::bool_(true));
                 i += 1;
             } else if let Some(o) = options
                 .iter()
@@ -532,7 +536,7 @@ fn parse_args_against_spec(
                     return Err(format!("option '-{}' requires a value", short_key));
                 }
                 let val = args[i].clone();
-                option_map.insert(o.name.clone(), Value::Str(val.into()));
+                option_map.insert(o.name.clone(), Value::str(val));
                 i += 1;
             } else {
                 return Err(format!("unknown option '-{}'", short_key));
@@ -548,11 +552,11 @@ fn parse_args_against_spec(
     let mut positionals_map: IndexMap<String, Value> = IndexMap::new();
     for (idx, pos_spec) in positionals.iter().enumerate() {
         if let Some(v) = positional_values.get(idx) {
-            positionals_map.insert(pos_spec.name.clone(), Value::Str(v.as_str().into()));
+            positionals_map.insert(pos_spec.name.clone(), Value::str(v.as_str()));
         } else if pos_spec.required {
             return Err(format!("missing required argument <{}>", pos_spec.name));
         } else {
-            positionals_map.insert(pos_spec.name.clone(), Value::Nil);
+            positionals_map.insert(pos_spec.name.clone(), Value::nil());
         }
     }
 
@@ -652,19 +656,19 @@ fn result_to_value(pr: ParseResult, subcommand: Value, help: Value) -> Value {
     let mut map = IndexMap::new();
     map.insert(
         "flags".to_string(),
-        Value::Object(crate::value::ObjectCell::new(pr.flags)),
+        Value::object_cell(crate::value::ObjectCell::new(pr.flags)),
     );
     map.insert(
         "options".to_string(),
-        Value::Object(crate::value::ObjectCell::new(pr.options)),
+        Value::object_cell(crate::value::ObjectCell::new(pr.options)),
     );
     map.insert(
         "positionals".to_string(),
-        Value::Object(crate::value::ObjectCell::new(pr.positionals_map)),
+        Value::object_cell(crate::value::ObjectCell::new(pr.positionals_map)),
     );
     map.insert("subcommand".to_string(), subcommand);
     map.insert("help".to_string(), help);
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object_cell(crate::value::ObjectCell::new(map))
 }
 
 // ── the impl Interp dispatch ──────────────────────────────────────────────────
@@ -680,37 +684,37 @@ impl Interp {
             "parse" => {
                 let spec_val = arg(args, 0);
                 // args defaults to env.args() when omitted/nil
-                let args_val = match args.get(1) {
-                    None | Some(Value::Nil) => self.get_cli_args(),
-                    Some(v) => v.clone(),
+                let args_val = match args.get(1).map(|v| v.kind()) {
+                    None | Some(ValueKind::Nil) => self.get_cli_args(),
+                    Some(_) => args.get(1).unwrap().clone(),
                 };
 
                 // Parse the spec (Tier-2 panic on malformed spec)
                 let spec = parse_spec(&spec_val, span)?;
 
                 // Extract the args array (Tier-2 panic if wrong type)
-                let raw_args: Vec<String> = match &args_val {
-                    Value::Array(a) => a
+                let raw_args: Vec<String> = match args_val.kind() {
+                    ValueKind::Array(a) => a
                         .borrow()
                         .iter()
-                        .map(|v| match v {
-                            Value::Str(s) => Ok(s.to_string()),
-                            other => Err(AsError::at(
+                        .map(|v| match v.kind() {
+                            ValueKind::Str(s) => Ok(s.to_string()),
+                            _ => Err(AsError::at(
                                 format!(
                                     "cli.parse: args must be an array of strings, got {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(v)
                                 ),
                                 span,
                             )
                             .into()),
                         })
                         .collect::<Result<Vec<_>, Control>>()?,
-                    Value::Nil => Vec::new(),
-                    other => {
+                    ValueKind::Nil => Vec::new(),
+                    _ => {
                         return Err(AsError::at(
                             format!(
                                 "cli.parse: args must be an array, got {}",
-                                crate::interp::type_name(other)
+                                crate::interp::type_name(&args_val)
                             ),
                             span,
                         )
@@ -738,7 +742,7 @@ impl Interp {
                         flags: spec
                             .flags
                             .iter()
-                            .map(|f| (f.name.clone(), Value::Bool(false)))
+                            .map(|f| (f.name.clone(), Value::bool_(false)))
                             .collect(),
                         options: spec
                             .options
@@ -748,15 +752,15 @@ impl Interp {
                                     o.name.clone(),
                                     o.default
                                         .as_deref()
-                                        .map(|d| Value::Str(d.into()))
-                                        .unwrap_or(Value::Nil),
+                                        .map(Value::str)
+                                        .unwrap_or(Value::nil()),
                                 )
                             })
                             .collect(),
                         positionals_map: IndexMap::new(),
                     };
-                    let result = result_to_value(pr, Value::Nil, Value::Str(help_text.into()));
-                    return Ok(make_pair(result, Value::Nil));
+                    let result = result_to_value(pr, Value::nil(), Value::str(help_text));
+                    return Ok(make_pair(result, Value::nil()));
                 }
 
                 // Detect subcommand: only the first *genuine* positional token
@@ -783,8 +787,8 @@ impl Interp {
                             Ok(pr) => pr,
                             Err(msg) => {
                                 return Ok(make_pair(
-                                    Value::Nil,
-                                    make_error(Value::Str(msg.into())),
+                                    Value::nil(),
+                                    make_error(Value::str(msg)),
                                 ));
                             }
                         };
@@ -798,29 +802,29 @@ impl Interp {
                     ) {
                         Ok(pr) => pr,
                         Err(msg) => {
-                            return Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into()))));
+                            return Ok(make_pair(Value::nil(), make_error(Value::str(msg))));
                         }
                     };
 
                     // Build subcommand result object
                     let mut sub_map = IndexMap::new();
-                    sub_map.insert("name".to_string(), Value::Str(sub_name.as_str().into()));
+                    sub_map.insert("name".to_string(), Value::str(sub_name.as_str()));
                     sub_map.insert(
                         "flags".to_string(),
-                        Value::Object(crate::value::ObjectCell::new(sub_pr.flags)),
+                        Value::object_cell(crate::value::ObjectCell::new(sub_pr.flags)),
                     );
                     sub_map.insert(
                         "options".to_string(),
-                        Value::Object(crate::value::ObjectCell::new(sub_pr.options)),
+                        Value::object_cell(crate::value::ObjectCell::new(sub_pr.options)),
                     );
                     sub_map.insert(
                         "positionals".to_string(),
-                        Value::Object(crate::value::ObjectCell::new(sub_pr.positionals_map)),
+                        Value::object_cell(crate::value::ObjectCell::new(sub_pr.positionals_map)),
                     );
-                    let sub_val = Value::Object(crate::value::ObjectCell::new(sub_map));
+                    let sub_val = Value::object_cell(crate::value::ObjectCell::new(sub_map));
 
-                    let result = result_to_value(top_pr, sub_val, Value::Nil);
-                    return Ok(make_pair(result, Value::Nil));
+                    let result = result_to_value(top_pr, sub_val, Value::nil());
+                    return Ok(make_pair(result, Value::nil()));
                 }
 
                 // Regular parse (no subcommand)
@@ -831,10 +835,10 @@ impl Interp {
                     &spec.positionals,
                 ) {
                     Ok(pr) => {
-                        let result = result_to_value(pr, Value::Nil, Value::Nil);
-                        Ok(make_pair(result, Value::Nil))
+                        let result = result_to_value(pr, Value::nil(), Value::nil());
+                        Ok(make_pair(result, Value::nil()))
                     }
-                    Err(msg) => Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into())))),
+                    Err(msg) => Ok(make_pair(Value::nil(), make_error(Value::str(msg)))),
                 }
             }
             _ => Err(AsError::at(format!("std/cli has no function '{}'", func), span).into()),
@@ -849,7 +853,7 @@ mod tests {
     use super::*;
     use crate::interp::Interp;
     use crate::span::Span;
-    use crate::value::Value;
+    use crate::value::{Value, ValueKind};
     use indexmap::IndexMap;
     
 
@@ -858,11 +862,11 @@ mod tests {
     }
 
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     fn b(x: bool) -> Value {
-        Value::Bool(x)
+        Value::bool_(x)
     }
 
     fn obj(fields: Vec<(&str, Value)>) -> Value {
@@ -870,11 +874,11 @@ mod tests {
         for (k, v) in fields {
             m.insert(k.to_string(), v);
         }
-        Value::Object(crate::value::ObjectCell::new(m))
+        Value::object_cell(crate::value::ObjectCell::new(m))
     }
 
     fn arr(items: Vec<Value>) -> Value {
-        Value::Array(crate::value::ArrayCell::new(items))
+        Value::array_cell(crate::value::ArrayCell::new(items))
     }
 
     /// Build a simple spec with flags, options, positionals.
@@ -908,7 +912,7 @@ mod tests {
     fn option_spec(name: &str, short: &str, default: Option<&str>) -> Value {
         let default_val = match default {
             Some(d) => s(d),
-            None => Value::Nil,
+            None => Value::nil(),
         };
         obj(vec![
             ("name", s(name)),
@@ -929,28 +933,28 @@ mod tests {
     // ── helper: get a nested field from a parse result ──────────────────────
 
     fn get_field(v: &Value, key: &str) -> Value {
-        match v {
-            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
-            _ => Value::Nil,
+        match v.kind() {
+            ValueKind::Object(o) => o.get(key).unwrap_or(Value::nil()),
+            _ => Value::nil(),
         }
     }
 
     fn pair_val(pair: &Value) -> Value {
-        match pair {
-            Value::Array(a) => a.borrow()[0].clone(),
+        match pair.kind() {
+            ValueKind::Array(a) => a.borrow()[0].clone(),
             _ => panic!("expected pair array"),
         }
     }
 
     fn pair_err(pair: &Value) -> Value {
-        match pair {
-            Value::Array(a) => a.borrow()[1].clone(),
+        match pair.kind() {
+            ValueKind::Array(a) => a.borrow()[1].clone(),
             _ => panic!("expected pair array"),
         }
     }
 
     fn is_err(pair: &Value) -> bool {
-        pair_err(pair) != Value::Nil
+        pair_err(pair) != Value::nil()
     }
 
     // ── tests ────────────────────────────────────────────────────────────────
@@ -1089,7 +1093,7 @@ mod tests {
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
         let options = get_field(&pair_val(&result), "options");
-        assert_eq!(get_field(&options, "output"), Value::Nil);
+        assert_eq!(get_field(&options, "output"), Value::nil());
     }
 
     #[tokio::test]
@@ -1148,9 +1152,9 @@ mod tests {
         assert!(!is_err(&result), "help should not produce an error");
         let val = pair_val(&result);
         let help = get_field(&val, "help");
-        assert!(matches!(help, Value::Str(_)), "help should be a string");
-        let help_str = match &help {
-            Value::Str(s) => s.to_string(),
+        assert!(matches!(help.kind(), ValueKind::Str(_)), "help should be a string");
+        let help_str = match help.kind() {
+            ValueKind::Str(s) => s.to_string(),
             _ => unreachable!(),
         };
         assert!(!help_str.is_empty(), "help text should not be empty");
@@ -1169,7 +1173,7 @@ mod tests {
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
         let help = get_field(&pair_val(&result), "help");
-        assert!(matches!(help, Value::Str(_)));
+        assert!(matches!(help.kind(), ValueKind::Str(_)));
     }
 
     #[tokio::test]
@@ -1227,7 +1231,7 @@ mod tests {
         assert!(!is_err(&result), "err: {}", pair_err(&result));
         let val = pair_val(&result);
         let subcommand = get_field(&val, "subcommand");
-        assert_ne!(subcommand, Value::Nil, "subcommand should not be nil");
+        assert_ne!(subcommand, Value::nil(), "subcommand should not be nil");
         let sub_name = get_field(&subcommand, "name");
         assert_eq!(sub_name, s("build"));
         let sub_pos = get_field(&subcommand, "positionals");
@@ -1259,7 +1263,7 @@ mod tests {
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
         let positionals = get_field(&pair_val(&result), "positionals");
-        assert_eq!(get_field(&positionals, "file"), Value::Nil);
+        assert_eq!(get_field(&positionals, "file"), Value::nil());
     }
 
     #[tokio::test]
@@ -1333,7 +1337,7 @@ mod tests {
         // No subcommand dispatch.
         assert_eq!(
             get_field(&val, "subcommand"),
-            Value::Nil,
+            Value::nil(),
             "should NOT dispatch subcommand"
         );
         // output is the literal "build".
@@ -1362,7 +1366,7 @@ mod tests {
         let val = pair_val(&result);
         assert_eq!(
             get_field(&val, "help"),
-            Value::Nil,
+            Value::nil(),
             "should NOT be help mode"
         );
         let positionals = get_field(&val, "positionals");
@@ -1393,7 +1397,7 @@ mod tests {
         let val = pair_val(&result);
         assert_eq!(
             get_field(&val, "subcommand"),
-            Value::Nil,
+            Value::nil(),
             "should NOT dispatch subcommand"
         );
         let positionals = get_field(&val, "positionals");

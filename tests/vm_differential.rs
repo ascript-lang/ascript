@@ -298,7 +298,7 @@ async fn vm_adaptive_specialization_matches_treewalker() {
          print(n)\nprint(t)",
         // (Decimal-arithmetic specialization — ADD_DECIMAL — is covered by the
         // run-loop unit test `add_specializes_to_decimal`; it can't run through a
-        // source-level differential here because constructing a `Value::Decimal`
+        // source-level differential here because constructing a `Value::decimal_rc`
         // needs `import { from } from "std/decimal"`, and the VM does not compile
         // `import` until V12. The whole-corpus differential exercises the decimal
         // examples once that lands.)
@@ -405,7 +405,7 @@ async fn vm_run_bare_builtins_match_treewalker() {
 
 #[tokio::test]
 async fn vm_eval_first_class_builtin_reference_matches_treewalker() {
-    // A bare builtin name used as a *value* (not called) is the `Value::Builtin`
+    // A bare builtin name used as a *value* (not called) is the `Value::builtin`
     // itself; printing it must render identically on both engines. This exercises
     // the compiler's `compile_name_ref` GET_GLOBAL path (first-class builtins).
     for name in ["print", "len", "type", "range", "assert", "Ok", "Err"] {
@@ -804,7 +804,7 @@ async fn vm_match_guard_ending_in_ident_matches_treewalker() {
 
 #[tokio::test]
 async fn vm_closure_into_stdlib_hof_matches_treewalker() {
-    // V12 #176: a VM-compiled script function is a `Value::Closure`. Stdlib native
+    // V12 #176: a VM-compiled script function is a `Value::closure`. Stdlib native
     // HOFs that take a CALLBACK argument used to enumerate the callable `Value`
     // variants WITHOUT `Closure`, so a VM program passing an arrow/`fn` to e.g.
     // `stream.filter`/`stream.map`/`array.sort`'s comparator panicked "expects a
@@ -1002,10 +1002,10 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     // typed-parse with a defaulted field) ALSO runs byte-identically now and is
     // UNSKIPPED — its in-process round-trip completes and the output is deterministic
     // (it binds an ephemeral port but, unlike `typed_api.as`, never prints it).
-    // ---- stdlib callable-accept gap: Value::Closure (V12 #176) — NOW FIXED -----
+    // ---- stdlib callable-accept gap: Value::closure (V12 #176) — NOW FIXED -----
     // `streams_and_testing.as` was here (it passes arrow/`fn` closures to
     // `stream.filter`/`map`/`reduce`/…). With native HOFs now accepting
-    // `Value::Closure` it runs byte-identically on the VM and has been UNSKIPPED
+    // `Value::closure` it runs byte-identically on the VM and has been UNSKIPPED
     // into the whole-corpus gate. `typed_api.as` / `typed_http.as` (server route +
     // middleware closures) ALSO run on the VM now, but each stays skipped for a
     // DIFFERENT, now-surfaced reason — see below.
@@ -2360,7 +2360,7 @@ async fn vm_for_in_over_value_matches_treewalker() {
     // uses the lazy range loop; `in` over any OTHER value falls back to ForOf and
     // iterates the resulting value (src/parser.rs `Tok::In` arm). The VM must mirror
     // that overload: `in` + non-`RangeExpr` is a sync for-of, byte-identical to the
-    // tree-walker. `..` itself produces a `Value::Array`, so `for (i in r)` where `r`
+    // tree-walker. `..` itself produces a `Value::array_cell`, so `for (i in r)` where `r`
     // is a range VALUE iterates that array's elements.
     let cases = [
         // `in` over a NAME bound to a range VALUE -> iterate elements 0,1,2.
@@ -2768,7 +2768,7 @@ async fn vm_fn_type_param_contract_matches_treewalker() {
 // `recover(fn)` is the testable end-to-end surface for the `native → VM` bridge:
 // it is a BARE builtin (so the VM compiler can emit the call without `import`,
 // which lands in a later VM slice) and its native implementation invokes the
-// closure argument through `Interp::call_value`, which routes a `Value::Closure`
+// closure argument through `Interp::call_value`, which routes a `Value::closure`
 // back into `Vm::call_value` to run it on a fresh Fiber. The whole point is that
 // the closure runs on the VM and produces byte-identical observable output to the
 // tree-walker. The HOF callers (`array.map`/`filter`/sort comparator/middleware)
@@ -3552,7 +3552,7 @@ async fn vm_async_contract_violation_surfaces_lazily_at_await() {
 
 #[tokio::test]
 async fn vm_unawaited_async_call_is_cancelled_like_treewalker() {
-    // M17 invariant: an `async fn` whose `Value::Future` is dropped WITHOUT being
+    // M17 invariant: an `async fn` whose `Value::future` is dropped WITHOUT being
     // awaited is CANCELLED (its task aborted), not orphaned — its side effect does
     // NOT run. The tree-walker does this too (its `SharedFuture` is cancel-on-drop
     // via AbortHandle); the VM reuses the EXACT same `SharedFuture` machinery in
@@ -3562,7 +3562,7 @@ async fn vm_unawaited_async_call_is_cancelled_like_treewalker() {
     // `unawaited_async_call_is_cancelled` (which uses `time.sleep` — V12 on the
     // VM). Concretely: `worked` must NOT appear; only `main` is printed.
     // NOTE: we assert the BARE un-awaited call (the true M17 leak class: the
-    // `Value::Future` is dropped at the end of its expression statement). The
+    // `Value::future` is dropped at the end of its expression statement). The
     // distinct case of a future *held* in a local until program end
     // (`let f = work()`) is covered by `vm_held_future_drains_identically_to_treewalker`
     // (#147): both engines drain it at end-of-program, so its body runs identically.
@@ -3674,7 +3674,7 @@ async fn vm_async_chained_and_control_flow_matches_treewalker() {
 // ---- V8: generators (fn* / yield / next / close) ------------------------
 //
 // A VM generator is a Suspended Fiber (see `src/coro.rs` `GenImpl::Vm`): calling
-// a `fn*` closure builds a not-started Fiber and returns a `Value::Generator`;
+// a `fn*` closure builds a not-started Fiber and returns a `Value::generator`;
 // `gen.next(v)` resumes it to the next `Op::Yield` (or completion → nil), and
 // `next(v)` injects `v` as the suspended `yield` expression's value. Every case
 // below asserts byte-identical stdout against the tree-walker.
@@ -4295,7 +4295,7 @@ async fn vm_three_level_inheritance_chain() {
 
 #[tokio::test]
 async fn vm_enum_decl_and_variant_access() {
-    // Declaring an enum binds a `Value::Enum`; `Color.Red` reads a `Value::EnumVariant`
+    // Declaring an enum binds a `Value::enum_`; `Color.Red` reads a `Value::enum_variant`
     // whose display is `Color.Red` — byte-identical to the tree-walker.
     for src in [
         "enum Color { Red, Green, Blue }\nprint(Color.Red)",
@@ -4380,7 +4380,7 @@ async fn vm_enum_in_conditional() {
 #[tokio::test]
 async fn vm_enum_no_variant_error() {
     // Accessing a missing variant raises the SAME Tier-2 panic message on both
-    // engines (shared `read_member` on `Value::Enum`).
+    // engines (shared `read_member` on `Value::enum_`).
     let src = "enum Color { Red, Green }\nprint(Color.Purple)";
     assert_vm_run_error_matches_treewalker(src).await;
 }
@@ -4388,9 +4388,9 @@ async fn vm_enum_no_variant_error() {
 // ---- ClassName.from validation (V9-T4): via the CALL_METHOD path ---------
 //
 // `User.from({...})` compiles to `<class-name-ref> <obj-arg> CALL_METHOD "from"`.
-// In CALL_METHOD the receiver is a `Value::Class` (NOT a schema value), so the
+// In CALL_METHOD the receiver is a `Value::class` (NOT a schema value), so the
 // hook falls through to `vm_read_member(class, "from")` → `Interp::read_member`
-// (yields `Value::ClassMethod(c, "from")`) → `Vm::call_value` → the non-VM-class
+// (yields `Value::class_method(c, "from")`) → `Vm::call_value` → the non-VM-class
 // arm delegates to `Interp::call_value`, whose `ClassMethod(c, "from")` arm runs
 // `validate_into`. So the `.from` CALL PATH is REACHABLE on the VM with NO import
 // (the class is defined in-file): a valid object, an optional-no-default field,
@@ -4469,7 +4469,7 @@ async fn vm_class_from_not_an_object_matches_treewalker() {
 #[tokio::test]
 async fn vm_class_unknown_static_member_matches_treewalker() {
     // A class static member other than `from` is the SAME Tier-2 panic on both
-    // engines (shared `read_member` on `Value::Class`).
+    // engines (shared `read_member` on `Value::class`).
     let src = "class User {\n  name: string\n}\nprint(User.nope)";
     assert_vm_run_error_matches_treewalker(src).await;
 }

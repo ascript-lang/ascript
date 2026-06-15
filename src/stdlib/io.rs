@@ -63,7 +63,7 @@ impl Interp {
                 // EOF: store the (exhausted) reader back so a subsequent call finds
                 // it and returns EOF again immediately instead of recreating it.
                 self.return_resource(STDIN_RESOURCE_ID, ResourceState::StdinReader(reader));
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             Ok(_) => {
                 // Strip trailing \r\n or \n.
@@ -74,8 +74,8 @@ impl Interp {
                     }
                 }
                 self.return_resource(STDIN_RESOURCE_ID, ResourceState::StdinReader(reader));
-                Ok(Value::Str(
-                    String::from_utf8_lossy(&buf).into_owned().into(),
+                Ok(Value::str(
+                    String::from_utf8_lossy(&buf).into_owned(),
                 ))
             }
             Err(e) => {
@@ -96,8 +96,8 @@ impl Interp {
             Ok(_) => {
                 // Return the (exhausted) reader so a subsequent call doesn't panic.
                 self.return_resource(STDIN_RESOURCE_ID, ResourceState::StdinReader(reader));
-                Ok(Value::Str(
-                    String::from_utf8_lossy(&buf).into_owned().into(),
+                Ok(Value::str(
+                    String::from_utf8_lossy(&buf).into_owned(),
                 ))
             }
             Err(e) => {
@@ -124,8 +124,8 @@ impl Interp {
                             buf.pop();
                         }
                     }
-                    lines.push(Value::Str(
-                        String::from_utf8_lossy(&buf).into_owned().into(),
+                    lines.push(Value::str(
+                        String::from_utf8_lossy(&buf).into_owned(),
                     ));
                 }
                 Err(e) => {
@@ -135,8 +135,6 @@ impl Interp {
             }
         }
         self.return_resource(STDIN_RESOURCE_ID, ResourceState::StdinReader(reader));
-        Ok(Value::Array(crate::value::ArrayCell::new(
-            lines,
-        )))
+        Ok(Value::array(lines))
     }
 }

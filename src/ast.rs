@@ -50,7 +50,7 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     Object(Vec<ObjEntry>),
-    /// `#{ keyExpr: valueExpr, … }` — a map literal producing a `Value::Map`.
+    /// `#{ keyExpr: valueExpr, … }` — a map literal producing a `Value::map_cell`.
     /// Unlike object literals, the KEY is an arbitrary evaluated expression
     /// (converted via `MapKey::from_value`), not a bare identifier name.
     /// Spread is not representable (out of scope for SP2; a `...` inside `#{}`
@@ -150,9 +150,9 @@ pub enum CallArg {
 pub enum Type {
     /// `number` — the union `int | float`; accepts either numeric subtype.
     Number,
-    /// `int` (NUM) — accepts only `Value::Int`.
+    /// `int` (NUM) — accepts only `Value::int`.
     Int,
-    /// `float` (NUM) — accepts only `Value::Float`.
+    /// `float` (NUM) — accepts only `Value::float`.
     Float,
     String,
     Bool,
@@ -378,7 +378,7 @@ pub enum Stmt {
         name_span: Span,
     },
     /// IFACE §3: a structural interface declaration — a named method SET (no bodies).
-    /// Binds a `Value::Interface` module-global. `extends` composes other interfaces
+    /// Binds a `Value::interface` module-global. `extends` composes other interfaces
     /// (transitive union, lazy). `type_params` reserves generics (empty in v1, §6.1).
     Interface {
         name: String,
@@ -944,9 +944,9 @@ mod tests {
         let t = Type::Param("T".into());
         // Runtime-erased: a `T`-annotated slot accepts EVERY value (accept-anything),
         // exactly like `any`. No runtime obligation.
-        assert!(check_type(&Value::Int(5), &t));
-        assert!(check_type(&Value::Str("hi".into()), &t));
-        assert!(check_type(&Value::Bool(true), &t));
-        assert!(check_type(&Value::Nil, &t));
+        assert!(check_type(&Value::int(5), &t));
+        assert!(check_type(&Value::str("hi"), &t));
+        assert!(check_type(&Value::bool_(true), &t));
+        assert!(check_type(&Value::nil(), &t));
     }
 }

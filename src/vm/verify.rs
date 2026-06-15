@@ -53,7 +53,7 @@ pub enum VerifyError {
         len: usize,
     },
     /// A name-const operand (e.g. `GET_PROP`, `GET_GLOBAL`) indexes a constant that
-    /// is not a `Value::Str`.
+    /// is not a `Value::str`.
     NameConstNotString { offset: usize, index: usize },
     /// A jump's computed absolute target is outside `[0, code.len()]`.
     JumpOutOfBounds {
@@ -487,7 +487,7 @@ fn check_operands(
     };
     let check_name_const = |idx: usize| -> Result<(), VerifyError> {
         check_const(idx)?;
-        if !matches!(chunk.consts[idx], crate::value::Value::Str(_)) {
+        if !matches!(chunk.consts[idx].kind(), crate::value::ValueKind::Str(_)) {
             return Err(VerifyError::NameConstNotString {
                 offset: off,
                 index: idx,
@@ -559,7 +559,7 @@ fn check_operands(
         //      `VariantElem(0..=299)` / `MatchVariantArity(300)`. So a tighter constant cap
         //      such as 255 would *over-reject* valid bytecode and is unsound.)
         //   2. The run loop is independently out-of-bounds-safe: `VariantElem` reads the
-        //      payload with `.get(idx)` / `IndexMap::get_index(idx)` (→ `Value::Nil` when
+        //      payload with `.get(idx)` / `IndexMap::get_index(idx)` (→ `Value::nil()` when
         //      out of range) and `MatchVariantArity` tests `payload_len == Some(n)` — a
         //      false match, never an index panic. (The inline tests below assert a 0xFFFF
         //      operand verifies, and `run.rs` asserts the run loop returns Nil/false for
@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn const_index_out_of_range_rejected() {
         let mut c = Chunk::new();
-        c.add_const(Value::Float(1.0)); // index 0 is the only valid one
+        c.add_const(Value::float(1.0)); // index 0 is the only valid one
         c.emit_u16(Op::Const, 5, s()); // index 5 is out of range
         c.emit(Op::Return, s());
         match verify(&c) {
@@ -1242,7 +1242,7 @@ mod tests {
     #[test]
     fn name_const_not_string_rejected() {
         let mut c = Chunk::new();
-        let n = c.add_const(Value::Float(1.0)); // a number, not a Str
+        let n = c.add_const(Value::float(1.0)); // a number, not a Str
         c.emit_u16(Op::GetGlobal, n, s());
         c.emit(Op::Return, s());
         assert!(matches!(
@@ -1281,7 +1281,7 @@ mod tests {
     fn jump_into_instruction_rejected() {
         let mut c = Chunk::new();
         // CONST (3 bytes) then JUMP whose target lands in the middle of the CONST.
-        let k = c.add_const(Value::Float(1.0));
+        let k = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, k, s()); // bytes 0,1,2
         let site = c.emit_jump(Op::Jump, s()); // op at 3, operand at 4
         c.emit(Op::Return, s());
@@ -1314,7 +1314,7 @@ mod tests {
         // this malformed chunk must be REJECTED (was wrongly accepted when the effect
         // was `(0, 0)`).
         let mut c = Chunk::new();
-        let n = c.add_const(Value::Str("g".into())); // a valid name-const (Str)
+        let n = c.add_const(Value::str("g")); // a valid name-const (Str)
         c.emit_u16(Op::SetGlobal, n, s()); // depth 0 here -> underflow
         c.emit(Op::Return, s());
         match verify(&c) {
@@ -1595,7 +1595,7 @@ mod tests {
     fn defer_push_method_bad_flags_rejected() {
         // DeferPushMethod with flags=0xF0 must be rejected.
         let mut c = Chunk::new();
-        let idx = c.add_const(Value::Str("m".into()));
+        let idx = c.add_const(Value::str("m"));
         // Emit DeferPushMethod: opcode + u16 name_idx (LE) + u8 flags + u8 argc
         c.code.push(Op::DeferPushMethod as u8);
         let [lo, hi] = idx.to_le_bytes();
@@ -1614,7 +1614,7 @@ mod tests {
     fn defer_push_method_name_not_string_rejected() {
         // DeferPushMethod with a non-Str name const must be rejected.
         let mut c = Chunk::new();
-        let idx = c.add_const(Value::Float(1.0)); // not a Str
+        let idx = c.add_const(Value::float(1.0)); // not a Str
         c.code.push(Op::DeferPushMethod as u8);
         let [lo, hi] = idx.to_le_bytes();
         c.code.push(lo);

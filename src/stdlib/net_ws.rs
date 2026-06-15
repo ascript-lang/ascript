@@ -56,10 +56,9 @@ use super::{arg, bi, want_array, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
@@ -105,11 +104,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn bytes_value(b: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(b)))
+    Value::bytes(b)
 }
 
 /// Parse `connect`'s optional `opts` into a flat list of handshake request headers.
@@ -121,14 +120,14 @@ fn bytes_value(b: Vec<u8>) -> Value {
 /// shape) is a Tier-2 panic.
 fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>, Control> {
     let mut out: Vec<(String, String)> = Vec::new();
-    let obj = match opts {
-        Value::Nil => return Ok(out),
-        Value::Object(o) => o,
-        other => {
+    let obj = match opts.kind() {
+        ValueKind::Nil => return Ok(out),
+        ValueKind::Object(o) => o,
+        _ => {
             return Err(AsError::at(
                 format!(
                     "net/ws.connect opts expects an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(opts)
                 ),
                 span,
             )
@@ -137,13 +136,13 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
     };
     // headers: object of string→string.
     if let Some(h) = obj.get("headers") {
-        let map = match h {
-            Value::Object(o) => o,
-            ref other => {
+        let map = match h.kind() {
+            ValueKind::Object(o) => o,
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "net/ws.connect headers expects an object, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&h)
                     ),
                     span,
                 )
@@ -158,13 +157,13 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
 
     // auth: {bearer: tok} or {basic: [user, pass?]}.
     if let Some(a) = obj.get("auth") {
-        let ao = match a {
-            Value::Object(o) => o,
-            ref other => {
+        let ao = match a.kind() {
+            ValueKind::Object(o) => o,
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "net/ws.connect auth expects an object, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&a)
                     ),
                     span,
                 )
@@ -178,12 +177,13 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
             let arr = want_array(&basic, span, "net/ws.connect auth.basic")?;
             let arr = arr.borrow();
             let user = want_string(
-                arr.first().unwrap_or(&Value::Nil),
+                arr.first().unwrap_or(&Value::nil()),
                 span,
                 "net/ws.connect auth.basic[0]",
             )?;
             let pass = match arr.get(1) {
-                Some(Value::Nil) | None => String::new(),
+                None => String::new(),
+                Some(p) if matches!(p.kind(), ValueKind::Nil) => String::new(),
                 Some(p) => want_string(p, span, "net/ws.connect auth.basic[1]")?.to_string(),
             };
             let creds =
@@ -256,7 +256,7 @@ impl Interp {
                     indexmap::IndexMap::new(),
                     ResourceState::WsConnection(WsConnState::new(stream)),
                 );
-                Ok(make_pair(handle, Value::Nil))
+                Ok(make_pair(handle, Value::nil()))
             }
             Err(e) => Ok(err_pair(format!("net/ws.connect to {} failed: {}", url, e))),
         }
@@ -279,13 +279,13 @@ impl Interp {
                 let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                 let mut fields = indexmap::IndexMap::new();
                 // NUM §4: a port is an `Int`.
-                fields.insert("port".to_string(), Value::Int(i64::from(bound)));
+                fields.insert("port".to_string(), Value::int(i64::from(bound)));
                 let handle = self.register_resource(
                     NativeKind::WsListener,
                     fields,
                     ResourceState::WsListener(listener),
                 );
-                Ok(make_pair(handle, Value::Nil))
+                Ok(make_pair(handle, Value::nil()))
             }
             Err(e) => Ok(err_pair(format!("net/ws.listen on {} failed: {}", addr, e))),
         }
@@ -318,14 +318,15 @@ impl Interp {
     ) -> Result<Value, Control> {
         match method {
             "send" => {
-                let msg = match &arg(args, 0) {
-                    Value::Str(s) => Message::Text(s.to_string()),
-                    Value::Bytes(b) => Message::Binary(b.borrow().clone()),
-                    other => {
+                let send_arg = arg(args, 0);
+                let msg = match send_arg.kind() {
+                    ValueKind::Str(s) => Message::Text(s.to_string()),
+                    ValueKind::Bytes(b) => Message::Binary(b.borrow().clone()),
+                    _ => {
                         return Err(AsError::at(
                             format!(
                                 "ws.send expects a string or bytes, got {}",
-                                crate::interp::type_name(other)
+                                crate::interp::type_name(&send_arg)
                             ),
                             span,
                         )
@@ -345,7 +346,7 @@ impl Interp {
                 let r = conn.inner.send(msg).await;
                 self.return_resource(id, ResourceState::WsConnection(conn));
                 match r {
-                    Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                    Ok(()) => Ok(make_pair(Value::nil(), Value::nil())),
                     Err(e) => Ok(err_pair(format!("ws.send failed: {}", e))),
                 }
             }
@@ -358,18 +359,18 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(make_pair(Value::Nil, Value::Nil));
+                        return Ok(make_pair(Value::nil(), Value::nil()));
                     }
                 };
                 loop {
                     match conn.inner.next().await {
                         Some(Ok(Message::Text(s))) => {
                             self.return_resource(id, ResourceState::WsConnection(conn));
-                            return Ok(make_pair(Value::Str(s.into()), Value::Nil));
+                            return Ok(make_pair(Value::str(s), Value::nil()));
                         }
                         Some(Ok(Message::Binary(b))) => {
                             self.return_resource(id, ResourceState::WsConnection(conn));
-                            return Ok(make_pair(bytes_value(b), Value::Nil));
+                            return Ok(make_pair(bytes_value(b), Value::nil()));
                         }
                         // Control frames are handled by tungstenite (it auto-replies to
                         // Ping); skip them and keep reading for an application message.
@@ -379,14 +380,14 @@ impl Interp {
                         // Peer sent a Close frame, or the stream ended: drop the conn
                         // and report end-of-connection as nil.
                         Some(Ok(Message::Close(_))) | None => {
-                            return Ok(make_pair(Value::Nil, Value::Nil));
+                            return Ok(make_pair(Value::nil(), Value::nil()));
                         }
                         Some(Err(e)) => {
                             // A transport-level reset after the peer is gone is an EOF
                             // for our purposes: drop the conn and surface nil, not a
                             // Tier-1 err (matches the tcp reader's EOF-as-nil contract).
                             if matches!(e, WsError::ConnectionClosed | WsError::AlreadyClosed) {
-                                return Ok(make_pair(Value::Nil, Value::Nil));
+                                return Ok(make_pair(Value::nil(), Value::nil()));
                             }
                             return Ok(err_pair(format!("ws.recv failed: {}", e)));
                         }
@@ -398,7 +399,7 @@ impl Interp {
                 if let Some(ResourceState::WsConnection(mut conn)) = self.take_resource(id) {
                     let _ = conn.inner.close().await;
                 }
-                Ok(make_pair(Value::Nil, Value::Nil))
+                Ok(make_pair(Value::nil(), Value::nil()))
             }
             other => {
                 Err(AsError::at(format!("wsConnection has no method '{}'", other), span).into())
@@ -440,7 +441,7 @@ impl Interp {
                             indexmap::IndexMap::new(),
                             ResourceState::WsConnection(WsConnState::new(stream)),
                         );
-                        Ok(make_pair(handle, Value::Nil))
+                        Ok(make_pair(handle, Value::nil()))
                     }
                     Err(e) => Ok(err_pair(format!(
                         "ws listener.accept handshake failed: {}",
@@ -450,7 +451,7 @@ impl Interp {
             }
             "close" => {
                 self.take_resource(id);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => Err(AsError::at(format!("wsListener has no method '{}'", other), span).into()),
         }

@@ -142,42 +142,42 @@ mod tests {
     #[test]
     fn defines_and_gets() {
         let env = Environment::global();
-        env.define("x", Value::Float(5.0), true).unwrap();
-        assert!(matches!(env.get("x"), Some(Value::Float(n)) if n == 5.0));
+        env.define("x", Value::float(5.0), true).unwrap();
+        assert!(matches!(env.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 5.0));
     }
 
     #[test]
     fn redefining_in_same_scope_errors() {
         let env = Environment::global();
-        env.define("x", Value::Float(1.0), true).unwrap();
-        assert!(env.define("x", Value::Float(2.0), true).is_err());
+        env.define("x", Value::float(1.0), true).unwrap();
+        assert!(env.define("x", Value::float(2.0), true).is_err());
     }
 
     #[test]
     fn child_reads_parent_but_can_shadow() {
         let parent = Environment::global();
-        parent.define("x", Value::Float(1.0), true).unwrap();
+        parent.define("x", Value::float(1.0), true).unwrap();
         let child = parent.child();
-        assert!(matches!(child.get("x"), Some(Value::Float(n)) if n == 1.0));
-        child.define("x", Value::Float(9.0), true).unwrap();
-        assert!(matches!(child.get("x"), Some(Value::Float(n)) if n == 9.0));
-        assert!(matches!(parent.get("x"), Some(Value::Float(n)) if n == 1.0));
+        assert!(matches!(child.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 1.0));
+        child.define("x", Value::float(9.0), true).unwrap();
+        assert!(matches!(child.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 9.0));
+        assert!(matches!(parent.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 1.0));
     }
 
     #[test]
     fn assign_walks_outward_and_respects_mutability() {
         let parent = Environment::global();
-        parent.define("m", Value::Float(1.0), true).unwrap();
-        parent.define("c", Value::Float(2.0), false).unwrap();
+        parent.define("m", Value::float(1.0), true).unwrap();
+        parent.define("c", Value::float(2.0), false).unwrap();
         let child = parent.child();
-        child.assign("m", Value::Float(10.0)).unwrap();
-        assert!(matches!(parent.get("m"), Some(Value::Float(n)) if n == 10.0));
+        child.assign("m", Value::float(10.0)).unwrap();
+        assert!(matches!(parent.get("m").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 10.0));
         assert_eq!(
-            child.assign("c", Value::Float(3.0)),
+            child.assign("c", Value::float(3.0)),
             Err(AssignError::Immutable)
         );
         assert_eq!(
-            child.assign("nope", Value::Nil),
+            child.assign("nope", Value::nil()),
             Err(AssignError::Undefined)
         );
     }

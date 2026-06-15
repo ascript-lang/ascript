@@ -37,7 +37,7 @@ use crate::env::Environment;
 use crate::error::{AsError, SourceInfo};
 use crate::interp::{Control, Interp};
 use crate::token::Tok;
-use crate::value::Value;
+use crate::value::ValueKind;
 use crate::vm::chunk::FnProto;
 use crate::vm::value_ext::{Closure, RunOutcome};
 use crate::vm::Vm;
@@ -252,7 +252,7 @@ async fn eval_line_vm(vm: &Rc<Vm>, line: &str, session_src: &mut String) -> bool
                 // compiler emitted `RETURN <value>`. Print it unless it is `Nil`,
                 // matching the tree-walker REPL's trailing-expression rule.
                 Ok(RunOutcome::Done(value)) => {
-                    if !matches!(value, Value::Nil) {
+                    if !matches!(value.kind(), ValueKind::Nil) {
                         println!("{}", value);
                     }
                     false
@@ -443,7 +443,7 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) -> bool {
                     Ok(value) => {
                         interp.drain_session_defers(&defer_list).await;
                         flush_output(interp);
-                        if !matches!(value, Value::Nil) {
+                        if !matches!(value.kind(), ValueKind::Nil) {
                             println!("{}", value);
                         }
                     }

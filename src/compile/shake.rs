@@ -396,8 +396,8 @@ fn member_name_at(chunk: &Chunk, op_ip: usize) -> Option<Rc<str>> {
         return None;
     }
     let idx = chunk.read_u16(name_ip) as usize;
-    match chunk.consts.get(idx) {
-        Some(crate::value::Value::Str(name)) => Some(name.clone()),
+    match chunk.consts.get(idx).map(|v| v.kind()) {
+        Some(crate::value::ValueKind::Str(name)) => Some(name.clone()),
         _ => None,
     }
 }
@@ -515,8 +515,8 @@ fn classify_namespace_use_rec(
             // The GET_GLOBAL's u16 operand names the global being read.
             let name_idx = chunk.read_u16(ip + 1) as usize;
             let is_alias = matches!(
-                chunk.consts.get(name_idx),
-                Some(crate::value::Value::Str(name)) if &**name == alias
+                chunk.consts.get(name_idx).map(|v| v.kind()),
+                Some(crate::value::ValueKind::Str(name)) if &**name == alias
             );
             if is_alias {
                 match classify_site(chunk, ip) {

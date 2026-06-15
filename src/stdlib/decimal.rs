@@ -1,6 +1,6 @@
 //! `std/decimal` — exact decimal arithmetic (money / large integers).
 //!
-//! `Value::Decimal` wraps `rust_decimal::Decimal` (a 96-bit scaled integer).
+//! `Value::decimal_rc` wraps `rust_decimal::Decimal` (a 96-bit scaled integer).
 //! Construction is always explicit — no grammar changes.
 //!
 //! **Rounding:** `round(d, places)` uses `MidpointRounding::MidpointAwayFromZero`
@@ -23,8 +23,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
-use std::rc::Rc; // VAL Task 2: `Value::Decimal` is now `Rc<Decimal>`.
+use crate::value::{Value, ValueKind};
 use rust_decimal::prelude::*;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -48,17 +47,17 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// - Number: `Decimal::from_f64`; non-finite → Tier-2 panic.
 /// - Anything else: None (caller panics with a better message).
 pub(crate) fn coerce_to_decimal(v: &Value, span: Span) -> Result<Option<Decimal>, Control> {
-    match v {
-        Value::Decimal(d) => Ok(Some(**d)),
+    match v.kind() {
+        ValueKind::Decimal(d) => Ok(Some(**d)),
         // NUM §4: an `Int` converts EXACTLY (no f64 round-trip).
-        Value::Int(i) => Ok(Some(Decimal::from(*i))),
-        Value::Float(n) => {
+        ValueKind::Int(i) => Ok(Some(Decimal::from(i))),
+        ValueKind::Float(n) => {
             if !n.is_finite() {
                 return Err(
                     AsError::at("cannot convert non-finite number to decimal", span).into(),
                 );
             }
-            match Decimal::from_f64(*n) {
+            match Decimal::from_f64(n) {
                 Some(d) => Ok(Some(d)),
                 None => {
                     Err(AsError::at("cannot convert number to decimal (out of range)", span).into())
@@ -80,12 +79,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         //   x = decimal : identity
         "from" => {
             let v = arg(args, 0);
-            match &v {
-                Value::Decimal(d) => Ok(Value::Decimal(d.clone())),
+            match v.kind() {
+                ValueKind::Decimal(d) => Ok(Value::decimal_rc(d.clone())),
                 // NUM §4: an `Int` converts EXACTLY.
-                Value::Int(i) => Ok(Value::Decimal(Rc::new(Decimal::from(*i)))),
-                Value::Str(s) => Decimal::from_str(s.as_ref())
-                    .map(|d| Value::Decimal(Rc::new(d)))
+                ValueKind::Int(i) => Ok(Value::decimal(Decimal::from(i))),
+                ValueKind::Str(s) => Decimal::from_str(s.as_ref())
+                    .map(Value::decimal)
                     .map_err(|_| {
                         AsError::at(
                             format!("decimal.from: invalid decimal string {:?}", s.as_ref()),
@@ -93,7 +92,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         )
                         .into()
                     }),
-                Value::Float(n) => {
+                ValueKind::Float(n) => {
                     if !n.is_finite() {
                         return Err(AsError::at(
                             "decimal.from: cannot convert non-finite number to decimal",
@@ -106,12 +105,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     // i64 range), so `<=` would admit 2^63 and `as i64` would saturate;
                     // `-(i64::MIN as f64)` == 2^63 and `<` excludes it. Out-of-i64-range
                     // integral floats fall through to the exact `from_f64` path below.
-                    if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n < -(i64::MIN as f64) {
-                        Ok(Value::Decimal(Rc::new(Decimal::from(*n as i64))))
+                    if n.fract() == 0.0 && n >= i64::MIN as f64 && n < -(i64::MIN as f64) {
+                        Ok(Value::decimal(Decimal::from(n as i64)))
                     } else {
                         // Non-integer: use shortest round-trip via from_f64.
-                        Decimal::from_f64(*n)
-                            .map(|d| Value::Decimal(Rc::new(d)))
+                        Decimal::from_f64(n)
+                            .map(Value::decimal)
                             .ok_or_else(|| {
                                 AsError::at(
                                     "decimal.from: cannot convert number to decimal (out of range)",
@@ -136,10 +135,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "parse" => {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
             match Decimal::from_str(s.as_ref()) {
-                Ok(d) => Ok(make_pair(Value::Decimal(Rc::new(d)), Value::Nil)),
+                Ok(d) => Ok(make_pair(Value::decimal(d), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid decimal: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid decimal: {}", e))),
                 )),
             }
         }
@@ -147,20 +146,21 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         // decimal.toString(d) → string
         "toString" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("toString"))?;
-            Ok(Value::Str(d.to_string().into()))
+            Ok(Value::str(d.to_string()))
         }
 
         // decimal.toNumber(d) → number  (lossy f64 conversion)
         "toNumber" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("toNumber"))?;
-            Ok(Value::Float(d.to_f64().unwrap_or(f64::NAN)))
+            Ok(Value::float(d.to_f64().unwrap_or(f64::NAN)))
         }
 
         // decimal.round(d, places=0) → decimal  (half-away-from-zero)
         "round" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("round"))?;
             let places = match args.get(1) {
-                Some(Value::Nil) | None => 0,
+                Some(v) if matches!(v.kind(), ValueKind::Nil) => 0,
+                None => 0,
                 // NUM §4: accept BOTH numeric subtypes for `places`.
                 Some(v) if v.is_number() => {
                     let n = v.as_f64().unwrap_or(f64::NAN);
@@ -175,34 +175,34 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 }
                 _ => return Err(AsError::at("decimal.round: places must be a number", span).into()),
             };
-            Ok(Value::Decimal(Rc::new(d.round_dp_with_strategy(
+            Ok(Value::decimal(d.round_dp_with_strategy(
                 places,
                 rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-            ))))
+            )))
         }
 
         // decimal.abs(d) → decimal
         "abs" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("abs"))?;
-            Ok(Value::Decimal(Rc::new(d.abs())))
+            Ok(Value::decimal(d.abs()))
         }
 
         // decimal.floor(d) → decimal
         "floor" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("floor"))?;
-            Ok(Value::Decimal(Rc::new(d.floor())))
+            Ok(Value::decimal(d.floor()))
         }
 
         // decimal.ceil(d) → decimal
         "ceil" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("ceil"))?;
-            Ok(Value::Decimal(Rc::new(d.ceil())))
+            Ok(Value::decimal(d.ceil()))
         }
 
         // decimal.trunc(d) → decimal
         "trunc" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("trunc"))?;
-            Ok(Value::Decimal(Rc::new(d.trunc())))
+            Ok(Value::decimal(d.trunc()))
         }
 
         _ => Err(AsError::at(format!("std/decimal has no function '{}'", func), span).into()),
@@ -212,8 +212,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 // ---- argument helper --------------------------------------------------------
 
 pub(crate) fn want_decimal(v: &Value, span: Span, ctx: &str) -> Result<Decimal, Control> {
-    match v {
-        Value::Decimal(d) => Ok(**d),
+    match v.kind() {
+        ValueKind::Decimal(d) => Ok(**d),
         _ => Err(AsError::at(
             format!(
                 "{} expects a decimal, got {}",
@@ -237,34 +237,34 @@ mod tests {
     }
 
     fn d(s: &str) -> Value {
-        Value::Decimal(Rc::new(Decimal::from_str(s).unwrap()))
+        Value::decimal(Decimal::from_str(s).unwrap())
     }
 
     // --- construction ---
 
     #[test]
     fn from_string_preserves_scale() {
-        let v = call("from", &[Value::Str("1.50".into())], sp()).unwrap();
+        let v = call("from", &[Value::str("1.50")], sp()).unwrap();
         assert_eq!(v.to_string(), "1.50");
     }
 
     #[test]
     fn from_string_integer() {
-        let v = call("from", &[Value::Str("42".into())], sp()).unwrap();
+        let v = call("from", &[Value::str("42")], sp()).unwrap();
         assert_eq!(v.to_string(), "42");
     }
 
     #[test]
     fn from_integer_number() {
-        let v = call("from", &[Value::Float(3.0)], sp()).unwrap();
+        let v = call("from", &[Value::float(3.0)], sp()).unwrap();
         assert_eq!(v.to_string(), "3");
     }
 
     #[test]
     fn from_float_number_round_trips() {
         // decimal.from(1.1) must equal decimal.parse("1.1")
-        let via_number = call("from", &[Value::Float(1.1)], sp()).unwrap();
-        let via_string = call("from", &[Value::Str("1.1".into())], sp()).unwrap();
+        let via_number = call("from", &[Value::float(1.1)], sp()).unwrap();
+        let via_string = call("from", &[Value::str("1.1")], sp()).unwrap();
         assert_eq!(
             via_number, via_string,
             "from(1.1) should equal from(\"1.1\"): got {} vs {}",
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn from_invalid_string_panics() {
-        let result = call("from", &[Value::Str("xyz".into())], sp());
+        let result = call("from", &[Value::str("xyz")], sp());
         assert!(
             matches!(result, Err(crate::interp::Control::Panic(_))),
             "expected Tier-2 panic for invalid string"
@@ -283,15 +283,15 @@ mod tests {
 
     #[test]
     fn from_non_finite_panics() {
-        let result = call("from", &[Value::Float(f64::INFINITY)], sp());
+        let result = call("from", &[Value::float(f64::INFINITY)], sp());
         assert!(matches!(result, Err(crate::interp::Control::Panic(_))));
-        let result2 = call("from", &[Value::Float(f64::NAN)], sp());
+        let result2 = call("from", &[Value::float(f64::NAN)], sp());
         assert!(matches!(result2, Err(crate::interp::Control::Panic(_))));
     }
 
     #[test]
     fn from_wrong_type_panics() {
-        let result = call("from", &[Value::Bool(true)], sp());
+        let result = call("from", &[Value::bool_(true)], sp());
         assert!(matches!(result, Err(crate::interp::Control::Panic(_))));
     }
 
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn parse_valid_returns_decimal() {
-        let pair = call("parse", &[Value::Str("1.5".into())], sp()).unwrap();
+        let pair = call("parse", &[Value::str("1.5")], sp()).unwrap();
         // pair is [decimal, nil]
         let s = pair.to_string();
         assert!(s.starts_with("[1.5, nil]"), "got: {s}");
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn parse_invalid_returns_err() {
-        let pair = call("parse", &[Value::Str("x".into())], sp()).unwrap();
+        let pair = call("parse", &[Value::str("x")], sp()).unwrap();
         let s = pair.to_string();
         assert!(s.starts_with("[nil, {message:"), "got: {s}");
     }
@@ -318,14 +318,14 @@ mod tests {
     fn to_string_preserves_scale() {
         let dec = d("1.50");
         let s = call("toString", &[dec], sp()).unwrap();
-        assert_eq!(s, Value::Str("1.50".into()));
+        assert_eq!(s, Value::str("1.50"));
     }
 
     #[test]
     fn to_number_is_lossy() {
         let dec = d("1.5");
         let n = call("toNumber", &[dec], sp()).unwrap();
-        assert_eq!(n, Value::Float(1.5));
+        assert_eq!(n, Value::float(1.5));
     }
 
     // --- round ---
@@ -342,7 +342,7 @@ mod tests {
     fn round_with_places() {
         // round(1.456, 2) → 1.46
         assert_eq!(
-            call("round", &[d("1.456"), Value::Float(2.0)], sp()).unwrap(),
+            call("round", &[d("1.456"), Value::float(2.0)], sp()).unwrap(),
             d("1.46")
         );
     }

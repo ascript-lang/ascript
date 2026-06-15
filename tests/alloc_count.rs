@@ -65,7 +65,7 @@ fn slope(make_src: impl Fn(u64) -> String, call_fast: bool) -> f64 {
 /// A1+A2 (Task 2.1/2.2 gate): capture-free calls must show reduced per-call allocs.
 /// A1 (empty-cells fast path) is always-on and benefits both call_fast=true and
 /// call_fast=false. A2 (in-place arg binding) is gated on call_fast=true and
-/// eliminates the 2 arg Vecs (the `vec![Value::Nil; argc]` in push_closure_frame
+/// eliminates the 2 arg Vecs (the `vec![Value::nil(); argc]` in push_closure_frame
 /// and the `BoundArgs.values` Vec from check_call_args).
 ///
 /// After A2: `call_fast=true` path should reach ~0 allocs/call (slope < 1.0).

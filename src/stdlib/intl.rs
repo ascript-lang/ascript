@@ -34,7 +34,9 @@ use super::{arg, bi, want_number, want_object, want_string};
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
+#[cfg(test)]
+use crate::value::OwnedKind;
 use fixed_decimal::FixedDecimal;
 use icu::casemap::CaseMapper;
 use icu::collator::Collator;
@@ -262,7 +264,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 |e| -> Control { AsError::at(format!("intl.formatNumber: {}", e), span).into() },
             )?;
             let fd = fixed_from_f64(n, None);
-            Ok(Value::Str(fdf.format_to_string(&fd).into()))
+            Ok(Value::str(fdf.format_to_string(&fd)))
         }
         "formatCurrency" => {
             let n = want_number(&arg(args, 0), span, &ctx("formatCurrency"))?;
@@ -287,8 +289,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 |e| -> Control { AsError::at(format!("intl.formatCurrency: {}", e), span).into() },
             )?;
             let fd = fixed_from_f64(n, Some(digits));
-            Ok(Value::Str(
-                format!("{}{}", symbol, fdf.format_to_string(&fd)).into(),
+            Ok(Value::str(
+                format!("{}{}", symbol, fdf.format_to_string(&fd)),
             ))
         }
         "formatDate" => {
@@ -311,7 +313,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 &ctx("formatDate"),
             )?;
             let style = match args.get(2) {
-                None | Some(Value::Nil) => "medium".to_string(),
+                None => "medium".to_string(),
+                Some(v) if matches!(v.kind(), ValueKind::Nil) => "medium".to_string(),
                 Some(v) => want_string(v, span, &ctx("formatDate"))?.to_string(),
             };
             use chrono::TimeZone;
@@ -332,7 +335,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 let pattern = date_pattern(&loc, &style);
                 naive.format(pattern).to_string()
             };
-            Ok(Value::Str(out.into()))
+            Ok(Value::str(out))
         }
         "caseUpper" | "caseLower" => {
             let s = want_string(&arg(args, 0), span, &ctx(func))?;
@@ -347,7 +350,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             } else {
                 cm.lowercase_to_string(&s, &loc.id)
             };
-            Ok(Value::Str(out.into()))
+            Ok(Value::str(out))
         }
         "compare" => {
             let a = want_string(&arg(args, 0), span, &ctx("compare"))?;
@@ -362,7 +365,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     AsError::at(format!("intl.compare: {}", e), span).into()
                 })?;
             let ord = collator.compare(&a, &b);
-            Ok(Value::Float(match ord {
+            Ok(Value::float(match ord {
                 std::cmp::Ordering::Less => -1.0,
                 std::cmp::Ordering::Equal => 0.0,
                 std::cmp::Ordering::Greater => 1.0,
@@ -379,14 +382,14 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
     fn n(x: f64) -> Value {
-        Value::Float(x)
+        Value::float(x)
     }
     fn str_of(v: Value) -> String {
-        match v {
-            Value::Str(s) => s.to_string(),
+        match v.into_kind() {
+            OwnedKind::Str(s) => s.to_string(),
             other => panic!("expected string, got {:?}", other),
         }
     }
@@ -451,8 +454,8 @@ mod tests {
         // object (only epochMs is read by formatDate) so this test doesn't
         // depend on the `datetime` feature being enabled.
         let mut o: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        o.insert("epochMs".into(), Value::Float(1623760200000.0));
-        let inst = Value::Object(crate::value::ObjectCell::new(o));
+        o.insert("epochMs".into(), Value::float(1623760200000.0));
+        let inst = Value::object(o);
         let us =
             str_of(call("formatDate", &[inst.clone(), s("en-US"), s("medium")], sp()).unwrap());
         let de =
@@ -469,8 +472,8 @@ mod tests {
         // 2021-03-15T12:00:00Z = 1615809600000 ms (March, to exercise März/mars).
         let inst = || {
             let mut o: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-            o.insert("epochMs".into(), Value::Float(1615809600000.0));
-            Value::Object(crate::value::ObjectCell::new(o))
+            o.insert("epochMs".into(), Value::float(1615809600000.0));
+            Value::object(o)
         };
         let de = str_of(call("formatDate", &[inst(), s("de-DE"), s("long")], sp()).unwrap());
         let fr = str_of(call("formatDate", &[inst(), s("fr-FR"), s("long")], sp()).unwrap());
@@ -487,12 +490,12 @@ mod tests {
 
     #[test]
     fn non_finite_number_panics() {
-        let inf = Value::Float(f64::INFINITY);
+        let inf = Value::float(f64::INFINITY);
         assert!(matches!(
             call("formatNumber", &[inf, s("en-US")], sp()),
             Err(Control::Panic(_))
         ));
-        let nan = Value::Float(f64::NAN);
+        let nan = Value::float(f64::NAN);
         assert!(matches!(
             call("formatCurrency", &[nan, s("USD"), s("en-US")], sp()),
             Err(Control::Panic(_))

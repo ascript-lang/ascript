@@ -321,10 +321,13 @@ mod tests {
         let cold = GlobalCache::Cold;
         assert!(cold.get(0).is_none());
 
-        let c = GlobalCache::set(Value::Builtin("print".into()), 7);
+        let c = GlobalCache::set(Value::builtin("print"), 7);
         // Same version hits.
         match c.get(7) {
-            Some(Value::Builtin(n)) => assert_eq!(&*n, "print"),
+            Some(v) => match v.into_kind() {
+                crate::value::OwnedKind::Builtin(n) => assert_eq!(&*n, "print"),
+                other => panic!("expected cached print builtin, got {other:?}"),
+            },
             other => panic!("expected cached print builtin, got {other:?}"),
         }
         // A bumped version invalidates the cache.
@@ -348,7 +351,7 @@ mod tests {
         // The builtin-`get` path never returns an IndexBound value.
         assert!(c.get(5).is_none(), "IndexBound is not a builtin Cached");
         // And a builtin Cached never returns an index.
-        let b = GlobalCache::set(Value::Builtin("print".into()), 1);
+        let b = GlobalCache::set(Value::builtin("print"), 1);
         assert!(b.get_index(1).is_none(), "Cached is not an IndexBound");
     }
 

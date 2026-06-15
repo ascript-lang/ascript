@@ -30,7 +30,7 @@ use crate::det::{DetEvent, DeterminismContext, Mode};
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -52,10 +52,10 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// Build a tagged activity Object `{__kind:"activity", name, fn}`.
 pub fn make_activity(name: String, func: Value) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("__kind".to_string(), Value::Str(ACTIVITY_KIND.into()));
-    m.insert("name".to_string(), Value::Str(name.into()));
+    m.insert("__kind".to_string(), Value::str(ACTIVITY_KIND));
+    m.insert("name".to_string(), Value::str(name));
     m.insert("fn".to_string(), func);
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }
 
 /// Build the tagged workflow-context Object passed to a workflow body. It carries no
@@ -63,8 +63,8 @@ pub fn make_activity(name: String, func: Value) -> Value {
 /// `DeterminismContext`); the tag is what the call-site hook dispatches on.
 pub fn make_ctx() -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("__kind".to_string(), Value::Str(CTX_KIND.into()));
-    Value::Object(crate::value::ObjectCell::new(m))
+    m.insert("__kind".to_string(), Value::str(CTX_KIND));
+    Value::object(m)
 }
 
 /// True iff `v` is the workflow-context tagged Object.
@@ -87,8 +87,8 @@ pub fn is_ctx_method(name: &str) -> bool {
 
 /// Read the `__kind` tag of an Object value, if it is one.
 fn tagged_kind(v: &Value) -> Option<&'static str> {
-    if let Value::Object(o) = v {
-        if let Some(Value::Str(k)) = o.get("__kind") {
+    if let ValueKind::Object(o) = v.kind() {
+        if let Some(ValueKind::Str(k)) = o.get("__kind").as_ref().map(Value::kind) {
             return match k.as_ref() {
                 CTX_KIND => Some(CTX_KIND),
                 ACTIVITY_KIND => Some(ACTIVITY_KIND),
@@ -110,7 +110,7 @@ pub fn to_json_string(v: &Value) -> String {
 pub fn from_json_string(s: &str) -> Value {
     match serde_json::from_str::<serde_json::Value>(s) {
         Ok(jv) => crate::stdlib::json::to_ascript(&jv),
-        Err(_) => Value::Nil,
+        Err(_) => Value::nil(),
     }
 }
 
@@ -367,15 +367,15 @@ fn ffi_ret_from_json(rec: &serde_json::Value) -> crate::det::FfiRet {
 /// Read `{log: "path", durability?: "fsync"|"buffered"}` from a workflow options
 /// Object, returning `(log_path, fsync)`. `log` is required.
 fn read_options(opts: &Value, span: Span) -> Result<(String, bool), Control> {
-    let Value::Object(o) = opts else {
+    let ValueKind::Object(o) = opts.kind() else {
         return Err(AsError::at(
             "workflow: options must be an object with a `log` path",
             span,
         )
         .into());
     };
-    let log = match o.get("log") {
-        Some(Value::Str(s)) => s.to_string(),
+    let log = match o.get("log").as_ref().map(Value::kind) {
+        Some(ValueKind::Str(s)) => s.to_string(),
         _ => {
             return Err(AsError::at(
                 "workflow: options.log must be a string file path",
@@ -384,7 +384,8 @@ fn read_options(opts: &Value, span: Span) -> Result<(String, bool), Control> {
             .into())
         }
     };
-    let fsync = !matches!(o.get("durability"), Some(Value::Str(s)) if s.as_ref() == "buffered");
+    let fsync =
+        !matches!(o.get("durability").as_ref().map(Value::kind), Some(ValueKind::Str(s)) if s.as_ref() == "buffered");
     Ok((log, fsync))
 }
 
@@ -403,8 +404,8 @@ impl Interp {
             // A bare `activity(...)` outside a workflow is just a callable record;
             // recording happens only via `ctx.call`.
             "activity" => {
-                let name = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
+                let name = match args.first().map(Value::kind) {
+                    Some(ValueKind::Str(s)) => s.to_string(),
                     _ => {
                         return Err(AsError::at(
                             "workflow.activity(name, fn): name must be a string",
@@ -413,7 +414,7 @@ impl Interp {
                         .into())
                     }
                 };
-                let func_val = args.get(1).cloned().unwrap_or(Value::Nil);
+                let func_val = args.get(1).cloned().unwrap_or(Value::nil());
                 if !is_callable(&func_val) {
                     return Err(AsError::at(
                         "workflow.activity(name, fn): fn must be a function",
@@ -440,12 +441,12 @@ impl Interp {
         span: Span,
         replay: bool,
     ) -> Result<Value, Control> {
-        let wf = args.first().cloned().unwrap_or(Value::Nil);
+        let wf = args.first().cloned().unwrap_or(Value::nil());
         if !is_callable(&wf) {
             return Err(AsError::at("workflow.run/resume: first arg must be a function", span).into());
         }
-        let input = args.get(1).cloned().unwrap_or(Value::Nil);
-        let opts = args.get(2).cloned().unwrap_or(Value::Nil);
+        let input = args.get(1).cloned().unwrap_or(Value::nil());
+        let opts = args.get(2).cloned().unwrap_or(Value::nil());
         let (log_path, fsync) = read_options(&opts, span)?;
 
         // Seed the determinism context from the log path so a record/resume pair on
@@ -487,9 +488,13 @@ impl Interp {
         let ctx = make_ctx();
         let result = self.call_value(wf, vec![ctx, input], span).await?;
         // A workflow body may be `async fn` (returns a Future) — await it.
-        match result {
-            Value::Future(f) => f.get().await,
-            other => Ok(other),
+        if matches!(result.kind(), ValueKind::Future(_)) {
+            let OwnedKind::Future(f) = result.into_kind() else {
+                unreachable!()
+            };
+            f.get().await
+        } else {
+            Ok(result)
         }
     }
 
@@ -544,14 +549,14 @@ impl Interp {
         // args[0] is the receiver ctx (pushed by the hook); the user args follow.
         let user = &args[1..];
         match name {
-            "now" => Ok(Value::Float(self.clock_now_ms())),
-            "random" => Ok(Value::Float(self.next_seeded_f64().unwrap_or(0.0))),
+            "now" => Ok(Value::float(self.clock_now_ms())),
+            "random" => Ok(Value::float(self.next_seeded_f64().unwrap_or(0.0))),
             "uuid" => {
                 let mut bytes = [0u8; 16];
                 self.fill_seeded_bytes(&mut bytes);
                 bytes[6] = (bytes[6] & 0x0f) | 0x40;
                 bytes[8] = (bytes[8] & 0x3f) | 0x80;
-                Ok(Value::Str(uuid::Uuid::from_bytes(bytes).to_string().into()))
+                Ok(Value::str(uuid::Uuid::from_bytes(bytes).to_string()))
             }
             "sleep" => {
                 let ms = user.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -573,7 +578,7 @@ impl Interp {
                     let wake = c.clock.now_ms();
                     c.events.push(DetEvent::TimerSet { wake });
                 });
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "call" => self.ctx_call_activity(user, span).await,
             _ => Err(AsError::at(format!("workflow ctx has no method '{}'", name), span).into()),
@@ -587,7 +592,7 @@ impl Interp {
     /// result WITHOUT executing the side effect; on a missing event (the crash
     /// point) switch to Record and execute for real.
     async fn ctx_call_activity(&self, user: &[Value], span: Span) -> Result<Value, Control> {
-        let activity = user.first().cloned().unwrap_or(Value::Nil);
+        let activity = user.first().cloned().unwrap_or(Value::nil());
         if !is_activity_value(&activity) {
             return Err(AsError::at(
                 "workflow ctx.call(activity, ...): first arg must be an activity",
@@ -639,9 +644,13 @@ impl Interp {
 
         // Record path: run the activity for real, await if async, serialize result.
         let result = self.call_value(act_fn, act_args, span).await?;
-        let result = match result {
-            Value::Future(f) => f.get().await?,
-            other => other,
+        let result = if matches!(result.kind(), ValueKind::Future(_)) {
+            let OwnedKind::Future(f) = result.into_kind() else {
+                unreachable!()
+            };
+            f.get().await?
+        } else {
+            result
         };
         // Constraint: only Value-serializable results persist. A native handle /
         // function / class is a constraint violation at record time.
@@ -666,27 +675,27 @@ impl Interp {
 
 /// Extract `(name, fn)` from an activity tagged Object.
 fn activity_parts(activity: &Value) -> (String, Value) {
-    if let Value::Object(o) = activity {
-        let name = match o.get("name") {
-            Some(Value::Str(s)) => s.to_string(),
+    if let ValueKind::Object(o) = activity.kind() {
+        let name = match o.get("name").as_ref().map(Value::kind) {
+            Some(ValueKind::Str(s)) => s.to_string(),
             _ => String::new(),
         };
-        let func = o.get("fn").unwrap_or(Value::Nil);
+        let func = o.get("fn").unwrap_or(Value::nil());
         (name, func)
     } else {
-        (String::new(), Value::Nil)
+        (String::new(), Value::nil())
     }
 }
 
 /// A callable value (function/closure/builtin/bound-method).
 fn is_callable(v: &Value) -> bool {
     matches!(
-        v,
-        Value::Function(_)
-            | Value::Closure(_)
-            | Value::Builtin(_)
-            | Value::BoundMethod(_)
-            | Value::NativeMethod(_)
+        v.kind(),
+        ValueKind::Function(_)
+            | ValueKind::Closure(_)
+            | ValueKind::Builtin(_)
+            | ValueKind::BoundMethod(_)
+            | ValueKind::NativeMethod(_)
     )
 }
 
@@ -694,16 +703,16 @@ fn is_callable(v: &Value) -> bool {
 /// live native handle / function / class.
 fn is_serializable(v: &Value) -> bool {
     !matches!(
-        v,
-        Value::Native(_)
-            | Value::NativeMethod(_)
-            | Value::Function(_)
-            | Value::Closure(_)
-            | Value::Builtin(_)
-            | Value::Class(_)
-            | Value::BoundMethod(_)
-            | Value::Future(_)
-            | Value::Generator(_)
+        v.kind(),
+        ValueKind::Native(_)
+            | ValueKind::NativeMethod(_)
+            | ValueKind::Function(_)
+            | ValueKind::Closure(_)
+            | ValueKind::Builtin(_)
+            | ValueKind::Class(_)
+            | ValueKind::BoundMethod(_)
+            | ValueKind::Future(_)
+            | ValueKind::Generator(_)
     )
 }
 

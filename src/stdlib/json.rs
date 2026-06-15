@@ -5,7 +5,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use indexmap::IndexMap;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -21,17 +21,17 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "parse" => {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
             match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(jv) => Ok(make_pair(to_ascript(&jv), Value::Nil)),
+                Ok(jv) => Ok(make_pair(to_ascript(&jv), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid JSON: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid JSON: {}", e))),
                 )),
             }
         }
         "stringify" => {
             let v = arg(args, 0);
             let pretty = matches!(args.get(1), Some(v) if v.as_f64().is_some_and(|n| n > 0.0))
-                || matches!(args.get(1), Some(Value::Bool(true)));
+                || matches!(args.get(1).map(|v| v.kind()), Some(ValueKind::Bool(true)));
             match from_ascript(&v, &mut Vec::new()) {
                 Ok(jv) => {
                     let s = if pretty {
@@ -40,14 +40,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         serde_json::to_string(&jv)
                     };
                     match s {
-                        Ok(text) => Ok(make_pair(Value::Str(text.into()), Value::Nil)),
+                        Ok(text) => Ok(make_pair(Value::str(text), Value::nil())),
                         Err(e) => Ok(make_pair(
-                            Value::Nil,
-                            make_error(Value::Str(format!("cannot serialize: {}", e).into())),
+                            Value::nil(),
+                            make_error(Value::str(format!("cannot serialize: {}", e))),
                         )),
                     }
                 }
-                Err(msg) => Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into())))),
+                Err(msg) => Ok(make_pair(Value::nil(), make_error(Value::str(msg)))),
             }
         }
         _ => Err(AsError::at(format!("std/json has no function '{}'", func), span).into()),
@@ -57,16 +57,16 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 /// serde_json::Value -> AScript Value. Objects become insertion-ordered Objects.
 pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
     match jv {
-        serde_json::Value::Null => Value::Nil,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Null => Value::nil(),
+        serde_json::Value::Bool(b) => Value::bool_(*b),
         // NUM §4: a JSON integer parses to `Int`; a fractional/exponent number to
         // `Float`. `as_i64` succeeds only for integers within `i64` range.
         serde_json::Value::Number(n) => match n.as_i64() {
-            Some(i) => Value::Int(i),
-            None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+            Some(i) => Value::int(i),
+            None => Value::float(n.as_f64().unwrap_or(f64::NAN)),
         },
-        serde_json::Value::String(s) => Value::Str(s.as_str().into()),
-        serde_json::Value::Array(a) => Value::Array(crate::value::ArrayCell::new(
+        serde_json::Value::String(s) => Value::str(s.as_str()),
+        serde_json::Value::Array(a) => Value::array_cell(crate::value::ArrayCell::new(
             a.iter().map(to_ascript).collect(),
         )),
         serde_json::Value::Object(o) => {
@@ -74,7 +74,7 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
             for (k, v) in o {
                 m.insert(k.clone(), to_ascript(v));
             }
-            Value::Object(crate::value::ObjectCell::new(m))
+            Value::object_cell(crate::value::ObjectCell::new(m))
         }
     }
 }
@@ -82,21 +82,21 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
 /// AScript Value -> serde_json::Value. Err (String) on a non-serializable value
 /// or a reference cycle (`seen` tracks Array/Object/Map Rc pointers in progress).
 pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_json::Value, String> {
-    match v {
-        Value::Nil => Ok(serde_json::Value::Null),
-        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+    match v.kind() {
+        ValueKind::Nil => Ok(serde_json::Value::Null),
+        ValueKind::Bool(b) => Ok(serde_json::Value::Bool(b)),
         // Decimal: emit as a JSON number literal from the canonical string.
         // `rust_decimal` always produces a valid JSON number string (no ±Inf/NaN),
         // so `serde_json::from_str` never fails here.
-        Value::Decimal(d) => {
+        ValueKind::Decimal(d) => {
             let s = d.to_string();
             let raw: serde_json::Value = serde_json::from_str(&s)
                 .map_err(|_| format!("cannot serialize decimal {} to JSON", d))?;
             Ok(raw)
         }
         // NUM §4: an `Int` serializes as a JSON integer directly (no float round-trip).
-        Value::Int(i) => Ok(serde_json::Value::Number(serde_json::Number::from(*i))),
-        Value::Float(n) => {
+        ValueKind::Int(i) => Ok(serde_json::Value::Number(serde_json::Number::from(i))),
+        ValueKind::Float(n) => {
             if !n.is_finite() {
                 return Err(format!("cannot serialize non-finite number {} to JSON", n));
             }
@@ -104,12 +104,12 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             // so `parse ∘ stringify` preserves the int/float subtype (a JSON number
             // with a `.`/`e`/`E` parses back to `float`). serde_json's
             // `Number::from_f64` renders an integral float with a trailing `.0`.
-            serde_json::Number::from_f64(*n)
+            serde_json::Number::from_f64(n)
                 .map(serde_json::Value::Number)
                 .ok_or_else(|| format!("cannot serialize number {} to JSON", n))
         }
-        Value::Str(s) => Ok(serde_json::Value::String(s.to_string())),
-        Value::Array(a) => {
+        ValueKind::Str(s) => Ok(serde_json::Value::String(s.to_string())),
+        ValueKind::Array(a) => {
             let ptr = crate::gc::cc_addr(a);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to JSON".into());
@@ -122,7 +122,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             seen.pop();
             Ok(serde_json::Value::Array(out))
         }
-        Value::Object(o) => {
+        ValueKind::Object(o) => {
             let ptr = crate::gc::cc_addr(o);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to JSON".into());
@@ -136,7 +136,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             seen.pop();
             Ok(serde_json::Value::Object(map))
         }
-        Value::Map(m) => {
+        ValueKind::Map(m) => {
             // A Map serializes as a JSON object only if every key is a string.
             let ptr = crate::gc::cc_addr(m);
             if seen.contains(&ptr) {
@@ -145,14 +145,15 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             seen.push(ptr);
             let mut map = serde_json::Map::new();
             for (k, val) in m.borrow().iter() {
-                match k.to_value() {
-                    Value::Str(s) => {
+                let key_val = k.to_value();
+                match key_val.kind() {
+                    ValueKind::Str(s) => {
                         map.insert(s.to_string(), from_ascript(val, seen)?);
                     }
-                    other => {
+                    _ => {
                         return Err(format!(
                             "cannot serialize a map with a non-string key ({}) to JSON",
-                            crate::interp::type_name(&other)
+                            crate::interp::type_name(&key_val)
                         ))
                     }
                 }
@@ -160,7 +161,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             seen.pop();
             Ok(serde_json::Value::Object(map))
         }
-        Value::Set(s) => {
+        ValueKind::Set(s) => {
             // A Set serializes as a JSON array of its values (insertion order).
             let ptr = crate::gc::cc_addr(s);
             if seen.contains(&ptr) {
@@ -175,19 +176,19 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             Ok(serde_json::Value::Array(out))
         }
         // SRV §3: a frozen value serializes exactly like its underlying kind. A
-        // frozen container materializes one level (children stay `Value::Shared`) and
+        // frozen container materializes one level (children stay `Value::shared`) and
         // recurses; a frozen instance/enum-variant/regex falls through to the same
         // catch-all a LIVE instance/regex hits (kept consistent via `kind_name`).
-        Value::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
+        ValueKind::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
             Some(live) => from_ascript(&live, seen),
             None => Err(format!(
                 "cannot serialize a value of type {} to JSON",
                 node.kind_name()
             )),
         },
-        other => Err(format!(
+        _ => Err(format!(
             "cannot serialize a value of type {} to JSON",
-            crate::interp::type_name(other)
+            crate::interp::type_name(v)
         )),
     }
 }
@@ -197,25 +198,25 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
 /// std/log so a logging call never crashes the program.
 pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Value {
     use serde_json::Value as J;
-    match v {
-        Value::Nil => J::Null,
-        Value::Bool(b) => J::Bool(*b),
+    match v.kind() {
+        ValueKind::Nil => J::Null,
+        ValueKind::Bool(b) => J::Bool(b),
         // Decimal: emit as a JSON number from the canonical string (always finite).
-        Value::Decimal(d) => serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null),
+        ValueKind::Decimal(d) => serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null),
         // NUM §4: an `Int` serializes as a JSON integer directly.
-        Value::Int(i) => J::Number(serde_json::Number::from(*i)),
-        Value::Float(n) => {
+        ValueKind::Int(i) => J::Number(serde_json::Number::from(i)),
+        ValueKind::Float(n) => {
             if !n.is_finite() {
                 return J::Null;
             }
             // NUM §4: a `float` always serializes as a JSON float (`5.0`), matching
             // `from_ascript`, so the int/float subtype is visible in logs too.
-            serde_json::Number::from_f64(*n)
+            serde_json::Number::from_f64(n)
                 .map(J::Number)
                 .unwrap_or(J::Null)
         }
-        Value::Str(s) => J::String(s.to_string()),
-        Value::Array(a) => {
+        ValueKind::Str(s) => J::String(s.to_string()),
+        ValueKind::Array(a) => {
             let ptr = crate::gc::cc_addr(a);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
@@ -225,7 +226,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             seen.pop();
             J::Array(out)
         }
-        Value::Object(o) => {
+        ValueKind::Object(o) => {
             let ptr = crate::gc::cc_addr(o);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
@@ -236,7 +237,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             seen.pop();
             J::Object(m)
         }
-        Value::Instance(i) => {
+        ValueKind::Instance(i) => {
             let ptr = crate::gc::cc_addr(i);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
@@ -250,7 +251,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             seen.pop();
             J::Object(m)
         }
-        Value::Map(mp) => {
+        ValueKind::Map(mp) => {
             let ptr = crate::gc::cc_addr(mp);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
@@ -258,16 +259,17 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             seen.push(ptr);
             let mut m = serde_json::Map::new();
             for (k, val) in mp.borrow().iter() {
-                let key = match k.to_value() {
-                    Value::Str(s) => s.to_string(),
-                    other => other.to_string(),
+                let key_val = k.to_value();
+                let key = match key_val.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => key_val.to_string(),
                 };
                 m.insert(key, to_json_lossy(val, seen));
             }
             seen.pop();
             J::Object(m)
         }
-        Value::Set(s) => {
+        ValueKind::Set(s) => {
             let ptr = crate::gc::cc_addr(s);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
@@ -281,14 +283,14 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             seen.pop();
             J::Array(out)
         }
-        Value::Function(_) | Value::Closure(_) | Value::Builtin(_) => {
+        ValueKind::Function(_) | ValueKind::Closure(_) | ValueKind::Builtin(_) => {
             J::String("<function>".into())
         }
         // SRV §3: a frozen value renders exactly like its live kind. Frozen containers
         // materialize one level + recurse; a frozen instance renders its fields (as a
         // live instance does above); a frozen enum-variant/regex falls to the same
         // lossy `<kind>` string a live one would.
-        Value::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
+        ValueKind::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
             Some(live) => to_json_lossy(&live, seen),
             None => match &**node {
                 crate::value::SharedNode::Instance { fields, .. } => {
@@ -304,7 +306,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
                 _ => J::String(format!("<{}>", node.kind_name())),
             },
         },
-        other => J::String(format!("<{}>", crate::interp::type_name(other))),
+        _ => J::String(format!("<{}>", crate::interp::type_name(v))),
     }
 }
 
@@ -315,7 +317,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     #[test]
@@ -332,7 +334,7 @@ mod tests {
             .starts_with("[{a: 1, b: [true, nil, \"x\"]}, nil]"));
     }
 
-    // SRV regression (holistic-review MAJOR): a frozen `Value::Shared` must serialize
+    // SRV regression (holistic-review MAJOR): a frozen `Value::shared` must serialize
     // byte-identically to its live equivalent — and a frozen CHILD must not poison a
     // live container that holds it. Before the fix, `from_ascript` hit its catch-all
     // ("cannot serialize a value of type object to JSON") for any frozen value.
@@ -342,8 +344,8 @@ mod tests {
         use crate::stdlib::shared;
         let src = "{\"region\":\"us\",\"ports\":[80,443],\"meta\":{\"a\":1,\"b\":[true,null]}}";
         let parsed = call("parse", &[s(src)], sp()).unwrap();
-        let live = match parsed {
-            Value::Array(a) => a.borrow()[0].clone(),
+        let live = match parsed.kind() {
+            ValueKind::Array(a) => a.borrow()[0].clone(),
             _ => unreachable!("parse returns [value, err]"),
         };
         let frozen = shared::freeze(&live, sp()).unwrap();
@@ -362,14 +364,14 @@ mod tests {
         // 3. Contagion guard: a frozen child inside a LIVE object still serializes.
         let mut m = indexmap::IndexMap::new();
         m.insert("cfg".to_string(), frozen.clone());
-        let mixed = Value::Object(crate::value::ObjectCell::new(m));
+        let mixed = Value::object(m);
         assert_eq!(
             from_ascript(&mixed, &mut Vec::new()).unwrap(),
             serde_json::json!({ "cfg": live_j }),
         );
 
         // 4. Frozen scalar + frozen array serialize directly.
-        let fi = shared::freeze(&Value::Int(42), sp()).unwrap();
+        let fi = shared::freeze(&Value::int(42), sp()).unwrap();
         assert_eq!(
             from_ascript(&fi, &mut Vec::new()).unwrap(),
             serde_json::json!(42)
@@ -377,8 +379,8 @@ mod tests {
 
         // 5. Map + Set freeze through their canonical key/element forms.
         let mp = call("parse", &[s("{\"k\":[1,2,3]}")], sp()).unwrap();
-        let mv = match mp {
-            Value::Array(a) => a.borrow()[0].clone(),
+        let mv = match mp.kind() {
+            ValueKind::Array(a) => a.borrow()[0].clone(),
             _ => unreachable!(),
         };
         let fm = shared::freeze(&mv, sp()).unwrap();
@@ -394,7 +396,7 @@ mod tests {
         // (not alphabetical), matching AScript's insertion-ordered objects.
         let parsed = call(
             "parse",
-            &[Value::Str("{\"name\": 1, \"age\": 2, \"zoo\": 3}".into())],
+            &[Value::str("{\"name\": 1, \"age\": 2, \"zoo\": 3}")],
             Span::new(0, 0),
         )
         .unwrap();
@@ -407,8 +409,8 @@ mod tests {
     fn stringify_and_errors() {
         let obj = {
             let mut m = IndexMap::new();
-            m.insert("n".to_string(), Value::Float(2.0));
-            Value::Object(crate::value::ObjectCell::new(m))
+            m.insert("n".to_string(), Value::float(2.0));
+            Value::object(m)
         };
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         // out is the pair [resultString, nil]; the result string is the JSON
@@ -417,15 +419,15 @@ mod tests {
         // the string is quoted+escaped, hence the `\"` in the expected text.
         assert_eq!(out.to_string(), "[\"{\\\"n\\\":2.0}\", nil]");
         // a function is not serializable → [nil, err]
-        let f = Value::Builtin("print".into());
+        let f = Value::builtin("print");
         let err = call("stringify", std::slice::from_ref(&f), sp()).unwrap();
         assert!(err.to_string().starts_with("[nil, {message:"));
     }
 
     #[test]
     fn lossy_serializer_never_errors() {
-        let a = Value::Array(crate::value::ArrayCell::new(vec![]));
-        if let Value::Array(inner) = &a {
+        let a = Value::array(vec![]);
+        if let ValueKind::Array(inner) = a.kind() {
             inner.borrow_mut().push(a.clone());
         }
         assert_eq!(
@@ -433,11 +435,11 @@ mod tests {
             "[\"[Circular]\"]"
         );
         assert_eq!(
-            to_json_lossy(&Value::Builtin("print".into()), &mut Vec::new()).to_string(),
+            to_json_lossy(&Value::builtin("print"), &mut Vec::new()).to_string(),
             "\"<function>\""
         );
         assert_eq!(
-            to_json_lossy(&Value::Float(f64::NAN), &mut Vec::new()),
+            to_json_lossy(&Value::float(f64::NAN), &mut Vec::new()),
             serde_json::Value::Null
         );
     }
@@ -450,41 +452,41 @@ mod tests {
 
     /// Pull the value (index 0) out of a `[value, err]` Tier-1 pair.
     fn pair_value(v: &Value) -> Value {
-        match v {
-            Value::Array(a) => a.borrow().first().cloned().unwrap_or(Value::Nil),
-            other => other.clone(),
+        match v.kind() {
+            ValueKind::Array(a) => a.borrow().first().cloned().unwrap_or(Value::nil()),
+            _ => v.clone(),
         }
     }
 
     #[test]
     fn stringify_int_vs_float_subtype_fidelity() {
         // NUM §4: int → "5"; float → "5.0".
-        let int_out = call("stringify", &[Value::Int(5)], sp()).unwrap();
-        assert_eq!(pair_value(&int_out), Value::Str("5".into()));
-        let float_out = call("stringify", &[Value::Float(5.0)], sp()).unwrap();
-        assert_eq!(pair_value(&float_out), Value::Str("5.0".into()));
+        let int_out = call("stringify", &[Value::int(5)], sp()).unwrap();
+        assert_eq!(pair_value(&int_out), Value::str("5"));
+        let float_out = call("stringify", &[Value::float(5.0)], sp()).unwrap();
+        assert_eq!(pair_value(&float_out), Value::str("5.0"));
     }
 
     #[test]
     fn parse_subtype_by_syntax() {
         // A JSON number with `.` or `e`/`E` parses to `float`, else `int`.
-        assert_eq!(pair_value(&call("parse", &[s("5")], sp()).unwrap()), Value::Int(5));
+        assert_eq!(pair_value(&call("parse", &[s("5")], sp()).unwrap()), Value::int(5));
         assert_eq!(
             pair_value(&call("parse", &[s("5.0")], sp()).unwrap()),
-            Value::Float(5.0)
+            Value::float(5.0)
         );
         assert_eq!(
             pair_value(&call("parse", &[s("5e2")], sp()).unwrap()),
-            Value::Float(500.0)
+            Value::float(500.0)
         );
         assert_eq!(
             pair_value(&call("parse", &[s("-7")], sp()).unwrap()),
-            Value::Int(-7)
+            Value::int(-7)
         );
         // Integral but out of i64 range → float (documented, pending bigint).
         assert_eq!(
             pair_value(&call("parse", &[s("100000000000000000000")], sp()).unwrap()),
-            Value::Float(1e20)
+            Value::float(1e20)
         );
     }
 
@@ -493,7 +495,7 @@ mod tests {
         for (text, expect) in [("5", "5"), ("5.0", "5.0"), ("3.5", "3.5"), ("5e2", "500.0")] {
             let parsed = pair_value(&call("parse", &[s(text)], sp()).unwrap());
             let restr = pair_value(&call("stringify", std::slice::from_ref(&parsed), sp()).unwrap());
-            assert_eq!(restr, Value::Str(expect.into()), "round-trip of {text}");
+            assert_eq!(restr, Value::str(expect), "round-trip of {text}");
         }
     }
 }

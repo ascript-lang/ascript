@@ -16,7 +16,49 @@ use crate::error::AsError;
 use crate::interp::{error_message, Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
+use crate::value::{OwnedKind, ValueKind};
 use crate::vm::fiber::Fiber;
+// NANB Task 1.3: rebuild an owned `Value` from a consumed `OwnedKind` (the inverse
+// of `Value::into_kind`). Each handle moves straight back through its total
+// constructor — zero clones, no refcount change. Used by the consuming dispatch
+// matches whose fallback arm must hand the whole value to the shared `Interp`
+// dispatch (which takes `Value` by value).
+#[inline]
+#[allow(dead_code)]
+fn rebuild_value(k: OwnedKind) -> Value {
+    match k {
+        OwnedKind::Nil => Value::nil(),
+        OwnedKind::Bool(b) => Value::bool_(b),
+        OwnedKind::Int(i) => Value::int(i),
+        OwnedKind::Float(f) => Value::float(f),
+        OwnedKind::Decimal(d) => Value::decimal_rc(d),
+        OwnedKind::Str(s) => Value::str(s),
+        OwnedKind::Builtin(s) => Value::builtin(s),
+        OwnedKind::Function(f) => Value::function(f),
+        OwnedKind::Closure(c) => Value::closure(c),
+        OwnedKind::Array(a) => Value::array_cell(a),
+        OwnedKind::Object(o) => Value::object_cell(o),
+        OwnedKind::Map(m) => Value::map_cell(m),
+        OwnedKind::Set(s) => Value::set_cell(s),
+        OwnedKind::Bytes(b) => Value::bytes_rc(b),
+        #[cfg(feature = "data")]
+        OwnedKind::Regex(r) => Value::regex(r),
+        OwnedKind::Native(n) => Value::native(n),
+        OwnedKind::NativeMethod(m) => Value::native_method(m),
+        OwnedKind::Enum(e) => Value::enum_(e),
+        OwnedKind::EnumVariant(v) => Value::enum_variant(v),
+        OwnedKind::Class(c) => Value::class(c),
+        OwnedKind::Interface(i) => Value::interface(i),
+        OwnedKind::Instance(i) => Value::instance(i),
+        OwnedKind::BoundMethod(b) => Value::bound_method(b),
+        OwnedKind::Super(s) => Value::super_(s),
+        OwnedKind::Future(f) => Value::future(f),
+        OwnedKind::Generator(g) => Value::generator(g),
+        OwnedKind::GeneratorMethod(g) => Value::generator_method(g),
+        OwnedKind::ClassMethod(c) => Value::class_method(c),
+        OwnedKind::Shared(s) => Value::shared(s),
+    }
+}
 use crate::vm::opcode::Op;
 use crate::vm::value_ext::{Closure, RunOutcome};
 use gcmodule::Cc;
@@ -27,7 +69,7 @@ use std::rc::{Rc, Weak};
 
 /// A module's export collector (V12-T4): an insertion-ordered name→value map behind
 /// shared interior mutability, so `Op::DefineExport` records into it and an importer
-/// reads it back (the namespace form clones it into a `Value::Object`).
+/// reads it back (the namespace form clones it into a `Value::object_cell`).
 type ModuleExports = Rc<RefCell<indexmap::IndexMap<String, Value>>>;
 
 /// A module-scope user-global slot: its current value plus its REASSIGNABILITY,
@@ -521,9 +563,9 @@ pub struct Vm {
     self_weak: RefCell<Weak<Vm>>,
     /// Per-class compiled-method table (V9). `value.rs`'s `Class`/`Method` is
     /// frozen and holds a TREE-WALKER body the VM cannot run, so the VM compiles
-    /// each method to a `Value::Closure` and stores it HERE instead — keyed by the
+    /// each method to a `Value::closure` and stores it HERE instead — keyed by the
     /// class's `Rc` IDENTITY (`Rc::as_ptr` address) → method name → compiled
-    /// closure. A class's `Value::Class.methods` map is left empty; method dispatch
+    /// closure. A class's `Value::class.methods` map is left empty; method dispatch
     /// goes through this table (`compiled_method`). The key is stable because the
     /// `Rc<Class>` is created once at compile time and shared by every instance.
     // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
@@ -532,7 +574,7 @@ pub struct Vm {
     class_methods: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-class STATIC method table (SP1 §3): class `Rc` identity → static name →
     /// compiled closure. A SEPARATE namespace from `class_methods`; a static is
-    /// called as `C.name(args)` with NO receiver (a plain `Value::Closure` call),
+    /// called as `C.name(args)` with NO receiver (a plain `Value::closure` call),
     /// resolved up the superclass chain by `find_compiled_static_method`.
     // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
     // never attacker-scaled, iteration order never observed (see audit) — get/insert only.
@@ -932,7 +974,7 @@ impl Vm {
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
         // stdlib function (e.g. `array.map`, `recover`) can re-enter the VM to
-        // run a `Value::Closure` callback (the `native → VM` half of the bridge;
+        // run a `Value::closure` callback (the `native → VM` half of the bridge;
         // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
         vm.interp.set_vm(Rc::downgrade(&vm));
         vm
@@ -1459,7 +1501,7 @@ impl Vm {
     }
 
     /// Workers Spec A: dispatch a `worker fn` closure to a pooled isolate, returning
-    /// the `Value::Future`. Builds the shippable code slice — preferring the source
+    /// the `Value::future`. Builds the shippable code slice — preferring the source
     /// recompile path (via `Interp::worker_source`) when source is available (the normal
     /// run-from-source path, shared with the tree-walker), or falling back to building
     /// the slice directly from the stored pre-compiled top-level chunk (the `.aso`
@@ -1613,7 +1655,7 @@ impl Vm {
     /// Used by both the async `Op::Call` arm (`run_loop`) and (from Task 4 on) the
     /// sync `run_loop_sync` driver, ensuring byte-identical behavior across both lanes.
     ///
-    /// Responsibilities (verbatim from the `Op::Call Value::Closure` plain arm):
+    /// Responsibilities (verbatim from the `Op::Call Value::closure` plain arm):
     /// 1. Pops `argc` args from `fiber.stack` (top = last arg) then pops the callee slot.
     /// 2. Runs the SHARED `check_call_args` (arity + per-param contracts + rest
     ///    collection) — a mismatch returns a `Control::Panic` anchored at `call_span`.
@@ -1638,7 +1680,7 @@ impl Vm {
         let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
         // Pop the `argc` args into an owned vec (top of stack is the LAST arg), then
         // drop the callee value beneath them.
-        let mut args = vec![Value::Nil; argc];
+        let mut args = vec![Value::nil(); argc];
         for slot in args.iter_mut().rev() {
             *slot = fiber.pop();
         }
@@ -1661,7 +1703,7 @@ impl Vm {
         // Allocate cells, then place each bound param into its slot (cell slot → cell;
         // plain slot → stack). Reserve the remaining locals as Nil so the window is full.
         let cells = super::fiber::alloc_cells(slot_count, &callee.proto.chunk.cell_slots);
-        fiber.stack.resize(slot_base + slot_count, Value::Nil);
+        fiber.stack.resize(slot_base + slot_count, Value::nil());
         let supplied = bound.supplied;
         for (slot, v) in bound.values.into_iter().enumerate() {
             // CALL §2 A1: cells may be empty (no cell slots); use .get so the
@@ -2087,7 +2129,7 @@ impl Vm {
                         self.vm_run_defers(defers, &mut outcome).await;
                     }
                 }
-                return outcome.map(|_| RunOutcome::Done(Value::Nil));
+                return outcome.map(|_| RunOutcome::Done(Value::nil()));
             }
         }
 
@@ -2329,9 +2371,9 @@ impl Vm {
                     let v = fiber.frame().closure.proto.chunk.consts[idx].clone();
                     fiber.push(v);
                 }
-                Op::Nil => fiber.push(Value::Nil),
-                Op::True => fiber.push(Value::Bool(true)),
-                Op::False => fiber.push(Value::Bool(false)),
+                Op::Nil => fiber.push(Value::nil()),
+                Op::True => fiber.push(Value::bool_(true)),
+                Op::False => fiber.push(Value::bool_(false)),
                 Op::Pop => {
                     fiber.pop();
                 }
@@ -2387,8 +2429,8 @@ impl Vm {
                 Op::InstanceOfType => {
                     let idx =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -2410,7 +2452,7 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(Value::Bool(yes));
+                    fiber.push(Value::bool_(yes));
                 }
 
                 // ── unary ops ────────────────────────────────────────────────
@@ -2497,7 +2539,7 @@ impl Vm {
                         }
                         _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::CheckNumbers => {
@@ -2530,8 +2572,8 @@ impl Vm {
                     // Mirror run_loop's GET_GLOBAL exactly — same cache logic.
                     let idx =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -2566,7 +2608,7 @@ impl Vm {
                         }
                         fiber.push(v);
                     } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
-                        let v = Value::Builtin(name);
+                        let v = Value::builtin(name);
                         if self.specialize {
                             fiber.frame().closure.proto.chunk.set_global_cache(
                                 fault_ip,
@@ -2588,8 +2630,8 @@ impl Vm {
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let mutable =
                         fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) != 0;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -2612,8 +2654,8 @@ impl Vm {
                 Op::SetGlobal => {
                     let idx =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -2684,8 +2726,8 @@ impl Vm {
                 Op::ImmutableError => {
                     let idx =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -2736,7 +2778,7 @@ impl Vm {
                 }
                 Op::JumpIfNotNil => {
                     let v = fiber.pop();
-                    if v != Value::Nil {
+                    if v != Value::nil() {
                         let disp =
                             fiber.frame().closure.proto.chunk.read_i16(operand_at);
                         let base = fiber.frame().ip as isize;
@@ -2748,7 +2790,7 @@ impl Vm {
                 Op::Template => {
                     let n =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut parts = vec![Value::Nil; n];
+                    let mut parts = vec![Value::nil(); n];
                     for slot in parts.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
@@ -2756,7 +2798,7 @@ impl Vm {
                     for v in &parts {
                         out.push_str(&v.to_string());
                     }
-                    fiber.push(Value::Str(out.into()));
+                    fiber.push(Value::str(out));
                 }
 
                 // ── Return / Propagate / Unwrap / Yield ──────────────────────
@@ -2782,8 +2824,8 @@ impl Vm {
                 Op::Propagate => {
                     // DEFER GUARD: pending defers require async drain on propagation.
                     let v = fiber.pop();
-                    let (value, err) = match &v {
-                        Value::Array(a) if a.borrow().len() == 2 => {
+                    let (value, err) = match v.kind() {
+                        ValueKind::Array(a) if a.borrow().len() == 2 => {
                             let b = a.borrow();
                             (b[0].clone(), b[1].clone())
                         }
@@ -2795,7 +2837,7 @@ impl Vm {
                             ))
                         }
                     };
-                    if err == Value::Nil {
+                    if err == Value::nil() {
                         fiber.push(value);
                     } else {
                         // Error path: need to drain defers (possibly async) and then
@@ -2814,8 +2856,8 @@ impl Vm {
                     // No defer guard needed: Unwrap never drains defers (it either
                     // pushes the value or raises a recoverable Panic — no unwind).
                     let v = fiber.pop();
-                    let (value, err) = match &v {
-                        Value::Array(a) if a.borrow().len() == 2 => {
+                    let (value, err) = match v.kind() {
+                        ValueKind::Array(a) if a.borrow().len() == 2 => {
                             let b = a.borrow();
                             (b[0].clone(), b[1].clone())
                         }
@@ -2827,7 +2869,7 @@ impl Vm {
                             ))
                         }
                     };
-                    if err == Value::Nil {
+                    if err == Value::nil() {
                         fiber.push(value);
                     } else {
                         return Err(self.panic_at(fiber, fault_ip, error_message(&err)));
@@ -2855,21 +2897,21 @@ impl Vm {
                     let spread = (flags & 2) != 0;
                     let args: Vec<Value> = if spread {
                         let arr = fiber.pop();
-                        match arr {
-                            Value::Array(a) => a.borrow().clone(),
-                            other => {
+                        match arr.kind() {
+                            ValueKind::Array(a) => a.borrow().clone(),
+                            _ => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
                                     format!(
                                         "defer spread requires an array, got {}",
-                                        crate::interp::type_name(&other)
+                                        crate::interp::type_name(&arr)
                                     ),
                                 ))
                             }
                         }
                     } else {
-                        let mut v = vec![Value::Nil; argc];
+                        let mut v = vec![Value::nil(); argc];
                         for slot in v.iter_mut().rev() {
                             *slot = fiber.pop();
                         }
@@ -2895,36 +2937,35 @@ impl Vm {
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let awaited = (flags & 1) != 0;
                     let spread = (flags & 2) != 0;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[name_idx] {
-                        Value::Str(s) => s.clone(),
-                        other => {
+                    let name_const = &fiber.frame().closure.proto.chunk.consts[name_idx];
+                    let name = match name_const.kind() {
+                        ValueKind::Str(s) => s.clone(),
+                        _ => {
+                            let ty = crate::interp::type_name(name_const);
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
-                                format!(
-                                    "defer method name must be a string, got {}",
-                                    crate::interp::type_name(other)
-                                ),
-                            ))
+                                format!("defer method name must be a string, got {ty}"),
+                            ));
                         }
                     };
                     let args: Vec<Value> = if spread {
                         let arr = fiber.pop();
-                        match arr {
-                            Value::Array(a) => a.borrow().clone(),
-                            other => {
+                        match arr.kind() {
+                            ValueKind::Array(a) => a.borrow().clone(),
+                            _ => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
                                     format!(
                                         "defer spread requires an array, got {}",
-                                        crate::interp::type_name(&other)
+                                        crate::interp::type_name(&arr)
                                     ),
                                 ))
                             }
                         }
                     } else {
-                        let mut v = vec![Value::Nil; argc];
+                        let mut v = vec![Value::nil(); argc];
                         for slot in v.iter_mut().rev() {
                             *slot = fiber.pop();
                         }
@@ -2969,8 +3010,8 @@ impl Vm {
                     let idx = fiber.pop();
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let v = match &obj {
-                        Value::Object(cell) => {
+                    let v = match obj.kind() {
+                        ValueKind::Object(cell) => {
                             // Frozen guard (mirrors index_set's frozen_kind check).
                             if let Some(kind) = crate::value::frozen_kind(&obj) {
                                 return Err(self.panic_at(
@@ -2979,8 +3020,8 @@ impl Vm {
                                     format!("cannot mutate a frozen {kind}"),
                                 ));
                             }
-                            match &idx {
-                                Value::Str(key) => {
+                            match idx.kind() {
+                                ValueKind::Str(key) => {
                                     let key = key.clone();
                                     self.vm_object_insert(cell, &key, val.clone());
                                     val
@@ -3002,8 +3043,8 @@ impl Vm {
 
                 Op::GetProp | Op::GetPropOpt => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3013,8 +3054,8 @@ impl Vm {
                         }
                     };
                     let obj = fiber.pop();
-                    if op == Op::GetPropOpt && obj == Value::Nil {
-                        fiber.push(Value::Nil);
+                    if op == Op::GetPropOpt && obj == Value::nil() {
+                        fiber.push(Value::nil());
                     } else {
                         let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                         let proto = fiber.frame().closure.proto.clone();
@@ -3033,8 +3074,8 @@ impl Vm {
 
                 Op::SetProp => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3054,7 +3095,7 @@ impl Vm {
                 Op::GetSuper => {
                     // `super.<name>` (V9-T2): resolve `name` starting at the CURRENT
                     // method's DEFINING class's superclass, bound to `self` (slot 0).
-                    // Mirrors the tree-walker: `super` is a `Value::Super` whose
+                    // Mirrors the tree-walker: `super` is a `Value::super_` whose
                     // `start` is `defining_class.superclass`, and `read_member` on it
                     // finds the method up that chain and produces a BoundMethod on
                     // `self` (which the subsequent CALL invokes). The `defining_class`
@@ -3062,8 +3103,8 @@ impl Vm {
                     // declared the method, so a NESTED `super` resolves from the right
                     // link too.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3102,7 +3143,7 @@ impl Vm {
                         .and_then(|s| self.find_compiled_method(s, &name))
                     {
                         Some((_closure, found_class)) => {
-                            Value::BoundMethod(Rc::new(crate::value::BoundMethod {
+                            Value::bound_method(Rc::new(crate::value::BoundMethod {
                                 receiver,
                                 method: Rc::new(crate::value::Method {
                                     params: Vec::new(),
@@ -3117,7 +3158,7 @@ impl Vm {
                             }))
                         }
                         None => {
-                            // Mirror the tree-walker's `Value::Super` member-read
+                            // Mirror the tree-walker's `Value::super_` member-read
                             // error wording (with/without a superclass).
                             let msg = if start.is_some() {
                                 format!("no superclass method '{name}'")
@@ -3133,13 +3174,13 @@ impl Vm {
                 // ── IterSnapshot ──────────────────────────────────────────────
                 Op::IterSnapshot => {
                     let iterable = fiber.pop();
-                    let items: Vec<Value> = match iterable {
-                        Value::Array(arr) => arr.borrow().clone(),
-                        Value::Str(s) => s
+                    let items: Vec<Value> = match iterable.kind() {
+                        ValueKind::Array(arr) => arr.borrow().clone(),
+                        ValueKind::Str(s) => s
                             .chars()
-                            .map(|c| Value::Str(c.to_string().into()))
+                            .map(|c| Value::str(c.to_string()))
                             .collect(),
-                        Value::Shared(ref node) => match crate::interp::shared_iter_values(node) {
+                        ValueKind::Shared(node) => match crate::interp::shared_iter_values(node) {
                             Some(items) => items,
                             None => {
                                 return Err(self.panic_at(
@@ -3152,18 +3193,18 @@ impl Vm {
                                 ))
                             }
                         },
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "value of type {} is not iterable",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&iterable)
                                 ),
                             ))
                         }
                     };
-                    fiber.push(Value::Array(crate::value::ArrayCell::new(items)));
+                    fiber.push(Value::array(items));
                 }
 
                 Op::ArrayLen => {
@@ -3172,10 +3213,10 @@ impl Vm {
                     // compiler emits this only over an `IterSnapshot` result — so a
                     // non-array is a compiler bug surfaced as a Tier-2 panic.
                     let v = fiber.pop();
-                    match v {
-                        Value::Array(arr) => {
+                    match v.kind() {
+                        ValueKind::Array(arr) => {
                             let len = arr.borrow().len();
-                            fiber.push(Value::Float(len as f64));
+                            fiber.push(Value::float(len as f64));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -3190,11 +3231,11 @@ impl Vm {
                 // ── Builders ─────────────────────────────────────────────────
                 Op::NewArray => {
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut values = vec![Value::Nil; n];
+                    let mut values = vec![Value::nil(); n];
                     for slot in values.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    fiber.push(Value::Array(crate::value::ArrayCell::new(values)));
+                    fiber.push(Value::array(values));
                 }
 
                 Op::NewObject => {
@@ -3206,8 +3247,7 @@ impl Vm {
                 }
 
                 Op::NewMap => {
-                    let cell = crate::value::MapCell::new(indexmap::IndexMap::new());
-                    fiber.push(Value::Map(cell));
+                    fiber.push(Value::map(indexmap::IndexMap::new()));
                 }
 
                 Op::MapEntry => {
@@ -3226,17 +3266,17 @@ impl Vm {
                             ))
                         }
                     };
-                    match fiber.peek(0) {
-                        Value::Map(m) => {
+                    match fiber.peek(0).kind() {
+                        ValueKind::Map(m) => {
                             m.borrow_mut().insert(key, val);
                         }
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "MAP_ENTRY target is not a map: {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(fiber.peek(0))
                                 ),
                             ))
                         }
@@ -3245,33 +3285,33 @@ impl Vm {
 
                 Op::Spread | Op::SpreadArgs => {
                     let operand = fiber.pop();
-                    match operand {
-                        Value::Array(src) => {
+                    match operand.kind() {
+                        ValueKind::Array(src) => {
                             let items: Vec<Value> = src.borrow().iter().cloned().collect();
-                            match fiber.peek(0) {
-                                Value::Array(arr) => arr.borrow_mut().extend(items),
-                                other => {
+                            match fiber.peek(0).kind() {
+                                ValueKind::Array(arr) => arr.borrow_mut().extend(items),
+                                _ => {
                                     return Err(self.panic_at(
                                         fiber,
                                         fault_ip,
                                         format!(
                                             "SPREAD target is not an array: {}",
-                                            crate::interp::type_name(other)
+                                            crate::interp::type_name(fiber.peek(0))
                                         ),
                                     ))
                                 }
                             }
                         }
-                        other => {
+                        _ => {
                             let msg = if matches!(op, Op::SpreadArgs) {
                                 format!(
                                     "can only spread an array as call arguments, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 )
                             } else {
                                 format!(
                                     "can only spread an array into an array, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 )
                             };
                             return Err(self.panic_at(fiber, fault_ip, msg));
@@ -3281,15 +3321,15 @@ impl Vm {
 
                 Op::AppendArray => {
                     let item = fiber.pop();
-                    match fiber.peek(0) {
-                        Value::Array(arr) => arr.borrow_mut().push(item),
-                        other => {
+                    match fiber.peek(0).kind() {
+                        ValueKind::Array(arr) => arr.borrow_mut().push(item),
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "APPEND_ARRAY target is not an array: {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(fiber.peek(0))
                                 ),
                             ))
                         }
@@ -3301,8 +3341,8 @@ impl Vm {
                     // objects grow via precise registry transitions instead of
                     // dict borrow_mut + resync. The key must be a string const.
                     let val = fiber.pop();
-                    let key = match fiber.pop() {
-                        Value::Str(s) => s,
+                    let key = match fiber.pop().into_kind() {
+                        OwnedKind::Str(s) => s,
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3311,18 +3351,18 @@ impl Vm {
                             ))
                         }
                     };
-                    match fiber.peek(0) {
-                        Value::Object(obj) => {
+                    match fiber.peek(0).kind() {
+                        ValueKind::Object(obj) => {
                             let obj = obj.clone();
                             self.vm_object_insert(&obj, &key, val);
                         }
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "APPEND_OBJECT target is not an object: {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(fiber.peek(0))
                                 ),
                             ))
                         }
@@ -3334,36 +3374,36 @@ impl Vm {
                     // (works across slab and dict modes), then insert into the
                     // builder object via vm_object_insert (precise transitions).
                     let operand = fiber.pop();
-                    match operand {
-                        Value::Object(src) => {
+                    match operand.kind() {
+                        ValueKind::Object(src) => {
                             // Snapshot FIRST (avoids borrow conflict on self-spread).
                             let entries = src.entries();
-                            match fiber.peek(0) {
-                                Value::Object(obj) => {
+                            match fiber.peek(0).kind() {
+                                ValueKind::Object(obj) => {
                                     let obj = obj.clone();
                                     for (k, v) in entries {
                                         self.vm_object_insert(&obj, &k, v);
                                     }
                                 }
-                                other => {
+                                _ => {
                                     return Err(self.panic_at(
                                         fiber,
                                         fault_ip,
                                         format!(
                                             "SPREAD_OBJECT target is not an object: {}",
-                                            crate::interp::type_name(other)
+                                            crate::interp::type_name(fiber.peek(0))
                                         ),
                                     ))
                                 }
                             }
                         }
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "can only spread an object into an object, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 ),
                             ))
                         }
@@ -3376,8 +3416,8 @@ impl Vm {
                     // `argsArray` (peek 1) and push the field name `consts[idx]` (a
                     // `Str`) onto `namesArray` (peek 0).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => Value::Str(s.clone()),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => Value::str(s.clone()),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3387,8 +3427,8 @@ impl Vm {
                         }
                     };
                     let value = fiber.pop();
-                    match (fiber.peek(1), fiber.peek(0)) {
-                        (Value::Array(args), Value::Array(names)) => {
+                    match (fiber.peek(1).kind(), fiber.peek(0).kind()) {
+                        (ValueKind::Array(args), ValueKind::Array(names)) => {
                             args.borrow_mut().push(value);
                             names.borrow_mut().push(name);
                         }
@@ -3407,10 +3447,10 @@ impl Vm {
                     // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
                     // `argsArray` and push `Nil` onto `namesArray` (a positional value).
                     let value = fiber.pop();
-                    match (fiber.peek(1), fiber.peek(0)) {
-                        (Value::Array(args), Value::Array(names)) => {
+                    match (fiber.peek(1).kind(), fiber.peek(0).kind()) {
+                        (ValueKind::Array(args), ValueKind::Array(names)) => {
                             args.borrow_mut().push(value);
-                            names.borrow_mut().push(Value::Nil);
+                            names.borrow_mut().push(Value::nil());
                         }
                         _ => {
                             return Err(self.panic_at(
@@ -3428,24 +3468,24 @@ impl Vm {
                     // Array), extend `argsArray` with its elements and push `Nil` ONCE
                     // PER element onto `namesArray`.
                     let operand = fiber.pop();
-                    let items: Vec<Value> = match operand {
-                        Value::Array(src) => src.borrow().iter().cloned().collect(),
-                        other => {
+                    let items: Vec<Value> = match operand.kind() {
+                        ValueKind::Array(src) => src.borrow().iter().cloned().collect(),
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "can only spread an array as call arguments, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 ),
                             ))
                         }
                     };
                     let n = items.len();
-                    match (fiber.peek(1), fiber.peek(0)) {
-                        (Value::Array(args), Value::Array(names)) => {
+                    match (fiber.peek(1).kind(), fiber.peek(0).kind()) {
+                        (ValueKind::Array(args), ValueKind::Array(names)) => {
                             args.borrow_mut().extend(items);
-                            names.borrow_mut().extend(std::iter::repeat_n(Value::Nil, n));
+                            names.borrow_mut().extend(std::iter::repeat_n(Value::nil(), n));
                         }
                         _ => {
                             return Err(self.panic_at(
@@ -3459,7 +3499,7 @@ impl Vm {
 
                 // ── Destructure / match family ────────────────────────────────
                 Op::CheckArrayDestructure => {
-                    if !matches!(fiber.peek(0), Value::Array(_)) {
+                    if !matches!(fiber.peek(0).kind(), ValueKind::Array(_)) {
                         let t = crate::interp::type_name(fiber.peek(0));
                         return Err(self.panic_at(
                             fiber,
@@ -3470,7 +3510,7 @@ impl Vm {
                 }
 
                 Op::CheckObjectDestructure => {
-                    if !matches!(fiber.peek(0), Value::Object(_) | Value::Instance(_)) {
+                    if !matches!(fiber.peek(0).kind(), ValueKind::Object(_) | ValueKind::Instance(_)) {
                         let t = crate::interp::type_name(fiber.peek(0));
                         return Err(self.panic_at(
                             fiber,
@@ -3483,9 +3523,9 @@ impl Vm {
                 Op::ArrayElem => {
                     let index = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let src = fiber.pop();
-                    match src {
-                        Value::Array(arr) => {
-                            let v = arr.borrow().get(index).cloned().unwrap_or(Value::Nil);
+                    match src.kind() {
+                        ValueKind::Array(arr) => {
+                            let v = arr.borrow().get(index).cloned().unwrap_or(Value::nil());
                             fiber.push(v);
                         }
                         other => {
@@ -3500,8 +3540,8 @@ impl Vm {
 
                 Op::ObjectKey => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3511,14 +3551,14 @@ impl Vm {
                         }
                     };
                     let src = fiber.pop();
-                    let v = match src {
-                        Value::Object(o) => {
-                            o.get(key.as_ref()).unwrap_or(Value::Nil)
+                    let v = match src.kind() {
+                        ValueKind::Object(o) => {
+                            o.get(key.as_ref()).unwrap_or(Value::nil())
                         }
-                        Value::Instance(i) => i
+                        ValueKind::Instance(i) => i
                             .borrow()
                             .get(key.as_ref())
-                            .unwrap_or(Value::Nil),
+                            .unwrap_or(Value::nil()),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3533,11 +3573,11 @@ impl Vm {
                 Op::ArrayRest => {
                     let start = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let src = fiber.pop();
-                    match src {
-                        Value::Array(arr) => {
+                    match src.kind() {
+                        ValueKind::Array(arr) => {
                             let tail: Vec<Value> =
                                 arr.borrow().iter().skip(start).cloned().collect();
-                            fiber.push(Value::Array(crate::value::ArrayCell::new(tail)));
+                            fiber.push(Value::array(tail));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -3552,12 +3592,12 @@ impl Vm {
                 Op::ObjectRest => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let bound: std::collections::HashSet<Rc<str>> =
-                        match &fiber.frame().closure.proto.chunk.consts[idx] {
-                            Value::Array(keys) => keys
+                        match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                            ValueKind::Array(keys) => keys
                                 .borrow()
                                 .iter()
-                                .filter_map(|v| match v {
-                                    Value::Str(s) => Some(s.clone()),
+                                .filter_map(|v| match v.kind() {
+                                    ValueKind::Str(s) => Some(s.clone()),
                                     _ => None,
                                 })
                                 .collect(),
@@ -3574,15 +3614,15 @@ impl Vm {
                     let src = fiber.pop();
                     let mut remaining: indexmap::IndexMap<String, Value> =
                         indexmap::IndexMap::new();
-                    match src {
-                        Value::Object(o) => {
+                    match src.kind() {
+                        ValueKind::Object(o) => {
                             for (k, v) in o.entries() {
                                 if !bound.contains(k.as_ref()) {
                                     remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
-                        Value::Instance(i) => {
+                        ValueKind::Instance(i) => {
                             for (k, v) in i.borrow().entries() {
                                 if !bound.contains(k.as_ref()) {
                                     remaining.insert(k.to_string(), v);
@@ -3597,7 +3637,7 @@ impl Vm {
                             ))
                         }
                     }
-                    fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                    fiber.push(Value::object(remaining));
                     // SHAPE §3.5: count this fresh-dict OBJECT_REST build.
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                     self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
@@ -3607,26 +3647,26 @@ impl Vm {
                     let len = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let exact = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) == 1;
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::Array(a) => {
+                    let ok = match subject.kind() {
+                        ValueKind::Array(a) => {
                             let n = a.borrow().len();
                             if exact { n == len } else { n >= len }
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchObject => {
                     let subject = fiber.pop();
-                    let ok = matches!(subject, Value::Object(_) | Value::Instance(_));
-                    fiber.push(Value::Bool(ok));
+                    let ok = matches!(subject.kind(), ValueKind::Object(_) | ValueKind::Instance(_));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchHasKey => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3638,22 +3678,22 @@ impl Vm {
                         }
                     };
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::Object(o) => o.contains_key(key.as_ref()),
-                        Value::Instance(i) => i.borrow().contains_key(key.as_ref()),
+                    let ok = match subject.kind() {
+                        ValueKind::Object(o) => o.contains_key(key.as_ref()),
+                        ValueKind::Instance(i) => i.borrow().contains_key(key.as_ref()),
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchVariant => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let (want_variant, want_enum) =
-                        match &fiber.frame().closure.proto.chunk.consts[idx] {
-                            Value::Array(a) => {
+                        match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                            ValueKind::Array(a) => {
                                 let b = a.borrow();
-                                let v = match b.first() {
-                                    Some(Value::Str(s)) => s.clone(),
+                                let v = match b.first().map(Value::kind) {
+                                    Some(ValueKind::Str(s)) => s.clone(),
                                     _ => {
                                         return Err(self.panic_at(
                                             fiber,
@@ -3663,8 +3703,8 @@ impl Vm {
                                         ))
                                     }
                                 };
-                                let e = match b.get(1) {
-                                    Some(Value::Str(s)) => Some(s.clone()),
+                                let e = match b.get(1).map(Value::kind) {
+                                    Some(ValueKind::Str(s)) => Some(s.clone()),
                                     _ => None,
                                 };
                                 (v, e)
@@ -3680,8 +3720,8 @@ impl Vm {
                             }
                         };
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::EnumVariant(ev) if ev.payload.is_some() => {
+                    let ok = match subject.kind() {
+                        ValueKind::EnumVariant(ev) if ev.payload.is_some() => {
                             ev.name.as_str() == want_variant.as_ref()
                                 && want_enum
                                     .as_ref()
@@ -3690,20 +3730,20 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchVariantArity => {
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let subject = fiber.pop();
                     let len = variant_payload_len(&subject);
-                    fiber.push(Value::Bool(len == Some(n)));
+                    fiber.push(Value::bool_(len == Some(n)));
                 }
 
                 Op::MatchVariantHasField => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3715,8 +3755,8 @@ impl Vm {
                         }
                     };
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::EnumVariant(ev) => match &ev.payload {
+                    let ok = match subject.kind() {
+                        ValueKind::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
                                 o.contains_key(key.as_ref())
                             }
@@ -3724,33 +3764,33 @@ impl Vm {
                         },
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::VariantElem => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let subject = fiber.pop();
-                    let v = match &subject {
-                        Value::EnumVariant(ev) => match &ev.payload {
+                    let v = match subject.kind() {
+                        ValueKind::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Positional(a)) => {
-                                a.borrow().get(idx).cloned().unwrap_or(Value::Nil)
+                                a.borrow().get(idx).cloned().unwrap_or(Value::nil())
                             }
                             Some(crate::value::Payload::Named(o)) => o
                                 .borrow()
                                 .get_index(idx)
                                 .map(|(_, v)| v.clone())
-                                .unwrap_or(Value::Nil),
-                            None => Value::Nil,
+                                .unwrap_or(Value::nil()),
+                            None => Value::nil(),
                         },
-                        _ => Value::Nil,
+                        _ => Value::nil(),
                     };
                     fiber.push(v);
                 }
 
                 Op::VariantField => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3760,14 +3800,14 @@ impl Vm {
                         }
                     };
                     let subject = fiber.pop();
-                    let v = match &subject {
-                        Value::EnumVariant(ev) => match &ev.payload {
+                    let v = match subject.kind() {
+                        ValueKind::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.get(key.as_ref()).unwrap_or(Value::Nil)
+                                o.get(key.as_ref()).unwrap_or(Value::nil())
                             }
-                            _ => Value::Nil,
+                            _ => Value::nil(),
                         },
-                        _ => Value::Nil,
+                        _ => Value::nil(),
                     };
                     fiber.push(v);
                 }
@@ -3804,7 +3844,7 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchNoArm => {
@@ -3918,7 +3958,7 @@ impl Vm {
                         upvalues.push(cell);
                     }
                     let closure = crate::vm::value_ext::Closure::with_upvalues(proto, upvalues);
-                    fiber.push(Value::Closure(closure));
+                    fiber.push(Value::closure(closure));
                 }
 
                 // ── Call / CallSpread (plain sync closure only) ───────────────
@@ -3935,8 +3975,8 @@ impl Vm {
                     if matches!(op, Op::CallSpread) {
                         // Stack is `[..., callee, argsArray]`. Peek callee at index -2.
                         let callee_ref = &fiber.stack[fiber.stack.len() - 2];
-                        let is_sync_closure = match callee_ref {
-                            Value::Closure(c) => {
+                        let is_sync_closure = match callee_ref.kind() {
+                            ValueKind::Closure(c) => {
                                 !c.proto.is_async && !c.proto.is_worker && !c.proto.is_generator
                             }
                             _ => false,
@@ -3946,16 +3986,15 @@ impl Vm {
                             return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                         }
                         // Pop the args array and flatten it, then dispatch.
-                        let args = match fiber.pop() {
-                            Value::Array(a) => a,
-                            other => {
+                        let args_arr = fiber.pop();
+                        let args_ty = crate::interp::type_name(&args_arr);
+                        let args = match args_arr.into_kind() {
+                            OwnedKind::Array(a) => a,
+                            _ => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
-                                    format!(
-                                        "CALL_SPREAD args are not an array: {}",
-                                        crate::interp::type_name(&other)
-                                    ),
+                                    format!("CALL_SPREAD args are not an array: {args_ty}"),
                                 ))
                             }
                         };
@@ -3965,8 +4004,8 @@ impl Vm {
                             fiber.push(v);
                         }
                         let callee_idx = fiber.stack.len() - argc - 1;
-                        let callee = match fiber.stack[callee_idx].clone() {
-                            Value::Closure(c) => c,
+                        let callee = match fiber.stack[callee_idx].clone().into_kind() {
+                            OwnedKind::Closure(c) => c,
                             _ => unreachable!("already checked above"),
                         };
                         let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
@@ -3982,8 +4021,8 @@ impl Vm {
                             fiber.frame().closure.proto.chunk.read_u8(operand_at) as usize;
                         let callee_idx = fiber.stack.len() - argc - 1;
                         let callee_ref = &fiber.stack[callee_idx];
-                        let is_sync_closure = match callee_ref {
-                            Value::Closure(c) => {
+                        let is_sync_closure = match callee_ref.kind() {
+                            ValueKind::Closure(c) => {
                                 !c.proto.is_async && !c.proto.is_worker && !c.proto.is_generator
                             }
                             _ => false,
@@ -3993,8 +4032,8 @@ impl Vm {
                             fiber.frame_mut().ip = fault_ip;
                             return Ok(BurstExit::Sync(SyncOutcome::NeedsAsync));
                         }
-                        let callee = match fiber.stack[callee_idx].clone() {
-                            Value::Closure(c) => c,
+                        let callee = match fiber.stack[callee_idx].clone().into_kind() {
+                            OwnedKind::Closure(c) => c,
                             _ => unreachable!("already checked above"),
                         };
                         let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
@@ -4016,7 +4055,7 @@ impl Vm {
                                 slot_count,
                                 &callee.proto.chunk.cell_slots,
                             );
-                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                            fiber.stack.resize(slot_base + slot_count, Value::nil());
                             if !cells.is_empty() {
                                 for slot in 0..supplied {
                                     if let Some(cell) =
@@ -4024,7 +4063,7 @@ impl Vm {
                                     {
                                         *cell.borrow_mut() = std::mem::replace(
                                             &mut fiber.stack[slot_base + slot],
-                                            Value::Nil,
+                                            Value::nil(),
                                         );
                                     }
                                 }
@@ -4073,8 +4112,8 @@ impl Vm {
                 // borrow held. `try_get` is a plain synchronous call — ZERO awaits.
                 Op::Await => {
                     // Peek TOS read-only before deciding whether to pop.
-                    let probe = match fiber.peek(0) {
-                        Value::Future(f) => {
+                    let probe = match fiber.peek(0).kind() {
+                        ValueKind::Future(f) => {
                             // try_get clones the result out; the slot borrow is
                             // dropped before try_get returns — no borrow held.
                             f.try_get()
@@ -4169,9 +4208,9 @@ impl Vm {
                     let v = fiber.frame().closure.proto.chunk.consts[idx].clone();
                     fiber.push(v);
                 }
-                Op::Nil => fiber.push(Value::Nil),
-                Op::True => fiber.push(Value::Bool(true)),
-                Op::False => fiber.push(Value::Bool(false)),
+                Op::Nil => fiber.push(Value::nil()),
+                Op::True => fiber.push(Value::bool_(true)),
+                Op::False => fiber.push(Value::bool_(false)),
                 Op::Pop => {
                     fiber.pop();
                 }
@@ -4250,8 +4289,8 @@ impl Vm {
                     // subject and run the SAME subtype check the tree-walker uses, so
                     // the two engines are byte-identical.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -4271,7 +4310,7 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(Value::Bool(yes));
+                    fiber.push(Value::bool_(yes));
                 }
 
                 Op::RangeInclusive => {
@@ -4371,7 +4410,7 @@ impl Vm {
                         }
                         _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::Neg | Op::Not | Op::BitNot => {
@@ -4397,8 +4436,8 @@ impl Vm {
 
                 Op::GetGlobal => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -4455,7 +4494,7 @@ impl Vm {
                         }
                         fiber.push(v);
                     } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
-                        let v = Value::Builtin(name);
+                        let v = Value::builtin(name);
                         if self.specialize {
                             fiber.frame().closure.proto.chunk.set_global_cache(
                                 fault_ip,
@@ -4477,8 +4516,8 @@ impl Vm {
                     // The u8 mutability flag follows the u16 name const (1 = `let`,
                     // 0 = immutable `const`/`fn`/`class`/`enum`/`import`).
                     let mutable = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) != 0;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -4508,8 +4547,8 @@ impl Vm {
 
                 Op::SetGlobal => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -4609,8 +4648,8 @@ impl Vm {
                     // message, and span all match the tree-walker's `Environment::assign`
                     // immutable error byte-for-byte.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -4630,7 +4669,7 @@ impl Vm {
 
                 Op::Call | Op::CallSpread => {
                     // `Op::Call` carries a STATIC `u8` argc; `Op::CallSpread` carries
-                    // none — its arguments arrived as a single runtime `Value::Array`
+                    // none — its arguments arrived as a single runtime `Value::array_cell`
                     // (built by the array/spread builder ops) sitting on top of the
                     // callee `[..., callee, argsArray]`. For `CallSpread` we POP the
                     // args array and re-push its elements as individual stack slots,
@@ -4639,16 +4678,15 @@ impl Vm {
                     // (arity/contracts then apply to the flattened list, byte-
                     // identical to the tree-walker's `eval_call_args` → call).
                     let argc = if matches!(op, Op::CallSpread) {
-                        let args = match fiber.pop() {
-                            Value::Array(a) => a,
-                            other => {
+                        let args_arr = fiber.pop();
+                        let args_ty = crate::interp::type_name(&args_arr);
+                        let args = match args_arr.into_kind() {
+                            OwnedKind::Array(a) => a,
+                            _ => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
-                                    format!(
-                                        "CALL_SPREAD args are not an array: {}",
-                                        crate::interp::type_name(&other)
-                                    ),
+                                    format!("CALL_SPREAD args are not an array: {args_ty}"),
                                 ))
                             }
                         };
@@ -4666,11 +4704,11 @@ impl Vm {
                     // base where, for a Closure callee, the args become the callee
                     // frame's first local slots (the CALL convention).
                     let callee_idx = fiber.stack.len() - argc - 1;
-                    match fiber.stack[callee_idx].clone() {
+                    match fiber.stack[callee_idx].clone().into_kind() {
                         // A generator closure (`fn*` / `async fn*`) is NOT run and
                         // NOT spawned: calling it builds a NOT-STARTED Fiber for the
                         // closure (args bound into its slots, ip 0) and wraps it in a
-                        // VM-backed `GeneratorHandle`, pushing a `Value::Generator`
+                        // VM-backed `GeneratorHandle`, pushing a `Value::generator`
                         // immediately. The body runs only when the consumer calls
                         // `gen.next()` (→ `GeneratorHandle::resume`), exactly like the
                         // tree-walker's `is_generator` branch of `call_function`.
@@ -4689,7 +4727,7 @@ impl Vm {
                         // `Interp::spawn_worker_stream` as the tree-walker → byte-
                         // identical. AWAIT DISCIPLINE: pop the args synchronously, then
                         // `.await` the spawn with no fiber borrow held.
-                        Value::Closure(callee)
+                        OwnedKind::Closure(callee)
                             if callee.proto.is_worker && callee.proto.is_generator =>
                         {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
@@ -4705,7 +4743,7 @@ impl Vm {
                                         call_span,
                                     ))
                                 })?;
-                            let mut args = vec![Value::Nil; argc];
+                            let mut args = vec![Value::nil(); argc];
                             for slot in args.iter_mut().rev() {
                                 *slot = fiber.pop();
                             }
@@ -4716,11 +4754,11 @@ impl Vm {
                                 .await?;
                             fiber.push(gen);
                         }
-                        Value::Closure(callee) if callee.proto.is_generator => {
+                        OwnedKind::Closure(callee) if callee.proto.is_generator => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
                             // Pop the args, then drop the callee value beneath them.
-                            let mut args = vec![Value::Nil; argc];
+                            let mut args = vec![Value::nil(); argc];
                             for slot in args.iter_mut().rev() {
                                 *slot = fiber.pop();
                             }
@@ -4756,7 +4794,7 @@ impl Vm {
                                 gfiber,
                                 Rc::downgrade(&self.rc()),
                             );
-                            fiber.push(Value::Generator(Rc::new(handle)));
+                            fiber.push(Value::generator(Rc::new(handle)));
                         }
                         // An `async fn` closure is NOT run inline: it is scheduled
                         // eagerly (M17 model 2a), exactly like the tree-walker's
@@ -4764,7 +4802,7 @@ impl Vm {
                         // that re-enters the VM via `Vm::call_value` (which sets up a
                         // fresh one-frame fiber, binds args via `check_call_args`, and
                         // runs to Done), `spawn_local` it onto the current-thread
-                        // LocalSet, and hand back a `Value::Future` IMMEDIATELY; the
+                        // LocalSet, and hand back a `Value::future` IMMEDIATELY; the
                         // caller `await`s it later. Because `call_value` runs the arity
                         // /contract check INSIDE the spawned task, an async arity or
                         // contract violation surfaces LAZILY — it resolves into the
@@ -4775,11 +4813,11 @@ impl Vm {
                         // spawn/await below.
                         // A `worker fn` closure dispatches to a pooled isolate
                         // (Workers Spec A): pop the args, build the code slice from the
-                        // entry program source, ship + return a `Value::Future`. Must
+                        // entry program source, ship + return a `Value::future`. Must
                         // precede the `is_async` branch (a worker fn is not async).
-                        Value::Closure(callee) if callee.proto.is_worker => {
+                        OwnedKind::Closure(callee) if callee.proto.is_worker => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            let mut args = vec![Value::Nil; argc];
+                            let mut args = vec![Value::nil(); argc];
                             for slot in args.iter_mut().rev() {
                                 *slot = fiber.pop();
                             }
@@ -4787,11 +4825,11 @@ impl Vm {
                             let fut = self.dispatch_worker_closure(&callee, args, call_span)?;
                             fiber.push(fut);
                         }
-                        Value::Closure(callee) if callee.proto.is_async => {
+                        OwnedKind::Closure(callee) if callee.proto.is_async => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             // Pop the `argc` args into an owned vec (top of stack is
                             // the LAST arg), then drop the callee value beneath them.
-                            let mut args = vec![Value::Nil; argc];
+                            let mut args = vec![Value::nil(); argc];
                             for slot in args.iter_mut().rev() {
                                 *slot = fiber.pop();
                             }
@@ -4809,14 +4847,14 @@ impl Vm {
                             let handle = tokio::task::spawn_local(async move {
                                 let _g = guard;
                                 let r =
-                                    vm.call_value(Value::Closure(callee), args, call_span).await;
+                                    vm.call_value(Value::closure(callee), args, call_span).await;
                                 cell.resolve(r);
                             });
                             fut.set_abort(handle.abort_handle());
                             self.interp.maybe_yield_for_inflight().await;
-                            fiber.push(Value::Future(fut));
+                            fiber.push(Value::future(fut));
                         }
-                        Value::Closure(callee) => {
+                        OwnedKind::Closure(callee) => {
                             // The call-site span anchors arity/contract/return
                             // panics exactly where the tree-walker's do.
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
@@ -4860,7 +4898,7 @@ impl Vm {
                                 // Extend to the full frame window; slots beyond `argc`
                                 // default to `Nil` (the same value the BoundArgs
                                 // placeholders carried for omitted defaulted params).
-                                fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                                fiber.stack.resize(slot_base + slot_count, Value::nil());
                                 // Rare: a param whose resolver-assigned slot is a cell
                                 // slot (a callback that captures AND mutates a param).
                                 // Move it from the window into its cell.
@@ -4871,7 +4909,7 @@ impl Vm {
                                         {
                                             *cell.borrow_mut() = std::mem::replace(
                                                 &mut fiber.stack[slot_base + slot],
-                                                Value::Nil,
+                                                Value::nil(),
                                             );
                                         }
                                     }
@@ -4905,7 +4943,7 @@ impl Vm {
                             }
                             // Continue the loop in the new frame.
                         }
-                        other => {
+                        _ => {
                             // Native callee (Builtin/Function/Class/BoundMethod/...):
                             // delegate to the VM-aware `call_value`, which routes a
                             // VM class constructor / VM bound method to COMPILED code
@@ -4914,13 +4952,13 @@ impl Vm {
                             // BEFORE the await so no borrow of `fiber` is held across
                             // the suspension point (`await_holding_refcell_ref` stays
                             // clean).
-                            let mut args = vec![Value::Nil; argc];
+                            let mut args = vec![Value::nil(); argc];
                             for slot in args.iter_mut().rev() {
                                 *slot = fiber.pop();
                             }
-                            let _callee = fiber.pop(); // the Value at callee_idx
+                            let callee_v = fiber.pop(); // the Value at callee_idx
                             let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            let result = self.call_value(other, args, span).await?;
+                            let result = self.call_value(callee_v, args, span).await?;
                             fiber.push(result);
                         }
                     }
@@ -4940,18 +4978,19 @@ impl Vm {
                     let names_idx =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) as usize;
-                    let names: Vec<Option<Rc<str>>> = match &fiber
+                    let names: Vec<Option<Rc<str>>> = match fiber
                         .frame()
                         .closure
                         .proto
                         .chunk
                         .consts[names_idx]
+                        .kind()
                     {
-                        Value::Array(a) => a
+                        ValueKind::Array(a) => a
                             .borrow()
                             .iter()
-                            .map(|v| match v {
-                                Value::Str(s) => Some(s.clone()),
+                            .map(|v| match v.kind() {
+                                ValueKind::Str(s) => Some(s.clone()),
                                 _ => None,
                             })
                             .collect(),
@@ -4963,24 +5002,24 @@ impl Vm {
                             ))
                         }
                     };
-                    let mut args = vec![Value::Nil; argc];
+                    let mut args = vec![Value::nil(); argc];
                     for slot in args.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
                     let callee = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let result = match callee {
-                        Value::EnumVariant(ev) => {
+                    let result = match callee.kind() {
+                        ValueKind::EnumVariant(ev) => {
                             self.interp
-                                .construct_variant_args(&ev, args, &names, span)
+                                .construct_variant_args(ev, args, &names, span)
                                 .await?
                         }
-                        other => {
+                        _ => {
                             return Err(Control::Panic(crate::error::AsError::at(
                                 format!(
                                     "named arguments are only valid for enum-variant \
                                      construction, not for {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&callee)
                                 ),
                                 span,
                             )))
@@ -4995,8 +5034,8 @@ impl Vm {
                     // `argsArray` (peek 1) and push the field name `consts[idx]` (a
                     // `Str`) onto `namesArray` (peek 0).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => Value::Str(s.clone()),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => Value::str(s.clone()),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -5006,8 +5045,8 @@ impl Vm {
                         }
                     };
                     let value = fiber.pop();
-                    match (fiber.peek(1), fiber.peek(0)) {
-                        (Value::Array(args), Value::Array(names)) => {
+                    match (fiber.peek(1).kind(), fiber.peek(0).kind()) {
+                        (ValueKind::Array(args), ValueKind::Array(names)) => {
                             args.borrow_mut().push(value);
                             names.borrow_mut().push(name);
                         }
@@ -5026,10 +5065,10 @@ impl Vm {
                     // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
                     // `argsArray` and push `Nil` onto `namesArray` (a positional value).
                     let value = fiber.pop();
-                    match (fiber.peek(1), fiber.peek(0)) {
-                        (Value::Array(args), Value::Array(names)) => {
+                    match (fiber.peek(1).kind(), fiber.peek(0).kind()) {
+                        (ValueKind::Array(args), ValueKind::Array(names)) => {
                             args.borrow_mut().push(value);
-                            names.borrow_mut().push(Value::Nil);
+                            names.borrow_mut().push(Value::nil());
                         }
                         _ => {
                             return Err(self.panic_at(
@@ -5048,24 +5087,24 @@ impl Vm {
                     // panic the positional path produces), extend `argsArray` with its
                     // elements and push `Nil` ONCE PER element onto `namesArray`.
                     let operand = fiber.pop();
-                    let items: Vec<Value> = match operand {
-                        Value::Array(src) => src.borrow().iter().cloned().collect(),
-                        other => {
+                    let items: Vec<Value> = match operand.kind() {
+                        ValueKind::Array(src) => src.borrow().iter().cloned().collect(),
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "can only spread an array as call arguments, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 ),
                             ))
                         }
                     };
                     let n = items.len();
-                    match (fiber.peek(1), fiber.peek(0)) {
-                        (Value::Array(args), Value::Array(names)) => {
+                    match (fiber.peek(1).kind(), fiber.peek(0).kind()) {
+                        (ValueKind::Array(args), ValueKind::Array(names)) => {
                             args.borrow_mut().extend(items);
-                            names.borrow_mut().extend(std::iter::repeat_n(Value::Nil, n));
+                            names.borrow_mut().extend(std::iter::repeat_n(Value::nil(), n));
                         }
                         _ => {
                             return Err(self.panic_at(
@@ -5084,12 +5123,12 @@ impl Vm {
                     // `construct_variant_args` (byte-identical to the tree-walker's
                     // `call_value_named`). AWAIT DISCIPLINE: pull args + names into owned
                     // Vecs before the await; hold no `fiber` borrow across it.
-                    let names: Vec<Option<Rc<str>>> = match fiber.pop() {
-                        Value::Array(a) => a
+                    let names: Vec<Option<Rc<str>>> = match fiber.pop().kind() {
+                        ValueKind::Array(a) => a
                             .borrow()
                             .iter()
-                            .map(|v| match v {
-                                Value::Str(s) => Some(s.clone()),
+                            .map(|v| match v.kind() {
+                                ValueKind::Str(s) => Some(s.clone()),
                                 _ => None,
                             })
                             .collect(),
@@ -5101,8 +5140,8 @@ impl Vm {
                             ))
                         }
                     };
-                    let args: Vec<Value> = match fiber.pop() {
-                        Value::Array(a) => a.borrow().iter().cloned().collect(),
+                    let args: Vec<Value> = match fiber.pop().kind() {
+                        ValueKind::Array(a) => a.borrow().iter().cloned().collect(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -5113,18 +5152,18 @@ impl Vm {
                     };
                     let callee = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let result = match callee {
-                        Value::EnumVariant(ev) => {
+                    let result = match callee.kind() {
+                        ValueKind::EnumVariant(ev) => {
                             self.interp
-                                .construct_variant_args(&ev, args, &names, span)
+                                .construct_variant_args(ev, args, &names, span)
                                 .await?
                         }
-                        other => {
+                        _ => {
                             return Err(Control::Panic(crate::error::AsError::at(
                                 format!(
                                     "named arguments are only valid for enum-variant \
                                      construction, not for {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&callee)
                                 ),
                                 span,
                             )))
@@ -5148,10 +5187,11 @@ impl Vm {
                     // deferred to the full V9 method-call slice; the generator
                     // consumer API (`gen.next(v)`/`gen.close()`) and the rest of the
                     // gated corpus do not hit it. Everything else is byte-identical.
-                    let name = match &fiber.frame().closure.proto.chunk.consts
+                    let name = match fiber.frame().closure.proto.chunk.consts
                         [fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize]
+                    .kind()
                     {
-                        Value::Str(s) => s.clone(),
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -5162,7 +5202,7 @@ impl Vm {
                     };
                     let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) as usize;
                     // Pop the args (top is the LAST arg), then the receiver beneath.
-                    let mut args = vec![Value::Nil; argc];
+                    let mut args = vec![Value::nil(); argc];
                     for slot in args.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
@@ -5181,7 +5221,7 @@ impl Vm {
                     // A method call `recv.<name>(...args)` whose argument list contains
                     // a spread (dynamic arity). Mirrors `Op::CallMethod` EXACTLY for
                     // dispatch — the only difference is how the arg list is obtained:
-                    // the args arrived as a single runtime `Value::Array` (built by the
+                    // the args arrived as a single runtime `Value::array_cell` (built by the
                     // array/spread builder ops), sitting on top of the receiver
                     // `[..., recv, argsArray]`. Pop the args array and flatten it into
                     // a positional `Vec`, then pop the receiver — yielding the SAME
@@ -5194,10 +5234,11 @@ impl Vm {
                     // already evaluated the receiver and the (spread-flattened) args
                     // onto the stack, so a member-read error does NOT preempt arg side
                     // effects. This is the SAME documented deviation as `Op::CallMethod`.
-                    let name = match &fiber.frame().closure.proto.chunk.consts
+                    let name = match fiber.frame().closure.proto.chunk.consts
                         [fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize]
+                    .kind()
                     {
-                        Value::Str(s) => s.clone(),
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -5210,17 +5251,18 @@ impl Vm {
                     };
                     // Pop the runtime args array (built by NEW_ARRAY + spread ops) and
                     // re-materialize its elements as a positional `Vec`. (The builder
-                    // always produces a `Value::Array`; a non-array OPERAND was already
+                    // always produces a `Value::array_cell`; a non-array OPERAND was already
                     // rejected by `SPREAD_ARGS` with the byte-identical message.)
-                    let args = match fiber.pop() {
-                        Value::Array(a) => a.borrow().iter().cloned().collect::<Vec<_>>(),
-                        other => {
+                    let args_arr = fiber.pop();
+                    let args = match args_arr.kind() {
+                        ValueKind::Array(a) => a.borrow().iter().cloned().collect::<Vec<_>>(),
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "CALL_METHOD_SPREAD args are not an array: {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&args_arr)
                                 ),
                             ))
                         }
@@ -5238,7 +5280,7 @@ impl Vm {
                     // shared with `print`), so a template interpolating any value
                     // renders byte-identically to `ExprKind::Template`.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut parts = vec![Value::Nil; n];
+                    let mut parts = vec![Value::nil(); n];
                     for slot in parts.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
@@ -5246,7 +5288,7 @@ impl Vm {
                     for v in &parts {
                         out.push_str(&v.to_string());
                     }
-                    fiber.push(Value::Str(out.into()));
+                    fiber.push(Value::str(out));
                 }
 
                 Op::Jump => {
@@ -5292,11 +5334,11 @@ impl Vm {
                 }
                 Op::JumpIfNotNil => {
                     // Pop the tested value; jump iff it is NOT `nil`. Mirrors the
-                    // tree-walker's `??` test (`l == Value::Nil` selects the RHS;
+                    // tree-walker's `??` test (`l == Value::nil()` selects the RHS;
                     // anything else keeps the left), so the jump fires on "keep
                     // the non-nil left operand".
                     let v = fiber.pop();
-                    if v != Value::Nil {
+                    if v != Value::nil() {
                         let disp = fiber.frame().closure.proto.chunk.read_i16(operand_at);
                         let base = fiber.frame().ip as isize;
                         fiber.frame_mut().ip = (base + disp as isize) as usize;
@@ -5363,14 +5405,14 @@ impl Vm {
                 Op::NewArray => {
                     // Pop `n` elements (pushed in source order, so the last
                     // pushed is on top) into a Vec preserving source order, then
-                    // push `Value::Array`. Matches the tree-walker's
+                    // push `Value::array_cell`. Matches the tree-walker's
                     // `ExprKind::Array` construction (`Rc<RefCell<Vec>>`).
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let mut values = vec![Value::Nil; n];
+                    let mut values = vec![Value::nil(); n];
                     for slot in values.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    fiber.push(Value::Array(crate::value::ArrayCell::new(values)));
+                    fiber.push(Value::array(values));
                 }
 
                 Op::NewObject => {
@@ -5383,10 +5425,9 @@ impl Vm {
                 }
 
                 Op::NewMap => {
-                    // Push a fresh, empty `Value::Map`. The `#{…}` builder runs one
+                    // Push a fresh, empty `Value::map_cell`. The `#{…}` builder runs one
                     // `MAP_ENTRY` per entry after this (or nothing for `#{}`).
-                    let cell = crate::value::MapCell::new(indexmap::IndexMap::new());
-                    fiber.push(Value::Map(cell));
+                    fiber.push(Value::map(indexmap::IndexMap::new()));
                 }
 
                 Op::MapEntry => {
@@ -5410,17 +5451,17 @@ impl Vm {
                             ))
                         }
                     };
-                    match fiber.peek(0) {
-                        Value::Map(m) => {
+                    match fiber.peek(0).kind() {
+                        ValueKind::Map(m) => {
                             m.borrow_mut().insert(key, val);
                         }
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "MAP_ENTRY target is not a map: {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(fiber.peek(0))
                                 ),
                             ))
                         }
@@ -5436,36 +5477,36 @@ impl Vm {
                     // ONLY difference between SPREAD and SPREAD_ARGS is the message
                     // ("into an array" vs "as call arguments").
                     let operand = fiber.pop();
-                    match operand {
-                        Value::Array(src) => {
+                    match operand.kind() {
+                        ValueKind::Array(src) => {
                             // Clone elements out FIRST so a self-spread (`[...a]`
                             // where `arr` aliased `a`) cannot observe a borrow
                             // conflict, then extend the builder array.
                             let items: Vec<Value> = src.borrow().iter().cloned().collect();
-                            match fiber.peek(0) {
-                                Value::Array(arr) => arr.borrow_mut().extend(items),
-                                other => {
+                            match fiber.peek(0).kind() {
+                                ValueKind::Array(arr) => arr.borrow_mut().extend(items),
+                                _ => {
                                     return Err(self.panic_at(
                                         fiber,
                                         fault_ip,
                                         format!(
                                             "SPREAD target is not an array: {}",
-                                            crate::interp::type_name(other)
+                                            crate::interp::type_name(fiber.peek(0))
                                         ),
                                     ))
                                 }
                             }
                         }
-                        other => {
+                        _ => {
                             let msg = if matches!(op, Op::SpreadArgs) {
                                 format!(
                                     "can only spread an array as call arguments, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 )
                             } else {
                                 format!(
                                     "can only spread an array into an array, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 )
                             };
                             return Err(self.panic_at(fiber, fault_ip, msg));
@@ -5477,15 +5518,15 @@ impl Vm {
                     // `[arr, item] -- [arr]` — push one `item` onto the builder
                     // array `arr` below it.
                     let item = fiber.pop();
-                    match fiber.peek(0) {
-                        Value::Array(arr) => arr.borrow_mut().push(item),
-                        other => {
+                    match fiber.peek(0).kind() {
+                        ValueKind::Array(arr) => arr.borrow_mut().push(item),
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "APPEND_ARRAY target is not an array: {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(fiber.peek(0))
                                 ),
                             ))
                         }
@@ -5498,8 +5539,8 @@ impl Vm {
                     // slab and dict mode). Later-wins + first-position, byte-identical
                     // to the tree-walker's `ExprKind::Object`.
                     let val = fiber.pop();
-                    let key = match fiber.pop() {
-                        Value::Str(s) => s,
+                    let key = match fiber.pop().into_kind() {
+                        OwnedKind::Str(s) => s,
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -5508,18 +5549,18 @@ impl Vm {
                             ))
                         }
                     };
-                    match fiber.peek(0) {
-                        Value::Object(obj) => {
+                    match fiber.peek(0).kind() {
+                        ValueKind::Object(obj) => {
                             let obj = obj.clone();
                             self.vm_object_insert(&obj, &key, val);
                         }
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "APPEND_OBJECT target is not an object: {}",
-                                    crate::interp::type_name(other)
+                                    crate::interp::type_name(fiber.peek(0))
                                 ),
                             ))
                         }
@@ -5533,36 +5574,36 @@ impl Vm {
                     // Tier-2 panic, anchored at this op's span; entries insert
                     // later-wins/first-pos — byte-identical to the tree-walker.
                     let operand = fiber.pop();
-                    match operand {
-                        Value::Object(src) => {
+                    match operand.kind() {
+                        ValueKind::Object(src) => {
                             // Snapshot FIRST (avoids borrow conflict on self-spread).
                             let entries = src.entries();
-                            match fiber.peek(0) {
-                                Value::Object(obj) => {
+                            match fiber.peek(0).kind() {
+                                ValueKind::Object(obj) => {
                                     let obj = obj.clone();
                                     for (k, v) in entries {
                                         self.vm_object_insert(&obj, &k, v);
                                     }
                                 }
-                                other => {
+                                _ => {
                                     return Err(self.panic_at(
                                         fiber,
                                         fault_ip,
                                         format!(
                                             "SPREAD_OBJECT target is not an object: {}",
-                                            crate::interp::type_name(other)
+                                            crate::interp::type_name(fiber.peek(0))
                                         ),
                                     ))
                                 }
                             }
                         }
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "can only spread an object into an object, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&operand)
                                 ),
                             ))
                         }
@@ -5592,8 +5633,8 @@ impl Vm {
                     let idx = fiber.pop();
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let v = match &obj {
-                        Value::Object(cell) => {
+                    let v = match obj.kind() {
+                        ValueKind::Object(cell) => {
                             // Frozen guard (mirrors index_set's frozen_kind check).
                             if let Some(kind) = crate::value::frozen_kind(&obj) {
                                 return Err(Control::Panic(AsError::at(
@@ -5601,8 +5642,8 @@ impl Vm {
                                     span,
                                 )));
                             }
-                            match &idx {
-                                Value::Str(key) => {
+                            match idx.kind() {
+                                ValueKind::Str(key) => {
                                     let key = key.clone();
                                     self.vm_object_insert(cell, &key, val.clone());
                                     val
@@ -5628,8 +5669,8 @@ impl Vm {
                     // → BoundMethod, enum variants, native handles, nil-receiver
                     // errors), so the two engines cannot drift.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -5639,11 +5680,11 @@ impl Vm {
                         }
                     };
                     let obj = fiber.pop();
-                    if op == Op::GetPropOpt && obj == Value::Nil {
+                    if op == Op::GetPropOpt && obj == Value::nil() {
                         // `?.` short-circuit guard: a nil receiver never consults
                         // the IC (and never resolves a field), matching the generic
                         // path's nil short-circuit exactly.
-                        fiber.push(Value::Nil);
+                        fiber.push(Value::nil());
                     } else {
                         let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                         // Try the field inline cache (fast path for FIELD reads on a
@@ -5703,15 +5744,15 @@ impl Vm {
                     // expression's trivia-trimmed code span), exactly like
                     // `AsError::at(format!("value of type {} is not iterable", ...))`.
                     let iterable = fiber.pop();
-                    let items: Vec<Value> = match iterable {
-                        Value::Array(arr) => arr.borrow().clone(),
-                        Value::Str(s) => s
+                    let items: Vec<Value> = match iterable.kind() {
+                        ValueKind::Array(arr) => arr.borrow().clone(),
+                        ValueKind::Str(s) => s
                             .chars()
-                            .map(|c| Value::Str(c.to_string().into()))
+                            .map(|c| Value::str(c.to_string()))
                             .collect(),
                         // SRV §3.5: a frozen `Shared` array/string/set iterates
                         // zero-copy, byte-identical to the tree-walker's `ForOf`.
-                        Value::Shared(ref node) => match crate::interp::shared_iter_values(node) {
+                        ValueKind::Shared(node) => match crate::interp::shared_iter_values(node) {
                             Some(items) => items,
                             None => {
                                 return Err(self.panic_at(
@@ -5724,18 +5765,18 @@ impl Vm {
                                 ))
                             }
                         },
-                        other => {
+                        _ => {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
                                 format!(
                                     "value of type {} is not iterable",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&iterable)
                                 ),
                             ))
                         }
                     };
-                    fiber.push(Value::Array(crate::value::ArrayCell::new(items)));
+                    fiber.push(Value::array(items));
                 }
 
                 Op::ArrayLen => {
@@ -5744,10 +5785,10 @@ impl Vm {
                     // compiler emits this only over an `IterSnapshot` result — so a
                     // non-array is a compiler bug surfaced as a Tier-2 panic.
                     let v = fiber.pop();
-                    match v {
-                        Value::Array(arr) => {
+                    match v.kind() {
+                        ValueKind::Array(arr) => {
                             let len = arr.borrow().len();
-                            fiber.push(Value::Float(len as f64));
+                            fiber.push(Value::float(len as f64));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -5810,7 +5851,7 @@ impl Vm {
                         upvalues.push(cell);
                     }
                     let closure = crate::vm::value_ext::Closure::with_upvalues(proto, upvalues);
-                    fiber.push(Value::Closure(closure));
+                    fiber.push(Value::closure(closure));
                 }
 
                 Op::GetLocalCell => {
@@ -5873,7 +5914,7 @@ impl Vm {
                                 for name in entry.exports.borrow().iter() {
                                     m.insert(
                                         name.clone(),
-                                        entry.env.get(name).unwrap_or(Value::Nil),
+                                        entry.env.get(name).unwrap_or(Value::nil()),
                                     );
                                 }
                                 Rc::new(RefCell::new(m))
@@ -5932,7 +5973,7 @@ impl Vm {
                             ..
                         } => {
                             let map = exports.borrow().clone();
-                            let ns = Value::Object(crate::value::ObjectCell::new(map));
+                            let ns = Value::object(map);
                             // SHAPE §3.5: count this fresh-dict namespace-import build.
                             #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                             self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
@@ -5956,17 +5997,16 @@ impl Vm {
                     // throwaway (its exports are unused), exactly as the tree-walker
                     // discards the main program's `current_exports`.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.to_string(),
-                        other => {
+                    let name_const = &fiber.frame().closure.proto.chunk.consts[idx];
+                    let name = match name_const.kind() {
+                        ValueKind::Str(s) => s.to_string(),
+                        _ => {
+                            let ty = crate::interp::type_name(name_const);
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
-                                format!(
-                                    "DEFINE_EXPORT name const is not a string: {}",
-                                    crate::interp::type_name(other)
-                                ),
-                            ))
+                                format!("DEFINE_EXPORT name const is not a string: {ty}"),
+                            ));
                         }
                     };
                     let v = fiber.pop();
@@ -5978,7 +6018,7 @@ impl Vm {
                     // the tree-walker's `Stmt::LetDestructure` type check (which runs
                     // ONCE before binding any name). Leaves the source in place so the
                     // surrounding lowering can stash it in a temp slot.
-                    if !matches!(fiber.peek(0), Value::Array(_)) {
+                    if !matches!(fiber.peek(0).kind(), ValueKind::Array(_)) {
                         let t = crate::interp::type_name(fiber.peek(0));
                         return Err(self.panic_at(
                             fiber,
@@ -5992,7 +6032,7 @@ impl Vm {
                     // Peek the RHS on TOS and validate it is an Object or Instance,
                     // exactly like the tree-walker's `Stmt::LetDestructureObject` type
                     // check. Leaves the source in place.
-                    if !matches!(fiber.peek(0), Value::Object(_) | Value::Instance(_)) {
+                    if !matches!(fiber.peek(0).kind(), ValueKind::Object(_) | ValueKind::Instance(_)) {
                         let t = crate::interp::type_name(fiber.peek(0));
                         return Err(self.panic_at(
                             fiber,
@@ -6006,12 +6046,12 @@ impl Vm {
                     // `src -- src[index]`. Pop the (already-validated) array and push
                     // the element at `index`, or `nil` for an out-of-bounds position
                     // (positions past the length bind nil — `items.get(i).cloned()
-                    // .unwrap_or(Value::Nil)`).
+                    // .unwrap_or(Value::nil())`).
                     let index = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let src = fiber.pop();
-                    match src {
-                        Value::Array(arr) => {
-                            let v = arr.borrow().get(index).cloned().unwrap_or(Value::Nil);
+                    match src.kind() {
+                        ValueKind::Array(arr) => {
+                            let v = arr.borrow().get(index).cloned().unwrap_or(Value::nil());
                             fiber.push(v);
                         }
                         other => {
@@ -6031,8 +6071,8 @@ impl Vm {
                     // `get` closure EXACTLY: an Instance reads only its `fields` (it
                     // does NOT fall back to methods like `read_member` would).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -6042,14 +6082,14 @@ impl Vm {
                         }
                     };
                     let src = fiber.pop();
-                    let v = match src {
-                        Value::Object(o) => {
-                            o.get(key.as_ref()).unwrap_or(Value::Nil)
+                    let v = match src.kind() {
+                        ValueKind::Object(o) => {
+                            o.get(key.as_ref()).unwrap_or(Value::nil())
                         }
-                        Value::Instance(i) => i
+                        ValueKind::Instance(i) => i
                             .borrow()
                             .get(key.as_ref())
-                            .unwrap_or(Value::Nil),
+                            .unwrap_or(Value::nil()),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -6067,11 +6107,11 @@ impl Vm {
                     // collector (`items.iter().skip(names.len())`).
                     let start = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let src = fiber.pop();
-                    match src {
-                        Value::Array(arr) => {
+                    match src.kind() {
+                        ValueKind::Array(arr) => {
                             let tail: Vec<Value> =
                                 arr.borrow().iter().skip(start).cloned().collect();
-                            fiber.push(Value::Array(crate::value::ArrayCell::new(tail)));
+                            fiber.push(Value::array(tail));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -6091,12 +6131,12 @@ impl Vm {
                     // keys).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let bound: std::collections::HashSet<Rc<str>> =
-                        match &fiber.frame().closure.proto.chunk.consts[idx] {
-                            Value::Array(keys) => keys
+                        match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                            ValueKind::Array(keys) => keys
                                 .borrow()
                                 .iter()
-                                .filter_map(|v| match v {
-                                    Value::Str(s) => Some(s.clone()),
+                                .filter_map(|v| match v.kind() {
+                                    ValueKind::Str(s) => Some(s.clone()),
                                     _ => None,
                                 })
                                 .collect(),
@@ -6111,15 +6151,15 @@ impl Vm {
                     let src = fiber.pop();
                     let mut remaining: indexmap::IndexMap<String, Value> =
                         indexmap::IndexMap::new();
-                    match src {
-                        Value::Object(o) => {
+                    match src.kind() {
+                        ValueKind::Object(o) => {
                             for (k, v) in o.entries() {
                                 if !bound.contains(k.as_ref()) {
                                     remaining.insert(k.to_string(), v);
                                 }
                             }
                         }
-                        Value::Instance(i) => {
+                        ValueKind::Instance(i) => {
                             for (k, v) in i.borrow().entries() {
                                 if !bound.contains(k.as_ref()) {
                                     remaining.insert(k.to_string(), v);
@@ -6134,7 +6174,7 @@ impl Vm {
                             ))
                         }
                     }
-                    fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
+                    fiber.push(Value::object(remaining));
                     // SHAPE §3.5: count this fresh-dict OBJECT_REST build.
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                     self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
@@ -6148,8 +6188,8 @@ impl Vm {
                     let len = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let exact = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) == 1;
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::Array(a) => {
+                    let ok = match subject.kind() {
+                        ValueKind::Array(a) => {
                             let n = a.borrow().len();
                             if exact {
                                 n == len
@@ -6159,7 +6199,7 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchObject => {
@@ -6167,8 +6207,8 @@ impl Vm {
                     // Object or Instance. Mirrors the head guard of the tree-walker's
                     // `Pattern::Object` (any other value is a structural mismatch).
                     let subject = fiber.pop();
-                    let ok = matches!(subject, Value::Object(_) | Value::Instance(_));
-                    fiber.push(Value::Bool(ok));
+                    let ok = matches!(subject.kind(), ValueKind::Object(_) | ValueKind::Instance(_));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchHasKey => {
@@ -6178,8 +6218,8 @@ impl Vm {
                     // (not peeking) avoids orphaning the subject on a missing-key
                     // fail-jump; the matched path reloads the subject temp.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -6191,12 +6231,12 @@ impl Vm {
                         }
                     };
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::Object(o) => o.contains_key(key.as_ref()),
-                        Value::Instance(i) => i.borrow().contains_key(key.as_ref()),
+                    let ok = match subject.kind() {
+                        ValueKind::Object(o) => o.contains_key(key.as_ref()),
+                        ValueKind::Instance(i) => i.borrow().contains_key(key.as_ref()),
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchVariant => {
@@ -6207,11 +6247,11 @@ impl Vm {
                     // head tag-test of the tree-walker's `match_variant_pattern`.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let (want_variant, want_enum) =
-                        match &fiber.frame().closure.proto.chunk.consts[idx] {
-                            Value::Array(a) => {
+                        match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                            ValueKind::Array(a) => {
                                 let b = a.borrow();
-                                let v = match b.first() {
-                                    Some(Value::Str(s)) => s.clone(),
+                                let v = match b.first().map(Value::kind) {
+                                    Some(ValueKind::Str(s)) => s.clone(),
                                     _ => {
                                         return Err(self.panic_at(
                                             fiber,
@@ -6220,8 +6260,8 @@ impl Vm {
                                         ))
                                     }
                                 };
-                                let e = match b.get(1) {
-                                    Some(Value::Str(s)) => Some(s.clone()),
+                                let e = match b.get(1).map(Value::kind) {
+                                    Some(ValueKind::Str(s)) => Some(s.clone()),
                                     _ => None,
                                 };
                                 (v, e)
@@ -6235,8 +6275,8 @@ impl Vm {
                             }
                         };
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::EnumVariant(ev) if ev.payload.is_some() => {
+                    let ok = match subject.kind() {
+                        ValueKind::EnumVariant(ev) if ev.payload.is_some() => {
                             ev.name.as_str() == want_variant.as_ref()
                                 && want_enum
                                     .as_ref()
@@ -6245,7 +6285,7 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchVariantArity => {
@@ -6255,7 +6295,7 @@ impl Vm {
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let subject = fiber.pop();
                     let len = variant_payload_len(&subject);
-                    fiber.push(Value::Bool(len == Some(n)));
+                    fiber.push(Value::bool_(len == Some(n)));
                 }
 
                 Op::MatchVariantHasField => {
@@ -6263,8 +6303,8 @@ impl Vm {
                     // NAMED payload field `consts[idx]`. Mirrors the named-destructure
                     // presence check.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -6274,8 +6314,8 @@ impl Vm {
                         }
                     };
                     let subject = fiber.pop();
-                    let ok = match &subject {
-                        Value::EnumVariant(ev) => match &ev.payload {
+                    let ok = match subject.kind() {
+                        ValueKind::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
                                 o.contains_key(key.as_ref())
                             }
@@ -6283,7 +6323,7 @@ impl Vm {
                         },
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::VariantElem => {
@@ -6293,17 +6333,17 @@ impl Vm {
                     // positional destructure.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let subject = fiber.pop();
-                    let v = match &subject {
-                        Value::EnumVariant(ev) => match &ev.payload {
+                    let v = match subject.kind() {
+                        ValueKind::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Positional(a)) => {
-                                a.borrow().get(idx).cloned().unwrap_or(Value::Nil)
+                                a.borrow().get(idx).cloned().unwrap_or(Value::nil())
                             }
                             Some(crate::value::Payload::Named(o)) => {
-                                o.get_index(idx).map(|(_, v)| v).unwrap_or(Value::Nil)
+                                o.get_index(idx).map(|(_, v)| v).unwrap_or(Value::nil())
                             }
-                            None => Value::Nil,
+                            None => Value::nil(),
                         },
-                        _ => Value::Nil,
+                        _ => Value::nil(),
                     };
                     fiber.push(v);
                 }
@@ -6312,8 +6352,8 @@ impl Vm {
                     // ADT: `subject -- value`. Pop a constructed variant; push its
                     // NAMED payload field `consts[idx]` (presence already checked).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let key = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -6323,14 +6363,14 @@ impl Vm {
                         }
                     };
                     let subject = fiber.pop();
-                    let v = match &subject {
-                        Value::EnumVariant(ev) => match &ev.payload {
+                    let v = match subject.kind() {
+                        ValueKind::EnumVariant(ev) => match &ev.payload {
                             Some(crate::value::Payload::Named(o)) => {
-                                o.get(key.as_ref()).unwrap_or(Value::Nil)
+                                o.get(key.as_ref()).unwrap_or(Value::nil())
                             }
-                            _ => Value::Nil,
+                            _ => Value::nil(),
                         },
-                        _ => Value::Nil,
+                        _ => Value::nil(),
                     };
                     fiber.push(v);
                 }
@@ -6382,7 +6422,7 @@ impl Vm {
                         }
                         _ => false,
                     };
-                    fiber.push(Value::Bool(ok));
+                    fiber.push(Value::bool_(ok));
                 }
 
                 Op::MatchNoArm => {
@@ -6421,21 +6461,21 @@ impl Vm {
                     let args: Vec<Value> = if spread {
                         // Spread args: single array/spread was compiled; read it.
                         let arr = fiber.pop();
-                        match arr {
-                            Value::Array(a) => a.borrow().clone(),
-                            other => {
+                        match arr.kind() {
+                            ValueKind::Array(a) => a.borrow().clone(),
+                            _ => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
                                     format!(
                                         "defer spread requires an array, got {}",
-                                        crate::interp::type_name(&other)
+                                        crate::interp::type_name(&arr)
                                     ),
                                 ))
                             }
                         }
                     } else {
-                        let mut v = vec![Value::Nil; argc];
+                        let mut v = vec![Value::nil(); argc];
                         for slot in v.iter_mut().rev() {
                             *slot = fiber.pop();
                         }
@@ -6464,36 +6504,35 @@ impl Vm {
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let awaited = (flags & 1) != 0;
                     let spread = (flags & 2) != 0;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[name_idx] {
-                        Value::Str(s) => s.clone(),
-                        other => {
+                    let name_const = &fiber.frame().closure.proto.chunk.consts[name_idx];
+                    let name = match name_const.kind() {
+                        ValueKind::Str(s) => s.clone(),
+                        _ => {
+                            let ty = crate::interp::type_name(name_const);
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
-                                format!(
-                                    "defer method name must be a string, got {}",
-                                    crate::interp::type_name(other)
-                                ),
-                            ))
+                                format!("defer method name must be a string, got {ty}"),
+                            ));
                         }
                     };
                     let args: Vec<Value> = if spread {
                         let arr = fiber.pop();
-                        match arr {
-                            Value::Array(a) => a.borrow().clone(),
-                            other => {
+                        match arr.kind() {
+                            ValueKind::Array(a) => a.borrow().clone(),
+                            _ => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
                                     format!(
                                         "defer spread requires an array, got {}",
-                                        crate::interp::type_name(&other)
+                                        crate::interp::type_name(&arr)
                                     ),
                                 ))
                             }
                         }
                     } else {
-                        let mut v = vec![Value::Nil; argc];
+                        let mut v = vec![Value::nil(); argc];
                         for slot in v.iter_mut().rev() {
                             *slot = fiber.pop();
                         }
@@ -6576,8 +6615,8 @@ impl Vm {
                     // DEFER §3.3: on an early-return propagation, drain defers first
                     // (with the Propagate stash so §3.6 r2 fires if a defer panics).
                     let v = fiber.pop();
-                    let (value, err) = match &v {
-                        Value::Array(a) if a.borrow().len() == 2 => {
+                    let (value, err) = match v.kind() {
+                        ValueKind::Array(a) if a.borrow().len() == 2 => {
                             let b = a.borrow();
                             (b[0].clone(), b[1].clone())
                         }
@@ -6589,10 +6628,10 @@ impl Vm {
                             ))
                         }
                     };
-                    if err == Value::Nil {
+                    if err == Value::nil() {
                         fiber.push(value);
                     } else {
-                        let pair = crate::interp::make_pair(Value::Nil, err);
+                        let pair = crate::interp::make_pair(Value::nil(), err);
                         let defers = std::mem::take(&mut fiber.frame_mut().defers);
                         if !defers.is_empty() {
                             // Stash as Propagate so §3.6 r2 fires if a defer panics.
@@ -6625,8 +6664,8 @@ impl Vm {
                     // round-trips it into `[nil, err]` IDENTICALLY to the
                     // tree-walker's `AsError::at(error_message(&err), span)`.
                     let v = fiber.pop();
-                    let (value, err) = match &v {
-                        Value::Array(a) if a.borrow().len() == 2 => {
+                    let (value, err) = match v.kind() {
+                        ValueKind::Array(a) if a.borrow().len() == 2 => {
                             let b = a.borrow();
                             (b[0].clone(), b[1].clone())
                         }
@@ -6638,7 +6677,7 @@ impl Vm {
                             ))
                         }
                     };
-                    if err == Value::Nil {
+                    if err == Value::nil() {
                         fiber.push(value);
                     } else {
                         return Err(self.panic_at(fiber, fault_ip, error_message(&err)));
@@ -6647,7 +6686,7 @@ impl Vm {
 
                 Op::Await => {
                     // `await expr`. Mirrors the tree-walker's `ExprKind::Await`
-                    // EXACTLY: if the operand is a `Value::Future`, drive it to
+                    // EXACTLY: if the operand is a `Value::future`, drive it to
                     // completion (`f.get().await`) — a panic/propagation raised in
                     // the spawned task re-surfaces HERE (cross-task propagation),
                     // byte-identical to the tree-walker; otherwise `await` on a
@@ -6656,12 +6695,12 @@ impl Vm {
                     // held across the suspension point (`await_holding_refcell_ref`
                     // stays clean).
                     let v = fiber.pop();
-                    match v {
-                        Value::Future(f) => {
+                    match v.into_kind() {
+                        OwnedKind::Future(f) => {
                             let r = f.get().await?;
                             fiber.push(r);
                         }
-                        other => fiber.push(other),
+                        other => fiber.push(rebuild_value(other)),
                     }
                 }
 
@@ -6683,7 +6722,7 @@ impl Vm {
 
                 Op::GetIter => {
                     // `for await` async-iterable validation: TOS must be a
-                    // `Value::Generator` (driven by `resume`) or a native stream
+                    // `Value::generator` (driven by `resume`) or a native stream
                     // handle (WebSocket `recv` / SSE `next`). ANYTHING ELSE is the
                     // Tier-2 panic `value of type {t} is not async-iterable`,
                     // byte-identical to the tree-walker's `exec_for_await` (the
@@ -6691,9 +6730,9 @@ impl Vm {
                     // produce this message). We PEEK (leave the value in place): the
                     // compiler immediately stores it into a scratch slot to drive
                     // lazily across iterations.
-                    let ok = match fiber.peek(0) {
-                        Value::Generator(_) => true,
-                        Value::Native(n) => crate::interp::native_stream_method(n.kind).is_some(),
+                    let ok = match fiber.peek(0).kind() {
+                        ValueKind::Generator(_) => true,
+                        ValueKind::Native(n) => crate::interp::native_stream_method(n.kind).is_some(),
                         _ => false,
                     };
                     if !ok {
@@ -6717,28 +6756,28 @@ impl Vm {
                     // before any borrow/await so a native-stream call has a site.
                     let op_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let iterable = fiber.pop();
-                    match iterable {
-                        Value::Generator(g) => {
+                    match iterable.into_kind() {
+                        OwnedKind::Generator(g) => {
                             // `resume(nil)` drives the backing Fiber to its next
                             // `Op::Yield` (awaiting any inner futures along the way —
                             // this is how an async generator's await+yield fuse).
                             // `Some(v)` -> a value; `None` -> done.
-                            match g.resume(Value::Nil).await? {
+                            match g.resume(Value::nil()).await? {
                                 Some(v) => {
                                     fiber.push(v);
-                                    fiber.push(Value::Bool(false));
+                                    fiber.push(Value::bool_(false));
                                 }
                                 None => {
-                                    fiber.push(Value::Nil);
-                                    fiber.push(Value::Bool(true));
+                                    fiber.push(Value::nil());
+                                    fiber.push(Value::bool_(true));
                                 }
                             }
                         }
-                        Value::Native(n) => {
+                        OwnedKind::Native(n) => {
                             // A native stream: call its `recv`/`next` method for a
                             // `[value, err]` pair (a non-nil `err` is a Tier-2 panic,
                             // a nil `value` ends the stream), mirroring
-                            // `exec_for_await`'s `Value::Native` arm exactly.
+                            // `exec_for_await`'s `Value::native` arm exactly.
                             // `GetIter` already validated the handle, so a missing
                             // stream method here is a wiring bug — surface it as a
                             // defensive Tier-2 panic rather than an `unwrap`.
@@ -6750,12 +6789,12 @@ impl Vm {
                                         fault_ip,
                                         format!(
                                             "value of type {} is not async-iterable",
-                                            crate::interp::type_name(&Value::Native(n))
+                                            crate::interp::type_name(&Value::native(n))
                                         ),
                                     ))
                                 }
                             };
-                            let bound = Value::NativeMethod(Rc::new(crate::value::NativeMethod {
+                            let bound = Value::native_method(Rc::new(crate::value::NativeMethod {
                                 receiver: n,
                                 method: method.to_string(),
                             }));
@@ -6763,19 +6802,19 @@ impl Vm {
                             // the recursive future needs a finite size.
                             let pair =
                                 Box::pin(self.call_value(bound, Vec::new(), op_span)).await?;
-                            let (value, err) = match &pair {
-                                Value::Array(a) if a.borrow().len() == 2 => {
+                            let (value, err) = match pair.kind() {
+                                ValueKind::Array(a) if a.borrow().len() == 2 => {
                                     let b = a.borrow();
                                     (b[0].clone(), b[1].clone())
                                 }
                                 // Defensive: a non-pair return ends iteration.
                                 _ => {
-                                    fiber.push(Value::Nil);
-                                    fiber.push(Value::Bool(true));
+                                    fiber.push(Value::nil());
+                                    fiber.push(Value::bool_(true));
                                     continue;
                                 }
                             };
-                            if err != Value::Nil {
+                            if err != Value::nil() {
                                 let msg = crate::interp::error_message(&err);
                                 return Err(self.panic_at(
                                     fiber,
@@ -6783,12 +6822,12 @@ impl Vm {
                                     format!("for await stream error: {msg}"),
                                 ));
                             }
-                            if value == Value::Nil {
-                                fiber.push(Value::Nil);
-                                fiber.push(Value::Bool(true));
+                            if value == Value::nil() {
+                                fiber.push(Value::nil());
+                                fiber.push(Value::bool_(true));
                             } else {
                                 fiber.push(value);
-                                fiber.push(Value::Bool(false));
+                                fiber.push(Value::bool_(false));
                             }
                         }
                         other => {
@@ -6800,7 +6839,7 @@ impl Vm {
                                 fault_ip,
                                 format!(
                                     "value of type {} is not async-iterable",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&rebuild_value(other))
                                 ),
                             ));
                         }
@@ -6814,7 +6853,7 @@ impl Vm {
                     // the tree-walker. A native stream is reclaimed at scope end, so
                     // closing it is a no-op here.
                     let iterable = fiber.pop();
-                    if let Value::Generator(g) = iterable {
+                    if let OwnedKind::Generator(g) = iterable.into_kind() {
                         g.close();
                     }
                 }
@@ -6825,8 +6864,8 @@ impl Vm {
                     // `set_member` the tree-walker's `assign_to` Member arm uses, so
                     // the field contract panic (message + span) is byte-identical.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -6863,15 +6902,15 @@ impl Vm {
                     // Pop in reverse push order: static closures (top), then instance
                     // method closures, then default thunks (SP1 §3 stack layout
                     // `[super?, ..thunks.., ..methods.., ..statics..]`).
-                    let mut statics = vec![Value::Nil; n_statics];
+                    let mut statics = vec![Value::nil(); n_statics];
                     for slot in statics.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    let mut methods = vec![Value::Nil; n_methods];
+                    let mut methods = vec![Value::nil(); n_methods];
                     for slot in methods.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    let mut defaults = vec![Value::Nil; n_defaults];
+                    let mut defaults = vec![Value::nil(); n_defaults];
                     for slot in defaults.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
@@ -6881,7 +6920,7 @@ impl Vm {
                     // had `superclass: None`); the method/default tables are then
                     // registered under the NEW class's identity key. Mirrors the
                     // tree-walker's `Stmt::Class`, which sets `superclass` to the
-                    // resolved parent `Value::Class`.
+                    // resolved parent `Value::class`.
                     // The shared `def_env` for VM classes (task #157): the SHARED
                     // `validate_into` (`.from`/typed-parse) resolves nested-class
                     // field-type names and default-expr names through it, so EVERY
@@ -6891,13 +6930,13 @@ impl Vm {
                     let def_env = self.class_env();
                     let superclass = if cp.has_super {
                         let sup = fiber.pop();
-                        match sup {
-                            Value::Class(c) => Some(c),
+                        match sup.into_kind() {
+                            OwnedKind::Class(c) => Some(c),
                             other => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
-                                    format!("'{other}' is not a class"),
+                                    format!("'{}' is not a class", rebuild_value(other)),
                                 ))
                             }
                         }
@@ -6923,31 +6962,34 @@ impl Vm {
                     // `.from` time — late-bound exactly like the tree-walker's module
                     // env. A redefinition (same name re-run) overwrites the binding.
                     if def_env
-                        .define(&class.name, Value::Class(class.clone()), false)
+                        .define(&class.name, Value::class(class.clone()), false)
                         .is_err()
                     {
-                        let _ = def_env.assign(&class.name, Value::Class(class.clone()));
+                        let _ = def_env.assign(&class.name, Value::class(class.clone()));
                     }
                     let key = Rc::as_ptr(&class) as usize;
                     let mut method_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (name, mv) in cp.method_names.iter().zip(methods) {
-                        match mv {
-                            Value::Closure(c) => {
+                        match mv.into_kind() {
+                            OwnedKind::Closure(c) => {
                                 method_map.insert(name.clone(), c);
                             }
                             other => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
-                                    format!("class method '{name}' is not a closure: {other:?}"),
+                                    format!(
+                                        "class method '{name}' is not a closure: {:?}",
+                                        rebuild_value(other)
+                                    ),
                                 ))
                             }
                         }
                     }
                     let mut default_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (i, (name, dv)) in cp.default_fields.iter().zip(defaults).enumerate() {
-                        match dv {
-                            Value::Closure(c) => {
+                        match dv.into_kind() {
+                            OwnedKind::Closure(c) => {
                                 // Mirror the enclosing-scope names this default
                                 // captures into `def_env` (read from the thunk's
                                 // captured upvalue cells), so the SHARED
@@ -6978,7 +7020,8 @@ impl Vm {
                                     fiber,
                                     fault_ip,
                                     format!(
-                                        "field default '{name}' thunk is not a closure: {other:?}"
+                                        "field default '{name}' thunk is not a closure: {:?}",
+                                        rebuild_value(other)
                                     ),
                                 ))
                             }
@@ -6986,15 +7029,18 @@ impl Vm {
                     }
                     let mut static_map: FxHashMap<String, Cc<Closure>> = FxHashMap::default();
                     for (name, sv) in cp.static_method_names.iter().zip(statics) {
-                        match sv {
-                            Value::Closure(c) => {
+                        match sv.into_kind() {
+                            OwnedKind::Closure(c) => {
                                 static_map.insert(name.clone(), c);
                             }
                             other => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
-                                    format!("static method '{name}' is not a closure: {other:?}"),
+                                    format!(
+                                        "static method '{name}' is not a closure: {:?}",
+                                        rebuild_value(other)
+                                    ),
                                 ))
                             }
                         }
@@ -7005,7 +7051,7 @@ impl Vm {
                     // Invalidate any verdict cached against a now-reusable class pointer
                     // (the Interp cache is shared by both engines). See its field doc.
                     self.interp.bump_iface_cache_gen();
-                    fiber.push(Value::Class(class));
+                    fiber.push(Value::class(class));
                 }
 
                 Op::DefineInterface => {
@@ -7027,7 +7073,7 @@ impl Vm {
                             },
                         );
                     }
-                    let iface = Value::Interface(Rc::new(crate::value::InterfaceDef {
+                    let iface = Value::interface(Rc::new(crate::value::InterfaceDef {
                         name: ip.name.clone(),
                         own_methods,
                         extends: ip.extends.clone(),
@@ -7050,7 +7096,7 @@ impl Vm {
                 Op::GetSuper => {
                     // `super.<name>` (V9-T2): resolve `name` starting at the CURRENT
                     // method's DEFINING class's superclass, bound to `self` (slot 0).
-                    // Mirrors the tree-walker: `super` is a `Value::Super` whose
+                    // Mirrors the tree-walker: `super` is a `Value::super_` whose
                     // `start` is `defining_class.superclass`, and `read_member` on it
                     // finds the method up that chain and produces a BoundMethod on
                     // `self` (which the subsequent CALL invokes). The `defining_class`
@@ -7058,8 +7104,8 @@ impl Vm {
                     // declared the method, so a NESTED `super` resolves from the right
                     // link too.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
-                        Value::Str(s) => s.clone(),
+                    let name = match fiber.frame().closure.proto.chunk.consts[idx].kind() {
+                        ValueKind::Str(s) => s.clone(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -7098,7 +7144,7 @@ impl Vm {
                         .and_then(|s| self.find_compiled_method(s, &name))
                     {
                         Some((_closure, found_class)) => {
-                            Value::BoundMethod(Rc::new(crate::value::BoundMethod {
+                            Value::bound_method(Rc::new(crate::value::BoundMethod {
                                 receiver,
                                 method: Rc::new(crate::value::Method {
                                     params: Vec::new(),
@@ -7113,7 +7159,7 @@ impl Vm {
                             }))
                         }
                         None => {
-                            // Mirror the tree-walker's `Value::Super` member-read
+                            // Mirror the tree-walker's `Value::super_` member-read
                             // error wording (with/without a superclass).
                             let msg = if start.is_some() {
                                 format!("no superclass method '{name}'")
@@ -7644,7 +7690,7 @@ impl Vm {
     /// Call ANY value, the single primitive both engines re-enter through.
     ///
     /// This is the bridge in BOTH directions:
-    /// - A `Value::Closure` (`native → VM`): a native higher-order stdlib function
+    /// - A `Value::closure` (`native → VM`): a native higher-order stdlib function
     ///   (`array.map`, a sort comparator, `recover`, …) invokes a user callback
     ///   the VM produced. We build a fresh one-frame [`Fiber`] whose sole frame is
     ///   the closure called with `args`, then drive it to completion. Each closure
@@ -7663,7 +7709,7 @@ impl Vm {
     /// Workers Spec B §Task 5 (actor isolate side): call the method `name` on a VM
     /// instance `receiver` with `args`, resolving the method through the VM's
     /// per-class method side table (`vm_read_member` → `BoundMethod`) and driving any
-    /// returned `Value::Future` (an `async` method) to its value. Used by the actor
+    /// returned `Value::future` (an `async` method) to its value. Used by the actor
     /// mailbox loop, which runs on the isolate's own `Vm` — `Interp::read_member`
     /// cannot be used because a VM-built class keeps its methods in the side table,
     /// not in `Class.methods`.
@@ -7676,9 +7722,9 @@ impl Vm {
     ) -> Result<Value, Control> {
         let bound = self.vm_read_member(&receiver, name, span)?;
         let r = self.call_value(bound, args, span).await?;
-        match r {
-            Value::Future(f) => f.get().await,
-            other => Ok(other),
+        match r.into_kind() {
+            OwnedKind::Future(f) => f.get().await,
+            other => Ok(rebuild_value(other)),
         }
     }
 
@@ -7699,10 +7745,10 @@ impl Vm {
         use crate::interp::Control;
         // DEFER §3.4 VM fix: a bare `defer async_fn()` must produce the §3.4 loud
         // Tier-2 error on the VM exactly as on the tree-walker. On the tree-walker,
-        // `call_value` for an async fn returns `Value::Future`, and the check below
-        // (`else if let Value::Future(_)`) fires. On the VM, `Vm::call_value` runs the
+        // `call_value` for an async fn returns `Value::future`, and the check below
+        // (`else if let Value::future(_)`) fires. On the VM, `Vm::call_value` runs the
         // async body INLINE (a fresh fiber, no `spawn_local`) and returns the body
-        // result directly — so the result is `Value::Nil`, not `Value::Future`, and the
+        // result directly — so the result is `Value::nil()`, not `Value::future`, and the
         // check never fires. We detect the mismatch HERE, before calling, by inspecting
         // whether the callee is a VM async closure: if it is and `!entry.awaited`, raise
         // the §3.4 panic immediately (byte-identical to the tree-walker). The `awaited`
@@ -7712,8 +7758,8 @@ impl Vm {
         // would race with the caller frame's teardown).
         if !entry.awaited {
             let is_vm_async_closure = match &entry.kind {
-                crate::interp::DeferKind::Call { callee } => match callee {
-                    Value::Closure(c) => c.proto.is_async && !c.proto.is_generator,
+                crate::interp::DeferKind::Call { callee } => match callee.kind() {
+                    ValueKind::Closure(c) => c.proto.is_async && !c.proto.is_generator,
                     _ => false,
                 },
                 crate::interp::DeferKind::Method { .. } => false,
@@ -7751,10 +7797,10 @@ impl Vm {
             Err(e) => return Err(e),
         };
         if entry.awaited {
-            if let Value::Future(f) = result_v {
+            if let ValueKind::Future(f) = result_v.kind() {
                 f.get().await.map(|_| ())?;
             }
-        } else if let Value::Future(_) = result_v {
+        } else if let ValueKind::Future(_) = result_v.kind() {
             // Non-VM-compiled callables (native fns, interp builtins) that return a
             // future: the existing post-call check catches them (byte-identical to the
             // tree-walker's path).
@@ -7805,14 +7851,14 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        match callee {
-            Value::Closure(closure) => {
+        match callee.into_kind() {
+            OwnedKind::Closure(closure) => {
                 // Workers Spec A: a `worker fn` passed as a higher-order value (e.g.
                 // `array.map(seeds, workerFn)`) must be dispatched to a pooled isolate
                 // when running on the CALLER thread — otherwise the worker body runs
                 // inline and NO parallelism occurs. Mirror the `Op::Call` arm's
                 // `is_worker` branch so that the native → VM re-entry path produces a
-                // `Value::Future` (dispatched) rather than a synchronously-computed
+                // `Value::future` (dispatched) rather than a synchronously-computed
                 // result.
                 //
                 // INSIDE an isolate, this path is NOT taken: the `Op::Call` handler
@@ -7838,7 +7884,7 @@ impl Vm {
                 }
                 // A GENERATOR closure (`fn*` / `async fn*` / `worker fn*`) is NOT run to
                 // completion here — it builds a NOT-STARTED VM fiber wrapped in a
-                // `GeneratorHandle`, returning a `Value::Generator` (the consumer drives
+                // `GeneratorHandle`, returning a `Value::generator` (the consumer drives
                 // it via `resume`). This mirrors the `Op::Call` generator arm and is the
                 // path taken when a `worker fn*` runs ON ITS DEDICATED ISOLATE: the
                 // isolate's `build_producer` calls `call_value(entry, ..)` and expects a
@@ -7863,7 +7909,7 @@ impl Vm {
                     }
                     let handle =
                         crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
-                    return Ok(Value::Generator(Rc::new(handle)));
+                    return Ok(Value::generator(Rc::new(handle)));
                 }
                 // `what` mirrors the tree-walker's
                 // `func.name.as_deref().unwrap_or("function")` so an arity/contract
@@ -7921,12 +7967,12 @@ impl Vm {
             }
             // A class constructor (V9): build an instance VM-side (defaults via
             // thunks + compiled `init`) so the init method runs as COMPILED code.
-            Value::Class(class) if self.is_vm_class(&class) => {
+            OwnedKind::Class(class) if self.is_vm_class(&class) => {
                 self.vm_construct(class, args, span).await
             }
             // A bound method (V9) on a VM-registered class: run the COMPILED method
             // closure with `self` bound to the receiver (slot 0).
-            Value::BoundMethod(bm) if self.bound_method_is_vm(&bm).is_some() => {
+            OwnedKind::BoundMethod(bm) if self.bound_method_is_vm(&bm).is_some() => {
                 let closure = self.bound_method_is_vm(&bm).expect("checked above");
                 // The BoundMethod's `defining_class` is the class that actually
                 // declared the method (set by `vm_read_member` / `Op::GetSuper` via
@@ -7941,8 +7987,13 @@ impl Vm {
                 .await
             }
             // Native callee: delegate to the shared dispatch (same as the
-            // `Op::Call` non-Closure arm).
-            other => self.interp.call_value(other, args, span).await,
+            // `Op::Call` non-Closure arm). Rebuild the owned `Value` from the
+            // consumed kind (zero-clone: each handle moves straight back through
+            // its total constructor).
+            other => {
+                let callee = rebuild_value(other);
+                self.interp.call_value(callee, args, span).await
+            }
         }
     }
 
@@ -8053,7 +8104,7 @@ impl Vm {
     /// method closure (resolved up the chain); else `None` (so a tree-walker
     /// BoundMethod delegates).
     fn bound_method_is_vm(&self, bm: &crate::value::BoundMethod) -> Option<Cc<Closure>> {
-        if let Value::Instance(inst) = &bm.receiver {
+        if let ValueKind::Instance(inst) = bm.receiver.kind() {
             let class = inst.borrow().class.clone();
             // Resolve from the method's DEFINING class (set by `vm_read_member` /
             // `Op::GetSuper`) so an inherited or super-dispatched method runs the
@@ -8068,7 +8119,7 @@ impl Vm {
     }
 
     /// VM member read (V9). For an `Instance` of a VM-registered class, a method
-    /// name resolves to a `Value::BoundMethod` carrying the receiver + class +
+    /// name resolves to a `Value::bound_method` carrying the receiver + class +
     /// method name (the compiled closure is looked up at CALL time via
     /// `bound_method_is_vm`); a field name reads the stored field; anything else
     /// (and any non-VM receiver) delegates to the shared `Interp::read_member` so
@@ -8102,8 +8153,8 @@ impl Vm {
         obj: &Value,
         name: &str,
     ) -> Option<Value> {
-        match obj {
-            Value::Object(cell) => {
+        match obj.kind() {
+            ValueKind::Object(cell) => {
                 let shape = cell.shape.get();
                 if shape == 0 || crate::stdlib::schema::is_schema_value(obj) {
                     return None;
@@ -8132,7 +8183,7 @@ impl Vm {
                     None => None,
                 }
             }
-            Value::Instance(inst) => {
+            ValueKind::Instance(inst) => {
                 let b = inst.borrow();
                 let shape = b.shape_id.get();
                 if shape == 0 {
@@ -8241,7 +8292,7 @@ impl Vm {
         // isolate, return `future<handle>`. Mirrors the tree-walker `eval_chain` hook
         // exactly (same `Interp::spawn_actor`), so the VM matches byte-for-byte. A
         // bare `WorkerClass(args)` construction is UNCHANGED (handled by `Op::Call`).
-        if let Value::Class(class) = &recv {
+        if let ValueKind::Class(class) = recv.kind() {
             if class.is_worker && name == "spawn" {
                 let v = self.interp.spawn_actor(class, args, span).await?;
                 fiber.push(v);
@@ -8249,20 +8300,20 @@ impl Vm {
             }
         }
         // (1a'') Actor-handle async method dispatch: a member-CALL on a
-        // `Value::Native(WorkerActor)` sends an `ActorMsg::Call` (or `close()`) and
+        // `Value::native(WorkerActor)` sends an `ActorMsg::Call` (or `close()`) and
         // returns `future<T>`. Same `Interp::actor_handle_call` as the tree-walker.
-        if let Value::Native(n) = &recv {
+        if let ValueKind::Native(n) = recv.kind() {
             if n.kind == crate::value::NativeKind::WorkerActor {
                 let v = self.interp.actor_handle_call(n, name, args, span).await?;
                 fiber.push(v);
                 return Ok(());
             }
         }
-        // (1a''') SRV §3.5/§3.8: a member-CALL on a frozen `Value::Shared` routes to
+        // (1a''') SRV §3.5/§3.8: a member-CALL on a frozen `Value::shared` routes to
         // the read-only `call_shared` dispatcher (read-only methods; mutating-method
         // names + frozen-instance user-methods → the Tier-2 panics). Mirrors the
         // tree-walker `eval_chain` hook byte-for-byte (same `crate::interp::call_shared`).
-        if let Value::Shared(node) = &recv {
+        if let ValueKind::Shared(node) = recv.kind() {
             let v = crate::interp::call_shared(node, name, &args, span)?;
             fiber.push(v);
             return Ok(());
@@ -8271,10 +8322,10 @@ impl Vm {
         // class whose `name` resolves (up the chain) to a compiled STATIC closure.
         // Dispatch with NO receiver, with full generator/async/sync handling
         // matching the `Op::Call` closure arm (so a `static fn*` returns a
-        // `Value::Generator` and a `static async fn` a `Value::Future`, byte-
+        // `Value::generator` and a `static async fn` a `Value::future`, byte-
         // identical to the tree-walker's `call_static_method`). A non-static name
         // (the built-in `from`, or an error) falls through to the shared dispatch.
-        if let Value::Class(class) = &recv {
+        if let ValueKind::Class(class) = recv.kind() {
             if self.is_vm_class(class) {
                 if let Some(closure) = self.find_compiled_static_method(class, name) {
                     let v = self.invoke_compiled_static(closure, args, span).await?;
@@ -8303,7 +8354,7 @@ impl Vm {
                 let slot_base = fiber.stack.len();
                 let slot_count = closure.proto.chunk.slot_count as usize;
                 let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
-                fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                fiber.stack.resize(slot_base + slot_count, Value::nil());
                 // self -> slot 0 (cell-aware). CALL §2 A1: use .first so empty-vec
                 // is safe.
                 if let Some(cell) = cells.first().and_then(|c| c.as_ref()) {
@@ -8368,7 +8419,7 @@ impl Vm {
         recv: &Value,
         name: &str,
     ) -> Option<(Cc<Closure>, Rc<crate::value::Class>)> {
-        let Value::Instance(inst) = recv else {
+        let ValueKind::Instance(inst) = recv.kind() else {
             return None;
         };
         // A field SHADOWS a method — never fast-path a field-named access (it is
@@ -8395,7 +8446,7 @@ impl Vm {
     }
 
     fn vm_read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, Control> {
-        if let Value::Instance(inst) = obj {
+        if let ValueKind::Instance(inst) = obj.kind() {
             let (class, has_field) = {
                 let b = inst.borrow();
                 (b.class.clone(), b.contains_key(name))
@@ -8418,18 +8469,18 @@ impl Vm {
                         defining_class: def_class,
                         name: name.to_string(),
                     };
-                    return Ok(Value::BoundMethod(Rc::new(bm)));
+                    return Ok(Value::bound_method(Rc::new(bm)));
                 }
             }
         }
         // `C.name` static-method read (SP1 §3): a VM-compiled static resolves up
-        // the superclass chain to its closure, returned as a plain `Value::Closure`
+        // the superclass chain to its closure, returned as a plain `Value::closure`
         // (called with NO receiver). Falls through to the shared dispatch for the
         // built-in `from` and the "no static member" error (C3 generalization).
-        if let Value::Class(class) = obj {
+        if let ValueKind::Class(class) = obj.kind() {
             if self.is_vm_class(class) {
                 if let Some(closure) = self.find_compiled_static_method(class, name) {
-                    return Ok(Value::Closure(closure));
+                    return Ok(Value::closure(closure));
                 }
             }
         }
@@ -8702,8 +8753,8 @@ impl Vm {
         name_idx: usize,
         obj: Value,
     ) -> Result<Value, Control> {
-        let name = match &fiber.frame().closure.proto.chunk.consts[name_idx] {
-            Value::Str(s) => s.clone(),
+        let name = match fiber.frame().closure.proto.chunk.consts[name_idx].kind() {
+            ValueKind::Str(s) => s.clone(),
             other => {
                 return Err(self.panic_at(
                     fiber,
@@ -8771,8 +8822,8 @@ impl Vm {
         // Already specialized: GUARD the operands; on a hit take the inline fast
         // path, on a miss DEOPT and fall to generic.
         if let Some(kind) = cache.specialized() {
-            match (kind, &a, &b) {
-                (ArithKind::Int, Value::Int(x), Value::Int(y)) => {
+            match (kind, a.kind(), b.kind()) {
+                (ArithKind::Int, ValueKind::Int(x), ValueKind::Int(y)) => {
                     // SAME i64 arithmetic + checked-overflow/div-by-zero panics as
                     // apply_binop's int arm — delegated to the shared `int_binop`
                     // so the two paths cannot drift (NUM §7). The span is needed
@@ -8780,20 +8831,20 @@ impl Vm {
                     //
                     // VAL Task 3 (inline-scalar SMI fast path, spec §7.2): `*x`/`*y`
                     // read the operand's INLINE SCALAR WORD with no heap touch and no
-                    // refcount op — under the Stage-1 niche layout `Value::Int(i64)`
+                    // refcount op — under the Stage-1 niche layout `Value::int(i64)`
                     // carries the full i64 inline, so this IS the SMI/inline-scalar
                     // load. (Under a future Stage-2 NaN-box the matched `i64` would be
                     // the decoded i48 SMI, or the boxed-`i64` spill — the §7.2
                     // boundary differential pins both encodings byte-identical to this
                     // generic-delegating computation.)
                     let span = chunk.span_at(fault_ip);
-                    return crate::interp::int_binop(op, *x, *y, span);
+                    return crate::interp::int_binop(op, x, y, span);
                 }
-                (ArithKind::Number, Value::Float(x), Value::Float(y)) => {
+                (ArithKind::Number, ValueKind::Float(x), ValueKind::Float(y)) => {
                     // SAME f64 arithmetic as apply_binop's final numeric arm.
-                    return Ok(number_fast(op, *x, *y));
+                    return Ok(number_fast(op, x, y));
                 }
-                (ArithKind::Decimal, Value::Decimal(x), Value::Decimal(y))
+                (ArithKind::Decimal, ValueKind::Decimal(x), ValueKind::Decimal(y))
                     if ArithCache::decimal_specializable(op) =>
                 {
                     // SAME rust_decimal op as apply_binop's decimal arm. Both
@@ -8801,11 +8852,11 @@ impl Vm {
                     // — no coercion, no div-by-zero.
                     return Ok(decimal_fast(op, **x, **y));
                 }
-                (ArithKind::ConcatStr, Value::Str(x), Value::Str(y))
+                (ArithKind::ConcatStr, ValueKind::Str(x), ValueKind::Str(y))
                     if matches!(op, BinOp::Add) =>
                 {
                     // SAME concat as apply_binop's string arm.
-                    return Ok(Value::Str(format!("{}{}", x, y).into()));
+                    return Ok(Value::str(format!("{}{}", x, y)));
                 }
                 _ => {
                     // Guard miss: deopt and run the generic path.
@@ -8818,13 +8869,15 @@ impl Vm {
 
         // Not specialized yet: OBSERVE this execution's operand kinds (warmup),
         // then run the generic path (the result is identical regardless of warmup).
-        let observed = match (&a, &b) {
-            (Value::Int(_), Value::Int(_)) => Some(ArithKind::Int),
-            (Value::Float(_), Value::Float(_)) => Some(ArithKind::Number),
-            (Value::Decimal(_), Value::Decimal(_)) if ArithCache::decimal_specializable(op) => {
+        let observed = match (a.kind(), b.kind()) {
+            (ValueKind::Int(_), ValueKind::Int(_)) => Some(ArithKind::Int),
+            (ValueKind::Float(_), ValueKind::Float(_)) => Some(ArithKind::Number),
+            (ValueKind::Decimal(_), ValueKind::Decimal(_))
+                if ArithCache::decimal_specializable(op) =>
+            {
                 Some(ArithKind::Decimal)
             }
-            (Value::Str(_), Value::Str(_)) if matches!(op, BinOp::Add) => {
+            (ValueKind::Str(_), ValueKind::Str(_)) if matches!(op, BinOp::Add) => {
                 Some(ArithKind::ConcatStr)
             }
             _ => None,
@@ -8966,8 +9019,8 @@ impl Vm {
         // path below, which bypasses `set_member`. Byte-identical to the
         // tree-walker's `set_member` frozen check.
         crate::interp::check_not_frozen(obj, span)?;
-        match obj {
-            Value::Object(cell) => {
+        match obj.kind() {
+            ValueKind::Object(cell) => {
                 let shape = cell.shape.get();
                 // Fast path (specialize ON only): a shaped, non-schema object whose
                 // key already exists at the cached index — write in place (no
@@ -8996,7 +9049,7 @@ impl Vm {
                 }
                 Ok(value)
             }
-            Value::Instance(inst) => {
+            ValueKind::Instance(inst) => {
                 // SHAPE Task 3.4: run the declared field-type CONTRACT via the SHARED
                 // chokepoint (`check_instance_field_contract`, the same code the
                 // tree-walker's `set_member` reaches) — byte-identical panic
@@ -9049,7 +9102,7 @@ impl Vm {
         // precisely (no trailing full re-derive). Mirrors the object path.
         let instance =
             Cc::new(RefCell::new(crate::value::Instance::new_empty_slab(class.clone())));
-        let inst_val = Value::Instance(instance.clone());
+        let inst_val = Value::instance(instance.clone());
         // SHAPE §3.5: count every fresh instance slab construction.
         #[cfg(any(test, feature = "fuzzgen", fuzzing))]
         self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
@@ -9093,7 +9146,7 @@ impl Vm {
                     .cloned();
                 let Some(thunk) = thunk else { continue };
                 let dv = self
-                    .call_value(Value::Closure(thunk), Vec::new(), span)
+                    .call_value(Value::closure(thunk), Vec::new(), span)
                     .await?;
                 if let Some(schema) = c.fields.get(&fname) {
                     if !crate::interp::check_type(&dv, &schema.ty) {
@@ -9156,7 +9209,7 @@ impl Vm {
         let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
         // A generator method (`fn*` / `async fn*`) is NOT run inline: it binds `self`
         // and args into a NOT-STARTED fiber and wraps it in a VM-backed
-        // `GeneratorHandle`, returning a `Value::Generator` immediately — exactly like
+        // `GeneratorHandle`, returning a `Value::generator` immediately — exactly like
         // the standalone-generator CALL path (`Op::Call`) and the tree-walker's
         // `invoke_method` generator branch. The body runs only when the consumer
         // drives it via `gen.next()` / `for await`; `self` (slot 0) is visible to a
@@ -9185,7 +9238,7 @@ impl Vm {
             }
             let handle =
                 crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
-            return Ok(Value::Generator(Rc::new(handle)));
+            return Ok(Value::generator(Rc::new(handle)));
         }
         // CALL §4 A3: take a pooled fiber (or allocate fresh when pool is empty /
         // call_fast=false). Removal from pool means a nested re-entrant method
@@ -9237,8 +9290,8 @@ impl Vm {
 
     /// Dispatch a compiled STATIC method (SP1 §3): a class-level call with NO
     /// receiver. Args bind to slots `0..n` (no `self` slot). A `static fn*` returns
-    /// a `Value::Generator`; a `static async fn` is scheduled eagerly and returns a
-    /// `Value::Future`; a plain static runs to completion. Mirrors the `Op::Call`
+    /// a `Value::generator`; a `static async fn` is scheduled eagerly and returns a
+    /// `Value::future`; a plain static runs to completion. Mirrors the `Op::Call`
     /// closure arms and the tree-walker's `call_static_method` so the engines agree.
     #[async_recursion::async_recursion(?Send)]
     async fn invoke_compiled_static(
@@ -9247,7 +9300,7 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        // `static async fn`: schedule eagerly (M17), return a `Value::Future`. The
+        // `static async fn`: schedule eagerly (M17), return a `Value::future`. The
         // body re-enters via `Vm::call_value` inside the spawned task with the RAW
         // args (so the arity/contract check runs INSIDE the task and surfaces
         // lazily at `await`, byte-identical to the tree-walker and the `Op::Call`
@@ -9259,12 +9312,12 @@ impl Vm {
             let guard = self.interp.inflight_guard();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
-                let r = vm.call_value(Value::Closure(closure), args, span).await;
+                let r = vm.call_value(Value::closure(closure), args, span).await;
                 cell.resolve(r);
             });
             fut.set_abort(handle.abort_handle());
             self.interp.maybe_yield_for_inflight().await;
-            return Ok(Value::Future(fut));
+            return Ok(Value::future(fut));
         }
         let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
         let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
@@ -9284,7 +9337,7 @@ impl Vm {
                 }
             }
             let handle = crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
-            return Ok(Value::Generator(Rc::new(handle)));
+            return Ok(Value::generator(Rc::new(handle)));
         }
         // Plain sync static: run a fiber to completion (args bound into slots 0..,
         // no receiver) — mirrors `invoke_compiled_method`'s sync tail without the
@@ -9337,7 +9390,7 @@ impl Vm {
     /// the four/five-mode differential enforces it). `fault_ip` is the op's
     /// bytecode offset (both the `lit_shapes` cache key and the panic span); `n`
     /// is the pair count. Pops `n` (key, value) pairs (stack top-down is
-    /// vN,kN,…,v1,k1) and pushes the constructed `Value::Object`.
+    /// vN,kN,…,v1,k1) and pushes the constructed `Value::object_cell`.
     ///
     /// On the SPECIALIZED path a warm `lit_shapes` entry skips the registry probe
     /// and IndexMap fold; a cold pass runs the generic build and records the
@@ -9363,7 +9416,7 @@ impl Vm {
                     // discarding the key constants (already validated when this
                     // site was first recorded). Build a pre-sized values vector.
                     let slot_count = keys.len();
-                    let mut values: Vec<Value> = vec![Value::Nil; slot_count];
+                    let mut values: Vec<Value> = vec![Value::nil(); slot_count];
                     match &slot_of_pair {
                         // Identity case: pair `i` → slot `i`, no dups, popped
                         // order is reverse source order so write directly by
@@ -9398,7 +9451,7 @@ impl Vm {
                     // SHAPE §3.5: count this warm-hit slab build.
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                     self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
-                    fiber.push(Value::Object(cell));
+                    fiber.push(Value::object_cell(cell));
                     return Ok(());
                 }
                 Some(crate::vm::chunk::LitShapeCache::Negative) => {
@@ -9428,11 +9481,11 @@ impl Vm {
         record: bool,
     ) -> Result<(), Control> {
         // Pop `n` (key, value) pairs in source order (stack: vN,kN,…,v1,k1).
-        let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
+        let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::nil()); n];
         for slot in pairs.iter_mut().rev() {
             let value = fiber.pop();
-            let key = match fiber.pop() {
-                Value::Str(s) => s,
+            let key = match fiber.pop().into_kind() {
+                OwnedKind::Str(s) => s,
                 other => {
                     return Err(self.panic_at(
                         fiber,
@@ -9527,7 +9580,7 @@ impl Vm {
                 }
             }
         };
-        fiber.push(Value::Object(cell));
+        fiber.push(Value::object_cell(cell));
         Ok(())
     }
 
@@ -9591,8 +9644,8 @@ impl Vm {
 /// element count; named → field count), or `None` if `v` is not a constructed
 /// variant. Used by `MATCH_VARIANT_ARITY` (the positional length guard).
 fn variant_payload_len(v: &Value) -> Option<usize> {
-    match v {
-        Value::EnumVariant(ev) => match &ev.payload {
+    match v.kind() {
+        ValueKind::EnumVariant(ev) => match &ev.payload {
             Some(crate::value::Payload::Positional(a)) => Some(a.borrow().len()),
             Some(crate::value::Payload::Named(o)) => Some(o.len()),
             None => None,
@@ -9641,12 +9694,12 @@ fn binop_of(op: Op) -> BinOp {
 #[inline]
 fn number_fast(op: BinOp, a: f64, b: f64) -> Value {
     match op {
-        BinOp::Add => Value::Float(a + b),
-        BinOp::Sub => Value::Float(a - b),
-        BinOp::Mul => Value::Float(a * b),
-        BinOp::Div => Value::Float(a / b),
-        BinOp::Mod => Value::Float(a % b),
-        BinOp::Pow => Value::Float(a.powf(b)),
+        BinOp::Add => Value::float(a + b),
+        BinOp::Sub => Value::float(a - b),
+        BinOp::Mul => Value::float(a * b),
+        BinOp::Div => Value::float(a / b),
+        BinOp::Mod => Value::float(a % b),
+        BinOp::Pow => Value::float(a.powf(b)),
         _ => unreachable!("number_fast called with non-arithmetic op {op:?}"),
     }
 }
@@ -9660,9 +9713,9 @@ fn number_fast(op: BinOp, a: f64, b: f64) -> Value {
 #[inline]
 fn decimal_fast(op: BinOp, a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
     match op {
-        BinOp::Add => Value::Decimal(Rc::new(a + b)),
-        BinOp::Sub => Value::Decimal(Rc::new(a - b)),
-        BinOp::Mul => Value::Decimal(Rc::new(a * b)),
+        BinOp::Add => Value::decimal(a + b),
+        BinOp::Sub => Value::decimal(a - b),
+        BinOp::Mul => Value::decimal(a * b),
         _ => unreachable!("decimal_fast called with non-specializable op {op:?}"),
     }
 }
@@ -9860,10 +9913,11 @@ mod tests {
 
     fn expect_number(chunk: Chunk) -> f64 {
         match run_chunk(chunk).expect("run ok") {
-            RunOutcome::Done(Value::Float(n)) => n,
+            RunOutcome::Done(v) => match v.kind() {
+                ValueKind::Float(n) => n,
+                _ => panic!("expected Done(Number), got {v:?}"),
+            },
             other => panic!("expected Done(Number), got {other:?}"),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
         }
     }
 
@@ -9885,9 +9939,9 @@ mod tests {
     fn arithmetic_one_plus_two_times_four() {
         // (1 + 2) * 4 == 12
         let mut c = Chunk::new();
-        let k1 = c.add_const(Value::Float(1.0));
-        let k2 = c.add_const(Value::Float(2.0));
-        let k4 = c.add_const(Value::Float(4.0));
+        let k1 = c.add_const(Value::float(1.0));
+        let k2 = c.add_const(Value::float(2.0));
+        let k4 = c.add_const(Value::float(4.0));
         c.emit_u16(Op::Const, k1, s());
         c.emit_u16(Op::Const, k2, s());
         c.emit(Op::Add, s());
@@ -9900,7 +9954,7 @@ mod tests {
     #[test]
     fn negate() {
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Float(5.0));
+        let k = c.add_const(Value::float(5.0));
         c.emit_u16(Op::Const, k, s());
         c.emit(Op::Neg, s());
         c.emit(Op::Return, s());
@@ -9910,8 +9964,8 @@ mod tests {
     #[test]
     fn modulo() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Float(7.0));
-        let b = c.add_const(Value::Float(3.0));
+        let a = c.add_const(Value::float(7.0));
+        let b = c.add_const(Value::float(3.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Mod, s());
@@ -9922,8 +9976,8 @@ mod tests {
     #[test]
     fn power() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Float(2.0));
-        let b = c.add_const(Value::Float(10.0));
+        let a = c.add_const(Value::float(2.0));
+        let b = c.add_const(Value::float(10.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Pow, s());
@@ -9934,14 +9988,14 @@ mod tests {
     #[test]
     fn less_than_true() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Float(1.0));
-        let b = c.add_const(Value::Float(2.0));
+        let a = c.add_const(Value::float(1.0));
+        let b = c.add_const(Value::float(2.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Lt, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("run ok") {
-            RunOutcome::Done(Value::Bool(b)) => assert!(b),
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Bool(true)) => {}
             other => panic!("expected Done(Bool), got {other:?}"),
         }
     }
@@ -9953,7 +10007,7 @@ mod tests {
         c.emit(Op::Not, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("run ok") {
-            RunOutcome::Done(Value::Bool(b)) => assert!(!b),
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Bool(false)) => {}
             other => panic!("expected Done(Bool), got {other:?}"),
         }
     }
@@ -9961,14 +10015,14 @@ mod tests {
     #[test]
     fn eq_numbers() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Float(3.0));
-        let b = c.add_const(Value::Float(3.0));
+        let a = c.add_const(Value::float(3.0));
+        let b = c.add_const(Value::float(3.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Eq, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("run ok") {
-            RunOutcome::Done(Value::Bool(b)) => assert!(b),
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Bool(true)) => {}
             other => panic!("expected Done(Bool), got {other:?}"),
         }
     }
@@ -9977,7 +10031,7 @@ mod tests {
     fn neg_non_number_panics_with_span() {
         // Push a Str const, then NEG -> "cannot negate" panic with a real span.
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Str(Rc::from("nope")));
+        let k = c.add_const(Value::str("nope"));
         c.emit_u16(Op::Const, k, s());
         // give NEG a distinct, non-empty span so we can assert it is carried.
         let neg_span = Span::new(5, 9);
@@ -10001,8 +10055,8 @@ mod tests {
     #[test]
     fn add_non_numbers_panics() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Str(Rc::from("a")));
-        let b = c.add_const(Value::Float(1.0));
+        let a = c.add_const(Value::str("a"));
+        let b = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Add, s());
@@ -10017,7 +10071,7 @@ mod tests {
         }
     }
 
-    /// A `Value::Decimal` from a decimal string literal (test helper). The VM
+    /// A `Value::decimal_rc` from a decimal string literal (test helper). The VM
     /// compiler cannot yet *produce* a decimal (that needs `import`/member-access
     /// for `std/decimal`), so the decimal arithmetic path is exercised by pushing
     /// decimal consts directly. The semantics themselves are the SAME shared
@@ -10025,9 +10079,7 @@ mod tests {
     /// it.
     fn dec(s: &str) -> Value {
         use std::str::FromStr;
-        Value::Decimal(Rc::new(
-            rust_decimal::Decimal::from_str(s).expect("valid decimal literal"),
-        ))
+        Value::decimal(rust_decimal::Decimal::from_str(s).expect("valid decimal literal"))
     }
 
     /// Push two decimal consts and apply `op`, returning the run outcome.
@@ -10098,11 +10150,11 @@ mod tests {
     #[test]
     fn decimal_ordering_through_shared_dispatch() {
         match run_decimal_binop("1.5", Op::Lt, "2.5").expect("ok") {
-            RunOutcome::Done(Value::Bool(b)) => assert!(b),
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Bool(true)) => {}
             other => panic!("expected Done(Bool), got {other:?}"),
         }
         match run_decimal_binop("3", Op::Ge, "3").expect("ok") {
-            RunOutcome::Done(Value::Bool(b)) => assert!(b),
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Bool(true)) => {}
             other => panic!("expected Done(Bool), got {other:?}"),
         }
     }
@@ -10113,13 +10165,13 @@ mod tests {
         // as the tree-walker's `decimal_cross_eq`.
         let mut c = Chunk::new();
         let kd = c.add_const(dec("1"));
-        let kn = c.add_const(Value::Float(1.0));
+        let kn = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, kd, s());
         c.emit_u16(Op::Const, kn, s());
         c.emit(Op::Eq, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Bool(b)) => assert!(b, "decimal(1) == 1 should be true"),
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Bool(true)) => {}
             other => panic!("expected Done(Bool), got {other:?}"),
         }
     }
@@ -10128,24 +10180,27 @@ mod tests {
     fn range_op_builds_half_open_array() {
         // 0 .. 5 → [0, 1, 2, 3, 4].
         let mut c = Chunk::new();
-        let k0 = c.add_const(Value::Float(0.0));
-        let k5 = c.add_const(Value::Float(5.0));
+        let k0 = c.add_const(Value::float(0.0));
+        let k5 = c.add_const(Value::float(5.0));
         c.emit_u16(Op::Const, k0, s());
         c.emit_u16(Op::Const, k5, s());
         c.emit(Op::Range, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Array(a)) => {
-                let got: Vec<f64> = a
-                    .borrow()
-                    .iter()
-                    .map(|v| match v {
-                        Value::Float(n) => *n,
-                        other => panic!("non-number in range array: {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(got, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
-            }
+            RunOutcome::Done(v) => match v.kind() {
+                ValueKind::Array(a) => {
+                    let got: Vec<f64> = a
+                        .borrow()
+                        .iter()
+                        .map(|v| match v.kind() {
+                            ValueKind::Float(n) => n,
+                            other => panic!("non-number in range array: {other:?}"),
+                        })
+                        .collect();
+                    assert_eq!(got, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+                }
+                other => panic!("expected Done(Array), got {other:?}"),
+            },
             other => panic!("expected Done(Array), got {other:?}"),
         }
     }
@@ -10153,8 +10208,8 @@ mod tests {
     #[test]
     fn range_op_non_number_bounds_panics() {
         let mut c = Chunk::new();
-        let ks = c.add_const(Value::Str(Rc::from("x")));
-        let k5 = c.add_const(Value::Float(5.0));
+        let ks = c.add_const(Value::str("x"));
+        let k5 = c.add_const(Value::float(5.0));
         c.emit_u16(Op::Const, ks, s());
         c.emit_u16(Op::Const, k5, s());
         c.emit(Op::Range, s());
@@ -10174,14 +10229,14 @@ mod tests {
     #[test]
     fn string_concat_through_add() {
         let mut c = Chunk::new();
-        let ka = c.add_const(Value::Str(Rc::from("foo")));
-        let kb = c.add_const(Value::Str(Rc::from("bar")));
+        let ka = c.add_const(Value::str("foo"));
+        let kb = c.add_const(Value::str("bar"));
         c.emit_u16(Op::Const, ka, s());
         c.emit_u16(Op::Const, kb, s());
         c.emit(Op::Add, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Str(st)) => assert_eq!(&*st, "foobar"),
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Str(s) if &**s == "foobar") => {}
             other => panic!("expected Done(Str), got {other:?}"),
         }
     }
@@ -10223,9 +10278,9 @@ mod tests {
         // GET_GLOBAL print; CONST 42; CALL 1; RETURN (CALL leaves print's nil
         // result, which RETURN pops).
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str(Rc::from("print")));
+        let name = c.add_const(Value::str("print"));
         c.emit_u16(Op::GetGlobal, name, s());
-        let k = c.add_const(Value::Float(42.0));
+        let k = c.add_const(Value::float(42.0));
         c.emit_u16(Op::Const, k, s());
         c.emit_u8(Op::Call, 1, s());
         c.emit(Op::Return, s());
@@ -10309,11 +10364,11 @@ mod tests {
     /// arithmetic, return) so the byte-identity check covers more than a trivial op.
     fn output_demo_chunk() -> Chunk {
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str(Rc::from("print")));
+        let name = c.add_const(Value::str("print"));
         c.emit_u16(Op::GetGlobal, name, s());
-        let a = c.add_const(Value::Float(2.0));
+        let a = c.add_const(Value::float(2.0));
         c.emit_u16(Op::Const, a, s());
-        let b = c.add_const(Value::Float(3.0));
+        let b = c.add_const(Value::float(3.0));
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Add, s()); // 2.0 + 3.0
         c.emit_u8(Op::Call, 1, s()); // print(5.0)
@@ -10501,9 +10556,9 @@ mod tests {
         // A pure 0-operand op (RETURN) as the breakpoint target.
         fn demo() -> Chunk {
             let mut c = Chunk::new();
-            let name = c.add_const(Value::Str(Rc::from("print")));
+            let name = c.add_const(Value::str("print"));
             c.emit_u16(Op::GetGlobal, name, s());
-            let k = c.add_const(Value::Float(7.0));
+            let k = c.add_const(Value::float(7.0));
             c.emit_u16(Op::Const, k, s());
             c.emit_u8(Op::Call, 1, s());
             c.emit(Op::Return, s());
@@ -10524,9 +10579,9 @@ mod tests {
         // the program output is unchanged.
         fn demo() -> (Chunk, usize) {
             let mut c = Chunk::new();
-            let name = c.add_const(Value::Str(Rc::from("print")));
+            let name = c.add_const(Value::str("print"));
             c.emit_u16(Op::GetGlobal, name, s());
-            let k = c.add_const(Value::Float(9.0));
+            let k = c.add_const(Value::float(9.0));
             c.emit_u16(Op::Const, k, s());
             c.emit_u8(Op::Call, 1, s());
             c.emit(Op::Return, s());
@@ -10555,11 +10610,11 @@ mod tests {
         fn demo() -> (Chunk, usize) {
             let mut c = Chunk::new();
             c.slot_count = 1; // one local: the counter
-            let pname = c.add_const(Value::Str(Rc::from("print")));
-            let one = c.add_const(Value::Float(1.0));
+            let pname = c.add_const(Value::str("print"));
+            let one = c.add_const(Value::float(1.0));
 
             // Seed slot 0 = 2.0: CONST 2.0; SET_LOCAL 0 (SET_LOCAL POPS the value).
-            let two = c.add_const(Value::Float(2.0));
+            let two = c.add_const(Value::float(2.0));
             c.emit_u16(Op::Const, two, s());
             c.emit_u16(Op::SetLocal, 0, s());
 
@@ -11490,7 +11545,7 @@ mod tests {
     #[test]
     fn get_global_undefined_panics() {
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str(Rc::from("not_a_builtin")));
+        let name = c.add_const(Value::str("not_a_builtin"));
         let gg_span = Span::new(3, 16);
         c.emit_u16(Op::GetGlobal, name, gg_span);
         c.emit(Op::Return, s());
@@ -11543,7 +11598,7 @@ mod tests {
         // `await 5` is identity on a non-future, exactly like the tree-walker's
         // `ExprKind::Await` (`other => Ok(other)`).
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Float(5.0));
+        let k = c.add_const(Value::float(5.0));
         c.emit_u16(Op::Const, k, s());
         c.emit(Op::Await, s());
         c.emit(Op::Return, s());
@@ -11559,12 +11614,12 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
         let site = c.emit_jump(Op::Jump, s());
-        let k = c.add_const(Value::Float(999.0));
+        let k = c.add_const(Value::float(999.0));
         c.emit_u16(Op::Const, k, s()); // skipped
         c.patch_jump(site); // land here, leaving only NIL
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Nil) => {}
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Nil) => {}
             other => panic!("expected Done(Nil), got {other:?}"),
         }
     }
@@ -11576,10 +11631,10 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::False, s());
         let site = c.emit_jump(Op::JumpIfFalse, s());
-        let k1 = c.add_const(Value::Float(1.0));
+        let k1 = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, k1, s()); // skipped (would otherwise be the result)
         c.patch_jump(site);
-        let k2 = c.add_const(Value::Float(2.0));
+        let k2 = c.add_const(Value::float(2.0));
         c.emit_u16(Op::Const, k2, s());
         c.emit(Op::Return, s());
         assert_eq!(expect_number(c), 2.0);
@@ -11591,7 +11646,7 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::False, s());
         let site = c.emit_jump(Op::JumpIfTrue, s());
-        let k7 = c.add_const(Value::Float(7.0));
+        let k7 = c.add_const(Value::float(7.0));
         c.emit_u16(Op::Const, k7, s()); // executed (no jump)
         c.emit(Op::Return, s());
         c.patch_jump(site); // target is past RETURN; never reached
@@ -11603,13 +11658,13 @@ mod tests {
         // CONST 5 (non-nil) -> JUMP_IF_NOT_NIL pops & jumps over CONST 1; RETURN
         // sees the trailing CONST 2.
         let mut c = Chunk::new();
-        let k5 = c.add_const(Value::Float(5.0));
+        let k5 = c.add_const(Value::float(5.0));
         c.emit_u16(Op::Const, k5, s());
         let site = c.emit_jump(Op::JumpIfNotNil, s());
-        let k1 = c.add_const(Value::Float(1.0));
+        let k1 = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, k1, s()); // skipped
         c.patch_jump(site);
-        let k2 = c.add_const(Value::Float(2.0));
+        let k2 = c.add_const(Value::float(2.0));
         c.emit_u16(Op::Const, k2, s());
         c.emit(Op::Return, s());
         assert_eq!(expect_number(c), 2.0);
@@ -11622,23 +11677,26 @@ mod tests {
         // CONST 1; CONST 2; CONST 3; NEW_ARRAY 3 → [1, 2, 3].
         let mut c = Chunk::new();
         for n in [1.0, 2.0, 3.0] {
-            let k = c.add_const(Value::Float(n));
+            let k = c.add_const(Value::float(n));
             c.emit_u16(Op::Const, k, s());
         }
         c.emit_u16(Op::NewArray, 3, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Array(a)) => {
-                let got: Vec<f64> = a
-                    .borrow()
-                    .iter()
-                    .map(|v| match v {
-                        Value::Float(n) => *n,
-                        other => panic!("non-number: {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(got, vec![1.0, 2.0, 3.0]);
-            }
+            RunOutcome::Done(v) => match v.kind() {
+                ValueKind::Array(a) => {
+                    let got: Vec<f64> = a
+                        .borrow()
+                        .iter()
+                        .map(|v| match v.kind() {
+                            ValueKind::Float(n) => n,
+                            other => panic!("non-number: {other:?}"),
+                        })
+                        .collect();
+                    assert_eq!(got, vec![1.0, 2.0, 3.0]);
+                }
+                other => panic!("expected Done(Array), got {other:?}"),
+            },
             other => panic!("expected Done(Array), got {other:?}"),
         }
     }
@@ -11648,20 +11706,23 @@ mod tests {
         // CONST "a"; CONST 1; CONST "b"; CONST 2; NEW_OBJECT 2 → {a:1, b:2}.
         let mut c = Chunk::new();
         for (k, v) in [("a", 1.0), ("b", 2.0)] {
-            let ki = c.add_const(Value::Str(Rc::from(k)));
+            let ki = c.add_const(Value::str(k));
             c.emit_u16(Op::Const, ki, s());
-            let vi = c.add_const(Value::Float(v));
+            let vi = c.add_const(Value::float(v));
             c.emit_u16(Op::Const, vi, s());
         }
         c.emit_u16(Op::NewObject, 2, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Object(o)) => {
-                let keys: Vec<String> = o.keys_snapshot();
-                assert_eq!(keys, vec!["a", "b"], "keys in insertion order");
-                assert_eq!(o.get("a"), Some(Value::Float(1.0)));
-                assert_eq!(o.get("b"), Some(Value::Float(2.0)));
-            }
+            RunOutcome::Done(v) => match v.kind() {
+                ValueKind::Object(o) => {
+                    let keys: Vec<String> = o.keys_snapshot();
+                    assert_eq!(keys, vec!["a", "b"], "keys in insertion order");
+                    assert_eq!(o.get("a"), Some(Value::float(1.0)));
+                    assert_eq!(o.get("b"), Some(Value::float(2.0)));
+                }
+                other => panic!("expected Done(Object), got {other:?}"),
+            },
             other => panic!("expected Done(Object), got {other:?}"),
         }
     }
@@ -11713,9 +11774,9 @@ mod tests {
         // `lit_shapes` entry is Warm with the right shape id and keys.
         let mut c = Chunk::new();
         for (k, v) in [("a", 1.0), ("b", 2.0)] {
-            let ki = c.add_const(Value::Str(Rc::from(k)));
+            let ki = c.add_const(Value::str(k));
             c.emit_u16(Op::Const, ki, s());
-            let vi = c.add_const(Value::Float(v));
+            let vi = c.add_const(Value::float(v));
             c.emit_u16(Op::Const, vi, s());
         }
         let site_off = c.code.len(); // the NewObject op offset
@@ -11724,7 +11785,10 @@ mod tests {
 
         let (outcome, proto) = run_chunk_retain(c, true);
         let obj1 = match outcome.expect("run ok") {
-            RunOutcome::Done(Value::Object(o)) => o,
+            RunOutcome::Done(v) => match v.into_kind() {
+                OwnedKind::Object(o) => o,
+                _ => panic!("expected Done(Object)"),
+            },
             other => panic!("expected Done(Object), got {other:?}"),
         };
         let entry = proto
@@ -11747,9 +11811,9 @@ mod tests {
         let mut c2 = Chunk::new();
         for _ in 0..2 {
             for (k, v) in [("a", 1.0), ("b", 2.0)] {
-                let ki = c2.add_const(Value::Str(Rc::from(k)));
+                let ki = c2.add_const(Value::str(k));
                 c2.emit_u16(Op::Const, ki, s());
-                let vi = c2.add_const(Value::Float(v));
+                let vi = c2.add_const(Value::float(v));
                 c2.emit_u16(Op::Const, vi, s());
             }
             c2.emit_u16(Op::NewObject, 2, s());
@@ -11758,18 +11822,23 @@ mod tests {
         c2.emit(Op::Return, s());
         let (out2, _p2) = run_chunk_retain(c2, true);
         match out2.expect("run ok") {
-            RunOutcome::Done(Value::Array(a)) => {
-                let a = a.borrow();
-                let (o1, o2) = match (&a[0], &a[1]) {
-                    (Value::Object(o1), Value::Object(o2)) => (o1.clone(), o2.clone()),
-                    other => panic!("expected two objects, got {other:?}"),
-                };
-                assert_eq!(o1.shape.get(), o2.shape.get(), "same shape id");
-                assert!(
-                    Rc::ptr_eq(&o1.slab_keys().unwrap(), &o2.slab_keys().unwrap()),
-                    "two objects from the same shape share their keys Rc"
-                );
-            }
+            RunOutcome::Done(v) => match v.kind() {
+                ValueKind::Array(a) => {
+                    let a = a.borrow();
+                    let (o1, o2) = match (a[0].kind(), a[1].kind()) {
+                        (ValueKind::Object(o1), ValueKind::Object(o2)) => {
+                            (o1.clone(), o2.clone())
+                        }
+                        other => panic!("expected two objects, got {other:?}"),
+                    };
+                    assert_eq!(o1.shape.get(), o2.shape.get(), "same shape id");
+                    assert!(
+                        Rc::ptr_eq(&o1.slab_keys().unwrap(), &o2.slab_keys().unwrap()),
+                        "two objects from the same shape share their keys Rc"
+                    );
+                }
+                other => panic!("expected Done(Array), got {other:?}"),
+            },
             other => panic!("expected Done(Array), got {other:?}"),
         }
     }
@@ -11781,9 +11850,9 @@ mod tests {
         // `slot_of_pair = Some([0, 0])` (both source pairs map to slot 0).
         let mut c = Chunk::new();
         for v in [1.0, 2.0] {
-            let ki = c.add_const(Value::Str(Rc::from("a")));
+            let ki = c.add_const(Value::str("a"));
             c.emit_u16(Op::Const, ki, s());
-            let vi = c.add_const(Value::Float(v));
+            let vi = c.add_const(Value::float(v));
             c.emit_u16(Op::Const, vi, s());
         }
         let site_off = c.code.len();
@@ -11791,14 +11860,17 @@ mod tests {
         c.emit(Op::Return, s());
         let (outcome, proto) = run_chunk_retain(c, true);
         match outcome.expect("run ok") {
-            RunOutcome::Done(Value::Object(o)) => {
-                assert_eq!(o.keys_snapshot(), vec!["a"], "duplicate key folded");
-                assert_eq!(
-                    o.get("a"),
-                    Some(Value::Float(2.0)),
-                    "later source position wins"
-                );
-            }
+            RunOutcome::Done(v) => match v.kind() {
+                ValueKind::Object(o) => {
+                    assert_eq!(o.keys_snapshot(), vec!["a"], "duplicate key folded");
+                    assert_eq!(
+                        o.get("a"),
+                        Some(Value::float(2.0)),
+                        "later source position wins"
+                    );
+                }
+                other => panic!("expected Done(Object), got {other:?}"),
+            },
             other => panic!("expected Done(Object), got {other:?}"),
         }
         match proto.chunk.lit_shape(site_off).expect("warm") {
@@ -11819,11 +11891,11 @@ mod tests {
         // [10, 20, 30]; CONST 1; GET_INDEX → 20.
         let mut c = Chunk::new();
         for n in [10.0, 20.0, 30.0] {
-            let k = c.add_const(Value::Float(n));
+            let k = c.add_const(Value::float(n));
             c.emit_u16(Op::Const, k, s());
         }
         c.emit_u16(Op::NewArray, 3, s());
-        let i = c.add_const(Value::Float(1.0));
+        let i = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, i, s());
         c.emit(Op::GetIndex, s());
         c.emit(Op::Return, s());
@@ -11833,10 +11905,10 @@ mod tests {
     #[test]
     fn get_index_out_of_bounds_panics() {
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Float(10.0));
+        let k = c.add_const(Value::float(10.0));
         c.emit_u16(Op::Const, k, s());
         c.emit_u16(Op::NewArray, 1, s());
-        let i = c.add_const(Value::Float(5.0));
+        let i = c.add_const(Value::float(5.0));
         c.emit_u16(Op::Const, i, s());
         c.emit(Op::GetIndex, s());
         c.emit(Op::Return, s());
@@ -11851,19 +11923,19 @@ mod tests {
     #[test]
     fn variant_elem_oob_operand_is_nil_not_panic() {
         // Task 0.7 robustness: a `VARIANT_ELEM` whose operand is past the end of the
-        // variant's positional payload reads as `Value::Nil` (via `.get(idx)`), NOT a
+        // variant's positional payload reads as `Value::nil()` (via `.get(idx)`), NOT a
         // host panic. We build a real 2-field positional variant as a const and index
         // element 0xFFFF — verify(`variant_elem_max_operand_verifies`) already accepts
         // the operand; here we prove the run loop is independently OOB-safe so the
         // verifier need not (and soundly cannot) cap the bare index below `u16::MAX`.
         use crate::value::{ArrayCell, EnumVariant, Payload};
-        let variant = Value::EnumVariant(Rc::new(EnumVariant {
+        let variant = Value::enum_variant(Rc::new(EnumVariant {
             enum_name: "E".to_string(),
             name: "Pair".to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(Payload::Positional(ArrayCell::new(vec![
-                Value::Float(1.0),
-                Value::Float(2.0),
+                Value::float(1.0),
+                Value::float(2.0),
             ]))),
             ctor: false,
             def: None,
@@ -11874,7 +11946,7 @@ mod tests {
         c.emit_u16(Op::VariantElem, 0xFFFF, s()); // OOB index → Nil (net 0)
         c.emit(Op::Return, s());
         match run_chunk(c).expect("must not panic on an out-of-range VARIANT_ELEM index") {
-            RunOutcome::Done(Value::Nil) => {}
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Nil) => {}
             other => panic!("expected Done(Nil) for an OOB VARIANT_ELEM, got {other:?}"),
         }
     }
@@ -11884,13 +11956,13 @@ mod tests {
         // Companion: `MATCH_VARIANT_ARITY(0xFFFF)` on a 2-field variant is a false
         // match (`len == Some(n)`), never an index panic.
         use crate::value::{ArrayCell, EnumVariant, Payload};
-        let variant = Value::EnumVariant(Rc::new(EnumVariant {
+        let variant = Value::enum_variant(Rc::new(EnumVariant {
             enum_name: "E".to_string(),
             name: "Pair".to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(Payload::Positional(ArrayCell::new(vec![
-                Value::Float(1.0),
-                Value::Float(2.0),
+                Value::float(1.0),
+                Value::float(2.0),
             ]))),
             ctor: false,
             def: None,
@@ -11901,7 +11973,7 @@ mod tests {
         c.emit_u16(Op::MatchVariantArity, 0xFFFF, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("must not panic on an out-of-range MATCH_VARIANT_ARITY count") {
-            RunOutcome::Done(Value::Bool(false)) => {}
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Bool(false)) => {}
             other => panic!("expected Done(Bool(false)) for an OOB arity, got {other:?}"),
         }
     }
@@ -11910,17 +11982,17 @@ mod tests {
     fn get_index_object_missing_key_is_nil() {
         // {a:1}["b"] → nil (missing object key is nil, not a panic).
         let mut c = Chunk::new();
-        let ka = c.add_const(Value::Str(Rc::from("a")));
+        let ka = c.add_const(Value::str("a"));
         c.emit_u16(Op::Const, ka, s());
-        let v1 = c.add_const(Value::Float(1.0));
+        let v1 = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, v1, s());
         c.emit_u16(Op::NewObject, 1, s());
-        let kb = c.add_const(Value::Str(Rc::from("b")));
+        let kb = c.add_const(Value::str("b"));
         c.emit_u16(Op::Const, kb, s());
         c.emit(Op::GetIndex, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Nil) => {}
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Nil) => {}
             other => panic!("expected Done(Nil), got {other:?}"),
         }
     }
@@ -11929,12 +12001,12 @@ mod tests {
     fn get_prop_object_field() {
         // {a:1}.a → 1 via GET_PROP "a".
         let mut c = Chunk::new();
-        let ka = c.add_const(Value::Str(Rc::from("a")));
+        let ka = c.add_const(Value::str("a"));
         c.emit_u16(Op::Const, ka, s());
-        let v1 = c.add_const(Value::Float(1.0));
+        let v1 = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, v1, s());
         c.emit_u16(Op::NewObject, 1, s());
-        let name = c.add_const(Value::Str(Rc::from("a")));
+        let name = c.add_const(Value::str("a"));
         c.emit_u16(Op::GetProp, name, s());
         c.emit(Op::Return, s());
         assert_eq!(expect_number(c), 1.0);
@@ -11945,11 +12017,11 @@ mod tests {
         // nil?.a → nil (short-circuit, no read_member call).
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
-        let name = c.add_const(Value::Str(Rc::from("a")));
+        let name = c.add_const(Value::str("a"));
         c.emit_u16(Op::GetPropOpt, name, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Nil) => {}
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Nil) => {}
             other => panic!("expected Done(Nil), got {other:?}"),
         }
     }
@@ -11959,7 +12031,7 @@ mod tests {
         // nil.a → "cannot read property 'a' of nil" (NOT short-circuited).
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
-        let name = c.add_const(Value::Str(Rc::from("a")));
+        let name = c.add_const(Value::str("a"));
         c.emit_u16(Op::GetProp, name, s());
         c.emit(Op::Return, s());
         match run_chunk(c) {
@@ -11975,14 +12047,14 @@ mod tests {
     // ---- Vm::call_value bridge (native → VM closures), V4-T5 ---------------
 
     /// Compile a program whose trailing expression evaluates to a closure, run it
-    /// on the VM, and return that `Value::Closure`. This is how a native
+    /// on the VM, and return that `Value::closure`. This is how a native
     /// higher-order function would *receive* a user callback (e.g. the `f` arg of
     /// `array.map`). The closure is self-contained (proto + captured upvalue
     /// cells), so a fresh VM can later drive it via `Vm::call_value`.
     fn compile_closure(src: &str) -> Value {
         let chunk = crate::compile::compile_source(src).expect("compile ok");
         match run_chunk(chunk).expect("run ok") {
-            RunOutcome::Done(v @ Value::Closure(_)) => v,
+            RunOutcome::Done(v) if matches!(v.kind(), ValueKind::Closure(_)) => v,
             other => panic!("expected the program to yield a closure, got {other:?}"),
         }
     }
@@ -12013,11 +12085,11 @@ mod tests {
         // per element. `(x) => x * 2` called with 21 → 42.
         let f = compile_closure("(x) => x * 2");
         let got = with_vm(|vm| async move {
-            vm.call_value(f, vec![Value::Float(21.0)], s())
+            vm.call_value(f, vec![Value::float(21.0)], s())
                 .await
                 .expect("call ok")
         });
-        assert!(matches!(got, Value::Float(n) if n == 42.0), "got {got:?}");
+        assert!(matches!(got.kind(), ValueKind::Float(n) if n == 42.0), "got {got:?}");
     }
 
     #[test]
@@ -12029,7 +12101,7 @@ mod tests {
             let mut out = Vec::new();
             for n in [10.0, 20.0, 30.0] {
                 let v = vm
-                    .call_value(f.clone(), vec![Value::Float(n)], s())
+                    .call_value(f.clone(), vec![Value::float(n)], s())
                     .await
                     .expect("call ok");
                 out.push(v);
@@ -12038,8 +12110,8 @@ mod tests {
         });
         let nums: Vec<f64> = got
             .iter()
-            .map(|v| match v {
-                Value::Float(n) => *n,
+            .map(|v| match v.kind() {
+                ValueKind::Float(n) => n,
                 other => panic!("non-number: {other:?}"),
             })
             .collect();
@@ -12055,18 +12127,18 @@ mod tests {
         // top-level `let k` would instead be a module global read via GET_GLOBAL.)
         let f = compile_closure("fn make() {\n let k = 10\n return (x) => x + k\n}\nmake()");
         let got = with_vm(|vm| async move {
-            vm.call_value(f, vec![Value::Float(5.0)], s())
+            vm.call_value(f, vec![Value::float(5.0)], s())
                 .await
                 .expect("call ok")
         });
-        assert!(matches!(got, Value::Float(n) if n == 15.0), "got {got:?}");
+        assert!(matches!(got.kind(), ValueKind::Float(n) if n == 15.0), "got {got:?}");
     }
 
     // ---- V7-T4: structured-concurrency over VM-produced futures -----------
     //
     // The std/task ops (`gather`/`race`/`timeout`/`spawn`) are native fns on the
-    // shared `Interp` that await/select over `Value::Future`s. The VM produces
-    // ordinary `Value::Future`s (the SAME `SharedFuture` the tree-walker uses;
+    // shared `Interp` that await/select over `Value::future`s. The VM produces
+    // ordinary `Value::future`s (the SAME `SharedFuture` the tree-walker uses;
     // see the `Op::Call` async-fn arm). These tests de-risk the V12 end-to-end
     // structured-concurrency differential (`concurrency.as` /
     // `structured_concurrency.as`, which need `import` — not compiled until V12)
@@ -12076,7 +12148,7 @@ mod tests {
 
     /// Spawn a VM async-fn call exactly the way the `Op::Call` async arm does:
     /// `spawn_local` a task that drives `Vm::call_value(closure, args)` and
-    /// resolves a `SharedFuture` cell, returning the `Value::Future` handle
+    /// resolves a `SharedFuture` cell, returning the `Value::future` handle
     /// immediately. This is the canonical "VM-produced future".
     fn spawn_vm_future(vm: &Rc<Vm>, closure: Value, args: Vec<Value>) -> Value {
         let vm2 = vm.rc();
@@ -12087,7 +12159,7 @@ mod tests {
             cell.resolve(r);
         });
         fut.set_abort(handle.abort_handle());
-        Value::Future(fut)
+        Value::future(fut)
     }
 
     /// Compile + run a whole `.as` program `src` on a fresh Vm (mirroring the
@@ -12147,26 +12219,26 @@ mod tests {
     #[test]
     fn task_gather_awaits_vm_produced_futures_in_order() {
         // `(n) => n + 1` invoked as two independent VM futures, gathered. The
-        // native `task.gather` op awaits each `Value::Future` and returns the
+        // native `task.gather` op awaits each `Value::future` and returns the
         // values in input order — proving the VM's futures interoperate with the
         // structured-concurrency machinery (Part C de-risk; full e2e is V12).
         let f = compile_closure("(n) => n + 1");
         let out = with_vm(|vm| async move {
-            let a = spawn_vm_future(&vm, f.clone(), vec![Value::Float(10.0)]);
-            let b = spawn_vm_future(&vm, f, vec![Value::Float(20.0)]);
-            let arr = Value::Array(crate::value::ArrayCell::new(vec![a, b]));
+            let a = spawn_vm_future(&vm, f.clone(), vec![Value::float(10.0)]);
+            let b = spawn_vm_future(&vm, f, vec![Value::float(20.0)]);
+            let arr = Value::array(vec![a, b]);
             vm.interp()
                 .call_task("gather", &[arr], s())
                 .await
                 .expect("gather ok")
         });
-        match out {
-            Value::Array(a) => {
+        match out.kind() {
+            ValueKind::Array(a) => {
                 let got: Vec<f64> = a
                     .borrow()
                     .iter()
-                    .map(|v| match v {
-                        Value::Float(n) => *n,
+                    .map(|v| match v.kind() {
+                        ValueKind::Float(n) => n,
                         other => panic!("non-number in gather result: {other:?}"),
                     })
                     .collect();
@@ -12183,17 +12255,17 @@ mod tests {
     #[test]
     fn task_race_resolves_a_vm_produced_future() {
         // A single VM-produced future raced resolves to its value — `task.race`
-        // selects over `Value::Future`s and the VM's future drives to completion.
+        // selects over `Value::future`s and the VM's future drives to completion.
         let f = compile_closure("(n) => n * 2");
         let out = with_vm(|vm| async move {
-            let a = spawn_vm_future(&vm, f, vec![Value::Float(21.0)]);
-            let arr = Value::Array(crate::value::ArrayCell::new(vec![a]));
+            let a = spawn_vm_future(&vm, f, vec![Value::float(21.0)]);
+            let arr = Value::array(vec![a]);
             vm.interp()
                 .call_task("race", &[arr], s())
                 .await
                 .expect("race ok")
         });
-        assert!(matches!(out, Value::Float(n) if n == 42.0), "got {out:?}");
+        assert!(matches!(out.kind(), ValueKind::Float(n) if n == 42.0), "got {out:?}");
     }
 
     #[test]
@@ -12203,7 +12275,7 @@ mod tests {
         // `(x) => x[9]` indexes a 1-element array out of bounds at runtime.
         let f = compile_closure("(x) => x[9]");
         let err = with_vm(|vm| async move {
-            let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(0.0)]));
+            let arr = Value::array(vec![Value::float(0.0)]);
             vm.call_value(f, vec![arr], s())
                 .await
                 .expect_err("expected a panic")
@@ -12241,14 +12313,14 @@ mod tests {
         let out = with_vm(|vm| async move {
             let r = vm
                 .call_value(
-                    Value::Builtin(Rc::from("print")),
-                    vec![Value::Float(7.0)],
+                    Value::builtin("print"),
+                    vec![Value::float(7.0)],
                     s(),
                 )
                 .await
                 .expect("call ok");
             // print returns nil and writes to the shared sink.
-            assert!(matches!(r, Value::Nil), "print returns nil");
+            assert!(matches!(r.kind(), ValueKind::Nil), "print returns nil");
             vm.interp().output()
         });
         assert_eq!(out, "7.0\n", "print wrote through the delegated path");
@@ -12260,7 +12332,7 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
         let site = c.emit_jump(Op::JumpIfNotNil, s());
-        let k9 = c.add_const(Value::Float(9.0));
+        let k9 = c.add_const(Value::float(9.0));
         c.emit_u16(Op::Const, k9, s()); // executed (no jump)
         c.emit(Op::Return, s());
         c.patch_jump(site); // never reached
@@ -12274,7 +12346,7 @@ mod tests {
     #[test]
     fn propagate_success_yields_value() {
         let mut c = Chunk::new();
-        let pair = c.add_const(crate::interp::make_pair(Value::Float(7.0), Value::Nil));
+        let pair = c.add_const(crate::interp::make_pair(Value::float(7.0), Value::nil()));
         c.emit_u16(Op::Const, pair, s());
         c.emit(Op::Propagate, s());
         c.emit(Op::Return, s());
@@ -12288,22 +12360,25 @@ mod tests {
     fn propagate_failure_early_returns_pair_from_frame() {
         let mut c = Chunk::new();
         let pair = c.add_const(crate::interp::make_pair(
-            Value::Nil,
-            Value::Str(Rc::from("boom")),
+            Value::nil(),
+            Value::str("boom"),
         ));
         c.emit_u16(Op::Const, pair, s());
         c.emit(Op::Propagate, s());
         // Never reached: PROPAGATE early-returned from the root frame.
-        let k999 = c.add_const(Value::Float(999.0));
+        let k999 = c.add_const(Value::float(999.0));
         c.emit_u16(Op::Const, k999, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
-            RunOutcome::Done(Value::Array(a)) => {
-                let b = a.borrow();
-                assert_eq!(b.len(), 2);
-                assert_eq!(b[0], Value::Nil);
-                assert_eq!(b[1], Value::Str(Rc::from("boom")));
-            }
+            RunOutcome::Done(v) => match v.kind() {
+                ValueKind::Array(a) => {
+                    let b = a.borrow();
+                    assert_eq!(b.len(), 2);
+                    assert_eq!(b[0], Value::nil());
+                    assert_eq!(b[1], Value::str("boom"));
+                }
+                other => panic!("expected Done([nil, \"boom\"]), got {other:?}"),
+            },
             other => panic!("expected Done([nil, \"boom\"]), got {other:?}"),
         }
     }
@@ -12319,8 +12394,8 @@ mod tests {
     }
 
     fn obj_shape(v: &Value) -> u32 {
-        match v {
-            Value::Object(o) => o.shape.get(),
+        match v.kind() {
+            ValueKind::Object(o) => o.shape.get(),
             other => panic!("expected an Object, got {other:?}"),
         }
     }
@@ -12333,8 +12408,8 @@ mod tests {
     fn vm_object_literals_share_shape_by_layout() {
         // [{a,b}, {a,b}, {a,c}, {b,a}]
         let v = eval_src("[{a: 1, b: 2}, {a: 9, b: 8}, {a: 1, c: 2}, {b: 1, a: 2}]");
-        let arr = match v {
-            Value::Array(a) => a.borrow().clone(),
+        let arr = match v.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
             other => panic!("expected array, got {other:?}"),
         };
         let s_ab1 = obj_shape(&arr[0]);
@@ -12369,8 +12444,8 @@ mod tests {
              added.b = 9;\n\
              [base, reassigned, added]",
         );
-        let arr = match v {
-            Value::Array(a) => a.borrow().clone(),
+        let arr = match v.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
             other => panic!("expected array, got {other:?}"),
         };
         let s_base = obj_shape(&arr[0]);
@@ -12391,16 +12466,16 @@ mod tests {
             "class P { x: number = 0\n y: number = 0\n }\n\
              [P(), P()]",
         );
-        let arr = match v {
-            Value::Array(a) => a.borrow().clone(),
+        let arr = match v.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
             other => panic!("expected array, got {other:?}"),
         };
-        let s0 = match &arr[0] {
-            Value::Instance(i) => i.borrow().shape_id.get(),
+        let s0 = match arr[0].kind() {
+            ValueKind::Instance(i) => i.borrow().shape_id.get(),
             other => panic!("expected instance, got {other:?}"),
         };
-        let s1 = match &arr[1] {
-            Value::Instance(i) => i.borrow().shape_id.get(),
+        let s1 = match arr[1].kind() {
+            ValueKind::Instance(i) => i.borrow().shape_id.get(),
             other => panic!("expected instance, got {other:?}"),
         };
         assert_eq!(s0, s1, "two instances of one class share the base shape");
@@ -12481,11 +12556,11 @@ mod tests {
                     &fiber,
                     0,
                     BinOp::Add,
-                    Value::Float(i as f64),
-                    Value::Float(1.0),
+                    Value::float(i as f64),
+                    Value::float(1.0),
                 )
                 .expect("ok");
-            assert_eq!(v, Value::Float(i as f64 + 1.0));
+            assert_eq!(v, Value::float(i as f64 + 1.0));
         }
         // The cache MUST still be at its default cold state — the generic path
         // never observes (no warmup candidate, count 0) and never specializes.
@@ -12506,8 +12581,8 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Float(1.0),
-                Value::Float(1.0),
+                Value::float(1.0),
+                Value::float(1.0),
             )
             .expect("ok");
         }
@@ -12535,11 +12610,11 @@ mod tests {
                     &fiber,
                     0,
                     BinOp::Add,
-                    Value::Float(i as f64),
-                    Value::Float(1.0),
+                    Value::float(i as f64),
+                    Value::float(1.0),
                 )
                 .expect("ok");
-            assert_eq!(v, Value::Float(i as f64 + 1.0));
+            assert_eq!(v, Value::float(i as f64 + 1.0));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
         assert_eq!(
@@ -12555,11 +12630,11 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Float(40.0),
-                Value::Float(2.0),
+                Value::float(40.0),
+                Value::float(2.0),
             )
             .expect("ok");
-        assert_eq!(v, Value::Float(42.0));
+        assert_eq!(v, Value::float(42.0));
     }
 
     #[test]
@@ -12570,8 +12645,8 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Float(1.0),
-                Value::Float(1.0),
+                Value::float(1.0),
+                Value::float(1.0),
             )
             .expect("ok");
         }
@@ -12589,11 +12664,11 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Str("a".into()),
-                Value::Str("b".into()),
+                Value::str("a"),
+                Value::str("b"),
             )
             .expect("ok");
-        assert_eq!(v, Value::Str("ab".into()), "generic path gave the concat");
+        assert_eq!(v, Value::str("ab"), "generic path gave the concat");
         // The site deoptimized back to a fresh warmup (the deopt branch reverts and
         // runs generic without re-observing in the same step); a subsequent
         // execution starts observing anew.
@@ -12611,11 +12686,11 @@ mod tests {
                     &fiber,
                     0,
                     BinOp::Add,
-                    Value::Str("x".into()),
-                    Value::Str("y".into()),
+                    Value::str("x"),
+                    Value::str("y"),
                 )
                 .expect("ok");
-            assert_eq!(v, Value::Str("xy".into()));
+            assert_eq!(v, Value::str("xy"));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
         assert_eq!(
@@ -12630,11 +12705,11 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Str("1".into()),
-                Value::Str("2".into()),
+                Value::str("1"),
+                Value::str("2"),
             )
             .expect("ok");
-        assert_eq!(v, Value::Str("12".into()));
+        assert_eq!(v, Value::str("12"));
     }
 
     #[test]
@@ -12644,9 +12719,9 @@ mod tests {
         let b = Decimal::new(25, 1); // 2.5
         for _ in 0..WARMUP_THRESHOLD {
             let v = vm
-                .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(Rc::new(a)), Value::Decimal(Rc::new(b)))
+                .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::decimal(a), Value::decimal(b))
                 .expect("ok");
-            assert_eq!(v, Value::Decimal(Rc::new(a + b)));
+            assert_eq!(v, Value::decimal(a + b));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
         assert_eq!(
@@ -12657,10 +12732,10 @@ mod tests {
         );
         // Specialized decimal add equals the generic apply_binop result bit-exact.
         let v = vm
-            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(Rc::new(a)), Value::Decimal(Rc::new(b)))
+            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::decimal(a), Value::decimal(b))
             .expect("ok");
         let generic =
-            crate::interp::apply_binop(BinOp::Add, Value::Decimal(Rc::new(a)), Value::Decimal(Rc::new(b)), s())
+            crate::interp::apply_binop(BinOp::Add, Value::decimal(a), Value::decimal(b), s())
                 .expect("ok");
         assert_eq!(v, generic);
     }
@@ -12670,12 +12745,12 @@ mod tests {
         let (vm, fiber) = adaptive_harness(Op::Add);
         for i in 0..(WARMUP_THRESHOLD as usize * 4) {
             let (a, b, want) = if i % 2 == 0 {
-                (Value::Float(2.0), Value::Float(3.0), Value::Float(5.0))
+                (Value::float(2.0), Value::float(3.0), Value::float(5.0))
             } else {
                 (
-                    Value::Str("a".into()),
-                    Value::Str("b".into()),
-                    Value::Str("ab".into()),
+                    Value::str("a"),
+                    Value::str("b"),
+                    Value::str("ab"),
                 )
             };
             let v = vm
@@ -12707,14 +12782,14 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Float(1.0),
-                Value::Float(1.0),
+                Value::float(1.0),
+                Value::float(1.0),
             )
             .expect("ok");
         }
-        let got = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Float(1.0), Value::Nil);
+        let got = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::float(1.0), Value::nil());
         let generic =
-            crate::interp::apply_binop(BinOp::Add, Value::Float(1.0), Value::Nil, Span::new(0, 3));
+            crate::interp::apply_binop(BinOp::Add, Value::float(1.0), Value::nil(), Span::new(0, 3));
         match (got, generic) {
             (Err(Control::Panic(a)), Err(Control::Panic(b))) => {
                 assert_eq!(a.message, b.message);
@@ -12728,14 +12803,14 @@ mod tests {
     fn get_global_cached_returns_same_builtin() {
         // Manually populate + read the global cache for a GET_GLOBAL site.
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str(Rc::from("print")));
+        let name = c.add_const(Value::str("print"));
         c.emit_u16(Op::GetGlobal, name, s());
         c.emit(Op::Return, s());
         let version = 0u64;
         assert!(c.global_cache(0).get(version).is_none(), "cold initially");
-        c.set_global_cache(0, GlobalCache::set(Value::Builtin("print".into()), version));
-        match c.global_cache(0).get(version) {
-            Some(Value::Builtin(n)) => assert_eq!(&*n, "print"),
+        c.set_global_cache(0, GlobalCache::set(Value::builtin("print"), version));
+        match c.global_cache(0).get(version).map(Value::into_kind) {
+            Some(OwnedKind::Builtin(n)) => assert_eq!(&*n, "print"),
             other => panic!("expected cached print builtin, got {other:?}"),
         }
         // A version bump invalidates it (defence-in-depth; never happens today).
@@ -12824,12 +12899,12 @@ mod tests {
         );
     }
 
-    /// LANE §4.1 case 4: `Op::Await` on a PENDING `Value::Future` must escape
+    /// LANE §4.1 case 4: `Op::Await` on a PENDING `Value::future` must escape
     /// to the async driver with `ip` restored to the `Op::Await` byte. The async
     /// driver re-decodes and parks on `f.get().await`. If ip were left advanced the
     /// Await instruction would be silently skipped — a correctness hole.
     ///
-    /// Construction: push a pending `Value::Future` onto the fiber's stack, then
+    /// Construction: push a pending `Value::future` onto the fiber's stack, then
     /// place a single `Op::Await` instruction (ip == 0). After `run_loop_sync`
     /// the ip must still be 0 and the future must still be on TOS.
     #[test]
@@ -12857,7 +12932,7 @@ mod tests {
 
         // Push a PENDING future onto TOS.
         let pending = SharedFuture::new(); // not resolved — try_get() returns None
-        fiber.push(Value::Future(pending));
+        fiber.push(Value::future(pending));
 
         assert_eq!(fiber.frame().ip, 0, "ip must start at 0");
 
@@ -12880,7 +12955,7 @@ mod tests {
         );
         // The future must still be on TOS (the burst peeked only — did not pop).
         assert!(
-            matches!(fiber.peek(0), Value::Future(_)),
+            matches!(fiber.peek(0).kind(), ValueKind::Future(_)),
             "pending future must remain on TOS after escalation"
         );
     }
@@ -12890,7 +12965,7 @@ mod tests {
     #[test]
     fn propagate_non_pair_panics_with_span() {
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Float(5.0));
+        let k = c.add_const(Value::float(5.0));
         c.emit_u16(Op::Const, k, s());
         let prop_span = Span::new(8, 10);
         c.emit(Op::Propagate, prop_span);

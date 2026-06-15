@@ -5,6 +5,8 @@ use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
 use crate::value::Value;
+#[cfg(test)]
+use crate::value::ValueKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -45,24 +47,24 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as f64)
                 .unwrap_or(0.0);
-            Ok(Value::Float(ms))
+            Ok(Value::float(ms))
         }
         "monotonic" => {
             let ms = START.elapsed().as_secs_f64() * 1000.0;
-            Ok(Value::Float(ms))
+            Ok(Value::float(ms))
         }
-        "millis" => Ok(Value::Float(want_number(
+        "millis" => Ok(Value::float(want_number(
             &arg(args, 0),
             span,
             &ctx("millis"),
         )?)),
-        "seconds" => Ok(Value::Float(
+        "seconds" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("seconds"))? * 1000.0,
         )),
-        "minutes" => Ok(Value::Float(
+        "minutes" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("minutes"))? * 60_000.0,
         )),
-        "hours" => Ok(Value::Float(
+        "hours" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("hours"))? * 3_600_000.0,
         )),
         "sleep" => unreachable!("time.sleep is dispatched async in call_time"),
@@ -83,16 +85,16 @@ mod tests {
     #[test]
     fn now_is_after_a_known_past_epoch() {
         let v = call("now", &[], sp()).unwrap();
-        match v {
-            Value::Float(n) => assert!(n > 1.7e12, "now() = {n}, expected > 1.7e12"),
+        match v.kind() {
+            ValueKind::Float(n) => assert!(n > 1.7e12, "now() = {n}, expected > 1.7e12"),
             _ => panic!("now() should return a number"),
         }
     }
 
     #[test]
     fn monotonic_is_non_negative_and_increases() {
-        let a = match call("monotonic", &[], sp()).unwrap() {
-            Value::Float(n) => n,
+        let a = match call("monotonic", &[], sp()).unwrap().kind() {
+            ValueKind::Float(n) => n,
             _ => panic!("monotonic() should return a number"),
         };
         assert!(a >= 0.0, "monotonic() = {a}, expected >= 0");
@@ -102,8 +104,8 @@ mod tests {
             acc = acc.wrapping_add(i);
         }
         std::hint::black_box(acc);
-        let b = match call("monotonic", &[], sp()).unwrap() {
-            Value::Float(n) => n,
+        let b = match call("monotonic", &[], sp()).unwrap().kind() {
+            ValueKind::Float(n) => n,
             _ => panic!("monotonic() should return a number"),
         };
         assert!(b >= a, "monotonic must not go backwards: a={a}, b={b}");
@@ -112,20 +114,20 @@ mod tests {
     #[test]
     fn duration_helpers() {
         assert_eq!(
-            call("millis", &[Value::Float(250.0)], sp()).unwrap(),
-            Value::Float(250.0)
+            call("millis", &[Value::float(250.0)], sp()).unwrap(),
+            Value::float(250.0)
         );
         assert_eq!(
-            call("seconds", &[Value::Float(2.0)], sp()).unwrap(),
-            Value::Float(2000.0)
+            call("seconds", &[Value::float(2.0)], sp()).unwrap(),
+            Value::float(2000.0)
         );
         assert_eq!(
-            call("minutes", &[Value::Float(1.0)], sp()).unwrap(),
-            Value::Float(60_000.0)
+            call("minutes", &[Value::float(1.0)], sp()).unwrap(),
+            Value::float(60_000.0)
         );
         assert_eq!(
-            call("hours", &[Value::Float(1.0)], sp()).unwrap(),
-            Value::Float(3_600_000.0)
+            call("hours", &[Value::float(1.0)], sp()).unwrap(),
+            Value::float(3_600_000.0)
         );
     }
 

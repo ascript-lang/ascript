@@ -206,7 +206,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         _ => return Err(AsError::at(format!("color.{func}: unknown function"), span).into()),
     };
-    Ok(Value::Str(result.into()))
+    Ok(Value::str(result))
 }
 
 // ---------------------------------------------------------------------------
@@ -217,18 +217,18 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 mod tests {
     use super::*;
     use crate::span::Span;
-    use crate::value::Value;
+    use crate::value::{OwnedKind, Value};
 
     fn span() -> Span {
         Span::new(0, 0)
     }
 
     fn sv(s: &str) -> Value {
-        Value::Str(s.into())
+        Value::str(s)
     }
 
     fn nv(n: f64) -> Value {
-        Value::Float(n)
+        Value::float(n)
     }
 
     // ---- sgr helper (env-independent) ----
@@ -263,8 +263,8 @@ mod tests {
     // ---- call dispatch (assumes NO_COLOR is not set in the test environment) ----
 
     fn call_ok(func: &str, args: &[Value]) -> String {
-        match call(func, args, span()) {
-            Ok(Value::Str(s)) => s.to_string(),
+        match call(func, args, span()).map(Value::into_kind) {
+            Ok(OwnedKind::Str(s)) => s.to_string(),
             other => panic!("unexpected result for color.{func}: {other:?}"),
         }
     }

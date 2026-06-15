@@ -17,7 +17,7 @@ use genai::chat::{
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 
 /// A resolved tool ready for the loop: its name, genai `Tool` (with projected
 /// schema), the `input` shape (for arg validation), and the `execute` callable.
@@ -32,7 +32,7 @@ pub(crate) struct ResolvedTool {
 /// definition (missing `input`, `execute` not callable) is a Tier-2 panic.
 pub(crate) fn make_tool(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     let def = match args.first() {
-        Some(v @ Value::Object(_)) | Some(v @ Value::Instance(_)) => v.clone(),
+        Some(v) if matches!(v.kind(), ValueKind::Object(_) | ValueKind::Instance(_)) => v.clone(),
         _ => {
             return Err(AsError::at(
                 "ai.tool(def): expected an object with input + execute",
@@ -43,7 +43,7 @@ pub(crate) fn make_tool(interp: &Interp, args: &[Value], span: Span) -> Result<V
     };
     let input = super::request::get_field(&def, "input");
     let is_shape =
-        matches!(input, Value::Class(_)) || crate::stdlib::schema::schema_kind(&input).is_some();
+        matches!(input.kind(), ValueKind::Class(_)) || crate::stdlib::schema::schema_kind(&input).is_some();
     if !is_shape {
         return Err(AsError::at("ai.tool: 'input' must be a class or a std/schema", span).into());
     }
@@ -52,8 +52,8 @@ pub(crate) fn make_tool(interp: &Interp, args: &[Value], span: Span) -> Result<V
         return Err(AsError::at("ai.tool: 'execute' must be a function", span).into());
     }
     let mut fields = indexmap::IndexMap::new();
-    if let Value::Str(d) = super::request::get_field(&def, "description") {
-        fields.insert("description".to_string(), Value::Str(d));
+    if let OwnedKind::Str(d) = super::request::get_field(&def, "description").into_kind() {
+        fields.insert("description".to_string(), Value::str(d));
     }
     fields.insert("input".to_string(), input);
     fields.insert("execute".to_string(), execute);
@@ -62,13 +62,13 @@ pub(crate) fn make_tool(interp: &Interp, args: &[Value], span: Span) -> Result<V
 
 fn is_callable(v: &Value) -> bool {
     matches!(
-        v,
-        Value::Function(_)
-            | Value::Closure(_)
-            | Value::Builtin(_)
-            | Value::BoundMethod(_)
-            | Value::NativeMethod(_)
-            | Value::ClassMethod(_)
+        v.kind(),
+        ValueKind::Function(_)
+            | ValueKind::Closure(_)
+            | ValueKind::Builtin(_)
+            | ValueKind::BoundMethod(_)
+            | ValueKind::NativeMethod(_)
+            | ValueKind::ClassMethod(_)
     )
 }
 
@@ -80,14 +80,14 @@ pub(crate) fn resolve_tools(
     tools_opt: &Value,
     span: Span,
 ) -> Result<Vec<ResolvedTool>, Control> {
-    let entries = match tools_opt {
-        Value::Object(o) => o.entries(),
-        Value::Nil => return Ok(Vec::new()),
-        other => {
+    let entries = match tools_opt.kind() {
+        ValueKind::Object(o) => o.entries(),
+        ValueKind::Nil => return Ok(Vec::new()),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "ai.generate: 'tools' must be an object of named tools, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(tools_opt)
                 ),
                 span,
             )
@@ -96,24 +96,24 @@ pub(crate) fn resolve_tools(
     };
     let mut out = Vec::new();
     for (name, tool_val) in entries {
-        let n = match &tool_val {
-            Value::Native(nat) if nat.kind == crate::value::NativeKind::AiTool => nat,
-            other => {
+        let n = match tool_val.kind() {
+            ValueKind::Native(nat) if nat.kind == crate::value::NativeKind::AiTool => nat,
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "ai.generate: tool '{}' must be an ai.tool(...) handle, got {}",
                         name,
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&tool_val)
                     ),
                     span,
                 )
                 .into())
             }
         };
-        let input_shape = n.fields.get("input").cloned().unwrap_or(Value::Nil);
-        let execute = n.fields.get("execute").cloned().unwrap_or(Value::Nil);
-        let description = match n.fields.get("description") {
-            Some(Value::Str(s)) => Some(s.to_string()),
+        let input_shape = n.fields.get("input").cloned().unwrap_or(Value::nil());
+        let execute = n.fields.get("execute").cloned().unwrap_or(Value::nil());
+        let description = match n.fields.get("description").map(|v| v.kind()) {
+            Some(ValueKind::Str(s)) => Some(s.to_string()),
             _ => None,
         };
         let schema_json = interp.project_shape_json(&input_shape);
@@ -253,7 +253,7 @@ async fn run_one_tool(
     let ret = interp.await_if_future(ret).await?;
 
     let (value, err) = unpair(&ret);
-    if !matches!(err, Value::Nil) {
+    if !matches!(err.kind(), ValueKind::Nil) {
         let msg = crate::interp::error_message(&err);
         return Ok((
             format!("{{\"error\":{:?}}}", msg),
@@ -274,24 +274,24 @@ async fn validate_args(
     args: Value,
     span: Span,
 ) -> Result<Result<Value, Value>, Control> {
-    let pair = crate::interp::make_pair(args, Value::Nil);
+    let pair = crate::interp::make_pair(args, Value::nil());
     let decoded = interp.typed_decode(pair, shape, false, "", span).await?;
     Ok(unpair_result(&decoded))
 }
 
 fn unpair(v: &Value) -> (Value, Value) {
-    match v {
-        Value::Array(a) if a.borrow().len() == 2 => {
+    match v.kind() {
+        ValueKind::Array(a) if a.borrow().len() == 2 => {
             let b = a.borrow();
             (b[0].clone(), b[1].clone())
         }
-        other => (other.clone(), Value::Nil),
+        _ => (v.clone(), Value::nil()),
     }
 }
 
 fn unpair_result(v: &Value) -> Result<Value, Value> {
     let (value, err) = unpair(v);
-    if matches!(err, Value::Nil) {
+    if matches!(err.kind(), ValueKind::Nil) {
         Ok(value)
     } else {
         Err(err)
@@ -301,12 +301,12 @@ fn unpair_result(v: &Value) -> Result<Value, Value> {
 /// Build a per-turn `step` value `{tool, arguments, result|error}`.
 fn tool_step_value(name: &str, args: &serde_json::Value, result: &str, is_error: bool) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("tool".to_string(), Value::Str(name.into()));
+    m.insert("tool".to_string(), Value::str(name));
     m.insert("arguments".to_string(), crate::stdlib::json::to_ascript(args));
     if is_error {
-        m.insert("error".to_string(), Value::Str(result.into()));
+        m.insert("error".to_string(), Value::str(result));
     } else {
-        m.insert("result".to_string(), Value::Str(result.into()));
+        m.insert("result".to_string(), Value::str(result));
     }
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }

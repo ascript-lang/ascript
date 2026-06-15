@@ -66,7 +66,7 @@ pub enum Op {
     // ---- globals ----------------------------------------------------------
     /// `GET_GLOBAL(u16)` — push the global named by `consts[idx]` (a `Str`).
     /// The VM's globals are the bare builtins (`crate::interp::BUILTIN_NAMES`);
-    /// the result is the corresponding `Value::Builtin`.
+    /// the result is the corresponding `Value::builtin`.
     GetGlobal,
     /// `DEFINE_GLOBAL(u16 name, u8 mutable)` — pop TOS and bind it as the MODULE-SCOPE
     /// user-global named by `consts[name]` (a `Str`), creating or overwriting the entry
@@ -141,7 +141,7 @@ pub enum Op {
     /// `a > b` yields `[]`).
     RangeInclusive,
     /// `a b -- a b` (peek-only) — verify the top TWO stack values are both
-    /// `Value::Float`, otherwise raise the Tier-2 panic carried at this op's span.
+    /// `Value::float`, otherwise raise the Tier-2 panic carried at this op's span.
     /// Used to lower the for-range bounds check eagerly (before the loop) so the
     /// VM reports `for-range bounds must be numbers` at the START bound's span,
     /// byte-identically to the tree-walker's `Stmt::ForRange`. Leaves both operands
@@ -215,7 +215,7 @@ pub enum Op {
     /// `CALL_METHOD_SPREAD(u16 name)` — the dynamic-arity counterpart of
     /// [`Op::CallMethod`]: a method call `recv.<name>(...args)` whose argument list
     /// contains a `...spread`, so the argc cannot be known statically. The arguments
-    /// arrived as a single runtime `Value::Array` (built by the array/spread builder
+    /// arrived as a single runtime `Value::array_cell` (built by the array/spread builder
     /// ops) sitting on top of the receiver `[..., recv, argsArray]`. The op pops the
     /// args array, flattens its elements, pops the receiver, and dispatches EXACTLY
     /// like [`Op::CallMethod`] (the schema fluent-method hook, else the METHOD
@@ -236,7 +236,7 @@ pub enum Op {
     NewArray,
     /// `NEW_OBJECT(u16)` — pop `n` key/value pairs, push a new object.
     NewObject,
-    /// `NEW_MAP` — push a new, empty `Value::Map`. The `#{…}` map-literal builder
+    /// `NEW_MAP` — push a new, empty `Value::map_cell`. The `#{…}` map-literal builder
     /// starts here, then runs one [`Op::MapEntry`] per entry. (`#{}` is just this
     /// op.)
     NewMap,
@@ -252,7 +252,7 @@ pub enum Op {
     /// under-construction array `arr` (which sits just below `v` on the stack).
     /// Used for BOTH array-literal spreads `[...a]` AND call-argument spreads
     /// `f(...a)` (call args are built into a scratch array, then dispatched via
-    /// [`Op::CallSpread`]). `v` MUST be a `Value::Array`; its elements are appended
+    /// [`Op::CallSpread`]). `v` MUST be a `Value::array_cell`; its elements are appended
     /// (cloned) to `arr` in order. Any other value raises the SAME Tier-2 panic the
     /// tree-walker's `ExprKind::Array` spread arm raises — `can only spread an array
     /// into an array, got {type}` — anchored at this op's span (the spread operand
@@ -271,13 +271,13 @@ pub enum Op {
     /// below is always a compiler-produced builder array).
     AppendArray,
     /// `[obj, key, val] -- [obj]` — insert `key -> val` into the under-construction
-    /// object `obj` (which sits below the key/value). `key` is a `Value::Str`.
+    /// object `obj` (which sits below the key/value). `key` is a `Value::str`.
     /// Mirrors the tree-walker's `ExprKind::Object` `IndexMap::insert`: a later
     /// duplicate key OVERWRITES the value but KEEPS the first-seen position. Used by
     /// the object-literal builder for a non-spread `key: value` entry.
     AppendObject,
     /// `[obj, v] -- [obj]` — flatten the object spread operand `v` into the
-    /// under-construction object `obj`. `v` MUST be a `Value::Object`; each of its
+    /// under-construction object `obj`. `v` MUST be a `Value::object_cell`; each of its
     /// entries is inserted (later-wins, first-position, like [`Op::AppendObject`]).
     /// Any other value raises the SAME Tier-2 panic the tree-walker's
     /// `ExprKind::Object` spread arm raises — `can only spread an object into an
@@ -309,7 +309,7 @@ pub enum Op {
     /// IFACE: `DEFINE_INTERFACE(u16)` — build the `InterfaceDef` from
     /// `interface_protos[idx]` (with `def_env` = the VM's shared class/module env, into
     /// which it also self-registers for sibling/forward-ref `extends`), and PUSH the
-    /// resulting `Value::Interface`. The compiler emits the matching bind op
+    /// resulting `Value::interface`. The compiler emits the matching bind op
     /// (`DEFINE_GLOBAL` for a top-level interface, `SET_LOCAL` for a nested one) right
     /// after — exactly mirroring `Op::Class`.
     DefineInterface,
@@ -348,7 +348,7 @@ pub enum Op {
     /// `iterable -- iterable` — validate that TOS is async-iterable for a
     /// `for await` loop and leave it in place (to be stashed in a slot and driven
     /// lazily by [`Op::IterNext`]). Mirrors the tree-walker's `exec_for_await`
-    /// dispatch (`src/interp.rs`): a `Value::Generator` and a native stream handle
+    /// dispatch (`src/interp.rs`): a `Value::generator` and a native stream handle
     /// (WebSocket `recv` / SSE `next`, via `native_stream_method`) are accepted;
     /// ANY OTHER value raises the Tier-2 panic `value of type {t} is not
     /// async-iterable` (`t` = `interp::type_name`) anchored at this op's span (the
@@ -356,7 +356,7 @@ pub enum Op {
     GetIter,
     /// `iterable -- value done:bool` — drive one lazy `for await` step over the
     /// async-iterable on TOS, pushing the produced `value` (below) and a `done`
-    /// boolean (on top). Mirrors `exec_for_await` exactly: a `Value::Generator` is
+    /// boolean (on top). Mirrors `exec_for_await` exactly: a `Value::generator` is
     /// driven by an (awaiting) `resume(nil)` — `Some(v) -> v,false`, `None ->
     /// nil,true`; a native stream calls its `recv`/`next` method for a `[value,
     /// err]` pair — a non-nil `err` is the Tier-2 panic `for await stream error:
@@ -399,7 +399,7 @@ pub enum Op {
     /// `SET_LOCAL_CELL(u16)` — store TOS (popped) into the heap cell for local
     /// slot `n`. The cell-slot counterpart of `SET_LOCAL`.
     SetLocalCell,
-    /// `FRESH_CELL(u16)` — install a BRAND-NEW heap cell (`Rc<RefCell<Value::Nil>>`)
+    /// `FRESH_CELL(u16)` — install a BRAND-NEW heap cell (`Rc<RefCell<Value::nil()>>`)
     /// into the current frame's slot `n`, dropping the frame's strong ref to the
     /// PREVIOUS cell. Any closure that captured the previous cell keeps it alive (an
     /// `Rc` clone) with its own value, so that closure is unaffected. Emitted at the
@@ -413,43 +413,43 @@ pub enum Op {
     FreshCell,
 
     // ---- destructuring let (V10-T1) ---------------------------------------
-    /// `src -- src` (peek-only) — verify the value on TOS is a `Value::Array`,
+    /// `src -- src` (peek-only) — verify the value on TOS is a `Value::array_cell`,
     /// else raise the Tier-2 panic `cannot destructure a non-array value of type
     /// {t}` (`t` = `interp::type_name`) at this op's span (the RHS expression's
     /// trivia-trimmed code span). Mirrors the tree-walker's `Stmt::LetDestructure`
     /// type check, which validates ONCE before binding any name. Leaves the source
     /// in place so the surrounding lowering can store it into a temp slot.
     CheckArrayDestructure,
-    /// `src -- src` (peek-only) — verify the value on TOS is a `Value::Object` or
-    /// `Value::Instance`, else raise the Tier-2 panic `cannot destructure a
+    /// `src -- src` (peek-only) — verify the value on TOS is a `Value::object_cell` or
+    /// `Value::instance`, else raise the Tier-2 panic `cannot destructure a
     /// non-object value of type {t}` (`t` = `interp::type_name`) at this op's span.
     /// Mirrors the tree-walker's `Stmt::LetDestructureObject` type check. Leaves
     /// the source in place.
     CheckObjectDestructure,
-    /// `ARRAY_ELEM(u16 index)` — `src -- src[index]`. Pop a `Value::Array` and push
+    /// `ARRAY_ELEM(u16 index)` — `src -- src[index]`. Pop a `Value::array_cell` and push
     /// the element at `index`, or `nil` if the index is out of bounds (positions
     /// past the array's length bind nil, NOT an out-of-bounds panic — matching the
-    /// tree-walker's `items.get(i).cloned().unwrap_or(Value::Nil)`). The source has
+    /// tree-walker's `items.get(i).cloned().unwrap_or(Value::nil())`). The source has
     /// already been validated as an array by `CheckArrayDestructure`; a non-array
     /// here is a compiler bug surfaced as a Tier-2 panic.
     ArrayElem,
     /// `OBJECT_KEY(u16 const)` — `src -- src[key]` where `key = consts[const]` (a
-    /// `Str`). Pop a `Value::Object` or `Value::Instance` and push the value stored
+    /// `Str`). Pop a `Value::object_cell` or `Value::instance` and push the value stored
     /// under `key`, or `nil` if the key is absent. Mirrors the tree-walker's
     /// destructure `get` closure EXACTLY: an Object reads its map entry, an Instance
     /// reads its `fields` entry (it does NOT fall back to methods, unlike
     /// `read_member`). The source has already been validated by
     /// `CheckObjectDestructure`; any other value here is a compiler bug.
     ObjectKey,
-    /// `ARRAY_REST(u16 start)` — `src -- src[start..]`. Pop a `Value::Array` and
+    /// `ARRAY_REST(u16 start)` — `src -- src[start..]`. Pop a `Value::array_cell` and
     /// push a NEW array of its elements from index `start` to the end (the trailing
     /// collector `...rest`), matching the tree-walker's
     /// `items.iter().skip(names.len())`. An empty tail yields an empty array. The
     /// source has already been validated as an array; a non-array is a compiler bug.
     ArrayRest,
     /// `OBJECT_REST(u16 const)` — `src -- leftover` where `consts[const]` is a
-    /// `Value::Array` of `Str` keys that were explicitly bound. Pop a
-    /// `Value::Object`/`Value::Instance` and push a NEW object of its entries whose
+    /// `Value::array_cell` of `Str` keys that were explicitly bound. Pop a
+    /// `Value::object_cell`/`Value::instance` and push a NEW object of its entries whose
     /// key is NOT in the bound-keys set, preserving source order — matching the
     /// tree-walker's leftover-keys collection (`...rest` excludes the already-bound
     /// SOURCE keys). The source has already been validated; any other value is a
@@ -458,7 +458,7 @@ pub enum Op {
 
     // ---- match pattern tests (V10-T3/T4) ----------------------------------
     /// `MATCH_ARRAY(u16 len, u8 exact)` — `subject -- ok:bool`. Pop the subject and
-    /// push `true` iff it is a `Value::Array` whose length is exactly `len` (when
+    /// push `true` iff it is a `Value::array_cell` whose length is exactly `len` (when
     /// `exact == 1`) or at least `len` (when `exact == 0`, i.e. the pattern has a
     /// `...rest`). Any non-array subject pushes `false`. Mirrors the tree-walker's
     /// `Pattern::Array` length/type guard (a non-array or wrong-length array is a
@@ -466,7 +466,7 @@ pub enum Op {
     /// separately by reloading the subject temp and applying `ARRAY_ELEM`/`ARRAY_REST`.
     MatchArray,
     /// `MATCH_OBJECT` — `subject -- ok:bool`. Pop the subject and push `true` iff it
-    /// is a `Value::Object` or `Value::Instance`. Any other value pushes `false`.
+    /// is a `Value::object_cell` or `Value::instance`. Any other value pushes `false`.
     /// Mirrors the type guard at the head of the tree-walker's `Pattern::Object`.
     MatchObject,
     /// `MATCH_HAS_KEY(u16 const)` — `subject -- ok:bool`. Pop the subject (an
@@ -478,8 +478,8 @@ pub enum Op {
     MatchHasKey,
     /// `MATCH_RANGE(u8 flags)` — `subject lo hi step -- ok:bool` (step on top).
     /// `flags` bit0 = inclusive, bit1 = step PRESENT. Pop the four operands and push
-    /// `true` iff the subject is a `Value::Float` `n` matching the range, with `lo`
-    /// and `hi` `Value::Float`s. With step OMITTED (a `nil` placeholder) this is
+    /// `true` iff the subject is a `Value::float` `n` matching the range, with `lo`
+    /// and `hi` `Value::float`s. With step OMITTED (a `nil` placeholder) this is
     /// the plain in-bounds test `n >= lo && (n <= hi if inclusive else n < hi)`
     /// (bounds-inferred direction). With step PRESENT it is strided membership
     /// (spec §3.7) anchored at `lo`, via the SHARED `interp::resolve_step` (validates
@@ -576,7 +576,7 @@ pub enum Op {
     /// `CALL_NAMED(u16 names, u8 argc)` — ADT §3.2: a call carrying NAMED arguments
     /// (`Shape.Rect(w: 3.0, h: 4.0)`). The callee sits below its `argc` argument
     /// VALUES on the stack (`[..., callee, v0, .., v{argc-1}]`, in source order);
-    /// `consts[names]` is a `Value::Array` of length `argc` where each element is a
+    /// `consts[names]` is a `Value::array_cell` of length `argc` where each element is a
     /// `Str` field name for a named arg or `Nil` for a positional arg. The only
     /// valid callee is an enum-variant constructor: the op pops the values + callee
     /// and routes to `construct_variant_args(ev, values, names, span)` (byte-

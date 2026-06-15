@@ -1,7 +1,7 @@
 //! SRV Task 9 — Negative-space verification.
 //!
 //! The Server Tier / shared read-only heap (SRV) is **purely runtime + stdlib**:
-//! `shared.freeze` is an ordinary `std/shared` call, `Value::Shared` is a runtime
+//! `shared.freeze` is an ordinary `std/shared` call, `Value::shared` is a runtime
 //! value variant, and `server.serve({ workers })` is a stdlib call — NONE of them
 //! touch the grammar, the two parsers, the formatter, the tree-sitter grammar, or
 //! the `.aso` bytecode format. The `worker`/`fn` keywords SRV reuses already
@@ -15,7 +15,7 @@
 //!  - The tree-sitter grammar (`grammar.js`) has NO `shared`/`freeze`/`serve`/
 //!    `Shared` rule — SRV added no surface form.
 //!  - The generated `parser.c` ABI version is unchanged (no regen).
-//!  - A program that builds a `Value::Shared` compiles to `.aso` and round-trips —
+//!  - A program that builds a `Value::shared` compiles to `.aso` and round-trips —
 //!    proving freeze is a runtime object, not a serialized bytecode constant.
 
 use std::path::Path;
@@ -126,7 +126,7 @@ fn rust_frontends_and_formatter_have_no_srv_keyword_or_node() {
 }
 
 /// End-to-end proof that freeze is a RUNTIME object, not a bytecode constant: a
-/// program that constructs a `Value::Shared` compiles to `.aso` and runs identically
+/// program that constructs a `Value::shared` compiles to `.aso` and runs identically
 /// to direct execution. If freeze had leaked into the `.aso` constant pool, this
 /// would need a format-version bump (which `aso_format_version_is_unchanged_by_srv`
 /// forbids) and/or a serializer arm; instead the `.aso` carries only the *bytecode*

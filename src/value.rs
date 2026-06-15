@@ -729,11 +729,11 @@ pub enum MapKey {
 impl MapKey {
     /// Convert a value to a key, or `None` if its kind is not hashable.
     pub fn from_value(v: &Value) -> Option<MapKey> {
-        match v {
-            Value::Nil => Some(MapKey::Nil),
-            Value::Bool(b) => Some(MapKey::Bool(*b)),
-            Value::Int(i) => Some(MapKey::Int(*i)),
-            Value::Float(n) => {
+        match &v.0 {
+            ValueRepr::Nil => Some(MapKey::Nil),
+            ValueRepr::Bool(b) => Some(MapKey::Bool(*b)),
+            ValueRepr::Int(i) => Some(MapKey::Int(*i)),
+            ValueRepr::Float(n) => {
                 // NUM §3.3: an integral, finite, in-i64-range float folds to the same
                 // key as the equal `int` (so `map[1]` and `map[1.0]` collide). Every
                 // other float (fractional, ±inf, NaN) keeps its canonical-bits key —
@@ -760,11 +760,11 @@ impl MapKey {
                     Some(MapKey::Num(canon))
                 }
             }
-            Value::Str(s) => Some(MapKey::Str(s.clone())),
+            ValueRepr::Str(s) => Some(MapKey::Str(s.clone())),
             // VAL Task 2: `MapKey::Decimal` still folds BY VALUE (the inner
             // `Decimal`), so exact key equality is preserved — `**d` decodes the
             // boxed value out of the `Rc` (the box is invisible to keying).
-            Value::Decimal(d) => Some(MapKey::Decimal(**d)),
+            ValueRepr::Decimal(d) => Some(MapKey::Decimal(**d)),
             _ => None,
         }
     }
@@ -772,12 +772,12 @@ impl MapKey {
     /// Recover the value form of a key (for `keys`/`entries`/display/contracts).
     pub fn to_value(&self) -> Value {
         match self {
-            MapKey::Nil => Value::Nil,
-            MapKey::Bool(b) => Value::Bool(*b),
-            MapKey::Int(i) => Value::Int(*i),
-            MapKey::Num(bits) => Value::Float(f64::from_bits(*bits)),
-            MapKey::Str(s) => Value::Str(s.clone()),
-            MapKey::Decimal(d) => Value::Decimal(Rc::new(*d)),
+            MapKey::Nil => Value::nil(),
+            MapKey::Bool(b) => Value::bool_(*b),
+            MapKey::Int(i) => Value::int(*i),
+            MapKey::Num(bits) => Value::float(f64::from_bits(*bits)),
+            MapKey::Str(s) => Value::str(s.clone()),
+            MapKey::Decimal(d) => Value::decimal(*d),
         }
     }
 }
@@ -788,17 +788,17 @@ impl MapKey {
 /// `None` (mutation of an unfrozen container is allowed; non-containers are never
 /// frozen). Used by `check_not_frozen` at every mutation site on both engines.
 pub fn frozen_kind(v: &Value) -> Option<&'static str> {
-    match v {
-        Value::Array(a) if a.is_frozen() => Some("array"),
-        Value::Object(o) if o.is_frozen() => Some("object"),
-        Value::Map(m) if m.is_frozen() => Some("map"),
-        Value::Set(s) if s.is_frozen() => Some("set"),
-        Value::Instance(i) if i.borrow().frozen.get() => Some("instance"),
+    match &v.0 {
+        ValueRepr::Array(a) if a.is_frozen() => Some("array"),
+        ValueRepr::Object(o) if o.is_frozen() => Some("object"),
+        ValueRepr::Map(m) if m.is_frozen() => Some("map"),
+        ValueRepr::Set(s) if s.is_frozen() => Some("set"),
+        ValueRepr::Instance(i) if i.borrow().frozen.get() => Some("instance"),
         // SRV §3.8: a frozen `Shared` reports its underlying CONTAINER kind so the
         // shipped `cannot mutate a frozen {kind}` message applies (a frozen-shared
         // object → "object", array → "array", …). A frozen scalar / regex /
         // enum-variant is not a mutable container → `None`.
-        Value::Shared(n) => n.mutable_container_kind(),
+        ValueRepr::Shared(n) => n.mutable_container_kind(),
         _ => None,
     }
 }
@@ -807,12 +807,12 @@ pub fn frozen_kind(v: &Value) -> Option<&'static str> {
 /// for any non-container value (JS `Object.freeze` ergonomics). Idempotent /
 /// one-way (no unfreeze). The caller returns `v` unchanged for chaining.
 pub fn freeze_value(v: &Value) {
-    match v {
-        Value::Array(a) => a.freeze(),
-        Value::Object(o) => o.freeze(),
-        Value::Map(m) => m.freeze(),
-        Value::Set(s) => s.freeze(),
-        Value::Instance(i) => i.borrow().frozen.set(true),
+    match &v.0 {
+        ValueRepr::Array(a) => a.freeze(),
+        ValueRepr::Object(o) => o.freeze(),
+        ValueRepr::Map(m) => m.freeze(),
+        ValueRepr::Set(s) => s.freeze(),
+        ValueRepr::Instance(i) => i.borrow().frozen.set(true),
         _ => {}
     }
 }
@@ -820,14 +820,14 @@ pub fn freeze_value(v: &Value) {
 /// `object.isFrozen` (SP2 §4): whether `v` is a frozen container. `false` for any
 /// non-container value.
 pub fn is_frozen_value(v: &Value) -> bool {
-    match v {
-        Value::Array(a) => a.is_frozen(),
-        Value::Object(o) => o.is_frozen(),
-        Value::Map(m) => m.is_frozen(),
-        Value::Set(s) => s.is_frozen(),
-        Value::Instance(i) => i.borrow().frozen.get(),
+    match &v.0 {
+        ValueRepr::Array(a) => a.is_frozen(),
+        ValueRepr::Object(o) => o.is_frozen(),
+        ValueRepr::Map(m) => m.is_frozen(),
+        ValueRepr::Set(s) => s.is_frozen(),
+        ValueRepr::Instance(i) => i.borrow().frozen.get(),
         // SRV §3.5: a `Shared` is frozen by construction.
-        Value::Shared(_) => true,
+        ValueRepr::Shared(_) => true,
         _ => false,
     }
 }
@@ -1454,7 +1454,7 @@ pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Clas
 /// (number, string, object, nil, enum, …) is `false`, never an error. Single source
 /// of truth shared by the tree-walker (`apply_binop`) and the VM (`Op::InstanceOf`).
 pub(crate) fn is_instance_of(v: &Value, class: &Rc<Class>) -> bool {
-    let Value::Instance(inst) = v else {
+    let ValueRepr::Instance(inst) = &v.0 else {
         return false;
     };
     let target = Rc::as_ptr(class);
@@ -1768,8 +1768,27 @@ pub struct ClassMethodData {
     pub name: Rc<str>,
 }
 
+/// NANB §4.2 / Task 1.7 — the SEALED runtime value. `Value` is a newtype over a
+/// MODULE-PRIVATE [`ValueRepr`] enum: nothing outside `src/value.rs` can name a
+/// concrete variant (`ValueRepr::Int` etc.), so the ONLY way to construct or
+/// inspect a `Value` is via the total constructors + the [`Value::kind`] /
+/// [`Value::into_kind`] views. The wrap is a plain newtype — layout-identical to
+/// the inner enum (`value_size_is_documented` pins the size unchanged) — so the
+/// seal is zero-cost; Phase 2 swaps `ValueRepr` for the 16-byte NaN-boxed layout
+/// behind this exact boundary with ZERO call-site churn.
+///
+/// The repr is genuinely sealed: a concrete variant cannot be named from outside
+/// this module. The following does not compile — `ValueRepr` is module-private and
+/// `Value` has no public `Int` variant, only the `Value::int` constructor:
+///
+/// ```compile_fail
+/// let _ = ascript::value::Value::Int(5);
+/// ```
 #[derive(Clone)]
-pub enum Value {
+pub struct Value(ValueRepr);
+
+#[derive(Clone)]
+enum ValueRepr {
     Nil,
     Bool(bool),
     /// A 64-bit signed integer (NUM §3.1). The exact-arithmetic default subtype of
@@ -1862,6 +1881,91 @@ pub enum Value {
     Shared(Arc<SharedNode>),
 }
 
+/// NANB §3.1.2 — the string-payload seam. `AStr` is the type name every site that
+/// constructs/holds a string payload out of a `Value` refers to, so the underlying
+/// representation can change behind the seam (Phase 1: `Rc<str>`; Phase 2(b):
+/// `ThinStr`) with ZERO call-site churn. `MapKey::Str` tracks the same alias.
+pub type AStr = Rc<str>;
+
+/// NANB §4.2 — the borrowed view of a `Value`'s logical kind. The variant set
+/// mirrors today's [`Value`] enum 1:1 so a match-site migration is textual:
+/// `match v { Value::X(p) => … }` becomes `match v.kind() { ValueKind::X(p) => … }`
+/// with bodies unchanged modulo one `&`/`*`. **Scalars are by-value (`Copy`);
+/// handles are borrowed** (`&'a`) — no refcount traffic crossing the seam. Once the
+/// repr is sealed (Task 1.7), `kind()` is the only window onto the storage, so the
+/// repr is free to change behind it. `Debug` is hand-written (handles aren't
+/// uniformly `Debug`) and mirrors [`Value`]'s own `Debug` shape.
+pub enum ValueKind<'a> {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Decimal(&'a Rc<Decimal>),
+    Str(&'a AStr),
+    Builtin(&'a AStr),
+    Function(&'a Rc<Function>),
+    Closure(&'a Cc<crate::vm::value_ext::Closure>),
+    Array(&'a Cc<ArrayCell>),
+    Object(&'a Cc<ObjectCell>),
+    Map(&'a Cc<MapCell>),
+    Set(&'a Cc<SetCell>),
+    Bytes(&'a Rc<RefCell<Vec<u8>>>),
+    #[cfg(feature = "data")]
+    Regex(&'a Rc<RegexHandle>),
+    Native(&'a Rc<NativeObject>),
+    NativeMethod(&'a Rc<NativeMethod>),
+    Enum(&'a Rc<EnumDef>),
+    EnumVariant(&'a Rc<EnumVariant>),
+    Class(&'a Rc<Class>),
+    Interface(&'a Rc<InterfaceDef>),
+    Instance(&'a Cc<RefCell<Instance>>),
+    BoundMethod(&'a Rc<BoundMethod>),
+    Super(&'a Rc<SuperRef>),
+    Future(&'a crate::task::SharedFuture),
+    Generator(&'a Rc<crate::coro::GeneratorHandle>),
+    GeneratorMethod(&'a Rc<GeneratorMethodData>),
+    ClassMethod(&'a Rc<ClassMethodData>),
+    Shared(&'a Arc<SharedNode>),
+}
+
+/// NANB §4.2 — the by-value mirror of [`ValueKind`] for CONSUMING matches: payloads
+/// are MOVED out of the `Value` (not borrowed), so the VM's consuming match sites
+/// avoid a clone. Produced by [`Value::into_kind`]. Scalars are by-value `Copy`;
+/// handles are owned (`Rc`/`Cc`/`Arc`) — the move transfers the same allocation, no
+/// refcount change (proved by `owned_kind_moves_without_refcount_change`).
+pub enum OwnedKind {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Decimal(Rc<Decimal>),
+    Str(AStr),
+    Builtin(AStr),
+    Function(Rc<Function>),
+    Closure(Cc<crate::vm::value_ext::Closure>),
+    Array(Cc<ArrayCell>),
+    Object(Cc<ObjectCell>),
+    Map(Cc<MapCell>),
+    Set(Cc<SetCell>),
+    Bytes(Rc<RefCell<Vec<u8>>>),
+    #[cfg(feature = "data")]
+    Regex(Rc<RegexHandle>),
+    Native(Rc<NativeObject>),
+    NativeMethod(Rc<NativeMethod>),
+    Enum(Rc<EnumDef>),
+    EnumVariant(Rc<EnumVariant>),
+    Class(Rc<Class>),
+    Interface(Rc<InterfaceDef>),
+    Instance(Cc<RefCell<Instance>>),
+    BoundMethod(Rc<BoundMethod>),
+    Super(Rc<SuperRef>),
+    Future(crate::task::SharedFuture),
+    Generator(Rc<crate::coro::GeneratorHandle>),
+    GeneratorMethod(Rc<GeneratorMethodData>),
+    ClassMethod(Rc<ClassMethodData>),
+    Shared(Arc<SharedNode>),
+}
+
 // VAL Task 0 / spec §6 — the `!Send`/`!Sync` lock, module-level (compile-time)
 // next to the `Value` definition so it fails the build, not just a test run, if a
 // future edit (VAL's own NaN-box, SRV's `Arc` leaf, or any variant-adder) ever
@@ -1879,15 +1983,15 @@ impl Value {
     /// empty string `""`. EVERYTHING else is truthy — including non-empty strings
     /// and ALL collections/objects/instances even when empty.
     pub fn is_truthy(&self) -> bool {
-        match self {
-            Value::Nil => false,
-            Value::Bool(b) => *b,
-            Value::Int(i) => *i != 0,
+        match &self.0 {
+            ValueRepr::Nil => false,
+            ValueRepr::Bool(b) => *b,
+            ValueRepr::Int(i) => *i != 0,
             // `0.0 == -0.0` is `true`, so the `!= 0.0` test covers both signed zeros;
             // NaN is excluded explicitly (`!is_nan()`) → `0.0`/`-0.0`/`NaN` all falsy.
-            Value::Float(f) => *f != 0.0 && !f.is_nan(),
-            Value::Decimal(d) => **d != Decimal::ZERO,
-            Value::Str(s) => !s.is_empty(),
+            ValueRepr::Float(f) => *f != 0.0 && !f.is_nan(),
+            ValueRepr::Decimal(d) => **d != Decimal::ZERO,
+            ValueRepr::Str(s) => !s.is_empty(),
             _ => true,
         }
     }
@@ -1897,22 +2001,22 @@ impl Value {
     /// non-number. This is the single helper every "accepts a number" site should
     /// route through so `Int` is first-class everywhere a number was accepted.
     pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Value::Int(i) => Some(*i as f64),
-            Value::Float(f) => Some(*f),
+        match &self.0 {
+            ValueRepr::Int(i) => Some(*i as f64),
+            ValueRepr::Float(f) => Some(*f),
             _ => None,
         }
     }
 
     /// `true` for any number kind (`Int` or `Float`).
     pub fn is_number(&self) -> bool {
-        matches!(self, Value::Int(_) | Value::Float(_))
+        matches!(&self.0, ValueRepr::Int(_) | ValueRepr::Float(_))
     }
 
     /// `true` only for `Value::Int`. Used by range lowering to decide whether a
     /// range yields an `Int` sequence (both bounds + step `Int`) or a `Float` one.
     pub fn is_int_value(&self) -> bool {
-        matches!(self, Value::Int(_))
+        matches!(&self.0, ValueRepr::Int(_))
     }
 
     /// NUM: exact integer extraction for integral contexts (indexing, range bounds,
@@ -1921,9 +2025,9 @@ impl Value {
     /// out-of-range `Float` yields `None` (callers turn that into a Tier-2 panic
     /// such as `array index must be an int, got float`). Non-numbers yield `None`.
     pub fn as_int_exact(&self) -> Option<i64> {
-        match self {
-            Value::Int(i) => Some(*i),
-            Value::Float(f) => {
+        match &self.0 {
+            ValueRepr::Int(i) => Some(*i),
+            ValueRepr::Float(f) => {
                 if f.is_finite()
                     && f.fract() == 0.0
                     && *f >= i64::MIN as f64
@@ -1952,27 +2056,356 @@ impl Value {
     /// Construct an `Int` value (NUM's exact-integer subtype).
     #[inline]
     pub fn int(n: i64) -> Value {
-        Value::Int(n)
+        Value(ValueRepr::Int(n))
     }
 
     /// Construct a `Float` value (NUM's IEEE-754 subtype).
     #[inline]
     pub fn float(n: f64) -> Value {
-        Value::Float(n)
+        Value(ValueRepr::Float(n))
     }
 
     /// Construct an `Object` value from an insertion-ordered key map.
     #[inline]
     pub fn object(map: IndexMap<String, Value>) -> Value {
-        Value::Object(ObjectCell::new(map))
+        Value(ValueRepr::Object(ObjectCell::new(map)))
+    }
+
+    // ── NANB Task 1.1: the API seam ──────────────────────────────────────────
+    // `kind()`/`into_kind()` are the borrowed/consuming windows onto the repr;
+    // the constructors below are TOTAL coverage of every variant. Over today's
+    // enum each is a trivial one-line re-projection (`#[inline(always)]`), so
+    // LLVM compiles `match v.kind()` to the same jump table as `match v`. Once
+    // the repr is sealed (Task 1.7), this is the ONLY way consumers touch it.
+
+    /// NANB §4.2 — borrowed view of this value's logical kind. Scalars by value,
+    /// handles by `&`. Total over every [`Value`] variant.
+    #[inline(always)]
+    pub fn kind(&self) -> ValueKind<'_> {
+        match &self.0 {
+            ValueRepr::Nil => ValueKind::Nil,
+            ValueRepr::Bool(b) => ValueKind::Bool(*b),
+            ValueRepr::Int(i) => ValueKind::Int(*i),
+            ValueRepr::Float(f) => ValueKind::Float(*f),
+            ValueRepr::Decimal(d) => ValueKind::Decimal(d),
+            ValueRepr::Str(s) => ValueKind::Str(s),
+            ValueRepr::Builtin(s) => ValueKind::Builtin(s),
+            ValueRepr::Function(f) => ValueKind::Function(f),
+            ValueRepr::Closure(c) => ValueKind::Closure(c),
+            ValueRepr::Array(a) => ValueKind::Array(a),
+            ValueRepr::Object(o) => ValueKind::Object(o),
+            ValueRepr::Map(m) => ValueKind::Map(m),
+            ValueRepr::Set(s) => ValueKind::Set(s),
+            ValueRepr::Bytes(b) => ValueKind::Bytes(b),
+            #[cfg(feature = "data")]
+            ValueRepr::Regex(r) => ValueKind::Regex(r),
+            ValueRepr::Native(n) => ValueKind::Native(n),
+            ValueRepr::NativeMethod(m) => ValueKind::NativeMethod(m),
+            ValueRepr::Enum(e) => ValueKind::Enum(e),
+            ValueRepr::EnumVariant(v) => ValueKind::EnumVariant(v),
+            ValueRepr::Class(c) => ValueKind::Class(c),
+            ValueRepr::Interface(i) => ValueKind::Interface(i),
+            ValueRepr::Instance(i) => ValueKind::Instance(i),
+            ValueRepr::BoundMethod(b) => ValueKind::BoundMethod(b),
+            ValueRepr::Super(s) => ValueKind::Super(s),
+            ValueRepr::Future(f) => ValueKind::Future(f),
+            ValueRepr::Generator(g) => ValueKind::Generator(g),
+            ValueRepr::GeneratorMethod(g) => ValueKind::GeneratorMethod(g),
+            ValueRepr::ClassMethod(c) => ValueKind::ClassMethod(c),
+            ValueRepr::Shared(s) => ValueKind::Shared(s),
+        }
+    }
+
+    /// NANB §4.2 — consuming deconstruction. Moves each payload out (no clone)
+    /// for the VM's owning matches. Total over every [`Value`] variant.
+    #[inline(always)]
+    pub fn into_kind(self) -> OwnedKind {
+        match self.0 {
+            ValueRepr::Nil => OwnedKind::Nil,
+            ValueRepr::Bool(b) => OwnedKind::Bool(b),
+            ValueRepr::Int(i) => OwnedKind::Int(i),
+            ValueRepr::Float(f) => OwnedKind::Float(f),
+            ValueRepr::Decimal(d) => OwnedKind::Decimal(d),
+            ValueRepr::Str(s) => OwnedKind::Str(s),
+            ValueRepr::Builtin(s) => OwnedKind::Builtin(s),
+            ValueRepr::Function(f) => OwnedKind::Function(f),
+            ValueRepr::Closure(c) => OwnedKind::Closure(c),
+            ValueRepr::Array(a) => OwnedKind::Array(a),
+            ValueRepr::Object(o) => OwnedKind::Object(o),
+            ValueRepr::Map(m) => OwnedKind::Map(m),
+            ValueRepr::Set(s) => OwnedKind::Set(s),
+            ValueRepr::Bytes(b) => OwnedKind::Bytes(b),
+            #[cfg(feature = "data")]
+            ValueRepr::Regex(r) => OwnedKind::Regex(r),
+            ValueRepr::Native(n) => OwnedKind::Native(n),
+            ValueRepr::NativeMethod(m) => OwnedKind::NativeMethod(m),
+            ValueRepr::Enum(e) => OwnedKind::Enum(e),
+            ValueRepr::EnumVariant(v) => OwnedKind::EnumVariant(v),
+            ValueRepr::Class(c) => OwnedKind::Class(c),
+            ValueRepr::Interface(i) => OwnedKind::Interface(i),
+            ValueRepr::Instance(i) => OwnedKind::Instance(i),
+            ValueRepr::BoundMethod(b) => OwnedKind::BoundMethod(b),
+            ValueRepr::Super(s) => OwnedKind::Super(s),
+            ValueRepr::Future(f) => OwnedKind::Future(f),
+            ValueRepr::Generator(g) => OwnedKind::Generator(g),
+            ValueRepr::GeneratorMethod(g) => OwnedKind::GeneratorMethod(g),
+            ValueRepr::ClassMethod(c) => OwnedKind::ClassMethod(c),
+            ValueRepr::Shared(s) => OwnedKind::Shared(s),
+        }
+    }
+
+    // ── Total constructor coverage (NANB §4.2; extends the VAL Task-0 set) ────
+    // Each is a one-line wrap so call sites never name a `Value::` variant. The
+    // scalar `int`/`float`/`object` helpers already live above.
+
+    /// Construct the unit `nil` value.
+    #[inline]
+    pub fn nil() -> Value {
+        Value(ValueRepr::Nil)
+    }
+
+    /// Construct a `bool` value (named `bool_` to avoid the `bool` keyword).
+    #[inline]
+    pub fn bool_(b: bool) -> Value {
+        Value(ValueRepr::Bool(b))
+    }
+
+    /// Construct a `Decimal` value (NUM's exact subtype, boxed behind `Rc`).
+    #[inline]
+    pub fn decimal(d: Decimal) -> Value {
+        Value(ValueRepr::Decimal(Rc::new(d)))
+    }
+
+    /// Construct a `Decimal` value from an already-shared `Rc<Decimal>` handle
+    /// (NANB Task 1.7 — the handle-taking sibling of [`Value::decimal`]; preserves
+    /// `Rc` sharing instead of re-allocating).
+    #[inline]
+    pub fn decimal_rc(d: Rc<Decimal>) -> Value {
+        Value(ValueRepr::Decimal(d))
+    }
+
+    /// Construct a `Str` value from anything convertible into the [`AStr`] seam
+    /// (e.g. `&str`, `String`, `Rc<str>`).
+    #[inline]
+    pub fn str(s: impl Into<AStr>) -> Value {
+        Value(ValueRepr::Str(s.into()))
+    }
+
+    /// Construct a `Builtin` value (a named native function dispatched by name).
+    #[inline]
+    pub fn builtin(name: impl Into<AStr>) -> Value {
+        Value(ValueRepr::Builtin(name.into()))
+    }
+
+    /// Construct a `Function` value from a prepared `Rc<Function>`.
+    #[inline]
+    pub fn function(f: Rc<Function>) -> Value {
+        Value(ValueRepr::Function(f))
+    }
+
+    /// Construct a `Closure` value from a prepared VM closure cell.
+    #[inline]
+    pub fn closure(c: Cc<crate::vm::value_ext::Closure>) -> Value {
+        Value(ValueRepr::Closure(c))
+    }
+
+    /// Construct an `Array` value from a `Vec<Value>` (fresh, unfrozen cell).
+    #[inline]
+    pub fn array(vec: Vec<Value>) -> Value {
+        Value(ValueRepr::Array(ArrayCell::new(vec)))
+    }
+
+    /// Construct an `Array` value from an already-built array cell (NANB Task 1.7 —
+    /// the handle-taking sibling of [`Value::array`]; preserves the cell handle,
+    /// e.g. for `.value` ADT reflection or rewrapping a borrowed cell).
+    #[inline]
+    pub fn array_cell(cell: Cc<ArrayCell>) -> Value {
+        Value(ValueRepr::Array(cell))
+    }
+
+    /// Construct a `Map` value from an insertion-ordered key→value map.
+    #[inline]
+    pub fn map(map: IndexMap<MapKey, Value>) -> Value {
+        Value(ValueRepr::Map(MapCell::new(map)))
+    }
+
+    /// Construct a `Map` value from an already-built map cell (NANB Task 1.7).
+    #[inline]
+    pub fn map_cell(cell: Cc<MapCell>) -> Value {
+        Value(ValueRepr::Map(cell))
+    }
+
+    /// Construct a `Set` value from an insertion-ordered key set.
+    #[inline]
+    pub fn set(set: IndexSet<MapKey>) -> Value {
+        Value(ValueRepr::Set(SetCell::new(set)))
+    }
+
+    /// Construct a `Set` value from an already-built set cell (NANB Task 1.7).
+    #[inline]
+    pub fn set_cell(cell: Cc<SetCell>) -> Value {
+        Value(ValueRepr::Set(cell))
+    }
+
+    /// Construct an `Object` value from an already-built object cell (NANB Task 1.7 —
+    /// the handle-taking sibling of [`Value::object`]; preserves the cell handle).
+    #[inline]
+    pub fn object_cell(cell: Cc<ObjectCell>) -> Value {
+        Value(ValueRepr::Object(cell))
+    }
+
+    /// Construct a `Bytes` value from a mutable byte buffer.
+    #[inline]
+    pub fn bytes(b: Vec<u8>) -> Value {
+        Value(ValueRepr::Bytes(Rc::new(RefCell::new(b))))
+    }
+
+    /// Construct a `Bytes` value from an already-shared buffer handle (NANB Task 1.7 —
+    /// the handle-taking sibling of [`Value::bytes`]; preserves `Rc` aliasing so two
+    /// `Value`s can observe the same mutable buffer).
+    #[inline]
+    pub fn bytes_rc(b: Rc<RefCell<Vec<u8>>>) -> Value {
+        Value(ValueRepr::Bytes(b))
+    }
+
+    /// Construct a `Regex` value from a prepared handle.
+    #[cfg(feature = "data")]
+    #[inline]
+    pub fn regex(r: Rc<RegexHandle>) -> Value {
+        Value(ValueRepr::Regex(r))
+    }
+
+    /// Construct a `Native` resource-handle value.
+    #[inline]
+    pub fn native(n: Rc<NativeObject>) -> Value {
+        Value(ValueRepr::Native(n))
+    }
+
+    /// Construct a `NativeMethod` value (a method bound to a native handle).
+    #[inline]
+    pub fn native_method(m: Rc<NativeMethod>) -> Value {
+        Value(ValueRepr::NativeMethod(m))
+    }
+
+    /// Construct an `Enum` value (an enum-definition descriptor).
+    #[inline]
+    pub fn enum_(e: Rc<EnumDef>) -> Value {
+        Value(ValueRepr::Enum(e))
+    }
+
+    /// Construct an `EnumVariant` value.
+    #[inline]
+    pub fn enum_variant(v: Rc<EnumVariant>) -> Value {
+        Value(ValueRepr::EnumVariant(v))
+    }
+
+    /// Construct a `Class` value.
+    #[inline]
+    pub fn class(c: Rc<Class>) -> Value {
+        Value(ValueRepr::Class(c))
+    }
+
+    /// Construct an `Interface` value (a structural conformance descriptor).
+    #[inline]
+    pub fn interface(i: Rc<InterfaceDef>) -> Value {
+        Value(ValueRepr::Interface(i))
+    }
+
+    /// Construct an `Instance` value from a prepared instance cell.
+    #[inline]
+    pub fn instance(i: Cc<RefCell<Instance>>) -> Value {
+        Value(ValueRepr::Instance(i))
+    }
+
+    /// Construct a `BoundMethod` value.
+    #[inline]
+    pub fn bound_method(b: Rc<BoundMethod>) -> Value {
+        Value(ValueRepr::BoundMethod(b))
+    }
+
+    /// Construct a `Super` reference value.
+    #[inline]
+    pub fn super_(s: Rc<SuperRef>) -> Value {
+        Value(ValueRepr::Super(s))
+    }
+
+    /// Construct a `Future` value from a shared task handle.
+    #[inline]
+    pub fn future(f: crate::task::SharedFuture) -> Value {
+        Value(ValueRepr::Future(f))
+    }
+
+    /// Construct a `Generator` value from a generator handle.
+    #[inline]
+    pub fn generator(g: Rc<crate::coro::GeneratorHandle>) -> Value {
+        Value(ValueRepr::Generator(g))
+    }
+
+    /// Construct a `GeneratorMethod` value (a method bound to a generator handle).
+    #[inline]
+    pub fn generator_method(g: Rc<GeneratorMethodData>) -> Value {
+        Value(ValueRepr::GeneratorMethod(g))
+    }
+
+    /// Construct a `ClassMethod` value (a static/`from` method bound to its class).
+    #[inline]
+    pub fn class_method(c: Rc<ClassMethodData>) -> Value {
+        Value(ValueRepr::ClassMethod(c))
+    }
+
+    /// Construct a `Shared` value (SRV §3.2 — the frozen `Arc`-backed leaf).
+    #[inline]
+    pub fn shared(arc: Arc<SharedNode>) -> Value {
+        Value(ValueRepr::Shared(arc))
+    }
+
+    // ── Borrowed extractors the migration needs ──────────────────────────────
+
+    /// Borrow the underlying `&str` of a `Str` value; `None` otherwise.
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match &self.0 {
+            ValueRepr::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Borrow the `Array` cell handle; `None` otherwise.
+    #[inline]
+    pub fn as_array(&self) -> Option<&Cc<ArrayCell>> {
+        match &self.0 {
+            ValueRepr::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Borrow the `Bytes` cell handle; `None` otherwise.
+    #[inline]
+    pub fn as_bytes(&self) -> Option<&Rc<RefCell<Vec<u8>>>> {
+        match &self.0 {
+            ValueRepr::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Test-only probe: the `Rc<str>` strong count of a `Str` value, used by
+    /// `owned_kind_moves_without_refcount_change` to prove `into_kind` moves
+    /// (rather than clones) the string payload. `None` for every non-`Str`.
+    #[cfg(test)]
+    #[inline]
+    pub fn str_strong_count(&self) -> Option<usize> {
+        match &self.0 {
+            ValueRepr::Str(s) => Some(Rc::strong_count(s)),
+            _ => None,
+        }
     }
 
     /// Extract the `i64` of an `Int` value EXACTLY — `None` for every other kind
     /// (including `Float`; use `as_int_exact` for the integral-float coercion).
     #[inline]
     pub fn as_int(&self) -> Option<i64> {
-        match self {
-            Value::Int(i) => Some(*i),
+        match &self.0 {
+            ValueRepr::Int(i) => Some(*i),
             _ => None,
         }
     }
@@ -1981,8 +2414,8 @@ impl Value {
     /// (including `Int`; use `as_f64` for the number-widening view).
     #[inline]
     pub fn as_float(&self) -> Option<f64> {
-        match self {
-            Value::Float(f) => Some(*f),
+        match &self.0 {
+            ValueRepr::Float(f) => Some(*f),
             _ => None,
         }
     }
@@ -1990,8 +2423,8 @@ impl Value {
     /// View the underlying `ObjectCell` of an `Object` value, `None` otherwise.
     #[inline]
     pub fn as_object(&self) -> Option<Cc<ObjectCell>> {
-        match self {
-            Value::Object(o) => Some(o.clone()),
+        match &self.0 {
+            ValueRepr::Object(o) => Some(o.clone()),
             _ => None,
         }
     }
@@ -2063,44 +2496,44 @@ pub(crate) fn int_cmp_float(i: i64, f: f64) -> Option<std::cmp::Ordering> {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
+        match (&self.0, &other.0) {
+            (ValueRepr::Nil, ValueRepr::Nil) => true,
+            (ValueRepr::Bool(a), ValueRepr::Bool(b)) => a == b,
+            (ValueRepr::Int(a), ValueRepr::Int(b)) => a == b,
+            (ValueRepr::Float(a), ValueRepr::Float(b)) => a == b,
             // Cross-subtype numeric equality is EXACT (NUM §3.3): an `int` equals a
             // `float` iff they are mathematically equal — no lossy `i as f64` cast
             // (which would make `2**53+1 == float(2**53)`). Symmetric.
-            (Value::Int(i), Value::Float(f)) | (Value::Float(f), Value::Int(i)) => {
+            (ValueRepr::Int(i), ValueRepr::Float(f)) | (ValueRepr::Float(f), ValueRepr::Int(i)) => {
                 int_eq_float(*i, *f)
             }
             // Decimal: same-type value equality by the Decimal's own PartialEq.
             // Cross-type Number↔Decimal equality is handled in the evaluator's
             // Eq/Ne path, not here.
-            (Value::Decimal(a), Value::Decimal(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
+            (ValueRepr::Decimal(a), ValueRepr::Decimal(b)) => a == b,
+            (ValueRepr::Str(a), ValueRepr::Str(b)) => a == b,
             // Built-ins are equal iff they name the same function.
-            (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            (ValueRepr::Builtin(a), ValueRepr::Builtin(b)) => a == b,
             // Functions compare by identity.
-            (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
-            (Value::Closure(a), Value::Closure(b)) => crate::gc::cc_ptr_eq(a, b),
-            (Value::Array(a), Value::Array(b)) => crate::gc::cc_ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => crate::gc::cc_ptr_eq(a, b),
-            (Value::Map(a), Value::Map(b)) => crate::gc::cc_ptr_eq(a, b),
-            (Value::Set(a), Value::Set(b)) => crate::gc::cc_ptr_eq(a, b),
-            (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Function(a), ValueRepr::Function(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Closure(a), ValueRepr::Closure(b)) => crate::gc::cc_ptr_eq(a, b),
+            (ValueRepr::Array(a), ValueRepr::Array(b)) => crate::gc::cc_ptr_eq(a, b),
+            (ValueRepr::Object(a), ValueRepr::Object(b)) => crate::gc::cc_ptr_eq(a, b),
+            (ValueRepr::Map(a), ValueRepr::Map(b)) => crate::gc::cc_ptr_eq(a, b),
+            (ValueRepr::Set(a), ValueRepr::Set(b)) => crate::gc::cc_ptr_eq(a, b),
+            (ValueRepr::Bytes(a), ValueRepr::Bytes(b)) => Rc::ptr_eq(a, b),
             #[cfg(feature = "data")]
-            (Value::Regex(a), Value::Regex(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Regex(a), ValueRepr::Regex(b)) => Rc::ptr_eq(a, b),
             // Native handles and bound native methods compare by identity.
-            (Value::Native(a), Value::Native(b)) => Rc::ptr_eq(a, b),
-            (Value::NativeMethod(a), Value::NativeMethod(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Native(a), ValueRepr::Native(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::NativeMethod(a), ValueRepr::NativeMethod(b)) => Rc::ptr_eq(a, b),
             // Enums and their (interned) variants compare by identity.
-            (Value::Enum(a), Value::Enum(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Enum(a), ValueRepr::Enum(b)) => Rc::ptr_eq(a, b),
             // ADT §5.2: unit / constructor variants compare by interned IDENTITY
             // (byte-identical to pre-ADT). A CONSTRUCTED payload variant compares
             // STRUCTURALLY: same enum, same variant name, payloads equal element-wise
             // (positional) or key-wise (named, via the existing Object `PartialEq`).
-            (Value::EnumVariant(a), Value::EnumVariant(b)) => {
+            (ValueRepr::EnumVariant(a), ValueRepr::EnumVariant(b)) => {
                 if Rc::ptr_eq(a, b) {
                     return true;
                 }
@@ -2128,20 +2561,20 @@ impl PartialEq for Value {
                 }
             }
             // Classes/instances/bound-methods/super compare by identity.
-            (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Class(a), ValueRepr::Class(b)) => Rc::ptr_eq(a, b),
             // Interfaces compare by identity (immutable descriptors, IFACE §4).
-            (Value::Interface(a), Value::Interface(b)) => Rc::ptr_eq(a, b),
-            (Value::Instance(a), Value::Instance(b)) => crate::gc::cc_ptr_eq(a, b),
-            (Value::BoundMethod(a), Value::BoundMethod(b)) => Rc::ptr_eq(a, b),
-            (Value::Super(a), Value::Super(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Interface(a), ValueRepr::Interface(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Instance(a), ValueRepr::Instance(b)) => crate::gc::cc_ptr_eq(a, b),
+            (ValueRepr::BoundMethod(a), ValueRepr::BoundMethod(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::Super(a), ValueRepr::Super(b)) => Rc::ptr_eq(a, b),
             // Futures compare by identity (same completion cell).
-            (Value::Future(a), Value::Future(b)) => a.ptr_eq(b),
+            (ValueRepr::Future(a), ValueRepr::Future(b)) => a.ptr_eq(b),
             // Generators compare by identity (same body channel).
-            (Value::Generator(a), Value::Generator(b)) => Rc::ptr_eq(a, b),
-            (Value::GeneratorMethod(a), Value::GeneratorMethod(b)) => {
+            (ValueRepr::Generator(a), ValueRepr::Generator(b)) => Rc::ptr_eq(a, b),
+            (ValueRepr::GeneratorMethod(a), ValueRepr::GeneratorMethod(b)) => {
                 Rc::ptr_eq(&a.handle, &b.handle) && a.name == b.name
             }
-            (Value::ClassMethod(a), Value::ClassMethod(b)) => {
+            (ValueRepr::ClassMethod(a), ValueRepr::ClassMethod(b)) => {
                 Rc::ptr_eq(&a.class, &b.class) && a.name == b.name
             }
             // SRV §3.5: a frozen `Shared` compares by `Arc` IDENTITY (like every
@@ -2149,7 +2582,7 @@ impl PartialEq for Value {
             // `Arc` are equal (idempotent `freeze` returns the same `Arc`); distinct
             // `Arc`s are NOT equal even if structurally identical; a `Shared` never
             // equals a non-frozen container (a distinct value kind → `_`).
-            (Value::Shared(a), Value::Shared(b)) => Arc::ptr_eq(a, b),
+            (ValueRepr::Shared(a), ValueRepr::Shared(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -2157,51 +2590,143 @@ impl PartialEq for Value {
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Nil => write!(f, "Nil"),
-            Value::Bool(b) => write!(f, "Bool({})", b),
-            Value::Int(i) => write!(f, "Int({})", i),
-            Value::Float(n) => write!(f, "Float({})", n),
-            Value::Decimal(d) => write!(f, "Decimal({})", d),
-            Value::Str(s) => write!(f, "Str({:?})", s),
-            Value::Builtin(name) => write!(f, "Builtin({:?})", name),
-            Value::Function(func) => {
+        match &self.0 {
+            ValueRepr::Nil => write!(f, "Nil"),
+            ValueRepr::Bool(b) => write!(f, "Bool({})", b),
+            ValueRepr::Int(i) => write!(f, "Int({})", i),
+            ValueRepr::Float(n) => write!(f, "Float({})", n),
+            ValueRepr::Decimal(d) => write!(f, "Decimal({})", d),
+            ValueRepr::Str(s) => write!(f, "Str({:?})", s),
+            ValueRepr::Builtin(name) => write!(f, "Builtin({:?})", name),
+            ValueRepr::Function(func) => {
                 write!(
                     f,
                     "Function({})",
                     func.name.as_deref().unwrap_or("<anonymous>")
                 )
             }
-            Value::Closure(_) => write!(f, "Closure(<anonymous>)"),
-            Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
-            Value::Object(o) => write!(f, "Object(len {})", o.len()),
-            Value::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
-            Value::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
-            Value::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
+            ValueRepr::Closure(_) => write!(f, "Closure(<anonymous>)"),
+            ValueRepr::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
+            ValueRepr::Object(o) => write!(f, "Object(len {})", o.len()),
+            ValueRepr::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            ValueRepr::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
+            ValueRepr::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
             #[cfg(feature = "data")]
-            Value::Regex(r) => write!(f, "Regex({:?})", r.source),
-            Value::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
-            Value::NativeMethod(m) => write!(
+            ValueRepr::Regex(r) => write!(f, "Regex({:?})", r.source),
+            ValueRepr::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
+            ValueRepr::NativeMethod(m) => write!(
                 f,
                 "NativeMethod({}.{})",
                 m.receiver.kind.type_name(),
                 m.method
             ),
-            Value::Enum(e) => write!(f, "Enum({})", e.name),
-            Value::EnumVariant(v) => match &v.payload {
+            ValueRepr::Enum(e) => write!(f, "Enum({})", e.name),
+            ValueRepr::EnumVariant(v) => match &v.payload {
                 None => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
                 Some(_) => write!(f, "EnumVariant({}.{}(..))", v.enum_name, v.name),
             },
-            Value::Class(c) => write!(f, "Class({})", c.name),
-            Value::Interface(i) => write!(f, "Interface({})", i.name),
-            Value::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
-            Value::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
-            Value::Super(_) => write!(f, "Super"),
-            Value::Future(_) => write!(f, "Future"),
-            Value::Generator(_) => write!(f, "Generator"),
-            Value::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
-            Value::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
-            Value::Shared(n) => write!(f, "Shared({})", n.kind_name()),
+            ValueRepr::Class(c) => write!(f, "Class({})", c.name),
+            ValueRepr::Interface(i) => write!(f, "Interface({})", i.name),
+            ValueRepr::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
+            ValueRepr::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
+            ValueRepr::Super(_) => write!(f, "Super"),
+            ValueRepr::Future(_) => write!(f, "Future"),
+            ValueRepr::Generator(_) => write!(f, "Generator"),
+            ValueRepr::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
+            ValueRepr::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
+            ValueRepr::Shared(n) => write!(f, "Shared({})", n.kind_name()),
+        }
+    }
+}
+
+impl fmt::Debug for ValueKind<'_> {
+    /// Mirrors [`Value`]'s `Debug` shape — handles aren't uniformly `Debug`, so it
+    /// is hand-written. Used by the Task 1.1 view tests' `{other:?}` panic arms.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValueKind::Nil => write!(f, "Nil"),
+            ValueKind::Bool(b) => write!(f, "Bool({})", b),
+            ValueKind::Int(i) => write!(f, "Int({})", i),
+            ValueKind::Float(n) => write!(f, "Float({})", n),
+            ValueKind::Decimal(d) => write!(f, "Decimal({})", d),
+            ValueKind::Str(s) => write!(f, "Str({:?})", s),
+            ValueKind::Builtin(name) => write!(f, "Builtin({:?})", name),
+            ValueKind::Function(func) => {
+                write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
+            }
+            ValueKind::Closure(_) => write!(f, "Closure(<anonymous>)"),
+            ValueKind::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
+            ValueKind::Object(o) => write!(f, "Object(len {})", o.len()),
+            ValueKind::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            ValueKind::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
+            ValueKind::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
+            #[cfg(feature = "data")]
+            ValueKind::Regex(r) => write!(f, "Regex({:?})", r.source),
+            ValueKind::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
+            ValueKind::NativeMethod(m) => {
+                write!(f, "NativeMethod({}.{})", m.receiver.kind.type_name(), m.method)
+            }
+            ValueKind::Enum(e) => write!(f, "Enum({})", e.name),
+            ValueKind::EnumVariant(v) => match &v.payload {
+                None => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
+                Some(_) => write!(f, "EnumVariant({}.{}(..))", v.enum_name, v.name),
+            },
+            ValueKind::Class(c) => write!(f, "Class({})", c.name),
+            ValueKind::Interface(i) => write!(f, "Interface({})", i.name),
+            ValueKind::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
+            ValueKind::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
+            ValueKind::Super(_) => write!(f, "Super"),
+            ValueKind::Future(_) => write!(f, "Future"),
+            ValueKind::Generator(_) => write!(f, "Generator"),
+            ValueKind::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
+            ValueKind::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
+            ValueKind::Shared(n) => write!(f, "Shared({})", n.kind_name()),
+        }
+    }
+}
+
+impl fmt::Debug for OwnedKind {
+    /// Mirrors [`Value`]'s `Debug` shape (see [`ValueKind`]'s `Debug`). Used by the
+    /// Task 1.1 `into_kind` test's `{other:?}` panic arm.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OwnedKind::Nil => write!(f, "Nil"),
+            OwnedKind::Bool(b) => write!(f, "Bool({})", b),
+            OwnedKind::Int(i) => write!(f, "Int({})", i),
+            OwnedKind::Float(n) => write!(f, "Float({})", n),
+            OwnedKind::Decimal(d) => write!(f, "Decimal({})", d),
+            OwnedKind::Str(s) => write!(f, "Str({:?})", s),
+            OwnedKind::Builtin(name) => write!(f, "Builtin({:?})", name),
+            OwnedKind::Function(func) => {
+                write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
+            }
+            OwnedKind::Closure(_) => write!(f, "Closure(<anonymous>)"),
+            OwnedKind::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
+            OwnedKind::Object(o) => write!(f, "Object(len {})", o.len()),
+            OwnedKind::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            OwnedKind::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
+            OwnedKind::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
+            #[cfg(feature = "data")]
+            OwnedKind::Regex(r) => write!(f, "Regex({:?})", r.source),
+            OwnedKind::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
+            OwnedKind::NativeMethod(m) => {
+                write!(f, "NativeMethod({}.{})", m.receiver.kind.type_name(), m.method)
+            }
+            OwnedKind::Enum(e) => write!(f, "Enum({})", e.name),
+            OwnedKind::EnumVariant(v) => match &v.payload {
+                None => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
+                Some(_) => write!(f, "EnumVariant({}.{}(..))", v.enum_name, v.name),
+            },
+            OwnedKind::Class(c) => write!(f, "Class({})", c.name),
+            OwnedKind::Interface(i) => write!(f, "Interface({})", i.name),
+            OwnedKind::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
+            OwnedKind::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
+            OwnedKind::Super(_) => write!(f, "Super"),
+            OwnedKind::Future(_) => write!(f, "Future"),
+            OwnedKind::Generator(_) => write!(f, "Generator"),
+            OwnedKind::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
+            OwnedKind::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
+            OwnedKind::Shared(n) => write!(f, "Shared({})", n.kind_name()),
         }
     }
 }
@@ -2236,25 +2761,25 @@ impl fmt::Display for Value {
 
 impl Value {
     fn write_display(&self, f: &mut fmt::Formatter<'_>, seen: &mut Vec<usize>) -> fmt::Result {
-        match self {
-            Value::Nil => write!(f, "nil"),
-            Value::Bool(b) => write!(f, "{}", b),
-            Value::Int(i) => write!(f, "{}", i),
+        match &self.0 {
+            ValueRepr::Nil => write!(f, "nil"),
+            ValueRepr::Bool(b) => write!(f, "{}", b),
+            ValueRepr::Int(i) => write!(f, "{}", i),
             // NUM §4: a `float` always shows a decimal (`5.0`, not `5`) so it is
             // distinguishable from an `int`. See `format_float`.
-            Value::Float(n) => write!(f, "{}", format_float(*n)),
+            ValueRepr::Float(n) => write!(f, "{}", format_float(*n)),
             // Decimal: print the canonical string (scale preserved, e.g. "1.50").
-            Value::Decimal(d) => write!(f, "{}", d),
-            Value::Str(s) => write!(f, "{}", s),
-            Value::Builtin(name) => write!(f, "<builtin {}>", name),
-            Value::Function(func) => match &func.name {
+            ValueRepr::Decimal(d) => write!(f, "{}", d),
+            ValueRepr::Str(s) => write!(f, "{}", s),
+            ValueRepr::Builtin(name) => write!(f, "<builtin {}>", name),
+            ValueRepr::Function(func) => match &func.name {
                 Some(n) => write!(f, "<function {}>", n),
                 None => write!(f, "<function>"),
             },
             // A VM closure has no name on its proto, so it displays exactly like
             // an anonymous `Function`. (Same concept to the user.)
-            Value::Closure(_) => write!(f, "<function>"),
-            Value::Array(a) => {
+            ValueRepr::Closure(_) => write!(f, "<function>"),
+            ValueRepr::Array(a) => {
                 let ptr = crate::gc::cc_addr(a);
                 if seen.contains(&ptr) {
                     return write!(f, "[...]");
@@ -2271,7 +2796,7 @@ impl Value {
                 seen.pop();
                 Ok(())
             }
-            Value::Object(o) => {
+            ValueRepr::Object(o) => {
                 let ptr = crate::gc::cc_addr(o);
                 if seen.contains(&ptr) {
                     return write!(f, "{{...}}");
@@ -2290,7 +2815,7 @@ impl Value {
                 seen.pop();
                 Ok(())
             }
-            Value::Map(m) => {
+            ValueRepr::Map(m) => {
                 let ptr = crate::gc::cc_addr(m);
                 if seen.contains(&ptr) {
                     return write!(f, "map {{...}}");
@@ -2309,7 +2834,7 @@ impl Value {
                 seen.pop();
                 Ok(())
             }
-            Value::Set(s) => {
+            ValueRepr::Set(s) => {
                 let ptr = crate::gc::cc_addr(s);
                 if seen.contains(&ptr) {
                     return write!(f, "set {{...}}");
@@ -2326,13 +2851,13 @@ impl Value {
                 seen.pop();
                 Ok(())
             }
-            Value::Bytes(b) => write!(f, "<bytes len {}>", b.borrow().len()),
+            ValueRepr::Bytes(b) => write!(f, "<bytes len {}>", b.borrow().len()),
             #[cfg(feature = "data")]
-            Value::Regex(r) => write!(f, "<regex {}>", r.source),
-            Value::Native(n) => write!(f, "<native {} #{}>", n.kind.type_name(), n.id),
-            Value::NativeMethod(m) => write!(f, "<native method {}>", m.method),
-            Value::Enum(e) => write!(f, "<enum {}>", e.name),
-            Value::EnumVariant(v) => match &v.payload {
+            ValueRepr::Regex(r) => write!(f, "<regex {}>", r.source),
+            ValueRepr::Native(n) => write!(f, "<native {} #{}>", n.kind.type_name(), n.id),
+            ValueRepr::NativeMethod(m) => write!(f, "<native method {}>", m.method),
+            ValueRepr::Enum(e) => write!(f, "<enum {}>", e.name),
+            ValueRepr::EnumVariant(v) => match &v.payload {
                 // Unit / scalar-backed / constructor: byte-identical to pre-ADT.
                 None => write!(f, "{}.{}", v.enum_name, v.name),
                 // ADT: a constructed payload variant renders as `Enum.Variant(a, b)`
@@ -2375,28 +2900,90 @@ impl Value {
                     Ok(())
                 }
             },
-            Value::Class(c) => write!(f, "<class {}>", c.name),
-            Value::Interface(i) => write!(f, "<interface {}>", i.name),
-            Value::Instance(i) => write!(f, "<{} instance>", i.borrow().class.name),
-            Value::BoundMethod(b) => write!(f, "<method {}>", b.name),
-            Value::Super(_) => write!(f, "<super>"),
-            Value::Future(_) => write!(f, "<future>"),
-            Value::Generator(_) => write!(f, "<generator>"),
-            Value::GeneratorMethod(g) => write!(f, "<generator method {}>", g.name),
-            Value::ClassMethod(c) => write!(f, "<class method {}.{}>", c.class.name, c.name),
+            ValueRepr::Class(c) => write!(f, "<class {}>", c.name),
+            ValueRepr::Interface(i) => write!(f, "<interface {}>", i.name),
+            ValueRepr::Instance(i) => write!(f, "<{} instance>", i.borrow().class.name),
+            ValueRepr::BoundMethod(b) => write!(f, "<method {}>", b.name),
+            ValueRepr::Super(_) => write!(f, "<super>"),
+            ValueRepr::Future(_) => write!(f, "<future>"),
+            ValueRepr::Generator(_) => write!(f, "<generator>"),
+            ValueRepr::GeneratorMethod(g) => write!(f, "<generator method {}>", g.name),
+            ValueRepr::ClassMethod(c) => write!(f, "<class method {}.{}>", c.class.name, c.name),
             // SRV §3.5: a frozen `Shared` prints like the value it froze (a frozen
             // object as `{...}`, a frozen array as `[...]`, a scalar bare).
-            Value::Shared(n) => n.write_display(f),
+            ValueRepr::Shared(n) => n.write_display(f),
         }
     }
 
     /// Like `write_display`, but quotes bare strings (used for nested elements
     /// so `[1, "two"]` shows the quotes while top-level `print("x")` stays raw).
     fn write_element(&self, f: &mut fmt::Formatter<'_>, seen: &mut Vec<usize>) -> fmt::Result {
-        match self {
-            Value::Str(s) => write!(f, "{:?}", s),
+        match &self.0 {
+            ValueRepr::Str(s) => write!(f, "{:?}", s),
             _ => self.write_display(f, seen),
         }
+    }
+}
+
+// ── GC tracing (NANB Task 1.2) ────────────────────────────────────────────────
+//
+// `impl Trace for Value` lives here (beside the repr) so that after Task 1.7's
+// repr seal it still has access to the private Value variants.  The container
+// `Trace` impls for `ObjectCell`/`ArrayCell`/`MapCell`/`SetCell`/`EnumVariant`
+// plus `cc_addr`/`cc_ptr_eq` STAY in `src/gc.rs` (they never inspect a `Value`
+// word directly — spec §4.2).
+impl Trace for Value {
+    fn trace(&self, tracer: &mut Tracer) {
+        match &self.0 {
+            // Cycle-capable container variants: recurse into contained Values.
+            // NOTE: these still hold `Rc` in V13-T1 — `Rc<T>: Trace` delegates
+            // to `T::trace`, so tracing already reaches the inner Values. After
+            // V13-T2 these become `Cc<T>` and the collector takes over.
+            ValueRepr::Array(a) => a.trace(tracer),
+            ValueRepr::Object(o) => o.trace(tracer),
+            // Map/Set wrap a foreign `IndexMap`/`IndexSet` (orphan rule: no
+            // blanket `Trace`), so each is held in a local `MapCell`/`SetCell`
+            // newtype that carries the hand-written `Trace` impl below. The `Cc`
+            // delegates to that impl, which borrows and traces the contents.
+            ValueRepr::Map(m) => m.trace(tracer),
+            ValueRepr::Set(s) => s.trace(tracer),
+            ValueRepr::Instance(i) => i.trace(tracer),
+            ValueRepr::Closure(c) => c.trace(tracer),
+            // ADT §5.3: the `EnumVariant` WRAPPER stays on `Rc` (unit-variant
+            // construction is registration-free), but a `Some(payload)` can hold
+            // cycle-capable containers (a recursive enum like `Json::Arr(array<Json>)`
+            // self-references), so the collector must reach the payload's values.
+            // NOTE: `Rc<T>: Trace` is gcmodule's ACYCLIC no-op (it does NOT delegate
+            // to `T::trace`), so we deref to call `EnumVariant::trace` explicitly,
+            // reaching the payload's `Cc` container (the actual cycle node).
+            ValueRepr::EnumVariant(v) => (**v).trace(tracer),
+            // SRV §3.6: a frozen `Shared` is an `Arc` DAG in a DIFFERENT ownership
+            // domain (NOT `Cc`), acyclic by construction (`shared.freeze` rejects
+            // input cycles), so refcounting reclaims it — the Bacon–Rajan collector
+            // must NEVER descend into it. The same NO-OP invariant native handles
+            // rely on. The `Arc` graph holds no `Cc` and no `Value` cell, so it adds
+            // ZERO new GC edges and cannot participate in a `Cc` cycle even
+            // transitively (no `Arc→Cc→Arc` cross-domain cycle is possible). Explicit
+            // arm (folds into the catch-all, but spelled out for the invariant).
+            ValueRepr::Shared(_) => {}
+            // NOTE on `Function`: a tree-walker `Function` captures an
+            // `Environment` (its own `Rc<RefCell<Scope>>` graph), which is NOT
+            // one of the cycle-capable Value containers migrated in V13-T2 (see
+            // the V13 type list: Array/Object/Map/Set/Instance/Closure + upvalue
+            // cells). The VM expresses closures as `Value::Closure` with traced
+            // upvalue cells instead. So `Function` (and its Environment) STAY on
+            // `Rc` and are a no-op here — falling through to the catch-all.
+            //
+            // Everything else holds no cycle-capable Value (primitives), or is a
+            // native/immutable/opaque handle that must stay acyclic (see the
+            // module docs / deterministic-Drop invariant). No-op.
+            _ => {}
+        }
+    }
+
+    // Conservatively tracked: `Value` can contain `Cc<T>` after V13-T2.
+    fn is_type_tracked() -> bool {
+        true
     }
 }
 
@@ -2433,6 +3020,49 @@ mod tests {
         assert_eq!(hasher_type_of_set(&set.borrow()), TypeId::of::<SipState>());
     }
 
+    // NANB Task 1.1 — the `ValueKind<'_>` borrowed view is TOTAL (one arm per
+    // `Value` variant) and FAITHFUL (reports the same logical kind, borrows the
+    // SAME handle / preserves the exact scalar bits, incl. a non-canonical NaN).
+    #[test]
+    fn value_kind_view_is_total_and_faithful() {
+        // The view BORROWS the same handle: pointer-identical to the accessor's clone.
+        let arr = Value::array(vec![Value::int(1)]);
+        match arr.kind() {
+            ValueKind::Array(a) => {
+                let cell = arr.as_array().expect("array accessor");
+                assert!(crate::gc::cc_ptr_eq(a, cell));
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+        assert!(matches!(Value::int(7).kind(), ValueKind::Int(7)));
+        assert!(matches!(Value::float(2.5).kind(), ValueKind::Float(f) if f == 2.5));
+        assert!(matches!(Value::str("hi").kind(), ValueKind::Str(s) if &**s == "hi"));
+        assert!(matches!(Value::nil().kind(), ValueKind::Nil));
+        assert!(matches!(Value::bool_(true).kind(), ValueKind::Bool(true)));
+        // NaN bit pattern preserved through construct→kind (the §7.5 seed property).
+        let weird_nan = f64::from_bits(0x7FF0_0000_0000_0001);
+        assert!(matches!(Value::float(weird_nan).kind(),
+            ValueKind::Float(f) if f.to_bits() == weird_nan.to_bits()));
+    }
+
+    // NANB Task 1.1 — `into_kind()` MOVES the payload out (no clone): the `Rc<str>`
+    // strong count is unchanged across `Value` → `OwnedKind::Str` (it would be +1
+    // momentarily if the projection cloned). After the owned payload drops, the
+    // probe is back at the start.
+    #[test]
+    fn owned_kind_moves_without_refcount_change() {
+        let v = Value::str("payload");
+        let before = v.str_strong_count().expect("str strong count");
+        match v.into_kind() {
+            OwnedKind::Str(s) => {
+                assert_eq!(&*s, "payload");
+                // The moved-out `Rc<str>` is the SAME allocation — still strong count 1.
+                assert_eq!(Rc::strong_count(&s), before);
+            }
+            other => panic!("wrong owned kind: {other:?}"),
+        }
+    }
+
     // SHAPE §6.2: the demoted hostile-key object dict also keeps SipHash.
     #[test]
     fn object_dict_storage_keeps_siphash_random_state() {
@@ -2456,17 +3086,17 @@ mod tests {
     fn float_two_pow_63_is_not_i64_max() {
         let two63 = 9223372036854775808.0_f64; // 2^63, NOT representable as i64
         assert!(!int_eq_float(i64::MAX, two63));
-        assert_eq!(Value::Float(two63).as_int_exact(), None);
+        assert_eq!(Value::float(two63).as_int_exact(), None);
         // `MapKey` has no `Debug`, so compare for inequality with `==` directly.
         assert!(
-            MapKey::from_value(&Value::Float(two63))
-                != MapKey::from_value(&Value::Int(i64::MAX)),
+            MapKey::from_value(&Value::float(two63))
+                != MapKey::from_value(&Value::int(i64::MAX)),
             "2^63 float must not share a map key with i64::MAX"
         );
         // The largest in-range integral float (2^63 − 2048) still folds correctly.
         let max_in_range = 9223372036854773760.0_f64;
         assert!(int_eq_float(9223372036854773760, max_in_range));
-        assert_eq!(Value::Float(max_in_range).as_int_exact(), Some(9223372036854773760));
+        assert_eq!(Value::float(max_in_range).as_int_exact(), Some(9223372036854773760));
     }
 
     // VAL Task 0 — the MOVING SIZE TRIPWIRE. `Value` is the runtime tagged union
@@ -2530,7 +3160,7 @@ mod tests {
         // Object round-trip preserves pointer identity.
         let obj = Value::object(IndexMap::new());
         let cell = obj.as_object().expect("object accessor");
-        assert!(matches!(&obj, Value::Object(c) if crate::gc::cc_ptr_eq(c, &cell)));
+        assert!(matches!(obj.kind(), ValueKind::Object(c) if crate::gc::cc_ptr_eq(c, &cell)));
     }
 
     // VAL Task 3 — the SMI↔boxed spill-BOUNDARY round-trip + Map-key fold (spec
@@ -2579,14 +3209,14 @@ mod tests {
         let lo = (1i64 << 47) - 1;
         for &n in &[lo, lo + 1, -(1i64 << 47), i64::MAX, i64::MIN] {
             let a = MapKey::from_value(&Value::int(n)).unwrap();
-            let b = MapKey::from_value(&Value::Int(n)).unwrap();
+            let b = MapKey::from_value(&Value::int(n)).unwrap();
             assert!(a == b, "equal-valued Ints must fold to the SAME Map key ({n})");
         }
     }
 
     // ADT Task 1 helpers — construct variant values directly at the value layer.
     fn unit_variant(en: &str, name: &str, backing: Value) -> Value {
-        Value::EnumVariant(Rc::new(EnumVariant {
+        Value::enum_variant(Rc::new(EnumVariant {
             enum_name: en.to_string(),
             name: name.to_string(),
             value: backing,
@@ -2596,10 +3226,10 @@ mod tests {
         }))
     }
     fn pos_variant(en: &str, name: &str, items: Vec<Value>) -> Value {
-        Value::EnumVariant(Rc::new(EnumVariant {
+        Value::enum_variant(Rc::new(EnumVariant {
             enum_name: en.to_string(),
             name: name.to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(Payload::Positional(ArrayCell::new(items))),
             ctor: false,
         def: None,
@@ -2610,10 +3240,10 @@ mod tests {
         for (k, v) in fields {
             m.insert(k.to_string(), v);
         }
-        Value::EnumVariant(Rc::new(EnumVariant {
+        Value::enum_variant(Rc::new(EnumVariant {
             enum_name: en.to_string(),
             name: name.to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(Payload::Named(ObjectCell::new(m))),
             ctor: false,
         def: None,
@@ -2625,12 +3255,12 @@ mod tests {
         // A `payload: None, ctor: false` unit variant: `.value` is the backing scalar
         // (or Nil), it is truthy, and two DISTINCT `Rc`s of the same name are NOT
         // equal (identity equality, as pre-ADT — interning makes real uses equal).
-        let red = unit_variant("Color", "Red", Value::Nil);
-        let green = unit_variant("Color", "Green", Value::Int(2));
+        let red = unit_variant("Color", "Red", Value::nil());
+        let green = unit_variant("Color", "Green", Value::int(2));
         assert!(red.is_truthy());
         assert!(green.is_truthy());
         // Distinct allocations of the same unit variant are NOT `==` (identity).
-        let red2 = unit_variant("Color", "Red", Value::Nil);
+        let red2 = unit_variant("Color", "Red", Value::nil());
         assert_ne!(red, red2);
         // But cloning the SAME `Rc` is equal (the interned-use case).
         assert_eq!(red.clone(), red);
@@ -2639,22 +3269,22 @@ mod tests {
     #[test]
     fn adt_constructed_variants_compare_structurally() {
         // Positional: `Pair(3, 4) == Pair(3, 4)`, `!= Pair(3, 5)`.
-        let p1 = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
-        let p2 = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
-        let p3 = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(5)]);
+        let p1 = pos_variant("Shape", "Pair", vec![Value::int(3), Value::int(4)]);
+        let p2 = pos_variant("Shape", "Pair", vec![Value::int(3), Value::int(4)]);
+        let p3 = pos_variant("Shape", "Pair", vec![Value::int(3), Value::int(5)]);
         assert_eq!(p1, p2);
         assert_ne!(p1, p3);
         // Named: `Circle(radius: 2.0) == Circle(radius: 2.0)`, `!= Circle(radius: 3.0)`.
-        let c1 = named_variant("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
-        let c2 = named_variant("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
-        let c3 = named_variant("Shape", "Circle", vec![("radius", Value::Float(3.0))]);
+        let c1 = named_variant("Shape", "Circle", vec![("radius", Value::float(2.0))]);
+        let c2 = named_variant("Shape", "Circle", vec![("radius", Value::float(2.0))]);
+        let c3 = named_variant("Shape", "Circle", vec![("radius", Value::float(3.0))]);
         assert_eq!(c1, c2);
         assert_ne!(c1, c3);
         // A payload variant is never equal to a unit variant of the same name.
-        let unit_circle = unit_variant("Shape", "Circle", Value::Nil);
+        let unit_circle = unit_variant("Shape", "Circle", Value::nil());
         assert_ne!(c1, unit_circle);
         // Different variant names with equal payload are not equal.
-        let other = pos_variant("Shape", "Other", vec![Value::Int(3), Value::Int(4)]);
+        let other = pos_variant("Shape", "Other", vec![Value::int(3), Value::int(4)]);
         assert_ne!(p1, other);
         // Constructed payload variants are truthy.
         assert!(p1.is_truthy());
@@ -2663,15 +3293,15 @@ mod tests {
 
     #[test]
     fn adt_constructed_variant_display() {
-        let pair = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        let pair = pos_variant("Shape", "Pair", vec![Value::int(3), Value::int(4)]);
         assert_eq!(pair.to_string(), "Shape.Pair(3, 4)");
-        let circle = named_variant("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
+        let circle = named_variant("Shape", "Circle", vec![("radius", Value::float(2.0))]);
         assert_eq!(circle.to_string(), "Shape.Circle(radius: 2.0)");
         // Unit variant display is unchanged: `Enum.Variant`.
-        let red = unit_variant("Color", "Red", Value::Nil);
+        let red = unit_variant("Color", "Red", Value::nil());
         assert_eq!(red.to_string(), "Color.Red");
         // Nested string payload quotes the inner string (write_element).
-        let str_v = pos_variant("Json", "Str", vec![Value::Str("hi".into())]);
+        let str_v = pos_variant("Json", "Str", vec![Value::str("hi")]);
         assert_eq!(str_v.to_string(), "Json.Str(\"hi\")");
     }
 
@@ -2680,9 +3310,9 @@ mod tests {
         // Payload variants are identity-style containers (like Array/Map): NOT
         // hashable as a `MapKey`. Unit variants were never hashable either (today's
         // behavior is preserved — both return `None`).
-        let pair = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        let pair = pos_variant("Shape", "Pair", vec![Value::int(3), Value::int(4)]);
         assert!(MapKey::from_value(&pair).is_none());
-        let red = unit_variant("Color", "Red", Value::Nil);
+        let red = unit_variant("Color", "Red", Value::nil());
         assert!(MapKey::from_value(&red).is_none());
     }
 
@@ -2691,8 +3321,8 @@ mod tests {
         // The runtime `type_name` for any EnumVariant stays "enum variant" (the
         // wildcard arm). Asserted at the interp layer; here we assert the value-layer
         // Debug differentiates payload vs unit (used in panics/tests only).
-        let red = unit_variant("Color", "Red", Value::Nil);
-        let pair = pos_variant("Shape", "Pair", vec![Value::Int(1), Value::Int(2)]);
+        let red = unit_variant("Color", "Red", Value::nil());
+        let pair = pos_variant("Shape", "Pair", vec![Value::int(1), Value::int(2)]);
         assert_eq!(format!("{:?}", red), "EnumVariant(Color.Red)");
         assert_eq!(format!("{:?}", pair), "EnumVariant(Shape.Pair(..))");
     }
@@ -2701,27 +3331,27 @@ mod tests {
     fn displays_values_like_a_script_language() {
         // NUM §4: a `float` always renders with at least one fractional digit so it
         // is visually distinguishable from an `int` (Python/Swift convention).
-        assert_eq!(Value::Float(7.0).to_string(), "7.0");
-        assert_eq!(Value::Float(2.5).to_string(), "2.5");
-        assert_eq!(Value::Float(1500.0).to_string(), "1500.0");
-        assert_eq!(Value::Float(-0.0).to_string(), "-0.0");
-        assert_eq!(Value::Float(0.0).to_string(), "0.0");
-        assert_eq!(Value::Float(f64::INFINITY).to_string(), "inf");
-        assert_eq!(Value::Float(f64::NEG_INFINITY).to_string(), "-inf");
-        assert_eq!(Value::Float(f64::NAN).to_string(), "NaN");
+        assert_eq!(Value::float(7.0).to_string(), "7.0");
+        assert_eq!(Value::float(2.5).to_string(), "2.5");
+        assert_eq!(Value::float(1500.0).to_string(), "1500.0");
+        assert_eq!(Value::float(-0.0).to_string(), "-0.0");
+        assert_eq!(Value::float(0.0).to_string(), "0.0");
+        assert_eq!(Value::float(f64::INFINITY).to_string(), "inf");
+        assert_eq!(Value::float(f64::NEG_INFINITY).to_string(), "-inf");
+        assert_eq!(Value::float(f64::NAN).to_string(), "NaN");
         // `int` keeps NO decimal.
-        assert_eq!(Value::Int(5).to_string(), "5");
-        assert_eq!(Value::Int(-7).to_string(), "-7");
-        assert_eq!(Value::Bool(true).to_string(), "true");
-        assert_eq!(Value::Nil.to_string(), "nil");
-        assert_eq!(Value::Str("hi".into()).to_string(), "hi");
+        assert_eq!(Value::int(5).to_string(), "5");
+        assert_eq!(Value::int(-7).to_string(), "-7");
+        assert_eq!(Value::bool_(true).to_string(), "true");
+        assert_eq!(Value::nil().to_string(), "nil");
+        assert_eq!(Value::str("hi").to_string(), "hi");
     }
 
     #[test]
     fn float_in_collections_keeps_decimal() {
-        let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Float(1.0),
-            Value::Float(2.0),
+        let arr = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::float(1.0),
+            Value::float(2.0),
         ]));
         assert_eq!(arr.to_string(), "[1.0, 2.0]");
     }
@@ -2730,37 +3360,37 @@ mod tests {
     fn truthiness_follows_spec() {
         // NUM: falsy = nil, false, 0 (int), 0.0/-0.0/NaN (float), 0 decimal, "" (string).
         // Everything else — incl. non-empty strings and all collections even when empty — is truthy.
-        assert!(Value::Bool(true).is_truthy());
-        assert!(!Value::Bool(false).is_truthy());
-        assert!(!Value::Nil.is_truthy());
-        assert!(!Value::Int(0).is_truthy());
-        assert!(Value::Int(1).is_truthy());
-        assert!(!Value::Float(0.0).is_truthy());
-        assert!(!Value::Float(-0.0).is_truthy());
-        assert!(!Value::Float(f64::NAN).is_truthy());
-        assert!(Value::Float(0.5).is_truthy());
-        assert!(!Value::Str("".into()).is_truthy());
-        assert!(Value::Str("x".into()).is_truthy());
+        assert!(Value::bool_(true).is_truthy());
+        assert!(!Value::bool_(false).is_truthy());
+        assert!(!Value::nil().is_truthy());
+        assert!(!Value::int(0).is_truthy());
+        assert!(Value::int(1).is_truthy());
+        assert!(!Value::float(0.0).is_truthy());
+        assert!(!Value::float(-0.0).is_truthy());
+        assert!(!Value::float(f64::NAN).is_truthy());
+        assert!(Value::float(0.5).is_truthy());
+        assert!(!Value::str("").is_truthy());
+        assert!(Value::str("x").is_truthy());
     }
 
     #[test]
     fn equality_is_structural_and_cross_kind_is_false() {
-        assert_eq!(Value::Float(1.0), Value::Float(1.0));
-        assert_eq!(Value::Str("a".into()), Value::Str("a".into()));
-        assert_ne!(Value::Float(1.0), Value::Str("1".into()));
-        assert_ne!(Value::Bool(true), Value::Float(1.0));
+        assert_eq!(Value::float(1.0), Value::float(1.0));
+        assert_eq!(Value::str("a"), Value::str("a"));
+        assert_ne!(Value::float(1.0), Value::str("1"));
+        assert_ne!(Value::bool_(true), Value::float(1.0));
     }
 
     #[test]
     fn builtins_compare_by_name_and_are_truthy() {
         assert_eq!(
-            Value::Builtin("print".into()),
-            Value::Builtin("print".into())
+            Value::builtin("print"),
+            Value::builtin("print")
         );
-        assert_ne!(Value::Builtin("print".into()), Value::Builtin("len".into()));
-        assert!(Value::Builtin("print".into()).is_truthy());
+        assert_ne!(Value::builtin("print"), Value::builtin("len"));
+        assert!(Value::builtin("print").is_truthy());
         assert_eq!(
-            Value::Builtin("print".into()).to_string(),
+            Value::builtin("print").to_string(),
             "<builtin print>"
         );
     }
@@ -2769,14 +3399,14 @@ mod tests {
     fn arrays_compare_by_identity_and_display() {
         
 
-        let a = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Float(1.0),
-            Value::Str("two".into()),
+        let a = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::float(1.0),
+            Value::str("two"),
         ]));
         assert_eq!(a.to_string(), "[1.0, \"two\"]");
         // identity: a clone of the SAME Rc is equal; a fresh array is not
         assert_eq!(a.clone(), a);
-        let b = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
+        let b = Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(1.0)]));
         assert_ne!(a, b);
         assert!(a.is_truthy());
     }
@@ -2785,15 +3415,15 @@ mod tests {
     fn maps_display_and_compare_by_identity() {
         use indexmap::IndexMap;
         let mut m = IndexMap::new();
-        m.insert(MapKey::Str("a".into()), Value::Float(1.0));
-        m.insert(MapKey::Num(0.0f64.to_bits()), Value::Str("zero".into()));
-        let map = Value::Map(crate::value::MapCell::new(m));
+        m.insert(MapKey::Str("a".into()), Value::float(1.0));
+        m.insert(MapKey::Num(0.0f64.to_bits()), Value::str("zero"));
+        let map = Value::map_cell(crate::value::MapCell::new(m));
         assert_eq!(map.to_string(), "map {\"a\": 1.0, 0.0: \"zero\"}");
         assert_eq!(map.clone(), map);
         assert!(map.is_truthy());
-        assert!(MapKey::from_value(&Value::Float(0.0)).is_some());
+        assert!(MapKey::from_value(&Value::float(0.0)).is_some());
         assert!(
-            MapKey::from_value(&Value::Array(crate::value::ArrayCell::new(vec![]))).is_none()
+            MapKey::from_value(&Value::array_cell(crate::value::ArrayCell::new(vec![]))).is_none()
         );
     }
 
@@ -2804,18 +3434,18 @@ mod tests {
         // distinct slots in a Map/Set. This pins the MapKey::Decimal claim directly.
         // (MapKey intentionally has no Debug derive, so compare via bool to avoid
         // requiring it in assert_eq!/assert_ne!.)
-        let num_key = MapKey::from_value(&Value::Float(1.0)).expect("number is hashable");
+        let num_key = MapKey::from_value(&Value::float(1.0)).expect("number is hashable");
         let dec_key =
-            MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1)))).expect("decimal is hashable");
+            MapKey::from_value(&Value::decimal_rc(Rc::new(Decimal::from(1)))).expect("decimal is hashable");
         assert!(
             num_key != dec_key,
             "number 1 and decimal 1 must be distinct map keys"
         );
         // Two equal Decimals produce the same key (round-trips through to_value).
-        let a = MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1))));
-        let b = MapKey::from_value(&Value::Decimal(Rc::new(Decimal::from(1))));
+        let a = MapKey::from_value(&Value::decimal_rc(Rc::new(Decimal::from(1))));
+        let b = MapKey::from_value(&Value::decimal_rc(Rc::new(Decimal::from(1))));
         assert!(a == b);
-        assert_eq!(dec_key.to_value(), Value::Decimal(Rc::new(Decimal::from(1))));
+        assert_eq!(dec_key.to_value(), Value::decimal_rc(Rc::new(Decimal::from(1))));
     }
 
     // ---- IFACE Task 1: Value::Interface descriptor ----
@@ -2833,7 +3463,7 @@ mod tests {
     #[test]
     fn iface_value_basics() {
         let r = iface("Reader");
-        let v = Value::Interface(r.clone());
+        let v = Value::interface(r.clone());
         // type_name → "interface"
         assert_eq!(crate::interp::type_name(&v), "interface");
         // truthy (a descriptor is truthy)
@@ -2842,20 +3472,20 @@ mod tests {
         assert_eq!(format!("{}", v), "<interface Reader>");
         // same Rc → equal (identity)
         assert_eq!(v.clone(), v);
-        assert_eq!(Value::Interface(r.clone()), Value::Interface(r));
+        assert_eq!(Value::interface(r.clone()), Value::interface(r));
         // two distinct Rcs of the same name → NOT equal (identity, not structural)
-        assert_ne!(Value::Interface(iface("Reader")), Value::Interface(iface("Reader")));
+        assert_ne!(Value::interface(iface("Reader")), Value::interface(iface("Reader")));
     }
 
     // ---- NUM Task 1: int subtype, truthiness, MapKey fold, cross-subtype eq ----
 
     #[test]
     fn num_type_names_distinguish_int_and_float() {
-        assert_eq!(crate::interp::type_name(&Value::Int(5)), "int");
-        assert_eq!(crate::interp::type_name(&Value::Float(5.0)), "float");
+        assert_eq!(crate::interp::type_name(&Value::int(5)), "int");
+        assert_eq!(crate::interp::type_name(&Value::float(5.0)), "float");
         // Decimal is its own subtype, unchanged.
         assert_eq!(
-            crate::interp::type_name(&Value::Decimal(Rc::new(Decimal::from(1)))),
+            crate::interp::type_name(&Value::decimal_rc(Rc::new(Decimal::from(1)))),
             "decimal"
         );
     }
@@ -2892,57 +3522,57 @@ mod tests {
 
     #[test]
     fn num_int_displays_without_a_decimal_point() {
-        assert_eq!(Value::Int(5).to_string(), "5");
-        assert_eq!(Value::Int(-42).to_string(), "-42");
-        assert_eq!(Value::Int(0).to_string(), "0");
+        assert_eq!(Value::int(5).to_string(), "5");
+        assert_eq!(Value::int(-42).to_string(), "-42");
+        assert_eq!(Value::int(0).to_string(), "0");
         // Debug carries the subtype tag.
-        assert_eq!(format!("{:?}", Value::Int(7)), "Int(7)");
-        assert_eq!(format!("{:?}", Value::Float(7.0)), "Float(7)");
+        assert_eq!(format!("{:?}", Value::int(7)), "Int(7)");
+        assert_eq!(format!("{:?}", Value::float(7.0)), "Float(7)");
     }
 
     #[test]
     fn num_truthiness_resolved_falsy_set() {
         // Falsy: nil, false, Int(0), 0.0/-0.0/NaN, 0m, "".
-        assert!(!Value::Nil.is_truthy());
-        assert!(!Value::Bool(false).is_truthy());
-        assert!(!Value::Int(0).is_truthy());
-        assert!(!Value::Float(0.0).is_truthy());
-        assert!(!Value::Float(-0.0).is_truthy());
-        assert!(!Value::Float(f64::NAN).is_truthy());
-        assert!(!Value::Decimal(Rc::new(Decimal::ZERO)).is_truthy());
-        assert!(!Value::Str("".into()).is_truthy());
+        assert!(!Value::nil().is_truthy());
+        assert!(!Value::bool_(false).is_truthy());
+        assert!(!Value::int(0).is_truthy());
+        assert!(!Value::float(0.0).is_truthy());
+        assert!(!Value::float(-0.0).is_truthy());
+        assert!(!Value::float(f64::NAN).is_truthy());
+        assert!(!Value::decimal_rc(Rc::new(Decimal::ZERO)).is_truthy());
+        assert!(!Value::str("").is_truthy());
         // Truthy: any non-zero number, non-empty string, EVERY collection even empty.
-        assert!(Value::Bool(true).is_truthy());
-        assert!(Value::Int(1).is_truthy());
-        assert!(Value::Int(-1).is_truthy());
-        assert!(Value::Float(0.5).is_truthy());
-        assert!(Value::Float(f64::INFINITY).is_truthy());
-        assert!(Value::Decimal(Rc::new(Decimal::from(1))).is_truthy());
-        assert!(Value::Str("x".into()).is_truthy());
-        assert!(Value::Array(crate::value::ArrayCell::new(vec![])).is_truthy());
+        assert!(Value::bool_(true).is_truthy());
+        assert!(Value::int(1).is_truthy());
+        assert!(Value::int(-1).is_truthy());
+        assert!(Value::float(0.5).is_truthy());
+        assert!(Value::float(f64::INFINITY).is_truthy());
+        assert!(Value::decimal_rc(Rc::new(Decimal::from(1))).is_truthy());
+        assert!(Value::str("x").is_truthy());
+        assert!(Value::array_cell(crate::value::ArrayCell::new(vec![])).is_truthy());
         {
             use indexmap::IndexMap;
-            assert!(Value::Map(crate::value::MapCell::new(IndexMap::new())).is_truthy());
-            assert!(Value::Object(crate::value::ObjectCell::new(IndexMap::new())).is_truthy());
+            assert!(Value::map_cell(crate::value::MapCell::new(IndexMap::new())).is_truthy());
+            assert!(Value::object_cell(crate::value::ObjectCell::new(IndexMap::new())).is_truthy());
         }
     }
 
     #[test]
     fn num_mapkey_folds_integral_float_to_int() {
         // §3.3: an integral, in-range float is the SAME map key as the equal int.
-        let from_int = MapKey::from_value(&Value::Int(1)).expect("int is hashable");
-        let from_float = MapKey::from_value(&Value::Float(1.0)).expect("float is hashable");
+        let from_int = MapKey::from_value(&Value::int(1)).expect("int is hashable");
+        let from_float = MapKey::from_value(&Value::float(1.0)).expect("float is hashable");
         assert!(from_int == from_float, "Int(1) and Float(1.0) must share a key");
         // -0.0 folds to Int(0) and equals Int(0)/0.0.
-        let neg_zero = MapKey::from_value(&Value::Float(-0.0)).expect("float is hashable");
-        let pos_zero = MapKey::from_value(&Value::Float(0.0)).expect("float is hashable");
-        let int_zero = MapKey::from_value(&Value::Int(0)).expect("int is hashable");
+        let neg_zero = MapKey::from_value(&Value::float(-0.0)).expect("float is hashable");
+        let pos_zero = MapKey::from_value(&Value::float(0.0)).expect("float is hashable");
+        let int_zero = MapKey::from_value(&Value::int(0)).expect("int is hashable");
         assert!(neg_zero == pos_zero && pos_zero == int_zero);
         // A fractional float is a distinct (non-Int) key.
-        let frac = MapKey::from_value(&Value::Float(1.5)).expect("float is hashable");
+        let frac = MapKey::from_value(&Value::float(1.5)).expect("float is hashable");
         assert!(frac != from_int);
         // Round-trips: Int key -> Value::Int.
-        assert_eq!(from_int.to_value(), Value::Int(1));
+        assert_eq!(from_int.to_value(), Value::int(1));
     }
 
     #[test]
@@ -2950,12 +3580,12 @@ mod tests {
         // §3.3: NaN is excluded from the "a==b ⟺ same key" claim. NaN keys
         // canonicalize to ONE storable key, but never equal a non-NaN key, and a
         // NaN float is NOT folded to any Int.
-        let nan1 = MapKey::from_value(&Value::Float(f64::NAN)).expect("nan is hashable");
-        let nan2 = MapKey::from_value(&Value::Float(f64::NAN)).expect("nan is hashable");
+        let nan1 = MapKey::from_value(&Value::float(f64::NAN)).expect("nan is hashable");
+        let nan2 = MapKey::from_value(&Value::float(f64::NAN)).expect("nan is hashable");
         // Two NaN keys canonicalize identically (storable/retrievable as one key).
         assert!(nan1 == nan2);
         // A NaN key never collides with any integer key (incl. 0).
-        let zero = MapKey::from_value(&Value::Int(0)).expect("int is hashable");
+        let zero = MapKey::from_value(&Value::int(0)).expect("int is hashable");
         assert!(nan1 != zero);
         // The canonical NaN key is a `Num` (float) key, not an `Int` fold.
         assert!(matches!(nan1, MapKey::Num(_)));
@@ -2964,21 +3594,21 @@ mod tests {
     #[test]
     fn num_cross_subtype_equality_is_exact() {
         // Int(1) == Float(1.0), symmetric.
-        assert_eq!(Value::Int(1), Value::Float(1.0));
-        assert_eq!(Value::Float(1.0), Value::Int(1));
-        assert_eq!(Value::Int(0), Value::Float(-0.0));
+        assert_eq!(Value::int(1), Value::float(1.0));
+        assert_eq!(Value::float(1.0), Value::int(1));
+        assert_eq!(Value::int(0), Value::float(-0.0));
         // Non-integral float is never equal to an int.
-        assert_ne!(Value::Int(2), Value::Float(2.5));
-        assert_ne!(Value::Float(2.5), Value::Int(2));
+        assert_ne!(Value::int(2), Value::float(2.5));
+        assert_ne!(Value::float(2.5), Value::int(2));
         // Exact (not lossy): 2^53+1 as int does NOT equal float(2^53) which rounds.
         let big = (1i64 << 53) + 1;
-        assert_ne!(Value::Int(big), Value::Float(big as f64));
+        assert_ne!(Value::int(big), Value::float(big as f64));
         // NaN/inf floats never equal any int.
-        assert_ne!(Value::Int(0), Value::Float(f64::NAN));
-        assert_ne!(Value::Int(0), Value::Float(f64::INFINITY));
+        assert_ne!(Value::int(0), Value::float(f64::NAN));
+        assert_ne!(Value::int(0), Value::float(f64::INFINITY));
         // Same-subtype equality still holds.
-        assert_eq!(Value::Int(7), Value::Int(7));
-        assert_ne!(Value::Int(7), Value::Int(8));
+        assert_eq!(Value::int(7), Value::int(7));
+        assert_ne!(Value::int(7), Value::int(8));
     }
 
     #[test]
@@ -3000,21 +3630,21 @@ mod tests {
             debug_name: None,
         });
         let a = Closure::new(proto);
-        let cv = Value::Closure(a.clone());
+        let cv = Value::closure(a.clone());
 
         // Display mirrors an anonymous Function exactly.
         assert_eq!(cv.to_string(), "<function>");
-        assert_eq!(Value::Function(anon_function()).to_string(), "<function>");
+        assert_eq!(Value::function(anon_function()).to_string(), "<function>");
 
         // type() reports "function", like a Function.
         assert_eq!(crate::interp::type_name(&cv), "function");
         assert_eq!(
-            crate::interp::type_name(&Value::Function(anon_function())),
+            crate::interp::type_name(&Value::function(anon_function())),
             "function"
         );
 
         // Pointer identity: same Rc is equal; a distinct closure is not.
-        assert_eq!(Value::Closure(a.clone()), Value::Closure(a.clone()));
+        assert_eq!(Value::closure(a.clone()), Value::closure(a.clone()));
         let b = Closure::new(Rc::new(FnProto {
             chunk: Chunk::new(),
             arity: 0,
@@ -3028,7 +3658,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
         }));
-        assert_ne!(Value::Closure(a), Value::Closure(b));
+        assert_ne!(Value::closure(a), Value::closure(b));
 
         // Not a valid map key (mirrors Function).
         assert!(MapKey::from_value(&cv).is_none());
@@ -3054,9 +3684,9 @@ mod tests {
     fn objects_display_and_compare_by_identity() {
         use indexmap::IndexMap;
         let mut m = IndexMap::new();
-        m.insert("a".to_string(), Value::Float(1.0));
-        m.insert("b".to_string(), Value::Str("x".into()));
-        let o = Value::Object(ObjectCell::new(m));
+        m.insert("a".to_string(), Value::float(1.0));
+        m.insert("b".to_string(), Value::str("x"));
+        let o = Value::object_cell(ObjectCell::new(m));
         assert_eq!(o.to_string(), "{a: 1.0, b: \"x\"}");
         assert_eq!(o.clone(), o);
         assert!(o.is_truthy());
@@ -3086,19 +3716,19 @@ mod tests {
 
     #[test]
     fn shared_frozen_helpers_report_underlying_kind() {
-        let obj = Value::Shared(shared_obj());
+        let obj = Value::shared(shared_obj());
         assert_eq!(frozen_kind(&obj), Some("object"));
-        let arr = Value::Shared(Arc::new(SharedNode::Array(Arc::from(vec![Arc::new(
+        let arr = Value::shared(Arc::new(SharedNode::Array(Arc::from(vec![Arc::new(
             SharedNode::Int(1),
         )]))));
         assert_eq!(frozen_kind(&arr), Some("array"));
-        let map = Value::Shared(Arc::new(SharedNode::Map(Arc::new(vec![(
+        let map = Value::shared(Arc::new(SharedNode::Map(Arc::new(vec![(
             SharedKey::Str("k".into()),
             Arc::new(SharedNode::Int(1)),
         )]))));
         assert_eq!(frozen_kind(&map), Some("map"));
         // A frozen SCALAR is not a mutable container → not a frozen-mutation target.
-        let scalar = Value::Shared(Arc::new(SharedNode::Int(5)));
+        let scalar = Value::shared(Arc::new(SharedNode::Int(5)));
         assert_eq!(frozen_kind(&scalar), None);
         // But every Shared is frozen; freeze_value of it is a no-op.
         assert!(is_frozen_value(&obj));
@@ -3110,50 +3740,50 @@ mod tests {
     #[test]
     fn shared_type_name_is_underlying_kind() {
         assert_eq!(
-            crate::interp::type_name(&Value::Shared(shared_obj())),
+            crate::interp::type_name(&Value::shared(shared_obj())),
             "object"
         );
         assert_eq!(
-            crate::interp::type_name(&Value::Shared(Arc::new(SharedNode::Array(Arc::from(
+            crate::interp::type_name(&Value::shared(Arc::new(SharedNode::Array(Arc::from(
                 Vec::<Arc<SharedNode>>::new()
             ))))),
             "array"
         );
         assert_eq!(
-            crate::interp::type_name(&Value::Shared(Arc::new(SharedNode::Str("x".into())))),
+            crate::interp::type_name(&Value::shared(Arc::new(SharedNode::Str("x".into())))),
             "string"
         );
     }
 
     #[test]
     fn shared_is_truthy() {
-        assert!(Value::Shared(shared_obj()).is_truthy());
+        assert!(Value::shared(shared_obj()).is_truthy());
         // Even a "scalar" frozen node is truthy as a Shared wrapper (it is a
         // container value to the user). Spec §3.5: a Shared is truthy.
-        assert!(Value::Shared(Arc::new(SharedNode::Int(0))).is_truthy());
+        assert!(Value::shared(Arc::new(SharedNode::Int(0))).is_truthy());
     }
 
     #[test]
     fn shared_equality_is_arc_identity() {
         let a = shared_obj();
-        let v1 = Value::Shared(a.clone());
-        let v2 = Value::Shared(a.clone()); // SAME Arc
+        let v1 = Value::shared(a.clone());
+        let v2 = Value::shared(a.clone()); // SAME Arc
         assert_eq!(v1, v2, "two clones of one Arc are equal (Arc identity)");
         // A structurally-identical but DISTINCT Arc is NOT equal.
-        let other = Value::Shared(shared_obj());
+        let other = Value::shared(shared_obj());
         assert_ne!(v1, other, "distinct Arcs are not equal even if structural");
         // A Shared never equals a non-frozen container.
         use indexmap::IndexMap;
-        let plain = Value::Object(ObjectCell::new(IndexMap::new()));
+        let plain = Value::object_cell(ObjectCell::new(IndexMap::new()));
         assert_ne!(v1, plain);
     }
 
     #[test]
     fn shared_displays_like_underlying_kind() {
-        let v = Value::Shared(shared_obj());
+        let v = Value::shared(shared_obj());
         assert_eq!(v.to_string(), "{region: \"us\", limits: [10, 100]}");
         assert_eq!(
-            Value::Shared(Arc::new(SharedNode::Str("hi".into()))).to_string(),
+            Value::shared(Arc::new(SharedNode::Str("hi".into()))).to_string(),
             "hi"
         );
     }
@@ -3164,7 +3794,7 @@ mod tests {
     fn obj(pairs: &[(&str, i64)]) -> Cc<ObjectCell> {
         let mut m = IndexMap::new();
         for (k, v) in pairs {
-            m.insert(k.to_string(), Value::Int(*v));
+            m.insert(k.to_string(), Value::int(*v));
         }
         ObjectCell::new(m)
     }
@@ -3172,25 +3802,25 @@ mod tests {
     #[test]
     fn object_accessors_mirror_indexmap_semantics() {
         let mut m = IndexMap::new();
-        m.insert("a".to_string(), Value::Int(1));
-        m.insert("b".to_string(), Value::Int(2));
+        m.insert("a".to_string(), Value::int(1));
+        m.insert("b".to_string(), Value::int(2));
         let o = ObjectCell::new(m);
         assert_eq!(o.len(), 2);
-        assert_eq!(o.get("a"), Some(Value::Int(1)));
+        assert_eq!(o.get("a"), Some(Value::int(1)));
         assert_eq!(o.get_index_of("b"), Some(1));
-        o.insert("a", Value::Int(9)); // overwrite: position kept
+        o.insert("a", Value::int(9)); // overwrite: position kept
         assert_eq!(
             o.get_index(0).map(|(k, _)| k.to_string()),
             Some("a".into())
         );
-        o.insert("c", Value::Int(3)); // new key: appended
+        o.insert("c", Value::int(3)); // new key: appended
         let keys: Vec<String> = {
             let mut v = vec![];
             o.for_each(|k, _| v.push(k.to_string()));
             v
         };
         assert_eq!(keys, ["a", "b", "c"]);
-        assert_eq!(o.shift_remove("b"), Some(Value::Int(2)));
+        assert_eq!(o.shift_remove("b"), Some(Value::int(2)));
         assert_eq!(o.get_index_of("c"), Some(1)); // order preserved after removal
     }
 
@@ -3215,7 +3845,7 @@ mod tests {
         }
         let mut values = Vec::with_capacity(pairs.len());
         for (_, v) in pairs {
-            values.push(Value::Int(*v));
+            values.push(Value::int(*v));
         }
         ObjectCell::new_slab(reg.keys_of(shape), values, shape)
     }
@@ -3230,18 +3860,18 @@ mod tests {
         let s_ab = reg.add_key(s_a, "b").unwrap();
         let s_abc = reg.add_key(s_ab, "c").unwrap();
         let cell = ObjectCell::new_slab(reg.keys_of(EMPTY_SHAPE), vec![], EMPTY_SHAPE);
-        cell.slab_append(s_a, reg.keys_of(s_a), Value::Int(1));
-        cell.slab_append(s_ab, reg.keys_of(s_ab), Value::Int(2));
-        cell.slab_append(s_abc, reg.keys_of(s_abc), Value::Int(3));
+        cell.slab_append(s_a, reg.keys_of(s_a), Value::int(1));
+        cell.slab_append(s_ab, reg.keys_of(s_ab), Value::int(2));
+        cell.slab_append(s_abc, reg.keys_of(s_abc), Value::int(3));
 
         // len / is_empty
         assert_eq!(cell.len(), 3);
         assert!(!cell.is_empty());
 
         // get
-        assert_eq!(cell.get("a"), Some(Value::Int(1)));
-        assert_eq!(cell.get("b"), Some(Value::Int(2)));
-        assert_eq!(cell.get("c"), Some(Value::Int(3)));
+        assert_eq!(cell.get("a"), Some(Value::int(1)));
+        assert_eq!(cell.get("b"), Some(Value::int(2)));
+        assert_eq!(cell.get("c"), Some(Value::int(3)));
         assert_eq!(cell.get("z"), None);
 
         // contains_key
@@ -3255,18 +3885,18 @@ mod tests {
         assert_eq!(cell.get_index_of("z"), None);
 
         // get_index
-        assert_eq!(cell.get_index(0), Some((Rc::from("a"), Value::Int(1))));
-        assert_eq!(cell.get_index(2), Some((Rc::from("c"), Value::Int(3))));
+        assert_eq!(cell.get_index(0), Some((Rc::from("a"), Value::int(1))));
+        assert_eq!(cell.get_index(2), Some((Rc::from("c"), Value::int(3))));
         assert_eq!(cell.get_index(3), None);
 
         // value_at
-        assert_eq!(cell.value_at(0), Some(Value::Int(1)));
+        assert_eq!(cell.value_at(0), Some(Value::int(1)));
         assert_eq!(cell.value_at(3), None);
 
         // set_value_at
-        assert!(cell.set_value_at(1, Value::Int(99)));
-        assert_eq!(cell.value_at(1), Some(Value::Int(99)));
-        assert!(!cell.set_value_at(5, Value::Int(0)));
+        assert!(cell.set_value_at(1, Value::int(99)));
+        assert_eq!(cell.value_at(1), Some(Value::int(99)));
+        assert!(!cell.set_value_at(5, Value::int(0)));
 
         // entries order
         let entries: Vec<(String, i64)> = cell
@@ -3275,7 +3905,7 @@ mod tests {
             .map(|(k, v)| {
                 (
                     k.to_string(),
-                    if let Value::Int(n) = v { n } else { panic!("expected Int") },
+                    if let Some(n) = v.as_int() { n } else { panic!("expected Int") },
                 )
             })
             .collect();
@@ -3299,16 +3929,16 @@ mod tests {
         assert_eq!(keys2, ["a", "b", "c"]);
 
         // insert existing key — position kept, still in slab mode
-        cell.insert("a", Value::Int(42));
+        cell.insert("a", Value::int(42));
         assert_eq!(cell.get_index_of("a"), Some(0)); // position 0 preserved
-        assert_eq!(cell.value_at(0), Some(Value::Int(42)));
+        assert_eq!(cell.value_at(0), Some(Value::int(42)));
         // shape must be non-zero (still slab)
         assert_ne!(cell.shape.get(), 0);
 
         // insert new key on slab — demotes to dict
-        cell.insert("d", Value::Int(4));
+        cell.insert("d", Value::int(4));
         assert_eq!(cell.shape.get(), 0); // demoted → shape 0
-        assert_eq!(cell.get("d"), Some(Value::Int(4)));
+        assert_eq!(cell.get("d"), Some(Value::int(4)));
 
         // keys_snapshot (post-demotion, dict mode)
         let ks = cell.keys_snapshot();
@@ -3324,7 +3954,7 @@ mod tests {
         let o = slab_obj(&[("x", 10), ("y", 20), ("z", 30)]);
         assert_ne!(o.shape.get(), 0); // starts in slab mode
         let removed = o.shift_remove("x");
-        assert_eq!(removed, Some(Value::Int(10)));
+        assert_eq!(removed, Some(Value::int(10)));
         assert_eq!(o.shape.get(), 0); // demoted
         // remaining order: y, z
         let mut keys = vec![];
@@ -3339,8 +3969,8 @@ mod tests {
         let slab = slab_obj(&[("a", 1), ("b", 2)]);
         // dict with same content, different insertion order → content_eq is order-insensitive
         let mut m = IndexMap::new();
-        m.insert("b".to_string(), Value::Int(2));
-        m.insert("a".to_string(), Value::Int(1));
+        m.insert("b".to_string(), Value::int(2));
+        m.insert("a".to_string(), Value::int(1));
         let dict = ObjectCell::new(m);
         assert!(slab.content_eq(&dict));
         assert!(dict.content_eq(&slab));

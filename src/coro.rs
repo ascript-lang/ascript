@@ -86,7 +86,7 @@ enum GenImpl {
     /// [`crate::worker::stream::StreamDriver`]'s channel, awaits the next serialized
     /// yield, and DECODES it against the consumer's `Interp`. A bounded prefetch
     /// buffer (default 1 = strict pull) gives backpressure (the producer runs at most
-    /// one step ahead of demand). Transparent behind `Value::Generator`, so
+    /// one step ahead of demand). Transparent behind `Value::generator`, so
     /// `for await`/`.next(v)`/`.close()` work unchanged.
     Worker {
         /// The cross-thread driver, moved OUT across the `.await` (take-out-then-
@@ -107,7 +107,7 @@ enum GenImpl {
     },
 }
 
-/// The runtime handle behind `Value::Generator`. Wraps either engine (tree-walker
+/// The runtime handle behind `Value::generator`. Wraps either engine (tree-walker
 /// body future or VM Suspended Fiber). Identity equality (`Rc::ptr_eq`), like
 /// other handles.
 pub struct GeneratorHandle {
@@ -405,7 +405,7 @@ impl GeneratorHandle {
         // Encode the injected value on FIRST resume too, but the producer ignores it
         // (first-`next` semantics) — we pass nil's encoding then to keep the protocol
         // uniform. Encode against the consumer's serializer (sendability gate applies).
-        let to_inject = if started.get() { input } else { Value::Nil };
+        let to_inject = if started.get() { input } else { Value::nil() };
         if !started.get() {
             started.set(true);
         }
@@ -427,7 +427,7 @@ impl GeneratorHandle {
         interp.with_determinism_mut(|ctx| {
             if ctx.mode == crate::det::Mode::Record {
                 let ev = match &outcome {
-                    // The det log is byte-only; a yielded `Value::Shared`'s `Arc`
+                    // The det log is byte-only; a yielded `Value::shared`'s `Arc`
                     // side-vector is not event-sourced (a frozen graph is not
                     // replayable bytes — accepted limitation, like the actor path).
                     Ok(Some((bytes, _shared))) => crate::det::BoundaryOutcome::Bytes(bytes.clone()),
@@ -509,6 +509,7 @@ pub fn current_generator() -> Option<Rc<GeneratorHandle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueKind;
     use crate::error::AsError;
     use tokio::task::LocalSet;
 
@@ -529,9 +530,9 @@ mod tests {
         let body: BodyFuture = Box::pin(async move {
             for v in vals {
                 let g = current_generator().expect("inside a generator");
-                g.yield_(Value::Float(v)).await;
+                g.yield_(Value::float(v)).await;
             }
-            Ok(Value::Nil)
+            Ok(Value::nil())
         });
         Rc::new(GeneratorHandle::new(body))
     }
@@ -541,20 +542,20 @@ mod tests {
         on_localset(async {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
             assert_eq!(
-                g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(1.0))
+                g.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(1.0))
             );
             assert_eq!(
-                g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(2.0))
+                g.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(2.0))
             );
             assert_eq!(
-                g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(3.0))
+                g.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(3.0))
             );
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
+            assert_eq!(g.resume(Value::nil()).await.unwrap(), None);
             // Idempotent: still None after done.
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
+            assert_eq!(g.resume(Value::nil()).await.unwrap(), None);
         })
         .await;
     }
@@ -563,7 +564,7 @@ mod tests {
     async fn empty_generator_first_resume_is_none() {
         on_localset(async {
             let g = make_gen(vec![]);
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
+            assert_eq!(g.resume(Value::nil()).await.unwrap(), None);
         })
         .await;
     }
@@ -576,27 +577,27 @@ mod tests {
             let seen2 = seen.clone();
             let body: BodyFuture = Box::pin(async move {
                 let g = current_generator().unwrap();
-                let a = g.yield_(Value::Float(10.0)).await;
+                let a = g.yield_(Value::float(10.0)).await;
                 seen2.borrow_mut().push(a);
                 let g = current_generator().unwrap();
-                let b = g.yield_(Value::Float(20.0)).await;
+                let b = g.yield_(Value::float(20.0)).await;
                 seen2.borrow_mut().push(b);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             });
             let g = Rc::new(GeneratorHandle::new(body));
             assert_eq!(
-                g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(10.0))
+                g.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(10.0))
             );
             assert_eq!(
-                g.resume(Value::Str("first".into())).await.unwrap(),
-                Some(Value::Float(20.0))
+                g.resume(Value::str("first")).await.unwrap(),
+                Some(Value::float(20.0))
             );
-            assert_eq!(g.resume(Value::Str("second".into())).await.unwrap(), None);
+            assert_eq!(g.resume(Value::str("second")).await.unwrap(), None);
             let s = seen.borrow();
             assert_eq!(
                 s.as_slice(),
-                &[Value::Str("first".into()), Value::Str("second".into())]
+                &[Value::str("first"), Value::str("second")]
             );
         })
         .await;
@@ -609,12 +610,12 @@ mod tests {
             let ran2 = ran.clone();
             let body: BodyFuture = Box::pin(async move {
                 ran2.set(true);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             });
             let g = Rc::new(GeneratorHandle::new(body));
             // The body is an unpolled future: nothing has run yet.
             assert!(!ran.get(), "body must not run before the first resume");
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
+            assert_eq!(g.resume(Value::nil()).await.unwrap(), None);
             assert!(ran.get(), "body should have run after the first resume");
         })
         .await;
@@ -628,8 +629,8 @@ mod tests {
         on_localset(async {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
             assert_eq!(
-                g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(1.0))
+                g.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(1.0))
             );
             drop(g);
         })
@@ -641,20 +642,20 @@ mod tests {
         on_localset(async {
             let body: BodyFuture = Box::pin(async move {
                 let g = current_generator().unwrap();
-                g.yield_(Value::Float(1.0)).await;
+                g.yield_(Value::float(1.0)).await;
                 Err(Control::Panic(AsError::new("boom")))
             });
             let g = Rc::new(GeneratorHandle::new(body));
             assert_eq!(
-                g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(1.0))
+                g.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(1.0))
             );
-            match g.resume(Value::Nil).await {
+            match g.resume(Value::nil()).await {
                 Err(Control::Panic(e)) => assert_eq!(e.message, "boom"),
                 other => panic!("expected a panic surfaced to the consumer, got {other:?}"),
             }
             // After the error the generator is done.
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
+            assert_eq!(g.resume(Value::nil()).await.unwrap(), None);
         })
         .await;
     }
@@ -664,11 +665,11 @@ mod tests {
         on_localset(async {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
             assert_eq!(
-                g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(1.0))
+                g.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(1.0))
             );
             g.close();
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
+            assert_eq!(g.resume(Value::nil()).await.unwrap(), None);
         })
         .await;
     }
@@ -682,22 +683,23 @@ mod tests {
             let inner = make_gen(vec![1.0, 2.0]);
             let inner_for_body = inner.clone();
             let outer_body: BodyFuture = Box::pin(async move {
-                while let Some(Value::Float(n)) = inner_for_body.resume(Value::Nil).await? {
+                while let Some(v) = inner_for_body.resume(Value::nil()).await? {
+                    let ValueKind::Float(n) = v.kind() else { break };
                     let g = current_generator().unwrap();
-                    g.yield_(Value::Float(n * 2.0)).await;
+                    g.yield_(Value::float(n * 2.0)).await;
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             });
             let outer = Rc::new(GeneratorHandle::new(outer_body));
             assert_eq!(
-                outer.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(2.0))
+                outer.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(2.0))
             );
             assert_eq!(
-                outer.resume(Value::Nil).await.unwrap(),
-                Some(Value::Float(4.0))
+                outer.resume(Value::nil()).await.unwrap(),
+                Some(Value::float(4.0))
             );
-            assert_eq!(outer.resume(Value::Nil).await.unwrap(), None);
+            assert_eq!(outer.resume(Value::nil()).await.unwrap(), None);
             // The stack is balanced after all polling.
             assert!(current_generator().is_none());
         })

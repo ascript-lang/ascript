@@ -359,7 +359,7 @@ async fn trampoline_reset_invariant_five_mode_identity() {
 /// trampoline arm gate correctly excludes is_async closures).
 #[tokio::test]
 async fn trampoline_arm_refuses_ineligible_callables_produces_correct_output() {
-    // Builtin (len) is a Value::Builtin, not Closure — arm() returns None.
+    // Builtin (len) is a Value::builtin, not Closure — arm() returns None.
     // Both call_fast modes must produce identical output.
     let src = r#"
         import * as array from "std/array"

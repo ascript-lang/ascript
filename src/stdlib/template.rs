@@ -20,14 +20,14 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::{MapKey, Value};
+use crate::value::{MapKey, Value, ValueKind};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![("render", bi("template.render"))]
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -36,7 +36,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let tmpl = want_string(&arg(args, 0), span, "template.render")?;
             let data = arg(args, 1);
             match render(&tmpl, &data) {
-                Ok(s) => Ok(make_pair(Value::Str(s.into()), Value::Nil)),
+                Ok(s) => Ok(make_pair(Value::str(s), Value::nil())),
                 Err(msg) => Ok(err_pair(msg)),
             }
         }
@@ -99,11 +99,11 @@ fn resolve_path(data: &Value, path: &str) -> Result<Value, String> {
 
 /// Look up a single key on an Object, Instance, or Map; `None` if absent.
 fn lookup(v: &Value, key: &str) -> Option<Value> {
-    match v {
-        Value::Object(o) => o.get(key),
-        Value::Instance(inst) => inst.borrow().get(key),
-        Value::Map(m) => {
-            let mk = MapKey::from_value(&Value::Str(key.into()))?;
+    match v.kind() {
+        ValueKind::Object(o) => o.get(key),
+        ValueKind::Instance(inst) => inst.borrow().get(key),
+        ValueKind::Map(m) => {
+            let mk = MapKey::from_value(&Value::str(key))?;
             m.borrow().get(&mk).cloned()
         }
         _ => None,
@@ -113,9 +113,9 @@ fn lookup(v: &Value, key: &str) -> Option<Value> {
 /// Stringify a substituted value. Strings pass through verbatim; everything else
 /// uses the canonical Display (numbers, bools, nil, etc.).
 fn stringify(v: &Value) -> String {
-    match v {
-        Value::Str(s) => s.to_string(),
-        other => format!("{}", other),
+    match v.kind() {
+        ValueKind::Str(s) => s.to_string(),
+        _ => format!("{}", v),
     }
 }
 
@@ -132,39 +132,39 @@ mod tests {
         for (k, v) in pairs {
             m.insert((*k).to_string(), v.clone());
         }
-        Value::Object(crate::value::ObjectCell::new(m))
+        Value::object(m)
     }
     fn ok(v: Value) -> String {
-        match v {
-            Value::Array(a) => {
+        match v.kind() {
+            ValueKind::Array(a) => {
                 let b = a.borrow();
-                assert_eq!(b[1], Value::Nil, "expected nil err, got {:?}", b[1]);
-                match &b[0] {
-                    Value::Str(s) => s.to_string(),
-                    other => panic!("expected string, got {:?}", other),
+                assert_eq!(b[1], Value::nil(), "expected nil err, got {:?}", b[1]);
+                match b[0].kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => panic!("expected string, got {:?}", b[0]),
                 }
             }
             _ => panic!("expected pair"),
         }
     }
     fn is_err(v: &Value) -> bool {
-        matches!(v, Value::Array(a) if { let b = a.borrow(); b[0] == Value::Nil && b[1] != Value::Nil })
+        matches!(v.kind(), ValueKind::Array(a) if { let b = a.borrow(); b[0] == Value::nil() && b[1] != Value::nil() })
     }
 
     #[test]
     fn simple_substitution() {
-        let data = obj(&[("name", Value::Str("Ada".into()))]);
-        let out = call("render", &[Value::Str("Hi {{name}}!".into()), data], sp()).unwrap();
+        let data = obj(&[("name", Value::str("Ada"))]);
+        let out = call("render", &[Value::str("Hi {{name}}!"), data], sp()).unwrap();
         assert_eq!(ok(out), "Hi Ada!");
     }
 
     #[test]
     fn dotted_path_and_number() {
-        let inner = obj(&[("b", Value::Float(1.0))]);
+        let inner = obj(&[("b", Value::float(1.0))]);
         let data = obj(&[("a", inner)]);
         let out = call(
             "render",
-            &[Value::Str("v={{a.b}}".into()), data],
+            &[Value::str("v={{a.b}}"), data],
             sp(),
         )
         .unwrap();
@@ -173,8 +173,8 @@ mod tests {
 
     #[test]
     fn whitespace_trimmed() {
-        let data = obj(&[("x", Value::Str("y".into()))]);
-        let out = call("render", &[Value::Str("{{ x }}".into()), data], sp()).unwrap();
+        let data = obj(&[("x", Value::str("y"))]);
+        let out = call("render", &[Value::str("{{ x }}"), data], sp()).unwrap();
         assert_eq!(ok(out), "y");
     }
 
@@ -182,7 +182,7 @@ mod tests {
     fn literal_text_passthrough() {
         let out = call(
             "render",
-            &[Value::Str("no placeholders here".into()), Value::Nil],
+            &[Value::str("no placeholders here"), Value::nil()],
             sp(),
         )
         .unwrap();
@@ -191,21 +191,24 @@ mod tests {
 
     #[test]
     fn missing_key_is_tier1_err() {
-        let data = obj(&[("name", Value::Str("Ada".into()))]);
-        let out = call("render", &[Value::Str("{{nope}}".into()), data], sp()).unwrap();
+        let data = obj(&[("name", Value::str("Ada"))]);
+        let out = call("render", &[Value::str("{{nope}}"), data], sp()).unwrap();
         assert!(is_err(&out), "expected Tier-1 err, got {:?}", out);
     }
 
     #[test]
     fn missing_nested_key_names_the_path() {
-        let data = obj(&[("a", obj(&[("b", Value::Float(1.0))]))]);
-        let out = call("render", &[Value::Str("{{a.c}}".into()), data], sp()).unwrap();
-        match &out {
-            Value::Array(arr) => {
+        let data = obj(&[("a", obj(&[("b", Value::float(1.0))]))]);
+        let out = call("render", &[Value::str("{{a.c}}"), data], sp()).unwrap();
+        match out.kind() {
+            ValueKind::Array(arr) => {
                 let b = arr.borrow();
-                match &b[1] {
-                    Value::Object(o) => match o.get("message") {
-                        Some(Value::Str(s)) => assert!(s.contains("a.c"), "msg: {}", s),
+                match b[1].kind() {
+                    ValueKind::Object(o) => match o.get("message") {
+                        Some(v) => match v.kind() {
+                            ValueKind::Str(s) => assert!(s.contains("a.c"), "msg: {}", s),
+                            _ => panic!("no message"),
+                        },
                         _ => panic!("no message"),
                     },
                     _ => panic!("no err object"),
@@ -219,7 +222,7 @@ mod tests {
     fn unterminated_placeholder_is_err() {
         let out = call(
             "render",
-            &[Value::Str("oops {{name".into()), obj(&[])],
+            &[Value::str("oops {{name"), obj(&[])],
             sp(),
         )
         .unwrap();

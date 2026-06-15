@@ -4,7 +4,7 @@ use super::{arg, bi, want_array, want_number};
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use std::cell::Cell;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -29,8 +29,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("ln", bi("math.ln")),
         ("log2", bi("math.log2")),
         ("log10", bi("math.log10")),
-        ("pi", Value::Float(std::f64::consts::PI)),
-        ("e", Value::Float(std::f64::consts::E)),
+        ("pi", Value::float(std::f64::consts::PI)),
+        ("e", Value::float(std::f64::consts::E)),
         ("sign", bi("math.sign")),
         ("trunc", bi("math.trunc")),
         ("clamp", bi("math.clamp")),
@@ -101,26 +101,26 @@ fn round_to_int(
     span: Span,
     ctx: &str,
 ) -> Result<Value, Control> {
-    match v {
-        Value::Int(i) => Ok(Value::Int(*i)),
-        Value::Float(f) => Ok(Value::Int(f64_to_int(round_op(*f), span, ctx)?)),
-        other => Err(AsError::at(
-            format!("{} expects a number, got {}", ctx, crate::interp::type_name(other)),
+    match v.kind() {
+        ValueKind::Int(i) => Ok(Value::int(i)),
+        ValueKind::Float(f) => Ok(Value::int(f64_to_int(round_op(f), span, ctx)?)),
+        _ => Err(AsError::at(
+            format!("{} expects a number, got {}", ctx, crate::interp::type_name(v)),
             span,
         )
         .into()),
     }
 }
 
-/// NUM §4: require the argument to be a strict `Value::Int` (the int→int
+/// NUM §4: require the argument to be a strict `Value::int` (the int→int
 /// helpers — `floordiv`/`divmod`/`ceildiv` and the bit ops — do not accept a
 /// `float`, since they are exact integer operations). A `float` (or any other
 /// kind) is a Tier-2 panic.
 fn want_int_value(v: &Value, span: Span, ctx: &str) -> Result<i64, Control> {
-    match v {
-        Value::Int(i) => Ok(*i),
-        other => Err(AsError::at(
-            format!("{} expects an int, got {}", ctx, crate::interp::type_name(other)),
+    match v.kind() {
+        ValueKind::Int(i) => Ok(i),
+        _ => Err(AsError::at(
+            format!("{} expects an int, got {}", ctx, crate::interp::type_name(v)),
             span,
         )
         .into()),
@@ -183,34 +183,37 @@ pub fn call(
         // NUM §4: `abs` is the only SUBTYPE-PRESERVING math fn: `abs(int)->int`
         // (checked — `abs(i64::MIN)` overflows and is a clean panic, never
         // wraps), `abs(float)->float`.
-        "abs" => match &arg(args, 0) {
-            Value::Int(i) => match i.checked_abs() {
-                Some(a) => Ok(Value::Int(a)),
-                None => Err(AsError::at(
-                    "math.abs: integer overflow (abs of i64::MIN)",
+        "abs" => {
+            let v = arg(args, 0);
+            match v.kind() {
+                ValueKind::Int(i) => match i.checked_abs() {
+                    Some(a) => Ok(Value::int(a)),
+                    None => Err(AsError::at(
+                        "math.abs: integer overflow (abs of i64::MIN)",
+                        span,
+                    )
+                    .into()),
+                },
+                ValueKind::Float(f) => Ok(Value::float(f.abs())),
+                _ => Err(AsError::at(
+                    format!("math.abs expects a number, got {}", crate::interp::type_name(&v)),
                     span,
                 )
                 .into()),
-            },
-            Value::Float(f) => Ok(Value::Float(f.abs())),
-            other => Err(AsError::at(
-                format!("math.abs expects a number, got {}", crate::interp::type_name(other)),
-                span,
-            )
-            .into()),
-        },
+            }
+        }
         // NUM §4: rounding fns return an `int`. An `int` input is already
         // integral and passes through unchanged.
         "floor" => round_to_int(&arg(args, 0), f64::floor, span, &ctx("floor")),
         "ceil" => round_to_int(&arg(args, 0), f64::ceil, span, &ctx("ceil")),
         "round" => round_to_int(&arg(args, 0), f64::round, span, &ctx("round")),
-        "sqrt" => Ok(Value::Float(
+        "sqrt" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("sqrt"))?.sqrt(),
         )),
         "pow" => {
             let b = want_number(&arg(args, 0), span, &ctx("pow"))?;
             let e = want_number(&arg(args, 1), span, &ctx("pow"))?;
-            Ok(Value::Float(b.powf(e)))
+            Ok(Value::float(b.powf(e)))
         }
         "min" | "max" => {
             if args.is_empty() {
@@ -230,42 +233,42 @@ pub fn call(
             } else {
                 nums.iter().copied().fold(f64::NEG_INFINITY, f64::max)
             };
-            Ok(Value::Float(acc))
+            Ok(Value::float(acc))
         }
-        "random" => Ok(Value::Float(next_random(interp))),
-        "sin" => Ok(Value::Float(
+        "random" => Ok(Value::float(next_random(interp))),
+        "sin" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("sin"))?.sin(),
         )),
-        "cos" => Ok(Value::Float(
+        "cos" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("cos"))?.cos(),
         )),
-        "tan" => Ok(Value::Float(
+        "tan" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("tan"))?.tan(),
         )),
-        "asin" => Ok(Value::Float(
+        "asin" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("asin"))?.asin(),
         )),
-        "acos" => Ok(Value::Float(
+        "acos" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("acos"))?.acos(),
         )),
-        "atan" => Ok(Value::Float(
+        "atan" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("atan"))?.atan(),
         )),
         "atan2" => {
             let y = want_number(&arg(args, 0), span, &ctx("atan2"))?;
             let x = want_number(&arg(args, 1), span, &ctx("atan2"))?;
-            Ok(Value::Float(y.atan2(x)))
+            Ok(Value::float(y.atan2(x)))
         }
-        "exp" => Ok(Value::Float(
+        "exp" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("exp"))?.exp(),
         )),
-        "ln" => Ok(Value::Float(
+        "ln" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("ln"))?.ln(),
         )),
-        "log2" => Ok(Value::Float(
+        "log2" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("log2"))?.log2(),
         )),
-        "log10" => Ok(Value::Float(
+        "log10" => Ok(Value::float(
             want_number(&arg(args, 0), span, &ctx("log10"))?.log10(),
         )),
         "sign" => {
@@ -279,7 +282,7 @@ pub fn call(
             } else {
                 0.0
             };
-            Ok(Value::Float(r))
+            Ok(Value::float(r))
         }
         "trunc" => round_to_int(&arg(args, 0), f64::trunc, span, &ctx("trunc")),
         "clamp" => {
@@ -289,12 +292,12 @@ pub fn call(
             if lo > hi {
                 return Err(AsError::at("math.clamp requires lo <= hi", span).into());
             }
-            Ok(Value::Float(x.max(lo).min(hi)))
+            Ok(Value::float(x.max(lo).min(hi)))
         }
         "hypot" => {
             let x = want_number(&arg(args, 0), span, &ctx("hypot"))?;
             let y = want_number(&arg(args, 1), span, &ctx("hypot"))?;
-            Ok(Value::Float(x.hypot(y)))
+            Ok(Value::float(x.hypot(y)))
         }
         "gcd" => {
             let a = want_int(
@@ -307,7 +310,7 @@ pub fn call(
                 span,
                 "math.gcd",
             )?;
-            Ok(Value::Float(gcd_i64(a, b) as f64))
+            Ok(Value::float(gcd_i64(a, b) as f64))
         }
         "lcm" => {
             let a = want_int(
@@ -331,18 +334,18 @@ pub fn call(
                 }
                 abs as i64
             };
-            Ok(Value::Float(r as f64))
+            Ok(Value::float(r as f64))
         }
         "sum" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx("sum"))?;
-            Ok(Value::Float(xs.iter().sum()))
+            Ok(Value::float(xs.iter().sum()))
         }
         "mean" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx("mean"))?;
             if xs.is_empty() {
                 return Err(AsError::at("math.mean of empty array", span).into());
             }
-            Ok(Value::Float(xs.iter().sum::<f64>() / xs.len() as f64))
+            Ok(Value::float(xs.iter().sum::<f64>() / xs.len() as f64))
         }
         "median" => {
             let mut xs = want_number_vec(&arg(args, 0), span, &ctx("median"))?;
@@ -356,7 +359,7 @@ pub fn call(
             } else {
                 (xs[m - 1] + xs[m]) / 2.0
             };
-            Ok(Value::Float(med))
+            Ok(Value::float(med))
         }
         "variance" | "stddev" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx(func))?;
@@ -379,7 +382,7 @@ pub fn call(
                 xs.len() as f64
             };
             let var = ss / denom;
-            Ok(Value::Float(if func == "stddev" {
+            Ok(Value::float(if func == "stddev" {
                 var.sqrt()
             } else {
                 var
@@ -401,7 +404,7 @@ pub fn call(
             }
             let span_len = (max - min + 1) as f64;
             let v = min + (next_random(interp) * span_len).floor() as i64;
-            Ok(Value::Float(v as f64))
+            Ok(Value::float(v as f64))
         }
         "shuffle" => {
             let a = want_array(&arg(args, 0), span, &ctx("shuffle"))?;
@@ -411,13 +414,13 @@ pub fn call(
                 let j = (next_random(interp) * (i as f64 + 1.0)).floor() as usize;
                 items.swap(i, j.min(i));
             }
-            Ok(Value::Array(crate::value::ArrayCell::new(items)))
+            Ok(Value::array_cell(crate::value::ArrayCell::new(items)))
         }
         "choice" => {
             let a = want_array(&arg(args, 0), span, &ctx("choice"))?;
             let b = a.borrow();
             if b.is_empty() {
-                return Ok(Value::Nil);
+                return Ok(Value::nil());
             }
             let idx = (next_random(interp) * b.len() as f64).floor() as usize;
             Ok(b[idx.min(b.len() - 1)].clone())
@@ -427,7 +430,7 @@ pub fn call(
         "floordiv" => {
             let a = want_int_value(&arg(args, 0), span, "math.floordiv")?;
             let b = want_int_value(&arg(args, 1), span, "math.floordiv")?;
-            Ok(Value::Int(floordiv_i64(a, b, span, "math.floordiv")?))
+            Ok(Value::int(floordiv_i64(a, b, span, "math.floordiv")?))
         }
         "ceildiv" => {
             let a = want_int_value(&arg(args, 0), span, "math.ceildiv")?;
@@ -445,7 +448,7 @@ pub fn call(
             let q = neg_floor.checked_neg().ok_or_else(|| -> Control {
                 AsError::at("math.ceildiv: integer overflow", span).into()
             })?;
-            Ok(Value::Int(q))
+            Ok(Value::int(q))
         }
         // `divmod(a, b) -> [q, r]` with q FLOORED and r the matching remainder,
         // satisfying `a == q*b + r` (r has the sign of the divisor, in `[0, |b|)`
@@ -463,23 +466,23 @@ pub fn call(
             let r = a.checked_sub(qb).ok_or_else(|| -> Control {
                 AsError::at("math.divmod: integer overflow", span).into()
             })?;
-            Ok(Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Int(q),
-                Value::Int(r),
+            Ok(Value::array_cell(crate::value::ArrayCell::new(vec![
+                Value::int(q),
+                Value::int(r),
             ])))
         }
         // NUM §4: bit helpers on the 64-bit i64 representation (int → int).
         "popcount" => {
             let x = want_int_value(&arg(args, 0), span, "math.popcount")?;
-            Ok(Value::Int(x.count_ones() as i64))
+            Ok(Value::int(x.count_ones() as i64))
         }
         "leading_zeros" => {
             let x = want_int_value(&arg(args, 0), span, "math.leading_zeros")?;
-            Ok(Value::Int(x.leading_zeros() as i64))
+            Ok(Value::int(x.leading_zeros() as i64))
         }
         "trailing_zeros" => {
             let x = want_int_value(&arg(args, 0), span, "math.trailing_zeros")?;
-            Ok(Value::Int(x.trailing_zeros() as i64))
+            Ok(Value::int(x.trailing_zeros() as i64))
         }
         // Rotations are modulo the 64-bit width (Rust `rotate_left`/`rotate_right`
         // already reduce the shift mod 64); the count is taken from the low bits
@@ -487,12 +490,12 @@ pub fn call(
         "rotl" => {
             let x = want_int_value(&arg(args, 0), span, "math.rotl")?;
             let n = want_int_value(&arg(args, 1), span, "math.rotl")?;
-            Ok(Value::Int(x.rotate_left(n.rem_euclid(64) as u32)))
+            Ok(Value::int(x.rotate_left(n.rem_euclid(64) as u32)))
         }
         "rotr" => {
             let x = want_int_value(&arg(args, 0), span, "math.rotr")?;
             let n = want_int_value(&arg(args, 1), span, "math.rotr")?;
-            Ok(Value::Int(x.rotate_right(n.rem_euclid(64) as u32)))
+            Ok(Value::int(x.rotate_right(n.rem_euclid(64) as u32)))
         }
         _ => Err(AsError::at(format!("std/math has no function '{}'", func), span).into()),
     }
@@ -540,7 +543,7 @@ mod tests {
     use super::*;
 
     fn n(x: f64) -> Value {
-        Value::Float(x)
+        Value::float(x)
     }
 
     fn sp() -> Span {
@@ -572,35 +575,35 @@ mod tests {
         let sp = Span::new(0, 0);
         // NUM §4: abs is subtype-preserving — float in, float out.
         assert_eq!(
-            call("abs", &[Value::Float(-3.0)], sp).unwrap(),
-            Value::Float(3.0)
+            call("abs", &[Value::float(-3.0)], sp).unwrap(),
+            Value::float(3.0)
         );
         // NUM §4: floor returns an int.
         assert_eq!(
-            call("floor", &[Value::Float(2.9)], sp).unwrap(),
-            Value::Int(2)
+            call("floor", &[Value::float(2.9)], sp).unwrap(),
+            Value::int(2)
         );
         assert_eq!(
-            call("pow", &[Value::Float(2.0), Value::Float(10.0)], sp).unwrap(),
-            Value::Float(1024.0)
+            call("pow", &[Value::float(2.0), Value::float(10.0)], sp).unwrap(),
+            Value::float(1024.0)
         );
         assert_eq!(
             call(
                 "max",
-                &[Value::Float(1.0), Value::Float(9.0), Value::Float(4.0)],
+                &[Value::float(1.0), Value::float(9.0), Value::float(4.0)],
                 sp
             )
             .unwrap(),
-            Value::Float(9.0)
+            Value::float(9.0)
         );
         assert_eq!(
             call(
                 "min",
-                &[Value::Float(1.0), Value::Float(9.0), Value::Float(4.0)],
+                &[Value::float(1.0), Value::float(9.0), Value::float(4.0)],
                 sp
             )
             .unwrap(),
-            Value::Float(1.0)
+            Value::float(1.0)
         );
     }
 
@@ -615,7 +618,7 @@ mod tests {
 
     #[test]
     fn type_misuse_panics() {
-        let e = call("sqrt", &[Value::Str("x".into())], Span::new(0, 0));
+        let e = call("sqrt", &[Value::str("x")], Span::new(0, 0));
         assert!(matches!(e, Err(Control::Panic(_))));
     }
 
@@ -628,7 +631,7 @@ mod tests {
 
     #[test]
     fn math_stats() {
-        let a = Value::Array(crate::value::ArrayCell::new(vec![
+        let a = Value::array_cell(crate::value::ArrayCell::new(vec![
             n(1.0),
             n(2.0),
             n(3.0),
@@ -650,13 +653,13 @@ mod tests {
             call("variance", std::slice::from_ref(&a), sp()).unwrap(),
             n(1.25)
         );
-        let sv = call("variance", &[a.clone(), Value::Bool(true)], sp()).unwrap();
-        assert!(matches!(sv, Value::Float(x) if (x - 5.0/3.0).abs() < 1e-12));
+        let sv = call("variance", &[a.clone(), Value::bool_(true)], sp()).unwrap();
+        assert!(matches!(sv.kind(), ValueKind::Float(x) if (x - 5.0/3.0).abs() < 1e-12));
         // stddev returns sqrt(population variance)
         assert!(
-            matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Float(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
+            matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap().kind(), ValueKind::Float(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
         );
-        let empty = Value::Array(crate::value::ArrayCell::new(vec![]));
+        let empty = Value::array_cell(crate::value::ArrayCell::new(vec![]));
         assert_eq!(
             call("sum", std::slice::from_ref(&empty), sp()).unwrap(),
             n(0.0)
@@ -671,9 +674,9 @@ mod tests {
             Err(Control::Panic(_))
         ));
         // sample variance needs >= 2 elements
-        let one = Value::Array(crate::value::ArrayCell::new(vec![n(5.0)]));
+        let one = Value::array_cell(crate::value::ArrayCell::new(vec![n(5.0)]));
         assert!(matches!(
-            call("variance", &[one, Value::Bool(true)], sp()),
+            call("variance", &[one, Value::bool_(true)], sp()),
             Err(Control::Panic(_))
         ));
     }
@@ -682,7 +685,7 @@ mod tests {
     fn math_random_helpers() {
         for _ in 0..100 {
             let r = call("randomInt", &[n(1.0), n(6.0)], sp()).unwrap();
-            if let Value::Float(x) = r {
+            if let ValueKind::Float(x) = r.kind() {
                 assert!((1.0..=6.0).contains(&x) && x.fract() == 0.0);
             } else {
                 panic!()
@@ -693,19 +696,19 @@ mod tests {
             call("randomInt", &[n(6.0), n(1.0)], sp()),
             Err(Control::Panic(_))
         ));
-        let a = Value::Array(crate::value::ArrayCell::new(vec![
+        let a = Value::array_cell(crate::value::ArrayCell::new(vec![
             n(1.0),
             n(2.0),
             n(3.0),
         ]));
         let sh = call("shuffle", std::slice::from_ref(&a), sp()).unwrap();
-        if let Value::Array(v) = sh {
+        if let ValueKind::Array(v) = sh.kind() {
             assert_eq!(v.borrow().len(), 3);
         } else {
             panic!()
         }
         // shuffle is non-mutating: original unchanged length & content set
-        if let Value::Array(orig) = &a {
+        if let ValueKind::Array(orig) = a.kind() {
             assert_eq!(orig.borrow().len(), 3);
         }
         // choice returns an element actually in the array
@@ -713,13 +716,13 @@ mod tests {
         assert!([n(1.0), n(2.0), n(3.0)].contains(&elem));
         // shuffle preserves the multiset of elements (sorted equal to original)
         let sh2 = call("shuffle", std::slice::from_ref(&a), sp()).unwrap();
-        if let Value::Array(v) = sh2 {
+        if let ValueKind::Array(v) = sh2.kind() {
             let mut got: Vec<f64> = v
                 .borrow()
                 .iter()
                 .map(|x| {
-                    if let Value::Float(n) = x {
-                        *n
+                    if let ValueKind::Float(n) = x.kind() {
+                        n
                     } else {
                         f64::NAN
                     }
@@ -730,10 +733,10 @@ mod tests {
         } else {
             panic!()
         }
-        let empty = Value::Array(crate::value::ArrayCell::new(vec![]));
+        let empty = Value::array_cell(crate::value::ArrayCell::new(vec![]));
         assert_eq!(
             call("choice", std::slice::from_ref(&empty), sp()).unwrap(),
-            Value::Nil
+            Value::nil()
         );
     }
 
@@ -742,10 +745,10 @@ mod tests {
         assert_eq!(call("sign", &[n(-3.0)], sp()).unwrap(), n(-1.0));
         assert_eq!(call("sign", &[n(0.0)], sp()).unwrap(), n(0.0));
         assert!(
-            matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Float(x) if x.is_nan())
+            matches!(call("sign", &[n(f64::NAN)], sp()).unwrap().kind(), ValueKind::Float(x) if x.is_nan())
         );
         // NUM §4: trunc returns an int.
-        assert_eq!(call("trunc", &[n(3.7)], sp()).unwrap(), Value::Int(3));
+        assert_eq!(call("trunc", &[n(3.7)], sp()).unwrap(), Value::int(3));
         assert_eq!(
             call("clamp", &[n(5.0), n(0.0), n(3.0)], sp()).unwrap(),
             n(3.0)
@@ -766,7 +769,7 @@ mod tests {
     // ---- NUM §4: typed returns -------------------------------------------
 
     fn i(x: i64) -> Value {
-        Value::Int(x)
+        Value::int(x)
     }
 
     #[test]
@@ -866,14 +869,14 @@ mod tests {
         // divmod returns [q, r] with q floored and a == q*b + r.
         for (a, b) in [(17i64, 5i64), (-17, 5), (17, -5), (-17, -5), (10, 2), (0, 7)] {
             let r = call("divmod", &[i(a), i(b)], sp()).unwrap();
-            if let Value::Array(arr) = r {
+            if let ValueKind::Array(arr) = r.kind() {
                 let arr = arr.borrow();
                 assert_eq!(arr.len(), 2);
-                let q = if let Value::Int(q) = arr[0] { q } else { panic!() };
-                let rem = if let Value::Int(r) = arr[1] { r } else { panic!() };
+                let q = if let ValueKind::Int(q) = arr[0].kind() { q } else { panic!() };
+                let rem = if let ValueKind::Int(r) = arr[1].kind() { r } else { panic!() };
                 assert_eq!(a, q * b + rem, "identity for divmod({a},{b})");
                 // q is floored: matches floordiv.
-                assert_eq!(Value::Int(q), call("floordiv", &[i(a), i(b)], sp()).unwrap());
+                assert_eq!(Value::int(q), call("floordiv", &[i(a), i(b)], sp()).unwrap());
             } else {
                 panic!("divmod did not return an array");
             }

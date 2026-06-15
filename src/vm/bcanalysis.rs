@@ -31,7 +31,7 @@
 //! recursing into newly-added fns. Unrelated top-level fns are never reached.
 
 use crate::interp::Control;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use crate::vm::chunk::{Chunk, FnProto, InterfaceProto};
 use crate::vm::opcode::Op;
 use std::collections::{HashMap, HashSet};
@@ -102,7 +102,7 @@ pub(crate) fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
         let operand_u16 = if width >= 2 { top.read_u16(ip + 1) } else { 0 };
 
         if op == Op::DefineGlobal {
-            if let Some(Value::Str(name)) = top.consts.get(operand_u16 as usize) {
+            if let Some(ValueKind::Str(name)) = top.consts.get(operand_u16 as usize).map(Value::kind) {
                 // The initializer starts at the last statement boundary at-or-before
                 // this DEFINE_GLOBAL (the start of THIS binding's own statement).
                 let stmt_start = starts
@@ -249,13 +249,13 @@ fn classify_binding(
             TopDef::ComputedConst { start: stmt_start, end: define_ip }
         }
         Some((Op::Nil, _)) if stmt_start == define_ip.saturating_sub(1) => {
-            TopDef::Const(Value::Nil)
+            TopDef::Const(Value::nil())
         }
         Some((Op::True, _)) if stmt_start == define_ip.saturating_sub(1) => {
-            TopDef::Const(Value::Bool(true))
+            TopDef::Const(Value::bool_(true))
         }
         Some((Op::False, _)) if stmt_start == define_ip.saturating_sub(1) => {
-            TopDef::Const(Value::Bool(false))
+            TopDef::Const(Value::bool_(false))
         }
         // A run ending in `CLASS` is a `class` declaration — shipped via the class
         // machinery, not from this map's range.
@@ -286,7 +286,7 @@ pub(crate) fn collect_get_global_names(chunk: &Chunk, out: &mut Vec<Rc<str>>) {
         let width = op.operand_width();
         if op == Op::GetGlobal {
             let idx = chunk.read_u16(ip + 1) as usize;
-            if let Some(Value::Str(name)) = chunk.consts.get(idx) {
+            if let Some(ValueKind::Str(name)) = chunk.consts.get(idx).map(Value::kind) {
                 out.push(name.clone());
             }
         }
@@ -314,7 +314,7 @@ pub(crate) fn collect_range_refs(top: &Chunk, start: usize, end: usize, out: &mu
         match op {
             Op::GetGlobal => {
                 let idx = top.read_u16(ip + 1) as usize;
-                if let Some(Value::Str(name)) = top.consts.get(idx) {
+                if let Some(ValueKind::Str(name)) = top.consts.get(idx).map(Value::kind) {
                     out.push(name.clone());
                 }
             }
@@ -392,7 +392,7 @@ fn collect_def_refs(top: &Chunk, def: &TopDef, name: &str, out: &mut Vec<Rc<str>
             // ANYWAY: it is a sound under-shake (never drops live code), it future-proofs
             // the closure against a payload-coercion path being added, and it keeps the
             // worker slice conservative. A non-enum const contributes nothing.
-            if let Value::Enum(def) = v {
+            if let ValueKind::Enum(def) = v.kind() {
                 let mut named: HashSet<Rc<str>> = HashSet::new();
                 for schema in def.variant_schemas.values() {
                     for (_fname, ty) in &schema.fields {
@@ -607,8 +607,8 @@ fn decode_class_group(
 }
 
 fn class_name_from_const(top: &Chunk, operand: u16) -> Result<Rc<str>, Control> {
-    match top.consts.get(operand as usize) {
-        Some(Value::Str(s)) => Ok(s.clone()),
+    match top.consts.get(operand as usize).map(Value::kind) {
+        Some(ValueKind::Str(s)) => Ok(s.clone()),
         _ => Err(panic_build("superclass GET_GLOBAL has no name constant")),
     }
 }

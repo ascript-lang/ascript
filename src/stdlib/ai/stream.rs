@@ -19,7 +19,7 @@ use genai::chat::{ChatStream, ChatStreamEvent};
 use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 
 use super::response::{finish_reason_str, NeutralResponse, NeutralToolCall};
 
@@ -55,7 +55,7 @@ struct Step {
 /// `ai.stream(opts)` — open a streaming chat. Returns Tier-1 `[stream, err]`.
 pub(crate) async fn stream(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     let opts = match args.first() {
-        Some(v @ Value::Object(_)) | Some(v @ Value::Instance(_)) => v.clone(),
+        Some(v) if matches!(v.kind(), ValueKind::Object(_) | ValueKind::Instance(_)) => v.clone(),
         _ => {
             return Err(AsError::at(
                 "ai.stream(opts): expected an options object with a 'model'",
@@ -65,12 +65,12 @@ pub(crate) async fn stream(interp: &Interp, args: &[Value], span: Span) -> Resul
         }
     };
     let model_arg = super::request::get_field(&opts, "model");
-    if matches!(model_arg, Value::Nil) {
+    if matches!(model_arg.kind(), ValueKind::Nil) {
         return Err(AsError::at("ai.stream: 'model' is required", span).into());
     }
     let resolved = super::request::resolve_model(&model_arg, span)?;
     if let Some(err) = super::request::credential_missing_error(&resolved) {
-        return Ok(crate::interp::make_pair(Value::Nil, err));
+        return Ok(crate::interp::make_pair(Value::nil(), err));
     }
 
     let chat_req = super::request::build_chat_request(&opts, span)?;
@@ -95,10 +95,10 @@ pub(crate) async fn stream(interp: &Interp, args: &[Value], span: Span) -> Resul
                 indexmap::IndexMap::new(),
                 ResourceState::AiStream(Box::new(state)),
             );
-            Ok(crate::interp::make_pair(handle, Value::Nil))
+            Ok(crate::interp::make_pair(handle, Value::nil()))
         }
         Err(e) => Ok(crate::interp::make_pair(
-            Value::Nil,
+            Value::nil(),
             super::response::error_to_value(&e),
         )),
     }
@@ -120,11 +120,11 @@ pub(crate) async fn call_stream_method(
             let mut fields = indexmap::IndexMap::new();
             fields.insert(
                 "__streamId".to_string(),
-                Value::Float(m.receiver.id as f64),
+                Value::float(m.receiver.id as f64),
             );
             // The adapter shares the resource id: register_resource is NOT used; the
             // adapter handle carries the same id so `next()` resolves the same state.
-            Ok(Value::Native(std::rc::Rc::new(crate::value::NativeObject {
+            Ok(Value::native(std::rc::Rc::new(crate::value::NativeObject {
                 id: m.receiver.id,
                 kind: crate::value::NativeKind::AiTextStream,
                 fields,
@@ -151,12 +151,12 @@ async fn next(interp: &Interp, id: u64, text_only: bool, _span: Span) -> Result<
                 if let Some(o) = other {
                     interp.return_resource(id, o);
                 }
-                return Ok(crate::interp::make_pair(Value::Nil, Value::Nil));
+                return Ok(crate::interp::make_pair(Value::nil(), Value::nil()));
             }
         };
         if state.done {
             interp.return_resource(id, ResourceState::AiStream(state));
-            return Ok(crate::interp::make_pair(Value::Nil, Value::Nil));
+            return Ok(crate::interp::make_pair(Value::nil(), Value::nil()));
         }
         let event = state.stream.next().await;
         let outcome = map_event(&mut state, event, text_only);
@@ -167,7 +167,7 @@ async fn next(interp: &Interp, id: u64, text_only: bool, _span: Span) -> Result<
                     state.done = true;
                 }
                 interp.return_resource(id, ResourceState::AiStream(state));
-                return Ok(crate::interp::make_pair(step.chunk, Value::Nil));
+                return Ok(crate::interp::make_pair(step.chunk, Value::nil()));
             }
             StepOutcome::Skip => {
                 // A non-emitting event (Start / reasoning / a text-only non-text
@@ -179,7 +179,7 @@ async fn next(interp: &Interp, id: u64, text_only: bool, _span: Span) -> Result<
                 let _ = finished;
                 state.done = true;
                 interp.return_resource(id, ResourceState::AiStream(state));
-                return Ok(crate::interp::make_pair(Value::Nil, err));
+                return Ok(crate::interp::make_pair(Value::nil(), err));
             }
         }
     }
@@ -203,7 +203,7 @@ fn map_event(
             StepOutcome::Yield(Step {
                 chunk: if text_only {
                     // text-only consumers get end-of-stream as a nil sentinel
-                    Value::Nil
+                    Value::nil()
                 } else {
                     finish_chunk(&state.aggregate)
                 },
@@ -219,7 +219,7 @@ fn map_event(
                 state.aggregate.text.push_str(&c.content);
                 if text_only {
                     StepOutcome::Yield(Step {
-                        chunk: Value::Str(c.content.into()),
+                        chunk: Value::str(c.content),
                         finished: false,
                     })
                 } else {
@@ -263,7 +263,7 @@ fn map_event(
                 }
                 StepOutcome::Yield(Step {
                     chunk: if text_only {
-                        Value::Nil
+                        Value::nil()
                     } else {
                         finish_chunk(&state.aggregate)
                     },
@@ -279,34 +279,34 @@ fn result(interp: &Interp, id: u64, _span: Span) -> Result<Value, Control> {
     interp.with_resource(id, |r| match r {
         Some(ResourceState::AiStream(s)) => {
             let mut m = indexmap::IndexMap::new();
-            m.insert("text".to_string(), Value::Str(s.aggregate.text.clone().into()));
+            m.insert("text".to_string(), Value::str(s.aggregate.text.clone()));
             m.insert(
                 "finishReason".to_string(),
                 match &s.aggregate.finish_reason {
-                    Some(fr) => Value::Str(fr.clone().into()),
-                    None => Value::Nil,
+                    Some(fr) => Value::str(fr.clone()),
+                    None => Value::nil(),
                 },
             );
             m.insert("usage".to_string(), usage_value(&s.aggregate));
             m.insert(
                 "toolCalls".to_string(),
-                Value::Array(crate::value::ArrayCell::new(
+                Value::array(
                     super::response::tool_calls_value(&s.aggregate),
-                )),
+                ),
             );
-            Ok(Value::Object(crate::value::ObjectCell::new(m)))
+            Ok(Value::object(m))
         }
         _ => {
             // Stream already fully drained + reclaimed: return an empty aggregate.
             let mut m = indexmap::IndexMap::new();
-            m.insert("text".to_string(), Value::Str("".into()));
-            m.insert("finishReason".to_string(), Value::Nil);
+            m.insert("text".to_string(), Value::str(""));
+            m.insert("finishReason".to_string(), Value::nil());
             m.insert("usage".to_string(), usage_value(&NeutralResponse::default()));
             m.insert(
                 "toolCalls".to_string(),
-                Value::Array(crate::value::ArrayCell::new(Vec::new())),
+                Value::array(Vec::new()),
             );
-            Ok(Value::Object(crate::value::ObjectCell::new(m)))
+            Ok(Value::object(m))
         }
     })
 }
@@ -316,46 +316,46 @@ fn usage_value(n: &NeutralResponse) -> Value {
     m.insert("inputTokens".to_string(), opt_num(n.input_tokens));
     m.insert("outputTokens".to_string(), opt_num(n.output_tokens));
     m.insert("totalTokens".to_string(), opt_num(n.total_tokens));
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }
 
 fn opt_num(v: Option<i64>) -> Value {
     match v {
         // NUM §4: a token count is an `int`.
-        Some(n) => Value::Int(n),
-        None => Value::Nil,
+        Some(n) => Value::int(n),
+        None => Value::nil(),
     }
 }
 
 fn text_chunk(text: &str) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("type".to_string(), Value::Str("text".into()));
-    m.insert("text".to_string(), Value::Str(text.into()));
-    Value::Object(crate::value::ObjectCell::new(m))
+    m.insert("type".to_string(), Value::str("text"));
+    m.insert("text".to_string(), Value::str(text));
+    Value::object(m)
 }
 
 fn tool_call_chunk(call: &NeutralToolCall) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("type".to_string(), Value::Str("toolCall".into()));
-    m.insert("id".to_string(), Value::Str(call.call_id.clone().into()));
-    m.insert("name".to_string(), Value::Str(call.name.clone().into()));
+    m.insert("type".to_string(), Value::str("toolCall"));
+    m.insert("id".to_string(), Value::str(call.call_id.clone()));
+    m.insert("name".to_string(), Value::str(call.name.clone()));
     m.insert(
         "arguments".to_string(),
         crate::stdlib::json::to_ascript(&call.args_json),
     );
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }
 
 fn finish_chunk(agg: &NeutralResponse) -> Value {
     let mut m = indexmap::IndexMap::new();
-    m.insert("type".to_string(), Value::Str("finish".into()));
+    m.insert("type".to_string(), Value::str("finish"));
     m.insert(
         "finishReason".to_string(),
         match &agg.finish_reason {
-            Some(fr) => Value::Str(fr.clone().into()),
-            None => Value::Nil,
+            Some(fr) => Value::str(fr.clone()),
+            None => Value::nil(),
         },
     );
     m.insert("usage".to_string(), usage_value(agg));
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }

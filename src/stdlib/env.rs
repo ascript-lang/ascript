@@ -9,7 +9,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use indexmap::IndexMap;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -32,8 +32,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "get" => {
             let name = want_string(&arg(args, 0), span, &ctx("get"))?;
             match std::env::var(name.as_ref()) {
-                Ok(v) => Ok(Value::Str(v.into())),
-                Err(_) => Ok(Value::Nil),
+                Ok(v) => Ok(Value::str(v)),
+                Err(_) => Ok(Value::nil()),
             }
         }
         // set(name, value) -> nil. Mutates the process-global environment.
@@ -41,27 +41,27 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let name = want_string(&arg(args, 0), span, &ctx("set"))?;
             let value = want_string(&arg(args, 1), span, &ctx("set"))?;
             std::env::set_var(name.as_ref(), value.as_ref());
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         // unset(name) -> nil. Mutates the process-global environment.
         "unset" => {
             let name = want_string(&arg(args, 0), span, &ctx("unset"))?;
             std::env::remove_var(name.as_ref());
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         // vars() -> object of all current environment variables (order arbitrary).
         "vars" => {
             let mut m = IndexMap::new();
             for (k, v) in std::env::vars() {
-                m.insert(k, Value::Str(v.into()));
+                m.insert(k, Value::str(v));
             }
-            Ok(Value::Object(crate::value::ObjectCell::new(m)))
+            Ok(Value::object(m))
         }
         // loadDotenv(path?) -> [count, err]. Loads a `.env` file (default `.env`)
         // into the process env and returns the number of variables loaded.
         "loadDotenv" => {
-            let path = match args.first() {
-                None | Some(Value::Nil) => std::path::PathBuf::from(".env"),
+            let path = match args.first().map(|v| v.kind()) {
+                None | Some(ValueKind::Nil) => std::path::PathBuf::from(".env"),
                 Some(_) => std::path::PathBuf::from(
                     want_string(&arg(args, 0), span, &ctx("loadDotenv"))?.as_ref(),
                 ),
@@ -72,8 +72,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 Ok(iter) => iter,
                 Err(e) => {
                     return Ok(make_pair(
-                        Value::Nil,
-                        make_error(Value::Str(format!("cannot load dotenv: {}", e).into())),
+                        Value::nil(),
+                        make_error(Value::str(format!("cannot load dotenv: {}", e))),
                     ))
                 }
             };
@@ -86,13 +86,13 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     }
                     Err(e) => {
                         return Ok(make_pair(
-                            Value::Nil,
-                            make_error(Value::Str(format!("cannot parse dotenv: {}", e).into())),
+                            Value::nil(),
+                            make_error(Value::str(format!("cannot parse dotenv: {}", e))),
                         ))
                     }
                 }
             }
-            Ok(make_pair(Value::Float(count as f64), Value::Nil))
+            Ok(make_pair(Value::float(count as f64), Value::nil()))
         }
         _ => Err(AsError::at(format!("std/env has no function '{}'", func), span).into()),
     }
@@ -105,23 +105,23 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     #[test]
     fn set_get_unset_roundtrip() {
         let key = "ASCRIPT_TEST_ENV_RT_8f31";
         // initially unset
-        assert_eq!(call("get", &[s(key)], sp()).unwrap(), Value::Nil);
+        assert_eq!(call("get", &[s(key)], sp()).unwrap(), Value::nil());
         // set then get
         assert_eq!(
             call("set", &[s(key), s("hello")], sp()).unwrap(),
-            Value::Nil
+            Value::nil()
         );
         assert_eq!(call("get", &[s(key)], sp()).unwrap(), s("hello"));
         // unset then get is nil again
-        assert_eq!(call("unset", &[s(key)], sp()).unwrap(), Value::Nil);
-        assert_eq!(call("get", &[s(key)], sp()).unwrap(), Value::Nil);
+        assert_eq!(call("unset", &[s(key)], sp()).unwrap(), Value::nil());
+        assert_eq!(call("get", &[s(key)], sp()).unwrap(), Value::nil());
     }
 
     #[test]
@@ -129,9 +129,9 @@ mod tests {
         let key = "ASCRIPT_TEST_ENV_VARS_a72c";
         call("set", &[s(key), s("present")], sp()).unwrap();
         let vars = call("vars", &[], sp()).unwrap();
-        let obj = match &vars {
-            Value::Object(o) => o.clone(),
-            other => panic!("vars() should return an object, got {:?}", other),
+        let obj = match vars.kind() {
+            ValueKind::Object(o) => o.clone(),
+            _ => panic!("vars() should return an object, got {:?}", vars),
         };
         assert_eq!(obj.get(key), Some(s("present")));
         call("unset", &[s(key)], sp()).unwrap();
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn get_non_string_arg_is_tier2_panic() {
-        let err = call("get", &[Value::Float(42.0)], sp());
+        let err = call("get", &[Value::float(42.0)], sp());
         assert!(matches!(err, Err(Control::Panic(_))));
     }
 
@@ -157,13 +157,13 @@ mod tests {
 
         let result = call("loadDotenv", &[s(path.to_str().unwrap())], sp()).unwrap();
         // result is [count, nil]
-        let arr = match &result {
-            Value::Array(a) => a.clone(),
-            other => panic!("loadDotenv should return a pair, got {:?}", other),
+        let arr = match result.kind() {
+            ValueKind::Array(a) => a.clone(),
+            _ => panic!("loadDotenv should return a pair, got {:?}", result),
         };
         let arr = arr.borrow();
-        assert_eq!(arr[0], Value::Float(2.0));
-        assert_eq!(arr[1], Value::Nil);
+        assert_eq!(arr[0], Value::float(2.0));
+        assert_eq!(arr[1], Value::nil());
         // and the vars are now in the process env
         assert_eq!(
             call("get", &[s("ASCRIPT_DOTENV_KEY_3b9e")], sp()).unwrap(),

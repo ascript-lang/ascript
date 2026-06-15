@@ -1,6 +1,6 @@
 //! `std/shared` — the shared, immutable, zero-copy-across-isolates read-only heap
 //! (SRV §3/§4). `shared.freeze(v)` deep-converts a value into an immutable,
-//! `Arc`-backed `Value::Shared(Arc<SharedNode>)` — AScript's FIRST `Send` value,
+//! `Arc`-backed `Value::shared(Arc<SharedNode>)` — AScript's FIRST `Send` value,
 //! so a 5 MB routing table can be shared across N worker isolates by an `Arc`
 //! pointer bump instead of a per-request structured-clone copy.
 //!
@@ -23,7 +23,7 @@ use super::{arg, bi};
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
-use crate::value::{SharedKey, SharedNode, SharedValue, Value};
+use crate::value::{SharedKey, SharedNode, SharedValue, Value, ValueKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "freeze" => freeze(&arg(args, 0), span),
-        "isShared" => Ok(Value::Bool(matches!(arg(args, 0), Value::Shared(_)))),
+        "isShared" => Ok(Value::bool_(matches!(arg(args, 0).kind(), ValueKind::Shared(_)))),
         other => Err(AsError::at(format!("unknown shared function '{}'", other), span).into()),
     }
 }
@@ -47,15 +47,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 /// the field path.
 pub fn freeze(v: &Value, span: Span) -> Result<Value, Control> {
     // Fast path: freeze of an already-frozen value is the identity (the SAME Arc).
-    if let Value::Shared(arc) = v {
-        return Ok(Value::Shared(arc.clone()));
+    if let ValueKind::Shared(arc) = v.kind() {
+        return Ok(Value::shared(arc.clone()));
     }
     let mut walker = Freezer {
         in_progress: HashSet::new(),
         completed: HashMap::new(),
     };
     let node = walker.walk(v, &mut String::new(), span)?;
-    Ok(Value::Shared(node))
+    Ok(Value::shared(node))
 }
 
 /// A freeze-time failure: a non-freezable value kind, or a cycle, at a field path.
@@ -95,19 +95,19 @@ impl Freezer {
         path: &mut String,
         span: Span,
     ) -> Result<SharedValue, Control> {
-        match v {
+        match v.kind() {
             // Scalars freeze directly — no identity, no recursion.
-            Value::Nil => Ok(Arc::new(SharedNode::Nil)),
-            Value::Bool(b) => Ok(Arc::new(SharedNode::Bool(*b))),
-            Value::Int(i) => Ok(Arc::new(SharedNode::Int(*i))),
-            Value::Float(n) => Ok(Arc::new(SharedNode::Float(*n))),
-            Value::Decimal(d) => Ok(Arc::new(SharedNode::Decimal(**d))),
-            Value::Str(s) => Ok(Arc::new(SharedNode::Str(Arc::from(&**s)))),
+            ValueKind::Nil => Ok(Arc::new(SharedNode::Nil)),
+            ValueKind::Bool(b) => Ok(Arc::new(SharedNode::Bool(b))),
+            ValueKind::Int(i) => Ok(Arc::new(SharedNode::Int(i))),
+            ValueKind::Float(n) => Ok(Arc::new(SharedNode::Float(n))),
+            ValueKind::Decimal(d) => Ok(Arc::new(SharedNode::Decimal(**d))),
+            ValueKind::Str(s) => Ok(Arc::new(SharedNode::Str(Arc::from(&**s)))),
 
             // Freezing an already-frozen sub-value is the identity (shares the Arc).
-            Value::Shared(arc) => Ok(arc.clone()),
+            ValueKind::Shared(arc) => Ok(arc.clone()),
 
-            Value::Bytes(b) => {
+            ValueKind::Bytes(b) => {
                 let ptr = Rc_as_ptr(b);
                 if let Some(reused) = self.enter(ptr, path, span)? {
                     return Ok(reused);
@@ -117,7 +117,7 @@ impl Freezer {
                 self.finish(ptr, node)
             }
 
-            Value::Array(a) => {
+            ValueKind::Array(a) => {
                 let ptr = crate::gc::cc_addr(a);
                 if let Some(reused) = self.enter(ptr, path, span)? {
                     return Ok(reused);
@@ -135,7 +135,7 @@ impl Freezer {
                 self.finish(ptr, node)
             }
 
-            Value::Object(o) => {
+            ValueKind::Object(o) => {
                 let ptr = crate::gc::cc_addr(o);
                 if let Some(reused) = self.enter(ptr, path, span)? {
                     return Ok(reused);
@@ -158,7 +158,7 @@ impl Freezer {
                 self.finish(ptr, node)
             }
 
-            Value::Map(m) => {
+            ValueKind::Map(m) => {
                 let ptr = crate::gc::cc_addr(m);
                 if let Some(reused) = self.enter(ptr, path, span)? {
                     return Ok(reused);
@@ -181,7 +181,7 @@ impl Freezer {
                 self.finish(ptr, node)
             }
 
-            Value::Set(s) => {
+            ValueKind::Set(s) => {
                 let ptr = crate::gc::cc_addr(s);
                 if let Some(reused) = self.enter(ptr, path, span)? {
                     return Ok(reused);
@@ -193,7 +193,7 @@ impl Freezer {
                 self.finish(ptr, node)
             }
 
-            Value::EnumVariant(ev) => {
+            ValueKind::EnumVariant(ev) => {
                 // The payload value must also freeze. A variant's identity is its
                 // (enum, name); the payload is the cycle-capable part. We deliberately
                 // do NOT enter/finish the variant itself in the visited map: any cycle
@@ -207,10 +207,10 @@ impl Freezer {
                 let value: SharedValue = match &ev.payload {
                     None => self.walk(&ev.value, path, span)?,
                     Some(crate::value::Payload::Positional(a)) => {
-                        self.walk(&Value::Array(a.clone()), path, span)?
+                        self.walk(&Value::array_cell(a.clone()), path, span)?
                     }
                     Some(crate::value::Payload::Named(o)) => {
-                        self.walk(&Value::Object(o.clone()), path, span)?
+                        self.walk(&Value::object_cell(o.clone()), path, span)?
                     }
                 };
                 path.truncate(len);
@@ -222,11 +222,11 @@ impl Freezer {
             }
 
             #[cfg(feature = "data")]
-            Value::Regex(r) => Ok(Arc::new(SharedNode::Regex {
+            ValueKind::Regex(r) => Ok(Arc::new(SharedNode::Regex {
                 source: Arc::from(&*r.source),
             })),
 
-            Value::Instance(inst) => {
+            ValueKind::Instance(inst) => {
                 let ptr = crate::gc::cc_addr(inst);
                 if let Some(reused) = self.enter(ptr, path, span)? {
                     return Ok(reused);
@@ -256,10 +256,10 @@ impl Freezer {
 
             // Non-freezable kinds — a clean recoverable Tier-2 panic naming the kind
             // and the field path (mirrors the airlock's SendError message style).
-            other => Err(FreezeError {
+            _ => Err(FreezeError {
                 message: format!(
                     "value of kind {} cannot be frozen at {}",
-                    crate::interp::type_name(other),
+                    crate::interp::type_name(v),
                     if path.is_empty() { "<root>" } else { path }
                 ),
                 span,
@@ -339,7 +339,7 @@ fn display_key(k: &crate::value::MapKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{ArrayCell, MapCell, MapKey, ObjectCell, Value};
+    use crate::value::{ArrayCell, MapKey, OwnedKind, Value, ValueKind};
     use indexmap::IndexMap;
 
     fn s() -> Span {
@@ -351,23 +351,23 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
-        Value::Object(ObjectCell::new(m))
+        Value::object(m)
     }
 
     #[test]
     fn freeze_scalars_and_containers() {
         let v = obj(vec![
-            ("region", Value::Str("us".into())),
-            ("n", Value::Int(5)),
-            ("f", Value::Float(1.5)),
+            ("region", Value::str("us")),
+            ("n", Value::int(5)),
+            ("f", Value::float(1.5)),
             (
                 "limits",
-                Value::Array(ArrayCell::new(vec![Value::Int(10), Value::Int(100)])),
+                Value::array(vec![Value::int(10), Value::int(100)]),
             ),
         ]);
         let frozen = freeze(&v, s()).unwrap();
-        match &frozen {
-            Value::Shared(node) => match &**node {
+        match frozen.kind() {
+            ValueKind::Shared(node) => match &**node {
                 SharedNode::Object(map) => {
                     assert_eq!(map.len(), 4);
                     assert_eq!(&*map[0].0, "region");
@@ -393,15 +393,15 @@ mod tests {
         // WITHOUT the fix also overflows on the deep value's DROP (a separate, pre-existing
         // deep-drop limitation with no per-level stacker). So this test uses a depth that
         // exercises the recursion cleanly on the test stack.
-        let mut v = Value::Int(0);
+        let mut v = Value::int(0);
         for _ in 0..2_000 {
-            v = Value::Array(ArrayCell::new(vec![v]));
+            v = Value::array(vec![v]);
         }
         let frozen = freeze(&v, s());
         assert!(frozen.is_ok(), "moderately-deep freeze must succeed");
         // Confirm it descended the whole way: 2000 nested Shared arrays, innermost Int 0.
-        let mut node = match frozen.unwrap() {
-            Value::Shared(n) => n,
+        let mut node = match frozen.unwrap().into_kind() {
+            OwnedKind::Shared(n) => n,
             _ => panic!("expected Shared"),
         };
         let mut depth = 0;
@@ -415,13 +415,13 @@ mod tests {
 
     #[test]
     fn freeze_is_idempotent_same_arc() {
-        let v = obj(vec![("x", Value::Int(1))]);
+        let v = obj(vec![("x", Value::int(1))]);
         let f1 = freeze(&v, s()).unwrap();
         let f2 = freeze(&f1, s()).unwrap();
         // freeze(freeze(x)) returns the SAME Arc (identity-equal).
         assert_eq!(f1, f2);
-        match (&f1, &f2) {
-            (Value::Shared(a), Value::Shared(b)) => assert!(Arc::ptr_eq(a, b)),
+        match (f1.kind(), f2.kind()) {
+            (ValueKind::Shared(a), ValueKind::Shared(b)) => assert!(Arc::ptr_eq(a, b)),
             _ => panic!(),
         }
     }
@@ -429,11 +429,11 @@ mod tests {
     #[test]
     fn freeze_diamond_reuses_one_arc() {
         // One shared inner array reachable by two object keys → ONE frozen Arc.
-        let inner = Value::Array(ArrayCell::new(vec![Value::Int(7)]));
+        let inner = Value::array(vec![Value::int(7)]);
         let v = obj(vec![("a", inner.clone()), ("b", inner)]);
         let frozen = freeze(&v, s()).unwrap();
-        let node = match &frozen {
-            Value::Shared(n) => n.clone(),
+        let node = match frozen.kind() {
+            ValueKind::Shared(n) => n.clone(),
             _ => panic!(),
         };
         match &*node {
@@ -453,8 +453,8 @@ mod tests {
     #[test]
     fn freeze_cycle_is_a_clean_panic_not_a_hang() {
         // a = [ ... ]; a.push(a)  — a self-referential array.
-        let cell = ArrayCell::new(vec![Value::Int(1)]);
-        let a = Value::Array(cell.clone());
+        let cell = ArrayCell::new(vec![Value::int(1)]);
+        let a = Value::array_cell(cell.clone());
         cell.borrow_mut().push(a.clone());
         let err = freeze(&a, s()).unwrap_err();
         match err {
@@ -470,11 +470,11 @@ mod tests {
     #[test]
     fn freeze_diamond_and_cycle_together() {
         // A value containing BOTH a diamond (reused) and a cycle (rejected).
-        let shared_inner = Value::Array(ArrayCell::new(vec![Value::Int(9)]));
+        let shared_inner = Value::array(vec![Value::int(9)]);
         let cyclic = ArrayCell::new(vec![shared_inner.clone(), shared_inner.clone()]);
         // Make `cyclic` reference itself → a cycle.
-        cyclic.borrow_mut().push(Value::Array(cyclic.clone()));
-        let v = Value::Array(cyclic);
+        cyclic.borrow_mut().push(Value::array_cell(cyclic.clone()));
+        let v = Value::array_cell(cyclic);
         // The cycle wins (it is reached) → a clean panic, NOT a hang.
         let err = freeze(&v, s()).unwrap_err();
         assert!(matches!(err, Control::Panic(ref e) if e.message.contains("cyclic")));
@@ -483,11 +483,11 @@ mod tests {
     #[test]
     fn freeze_diamond_without_cycle_succeeds() {
         // The same inner reached twice but NO self-reference → diamond reuse, no panic.
-        let inner = Value::Array(ArrayCell::new(vec![Value::Int(9)]));
-        let v = Value::Array(ArrayCell::new(vec![inner.clone(), inner]));
+        let inner = Value::array(vec![Value::int(9)]);
+        let v = Value::array(vec![inner.clone(), inner]);
         let frozen = freeze(&v, s()).unwrap();
-        let node = match &frozen {
-            Value::Shared(n) => n.clone(),
+        let node = match frozen.kind() {
+            ValueKind::Shared(n) => n.clone(),
             _ => panic!(),
         };
         if let SharedNode::Array(arr) = &*node {
@@ -501,7 +501,7 @@ mod tests {
     fn freeze_nonfreezable_names_the_path() {
         // A function value inside a field → "value of kind function cannot be frozen
         // at .handler".
-        let v = obj(vec![("handler", Value::Builtin("len".into()))]);
+        let v = obj(vec![("handler", Value::builtin("len"))]);
         let err = freeze(&v, s()).unwrap_err();
         match err {
             Control::Panic(e) => {
@@ -515,12 +515,12 @@ mod tests {
     #[test]
     fn freeze_map_canonical_keys() {
         let mut m = IndexMap::new();
-        m.insert(MapKey::Str("k".into()), Value::Int(1));
-        m.insert(MapKey::Int(2), Value::Int(3));
-        let v = Value::Map(MapCell::new(m));
+        m.insert(MapKey::Str("k".into()), Value::int(1));
+        m.insert(MapKey::Int(2), Value::int(3));
+        let v = Value::map(m);
         let frozen = freeze(&v, s()).unwrap();
-        match &frozen {
-            Value::Shared(n) => match &**n {
+        match frozen.kind() {
+            ValueKind::Shared(n) => match &**n {
                 SharedNode::Map(map) => {
                     assert_eq!(map.len(), 2);
                     assert_eq!(map[0].0, SharedKey::Str("k".into()));
@@ -534,9 +534,9 @@ mod tests {
 
     #[test]
     fn is_shared_reflection() {
-        let v = obj(vec![("x", Value::Int(1))]);
+        let v = obj(vec![("x", Value::int(1))]);
         let frozen = freeze(&v, s()).unwrap();
-        assert_eq!(call("isShared", &[frozen], s()).unwrap(), Value::Bool(true));
-        assert_eq!(call("isShared", &[v], s()).unwrap(), Value::Bool(false));
+        assert_eq!(call("isShared", &[frozen], s()).unwrap(), Value::bool_(true));
+        assert_eq!(call("isShared", &[v], s()).unwrap(), Value::bool_(false));
     }
 }

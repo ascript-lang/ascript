@@ -16,8 +16,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
-use std::cell::RefCell;
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use std::rc::Rc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -72,23 +71,23 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn bytes_value(b: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(b)))
+    Value::bytes(b)
 }
 
 /// Pull a string/bytes value into raw bytes (for `stream.write`).
 fn data_to_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
-    match v {
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
-        Value::Bytes(b) => Ok(b.borrow().clone()),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
+        ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+        _ => Err(AsError::at(
             format!(
                 "{} expects a string or bytes, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -134,7 +133,7 @@ impl Interp {
                     indexmap::IndexMap::new(),
                     ResourceState::TcpStream(TcpStreamState::new(stream)),
                 );
-                Ok(make_pair(handle, Value::Nil))
+                Ok(make_pair(handle, Value::nil()))
             }
             Err(e) => Ok(err_pair(format!(
                 "net/tcp.connect to {} failed: {}",
@@ -156,13 +155,13 @@ impl Interp {
                 let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                 let mut fields = indexmap::IndexMap::new();
                 // NUM §4: a port is an `Int`.
-                fields.insert("port".to_string(), Value::Int(i64::from(port)));
+                fields.insert("port".to_string(), Value::int(i64::from(port)));
                 let handle = self.register_resource(
                     NativeKind::TcpListener,
                     fields,
                     ResourceState::TcpListener(listener),
                 );
-                Ok(make_pair(handle, Value::Nil))
+                Ok(make_pair(handle, Value::nil()))
             }
             Err(e) => Ok(err_pair(format!(
                 "net/tcp.listen on {} failed: {}",
@@ -199,7 +198,8 @@ impl Interp {
         match method {
             "read" => {
                 let n = match args.first() {
-                    None | Some(Value::Nil) => DEFAULT_CHUNK,
+                    None => DEFAULT_CHUNK,
+                    Some(v) if matches!(v.kind(), ValueKind::Nil) => DEFAULT_CHUNK,
                     // Guard before the cast: an `Inf`/`NaN`/out-of-range `n` would cast
                     // to `usize::MAX` and abort the host via `buf.reserve(n)`.
                     Some(v) => super::want_count(v, span, "stream.read", super::MAX_ALLOC_COUNT)?,
@@ -218,14 +218,14 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(Value::Nil);
+                        return Ok(Value::nil());
                     }
                 };
                 let mut buf = Vec::new();
                 match stream.read_upto(n, &mut buf).await {
                     Ok(0) => {
                         // EOF: drop the stream so its socket fd is reclaimed now.
-                        Ok(Value::Nil)
+                        Ok(Value::nil())
                     }
                     Ok(_) => {
                         self.return_resource(id, ResourceState::TcpStream(stream));
@@ -241,14 +241,14 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(Value::Nil); // gone → EOF
+                        return Ok(Value::nil()); // gone → EOF
                     }
                 };
                 let mut buf = Vec::new();
                 match stream.read_line_bytes(&mut buf).await {
                     Ok(0) => {
                         // EOF: drop the stream.
-                        Ok(Value::Nil)
+                        Ok(Value::nil())
                     }
                     Ok(_) => {
                         self.return_resource(id, ResourceState::TcpStream(stream));
@@ -259,8 +259,8 @@ impl Interp {
                                 buf.pop();
                             }
                         }
-                        Ok(Value::Str(
-                            String::from_utf8_lossy(&buf).into_owned().into(),
+                        Ok(Value::str(
+                            String::from_utf8_lossy(&buf).into_owned(),
                         ))
                     }
                     Err(e) => {
@@ -303,14 +303,14 @@ impl Interp {
                 let r = stream.write_all(&data).await;
                 self.return_resource(id, ResourceState::TcpStream(stream));
                 match r {
-                    Ok(_) => Ok(make_pair(Value::Nil, Value::Nil)),
+                    Ok(_) => Ok(make_pair(Value::nil(), Value::nil())),
                     Err(e) => Ok(err_pair(format!("stream.write failed: {}", e))),
                 }
             }
             "close" => {
                 // Dropping the stream closes the socket.
                 self.take_resource(id);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => Err(AsError::at(format!("tcpStream has no method '{}'", other), span).into()),
         }
@@ -344,7 +344,7 @@ impl Interp {
                             indexmap::IndexMap::new(),
                             ResourceState::TcpStream(TcpStreamState::new(stream)),
                         );
-                        Ok(make_pair(handle, Value::Nil))
+                        Ok(make_pair(handle, Value::nil()))
                     }
                     Err(e) => Ok(err_pair(format!("listener.accept failed: {}", e))),
                 }
@@ -352,7 +352,7 @@ impl Interp {
             "close" => {
                 // Dropping the listener stops accepting.
                 self.take_resource(id);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => {
                 Err(AsError::at(format!("tcpListener has no method '{}'", other), span).into())

@@ -12,7 +12,7 @@
 //! ## Routing
 //! `exports()` returns the builtin bindings; the qualified calls (`telemetry.init`,
 //! `telemetry.startSpan`, …) route through `Interp::call_telemetry` in `interp.rs`.
-//! Span/instrument handles are `Value::Native` whose methods dispatch back into
+//! Span/instrument handles are `Value::native` whose methods dispatch back into
 //! `call_telemetry`-adjacent handlers on `Interp`.
 //!
 //! ## No new `Value` variant
@@ -28,7 +28,7 @@ pub mod sentry;
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeObject, Value};
+use crate::value::{NativeKind, NativeObject, OwnedKind, Value, ValueKind};
 use indexmap::IndexMap;
 use model::{
     AnalyticsEvent, Exporters, MetricKind, OtlpExporter, PostHogExporter, SentryExporter, SpanCtx,
@@ -96,23 +96,23 @@ pub(crate) fn test_force_send_error() -> bool {
 
 /// A Tier-1 success acknowledgement `[true, nil]` (from `init`/`flush`).
 fn tier1_ok() -> Value {
-    crate::interp::make_pair(Value::Bool(true), Value::Nil)
+    crate::interp::make_pair(Value::bool_(true), Value::nil())
 }
 
 /// A Tier-1 failure `[nil, {message}]` (from `init`/`flush`).
 fn tier1_err(msg: &str) -> Value {
     crate::interp::make_pair(
-        Value::Nil,
-        crate::interp::make_error(Value::Str(msg.into())),
+        Value::nil(),
+        crate::interp::make_error(Value::str(msg)),
     )
 }
 
-/// An inert `Value::Native` handle returned when telemetry is not initialized:
+/// An inert `Value::native` handle returned when telemetry is not initialized:
 /// every method on it is a no-op (`call_telemetry_noop_method`). Lets `.as` code
 /// call `telemetry.startSpan(...).end()` / `telemetry.counter(...).add(1)`
 /// unconditionally — the "safe to leave in production" promise.
 fn noop_handle() -> Value {
-    Value::Native(Rc::new(NativeObject {
+    Value::native(Rc::new(NativeObject {
         id: u64::MAX,
         kind: NativeKind::TelemetryNoop,
         fields: IndexMap::new(),
@@ -121,7 +121,7 @@ fn noop_handle() -> Value {
 
 /// Build an instrument handle pointing at resource `id`.
 fn instrument_handle(id: u64) -> Value {
-    Value::Native(Rc::new(NativeObject {
+    Value::native(Rc::new(NativeObject {
         id,
         kind: NativeKind::TelemetryInstrument,
         fields: IndexMap::new(),
@@ -131,14 +131,14 @@ fn instrument_handle(id: u64) -> Value {
 // ---- argument helpers (Tier-2 panic on type misuse, spec §5) ----
 
 fn want_obj_or_nil<'a>(v: &'a Value, span: Span, ctx: &str) -> Result<Option<&'a Value>, Control> {
-    match v {
-        Value::Nil => Ok(None),
-        Value::Object(_) => Ok(Some(v)),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Nil => Ok(None),
+        ValueKind::Object(_) => Ok(Some(v)),
+        _ => Err(AsError::at(
             format!(
                 "{} expects an options object, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -148,9 +148,11 @@ fn want_obj_or_nil<'a>(v: &'a Value, span: Span, ctx: &str) -> Result<Option<&'a
 
 /// Read a string field from an object (None if absent or non-string-nil).
 fn obj_str(obj: &Value, key: &str) -> Option<String> {
-    if let Value::Object(o) = obj {
-        if let Some(Value::Str(s)) = o.get(key) {
-            return Some(s.to_string());
+    if let ValueKind::Object(o) = obj.kind() {
+        if let Some(v) = o.get(key) {
+            if let ValueKind::Str(s) = v.kind() {
+                return Some(s.to_string());
+            }
         }
     }
     None
@@ -158,8 +160,11 @@ fn obj_str(obj: &Value, key: &str) -> Option<String> {
 
 /// Read a bool field from an object (default false).
 fn obj_bool(obj: &Value, key: &str) -> bool {
-    if let Value::Object(o) = obj {
-        matches!(o.get(key), Some(Value::Bool(true)))
+    if let ValueKind::Object(o) = obj.kind() {
+        matches!(
+            o.get(key).map(|v| v.into_kind()),
+            Some(OwnedKind::Bool(true))
+        )
     } else {
         false
     }
@@ -167,13 +172,15 @@ fn obj_bool(obj: &Value, key: &str) -> bool {
 
 /// Read the `attributes`/`properties`/`headers` sub-object as ordered pairs.
 fn obj_pairs(obj: &Value, key: &str) -> Vec<(String, Value)> {
-    if let Value::Object(o) = obj {
-        if let Some(Value::Object(inner)) = o.get(key) {
-            return inner
-                .entries()
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
+    if let ValueKind::Object(o) = obj.kind() {
+        if let Some(v) = o.get(key) {
+            if let ValueKind::Object(inner) = v.kind() {
+                return inner
+                    .entries()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+            }
         }
     }
     Vec::new()
@@ -183,9 +190,9 @@ fn obj_pairs(obj: &Value, key: &str) -> Vec<(String, Value)> {
 fn obj_headers(obj: &Value, key: &str) -> Vec<(String, String)> {
     obj_pairs(obj, key)
         .into_iter()
-        .map(|(k, v)| match v {
-            Value::Str(s) => (k, s.to_string()),
-            other => (k, other.to_string()),
+        .map(|(k, v)| match v.kind() {
+            ValueKind::Str(s) => (k, s.to_string()),
+            _ => (k, v.to_string()),
         })
         .collect()
 }
@@ -230,13 +237,15 @@ fn tagged_descriptor(kind: &str, args: &[Value], span: Span, ctx: &str) -> Resul
     let opts = super::arg(args, 0);
     let opts = want_obj_or_nil(&opts, span, ctx)?;
     let mut m: IndexMap<String, Value> = IndexMap::new();
-    m.insert("__exporter".into(), Value::Str(kind.into()));
-    if let Some(Value::Object(src)) = opts {
-        for (k, v) in src.entries() {
-            m.insert(k.to_string(), v);
+    m.insert("__exporter".into(), Value::str(kind));
+    if let Some(opts) = opts {
+        if let ValueKind::Object(src) = opts.kind() {
+            for (k, v) in src.entries() {
+                m.insert(k.to_string(), v);
+            }
         }
     }
-    Ok(Value::Object(crate::value::ObjectCell::new(m)))
+    Ok(Value::object(m))
 }
 
 fn build_otlp_descriptor(args: &[Value], span: Span) -> Result<Value, Control> {
@@ -259,13 +268,13 @@ fn build_posthog_descriptor(args: &[Value], span: Span) -> Result<Value, Control
 /// protocol) is a Tier-2 panic.
 async fn init(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     let cfg = super::arg(args, 0);
-    let cfg_obj = match &cfg {
-        Value::Object(_) => cfg.clone(),
-        other => {
+    let cfg_obj = match cfg.kind() {
+        ValueKind::Object(_) => cfg.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "telemetry.init expects a config object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(&cfg)
                 ),
                 span,
             )
@@ -287,9 +296,9 @@ async fn init(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Cont
 
     // Parse the exporters array.
     let mut exporters = Exporters::default();
-    if let Value::Object(o) = &cfg_obj {
+    if let ValueKind::Object(o) = cfg_obj.kind() {
         let exporters_val = o.get("exporters");
-        if let Some(Value::Array(a)) = exporters_val {
+        if let Some(ValueKind::Array(a)) = exporters_val.as_ref().map(|v| v.kind()) {
             for d in a.borrow().iter() {
                 match parse_exporter(d, span)? {
                     Ok(ParsedExporter::Otlp(e)) => exporters.otlp = Some(e),
@@ -425,7 +434,7 @@ fn start_span(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Cont
 
 /// Build a span handle pointing at resource `id`.
 fn span_handle(id: u64) -> Value {
-    Value::Native(Rc::new(NativeObject {
+    Value::native(Rc::new(NativeObject {
         id,
         kind: NativeKind::TelemetrySpan,
         fields: IndexMap::new(),
@@ -464,9 +473,9 @@ async fn scoped_span(interp: &Interp, args: &[Value], span: Span) -> Result<Valu
     // Determine status from the callback outcome.
     match &result {
         Ok(pair) => {
-            let errd = matches!(pair, Value::Array(a) if a.borrow().len() == 2 && a.borrow()[1] != Value::Nil);
+            let errd = matches!(pair.kind(), ValueKind::Array(a) if a.borrow().len() == 2 && a.borrow()[1] != Value::nil());
             if errd {
-                if let Value::Array(a) = pair {
+                if let ValueKind::Array(a) = pair.kind() {
                     let msg = pair_err_message(&a.borrow()[1]);
                     interp.telemetry_span_set_status(id, SpanStatusCode::Error, msg);
                 }
@@ -489,24 +498,28 @@ async fn run_scoped_cb(interp: &Interp, cb: Value, span: Span) -> Result<Value, 
     match res {
         Ok(v) => {
             // Drive an `async fn` callback's Future to completion.
-            let v = match v {
-                Value::Future(f) => match f.get().await {
+            let v = if matches!(v.kind(), ValueKind::Future(_)) {
+                let OwnedKind::Future(f) = v.into_kind() else {
+                    unreachable!("kind() matched Future")
+                };
+                match f.get().await {
                     Ok(x) => x,
                     Err(Control::Panic(e)) => {
                         return Ok(crate::interp::make_pair(
-                            Value::Nil,
-                            crate::interp::make_error(Value::Str(e.message.into())),
+                            Value::nil(),
+                            crate::interp::make_error(Value::str(e.message)),
                         ))
                     }
                     Err(other) => return Err(other),
-                },
-                other => other,
+                }
+            } else {
+                v
             };
-            Ok(crate::interp::make_pair(v, Value::Nil))
+            Ok(crate::interp::make_pair(v, Value::nil()))
         }
         Err(Control::Panic(e)) => Ok(crate::interp::make_pair(
-            Value::Nil,
-            crate::interp::make_error(Value::Str(e.message.into())),
+            Value::nil(),
+            crate::interp::make_error(Value::str(e.message)),
         )),
         Err(other) => Err(other),
     }
@@ -514,13 +527,15 @@ async fn run_scoped_cb(interp: &Interp, cb: Value, span: Span) -> Result<Value, 
 
 /// Pull a human message out of an err value (`{message: ...}` or any value).
 fn pair_err_message(err: &Value) -> Option<String> {
-    match err {
-        Value::Object(o) => match o.get("message") {
-            Some(Value::Str(s)) => Some(s.to_string()),
-            Some(other) => Some(other.to_string()),
+    match err.kind() {
+        ValueKind::Object(o) => match o.get("message") {
+            Some(v) => match v.kind() {
+                ValueKind::Str(s) => Some(s.to_string()),
+                _ => Some(v.to_string()),
+            },
             None => Some(err.to_string()),
         },
-        other => Some(other.to_string()),
+        _ => Some(err.to_string()),
     }
 }
 
@@ -550,7 +565,7 @@ fn instrument(
 
 fn capture(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     if !interp.telemetry_active() {
-        return Ok(Value::Nil);
+        return Ok(Value::nil());
     }
     let event = super::want_string(&super::arg(args, 0), span, "telemetry.capture")?;
     let opts = super::arg(args, 1);
@@ -564,18 +579,18 @@ fn capture(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control
         set_props: Vec::new(),
         time_unix_nano: model::now_unix_nanos(),
     });
-    Ok(Value::Nil)
+    Ok(Value::nil())
 }
 
 fn identify(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     if !interp.telemetry_active() {
-        return Ok(Value::Nil);
+        return Ok(Value::nil());
     }
     let distinct_id = super::want_string(&super::arg(args, 0), span, "telemetry.identify")?;
     let props_val = super::arg(args, 1);
     want_obj_or_nil(&props_val, span, "telemetry.identify")?;
-    let set_props: Vec<(String, Value)> = match &props_val {
-        Value::Object(o) => o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+    let set_props: Vec<(String, Value)> = match props_val.kind() {
+        ValueKind::Object(o) => o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         _ => Vec::new(),
     };
     interp.telemetry_enqueue_event(AnalyticsEvent {
@@ -585,7 +600,7 @@ fn identify(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Contro
         set_props,
         time_unix_nano: model::now_unix_nanos(),
     });
-    Ok(Value::Nil)
+    Ok(Value::nil())
 }
 
 /// Native-method dispatch for span / instrument / no-op handles. Routed from
@@ -598,7 +613,7 @@ pub async fn call_method(
     span: Span,
 ) -> Result<Value, Control> {
     match recv.kind {
-        NativeKind::TelemetryNoop => Ok(Value::Nil),
+        NativeKind::TelemetryNoop => Ok(Value::nil()),
         NativeKind::TelemetrySpan => span_method(interp, recv.id, method, args, span),
         NativeKind::TelemetryInstrument => instrument_method(interp, recv.id, method, args, span),
         _ => Err(AsError::at(
@@ -622,7 +637,7 @@ fn span_method(
             let val = super::arg(&args, 1);
             // Route through the SP11 soft hook (the shared funnel).
             interp.telemetry_span_set(id, &key, val);
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         "addEvent" => {
             let name = super::want_string(&super::arg(&args, 0), span, "span.addEvent")?;
@@ -631,8 +646,8 @@ fn span_method(
             let attrs = obj_pairs(&opts, "attributes");
             // Allow a flat attributes object too: addEvent("x", {k:v}).
             let attrs = if attrs.is_empty() {
-                match &opts {
-                    Value::Object(o) => {
+                match opts.kind() {
+                    ValueKind::Object(o) => {
                         o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect()
                     }
                     _ => Vec::new(),
@@ -641,7 +656,7 @@ fn span_method(
                 attrs
             };
             interp.telemetry_span_event(id, &name, attrs);
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         "setStatus" => {
             let status = super::want_string(&super::arg(&args, 0), span, "span.setStatus")?;
@@ -657,18 +672,18 @@ fn span_method(
                     .into())
                 }
             };
-            let message = match super::arg(&args, 1) {
-                Value::Str(s) => Some(s.to_string()),
+            let message = match super::arg(&args, 1).kind() {
+                ValueKind::Str(s) => Some(s.to_string()),
                 _ => None,
             };
             interp.telemetry_span_set_status(id, code, message);
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         "end" => {
             // Route through the SP11 soft hook; `Unset` preserves any status set
             // via `setStatus`.
             interp.telemetry_span_end(id, crate::interp::SpanStatus::Unset);
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         other => Err(AsError::at(format!("span has no method '{}'", other), span).into()),
     }
@@ -686,14 +701,14 @@ fn instrument_method(
             let amount = super::want_number(&super::arg(&args, 0), span, "telemetry metric")?;
             let attrs_val = super::arg(&args, 1);
             want_obj_or_nil(&attrs_val, span, "telemetry metric")?;
-            let attrs: Vec<(String, Value)> = match &attrs_val {
-                Value::Object(o) => {
+            let attrs: Vec<(String, Value)> = match attrs_val.kind() {
+                ValueKind::Object(o) => {
                     o.entries().into_iter().map(|(k, v)| (k.to_string(), v)).collect()
                 }
                 _ => Vec::new(),
             };
             interp.telemetry_record_metric(id, method, amount, attrs);
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         other => Err(AsError::at(format!("instrument has no method '{}'", other), span).into()),
     }
@@ -734,9 +749,9 @@ telemetry.init({ service: "hook-test", exporters: [ telemetry.otlp({ endpoint: "
         let interp = active_interp().await;
         assert!(interp.telemetry_active());
         let id = interp
-            .telemetry_span_start("chat openai:gpt-4.1", vec![("gen_ai.system".into(), Value::Str("openai".into()))])
+            .telemetry_span_start("chat openai:gpt-4.1", vec![("gen_ai.system".into(), Value::str("openai"))])
             .expect("active → Some id");
-        interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::Float(12.0));
+        interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::float(12.0));
         interp.telemetry_span_event(id, "first-token", vec![]);
         interp.telemetry_span_end(id, SpanStatus::Ok);
         // The span is buffered (capture is empty until flush, but the pipeline

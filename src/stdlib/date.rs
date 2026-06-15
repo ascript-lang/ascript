@@ -9,7 +9,7 @@ use super::{arg, bi, want_number, want_object, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use indexmap::IndexMap;
 
@@ -41,23 +41,23 @@ fn make_instant(epoch_ms: i64) -> Value {
         .single()
         .unwrap_or_else(|| Utc.timestamp_millis_opt(0).unwrap());
     let mut o: IndexMap<String, Value> = IndexMap::new();
-    o.insert("epochMs".into(), Value::Float(epoch_ms as f64));
-    o.insert("year".into(), Value::Float(dt.year() as f64));
-    o.insert("month".into(), Value::Float(dt.month() as f64));
-    o.insert("day".into(), Value::Float(dt.day() as f64));
-    o.insert("hour".into(), Value::Float(dt.hour() as f64));
-    o.insert("minute".into(), Value::Float(dt.minute() as f64));
-    o.insert("second".into(), Value::Float(dt.second() as f64));
+    o.insert("epochMs".into(), Value::float(epoch_ms as f64));
+    o.insert("year".into(), Value::float(dt.year() as f64));
+    o.insert("month".into(), Value::float(dt.month() as f64));
+    o.insert("day".into(), Value::float(dt.day() as f64));
+    o.insert("hour".into(), Value::float(dt.hour() as f64));
+    o.insert("minute".into(), Value::float(dt.minute() as f64));
+    o.insert("second".into(), Value::float(dt.second() as f64));
     o.insert(
         "millisecond".into(),
-        Value::Float(dt.timestamp_subsec_millis() as f64),
+        Value::float(dt.timestamp_subsec_millis() as f64),
     );
     o.insert(
         "weekday".into(),
-        Value::Float(dt.weekday().num_days_from_sunday() as f64),
+        Value::float(dt.weekday().num_days_from_sunday() as f64),
     );
-    o.insert("iso".into(), Value::Str(dt.to_rfc3339().into()));
-    Value::Object(crate::value::ObjectCell::new(o))
+    o.insert("iso".into(), Value::str(dt.to_rfc3339()));
+    Value::object(o)
 }
 
 /// Read the canonical `epochMs` field from an instant object (Tier-2 panic if absent).
@@ -103,8 +103,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "parse" => {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
-            let parsed = match args.get(1) {
-                None | Some(Value::Nil) => {
+            let fmt_arg = match args.get(1) {
+                Some(v) if !matches!(v.kind(), ValueKind::Nil) => Some(v),
+                _ => None,
+            };
+            let parsed = match fmt_arg {
+                None => {
                     // default: RFC3339 / ISO8601
                     chrono::DateTime::parse_from_rfc3339(&s)
                         .map(|dt| dt.with_timezone(&Utc))
@@ -122,10 +126,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 }
             };
             match parsed {
-                Ok(dt) => Ok(make_pair(make_instant(dt.timestamp_millis()), Value::Nil)),
+                Ok(dt) => Ok(make_pair(make_instant(dt.timestamp_millis()), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("cannot parse date: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("cannot parse date: {}", e))),
                 )),
             }
         }
@@ -133,8 +137,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let epoch = instant_epoch(&arg(args, 0), span, &ctx("format"))?;
             let fmt = want_string(&arg(args, 1), span, &ctx("format"))?;
             let offset_min = match args.get(2) {
-                None | Some(Value::Nil) => 0i64,
-                Some(v) => want_number(v, span, &ctx("format"))? as i64,
+                Some(v) if !matches!(v.kind(), ValueKind::Nil) => {
+                    want_number(v, span, &ctx("format"))? as i64
+                }
+                _ => 0i64,
             };
             let dt = Utc
                 .timestamp_millis_opt(epoch)
@@ -142,9 +148,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .unwrap_or_else(|| Utc.timestamp_millis_opt(0).unwrap());
             let shifted = dt + chrono::Duration::minutes(offset_min);
             // format with the shifted naive time (offset applied for display)
-            Ok(Value::Str(
-                shifted.naive_utc().format(&fmt).to_string().into(),
-            ))
+            Ok(Value::str(shifted.naive_utc().format(&fmt).to_string()))
         }
         "addDays" | "addHours" | "addMinutes" | "addSeconds" | "addMonths" | "addYears" => {
             let epoch = instant_epoch(&arg(args, 0), span, &ctx(func))?;
@@ -167,7 +171,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "diffMs" => {
             let a = instant_epoch(&arg(args, 0), span, &ctx("diffMs"))?;
             let b = instant_epoch(&arg(args, 1), span, &ctx("diffMs"))?;
-            Ok(Value::Float((a - b) as f64))
+            Ok(Value::float((a - b) as f64))
         }
         _ => Err(AsError::at(format!("std/date has no function '{}'", func), span).into()),
     }
@@ -209,13 +213,13 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     #[test]
     fn from_epoch_components_and_iso() {
         // 2021-01-01T00:00:00Z = 1609459200000 ms
-        let inst = call("fromEpochMs", &[Value::Float(1609459200000.0)], sp()).unwrap();
+        let inst = call("fromEpochMs", &[Value::float(1609459200000.0)], sp()).unwrap();
         let txt = inst.to_string();
         assert!(txt.contains("year: 2021"), "{txt}");
         assert!(txt.contains("month: 1"), "{txt}");
@@ -227,7 +231,7 @@ mod tests {
         let pair = call("parse", &[s("2021-06-15T12:30:00Z")], sp()).unwrap();
         assert!(pair.to_string().contains("year: 2021"));
         // extract the instant (index 0) and format it
-        if let Value::Array(a) = &pair {
+        if let ValueKind::Array(a) = pair.kind() {
             let inst = a.borrow()[0].clone();
             let formatted = call("format", &[inst, s("%Y-%m-%d")], sp()).unwrap();
             assert_eq!(formatted, s("2021-06-15"));
@@ -246,19 +250,19 @@ mod tests {
 
     #[test]
     fn arithmetic_and_diff() {
-        let base = call("fromEpochMs", &[Value::Float(1609459200000.0)], sp()).unwrap();
-        let plus1 = call("addDays", &[base.clone(), Value::Float(1.0)], sp()).unwrap();
+        let base = call("fromEpochMs", &[Value::float(1609459200000.0)], sp()).unwrap();
+        let plus1 = call("addDays", &[base.clone(), Value::float(1.0)], sp()).unwrap();
         let d = call("diffMs", &[plus1, base], sp()).unwrap();
-        assert_eq!(d, Value::Float(86_400_000.0)); // one day in ms
+        assert_eq!(d, Value::float(86_400_000.0)); // one day in ms
     }
 
     #[test]
     fn add_months_clamps_day() {
         // Jan 31 + 1 month → Feb 28 (2021 non-leap)
         let jan31 = call("parse", &[s("2021-01-31T00:00:00Z")], sp()).unwrap();
-        if let Value::Array(a) = &jan31 {
+        if let ValueKind::Array(a) = jan31.kind() {
             let inst = a.borrow()[0].clone();
-            let feb = call("addMonths", &[inst, Value::Float(1.0)], sp()).unwrap();
+            let feb = call("addMonths", &[inst, Value::float(1.0)], sp()).unwrap();
             assert!(feb.to_string().contains("month: 2"));
             assert!(feb.to_string().contains("day: 28"));
         } else {
@@ -269,11 +273,11 @@ mod tests {
     #[test]
     fn tz_offset_shifts_display() {
         // 2021-01-01T00:00:00Z formatted at +120 min → 02:00; at -300 → prev day 19:00
-        let inst = call("fromEpochMs", &[Value::Float(1609459200000.0)], sp()).unwrap();
+        let inst = call("fromEpochMs", &[Value::float(1609459200000.0)], sp()).unwrap();
         assert_eq!(
             call(
                 "format",
-                &[inst.clone(), s("%Y-%m-%d %H:%M"), Value::Float(120.0)],
+                &[inst.clone(), s("%Y-%m-%d %H:%M"), Value::float(120.0)],
                 sp()
             )
             .unwrap(),
@@ -282,7 +286,7 @@ mod tests {
         assert_eq!(
             call(
                 "format",
-                &[inst, s("%Y-%m-%d %H:%M"), Value::Float(-300.0)],
+                &[inst, s("%Y-%m-%d %H:%M"), Value::float(-300.0)],
                 sp()
             )
             .unwrap(),
@@ -294,11 +298,11 @@ mod tests {
     fn month_arithmetic_edges() {
         // Jan 31 2020 (leap) + 1 month → Feb 29; negative; cross-year
         let leap = call("parse", &[s("2020-01-31T00:00:00Z")], sp()).unwrap();
-        if let Value::Array(a) = &leap {
+        if let ValueKind::Array(a) = leap.kind() {
             let inst = a.borrow()[0].clone();
-            let feb = call("addMonths", &[inst.clone(), Value::Float(1.0)], sp()).unwrap();
+            let feb = call("addMonths", &[inst.clone(), Value::float(1.0)], sp()).unwrap();
             assert!(feb.to_string().contains("month: 2") && feb.to_string().contains("day: 29"));
-            let dec = call("addMonths", &[inst, Value::Float(-1.0)], sp()).unwrap(); // Jan 31 2020 - 1mo → Dec 31 2019
+            let dec = call("addMonths", &[inst, Value::float(-1.0)], sp()).unwrap(); // Jan 31 2020 - 1mo → Dec 31 2019
             assert!(
                 dec.to_string().contains("year: 2019")
                     && dec.to_string().contains("month: 12")
@@ -312,7 +316,7 @@ mod tests {
     #[test]
     fn from_epoch_out_of_range_panics() {
         assert!(matches!(
-            call("fromEpochMs", &[Value::Float(9.0e18)], sp()),
+            call("fromEpochMs", &[Value::float(9.0e18)], sp()),
             Err(Control::Panic(_))
         ));
     }

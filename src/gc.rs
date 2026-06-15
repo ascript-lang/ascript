@@ -46,7 +46,7 @@
 //! The [`Trace`] impl on [`Value`] therefore visits ONLY the container variants
 //! and is a no-op for everything else.
 
-use crate::value::{ArrayCell, Instance, MapCell, MapKey, SetCell, Value};
+use crate::value::{ArrayCell, Instance, MapCell, MapKey, SetCell};
 use crate::vm::value_ext::Closure;
 use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
@@ -190,60 +190,11 @@ impl Trace for MapKey {
     }
 }
 
-impl Trace for Value {
-    fn trace(&self, tracer: &mut Tracer) {
-        match self {
-            // Cycle-capable container variants: recurse into contained Values.
-            // NOTE: these still hold `Rc` in V13-T1 — `Rc<T>: Trace` delegates
-            // to `T::trace`, so tracing already reaches the inner Values. After
-            // V13-T2 these become `Cc<T>` and the collector takes over.
-            Value::Array(a) => a.trace(tracer),
-            Value::Object(o) => o.trace(tracer),
-            // Map/Set wrap a foreign `IndexMap`/`IndexSet` (orphan rule: no
-            // blanket `Trace`), so each is held in a local `MapCell`/`SetCell`
-            // newtype that carries the hand-written `Trace` impl below. The `Cc`
-            // delegates to that impl, which borrows and traces the contents.
-            Value::Map(m) => m.trace(tracer),
-            Value::Set(s) => s.trace(tracer),
-            Value::Instance(i) => i.trace(tracer),
-            Value::Closure(c) => c.trace(tracer),
-            // ADT §5.3: the `EnumVariant` WRAPPER stays on `Rc` (unit-variant
-            // construction is registration-free), but a `Some(payload)` can hold
-            // cycle-capable containers (a recursive enum like `Json::Arr(array<Json>)`
-            // self-references), so the collector must reach the payload's values.
-            // NOTE: `Rc<T>: Trace` is gcmodule's ACYCLIC no-op (it does NOT delegate
-            // to `T::trace`), so we deref to call `EnumVariant::trace` explicitly,
-            // reaching the payload's `Cc` container (the actual cycle node).
-            Value::EnumVariant(v) => (**v).trace(tracer),
-            // SRV §3.6: a frozen `Shared` is an `Arc` DAG in a DIFFERENT ownership
-            // domain (NOT `Cc`), acyclic by construction (`shared.freeze` rejects
-            // input cycles), so refcounting reclaims it — the Bacon–Rajan collector
-            // must NEVER descend into it. The same NO-OP invariant native handles
-            // rely on. The `Arc` graph holds no `Cc` and no `Value` cell, so it adds
-            // ZERO new GC edges and cannot participate in a `Cc` cycle even
-            // transitively (no `Arc→Cc→Arc` cross-domain cycle is possible). Explicit
-            // arm (folds into the catch-all, but spelled out for the invariant).
-            Value::Shared(_) => {}
-            // NOTE on `Function`: a tree-walker `Function` captures an
-            // `Environment` (its own `Rc<RefCell<Scope>>` graph), which is NOT
-            // one of the cycle-capable Value containers migrated in V13-T2 (see
-            // the V13 type list: Array/Object/Map/Set/Instance/Closure + upvalue
-            // cells). The VM expresses closures as `Value::Closure` with traced
-            // upvalue cells instead. So `Function` (and its Environment) STAY on
-            // `Rc` and are a no-op here — falling through to the catch-all.
-            //
-            // Everything else holds no cycle-capable Value (primitives), or is a
-            // native/immutable/opaque handle that must stay acyclic (see the
-            // module docs / deterministic-Drop invariant). No-op.
-            _ => {}
-        }
-    }
-
-    // Conservatively tracked: `Value` can contain `Cc<T>` after V13-T2.
-    fn is_type_tracked() -> bool {
-        true
-    }
-}
+// `impl Trace for Value` has been relocated to `src/value.rs` (NANB Task 1.2)
+// so it sits beside the (soon-to-be-private) repr after Task 1.7's seal.
+// Container `Trace` impls (`ObjectCell`/`ArrayCell`/`MapCell`/`SetCell`/
+// `EnumVariant`) plus `cc_addr`/`cc_ptr_eq` STAY here — they take `&self`,
+// never inspect a `Value` word directly (spec §4.2).
 
 // `Trace for ObjectCell` is implemented in `src/value.rs` (co-located with the
 // struct definition) so the private `map` field is directly accessible.
@@ -273,7 +224,7 @@ impl Trace for crate::value::EnumVariant {
     }
 }
 
-/// `ArrayCell` (`Value::Array` payload, SP2 §4): wraps `vec: RefCell<Vec<Value>>`
+/// `ArrayCell` (`Value::array_cell` payload, SP2 §4): wraps `vec: RefCell<Vec<Value>>`
 /// beside a `frozen: Cell<bool>`. Only the vector can hold cycles; the `Cell<bool>`
 /// is acyclic (`Copy`, no traceable edge). Avoid holding the borrow if it is
 /// already mutably borrowed (an outstanding borrow implies an outstanding
@@ -292,7 +243,7 @@ impl Trace for ArrayCell {
     }
 }
 
-/// `MapCell` (`Value::Map` payload): a newtype over `RefCell<IndexMap<…>>`. The
+/// `MapCell` (`Value::map_cell` payload): a newtype over `RefCell<IndexMap<…>>`. The
 /// foreign `IndexMap` has no `Trace`, so we trace the borrowed contents via the
 /// free `trace_index_map` helper. An outstanding mutable borrow implies an
 /// outstanding reference, so skipping it is safe (mirrors gcmodule's `RefCell`).
@@ -308,7 +259,7 @@ impl Trace for MapCell {
     }
 }
 
-/// `SetCell` (`Value::Set` payload): a newtype over `RefCell<IndexSet<…>>`. See
+/// `SetCell` (`Value::set_cell` payload): a newtype over `RefCell<IndexSet<…>>`. See
 /// [`MapCell`] — keys are acyclic `MapKey`s, traced via the free helper for
 /// uniformity.
 impl Trace for SetCell {
@@ -363,8 +314,8 @@ impl Trace for Closure {
     }
 }
 
-// Note: `IndexMap<MapKey, Value>` (the `Value::Map` payload) and
-// `IndexSet<MapKey>` (the `Value::Set` payload) are foreign types, so we cannot
+// Note: `IndexMap<MapKey, Value>` (the `Value::map_cell` payload) and
+// `IndexSet<MapKey>` (the `Value::set_cell` payload) are foreign types, so we cannot
 // give them a blanket `Trace` impl (orphan rule). Instead the `Map`/`Set` arms
 // of `Value::trace` above borrow and trace them via the free `trace_index_map`
 // / `trace_index_set` helpers — no orphan impl needed.
@@ -372,7 +323,7 @@ impl Trace for Closure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{MapKey, ObjectCell};
+    use crate::value::{MapKey, ObjectCell, Value, ValueKind};
     use crate::vm::chunk::{Chunk, FnProto};
     use gcmodule::{Trace, Tracer};
     use std::cell::Cell;
@@ -453,11 +404,11 @@ mod tests {
         // recursion). Builtin stands in for the acyclic/native family.
         VISITS.with(|c| c.set(0));
         for v in [
-            Value::Nil,
-            Value::Bool(true),
-            Value::Float(3.0),
-            Value::Str("hi".into()),
-            Value::Builtin("print".into()),
+            Value::nil(),
+            Value::bool_(true),
+            Value::float(3.0),
+            Value::str("hi"),
+            Value::builtin("print"),
         ] {
             v.trace(&mut noop);
         }
@@ -472,17 +423,17 @@ mod tests {
         // and the borrows are taken safely).
         let inner = {
             let mut m = IndexMap::new();
-            m.insert("k".to_string(), Value::Float(1.0));
-            Value::Object(ObjectCell::new(m))
+            m.insert("k".to_string(), Value::float(1.0));
+            Value::object_cell(ObjectCell::new(m))
         };
-        let arr = Value::Array(crate::value::ArrayCell::new(vec![inner.clone(), Value::Nil]));
+        let arr = Value::array_cell(crate::value::ArrayCell::new(vec![inner.clone(), Value::nil()]));
         let mut mm: IndexMap<MapKey, Value> = IndexMap::new();
         mm.insert(MapKey::Str("a".into()), arr.clone());
-        let map = Value::Map(MapCell::new(mm));
+        let map = Value::map_cell(MapCell::new(mm));
         let mut ss: IndexSet<MapKey> = IndexSet::new();
         ss.insert(MapKey::Num(0.0f64.to_bits()));
-        let set = Value::Set(SetCell::new(ss));
-        let closure = Value::Closure(Closure::with_upvalues(
+        let set = Value::set_cell(SetCell::new(ss));
+        let closure = Value::closure(Closure::with_upvalues(
             anon_proto(),
             vec![Cc::new(RefCell::new(arr.clone()))],
         ));
@@ -508,14 +459,14 @@ mod tests {
         // ObjectCell / Instance / Closure trace arms exercised directly.
         let cell = ObjectCell::new({
             let mut m = IndexMap::new();
-            m.insert("n".to_string(), Value::Float(2.0));
+            m.insert("n".to_string(), Value::float(2.0));
             m
         });
         cell.trace(&mut noop); // no panic, borrows safely
 
         let closure_inner = Closure::with_upvalues(
             anon_proto(),
-            vec![Cc::new(RefCell::new(Value::Float(9.0)))],
+            vec![Cc::new(RefCell::new(Value::float(9.0)))],
         );
         closure_inner.trace(&mut noop); // no panic, traces upvalue cells
     }
@@ -524,8 +475,8 @@ mod tests {
     /// (`ForeignLib`/`ForeignSymbol`/`ForeignPtr`) contribute ZERO traced edges — the
     /// GC must NEVER trace into a `Library` / raw foreign pointer (it is opaque memory
     /// the collector cannot reason about; reclamation is the deterministic `Drop` of the
-    /// `ResourceState`). `Value::Native` traces as a no-op (`_ => {}`), so a
-    /// `Value::Native(ForeignPtr)` adds no Probe visits regardless of the kind.
+    /// `ResourceState`). `Value::native` traces as a no-op (`_ => {}`), so a
+    /// `Value::native(ForeignPtr)` adds no Probe visits regardless of the kind.
     #[test]
     fn ffi_native_handles_add_zero_traced_edges() {
         let mut noop: Box<dyn FnMut(*const ())> = Box::new(|_p| {});
@@ -535,7 +486,7 @@ mod tests {
             crate::value::NativeKind::ForeignSymbol,
             crate::value::NativeKind::ForeignPtr,
         ] {
-            let handle = Value::Native(Rc::new(crate::value::NativeObject {
+            let handle = Value::native(Rc::new(crate::value::NativeObject {
                 id: 0,
                 kind,
                 fields: IndexMap::new(),
@@ -568,8 +519,8 @@ mod tests {
         // `Cc<RefCell<Vec<Value>>>` now has an internal edge from its own slot, so
         // dropping the external `a` leaves refcount 1 (the self-edge) → it is NOT
         // freed by refcounting and would leak without cycle collection.
-        let a = Value::Array(crate::value::ArrayCell::new(Vec::new()));
-        if let Value::Array(arr) = &a {
+        let a = Value::array(Vec::new());
+        if let ValueKind::Array(arr) = a.kind() {
             arr.borrow_mut().push(a.clone());
         }
         // The cycle is now live and tracked. Drop the only external reference.
@@ -604,12 +555,12 @@ mod tests {
 
         // arr = []; v = Json.Arr([arr-payload]); arr.push(v)  → arr ⇄ v cycle.
         let arr = crate::value::ArrayCell::new(Vec::new());
-        let v = Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
+        let v = Value::enum_variant(std::rc::Rc::new(crate::value::EnumVariant {
             enum_name: "Json".to_string(),
             name: "Arr".to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(crate::value::Payload::Positional(
-                crate::value::ArrayCell::new(vec![Value::Array(arr.clone())]),
+                crate::value::ArrayCell::new(vec![Value::array_cell(arr.clone())]),
             )),
             ctor: false,
             def: None,
@@ -632,7 +583,7 @@ mod tests {
 
     // ──────────── SHAPE Task 2.3 — SLAB-MODE CYCLE RECLAMATION ────────────
     //
-    // A `Value::Object` backed by `ObjectStorage::Slab` (not a Dict) participates
+    // A `Value::object_cell` backed by `ObjectStorage::Slab` (not a Dict) participates
     // in a reference cycle through its `values` vector. The `Trace for ObjectCell`
     // slab arm must reach those values so the Bacon–Rajan collector can break the
     // cycle. If the slab arm is a no-op the cycle leaks (the self-edge keeps the
@@ -658,11 +609,11 @@ mod tests {
         // Create an empty array first; we will push the object into it to form the
         // cycle: obj.next = [obj]  →  obj → array → obj.
         let arr = crate::value::ArrayCell::new(Vec::new());
-        let arr_val = Value::Array(arr.clone());
+        let arr_val = Value::array_cell(arr.clone());
 
         // Build the slab object with values[0] = arr_val (not yet cyclic).
         let obj = crate::value::ObjectCell::new_slab(keys, vec![arr_val], shape);
-        let obj_val = Value::Object(obj);
+        let obj_val = Value::object_cell(obj);
 
         // Now close the cycle: push the object into the array.
         arr.borrow_mut().push(obj_val.clone());
@@ -727,8 +678,8 @@ mod tests {
 
         let mut held = Vec::with_capacity(N);
         for _ in 0..N {
-            let a = Value::Array(crate::value::ArrayCell::new(Vec::new()));
-            if let Value::Array(arr) = &a {
+            let a = Value::array(Vec::new());
+            if let ValueKind::Array(arr) = a.kind() {
                 arr.borrow_mut().push(a.clone()); // self-edge
             }
             held.push(a);
@@ -754,8 +705,8 @@ mod tests {
     }
 
     /// Cycle class 2 — MUTUALLY-REFERENCING objects AND instances: `a.other = b;
-    /// b.other = a`, N pairs. Covers both `Value::Object` (`Cc<ObjectCell>`) and
-    /// `Value::Instance` (`Cc<RefCell<Instance>>`) since both are cycle-capable
+    /// b.other = a`, N pairs. Covers both `Value::object_cell` (`Cc<ObjectCell>`) and
+    /// `Value::instance` (`Cc<RefCell<Instance>>`) since both are cycle-capable
     /// containers with field maps that can close a 2-node cycle.
     #[test]
     fn soundness_mutual_objects_and_instances_no_linear_growth() {
@@ -765,9 +716,9 @@ mod tests {
         // --- Objects: a ⇄ b via "other" fields. ---
         let mut held = Vec::with_capacity(N);
         for _ in 0..N {
-            let a = Value::Object(ObjectCell::new(IndexMap::new()));
-            let b = Value::Object(ObjectCell::new(IndexMap::new()));
-            if let (Value::Object(oa), Value::Object(ob)) = (&a, &b) {
+            let a = Value::object_cell(ObjectCell::new(IndexMap::new()));
+            let b = Value::object_cell(ObjectCell::new(IndexMap::new()));
+            if let (ValueKind::Object(oa), ValueKind::Object(ob)) = (a.kind(), b.kind()) {
                 oa.borrow_mut().insert("other".into(), b.clone());
                 ob.borrow_mut().insert("other".into(), a.clone());
             }
@@ -787,14 +738,14 @@ mod tests {
         let mut held_inst = Vec::with_capacity(N);
         for _ in 0..N {
             let mk = || {
-                Value::Instance(Cc::new(RefCell::new(Instance::from_dict(
+                Value::instance(Cc::new(RefCell::new(Instance::from_dict(
                     class.clone(),
                     IndexMap::new(),
                 ))))
             };
             let a = mk();
             let b = mk();
-            if let (Value::Instance(ia), Value::Instance(ib)) = (&a, &b) {
+            if let (ValueKind::Instance(ia), ValueKind::Instance(ib)) = (a.kind(), b.kind()) {
                 ia.borrow_mut().insert("other", b.clone());
                 ib.borrow_mut().insert("other", a.clone());
             }
@@ -827,7 +778,7 @@ mod tests {
 
     /// Cycle class 3 — MUTUALLY-CAPTURING closures: two closures `f`, `g` that each
     /// capture the OTHER through a shared upvalue cell (`f = fn => g(); g = fn =>
-    /// f()`). The cells are `Cc<RefCell<Value>>` and each holds a `Value::Closure`
+    /// f()`). The cells are `Cc<RefCell<Value>>` and each holds a `Value::closure`
     /// whose upvalue list points at the OTHER's cell — a closure↔cell cycle the
     /// collector must break. Built directly over the `Cc` model because expressing
     /// "two closures capturing each other by reference" is the VM closure shape,
@@ -842,14 +793,14 @@ mod tests {
             // Two cells, initially Nil; each will hold a closure that captures the
             // other cell — closure_f.upvalues = [cell_g], closure_g.upvalues =
             // [cell_f]; cell_f holds closure_f, cell_g holds closure_g.
-            let cell_f: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::Nil));
-            let cell_g: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::Nil));
+            let cell_f: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::nil()));
+            let cell_g: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::nil()));
 
-            let closure_f = Value::Closure(Closure::with_upvalues(
+            let closure_f = Value::closure(Closure::with_upvalues(
                 anon_proto(),
                 vec![cell_g.clone()], // f captures g's cell
             ));
-            let closure_g = Value::Closure(Closure::with_upvalues(
+            let closure_g = Value::closure(Closure::with_upvalues(
                 anon_proto(),
                 vec![cell_f.clone()], // g captures f's cell
             ));
@@ -884,7 +835,7 @@ mod tests {
     }
 
     /// Cycle class 4 — FIBER ↔ FUTURE/GENERATOR loop. The handle types themselves
-    /// (`Value::Future` = `SharedFuture(Rc<…>)`, `Value::Generator` =
+    /// (`Value::future` = `SharedFuture(Rc<…>)`, `Value::generator` =
     /// `Rc<GeneratorHandle>`) deliberately STAY on `Rc` and have NO-OP `Trace`
     /// (module docs: opaque task/coroutine state that must reclaim deterministically
     /// — they are NOT in the `Cc` collector's object space). So a cycle is NEVER
@@ -914,12 +865,12 @@ mod tests {
             // capturing a value that references the body). cell → array → closure →
             // cell is a pure-Cc cycle; the (Rc) handle that would sit beside it is
             // off-graph and irrelevant to reclamation.
-            let env_cell: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::Nil));
-            let body = Value::Closure(Closure::with_upvalues(
+            let env_cell: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::nil()));
+            let body = Value::closure(Closure::with_upvalues(
                 anon_proto(),
                 vec![env_cell.clone()], // body captures its environment
             ));
-            let arr = Value::Array(crate::value::ArrayCell::new(vec![body]));
+            let arr = Value::array_cell(crate::value::ArrayCell::new(vec![body]));
             *env_cell.borrow_mut() = arr; // environment references the body's container
             held.push(env_cell);
         }
@@ -958,7 +909,7 @@ mod tests {
 
         let mut held = Vec::with_capacity(N);
         for i in 0..N {
-            held.push(Value::Array(crate::value::ArrayCell::new(vec![Value::Float(
+            held.push(Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(
                 i as f64,
             )])));
         }
@@ -986,7 +937,7 @@ mod tests {
         super::collect(); // reset baseline
                           // A single tiny acyclic allocation is far below the
                           // COLLECT_GROWTH_THRESHOLD, so maybe_collect must skip.
-        let v = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
+        let v = Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(1.0)]));
         let reclaimed = super::maybe_collect();
         assert_eq!(
             reclaimed, 0,
@@ -1001,7 +952,7 @@ mod tests {
     // migration. The whole design rests on: OS resources (TCP/file/DB/child/timer/
     // socket/terminal handles) are NOT embedded in `Value` and NOT on the Cc graph.
     // They live in `Interp.resources` (a plain `HashMap<u64, ResourceState>`) keyed
-    // by a handle id; the script-visible `Value::Native(Rc<NativeObject>)` is a cheap
+    // by a handle id; the script-visible `Value::native(Rc<NativeObject>)` is a cheap
     // clonable handle carrying only `{ id, kind, fields }` — no OS resource, no
     // `Drop` impl (verified: there is NO `impl Drop for NativeObject`).
     //
@@ -1010,10 +961,10 @@ mod tests {
     //       (explicit `close()`/`kill()`/EOF or scope-driven reclamation) — and NOT by
     //       a cycle collection. Closing/taking the resource frees the OS handle right
     //       then, with NO `gc::collect()` in sight.
-    //   (B) Even when the `Value::Native` HANDLE is captured INTO a reference cycle
+    //   (B) Even when the `Value::native` HANDLE is captured INTO a reference cycle
     //       (an Object that references itself and holds the handle), the OS resource
     //       is freed via the resource model independently of when the Cc cycle is
-    //       collected — because `Value::Native` traces as a NO-OP (`_ => {}` in
+    //       collected — because `Value::native` traces as a NO-OP (`_ => {}` in
     //       `Value::trace`), so the handle is invisible to the collector and the
     //       table entry is never owned by / trapped in the cycle. Collecting the
     //       cycle later drops only the `Rc<NativeObject>` (id+kind+fields) — never the
@@ -1041,7 +992,7 @@ mod tests {
         let baseline = interp.resource_count();
 
         // Register a real OS-backed resource (a tokio Interval timer) behind a
-        // Value::Native handle, exactly as std/time does.
+        // Value::native handle, exactly as std/time does.
         let handle = interp.register_resource(
             crate::value::NativeKind::Interval,
             indexmap::IndexMap::new(),
@@ -1049,8 +1000,8 @@ mod tests {
                 std::time::Duration::from_secs(1),
             ))),
         );
-        let id = match &handle {
-            Value::Native(n) => n.id,
+        let id = match handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => unreachable!("register_resource yields a Native handle"),
         };
         assert_eq!(
@@ -1085,13 +1036,13 @@ mod tests {
             "collection does not resurrect or double-free the closed resource"
         );
 
-        // The Value::Native handle is still a valid (now-dangling) id — it is NOT
+        // The Value::native handle is still a valid (now-dangling) id — it is NOT
         // freed by the collector and dropping it does nothing to the table.
         drop(handle);
         assert_eq!(interp.resource_count(), baseline);
     }
 
-    /// (A') Dropping the `Value::Native` HANDLE alone does NOT free the table entry —
+    /// (A') Dropping the `Value::native` HANDLE alone does NOT free the table entry —
     /// the resource model (close/scope), not handle refcount, governs the OS
     /// resource's lifetime. (This is the SAME pre-GC behavior: `NativeObject` has no
     /// `Drop`.) The entry is reclaimed deterministically by `take_resource`, and is
@@ -1106,8 +1057,8 @@ mod tests {
             indexmap::IndexMap::new(),
             ResourceState::Closed,
         );
-        let id = match &handle {
-            Value::Native(n) => n.id,
+        let id = match handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => unreachable!(),
         };
         assert_eq!(interp.resource_count(), baseline + 1);
@@ -1133,7 +1084,7 @@ mod tests {
         assert_eq!(interp.resource_count(), baseline);
     }
 
-    /// (B) ADVERSARIAL: a `Value::Native` handle captured INTO a reference cycle.
+    /// (B) ADVERSARIAL: a `Value::native` handle captured INTO a reference cycle.
     /// Build a self-referential Object that ALSO holds the native handle, drop the
     /// external reference (the cycle is now unreachable but kept alive by its own
     /// internal edge), close the resource via the resource model, and prove:
@@ -1156,8 +1107,8 @@ mod tests {
                 std::time::Duration::from_secs(1),
             ))),
         );
-        let id = match &handle {
-            Value::Native(n) => n.id,
+        let id = match handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => unreachable!(),
         };
         assert_eq!(interp.resource_count(), baseline + 1);
@@ -1172,9 +1123,9 @@ mod tests {
         let obj = {
             let mut m = IndexMap::new();
             m.insert("conn".to_string(), handle.clone());
-            Value::Object(ObjectCell::new(m))
+            Value::object_cell(ObjectCell::new(m))
         };
-        if let Value::Object(o) = &obj {
+        if let ValueKind::Object(o) = obj.kind() {
             o.borrow_mut().insert("self".to_string(), obj.clone());
         }
         // Drop every external reference to the cycle AND the standalone handle. The
@@ -1246,9 +1197,9 @@ mod tests {
         let obj = {
             let mut m = IndexMap::new();
             m.insert("conn".to_string(), handle.clone());
-            Value::Object(ObjectCell::new(m))
+            Value::object_cell(ObjectCell::new(m))
         };
-        if let Value::Object(o) = &obj {
+        if let ValueKind::Object(o) = obj.kind() {
             o.borrow_mut().insert("self".to_string(), obj.clone());
         }
         drop(obj);
@@ -1274,7 +1225,7 @@ mod tests {
     }
 
     // SRV §3.4 (Gate 0) — the NEGATIVE compile-time guard. `Value` gained its first
-    // `Send` member (`Value::Shared(Arc<SharedNode>)`), but the union as a whole MUST
+    // `Send` member (`Value::shared(Arc<SharedNode>)`), but the union as a whole MUST
     // stay `!Send` (the `LocalSet`/current-thread invariant). This expands to a
     // `const` impl-check: if a future edit removes the last `Rc`/`Cc`/`Native` member
     // or adds `unsafe impl Send for Value`, the build fails HERE rather than silently
@@ -1282,7 +1233,7 @@ mod tests {
     // (`is_send_sync::<SharedNode>()`) lives in `value.rs`.
     static_assertions::assert_not_impl_any!(crate::value::Value: Send);
 
-    // SRV §3.6 — a `Cc` container holding a `Value::Shared` field is GC-collected
+    // SRV §3.6 — a `Cc` container holding a `Value::shared` field is GC-collected
     // normally: the `Shared` is a traced-SKIPPED leaf (the `Arc` graph is a different
     // ownership domain), so tracing the container reaches its OTHER children but NOT
     // the frozen DAG, and adds ZERO edges through the `Shared`.
@@ -1293,14 +1244,14 @@ mod tests {
         use std::sync::Arc;
 
         // A frozen leaf (an `Arc<SharedNode>`), stored as a field of a `Cc` Object.
-        let frozen = Value::Shared(Arc::new(SharedNode::Int(7)));
+        let frozen = Value::shared(Arc::new(SharedNode::Int(7)));
         let mut map = IndexMap::new();
         map.insert("frozen".to_string(), frozen);
-        map.insert("probe".to_string(), Value::Int(1));
-        let obj = Value::Object(ObjectCell::new(map));
+        map.insert("probe".to_string(), Value::int(1));
+        let obj = Value::object_cell(ObjectCell::new(map));
 
         // Tracing the container must NOT panic and must NOT descend into the `Arc`
-        // graph (there is no `Trace` edge through `Value::Shared`). We assert the
+        // graph (there is no `Trace` edge through `Value::shared`). We assert the
         // trace runs cleanly; the `Shared` arm is a no-op by construction.
         VISITS.with(|c| c.set(0));
         let mut probe_root = Probe;

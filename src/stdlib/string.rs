@@ -4,7 +4,7 @@ use super::{arg, bi, clamp_index, want_array, want_count, want_number, want_stri
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -36,7 +36,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn str_val(s: String) -> Value {
-    Value::Str(s.into())
+    Value::str(s)
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -52,7 +52,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     .map(|p| str_val(p.to_string()))
                     .collect()
             };
-            Ok(Value::Array(crate::value::ArrayCell::new(parts)))
+            Ok(Value::array_cell(crate::value::ArrayCell::new(parts)))
         }
         "join" => {
             let arr = want_array(&arg(args, 0), span, &ctx("join"))?;
@@ -66,7 +66,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let len = chars.len();
             let start = clamp_index(want_number(&arg(args, 1), span, &ctx("slice"))?, len);
             let end = match args.get(2) {
-                None | Some(Value::Nil) => len,
+                None => len,
+                Some(v) if matches!(v.kind(), ValueKind::Nil) => len,
                 Some(v) => clamp_index(want_number(v, span, &ctx("slice"))?, len),
             };
             let slice: String = if start < end {
@@ -92,8 +93,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let sub = want_string(&arg(args, 1), span, &ctx("find"))?;
             // NUM §4: a character index/count is an `Int`.
             match s.find(sub.as_ref()) {
-                Some(byte_idx) => Ok(Value::Int(s[..byte_idx].chars().count() as i64)),
-                None => Ok(Value::Int(-1)),
+                Some(byte_idx) => Ok(Value::int(s[..byte_idx].chars().count() as i64)),
+                None => Ok(Value::int(-1)),
             }
         }
         "replace" => {
@@ -132,7 +133,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             // non-finite / out-of-range width would cast to `usize::MAX` and OOM-abort.
             let width = want_count(&arg(args, 1), span, &ctx(func), MAX_ALLOC_COUNT)?;
             let fill = match args.get(2) {
-                None | Some(Value::Nil) => " ".to_string(),
+                None => " ".to_string(),
+                Some(v) if matches!(v.kind(), ValueKind::Nil) => " ".to_string(),
                 Some(v) => want_string(v, span, &ctx(func))?.to_string(),
             };
             let cur = s.chars().count();
@@ -174,34 +176,34 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "startsWith" => {
             let s = want_string(&arg(args, 0), span, &ctx("startsWith"))?;
             let p = want_string(&arg(args, 1), span, &ctx("startsWith"))?;
-            Ok(Value::Bool(s.starts_with(p.as_ref())))
+            Ok(Value::bool_(s.starts_with(p.as_ref())))
         }
         "endsWith" => {
             let s = want_string(&arg(args, 0), span, &ctx("endsWith"))?;
             let p = want_string(&arg(args, 1), span, &ctx("endsWith"))?;
-            Ok(Value::Bool(s.ends_with(p.as_ref())))
+            Ok(Value::bool_(s.ends_with(p.as_ref())))
         }
         "contains" => {
             let s = want_string(&arg(args, 0), span, &ctx("contains"))?;
             let sub = want_string(&arg(args, 1), span, &ctx("contains"))?;
-            Ok(Value::Bool(s.contains(sub.as_ref())))
+            Ok(Value::bool_(s.contains(sub.as_ref())))
         }
         "chars" => {
             let s = want_string(&arg(args, 0), span, &ctx("chars"))?;
             let out: Vec<Value> = s
                 .chars()
-                .map(|c| Value::Str(c.to_string().into()))
+                .map(|c| Value::str(c.to_string()))
                 .collect();
-            Ok(Value::Array(crate::value::ArrayCell::new(out)))
+            Ok(Value::array_cell(crate::value::ArrayCell::new(out)))
         }
         "lines" => {
             let s = want_string(&arg(args, 0), span, &ctx("lines"))?;
-            let out: Vec<Value> = s.lines().map(|l| Value::Str(l.into())).collect();
-            Ok(Value::Array(crate::value::ArrayCell::new(out)))
+            let out: Vec<Value> = s.lines().map(Value::str).collect();
+            Ok(Value::array_cell(crate::value::ArrayCell::new(out)))
         }
         "reverse" => {
             let s = want_string(&arg(args, 0), span, &ctx("reverse"))?;
-            Ok(Value::Str(s.chars().rev().collect::<String>().into()))
+            Ok(Value::str(s.chars().rev().collect::<String>()))
         }
         "count" => {
             let s = want_string(&arg(args, 0), span, &ctx("count"))?;
@@ -212,7 +214,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 s.matches(sub.as_ref()).count()
             };
             // NUM §4: an occurrence count is an `Int`.
-            Ok(Value::Int(n as i64))
+            Ok(Value::int(n as i64))
         }
         "splitN" => {
             let s = want_string(&arg(args, 0), span, &ctx("splitN"))?;
@@ -224,15 +226,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let n = n_raw as usize;
             let out: Vec<Value> = s
                 .splitn(n, sep.as_ref())
-                .map(|p| Value::Str(p.into()))
+                .map(Value::str)
                 .collect();
-            Ok(Value::Array(crate::value::ArrayCell::new(out)))
+            Ok(Value::array_cell(crate::value::ArrayCell::new(out)))
         }
         "codepoints" => {
             // NUM §1/§4: Unicode scalar values are `int`s (the Go rune model).
             let s = want_string(&arg(args, 0), span, &ctx("codepoints"))?;
-            let out: Vec<Value> = s.chars().map(|c| Value::Int(c as i64)).collect();
-            Ok(Value::Array(crate::value::ArrayCell::new(out)))
+            let out: Vec<Value> = s.chars().map(|c| Value::int(c as i64)).collect();
+            Ok(Value::array_cell(crate::value::ArrayCell::new(out)))
         }
         "from_codepoints" => {
             // Validate each element is a valid Unicode scalar (0..=0x10FFFF, excluding
@@ -297,7 +299,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 }
             };
             match s.chars().nth(idx) {
-                Some(c) => Ok(Value::Int(c as i64)),
+                Some(c) => Ok(Value::int(c as i64)),
                 None => Err(AsError::at(
                     format!(
                         "string.code_at: index {} out of range (length {})",
@@ -355,7 +357,7 @@ fn format_template(template: &str, args: &[Value], span: Span) -> Result<String,
 mod tests {
     use super::*;
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
     fn sp() -> Span {
         Span::new(0, 0)
@@ -374,14 +376,14 @@ mod tests {
         assert_eq!(
             call(
                 "slice",
-                &[s("hello"), Value::Float(1.0), Value::Float(4.0)],
+                &[s("hello"), Value::float(1.0), Value::float(4.0)],
                 sp()
             )
             .unwrap(),
             s("ell")
         );
         assert_eq!(
-            call("slice", &[s("hello"), Value::Float(-2.0)], sp()).unwrap(),
+            call("slice", &[s("hello"), Value::float(-2.0)], sp()).unwrap(),
             s("lo")
         );
         assert_eq!(call("trim", &[s("  hi  ")], sp()).unwrap(), s("hi"));
@@ -393,11 +395,11 @@ mod tests {
     fn find_replace_format_pad_repeat() {
         assert_eq!(
             call("find", &[s("hello"), s("ll")], sp()).unwrap(),
-            Value::Int(2)
+            Value::int(2)
         );
         assert_eq!(
             call("find", &[s("hello"), s("z")], sp()).unwrap(),
-            Value::Int(-1)
+            Value::int(-1)
         );
         // replace = FIRST occurrence only
         assert_eq!(
@@ -414,9 +416,9 @@ mod tests {
                 "format",
                 &[
                     s("{} + {} = {}"),
-                    Value::Float(1.0),
-                    Value::Float(2.0),
-                    Value::Float(3.0)
+                    Value::float(1.0),
+                    Value::float(2.0),
+                    Value::float(3.0)
                 ],
                 sp()
             )
@@ -429,15 +431,15 @@ mod tests {
             s("{literal}")
         );
         assert_eq!(
-            call("padStart", &[s("7"), Value::Float(3.0), s("0")], sp()).unwrap(),
+            call("padStart", &[s("7"), Value::float(3.0), s("0")], sp()).unwrap(),
             s("007")
         );
         assert_eq!(
-            call("padEnd", &[s("7"), Value::Float(3.0)], sp()).unwrap(),
+            call("padEnd", &[s("7"), Value::float(3.0)], sp()).unwrap(),
             s("7  ")
         );
         assert_eq!(
-            call("repeat", &[s("ab"), Value::Float(3.0)], sp()).unwrap(),
+            call("repeat", &[s("ab"), Value::float(3.0)], sp()).unwrap(),
             s("ababab")
         );
     }
@@ -452,14 +454,14 @@ mod tests {
         );
         // padStart when already wide enough returns unchanged
         assert_eq!(
-            call("padStart", &[s("hello"), Value::Float(3.0), s("0")], sp).unwrap(),
+            call("padStart", &[s("hello"), Value::float(3.0), s("0")], sp).unwrap(),
             s("hello")
         );
         // slice start >= end → empty
         assert_eq!(
             call(
                 "slice",
-                &[s("hello"), Value::Float(4.0), Value::Float(2.0)],
+                &[s("hello"), Value::float(4.0), Value::float(2.0)],
                 sp
             )
             .unwrap(),
@@ -476,7 +478,7 @@ mod tests {
         );
         // negative repeat count → panic
         assert!(matches!(
-            call("repeat", &[s("a"), Value::Float(-1.0)], sp),
+            call("repeat", &[s("a"), Value::float(-1.0)], sp),
             Err(Control::Panic(_))
         ));
         // standalone }} escape
@@ -486,7 +488,7 @@ mod tests {
     #[test]
     fn misuse_panics() {
         assert!(matches!(
-            call("split", &[Value::Float(1.0), s(",")], sp()),
+            call("split", &[Value::float(1.0), s(",")], sp()),
             Err(Control::Panic(_))
         ));
         assert!(matches!(
@@ -499,27 +501,27 @@ mod tests {
     fn string_completeness() {
         assert_eq!(
             call("startsWith", &[s("hello"), s("he")], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("startsWith", &[s("hello"), s("xy")], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
         assert_eq!(
             call("endsWith", &[s("hello"), s("lo")], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("contains", &[s("hello"), s("ell")], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("contains", &[s("hello"), s("")], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("contains", &[s("hello"), s("zzz")], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
         assert_eq!(
             call("chars", &[s("ab")], sp()).unwrap().to_string(),
@@ -532,26 +534,26 @@ mod tests {
         assert_eq!(call("reverse", &[s("abc")], sp()).unwrap(), s("cba"));
         assert_eq!(
             call("count", &[s("a.a.a"), s(".")], sp()).unwrap(),
-            Value::Int(2)
+            Value::int(2)
         );
         assert_eq!(
             call("count", &[s("abc"), s("")], sp()).unwrap(),
-            Value::Int(0)
+            Value::int(0)
         );
         assert_eq!(
-            call("splitN", &[s("a:b:c"), s(":"), Value::Float(2.0)], sp())
+            call("splitN", &[s("a:b:c"), s(":"), Value::float(2.0)], sp())
                 .unwrap()
                 .to_string(),
             "[\"a\", \"b:c\"]"
         );
         assert_eq!(
-            call("splitN", &[s("a:b:c"), s(":"), Value::Float(1.0)], sp())
+            call("splitN", &[s("a:b:c"), s(":"), Value::float(1.0)], sp())
                 .unwrap()
                 .to_string(),
             "[\"a:b:c\"]"
         );
         assert!(matches!(
-            call("splitN", &[s("a:b"), s(":"), Value::Float(0.0)], sp()),
+            call("splitN", &[s("a:b"), s(":"), Value::float(0.0)], sp()),
             Err(Control::Panic(_))
         ));
     }
@@ -566,16 +568,16 @@ mod tests {
         let cps2 = call("codepoints", &[s("é")], sp).unwrap();
         assert_eq!(cps2.to_string(), "[233]");
         // from_codepoints is the inverse.
-        let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Int(72),
-            Value::Int(105),
+        let arr = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::int(72),
+            Value::int(105),
         ]));
         assert_eq!(call("from_codepoints", &[arr], sp).unwrap(), s("Hi"));
         // astral plane (emoji U+1F600).
-        let astral = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(0x1F600)]));
+        let astral = Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(0x1F600)]));
         assert_eq!(call("from_codepoints", &[astral], sp).unwrap(), s("😀"));
         // integral floats are accepted as code points.
-        let fl = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(65.0)]));
+        let fl = Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(65.0)]));
         assert_eq!(call("from_codepoints", &[fl], sp).unwrap(), s("A"));
     }
 
@@ -583,31 +585,31 @@ mod tests {
     fn from_codepoints_rejects_invalid() {
         let sp = sp();
         // Surrogate (U+D800) is not a scalar value.
-        let surr = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(0xD800)]));
+        let surr = Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(0xD800)]));
         assert!(matches!(
             call("from_codepoints", &[surr], sp),
             Err(Control::Panic(_))
         ));
         // Beyond U+10FFFF.
-        let over = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(0x110000)]));
+        let over = Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(0x110000)]));
         assert!(matches!(
             call("from_codepoints", &[over], sp),
             Err(Control::Panic(_))
         ));
         // Negative.
-        let neg = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(-1)]));
+        let neg = Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(-1)]));
         assert!(matches!(
             call("from_codepoints", &[neg], sp),
             Err(Control::Panic(_))
         ));
         // Non-int element.
-        let bad = Value::Array(crate::value::ArrayCell::new(vec![s("x")]));
+        let bad = Value::array_cell(crate::value::ArrayCell::new(vec![s("x")]));
         assert!(matches!(
             call("from_codepoints", &[bad], sp),
             Err(Control::Panic(_))
         ));
         // Non-integral float.
-        let frac = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(65.5)]));
+        let frac = Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(65.5)]));
         assert!(matches!(
             call("from_codepoints", &[frac], sp),
             Err(Control::Panic(_))
@@ -618,26 +620,26 @@ mod tests {
     fn code_at_basic_and_bounds() {
         let sp = sp();
         assert_eq!(
-            call("code_at", &[s("ABC"), Value::Int(0)], sp).unwrap(),
-            Value::Int(65)
+            call("code_at", &[s("ABC"), Value::int(0)], sp).unwrap(),
+            Value::int(65)
         );
         assert_eq!(
-            call("code_at", &[s("ABC"), Value::Int(2)], sp).unwrap(),
-            Value::Int(67)
+            call("code_at", &[s("ABC"), Value::int(2)], sp).unwrap(),
+            Value::int(67)
         );
         // out of range → panic.
         assert!(matches!(
-            call("code_at", &[s("ABC"), Value::Int(3)], sp),
+            call("code_at", &[s("ABC"), Value::int(3)], sp),
             Err(Control::Panic(_))
         ));
         // negative → panic.
         assert!(matches!(
-            call("code_at", &[s("ABC"), Value::Int(-1)], sp),
+            call("code_at", &[s("ABC"), Value::int(-1)], sp),
             Err(Control::Panic(_))
         ));
         // non-integral float index → panic.
         assert!(matches!(
-            call("code_at", &[s("ABC"), Value::Float(1.5)], sp),
+            call("code_at", &[s("ABC"), Value::float(1.5)], sp),
             Err(Control::Panic(_))
         ));
     }
@@ -647,31 +649,31 @@ mod tests {
     fn repeat_count_guards_are_tier2() {
         let sp = sp();
         // A finite, in-range count still works.
-        assert_eq!(call("repeat", &[s("ab"), Value::Int(3)], sp).unwrap(), s("ababab"));
-        assert_eq!(call("repeat", &[s("x"), Value::Int(0)], sp).unwrap(), s(""));
+        assert_eq!(call("repeat", &[s("ab"), Value::int(3)], sp).unwrap(), s("ababab"));
+        assert_eq!(call("repeat", &[s("x"), Value::int(0)], sp).unwrap(), s(""));
         // Infinity (`1/0`) must be a CLEAN Tier-2 panic, NOT a `usize::MAX` abort.
         assert!(matches!(
-            call("repeat", &[s("x"), Value::Float(f64::INFINITY)], sp),
+            call("repeat", &[s("x"), Value::float(f64::INFINITY)], sp),
             Err(Control::Panic(_))
         ));
         // NaN → panic.
         assert!(matches!(
-            call("repeat", &[s("x"), Value::Float(f64::NAN)], sp),
+            call("repeat", &[s("x"), Value::float(f64::NAN)], sp),
             Err(Control::Panic(_))
         ));
         // Huge finite count (10^18) → OOM-class allocation → panic, not abort.
         assert!(matches!(
-            call("repeat", &[s("x"), Value::Float(1e18)], sp),
+            call("repeat", &[s("x"), Value::float(1e18)], sp),
             Err(Control::Panic(_))
         ));
         // Negative → panic.
         assert!(matches!(
-            call("repeat", &[s("x"), Value::Float(-1.0)], sp),
+            call("repeat", &[s("x"), Value::float(-1.0)], sp),
             Err(Control::Panic(_))
         ));
         // In-range count but the PRODUCT overflows the bound → panic (no `repeat` panic).
         assert!(matches!(
-            call("repeat", &[s("0123456789"), Value::Float(u32::MAX as f64)], sp),
+            call("repeat", &[s("0123456789"), Value::float(u32::MAX as f64)], sp),
             Err(Control::Panic(_))
         ));
     }
@@ -681,16 +683,16 @@ mod tests {
     fn pad_width_guards_are_tier2() {
         let sp = sp();
         assert_eq!(
-            call("padStart", &[s("7"), Value::Int(3), s("0")], sp).unwrap(),
+            call("padStart", &[s("7"), Value::int(3), s("0")], sp).unwrap(),
             s("007")
         );
         // Infinite width → clean Tier-2 panic, not a `usize::MAX` cycle/take abort.
         assert!(matches!(
-            call("padStart", &[s("x"), Value::Float(f64::INFINITY), s("-")], sp),
+            call("padStart", &[s("x"), Value::float(f64::INFINITY), s("-")], sp),
             Err(Control::Panic(_))
         ));
         assert!(matches!(
-            call("padEnd", &[s("x"), Value::Float(1e18), s("-")], sp),
+            call("padEnd", &[s("x"), Value::float(1e18), s("-")], sp),
             Err(Control::Panic(_))
         ));
     }

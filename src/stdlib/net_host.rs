@@ -11,8 +11,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
-use std::rc::Rc;
+use crate::value::{Value, ValueKind};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -22,7 +21,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 /// Normalise `host` into a `host:port` form for `tokio::net::lookup_host`.
@@ -64,19 +63,19 @@ impl Interp {
                 let pair = self.net_lookup(host.to_string(), span).await?;
                 // Unwrap the [arr, err] pair: if err != nil, pass it through.
                 // If arr is empty, return an error.
-                if let Value::Array(ref a) = pair {
+                if let ValueKind::Array(a) = pair.kind() {
                     let (val, err) = {
                         let b = a.borrow();
                         (b[0].clone(), b[1].clone())
                     };
-                    if err != Value::Nil {
+                    if err != Value::nil() {
                         return Ok(pair);
                     }
                     // arr is the resolved list; get the first element.
-                    if let Value::Array(ref list) = val {
+                    if let ValueKind::Array(list) = val.kind() {
                         let first = list.borrow().first().cloned();
                         return match first {
-                            Some(ip) => Ok(make_pair(ip, Value::Nil)),
+                            Some(ip) => Ok(make_pair(ip, Value::nil())),
                             None => Ok(err_pair("net.lookupOne: no addresses returned".into())),
                         };
                     }
@@ -116,11 +115,11 @@ impl Interp {
         for sa in addrs {
             let ip = sa.ip().to_string();
             if seen.insert(ip.clone()) {
-                ips.push(Value::Str(Rc::from(ip.as_str())));
+                ips.push(Value::str(ip.as_str()));
             }
         }
-        let arr = Value::Array(crate::value::ArrayCell::new(ips));
-        Ok(make_pair(arr, Value::Nil))
+        let arr = Value::array(ips);
+        Ok(make_pair(arr, Value::nil()))
     }
 }
 

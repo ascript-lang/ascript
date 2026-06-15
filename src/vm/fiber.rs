@@ -56,7 +56,7 @@ pub struct CallFrame {
 
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
 /// (every captured local). `slot_count` sizes the vector; each cell slot gets a
-/// fresh `Cc<RefCell<Value::Nil>>`, every other slot is `None`.
+/// fresh `Cc<RefCell<Value::nil()>>`, every other slot is `None`.
 ///
 /// **CALL §2 — A1 empty-cells fast path:** when `cell_slots` is empty (the
 /// overwhelmingly common case — most functions capture nothing by reference),
@@ -80,7 +80,7 @@ pub(crate) fn alloc_cells(
         let idx = slot as usize;
         // The resolver allocated this slot within the frame's window, so it is in
         // range; a stale index would be a resolver/compiler bug.
-        cells[idx] = Some(Cc::new(RefCell::new(Value::Nil)));
+        cells[idx] = Some(Cc::new(RefCell::new(Value::nil())));
     }
     cells
 }
@@ -94,11 +94,11 @@ pub struct Fiber {
 
 impl Fiber {
     /// Create a fiber running `top` as its sole (bottom) frame. Reserves the
-    /// frame's local slots as `Value::Nil` so locals occupy `stack[0 ..
+    /// frame's local slots as `Value::nil()` so locals occupy `stack[0 ..
     /// slot_count]`; operands push above. Starts in [`FiberState::Running`].
     pub fn new(top: Cc<Closure>) -> Self {
         let slot_count = top.proto.chunk.slot_count as usize;
-        let stack = vec![Value::Nil; slot_count];
+        let stack = vec![Value::nil(); slot_count];
         let cells = alloc_cells(slot_count, &top.proto.chunk.cell_slots);
         let frame = CallFrame {
             closure: top,
@@ -222,7 +222,7 @@ impl Fiber {
         *cell.borrow_mut() = v;
     }
 
-    /// Install a BRAND-NEW heap cell (`Cc<RefCell<Value::Nil>>`) into the current
+    /// Install a BRAND-NEW heap cell (`Cc<RefCell<Value::nil()>>`) into the current
     /// frame's `slot`, dropping the frame's strong ref to the previous cell. Any
     /// closure that captured the previous cell keeps it alive with its own value.
     /// Used by `Op::FreshCell` to give each loop iteration a fresh cell for the
@@ -238,7 +238,7 @@ impl Fiber {
             .get_mut(slot)
             .and_then(|c| c.as_mut())
             .expect("Fiber::fresh_cell on a non-cell slot (compiler/resolver bug)");
-        *slot_cell = Cc::new(RefCell::new(Value::Nil));
+        *slot_cell = Cc::new(RefCell::new(Value::nil()));
     }
 
     /// **CALL §4 A3 — fiber pool reset.**
@@ -246,7 +246,7 @@ impl Fiber {
     /// Recycle this fiber for `top`, clearing mid-flight state so it can be reused
     /// by a re-entrant call. The returned fiber is in the exact same state as
     /// `Fiber::new(top)` — one bottom frame at `ip 0`, stack pre-filled with
-    /// `Value::Nil` for all locals, fresh cells, state `Running`.
+    /// `Value::nil()` for all locals, fresh cells, state `Running`.
     ///
     /// Cell freshness is load-bearing: cells are `Cc` handles captured by closures
     /// that this call creates. Reusing the old `Cc` would let a previously-returned
@@ -267,7 +267,7 @@ impl Fiber {
         // Resize the stack to exactly `slot_count` Nils — clearing any mid-flight
         // operand pushes and resizing for the new proto's local window.
         self.stack.clear();
-        self.stack.resize(slot_count, Value::Nil);
+        self.stack.resize(slot_count, Value::nil());
         // Fresh cells — NEVER reuse old Cc handles (see doc comment above).
         let cells = alloc_cells(slot_count, &top.proto.chunk.cell_slots);
         let frame = CallFrame {
@@ -288,6 +288,7 @@ impl Fiber {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueKind;
     use crate::vm::chunk::{Chunk, FnProto};
 
     fn closure_with_slots(slots: u16) -> Cc<Closure> {
@@ -340,10 +341,10 @@ mod tests {
     #[test]
     fn cell_get_set_roundtrip_through_the_cell() {
         let fiber = Fiber::new(closure_with_cell_slots(2, vec![1]));
-        fiber.set_local_cell(1, Value::Float(7.0));
-        assert!(matches!(fiber.get_local_cell(1), Value::Float(n) if n == 7.0));
+        fiber.set_local_cell(1, Value::float(7.0));
+        assert!(matches!(fiber.get_local_cell(1).kind(), ValueKind::Float(n) if n == 7.0));
         // The cell access does NOT touch the plain stack slot.
-        assert!(matches!(fiber.local(1), Value::Nil));
+        assert!(matches!(fiber.local(1).kind(), ValueKind::Nil));
     }
 
     #[test]
@@ -351,8 +352,8 @@ mod tests {
         let fiber = Fiber::new(closure_with_slots(2));
         assert_eq!(fiber.frames.len(), 1);
         assert_eq!(fiber.stack.len(), 2);
-        assert!(matches!(fiber.stack[0], Value::Nil));
-        assert!(matches!(fiber.stack[1], Value::Nil));
+        assert!(matches!(fiber.stack[0].kind(), ValueKind::Nil));
+        assert!(matches!(fiber.stack[1].kind(), ValueKind::Nil));
         assert_eq!(fiber.state, FiberState::Running);
         assert_eq!(fiber.frame().ip, 0);
         assert_eq!(fiber.frame().slot_base, 0);
@@ -361,25 +362,25 @@ mod tests {
     #[test]
     fn push_pop_peek_lifo() {
         let mut fiber = Fiber::new(closure_with_slots(0));
-        fiber.push(Value::Float(1.0));
-        fiber.push(Value::Float(2.0));
-        fiber.push(Value::Float(3.0));
+        fiber.push(Value::float(1.0));
+        fiber.push(Value::float(2.0));
+        fiber.push(Value::float(3.0));
 
-        assert!(matches!(fiber.peek(0), Value::Float(n) if *n == 3.0));
-        assert!(matches!(fiber.peek(1), Value::Float(n) if *n == 2.0));
-        assert!(matches!(fiber.peek(2), Value::Float(n) if *n == 1.0));
+        assert!(matches!(fiber.peek(0).kind(), ValueKind::Float(n) if n == 3.0));
+        assert!(matches!(fiber.peek(1).kind(), ValueKind::Float(n) if n == 2.0));
+        assert!(matches!(fiber.peek(2).kind(), ValueKind::Float(n) if n == 1.0));
 
-        assert!(matches!(fiber.pop(), Value::Float(n) if n == 3.0));
-        assert!(matches!(fiber.pop(), Value::Float(n) if n == 2.0));
-        assert!(matches!(fiber.pop(), Value::Float(n) if n == 1.0));
+        assert!(matches!(fiber.pop().kind(), ValueKind::Float(n) if n == 3.0));
+        assert!(matches!(fiber.pop().kind(), ValueKind::Float(n) if n == 2.0));
+        assert!(matches!(fiber.pop().kind(), ValueKind::Float(n) if n == 1.0));
     }
 
     #[test]
     fn set_local_and_local_roundtrip() {
         let mut fiber = Fiber::new(closure_with_slots(2));
-        fiber.set_local(1, Value::Float(42.0));
-        assert!(matches!(fiber.local(1), Value::Float(n) if *n == 42.0));
-        assert!(matches!(fiber.local(0), Value::Nil));
+        fiber.set_local(1, Value::float(42.0));
+        assert!(matches!(fiber.local(1).kind(), ValueKind::Float(n) if n == 42.0));
+        assert!(matches!(fiber.local(0).kind(), ValueKind::Nil));
     }
 
     #[test]
@@ -412,9 +413,9 @@ mod tests {
         let _old_cell = fiber.frame().cells[1].clone();
         let old_cell_ptr = _old_cell.as_ref().map(crate::gc::cc_addr);
         // Simulate in-flight: write locals + push some operands, change state.
-        fiber.stack[0] = Value::Bool(true);
-        fiber.stack[1] = Value::Bool(false);
-        fiber.push(Value::Bool(true)); // operand above locals
+        fiber.stack[0] = Value::bool_(true);
+        fiber.stack[1] = Value::bool_(false);
+        fiber.push(Value::bool_(true)); // operand above locals
         fiber.state = FiberState::Done;
 
         // Reset.
@@ -431,7 +432,7 @@ mod tests {
         // Stack invariants: exactly slot_count Nils, no leftover operands.
         assert_eq!(fiber.stack.len(), 3, "stack len == slot_count");
         for (i, v) in fiber.stack.iter().enumerate() {
-            assert!(matches!(v, Value::Nil), "stack[{i}] must be Nil after reset");
+            assert!(matches!(v.kind(), ValueKind::Nil), "stack[{i}] must be Nil after reset");
         }
 
         // State invariant.

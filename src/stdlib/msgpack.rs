@@ -28,7 +28,7 @@ use super::{arg, bi, want_bytes};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use indexmap::IndexMap;
 use rmpv::Value as Mp;
 
@@ -39,16 +39,16 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// AScript `Value` → `rmpv::Value`. Err(String) on an unrepresentable handle or
 /// a reference cycle (`seen` tracks Array/Object/Map/Set Cc pointers in progress).
 pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
-    match v {
-        Value::Nil => Ok(Mp::Nil),
-        Value::Bool(b) => Ok(Mp::Boolean(*b)),
+    match v.kind() {
+        ValueKind::Nil => Ok(Mp::Nil),
+        ValueKind::Bool(b) => Ok(Mp::Boolean(b)),
         // NUM §4: an `Int` encodes as a MessagePack integer directly.
-        Value::Int(i) => Ok(Mp::Integer((*i).into())),
-        Value::Float(n) => Ok(number_to_mp(*n)),
-        Value::Decimal(d) => Ok(Mp::String(d.to_string().into())),
-        Value::Str(s) => Ok(Mp::String(s.to_string().into())),
-        Value::Bytes(b) => Ok(Mp::Binary(b.borrow().clone())),
-        Value::Array(a) => {
+        ValueKind::Int(i) => Ok(Mp::Integer(i.into())),
+        ValueKind::Float(n) => Ok(number_to_mp(n)),
+        ValueKind::Decimal(d) => Ok(Mp::String(d.to_string().into())),
+        ValueKind::Str(s) => Ok(Mp::String(s.to_string().into())),
+        ValueKind::Bytes(b) => Ok(Mp::Binary(b.borrow().clone())),
+        ValueKind::Array(a) => {
             let ptr = crate::gc::cc_addr(a);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to MessagePack".into());
@@ -61,7 +61,7 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
             seen.pop();
             Ok(Mp::Array(out))
         }
-        Value::Set(s) => {
+        ValueKind::Set(s) => {
             let ptr = crate::gc::cc_addr(s);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to MessagePack".into());
@@ -74,7 +74,7 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
             seen.pop();
             Ok(Mp::Array(out))
         }
-        Value::Object(o) => {
+        ValueKind::Object(o) => {
             let ptr = crate::gc::cc_addr(o);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to MessagePack".into());
@@ -88,7 +88,7 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
             seen.pop();
             Ok(Mp::Map(pairs))
         }
-        Value::Map(m) => {
+        ValueKind::Map(m) => {
             let ptr = crate::gc::cc_addr(m);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to MessagePack".into());
@@ -104,16 +104,16 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
         // SRV §3: a frozen value encodes like its underlying kind. Frozen containers
         // materialize one level + recurse; instance/enum-variant/regex error like a
         // live one (no live arm exists for them either).
-        Value::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
+        ValueKind::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
             Some(live) => to_mp(&live, seen),
             None => Err(format!(
                 "cannot serialize a value of type {} to MessagePack",
                 node.kind_name()
             )),
         },
-        other => Err(format!(
+        _ => Err(format!(
             "cannot serialize a value of type {} to MessagePack",
-            crate::interp::type_name(other)
+            crate::interp::type_name(v)
         )),
     }
 }
@@ -143,32 +143,32 @@ fn number_to_mp(n: f64) -> Mp {
 /// floats both become `Number`.
 pub(crate) fn from_mp(mp: &Mp) -> Value {
     match mp {
-        Mp::Nil => Value::Nil,
-        Mp::Boolean(b) => Value::Bool(*b),
+        Mp::Nil => Value::nil(),
+        Mp::Boolean(b) => Value::bool_(*b),
         Mp::Integer(i) => {
             // NUM §4: a MessagePack integer decodes to `Int` when it fits `i64`; a
             // `u64` value above `i64::MAX` is preserved as `Float` (the only lossy
             // edge — `Int` is `i64`).
             if let Some(s) = i.as_i64() {
-                Value::Int(s)
+                Value::int(s)
             } else if let Some(u) = i.as_u64() {
-                Value::Float(u as f64)
+                Value::float(u as f64)
             } else {
-                Value::Float(f64::NAN)
+                Value::float(f64::NAN)
             }
         }
-        Mp::F32(f) => Value::Float(*f as f64),
-        Mp::F64(f) => Value::Float(*f),
+        Mp::F32(f) => Value::float(*f as f64),
+        Mp::F64(f) => Value::float(*f),
         Mp::String(s) => match s.as_str() {
-            Some(st) => Value::Str(st.into()),
+            Some(st) => Value::str(st),
             // Non-UTF-8 msgpack string → expose the raw bytes.
-            None => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(
+            None => Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(
                 s.as_bytes().to_vec(),
             ))),
         },
-        Mp::Binary(b) => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
+        Mp::Binary(b) => Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
         Mp::Array(a) => {
-            Value::Array(crate::value::ArrayCell::new(a.iter().map(from_mp).collect()))
+            Value::array_cell(crate::value::ArrayCell::new(a.iter().map(from_mp).collect()))
         }
         Mp::Map(pairs) => {
             // All-string keys → Object; otherwise → Map.
@@ -180,7 +180,7 @@ pub(crate) fn from_mp(mp: &Mp) -> Value {
                         m.insert(s.as_str().unwrap_or_default().to_string(), from_mp(v));
                     }
                 }
-                Value::Object(crate::value::ObjectCell::new(m))
+                Value::object_cell(crate::value::ObjectCell::new(m))
             } else {
                 let mut m: IndexMap<crate::value::MapKey, Value> = IndexMap::new();
                 for (k, v) in pairs {
@@ -188,12 +188,12 @@ pub(crate) fn from_mp(mp: &Mp) -> Value {
                         m.insert(mk, from_mp(v));
                     }
                 }
-                Value::Map(crate::value::MapCell::new(m))
+                Value::map_cell(crate::value::MapCell::new(m))
             }
         }
         // Extension types are not part of AScript's value model → represent the
         // payload bytes (the type tag is dropped — documented).
-        Mp::Ext(_, data) => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(data.clone()))),
+        Mp::Ext(_, data) => Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(data.clone()))),
     }
 }
 
@@ -204,7 +204,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mp = to_mp(&v, &mut Vec::new()).map_err(|e| AsError::at(e, span))?;
             let mut buf = Vec::new();
             match rmpv::encode::write_value(&mut buf, &mp) {
-                Ok(()) => Ok(Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(buf)))),
+                Ok(()) => Ok(Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(buf)))),
                 Err(e) => Err(AsError::at(
                     format!("msgpack.encode: {}", e),
                     span,
@@ -217,10 +217,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let buf = bytes.borrow();
             let mut slice: &[u8] = &buf;
             match rmpv::decode::read_value(&mut slice) {
-                Ok(mp) => Ok(make_pair(from_mp(&mp), Value::Nil)),
+                Ok(mp) => Ok(make_pair(from_mp(&mp), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid MessagePack: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid MessagePack: {}", e))),
                 )),
             }
         }
@@ -231,6 +231,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::OwnedKind;
 
     fn sp() -> Span {
         Span::new(0, 0)
@@ -240,10 +241,10 @@ mod tests {
     fn roundtrip(v: Value) -> Value {
         let bytes = call("encode", &[v], sp()).unwrap();
         let pair = call("decode", &[bytes], sp()).unwrap();
-        match pair {
-            Value::Array(a) => {
+        match pair.kind() {
+            ValueKind::Array(a) => {
                 let b = a.borrow();
-                assert_eq!(b[1], Value::Nil, "decode err should be nil");
+                assert_eq!(b[1], Value::nil(), "decode err should be nil");
                 b[0].clone()
             }
             _ => panic!("decode did not return a pair"),
@@ -252,19 +253,19 @@ mod tests {
 
     #[test]
     fn roundtrip_primitives() {
-        assert_eq!(roundtrip(Value::Float(42.0)), Value::Float(42.0));
-        assert_eq!(roundtrip(Value::Float(3.5)), Value::Float(3.5));
-        assert_eq!(roundtrip(Value::Float(-7.0)), Value::Float(-7.0));
-        assert_eq!(roundtrip(Value::Str("hello".into())), Value::Str("hello".into()));
-        assert_eq!(roundtrip(Value::Bool(true)), Value::Bool(true));
-        assert_eq!(roundtrip(Value::Nil), Value::Nil);
+        assert_eq!(roundtrip(Value::float(42.0)), Value::float(42.0));
+        assert_eq!(roundtrip(Value::float(3.5)), Value::float(3.5));
+        assert_eq!(roundtrip(Value::float(-7.0)), Value::float(-7.0));
+        assert_eq!(roundtrip(Value::str("hello")), Value::str("hello"));
+        assert_eq!(roundtrip(Value::bool_(true)), Value::bool_(true));
+        assert_eq!(roundtrip(Value::nil()), Value::nil());
     }
 
     #[test]
     fn roundtrip_bytes() {
-        let b = Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(vec![1, 2, 3, 255])));
-        match roundtrip(b) {
-            Value::Bytes(out) => assert_eq!(*out.borrow(), vec![1, 2, 3, 255]),
+        let b = Value::bytes(vec![1, 2, 3, 255]);
+        match roundtrip(b).kind() {
+            ValueKind::Bytes(out) => assert_eq!(*out.borrow(), vec![1, 2, 3, 255]),
             other => panic!("expected bytes, got {:?}", other),
         }
     }
@@ -272,21 +273,18 @@ mod tests {
     #[test]
     fn roundtrip_nested_array_object() {
         let mut m = IndexMap::new();
-        m.insert("name".to_string(), Value::Str("Ada".into()));
+        m.insert("name".to_string(), Value::str("Ada"));
         m.insert(
             "nums".to_string(),
-            Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Float(1.0),
-                Value::Float(2.0),
-            ])),
+            Value::array(vec![Value::float(1.0), Value::float(2.0)]),
         );
-        let obj = Value::Object(crate::value::ObjectCell::new(m));
+        let obj = Value::object(m);
         let out = roundtrip(obj);
-        match out {
-            Value::Object(o) => {
-                assert_eq!(o.get("name"), Some(Value::Str("Ada".into())));
-                match o.get("nums") {
-                    Some(Value::Array(a)) => assert_eq!(a.borrow().len(), 2),
+        match out.kind() {
+            ValueKind::Object(o) => {
+                assert_eq!(o.get("name"), Some(Value::str("Ada")));
+                match o.get("nums").map(|v| v.into_kind()) {
+                    Some(OwnedKind::Array(a)) => assert_eq!(a.borrow().len(), 2),
                     other => panic!("nums not an array: {:?}", other),
                 }
             }
@@ -298,25 +296,25 @@ mod tests {
     fn roundtrip_map_with_number_keys_stays_map() {
         let mut m: IndexMap<crate::value::MapKey, Value> = IndexMap::new();
         m.insert(
-            crate::value::MapKey::from_value(&Value::Float(1.0)).unwrap(),
-            Value::Str("one".into()),
+            crate::value::MapKey::from_value(&Value::float(1.0)).unwrap(),
+            Value::str("one"),
         );
-        let map = Value::Map(crate::value::MapCell::new(m));
+        let map = Value::map(m);
         // number-keyed map → msgpack map with non-string keys → decodes to Map.
-        assert!(matches!(roundtrip(map), Value::Map(_)));
+        assert!(matches!(roundtrip(map).kind(), ValueKind::Map(_)));
     }
 
     #[test]
     fn malformed_bytes_is_tier1_err() {
         // A fixarray header claiming 5 elements but with no element bytes that
         // follow → a truncated/invalid stream → decode error.
-        let bad = Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(vec![0x95])));
+        let bad = Value::bytes(vec![0x95]);
         let pair = call("decode", &[bad], sp()).unwrap();
-        match pair {
-            Value::Array(a) => {
+        match pair.kind() {
+            ValueKind::Array(a) => {
                 let b = a.borrow();
-                assert_eq!(b[0], Value::Nil);
-                assert!(matches!(b[1], Value::Object(_)), "err should be set");
+                assert_eq!(b[0], Value::nil());
+                assert!(matches!(b[1].kind(), ValueKind::Object(_)), "err should be set");
             }
             _ => panic!("expected pair"),
         }
@@ -324,22 +322,20 @@ mod tests {
 
     #[test]
     fn encode_function_is_tier2_panic() {
-        let f = Value::Builtin("math.abs".into());
+        let f = Value::builtin("math.abs");
         assert!(call("encode", &[f], sp()).is_err());
     }
 
     #[test]
     fn fixture_decodes_to_expected() {
         // Canonical MessagePack: fixmap{1} "a":1 → 81 a1 61 01
-        let fixture = Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(vec![
-            0x81, 0xa1, 0x61, 0x01,
-        ])));
+        let fixture = Value::bytes(vec![0x81, 0xa1, 0x61, 0x01]);
         let pair = call("decode", &[fixture], sp()).unwrap();
-        if let Value::Array(a) = pair {
+        if let ValueKind::Array(a) = pair.kind() {
             let b = a.borrow();
-            match &b[0] {
-                Value::Object(o) => {
-                    assert_eq!(o.get("a"), Some(Value::Float(1.0)))
+            match b[0].kind() {
+                ValueKind::Object(o) => {
+                    assert_eq!(o.get("a"), Some(Value::float(1.0)))
                 }
                 other => panic!("expected object, got {:?}", other),
             }
@@ -347,32 +343,29 @@ mod tests {
     }
 
     // SRV regression (holistic-review MAJOR): a frozen container must encode like its
-    // live equivalent (before the fix, `to_mp` errored on any `Value::Shared`).
+    // live equivalent (before the fix, `to_mp` errored on any `Value::shared`).
     #[cfg(feature = "shared")]
     #[test]
     fn frozen_container_encodes_like_live() {
         use crate::stdlib::shared;
         let mut m = indexmap::IndexMap::new();
-        m.insert("a".to_string(), Value::Int(1));
+        m.insert("a".to_string(), Value::int(1));
         m.insert(
             "xs".to_string(),
-            Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Int(2),
-                Value::Int(3),
-            ])),
+            Value::array(vec![Value::int(2), Value::int(3)]),
         );
-        let live = Value::Object(crate::value::ObjectCell::new(m));
+        let live = Value::object(m);
         let frozen = shared::freeze(&live, sp()).unwrap();
         // Encoding is deterministic: the frozen object must encode to the SAME bytes
-        // as the live one (Value::Object `==` is identity, so compare the bytes).
-        let bytes_of = |v: Value| match call("encode", &[v], sp()).unwrap() {
-            Value::Bytes(b) => b.borrow().clone(),
+        // as the live one (Value::object_cell `==` is identity, so compare the bytes).
+        let bytes_of = |v: Value| match call("encode", &[v], sp()).unwrap().kind() {
+            ValueKind::Bytes(b) => b.borrow().clone(),
             _ => panic!("encode did not return bytes"),
         };
         assert_eq!(bytes_of(live.clone()), bytes_of(frozen));
         // And it still round-trips cleanly through decode.
-        assert!(matches!(roundtrip(live), Value::Object(_)));
+        assert!(matches!(roundtrip(live).kind(), ValueKind::Object(_)));
         // Frozen scalar encodes too.
-        assert!(call("encode", &[shared::freeze(&Value::Int(7), sp()).unwrap()], sp()).is_ok());
+        assert!(call("encode", &[shared::freeze(&Value::int(7), sp()).unwrap()], sp()).is_ok());
     }
 }

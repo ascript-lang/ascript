@@ -24,7 +24,7 @@ use crate::syntax::resolve::types::{Resolution, ResolveResult};
 use crate::syntax::parser::parse;
 use crate::syntax::tree_builder::build_tree;
 use crate::syntax::{first_syntax_error_in, resolve::resolve};
-use crate::value::Value;
+use crate::value::{OwnedKind, Value};
 use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc};
 use crate::vm::opcode::Op;
 use cstree::text::TextRange;
@@ -175,7 +175,7 @@ fn range_span_bytes(node: &crate::syntax::cst::ResolvedNode) -> Span {
 /// Whether `expr` is the bare name `super` — the implicit super reference used as
 /// the receiver of `super.<name>(...)` (V9-T2). `super` is lexed as a plain
 /// `Ident` (not a reserved keyword), so it surfaces as a `NameRef`; matching by
-/// text mirrors the tree-walker, where `super` is a `Value::Super` bound in the
+/// text mirrors the tree-walker, where `super` is a `Value::super_` bound in the
 /// method's call env. There is NO bare `super` value outside a `super.<name>(...)`
 /// call position (a bare `super` expression is a compile error via the normal
 /// name-resolution path, exactly as the tree-walker rejects `super` not used as a
@@ -367,12 +367,12 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     // records CHAR spans). See the module note on the reparse subsystem.
     let span = node_span_bytes(expr);
     let kind = match expr {
-        Expr::Literal(lit) => match literal_const_value(lit)? {
-            Value::Int(i) => ExprKind::Int(i),
-            Value::Float(n) => ExprKind::Float(n),
-            Value::Str(s) => ExprKind::Str(s.to_string()),
-            Value::Bool(b) => ExprKind::Bool(b),
-            Value::Nil => ExprKind::Nil,
+        Expr::Literal(lit) => match literal_const_value(lit)?.into_kind() {
+            OwnedKind::Int(i) => ExprKind::Int(i),
+            OwnedKind::Float(n) => ExprKind::Float(n),
+            OwnedKind::Str(s) => ExprKind::Str(s.to_string()),
+            OwnedKind::Bool(b) => ExprKind::Bool(b),
+            OwnedKind::Nil => ExprKind::Nil,
             other => {
                 return Err(CompileError::new(
                     format!("unsupported literal default value {other:?}"),
@@ -1523,7 +1523,7 @@ impl Compiler {
     /// Lower a bare identifier reference (`NameRef`). The resolver classifies the
     /// use via its `text_range()`: a `Local(slot)` reads the frame's slot
     /// (`GET_LOCAL`); a `Global(name)` that is a known builtin is a first-class
-    /// builtin reference (`GET_GLOBAL`, yielding the `Value::Builtin` — e.g.
+    /// builtin reference (`GET_GLOBAL`, yielding the `Value::builtin` — e.g.
     /// `let p = print`, exactly as the tree-walker treats a bare builtin name);
     /// `Upvalue` is a closure capture, emitted (V4-T3) as `GET_UPVALUE` reading
     /// the captured cell by its index in this frame's upvalue plan; a non-builtin
@@ -1551,13 +1551,13 @@ impl Compiler {
             // A bare reference to a free (global) name lowers to `GET_GLOBAL <name>`,
             // resolved at RUNTIME — exactly like the tree-walker, which looks the name
             // up in its global env when the `Ident` is evaluated. For a builtin name
-            // this yields the first-class `Value::Builtin` (so `let p = print; p("hi")`
+            // this yields the first-class `Value::builtin` (so `let p = print; p("hi")`
             // works); for any other free name the runtime handler raises the
             // byte-identical `undefined variable '<name>'` panic IF AND WHEN it is
             // actually evaluated (so an unreferenced free name in dead code is not a
             // compile error, matching the tree-walker's deferred semantics).
             Some(Resolution::Global(name)) => {
-                let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetGlobal, idx, span);
                 Ok(())
             }
@@ -1698,7 +1698,7 @@ impl Compiler {
                     Some(Resolution::Global(name)) => {
                         // SET_GLOBAL anchors any error (immutable / undefined) at the
                         // TARGET's span, matching the tree-walker's `target.span`.
-                        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                        let idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                         self.chunk
                             .emit_u16(Op::SetGlobal, idx, node_code_span(name_ref));
                     }
@@ -1727,7 +1727,7 @@ impl Compiler {
                     })?;
                 self.compile_expr(&object)?;
                 self.chunk.emit(Op::Swap, span);
-                let name_idx = self.chunk.add_const(Value::Str(field.into()));
+                let name_idx = self.chunk.add_const(Value::str(field));
                 // The op's span is the value's TRIVIA-TRIMMED span so a field-type
                 // contract panic anchors EXACTLY where the tree-walker's does
                 // (`assign_to`/`set_member` uses `value.span`). See #132.
@@ -2078,7 +2078,7 @@ impl Compiler {
     /// table. The crux is that `value.rs`'s `Class`/`Method` is FROZEN and holds a
     /// TREE-WALKER body (`Vec<Stmt>`), which the VM cannot run — so the VM compiles
     /// each method body to its OWN [`FnProto`]/closure and dispatches THOSE; the
-    /// built `Value::Class.methods` map is left EMPTY and the compiled method
+    /// built `Value::class.methods` map is left EMPTY and the compiled method
     /// closures are registered in the VM's per-class side table (keyed by the
     /// class's `Rc` identity) at runtime by `Op::Class`.
     ///
@@ -2228,7 +2228,7 @@ impl Compiler {
                     // case): read it via `GET_GLOBAL`, late-bound exactly like the
                     // tree-walker's `env.get(sup_name)`. (A non-class value here is
                     // caught by `Op::Class` at run time.)
-                    let idx = self.chunk.add_const(Value::Str(Rc::from(gname.as_str())));
+                    let idx = self.chunk.add_const(Value::str(Rc::from(gname.as_str())));
                     self.chunk.emit_u16(Op::GetGlobal, idx, sup_span);
                 }
                 Some(Resolution::Unresolved) | None => {
@@ -2499,19 +2499,19 @@ impl Compiler {
     /// Compile an `enum Name { A, B = 1, ... }` declaration. Mirrors the
     /// tree-walker's `Stmt::Enum`: build a [`crate::value::EnumDef`] whose
     /// `variants` map each name to an interned [`crate::value::EnumVariant`]
-    /// (`enum_name`, `name`, backing `value`). The whole `Value::Enum` is an
+    /// (`enum_name`, `name`, backing `value`). The whole `Value::enum_` is an
     /// immutable def, so — unlike a class, whose method closures need runtime
     /// upvalues — it is fully constructible at COMPILE time: build it, store it as
     /// a (non-dedupable) constant, `Const`-load it, and bind it to the enum's slot.
     ///
-    /// Because `Value::Enum`/`Value::EnumVariant` are NOT dedupable in the const
+    /// Because `Value::enum_`/`Value::enum_variant` are NOT dedupable in the const
     /// pool (`const_is_dedupable` excludes them), each `Const` load returns the SAME
     /// `Rc`, so the interned-variant identity that drives `Color.Red == Color.Red`
     /// (`Rc::ptr_eq` in `Value`'s `PartialEq`) holds byte-identically.
     ///
     /// Variant access (`Color.Red`) and `.name`/`.value` are handled at runtime by
     /// `GetProp` → the SHARED `Interp::read_member` (via `Vm::vm_read_member`), which
-    /// already maps `Value::Enum` → its `EnumVariant` and `Value::EnumVariant` →
+    /// already maps `Value::enum_` → its `EnumVariant` and `Value::enum_variant` →
     /// `.name`/`.value` — no new opcode is needed.
     fn compile_enum(&mut self, enum_decl: &EnumDecl) -> Result<(), CompileError> {
         let span = node_span(enum_decl);
@@ -2553,10 +2553,10 @@ impl Compiler {
             // A payload variant interns as a CONSTRUCTOR (`ctor: true`); a
             // unit/scalar-backed variant keeps its const backing (byte-identical).
             let value = if schema.has_payload() {
-                Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+                Value::enum_variant(Rc::new(crate::value::EnumVariant {
                     enum_name: name.clone(),
                     name: v_name.clone(),
-                    value: Value::Nil,
+                    value: Value::nil(),
                     payload: None,
                     ctor: true,
                     def: None,
@@ -2564,9 +2564,9 @@ impl Compiler {
             } else {
                 let backing = match variant.expr() {
                     Some(expr) => self.const_eval_enum_backing(&expr)?,
-                    None => Value::Nil,
+                    None => Value::nil(),
                 };
-                Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+                Value::enum_variant(Rc::new(crate::value::EnumVariant {
                     enum_name: name.clone(),
                     name: v_name.clone(),
                     value: backing,
@@ -2579,7 +2579,7 @@ impl Compiler {
             schemas.insert(v_name, schema);
         }
 
-        let def = Value::Enum(Rc::new(crate::value::EnumDef {
+        let def = Value::enum_(Rc::new(crate::value::EnumDef {
             name: name.clone(),
             variants,
             variant_schemas: schemas,
@@ -2618,21 +2618,21 @@ impl Compiler {
                 let operand = un.expr().ok_or_else(|| {
                     CompileError::new("unary minus has no operand", node_span(un))
                 })?;
-                match self.const_eval_enum_backing(&operand)? {
-                    // NUM split: integer literals are `Value::Int`. Negate with
+                match self.const_eval_enum_backing(&operand)?.into_kind() {
+                    // NUM split: integer literals are `Value::int`. Negate with
                     // `checked_neg` so a literal `i64::MIN` backing is a clean
                     // CompileError, not a Rust panic — mirroring the NUM model's
                     // overflow trap on `-` (`interp.rs` unary `-`). (In practice the
                     // out-of-range integer LITERAL `9223372036854775808` is already
                     // rejected by `literal_const_value`, so this guard is belt-and-
                     // suspenders against any future const-folding path reaching here.)
-                    Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
+                    OwnedKind::Int(n) => n.checked_neg().map(Value::int).ok_or_else(|| {
                         CompileError::new(
                             "integer overflow negating enum backing value",
                             node_span(un),
                         )
                     }),
-                    Value::Float(n) => Ok(Value::Float(-n)),
+                    OwnedKind::Float(n) => Ok(Value::float(-n)),
                     _ => Err(CompileError::new(
                         "enum variant backing value must be a number or string literal",
                         node_span(un),
@@ -2840,11 +2840,11 @@ impl Compiler {
             match slot {
                 Some(slot) => self.emit_get_local(slot, span),
                 None => {
-                    let gidx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    let gidx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                     self.chunk.emit_u16(Op::GetGlobal, gidx, span);
                 }
             }
-            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
             self.chunk.emit_u16(Op::DefineExport, name_idx, span);
         }
         Ok(())
@@ -2912,7 +2912,7 @@ impl Compiler {
                     })?
                     .text()
                     .to_string();
-                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
 
                 // Compile the receiver.
                 self.compile_expr(&recv)?;
@@ -2954,7 +2954,7 @@ impl Compiler {
                     })?
                     .text()
                     .to_string();
-                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
 
                 // Compile the receiver, dup, test for nil.
                 self.compile_expr(&recv)?;
@@ -3094,7 +3094,7 @@ impl Compiler {
         // / `is_async`, and `compile_fn_body` lowers `yield` via the SAME
         // `MAKE_GENERATOR`/`YIELD` machinery standalone generators use (SP1 Phase B).
         // The method-CALL path (`invoke_compiled_method`) binds `self` and wraps the
-        // not-started fiber in a `GeneratorHandle`, yielding a `Value::Generator`.
+        // not-started fiber in a `GeneratorHandle`, yielding a `Value::generator`.
         self.compile_fn_proto(method.syntax())
     }
 
@@ -3218,7 +3218,7 @@ impl Compiler {
 
     /// Compile an arrow expression `(params) => body` (an EXPRESSION): build its
     /// [`FnProto`], add it to the current chunk's proto table, and emit `CLOSURE
-    /// idx`, which leaves the resulting `Value::Closure` on the stack. The arrow has
+    /// idx`, which leaves the resulting `Value::closure` on the stack. The arrow has
     /// no name, so nothing is bound.
     fn compile_arrow(&mut self, arrow: &ArrowExpr) -> Result<(), CompileError> {
         let span = node_span(arrow);
@@ -3247,7 +3247,7 @@ impl Compiler {
     ///
     /// Body lowering mirrors the tree-walker: a `Block` body is compiled
     /// statement-by-statement, then `NIL; RETURN` is appended so a function that
-    /// falls off the end returns `nil` (`Flow::Normal => Value::Nil` in
+    /// falls off the end returns `nil` (`Flow::Normal => Value::nil()` in
     /// `run_body`); an explicit `return` inside still emits its own `RETURN`. An
     /// arrow EXPRESSION body (no Block) compiles the expression then `RETURN` (an
     /// implicit return of the expression value).
@@ -3256,7 +3256,7 @@ impl Compiler {
     /// (`frame.upvalues`) and its captured-local cell slots (`frame.cell_slots`)
     /// come straight from the resolver. The upvalue plan is stored on the body
     /// chunk (`body_chunk.upvalues`) so the enclosing frame's `Op::Closure`
-    /// materializes the `Value::Closure` with its upvalue cells wired at runtime,
+    /// materializes the `Value::closure` with its upvalue cells wired at runtime,
     /// and the cell slots drive both cell allocation at frame entry and the
     /// compiler's cell-aware local opcodes. A body that reads an outer-scope local
     /// (including a `fn`'s reference to its OWN name, declared in the ENCLOSING
@@ -3452,7 +3452,7 @@ impl Compiler {
                 .ok_or_else(|| CompileError::new("function body is not a block", span))?;
             self.compile_block(&block)?;
             // Fall-off-end: a function with no explicit trailing `return` returns
-            // `nil` (mirrors the tree-walker's `Flow::Normal => Value::Nil`).
+            // `nil` (mirrors the tree-walker's `Flow::Normal => Value::nil()`).
             self.chunk.emit(Op::Nil, span);
             self.chunk.emit(Op::Return, span);
             Ok(())
@@ -3691,7 +3691,7 @@ impl Compiler {
             self.compile_expr(step)?;
             1u8
         } else {
-            let one = self.chunk.add_const(Value::Float(1.0));
+            let one = self.chunk.add_const(Value::float(1.0));
             self.chunk.emit_u16(Op::Const, one, span);
             0u8
         };
@@ -3829,7 +3829,7 @@ impl Compiler {
         self.chunk.emit_u16(Op::GetLocal, arr_slot, span);
         self.chunk.emit(Op::ArrayLen, span);
         self.chunk.emit_u16(Op::SetLocal, len_slot, span);
-        let zero = self.chunk.add_const(Value::Float(0.0));
+        let zero = self.chunk.add_const(Value::float(0.0));
         self.chunk.emit_u16(Op::Const, zero, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
@@ -3874,7 +3874,7 @@ impl Compiler {
             self.chunk.patch_jump(site);
         }
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
-        let one = self.chunk.add_const(Value::Float(1.0));
+        let one = self.chunk.add_const(Value::float(1.0));
         self.chunk.emit_u16(Op::Const, one, span);
         self.chunk.emit(Op::Add, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
@@ -3897,7 +3897,7 @@ impl Compiler {
     /// Compile a `for await (x of iterable) { body }` ASYNC for-of. Mirrors the
     /// tree-walker's `Stmt::ForOf { for_await: true }` → `exec_for_await`
     /// (`src/interp.rs`) exactly: the iterable must be async-iterable — a
-    /// `Value::Generator` (driven LAZILY via an awaiting `resume`) or a native
+    /// `Value::generator` (driven LAZILY via an awaiting `resume`) or a native
     /// stream handle (WebSocket `recv` / SSE `next`); ANY OTHER value is the Tier-2
     /// panic `value of type {t} is not async-iterable` at the iterable's span
     /// (raised by `GET_ITER`). Each produced value binds `x` in a fresh child scope
@@ -4143,7 +4143,7 @@ impl Compiler {
             .ident_token()
             .map(|t| t.text().to_string())
             .unwrap_or_default();
-        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
         self.chunk
             .emit_u16(Op::ImmutableError, idx, node_code_span(name_ref));
     }
@@ -4153,7 +4153,7 @@ impl Compiler {
     /// `SET_GLOBAL` reject a cross-chunk reassignment of an immutable global.
     fn emit_define_global(&mut self, name: &str, span: Span) {
         let mutable = self.global_mutable(name);
-        let idx = self.chunk.add_const(Value::Str(Rc::from(name)));
+        let idx = self.chunk.add_const(Value::str(Rc::from(name)));
         self.chunk
             .emit_u16_u8(Op::DefineGlobal, idx, u8::from(mutable), span);
     }
@@ -4305,8 +4305,8 @@ impl Compiler {
                     let key = bind_entry_key(entry).ok_or_else(|| {
                         CompileError::new("destructuring entry has no key", espan)
                     })?;
-                    let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
-                    bound_keys.push(Value::Str(Rc::from(key.as_str())));
+                    let key_idx = self.chunk.add_const(Value::str(Rc::from(key.as_str())));
+                    bound_keys.push(Value::str(Rc::from(key.as_str())));
                     self.chunk.emit_u16(Op::GetLocal, temp, span);
                     self.chunk.emit_u16(Op::ObjectKey, key_idx, span);
                     self.emit_pattern_store(entry, espan)?;
@@ -4319,7 +4319,7 @@ impl Compiler {
                     } else {
                         // Leftover keys — those not in `bound_keys`. The bound-key
                         // set is stored as a single Array const referenced by index.
-                        let keys = Value::Array(crate::value::ArrayCell::new(
+                        let keys = Value::array_cell(crate::value::ArrayCell::new(
                             bound_keys.clone(),
                         ));
                         let keys_idx = self.chunk.add_const(keys);
@@ -4677,8 +4677,8 @@ impl Compiler {
             let key = bind_entry_key(entry).ok_or_else(|| {
                 CompileError::new("object pattern entry has no key", range_span(entry))
             })?;
-            bound_keys.push(Value::Str(Rc::from(key.as_str())));
-            let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+            bound_keys.push(Value::str(Rc::from(key.as_str())));
+            let key_idx = self.chunk.add_const(Value::str(Rc::from(key.as_str())));
 
             // Presence test: `MATCH_HAS_KEY key` (pops the subject, pushes bool).
             self.emit_get_local_temp(subj_temp, span);
@@ -4709,7 +4709,7 @@ impl Compiler {
                 .any(|el| el.as_token().map(|t| t.kind() == Ident).unwrap_or(false))
             {
                 let slot = self.pattern_bind_slot(rest, range_span(rest))?;
-                let keys = Value::Array(crate::value::ArrayCell::new(bound_keys));
+                let keys = Value::array_cell(crate::value::ArrayCell::new(bound_keys));
                 let keys_idx = self.chunk.add_const(keys);
                 self.emit_get_local_temp(subj_temp, span);
                 self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
@@ -4751,11 +4751,11 @@ impl Compiler {
             }
         };
         // Tag-test const: `[variantName, enumNameOrNil]`.
-        let tag = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Str(Rc::from(variant.as_str())),
+        let tag = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::str(Rc::from(variant.as_str())),
             match &enum_name {
-                Some(e) => Value::Str(Rc::from(e.as_str())),
-                None => Value::Nil,
+                Some(e) => Value::str(Rc::from(e.as_str())),
+                None => Value::nil(),
             },
         ]));
         let tag_idx = self.chunk.add_const(tag);
@@ -4779,7 +4779,7 @@ impl Compiler {
                     .ok_or_else(|| {
                         CompileError::new("variant field entry has no name", range_span(entry))
                     })?;
-                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                let key_idx = self.chunk.add_const(Value::str(Rc::from(key.as_str())));
                 // Presence test.
                 self.emit_get_local_temp(subj_temp, span);
                 self.chunk.emit_u16(Op::MatchVariantHasField, key_idx, span);
@@ -4853,7 +4853,7 @@ impl Compiler {
             // `GET_GLOBAL` (builtin value, or the byte-identical `undefined variable`
             // panic at evaluation), mirroring `compile_name_ref`'s `uses` arm.
             Resolution::Global(name) => {
-                let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetGlobal, idx, span);
                 Ok(())
             }
@@ -4889,12 +4889,12 @@ impl Compiler {
     /// Lower a call `callee(arg0, .., argN)`. The general convention places the
     /// callee value on the stack first, then each argument left-to-right, then
     /// `CALL argc` — the run loop reads `[.., callee, arg0, .., arg{argc-1}]`. A
-    /// `Value::Closure` callee enters a new VM frame (the args become its first
+    /// `Value::closure` callee enters a new VM frame (the args become its first
     /// local slots); any other callee (builtin, native function, class
     /// constructor, bound method) is dispatched through the shared `call_value`.
     ///
     /// The callee is any compilable expression: a bare builtin name
-    /// (`Resolution::Global` → `GET_GLOBAL`, yielding a `Value::Builtin`), a
+    /// (`Resolution::Global` → `GET_GLOBAL`, yielding a `Value::builtin`), a
     /// local/upvalue holding a closure (`GET_LOCAL`/`GET_LOCAL_CELL`/`GET_UPVALUE`),
     /// or a parenthesized arrow. Member calls (`a.m(...)`) and calls whose callee
     /// resolves to a non-builtin bare global are later deferrals (V9).
@@ -5008,7 +5008,7 @@ impl Compiler {
                 let obj_span = node_code_span(&object);
                 self.compile_chain(&object, sink)?;
                 self.emit_chain_nil_guard(sink, obj_span);
-                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
                 Ok(())
             }
@@ -5044,7 +5044,7 @@ impl Compiler {
                 // variant constructor) then `CALL_NAMED`, mirroring the plain
                 // `compile_call` named path.
                 if self.arg_list_has_named(call) {
-                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                     self.chunk.emit_u16(Op::GetProp, name_idx, span);
                     return self.compile_named_call(call, span);
                 }
@@ -5096,7 +5096,7 @@ impl Compiler {
                     .to_string();
                 let obj_span = node_code_span(&object);
                 self.compile_chain(&object, sink)?;
-                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
                 Ok(())
             }
@@ -5146,7 +5146,7 @@ impl Compiler {
         name: &str,
         span: Span,
     ) -> Result<(), CompileError> {
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name)));
+        let name_idx = self.chunk.add_const(Value::str(Rc::from(name)));
         if self.arg_list_has_spread(call) {
             self.compile_spread_args(call, span)?;
             self.chunk.emit_u16(Op::CallMethodSpread, name_idx, span);
@@ -5262,7 +5262,7 @@ impl Compiler {
     /// ADT §3.2: lower a call carrying named arguments (`Shape.Rect(w: 3.0, h: 4.0)`).
     /// The callee is ALREADY on the stack. Each argument's VALUE is compiled in
     /// source order, then a `CALL_NAMED names, argc` op is emitted carrying a const
-    /// `Value::Array` of per-arg field names (`Str` for a named arg, `Nil` for a
+    /// `Value::array_cell` of per-arg field names (`Str` for a named arg, `Nil` for a
     /// positional one). Dispatch (variant construction, or the Tier-2 error for any
     /// other callee) is byte-identical to the tree-walker's `call_value_named`.
     ///
@@ -5294,10 +5294,10 @@ impl Compiler {
                             CompileError::new("named call arg missing value expression", span)
                         })?;
                     self.compile_expr(&value)?;
-                    names.push(Value::Str(Rc::from(name.as_str())));
+                    names.push(Value::str(Rc::from(name.as_str())));
                 } else if let Some(arg) = Expr::cast(child.clone()) {
                     self.compile_expr(&arg)?;
-                    names.push(Value::Nil);
+                    names.push(Value::nil());
                 } else {
                     continue;
                 }
@@ -5308,7 +5308,7 @@ impl Compiler {
         }
         let names_idx = self
             .chunk
-            .add_const(Value::Array(crate::value::ArrayCell::new(names)));
+            .add_const(Value::array_cell(crate::value::ArrayCell::new(names)));
         self.chunk.emit_u16_u8(Op::CallNamed, names_idx, argc, span);
         Ok(())
     }
@@ -5344,7 +5344,7 @@ impl Compiler {
                             CompileError::new("named call arg missing value expression", span)
                         })?;
                     self.compile_expr(&value)?;
-                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                     self.chunk.emit_u16(Op::AppendNamedArg, name_idx, span);
                 } else if let Some(spread) = SpreadElem::cast(child.clone()) {
                     let operand = spread.expr().ok_or_else(|| {
@@ -5365,7 +5365,7 @@ impl Compiler {
     }
 
     /// Build the flattened call-argument array at runtime onto the stack (leaving a
-    /// single `Value::Array`): `NEW_ARRAY 0`, then for each source-order arg either
+    /// single `Value::array_cell`): `NEW_ARRAY 0`, then for each source-order arg either
     /// `<item>; APPEND_ARRAY` (one positional arg) or `<operand>; SPREAD_ARGS`
     /// (flatten the operand array's elements in). `SPREAD_ARGS` mirrors the
     /// tree-walker's `eval_call_args` spread arm — a non-array operand panics with
@@ -5425,10 +5425,10 @@ impl Compiler {
         // `GET_SUPER name` (which resolves `name` up from the current method's
         // DEFINING class's superclass, bound to `self` at slot 0, producing a
         // BoundMethod), then the args, then a plain `CALL`. Mirrors the tree-walker:
-        // `super` is a `Value::Super` whose `read_member` walks from
+        // `super` is a `Value::super_` whose `read_member` walks from
         // `defining_class.superclass`, and the resulting BoundMethod runs on `self`.
         if is_super_receiver(&object) {
-            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
             self.chunk.emit_u16(Op::GetSuper, name_idx, span);
             // `GET_SUPER` leaves the BoundMethod callee on the stack, so a spread
             // argument list is the same dynamic-arity build + `CALL_SPREAD` as a
@@ -5461,7 +5461,7 @@ impl Compiler {
         if self.arg_list_has_spread(call) {
             self.compile_expr(&object)?;
             self.compile_spread_args(call, span)?;
-            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
             self.chunk.emit_u16(Op::CallMethodSpread, name_idx, span);
             return Ok(());
         }
@@ -5477,7 +5477,7 @@ impl Compiler {
                     .ok_or_else(|| CompileError::new("too many call arguments (max 255)", span))?;
             }
         }
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
         self.chunk.emit_u16_u8(Op::CallMethod, name_idx, argc, span);
         Ok(())
     }
@@ -5544,7 +5544,7 @@ impl Compiler {
                 if let Some(name) = name_ref.ident_token().map(|t| t.text().to_string()) {
                     if crate::interp::is_reserved_instanceof_type_name(&name) {
                         self.compile_expr(&lhs)?;
-                        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                        let idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
                         self.chunk.emit_u16(Op::InstanceOfType, idx, span);
                         return Ok(());
                     }
@@ -5647,7 +5647,7 @@ impl Compiler {
 
     /// Lower an array literal `[a, b, c]`: compile each element in source order,
     /// then `NEW_ARRAY n` (which pops `n` values, preserving source order, into a
-    /// fresh `Value::Array`). Matches the tree-walker's `ExprKind::Array`.
+    /// fresh `Value::array_cell`). Matches the tree-walker's `ExprKind::Array`.
     ///
     /// A spread element `[...a, x, ...b]` (the CST records each as a `SpreadElem`
     /// child interleaved with the plain `Expr` children) switches the lowering to
@@ -5700,7 +5700,7 @@ impl Compiler {
     }
 
     /// Lower an object literal `{a: 1, "k": v}`: for each field, push the KEY (a
-    /// `Value::Str` const) then the VALUE expression, all in source order; then
+    /// `Value::str` const) then the VALUE expression, all in source order; then
     /// `NEW_OBJECT n` (which pops `n` key/value pairs into an insertion-ordered
     /// `IndexMap`). Matches the tree-walker's `ExprKind::Object` — a later
     /// duplicate key overwrites the value but keeps the first-seen position
@@ -5738,7 +5738,7 @@ impl Compiler {
                 let value = field
                     .value()
                     .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
-                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                let key_idx = self.chunk.add_const(Value::str(Rc::from(key.as_str())));
                 self.chunk.emit_u16(Op::Const, key_idx, fspan);
                 self.compile_expr(&value)?;
                 n = n
@@ -5766,7 +5766,7 @@ impl Compiler {
                 let value = field
                     .value()
                     .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
-                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                let key_idx = self.chunk.add_const(Value::str(Rc::from(key.as_str())));
                 self.chunk.emit_u16(Op::Const, key_idx, fspan);
                 self.compile_expr(&value)?;
                 self.chunk.emit(Op::AppendObject, fspan);
@@ -5777,7 +5777,7 @@ impl Compiler {
     }
 
     /// Lower a `#{ keyExpr: valueExpr, … }` map literal. Mirrors the tree-walker's
-    /// `ExprKind::Map`: `NEW_MAP` pushes an empty `Value::Map`, then each entry (in
+    /// `ExprKind::Map`: `NEW_MAP` pushes an empty `Value::map_cell`, then each entry (in
     /// source order) compiles `key`, compiles `value`, and emits `MAP_ENTRY` (which
     /// converts the key to a `MapKey` — panicking on an unhashable key — and inserts
     /// later-wins). `#{}` is just `NEW_MAP`. The `MAP_ENTRY` op carries the entry's
@@ -5848,7 +5848,7 @@ impl Compiler {
         // bare `a.foo` statement's nil-receiver panic matches byte-for-byte (#132).
         let obj_span = node_code_span(&object);
         self.compile_expr(&object)?;
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
         self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
         Ok(())
     }
@@ -5874,7 +5874,7 @@ impl Compiler {
         // identically on a non-nil receiver and anchors its panic at the receiver.
         let obj_span = node_code_span(&object);
         self.compile_expr(&object)?;
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let name_idx = self.chunk.add_const(Value::str(Rc::from(name.as_str())));
         self.chunk.emit_u16(Op::GetPropOpt, name_idx, obj_span);
         Ok(())
     }
@@ -5960,7 +5960,7 @@ impl Compiler {
     }
 
     /// Lower `await expr`: compile the inner expression, then emit `AWAIT`. The op
-    /// drives a `Value::Future` to completion (re-surfacing any panic/propagation
+    /// drives a `Value::future` to completion (re-surfacing any panic/propagation
     /// raised in the spawned task at THIS site) and is identity on a non-future —
     /// byte-identical to the tree-walker's `ExprKind::Await`. The op's span is the
     /// `AwaitExpr`'s trivia-trimmed code span.
@@ -6018,7 +6018,7 @@ impl Compiler {
                     | SyntaxKind::TemplateMiddle
                     | SyntaxKind::TemplateEnd => {
                         let chunk = unescape_template_body(strip_template_delims(tok.text()));
-                        let idx = self.chunk.add_const(Value::Str(Rc::from(chunk.as_str())));
+                        let idx = self.chunk.add_const(Value::str(Rc::from(chunk.as_str())));
                         self.chunk.emit_u16(Op::Const, idx, span);
                     }
                     // Trivia (whitespace/comments) never appears between template
@@ -6170,8 +6170,8 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
             // range-check); a malformed token is a compiler-invariant bug.
             use crate::lex_literals::{NumLit, NumLitError};
             match parse_number_text(&text) {
-                Ok(NumLit::Int(i)) => Value::Int(i),
-                Ok(NumLit::Float(f)) => Value::Float(f),
+                Ok(NumLit::Int(i)) => Value::int(i),
+                Ok(NumLit::Float(f)) => Value::float(f),
                 Err(NumLitError::OutOfRange) => {
                     return Err(CompileError::new(
                         "integer literal out of range for int (i64)".to_string(),
@@ -6202,10 +6202,10 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
                 }
             }
         }
-        SyntaxKind::Str => Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str())),
-        SyntaxKind::TrueKw => Value::Bool(true),
-        SyntaxKind::FalseKw => Value::Bool(false),
-        SyntaxKind::NilKw => Value::Nil,
+        SyntaxKind::Str => Value::str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str())),
+        SyntaxKind::TrueKw => Value::bool_(true),
+        SyntaxKind::FalseKw => Value::bool_(false),
+        SyntaxKind::NilKw => Value::nil(),
         other => {
             return Err(CompileError::new(
                 format!("internal: unexpected literal token {other:?} (compiler invariant)"),
@@ -6463,7 +6463,7 @@ mod tests {
     #[test]
     fn bare_builtin_reference_emits_get_global() {
         // A bare builtin name used as a value (not a call) is a first-class
-        // builtin reference: `let p = print` stores the `Value::Builtin`. The
+        // builtin reference: `let p = print` stores the `Value::builtin`. The
         // initializer compiles to `GET_GLOBAL print`.
         let chunk = compile_source("let p = print\np").expect("compiles");
         let text = disasm(&chunk);
@@ -6588,8 +6588,8 @@ mod tests {
     }
 
     async fn eval_string(src: &str) -> String {
-        match crate::vm_eval_source(src).await.expect("evaluates") {
-            Value::Str(s) => s.to_string(),
+        match crate::vm_eval_source(src).await.expect("evaluates").into_kind() {
+            OwnedKind::Str(s) => s.to_string(),
             other => panic!("expected Str, got {other:?}"),
         }
     }
@@ -7249,7 +7249,7 @@ mod tests {
     #[test]
     fn empty_fn_body_returns_nil() {
         // A function that falls off the end returns nil: the proto body is exactly
-        // `NIL; RETURN` (mirrors the tree-walker's `Flow::Normal => Value::Nil`).
+        // `NIL; RETURN` (mirrors the tree-walker's `Flow::Normal => Value::nil()`).
         let chunk = compile_source("fn noop() {}\n").expect("compiles");
         let proto = chunk.protos.first().expect("one nested proto");
         // The proto's code is exactly the two zero-operand ops NIL then RETURN.
@@ -7340,7 +7340,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn arrow_value_is_a_function() {
-        // The CLOSURE op materializes a Value::Closure; `type()` reports it as
+        // The CLOSURE op materializes a Value::closure; `type()` reports it as
         // "function" (exercises CLOSURE exec + the type() builtin without CALL).
         assert_eq!(eval_string("let f = (x) => x\ntype(f)").await, "function");
     }

@@ -20,8 +20,7 @@ use super::{bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
-use std::cell::RefCell;
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use std::rc::Rc;
 use tokio::net::UdpSocket;
 
@@ -33,23 +32,23 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn bytes_value(b: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(b)))
+    Value::bytes(b)
 }
 
 /// Parse `data` argument (string → UTF-8 bytes, or bytes value).
 fn data_to_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
-    match v {
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
-        Value::Bytes(b) => Ok(b.borrow().clone()),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
+        ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+        _ => Err(AsError::at(
             format!(
                 "{} expects a string or bytes, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -73,7 +72,7 @@ impl Interp {
 
     async fn udp_bind(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let addr = want_string(
-            args.first().unwrap_or(&Value::Nil),
+            args.first().unwrap_or(&Value::nil()),
             span,
             "net/udp.bind addr",
         )?;
@@ -87,7 +86,7 @@ impl Interp {
                     indexmap::IndexMap::new(),
                     ResourceState::UdpSocket(sock),
                 );
-                Ok(make_pair(handle, Value::Nil))
+                Ok(make_pair(handle, Value::nil()))
             }
             Err(e) => Ok(err_pair(format!("net/udp.bind to {} failed: {}", addr, e))),
         }
@@ -105,9 +104,9 @@ impl Interp {
         match m.method.as_str() {
             "send" => {
                 // send(data, addr) -> [bytesSent, err]
-                let data = data_to_bytes(args.first().unwrap_or(&Value::Nil), span, "socket.send")?;
+                let data = data_to_bytes(args.first().unwrap_or(&Value::nil()), span, "socket.send")?;
                 let addr =
-                    want_string(args.get(1).unwrap_or(&Value::Nil), span, "socket.send addr")?;
+                    want_string(args.get(1).unwrap_or(&Value::nil()), span, "socket.send addr")?;
                 // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the
                 // DESTINATION host before sending. Gate-12: no carve-out → no-op.
                 self.check_net_host(crate::stdlib::caps::host_of_addr(&addr), span)?;
@@ -124,7 +123,7 @@ impl Interp {
                 self.return_resource(id, ResourceState::UdpSocket(sock));
                 match result {
                     // NUM §4: a byte count is an `Int`.
-                    Ok(n) => Ok(make_pair(Value::Int(n as i64), Value::Nil)),
+                    Ok(n) => Ok(make_pair(Value::int(n as i64), Value::nil())),
                     Err(e) => Ok(err_pair(format!("socket.send to {} failed: {}", addr, e))),
                 }
             }
@@ -147,10 +146,10 @@ impl Interp {
                         buf.truncate(n);
                         let mut obj = indexmap::IndexMap::new();
                         obj.insert("data".to_string(), bytes_value(buf));
-                        obj.insert("from".to_string(), Value::Str(from.to_string().into()));
+                        obj.insert("from".to_string(), Value::str(from.to_string()));
                         Ok(make_pair(
-                            Value::Object(crate::value::ObjectCell::new(obj)),
-                            Value::Nil,
+                            Value::object(obj),
+                            Value::nil(),
                         ))
                     }
                     Err(e) => Ok(err_pair(format!("socket.recv failed: {}", e))),
@@ -164,11 +163,11 @@ impl Interp {
                     }
                     _ => String::new(),
                 });
-                Ok(Value::Str(addr.into()))
+                Ok(Value::str(addr))
             }
             "close" => {
                 self.take_resource(id);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => Err(AsError::at(format!("udpSocket has no method '{}'", other), span).into()),
         }

@@ -9,7 +9,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, type_name, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -37,28 +37,28 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(crate::value::ArrayCell::new(v))
+    Value::array(v)
 }
 
 fn obj(m: IndexMap<String, Value>) -> Value {
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// A Tier-1 error pair `[nil, {message}]` from a `std::io::Error` (or any Display).
 fn io_err(e: impl std::fmt::Display) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(e.to_string().into())))
+    make_pair(Value::nil(), make_error(Value::str(e.to_string())))
 }
 
 /// Resolve a string-or-bytes argument to a byte buffer (string → utf8 bytes).
 /// Used by `write`/`append`. Anything else is a Tier-2 panic.
 fn want_data(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
-    match v {
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
-        Value::Bytes(b) => Ok(b.borrow().clone()),
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
+        ValueKind::Bytes(b) => Ok(b.borrow().clone()),
         _ => Err(AsError::at(
             format!("{} expects a string or bytes, got {}", ctx, type_name(v)),
             span,
@@ -75,7 +75,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let path = want_string(&arg(args, 0), span, &ctx("read"))?;
             match std::fs::read(path.as_ref()) {
                 Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => Ok(make_pair(Value::Str(s.into()), Value::Nil)),
+                    Ok(s) => Ok(make_pair(Value::str(s), Value::nil())),
                     Err(_) => Ok(io_err("file is not valid UTF-8")),
                 },
                 Err(e) => Ok(io_err(e)),
@@ -85,7 +85,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "readBytes" => {
             let path = want_string(&arg(args, 0), span, &ctx("readBytes"))?;
             match std::fs::read(path.as_ref()) {
-                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::Nil)),
+                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::nil())),
                 Err(e) => Ok(io_err(e)),
             }
         }
@@ -94,7 +94,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let path = want_string(&arg(args, 0), span, &ctx("write"))?;
             let data = want_data(&arg(args, 1), span, &ctx("write"))?;
             match std::fs::write(path.as_ref(), data) {
-                Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                Ok(()) => Ok(make_pair(Value::nil(), Value::nil())),
                 Err(e) => Ok(io_err(e)),
             }
         }
@@ -109,14 +109,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .open(path.as_ref())
                 .and_then(|mut f| f.write_all(&data));
             match result {
-                Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                Ok(()) => Ok(make_pair(Value::nil(), Value::nil())),
                 Err(e) => Ok(io_err(e)),
             }
         }
         // exists(path) -> bool
         "exists" => {
             let path = want_string(&arg(args, 0), span, &ctx("exists"))?;
-            Ok(Value::Bool(Path::new(path.as_ref()).exists()))
+            Ok(Value::bool_(Path::new(path.as_ref()).exists()))
         }
         // stat(path) -> [{size, isFile, isDir, modifiedMs}, err]
         "stat" => {
@@ -127,15 +127,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| Value::Float(d.as_millis() as f64))
-                        .unwrap_or(Value::Nil);
+                        .map(|d| Value::float(d.as_millis() as f64))
+                        .unwrap_or(Value::nil());
                     let mut m = IndexMap::new();
                     // NUM §4: a byte size is an integer length → `Int`.
-                    m.insert("size".to_string(), Value::Int(md.len() as i64));
-                    m.insert("isFile".to_string(), Value::Bool(md.is_file()));
-                    m.insert("isDir".to_string(), Value::Bool(md.is_dir()));
+                    m.insert("size".to_string(), Value::int(md.len() as i64));
+                    m.insert("isFile".to_string(), Value::bool_(md.is_file()));
+                    m.insert("isDir".to_string(), Value::bool_(md.is_dir()));
                     m.insert("modifiedMs".to_string(), modified);
-                    Ok(make_pair(obj(m), Value::Nil))
+                    Ok(make_pair(obj(m), Value::nil()))
                 }
                 Err(e) => Ok(io_err(e)),
             }
@@ -150,7 +150,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 std::fs::create_dir(path.as_ref())
             };
             match result {
-                Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                Ok(()) => Ok(make_pair(Value::nil(), Value::nil())),
                 Err(e) => Ok(io_err(e)),
             }
         }
@@ -169,7 +169,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 std::fs::remove_file(p)
             };
             match result {
-                Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                Ok(()) => Ok(make_pair(Value::nil(), Value::nil())),
                 Err(e) => Ok(io_err(e)),
             }
         }
@@ -181,13 +181,13 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     let mut names = Vec::new();
                     for entry in entries {
                         match entry {
-                            Ok(e) => names.push(Value::Str(
-                                e.file_name().to_string_lossy().into_owned().into(),
+                            Ok(e) => names.push(Value::str(
+                                e.file_name().to_string_lossy().into_owned(),
                             )),
                             Err(e) => return Ok(io_err(e)),
                         }
                     }
-                    Ok(make_pair(arr(names), Value::Nil))
+                    Ok(make_pair(arr(names), Value::nil()))
                 }
                 Err(e) => Ok(io_err(e)),
             }
@@ -198,11 +198,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mut paths = Vec::new();
             for entry in walkdir::WalkDir::new(path.as_ref()) {
                 match entry {
-                    Ok(e) => paths.push(Value::Str(e.path().to_string_lossy().into_owned().into())),
+                    Ok(e) => paths.push(Value::str(e.path().to_string_lossy().into_owned())),
                     Err(e) => return Ok(io_err(e)),
                 }
             }
-            Ok(make_pair(arr(paths), Value::Nil))
+            Ok(make_pair(arr(paths), Value::nil()))
         }
         // ---- pure path helpers (infallible) ----
         // join(...parts) -> string
@@ -212,7 +212,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 let part = want_string(a, span, &format!("fs.join (argument {})", i + 1))?;
                 p.push(part.as_ref());
             }
-            Ok(Value::Str(p.to_string_lossy().into_owned().into()))
+            Ok(Value::str(p.to_string_lossy().into_owned()))
         }
         // dirname(p) -> string (parent path, or "" if none)
         "dirname" => {
@@ -221,7 +221,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .parent()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            Ok(Value::Str(d.into()))
+            Ok(Value::str(d))
         }
         // basename(p) -> string (final component, or "" if none)
         "basename" => {
@@ -230,7 +230,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .file_name()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            Ok(Value::Str(b.into()))
+            Ok(Value::str(b))
         }
         // extname(p) -> string (e.g. ".txt" or "")
         "extname" => {
@@ -239,12 +239,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .extension()
                 .map(|p| format!(".{}", p.to_string_lossy()))
                 .unwrap_or_default();
-            Ok(Value::Str(e.into()))
+            Ok(Value::str(e))
         }
         // isAbsolute(p) -> bool
         "isAbsolute" => {
             let path = want_string(&arg(args, 0), span, &ctx("isAbsolute"))?;
-            Ok(Value::Bool(Path::new(path.as_ref()).is_absolute()))
+            Ok(Value::bool_(Path::new(path.as_ref()).is_absolute()))
         }
         // grep(pattern, dir, opts?) -> [matches, err]  (spec §11.3)
         "grep" => grep(args, span),
@@ -268,8 +268,8 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
     let mut ignore_case = false;
     let mut max_results: Option<usize> = None;
     let mut respect_gitignore = true;
-    if let Value::Object(o) = arg(args, 2) {
-        if let Some(Value::Str(g)) = o.get("glob") {
+    if let OwnedKind::Object(o) = arg(args, 2).into_kind() {
+        if let Some(OwnedKind::Str(g)) = o.get("glob").map(|x| x.into_kind()) {
             glob = Some(g.to_string());
         }
         if let Some(v) = o.get("ignoreCase") {
@@ -358,17 +358,17 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
                 }
                 let column = line[..m.start()].chars().count() + 1;
                 let mut entry_obj = IndexMap::new();
-                entry_obj.insert("path".to_string(), Value::Str(path_str.clone().into()));
+                entry_obj.insert("path".to_string(), Value::str(path_str.clone()));
                 // NUM §4: line/column are 1-based integer offsets → `Int`.
-                entry_obj.insert("line".to_string(), Value::Int((line_idx + 1) as i64));
-                entry_obj.insert("column".to_string(), Value::Int(column as i64));
-                entry_obj.insert("text".to_string(), Value::Str(line.into()));
+                entry_obj.insert("line".to_string(), Value::int((line_idx + 1) as i64));
+                entry_obj.insert("column".to_string(), Value::int(column as i64));
+                entry_obj.insert("text".to_string(), Value::str(line));
                 matches.push(obj(entry_obj));
             }
         }
     }
 
-    Ok(make_pair(arr(matches), Value::Nil))
+    Ok(make_pair(arr(matches), Value::nil()))
 }
 
 #[cfg(test)]
@@ -379,7 +379,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     /// A unique temp dir for a test, created fresh and returned. Caller cleans up.
@@ -395,13 +395,13 @@ mod tests {
     }
 
     fn unwrap_pair_ok(v: &Value) -> Value {
-        match v {
-            Value::Array(a) => {
+        match v.kind() {
+            ValueKind::Array(a) => {
                 let a = a.borrow();
-                assert_eq!(a[1], Value::Nil, "expected ok pair, got err: {:?}", a[1]);
+                assert_eq!(a[1], Value::nil(), "expected ok pair, got err: {:?}", a[1]);
                 a[0].clone()
             }
-            other => panic!("expected a pair, got {:?}", other),
+            _ => panic!("expected a pair, got {:?}", v),
         }
     }
 
@@ -410,7 +410,7 @@ mod tests {
         let dir = temp_dir("rw_string");
         let f = path_str(&dir.join("hello.txt"));
         let w = call("write", &[s(&f), s("hello world")], sp()).unwrap();
-        assert_eq!(unwrap_pair_ok(&w), Value::Nil);
+        assert_eq!(unwrap_pair_ok(&w), Value::nil());
         let r = call("read", &[s(&f)], sp()).unwrap();
         assert_eq!(unwrap_pair_ok(&r), s("hello world"));
         std::fs::remove_dir_all(&dir).ok();
@@ -422,12 +422,12 @@ mod tests {
         let f = path_str(&dir.join("data.bin"));
         let data = bytes_val(vec![0, 1, 2, 255, 254]);
         let w = call("write", &[s(&f), data], sp()).unwrap();
-        assert_eq!(unwrap_pair_ok(&w), Value::Nil);
+        assert_eq!(unwrap_pair_ok(&w), Value::nil());
         let r = call("readBytes", &[s(&f)], sp()).unwrap();
         let got = unwrap_pair_ok(&r);
-        match got {
-            Value::Bytes(b) => assert_eq!(*b.borrow(), vec![0u8, 1, 2, 255, 254]),
-            other => panic!("expected bytes, got {:?}", other),
+        match got.kind() {
+            ValueKind::Bytes(b) => assert_eq!(*b.borrow(), vec![0u8, 1, 2, 255, 254]),
+            _ => panic!("expected bytes, got {:?}", got),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -448,11 +448,11 @@ mod tests {
         let dir = temp_dir("exists");
         let f = path_str(&dir.join("present.txt"));
         call("write", &[s(&f), s("x")], sp()).unwrap();
-        assert_eq!(call("exists", &[s(&f)], sp()).unwrap(), Value::Bool(true));
+        assert_eq!(call("exists", &[s(&f)], sp()).unwrap(), Value::bool_(true));
         let missing = path_str(&dir.join("absent.txt"));
         assert_eq!(
             call("exists", &[s(&missing)], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -464,19 +464,22 @@ mod tests {
         call("write", &[s(&f), s("12345")], sp()).unwrap();
         let st = call("stat", &[s(&f)], sp()).unwrap();
         let o = unwrap_pair_ok(&st);
-        let o = match &o {
-            Value::Object(o) => o,
-            other => panic!("expected object, got {:?}", other),
+        let o = match o.kind() {
+            ValueKind::Object(o) => o,
+            _ => panic!("expected object, got {:?}", o),
         };
-        assert_eq!(o.get("size"), Some(Value::Int(5)));
-        assert_eq!(o.get("isFile"), Some(Value::Bool(true)));
-        assert_eq!(o.get("isDir"), Some(Value::Bool(false)));
-        assert!(matches!(o.get("modifiedMs"), Some(Value::Float(_))));
+        assert_eq!(o.get("size"), Some(Value::int(5)));
+        assert_eq!(o.get("isFile"), Some(Value::bool_(true)));
+        assert_eq!(o.get("isDir"), Some(Value::bool_(false)));
+        assert!(matches!(
+            o.get("modifiedMs").map(|x| x.into_kind()),
+            Some(OwnedKind::Float(_))
+        ));
         // and a directory
         let st_dir = call("stat", &[s(&path_str(&dir))], sp()).unwrap();
         let od = unwrap_pair_ok(&st_dir);
-        if let Value::Object(o) = &od {
-            assert_eq!(o.get("isDir"), Some(Value::Bool(true)));
+        if let ValueKind::Object(o) = od.kind() {
+            assert_eq!(o.get("isDir"), Some(Value::bool_(true)));
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -486,13 +489,13 @@ mod tests {
         let dir = temp_dir("stat_missing");
         let missing = path_str(&dir.join("nope.txt"));
         let st = call("stat", &[s(&missing)], sp()).unwrap();
-        match &st {
-            Value::Array(a) => {
+        match st.kind() {
+            ValueKind::Array(a) => {
                 let a = a.borrow();
-                assert_eq!(a[0], Value::Nil);
-                assert!(matches!(a[1], Value::Object(_)));
+                assert_eq!(a[0], Value::nil());
+                assert!(matches!(a[1].kind(), ValueKind::Object(_)));
             }
-            other => panic!("expected pair, got {:?}", other),
+            _ => panic!("expected pair, got {:?}", st),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -503,23 +506,23 @@ mod tests {
         let nested = path_str(&dir.join("a").join("b").join("c"));
         // non-recursive on a deep path fails (Tier-1)
         let fail = call("mkdir", &[s(&nested)], sp()).unwrap();
-        if let Value::Array(a) = &fail {
-            assert!(matches!(a.borrow()[1], Value::Object(_)));
+        if let ValueKind::Array(a) = fail.kind() {
+            assert!(matches!(a.borrow()[1].kind(), ValueKind::Object(_)));
         }
         // recursive succeeds
-        let ok = call("mkdir", &[s(&nested), Value::Bool(true)], sp()).unwrap();
-        assert_eq!(unwrap_pair_ok(&ok), Value::Nil);
+        let ok = call("mkdir", &[s(&nested), Value::bool_(true)], sp()).unwrap();
+        assert_eq!(unwrap_pair_ok(&ok), Value::nil());
         assert_eq!(
             call("exists", &[s(&nested)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         // recursive remove of the top dir clears the tree
         let top = path_str(&dir.join("a"));
-        let rm = call("remove", &[s(&top), Value::Bool(true)], sp()).unwrap();
-        assert_eq!(unwrap_pair_ok(&rm), Value::Nil);
+        let rm = call("remove", &[s(&top), Value::bool_(true)], sp()).unwrap();
+        assert_eq!(unwrap_pair_ok(&rm), Value::nil());
         assert_eq!(
             call("exists", &[s(&top)], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -530,8 +533,8 @@ mod tests {
         let f = path_str(&dir.join("gone.txt"));
         call("write", &[s(&f), s("x")], sp()).unwrap();
         let rm = call("remove", &[s(&f)], sp()).unwrap();
-        assert_eq!(unwrap_pair_ok(&rm), Value::Nil);
-        assert_eq!(call("exists", &[s(&f)], sp()).unwrap(), Value::Bool(false));
+        assert_eq!(unwrap_pair_ok(&rm), Value::nil());
+        assert_eq!(call("exists", &[s(&f)], sp()).unwrap(), Value::bool_(false));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -542,9 +545,9 @@ mod tests {
         call("write", &[s(&path_str(&dir.join("two.txt"))), s("2")], sp()).unwrap();
         let rd = call("readDir", &[s(&path_str(&dir))], sp()).unwrap();
         let listing = unwrap_pair_ok(&rd);
-        let mut names: Vec<String> = match &listing {
-            Value::Array(a) => a.borrow().iter().map(|v| v.to_string()).collect(),
-            other => panic!("expected array, got {:?}", other),
+        let mut names: Vec<String> = match listing.kind() {
+            ValueKind::Array(a) => a.borrow().iter().map(|v| v.to_string()).collect(),
+            _ => panic!("expected array, got {:?}", listing),
         };
         names.sort();
         assert_eq!(names, vec!["one.txt".to_string(), "two.txt".to_string()]);
@@ -603,11 +606,11 @@ mod tests {
         // isAbsolute
         assert_eq!(
             call("isAbsolute", &[s("/abs/path")], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("isAbsolute", &[s("rel/path")], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
@@ -634,23 +637,23 @@ mod tests {
         .unwrap();
         let g = call("grep", &[s("TODO"), s(&path_str(&dir))], sp()).unwrap();
         let matches = unwrap_pair_ok(&g);
-        let v = match &matches {
-            Value::Array(a) => a.borrow().clone(),
-            other => panic!("expected array, got {:?}", other),
+        let v = match matches.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
+            _ => panic!("expected array, got {:?}", matches),
         };
         assert_eq!(v.len(), 2, "expected 2 matches, got {:?}", v);
         // verify the shape of one match (from a.txt: line 2, "TODO" at column 1)
         let mut by_text: Vec<(String, f64, f64, String)> = v
             .iter()
-            .map(|m| match m {
-                Value::Object(o) => {
+            .map(|m| match m.kind() {
+                ValueKind::Object(o) => {
                     let line = o.get("line").and_then(|v| v.as_f64()).unwrap_or(-1.0);
                     let col = o.get("column").and_then(|v| v.as_f64()).unwrap_or(-1.0);
                     let text = o.get("text").map(|t| t.to_string()).unwrap_or_default();
                     let path = o.get("path").map(|t| t.to_string()).unwrap_or_default();
                     (path, line, col, text)
                 }
-                other => panic!("expected match object, got {:?}", other),
+                _ => panic!("expected match object, got {:?}", m),
             })
             .collect();
         by_text.sort_by(|a, b| a.3.cmp(&b.3));
@@ -681,18 +684,19 @@ mod tests {
                 args.push(o);
             }
             let g = call("grep", &args, sp()).unwrap();
-            match unwrap_pair_ok(&g) {
-                Value::Array(a) => a.borrow().len(),
-                other => panic!("expected array, got {:?}", other),
+            let pair = unwrap_pair_ok(&g);
+            match pair.kind() {
+                ValueKind::Array(a) => a.borrow().len(),
+                _ => panic!("expected array, got {:?}", pair),
             }
         };
         // maxResults: 2 → exactly 2
         let mut o2 = IndexMap::new();
-        o2.insert("maxResults".to_string(), Value::Float(2.0));
+        o2.insert("maxResults".to_string(), Value::float(2.0));
         assert_eq!(count(Some(obj(o2))), 2);
         // maxResults: 0 → NO limit (all 4)
         let mut o0 = IndexMap::new();
-        o0.insert("maxResults".to_string(), Value::Float(0.0));
+        o0.insert("maxResults".to_string(), Value::float(0.0));
         assert_eq!(count(Some(obj(o0))), 4);
         // absent → NO limit (all 4)
         assert_eq!(count(None), 4);
@@ -712,11 +716,11 @@ mod tests {
         .unwrap();
         let g = call("grep", &[s("findme"), s(&path_str(&dir))], sp()).unwrap();
         let matches = unwrap_pair_ok(&g);
-        match &matches {
-            Value::Array(a) => {
+        match matches.kind() {
+            ValueKind::Array(a) => {
                 let a = a.borrow();
                 assert_eq!(a.len(), 1, "dotfile should be searched: {:?}", a);
-                if let Value::Object(o) = &a[0] {
+                if let ValueKind::Object(o) = a[0].kind() {
                     assert!(o
                         .borrow()
                         .get("path")
@@ -725,7 +729,7 @@ mod tests {
                         .contains(".config"));
                 }
             }
-            other => panic!("expected array, got {:?}", other),
+            _ => panic!("expected array, got {:?}", matches),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -741,14 +745,14 @@ mod tests {
         .unwrap();
         // case-sensitive: no match for "world"
         let g1 = call("grep", &[s("world"), s(&path_str(&dir))], sp()).unwrap();
-        if let Value::Array(a) = &unwrap_pair_ok(&g1) {
+        if let ValueKind::Array(a) = unwrap_pair_ok(&g1).kind() {
             assert_eq!(a.borrow().len(), 0);
         }
         // case-insensitive: matches
         let mut opts = IndexMap::new();
-        opts.insert("ignoreCase".to_string(), Value::Bool(true));
+        opts.insert("ignoreCase".to_string(), Value::bool_(true));
         let g2 = call("grep", &[s("world"), s(&path_str(&dir)), obj(opts)], sp()).unwrap();
-        if let Value::Array(a) = &unwrap_pair_ok(&g2) {
+        if let ValueKind::Array(a) = unwrap_pair_ok(&g2).kind() {
             assert_eq!(a.borrow().len(), 1);
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -773,12 +777,12 @@ mod tests {
         opts.insert("glob".to_string(), s("*.rs"));
         let g = call("grep", &[s("needle"), s(&path_str(&dir)), obj(opts)], sp()).unwrap();
         let matches = unwrap_pair_ok(&g);
-        let v = match &matches {
-            Value::Array(a) => a.borrow().clone(),
-            other => panic!("expected array, got {:?}", other),
+        let v = match matches.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
+            _ => panic!("expected array, got {:?}", matches),
         };
         assert_eq!(v.len(), 1, "glob should restrict to .rs only: {:?}", v);
-        if let Value::Object(o) = &v[0] {
+        if let ValueKind::Object(o) = v[0].kind() {
             assert!(o
                 .borrow()
                 .get("path")
@@ -803,7 +807,7 @@ mod tests {
         let g = call("grep", &[s("findme"), s(&path_str(&dir))], sp()).unwrap();
         // should not error, and finds the one text match
         let matches = unwrap_pair_ok(&g);
-        if let Value::Array(a) = &matches {
+        if let ValueKind::Array(a) = matches.kind() {
             assert_eq!(a.borrow().len(), 1);
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -813,13 +817,13 @@ mod tests {
     fn grep_bad_pattern_is_tier1_err() {
         let dir = temp_dir("grep_badpat");
         let g = call("grep", &[s("("), s(&path_str(&dir))], sp()).unwrap();
-        match &g {
-            Value::Array(a) => {
+        match g.kind() {
+            ValueKind::Array(a) => {
                 let a = a.borrow();
-                assert_eq!(a[0], Value::Nil);
-                assert!(matches!(a[1], Value::Object(_)));
+                assert_eq!(a[0], Value::nil());
+                assert!(matches!(a[1].kind(), ValueKind::Object(_)));
             }
-            other => panic!("expected pair, got {:?}", other),
+            _ => panic!("expected pair, got {:?}", g),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -827,7 +831,7 @@ mod tests {
     #[test]
     fn read_non_string_path_is_tier2_panic() {
         assert!(matches!(
-            call("read", &[Value::Float(1.0)], sp()),
+            call("read", &[Value::float(1.0)], sp()),
             Err(Control::Panic(_))
         ));
     }
@@ -837,7 +841,7 @@ mod tests {
         let dir = temp_dir("write_panic");
         let f = path_str(&dir.join("x.txt"));
         assert!(matches!(
-            call("write", &[s(&f), Value::Float(1.0)], sp()),
+            call("write", &[s(&f), Value::float(1.0)], sp()),
             Err(Control::Panic(_))
         ));
         std::fs::remove_dir_all(&dir).ok();

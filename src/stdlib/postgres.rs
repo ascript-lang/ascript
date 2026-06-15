@@ -35,7 +35,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use std::rc::Rc;
 use tokio_postgres::types::{ToSql, Type};
 
@@ -44,7 +44,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 impl Interp {
@@ -81,7 +81,7 @@ impl Interp {
             indexmap::IndexMap::new(),
             ResourceState::PostgresConnection { client, conn_task },
         );
-        Ok(make_pair(handle, Value::Nil))
+        Ok(make_pair(handle, Value::nil()))
     }
 
     /// Dispatch a method on a Postgres connection handle.
@@ -100,7 +100,7 @@ impl Interp {
                 {
                     conn_task.abort();
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "query" => {
                 // query(sql, params?, Class?) -> [array<row|instance>, err]
@@ -115,19 +115,19 @@ impl Interp {
                 let row_vals = rows.iter().map(rows_to_value).collect::<Vec<_>>();
                 // Optional typed decode per row (Class or schema).
                 if let Some(t) = type_arg {
-                    let is_class = matches!(t, Value::Class(_));
+                    let is_class = matches!(t.kind(), ValueKind::Class(_));
                     let is_schema = crate::stdlib::schema::schema_kind(&t).is_some();
                     if is_class || is_schema {
                         let parsed = make_pair(
-                            Value::Array(crate::value::ArrayCell::new(row_vals)),
-                            Value::Nil,
+                            Value::array_cell(crate::value::ArrayCell::new(row_vals)),
+                            Value::nil(),
                         );
                         return self.typed_decode_rows(parsed, &t, span).await;
                     }
                 }
                 Ok(make_pair(
-                    Value::Array(crate::value::ArrayCell::new(row_vals)),
-                    Value::Nil,
+                    Value::array_cell(crate::value::ArrayCell::new(row_vals)),
+                    Value::nil(),
                 ))
             }
             "queryOne" => {
@@ -139,15 +139,15 @@ impl Interp {
                     Err(c) => return Err(c),
                 };
                 match rows.first() {
-                    Some(r) => Ok(make_pair(rows_to_value(r), Value::Nil)),
-                    None => Ok(make_pair(Value::Nil, Value::Nil)),
+                    Some(r) => Ok(make_pair(rows_to_value(r), Value::nil())),
+                    None => Ok(make_pair(Value::nil(), Value::nil())),
                 }
             }
             "exec" => {
                 let sql = want_string(&arg(&args, 0), span, "connection.exec")?;
                 let params = bind_params(args.get(1), span, "connection.exec")?;
                 match self.pg_run_execute(id, &sql, &params, span).await {
-                    Ok(Ok(n)) => Ok(make_pair(Value::Int(n as i64), Value::Nil)),
+                    Ok(Ok(n)) => Ok(make_pair(Value::int(n as i64), Value::nil())),
                     Ok(Err(msg)) => Ok(err_pair(msg)),
                     Err(c) => Err(c),
                 }
@@ -227,7 +227,7 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         match self.pg_run_execute(id, sql, &[], span).await {
-            Ok(Ok(_)) => Ok(make_pair(Value::Nil, Value::Nil)),
+            Ok(Ok(_)) => Ok(make_pair(Value::nil(), Value::nil())),
             Ok(Err(msg)) => Ok(err_pair(format!("{}: {}", ctx, msg))),
             Err(c) => Err(c),
         }
@@ -259,22 +259,22 @@ impl BoundParam {
 
 /// Parse the optional params array into bound params. Missing/nil → empty.
 fn bind_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Vec<BoundParam>, Control> {
-    match v {
-        None | Some(Value::Nil) => Ok(Vec::new()),
+    match v.map(|x| x.kind()) {
+        None | Some(ValueKind::Nil) => Ok(Vec::new()),
         // A Class/schema 3rd-arg-style value passed as 2nd arg is not params; but
         // params is positional-only (an array). Anything non-array is Tier-2.
-        Some(Value::Array(a)) => {
+        Some(ValueKind::Array(a)) => {
             let mut out = Vec::new();
             for item in a.borrow().iter() {
                 out.push(value_to_param(item, span, ctx)?);
             }
             Ok(out)
         }
-        Some(other) => Err(AsError::at(
+        Some(_) => Err(AsError::at(
             format!(
                 "{} params must be an array, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v.unwrap())
             ),
             span,
         )
@@ -283,26 +283,26 @@ fn bind_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Vec<BoundPara
 }
 
 fn value_to_param(v: &Value, span: Span, ctx: &str) -> Result<BoundParam, Control> {
-    Ok(match v {
-        Value::Nil => BoundParam::Null,
-        Value::Bool(b) => BoundParam::Bool(*b),
+    Ok(match v.kind() {
+        ValueKind::Nil => BoundParam::Null,
+        ValueKind::Bool(b) => BoundParam::Bool(b),
         // NUM §4: an `Int` binds directly as a SQL integer.
-        Value::Int(i) => BoundParam::Int(*i),
-        Value::Float(n) => {
+        ValueKind::Int(i) => BoundParam::Int(i),
+        ValueKind::Float(n) => {
             if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.2e18 {
-                BoundParam::Int(*n as i64)
+                BoundParam::Int(n as i64)
             } else {
-                BoundParam::Float(*n)
+                BoundParam::Float(n)
             }
         }
-        Value::Str(s) => BoundParam::Text(s.to_string()),
-        Value::Bytes(b) => BoundParam::Bytes(b.borrow().clone()),
-        other => {
+        ValueKind::Str(s) => BoundParam::Text(s.to_string()),
+        ValueKind::Bytes(b) => BoundParam::Bytes(b.borrow().clone()),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "{}: cannot bind a {} as a SQL parameter",
                     ctx,
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(v)
                 ),
                 span,
             )
@@ -317,7 +317,7 @@ fn rows_to_value(row: &tokio_postgres::Row) -> Value {
     for (i, col) in row.columns().iter().enumerate() {
         map.insert(col.name().to_string(), column_to_value(row, i, col.type_()));
     }
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object_cell(crate::value::ObjectCell::new(map))
 }
 
 /// Map a single Postgres column value to an AScript value, per the type map. A
@@ -330,8 +330,8 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
             .try_get::<_, Option<bool>>(i)
             .ok()
             .flatten()
-            .map(Value::Bool)
-            .unwrap_or(Value::Nil),
+            .map(Value::bool_)
+            .unwrap_or(Value::nil()),
         Type::INT2 => opt_int(row.try_get::<_, Option<i16>>(i).ok().flatten().map(|n| n as i64)),
         Type::INT4 => opt_int(row.try_get::<_, Option<i32>>(i).ok().flatten().map(|n| n as i64)),
         Type::INT8 => opt_int(row.try_get::<_, Option<i64>>(i).ok().flatten()),
@@ -348,8 +348,8 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
             .try_get::<_, Option<Vec<u8>>>(i)
             .ok()
             .flatten()
-            .map(|b| Value::Bytes(Rc::new(RefCell::new(b))))
-            .unwrap_or(Value::Nil),
+            .map(|b| Value::bytes_rc(Rc::new(RefCell::new(b))))
+            .unwrap_or(Value::nil()),
         Type::UUID => opt_str(
             row.try_get::<_, Option<String>>(i)
                 .ok()
@@ -358,7 +358,7 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
         ),
         Type::JSON | Type::JSONB => match row.try_get::<_, Option<serde_json::Value>>(i) {
             Ok(Some(jv)) => crate::stdlib::json::to_ascript(&jv),
-            _ => Value::Nil,
+            _ => Value::nil(),
         },
         Type::TIMESTAMP | Type::TIMESTAMPTZ | Type::DATE | Type::TIME => {
             opt_str(row.try_get::<_, Option<String>>(i).ok().flatten())
@@ -369,14 +369,14 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
 }
 
 fn opt_num(n: Option<f64>) -> Value {
-    n.map(Value::Float).unwrap_or(Value::Nil)
+    n.map(Value::float).unwrap_or(Value::nil())
 }
 /// NUM §4: an integer SQL column decodes to `Int`.
 fn opt_int(n: Option<i64>) -> Value {
-    n.map(Value::Int).unwrap_or(Value::Nil)
+    n.map(Value::int).unwrap_or(Value::nil())
 }
 fn opt_str(s: Option<String>) -> Value {
-    s.map(|s| Value::Str(s.into())).unwrap_or(Value::Nil)
+    s.map(Value::str).unwrap_or(Value::nil())
 }
 
 /// numeric columns: tokio-postgres has no built-in Decimal without a feature, so
@@ -403,26 +403,26 @@ mod tests {
     // value_to_param maps each supported kind; unsupported is Tier-2.
     #[test]
     fn value_to_param_type_map() {
-        assert!(matches!(value_to_param(&Value::Nil, sp(), "x").unwrap(), BoundParam::Null));
-        assert!(matches!(value_to_param(&Value::Bool(true), sp(), "x").unwrap(), BoundParam::Bool(true)));
-        assert!(matches!(value_to_param(&Value::Float(3.0), sp(), "x").unwrap(), BoundParam::Int(3)));
-        assert!(matches!(value_to_param(&Value::Float(3.5), sp(), "x").unwrap(), BoundParam::Float(_)));
-        assert!(matches!(value_to_param(&Value::Str("hi".into()), sp(), "x").unwrap(), BoundParam::Text(_)));
+        assert!(matches!(value_to_param(&Value::nil(), sp(), "x").unwrap(), BoundParam::Null));
+        assert!(matches!(value_to_param(&Value::bool_(true), sp(), "x").unwrap(), BoundParam::Bool(true)));
+        assert!(matches!(value_to_param(&Value::float(3.0), sp(), "x").unwrap(), BoundParam::Int(3)));
+        assert!(matches!(value_to_param(&Value::float(3.5), sp(), "x").unwrap(), BoundParam::Float(_)));
+        assert!(matches!(value_to_param(&Value::str("hi"), sp(), "x").unwrap(), BoundParam::Text(_)));
         // A function value cannot be bound.
-        assert!(value_to_param(&Value::Builtin("math.abs".into()), sp(), "x").is_err());
+        assert!(value_to_param(&Value::builtin("math.abs"), sp(), "x").is_err());
     }
 
     #[test]
     fn bind_params_array_and_nil() {
         assert_eq!(bind_params(None, sp(), "x").unwrap().len(), 0);
-        assert_eq!(bind_params(Some(&Value::Nil), sp(), "x").unwrap().len(), 0);
-        let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Float(1.0),
-            Value::Str("a".into()),
+        assert_eq!(bind_params(Some(&Value::nil()), sp(), "x").unwrap().len(), 0);
+        let arr = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::float(1.0),
+            Value::str("a"),
         ]));
         assert_eq!(bind_params(Some(&arr), sp(), "x").unwrap().len(), 2);
         // A non-array params arg is a Tier-2 error.
-        assert!(bind_params(Some(&Value::Float(1.0)), sp(), "x").is_err());
+        assert!(bind_params(Some(&Value::float(1.0)), sp(), "x").is_err());
     }
 
     // Dead-port connect → clean Tier-1 err (NOT a panic). Runs under a LocalSet
@@ -437,16 +437,16 @@ mod tests {
                 let pair = interp
                     .call_postgres(
                         "connect",
-                        &[Value::Str("postgres://127.0.0.1:1/none".into())],
+                        &[Value::str("postgres://127.0.0.1:1/none")],
                         sp(),
                     )
                     .await
                     .expect("connect must not panic on a dead port");
                 // [nil, err]
-                if let Value::Array(a) = &pair {
+                if let ValueKind::Array(a) = pair.kind() {
                     let b = a.borrow();
-                    assert_eq!(b[0], Value::Nil, "value slot should be nil");
-                    assert!(matches!(b[1], Value::Object(_)), "err slot should be set");
+                    assert_eq!(b[0], Value::nil(), "value slot should be nil");
+                    assert!(matches!(b[1].kind(), ValueKind::Object(_)), "err slot should be set");
                 } else {
                     panic!("expected a [value, err] pair");
                 }
@@ -468,17 +468,17 @@ mod tests {
                 let suffix = format!("{}", uuid::Uuid::new_v4().simple());
                 let table = format!("sp5_pg_{}", suffix);
                 let pair = interp
-                    .call_postgres("connect", &[Value::Str(url.clone().into())], sp())
+                    .call_postgres("connect", &[Value::str(url.clone())], sp())
                     .await
                     .unwrap();
-                let conn = match &pair {
-                    Value::Array(a) => a.borrow()[0].clone(),
+                let conn = match pair.kind() {
+                    ValueKind::Array(a) => a.borrow()[0].clone(),
                     _ => panic!("connect pair"),
                 };
-                assert!(matches!(conn, Value::Native(_)), "connect should yield a handle");
+                assert!(matches!(conn.kind(), ValueKind::Native(_)), "connect should yield a handle");
                 let m = |method: &str| -> Rc<NativeMethod> {
-                    match &conn {
-                        Value::Native(n) => Rc::new(NativeMethod {
+                    match conn.kind() {
+                        ValueKind::Native(n) => Rc::new(NativeMethod {
                             receiver: n.clone(),
                             method: method.to_string(),
                         }),
@@ -490,7 +490,7 @@ mod tests {
                     let mm = m("exec");
                     async move {
                         interp
-                            .call_postgres_method(&mm, vec![Value::Str(sql.into())], sp())
+                            .call_postgres_method(&mm, vec![Value::str(sql)], sp())
                             .await
                             .unwrap()
                     }
@@ -501,20 +501,20 @@ mod tests {
                 let rows = interp
                     .call_postgres_method(
                         &q,
-                        vec![Value::Str(format!("SELECT id, name FROM {} ORDER BY id", table).into())],
+                        vec![Value::str(format!("SELECT id, name FROM {} ORDER BY id", table))],
                         sp(),
                     )
                     .await
                     .unwrap();
-                if let Value::Array(a) = &rows {
+                if let ValueKind::Array(a) = rows.kind() {
                     let b = a.borrow();
-                    assert_eq!(b[1], Value::Nil, "query err should be nil");
-                    if let Value::Array(rs) = &b[0] {
+                    assert_eq!(b[1], Value::nil(), "query err should be nil");
+                    if let ValueKind::Array(rs) = b[0].kind() {
                         let rs = rs.borrow();
                         assert_eq!(rs.len(), 1, "one row expected");
-                        if let Value::Object(o) = &rs[0] {
-                            assert_eq!(o.get("id"), Some(Value::Int(1)));
-                            assert_eq!(o.get("name"), Some(Value::Str("ada".into())));
+                        if let ValueKind::Object(o) = rs[0].kind() {
+                            assert_eq!(o.get("id"), Some(Value::int(1)));
+                            assert_eq!(o.get("name"), Some(Value::str("ada")));
                         }
                     }
                 }

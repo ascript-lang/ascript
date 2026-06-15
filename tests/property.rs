@@ -589,14 +589,14 @@ mod worker_serialize {
     /// A scalar sendable leaf.
     fn scalar() -> impl Strategy<Value = Value> {
         prop_oneof![
-            Just(Value::Nil),
-            any::<bool>().prop_map(Value::Bool),
-            any::<i64>().prop_map(Value::Int),
+            Just(Value::nil()),
+            any::<bool>().prop_map(Value::bool_),
+            any::<i64>().prop_map(Value::int),
             // Avoid NaN/inf in the float generator: NaN != NaN would break the structural
             // round-trip equality (NaN is a documented Map-key carve-out, not a round-trip
             // failure). Finite floats round-trip exactly.
-            (-1e6f64..1e6f64).prop_map(Value::Float),
-            "[a-z]{0,8}".prop_map(|s| Value::Str(s.into())),
+            (-1e6f64..1e6f64).prop_map(Value::float),
+            "[a-z]{0,8}".prop_map(Value::str),
         ]
     }
 
@@ -607,14 +607,14 @@ mod worker_serialize {
             prop_oneof![
                 // array
                 prop::collection::vec(inner.clone(), 0..5)
-                    .prop_map(|v| Value::Array(ArrayCell::new(v))),
+                    .prop_map(|v| Value::array_cell(ArrayCell::new(v))),
                 // object (string keys)
                 prop::collection::vec(("[a-z]{1,4}", inner.clone()), 0..5).prop_map(|pairs| {
                     let mut m: IndexMap<String, Value> = IndexMap::new();
                     for (k, v) in pairs {
                         m.insert(k, v);
                     }
-                    Value::Object(ObjectCell::new(m))
+                    Value::object_cell(ObjectCell::new(m))
                 }),
                 // map (scalar keys via MapKey)
                 prop::collection::vec((scalar_key(), inner.clone()), 0..5).prop_map(|pairs| {
@@ -624,7 +624,7 @@ mod worker_serialize {
                             m.insert(key, v);
                         }
                     }
-                    Value::Map(MapCell::new(m))
+                    Value::map_cell(MapCell::new(m))
                 }),
                 // set
                 prop::collection::vec(scalar_key(), 0..5).prop_map(|keys| {
@@ -634,7 +634,7 @@ mod worker_serialize {
                             s.insert(key);
                         }
                     }
-                    Value::Set(ascript::value::SetCell::new(s))
+                    Value::set_cell(ascript::value::SetCell::new(s))
                 }),
             ]
         })
@@ -643,9 +643,9 @@ mod worker_serialize {
     /// A scalar usable as a Map/Set key (no nil/collection keys).
     fn scalar_key() -> impl Strategy<Value = Value> {
         prop_oneof![
-            any::<bool>().prop_map(Value::Bool),
-            any::<i64>().prop_map(Value::Int),
-            "[a-z]{0,6}".prop_map(|s| Value::Str(s.into())),
+            any::<bool>().prop_map(Value::bool_),
+            any::<i64>().prop_map(Value::int),
+            "[a-z]{0,6}".prop_map(Value::str),
         ]
     }
 
@@ -683,11 +683,11 @@ mod worker_serialize {
     /// SENDABILITY HONESTY: a NON-sendable kind (a closure/native/future/generator) must be
     /// REJECTED by `encode` with a `SendError` (a field-path error), never a panic and never
     /// silent loss — `encode(v)` succeeds iff `check_sendable(v)` is `Ok`. We use a
-    /// `Value::Builtin` (a native fn handle) as the canonical non-sendable leaf.
+    /// `Value::builtin` (a native fn handle) as the canonical non-sendable leaf.
     #[test]
     fn non_sendable_value_is_rejected_cleanly() {
         // A builtin (native function) is non-sendable. `global_env()` installs builtins, so
-        // `print` resolves to a `Value::Builtin` handle — the canonical non-sendable leaf.
+        // `print` resolves to a `Value::builtin` handle — the canonical non-sendable leaf.
         let env = ascript::interp::global_env();
         let non_sendable = env.get("print").expect("print builtin is installed");
         // It must be classified non-sendable AND encode must refuse it (the SAME verdict):
@@ -835,17 +835,17 @@ mod worker_serialize {
     /// re-encoding and asserting the structural compare catches the difference.
     #[test]
     fn serialize_roundtrip_self_test_catches_loss() {
-        let v = Value::Array(ArrayCell::new(vec![
-            Value::Int(1),
-            Value::Int(2),
-            Value::Int(3),
+        let v = Value::array_cell(ArrayCell::new(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
         ]));
         let good = round_trip(&v).expect("round-trip ok");
         assert_eq!(format!("{good}"), format!("{v}"), "honest round-trip preserves the array");
 
         // The "lossy decode": an array missing its last element. The structural compare the
         // property uses MUST flag this as different — i.e. the check is not vacuously true.
-        let lossy = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2)]));
+        let lossy = Value::array_cell(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
         assert_ne!(
             format!("{lossy}"),
             format!("{v}"),
@@ -899,35 +899,35 @@ mod gc_property {
     fn build(shape: &GraphShape) -> Vec<Value> {
         match shape {
             GraphShape::SelfArray => {
-                let a = Value::Array(ArrayCell::new(Vec::new()));
-                if let Value::Array(arr) = &a {
+                let a = Value::array_cell(ArrayCell::new(Vec::new()));
+                if let Some(arr) = a.as_array() {
                     arr.borrow_mut().push(a.clone());
                 }
                 vec![a]
             }
             GraphShape::ArrayPair => {
-                let a = Value::Array(ArrayCell::new(Vec::new()));
-                let b = Value::Array(ArrayCell::new(Vec::new()));
-                if let (Value::Array(av), Value::Array(bv)) = (&a, &b) {
+                let a = Value::array_cell(ArrayCell::new(Vec::new()));
+                let b = Value::array_cell(ArrayCell::new(Vec::new()));
+                if let (Some(av), Some(bv)) = (a.as_array(), b.as_array()) {
                     av.borrow_mut().push(b.clone());
                     bv.borrow_mut().push(a.clone());
                 }
                 vec![a, b]
             }
             GraphShape::SelfObject => {
-                let o = Value::Object(ObjectCell::new(IndexMap::new()));
-                if let Value::Object(oc) = &o {
+                let o = Value::object_cell(ObjectCell::new(IndexMap::new()));
+                if let Some(oc) = o.as_object() {
                     oc.borrow_mut().insert("self".to_string(), o.clone());
                 }
                 vec![o]
             }
             GraphShape::Ring(n) => {
                 let nodes: Vec<Value> = (0..*n)
-                    .map(|_| Value::Array(ArrayCell::new(Vec::new())))
+                    .map(|_| Value::array_cell(ArrayCell::new(Vec::new())))
                     .collect();
                 for i in 0..*n {
                     let next = nodes[(i + 1) % *n].clone();
-                    if let Value::Array(arr) = &nodes[i] {
+                    if let Some(arr) = nodes[i].as_array() {
                         arr.borrow_mut().push(next);
                     }
                 }
@@ -935,8 +935,8 @@ mod gc_property {
             }
             GraphShape::Forest(m) => (0..*m)
                 .map(|_| {
-                    let a = Value::Array(ArrayCell::new(Vec::new()));
-                    if let Value::Array(arr) = &a {
+                    let a = Value::array_cell(ArrayCell::new(Vec::new()));
+                    if let Some(arr) = a.as_array() {
                         arr.borrow_mut().push(a.clone());
                     }
                     a
@@ -1583,23 +1583,23 @@ mod object_storage_property {
             Op::Insert(k, v) => {
                 if cell.contains_key(k) {
                     // Overwrite in place (position kept)
-                    cell.insert(k, Value::Int(*v));
+                    cell.insert(k, Value::int(*v));
                 } else {
                     // New key: try registry-driven slab append, else demote+insert
                     let shape = cell.shape.get();
                     match reg.add_key(shape, k) {
                         Some(child_shape) => {
                             let child_keys = reg.keys_of(child_shape);
-                            let ok = cell.slab_append(child_shape, child_keys, Value::Int(*v));
+                            let ok = cell.slab_append(child_shape, child_keys, Value::int(*v));
                             if !ok {
                                 // Was already in dict mode; just insert
-                                cell.insert(k, Value::Int(*v));
+                                cell.insert(k, Value::int(*v));
                             }
                         }
                         None => {
                             // Cap exceeded — demote (if slab) and dict-insert
                             cell.demote_to_dict();
-                            cell.insert(k, Value::Int(*v));
+                            cell.insert(k, Value::int(*v));
                         }
                     }
                 }
@@ -1631,8 +1631,8 @@ mod object_storage_property {
                 let got: Vec<(String, i64)> = {
                     let mut pairs = vec![];
                     cell.for_each(|k, v| {
-                        if let Value::Int(n) = v {
-                            pairs.push((k.to_string(), *n));
+                        if let Some(n) = v.as_int() {
+                            pairs.push((k.to_string(), n));
                         }
                     });
                     pairs
@@ -1658,8 +1658,8 @@ mod object_storage_property {
         let s_x = reg.add_key(EMPTY_SHAPE, "x").unwrap();
         let s_xy = reg.add_key(s_x, "y").unwrap();
         let cell = ObjectCell::new_slab(reg.keys_of(EMPTY_SHAPE), vec![], EMPTY_SHAPE);
-        cell.slab_append(s_x, reg.keys_of(s_x), Value::Int(1));
-        cell.slab_append(s_xy, reg.keys_of(s_xy), Value::Int(2));
+        cell.slab_append(s_x, reg.keys_of(s_x), Value::int(1));
+        cell.slab_append(s_xy, reg.keys_of(s_xy), Value::int(2));
 
         // Model: x=1, y=2
         let mut model: IndexMap<String, i64> = IndexMap::new();
@@ -1669,8 +1669,8 @@ mod object_storage_property {
         let got: Vec<(String, i64)> = {
             let mut pairs = vec![];
             cell.for_each(|k, v| {
-                if let Value::Int(n) = v {
-                    pairs.push((k.to_string(), *n));
+                if let Some(n) = v.as_int() {
+                    pairs.push((k.to_string(), n));
                 }
             });
             pairs

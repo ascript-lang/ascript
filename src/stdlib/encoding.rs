@@ -4,7 +4,7 @@ use super::{arg, bi, want_bytes, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use base64::Engine;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,14 +23,14 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// Accept bytes OR a string (encoded as UTF-8) as a source of raw bytes.
 fn source_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
-    match v {
-        Value::Bytes(b) => Ok(b.borrow().clone()),
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
+    match v.kind() {
+        ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
         _ => Err(AsError::at(
             format!(
                 "{} expects bytes or a string, got {}",
@@ -48,31 +48,31 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "base64Encode" => {
             let src = source_bytes(&arg(args, 0), span, &ctx("base64Encode"))?;
-            Ok(Value::Str(
-                base64::engine::general_purpose::STANDARD.encode(src).into(),
+            Ok(Value::str(
+                base64::engine::general_purpose::STANDARD.encode(src),
             ))
         }
         "base64Decode" => {
             let s = want_string(&arg(args, 0), span, &ctx("base64Decode"))?;
             match base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
-                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::Nil)),
+                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid base64: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid base64: {}", e))),
                 )),
             }
         }
         "hexEncode" => {
             let src = source_bytes(&arg(args, 0), span, &ctx("hexEncode"))?;
-            Ok(Value::Str(hex::encode(src).into()))
+            Ok(Value::str(hex::encode(src)))
         }
         "hexDecode" => {
             let s = want_string(&arg(args, 0), span, &ctx("hexDecode"))?;
             match hex::decode(s.as_ref()) {
-                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::Nil)),
+                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid hex: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid hex: {}", e))),
                 )),
             }
         }
@@ -81,18 +81,18 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let encoded =
                 percent_encoding::utf8_percent_encode(&s, percent_encoding::NON_ALPHANUMERIC)
                     .to_string();
-            Ok(Value::Str(encoded.into()))
+            Ok(Value::str(encoded))
         }
         "urlDecode" => {
             let s = want_string(&arg(args, 0), span, &ctx("urlDecode"))?;
             match percent_encoding::percent_decode_str(&s).decode_utf8() {
                 Ok(decoded) => Ok(make_pair(
-                    Value::Str(decoded.into_owned().into()),
-                    Value::Nil,
+                    Value::str(decoded.into_owned()),
+                    Value::nil(),
                 )),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid url encoding: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid url encoding: {}", e))),
                 )),
             }
         }
@@ -104,10 +104,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let b = want_bytes(&arg(args, 0), span, &ctx("utf8Decode"))?;
             let raw = b.borrow().clone();
             match String::from_utf8(raw) {
-                Ok(s) => Ok(make_pair(Value::Str(s.into()), Value::Nil)),
+                Ok(s) => Ok(make_pair(Value::str(s), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid utf-8: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid utf-8: {}", e))),
                 )),
             }
         }
@@ -122,7 +122,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     #[test]

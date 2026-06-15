@@ -55,7 +55,7 @@ use crate::coro::GeneratorHandle;
 use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, Value};
+use crate::value::{NativeKind, Value, ValueKind};
 use async_recursion::async_recursion;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -72,7 +72,7 @@ pub enum StreamSource {
         /// NUM §4: emit `Int` elements when both bounds and the step are `Int`.
         is_int: bool,
     },
-    /// A script generator (`Value::Generator`), pulled via `resume(nil)`.
+    /// A script generator (`Value::generator`), pulled via `resume(nil)`.
     Generator(Rc<GeneratorHandle>),
 }
 
@@ -101,7 +101,7 @@ pub enum Stage {
     Zip { other_id: u64 },
 }
 
-/// The resource behind a `Value::Native(stream)` handle: a source + an ordered chain
+/// The resource behind a `Value::native(stream)` handle: a source + an ordered chain
 /// of stages. Mutated in place (cursor / stage counters / flatMap buffer) as it is
 /// pulled, so a stream is single-consumption.
 pub struct StreamState {
@@ -181,8 +181,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// Require that `v` is a stream handle, returning its resource id; Tier-2 panic
 /// otherwise (argument-type misuse, spec §11.3).
 fn require_stream_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
-    match v {
-        Value::Native(obj) if obj.kind == NativeKind::Stream => Ok(obj.id),
+    match v.kind() {
+        ValueKind::Native(obj) if obj.kind == NativeKind::Stream => Ok(obj.id),
         _ => Err(AsError::at(
             format!(
                 "{} expects a stream, got {}",
@@ -200,17 +200,17 @@ fn require_stream_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
 /// clean "value is not callable" if it isn't — but rejecting obvious non-callables
 /// early gives a better message naming the stream op.
 fn require_callable(v: &Value, span: Span, ctx: &str) -> Result<Value, Control> {
-    match v {
-        // `Value::Closure` is the VM's compiled-function value — equally callable
+    match v.kind() {
+        // `Value::closure` is the VM's compiled-function value — equally callable
         // via `call_value` (the V4-T5 bridge). The tree-walker never produces a
         // Closure, so this arm is inert there; it only matters for VM programs.
-        Value::Function(_)
-        | Value::Closure(_)
-        | Value::Builtin(_)
-        | Value::BoundMethod(_)
-        | Value::NativeMethod(_)
-        | Value::Class(_)
-        | Value::ClassMethod(_) => Ok(v.clone()),
+        ValueKind::Function(_)
+        | ValueKind::Closure(_)
+        | ValueKind::Builtin(_)
+        | ValueKind::BoundMethod(_)
+        | ValueKind::NativeMethod(_)
+        | ValueKind::Class(_)
+        | ValueKind::ClassMethod(_) => Ok(v.clone()),
         _ => Err(AsError::at(
             format!(
                 "{} expects a function, got {}",
@@ -272,17 +272,18 @@ impl Interp {
 
     /// `stream.from(x)` — array (index-pull) or generator (resume-pull) source.
     fn stream_from(&self, args: &[Value], span: Span) -> Result<Value, Control> {
-        let source = match arg(args, 0) {
-            Value::Array(a) => StreamSource::Array {
+        let arg0 = arg(args, 0);
+        let source = match arg0.kind() {
+            ValueKind::Array(a) => StreamSource::Array {
                 items: a.borrow().clone(),
                 cursor: 0,
             },
-            Value::Generator(g) => StreamSource::Generator(g),
-            other => {
+            ValueKind::Generator(g) => StreamSource::Generator(g.clone()),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "stream.from expects an array or generator, got {}",
-                        crate::interp::type_name(&other)
+                        crate::interp::type_name(&arg0)
                     ),
                     span,
                 )
@@ -307,9 +308,12 @@ impl Interp {
         let start = want_number(&start_v, span, "stream.range start")?;
         let end = want_number(&end_v, span, "stream.range end")?;
         let step_arg = arg(args, 2);
-        let (step_opt, step_int) = match &step_arg {
-            Value::Nil => (None, true),
-            v => (Some(want_number(v, span, "stream.range step")?), v.is_int_value()),
+        let (step_opt, step_int) = match step_arg.kind() {
+            ValueKind::Nil => (None, true),
+            _ => (
+                Some(want_number(&step_arg, span, "stream.range step")?),
+                step_arg.is_int_value(),
+            ),
         };
         let step = crate::interp::resolve_step(start, end, step_opt, span)?;
         // NUM §4: int bounds + int step → an Int sequence; a float anywhere → float.
@@ -548,7 +552,7 @@ impl Interp {
             StreamSource::Generator(g) => {
                 // resume is async; the state is owned on the stack, no borrow held.
                 let g = g.clone();
-                match g.resume(Value::Nil).await? {
+                match g.resume(Value::nil()).await? {
                     Some(v) => Ok(Some(v)),
                     None => Ok(None),
                 }
@@ -612,13 +616,13 @@ impl Interp {
                     let func = func.clone();
                     let mut cb = self.callback_driver(func, span);
                     let out = cb.call1(value.clone()).await?;
-                    let items = match out {
-                        Value::Array(a) => a.borrow().clone(),
-                        other => {
+                    let items = match out.kind() {
+                        ValueKind::Array(a) => a.borrow().clone(),
+                        _ => {
                             return Err(AsError::at(
                                 format!(
                                     "stream.flatMap callback must return an array, got {}",
-                                    crate::interp::type_name(&other)
+                                    crate::interp::type_name(&out)
                                 ),
                                 span,
                             )
@@ -637,10 +641,7 @@ impl Interp {
                 Stage::Enumerate { index } => {
                     let idx = *index;
                     *index += 1;
-                    value = Value::Array(crate::value::ArrayCell::new(vec![
-                        Value::Int(idx),
-                        value,
-                    ]));
+                    value = Value::array(vec![Value::int(idx), value]);
                 }
                 Stage::Zip { other_id } => {
                     let other_id = *other_id;
@@ -648,9 +649,7 @@ impl Interp {
                     // zipped stream ends too (the already-pulled `value` is dropped).
                     match self.pull_next(other_id, span).await? {
                         Some(partner) => {
-                            value = Value::Array(crate::value::ArrayCell::new(vec![
-                                value, partner,
-                            ]));
+                            value = Value::array(vec![value, partner]);
                         }
                         None => return Ok(StageOutcome::End),
                     }
@@ -670,9 +669,7 @@ impl Interp {
         while let Some(v) = self.pull_next(id, span).await? {
             out.push(v);
         }
-        Ok(Value::Array(crate::value::ArrayCell::new(
-            out,
-        )))
+        Ok(Value::array(out))
     }
 
     /// `stream.forEach(s, fn)` — pull every item and call `fn(value)` for its effect.
@@ -686,7 +683,7 @@ impl Interp {
         while let Some(v) = self.pull_next(id, span).await? {
             cb.call1(v).await?;
         }
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }
 
     /// `stream.reduce(s, fn, init)` — fold with `fn(acc, value) -> acc`.
@@ -712,7 +709,7 @@ impl Interp {
         while self.pull_next(id, span).await?.is_some() {
             n += 1;
         }
-        Ok(Value::Int(n))
+        Ok(Value::int(n))
     }
 
     /// `stream.find(s, fn)` — first item where `fn(value)` is truthy, else `nil`.
@@ -731,14 +728,14 @@ impl Interp {
                 return Ok(v);
             }
         }
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }
 
     /// `stream.first(s)` — the first produced item, or `nil` if empty.
     /// Short-circuits: pulls exactly one item.
     async fn stream_first(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.first")?;
-        Ok(self.pull_next(id, span).await?.unwrap_or(Value::Nil))
+        Ok(self.pull_next(id, span).await?.unwrap_or(Value::nil()))
     }
 }
 

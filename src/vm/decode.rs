@@ -680,7 +680,7 @@ mod tests {
         // Build a chunk exercising every operand SHAPE (spec §2.1): zero-op, u8,
         // u16, i16 jump, u16+u8, u16+i16.
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Float(1.0));
+        let k = c.add_const(Value::float(1.0));
         c.emit_u16(Op::Const, k, s(0, 1)); // u16
         c.emit_u8(Op::Call, 2, s(1, 2)); // u8
         c.emit_u16_u8(Op::DefineGlobal, 3, 1, s(2, 3)); // u16+u8
@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn peephole_fuses_a_simple_pair() {
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str("field".into()));
+        let name = c.add_const(Value::str("field"));
         c.emit_u16(Op::GetLocal, 3, s(0, 1)); // rec 0
         c.emit_u16(Op::GetProp, name, s(1, 2)); // rec 1 (swallowed)
         c.emit(Op::Return, s(2, 3)); // rec 2 → record 1 after fusion
@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn peephole_prefers_the_triple_over_the_pair() {
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str("v".into()));
+        let name = c.add_const(Value::str("v"));
         c.emit_u16(Op::GetLocal, 1, s(0, 1));
         c.emit_u16(Op::GetProp, name, s(1, 2));
         c.emit(Op::Add, s(2, 3));
@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn peephole_never_fuses_across_an_entry_point() {
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str("f".into()));
+        let name = c.add_const(Value::str("f"));
         // Layout (byte offsets):
         //   0: GetLocal 0        (3 bytes) — would be the pair HEAD
         //   3: GetProp name      (3 bytes) — the loop back-edge TARGET
@@ -1010,7 +1010,7 @@ mod tests {
     #[test]
     fn peephole_fuses_when_the_jump_target_is_the_fused_head() {
         let mut c = Chunk::new();
-        let name = c.add_const(Value::Str("f".into()));
+        let name = c.add_const(Value::str("f"));
         //   0: Nil               (1)
         //   1: GetProp name      (3) — back-edge TARGET, but the fused HEAD
         //   4: Add               (1)

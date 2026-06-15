@@ -21,7 +21,7 @@ use super::{arg, bi};
 use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{MapKey, NativeKind, NativeMethod, Value};
+use crate::value::{MapKey, NativeKind, NativeMethod, Value, ValueKind};
 use indexmap::IndexMap;
 use std::rc::Rc;
 
@@ -67,20 +67,21 @@ impl Interp {
     ) -> Result<Value, Control> {
         match func {
             "new" => {
-                let cap = match arg(args, 0) {
+                let v = arg(args, 0);
+                let cap = match v.kind() {
                     // NUM §4: accept BOTH numeric subtypes for the capacity.
-                    ref v if v.as_f64().is_some_and(|n| n.is_finite() && n >= 1.0) => {
+                    _ if v.as_f64().is_some_and(|n| n.is_finite() && n >= 1.0) => {
                         v.as_f64().unwrap_or(0.0) as usize
                     }
-                    Value::Nil => {
+                    ValueKind::Nil => {
                         return Err(AsError::at("lru.new requires a capacity (number >= 1)", span)
                             .into())
                     }
-                    other => {
+                    _ => {
                         return Err(AsError::at(
                             format!(
                                 "lru.new capacity must be a number >= 1, got {}",
-                                crate::interp::type_name(&other)
+                                crate::interp::type_name(&v)
                             ),
                             span,
                         )
@@ -111,18 +112,18 @@ impl Interp {
             "get" => {
                 let key = match MapKey::from_value(&arg(args, 0)) {
                     Some(k) => k,
-                    None => return Ok(Value::Nil),
+                    None => return Ok(Value::nil()),
                 };
                 Ok(self.with_resource_mut(id, |r| match r {
                     Some(ResourceState::Lru(s)) => {
                         if s.map.contains_key(&key) {
                             s.touch(&key);
-                            s.map.get(&key).cloned().unwrap_or(Value::Nil)
+                            s.map.get(&key).cloned().unwrap_or(Value::nil())
                         } else {
-                            Value::Nil
+                            Value::nil()
                         }
                     }
-                    _ => Value::Nil,
+                    _ => Value::nil(),
                 }))
             }
             "set" => {
@@ -155,14 +156,14 @@ impl Interp {
                         }
                     }
                 });
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "has" => {
                 let key = match MapKey::from_value(&arg(args, 0)) {
                     Some(k) => k,
-                    None => return Ok(Value::Bool(false)),
+                    None => return Ok(Value::bool_(false)),
                 };
-                Ok(Value::Bool(self.with_resource(id, |r| match r {
+                Ok(Value::bool_(self.with_resource(id, |r| match r {
                     Some(ResourceState::Lru(s)) => s.map.contains_key(&key),
                     _ => false,
                 })))
@@ -170,9 +171,9 @@ impl Interp {
             "delete" => {
                 let key = match MapKey::from_value(&arg(args, 0)) {
                     Some(k) => k,
-                    None => return Ok(Value::Bool(false)),
+                    None => return Ok(Value::bool_(false)),
                 };
-                Ok(Value::Bool(self.with_resource_mut(id, |r| match r {
+                Ok(Value::bool_(self.with_resource_mut(id, |r| match r {
                     Some(ResourceState::Lru(s)) => s.map.shift_remove(&key).is_some(),
                     _ => false,
                 })))
@@ -183,10 +184,10 @@ impl Interp {
                         s.map.clear();
                     }
                 });
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // NUM §4: a count is an `Int`.
-            "len" => Ok(Value::Int(self.with_resource(id, |r| match r {
+            "len" => Ok(Value::int(self.with_resource(id, |r| match r {
                 Some(ResourceState::Lru(s)) => s.map.len() as i64,
                 _ => 0,
             }))),
@@ -197,7 +198,7 @@ impl Interp {
                     }
                     _ => Vec::new(),
                 });
-                Ok(Value::Array(crate::value::ArrayCell::new(keys)))
+                Ok(Value::array(keys))
             }
             other => Err(AsError::at(format!("lru cache has no method '{}'", other), span).into()),
         }

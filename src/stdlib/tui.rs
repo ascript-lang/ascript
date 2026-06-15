@@ -3,7 +3,7 @@
 //! cursor / styling; the screen `Buffer` (a `width × height` grid of `Cell`s) is
 //! hand-rolled so it bridges cleanly to AScript's value model.
 //!
-//! Task 1 (this file's first slice) lands the `Terminal` `Value::Native` handle
+//! Task 1 (this file's first slice) lands the `Terminal` `Value::native` handle
 //! plus the screen `Buffer`/`Cell` types and the terminal lifecycle methods
 //! (size / clear / raw / alt screen / cursor / restore). The buffer, the size
 //! query, and the close lifecycle are unit-testable WITHOUT a real tty (`size()`
@@ -26,7 +26,7 @@ use super::bi;
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use std::io::Write as _;
 use std::rc::Rc;
 
@@ -311,7 +311,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn use_after_close(span: Span) -> Control {
@@ -343,7 +343,7 @@ impl Interp {
             indexmap::IndexMap::new(),
             ResourceState::Terminal(Box::new(state)),
         );
-        Ok(make_pair(handle, Value::Nil))
+        Ok(make_pair(handle, Value::nil()))
     }
 
     /// `buffer(width, height) -> term`. An OFF-SCREEN, explicit-size variant of
@@ -408,7 +408,7 @@ impl Interp {
                     }
                     match last_err {
                         Some(msg) => Ok(err_pair(msg)),
-                        None => Ok(make_pair(Value::Nil, Value::Nil)),
+                        None => Ok(make_pair(Value::nil(), Value::nil())),
                     }
                 }
                 _ => Err(use_after_close(span)),
@@ -425,33 +425,33 @@ impl Interp {
                 let state = self.terminal_mut(id).expect("checked present");
                 let mut map = indexmap::IndexMap::new();
                 // NUM §4: terminal dimensions are integral → `Int`.
-                map.insert("width".to_string(), Value::Int(state.back.width as i64));
-                map.insert("height".to_string(), Value::Int(state.back.height as i64));
-                Ok(Value::Object(crate::value::ObjectCell::new(map)))
+                map.insert("width".to_string(), Value::int(state.back.width as i64));
+                map.insert("height".to_string(), Value::int(state.back.height as i64));
+                Ok(Value::object_cell(crate::value::ObjectCell::new(map)))
             }
             "clear" => {
                 let mut state = self.terminal_mut(id).expect("checked present");
                 state.back.clear();
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "moveCursor" => {
                 let x = want_u16(&super::arg(&args, 0), span, "terminal.moveCursor x")?;
                 let y = want_u16(&super::arg(&args, 1), span, "terminal.moveCursor y")?;
                 let mut state = self.terminal_mut(id).expect("checked present");
                 state.cursor = (x, y);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "enterRaw" => match crossterm::terminal::enable_raw_mode() {
                 Ok(()) => {
                     self.terminal_mut(id).expect("checked present").raw = true;
-                    Ok(make_pair(Value::Nil, Value::Nil))
+                    Ok(make_pair(Value::nil(), Value::nil()))
                 }
                 Err(e) => Ok(err_pair(format!("terminal.enterRaw failed: {}", e))),
             },
             "leaveRaw" => match crossterm::terminal::disable_raw_mode() {
                 Ok(()) => {
                     self.terminal_mut(id).expect("checked present").raw = false;
-                    Ok(make_pair(Value::Nil, Value::Nil))
+                    Ok(make_pair(Value::nil(), Value::nil()))
                 }
                 Err(e) => Ok(err_pair(format!("terminal.leaveRaw failed: {}", e))),
             },
@@ -462,7 +462,7 @@ impl Interp {
                 ) {
                     Ok(()) => {
                         self.terminal_mut(id).expect("checked present").alt = true;
-                        Ok(make_pair(Value::Nil, Value::Nil))
+                        Ok(make_pair(Value::nil(), Value::nil()))
                     }
                     Err(e) => Ok(err_pair(format!("terminal.enterAltScreen failed: {}", e))),
                 }
@@ -474,7 +474,7 @@ impl Interp {
                 ) {
                     Ok(()) => {
                         self.terminal_mut(id).expect("checked present").alt = false;
-                        Ok(make_pair(Value::Nil, Value::Nil))
+                        Ok(make_pair(Value::nil(), Value::nil()))
                     }
                     Err(e) => Ok(err_pair(format!("terminal.leaveAltScreen failed: {}", e))),
                 }
@@ -489,7 +489,7 @@ impl Interp {
                 };
                 let _ = out.flush();
                 match res {
-                    Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                    Ok(()) => Ok(make_pair(Value::nil(), Value::nil())),
                     Err(e) => Ok(err_pair(format!("terminal.showCursor failed: {}", e))),
                 }
             }
@@ -504,7 +504,7 @@ impl Interp {
                         .back
                         .set_cell(x, y, ch, style);
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "text" => {
                 let x = want_u16(&super::arg(&args, 0), span, "terminal.text x")?;
@@ -515,15 +515,16 @@ impl Interp {
                     .expect("checked present")
                     .back
                     .text(x, y, &s, style);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "hline" => {
                 let x = want_u16(&super::arg(&args, 0), span, "terminal.hline x")?;
                 let y = want_u16(&super::arg(&args, 1), span, "terminal.hline y")?;
                 let len = want_u16(&super::arg(&args, 2), span, "terminal.hline len")?;
-                let ch = match &super::arg(&args, 3) {
-                    Value::Nil => Some('─'),
-                    other => want_char(other, span, "terminal.hline char")?,
+                let arg3 = super::arg(&args, 3);
+                let ch = match arg3.kind() {
+                    ValueKind::Nil => Some('─'),
+                    _ => want_char(&arg3, span, "terminal.hline char")?,
                 };
                 let style = parse_style(&super::arg(&args, 4), span)?;
                 if let Some(ch) = ch {
@@ -532,15 +533,16 @@ impl Interp {
                         .back
                         .hline(x, y, len, ch, style);
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "vline" => {
                 let x = want_u16(&super::arg(&args, 0), span, "terminal.vline x")?;
                 let y = want_u16(&super::arg(&args, 1), span, "terminal.vline y")?;
                 let len = want_u16(&super::arg(&args, 2), span, "terminal.vline len")?;
-                let ch = match &super::arg(&args, 3) {
-                    Value::Nil => Some('│'),
-                    other => want_char(other, span, "terminal.vline char")?,
+                let arg3 = super::arg(&args, 3);
+                let ch = match arg3.kind() {
+                    ValueKind::Nil => Some('│'),
+                    _ => want_char(&arg3, span, "terminal.vline char")?,
                 };
                 let style = parse_style(&super::arg(&args, 4), span)?;
                 if let Some(ch) = ch {
@@ -549,7 +551,7 @@ impl Interp {
                         .back
                         .vline(x, y, len, ch, style);
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "box" => {
                 let x = want_u16(&super::arg(&args, 0), span, "terminal.box x")?;
@@ -561,7 +563,7 @@ impl Interp {
                     .expect("checked present")
                     .back
                     .draw_box(x, y, w, h, style);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "fill" => {
                 let x = want_u16(&super::arg(&args, 0), span, "terminal.fill x")?;
@@ -576,7 +578,7 @@ impl Interp {
                         .back
                         .fill(x, y, w, h, ch, style);
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "flush" => {
                 // Scope each `terminal_mut` (a RefMut guard) so it drops before the
@@ -594,14 +596,15 @@ impl Interp {
                     state.flushed = state.back.clone();
                 }
                 match res {
-                    Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                    Ok(()) => Ok(make_pair(Value::nil(), Value::nil())),
                     Err(e) => Ok(err_pair(format!("terminal.flush failed: {}", e))),
                 }
             }
             "pollEvent" => {
-                let ms = match &super::arg(&args, 0) {
-                    Value::Nil => 0,
-                    other => want_u16(other, span, "terminal.pollEvent timeoutMs")? as u64,
+                let arg0 = super::arg(&args, 0);
+                let ms = match arg0.kind() {
+                    ValueKind::Nil => 0,
+                    _ => want_u16(&arg0, span, "terminal.pollEvent timeoutMs")? as u64,
                 };
                 // Poll → read → skip non-surfacing events (key Release) → re-poll for
                 // the next one with a small budget. We bound the loop so a flood of
@@ -615,7 +618,7 @@ impl Interp {
                             Ok(ev) => {
                                 if surfaces(&ev) {
                                     self.apply_event_resize(id, &ev);
-                                    break Ok(make_pair(event_to_value(ev), Value::Nil));
+                                    break Ok(make_pair(event_to_value(ev), Value::nil()));
                                 }
                                 // Skipped (e.g. a key Release). Look for the next event
                                 // within the leftover budget; on a timed poll we drop to
@@ -629,7 +632,7 @@ impl Interp {
                                 )))
                             }
                         },
-                        Ok(false) => break Ok(make_pair(Value::Nil, Value::Nil)),
+                        Ok(false) => break Ok(make_pair(Value::nil(), Value::nil())),
                         Err(e) => break Ok(err_pair(format!("terminal.pollEvent failed: {}", e))),
                     }
                 }
@@ -642,7 +645,7 @@ impl Interp {
                         Ok(ev) => {
                             if surfaces(&ev) {
                                 self.apply_event_resize(id, &ev);
-                                break Ok(make_pair(event_to_value(ev), Value::Nil));
+                                break Ok(make_pair(event_to_value(ev), Value::nil()));
                             }
                         }
                         Err(e) => break Ok(err_pair(format!("terminal.readEvent failed: {}", e))),
@@ -651,12 +654,12 @@ impl Interp {
             }
             "dump" => {
                 let state = self.terminal_mut(id).expect("checked present");
-                Ok(Value::Str(state.back.dump().into()))
+                Ok(Value::str(state.back.dump()))
             }
             "dumpRow" => {
                 let y = want_u16(&super::arg(&args, 0), span, "terminal.dumpRow y")?;
                 let state = self.terminal_mut(id).expect("checked present");
-                Ok(Value::Str(state.back.dump_row(y).into()))
+                Ok(Value::str(state.back.dump_row(y)))
             }
             other => Err(AsError::at(format!("terminal has no method '{}'", other), span).into()),
         }
@@ -776,8 +779,8 @@ fn named_color(name: &str) -> Option<Color> {
 /// Parse one color field (`fg`/`bg`): a name string → `Named`, a `[r,g,b]` array
 /// (each 0-255) → `Rgb`, a number 0-255 → `Indexed`. Malformed → Tier-2 panic.
 fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
-    match v {
-        Value::Str(s) => named_color(s).ok_or_else(|| {
+    match v.kind() {
+        ValueKind::Str(s) => named_color(s).ok_or_else(|| {
             AsError::at(
                 format!("terminal style: unknown color name '{}' for '{}'", s, field),
                 span,
@@ -786,7 +789,7 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
         }),
         // NUM §4: a color index may be an `Int` or `Float`; both must be an integer
         // in 0..=255.
-        Value::Int(_) | Value::Float(_) => {
+        ValueKind::Int(_) | ValueKind::Float(_) => {
             let n = v.as_f64().unwrap_or(f64::NAN);
             if n < 0.0 || n.fract() != 0.0 || n > 255.0 {
                 return Err(AsError::at(
@@ -800,7 +803,7 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
             }
             Ok(Color::Indexed(n as u8))
         }
-        Value::Array(a) => {
+        ValueKind::Array(a) => {
             let a = a.borrow();
             if a.len() != 3 {
                 return Err(AsError::at(
@@ -837,11 +840,11 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
             }
             Ok(Color::Rgb(parts[0], parts[1], parts[2]))
         }
-        other => Err(AsError::at(
+        _ => Err(AsError::at(
             format!(
                 "terminal style: '{}' must be a color name, index 0..=255, or [r,g,b], got {}",
                 field,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -857,17 +860,20 @@ fn parse_flag(
     span: Span,
 ) -> Result<bool, Control> {
     match map.get(key) {
-        None | Some(Value::Nil) => Ok(false),
-        Some(Value::Bool(b)) => Ok(b),
-        Some(other) => Err(AsError::at(
-            format!(
-                "terminal style: '{}' must be a boolean, got {}",
-                key,
-                crate::interp::type_name(&other)
-            ),
-            span,
-        )
-        .into()),
+        None => Ok(false),
+        Some(v) => match v.kind() {
+            ValueKind::Nil => Ok(false),
+            ValueKind::Bool(b) => Ok(b),
+            _ => Err(AsError::at(
+                format!(
+                    "terminal style: '{}' must be a boolean, got {}",
+                    key,
+                    crate::interp::type_name(&v)
+                ),
+                span,
+            )
+            .into()),
+        },
     }
 }
 
@@ -876,24 +882,24 @@ fn parse_flag(
 /// (Reset color / no attribute). Any malformed field → Tier-2 panic (spec §11.3).
 pub fn parse_style(v: &Value, span: Span) -> Result<Style, Control> {
     let mut style = Style::default();
-    let map = match v {
-        Value::Nil => return Ok(style),
-        Value::Object(o) => o.clone(),
-        other => {
+    let map = match v.kind() {
+        ValueKind::Nil => return Ok(style),
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "terminal style must be an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(v)
                 ),
                 span,
             )
             .into())
         }
     };
-    if let Some(fg) = map.get("fg").filter(|v| !matches!(v, Value::Nil)) {
+    if let Some(fg) = map.get("fg").filter(|v| !matches!(v.kind(), ValueKind::Nil)) {
         style.fg = parse_color(&fg, span, "fg")?;
     }
-    if let Some(bg) = map.get("bg").filter(|v| !matches!(v, Value::Nil)) {
+    if let Some(bg) = map.get("bg").filter(|v| !matches!(v.kind(), ValueKind::Nil)) {
         style.bg = parse_color(&bg, span, "bg")?;
     }
     style.attrs.bold = parse_flag(&map, "bold", span)?;
@@ -913,8 +919,8 @@ fn want_char(v: &Value, span: Span, ctx: &str) -> Result<Option<char>, Control> 
 
 /// A boolean argument (Tier-2 on misuse).
 fn want_bool(v: &Value, span: Span, ctx: &str) -> Result<bool, Control> {
-    match v {
-        Value::Bool(b) => Ok(*b),
+    match v.kind() {
+        ValueKind::Bool(b) => Ok(b),
         _ => Err(AsError::at(
             format!(
                 "{} expects a boolean, got {}",
@@ -933,7 +939,7 @@ fn make_object(pairs: Vec<(&str, Value)>) -> Value {
     for (k, v) in pairs {
         m.insert(k.to_string(), v);
     }
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object_cell(crate::value::ObjectCell::new(m))
 }
 
 /// A readable name for a crossterm `KeyCode`. `Char(c)` becomes the single-char
@@ -1002,11 +1008,11 @@ pub fn event_to_value(ev: crossterm::event::Event) -> Value {
         Event::Key(k) => {
             let m = k.modifiers;
             make_object(vec![
-                ("type", Value::Str("key".into())),
-                ("key", Value::Str(key_code_name(k.code).into())),
-                ("ctrl", Value::Bool(m.contains(KeyModifiers::CONTROL))),
-                ("alt", Value::Bool(m.contains(KeyModifiers::ALT))),
-                ("shift", Value::Bool(m.contains(KeyModifiers::SHIFT))),
+                ("type", Value::str("key")),
+                ("key", Value::str(key_code_name(k.code))),
+                ("ctrl", Value::bool_(m.contains(KeyModifiers::CONTROL))),
+                ("alt", Value::bool_(m.contains(KeyModifiers::ALT))),
+                ("shift", Value::bool_(m.contains(KeyModifiers::SHIFT))),
             ])
         }
         Event::Mouse(me) => {
@@ -1021,37 +1027,37 @@ pub fn event_to_value(ev: crossterm::event::Event) -> Value {
                 MouseEventKind::ScrollRight => ("scrollRight", None),
             };
             let button = match button {
-                Some(MouseButton::Left) => Value::Str("left".into()),
-                Some(MouseButton::Right) => Value::Str("right".into()),
-                Some(MouseButton::Middle) => Value::Str("middle".into()),
-                None => Value::Nil,
+                Some(MouseButton::Left) => Value::str("left"),
+                Some(MouseButton::Right) => Value::str("right"),
+                Some(MouseButton::Middle) => Value::str("middle"),
+                None => Value::nil(),
             };
             // NUM §4: mouse cell coordinates are integral → `Int`.
             make_object(vec![
-                ("type", Value::Str("mouse".into())),
-                ("x", Value::Int(me.column as i64)),
-                ("y", Value::Int(me.row as i64)),
-                ("kind", Value::Str(kind.into())),
+                ("type", Value::str("mouse")),
+                ("x", Value::int(me.column as i64)),
+                ("y", Value::int(me.row as i64)),
+                ("kind", Value::str(kind)),
                 ("button", button),
             ])
         }
         Event::Resize(w, h) => make_object(vec![
-            ("type", Value::Str("resize".into())),
+            ("type", Value::str("resize")),
             // NUM §4: terminal dimensions are integral → `Int`.
-            ("width", Value::Int(w as i64)),
-            ("height", Value::Int(h as i64)),
+            ("width", Value::int(w as i64)),
+            ("height", Value::int(h as i64)),
         ]),
         Event::FocusGained => make_object(vec![
-            ("type", Value::Str("focus".into())),
-            ("focused", Value::Bool(true)),
+            ("type", Value::str("focus")),
+            ("focused", Value::bool_(true)),
         ]),
         Event::FocusLost => make_object(vec![
-            ("type", Value::Str("focus".into())),
-            ("focused", Value::Bool(false)),
+            ("type", Value::str("focus")),
+            ("focused", Value::bool_(false)),
         ]),
         Event::Paste(text) => make_object(vec![
-            ("type", Value::Str("paste".into())),
-            ("text", Value::Str(text.into())),
+            ("type", Value::str("paste")),
+            ("text", Value::str(text)),
         ]),
     }
 }
@@ -1068,12 +1074,12 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
-        Value::Object(crate::value::ObjectCell::new(m))
+        Value::object_cell(crate::value::ObjectCell::new(m))
     }
 
     fn arr(items: Vec<f64>) -> Value {
-        Value::Array(crate::value::ArrayCell::new(
-            items.into_iter().map(Value::Float).collect(),
+        Value::array_cell(crate::value::ArrayCell::new(
+            items.into_iter().map(Value::float).collect(),
         ))
     }
 
@@ -1091,15 +1097,15 @@ mod tests {
 
     #[test]
     fn parse_style_nil_is_default() {
-        let s = parse_style(&Value::Nil, Span::new(0, 0)).unwrap();
+        let s = parse_style(&Value::nil(), Span::new(0, 0)).unwrap();
         assert_eq!(s, Style::default());
     }
 
     #[test]
     fn parse_style_named_color_and_flags() {
         let v = obj(vec![
-            ("fg", Value::Str("red".into())),
-            ("bold", Value::Bool(true)),
+            ("fg", Value::str("red")),
+            ("bold", Value::bool_(true)),
         ]);
         let s = parse_style(&v, Span::new(0, 0)).unwrap();
         assert_eq!(s.fg, Color::Named(Ct::DarkRed));
@@ -1110,7 +1116,7 @@ mod tests {
 
     #[test]
     fn parse_style_bright_color() {
-        let v = obj(vec![("fg", Value::Str("brightred".into()))]);
+        let v = obj(vec![("fg", Value::str("brightred"))]);
         let s = parse_style(&v, Span::new(0, 0)).unwrap();
         assert_eq!(s.fg, Color::Named(Ct::Red));
     }
@@ -1124,14 +1130,14 @@ mod tests {
 
     #[test]
     fn parse_style_indexed_number() {
-        let v = obj(vec![("bg", Value::Float(200.0))]);
+        let v = obj(vec![("bg", Value::float(200.0))]);
         let s = parse_style(&v, Span::new(0, 0)).unwrap();
         assert_eq!(s.bg, Color::Indexed(200));
     }
 
     #[test]
     fn parse_style_unknown_color_panics() {
-        let v = obj(vec![("fg", Value::Str("banana".into()))]);
+        let v = obj(vec![("fg", Value::str("banana"))]);
         assert!(parse_style(&v, Span::new(0, 0)).is_err());
     }
 
@@ -1149,7 +1155,7 @@ mod tests {
 
     #[test]
     fn parse_style_non_bool_flag_panics() {
-        let v = obj(vec![("bold", Value::Str("yes".into()))]);
+        let v = obj(vec![("bold", Value::str("yes"))]);
         assert!(parse_style(&v, Span::new(0, 0)).is_err());
     }
 
@@ -1492,25 +1498,31 @@ print("[" + term.dumpRow(0) + "]")
 
     /// Read a string field from an event object Value.
     fn field_str(v: &Value, key: &str) -> String {
-        let Value::Object(o) = v else {
+        let ValueKind::Object(o) = v.kind() else {
             panic!("not an object: {:?}", v)
         };
         match o.get(key) {
-            Some(Value::Str(s)) => s.to_string(),
-            other => panic!("field {} not a string: {:?}", key, other),
+            Some(val) => match val.kind() {
+                ValueKind::Str(s) => s.to_string(),
+                _ => panic!("field {} not a string: {:?}", key, val),
+            },
+            None => panic!("field {} not a string: {:?}", key, None::<Value>),
         }
     }
     fn field_bool(v: &Value, key: &str) -> bool {
-        let Value::Object(o) = v else {
+        let ValueKind::Object(o) = v.kind() else {
             panic!("not an object")
         };
         match o.get(key) {
-            Some(Value::Bool(b)) => b,
-            other => panic!("field {} not a bool: {:?}", key, other),
+            Some(val) => match val.kind() {
+                ValueKind::Bool(b) => b,
+                _ => panic!("field {} not a bool: {:?}", key, val),
+            },
+            None => panic!("field {} not a bool: {:?}", key, None::<Value>),
         }
     }
     fn field_num(v: &Value, key: &str) -> f64 {
-        let Value::Object(o) = v else {
+        let ValueKind::Object(o) = v.kind() else {
             panic!("not an object")
         };
         match o.get(key).map(|v| (v.as_f64(), v)) {
@@ -1519,10 +1531,13 @@ print("[" + term.dumpRow(0) + "]")
         }
     }
     fn field_is_nil(v: &Value, key: &str) -> bool {
-        let Value::Object(o) = v else {
+        let ValueKind::Object(o) = v.kind() else {
             panic!("not an object")
         };
-        matches!(o.get(key), Some(Value::Nil) | None)
+        match o.get(key) {
+            None => true,
+            Some(v) => matches!(v.kind(), ValueKind::Nil),
+        }
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Event {

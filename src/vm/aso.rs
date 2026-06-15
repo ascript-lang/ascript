@@ -42,7 +42,7 @@ use crate::ast::{
 };
 use crate::span::Span;
 use crate::syntax::resolve::types::UpvalueDescriptor;
-use crate::value::{Class, FieldSchema, Value};
+use crate::value::{Class, FieldSchema, Value, ValueKind};
 use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc, InterfaceProto};
 use std::rc::Rc;
 
@@ -104,7 +104,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `Class.is_worker`), written by `write_class` before the field list. Drives
 ///   `ClassName.spawn(args)` actor routing on both engines.
 /// - 19: NUM — the numeric model split `Value::Number(f64)` into the two kinds
-///   `Value::Int(i64)` and `Value::Float(f64)`. The constant pool gained
+///   `Value::int(i64)` and `Value::float(f64)`. The constant pool gained
 ///   `TAG_INT`, the field-default expr stream gained `EX_INT`, and the former
 ///   `TAG_NUMBER`/`EX_NUMBER` tags now carry `Float` (value-identical bytes).
 /// - 20: NUM bitwise/wrapping operators — nine new appended opcodes (`BitAnd`/
@@ -239,14 +239,14 @@ impl std::error::Error for AsoError {}
 
 const TAG_NIL: u8 = 0;
 const TAG_BOOL: u8 = 1;
-/// `Value::Float` (the former `Value::Number`; tag value unchanged so existing
+/// `Value::float` (the former `Value::Number`; tag value unchanged so existing
 /// float constants keep the same wire byte — NUM §8 "the `Float` tag is the
 /// former `Number` tag, value-identical").
 const TAG_NUMBER: u8 = 2;
 const TAG_STR: u8 = 3;
 const TAG_DECIMAL: u8 = 4;
 const TAG_ENUM: u8 = 5;
-/// `Value::Int` (NUM §8): a 64-bit signed integer constant. New tag.
+/// `Value::int` (NUM §8): a 64-bit signed integer constant. New tag.
 const TAG_INT: u8 = 7;
 /// An `Array` whose elements are themselves literal constants. Emitted by the
 /// compiler for the object-rest bound-key list (`let {a, ...rest} = obj` lowers
@@ -617,32 +617,32 @@ impl Chunk {
 /// The serializable "literal kind" name for a constant-pool value, or an error
 /// naming the non-literal variant.
 fn literal_kind(v: &Value) -> Result<&'static str, &'static str> {
-    match v {
-        Value::Nil => Ok("nil"),
-        Value::Bool(_) => Ok("bool"),
-        Value::Int(_) => Ok("int"),
-        Value::Float(_) => Ok("number"),
-        Value::Str(_) => Ok("string"),
-        Value::Decimal(_) => Ok("decimal"),
-        Value::Enum(_) => Ok("enum"),
-        Value::Builtin(_) => Err("builtin"),
-        Value::Function(_) => Err("function"),
-        Value::Closure(_) => Err("closure"),
+    match v.kind() {
+        ValueKind::Nil => Ok("nil"),
+        ValueKind::Bool(_) => Ok("bool"),
+        ValueKind::Int(_) => Ok("int"),
+        ValueKind::Float(_) => Ok("number"),
+        ValueKind::Str(_) => Ok("string"),
+        ValueKind::Decimal(_) => Ok("decimal"),
+        ValueKind::Enum(_) => Ok("enum"),
+        ValueKind::Builtin(_) => Err("builtin"),
+        ValueKind::Function(_) => Err("function"),
+        ValueKind::Closure(_) => Err("closure"),
         // An Array constant is serializable iff every element is itself a literal
         // (the compiler only ever pools the object-rest bound-key list, an array
         // of `Str`s; recurse so a non-literal element is still rejected cleanly).
-        Value::Array(a) => {
+        ValueKind::Array(a) => {
             for e in a.borrow().iter() {
                 literal_kind(e)?;
             }
             Ok("array")
         }
-        Value::Object(_) => Err("object"),
-        Value::Map(_) => Err("map"),
-        Value::Bytes(_) => Err("bytes"),
-        Value::EnumVariant(_) => Err("enum-variant"),
-        Value::Class(_) => Err("class"),
-        Value::Instance(_) => Err("instance"),
+        ValueKind::Object(_) => Err("object"),
+        ValueKind::Map(_) => Err("map"),
+        ValueKind::Bytes(_) => Err("bytes"),
+        ValueKind::EnumVariant(_) => Err("enum-variant"),
+        ValueKind::Class(_) => Err("class"),
+        ValueKind::Instance(_) => Err("instance"),
         _ => Err("non-literal"),
     }
 }
@@ -788,46 +788,46 @@ fn read_chunk(r: &mut Reader, with_debug: bool) -> Result<Chunk, AsoError> {
 // ---- Value (constant pool) ---------------------------------------------------
 
 fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
-    match v {
-        Value::Nil => w.u8(TAG_NIL),
-        Value::Bool(b) => {
+    match v.kind() {
+        ValueKind::Nil => w.u8(TAG_NIL),
+        ValueKind::Bool(b) => {
             w.u8(TAG_BOOL);
-            w.u8(u8::from(*b));
+            w.u8(u8::from(b));
         }
-        Value::Int(i) => {
+        ValueKind::Int(i) => {
             w.u8(TAG_INT);
-            w.u64(*i as u64);
+            w.u64(i as u64);
         }
-        Value::Float(n) => {
+        ValueKind::Float(n) => {
             w.u8(TAG_NUMBER);
-            w.f64(*n);
+            w.f64(n);
         }
-        Value::Str(s) => {
+        ValueKind::Str(s) => {
             w.u8(TAG_STR);
             w.str(s);
         }
-        Value::Decimal(d) => {
+        ValueKind::Decimal(d) => {
             w.u8(TAG_DECIMAL);
             w.buf.extend_from_slice(&d.serialize());
         }
-        Value::Enum(e) => {
+        ValueKind::Enum(e) => {
             w.u8(TAG_ENUM);
             w.str(&e.name);
             w.len(e.variants.len());
             for (vname, variant) in &e.variants {
                 w.str(vname);
-                // Each variant is a Value::EnumVariant; serialize its fields plus the
+                // Each variant is a Value::enum_variant; serialize its fields plus the
                 // ADT `ctor` flag (a payload-variant CONSTRUCTOR re-decodes as `ctor`).
-                match variant {
-                    Value::EnumVariant(ev) => {
+                match variant.kind() {
+                    ValueKind::EnumVariant(ev) => {
                         w.str(&ev.enum_name);
                         w.str(&ev.name);
                         write_value(w, &ev.value)?;
                         w.u8(u8::from(ev.ctor));
                     }
-                    other => {
+                    _ => {
                         return Err(AsoError::NonLiteralConst(
-                            literal_kind(other).err().unwrap_or("enum-variant-payload"),
+                            literal_kind(variant).err().unwrap_or("enum-variant-payload"),
                         ))
                     }
                 }
@@ -850,7 +850,7 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
                 }
             }
         }
-        Value::Array(a) => {
+        ValueKind::Array(a) => {
             // Only literal-element arrays are poolable (the object-rest key list).
             // Each element is re-checked via `write_value`, so a non-literal
             // element surfaces as `NonLiteralConst` rather than silently encoding.
@@ -861,8 +861,8 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
                 write_value(w, e)?;
             }
         }
-        other => {
-            let kind = literal_kind(other).err().unwrap_or("non-literal");
+        _ => {
+            let kind = literal_kind(v).err().unwrap_or("non-literal");
             return Err(AsoError::NonLiteralConst(kind));
         }
     }
@@ -872,11 +872,11 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
 fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
     let tag = r.u8()?;
     let v = match tag {
-        TAG_NIL => Value::Nil,
-        TAG_BOOL => Value::Bool(r.u8()? != 0),
-        TAG_INT => Value::Int(r.u64()? as i64),
-        TAG_NUMBER => Value::Float(r.f64()?),
-        TAG_STR => Value::Str(Rc::from(r.str()?.as_str())),
+        TAG_NIL => Value::nil(),
+        TAG_BOOL => Value::bool_(r.u8()? != 0),
+        TAG_INT => Value::int(r.u64()? as i64),
+        TAG_NUMBER => Value::float(r.f64()?),
+        TAG_STR => Value::str(r.str()?.as_str()),
         TAG_DECIMAL => {
             let b = r.take(16)?;
             let mut arr = [0u8; 16];
@@ -884,7 +884,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
             // VAL Task 2: the on-disk form is unchanged (the 16 LOGICAL bytes of
             // the decimal); only the in-memory wrapping is now `Rc`. No
             // ASO_FORMAT_VERSION bump — the serialized layout is identical.
-            Value::Decimal(std::rc::Rc::new(rust_decimal::Decimal::deserialize(arr)))
+            Value::decimal(rust_decimal::Decimal::deserialize(arr))
         }
         TAG_ENUM => {
             let name = r.str()?;
@@ -898,7 +898,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
                 let ctor = r.u8()? != 0;
                 variants.insert(
                     key,
-                    Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+                    Value::enum_variant(Rc::new(crate::value::EnumVariant {
                         enum_name,
                         name: vname,
                         value: backing,
@@ -929,7 +929,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
                 }
                 variant_schemas.insert(vname, crate::value::VariantSchema { fields });
             }
-            Value::Enum(Rc::new(crate::value::EnumDef {
+            Value::enum_(Rc::new(crate::value::EnumDef {
                 name,
                 variants,
                 variant_schemas,
@@ -941,7 +941,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
             for _ in 0..n {
                 elems.push(read_value(r)?);
             }
-            Value::Array(crate::value::ArrayCell::new(elems))
+            Value::array(elems)
         }
         other => return Err(AsoError::BadConst(other)),
     };
@@ -2923,18 +2923,16 @@ run()
         use rust_decimal::Decimal;
         use std::str::FromStr;
         let mut c = Chunk::new();
-        c.add_const(Value::Float(f64::NAN));
-        c.add_const(Value::Float(-0.0));
-        c.add_const(Value::Float(f64::INFINITY));
-        c.add_const(Value::Decimal(std::rc::Rc::new(
-            Decimal::from_str("1.50").unwrap(),
-        )));
+        c.add_const(Value::float(f64::NAN));
+        c.add_const(Value::float(-0.0));
+        c.add_const(Value::float(f64::INFINITY));
+        c.add_const(Value::decimal(Decimal::from_str("1.50").unwrap()));
         let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
-        assert!(matches!(rt.consts[0], Value::Float(n) if n.is_nan()));
-        assert!(matches!(rt.consts[1], Value::Float(n) if n == 0.0 && n.is_sign_negative()));
-        assert!(matches!(rt.consts[2], Value::Float(n) if n.is_infinite()));
-        match &rt.consts[3] {
-            Value::Decimal(d) => assert_eq!(d.to_string(), "1.50"),
+        assert!(matches!(rt.consts[0].kind(), ValueKind::Float(n) if n.is_nan()));
+        assert!(matches!(rt.consts[1].kind(), ValueKind::Float(n) if n == 0.0 && n.is_sign_negative()));
+        assert!(matches!(rt.consts[2].kind(), ValueKind::Float(n) if n.is_infinite()));
+        match rt.consts[3].kind() {
+            ValueKind::Decimal(d) => assert_eq!(d.to_string(), "1.50"),
             other => panic!("expected Decimal, got {other:?}"),
         }
     }
@@ -2944,29 +2942,27 @@ run()
         // NUM §3.3: an `int` const pool entry round-trips exactly through
         // `TAG_INT`, distinct from a same-magnitude `Float`.
         let mut c = Chunk::new();
-        c.add_const(Value::Int(0));
-        c.add_const(Value::Int(42));
-        c.add_const(Value::Int(-7));
-        c.add_const(Value::Int(i64::MAX));
-        c.add_const(Value::Int(i64::MIN));
-        c.add_const(Value::Float(42.0));
+        c.add_const(Value::int(0));
+        c.add_const(Value::int(42));
+        c.add_const(Value::int(-7));
+        c.add_const(Value::int(i64::MAX));
+        c.add_const(Value::int(i64::MIN));
+        c.add_const(Value::float(42.0));
         let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
-        assert_eq!(rt.consts[0], Value::Int(0));
-        assert_eq!(rt.consts[1], Value::Int(42));
-        assert_eq!(rt.consts[2], Value::Int(-7));
-        assert_eq!(rt.consts[3], Value::Int(i64::MAX));
-        assert_eq!(rt.consts[4], Value::Int(i64::MIN));
+        assert_eq!(rt.consts[0], Value::int(0));
+        assert_eq!(rt.consts[1], Value::int(42));
+        assert_eq!(rt.consts[2], Value::int(-7));
+        assert_eq!(rt.consts[3], Value::int(i64::MAX));
+        assert_eq!(rt.consts[4], Value::int(i64::MIN));
         // The Float(42.0) entry stays a Float, NOT folded into the Int(42).
-        assert!(matches!(rt.consts[5], Value::Float(n) if n == 42.0));
+        assert!(matches!(rt.consts[5].kind(), ValueKind::Float(n) if n == 42.0));
     }
 
     #[test]
     fn non_literal_const_self_check_fails() {
         let mut c = Chunk::new();
         // An Object is never poolable.
-        c.consts.push(Value::Object(crate::value::ObjectCell::new(
-            indexmap::IndexMap::new(),
-        )));
+        c.consts.push(Value::object(indexmap::IndexMap::new()));
         assert_eq!(c.check_consts_literal_only(), Err("object"));
     }
 
@@ -2975,19 +2971,16 @@ run()
         // The object-rest bound-key list is an `Array` of literal `Str`s; it must
         // pass the literal-only check and round-trip byte-stably.
         let mut c = Chunk::new();
-        let keys = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Str(std::rc::Rc::from("a")),
-            Value::Str(std::rc::Rc::from("b")),
-        ]));
+        let keys = Value::array(vec![Value::str("a"), Value::str("b")]);
         c.add_const(keys);
         assert_eq!(c.check_consts_literal_only(), Ok(()));
         let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
-        match &rt.consts[0] {
-            Value::Array(a) => {
+        match rt.consts[0].kind() {
+            ValueKind::Array(a) => {
                 let a = a.borrow();
                 assert_eq!(a.len(), 2);
-                assert!(matches!(&a[0], Value::Str(s) if &**s == "a"));
-                assert!(matches!(&a[1], Value::Str(s) if &**s == "b"));
+                assert!(matches!(a[0].kind(), ValueKind::Str(s) if &**s == "a"));
+                assert!(matches!(a[1].kind(), ValueKind::Str(s) if &**s == "b"));
             }
             other => panic!("expected Array, got {other:?}"),
         }
@@ -2998,11 +2991,9 @@ run()
         // An array containing a non-literal element is still rejected.
         let mut c = Chunk::new();
         c.consts
-            .push(Value::Array(crate::value::ArrayCell::new(
-                vec![Value::Object(crate::value::ObjectCell::new(
-                    indexmap::IndexMap::new(),
-                ))],
-            )));
+            .push(Value::array(vec![Value::object(
+                indexmap::IndexMap::new(),
+            )]));
         assert_eq!(c.check_consts_literal_only(), Err("object"));
     }
 

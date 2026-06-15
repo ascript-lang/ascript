@@ -4,7 +4,7 @@ use super::{arg, bi, clamp_index, want_array, want_bytes, want_number};
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -25,7 +25,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// A non-negative integer offset/index/size, validated BEFORE the f64→usize
@@ -59,10 +59,10 @@ fn want_byte(v: &Value, span: Span, ctx: &str) -> Result<u8, Control> {
 }
 
 fn want_endian(v: &Value, span: Span, ctx: &str) -> Result<bool /*little*/, Control> {
-    match v {
-        Value::Str(s) if s.as_ref() == "le" => Ok(true),
-        Value::Str(s) if s.as_ref() == "be" => Ok(false),
-        Value::Nil => Ok(false), // default big-endian (network order)
+    match v.kind() {
+        ValueKind::Str(s) if s.as_ref() == "le" => Ok(true),
+        ValueKind::Str(s) if s.as_ref() == "be" => Ok(false),
+        ValueKind::Nil => Ok(false), // default big-endian (network order)
         _ => Err(AsError::at(format!("{}: endian must be \"le\" or \"be\"", ctx), span).into()),
     }
 }
@@ -88,22 +88,22 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let arr: Vec<Value> = b
                 .borrow()
                 .iter()
-                .map(|&x| Value::Int(x as i64))
+                .map(|&x| Value::int(x as i64))
                 .collect();
-            Ok(Value::Array(crate::value::ArrayCell::new(arr)))
+            Ok(Value::array_cell(crate::value::ArrayCell::new(arr)))
         }
         "get" => {
             let b = want_bytes(&arg(args, 0), span, &ctx("get"))?;
             let i = want_number(&arg(args, 1), span, &ctx("get"))?;
             if i < 0.0 || i.fract() != 0.0 {
-                return Ok(Value::Nil);
+                return Ok(Value::nil());
             }
             // NUM §4: a byte (0..=255) is an `Int`.
             let out = b
                 .borrow()
                 .get(i as usize)
-                .map(|&x| Value::Int(x as i64))
-                .unwrap_or(Value::Nil);
+                .map(|&x| Value::int(x as i64))
+                .unwrap_or(Value::nil());
             Ok(out)
         }
         "set" => {
@@ -119,7 +119,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .into());
             }
             bb[idx] = v;
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         "slice" => {
             let b = want_bytes(&arg(args, 0), span, &ctx("slice"))?;
@@ -127,7 +127,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let len = bb.len();
             let start = clamp_index(want_number(&arg(args, 1), span, &ctx("slice"))?, len);
             let end = match args.get(2) {
-                None | Some(Value::Nil) => len,
+                None => len,
+                Some(v) if matches!(v.kind(), ValueKind::Nil) => len,
                 Some(v) => clamp_index(want_number(v, span, &ctx("slice"))?, len),
             };
             let out = if start < end {
@@ -172,7 +173,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let raw = u64::from_le_bytes(buf);
             // NUM §4: a read integer is an `Int`.
             if func == "readUint" {
-                Ok(Value::Int(raw as i64))
+                Ok(Value::int(raw as i64))
             } else {
                 // sign-extend from the top bit of the n-byte value
                 let bits = 8 * n as u32;
@@ -181,7 +182,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 } else {
                     raw as i64
                 };
-                Ok(Value::Int(signed))
+                Ok(Value::int(signed))
             }
         }
         "writeUint" | "writeInt" => {
@@ -255,7 +256,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 let be = raw.to_be_bytes();
                 bb[offset..offset + n].copy_from_slice(&be[8 - n..]);
             }
-            Ok(Value::Nil)
+            Ok(Value::nil())
         }
         _ => Err(AsError::at(format!("std/bytes has no function '{}'", func), span).into()),
     }
@@ -268,7 +269,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn num(n: f64) -> Value {
-        Value::Float(n)
+        Value::float(n)
     }
 
     #[test]
@@ -287,7 +288,7 @@ mod tests {
         );
         assert_eq!(
             call("get", &[b.clone(), num(9.0)], sp()).unwrap(),
-            Value::Nil
+            Value::nil()
         );
         // out-of-range byte → panic
         assert!(matches!(
@@ -306,7 +307,7 @@ mod tests {
                 num(0.0),
                 num(0x01020304 as f64),
                 num(4.0),
-                Value::Str("be".into()),
+                Value::str("be"),
             ],
             sp(),
         )
@@ -320,7 +321,7 @@ mod tests {
         assert_eq!(
             call(
                 "readUint",
-                &[b.clone(), num(0.0), num(4.0), Value::Str("be".into())],
+                &[b.clone(), num(0.0), num(4.0), Value::str("be")],
                 sp()
             )
             .unwrap(),
@@ -335,7 +336,7 @@ mod tests {
                 num(0.0),
                 num(0x01020304 as f64),
                 num(4.0),
-                Value::Str("le".into()),
+                Value::str("le"),
             ],
             sp(),
         )
@@ -358,7 +359,7 @@ mod tests {
                 num(0.0),
                 num(-1.0),
                 num(2.0),
-                Value::Str("be".into()),
+                Value::str("be"),
             ],
             sp(),
         )
@@ -372,7 +373,7 @@ mod tests {
         assert_eq!(
             call(
                 "readInt",
-                &[b.clone(), num(0.0), num(2.0), Value::Str("be".into())],
+                &[b.clone(), num(0.0), num(2.0), Value::str("be")],
                 sp()
             )
             .unwrap(),
@@ -390,7 +391,7 @@ mod tests {
         assert!(matches!(
             call(
                 "readUint",
-                &[b.clone(), num(1e30), num(2.0), Value::Str("be".into())],
+                &[b.clone(), num(1e30), num(2.0), Value::str("be")],
                 sp()
             ),
             Err(Control::Panic(_))
@@ -403,7 +404,7 @@ mod tests {
                     num(1e30),
                     num(0.0),
                     num(2.0),
-                    Value::Str("be".into())
+                    Value::str("be")
                 ],
                 sp()
             ),
@@ -413,7 +414,7 @@ mod tests {
         assert!(matches!(
             call(
                 "readUint",
-                &[b.clone(), num(f64::NAN), num(2.0), Value::Str("be".into())],
+                &[b.clone(), num(f64::NAN), num(2.0), Value::str("be")],
                 sp()
             ),
             Err(Control::Panic(_))
@@ -436,7 +437,7 @@ mod tests {
                     num(0.0),
                     num(256.0),
                     num(1.0),
-                    Value::Str("be".into())
+                    Value::str("be")
                 ],
                 sp()
             ),
@@ -450,7 +451,7 @@ mod tests {
                 num(0.0),
                 num(255.0),
                 num(1.0),
-                Value::Str("be".into()),
+                Value::str("be"),
             ],
             sp(),
         )
@@ -470,7 +471,7 @@ mod tests {
                     num(0.0),
                     num(200.0),
                     num(1.0),
-                    Value::Str("be".into())
+                    Value::str("be")
                 ],
                 sp()
             ),
@@ -484,7 +485,7 @@ mod tests {
                 num(0.0),
                 num(-128.0),
                 num(1.0),
-                Value::Str("be".into()),
+                Value::str("be"),
             ],
             sp(),
         )
@@ -492,7 +493,7 @@ mod tests {
         assert_eq!(
             call(
                 "readInt",
-                &[b.clone(), num(0.0), num(1.0), Value::Str("be".into())],
+                &[b.clone(), num(0.0), num(1.0), Value::str("be")],
                 sp()
             )
             .unwrap(),
@@ -507,7 +508,7 @@ mod tests {
                     num(0.0),
                     num(-129.0),
                     num(1.0),
-                    Value::Str("be".into())
+                    Value::str("be")
                 ],
                 sp()
             ),

@@ -15,7 +15,7 @@
 //!   `Init`, then services `Call` messages against that instance, replying with the
 //!   encoded result / panic over a `oneshot`.
 //! - **Caller side** ([`WorkerActorHandle`] + the host hooks in `src/interp.rs` /
-//!   `src/vm/run.rs`): the `Value::Native(WorkerActor)` proxy. `ClassName.spawn(args)`
+//!   `src/vm/run.rs`): the `Value::native(WorkerActor)` proxy. `ClassName.spawn(args)`
 //!   builds the slice, spawns the isolate, sends `Init`, and registers the handle;
 //!   `await handle.method(args)` sends a `Call` and awaits the reply.
 //!
@@ -41,7 +41,7 @@ pub enum ActorReply {
 }
 
 /// One message in an actor's FIFO mailbox. Every field is `Send` (incl. the SRV
-/// §3.7(b) frozen-`Arc` side-vector that carries any `Value::Shared` args).
+/// §3.7(b) frozen-`Arc` side-vector that carries any `Value::shared` args).
 pub enum ActorMsg {
     /// Construct the instance: decode `args`, look up the class global, run `init`
     /// IN the isolate, store the instance. `reply` acks success (`Ok`) or the
@@ -53,7 +53,7 @@ pub enum ActorMsg {
         slice_bytes: Vec<u8>,
         /// Structured-clone-encoded ARRAY of the positional `init` args.
         args: Vec<u8>,
-        /// The frozen-`Arc` side-vector for `Value::Shared` args (SRV §3.7b).
+        /// The frozen-`Arc` side-vector for `Value::shared` args (SRV §3.7b).
         shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
         reply: oneshot::Sender<ActorReply>,
     },
@@ -62,13 +62,13 @@ pub enum ActorMsg {
         method: String,
         /// Structured-clone-encoded ARRAY of the positional method args.
         args: Vec<u8>,
-        /// The frozen-`Arc` side-vector for `Value::Shared` args (SRV §3.7b).
+        /// The frozen-`Arc` side-vector for `Value::shared` args (SRV §3.7b).
         shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
         reply: oneshot::Sender<ActorReply>,
     },
 }
 
-/// The caller-side proxy payload behind a `Value::Native(WorkerActor)`. Stored in
+/// The caller-side proxy payload behind a `Value::native(WorkerActor)`. Stored in
 /// `Interp.resources` as `ResourceState::WorkerActor(Box<WorkerActorHandle>)`.
 ///
 /// **Teardown:** dropping this handle drops the [`IsolateHandle`], whose `Drop` closes
@@ -78,7 +78,7 @@ pub enum ActorMsg {
 /// so an un-`close`d actor is reclaimed then.
 ///
 /// **GC invariant:** this holds `Send` channels + a thread handle, NOT script
-/// `Value`s, so the GC must NEVER trace into it. `Value::Native` already traces as a
+/// `Value`s, so the GC must NEVER trace into it. `Value::native` already traces as a
 /// no-op (`gc.rs`'s `_ => {}` arm), so the invariant holds for free.
 pub struct WorkerActorHandle {
     /// Outbound `Send` sender of mailbox messages into the dedicated isolate. Cloned
@@ -201,7 +201,7 @@ async fn actor_loop(
 
 /// An `Ok` ack carrying an encoded nil.
 fn ack_ok() -> ActorReply {
-    match crate::worker::serialize::encode(&Value::Nil) {
+    match crate::worker::serialize::encode(&Value::nil()) {
         Ok((b, shared)) => ActorReply::Ok(b, shared),
         Err(e) => ActorReply::Panic(e.message()),
     }
@@ -255,7 +255,7 @@ async fn call_method(
     };
     // Resolve + run the method via the VM's per-class method side table (a VM-built
     // class keeps its methods there, not in `Class.methods`). `call_method_named`
-    // drives an `async` method's `Value::Future` to its value.
+    // drives an `async` method's `Value::future` to its value.
     let value = vm
         .call_method_named(
             instance.clone(),
@@ -274,7 +274,7 @@ async fn call_method(
         Err(crate::interp::Control::Panic(e)) => ActorReply::Panic(e.message),
         Err(crate::interp::Control::Propagate(_)) => {
             // A top-level `?` propagation inside the method ends with nil.
-            match crate::worker::serialize::encode(&Value::Nil) {
+            match crate::worker::serialize::encode(&Value::nil()) {
                 Ok((bytes, shared)) => ActorReply::Ok(bytes, shared),
                 Err(e) => ActorReply::Panic(e.message()),
             }
