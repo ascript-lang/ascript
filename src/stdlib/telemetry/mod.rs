@@ -12,7 +12,7 @@
 //! ## Routing
 //! `exports()` returns the builtin bindings; the qualified calls (`telemetry.init`,
 //! `telemetry.startSpan`, …) route through `Interp::call_telemetry` in `interp.rs`.
-//! Span/instrument handles are `Value::Native` whose methods dispatch back into
+//! Span/instrument handles are `Value::native` whose methods dispatch back into
 //! `call_telemetry`-adjacent handlers on `Interp`.
 //!
 //! ## No new `Value` variant
@@ -107,12 +107,12 @@ fn tier1_err(msg: &str) -> Value {
     )
 }
 
-/// An inert `Value::Native` handle returned when telemetry is not initialized:
+/// An inert `Value::native` handle returned when telemetry is not initialized:
 /// every method on it is a no-op (`call_telemetry_noop_method`). Lets `.as` code
 /// call `telemetry.startSpan(...).end()` / `telemetry.counter(...).add(1)`
 /// unconditionally — the "safe to leave in production" promise.
 fn noop_handle() -> Value {
-    Value::Native(Rc::new(NativeObject {
+    Value::native(Rc::new(NativeObject {
         id: u64::MAX,
         kind: NativeKind::TelemetryNoop,
         fields: IndexMap::new(),
@@ -121,7 +121,7 @@ fn noop_handle() -> Value {
 
 /// Build an instrument handle pointing at resource `id`.
 fn instrument_handle(id: u64) -> Value {
-    Value::Native(Rc::new(NativeObject {
+    Value::native(Rc::new(NativeObject {
         id,
         kind: NativeKind::TelemetryInstrument,
         fields: IndexMap::new(),
@@ -434,7 +434,7 @@ fn start_span(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Cont
 
 /// Build a span handle pointing at resource `id`.
 fn span_handle(id: u64) -> Value {
-    Value::Native(Rc::new(NativeObject {
+    Value::native(Rc::new(NativeObject {
         id,
         kind: NativeKind::TelemetrySpan,
         fields: IndexMap::new(),

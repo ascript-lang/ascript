@@ -104,7 +104,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `Class.is_worker`), written by `write_class` before the field list. Drives
 ///   `ClassName.spawn(args)` actor routing on both engines.
 /// - 19: NUM — the numeric model split `Value::Number(f64)` into the two kinds
-///   `Value::Int(i64)` and `Value::Float(f64)`. The constant pool gained
+///   `Value::int(i64)` and `Value::float(f64)`. The constant pool gained
 ///   `TAG_INT`, the field-default expr stream gained `EX_INT`, and the former
 ///   `TAG_NUMBER`/`EX_NUMBER` tags now carry `Float` (value-identical bytes).
 /// - 20: NUM bitwise/wrapping operators — nine new appended opcodes (`BitAnd`/
@@ -239,14 +239,14 @@ impl std::error::Error for AsoError {}
 
 const TAG_NIL: u8 = 0;
 const TAG_BOOL: u8 = 1;
-/// `Value::Float` (the former `Value::Number`; tag value unchanged so existing
+/// `Value::float` (the former `Value::Number`; tag value unchanged so existing
 /// float constants keep the same wire byte — NUM §8 "the `Float` tag is the
 /// former `Number` tag, value-identical").
 const TAG_NUMBER: u8 = 2;
 const TAG_STR: u8 = 3;
 const TAG_DECIMAL: u8 = 4;
 const TAG_ENUM: u8 = 5;
-/// `Value::Int` (NUM §8): a 64-bit signed integer constant. New tag.
+/// `Value::int` (NUM §8): a 64-bit signed integer constant. New tag.
 const TAG_INT: u8 = 7;
 /// An `Array` whose elements are themselves literal constants. Emitted by the
 /// compiler for the object-rest bound-key list (`let {a, ...rest} = obj` lowers
@@ -816,7 +816,7 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
             w.len(e.variants.len());
             for (vname, variant) in &e.variants {
                 w.str(vname);
-                // Each variant is a Value::EnumVariant; serialize its fields plus the
+                // Each variant is a Value::enum_variant; serialize its fields plus the
                 // ADT `ctor` flag (a payload-variant CONSTRUCTOR re-decodes as `ctor`).
                 match variant.kind() {
                     ValueKind::EnumVariant(ev) => {

@@ -113,7 +113,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
                 return c.clone();
             }
             let out = crate::value::ArrayCell::new(Vec::new());
-            let cloned = Value::Array(out.clone());
+            let cloned = Value::array_cell(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.borrow().clone();
             {
@@ -130,7 +130,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
                 return c.clone();
             }
             let out = crate::value::ObjectCell::new(IndexMap::new());
-            let cloned = Value::Object(out.clone());
+            let cloned = Value::object_cell(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.entries();
             for (k, val) in &src {
@@ -144,7 +144,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
                 return c.clone();
             }
             let out = crate::value::MapCell::new(IndexMap::<MapKey, Value>::new());
-            let cloned = Value::Map(out.clone());
+            let cloned = Value::map_cell(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.borrow().clone();
             {
@@ -181,7 +181,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
                 class,
                 IndexMap::new(),
             )));
-            let cloned = Value::Instance(out.clone());
+            let cloned = Value::instance(out.clone());
             seen.insert(key, cloned.clone());
             {
                 let mut dst = out.borrow_mut();
@@ -522,7 +522,7 @@ mod tests {
     fn deep_clone_and_equal_handle_cycles() {
         // self-referential array: a = [a]
         let a: gcmodule::Cc<crate::value::ArrayCell> = crate::value::ArrayCell::new(Vec::new());
-        let arr_a = Value::Array(a.clone());
+        let arr_a = Value::array_cell(a.clone());
         a.borrow_mut().push(arr_a.clone());
         // deep_clone terminates and yields a distinct (by identity) container
         let mut seen = std::collections::HashMap::new();

@@ -119,14 +119,14 @@ impl Interp {
                     let is_schema = crate::stdlib::schema::schema_kind(&t).is_some();
                     if is_class || is_schema {
                         let parsed = make_pair(
-                            Value::Array(crate::value::ArrayCell::new(row_vals)),
+                            Value::array_cell(crate::value::ArrayCell::new(row_vals)),
                             Value::nil(),
                         );
                         return self.typed_decode_rows(parsed, &t, span).await;
                     }
                 }
                 Ok(make_pair(
-                    Value::Array(crate::value::ArrayCell::new(row_vals)),
+                    Value::array_cell(crate::value::ArrayCell::new(row_vals)),
                     Value::nil(),
                 ))
             }
@@ -317,7 +317,7 @@ fn rows_to_value(row: &tokio_postgres::Row) -> Value {
     for (i, col) in row.columns().iter().enumerate() {
         map.insert(col.name().to_string(), column_to_value(row, i, col.type_()));
     }
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object_cell(crate::value::ObjectCell::new(map))
 }
 
 /// Map a single Postgres column value to an AScript value, per the type map. A
@@ -348,7 +348,7 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
             .try_get::<_, Option<Vec<u8>>>(i)
             .ok()
             .flatten()
-            .map(|b| Value::Bytes(Rc::new(RefCell::new(b))))
+            .map(|b| Value::bytes_rc(Rc::new(RefCell::new(b))))
             .unwrap_or(Value::nil()),
         Type::UUID => opt_str(
             row.try_get::<_, Option<String>>(i)
@@ -416,7 +416,7 @@ mod tests {
     fn bind_params_array_and_nil() {
         assert_eq!(bind_params(None, sp(), "x").unwrap().len(), 0);
         assert_eq!(bind_params(Some(&Value::nil()), sp(), "x").unwrap().len(), 0);
-        let arr = Value::Array(crate::value::ArrayCell::new(vec![
+        let arr = Value::array_cell(crate::value::ArrayCell::new(vec![
             Value::float(1.0),
             Value::str("a"),
         ]));

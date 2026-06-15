@@ -9,7 +9,7 @@
 //!   permission denied, timeout) is the `err`; `check: true` flips a non-zero exit
 //!   into an err. `result = {stdout, stderr, stderrText, code, signal, success}`.
 //! - `spawn(cmd, args, opts?) -> [child, err]` — streaming: returns a
-//!   `Value::Native(kind=ChildProcess)` with `fields = {pid}` and methods `stdin`
+//!   `Value::native(kind=ChildProcess)` with `fields = {pid}` and methods `stdin`
 //!   (→ a Writer native), `stdout`/`stderr` (→ Reader natives), `wait()`, `kill(sig?)`.
 //!   The child + its piped stdio live in the interp `resources` table.
 //!
@@ -354,7 +354,7 @@ fn status_object(code: Value, signal: Value, success: bool) -> Value {
 /// Wrap captured bytes as Str (lossy) or Bytes per `capture`.
 fn captured_value(bytes: Vec<u8>, capture: Capture) -> Value {
     match capture {
-        Capture::Bytes => Value::Bytes(Rc::new(RefCell::new(bytes))),
+        Capture::Bytes => Value::bytes_rc(Rc::new(RefCell::new(bytes))),
         // Str/Inherit/Null: Inherit & Null produce empty buffers; decode lossily.
         _ => Value::str(String::from_utf8_lossy(&bytes).into_owned()),
     }

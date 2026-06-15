@@ -1,6 +1,6 @@
 //! `std/shared` — the shared, immutable, zero-copy-across-isolates read-only heap
 //! (SRV §3/§4). `shared.freeze(v)` deep-converts a value into an immutable,
-//! `Arc`-backed `Value::Shared(Arc<SharedNode>)` — AScript's FIRST `Send` value,
+//! `Arc`-backed `Value::shared(Arc<SharedNode>)` — AScript's FIRST `Send` value,
 //! so a 5 MB routing table can be shared across N worker isolates by an `Arc`
 //! pointer bump instead of a per-request structured-clone copy.
 //!
@@ -48,14 +48,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 pub fn freeze(v: &Value, span: Span) -> Result<Value, Control> {
     // Fast path: freeze of an already-frozen value is the identity (the SAME Arc).
     if let ValueKind::Shared(arc) = v.kind() {
-        return Ok(Value::Shared(arc.clone()));
+        return Ok(Value::shared(arc.clone()));
     }
     let mut walker = Freezer {
         in_progress: HashSet::new(),
         completed: HashMap::new(),
     };
     let node = walker.walk(v, &mut String::new(), span)?;
-    Ok(Value::Shared(node))
+    Ok(Value::shared(node))
 }
 
 /// A freeze-time failure: a non-freezable value kind, or a cycle, at a field path.
@@ -207,10 +207,10 @@ impl Freezer {
                 let value: SharedValue = match &ev.payload {
                     None => self.walk(&ev.value, path, span)?,
                     Some(crate::value::Payload::Positional(a)) => {
-                        self.walk(&Value::Array(a.clone()), path, span)?
+                        self.walk(&Value::array_cell(a.clone()), path, span)?
                     }
                     Some(crate::value::Payload::Named(o)) => {
-                        self.walk(&Value::Object(o.clone()), path, span)?
+                        self.walk(&Value::object_cell(o.clone()), path, span)?
                     }
                 };
                 path.truncate(len);
@@ -454,7 +454,7 @@ mod tests {
     fn freeze_cycle_is_a_clean_panic_not_a_hang() {
         // a = [ ... ]; a.push(a)  — a self-referential array.
         let cell = ArrayCell::new(vec![Value::int(1)]);
-        let a = Value::Array(cell.clone());
+        let a = Value::array_cell(cell.clone());
         cell.borrow_mut().push(a.clone());
         let err = freeze(&a, s()).unwrap_err();
         match err {
@@ -473,8 +473,8 @@ mod tests {
         let shared_inner = Value::array(vec![Value::int(9)]);
         let cyclic = ArrayCell::new(vec![shared_inner.clone(), shared_inner.clone()]);
         // Make `cyclic` reference itself → a cycle.
-        cyclic.borrow_mut().push(Value::Array(cyclic.clone()));
-        let v = Value::Array(cyclic);
+        cyclic.borrow_mut().push(Value::array_cell(cyclic.clone()));
+        let v = Value::array_cell(cyclic);
         // The cycle wins (it is reached) → a clean panic, NOT a hang.
         let err = freeze(&v, s()).unwrap_err();
         assert!(matches!(err, Control::Panic(ref e) if e.message.contains("cyclic")));

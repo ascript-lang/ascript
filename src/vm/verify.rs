@@ -53,7 +53,7 @@ pub enum VerifyError {
         len: usize,
     },
     /// A name-const operand (e.g. `GET_PROP`, `GET_GLOBAL`) indexes a constant that
-    /// is not a `Value::Str`.
+    /// is not a `Value::str`.
     NameConstNotString { offset: usize, index: usize },
     /// A jump's computed absolute target is outside `[0, code.len()]`.
     JumpOutOfBounds {
@@ -559,7 +559,7 @@ fn check_operands(
         //      `VariantElem(0..=299)` / `MatchVariantArity(300)`. So a tighter constant cap
         //      such as 255 would *over-reject* valid bytecode and is unsound.)
         //   2. The run loop is independently out-of-bounds-safe: `VariantElem` reads the
-        //      payload with `.get(idx)` / `IndexMap::get_index(idx)` (→ `Value::Nil` when
+        //      payload with `.get(idx)` / `IndexMap::get_index(idx)` (→ `Value::nil()` when
         //      out of range) and `MatchVariantArity` tests `payload_len == Some(n)` — a
         //      false match, never an index panic. (The inline tests below assert a 0xFFFF
         //      operand verifies, and `run.rs` asserts the run loop returns Nil/false for

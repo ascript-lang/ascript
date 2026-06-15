@@ -761,7 +761,7 @@ impl Interp {
 
 // ── argument helpers ──────────────────────────────────────────────────────────
 
-/// Extract the handle `id` from a `Value::Native(Channel)` argument.
+/// Extract the handle `id` from a `Value::native(Channel)` argument.
 fn require_channel_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
     match v.kind() {
         ValueKind::Native(obj) if obj.kind == NativeKind::Channel => Ok(obj.id),
@@ -777,7 +777,7 @@ fn require_channel_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> 
     }
 }
 
-/// Extract the handle `id` from a `Value::Native(Semaphore)` argument.
+/// Extract the handle `id` from a `Value::native(Semaphore)` argument.
 fn require_semaphore_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
     match v.kind() {
         ValueKind::Native(obj) if obj.kind == NativeKind::Semaphore => Ok(obj.id),

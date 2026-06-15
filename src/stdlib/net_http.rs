@@ -5,7 +5,7 @@
 //! Tier-1 pair `[resp, err]`:
 //!
 //! - a connect / TLS / DNS / timeout failure → `[nil, err]`;
-//! - otherwise `[resp, nil]` where `resp` is a `Value::Native(HttpResponse)` whose
+//! - otherwise `[resp, nil]` where `resp` is a `Value::native(HttpResponse)` whose
 //!   `fields` carry `status` (number), `ok` (200-299), `version` ("1.1"|"2"|...),
 //!   `url` (final string), `headers` (object, lowercased keys) and `cookies` (an
 //!   object of name→value parsed from `Set-Cookie`).
@@ -53,7 +53,7 @@
 //!     via a `tokio::select!` against a shared `Notify`.
 //!
 //! Streaming bodies (Task 4): with `opts.stream:true` the body is NOT buffered;
-//! `resp.body` is a `Value::Native(HttpBody)` reader following the §11.4 idiom
+//! `resp.body` is a `Value::native(HttpBody)` reader following the §11.4 idiom
 //! (`await resp.body.read(n?)`→chunk|nil, `readLine()`, `readToEnd()`; chunk type
 //! string|bytes per `opts.bodyMode`). The buffered accessors (text/bytes/json) are
 //! then unavailable; conversely `resp.body` is only present in streaming mode.
@@ -65,7 +65,7 @@
 //!
 //! Server-Sent Events (Task 5): `sse(url, opts?) → [stream, err]` is a first-class
 //! SSE client (NOT a flag on request). It GETs with `Accept: text/event-stream` and
-//! exposes a `Value::Native(SseStream)` whose `await stream.next() → [event, err]`
+//! exposes a `Value::native(SseStream)` whose `await stream.next() → [event, err]`
 //! parses the SSE wire format (`event:`/`data:`/`id:`/`retry:` fields, blank-line
 //! event boundaries, multi-line `data:` joined with `\n`, `:`-comment lines ignored,
 //! one-leading-space strip after the colon). `stream.lastEventId` is a live property
@@ -138,7 +138,7 @@ impl BodyMode {
     /// Wrap a finalized chunk as Str (lossy) or Bytes per the mode.
     fn wrap(self, bytes: Vec<u8>) -> Value {
         match self {
-            BodyMode::Bytes => Value::Bytes(Rc::new(RefCell::new(bytes))),
+            BodyMode::Bytes => Value::bytes_rc(Rc::new(RefCell::new(bytes))),
             BodyMode::Str => Value::str(String::from_utf8_lossy(&bytes).into_owned()),
         }
     }
@@ -251,7 +251,7 @@ struct SseEvent {
     nonempty: bool,
 }
 
-/// The live state behind a `Value::Native(SseStream)`: the current event-stream
+/// The live state behind a `Value::native(SseStream)`: the current event-stream
 /// body reader, the in-progress event buffer, the running `lastEventId`/`retry`,
 /// and the reconnect template. `next()` reads lines, accumulates fields, and on a
 /// blank line dispatches the buffered event; on EOF it either reconnects (carrying
@@ -821,7 +821,7 @@ fn err_pair(msg: String) -> Value {
 }
 
 fn bytes_value(b: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(b)))
+    Value::bytes_rc(Rc::new(RefCell::new(b)))
 }
 
 fn obj(map: IndexMap<String, Value>) -> Value {
@@ -1283,7 +1283,7 @@ impl Interp {
                 Ok(rb.body(bytes))
             }
             // (c) an async-generator fn → call to exhaustion (buffered-then-sent).
-            // `Value::Closure` is the VM's compiled-function value (V4-T5 bridge).
+            // `Value::closure` is the VM's compiled-function value (V4-T5 bridge).
             ValueKind::Function(_)
             | ValueKind::Closure(_)
             | ValueKind::Builtin(_)
@@ -1414,7 +1414,7 @@ impl Interp {
     }
 
     /// Read the response metadata into `fields` and register the live response (for
-    /// the buffered body accessors) behind a `Value::Native(HttpResponse)` handle.
+    /// the buffered body accessors) behind a `Value::native(HttpResponse)` handle.
     fn http_response_value(&self, resp: reqwest::Response) -> Value {
         let fields = Self::http_response_fields(&resp);
         self.register_resource(
@@ -1425,7 +1425,7 @@ impl Interp {
     }
 
     /// Build a streaming response: the body is NOT buffered. The response's chunked
-    /// byte stream is registered behind a `Value::Native(HttpBody)` reader handle,
+    /// byte stream is registered behind a `Value::native(HttpBody)` reader handle,
     /// which is exposed as the response's `body` field. The buffered accessors
     /// (text/bytes/json) are intentionally absent — see `call_http_response_method`.
     fn http_streaming_response_value(&self, resp: reqwest::Response, mode: BodyMode) -> Value {
@@ -1500,7 +1500,7 @@ impl Interp {
                                 //   resp.json(schema)          → schema.parse_value (schema path)
                                 //   resp.json()                → raw decoded value
                                 //
-                                // Disambiguation is unambiguous: Value::Class vs
+                                // Disambiguation is unambiguous: Value::class vs
                                 // tagged-Object (Object with __kind) vs absent.
                                 if let Some(ValueKind::Class(c)) = args.first().map(|x| x.kind()) {
                                     // Class path: validate_into.
@@ -1733,7 +1733,7 @@ impl Interp {
 
     /// `http.sse(url, opts?)` → `[stream, err]`. Issues a GET with
     /// `Accept: text/event-stream`, then registers the response body behind a
-    /// `Value::Native(SseStream)` whose `next()` parses the event stream. A
+    /// `Value::native(SseStream)` whose `next()` parses the event stream. A
     /// connect-time failure is the usual Tier-1 `[nil, err]`.
     async fn call_sse(&self, url: String, opts: &Value, span: Span) -> Result<Value, Control> {
         // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the host before the

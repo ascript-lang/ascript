@@ -284,7 +284,7 @@ fn emit_class_recursive(
     for m in &members {
         match m {
             GroupMember::SuperGlobal(sup) => {
-                let name_idx = frag.add_const(Value::Str(sup.clone()));
+                let name_idx = frag.add_const(Value::str(sup.clone()));
                 frag.emit_u16(Op::GetGlobal, name_idx, span);
             }
             GroupMember::Closure(proto) => {
@@ -297,7 +297,7 @@ fn emit_class_recursive(
     }
     let cp_idx = frag.add_class_proto(cp);
     frag.emit_u16(Op::Class, cp_idx, span);
-    let name_idx = frag.add_const(Value::Str(Rc::from(class_name)));
+    let name_idx = frag.add_const(Value::str(Rc::from(class_name)));
     frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
     Ok(())
 }
@@ -348,18 +348,18 @@ fn emit_dep_closure(
         match defs.get(name.as_ref()) {
             Some(TopDef::Const(v)) => {
                 emit_const_load(frag, v.clone(), span);
-                let name_idx = frag.add_const(Value::Str(name.clone()));
+                let name_idx = frag.add_const(Value::str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Fn(proto)) => {
                 let proto_idx = frag.add_proto(proto.clone());
                 frag.emit_u16(Op::Closure, proto_idx, span);
-                let name_idx = frag.add_const(Value::Str(name.clone()));
+                let name_idx = frag.add_const(Value::str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::ComputedConst { start, end }) => {
                 copy_code_range(frag, top, *start, *end, span);
-                let name_idx = frag.add_const(Value::Str(name.clone()));
+                let name_idx = frag.add_const(Value::str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Interface(proto)) => {
@@ -379,7 +379,7 @@ fn emit_dep_closure(
 fn emit_interface_def(frag: &mut Chunk, proto: Rc<InterfaceProto>, name: &Rc<str>, span: Span) {
     let idx = frag.add_interface_proto(proto);
     frag.emit_u16(Op::DefineInterface, idx, span);
-    let name_idx = frag.add_const(Value::Str(name.clone()));
+    let name_idx = frag.add_const(Value::str(name.clone()));
     frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
 }
 
@@ -735,13 +735,13 @@ fn materialize_slice(
         match defs.get(name.as_ref()) {
             Some(TopDef::Const(v)) => {
                 emit_const_load(&mut frag, v.clone(), span);
-                let name_idx = frag.add_const(Value::Str(name.clone()));
+                let name_idx = frag.add_const(Value::str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Fn(proto)) => {
                 let proto_idx = frag.add_proto(proto.clone());
                 frag.emit_u16(Op::Closure, proto_idx, span);
-                let name_idx = frag.add_const(Value::Str(name.clone()));
+                let name_idx = frag.add_const(Value::str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::ComputedConst { start, end }) => {
@@ -749,7 +749,7 @@ fn materialize_slice(
                 // bind the result with DEFINE_GLOBAL. The range excludes the trailing
                 // DEFINE_GLOBAL, so emit it here.
                 copy_code_range(&mut frag, top, *start, *end, span);
-                let name_idx = frag.add_const(Value::Str(name.clone()));
+                let name_idx = frag.add_const(Value::str(name.clone()));
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Interface(proto)) => {
@@ -764,7 +764,7 @@ fn materialize_slice(
     if emit_entry {
         let proto_idx = frag.add_proto(entry_proto.clone());
         frag.emit_u16(Op::Closure, proto_idx, span);
-        let name_idx = frag.add_const(Value::Str(Rc::from(entry_name)));
+        let name_idx = frag.add_const(Value::str(Rc::from(entry_name)));
         frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
     }
 
@@ -1076,8 +1076,8 @@ mod tests {
         // The shipped bytecode (entry_aso) deserializes via the .aso reader and
         // runs g(5) -> 15 on a FRESH interp/vm (no access to the original heap).
         let slice = build_slice_for_test(SRC, "g").await;
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(5.0)]).await;
-        assert_eq!(out.unwrap(), Value::Float(15.0));
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::float(5.0)]).await;
+        assert_eq!(out.unwrap(), Value::float(15.0));
     }
 
     #[tokio::test]
@@ -1108,8 +1108,8 @@ mod tests {
         let names = slice.dep_names();
         assert!(names.contains("K"), "missing computed const K: {names:?}");
         assert!(names.contains("expensive"), "missing helper: {names:?}");
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(8.0)]).await;
-        assert_eq!(out.unwrap(), Value::Float(50.0));
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::float(8.0)]).await;
+        assert_eq!(out.unwrap(), Value::float(50.0));
     }
 
     #[tokio::test]
@@ -1190,10 +1190,10 @@ mod tests {
         // original heap and `Outer.from` validates the nested `Inner`/`Item` correctly —
         // the exact path that errored before the fix (`type contract violated … expected
         // Inner, got object`). g(5) => inner.v(5) + items[0].n(5) == 10.
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Int(5)])
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::int(5)])
             .await
             .expect("fragment runs in a fresh isolate");
-        assert_eq!(out, Value::Int(10), "got: {out:?}");
+        assert_eq!(out, Value::int(10), "got: {out:?}");
     }
 
     #[tokio::test]
@@ -1298,8 +1298,8 @@ mod tests {
             "over-shipped absorbed `noisy` into the slice: {names:?}"
         );
         // The slice runs to completion in a fresh isolate (no `set_local` slot panic).
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(8.0)]).await;
-        assert_eq!(out.unwrap(), Value::Float(50.0));
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::float(8.0)]).await;
+        assert_eq!(out.unwrap(), Value::float(50.0));
     }
 }
 

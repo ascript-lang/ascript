@@ -22,8 +22,8 @@ fn arr(v: Vec<Value>) -> Value {
     Value::array(v)
 }
 
-/// Resolve arg 0 to a compiled regex: a `Value::Regex` is used directly; a
-/// `Value::Str` is compiled on the fly (a bad inline pattern is a Tier-2 panic —
+/// Resolve arg 0 to a compiled regex: a `Value::regex` is used directly; a
+/// `Value::str` is compiled on the fly (a bad inline pattern is a Tier-2 panic —
 /// use `compile` for the Tier-1 path on untrusted patterns).
 fn want_regex(v: &Value, span: Span, ctx: &str) -> Result<Rc<RegexHandle>, Control> {
     match v.kind() {
@@ -61,7 +61,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, &ctx("compile"))?;
             match regex::Regex::new(&s) {
                 Ok(re) => Ok(make_pair(
-                    Value::Regex(Rc::new(RegexHandle {
+                    Value::regex(Rc::new(RegexHandle {
                         re,
                         source: s.to_string(),
                     })),

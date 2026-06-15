@@ -2139,7 +2139,7 @@ fn negative_integer_enum_backing_both_engines() {
     // NUM-split regression: a NEGATIVE INTEGER enum backing value (`A = -1`) must
     // compile + run byte-identically on the default VM and the tree-walker. Before
     // the fix, `const_eval_enum_backing`'s unary-minus arm only handled
-    // `Value::Float`, so an integer literal (now `Value::Int`) fell through to
+    // `Value::float`, so an integer literal (now `Value::int`) fell through to
     // "enum variant backing value must be a number or string literal" — the VM
     // rejected legal code the tree-walker accepted.
     let cases = [

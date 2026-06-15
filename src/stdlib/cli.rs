@@ -656,19 +656,19 @@ fn result_to_value(pr: ParseResult, subcommand: Value, help: Value) -> Value {
     let mut map = IndexMap::new();
     map.insert(
         "flags".to_string(),
-        Value::Object(crate::value::ObjectCell::new(pr.flags)),
+        Value::object_cell(crate::value::ObjectCell::new(pr.flags)),
     );
     map.insert(
         "options".to_string(),
-        Value::Object(crate::value::ObjectCell::new(pr.options)),
+        Value::object_cell(crate::value::ObjectCell::new(pr.options)),
     );
     map.insert(
         "positionals".to_string(),
-        Value::Object(crate::value::ObjectCell::new(pr.positionals_map)),
+        Value::object_cell(crate::value::ObjectCell::new(pr.positionals_map)),
     );
     map.insert("subcommand".to_string(), subcommand);
     map.insert("help".to_string(), help);
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object_cell(crate::value::ObjectCell::new(map))
 }
 
 // ── the impl Interp dispatch ──────────────────────────────────────────────────
@@ -811,17 +811,17 @@ impl Interp {
                     sub_map.insert("name".to_string(), Value::str(sub_name.as_str()));
                     sub_map.insert(
                         "flags".to_string(),
-                        Value::Object(crate::value::ObjectCell::new(sub_pr.flags)),
+                        Value::object_cell(crate::value::ObjectCell::new(sub_pr.flags)),
                     );
                     sub_map.insert(
                         "options".to_string(),
-                        Value::Object(crate::value::ObjectCell::new(sub_pr.options)),
+                        Value::object_cell(crate::value::ObjectCell::new(sub_pr.options)),
                     );
                     sub_map.insert(
                         "positionals".to_string(),
-                        Value::Object(crate::value::ObjectCell::new(sub_pr.positionals_map)),
+                        Value::object_cell(crate::value::ObjectCell::new(sub_pr.positionals_map)),
                     );
-                    let sub_val = Value::Object(crate::value::ObjectCell::new(sub_map));
+                    let sub_val = Value::object_cell(crate::value::ObjectCell::new(sub_map));
 
                     let result = result_to_value(top_pr, sub_val, Value::nil());
                     return Ok(make_pair(result, Value::nil()));
@@ -874,11 +874,11 @@ mod tests {
         for (k, v) in fields {
             m.insert(k.to_string(), v);
         }
-        Value::Object(crate::value::ObjectCell::new(m))
+        Value::object_cell(crate::value::ObjectCell::new(m))
     }
 
     fn arr(items: Vec<Value>) -> Value {
-        Value::Array(crate::value::ArrayCell::new(items))
+        Value::array_cell(crate::value::ArrayCell::new(items))
     }
 
     /// Build a simple spec with flags, options, positionals.

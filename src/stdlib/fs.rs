@@ -45,7 +45,7 @@ fn obj(m: IndexMap<String, Value>) -> Value {
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// A Tier-1 error pair `[nil, {message}]` from a `std::io::Error` (or any Display).

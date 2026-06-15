@@ -39,7 +39,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// Accept bytes OR a string (encoded as UTF-8) as a source of raw bytes.
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(
             call(
                 "crc32",
-                &[Value::Bytes(Rc::new(RefCell::new(b"hello".to_vec())))],
+                &[Value::bytes_rc(Rc::new(RefCell::new(b"hello".to_vec())))],
                 sp()
             )
             .unwrap(),
@@ -538,7 +538,7 @@ mod tests {
         // bytes input also works for xxhash
         let r2 = call(
             "xxhash",
-            &[Value::Bytes(Rc::new(RefCell::new(b"hello".to_vec())))],
+            &[Value::bytes_rc(Rc::new(RefCell::new(b"hello".to_vec())))],
             sp(),
         )
         .unwrap();

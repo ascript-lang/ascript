@@ -112,7 +112,7 @@ fn round_to_int(
     }
 }
 
-/// NUM §4: require the argument to be a strict `Value::Int` (the int→int
+/// NUM §4: require the argument to be a strict `Value::int` (the int→int
 /// helpers — `floordiv`/`divmod`/`ceildiv` and the bit ops — do not accept a
 /// `float`, since they are exact integer operations). A `float` (or any other
 /// kind) is a Tier-2 panic.
@@ -414,7 +414,7 @@ pub fn call(
                 let j = (next_random(interp) * (i as f64 + 1.0)).floor() as usize;
                 items.swap(i, j.min(i));
             }
-            Ok(Value::Array(crate::value::ArrayCell::new(items)))
+            Ok(Value::array_cell(crate::value::ArrayCell::new(items)))
         }
         "choice" => {
             let a = want_array(&arg(args, 0), span, &ctx("choice"))?;
@@ -466,7 +466,7 @@ pub fn call(
             let r = a.checked_sub(qb).ok_or_else(|| -> Control {
                 AsError::at("math.divmod: integer overflow", span).into()
             })?;
-            Ok(Value::Array(crate::value::ArrayCell::new(vec![
+            Ok(Value::array_cell(crate::value::ArrayCell::new(vec![
                 Value::int(q),
                 Value::int(r),
             ])))
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn math_stats() {
-        let a = Value::Array(crate::value::ArrayCell::new(vec![
+        let a = Value::array_cell(crate::value::ArrayCell::new(vec![
             n(1.0),
             n(2.0),
             n(3.0),
@@ -659,7 +659,7 @@ mod tests {
         assert!(
             matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap().kind(), ValueKind::Float(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
         );
-        let empty = Value::Array(crate::value::ArrayCell::new(vec![]));
+        let empty = Value::array_cell(crate::value::ArrayCell::new(vec![]));
         assert_eq!(
             call("sum", std::slice::from_ref(&empty), sp()).unwrap(),
             n(0.0)
@@ -674,7 +674,7 @@ mod tests {
             Err(Control::Panic(_))
         ));
         // sample variance needs >= 2 elements
-        let one = Value::Array(crate::value::ArrayCell::new(vec![n(5.0)]));
+        let one = Value::array_cell(crate::value::ArrayCell::new(vec![n(5.0)]));
         assert!(matches!(
             call("variance", &[one, Value::bool_(true)], sp()),
             Err(Control::Panic(_))
@@ -696,7 +696,7 @@ mod tests {
             call("randomInt", &[n(6.0), n(1.0)], sp()),
             Err(Control::Panic(_))
         ));
-        let a = Value::Array(crate::value::ArrayCell::new(vec![
+        let a = Value::array_cell(crate::value::ArrayCell::new(vec![
             n(1.0),
             n(2.0),
             n(3.0),
@@ -733,7 +733,7 @@ mod tests {
         } else {
             panic!()
         }
-        let empty = Value::Array(crate::value::ArrayCell::new(vec![]));
+        let empty = Value::array_cell(crate::value::ArrayCell::new(vec![]));
         assert_eq!(
             call("choice", std::slice::from_ref(&empty), sp()).unwrap(),
             Value::nil()

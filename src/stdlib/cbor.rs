@@ -141,9 +141,9 @@ pub(crate) fn from_cbor(cb: &Cb) -> Value {
         }
         Cb::Float(f) => Value::float(*f),
         Cb::Text(s) => Value::str(s.as_str()),
-        Cb::Bytes(b) => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
+        Cb::Bytes(b) => Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
         Cb::Array(a) => {
-            Value::Array(crate::value::ArrayCell::new(a.iter().map(from_cbor).collect()))
+            Value::array_cell(crate::value::ArrayCell::new(a.iter().map(from_cbor).collect()))
         }
         Cb::Map(pairs) => {
             let all_text = pairs.iter().all(|(k, _)| matches!(k, Cb::Text(_)));
@@ -154,7 +154,7 @@ pub(crate) fn from_cbor(cb: &Cb) -> Value {
                         m.insert(s.clone(), from_cbor(v));
                     }
                 }
-                Value::Object(crate::value::ObjectCell::new(m))
+                Value::object_cell(crate::value::ObjectCell::new(m))
             } else {
                 let mut m: IndexMap<crate::value::MapKey, Value> = IndexMap::new();
                 for (k, v) in pairs {
@@ -162,7 +162,7 @@ pub(crate) fn from_cbor(cb: &Cb) -> Value {
                         m.insert(mk, from_cbor(v));
                     }
                 }
-                Value::Map(crate::value::MapCell::new(m))
+                Value::map_cell(crate::value::MapCell::new(m))
             }
         }
         // A tagged value: use the inner value (the tag semantics are not modeled).
@@ -179,7 +179,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let cb = to_cbor(&v, &mut Vec::new()).map_err(|e| AsError::at(e, span))?;
             let mut buf = Vec::new();
             match ciborium::into_writer(&cb, &mut buf) {
-                Ok(()) => Ok(Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(buf)))),
+                Ok(()) => Ok(Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(buf)))),
                 Err(e) => Err(AsError::at(format!("cbor.encode: {}", e), span).into()),
             }
         }
@@ -298,7 +298,7 @@ mod tests {
     }
 
     // SRV regression (holistic-review MAJOR): a frozen container must encode like its
-    // live equivalent (before the fix, `to_cbor` errored on any `Value::Shared`).
+    // live equivalent (before the fix, `to_cbor` errored on any `Value::shared`).
     #[cfg(feature = "shared")]
     #[test]
     fn frozen_container_encodes_like_live() {
@@ -312,7 +312,7 @@ mod tests {
         let live = Value::object(m);
         let frozen = shared::freeze(&live, sp()).unwrap();
         // Encoding is deterministic: the frozen object must encode to the SAME bytes
-        // as the live one (Value::Object `==` is identity, so compare the bytes).
+        // as the live one (Value::object_cell `==` is identity, so compare the bytes).
         let bytes_of = |v: Value| match call("encode", &[v], sp()).unwrap().kind() {
             ValueKind::Bytes(b) => b.borrow().clone(),
             _ => panic!("encode did not return bytes"),

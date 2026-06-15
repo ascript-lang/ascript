@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 /// RAII guard that decrements an isolate's in-flight counter on drop. This ensures
 /// the counter is decremented even if the caller-thread bridge task is aborted
-/// (cancel-on-drop: the last `Value::Future` clone drops → `SharedFuture::Drop` fires
+/// (cancel-on-drop: the last `Value::future` clone drops → `SharedFuture::Drop` fires
 /// the abort handle → the bridge `spawn_local` task is cancelled → this guard drops →
 /// the counter is decremented). Without the guard the counter leaks on cancel, making
 /// the isolate appear busier than it is and starving future jobs.
@@ -65,7 +65,7 @@ pub struct WorkerCodeSlice {
 }
 
 /// Dispatch a `worker fn` call: ship the entry's code slice + the structured-clone
-/// args to a pooled isolate (another OS thread) and return a `Value::Future` that
+/// args to a pooled isolate (another OS thread) and return a `Value::future` that
 /// resolves with the worker's result. Only BYTES cross the thread boundary — the
 /// `!Send` `Interp`/`Value`s never leave the caller thread; the isolate builds its
 /// own. The awaiting bridge lives on the caller thread.
@@ -82,7 +82,7 @@ pub struct WorkerCodeSlice {
 ///     a `SharedFuture` + reply/abort `oneshot`s, hand the request to the pool, and
 ///     `spawn_local` a small caller-thread bridge that awaits the reply, decodes the
 ///     result against `interp`, and resolves the future. `set_abort` wires
-///     cancel-on-drop: dropping the last `Value::Future` aborts the bridge, which
+///     cancel-on-drop: dropping the last `Value::future` aborts the bridge, which
 ///     drops the abort sender, which the isolate `select!`s on to cancel its run.
 pub fn dispatch_worker(
     interp: &Interp,
@@ -104,7 +104,7 @@ pub fn dispatch_worker(
             Control::Panic(crate::error::AsError::at(e.message(), span))
         })?;
     }
-    let args_array = Value::Array(crate::value::ArrayCell::new(args));
+    let args_array = Value::array_cell(crate::value::ArrayCell::new(args));
     let (encoded, encoded_shared) = serialize::encode(&args_array).map_err(|e| {
         Control::Panic(crate::error::AsError::at(e.message(), span))
     })?;
@@ -130,7 +130,7 @@ pub fn dispatch_worker(
         entry_name: slice.entry_name.to_string(),
         args: encoded,
         // SRV §3.7(b): the frozen `Arc<SharedNode>` side-vector travels alongside the
-        // bytes (a `Send` field, NOT structured-clone). A `Value::Shared` among the
+        // bytes (a `Send` field, NOT structured-clone). A `Value::shared` among the
         // args is shipped by `Arc` pointer — zero copy of the frozen graph.
         shared: encoded_shared,
         // FFI §4.5a: ship the dispatching isolate's caps as the pooled worker's
@@ -196,13 +196,13 @@ pub fn dispatch_worker(
     });
     fut.set_abort(handle.abort_handle());
 
-    Ok(Value::Future(fut))
+    Ok(Value::future(fut))
 }
 
 /// Inline-nesting path: a `worker fn` called from inside an isolate runs on the
 /// current isolate's VM (no pool round-trip → deadlock-free). The entry global is
 /// already defined (the enclosing slice shipped it transitively); we look it up and
-/// call it, eagerly scheduled like any async call so the result is a `Value::Future`.
+/// call it, eagerly scheduled like any async call so the result is a `Value::future`.
 ///
 /// Engine hooks call this DIRECTLY when `pool::in_isolate()`, so they avoid building
 /// a cross-thread code slice (the isolate's `Interp` has no `worker_source` and needs
@@ -229,7 +229,7 @@ pub fn dispatch_worker_inline(
     })?;
 
     // Eagerly schedule the inline body so it behaves like a normal async call
-    // (returns a `Value::Future`; `await` drives it). Runs on the current isolate's
+    // (returns a `Value::future`; `await` drives it). Runs on the current isolate's
     // LocalSet — no cross-thread transport.
     let fut = crate::task::SharedFuture::new();
     let cell = fut.cell();
@@ -238,7 +238,7 @@ pub fn dispatch_worker_inline(
         cell.resolve(r);
     });
     fut.set_abort(handle.abort_handle());
-    Ok(Value::Future(fut))
+    Ok(Value::future(fut))
 }
 
 /// Caller-thread INLINE FALLBACK (graceful degradation, #1): when the pool cannot
@@ -250,7 +250,7 @@ pub fn dispatch_worker_inline(
 /// slice run, no access to the caller's heap), so the result is byte-identical to the
 /// parallel path; only the parallelism is lost.
 ///
-/// Returns a `Value::Future` that resolves with the worker's result (scheduled on the
+/// Returns a `Value::future` that resolves with the worker's result (scheduled on the
 /// caller's `LocalSet`, like any async call).
 fn run_slice_inline(
     slice_bytes: Option<&[u8]>,
@@ -310,7 +310,7 @@ fn run_slice_inline(
             Ok(v) => Ok(v),
             // A top-level `?` propagation inside the worker body ends with nil (matches
             // the isolate's WorkerReply handling).
-            Err(Control::Propagate(_)) => Ok(Value::Nil),
+            Err(Control::Propagate(_)) => Ok(Value::nil()),
             Err(Control::Exit(_)) => Err(Control::Panic(crate::error::AsError::at(
                 "exit() is not allowed inside a worker".to_string(),
                 span,
@@ -320,7 +320,7 @@ fn run_slice_inline(
         cell.resolve(r);
     });
     fut.set_abort(handle.abort_handle());
-    Ok(Value::Future(fut))
+    Ok(Value::future(fut))
 }
 
 /// FFI §4.5a — THE KEYSTONE: dispatch a worker onto a DEDICATED (single-tenant)
@@ -337,7 +337,7 @@ fn run_slice_inline(
 /// `Interp::new` default), so it CAN drop further (one-way), but never re-grant.
 ///
 /// The reply crosses back as `Send` bytes over a `std::mpsc` back-channel; the caller
-/// bridges it onto a `Value::Future` decoded against the CALLER's interp (so the
+/// bridges it onto a `Value::future` decoded against the CALLER's interp (so the
 /// returned plain data — `int`/`Bytes`/`Object` — reconstructs in the caller's heap).
 pub fn dispatch_worker_dedicated(
     interp: &Interp,
@@ -353,7 +353,7 @@ pub fn dispatch_worker_dedicated(
         serialize::check_sendable(arg)
             .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
     }
-    let args_array = Value::Array(crate::value::ArrayCell::new(args));
+    let args_array = Value::array_cell(crate::value::ArrayCell::new(args));
     let (encoded, encoded_shared) = serialize::encode(&args_array)
         .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
 
@@ -395,7 +395,7 @@ pub fn dispatch_worker_dedicated(
         };
         // SRV §3.7: the dedicated isolate's inbound channel is `Vec<u8>` only, so the
         // frozen-`Arc` side-vector is CAPTURED directly in this `Send` closure (path-a
-        // style) rather than riding the byte channel — a `Value::Shared` arg crosses by
+        // style) rather than riding the byte channel — a `Value::shared` arg crosses by
         // `Arc` pointer (zero copy), reconstructed here against this isolate.
         let arg_values =
             match isolate::decode_args_with_shared(&args_bytes, &encoded_shared, &iso_interp) {
@@ -420,7 +420,7 @@ pub fn dispatch_worker_dedicated(
                 Err(e) => isolate::WorkerReply::Panic(e.message()),
             },
             Err(Control::Panic(e)) => isolate::WorkerReply::Panic(e.message),
-            Err(Control::Propagate(_)) => match serialize::encode(&Value::Nil) {
+            Err(Control::Propagate(_)) => match serialize::encode(&Value::nil()) {
                 Ok((bytes, shared)) => isolate::WorkerReply::Ok(bytes, shared),
                 Err(e) => isolate::WorkerReply::Panic(e.message()),
             },
@@ -438,7 +438,7 @@ pub fn dispatch_worker_dedicated(
         ))
     })?;
 
-    // Ship the args, then bridge the reply onto a Value::Future. The isolate handle is
+    // Ship the args, then bridge the reply onto a Value::future. The isolate handle is
     // moved into the bridge task so it stays alive until the reply arrives (and is then
     // dropped → the isolate's thread joins → no zombie).
     if handle.tx.send(encoded).is_err() {
@@ -482,7 +482,7 @@ pub fn dispatch_worker_dedicated(
         cell.resolve(result);
     });
     fut.set_abort(bridge.abort_handle());
-    Ok(Value::Future(fut))
+    Ok(Value::future(fut))
 }
 
 #[cfg(test)]

@@ -72,7 +72,7 @@ pub enum StreamSource {
         /// NUM §4: emit `Int` elements when both bounds and the step are `Int`.
         is_int: bool,
     },
-    /// A script generator (`Value::Generator`), pulled via `resume(nil)`.
+    /// A script generator (`Value::generator`), pulled via `resume(nil)`.
     Generator(Rc<GeneratorHandle>),
 }
 
@@ -101,7 +101,7 @@ pub enum Stage {
     Zip { other_id: u64 },
 }
 
-/// The resource behind a `Value::Native(stream)` handle: a source + an ordered chain
+/// The resource behind a `Value::native(stream)` handle: a source + an ordered chain
 /// of stages. Mutated in place (cursor / stage counters / flatMap buffer) as it is
 /// pulled, so a stream is single-consumption.
 pub struct StreamState {
@@ -201,7 +201,7 @@ fn require_stream_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
 /// early gives a better message naming the stream op.
 fn require_callable(v: &Value, span: Span, ctx: &str) -> Result<Value, Control> {
     match v.kind() {
-        // `Value::Closure` is the VM's compiled-function value — equally callable
+        // `Value::closure` is the VM's compiled-function value — equally callable
         // via `call_value` (the V4-T5 bridge). The tree-walker never produces a
         // Closure, so this arm is inert there; it only matters for VM programs.
         ValueKind::Function(_)

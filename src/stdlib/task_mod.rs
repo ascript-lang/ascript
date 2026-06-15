@@ -84,7 +84,7 @@ impl Interp {
             f.detach();
             return Ok(Value::future(f));
         }
-        // `Value::Closure` is the VM's compiled-function value (V4-T5 bridge);
+        // `Value::closure` is the VM's compiled-function value (V4-T5 bridge);
         // `task.spawn(closure)` must invoke it like any other callable.
         if matches!(
             v.kind(),
@@ -282,7 +282,7 @@ impl Interp {
 
         for attempt in 0..attempts {
             // Call the function. If it is an async fn, call_value returns
-            // Ok(Value::Future(..)) immediately — we must drive the future to
+            // Ok(Value::future(..)) immediately — we must drive the future to
             // completion by awaiting it before inspecting the result.
             let call_result = self.call_value(func.clone(), vec![], span).await;
             let result = match call_result {
@@ -342,8 +342,8 @@ impl Interp {
     /// end-to-end for free: a slow `on` listener slows `emit`, which slows the loop,
     /// which slows `resume`, which slows the producer (demand-driven pull).
     ///
-    /// Both arguments are required: `gen` must be a `Value::Generator`; `bus` must be a
-    /// `Value::Native` with `NativeKind::Events`. Type misuse → Tier-2 panic (spec §11.3).
+    /// Both arguments are required: `gen` must be a `Value::generator`; `bus` must be a
+    /// `Value::native` with `NativeKind::Events`. Type misuse → Tier-2 panic (spec §11.3).
     async fn task_pipe(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let gen_val = arg(args, 0);
         let bus = arg(args, 1);

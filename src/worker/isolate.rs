@@ -102,7 +102,7 @@ pub struct WorkerRequest {
     /// Structured-clone-encoded positional args (see `serialize::encode`).
     pub args: Vec<u8>,
     /// SRV §3.7(b) — the frozen `Arc<SharedNode>` side-vector that travels alongside
-    /// `args`. A `Value::Shared` arg is encoded as a `TAG_SHARED` index into this
+    /// `args`. A `Value::shared` arg is encoded as a `TAG_SHARED` index into this
     /// vector (a `Send` field; the frozen graph crosses by `Arc` pointer, NOT a
     /// structured-clone copy). Empty when no arg is a `Shared`.
     pub shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
@@ -118,13 +118,13 @@ pub struct WorkerRequest {
     pub caps: Box<crate::stdlib::caps::CapSet>,
     /// Where the isolate sends the reply (result bytes or a panic message).
     pub reply: oneshot::Sender<WorkerReply>,
-    /// Cancel signal: the caller drops the paired sender on `Value::Future` drop;
+    /// Cancel signal: the caller drops the paired sender on `Value::future` drop;
     /// the isolate `select!`s on this to abort the in-flight run (cancel-on-drop).
     pub abort: oneshot::Receiver<()>,
 }
 
 /// The isolate's response. `Send` bytes / a message string only — plus the SRV
-/// §3.7(b) frozen-`Arc` side-vector for a `Value::Shared` result (also `Send`).
+/// §3.7(b) frozen-`Arc` side-vector for a `Value::shared` result (also `Send`).
 pub enum WorkerReply {
     /// The structured-clone-encoded result `Value`, plus the frozen `Arc<SharedNode>`
     /// side-vector (a worker may RETURN a `shared.freeze`d value — it crosses back by
@@ -403,7 +403,7 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
                 Err(crate::interp::Control::Panic(e)) => WorkerReply::Panic(e.message),
                 // A top-level `?` propagation inside the worker body ends with nil.
                 Err(crate::interp::Control::Propagate(_)) => {
-                    match crate::worker::serialize::encode(&Value::Nil) {
+                    match crate::worker::serialize::encode(&Value::nil()) {
                         Ok((bytes, shared)) => WorkerReply::Ok(bytes, shared),
                         Err(e) => WorkerReply::Panic(e.message()),
                     }
@@ -469,7 +469,7 @@ pub(crate) async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Resul
 /// an encoded ARRAY of the positional args (the caller wraps them so one decode call
 /// reconstructs the whole arg list, preserving cross-arg shared references / cycles).
 /// Resolves any `TAG_SHARED` index against the frozen-`Arc` side-vector (SRV §3.7b
-/// — a `Value::Shared` arg crosses by `Arc` clone, zero copy). Callers with no shared
+/// — a `Value::shared` arg crosses by `Arc` clone, zero copy). Callers with no shared
 /// values pass `&[]`.
 pub(crate) fn decode_args_with_shared(
     bytes: &[u8],
@@ -525,7 +525,7 @@ mod tests {
         .expect("dedicated isolate should spawn");
 
         // Ship a trivial value as bytes; expect the doubled result back.
-        let (payload, _shared) = crate::worker::serialize::encode(&Value::Float(21.0))
+        let (payload, _shared) = crate::worker::serialize::encode(&Value::float(21.0))
             .expect("encode sendable number");
         handle.tx.send(payload).expect("isolate inbound channel open");
         let got = result_rx
@@ -607,7 +607,7 @@ mod tests {
         interp.set_caps_drop_allowed(false);
         assert!(!interp.caps_drop_allowed(), "pooled request refuses drops");
         let refused = interp
-            .call_caps("drop", &[crate::value::Value::Str("net".into())], crate::span::Span::new(0, 0))
+            .call_caps("drop", &[crate::value::Value::str("net")], crate::span::Span::new(0, 0))
             .await;
         assert!(refused.is_err(), "a pooled caps.drop must be refused");
         assert!(interp.caps().has(Cap::Net), "the refused drop must not mutate caps");

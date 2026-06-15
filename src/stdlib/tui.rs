@@ -3,7 +3,7 @@
 //! cursor / styling; the screen `Buffer` (a `width × height` grid of `Cell`s) is
 //! hand-rolled so it bridges cleanly to AScript's value model.
 //!
-//! Task 1 (this file's first slice) lands the `Terminal` `Value::Native` handle
+//! Task 1 (this file's first slice) lands the `Terminal` `Value::native` handle
 //! plus the screen `Buffer`/`Cell` types and the terminal lifecycle methods
 //! (size / clear / raw / alt screen / cursor / restore). The buffer, the size
 //! query, and the close lifecycle are unit-testable WITHOUT a real tty (`size()`
@@ -427,7 +427,7 @@ impl Interp {
                 // NUM §4: terminal dimensions are integral → `Int`.
                 map.insert("width".to_string(), Value::int(state.back.width as i64));
                 map.insert("height".to_string(), Value::int(state.back.height as i64));
-                Ok(Value::Object(crate::value::ObjectCell::new(map)))
+                Ok(Value::object_cell(crate::value::ObjectCell::new(map)))
             }
             "clear" => {
                 let mut state = self.terminal_mut(id).expect("checked present");
@@ -939,7 +939,7 @@ fn make_object(pairs: Vec<(&str, Value)>) -> Value {
     for (k, v) in pairs {
         m.insert(k.to_string(), v);
     }
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object_cell(crate::value::ObjectCell::new(m))
 }
 
 /// A readable name for a crossterm `KeyCode`. `Char(c)` becomes the single-char
@@ -1074,11 +1074,11 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
-        Value::Object(crate::value::ObjectCell::new(m))
+        Value::object_cell(crate::value::ObjectCell::new(m))
     }
 
     fn arr(items: Vec<f64>) -> Value {
-        Value::Array(crate::value::ArrayCell::new(
+        Value::array_cell(crate::value::ArrayCell::new(
             items.into_iter().map(Value::float).collect(),
         ))
     }

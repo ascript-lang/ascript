@@ -35,7 +35,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// Accept bytes OR a string (encoded as UTF-8) as a source of raw bytes.
@@ -113,7 +113,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let raw = src.borrow().clone();
             match extract_zip(&raw) {
                 Ok(arr) => Ok(make_pair(
-                    Value::Array(crate::value::ArrayCell::new(arr)),
+                    Value::array_cell(crate::value::ArrayCell::new(arr)),
                     Value::nil(),
                 )),
                 Err(msg) => Ok(err_pair(msg)),
@@ -176,7 +176,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let raw = src.borrow().clone();
             match extract_tar(&raw) {
                 Ok(arr) => Ok(make_pair(
-                    Value::Array(crate::value::ArrayCell::new(arr)),
+                    Value::array_cell(crate::value::ArrayCell::new(arr)),
                     Value::nil(),
                 )),
                 Err(msg) => Ok(err_pair(msg)),
@@ -237,7 +237,7 @@ fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<
                     format!(
                         "compress.{} entry.name must be a string, got {}",
                         ctx,
-                        crate::interp::type_name(name_field.as_ref().unwrap_or(&Value::Nil))
+                        crate::interp::type_name(name_field.as_ref().unwrap_or(&Value::nil()))
                     ),
                     span,
                 )
@@ -255,7 +255,7 @@ fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<
                     format!(
                         "compress.{} entry.data must be bytes or a string, got {}",
                         ctx,
-                        crate::interp::type_name(data_field.as_ref().unwrap_or(&Value::Nil))
+                        crate::interp::type_name(data_field.as_ref().unwrap_or(&Value::nil()))
                     ),
                     span,
                 )
@@ -306,7 +306,7 @@ fn extract_tar(raw: &[u8]) -> Result<Vec<Value>, String> {
         let mut obj = indexmap::IndexMap::new();
         obj.insert("name".to_string(), Value::str(name));
         obj.insert("data".to_string(), bytes_val(data));
-        out.push(Value::Object(crate::value::ObjectCell::new(obj)));
+        out.push(Value::object_cell(crate::value::ObjectCell::new(obj)));
     }
     Ok(out)
 }
@@ -347,7 +347,7 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
                     AsError::at(
                         format!(
                             "compress.zipCreate entry.name must be a string, got {}",
-                            crate::interp::type_name(name_field.as_ref().unwrap_or(&Value::Nil))
+                            crate::interp::type_name(name_field.as_ref().unwrap_or(&Value::nil()))
                         ),
                         span,
                     )
@@ -364,7 +364,7 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
                     AsError::at(
                         format!(
                             "compress.zipCreate entry.data must be bytes or a string, got {}",
-                            crate::interp::type_name(data_field.as_ref().unwrap_or(&Value::Nil))
+                            crate::interp::type_name(data_field.as_ref().unwrap_or(&Value::nil()))
                         ),
                         span,
                     )
@@ -402,7 +402,7 @@ fn extract_zip(raw: &[u8]) -> Result<Vec<Value>, String> {
         let mut obj = indexmap::IndexMap::new();
         obj.insert("name".to_string(), Value::str(name));
         obj.insert("data".to_string(), bytes_val(data));
-        out.push(Value::Object(crate::value::ObjectCell::new(obj)));
+        out.push(Value::object_cell(crate::value::ObjectCell::new(obj)));
     }
     Ok(out)
 }
@@ -417,7 +417,7 @@ mod tests {
         Value::str(x)
     }
     fn b(v: Vec<u8>) -> Value {
-        Value::Bytes(Rc::new(RefCell::new(v)))
+        Value::bytes_rc(Rc::new(RefCell::new(v)))
     }
     fn as_bytes(v: &Value) -> Vec<u8> {
         match v.kind() {
@@ -501,9 +501,9 @@ mod tests {
         let mut e2 = indexmap::IndexMap::new();
         e2.insert("name".to_string(), s("b.bin"));
         e2.insert("data".to_string(), b(vec![0x00, 0xFF, 0x10, 0x42]));
-        let entries = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Object(crate::value::ObjectCell::new(e1)),
-            Value::Object(crate::value::ObjectCell::new(e2)),
+        let entries = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::object_cell(crate::value::ObjectCell::new(e1)),
+            Value::object_cell(crate::value::ObjectCell::new(e2)),
         ]));
 
         let zipped = ok_value(call("zipCreate", &[entries], sp()).unwrap());
@@ -630,9 +630,9 @@ mod tests {
         let mut e2 = indexmap::IndexMap::new();
         e2.insert("name".to_string(), s("b.bin"));
         e2.insert("data".to_string(), b(vec![0x00, 0xFF, 0x10, 0x42]));
-        let entries = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Object(crate::value::ObjectCell::new(e1)),
-            Value::Object(crate::value::ObjectCell::new(e2)),
+        let entries = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::object_cell(crate::value::ObjectCell::new(e1)),
+            Value::object_cell(crate::value::ObjectCell::new(e2)),
         ]));
         let tarred = ok_value(call("tarCreate", &[entries], sp()).unwrap());
         let extracted = ok_value(call("tarExtract", &[tarred], sp()).unwrap());
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be an object")]
     fn tar_create_bad_entry_is_tier2_panic() {
-        let entries = Value::Array(crate::value::ArrayCell::new(vec![Value::float(1.0)]));
+        let entries = Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(1.0)]));
         call("tarCreate", &[entries], sp()).unwrap();
     }
 

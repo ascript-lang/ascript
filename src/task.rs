@@ -1,9 +1,9 @@
-//! M17 async runtime: `SharedFuture`, the handle behind `Value::Future`, with
+//! M17 async runtime: `SharedFuture`, the handle behind `Value::future`, with
 //! **structured concurrency / cancel-on-drop**.
 //!
 //! A script `async fn` call schedules its body on the current-thread `LocalSet`
-//! and hands back a `Value::Future`. Structured-concurrency rule: the spawned
-//! task's lifetime is bound to its handle(s). When the **last** `Value::Future`
+//! and hands back a `Value::future`. Structured-concurrency rule: the spawned
+//! task's lifetime is bound to its handle(s). When the **last** `Value::future`
 //! clone referring to a task is dropped, the task is **aborted** — so an
 //! un-awaited result is cancelled rather than orphaned (the dual of the
 //! consumer-driven generator design). `task.spawn(...)` is the one explicit way
@@ -13,7 +13,7 @@
 //! the lifetime owner are split into two `Rc`s:
 //! - [`ResultCell`] — the completion slot. The spawned task holds a clone of THIS
 //!   (only) to deposit its result. It deliberately does NOT hold the handle.
-//! - [`SharedFuture`] (`Rc<HandleInner>`) — the handle behind `Value::Future`. It
+//! - [`SharedFuture`] (`Rc<HandleInner>`) — the handle behind `Value::future`. It
 //!   owns the task's [`AbortHandle`] and aborts the task in its `Drop`. Because
 //!   the task never holds the handle, the handle's refcount can fall to zero while
 //!   the task is still running — which is exactly what triggers cancellation.
@@ -91,7 +91,7 @@ impl ResultCell {
     }
 }
 
-/// The lifetime owner behind `Value::Future`. Owns the task's abort handle and
+/// The lifetime owner behind `Value::future`. Owns the task's abort handle and
 /// cancels the task when the last handle clone is dropped (unless detached).
 struct HandleInner {
     cell: ResultCell,
@@ -110,7 +110,7 @@ impl Drop for HandleInner {
     }
 }
 
-/// Shared async handle behind `Value::Future`. `Rc`-shared, `!Send`. Cloning
+/// Shared async handle behind `Value::future`. `Rc`-shared, `!Send`. Cloning
 /// shares the same task/slot; dropping the last clone cancels the task.
 #[derive(Clone)]
 pub struct SharedFuture(Rc<HandleInner>);
@@ -154,7 +154,7 @@ impl SharedFuture {
         self.0.cell.get().await
     }
 
-    /// Identity equality (`Value::Future` is identity-equal, like other handles).
+    /// Identity equality (`Value::future` is identity-equal, like other handles).
     pub fn ptr_eq(&self, other: &SharedFuture) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
@@ -197,11 +197,11 @@ mod tests {
     async fn try_get_pending_is_none_resolved_is_some() {
         let f = SharedFuture::new();
         assert!(f.try_get().is_none(), "pending future must probe as None");
-        f.resolve(Ok(Value::Float(7.0)));
-        assert_eq!(f.try_get().unwrap().unwrap(), Value::Float(7.0));
-        assert_eq!(f.get().await.unwrap(), Value::Float(7.0));
+        f.resolve(Ok(Value::float(7.0)));
+        assert_eq!(f.try_get().unwrap().unwrap(), Value::float(7.0));
+        assert_eq!(f.get().await.unwrap(), Value::float(7.0));
         // Still Some after get() consumed nothing:
-        assert_eq!(f.try_get().unwrap().unwrap(), Value::Float(7.0));
+        assert_eq!(f.try_get().unwrap().unwrap(), Value::float(7.0));
     }
 
     #[tokio::test]
@@ -231,7 +231,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     tokio::task::yield_now().await;
                     ran2.set(true);
-                    cell.resolve(Ok(Value::Float(1.0)));
+                    cell.resolve(Ok(Value::float(1.0)));
                 });
                 f.set_abort(jh.abort_handle());
                 // Probe while still pending — must not abort:
@@ -251,17 +251,17 @@ mod tests {
     #[tokio::test]
     async fn resolves_once_and_get_returns_value() {
         let f = SharedFuture::new();
-        f.resolve(Ok(Value::Float(1.0)));
-        assert_eq!(f.get().await.unwrap(), Value::Float(1.0));
-        assert_eq!(f.get().await.unwrap(), Value::Float(1.0));
+        f.resolve(Ok(Value::float(1.0)));
+        assert_eq!(f.get().await.unwrap(), Value::float(1.0));
+        assert_eq!(f.get().await.unwrap(), Value::float(1.0));
     }
 
     #[tokio::test]
     async fn resolve_twice_keeps_first() {
         let f = SharedFuture::new();
-        f.resolve(Ok(Value::Float(1.0)));
-        f.resolve(Ok(Value::Float(2.0)));
-        assert_eq!(f.get().await.unwrap(), Value::Float(1.0));
+        f.resolve(Ok(Value::float(1.0)));
+        f.resolve(Ok(Value::float(2.0)));
+        assert_eq!(f.get().await.unwrap(), Value::float(1.0));
     }
 
     #[tokio::test]
@@ -283,9 +283,9 @@ mod tests {
             .run_until(async move {
                 tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
-                    cell.resolve(Ok(Value::Float(99.0)));
+                    cell.resolve(Ok(Value::float(99.0)));
                 });
-                assert_eq!(f.get().await.unwrap(), Value::Float(99.0));
+                assert_eq!(f.get().await.unwrap(), Value::float(99.0));
             })
             .await;
     }
@@ -318,7 +318,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     tokio::task::yield_now().await;
                     ran2.set(true);
-                    cell.resolve(Ok(Value::Float(1.0)));
+                    cell.resolve(Ok(Value::float(1.0)));
                 });
                 f.set_abort(jh.abort_handle());
                 drop(f); // last handle -> abort, before the task's first poll
@@ -345,7 +345,7 @@ mod tests {
                 let jh = tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
                     ran2.set(true);
-                    cell.resolve(Ok(Value::Float(7.0)));
+                    cell.resolve(Ok(Value::float(7.0)));
                 });
                 f.set_abort(jh.abort_handle());
                 f.detach(); // opt out of cancel-on-drop

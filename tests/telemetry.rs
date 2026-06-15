@@ -584,10 +584,10 @@ async fn sp11_soft_hook_contract() {
     let id = interp
         .telemetry_span_start(
             "chat openai:gpt-4.1",
-            vec![("gen_ai.system".into(), Value::Str("openai".into()))],
+            vec![("gen_ai.system".into(), Value::str("openai"))],
         )
         .expect("active → Some span id");
-    interp.telemetry_span_set(id, "gen_ai.request.model", Value::Str("gpt-4.1".into()));
+    interp.telemetry_span_set(id, "gen_ai.request.model", Value::str("gpt-4.1"));
     interp.telemetry_span_event(id, "first-token", vec![]);
     interp.telemetry_span_end(id, ascript::interp::SpanStatus::Ok);
     interp.telemetry_flush_on_exit().await;

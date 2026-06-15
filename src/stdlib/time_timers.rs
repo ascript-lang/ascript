@@ -11,14 +11,14 @@
 //! discard the first `tick()` call).
 //!
 //! ## debounce(fn, ms) → callable-wrapper
-//! Returns a `Value::NativeMethod` whose receiver is a `DebounceWrapper` resource.
+//! Returns a `Value::native_method` whose receiver is a `DebounceWrapper` resource.
 //! Each call to the wrapper resets a timer: any previously-scheduled delayed call
 //! is cancelled (cancel-on-drop via `AbortHandle::abort()`), and a new task is
 //! spawned that sleeps for `ms` then calls `fn(args)`.  The return value of the
 //! deferred call is discarded (fire-and-forget trailing edge).
 //!
 //! ## throttle(fn, ms) → callable-wrapper
-//! Returns a `Value::NativeMethod` whose receiver is a `ThrottleWrapper` resource.
+//! Returns a `Value::native_method` whose receiver is a `ThrottleWrapper` resource.
 //! Each call checks the monotonic time since the last fire.  If `>= ms` has
 //! elapsed (or it is the first call), `fn(args)` is called synchronously and the
 //! last-fire timestamp is updated (leading-edge).  Otherwise the call is a no-op.
@@ -85,7 +85,7 @@ pub struct ThrottleState {
 // ── factory functions (called from mod.rs call_time) ─────────────────────────
 
 /// `time.interval(ms)` — create and register a tokio `Interval` resource.
-/// Returns a `Value::Native(Interval)` handle; script accesses `.tick()` on it.
+/// Returns a `Value::native(Interval)` handle; script accesses `.tick()` on it.
 pub fn create_interval(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     let ms = want_number(&arg(args, 0), span, "time.interval")?;
     // Reject anything that would truncate to a zero Duration: tokio's
@@ -106,7 +106,7 @@ pub fn create_interval(interp: &Interp, args: &[Value], span: Span) -> Result<Va
 }
 
 /// `time.debounce(fn, ms)` — create a debounce wrapper.
-/// Returns a `Value::NativeMethod { receiver: DebounceWrapper, method: "call" }`.
+/// Returns a `Value::native_method { receiver: DebounceWrapper, method: "call" }`.
 /// Invoking the returned value as `wrapper(args)` dispatches through
 /// `call_native_method` → `call_debounce_method`.
 pub fn create_debounce(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -130,14 +130,14 @@ pub fn create_debounce(interp: &Interp, args: &[Value], span: Span) -> Result<Va
         ValueKind::Native(o) => o.clone(),
         _ => unreachable!(),
     };
-    Ok(Value::NativeMethod(Rc::new(NativeMethod {
+    Ok(Value::native_method(Rc::new(NativeMethod {
         receiver: obj,
         method: "call".to_string(),
     })))
 }
 
 /// `time.throttle(fn, ms)` — create a throttle wrapper.
-/// Returns a `Value::NativeMethod { receiver: ThrottleWrapper, method: "call" }`.
+/// Returns a `Value::native_method { receiver: ThrottleWrapper, method: "call" }`.
 pub fn create_throttle(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     let func = arg(args, 0);
     let ms_f = want_number(&arg(args, 1), span, "time.throttle ms")?;
@@ -158,7 +158,7 @@ pub fn create_throttle(interp: &Interp, args: &[Value], span: Span) -> Result<Va
         ValueKind::Native(o) => o.clone(),
         _ => unreachable!(),
     };
-    Ok(Value::NativeMethod(Rc::new(NativeMethod {
+    Ok(Value::native_method(Rc::new(NativeMethod {
         receiver: obj,
         method: "call".to_string(),
     })))
@@ -247,7 +247,7 @@ impl Interp {
         // the window expires (an AbortHandle's own Drop does NOT abort).
         let jh = tokio::task::spawn_local(async move {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-            // Calling an `async fn` returns Ok(Value::Future(..)) WITHOUT running
+            // Calling an `async fn` returns Ok(Value::future(..)) WITHOUT running
             // the body — so we must drive that inner future to completion here,
             // otherwise an async callback would silently never run. (Mirror of
             // `task.retry`.) The driven future's result/panic is swallowed:
@@ -320,7 +320,7 @@ impl Interp {
 
         if let Some(f) = func {
             // Fire on the leading edge; the return value is not surfaced.
-            // Calling an `async fn` returns Ok(Value::Future(..)) WITHOUT running
+            // Calling an `async fn` returns Ok(Value::future(..)) WITHOUT running
             // the body, so drive that inner future to completion here — otherwise
             // an async callback would silently never run. (Mirror of `task.retry`.)
             if let Ok(v) = self.call_value(f, args, span).await {

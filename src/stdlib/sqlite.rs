@@ -2,11 +2,11 @@
 //! with the `bundled` SQLite, so no system library is required).
 //!
 //! This is the first real consumer of the native resource-handle mechanism
-//! (`Value::Native` + the interp `resources` table from M13 Task 1). `open` is the
+//! (`Value::native` + the interp `resources` table from M13 Task 1). `open` is the
 //! only module-level function; everything else is a method on a handle:
 //!
 //! - `open(path) -> [connection, err]` (`":memory:"` for an in-memory DB) registers
-//!   a `ResourceState::SqliteConnection` and returns a `Value::Native` of kind
+//!   a `ResourceState::SqliteConnection` and returns a `Value::native` of kind
 //!   `SqliteConnection`.
 //! - Connection methods: `exec(sql, params?) -> [changes, err]`,
 //!   `query(sql, params?) -> [rows, err]` (rows are objects keyed by column),
@@ -52,7 +52,7 @@ fn err_pair(msg: String) -> Value {
 }
 
 fn obj(map: indexmap::IndexMap<String, Value>) -> Value {
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object_cell(crate::value::ObjectCell::new(map))
 }
 
 impl Interp {
@@ -139,7 +139,7 @@ impl Interp {
                 let conn = self.sqlite_conn(id).expect("checked present");
                 match query_sql(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(
-                        Value::Array(crate::value::ArrayCell::new(rows)),
+                        Value::array_cell(crate::value::ArrayCell::new(rows)),
                         Value::nil(),
                     )),
                     Err(e) => Ok(err_pair(format!("connection.query failed: {}", e))),
@@ -215,7 +215,7 @@ impl Interp {
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match query_cached(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(
-                        Value::Array(crate::value::ArrayCell::new(rows)),
+                        Value::array_cell(crate::value::ArrayCell::new(rows)),
                         Value::nil(),
                     )),
                     Err(e) => Ok(err_pair(format!("statement.all failed: {}", e))),
@@ -312,7 +312,7 @@ fn from_sql(v: ValueRef<'_>) -> Value {
         ValueRef::Integer(i) => Value::int(i),
         ValueRef::Real(r) => Value::float(r),
         ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
+        ValueRef::Blob(b) => Value::bytes_rc(Rc::new(RefCell::new(b.to_vec()))),
     }
 }
 

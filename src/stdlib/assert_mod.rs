@@ -8,7 +8,7 @@
 //! even though the two arrays are distinct heap objects.
 //!
 //! `assert.throws(fn) -> errValue` is async: it calls `fn`, drives any
-//! returned `Value::Future` to completion, then checks whether the call
+//! returned `Value::future` to completion, then checks whether the call
 //! raised a `Control::Panic`.  On success it returns the caught error value
 //! (the `{ message }` object that `recover` would have returned).  If `fn`
 //! completes without panicking, `assert.throws` itself panics.
@@ -304,7 +304,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("throws", bi("assert.throws")),
         ("throwsWith", bi("assert.throwsWith")),
     ];
-    // assert.matches requires `data` (Value::Regex + the regex crate).
+    // assert.matches requires `data` (Value::regex + the regex crate).
     #[cfg(feature = "data")]
     v.push(("matches", bi("assert.matches")));
     // assert.snapshot requires both `sys` (filesystem I/O) and `data` (JSON
@@ -372,11 +372,11 @@ impl Interp {
             }
             // ── assert.matches(value, regex) ─────────────────────────────────
             //
-            // Assert a string `value` matches a regex (a `Value::Regex` or a
+            // Assert a string `value` matches a regex (a `Value::regex` or a
             // pattern string, compiled on the fly — same convention as
             // `regex.test`). A non-string value or non-match fails clearly.
             //
-            // Gated on `data`: `Value::Regex` and the `regex` crate only exist
+            // Gated on `data`: `Value::regex` and the `regex` crate only exist
             // with it. Under `--no-default-features` `matches` is absent from the
             // exports and falls through to the catch-all "has no function" panic.
             #[cfg(feature = "data")]
@@ -627,7 +627,7 @@ impl Interp {
             }
             // ── assert.throws(fn) -> errValue ─────────────────────────────────
             //
-            // Calls fn with no arguments.  If fn returns a Value::Future (i.e.
+            // Calls fn with no arguments.  If fn returns a Value::future (i.e.
             // it is an async fn), that future is driven to completion before
             // checking whether a panic occurred.  Pattern mirrors `recover` +
             // the `task.retry` future-drive idiom.
@@ -1331,8 +1331,8 @@ A.eq(1, 1)
         // 1 vs 1.0 — deep_equal-equal → empty diff (no spurious change).
         assert_eq!(structural_diff(&Value::int(1), &Value::float(1.0)), "");
         // Deep arrays.
-        let a = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
-        let b = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
+        let a = Value::array_cell(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
+        let b = Value::array_cell(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
         assert_eq!(structural_diff(&a, &b), "");
         // Objects (insertion order).
         let mut o1 = indexmap::IndexMap::new();
@@ -1340,7 +1340,7 @@ A.eq(1, 1)
         let mut o2 = indexmap::IndexMap::new();
         o2.insert("a".to_string(), Value::int(1));
         assert_eq!(
-            structural_diff(&Value::Object(ObjectCell::new(o1)), &Value::Object(ObjectCell::new(o2))),
+            structural_diff(&Value::object_cell(ObjectCell::new(o1)), &Value::object_cell(ObjectCell::new(o2))),
             ""
         );
     }
@@ -1357,7 +1357,7 @@ A.eq(1, 1)
         b.insert("keep".to_string(), Value::int(1));
         b.insert("change".to_string(), Value::int(9));
         b.insert("extra".to_string(), Value::int(4));
-        let d = structural_diff(&Value::Object(ObjectCell::new(a)), &Value::Object(ObjectCell::new(b)));
+        let d = structural_diff(&Value::object_cell(ObjectCell::new(a)), &Value::object_cell(ObjectCell::new(b)));
         assert!(d.contains(".change: 2 → 9"), "change: {d}");
         assert!(d.contains("- .gone: 3"), "remove: {d}");
         assert!(d.contains("+ .extra: 4"), "add: {d}");
@@ -1369,13 +1369,13 @@ A.eq(1, 1)
         use super::structural_diff;
         use crate::value::{ArrayCell, Value};
         // index change
-        let a = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
-        let b = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(7)]));
+        let a = Value::array_cell(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
+        let b = Value::array_cell(ArrayCell::new(vec![Value::int(1), Value::int(7)]));
         let d = structural_diff(&a, &b);
         assert!(d.contains("[1]: 2 → 7"), "index change: {d}");
         // length difference (extra in a → removed)
-        let a2 = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2), Value::int(3)]));
-        let b2 = Value::Array(ArrayCell::new(vec![Value::int(1)]));
+        let a2 = Value::array_cell(ArrayCell::new(vec![Value::int(1), Value::int(2), Value::int(3)]));
+        let b2 = Value::array_cell(ArrayCell::new(vec![Value::int(1)]));
         let d2 = structural_diff(&a2, &b2);
         assert!(d2.contains("- [1]: 2"), "removed idx 1: {d2}");
         assert!(d2.contains("- [2]: 3"), "removed idx 2: {d2}");
@@ -1393,10 +1393,10 @@ A.eq(1, 1)
         let mk = |name: &str| {
             let mut inner = indexmap::IndexMap::new();
             inner.insert("name".to_string(), Value::str(name));
-            let arr = Value::Array(ArrayCell::new(vec![Value::Object(ObjectCell::new(inner))]));
+            let arr = Value::array_cell(ArrayCell::new(vec![Value::object_cell(ObjectCell::new(inner))]));
             let mut top = indexmap::IndexMap::new();
             top.insert("users".to_string(), arr);
-            Value::Object(ObjectCell::new(top))
+            Value::object_cell(ObjectCell::new(top))
         };
         let d = structural_diff(&mk("a"), &mk("b"));
         // Value::Display renders strings without quotes, so the change line is
@@ -1413,12 +1413,12 @@ A.eq(1, 1)
         use crate::value::{ArrayCell, Value};
         // Build a self-referential array a = [a], and an equal-shaped b = [b].
         let a = ArrayCell::new(vec![]);
-        a.borrow_mut().push(Value::Array(a.clone()));
+        a.borrow_mut().push(Value::array_cell(a.clone()));
         let b = ArrayCell::new(vec![]);
-        b.borrow_mut().push(Value::Array(b.clone()));
+        b.borrow_mut().push(Value::array_cell(b.clone()));
         // deep_equal treats these as equal (back-edge short-circuit) → empty diff,
         // and crucially this must NOT stack-overflow / loop.
-        let d = structural_diff(&Value::Array(a), &Value::Array(b));
+        let d = structural_diff(&Value::array_cell(a), &Value::array_cell(b));
         assert_eq!(d, "");
     }
 
@@ -1456,7 +1456,7 @@ print(r[1].message)
         assert!(out.contains("[1]: 2 → 9"), "expected diff line in: {out}");
     }
 
-    // ── assert.matches (data-gated: Value::Regex) ───────────────────────────
+    // ── assert.matches (data-gated: Value::regex) ───────────────────────────
 
     #[cfg(feature = "data")]
     #[tokio::test]

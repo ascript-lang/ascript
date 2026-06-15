@@ -17,7 +17,7 @@
 //! before it.
 //!
 //! **Sized C ints marshal OVER `int`** (NUM §10): `i8`…`u64`/`size` exist only at the
-//! C-ABI boundary, described as `ffi.i32` etc. and carried in/out over `Value::Int`
+//! C-ABI boundary, described as `ffi.i32` etc. and carried in/out over `Value::int`
 //! (i64). There is NO new `Value` kind. Narrowing is CHECKED (a too-large value → a
 //! Tier-2 panic), except `u64`/`size`, which take the i64 **bit pattern** with no
 //! sign check (§3.3).
@@ -138,7 +138,7 @@ fn err_pair(msg: Value) -> Value {
 fn descriptor(t: FfiType) -> Value {
     let mut m = indexmap::IndexMap::new();
     m.insert("__ffi".to_string(), Value::str(t.tag()));
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object_cell(crate::value::ObjectCell::new(m))
 }
 
 /// Read the `FfiType` out of a `ffi.<t>` descriptor Object, or `None` if `v` is not a
@@ -895,7 +895,7 @@ fn ffi_cstr(args: &[Value], span: Span) -> Result<Value, Control> {
     }
     let mut bytes = s.as_bytes().to_vec();
     bytes.push(0);
-    Ok(Value::Bytes(Rc::new(std::cell::RefCell::new(bytes))))
+    Ok(Value::bytes_rc(Rc::new(std::cell::RefCell::new(bytes))))
 }
 
 /// `ffi.read_cstr(ptr) -> string` — copy from a `ForeignPtr` (or a `Bytes` buffer)
@@ -986,7 +986,7 @@ fn ffi_struct(args: &[Value], span: Span) -> Result<Value, Control> {
         fd.insert("name".to_string(), Value::str(name));
         fd.insert("type".to_string(), Value::str(ty.tag()));
         fd.insert("offset".to_string(), Value::int(offset as i64));
-        field_descs.push(Value::Object(crate::value::ObjectCell::new(fd)));
+        field_descs.push(Value::object_cell(crate::value::ObjectCell::new(fd)));
 
         offset += size;
     }
@@ -998,9 +998,9 @@ fn ffi_struct(args: &[Value], span: Span) -> Result<Value, Control> {
     layout.insert("align".to_string(), Value::int(max_align as i64));
     layout.insert(
         "fields".to_string(),
-        Value::Array(crate::value::ArrayCell::new(field_descs)),
+        Value::array_cell(crate::value::ArrayCell::new(field_descs)),
     );
-    Ok(Value::Object(crate::value::ObjectCell::new(layout)))
+    Ok(Value::object_cell(crate::value::ObjectCell::new(layout)))
 }
 
 /// The size + alignment (bytes) of a scalar C type for struct layout.
@@ -1060,7 +1060,7 @@ fn ffi_alloc(args: &[Value], span: Span) -> Result<Value, Control> {
             .into())
         }
     };
-    Ok(Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; size]))))
+    Ok(Value::bytes_rc(Rc::new(std::cell::RefCell::new(vec![0u8; size]))))
 }
 
 /// Resolve a `(FfiType, offset)` for field `name` in `layout`, or a Tier-2 panic.
@@ -1338,7 +1338,7 @@ mod tests {
                 lib_id,
                 &[
                     Value::str(name),
-                    Value::Array(crate::value::ArrayCell::new(argtype_vals)),
+                    Value::array_cell(crate::value::ArrayCell::new(argtype_vals)),
                     descriptor(ret),
                 ],
                 span(),
@@ -1368,7 +1368,7 @@ mod tests {
         let r = interp
             .ffi_symbol_call(
                 sqrt,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::float(2.0)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(2.0)]))],
                 span(),
             )
             .unwrap();
@@ -1382,7 +1382,7 @@ mod tests {
         let r = interp
             .ffi_symbol_call(
                 cos,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::float(0.0)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::float(0.0)]))],
                 span(),
             )
             .unwrap();
@@ -1396,7 +1396,7 @@ mod tests {
         let r = interp
             .ffi_symbol_call(
                 abs,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::int(-5)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(-5)]))],
                 span(),
             )
             .unwrap();
@@ -1411,7 +1411,7 @@ mod tests {
         let r = interp
             .ffi_symbol_call(
                 strlen,
-                &[Value::Array(crate::value::ArrayCell::new(vec![cstr]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![cstr]))],
                 span(),
             )
             .unwrap();
@@ -1440,7 +1440,7 @@ mod tests {
         let err = interp
             .ffi_symbol_call(
                 sym,
-                &[Value::Array(crate::value::ArrayCell::new(vec![Value::int(300)]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(300)]))],
                 span(),
             )
             .unwrap_err();
@@ -1462,7 +1462,7 @@ mod tests {
         let err = interp
             .ffi_symbol_call(
                 abs,
-                &[Value::Array(crate::value::ArrayCell::new(vec![]))],
+                &[Value::array_cell(crate::value::ArrayCell::new(vec![]))],
                 span(),
             )
             .unwrap_err();
@@ -1501,7 +1501,7 @@ mod tests {
                 lib_id,
                 &[
                     Value::str("definitely_not_a_real_symbol_xyz"),
-                    Value::Array(crate::value::ArrayCell::new(vec![])),
+                    Value::array_cell(crate::value::ArrayCell::new(vec![])),
                     descriptor(FfiType::I32),
                 ],
                 span(),
@@ -1542,12 +1542,12 @@ mod tests {
     fn struct_layout_offsets_and_size() {
         // struct { i32 x; f64 y; } → x@0, y@8 (8-aligned), size 16.
         let layout = ffi_struct(
-            &[Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Array(crate::value::ArrayCell::new(vec![
+            &[Value::array_cell(crate::value::ArrayCell::new(vec![
+                Value::array_cell(crate::value::ArrayCell::new(vec![
                     Value::str("x"),
                     descriptor(FfiType::I32),
                 ])),
-                Value::Array(crate::value::ArrayCell::new(vec![
+                Value::array_cell(crate::value::ArrayCell::new(vec![
                     Value::str("y"),
                     descriptor(FfiType::F64),
                 ])),
@@ -1580,12 +1580,12 @@ mod tests {
     #[test]
     fn struct_alloc_set_get_round_trip() {
         let layout = ffi_struct(
-            &[Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Array(crate::value::ArrayCell::new(vec![
+            &[Value::array_cell(crate::value::ArrayCell::new(vec![
+                Value::array_cell(crate::value::ArrayCell::new(vec![
                     Value::str("x"),
                     descriptor(FfiType::I32),
                 ])),
-                Value::Array(crate::value::ArrayCell::new(vec![
+                Value::array_cell(crate::value::ArrayCell::new(vec![
                     Value::str("y"),
                     descriptor(FfiType::F64),
                 ])),
@@ -1628,7 +1628,7 @@ mod tests {
             let mut m = indexmap::IndexMap::new();
             m.insert("size".to_string(), Value::int(n));
             m.insert("align".to_string(), Value::int(1));
-            Value::Object(crate::value::ObjectCell::new(m))
+            Value::object_cell(crate::value::ObjectCell::new(m))
         };
         // A sane size succeeds.
         let ok = ffi_alloc(&[layout_with_size(8)], span()).unwrap();
@@ -1707,7 +1707,7 @@ print(buf != nil)
         use crate::det::{DeterminismContext, FfiRet};
 
         fn arr(vals: Vec<Value>) -> Value {
-            Value::Array(crate::value::ArrayCell::new(vals))
+            Value::array_cell(crate::value::ArrayCell::new(vals))
         }
 
         /// INERT by default: with NO determinism context, `sym.call` runs normally and
@@ -1769,7 +1769,7 @@ print(buf != nil)
                 FfiType::Void,
             );
             // A 4-byte buffer; memset it to 'A' (65).
-            let buf = Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
+            let buf = Value::bytes_rc(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
             let _ = interp
                 .ffi_symbol_call(
                     memset,
@@ -1794,7 +1794,7 @@ print(buf != nil)
                 vec![FfiType::Ptr, FfiType::I32, FfiType::Size],
                 FfiType::Void,
             );
-            let buf2 = Value::Bytes(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
+            let buf2 = Value::bytes_rc(Rc::new(std::cell::RefCell::new(vec![0u8; 4])));
             let _ = interp2
                 .ffi_symbol_call(
                     memset2,

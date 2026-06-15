@@ -31,16 +31,16 @@ fn rebuild_value(k: OwnedKind) -> Value {
         OwnedKind::Bool(b) => Value::bool_(b),
         OwnedKind::Int(i) => Value::int(i),
         OwnedKind::Float(f) => Value::float(f),
-        OwnedKind::Decimal(d) => Value::Decimal(d),
+        OwnedKind::Decimal(d) => Value::decimal_rc(d),
         OwnedKind::Str(s) => Value::str(s),
         OwnedKind::Builtin(s) => Value::builtin(s),
         OwnedKind::Function(f) => Value::function(f),
         OwnedKind::Closure(c) => Value::closure(c),
-        OwnedKind::Array(a) => Value::Array(a),
-        OwnedKind::Object(o) => Value::Object(o),
-        OwnedKind::Map(m) => Value::Map(m),
-        OwnedKind::Set(s) => Value::Set(s),
-        OwnedKind::Bytes(b) => Value::Bytes(b),
+        OwnedKind::Array(a) => Value::array_cell(a),
+        OwnedKind::Object(o) => Value::object_cell(o),
+        OwnedKind::Map(m) => Value::map_cell(m),
+        OwnedKind::Set(s) => Value::set_cell(s),
+        OwnedKind::Bytes(b) => Value::bytes_rc(b),
         #[cfg(feature = "data")]
         OwnedKind::Regex(r) => Value::regex(r),
         OwnedKind::Native(n) => Value::native(n),
@@ -69,7 +69,7 @@ use std::rc::{Rc, Weak};
 
 /// A module's export collector (V12-T4): an insertion-ordered name→value map behind
 /// shared interior mutability, so `Op::DefineExport` records into it and an importer
-/// reads it back (the namespace form clones it into a `Value::Object`).
+/// reads it back (the namespace form clones it into a `Value::object_cell`).
 type ModuleExports = Rc<RefCell<indexmap::IndexMap<String, Value>>>;
 
 /// A module-scope user-global slot: its current value plus its REASSIGNABILITY,
@@ -563,9 +563,9 @@ pub struct Vm {
     self_weak: RefCell<Weak<Vm>>,
     /// Per-class compiled-method table (V9). `value.rs`'s `Class`/`Method` is
     /// frozen and holds a TREE-WALKER body the VM cannot run, so the VM compiles
-    /// each method to a `Value::Closure` and stores it HERE instead — keyed by the
+    /// each method to a `Value::closure` and stores it HERE instead — keyed by the
     /// class's `Rc` IDENTITY (`Rc::as_ptr` address) → method name → compiled
-    /// closure. A class's `Value::Class.methods` map is left empty; method dispatch
+    /// closure. A class's `Value::class.methods` map is left empty; method dispatch
     /// goes through this table (`compiled_method`). The key is stable because the
     /// `Rc<Class>` is created once at compile time and shared by every instance.
     // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
@@ -574,7 +574,7 @@ pub struct Vm {
     class_methods: RefCell<FxHashMap<usize, FxHashMap<String, Cc<Closure>>>>,
     /// Per-class STATIC method table (SP1 §3): class `Rc` identity → static name →
     /// compiled closure. A SEPARATE namespace from `class_methods`; a static is
-    /// called as `C.name(args)` with NO receiver (a plain `Value::Closure` call),
+    /// called as `C.name(args)` with NO receiver (a plain `Value::closure` call),
     /// resolved up the superclass chain by `find_compiled_static_method`.
     // SHAPE §6.1: Fx — bounded inflow (class-identity pointers / source identifiers),
     // never attacker-scaled, iteration order never observed (see audit) — get/insert only.
@@ -974,7 +974,7 @@ impl Vm {
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
         // stdlib function (e.g. `array.map`, `recover`) can re-enter the VM to
-        // run a `Value::Closure` callback (the `native → VM` half of the bridge;
+        // run a `Value::closure` callback (the `native → VM` half of the bridge;
         // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
         vm.interp.set_vm(Rc::downgrade(&vm));
         vm
@@ -1501,7 +1501,7 @@ impl Vm {
     }
 
     /// Workers Spec A: dispatch a `worker fn` closure to a pooled isolate, returning
-    /// the `Value::Future`. Builds the shippable code slice — preferring the source
+    /// the `Value::future`. Builds the shippable code slice — preferring the source
     /// recompile path (via `Interp::worker_source`) when source is available (the normal
     /// run-from-source path, shared with the tree-walker), or falling back to building
     /// the slice directly from the stored pre-compiled top-level chunk (the `.aso`
@@ -1655,7 +1655,7 @@ impl Vm {
     /// Used by both the async `Op::Call` arm (`run_loop`) and (from Task 4 on) the
     /// sync `run_loop_sync` driver, ensuring byte-identical behavior across both lanes.
     ///
-    /// Responsibilities (verbatim from the `Op::Call Value::Closure` plain arm):
+    /// Responsibilities (verbatim from the `Op::Call Value::closure` plain arm):
     /// 1. Pops `argc` args from `fiber.stack` (top = last arg) then pops the callee slot.
     /// 2. Runs the SHARED `check_call_args` (arity + per-param contracts + rest
     ///    collection) — a mismatch returns a `Control::Panic` anchored at `call_span`.
@@ -3095,7 +3095,7 @@ impl Vm {
                 Op::GetSuper => {
                     // `super.<name>` (V9-T2): resolve `name` starting at the CURRENT
                     // method's DEFINING class's superclass, bound to `self` (slot 0).
-                    // Mirrors the tree-walker: `super` is a `Value::Super` whose
+                    // Mirrors the tree-walker: `super` is a `Value::super_` whose
                     // `start` is `defining_class.superclass`, and `read_member` on it
                     // finds the method up that chain and produces a BoundMethod on
                     // `self` (which the subsequent CALL invokes). The `defining_class`
@@ -3158,7 +3158,7 @@ impl Vm {
                             }))
                         }
                         None => {
-                            // Mirror the tree-walker's `Value::Super` member-read
+                            // Mirror the tree-walker's `Value::super_` member-read
                             // error wording (with/without a superclass).
                             let msg = if start.is_some() {
                                 format!("no superclass method '{name}'")
@@ -4669,7 +4669,7 @@ impl Vm {
 
                 Op::Call | Op::CallSpread => {
                     // `Op::Call` carries a STATIC `u8` argc; `Op::CallSpread` carries
-                    // none — its arguments arrived as a single runtime `Value::Array`
+                    // none — its arguments arrived as a single runtime `Value::array_cell`
                     // (built by the array/spread builder ops) sitting on top of the
                     // callee `[..., callee, argsArray]`. For `CallSpread` we POP the
                     // args array and re-push its elements as individual stack slots,
@@ -4708,7 +4708,7 @@ impl Vm {
                         // A generator closure (`fn*` / `async fn*`) is NOT run and
                         // NOT spawned: calling it builds a NOT-STARTED Fiber for the
                         // closure (args bound into its slots, ip 0) and wraps it in a
-                        // VM-backed `GeneratorHandle`, pushing a `Value::Generator`
+                        // VM-backed `GeneratorHandle`, pushing a `Value::generator`
                         // immediately. The body runs only when the consumer calls
                         // `gen.next()` (→ `GeneratorHandle::resume`), exactly like the
                         // tree-walker's `is_generator` branch of `call_function`.
@@ -4802,7 +4802,7 @@ impl Vm {
                         // that re-enters the VM via `Vm::call_value` (which sets up a
                         // fresh one-frame fiber, binds args via `check_call_args`, and
                         // runs to Done), `spawn_local` it onto the current-thread
-                        // LocalSet, and hand back a `Value::Future` IMMEDIATELY; the
+                        // LocalSet, and hand back a `Value::future` IMMEDIATELY; the
                         // caller `await`s it later. Because `call_value` runs the arity
                         // /contract check INSIDE the spawned task, an async arity or
                         // contract violation surfaces LAZILY — it resolves into the
@@ -4813,7 +4813,7 @@ impl Vm {
                         // spawn/await below.
                         // A `worker fn` closure dispatches to a pooled isolate
                         // (Workers Spec A): pop the args, build the code slice from the
-                        // entry program source, ship + return a `Value::Future`. Must
+                        // entry program source, ship + return a `Value::future`. Must
                         // precede the `is_async` branch (a worker fn is not async).
                         OwnedKind::Closure(callee) if callee.proto.is_worker => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
@@ -5221,7 +5221,7 @@ impl Vm {
                     // A method call `recv.<name>(...args)` whose argument list contains
                     // a spread (dynamic arity). Mirrors `Op::CallMethod` EXACTLY for
                     // dispatch — the only difference is how the arg list is obtained:
-                    // the args arrived as a single runtime `Value::Array` (built by the
+                    // the args arrived as a single runtime `Value::array_cell` (built by the
                     // array/spread builder ops), sitting on top of the receiver
                     // `[..., recv, argsArray]`. Pop the args array and flatten it into
                     // a positional `Vec`, then pop the receiver — yielding the SAME
@@ -5251,7 +5251,7 @@ impl Vm {
                     };
                     // Pop the runtime args array (built by NEW_ARRAY + spread ops) and
                     // re-materialize its elements as a positional `Vec`. (The builder
-                    // always produces a `Value::Array`; a non-array OPERAND was already
+                    // always produces a `Value::array_cell`; a non-array OPERAND was already
                     // rejected by `SPREAD_ARGS` with the byte-identical message.)
                     let args_arr = fiber.pop();
                     let args = match args_arr.kind() {
@@ -5334,7 +5334,7 @@ impl Vm {
                 }
                 Op::JumpIfNotNil => {
                     // Pop the tested value; jump iff it is NOT `nil`. Mirrors the
-                    // tree-walker's `??` test (`l == Value::Nil` selects the RHS;
+                    // tree-walker's `??` test (`l == Value::nil()` selects the RHS;
                     // anything else keeps the left), so the jump fires on "keep
                     // the non-nil left operand".
                     let v = fiber.pop();
@@ -5405,7 +5405,7 @@ impl Vm {
                 Op::NewArray => {
                     // Pop `n` elements (pushed in source order, so the last
                     // pushed is on top) into a Vec preserving source order, then
-                    // push `Value::Array`. Matches the tree-walker's
+                    // push `Value::array_cell`. Matches the tree-walker's
                     // `ExprKind::Array` construction (`Rc<RefCell<Vec>>`).
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let mut values = vec![Value::nil(); n];
@@ -5425,7 +5425,7 @@ impl Vm {
                 }
 
                 Op::NewMap => {
-                    // Push a fresh, empty `Value::Map`. The `#{…}` builder runs one
+                    // Push a fresh, empty `Value::map_cell`. The `#{…}` builder runs one
                     // `MAP_ENTRY` per entry after this (or nothing for `#{}`).
                     fiber.push(Value::map(indexmap::IndexMap::new()));
                 }
@@ -6046,7 +6046,7 @@ impl Vm {
                     // `src -- src[index]`. Pop the (already-validated) array and push
                     // the element at `index`, or `nil` for an out-of-bounds position
                     // (positions past the length bind nil — `items.get(i).cloned()
-                    // .unwrap_or(Value::Nil)`).
+                    // .unwrap_or(Value::nil())`).
                     let index = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let src = fiber.pop();
                     match src.kind() {
@@ -6686,7 +6686,7 @@ impl Vm {
 
                 Op::Await => {
                     // `await expr`. Mirrors the tree-walker's `ExprKind::Await`
-                    // EXACTLY: if the operand is a `Value::Future`, drive it to
+                    // EXACTLY: if the operand is a `Value::future`, drive it to
                     // completion (`f.get().await`) — a panic/propagation raised in
                     // the spawned task re-surfaces HERE (cross-task propagation),
                     // byte-identical to the tree-walker; otherwise `await` on a
@@ -6722,7 +6722,7 @@ impl Vm {
 
                 Op::GetIter => {
                     // `for await` async-iterable validation: TOS must be a
-                    // `Value::Generator` (driven by `resume`) or a native stream
+                    // `Value::generator` (driven by `resume`) or a native stream
                     // handle (WebSocket `recv` / SSE `next`). ANYTHING ELSE is the
                     // Tier-2 panic `value of type {t} is not async-iterable`,
                     // byte-identical to the tree-walker's `exec_for_await` (the
@@ -6777,7 +6777,7 @@ impl Vm {
                             // A native stream: call its `recv`/`next` method for a
                             // `[value, err]` pair (a non-nil `err` is a Tier-2 panic,
                             // a nil `value` ends the stream), mirroring
-                            // `exec_for_await`'s `Value::Native` arm exactly.
+                            // `exec_for_await`'s `Value::native` arm exactly.
                             // `GetIter` already validated the handle, so a missing
                             // stream method here is a wiring bug — surface it as a
                             // defensive Tier-2 panic rather than an `unwrap`.
@@ -6920,7 +6920,7 @@ impl Vm {
                     // had `superclass: None`); the method/default tables are then
                     // registered under the NEW class's identity key. Mirrors the
                     // tree-walker's `Stmt::Class`, which sets `superclass` to the
-                    // resolved parent `Value::Class`.
+                    // resolved parent `Value::class`.
                     // The shared `def_env` for VM classes (task #157): the SHARED
                     // `validate_into` (`.from`/typed-parse) resolves nested-class
                     // field-type names and default-expr names through it, so EVERY
@@ -7096,7 +7096,7 @@ impl Vm {
                 Op::GetSuper => {
                     // `super.<name>` (V9-T2): resolve `name` starting at the CURRENT
                     // method's DEFINING class's superclass, bound to `self` (slot 0).
-                    // Mirrors the tree-walker: `super` is a `Value::Super` whose
+                    // Mirrors the tree-walker: `super` is a `Value::super_` whose
                     // `start` is `defining_class.superclass`, and `read_member` on it
                     // finds the method up that chain and produces a BoundMethod on
                     // `self` (which the subsequent CALL invokes). The `defining_class`
@@ -7159,7 +7159,7 @@ impl Vm {
                             }))
                         }
                         None => {
-                            // Mirror the tree-walker's `Value::Super` member-read
+                            // Mirror the tree-walker's `Value::super_` member-read
                             // error wording (with/without a superclass).
                             let msg = if start.is_some() {
                                 format!("no superclass method '{name}'")
@@ -7690,7 +7690,7 @@ impl Vm {
     /// Call ANY value, the single primitive both engines re-enter through.
     ///
     /// This is the bridge in BOTH directions:
-    /// - A `Value::Closure` (`native → VM`): a native higher-order stdlib function
+    /// - A `Value::closure` (`native → VM`): a native higher-order stdlib function
     ///   (`array.map`, a sort comparator, `recover`, …) invokes a user callback
     ///   the VM produced. We build a fresh one-frame [`Fiber`] whose sole frame is
     ///   the closure called with `args`, then drive it to completion. Each closure
@@ -7709,7 +7709,7 @@ impl Vm {
     /// Workers Spec B §Task 5 (actor isolate side): call the method `name` on a VM
     /// instance `receiver` with `args`, resolving the method through the VM's
     /// per-class method side table (`vm_read_member` → `BoundMethod`) and driving any
-    /// returned `Value::Future` (an `async` method) to its value. Used by the actor
+    /// returned `Value::future` (an `async` method) to its value. Used by the actor
     /// mailbox loop, which runs on the isolate's own `Vm` — `Interp::read_member`
     /// cannot be used because a VM-built class keeps its methods in the side table,
     /// not in `Class.methods`.
@@ -7745,10 +7745,10 @@ impl Vm {
         use crate::interp::Control;
         // DEFER §3.4 VM fix: a bare `defer async_fn()` must produce the §3.4 loud
         // Tier-2 error on the VM exactly as on the tree-walker. On the tree-walker,
-        // `call_value` for an async fn returns `Value::Future`, and the check below
-        // (`else if let Value::Future(_)`) fires. On the VM, `Vm::call_value` runs the
+        // `call_value` for an async fn returns `Value::future`, and the check below
+        // (`else if let Value::future(_)`) fires. On the VM, `Vm::call_value` runs the
         // async body INLINE (a fresh fiber, no `spawn_local`) and returns the body
-        // result directly — so the result is `Value::Nil`, not `Value::Future`, and the
+        // result directly — so the result is `Value::nil()`, not `Value::future`, and the
         // check never fires. We detect the mismatch HERE, before calling, by inspecting
         // whether the callee is a VM async closure: if it is and `!entry.awaited`, raise
         // the §3.4 panic immediately (byte-identical to the tree-walker). The `awaited`
@@ -7858,7 +7858,7 @@ impl Vm {
                 // when running on the CALLER thread — otherwise the worker body runs
                 // inline and NO parallelism occurs. Mirror the `Op::Call` arm's
                 // `is_worker` branch so that the native → VM re-entry path produces a
-                // `Value::Future` (dispatched) rather than a synchronously-computed
+                // `Value::future` (dispatched) rather than a synchronously-computed
                 // result.
                 //
                 // INSIDE an isolate, this path is NOT taken: the `Op::Call` handler
@@ -7884,7 +7884,7 @@ impl Vm {
                 }
                 // A GENERATOR closure (`fn*` / `async fn*` / `worker fn*`) is NOT run to
                 // completion here — it builds a NOT-STARTED VM fiber wrapped in a
-                // `GeneratorHandle`, returning a `Value::Generator` (the consumer drives
+                // `GeneratorHandle`, returning a `Value::generator` (the consumer drives
                 // it via `resume`). This mirrors the `Op::Call` generator arm and is the
                 // path taken when a `worker fn*` runs ON ITS DEDICATED ISOLATE: the
                 // isolate's `build_producer` calls `call_value(entry, ..)` and expects a
@@ -8119,7 +8119,7 @@ impl Vm {
     }
 
     /// VM member read (V9). For an `Instance` of a VM-registered class, a method
-    /// name resolves to a `Value::BoundMethod` carrying the receiver + class +
+    /// name resolves to a `Value::bound_method` carrying the receiver + class +
     /// method name (the compiled closure is looked up at CALL time via
     /// `bound_method_is_vm`); a field name reads the stored field; anything else
     /// (and any non-VM receiver) delegates to the shared `Interp::read_member` so
@@ -8300,7 +8300,7 @@ impl Vm {
             }
         }
         // (1a'') Actor-handle async method dispatch: a member-CALL on a
-        // `Value::Native(WorkerActor)` sends an `ActorMsg::Call` (or `close()`) and
+        // `Value::native(WorkerActor)` sends an `ActorMsg::Call` (or `close()`) and
         // returns `future<T>`. Same `Interp::actor_handle_call` as the tree-walker.
         if let ValueKind::Native(n) = recv.kind() {
             if n.kind == crate::value::NativeKind::WorkerActor {
@@ -8309,7 +8309,7 @@ impl Vm {
                 return Ok(());
             }
         }
-        // (1a''') SRV §3.5/§3.8: a member-CALL on a frozen `Value::Shared` routes to
+        // (1a''') SRV §3.5/§3.8: a member-CALL on a frozen `Value::shared` routes to
         // the read-only `call_shared` dispatcher (read-only methods; mutating-method
         // names + frozen-instance user-methods → the Tier-2 panics). Mirrors the
         // tree-walker `eval_chain` hook byte-for-byte (same `crate::interp::call_shared`).
@@ -8322,7 +8322,7 @@ impl Vm {
         // class whose `name` resolves (up the chain) to a compiled STATIC closure.
         // Dispatch with NO receiver, with full generator/async/sync handling
         // matching the `Op::Call` closure arm (so a `static fn*` returns a
-        // `Value::Generator` and a `static async fn` a `Value::Future`, byte-
+        // `Value::generator` and a `static async fn` a `Value::future`, byte-
         // identical to the tree-walker's `call_static_method`). A non-static name
         // (the built-in `from`, or an error) falls through to the shared dispatch.
         if let ValueKind::Class(class) = recv.kind() {
@@ -8474,7 +8474,7 @@ impl Vm {
             }
         }
         // `C.name` static-method read (SP1 §3): a VM-compiled static resolves up
-        // the superclass chain to its closure, returned as a plain `Value::Closure`
+        // the superclass chain to its closure, returned as a plain `Value::closure`
         // (called with NO receiver). Falls through to the shared dispatch for the
         // built-in `from` and the "no static member" error (C3 generalization).
         if let ValueKind::Class(class) = obj.kind() {
@@ -8831,7 +8831,7 @@ impl Vm {
                     //
                     // VAL Task 3 (inline-scalar SMI fast path, spec §7.2): `*x`/`*y`
                     // read the operand's INLINE SCALAR WORD with no heap touch and no
-                    // refcount op — under the Stage-1 niche layout `Value::Int(i64)`
+                    // refcount op — under the Stage-1 niche layout `Value::int(i64)`
                     // carries the full i64 inline, so this IS the SMI/inline-scalar
                     // load. (Under a future Stage-2 NaN-box the matched `i64` would be
                     // the decoded i48 SMI, or the boxed-`i64` spill — the §7.2
@@ -9209,7 +9209,7 @@ impl Vm {
         let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
         // A generator method (`fn*` / `async fn*`) is NOT run inline: it binds `self`
         // and args into a NOT-STARTED fiber and wraps it in a VM-backed
-        // `GeneratorHandle`, returning a `Value::Generator` immediately — exactly like
+        // `GeneratorHandle`, returning a `Value::generator` immediately — exactly like
         // the standalone-generator CALL path (`Op::Call`) and the tree-walker's
         // `invoke_method` generator branch. The body runs only when the consumer
         // drives it via `gen.next()` / `for await`; `self` (slot 0) is visible to a
@@ -9290,8 +9290,8 @@ impl Vm {
 
     /// Dispatch a compiled STATIC method (SP1 §3): a class-level call with NO
     /// receiver. Args bind to slots `0..n` (no `self` slot). A `static fn*` returns
-    /// a `Value::Generator`; a `static async fn` is scheduled eagerly and returns a
-    /// `Value::Future`; a plain static runs to completion. Mirrors the `Op::Call`
+    /// a `Value::generator`; a `static async fn` is scheduled eagerly and returns a
+    /// `Value::future`; a plain static runs to completion. Mirrors the `Op::Call`
     /// closure arms and the tree-walker's `call_static_method` so the engines agree.
     #[async_recursion::async_recursion(?Send)]
     async fn invoke_compiled_static(
@@ -9300,7 +9300,7 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        // `static async fn`: schedule eagerly (M17), return a `Value::Future`. The
+        // `static async fn`: schedule eagerly (M17), return a `Value::future`. The
         // body re-enters via `Vm::call_value` inside the spawned task with the RAW
         // args (so the arity/contract check runs INSIDE the task and surfaces
         // lazily at `await`, byte-identical to the tree-walker and the `Op::Call`
@@ -9390,7 +9390,7 @@ impl Vm {
     /// the four/five-mode differential enforces it). `fault_ip` is the op's
     /// bytecode offset (both the `lit_shapes` cache key and the panic span); `n`
     /// is the pair count. Pops `n` (key, value) pairs (stack top-down is
-    /// vN,kN,…,v1,k1) and pushes the constructed `Value::Object`.
+    /// vN,kN,…,v1,k1) and pushes the constructed `Value::object_cell`.
     ///
     /// On the SPECIALIZED path a warm `lit_shapes` entry skips the registry probe
     /// and IndexMap fold; a cold pass runs the generic build and records the
@@ -9451,7 +9451,7 @@ impl Vm {
                     // SHAPE §3.5: count this warm-hit slab build.
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                     self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
-                    fiber.push(Value::Object(cell));
+                    fiber.push(Value::object_cell(cell));
                     return Ok(());
                 }
                 Some(crate::vm::chunk::LitShapeCache::Negative) => {
@@ -9580,7 +9580,7 @@ impl Vm {
                 }
             }
         };
-        fiber.push(Value::Object(cell));
+        fiber.push(Value::object_cell(cell));
         Ok(())
     }
 
@@ -10071,7 +10071,7 @@ mod tests {
         }
     }
 
-    /// A `Value::Decimal` from a decimal string literal (test helper). The VM
+    /// A `Value::decimal_rc` from a decimal string literal (test helper). The VM
     /// compiler cannot yet *produce* a decimal (that needs `import`/member-access
     /// for `std/decimal`), so the decimal arithmetic path is exercised by pushing
     /// decimal consts directly. The semantics themselves are the SAME shared
@@ -11923,7 +11923,7 @@ mod tests {
     #[test]
     fn variant_elem_oob_operand_is_nil_not_panic() {
         // Task 0.7 robustness: a `VARIANT_ELEM` whose operand is past the end of the
-        // variant's positional payload reads as `Value::Nil` (via `.get(idx)`), NOT a
+        // variant's positional payload reads as `Value::nil()` (via `.get(idx)`), NOT a
         // host panic. We build a real 2-field positional variant as a const and index
         // element 0xFFFF — verify(`variant_elem_max_operand_verifies`) already accepts
         // the operand; here we prove the run loop is independently OOB-safe so the
@@ -12047,7 +12047,7 @@ mod tests {
     // ---- Vm::call_value bridge (native → VM closures), V4-T5 ---------------
 
     /// Compile a program whose trailing expression evaluates to a closure, run it
-    /// on the VM, and return that `Value::Closure`. This is how a native
+    /// on the VM, and return that `Value::closure`. This is how a native
     /// higher-order function would *receive* a user callback (e.g. the `f` arg of
     /// `array.map`). The closure is self-contained (proto + captured upvalue
     /// cells), so a fresh VM can later drive it via `Vm::call_value`.
@@ -12137,8 +12137,8 @@ mod tests {
     // ---- V7-T4: structured-concurrency over VM-produced futures -----------
     //
     // The std/task ops (`gather`/`race`/`timeout`/`spawn`) are native fns on the
-    // shared `Interp` that await/select over `Value::Future`s. The VM produces
-    // ordinary `Value::Future`s (the SAME `SharedFuture` the tree-walker uses;
+    // shared `Interp` that await/select over `Value::future`s. The VM produces
+    // ordinary `Value::future`s (the SAME `SharedFuture` the tree-walker uses;
     // see the `Op::Call` async-fn arm). These tests de-risk the V12 end-to-end
     // structured-concurrency differential (`concurrency.as` /
     // `structured_concurrency.as`, which need `import` — not compiled until V12)
@@ -12148,7 +12148,7 @@ mod tests {
 
     /// Spawn a VM async-fn call exactly the way the `Op::Call` async arm does:
     /// `spawn_local` a task that drives `Vm::call_value(closure, args)` and
-    /// resolves a `SharedFuture` cell, returning the `Value::Future` handle
+    /// resolves a `SharedFuture` cell, returning the `Value::future` handle
     /// immediately. This is the canonical "VM-produced future".
     fn spawn_vm_future(vm: &Rc<Vm>, closure: Value, args: Vec<Value>) -> Value {
         let vm2 = vm.rc();
@@ -12219,7 +12219,7 @@ mod tests {
     #[test]
     fn task_gather_awaits_vm_produced_futures_in_order() {
         // `(n) => n + 1` invoked as two independent VM futures, gathered. The
-        // native `task.gather` op awaits each `Value::Future` and returns the
+        // native `task.gather` op awaits each `Value::future` and returns the
         // values in input order — proving the VM's futures interoperate with the
         // structured-concurrency machinery (Part C de-risk; full e2e is V12).
         let f = compile_closure("(n) => n + 1");
@@ -12255,7 +12255,7 @@ mod tests {
     #[test]
     fn task_race_resolves_a_vm_produced_future() {
         // A single VM-produced future raced resolves to its value — `task.race`
-        // selects over `Value::Future`s and the VM's future drives to completion.
+        // selects over `Value::future`s and the VM's future drives to completion.
         let f = compile_closure("(n) => n * 2");
         let out = with_vm(|vm| async move {
             let a = spawn_vm_future(&vm, f, vec![Value::float(21.0)]);
@@ -12899,12 +12899,12 @@ mod tests {
         );
     }
 
-    /// LANE §4.1 case 4: `Op::Await` on a PENDING `Value::Future` must escape
+    /// LANE §4.1 case 4: `Op::Await` on a PENDING `Value::future` must escape
     /// to the async driver with `ip` restored to the `Op::Await` byte. The async
     /// driver re-decodes and parks on `f.get().await`. If ip were left advanced the
     /// Await instruction would be silently skipped — a correctness hole.
     ///
-    /// Construction: push a pending `Value::Future` onto the fiber's stack, then
+    /// Construction: push a pending `Value::future` onto the fiber's stack, then
     /// place a single `Op::Await` instruction (ip == 0). After `run_loop_sync`
     /// the ip must still be 0 and the future must still be on TOS.
     #[test]

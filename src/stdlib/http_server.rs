@@ -378,8 +378,8 @@ fn bind_reuseport(_host: &str, _port: u16) -> std::io::Result<std::net::TcpListe
 }
 
 /// Extract the entry name of a `worker fn` value (the named top-level fn to ship to
-/// each isolate). Works for BOTH engines: a tree-walker `Value::Function` (reads
-/// `func.name` + `func.is_worker`) and a VM `Value::Closure` (reads
+/// each isolate). Works for BOTH engines: a tree-walker `Value::function` (reads
+/// `func.name` + `func.is_worker`) and a VM `Value::closure` (reads
 /// `proto.chunk.name` + `proto.is_worker`). Returns `None` for a non-worker fn or an
 /// anonymous one.
 fn worker_fn_entry_name(v: &Value) -> Option<String> {
@@ -390,7 +390,7 @@ fn worker_fn_entry_name(v: &Value) -> Option<String> {
     }
 }
 
-/// Extract the resource id from a server handle `Value::Native(HttpServer)` (what
+/// Extract the resource id from a server handle `Value::native(HttpServer)` (what
 /// `server.create()` returns). `None` for any other value.
 fn server_handle_id(v: &Value) -> Option<u64> {
     match v.kind() {
@@ -401,7 +401,7 @@ fn server_handle_id(v: &Value) -> Option<u64> {
 
 /// The body each multi-isolate REUSEPORT isolate runs (SRV §3.7a): load the `setup`
 /// slice into this isolate's Vm, decode the args (reconstructing any frozen
-/// `Value::Shared` by `Arc` bump), run `setup(...args)` to build THIS isolate's server
+/// `Value::shared` by `Arc` bump), run `setup(...args)` to build THIS isolate's server
 /// handle, wrap the REUSEPORT listener with tokio, and run the shared `accept_loop`
 /// against the group-wide budget/stop. Returns `Ok(())` on a clean stop or an error
 /// string (reported back to the main isolate over the `Send` completion channel).
@@ -1073,7 +1073,7 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         let id = m.receiver.id;
-        let server = Value::Native(m.receiver.clone());
+        let server = Value::native(m.receiver.clone());
         match m.method.as_str() {
             "route" => {
                 let method =
@@ -1427,7 +1427,7 @@ impl Interp {
     /// load-balances incoming connections across them. The `setup` worker fn runs once
     /// inside each isolate at boot to build that isolate's OWN server handle (open its
     /// own DB pool, register handlers); only the sendable `args` (incl. any frozen
-    /// `Value::Shared` — an `Arc` pointer bump, zero copy) cross into the isolate, via
+    /// `Value::shared` — an `Arc` pointer bump, zero copy) cross into the isolate, via
     /// direct capture in the `Send` `make_loop` closure (SRV §3.7a).
     ///
     /// A shared `Arc<AtomicUsize>` budget plus an `Arc<Notify>` stop coordinate
@@ -1969,7 +1969,7 @@ impl Interp {
     }
 
     /// Run the registered middleware chain → the terminal `handler` for one request,
-    /// settling any returned `Value::Future`, sweeping this dispatch's `next`
+    /// settling any returned `Value::future`, sweeping this dispatch's `next`
     /// continuations, and converting the outcome to an `HttpResponse`.
     ///
     /// This is the SINGLE copy of the dispatch logic, shared by the plain (no-schema)
@@ -1991,7 +1991,7 @@ impl Interp {
         // connections (each on its own task) must not clobber one another's pending
         // continuations.
         let dispatch_id = self.next_http_dispatch_id();
-        // An `async` handler/middleware returns a `Value::Future` (eagerly spawned on
+        // An `async` handler/middleware returns a `Value::future` (eagerly spawned on
         // the LocalSet); settle it before converting to a response so the client sees
         // the resolved body, not the future itself. A plain (sync) handler returns a
         // non-future, so this is the identity for sequential handlers (mirrors how the
@@ -2072,7 +2072,7 @@ impl Interp {
             ResourceState::HttpNext(Box::new(next_state)),
         );
         let next = match next_handle.kind() {
-            ValueKind::Native(n) => Value::NativeMethod(Rc::new(NativeMethod {
+            ValueKind::Native(n) => Value::native_method(Rc::new(NativeMethod {
                 receiver: n.clone(),
                 method: "call".into(),
             })),
@@ -2132,7 +2132,7 @@ pub struct NextState {
 fn is_callable(v: &Value) -> bool {
     matches!(
         v.kind(),
-        // `Value::Closure` is the VM's compiled-function value — `call_value` (the
+        // `Value::closure` is the VM's compiled-function value — `call_value` (the
         // V4-T5 bridge) dispatches it to the VM. A route handler / middleware passed
         // from a VM program is a Closure; accept it like any other callable.
         ValueKind::Function(_)

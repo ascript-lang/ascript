@@ -169,10 +169,10 @@ fn redis_to_value(v: &redis::Value) -> Value {
         redis::Value::Int(i) => Value::int(*i),
         redis::Value::BulkString(bytes) => match std::str::from_utf8(bytes) {
             Ok(s) => Value::str(s),
-            Err(_) => Value::Bytes(Rc::new(RefCell::new(bytes.clone()))),
+            Err(_) => Value::bytes_rc(Rc::new(RefCell::new(bytes.clone()))),
         },
         redis::Value::Array(items) => {
-            Value::Array(crate::value::ArrayCell::new(items.iter().map(redis_to_value).collect()))
+            Value::array_cell(crate::value::ArrayCell::new(items.iter().map(redis_to_value).collect()))
         }
         redis::Value::SimpleString(s) => Value::str(s.as_str()),
         redis::Value::Okay => Value::str("OK"),
@@ -187,14 +187,14 @@ fn redis_to_value(v: &redis::Value) -> Value {
                 };
                 m.insert(key, redis_to_value(val));
             }
-            Value::Object(crate::value::ObjectCell::new(m))
+            Value::object_cell(crate::value::ObjectCell::new(m))
         }
         redis::Value::Double(d) => Value::float(*d),
         redis::Value::Boolean(b) => Value::bool_(*b),
         redis::Value::BigNumber(n) => Value::str(n.to_string()),
         redis::Value::VerbatimString { text, .. } => Value::str(text.as_str()),
         redis::Value::Set(items) => {
-            Value::Array(crate::value::ArrayCell::new(items.iter().map(redis_to_value).collect()))
+            Value::array_cell(crate::value::ArrayCell::new(items.iter().map(redis_to_value).collect()))
         }
         // Push/Attribute and any future RESP3 variants: best-effort Nil.
         _ => Value::nil(),

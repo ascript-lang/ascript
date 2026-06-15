@@ -203,7 +203,7 @@ pub struct ModuleEntry {
     pub exports: Rc<RefCell<HashSet<String>>>,
 }
 
-/// The non-`Clone` OS resource behind a `Value::Native` handle. Real variants are
+/// The non-`Clone` OS resource behind a `Value::native` handle. Real variants are
 /// feature-gated (added by sqlite/process tasks); only `Closed` is always present,
 /// so under `--no-default-features` the enum has just the one variant.
 pub(crate) enum ResourceState {
@@ -376,7 +376,7 @@ pub(crate) enum ResourceState {
     /// `large_enum_variant`.
     ///
     /// GC INVARIANT: this is a native handle holding `Send` channels + a thread
-    /// handle — NOT script `Value`s. The GC must NEVER trace into it. `Value::Native`
+    /// handle — NOT script `Value`s. The GC must NEVER trace into it. `Value::native`
     /// already traces as a no-op (`gc.rs`'s `_ => {}` arm), so the invariant holds.
     WorkerActor(Box<crate::worker::actor::WorkerActorHandle>),
     /// FFI campaign §3.4: an open shared library (`ffi.open` → `dlopen`). The
@@ -387,7 +387,7 @@ pub(crate) enum ResourceState {
     /// pairing gives both `'static` storage and lifetime correctness — §3.4).
     ///
     /// GC INVARIANT: a `Library` is an opaque OS handle; the GC must NEVER trace into
-    /// it. `Value::Native` traces as a no-op (`gc.rs`'s `_ => {}`), so the invariant
+    /// it. `Value::native` traces as a no-op (`gc.rs`'s `_ => {}`), so the invariant
     /// holds for `ForeignLib`/`ForeignSymbol`/`ForeignPtr` automatically.
     #[cfg(feature = "ffi")]
     ForeignLib(std::rc::Rc<libloading::Library>),
@@ -507,7 +507,7 @@ pub struct Interp {
     /// Tests registered via the `test(name, fn)` builtin. Only executed by
     /// `ascript test` (via `run_registered_tests`); a normal `run` just collects them.
     tests: RefCell<Vec<(String, Value)>>,
-    /// Live OS resources backing `Value::Native` handles, keyed by handle id.
+    /// Live OS resources backing `Value::native` handles, keyed by handle id.
     resources: RefCell<HashMap<u64, ResourceState>>,
     /// Monotonic id source for newly registered resources.
     next_resource_id: Cell<u64>,
@@ -519,9 +519,9 @@ pub struct Interp {
     /// A `Weak` to the bytecode [`Vm`] driving this interpreter, installed by
     /// [`Vm::new`] via [`Interp::set_vm`]. Lets a native higher-order stdlib
     /// function (e.g. `array.map`, `recover`) re-enter the VM to run a
-    /// `Value::Closure` callback (see [`Interp::call_value`]'s `Closure` arm).
+    /// `Value::closure` callback (see [`Interp::call_value`]'s `Closure` arm).
     /// `None` (an empty `Weak`) on a pure tree-walker run where no VM exists; a
-    /// `Value::Closure` can only be produced by the VM, so a VM is always
+    /// `Value::closure` can only be produced by the VM, so a VM is always
     /// registered whenever a closure can reach `call_value`.
     vm: RefCell<std::rc::Weak<crate::vm::Vm>>,
     /// Number of eagerly-spawned `async fn`/method body tasks currently alive
@@ -931,7 +931,7 @@ impl TestSummary {
 }
 
 impl TestSummary {
-    /// DX D2 Task 5 — the airlock shape. Encode this summary as a `Value::Object`
+    /// DX D2 Task 5 — the airlock shape. Encode this summary as a `Value::object_cell`
     /// of EXISTING sendable kinds so a worker isolate can ship it back across the
     /// structured-clone airlock (`serialize::encode`) and the parent decode it.
     /// Shape: `{passed: number, failed: number, failures: array<{name, message}>}`.
@@ -960,7 +960,7 @@ impl TestSummary {
         Value::object(map)
     }
 
-    /// DX D2 Task 5 — reconstruct a `TestSummary` from the `Value::Object` produced
+    /// DX D2 Task 5 — reconstruct a `TestSummary` from the `Value::object_cell` produced
     /// by [`TestSummary::to_value`] after it crosses the airlock (lossless round-trip).
     /// Returns `None` on a malformed shape (a defensive guard: a corrupt isolate
     /// result is a clean error at the call site, never a panic).
@@ -1290,7 +1290,7 @@ impl Interp {
         *self.cli_args.borrow_mut() = args.iter().map(|s| Rc::from(s.as_str())).collect();
     }
 
-    /// Return the stored CLI args as a `Value::Array` of strings.
+    /// Return the stored CLI args as a `Value::array_cell` of strings.
     /// Called from `env.args` (sys-gated) and `cli.parse` (always available).
     pub(crate) fn get_cli_args(&self) -> Value {
         let args: Vec<Value> = self
@@ -1343,7 +1343,7 @@ impl Interp {
 
     /// Register the bytecode [`Vm`] driving this interpreter. Called by
     /// [`Vm::new`] right after the VM is constructed, so that a native
-    /// higher-order stdlib function reaching a `Value::Closure` in
+    /// higher-order stdlib function reaching a `Value::closure` in
     /// [`Interp::call_value`] can re-enter the VM to run it (`native → VM`).
     pub(crate) fn set_vm(&self, vm: std::rc::Weak<crate::vm::Vm>) {
         *self.vm.borrow_mut() = vm;
@@ -1660,13 +1660,13 @@ impl Interp {
                 // (after the level filter above) so a filtered call is free.
                 if matches!(
                     args.first().map(|v| v.kind()),
-                    // A VM-compiled thunk is a `Value::Closure` — equally a deferred
+                    // A VM-compiled thunk is a `Value::closure` — equally a deferred
                     // message callable (`call_value` dispatches it via the V4-T5
                     // bridge). Inert for the tree-walker (never makes a Closure).
                     Some(ValueKind::Function(_)) | Some(ValueKind::Closure(_)) | Some(ValueKind::Builtin(_))
                 ) {
                     let r = self.call_value(args[0].clone(), vec![], span).await?;
-                    // An `async fn` thunk returns a `Value::Future`; drive it to
+                    // An `async fn` thunk returns a `Value::future`; drive it to
                     // completion using the same mechanism as `await` (M17).
                     let r = if let ValueKind::Future(f) = r.kind() {
                         f.get().await?
@@ -2251,7 +2251,7 @@ impl Interp {
         self.resources.borrow_mut().insert(id, state);
     }
 
-    /// Register an OS `state` behind a fresh `Value::Native` handle of `kind`,
+    /// Register an OS `state` behind a fresh `Value::native` handle of `kind`,
     /// carrying the plain readable `fields`. Used unconditionally by std/time
     /// timers, plus the feature-gated modules (sqlite/process/net/...).
     pub(crate) fn register_resource(
@@ -2269,7 +2269,7 @@ impl Interp {
         }))
     }
 
-    /// Mint a `Value::Native` handle carrying only plain readable `fields` and NO
+    /// Mint a `Value::native` handle carrying only plain readable `fields` and NO
     /// backing OS resource (no `resources` table entry). Used by SP11 std/ai's
     /// provider/model/tool handles, which are pure config data — there is nothing to
     /// reclaim on drop, so they need no `ResourceState`. The id is still unique.
@@ -2283,7 +2283,7 @@ impl Interp {
         Value::native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
     }
 
-    /// Drive a value to completion if it is a `Value::Future` (an `async fn`
+    /// Drive a value to completion if it is a `Value::future` (an `async fn`
     /// return), else return it unchanged. SP11's tool loop uses this to await an
     /// `async fn` tool `execute` (mirrors the `await` operator's semantics:
     /// `await` on a non-future is identity). A panic in the spawned task
@@ -2297,7 +2297,7 @@ impl Interp {
         }
     }
 
-    /// Project a `shape:` argument (a `Value::Class` or a `std/schema` tagged
+    /// Project a `shape:` argument (a `Value::class` or a `std/schema` tagged
     /// Object) into a JSON Schema (`serde_json::Value`) for SP11 structured output.
     /// A class's nested `Type::Named` fields resolve through the class's `def_env`
     /// (the same environment `validate_into` uses), so nested-class / `array<Class>` /
@@ -2327,7 +2327,7 @@ impl Interp {
 
     /// `WorkerClass.spawn(args)` → spawn a dedicated actor isolate, ship the class
     /// code slice + init args, register a `ResourceState::WorkerActor`, and return a
-    /// `future<Value::Native(WorkerActor)>` (spawning is async — the future resolves
+    /// `future<Value::native(WorkerActor)>` (spawning is async — the future resolves
     /// once the isolate has constructed the instance via `init`).
     ///
     /// `!Send` integrity: the isolate builds its OWN `Interp`/`Vm`; only `Send` bytes
@@ -2511,7 +2511,7 @@ impl Interp {
             if let Ok(ref r) = reply {
                 let outcome = match r {
                     // SRV: the determinism log is byte-only; an actor returning a
-                    // `Value::Shared` records its bytes (the `Arc` side-vector is not
+                    // `Value::shared` records its bytes (the `Arc` side-vector is not
                     // event-sourced — a frozen graph is not replayable bytes, an
                     // accepted determinism limitation for shared results).
                     crate::worker::actor::ActorReply::Ok(bytes, _shared) => {
@@ -2548,7 +2548,7 @@ impl Interp {
     }
 
     /// SP9 determinism (Task 12): wrap a REPLAYED actor-call boundary outcome into an
-    /// already-resolved `Value::Future`, matching the shape `actor_handle_call` returns
+    /// already-resolved `Value::future`, matching the shape `actor_handle_call` returns
     /// for the real path. The recorded bytes are decoded on THIS consumer thread (no
     /// isolate crossing). A recorded panic replays as the same recoverable Tier-2 panic.
     fn resolve_boundary_outcome(
@@ -2574,7 +2574,7 @@ impl Interp {
 
     /// Workers Spec B §Task 6: build a streaming-generator handle for a `worker fn*`.
     /// Spawns a DEDICATED isolate running the generator body, ships the code slice +
-    /// call args, and returns a `Value::Generator` backed by a cross-thread
+    /// call args, and returns a `Value::generator` backed by a cross-thread
     /// [`crate::coro::GenImpl::Worker`] demand-driven driver. `for await` / `.next(v)` /
     /// `.close()` then work transparently — each consumer step is one demand credit
     /// across the boundary (strict pull = backpressure).
@@ -2583,7 +2583,7 @@ impl Interp {
     /// hooks call this), so streaming behavior is byte-identical.
     ///
     /// SPAWN IS SYNCHRONOUS here (unlike `spawn_actor`'s `future<handle>`): a generator
-    /// call returns a `Value::Generator` immediately, matching local generators — the
+    /// call returns a `Value::generator` immediately, matching local generators — the
     /// isolate is spawned + the producer built (its `Init` ack awaited) before returning,
     /// so a build failure surfaces eagerly at the call, exactly like a local generator's
     /// eager arg binding.
@@ -4259,7 +4259,7 @@ impl Interp {
                         return Ok((Value::nil(), true));
                     }
                     // Call-position hooks (schema fluent-chain, workflow `ctx.<m>()`,
-                    // `WorkerClass.spawn`, frozen `Value::Shared` reads, actor-handle
+                    // `WorkerClass.spawn`, frozen `Value::shared` reads, actor-handle
                     // dispatch). The hook ENUMERATION lives in `member_call_is_hook` and
                     // the DISPATCH in `call_method_recv` — the SAME routine the deferred
                     // `DeferKind::Method` drain re-enters (spec §3.1), so the two paths
@@ -4458,8 +4458,8 @@ impl Interp {
                 // identity, no per-access allocation).
                 "value" => match &v.payload {
                     None => Ok(v.value.clone()),
-                    Some(crate::value::Payload::Positional(a)) => Ok(Value::Array(a.clone())),
-                    Some(crate::value::Payload::Named(o)) => Ok(Value::Object(o.clone())),
+                    Some(crate::value::Payload::Positional(a)) => Ok(Value::array_cell(a.clone())),
+                    Some(crate::value::Payload::Named(o)) => Ok(Value::object_cell(o.clone())),
                 },
                 // ADT §3.4: named-payload field-access sugar — `c.radius` reads the
                 // named field directly off the payload Object.
@@ -4613,7 +4613,7 @@ impl Interp {
             // a user callback that the VM produced. Re-enter the VM to run it on a
             // fresh Fiber. Upgrade the registered `vm` weak to an owned `Rc<Vm>`
             // FIRST so no `RefCell` borrow is held across the await. A
-            // `Value::Closure` can only exist if the VM created it, so the VM is
+            // `Value::closure` can only exist if the VM created it, so the VM is
             // always registered here; a missing VM is a wiring bug (clear panic,
             // not UB).
             OwnedKind::Closure(c) => {
@@ -5323,7 +5323,7 @@ impl Interp {
     /// Execute one [`DeferEntry`]: call the captured callee with the captured args.
     /// For `DeferKind::Method` re-enters the member-call hook path so schema/shared/
     /// workflow hooks fire (spec §3.1). For `awaited=true` drives a returned
-    /// `Value::Future` to completion; for `awaited=false` a `Value::Future` result is
+    /// `Value::future` to completion; for `awaited=false` a `Value::future` result is
     /// the §3.4 Tier-2 error. A `Propagate` from the call is treated as discarded
     /// (the result of a deferred call is discarded per §3.2). Never holds a `RefCell`
     /// borrow across `.await`.
@@ -5613,7 +5613,7 @@ impl Interp {
         }
         // A `worker fn` is dispatched to a pooled isolate (Workers Spec A): build the
         // shippable code slice from the entry program's source and hand the args +
-        // slice over a `Send` byte channel; the returned `Value::Future` resolves with
+        // slice over a `Send` byte channel; the returned `Value::future` resolves with
         // the worker's result. Only bytes cross threads — the `!Send` runtime stays on
         // this thread. Inline-nesting (a worker fn called from inside an isolate) is
         // handled inside `dispatch_worker`. A worker fn cannot also be `async`/`fn*`
@@ -5636,7 +5636,7 @@ impl Interp {
             return crate::worker::dispatch_worker(self, slice, args, span);
         }
         // A script `async fn` is scheduled eagerly: build the body future, spawn it
-        // onto the current-thread LocalSet, and hand back a `Value::Future`
+        // onto the current-thread LocalSet, and hand back a `Value::future`
         // immediately. `await` later drives it; the top-level drain ensures even an
         // unawaited call runs to completion. Non-async functions run inline.
         if func.is_async {
@@ -5645,7 +5645,7 @@ impl Interp {
             let fut = crate::task::SharedFuture::new();
             // The task resolves the *cell* (not a `SharedFuture` clone) so it never
             // keeps the handle alive — letting the handle's `Drop` cancel the task
-            // once the last `Value::Future` is dropped (structured concurrency).
+            // once the last `Value::future` is dropped (structured concurrency).
             let cell = fut.cell();
             // Track this task's lifetime for backpressure; the guard moves into the
             // task and decrements on completion OR cancel-on-drop.
@@ -5854,8 +5854,8 @@ impl Interp {
     /// IFACE §5.2: the `instanceof` dispatch — the SINGLE source of truth both engines
     /// call (the tree-walker from `eval_expr`'s `BinOp::InstanceOf` arm; the VM from
     /// `eval_binop_adaptive`'s `InstanceOf` delegation). Branches on the RHS: a
-    /// `Value::Class(c)` runs `is_instance_of` (the UNCHANGED nominal `Rc::as_ptr` walk
-    /// — bit-for-bit identical to pre-IFACE); a `Value::Interface(i)` runs the
+    /// `Value::class(c)` runs `is_instance_of` (the UNCHANGED nominal `Rc::as_ptr` walk
+    /// — bit-for-bit identical to pre-IFACE); a `Value::interface(i)` runs the
     /// structural `conforms` (lazy flatten + verdict cache); anything else is a Tier-2
     /// panic with the single "class or interface" message. Because BOTH engines route
     /// InstanceOf through here (and NOT through `apply_binop`, whose InstanceOf arm is
@@ -5883,8 +5883,8 @@ impl Interp {
     /// class by NAME-STRING up the value's own chain and can never see an
     /// `InterfaceDef`. This `&self` path resolves a `Type::Named` through the in-scope
     /// `env` (the same `env.get(name)` ladder `coerce_field`/`validate_into` use): a
-    /// resolved `Value::Interface(i)` runs the structural `conforms`; a resolved
-    /// `Value::Class(c)` runs nominal `is_instance_of` (by class identity); an
+    /// resolved `Value::interface(i)` runs the structural `conforms`; a resolved
+    /// `Value::class(c)` runs nominal `is_instance_of` (by class identity); an
     /// unresolved name (or a non-class/non-interface binding) falls back to today's
     /// PERMISSIVE name-string match (the free `check_type` — the gradual escape).
     /// Composite arms (`Array`/`Optional`/`Union`/`Map`) recurse through this method so
@@ -5950,7 +5950,7 @@ impl Interp {
 
     /// IFACE §5.1: the structural conformance predicate — the runtime source of truth
     /// both engines call (the tree-walker via the `instanceof` eval site, the VM via the
-    /// same path through `eval_binop_adaptive`). `true` iff `v` is a `Value::Instance`
+    /// same path through `eval_binop_adaptive`). `true` iff `v` is a `Value::instance`
     /// whose class exposes every method `iface` requires (by name + arity, v1). Only a
     /// class instance can conform; every other LHS (number, bare object, enum, nil, …)
     /// is `Ok(false)`. The `Result` carries the lazy-`flatten` cycle / bad-`extends`
@@ -6153,7 +6153,7 @@ impl Interp {
                         let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
                         out.borrow_mut().insert(k, cv);
                     }
-                    Ok(Value::Map(out))
+                    Ok(Value::map_cell(out))
                 }
                 // A raw Object (e.g. a JSON dictionary) coerces into a Map at the
                 // `.from` boundary: each string key becomes a `MapKey::Str` and
@@ -6175,7 +6175,7 @@ impl Interp {
                         out.borrow_mut()
                             .insert(crate::value::MapKey::Str(k.as_str().into()), cv);
                     }
-                    Ok(Value::Map(out))
+                    Ok(Value::map_cell(out))
                 }
                 _ => Ok(val),
             },
@@ -6222,7 +6222,7 @@ impl Interp {
             )));
         }
         // An async method, like an async free function, is scheduled eagerly and
-        // returns a `Value::Future`. We move owned copies (the `Rc<Method>`, name,
+        // returns a `Value::future`. We move owned copies (the `Rc<Method>`, name,
         // and prepared `call_env`) into the spawned task so the body can outlive
         // this `&self` call.
         if bm.method.is_async {
@@ -6264,8 +6264,8 @@ impl Interp {
     /// Dispatch a STATIC method `C.name(args)` (SP1 §3). Unlike `invoke_method`
     /// there is NO receiver: the call env is the DEFINING class's `def_env` child
     /// (so the class name and sibling statics resolve), with NO `self`/`super`
-    /// binding. Async statics return a `Value::Future`; `static fn*` returns a
-    /// `Value::Generator` — reusing the same machinery as instance methods.
+    /// binding. Async statics return a `Value::future`; `static fn*` returns a
+    /// `Value::generator` — reusing the same machinery as instance methods.
     #[async_recursion(?Send)]
     async fn call_static_method(
         &self,
@@ -6965,7 +6965,7 @@ pub(crate) fn materialize_range(
 ///     non-zero number"* (no interpolation).
 ///   - `lo != hi` and `sign(s) != sign(hi - lo)` → Tier-2 panic *"step `<s>` moves
 ///     away from end (`<hi>`); range can never progress"*. The `<s>`/`<hi>` are
-///     formatted via `Value::Float` Display (`format_number`) so both engines
+///     formatted via `Value::float` Display (`format_number`) so both engines
 ///     produce a byte-identical string.
 /// - `step_v == None`: the omitted-step default infers direction from the bounds
 ///   (sequence semantics, spec §3.1): `+1.0` when `hi >= lo`, `-1.0` when
@@ -6984,7 +6984,7 @@ pub(crate) fn resolve_step(
             }
             if lo != hi && (s > 0.0) != (hi > lo) {
                 // `{s}`/`{hi}` MUST match the engines' canonical number formatting
-                // (the `Value::Float` Display path) so the message is byte-identical.
+                // (the `Value::float` Display path) so the message is byte-identical.
                 return Err(AsError::at(
                     format!(
                         "step {} moves away from end ({}); range can never progress",
@@ -7005,7 +7005,7 @@ pub(crate) fn resolve_step(
     }
 }
 
-/// Format a `Value::Float`'s `f64` exactly as the interpreter/VM display it
+/// Format a `Value::float`'s `f64` exactly as the interpreter/VM display it
 /// (`impl Display for Value` → `write!("{}", n)`), so a number interpolated into a
 /// range panic message is identical across both engines.
 pub(crate) fn format_number(n: f64) -> String {
@@ -7013,11 +7013,11 @@ pub(crate) fn format_number(n: f64) -> String {
 }
 
 /// NUM §4: produce a range loop counter `Value`. When `yields_int` is true the
-/// f64 counter `i` is converted to a `Value::Int` (an integral in-range range step
+/// f64 counter `i` is converted to a `Value::int` (an integral in-range range step
 /// always lands the counter on an exact integer within `i64` range, so this is
 /// lossless); a counter that is somehow non-integral or out of `i64` range falls
-/// back to `Value::Float` rather than producing a wrong int. Otherwise the counter
-/// stays a `Value::Float`. This is the SINGLE shared decision so the tree-walker
+/// back to `Value::float` rather than producing a wrong int. Otherwise the counter
+/// stays a `Value::float`. This is the SINGLE shared decision so the tree-walker
 /// and the VM (which seeds Int slots when the bounds+step are Int) agree.
 pub(crate) fn range_counter_value(i: f64, yields_int: bool) -> Value {
     if yields_int {
@@ -7614,7 +7614,7 @@ pub(crate) fn index_get(
 }
 
 /// Materialize a frozen child node as a `Value`: a scalar is cloned out cheaply, a
-/// container stays zero-copy by re-wrapping its `Arc` as a fresh `Value::Shared`.
+/// container stays zero-copy by re-wrapping its `Arc` as a fresh `Value::shared`.
 pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value {
     use crate::value::SharedNode;
     match &**child {
@@ -7631,11 +7631,11 @@ pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value 
 }
 
 /// Materialize ONE level of a frozen `SharedNode` into a LIVE `Value` whose children
-/// are `Value::Shared` views (an `Arc` bump per child, never a deep copy). The std
+/// are `Value::shared` views (an `Arc` bump per child, never a deep copy). The std
 /// serializers (json / msgpack / cbor / log's `to_json_lossy`) walk `Value`, so a raw
-/// `Value::Shared` otherwise hits their catch-all and a frozen container fails to
+/// `Value::shared` otherwise hits their catch-all and a frozen container fails to
 /// serialize (and poisons any live container that holds it). With this, a serializer
-/// detects `Value::Shared`, materializes one level, and recurses — re-materializing
+/// detects `Value::shared`, materializes one level, and recurses — re-materializing
 /// each deeper level on demand (frozen graphs are acyclic by construction, so this
 /// terminates without a `seen` guard).
 ///
@@ -7690,7 +7690,7 @@ pub(crate) fn shared_to_value_shallow(node: &crate::value::SharedNode) -> Option
 }
 
 /// Index-read into a frozen `Shared` node (SRV §3.5). Returns a scalar `Value` or a
-/// `Value::Shared` sub-view; an out-of-range/missing key is `nil` (matching the live
+/// `Value::shared` sub-view; an out-of-range/missing key is `nil` (matching the live
 /// Array/Object/Map semantics).
 pub(crate) fn shared_index_get(
     node: &crate::value::SharedNode,
@@ -7823,7 +7823,7 @@ fn is_shared_mutating_method(name: &str) -> bool {
     )
 }
 
-/// SRV §3.5/§3.8 — dispatch a member-CALL on a frozen `Value::Shared`. The
+/// SRV §3.5/§3.8 — dispatch a member-CALL on a frozen `Value::shared`. The
 /// read-only method surface (`has`/`get`/`keys`/`values`/`contains`/`len`) reads the
 /// frozen tree; a MUTATING method name is the shipped `cannot mutate a frozen {kind}`
 /// Tier-2 panic (§3.8); a frozen-INSTANCE user-method call gets the DISTINCT
@@ -8101,7 +8101,7 @@ pub(crate) fn error_message(err: &Value) -> String {
 
 /// FFI §4.5a: the dispatch name of a NAMED `worker fn` value, or `None` if `v` is not
 /// a named worker fn. Handles both engine representations — a tree-walker
-/// `Value::Function` and a VM `Value::Closure` (whose `proto` carries the name +
+/// `Value::function` and a VM `Value::closure` (whose `proto` carries the name +
 /// `is_worker`). `run_in_worker`'s first arg must resolve through this.
 fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
     match v.kind() {
@@ -8219,7 +8219,7 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
 /// Validate call arguments against a parameter list (exact arity OR rest), apply
 /// each declared parameter type contract, and return the values to bind into the
 /// callee's parameter slots in declaration order. For a rest parameter the
-/// returned slot holds the collected `Value::Array` of the trailing arguments.
+/// returned slot holds the collected `Value::array_cell` of the trailing arguments.
 ///
 /// This is the single source of truth for function-call argument checking; it is
 /// shared by the tree-walker (`run_body`) and the bytecode VM (`vm::run` CALL) so
@@ -8232,7 +8232,7 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
 ///
 /// `values` has length `params.len()`. Supplied positional args occupy
 /// `0..supplied` (already contract-checked); the trailing missing-defaulted
-/// positions (`defaults`) hold a placeholder `Value::Nil` to be OVERWRITTEN by
+/// positions (`defaults`) hold a placeholder `Value::nil()` to be OVERWRITTEN by
 /// the engine's default evaluation; the rest param (last, if present) holds the
 /// collected tail array. `supplied` is the count of supplied positional
 /// (non-rest) args. `defaults` is the half-open range of param indices whose
@@ -13341,7 +13341,7 @@ print(n?.m())
         let interp = Interp::new();
         let env = global_env().child();
         // extends a name that resolves to a class, not an interface
-        // (iface_class already binds "NotIface" as a module-global Value::Class).
+        // (iface_class already binds "NotIface" as a module-global Value::class).
         let _cls = iface_class(&env, "NotIface", vec![], None);
         let a = iface_def(&env, "A", vec![], vec!["NotIface"]);
         let inst = iface_instance(iface_class(&env, "X", vec![], None));
@@ -13657,7 +13657,7 @@ print(many([File(), File()]))
         }
     }
 
-    /// DX D2 Task 5 — the `TestSummary ↔ Value::Object` airlock conversion is
+    /// DX D2 Task 5 — the `TestSummary ↔ Value::object_cell` airlock conversion is
     /// lossless: passed/failed counts and every `(name, message)` failure survive the
     /// round-trip in order, AND through the worker structured-clone encode/decode
     /// (which crosses ONLY existing sendable `Value` kinds — no new kind).

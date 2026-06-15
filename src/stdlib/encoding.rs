@@ -23,7 +23,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// Accept bytes OR a string (encoded as UTF-8) as a source of raw bytes.

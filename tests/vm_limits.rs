@@ -287,7 +287,7 @@ fn cli_under_limit_recursion_succeeds_both_engines() {
 // that, well under the 3000 cap) is a faithful "used-to-SIGABRT, now-succeeds"
 // reproducer. The programs are written to terminate quickly once the stack grows.
 
-/// A recursion whose every level re-enters `Vm::call_value`'s `Value::Closure`
+/// A recursion whose every level re-enters `Vm::call_value`'s `Value::closure`
 /// arm through an `array.map` HOF callback (`src/vm/run.rs` `call_value` :2848).
 /// Each level is a fresh large native frame (map native + call_value + run).
 fn deep_hof_src(n: usize) -> String {

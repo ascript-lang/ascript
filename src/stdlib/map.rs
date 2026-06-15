@@ -83,7 +83,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     }
                 }
             }
-            Ok(Value::Map(m))
+            Ok(Value::map_cell(m))
         }
         "get" => {
             let m = want_map(&arg(args, 0), span, &ctx("get"))?;

@@ -1,6 +1,6 @@
 //! `std/decimal` — exact decimal arithmetic (money / large integers).
 //!
-//! `Value::Decimal` wraps `rust_decimal::Decimal` (a 96-bit scaled integer).
+//! `Value::decimal_rc` wraps `rust_decimal::Decimal` (a 96-bit scaled integer).
 //! Construction is always explicit — no grammar changes.
 //!
 //! **Rounding:** `round(d, places)` uses `MidpointRounding::MidpointAwayFromZero`
@@ -80,7 +80,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "from" => {
             let v = arg(args, 0);
             match v.kind() {
-                ValueKind::Decimal(d) => Ok(Value::Decimal(d.clone())),
+                ValueKind::Decimal(d) => Ok(Value::decimal_rc(d.clone())),
                 // NUM §4: an `Int` converts EXACTLY.
                 ValueKind::Int(i) => Ok(Value::decimal(Decimal::from(i))),
                 ValueKind::Str(s) => Decimal::from_str(s.as_ref())

@@ -66,7 +66,7 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
             None => Value::float(n.as_f64().unwrap_or(f64::NAN)),
         },
         serde_json::Value::String(s) => Value::str(s.as_str()),
-        serde_json::Value::Array(a) => Value::Array(crate::value::ArrayCell::new(
+        serde_json::Value::Array(a) => Value::array_cell(crate::value::ArrayCell::new(
             a.iter().map(to_ascript).collect(),
         )),
         serde_json::Value::Object(o) => {
@@ -74,7 +74,7 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
             for (k, v) in o {
                 m.insert(k.clone(), to_ascript(v));
             }
-            Value::Object(crate::value::ObjectCell::new(m))
+            Value::object_cell(crate::value::ObjectCell::new(m))
         }
     }
 }
@@ -176,7 +176,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             Ok(serde_json::Value::Array(out))
         }
         // SRV §3: a frozen value serializes exactly like its underlying kind. A
-        // frozen container materializes one level (children stay `Value::Shared`) and
+        // frozen container materializes one level (children stay `Value::shared`) and
         // recurses; a frozen instance/enum-variant/regex falls through to the same
         // catch-all a LIVE instance/regex hits (kept consistent via `kind_name`).
         ValueKind::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
@@ -334,7 +334,7 @@ mod tests {
             .starts_with("[{a: 1, b: [true, nil, \"x\"]}, nil]"));
     }
 
-    // SRV regression (holistic-review MAJOR): a frozen `Value::Shared` must serialize
+    // SRV regression (holistic-review MAJOR): a frozen `Value::shared` must serialize
     // byte-identically to its live equivalent — and a frozen CHILD must not poison a
     // live container that holds it. Before the fix, `from_ascript` hit its catch-all
     // ("cannot serialize a value of type object to JSON") for any frozen value.

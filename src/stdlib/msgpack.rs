@@ -162,13 +162,13 @@ pub(crate) fn from_mp(mp: &Mp) -> Value {
         Mp::String(s) => match s.as_str() {
             Some(st) => Value::str(st),
             // Non-UTF-8 msgpack string → expose the raw bytes.
-            None => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(
+            None => Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(
                 s.as_bytes().to_vec(),
             ))),
         },
-        Mp::Binary(b) => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
+        Mp::Binary(b) => Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
         Mp::Array(a) => {
-            Value::Array(crate::value::ArrayCell::new(a.iter().map(from_mp).collect()))
+            Value::array_cell(crate::value::ArrayCell::new(a.iter().map(from_mp).collect()))
         }
         Mp::Map(pairs) => {
             // All-string keys → Object; otherwise → Map.
@@ -180,7 +180,7 @@ pub(crate) fn from_mp(mp: &Mp) -> Value {
                         m.insert(s.as_str().unwrap_or_default().to_string(), from_mp(v));
                     }
                 }
-                Value::Object(crate::value::ObjectCell::new(m))
+                Value::object_cell(crate::value::ObjectCell::new(m))
             } else {
                 let mut m: IndexMap<crate::value::MapKey, Value> = IndexMap::new();
                 for (k, v) in pairs {
@@ -188,12 +188,12 @@ pub(crate) fn from_mp(mp: &Mp) -> Value {
                         m.insert(mk, from_mp(v));
                     }
                 }
-                Value::Map(crate::value::MapCell::new(m))
+                Value::map_cell(crate::value::MapCell::new(m))
             }
         }
         // Extension types are not part of AScript's value model → represent the
         // payload bytes (the type tag is dropped — documented).
-        Mp::Ext(_, data) => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(data.clone()))),
+        Mp::Ext(_, data) => Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(data.clone()))),
     }
 }
 
@@ -204,7 +204,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mp = to_mp(&v, &mut Vec::new()).map_err(|e| AsError::at(e, span))?;
             let mut buf = Vec::new();
             match rmpv::encode::write_value(&mut buf, &mp) {
-                Ok(()) => Ok(Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(buf)))),
+                Ok(()) => Ok(Value::bytes_rc(std::rc::Rc::new(std::cell::RefCell::new(buf)))),
                 Err(e) => Err(AsError::at(
                     format!("msgpack.encode: {}", e),
                     span,
@@ -343,7 +343,7 @@ mod tests {
     }
 
     // SRV regression (holistic-review MAJOR): a frozen container must encode like its
-    // live equivalent (before the fix, `to_mp` errored on any `Value::Shared`).
+    // live equivalent (before the fix, `to_mp` errored on any `Value::shared`).
     #[cfg(feature = "shared")]
     #[test]
     fn frozen_container_encodes_like_live() {
@@ -357,7 +357,7 @@ mod tests {
         let live = Value::object(m);
         let frozen = shared::freeze(&live, sp()).unwrap();
         // Encoding is deterministic: the frozen object must encode to the SAME bytes
-        // as the live one (Value::Object `==` is identity, so compare the bytes).
+        // as the live one (Value::object_cell `==` is identity, so compare the bytes).
         let bytes_of = |v: Value| match call("encode", &[v], sp()).unwrap().kind() {
             ValueKind::Bytes(b) => b.borrow().clone(),
             _ => panic!("encode did not return bytes"),

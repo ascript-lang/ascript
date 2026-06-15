@@ -88,7 +88,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     s.borrow_mut().insert(key);
                 }
             }
-            Ok(Value::Set(s))
+            Ok(Value::set_cell(s))
         }
 
         "add" => {
@@ -183,7 +183,7 @@ mod tests {
         for el in elems {
             s.borrow_mut().insert(MapKey::from_value(el).unwrap());
         }
-        Value::Set(s)
+        Value::set_cell(s)
     }
 
     // ---- new ----

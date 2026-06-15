@@ -56,7 +56,7 @@ pub struct CallFrame {
 
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
 /// (every captured local). `slot_count` sizes the vector; each cell slot gets a
-/// fresh `Cc<RefCell<Value::Nil>>`, every other slot is `None`.
+/// fresh `Cc<RefCell<Value::nil()>>`, every other slot is `None`.
 ///
 /// **CALL §2 — A1 empty-cells fast path:** when `cell_slots` is empty (the
 /// overwhelmingly common case — most functions capture nothing by reference),
@@ -94,7 +94,7 @@ pub struct Fiber {
 
 impl Fiber {
     /// Create a fiber running `top` as its sole (bottom) frame. Reserves the
-    /// frame's local slots as `Value::Nil` so locals occupy `stack[0 ..
+    /// frame's local slots as `Value::nil()` so locals occupy `stack[0 ..
     /// slot_count]`; operands push above. Starts in [`FiberState::Running`].
     pub fn new(top: Cc<Closure>) -> Self {
         let slot_count = top.proto.chunk.slot_count as usize;
@@ -222,7 +222,7 @@ impl Fiber {
         *cell.borrow_mut() = v;
     }
 
-    /// Install a BRAND-NEW heap cell (`Cc<RefCell<Value::Nil>>`) into the current
+    /// Install a BRAND-NEW heap cell (`Cc<RefCell<Value::nil()>>`) into the current
     /// frame's `slot`, dropping the frame's strong ref to the previous cell. Any
     /// closure that captured the previous cell keeps it alive with its own value.
     /// Used by `Op::FreshCell` to give each loop iteration a fresh cell for the
@@ -246,7 +246,7 @@ impl Fiber {
     /// Recycle this fiber for `top`, clearing mid-flight state so it can be reused
     /// by a re-entrant call. The returned fiber is in the exact same state as
     /// `Fiber::new(top)` — one bottom frame at `ip 0`, stack pre-filled with
-    /// `Value::Nil` for all locals, fresh cells, state `Running`.
+    /// `Value::nil()` for all locals, fresh cells, state `Running`.
     ///
     /// Cell freshness is load-bearing: cells are `Cc` handles captured by closures
     /// that this call creates. Reusing the old `Cc` would let a previously-returned

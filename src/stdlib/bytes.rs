@@ -25,7 +25,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {
-    Value::Bytes(Rc::new(RefCell::new(v)))
+    Value::bytes_rc(Rc::new(RefCell::new(v)))
 }
 
 /// A non-negative integer offset/index/size, validated BEFORE the f64→usize
@@ -90,7 +90,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .iter()
                 .map(|&x| Value::int(x as i64))
                 .collect();
-            Ok(Value::Array(crate::value::ArrayCell::new(arr)))
+            Ok(Value::array_cell(crate::value::ArrayCell::new(arr)))
         }
         "get" => {
             let b = want_bytes(&arg(args, 0), span, &ctx("get"))?;

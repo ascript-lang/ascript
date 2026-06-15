@@ -98,10 +98,10 @@ const TAG_REF: u8 = 13;
 /// A 64-bit integer (NUM §3.1). A scalar wire kind, distinct from `TAG_NUMBER`
 /// (float) so an `int` round-trips as an `int` (no lossy float fold).
 const TAG_INT: u8 = 14;
-/// SRV §3.7(b) — a frozen `Value::Shared`, encoded as a u32 INDEX into the encode
+/// SRV §3.7(b) — a frozen `Value::shared`, encoded as a u32 INDEX into the encode
 /// side-vector `Writer.shared` (a `Vec<Arc<SharedNode>>` shipped alongside the byte
 /// buffer). Encoding pushes `arc.clone()` (an atomic bump) + writes the index — NO
-/// deep walk of the frozen graph. Decode reconstructs `Value::Shared` from the
+/// deep walk of the frozen graph. Decode reconstructs `Value::shared` from the
 /// side-vector by index. WORKER-WIRE ONLY — never an `.aso` constant (no
 /// `ASO_FORMAT_VERSION` bump). The next free tag after `TAG_INT = 14`.
 const TAG_SHARED: u8 = 15;
@@ -323,7 +323,7 @@ fn display_key(k: &MapKey) -> String {
 
 struct Writer {
     buf: Vec<u8>,
-    /// SRV §3.7(b) — the shared-table side-vector. A frozen `Value::Shared` is
+    /// SRV §3.7(b) — the shared-table side-vector. A frozen `Value::shared` is
     /// encoded as a `TAG_SHARED` + a u32 index into this vector (`shared.push(
     /// arc.clone())`, an atomic bump, NO graph walk). Shipped alongside `buf`.
     shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
@@ -418,7 +418,7 @@ fn truncated_err() -> SendError {
 // ---------------------------------------------------------------------------
 
 /// Serialize `v` to a structured-clone byte payload PLUS a side-vector of frozen
-/// `Arc<SharedNode>`s (SRV §3.7b — a `Value::Shared` crosses by an `Arc` clone, NOT
+/// `Arc<SharedNode>`s (SRV §3.7b — a `Value::shared` crosses by an `Arc` clone, NOT
 /// a deep copy). Rejects non-sendable values (a bad value never produces a
 /// half-written payload — `check_sendable` runs first). The two members travel
 /// together (`WorkerRequest.args` + `WorkerRequest.shared`, etc.).
@@ -541,11 +541,11 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
                 None => w.u8(0),
                 Some(crate::value::Payload::Positional(a)) => {
                     w.u8(1);
-                    encode_value(&Value::Array(a.clone()), w, ids);
+                    encode_value(&Value::array_cell(a.clone()), w, ids);
                 }
                 Some(crate::value::Payload::Named(o)) => {
                     w.u8(2);
-                    encode_value(&Value::Object(o.clone()), w, ids);
+                    encode_value(&Value::object_cell(o.clone()), w, ids);
                 }
             }
         }
@@ -608,7 +608,7 @@ pub fn decode(bytes: &[u8], interp: &Interp) -> Result<Value, SendError> {
 }
 
 /// Deserialize a payload, resolving any `TAG_SHARED` index against the `shared`
-/// side-vector (SRV §3.7b). A frozen `Value::Shared` is reconstructed by an `Arc`
+/// side-vector (SRV §3.7b). A frozen `Value::shared` is reconstructed by an `Arc`
 /// clone from the side-vector — ZERO graph copy. Callers that carry no shared values
 /// pass `&[]` (the plain [`decode`] wrapper).
 pub fn decode_with_shared(
@@ -645,21 +645,21 @@ fn decode_value(
             })?;
             // VAL Task 2: same logical `TAG_DECIMAL` wire form (the decimal STRING,
             // not the pointer); only the in-memory wrap is now `Rc`.
-            Ok(Value::Decimal(std::rc::Rc::new(d)))
+            Ok(Value::decimal_rc(std::rc::Rc::new(d)))
         }
         TAG_STR => Ok(Value::str(r.str()?)),
         TAG_BYTES => {
             let id = r.u32()? as usize;
             let cell = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-            register(table, id, Value::Bytes(cell.clone()))?;
+            register(table, id, Value::bytes_rc(cell.clone()))?;
             let raw = r.bytes()?;
             *cell.borrow_mut() = raw;
-            Ok(Value::Bytes(cell))
+            Ok(Value::bytes_rc(cell))
         }
         TAG_ARRAY => {
             let id = r.u32()? as usize;
             let cell = crate::value::ArrayCell::new(Vec::new());
-            let value = Value::Array(cell.clone());
+            let value = Value::array_cell(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             // Bound the reservation against bytes remaining: `len` is attacker-
@@ -676,7 +676,7 @@ fn decode_value(
         TAG_OBJECT => {
             let id = r.u32()? as usize;
             let cell = crate::value::ObjectCell::new(indexmap::IndexMap::new());
-            let value = Value::Object(cell.clone());
+            let value = Value::object_cell(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
@@ -689,7 +689,7 @@ fn decode_value(
         TAG_MAP => {
             let id = r.u32()? as usize;
             let cell = crate::value::MapCell::new(indexmap::IndexMap::new());
-            let value = Value::Map(cell.clone());
+            let value = Value::map_cell(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
@@ -708,7 +708,7 @@ fn decode_value(
         TAG_SET => {
             let id = r.u32()? as usize;
             let cell = crate::value::SetCell::new(indexmap::IndexSet::new());
-            let value = Value::Set(cell.clone());
+            let value = Value::set_cell(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
@@ -740,7 +740,7 @@ fn decode_value(
                     if let Some(interned) = reintern_unit_variant(interp, &enum_name, &name) {
                         return Ok(interned);
                     }
-                    Ok(Value::EnumVariant(std::rc::Rc::new(
+                    Ok(Value::enum_variant(std::rc::Rc::new(
                         crate::value::EnumVariant {
                             enum_name,
                             name,
@@ -766,7 +766,7 @@ fn decode_value(
                             })
                         }
                     };
-                    Ok(Value::EnumVariant(std::rc::Rc::new(
+                    Ok(Value::enum_variant(std::rc::Rc::new(
                         crate::value::EnumVariant {
                             enum_name,
                             name,
@@ -790,7 +790,7 @@ fn decode_value(
                             })
                         }
                     };
-                    Ok(Value::EnumVariant(std::rc::Rc::new(
+                    Ok(Value::enum_variant(std::rc::Rc::new(
                         crate::value::EnumVariant {
                             enum_name,
                             name,
@@ -816,7 +816,7 @@ fn decode_value(
                 path: "<regex>".to_string(),
                 hint: None,
             })?;
-            Ok(Value::Regex(std::rc::Rc::new(crate::value::RegexHandle {
+            Ok(Value::regex(std::rc::Rc::new(crate::value::RegexHandle {
                 re,
                 source,
             })))
@@ -832,7 +832,7 @@ fn decode_value(
             let cell = gcmodule::Cc::new(std::cell::RefCell::new(
                 crate::value::Instance::from_dict(class, indexmap::IndexMap::new()),
             ));
-            let value = Value::Instance(cell.clone());
+            let value = Value::instance(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
@@ -850,7 +850,7 @@ fn decode_value(
                 hint: None,
             })
         }
-        // SRV §3.7(b): reconstruct a frozen `Value::Shared` from the side-vector by
+        // SRV §3.7(b): reconstruct a frozen `Value::shared` from the side-vector by
         // index — another `Arc` clone (atomic bump), ZERO graph copy. A bounds-checked
         // index guards a corrupt/mismatched payload.
         TAG_SHARED => {
@@ -860,7 +860,7 @@ fn decode_value(
                 path: format!("<shared {idx}>"),
                 hint: None,
             })?;
-            Ok(Value::Shared(arc))
+            Ok(Value::shared(arc))
         }
         other => Err(SendError {
             kind: "decode",
@@ -981,7 +981,7 @@ mod tests {
             Value::bool_(true),
             Value::float(3.5),
             Value::str("hi"),
-            Value::Decimal(Rc::new(Decimal::from_str("0.1").unwrap())),
+            Value::decimal_rc(Rc::new(Decimal::from_str("0.1").unwrap())),
         ] {
             assert_eq!(rt(&v), v);
         }
@@ -1035,8 +1035,8 @@ mod tests {
         // a = []; a.push(a) — a self-referential array must encode without infinite
         // recursion and decode into a value that is its own first element.
         let a = ArrayCell::new(Vec::new());
-        a.borrow_mut().push(Value::Array(a.clone()));
-        let back = rt(&Value::Array(a));
+        a.borrow_mut().push(Value::array_cell(a.clone()));
+        let back = rt(&Value::array_cell(a));
         if let ValueKind::Array(arr) = back.kind() {
             let inner = arr.borrow()[0].clone();
             assert!(
@@ -1053,8 +1053,8 @@ mod tests {
         // An object referring to itself through a field.
         let o = ObjectCell::new(IndexMap::new());
         o.borrow_mut()
-            .insert("self".to_string(), Value::Object(o.clone()));
-        let back = rt(&Value::Object(o));
+            .insert("self".to_string(), Value::object_cell(o.clone()));
+        let back = rt(&Value::object_cell(o));
         if let ValueKind::Object(obj) = back.kind() {
             let inner = obj.get("self").unwrap();
             assert!(matches!(inner.kind(), ValueKind::Object(i) if crate::gc::cc_ptr_eq(obj, i)));
@@ -1080,7 +1080,7 @@ mod tests {
         let mut fields = IndexMap::new();
         fields.insert("x".to_string(), num(1.0));
         fields.insert("y".to_string(), num(2.0));
-        let inst = Value::Instance(gcmodule::Cc::new(RefCell::new(
+        let inst = Value::instance(gcmodule::Cc::new(RefCell::new(
             crate::value::Instance::from_dict(class, fields),
         )));
         let back = rt(&inst);
@@ -1097,7 +1097,7 @@ mod tests {
 
     #[test]
     fn enum_variant_roundtrips() {
-        let v = Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+        let v = Value::enum_variant(Rc::new(crate::value::EnumVariant {
             enum_name: "Color".to_string(),
             name: "Green".to_string(),
             value: num(1.0),
@@ -1118,7 +1118,7 @@ mod tests {
     // ─────────────────────────── ADT (Task 9) ───────────────────────────
 
     fn pos_var(en: &str, name: &str, items: Vec<Value>) -> Value {
-        Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+        Value::enum_variant(Rc::new(crate::value::EnumVariant {
             enum_name: en.to_string(),
             name: name.to_string(),
             value: Value::nil(),
@@ -1134,7 +1134,7 @@ mod tests {
         for (k, v) in fields {
             m.insert(k.to_string(), v);
         }
-        Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+        Value::enum_variant(Rc::new(crate::value::EnumVariant {
             enum_name: en.to_string(),
             name: name.to_string(),
             value: Value::nil(),
@@ -1184,7 +1184,7 @@ mod tests {
         // arr = []; v = Json.Arr([arr]); arr.push(v) → a cycle through the payload.
         // The encoder's visited-ref table must serialize it once and refer by id.
         let arr = crate::value::ArrayCell::new(Vec::new());
-        let v = Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+        let v = Value::enum_variant(Rc::new(crate::value::EnumVariant {
             enum_name: "Json".to_string(),
             name: "Arr".to_string(),
             value: Value::nil(),
@@ -1230,7 +1230,7 @@ mod tests {
     #[test]
     fn regex_recompiles_from_source() {
         let re = regex::Regex::new("(?i)ab+c").unwrap();
-        let v = Value::Regex(Rc::new(crate::value::RegexHandle {
+        let v = Value::regex(Rc::new(crate::value::RegexHandle {
             re,
             source: "(?i)ab+c".to_string(),
         }));
@@ -1246,7 +1246,7 @@ mod tests {
     #[test]
     fn rejects_function_with_field_path() {
         // [1, {cb: <function>}]
-        let func = Value::Function(Rc::new(crate::value::Function {
+        let func = Value::function(Rc::new(crate::value::Function {
             name: None,
             params: Vec::new(),
             ret: None,
@@ -1271,7 +1271,7 @@ mod tests {
         // serializer must reject it with a field path so `encode_value`'s catch-all
         // `unreachable!` is never reached. (Interfaces cross isolates via code-shipping,
         // Task 8 — not the value channel.)
-        let iface = Value::Interface(Rc::new(crate::value::InterfaceDef {
+        let iface = Value::interface(Rc::new(crate::value::InterfaceDef {
             name: "Reader".to_string(),
             own_methods: IndexMap::new(),
             extends: Vec::new(),
@@ -1287,7 +1287,7 @@ mod tests {
         assert_eq!(err.kind, "interface");
         assert_eq!(err.path, "[1].r");
         // `encode` also rejects before writing any bytes (the unreachable! stays dead).
-        let iface2 = Value::Interface(Rc::new(crate::value::InterfaceDef {
+        let iface2 = Value::interface(Rc::new(crate::value::InterfaceDef {
             name: "Reader".to_string(),
             own_methods: IndexMap::new(),
             extends: Vec::new(),
@@ -1299,13 +1299,13 @@ mod tests {
 
     #[test]
     fn rejects_future_and_native() {
-        let fut = Value::Future(crate::task::SharedFuture::resolved(Ok(num(1.0))));
+        let fut = Value::future(crate::task::SharedFuture::resolved(Ok(num(1.0))));
         assert_eq!(check_sendable(&fut).unwrap_err().kind, "future");
     }
 
     #[test]
     fn rejects_native_channel_with_hint() {
-        let native = Value::Native(Rc::new(crate::value::NativeObject {
+        let native = Value::native(Rc::new(crate::value::NativeObject {
             id: 1,
             kind: crate::value::NativeKind::Channel,
             fields: IndexMap::new(),
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn encode_rejects_before_writing() {
-        let func = Value::Function(Rc::new(crate::value::Function {
+        let func = Value::function(Rc::new(crate::value::Function {
             name: None,
             params: Vec::new(),
             ret: None,
@@ -1391,7 +1391,7 @@ mod tests {
     fn shared_val() -> Value {
         use crate::value::SharedNode;
         use std::sync::Arc;
-        Value::Shared(Arc::new(SharedNode::Object(Arc::new(vec![
+        Value::shared(Arc::new(SharedNode::Object(Arc::new(vec![
             ("k".into(), Arc::new(SharedNode::Int(42))),
         ]))))
     }

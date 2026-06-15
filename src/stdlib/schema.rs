@@ -169,7 +169,7 @@ const SCHEMA_KINDS: &[&str] = &[
     "union", "oneOf",
 ];
 
-/// True iff `v` is a schema value: a `Value::Object` whose `__kind` field is a
+/// True iff `v` is a schema value: a `Value::object_cell` whose `__kind` field is a
 /// String equal to one of the known schema kinds (see `SCHEMA_KINDS`).
 ///
 /// Deliberately narrow: it MUST NOT match a stdlib module namespace object or
@@ -213,7 +213,7 @@ pub(crate) fn is_schema_method(name: &str) -> bool {
     )
 }
 
-/// Get a field from a `Value::Object`.
+/// Get a field from a `Value::object_cell`.
 fn obj_field(obj: &Value, key: &str) -> Option<Value> {
     match obj.kind() {
         ValueKind::Object(o) => o.get(key),
@@ -252,7 +252,7 @@ fn obj_field_num(obj: &Value, key: &str) -> Option<f64> {
 /// A `Named` type refers to a class by name (e.g. a field `addr: Address`).
 /// It is resolved in `def_env` — the declaring class's definition environment,
 /// the same scope `validate_into` uses for nested-class coercion. When the name
-/// resolves to a `Value::Class`, we recurse via `class_to_object_schema_inner`
+/// resolves to a `Value::class`, we recurse via `class_to_object_schema_inner`
 /// to build the nested `{__kind:"object", fields:{...}}` schema — so a nested
 /// field is fully validated.
 ///
@@ -949,7 +949,7 @@ impl Interp {
     /// Mirrors `parse_value` but, in the composite arms (object/array/map/union),
     /// instead of `return Err(Mismatch)` on the FIRST failing child it pushes the
     /// child's `{path, message}` error Object(s) into `errors` and KEEPS GOING,
-    /// substituting `Value::Nil` for the failed sub-value so traversal proceeds.
+    /// substituting `Value::nil()` for the failed sub-value so traversal proceeds.
     ///
     /// `InvalidSchema` (malformed schema) and `Control` (a panic/propagate from a
     /// user `refine` fn) still short-circuit via `?` — collect-all only accumulates
@@ -958,7 +958,7 @@ impl Interp {
     /// Leaf arms (string/number/bool/nil/any/literal) and the constraint/refine
     /// checks delegate to the fail-fast `parse_value` (each leaf produces exactly
     /// one error), so leaf wording is byte-identical between the two engines. A
-    /// leaf `Mismatch` is pushed into `errors` and `Value::Nil` returned.
+    /// leaf `Mismatch` is pushed into `errors` and `Value::nil()` returned.
     ///
     /// Returns the validated (best-effort, Nil-substituted) value; the caller
     /// reports failure iff `errors` is non-empty.
