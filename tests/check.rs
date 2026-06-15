@@ -1677,3 +1677,216 @@ mod defer_async_call {
         );
     }
 }
+
+// ── ELIDE Task 0.3: collector cost envelope measurement ──────────────────────
+//
+// Run with:
+//   cargo test --test check --release -- elide_collector_cost_envelope --ignored --nocapture
+//
+// This harness measures the wall time of the full checker pipeline
+// (parse → tree_builder::build_tree → resolve::resolve → Table::build → pass::run)
+// which is the cost CEILING for the ELIDE ElisionSet collector (same walk + cheap
+// set inserts). Results are printed to stdout for capture into bench/ELIDE_RESULTS.md.
+//
+// The harness is kept IGNORED so it never runs in normal CI (it's a one-shot
+// measurement tool, not a correctness gate).
+#[test]
+#[ignore]
+fn elide_collector_cost_envelope() {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    // ── collect corpus files ─────────────────────────────────────────────────
+    fn walk_as(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk_as(&p, out);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("as") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut corpus: Vec<PathBuf> = Vec::new();
+    walk_as(Path::new("examples"), &mut corpus);
+    corpus.sort();
+    let corpus_len = corpus.len();
+
+    // ── per-file checker pipeline timing ────────────────────────────────────
+    // Warm up the allocator with one throw-away pass.
+    let _ = ascript::check::analyze("let _ = 1\n");
+
+    const REPS: u32 = 10; // repeats per file to get a stable sample
+
+    let mut per_file: Vec<(String, u64 /* µs median */, usize /* lines */)> = Vec::new();
+
+    for path in &corpus {
+        let src = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let lines = src.lines().count();
+        let name = path.display().to_string();
+
+        let mut times: Vec<Duration> = Vec::with_capacity(REPS as usize);
+        for _ in 0..REPS {
+            let t0 = Instant::now();
+            let _ = ascript::check::analyze(&src);
+            times.push(t0.elapsed());
+        }
+        times.sort();
+        let median_us = times[REPS as usize / 2].as_micros() as u64;
+        per_file.push((name, median_us, lines));
+    }
+
+    // ── synthetic ~5 k-line module ───────────────────────────────────────────
+    // Build a big source by duplicating the all_features content with different
+    // top-level wrapper fn names until we reach ≥5000 lines.
+    let base = fs::read_to_string("examples/all_features.as").unwrap_or_default();
+    let base_lines = base.lines().count();
+    let needed = (5000usize.saturating_sub(base_lines) + base_lines - 1) / base_lines;
+    let mut big_src = String::with_capacity(base.len() * (needed + 1));
+    big_src.push_str(&base);
+    for i in 0..needed {
+        // Wrap each copy in a unique fn so top-level names don't clash.
+        big_src.push_str(&format!(
+            "\nfn _big_wrap_{}() {{\n{}\n}}\n",
+            i,
+            base.replace('\n', "\n  ")
+        ));
+    }
+    let big_lines = big_src.lines().count();
+    let mut big_times: Vec<Duration> = Vec::with_capacity(REPS as usize);
+    for _ in 0..REPS {
+        let t0 = Instant::now();
+        let _ = ascript::check::analyze(&big_src);
+        big_times.push(t0.elapsed());
+    }
+    big_times.sort();
+    let big_median_us = big_times[REPS as usize / 2].as_micros() as u64;
+
+    // ── statistics ───────────────────────────────────────────────────────────
+    let mut all_us: Vec<u64> = per_file.iter().map(|(_, us, _)| *us).collect();
+    all_us.sort();
+    let min_us = *all_us.first().unwrap_or(&0);
+    let max_us = *all_us.last().unwrap_or(&0);
+    let median_us = all_us[all_us.len() / 2];
+
+    // ── end-to-end ascript run timing (20 iterations over the corpus) ────────
+    // We only time files that are known-runnable (skip server/worker/db etc).
+    // Use the same EXAMPLE_SKIPS approach as the conformance tests: just run them
+    // all and accept that some will fail — we care about wall time, not output.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let run_iters = 20u32;
+
+    // Pick a representative subset: the largest files from examples/ (not advanced/)
+    // that are likely to run quickly. Use all_features.as as the canonical file.
+    let representative_files: Vec<&Path> = corpus
+        .iter()
+        .filter(|p| {
+            let s = p.display().to_string();
+            // Skip net/db/worker/tui/ai examples that block or need services
+            !s.contains("net")
+                && !s.contains("postgres")
+                && !s.contains("redis")
+                && !s.contains("sqlite")
+                && !s.contains("tui")
+                && !s.contains("ai")
+                && !s.contains("server")
+                && !s.contains("sse")
+                && !s.contains("ws")
+                && !s.contains("advanced")
+                && !s.contains("app/")
+                && !s.contains("workers_")
+        })
+        .map(|p| p.as_path())
+        .collect();
+
+    let mut e2e_results: Vec<(String, u64 /* ms */,  usize /* lines */)> = Vec::new();
+
+    for path in &representative_files {
+        let src = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let lines = src.lines().count();
+        let name = path.display().to_string();
+
+        let mut run_times: Vec<u64> = Vec::with_capacity(run_iters as usize);
+        for _ in 0..run_iters {
+            let t0 = Instant::now();
+            let _ = Command::new(bin)
+                .arg("run")
+                .arg(path)
+                .output();
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            run_times.push(elapsed_ms);
+        }
+        run_times.sort();
+        let median_ms = run_times[run_times.len() / 2];
+        e2e_results.push((name, median_ms, lines));
+    }
+
+    // Compute projected regression %:
+    // checker_median_us / (e2e_median_ms * 1000) * 100
+    // We use the grand median of checker times vs the grand median of e2e times
+    // for the representative files. Match by file.
+    let mut regression_pcts: Vec<f64> = Vec::new();
+    for (e2e_name, e2e_ms, _) in &e2e_results {
+        if let Some((_, check_us, _)) = per_file.iter().find(|(n, _, _)| n == e2e_name) {
+            if *e2e_ms > 0 {
+                let check_ms = *check_us as f64 / 1000.0;
+                let pct = check_ms / *e2e_ms as f64 * 100.0;
+                regression_pcts.push(pct);
+            }
+        }
+    }
+    regression_pcts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_regression_pct = if regression_pcts.is_empty() {
+        f64::NAN
+    } else {
+        regression_pcts[regression_pcts.len() / 2]
+    };
+
+    // ── print results ────────────────────────────────────────────────────────
+    println!();
+    println!("=== ELIDE Task 0.3: Collector cost envelope (release build) ===");
+    println!("Profile: release  |  Reps per file: {REPS}  |  Corpus size: {corpus_len} files");
+    println!();
+    println!("--- Checker pipeline wall time (parse+resolve+table+pass) ---");
+    println!("  min    = {:.2} ms ({:.0} µs)", min_us as f64 / 1000.0, min_us as f64);
+    println!("  median = {:.2} ms ({:.0} µs)", median_us as f64 / 1000.0, median_us as f64);
+    println!("  max    = {:.2} ms ({:.0} µs)", max_us as f64 / 1000.0, max_us as f64);
+    println!();
+    println!("--- Synthetic ~{big_lines}-line module ---");
+    println!("  median checker time = {:.2} ms ({big_median_us} µs)", big_median_us as f64 / 1000.0);
+    println!();
+    println!("--- Per-file checker pipeline times (median over {REPS} reps) ---");
+    println!("{:<60} {:>6}  {:>6}", "file", "lines", "µs");
+    println!("{}", "-".repeat(76));
+    for (name, us, lines) in &per_file {
+        println!("{:<60} {:>6}  {:>6}", name, lines, us);
+    }
+    println!();
+    println!("--- End-to-end `ascript run` times (median over {run_iters} iterations) ---");
+    println!("{:<60} {:>6}  {:>8}", "file", "lines", "e2e ms");
+    println!("{}", "-".repeat(76));
+    for (name, ms, lines) in &e2e_results {
+        // Find checker time for this file
+        let check_us = per_file.iter().find(|(n,_,_)| n==name).map(|(_,u,_)| *u).unwrap_or(0);
+        let pct = if *ms > 0 { check_us as f64 / 1000.0 / *ms as f64 * 100.0 } else { 0.0 };
+        println!("{:<60} {:>6}  {:>8}  (checker {:.2} ms = {:.1}% of e2e)", name, lines, ms, check_us as f64/1000.0, pct);
+    }
+    println!();
+    println!("--- Projected regression summary ---");
+    println!("  Median checker/e2e ratio = {:.2}%", median_regression_pct);
+    println!("  Spec §5.1 budget: ≤ 2% corpus geomean AND ≤ 1 ms for ≤500-line module");
+    println!("  500-line module ceiling: {:.2} ms (budget: ≤ 1.00 ms)", median_us as f64 / 1000.0);
+    println!();
+    println!("NOTE: 'collector ceiling' = checker pipeline time (collector = same walk + set inserts).");
+    println!("Task 4.1 decides whether option (a) (always-on) ships based on these numbers.");
+}
