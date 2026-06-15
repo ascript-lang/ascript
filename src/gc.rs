@@ -46,7 +46,7 @@
 //! The [`Trace`] impl on [`Value`] therefore visits ONLY the container variants
 //! and is a no-op for everything else.
 
-use crate::value::{ArrayCell, Instance, MapCell, MapKey, SetCell, Value};
+use crate::value::{ArrayCell, Instance, MapCell, MapKey, SetCell};
 use crate::vm::value_ext::Closure;
 use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
@@ -190,60 +190,11 @@ impl Trace for MapKey {
     }
 }
 
-impl Trace for Value {
-    fn trace(&self, tracer: &mut Tracer) {
-        match self {
-            // Cycle-capable container variants: recurse into contained Values.
-            // NOTE: these still hold `Rc` in V13-T1 — `Rc<T>: Trace` delegates
-            // to `T::trace`, so tracing already reaches the inner Values. After
-            // V13-T2 these become `Cc<T>` and the collector takes over.
-            Value::Array(a) => a.trace(tracer),
-            Value::Object(o) => o.trace(tracer),
-            // Map/Set wrap a foreign `IndexMap`/`IndexSet` (orphan rule: no
-            // blanket `Trace`), so each is held in a local `MapCell`/`SetCell`
-            // newtype that carries the hand-written `Trace` impl below. The `Cc`
-            // delegates to that impl, which borrows and traces the contents.
-            Value::Map(m) => m.trace(tracer),
-            Value::Set(s) => s.trace(tracer),
-            Value::Instance(i) => i.trace(tracer),
-            Value::Closure(c) => c.trace(tracer),
-            // ADT §5.3: the `EnumVariant` WRAPPER stays on `Rc` (unit-variant
-            // construction is registration-free), but a `Some(payload)` can hold
-            // cycle-capable containers (a recursive enum like `Json::Arr(array<Json>)`
-            // self-references), so the collector must reach the payload's values.
-            // NOTE: `Rc<T>: Trace` is gcmodule's ACYCLIC no-op (it does NOT delegate
-            // to `T::trace`), so we deref to call `EnumVariant::trace` explicitly,
-            // reaching the payload's `Cc` container (the actual cycle node).
-            Value::EnumVariant(v) => (**v).trace(tracer),
-            // SRV §3.6: a frozen `Shared` is an `Arc` DAG in a DIFFERENT ownership
-            // domain (NOT `Cc`), acyclic by construction (`shared.freeze` rejects
-            // input cycles), so refcounting reclaims it — the Bacon–Rajan collector
-            // must NEVER descend into it. The same NO-OP invariant native handles
-            // rely on. The `Arc` graph holds no `Cc` and no `Value` cell, so it adds
-            // ZERO new GC edges and cannot participate in a `Cc` cycle even
-            // transitively (no `Arc→Cc→Arc` cross-domain cycle is possible). Explicit
-            // arm (folds into the catch-all, but spelled out for the invariant).
-            Value::Shared(_) => {}
-            // NOTE on `Function`: a tree-walker `Function` captures an
-            // `Environment` (its own `Rc<RefCell<Scope>>` graph), which is NOT
-            // one of the cycle-capable Value containers migrated in V13-T2 (see
-            // the V13 type list: Array/Object/Map/Set/Instance/Closure + upvalue
-            // cells). The VM expresses closures as `Value::Closure` with traced
-            // upvalue cells instead. So `Function` (and its Environment) STAY on
-            // `Rc` and are a no-op here — falling through to the catch-all.
-            //
-            // Everything else holds no cycle-capable Value (primitives), or is a
-            // native/immutable/opaque handle that must stay acyclic (see the
-            // module docs / deterministic-Drop invariant). No-op.
-            _ => {}
-        }
-    }
-
-    // Conservatively tracked: `Value` can contain `Cc<T>` after V13-T2.
-    fn is_type_tracked() -> bool {
-        true
-    }
-}
+// `impl Trace for Value` has been relocated to `src/value.rs` (NANB Task 1.2)
+// so it sits beside the (soon-to-be-private) repr after Task 1.7's seal.
+// Container `Trace` impls (`ObjectCell`/`ArrayCell`/`MapCell`/`SetCell`/
+// `EnumVariant`) plus `cc_addr`/`cc_ptr_eq` STAY here — they take `&self`,
+// never inspect a `Value` word directly (spec §4.2).
 
 // `Trace for ObjectCell` is implemented in `src/value.rs` (co-located with the
 // struct definition) so the private `map` field is directly accessible.
@@ -372,7 +323,7 @@ impl Trace for Closure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{MapKey, ObjectCell};
+    use crate::value::{MapKey, ObjectCell, Value};
     use crate::vm::chunk::{Chunk, FnProto};
     use gcmodule::{Trace, Tracer};
     use std::cell::Cell;
