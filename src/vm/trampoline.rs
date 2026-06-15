@@ -47,7 +47,7 @@
 
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use crate::vm::fiber::Fiber;
 use crate::vm::value_ext::{Closure, RunOutcome};
 use crate::vm::run::SyncOutcome;
@@ -94,7 +94,7 @@ impl CallbackTrampoline {
     ///   normal builtin call, but we handle it defensively).
     /// - The `call_fast` kill switch is off.
     pub(crate) fn arm(interp: &Interp, f: &Value, span: Span) -> Option<CallbackTrampoline> {
-        let Value::Closure(c) = f else { return None };
+        let ValueKind::Closure(c) = f.kind() else { return None };
         if c.proto.is_async || c.proto.is_generator || c.proto.is_worker {
             return None;
         }
@@ -151,7 +151,7 @@ impl CallbackTrampoline {
         fiber.frame_mut().ret_span = self.span;
         fiber.frame_mut().argc = supplied;
         for (slot, a) in args[..supplied].iter_mut().enumerate() {
-            let v = std::mem::replace(a, Value::Nil);
+            let v = std::mem::replace(a, Value::nil());
             if let Some(cell) = fiber.frame().cells.get(slot).and_then(|c| c.as_ref()) {
                 *cell.borrow_mut() = v;
             } else {
@@ -383,15 +383,15 @@ mod tests {
             fn_src,
             "add_ten",
             vec![
-                vec![Value::Int(1)],
-                vec![Value::Int(2)],
-                vec![Value::Int(3)],
+                vec![Value::int(1)],
+                vec![Value::int(2)],
+                vec![Value::int(3)],
             ],
         );
         assert_eq!(results.len(), 3, "should have 3 results");
-        assert_eq!(results[0], Ok(Value::Int(11)), "call1 result[0]");
-        assert_eq!(results[1], Ok(Value::Int(12)), "call1 result[1]");
-        assert_eq!(results[2], Ok(Value::Int(13)), "call1 result[2]");
+        assert_eq!(results[0], Ok(Value::int(11)), "call1 result[0]");
+        assert_eq!(results[1], Ok(Value::int(12)), "call1 result[1]");
+        assert_eq!(results[2], Ok(Value::int(13)), "call1 result[2]");
         // The trampoline counter must have been bumped 3 times.
         let stats = vm.call_fast_stats();
         assert_eq!(
@@ -426,12 +426,12 @@ mod tests {
         let local = tokio::task::LocalSet::new();
 
         // Call 0: "hello" → Ok(5)
-        let r0 = local.block_on(&rt, tramp.call(&mut [Value::Str("hello".into())]));
+        let r0 = local.block_on(&rt, tramp.call(&mut [Value::str("hello")]));
         assert!(r0.is_ok(), "call 0 should succeed: {r0:?}");
-        assert_eq!(r0.unwrap(), Value::Int(5), "call 0 result wrong");
+        assert_eq!(r0.unwrap(), Value::int(5), "call 0 result wrong");
 
         // Call 1: 42 → contract panic (type mismatch)
-        let r1 = local.block_on(&rt, tramp.call(&mut [Value::Int(42)]));
+        let r1 = local.block_on(&rt, tramp.call(&mut [Value::int(42)]));
         assert!(r1.is_err(), "call 1 should panic on type mismatch");
         let msg1 = match r1 { Err(crate::interp::Control::Panic(e)) => e.message, other => panic!("unexpected: {other:?}") };
         assert!(
@@ -440,9 +440,9 @@ mod tests {
         );
 
         // Call 2: "world" → MUST succeed (the reset invariant: panic didn't poison).
-        let r2 = local.block_on(&rt, tramp.call(&mut [Value::Str("world".into())]));
+        let r2 = local.block_on(&rt, tramp.call(&mut [Value::str("world")]));
         assert!(r2.is_ok(), "call 2 should succeed after panic (reset invariant): {r2:?}");
-        assert_eq!(r2.unwrap(), Value::Int(5), "call 2 result wrong");
+        assert_eq!(r2.unwrap(), Value::int(5), "call 2 result wrong");
 
         // The counter is bumped ONLY for calls that reach the sync lane
         // (i.e., after the contract check passes). The panicking call (call 1)

@@ -224,8 +224,10 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
 /// to `Debug` for an out-of-range index (defensive).
 fn const_repr(chunk: &Chunk, idx: u16) -> String {
     match chunk.consts.get(idx as usize) {
-        Some(crate::value::Value::Str(s)) => format!("{s:?}"),
-        Some(v) => v.to_string(),
+        Some(v) => match v.kind() {
+            crate::value::ValueKind::Str(s) => format!("{s:?}"),
+            _ => v.to_string(),
+        },
         None => format!("?? const {idx}"),
     }
 }
@@ -373,8 +375,8 @@ mod tests {
     #[test]
     fn disasm_const_add_return() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Float(1.0));
-        let b = c.add_const(Value::Float(2.0));
+        let a = c.add_const(Value::float(1.0));
+        let b = c.add_const(Value::float(2.0));
         assert_eq!((a, b), (0, 1));
         c.emit_u16(Op::Const, a, s()); // offset 0, 3 bytes
         c.emit_u16(Op::Const, b, s()); // offset 3, 3 bytes
@@ -435,7 +437,7 @@ mod tests {
     #[test]
     fn disasm_string_const_is_quoted() {
         let mut c = Chunk::new();
-        let i = c.add_const(Value::Str(Rc::from("hi")));
+        let i = c.add_const(Value::str("hi"));
         c.emit_u16(Op::GetGlobal, i, s());
         let text = disasm(&c);
         let line = text.lines().find(|l| l.contains("GET_GLOBAL")).unwrap();
@@ -488,7 +490,7 @@ mod tests {
     #[test]
     fn disasm_at_advances_offset() {
         let mut c = Chunk::new();
-        let i = c.add_const(Value::Float(7.0));
+        let i = c.add_const(Value::float(7.0));
         c.emit_u16(Op::Const, i, s()); // 3 bytes
         c.emit(Op::Pop, s()); // 1 byte
 
