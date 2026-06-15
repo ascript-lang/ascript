@@ -17,6 +17,7 @@
 //! - **T4:** `match`/`instanceof` narrowing + early-return flow merge.
 
 use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
+use crate::check::infer::elide::{self, ElideCollect};
 use crate::check::infer::env::{BindingKey, Env};
 use crate::check::infer::table::Table;
 use crate::check::infer::ty::{CheckTy, Compat3, EnumId, LitVal};
@@ -64,6 +65,37 @@ pub fn run(
     pass.finish()
 }
 
+/// Drive the inference pass in ELIDE proof-COLLECTION mode (spec §4.1): record every
+/// proven call/let/fn-return site into an [`elide::ElisionSet`] and return it. The
+/// diagnostics produced by the walk are DISCARDED (the set is the only output) — and
+/// they are byte-identical to [`run`]'s, the diagnostic-neutrality invariant (§6.5,
+/// asserted by `tests/elide.rs`). NEVER instantiates the interpreter; runs no code.
+pub fn collect_elision(
+    tree: &ResolvedNode,
+    resolved: &ResolveResult,
+    src: &str,
+    table: &Table,
+) -> elide::ElisionSet {
+    collect_elision_with_diagnostics(tree, resolved, src, table).1
+}
+
+/// Like [`collect_elision`] but ALSO returns the diagnostics the walk emitted — used
+/// ONLY by the diagnostic-neutrality gate (§6.5): the returned diagnostics MUST be
+/// byte-identical to [`run`]'s over the whole corpus. Production code uses
+/// [`collect_elision`] (which discards them).
+pub fn collect_elision_with_diagnostics(
+    tree: &ResolvedNode,
+    resolved: &ResolveResult,
+    src: &str,
+    table: &Table,
+) -> (Vec<AsDiagnostic>, elide::ElisionSet) {
+    let mut pass = Pass::new(resolved, src, table);
+    pass.elide = Some(ElideCollect::new(src));
+    pass.run(tree);
+    let set = pass.elide.take().map(|c| c.set).unwrap_or_default();
+    (pass.finish(), set)
+}
+
 /// The stateful pass.
 struct Pass<'a> {
     resolved: &'a ResolveResult,
@@ -87,6 +119,11 @@ struct Pass<'a> {
     /// When `Some`, every `NameRef` synth records its (range, displayed type) here
     /// (the LSP hover collection mode). `None` for the normal diagnosing pass.
     hover: Option<Vec<HoverType>>,
+    /// ELIDE (§4.1): when `Some`, the pass runs in proof-COLLECTION mode — it records
+    /// proven call/let/fn-return sites into the [`ElideCollect`]'s [`ElisionSet`]
+    /// WITHOUT changing any diagnostic (§6.5, the hover-mode precedent). `None` for
+    /// every other consumer, so collection is fully inert outside this mode.
+    elide: Option<ElideCollect>,
 }
 
 impl<'a> Pass<'a> {
@@ -101,6 +138,7 @@ impl<'a> Pass<'a> {
             inferring: std::collections::HashSet::new(),
             suppress_emit: 0,
             hover: None,
+            elide: None,
         }
     }
 
@@ -216,15 +254,21 @@ impl<'a> Pass<'a> {
         refinements: &[(BindingKey, CheckTy)],
     ) {
         let mut inner = Env::new();
-        // Seed with the parent's CURRENT (possibly-narrowed) view of each binding.
-        for (k, _) in env.iter_base() {
-            if let Some(ty) = env.lookup(k) {
-                inner.define(k.clone(), ty);
+        // Seed with the parent's CURRENT (possibly-narrowed) view of each binding,
+        // CARRYING the ELIDE anchored flag (§2.3 narrowed-NameRef row: a narrowed use
+        // is anchored iff its base binding is). A narrowing refinement on top keeps
+        // the same anchored flag (the refinement only changes the TYPE).
+        let keys: Vec<BindingKey> = env.iter_base().map(|(k, _)| k.clone()).collect();
+        for k in keys {
+            if let Some(ty) = env.lookup(&k) {
+                let anchored = env.is_anchored(&k);
+                inner.define_anchored(k, ty, anchored);
             }
         }
-        // Apply branch refinements on top.
+        // Apply branch refinements on top (preserving the seeded anchored flag).
         for (k, ty) in refinements {
-            inner.define(k.clone(), ty.clone());
+            let anchored = inner.is_anchored(k);
+            inner.define_anchored(k.clone(), ty.clone(), anchored);
         }
         self.walk_stmts(block, &mut inner);
     }
@@ -264,21 +308,113 @@ impl<'a> Pass<'a> {
                 }
             }
         }
+
+        // ELIDE (§2.3 / §3 row 2): compute this binding's anchored flag and, when the
+        // (E)(Y)(A) predicate holds, record the proven `let` site. Collection-mode only
+        // — inert (and the `bound_ty` define falls through to the un-anchored `define`)
+        // otherwise.
+        let mut binding_anchored = false;
+        if self.elide.is_some() {
+            // The unmutated gate (§0 #2 / §2.3): a reassigned binding's checked
+            // annotation is not a runtime guarantee. Default-closed if not found.
+            let unmutated = !self.param_is_mutated(stmt);
+            binding_anchored = match (&ann, &init) {
+                // Annotated + initialized: anchored iff the annotation is ElideSafe.
+                // (The runtime's `Op::CheckLocal`/init contract guarantees the kind at
+                // bind time; the unmutated gate keeps it true forever.)
+                (Some(_), Some(init_expr)) => {
+                    let ann_safe = elide::elide_safe(&bound_ty);
+                    // §3 row 2 record predicate: annotation ElideSafe + concrete-`Yes`
+                    // verdict + Anchored initializer. (A) excludes rule-1 gradual `Yes`.
+                    // NOTE the unmutated gate: the `Op::CheckLocal` runs ONCE at init,
+                    // but the binding's KIND can change under a later (unchecked)
+                    // assignment — so a mutated binding's let site is NOT recorded
+                    // (a downstream read would be unanchored anyway, but the let-site
+                    // check itself only proves the INIT value, which is fine; we keep
+                    // the unmutated gate for coherence with the binding's anchoring and
+                    // to never claim more than v1 audits).
+                    if unmutated && ann_safe {
+                        let (init_ty, init_anchored) = self.anchored_synth(init_expr, env);
+                        let yes = matches!(
+                            init_ty.assignable(&bound_ty, self.table),
+                            Compat3::Yes
+                        );
+                        if yes && init_anchored {
+                            let r = code_range(init_expr);
+                            if let Some(c) = self.elide.as_mut() {
+                                c.record_let(r.start, r.end);
+                            }
+                        }
+                    }
+                    // The BINDING's own anchored flag (for downstream NameRef uses) is
+                    // STRICTER than the let-site record: it requires a KIND-PINNED
+                    // annotation (clause a of the NameRef row). An `any`/erased `Var`
+                    // annotation is a free-pass DESTINATION (so the let site above may
+                    // be recorded) but pins NO kind — the binding is NOT anchored.
+                    unmutated && elide::anchors_binding_kind(&bound_ty)
+                }
+                // Annotated, NO initializer (`let x: int`): the runtime binds `nil`
+                // WITHOUT checking the annotation (interp.rs binds nil unchecked), so
+                // the annotation is NOT a runtime guarantee → UNANCHORED. Soundness
+                // point flagged for review. Never records a let site (no initializer).
+                (Some(_), None) => false,
+                // Unannotated + initialized: anchored iff the initializer is anchored
+                // (clause b of the NameRef row). No `let` site is recorded (row 2 is
+                // annotated-let only — there is no runtime check at an unannotated let).
+                (None, Some(init_expr)) => {
+                    if unmutated {
+                        let (_ty, init_anchored) = self.anchored_synth(init_expr, env);
+                        init_anchored
+                    } else {
+                        false
+                    }
+                }
+                (None, None) => false,
+            };
+        }
+
         if let Some(k) = key {
-            env.define(k, bound_ty);
+            env.define_anchored(k, bound_ty, binding_anchored);
         }
     }
 
     fn walk_return(&mut self, stmt: &ResolvedNode, env: &mut Env) {
         let expr = first_expr_child(stmt);
         let expected = self.expected_return.last().cloned().flatten();
-        match (expr, expected) {
+        match (&expr, &expected) {
             // Declared return type (`fn f(): T { return v }`) → BLOCKING (TYPE §3.1).
-            (Some(e), Some(exp)) => self.check_against(&e, &exp, env, true),
+            (Some(e), Some(exp)) => self.check_against(e, exp, env, true),
             (Some(e), None) => {
-                self.synth(&e, env);
+                self.synth(e, env);
             }
             _ => {}
+        }
+        // ELIDE (§3 row 3): a `return <expr>` contributes to its fn's return proof.
+        // It is PROVEN only when the declared return is ElideSafe AND this expr is a
+        // concrete-`Yes` + Anchored against it. A bare `return;` (no expr) returns
+        // `nil` — proven only if `Nil` is `Yes` against the declared return (handled
+        // here so a `T?` return tolerates the implicit nil). Anything else fails the
+        // current fn's proof (default-closed).
+        if self.elide.is_some() {
+            let proven = match &expected {
+                Some(exp) if elide::elide_safe(exp) => match &expr {
+                    Some(e) => {
+                        let (ty, anchored) = self.anchored_synth(e, env);
+                        anchored && matches!(ty.assignable(exp, self.table), Compat3::Yes)
+                    }
+                    // `return;` yields nil — proven iff nil is assignable to the ret.
+                    None => matches!(CheckTy::Nil.assignable(exp, self.table), Compat3::Yes),
+                },
+                // No declared return, or a non-ElideSafe one → the fn is ineligible
+                // (its frame carries `elide_safe_ret = false`), but flag the failure
+                // anyway for clarity/robustness.
+                _ => false,
+            };
+            if !proven {
+                if let Some(c) = self.elide.as_mut() {
+                    c.fail_current_return();
+                }
+            }
         }
     }
 
@@ -318,13 +454,16 @@ impl<'a> Pass<'a> {
         for c in &else_if {
             // Seed a child env carrying else_refs so the chained condition sees them.
             let mut chained = Env::new();
-            for (k, _) in env.iter_base() {
-                if let Some(ty) = env.lookup(k) {
-                    chained.define(k.clone(), ty);
+            let keys: Vec<BindingKey> = env.iter_base().map(|(k, _)| k.clone()).collect();
+            for k in keys {
+                if let Some(ty) = env.lookup(&k) {
+                    let anchored = env.is_anchored(&k);
+                    chained.define_anchored(k, ty, anchored);
                 }
             }
             for (k, ty) in &else_refs {
-                chained.define(k.clone(), ty.clone());
+                let anchored = chained.is_anchored(k);
+                chained.define_anchored(k.clone(), ty.clone(), anchored);
             }
             self.walk_if(c, &mut chained);
         }
@@ -504,11 +643,65 @@ impl<'a> Pass<'a> {
         let expected = declared_return(fn_decl, self.table);
         let mut env = Env::new();
         self.bind_params(fn_decl, &mut env);
-        self.expected_return.push(expected);
+
+        // ELIDE (§3 row 3): a fn declaration is a return-contract proof candidate.
+        // Eligibility: NOT async/worker/generator (those wrap the return — out of v1),
+        // NOT generic (an erased `Var` return is never ElideSafe anyway, but exclude
+        // by construction), and a DECLARED ElideSafe return type. The frame is pushed
+        // unconditionally so `return` handling has a frame, but `elide_safe_ret`
+        // records whether the fn can ever be proven.
+        let mut pushed_fn = false;
+        if self.elide.is_some() {
+            let eligible = !is_async(fn_decl)
+                && !is_worker(fn_decl)
+                && !is_generator(fn_decl)
+                && !decl_has_type_params(fn_decl);
+            let elide_safe_ret =
+                eligible && expected.as_ref().map(elide::elide_safe).unwrap_or(false);
+            if let Some(name_key) = self.fn_name_key(fn_decl) {
+                if let Some(c) = self.elide.as_mut() {
+                    c.push_fn(name_key, elide_safe_ret);
+                    pushed_fn = true;
+                }
+            }
+        }
+
+        self.expected_return.push(expected.clone());
         if let Some(body) = fn_decl.children().find(|c| c.kind() == SyntaxKind::Block) {
             self.walk_stmts(body, &mut env);
         }
         self.expected_return.pop();
+
+        if pushed_fn {
+            // §3 row 3: the body must PROVABLY always return (so the implicit nil
+            // fall-off can never reach the kept site) OR `nil` must be `Yes` against
+            // the declared return (a `T?`/nilable return tolerates the implicit nil).
+            let body_total = fn_decl
+                .children()
+                .find(|c| c.kind() == SyntaxKind::Block)
+                .map(block_always_returns)
+                .unwrap_or(false)
+                || expected
+                    .as_ref()
+                    .map(|exp| matches!(CheckTy::Nil.assignable(exp, self.table), Compat3::Yes))
+                    .unwrap_or(false);
+            if let Some(c) = self.elide.as_mut() {
+                c.pop_fn(body_total);
+            }
+        }
+    }
+
+    /// The CHAR-span key of a fn declaration's NAME token (the first `Ident` token
+    /// directly under the `FnDecl`, after `fn`). `None` if absent (a malformed decl).
+    fn fn_name_key(&self, fn_decl: &ResolvedNode) -> Option<(u32, u32)> {
+        let tok = fn_decl
+            .children_with_tokens()
+            .filter_map(|el| el.into_token().cloned())
+            .find(|t| t.kind() == SyntaxKind::Ident)?;
+        let r = tok.text_range();
+        self.elide
+            .as_ref()
+            .map(|c| c.key(usize::from(r.start()), usize::from(r.end())))
     }
 
     fn walk_class(&mut self, class: &ResolvedNode) {
@@ -520,11 +713,28 @@ impl<'a> Pass<'a> {
                     let expected = declared_return(member, self.table);
                     let mut env = Env::new();
                     self.bind_params(member, &mut env);
+                    // ELIDE: methods are NEVER fn_ret keys in v1 (§3 row 3 — fn
+                    // declarations only). Push a sentinel (ineligible) frame so a
+                    // method's `return`s isolate against any outer fn frame and are
+                    // never recorded.
+                    let pushed = if self.elide.is_some() {
+                        if let Some(c) = self.elide.as_mut() {
+                            c.push_fn((0, 0), false);
+                        }
+                        true
+                    } else {
+                        false
+                    };
                     self.expected_return.push(expected);
                     if let Some(body) = member.children().find(|c| c.kind() == Block) {
                         self.walk_stmts(body, &mut env);
                     }
                     self.expected_return.pop();
+                    if pushed {
+                        if let Some(c) = self.elide.as_mut() {
+                            c.pop_fn(false);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -532,15 +742,17 @@ impl<'a> Pass<'a> {
     }
 
     /// Bind each annotated parameter to its declared type; unannotated/rest → Any.
-    fn bind_params(&self, decl: &ResolvedNode, env: &mut Env) {
+    fn bind_params(&mut self, decl: &ResolvedNode, env: &mut Env) {
         let Some(list) = decl.children().find(|c| c.kind() == SyntaxKind::ParamList) else {
             return;
         };
+        let collecting = self.elide.is_some();
         for param in list.children().filter(|c| c.kind() == SyntaxKind::Param) {
             let is_rest = param
                 .children_with_tokens()
                 .filter_map(|el| el.into_token())
                 .any(|t| t.kind() == SyntaxKind::DotDotDot);
+            let annotated = !is_rest && param.children().any(|c| is_type_kind(c.kind()));
             let ty = if is_rest {
                 CheckTy::Any
             } else {
@@ -550,6 +762,16 @@ impl<'a> Pass<'a> {
                     .map(|t| CheckTy::from_type_node(t, self.table))
                     .unwrap_or(CheckTy::Any)
             };
+            // ELIDE (§2.3 NameRef row, clause a): an ANNOTATED, NON-rest, UNMUTATED
+            // param is anchored exactly when its declared type is ElideSafe — the
+            // runtime's entry contract check makes the param's kind a guaranteed fact.
+            // A rest param, an unannotated param, a non-ElideSafe annotation, or a
+            // REASSIGNED param is NOT anchored (the entry check no longer holds after a
+            // reassignment). Fail-safe: any uncertainty ⇒ un-anchored.
+            let anchored = collecting
+                && annotated
+                && elide::anchors_binding_kind(&ty)
+                && !self.param_is_mutated(param);
             // A param is a DECLARATION (its name token is not a `uses` entry); key it
             // by the resolver binding recorded at this Param node's range — that
             // binding's slot is exactly what a use of the param resolves to.
@@ -564,9 +786,24 @@ impl<'a> Pass<'a> {
                 } else {
                     BindingKey::Local(b.slot)
                 };
-                env.define(key, ty);
+                env.define_anchored(key, ty, anchored);
             }
         }
+    }
+
+    /// Whether the resolver binding declared at this `Param`/`LetStmt` node's range is
+    /// REASSIGNED anywhere (`mutated == true`). The §2.3 anchoring gate: a mutated
+    /// binding's checked annotation is not a runtime guarantee (a later assignment is
+    /// NOT contract-checked — §0 #2). Default-closed: an un-found binding ⇒ treat as
+    /// mutated (`true`) so we never anchor a binding we cannot prove unmutated.
+    fn param_is_mutated(&self, decl: &ResolvedNode) -> bool {
+        let range = decl.text_range();
+        self.resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == range)
+            .map(|b| b.mutated)
+            .unwrap_or(true)
     }
 
     fn check_field_default(&mut self, field: &ResolvedNode) {
@@ -631,6 +868,176 @@ impl<'a> Pass<'a> {
                 Severity::Warning
             };
             self.emit_with("type-mismatch", sev, code_range(expr), msg);
+        }
+    }
+
+    /// ELIDE (§2.3): synthesize `expr`'s type AND decide whether it is ANCHORED — its
+    /// runtime kind is *guaranteed* by construction (a literal, an anchored binding,
+    /// kind-exact arithmetic, or an anchored eligible call), not merely `Yes` via the
+    /// gradual `Any` arm. Synthesis runs with emission SUPPRESSED (collection mode
+    /// discards diagnostics anyway, and this keeps the `out` vec untouched — the
+    /// diagnostic-neutrality invariant, §6.5). Returns `(synth, anchored)`.
+    ///
+    /// **Default-closed:** any expression form not on the §2.3 allowlist is NOT
+    /// anchored. A missing/uncertain piece never produces a key.
+    fn anchored_synth(&mut self, expr: &ResolvedNode, env: &mut Env) -> (CheckTy, bool) {
+        self.suppress_emit += 1;
+        let ty = self.synth(expr, env);
+        self.suppress_emit -= 1;
+        let anchored = self.is_anchored_expr(expr, env);
+        (ty, anchored)
+    }
+
+    /// The §2.3 STRUCTURAL anchoring predicate. Pure (no emission); reads only the
+    /// env-anchored flags and re-synthesizes sub-expressions (suppressed). Every arm
+    /// is default-closed — an unrecognized form is NOT anchored.
+    fn is_anchored_expr(&mut self, expr: &ResolvedNode, env: &mut Env) -> bool {
+        use SyntaxKind::*;
+        match expr.kind() {
+            // Literals + template strings — the value IS the literal / always a string.
+            Literal => !matches!(literal_type(expr), CheckTy::Any),
+            TemplateExpr => true,
+            // ParenExpr — transparent: anchored iff its operand is.
+            ParenExpr => first_expr_child(expr)
+                .map(|e| self.is_anchored_expr(&e, env))
+                .unwrap_or(false),
+            // Unary: `!x` is always bool; `-x`/`~x` anchored iff the operand is
+            // anchored AND numeric (kind-exact; overflow panics BEFORE the site).
+            UnaryExpr => self.is_anchored_unary(expr, env),
+            // Binary: anchored iff both operands anchored AND the NUM result-kind
+            // table yields a single deterministic kind (logical ops → None → not
+            // anchored). Comparisons are always bool → anchored if both operands are.
+            BinaryExpr => self.is_anchored_binary(expr, env),
+            // NameRef: the env-anchored flag (set at the binding's definition under the
+            // unmutated + ElideSafe-annotation / anchored-init gate, §2.3 clause a/b).
+            // Narrowing preserves the base flag (`is_anchored` reads the base map).
+            NameRef => self
+                .key_for_use(&expr.text_range())
+                .map(|k| env.is_anchored(&k))
+                .unwrap_or(false),
+            // CallExpr: anchored iff it is an ELIGIBLE call to an in-file fn whose
+            // return contract is PROVEN (its name-token key is in `fn_rets`) — the
+            // runtime return check (or its inductively-sound elision) guarantees the
+            // kind. (§2.3 CallExpr row.)
+            CallExpr => self.is_anchored_call(expr),
+            // TernaryExpr: anchored iff BOTH branches are anchored (union of anchored
+            // kinds). The condition's anchoring is irrelevant.
+            TernaryExpr => self.is_anchored_ternary(expr, env),
+            // Everything else (members, indexes, awaits, `?`/`!`, match exprs, object/
+            // array literals, …): default-closed → NOT anchored.
+            _ => false,
+        }
+    }
+
+    fn is_anchored_unary(&mut self, expr: &ResolvedNode, env: &mut Env) -> bool {
+        use SyntaxKind::*;
+        let op = expr
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .map(|t| t.kind())
+            .find(|k| matches!(k, Minus | Bang | Tilde));
+        match op {
+            // `!x` always yields a bool — anchored unconditionally.
+            Some(Bang) => true,
+            // `-x` / `~x`: anchored iff the operand is anchored AND numeric (`~` is
+            // int-only, but the runtime panics on a non-int BEFORE the site, so a
+            // numeric-anchored operand suffices for the kind guarantee).
+            Some(Minus | Tilde) => {
+                let Some(operand) = first_expr_child(expr) else {
+                    return false;
+                };
+                if !self.is_anchored_expr(&operand, env) {
+                    return false;
+                }
+                let (ty, _) = self.anchored_synth(&operand, env);
+                elide::operand_kind(&ty).is_some_and(|k| {
+                    matches!(
+                        k,
+                        elide::OperandKind::Int
+                            | elide::OperandKind::Float
+                            | elide::OperandKind::Number
+                    )
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn is_anchored_binary(&mut self, expr: &ResolvedNode, env: &mut Env) -> bool {
+        let op = match elide_arith_op(binary_op(expr)) {
+            Some(o) => o,
+            None => return false,
+        };
+        let operands: Vec<ResolvedNode> = expr
+            .children()
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        let (Some(lhs), Some(rhs)) = (operands.first(), operands.get(1)) else {
+            return false;
+        };
+        if !self.is_anchored_expr(lhs, env) || !self.is_anchored_expr(rhs, env) {
+            return false;
+        }
+        let (lt, _) = self.anchored_synth(lhs, env);
+        let (rt, _) = self.anchored_synth(rhs, env);
+        let (Some(lk), Some(rk)) = (elide::operand_kind(&lt), elide::operand_kind(&rt)) else {
+            return false;
+        };
+        elide::arith_result_kind(op, lk, rk).is_some()
+    }
+
+    fn is_anchored_call(&mut self, expr: &ResolvedNode) -> bool {
+        use SyntaxKind::*;
+        // Only a NameRef callee to a unique in-file fn can be anchored. A method /
+        // builtin / shadowed / spread / named-arg call is never anchored here.
+        let Some(callee) = expr.children().next() else {
+            return false;
+        };
+        if callee.kind() != NameRef {
+            return false;
+        }
+        let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
+        let Some(fn_decl) = self.resolve_in_file_fn(callee, &name) else {
+            return false;
+        };
+        // Async/worker/generator/generic callees are never anchored (their return is
+        // wrapped/erased — §2.3 CallExpr row).
+        if is_async(&fn_decl)
+            || is_worker(&fn_decl)
+            || is_generator(&fn_decl)
+            || decl_has_type_params(&fn_decl)
+        {
+            return false;
+        }
+        // The callee's RETURN contract must be PROVEN — its name-token key is in
+        // `fn_rets`. (Inductively sound: the kept/elided return check guarantees the
+        // kind.) Because the collector walks top-level fns BEFORE call sites that
+        // reference them only when the fn precedes the call, this is order-sensitive
+        // for forward references — fail-safe (a not-yet-recorded callee → not anchored,
+        // i.e. the check is kept; never unsound).
+        let Some(name_key) = self.fn_name_key(&fn_decl) else {
+            return false;
+        };
+        self.elide
+            .as_ref()
+            .map(|c| c.set.fn_rets.contains(&name_key))
+            .unwrap_or(false)
+    }
+
+    fn is_anchored_ternary(&mut self, expr: &ResolvedNode, env: &mut Env) -> bool {
+        // A ternary has three expr children: cond ? then : else. Anchored iff BOTH
+        // value branches (the 2nd and 3rd expr) are anchored.
+        let branches: Vec<ResolvedNode> = expr
+            .children()
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        match (branches.get(1), branches.get(2)) {
+            (Some(t), Some(e)) => {
+                self.is_anchored_expr(t, env) && self.is_anchored_expr(e, env)
+            }
+            _ => false,
         }
     }
 
@@ -932,7 +1339,7 @@ impl<'a> Pass<'a> {
                     if decl_has_type_params(&fn_decl) {
                         return self.synth_generic_fn_call(&fn_decl, expr, arg_list, &name, env);
                     }
-                    self.check_call_args(&fn_decl, arg_list, &name, env);
+                    self.check_call_args(&fn_decl, expr, arg_list, &name, env);
                     return self.fn_return_type(&fn_decl);
                 }
             } else if callee.kind() == MemberExpr {
@@ -1145,6 +1552,7 @@ impl<'a> Pass<'a> {
     fn check_call_args(
         &mut self,
         fn_decl: &ResolvedNode,
+        call_expr: &ResolvedNode,
         arg_list: Option<&ResolvedNode>,
         name: &str,
         env: &mut Env,
@@ -1177,6 +1585,86 @@ impl<'a> Pass<'a> {
                 // (`from_type_node` above) → BLOCKING annotated slot (TYPE §3.1).
                 self.emit_with("type-mismatch", Severity::Error, code_range(arg), msg);
             }
+        }
+        // ELIDE (§3 row 1): record the call site if it is PROVEN. Runs AFTER the
+        // diagnostic loop (diagnostics unchanged) and only in collection mode.
+        if self.elide.is_some() {
+            self.try_record_call(fn_decl, call_expr, arg_list, &args, env);
+        }
+    }
+
+    /// ELIDE (§3 row 1): decide row-1 eligibility + the per-param (E)(Y)(A) predicate
+    /// and record the call key if PROVEN. Fail-safe at every step.
+    fn try_record_call(
+        &mut self,
+        fn_decl: &ResolvedNode,
+        call_expr: &ResolvedNode,
+        arg_list: &ResolvedNode,
+        args: &[ResolvedNode],
+        env: &mut Env,
+    ) {
+        use SyntaxKind::*;
+        // Eligibility (§3 row 1):
+        //  - callee is a plain fn (not async/worker/generator).
+        if is_async(fn_decl) || is_worker(fn_decl) || is_generator(fn_decl) {
+            return;
+        }
+        //  - generic callees are excluded (this path is the non-generic one already,
+        //    but guard for robustness).
+        if decl_has_type_params(fn_decl) {
+            return;
+        }
+        //  - no rest param (a rest callee keeps its element checks).
+        if fn_has_rest(fn_decl) {
+            return;
+        }
+        //  - no NAMED args (only positional calls are row-1 eligible).
+        if arg_list.children().any(|c| c.kind() == NamedArg) {
+            return;
+        }
+        // Arity (the collector counts it itself — `pass.rs` does NOT): supplied
+        // positional count must be in [min_required, fixed_param_count].
+        let (min_required, max_fixed) = fn_param_arity(fn_decl);
+        let supplied = args.len();
+        if supplied < min_required || supplied > max_fixed {
+            return;
+        }
+        // Per-param (E)(Y)(A): every fixed param must be either a free-pass (`any` /
+        // erased) or an ElideSafe destination satisfied by a concrete-`Yes` + Anchored
+        // argument. A param with NO supplied arg (defaulted, within arity) is fine —
+        // the default's own CheckParam is kept (row 4); only the SUPPLIED args matter.
+        let params = param_type_nodes(fn_decl);
+        for (i, arg) in args.iter().enumerate() {
+            let expected = match params.get(i) {
+                // Unannotated param → free-pass (no runtime check to prove).
+                Some(None) | None => continue,
+                Some(Some(node)) => CheckTy::from_type_node(node, self.table),
+            };
+            // (E): the destination must be ElideSafe. `any`/erased are ElideSafe
+            // free-passes (no argument proof needed) — `elide_safe` returns true and
+            // the (Y)(A) checks below are vacuously satisfied for them, but we still
+            // require (A) for non-free-pass forms.
+            if !elide::elide_safe(&expected) {
+                return;
+            }
+            // A free-pass destination (`any`/`Var`) needs NO argument proof.
+            if matches!(expected, CheckTy::Any | CheckTy::Var(_, _)) {
+                continue;
+            }
+            // (Y) ∧ (A): the argument is concrete-`Yes` against the ElideSafe slot AND
+            // Anchored (which excludes the rule-1 gradual `Yes`).
+            let (actual, anchored) = self.anchored_synth(arg, env);
+            if !anchored {
+                return;
+            }
+            if !matches!(actual.assignable(&expected, self.table), Compat3::Yes) {
+                return;
+            }
+        }
+        // PROVEN — record the call expression's extent.
+        let r = code_range(call_expr);
+        if let Some(c) = self.elide.as_mut() {
+            c.record_call(r.start, r.end);
         }
     }
 
@@ -2546,6 +3034,75 @@ fn binary_op(expr: &ResolvedNode) -> Option<SyntaxKind> {
                     | StarPercent
             )
         })
+}
+
+/// ELIDE: map a `BinaryExpr`'s operator token kind to the anchoring [`elide::ArithOp`]
+/// category, or `None` if it is not a recognized binary operator (so the binary site
+/// is not anchored). The categories mirror NUM's promotion families exactly (§2.3).
+fn elide_arith_op(op: Option<SyntaxKind>) -> Option<elide::ArithOp> {
+    use SyntaxKind::*;
+    Some(match op? {
+        Plus => elide::ArithOp::Add,
+        Minus | Star | Slash | Percent => elide::ArithOp::NumericArith,
+        // `**` is NOT kind-deterministic: `int ** int` is `int` for a non-negative
+        // exponent but `float` for a negative one (NUM §3.2 — the synth pass returns
+        // gradual `Number` for the same reason). A non-deterministic result kind is
+        // never anchorable → return None (fail-safe, matching synth).
+        StarStar => return None,
+        PlusPercent | MinusPercent | StarPercent => elide::ArithOp::WrappingArith,
+        Amp | Pipe | Caret | Shl | Shr => elide::ArithOp::Bitwise,
+        EqEq | BangEq | Lt | Le | Gt | Ge | InstanceofKw => elide::ArithOp::Comparison,
+        AmpAmp | PipePipe | QuestionQuestion => elide::ArithOp::Logical,
+        _ => return None,
+    })
+}
+
+/// ELIDE: does this fn/method decl have a REST param (`...name`)? A rest callee is
+/// excluded from row-1 elision (its element checks are kept).
+fn fn_has_rest(decl: &ResolvedNode) -> bool {
+    use SyntaxKind::*;
+    decl.children()
+        .find(|c| c.kind() == ParamList)
+        .map(|list| {
+            list.children().filter(|c| c.kind() == Param).any(|p| {
+                p.children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .any(|t| t.kind() == DotDotDot)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// ELIDE: the `(min_required, max_fixed)` positional arity of a fn/method — the count
+/// of fixed (non-rest) params without a default, and the total fixed-param count. The
+/// collector counts arity itself (`pass.rs`'s arg-check does NOT; `call-arity` is a
+/// separate rule), so a proven row-1 call needs `supplied ∈ [min_required, max_fixed]`.
+/// A REST param is not counted here (a rest callee is excluded upstream).
+fn fn_param_arity(decl: &ResolvedNode) -> (usize, usize) {
+    use SyntaxKind::*;
+    let Some(list) = decl.children().find(|c| c.kind() == ParamList) else {
+        return (0, 0);
+    };
+    let mut min_required = 0usize;
+    let mut max_fixed = 0usize;
+    for p in list.children().filter(|c| c.kind() == Param) {
+        let is_rest = p
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == DotDotDot);
+        if is_rest {
+            break; // rest is last; not a fixed positional slot
+        }
+        max_fixed += 1;
+        // A default-value param has an EXPRESSION child (the `= <expr>`). A param's
+        // TYPE is a type-kind child, never an expr-kind child, so an expr child is
+        // unambiguously the default.
+        let has_default = p.children().any(|c| crate::check::rules::is_expr_kind(c.kind()));
+        if !has_default {
+            min_required += 1;
+        }
+    }
+    (min_required, max_fixed)
 }
 
 /// The member name accessed by a `MemberExpr`/`OptMemberExpr` (trailing Ident).

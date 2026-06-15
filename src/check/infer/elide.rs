@@ -319,6 +319,7 @@ impl ElisionSet {
 /// private thread-local installed per `compile_source`, not a clean API the checker
 /// can borrow, so per the task's production-grade mandate the checker carries its
 /// own documented prefix map.
+#[derive(Debug)]
 pub struct ByteToCharMap {
     /// `prefix[b]` = char count of `src[..b']` where `b'` is the largest char
     /// boundary `<= b`. Length is `src.len() + 1`.
@@ -372,6 +373,178 @@ impl ByteToCharMap {
 /// NOT do).
 pub fn byte_range_to_char_span(src: &str, range: std::ops::Range<usize>) -> (u32, u32) {
     ByteToCharMap::new(src).char_span(range.start, range.end)
+}
+
+// ---------------------------------------------------------------------------
+// (A) — mapping a synthesized `CheckTy` to a concrete operand/result kind
+// ---------------------------------------------------------------------------
+
+/// **(A) helper — binding anchoring.** Whether an ElideSafe binding declared with
+/// type `ty` ANCHORS its value's runtime kind. An ElideSafe type is a valid elision
+/// DESTINATION, but only a KIND-PINNED one anchors a SOURCE: `any` and an erased
+/// `Var` (`Param(T)`) are ElideSafe *free-passes* that guarantee NOTHING about the
+/// value's kind, so a binding annotated `any`/`T` is **not** anchored even though its
+/// entry check is unmutated. Everything else ElideSafe (scalars, callables, the
+/// `array<any>`/`map<any,any>` walks, ElideSafe unions) pins a kind set the entry
+/// check enforced. Default-closed: a non-ElideSafe type is never anchored.
+pub fn anchors_binding_kind(ty: &CheckTy) -> bool {
+    elide_safe(ty) && !matches!(ty, CheckTy::Any | CheckTy::Var(_, _))
+}
+
+/// The CONCRETE runtime [`OperandKind`] of a synthesized [`CheckTy`], for the
+/// arithmetic anchoring table — or `None` when the type is not a single, provable,
+/// non-gradual kind. **Default-closed:** `Any`/`Number`-without-subtype/containers/
+/// nominal types all yield a value that the anchoring table must treat
+/// conservatively. We map:
+/// - `Int`/`Float`/`String`/`Bool`/`Nil` → their kind;
+/// - `Number` → [`OperandKind::Number`] (a definite numeric value of unknown
+///   int-vs-float subtype — the table never produces a definite `Int`/`Float` from
+///   it, but a comparison over it is still `Bool`);
+/// - internal narrowing literals widen to their base kind;
+/// - everything else (gradual `Any`, a `Var`, containers, classes, …) → `None`
+///   (NOT anchorable as an arithmetic operand).
+///
+/// Pure and total. Note this is the OPERAND domain (it admits `Number`/`Nil`),
+/// distinct from [`result_kind_of`] (the four kinds an op can PRODUCE).
+pub fn operand_kind(ty: &CheckTy) -> Option<OperandKind> {
+    match ty {
+        CheckTy::Int => Some(OperandKind::Int),
+        CheckTy::Float => Some(OperandKind::Float),
+        CheckTy::Number => Some(OperandKind::Number),
+        CheckTy::String => Some(OperandKind::String),
+        CheckTy::Bool => Some(OperandKind::Bool),
+        CheckTy::Nil => Some(OperandKind::Nil),
+        // Internal narrowing literals widen to their base primitive kind.
+        CheckTy::Literal(LitVal::Number) => Some(OperandKind::Number),
+        CheckTy::Literal(LitVal::String) => Some(OperandKind::String),
+        CheckTy::Literal(LitVal::Bool) => Some(OperandKind::Bool),
+        CheckTy::Literal(LitVal::Nil) => Some(OperandKind::Nil),
+        // Gradual / variable / aggregate / nominal — not a single provable operand
+        // kind. Default-closed → None (the binary site is not anchored).
+        _ => None,
+    }
+}
+
+/// The CONCRETE [`ResultKind`] of a synthesized [`CheckTy`] — the four kinds an
+/// anchored expression can *produce* (the kinds an anchored ARGUMENT must have to
+/// feed a downstream check). `None` for any type that is not exactly one of
+/// `Int`/`Float`/`String`/`Bool`. **Default-closed.**
+///
+/// This is intentionally narrower than [`operand_kind`]: an anchored value's
+/// produced kind must be a concrete scalar the destination check accepts. A bare
+/// `Number` (unknown subtype) is NOT a single result kind here → `None` (so a
+/// `number`-valued expression is never anchored as a *source*; it can still be an
+/// arithmetic OPERAND via [`operand_kind`]).
+pub fn result_kind_of(ty: &CheckTy) -> Option<ResultKind> {
+    match ty {
+        CheckTy::Int => Some(ResultKind::Int),
+        CheckTy::Float => Some(ResultKind::Float),
+        CheckTy::String => Some(ResultKind::String),
+        CheckTy::Bool => Some(ResultKind::Bool),
+        CheckTy::Literal(LitVal::String) => Some(ResultKind::String),
+        CheckTy::Literal(LitVal::Bool) => Some(ResultKind::Bool),
+        // `Number` (no subtype), `Nil`, `Any`, containers, nominal → not a single
+        // result kind. Default-closed → None.
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The collector state (spec §4.1) — driven by the inference pass in elide mode
+// ---------------------------------------------------------------------------
+
+/// Per-function accumulator for the row-3 (declared-return) proof (§3 row 3). One
+/// is pushed per fn/method body the collector enters and popped (consulted) at
+/// body exit; nested fns nest naturally on the stack.
+#[derive(Debug)]
+pub struct FnReturnProof {
+    /// The fn's NAME-token CHAR span — the [`ElisionSet::fn_rets`] key, recorded
+    /// only when ALL the conditions hold.
+    pub name_key: (u32, u32),
+    /// The fn's declared return type, lowered — `Some` ONLY when it is ElideSafe
+    /// (an absent or non-ElideSafe declared return makes the fn ineligible, so the
+    /// accumulator is never pushed in that case; see [`ElideCollect::push_fn`]).
+    pub elide_safe_ret: bool,
+    /// Whether EVERY `return <expr>` seen so far is concrete-`Yes` + Anchored
+    /// against the declared return (§3 row 3). Starts `true`; any unproven return
+    /// flips it `false` permanently.
+    pub all_returns_proven: bool,
+}
+
+/// The collector's mutable state, threaded as `Pass.elide: Option<ElideCollect>`
+/// (mirroring `Pass.hover`). It owns the growing [`ElisionSet`], the byte→char map
+/// for key conversion, and the per-fn return-proof stack.
+///
+/// Diagnostic-neutrality (§6.5): this struct holds NO diagnostic state and the pass
+/// never branches its emit logic on it — it is a pure side-accumulator. The normal
+/// diagnosing pass leaves `elide == None`, so every method here is dead code there.
+#[derive(Debug)]
+pub struct ElideCollect {
+    /// The proven-site set being built.
+    pub set: ElisionSet,
+    /// The byte→char map over the module source (built once; O(1) per key).
+    pub bmap: ByteToCharMap,
+    /// The per-fn return-proof accumulator stack (innermost last).
+    pub fn_stack: Vec<FnReturnProof>,
+}
+
+impl ElideCollect {
+    /// Build a fresh collector over `src`.
+    pub fn new(src: &str) -> ElideCollect {
+        ElideCollect {
+            set: ElisionSet::new(),
+            bmap: ByteToCharMap::new(src),
+            fn_stack: Vec::new(),
+        }
+    }
+
+    /// Convert a `[start, end)` BYTE range into the CHAR-span key form.
+    pub fn key(&self, start: usize, end: usize) -> (u32, u32) {
+        self.bmap.char_span(start, end)
+    }
+
+    /// Record a proven CALL site (row 1), keyed by the call expression's extent.
+    pub fn record_call(&mut self, byte_start: usize, byte_end: usize) {
+        let k = self.key(byte_start, byte_end);
+        self.set.calls.insert(k);
+    }
+
+    /// Record a proven annotated-`let` site (row 2), keyed by the INITIALIZER's
+    /// extent.
+    pub fn record_let(&mut self, byte_start: usize, byte_end: usize) {
+        let k = self.key(byte_start, byte_end);
+        self.set.lets.insert(k);
+    }
+
+    /// Push a fn return-proof frame at body entry. `name_key` is the fn name-token's
+    /// CHAR span; `elide_safe_ret` is whether the declared return is ElideSafe (a fn
+    /// with no declared return, or a non-ElideSafe one, passes `false` → it can never
+    /// be recorded, but the frame is still pushed so `return` handling has a frame).
+    pub fn push_fn(&mut self, name_key: (u32, u32), elide_safe_ret: bool) {
+        self.fn_stack.push(FnReturnProof {
+            name_key,
+            elide_safe_ret,
+            all_returns_proven: true,
+        });
+    }
+
+    /// Mark the innermost fn's return-proof as FAILED (an unproven `return`).
+    pub fn fail_current_return(&mut self) {
+        if let Some(f) = self.fn_stack.last_mut() {
+            f.all_returns_proven = false;
+        }
+    }
+
+    /// Pop the innermost fn frame and, IFF its declared return is ElideSafe AND every
+    /// return was proven AND `body_total` (the caller's "always-returns OR nil-Yes"
+    /// verdict) holds, record the fn-return key.
+    pub fn pop_fn(&mut self, body_total: bool) {
+        if let Some(f) = self.fn_stack.pop() {
+            if f.elide_safe_ret && f.all_returns_proven && body_total {
+                self.set.fn_rets.insert(f.name_key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

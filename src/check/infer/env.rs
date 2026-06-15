@@ -5,6 +5,16 @@
 //! `HashMap<BindingKey, CheckTy>` pushed/popped at branch boundaries — it refines a
 //! binding's type within a flow region WITHOUT mutating the underlying inferred
 //! type. (Populated in T3/T4; T1 ships the structure.)
+//!
+//! ELIDE (§2.3 anchoring): each binding additionally carries an `anchored: bool`
+//! flag — whether the runtime is *guaranteed* (by an executed entry/init contract
+//! check, a literal, or kind-exact evaluation) to hold a value of the binding's
+//! recorded kind. The flag is a frame-local fact (it rides the same per-frame `Env`
+//! as the type), set ONCE at the binding's definition site (`bind_params`/`walk_let`)
+//! and read at every `NameRef` use. It is irrelevant to (and unread by) the normal
+//! diagnosing pass; only the elision collector consults it. Narrowing PRESERVES the
+//! base binding's anchored flag (§2.3 "NameRef to a narrowed binding"): a refinement
+//! re-uses the base entry's flag rather than resetting it.
 
 use crate::check::infer::ty::CheckTy;
 use crate::syntax::resolve::types::Resolution;
@@ -40,6 +50,12 @@ impl BindingKey {
 pub struct Env {
     base: HashMap<BindingKey, CheckTy>,
     overlay: Vec<HashMap<BindingKey, CheckTy>>,
+    /// ELIDE (§2.3): the per-binding anchored flag, keyed identically to `base`.
+    /// `define` sets it; `define_anchored` sets it `true`; absence ⇒ `false`
+    /// (fail-safe — an untracked or un-anchored binding is never proven). Narrowing
+    /// (the `overlay`) does NOT touch this map: a refinement keeps the base
+    /// binding's anchoring (§2.3 "NameRef to a narrowed binding").
+    anchored: HashMap<BindingKey, bool>,
 }
 
 impl Env {
@@ -47,9 +63,27 @@ impl Env {
         Env::default()
     }
 
-    /// Bind `key` to its inferred/declared type in the base environment.
+    /// Bind `key` to its inferred/declared type in the base environment. The binding
+    /// is recorded as UN-anchored (the default — most bindings are not elision
+    /// anchors; the collector opts a binding in via [`Self::define_anchored`]).
     pub fn define(&mut self, key: BindingKey, ty: CheckTy) {
+        self.anchored.insert(key.clone(), false);
         self.base.insert(key, ty);
+    }
+
+    /// Bind `key` to `ty` and record whether it is ELIDE-anchored (§2.3). Only the
+    /// collector calls this with `anchored == true`; the normal diagnosing pass uses
+    /// [`Self::define`] (always un-anchored), so anchoring is inert outside collection.
+    pub fn define_anchored(&mut self, key: BindingKey, ty: CheckTy, anchored: bool) {
+        self.anchored.insert(key.clone(), anchored);
+        self.base.insert(key, ty);
+    }
+
+    /// Whether `key`'s BASE binding is ELIDE-anchored (§2.3). Narrowing never changes
+    /// this — a narrowed `NameRef` is anchored iff its base binding is. Unknown ⇒
+    /// `false` (fail-safe).
+    pub fn is_anchored(&self, key: &BindingKey) -> bool {
+        self.anchored.get(key).copied().unwrap_or(false)
     }
 
     /// Look up a binding's CURRENT type: the innermost narrowing refinement if any,

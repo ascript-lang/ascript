@@ -464,3 +464,348 @@ fn kind_table_logical_ops_never_anchored() {
         }
     }
 }
+
+// ===========================================================================
+// Step 1 (Task 1.3) — `elision_proofs(src)`-level collection tests (spec §2.3).
+//
+// These assert SET MEMBERSHIP per the §2.3 anchoring table: which call / let /
+// fn-return sites the collector proves under the strict (E)∧(Y)∧(A) predicate.
+// Membership is checked by computing the CHAR-span key of a known source
+// substring (the same `(start_char, end_char)` convention the collector uses,
+// `code_range` → byte→char) and probing the corresponding `ElisionSet` field.
+// ===========================================================================
+
+mod collect {
+    use ascript::check::infer::elide::ElisionSet;
+    use ascript::check::infer::elision_proofs;
+
+    fn proofs(src: &str) -> ElisionSet {
+        elision_proofs(src)
+    }
+
+    /// CHAR `(start, end)` of the FIRST occurrence of `needle` in `src`. Mirrors the
+    /// `ByteToCharMap` convention: `start_char` = chars before the byte offset,
+    /// `end_char` = chars before the end byte. ASCII fixtures ⇒ byte == char.
+    fn char_span(src: &str, needle: &str) -> (u32, u32) {
+        let bstart = src.find(needle).unwrap_or_else(|| panic!("`{needle}` not in src"));
+        let bend = bstart + needle.len();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bend].chars().count() as u32;
+        (start, end)
+    }
+
+    fn has_call(src: &str, set: &ElisionSet, call_text: &str) -> bool {
+        set.calls.contains(&char_span(src, call_text))
+    }
+    fn has_let(src: &str, set: &ElisionSet, init_text: &str) -> bool {
+        set.lets.contains(&char_span(src, init_text))
+    }
+    fn has_fn_ret(src: &str, set: &ElisionSet, fn_name: &str) -> bool {
+        set.fn_rets.contains(&char_span(src, fn_name))
+    }
+
+    // ---- row 1: literals are anchored -------------------------------------
+
+    #[test]
+    fn literals_anchored_call() {
+        let src = "fn f(a: int, b: string) {} f(1, \"x\")\n";
+        let set = proofs(src);
+        assert!(has_call(src, &set, "f(1, \"x\")"), "literal call must be proven");
+        assert_eq!(set.calls.len(), 1, "exactly one call key");
+        // no annotated let / no ElideSafe-return fn ⇒ no other keys.
+        assert!(set.lets.is_empty());
+        assert!(set.fn_rets.is_empty());
+    }
+
+    // ---- row 2: unmutated annotated binding anchors the let AND the call ---
+
+    #[test]
+    fn unmutated_annotated_binding_anchors_let_and_call() {
+        let src = "fn f(p: int){}\nlet x: int = 5\nf(x)\n";
+        let set = proofs(src);
+        assert!(has_let(src, &set, "5"), "annotated let initializer proven");
+        assert!(has_call(src, &set, "f(x)"), "unmutated annotated binding anchors the call");
+    }
+
+    #[test]
+    fn mutated_binding_keeps_let_but_not_call() {
+        // x = 7 is provably fine, but a MUTATED binding is NOT anchored (v1) — the
+        // call keeps its check. The let key is NOT present either (the let binding is
+        // mutated ⇒ not anchored ⇒ not recorded).
+        let src = "fn f(p: int){}\nlet x: int = 5\nx = 7\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "mutated binding ⇒ call NOT proven");
+        // The let SITE: a mutated annotated binding is unanchored, so per the record
+        // predicate (annotation ElideSafe + Yes + Anchored-INITIALIZER) the initializer
+        // `5` IS still a literal (anchored) and the annotation IS ElideSafe and `5: int`
+        // is Yes — BUT the binding's unmutated gate fails, so the let is NOT recorded.
+        assert!(!has_let(src, &set, "5"), "mutated annotated let is NOT recorded");
+    }
+
+    #[test]
+    fn probe3_mutated_to_wrong_type_no_call_key() {
+        // THE soundness pin (§0 #2): x is reassigned to a string; even though the
+        // checker still believes x: int, the call must NOT be elided.
+        let src = "fn f(p: int){}\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "probe-3: mutated binding ⇒ no call key");
+    }
+
+    // ---- row 3: declared ElideSafe return + anchored call via it ----------
+
+    #[test]
+    fn declared_return_anchors_call_and_fn_ret() {
+        let src = "fn g(): int { return 1 }\nfn f(p: int){}\nf(g())\n";
+        let set = proofs(src);
+        assert!(has_fn_ret(src, &set, "g"), "g's return contract proven");
+        assert!(has_call(src, &set, "f(g())"), "call anchored via g's ElideSafe return");
+        // g() itself is a call to a 0-arg fn with no typed params ⇒ vacuously proven.
+        // (Compute the inner `g()` extent directly so the substring isn't confused with
+        // the declaration's empty param list `g():`.)
+        let call_off = src.find("f(g())").unwrap() + 2; // the inner `g(` start
+        assert_eq!(&src[call_off..call_off + 3], "g()");
+        let gkey = (call_off as u32, (call_off + 3) as u32);
+        assert!(set.calls.contains(&gkey), "g() (no typed params) is also proven");
+    }
+
+    // ---- gradual sources are excluded (rule-1 Yes via anchoring) ----------
+
+    #[test]
+    fn unknown_callee_arg_not_anchored() {
+        // unknown() resolves to nothing ⇒ Any ⇒ not anchored ⇒ no call key.
+        let src = "fn f(p: int){}\nf(unknown())\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(unknown())"), "Any-arg call not proven");
+    }
+
+    #[test]
+    fn any_typed_source_not_anchored() {
+        let src = "fn f(p: int){}\nlet a: any = 5\nf(a)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(a)"), "any-typed binding ⇒ not anchored");
+    }
+
+    // ---- ineligible call shapes -------------------------------------------
+
+    #[test]
+    fn spread_named_rest_async_worker_gen_excluded() {
+        // spread arg
+        let s1 = "fn f(p: int){}\nlet xs = [1]\nf(...xs)\n";
+        assert!(proofs(s1).calls.is_empty(), "spread ⇒ no key");
+        // named arg
+        let s2 = "fn f(p: int){}\nf(p: 1)\n";
+        assert!(proofs(s2).calls.is_empty(), "named arg ⇒ no key");
+        // rest-param callee
+        let s3 = "fn f(...p: array<int>){}\nf(1, 2)\n";
+        assert!(proofs(s3).calls.is_empty(), "rest callee ⇒ no key");
+        // async callee
+        let s4 = "async fn f(p: int){}\nf(1)\n";
+        assert!(proofs(s4).calls.is_empty(), "async callee ⇒ no key");
+        // worker callee
+        let s5 = "worker fn f(p: int) { return p }\nf(1)\n";
+        assert!(proofs(s5).calls.is_empty(), "worker callee ⇒ no key");
+        // generator callee
+        let s6 = "fn* f(p: int) { yield p }\nf(1)\n";
+        assert!(proofs(s6).calls.is_empty(), "generator callee ⇒ no key");
+    }
+
+    #[test]
+    fn arity_mismatch_no_key() {
+        // f(1,2,3) on a 2-arity fn: the collector counts arity itself ⇒ not proven.
+        let src = "fn f(a: int, b: int) {}\nf(1, 2, 3)\n";
+        let set = proofs(src);
+        assert!(set.calls.is_empty(), "arity mismatch ⇒ no key");
+        // too few:
+        let src2 = "fn f(a: int, b: int) {}\nf(1)\n";
+        assert!(proofs(src2).calls.is_empty(), "too-few args ⇒ no key");
+        // defaulted param: f(1) valid for (a:int, b:int=2)
+        let src3 = "fn f(a: int, b: int = 2) {}\nf(1)\n";
+        assert!(has_call(src3, &proofs(src3), "f(1)"), "defaulted arity ⇒ proven");
+    }
+
+    // ---- narrowing-from-anchored ------------------------------------------
+
+    #[test]
+    fn narrowed_anchored_binding_call() {
+        // x : int? unmutated, narrowed by `if (x != nil)` ⇒ the call inside is proven
+        // (the base binding is anchored via its ElideSafe `int?` annotation, and
+        // narrowing preserves anchoring).
+        let src = "fn f(p: int?){}\nlet x: int? = 5\nif (x != nil) { f(x) }\n";
+        let set = proofs(src);
+        assert!(has_call(src, &set, "f(x)"), "narrowed-from-anchored call proven");
+    }
+
+    // ---- arithmetic / ternary / unary / comparison composition ------------
+
+    #[test]
+    fn arithmetic_composition_anchored() {
+        // int literals + arithmetic → int (anchored).
+        let src = "fn f(p: int){}\nf(1 + 2)\n";
+        assert!(has_call(src, &proofs(src), "f(1 + 2)"), "int+int anchored");
+        // mixed int/float → float, into a float param.
+        let src2 = "fn g(p: float){}\ng(1 + 2.0)\n";
+        assert!(has_call(src2, &proofs(src2), "g(1 + 2.0)"), "int+float anchored as float");
+        // `**` is NOT kind-deterministic (int**−1 → float) ⇒ never anchored, so a
+        // call fed by it keeps its check (fail-safe — matches the synth's gradual
+        // `Number` for `**`).
+        let src3 = "fn f(p: int){}\nf(2 ** 3)\n";
+        assert!(proofs(src3).calls.is_empty(), "`**` ⇒ not anchored ⇒ no call key");
+    }
+
+    #[test]
+    fn unary_and_comparison_anchored() {
+        // `!cond` → bool, into a bool param.
+        let src = "fn f(p: bool){}\nf(!true)\n";
+        assert!(has_call(src, &proofs(src), "f(!true)"), "unary ! anchored as bool");
+        // comparison → bool.
+        let src2 = "fn f(p: bool){}\nf(1 < 2)\n";
+        assert!(has_call(src2, &proofs(src2), "f(1 < 2)"), "comparison anchored as bool");
+        // negation of an int literal → int.
+        let src3 = "fn f(p: int){}\nf(-5)\n";
+        assert!(has_call(src3, &proofs(src3), "f(-5)"), "unary - anchored as int");
+    }
+
+    #[test]
+    fn ternary_both_branches_anchored() {
+        let src = "fn f(p: int){}\nf(true ? 1 : 2)\n";
+        assert!(has_call(src, &proofs(src), "f(true ? 1 : 2)"), "ternary anchored");
+    }
+
+    #[test]
+    fn logical_op_not_anchored() {
+        // `&&` returns an operand (truthiness), not a fixed kind ⇒ never anchored.
+        let src = "fn f(p: bool){}\nlet a: bool = true\nlet b: bool = false\nf(a && b)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(a && b)"), "logical-op arg ⇒ not anchored");
+    }
+
+    // ---- uninitialized annotated let is UNANCHORED (soundness point) ------
+
+    #[test]
+    fn uninitialized_annotated_let_unanchored() {
+        // `let x: int` (no initializer): the runtime binds nil WITHOUT checking, so
+        // the annotation is not a runtime guarantee ⇒ the call must NOT be proven.
+        let src = "fn f(p: int){}\nlet x: int\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "uninitialized annotated let ⇒ no call key");
+        assert!(set.lets.is_empty(), "uninitialized let records no let key");
+    }
+
+    // ---- non-always-returning fn with non-nil ret is not a fn_ret key -----
+
+    #[test]
+    fn non_total_return_body_not_proven() {
+        // g returns int on one path but falls off the end ⇒ implicit nil; nil is NOT
+        // Yes against int ⇒ g's return contract is NOT proven ⇒ a call anchored via it
+        // is NOT proven.
+        let src = "fn g(c: bool): int { if (c) { return 1 } }\nfn f(p: int){}\nf(g(true))\n";
+        let set = proofs(src);
+        assert!(!has_fn_ret(src, &set, "g"), "non-total int-returning fn ⇒ no fn_ret key");
+        assert!(!has_call(src, &set, "f(g(true))"), "call via unproven return ⇒ no key");
+    }
+
+    // ---- shadowed fn name fails safe --------------------------------------
+
+    #[test]
+    fn shadowed_fn_name_no_call_key() {
+        // A genuine SHADOW: a local `f` (a non-fn binding) shadows the global `fn f`,
+        // so the call inside `g` resolves to the LOCAL, not the fn — resolve_in_file_fn
+        // must bail (not a unique non-shadowed Fn binding) ⇒ no call key for `f(1)`.
+        let src = "fn f(p: int) {}\nfn g() { let f = 5\nf(1) }\n";
+        let set = proofs(src);
+        // The call `f(1)` inside g resolves to the local `f = 5` (not callable / not the
+        // fn) — the collector must NOT prove it.
+        let off = src.rfind("f(1)").unwrap();
+        let key = (off as u32, (off + 4) as u32);
+        assert!(!set.calls.contains(&key), "shadowed fn name ⇒ no call key");
+    }
+
+    #[test]
+    fn captured_mutated_global_not_anchored() {
+        // A global mutated inside a nested fn (`mark_mutated_target` reaches the global
+        // binding) ⇒ the binding is NOT anchored ⇒ a call using it is not proven.
+        let src = "fn f(p: int){}\nlet x: int = 5\nfn bump() { x = 9 }\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "globally-mutated binding ⇒ no call key");
+    }
+
+    #[test]
+    fn forward_mutated_global_not_anchored() {
+        // The mutation `x = 9` (inside a fn) is collected order-independently, so even
+        // a mutation textually BEFORE the `let x` declaration marks x mutated ⇒ the
+        // call is not anchored (robustness of the resolver's mutated-globals set).
+        let src = "fn f(p: int){}\nfn bump() { x = 9 }\nlet x: int = 5\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "forward-mutated global ⇒ no call key");
+    }
+}
+
+// ===========================================================================
+// Step 3 (Task 1.3) — diagnostic-neutrality gate (spec §6.5).
+//
+// For EVERY file in examples/** (both intro and advanced), the inference pass's
+// diagnostics must be byte-IDENTICAL whether or not elide-collection mode ran —
+// the collector is a pure side-accumulator that NEVER changes diagnostics. This
+// is the hover-mode invariant, re-proven for elide mode. Runs in BOTH feature
+// configs (the inference pass is feature-independent, so `cargo test` and
+// `--no-default-features` both exercise this).
+// ===========================================================================
+
+mod neutrality {
+    use ascript::check::infer::check_with_elision;
+    use std::fs;
+    use std::path::Path;
+
+    /// The full inference-pass diagnostics for `src` in NORMAL mode — recomputed
+    /// here via the same front-end the collection path uses, so the only variable
+    /// is the elide flag.
+    fn normal_diags(src: &str) -> Vec<String> {
+        use ascript::check::infer;
+        use ascript::syntax::{resolve, tree_builder};
+        let tree = tree_builder::build_tree(ascript::syntax::parser::parse(src));
+        let resolved = resolve::resolve(&tree);
+        infer::check(&tree, &resolved, src)
+            .into_iter()
+            .map(fmt_diag)
+            .collect()
+    }
+
+    fn fmt_diag(d: ascript::check::diagnostic::AsDiagnostic) -> String {
+        format!("{}:{}-{}:{}:{}", d.code, d.range.start, d.range.end, d.severity as u8, d.message)
+    }
+
+    fn collect_as_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    collect_as_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "as") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn elide_collection_is_diagnostic_neutral_over_examples() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut files = Vec::new();
+        collect_as_files(&Path::new(root).join("examples"), &mut files);
+        assert!(files.len() > 10, "expected a real example corpus, found {}", files.len());
+        let mut checked = 0usize;
+        for f in &files {
+            let src = fs::read_to_string(f).unwrap();
+            let normal = normal_diags(&src);
+            let (elide_diags, _set) = check_with_elision(&src);
+            let elide: Vec<String> = elide_diags.into_iter().map(fmt_diag).collect();
+            assert_eq!(
+                normal, elide,
+                "DIAGNOSTIC DRIFT in elide-collection mode for {}",
+                f.display()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, files.len(), "every example must be checked");
+    }
+}
