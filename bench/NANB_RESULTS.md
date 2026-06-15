@@ -73,3 +73,123 @@ applies"). The gate holds.
 The Phase-1 seam (sealed `Value` struct + `ValueKind`/`OwnedKind` view layer) is
 **ZERO-COST**: geomean spec/tw 4.07× matches the pre-NANB baseline 4.00× within run-to-run
 noise. The enum-view-inlines-away claim is verified empirically. Phase 2 may proceed.
+
+---
+
+## Phase 3 — the evidence: cross-repr differential, deep fuzz, same-session A/B
+
+**Date:** 2026-06-15 16:03 UTC | **Machine:** Apple M4 (10 cores) / Darwin 25.5.0 arm64 | **Commit:** 1b77ba2 | **Reps:** 7 (interleaved, per-cell median)
+
+Same-session A/B: the 24-byte default repr vs the 16-byte `--features value16` repr, two RELEASE binaries built by feature-toggle into ONE `target/` (no worktree). `size_of::<Value>()` = **24** (default) vs **16** (value16), asserted by each binary's own `value_size` test. Speedup = base_ms / v16_ms (>1.000 means value16 is FASTER).
+
+### Time A/B — per workload, per VM mode
+
+| workload | base-spec ms | v16-spec ms | spec× | base-gen ms | v16-gen ms | gen× | base-tw ms | v16-tw ms | tw× |
+|---|---|---|---|---|---|---|---|---|---|
+| async_inline | 5245 | 5225 | 1.004× | 5323 | 5330 | 0.999× | 5678 | 5782 | 0.982× |
+| async_concurrent | 3136 | 3165 | 0.991× | 3148 | 3152 | 0.999× | 3963 | 3949 | 1.004× |
+| json_roundtrip | 2703 | 2737 | 0.988× | 2736 | 2766 | 0.989× | 3465 | 3484 | 0.995× |
+| object_churn | 2310 | 2346 | 0.985× | 4592 | 4598 | 0.999× | 11660 | 11427 | 1.020× |
+| workflow_loop | 24835 | 25021 | 0.993× | 24476 | 24802 | 0.987× | 24698 | 25103 | 0.984× |
+| func_pipeline | 1130 | 1070 | 1.056× | 2926 | 2825 | 1.036× | 6501 | 6469 | 1.005× |
+| call_heavy | 1143 | 1120 | 1.020× | 1540 | 1483 | 1.039× | 8738 | 8682 | 1.006× |
+| server_request | 1951 | 1942 | 1.005× | 2165 | 2177 | 0.994× | 3940 | 3909 | 1.008× |
+
+**Geomean speedup (value16 / default):**  spec **1.005×**  ·  gen **1.005×**  ·  tree-walker **1.000×**
+
+### Peak RSS A/B (Gate 18) — spec mode
+
+| workload | base RSS (MB) | v16 RSS (MB) | Δ (v16-base) | v16/base |
+|---|---|---|---|---|
+| async_inline | 12.5 | 12.7 | +0.2 | 1.015 |
+| async_concurrent | 13.0 | 12.9 | -0.0 | 0.998 |
+| json_roundtrip | 13.0 | 13.1 | +0.1 | 1.006 |
+| object_churn | 12.1 | 12.2 | +0.0 | 1.004 |
+| workflow_loop | 13.7 | 13.6 | -0.0 | 0.998 |
+| func_pipeline | 14.2 | 14.0 | -0.2 | 0.986 |
+| call_heavy | 12.2 | 12.3 | +0.2 | 1.014 |
+| server_request | 13.2 | 13.1 | -0.1 | 0.992 |
+
+**Geomean RSS ratio (value16 / default) = 1.001×**  (< 1.000 means value16 uses LESS memory — the 24→16 byte case).
+
+### Correctness evidence (Tasks 3.1 / 3.2)
+
+**Task 3.1 — cross-BINARY old-vs-new repr differential** (`scripts/nanb-cross-repr-diff.sh`).
+The within-process `vm_differential` cannot prove the repr is behavior-invisible on its own
+(both engines in ONE binary share the repr — spec §0). Two separately-built RELEASE binaries
+(24-byte default, 16-byte `--features value16`) from the SAME commit, run over the WHOLE
+examples corpus, stdout/stderr/exit-code diffed byte-for-byte:
+
+```
+corpus files : 127
+ran (diffed) : 110
+skipped      :  17   (nondeterministic / server / relative-import — the EXAMPLE_SKIPS mirror)
+DIFFS        :   0
+RESULT       : byte-identical across both reprs (110/110)
+```
+
+Plus the full four-mode in-process differential under the new repr — both feature configs:
+
+```
+cargo test --features value16 --test vm_differential                       -> 444 passed, 0 failed
+cargo test --no-default-features --features value16 --test vm_differential  -> 444 passed, 0 failed
+```
+
+**Task 3.2 — deep fuzz campaign** (the FUZZ ~284k bar set by merge `9b202eb`).
+
+```
+FUZZ_STRESS_N=300000 cargo test --release --features value16 --test property \
+  stress_differential_many_seeds -- --ignored --nocapture
+-> 300,000 generated programs, EACH through 8 engine modes (tree-walker, specialized-VM,
+   generic-VM, .aso round-trip, lane-off, no-call-fast, decoded-forced, no-decode) — all
+   on the 16-byte repr (the cross-repr axis). 0 divergences. (finished in 1190 s)
+```
+
+> **Campaign finding (fixed in-branch, failing-test-first — Gate 0):** the FIRST 300k run
+> crashed with `Multiplication overflowed` from `rust_decimal` propagated as
+> `worker thread panicked`. Root cause is **REPR-INDEPENDENT** — it reproduces
+> byte-identically on BOTH the 24-byte and 16-byte binaries (a pre-existing decimal bug
+> surfaced by the higher case count, NOT a value16 regression): `apply_binop` and the VM
+> `decimal_fast` path used bare `+ - * / %` on `Decimal`, which `panic!` on overflow.
+> Fixed to checked ops raising a recoverable Tier-2 `decimal <op> overflowed` from the
+> shared site (commit `1b77ba2`); the full 300k campaign then completed clean from scratch.
+
+### Gate 12/17 re-run under `value16` (`cargo test --release --features value16 --test vm_bench`)
+
+| Gate | Result | Value |
+|------|--------|-------|
+| spec/tw geomean ≥ 2× (compute-bound, Gate 12/17) | **PASS** | **4.03×** (7/9 ≥ 2.0×; every compute-bound ≥ 2.0×) |
+| DBG zero-cost (armed-idle / none ≤ 1.05×) | **PASS** | **0.996×** |
+| LANE on/off no-regression | **PASS** | 0.777× (lane faster) |
+
+Profiled (shipped profiler, observation-only, stdout byte-identical) — `call_heavy.as` under
+value16 produced a clean function-level call tree (`<script>;step;scale;add` …, collapsed format),
+confirming `--profile cpu` works under the new repr. (`json_roundtrip` profiles empty because its
+hot loop is almost entirely inside native `json.stringify`/`parse`, not script frames.)
+
+### Honest reading — verdict INPUTS (the SHIP/REJECT call is Phase 4's, not this task's)
+
+Measured against spec §8.1's criteria (recorded, not judged here):
+
+- **Time A/B is a WASH.** Geomean spec **1.005×**, gen **1.005×**, tw **1.000×** — all inside
+  run-to-run noise. Per-workload it is mixed: the call-bound `func_pipeline` (+5.6% spec) and
+  `call_heavy` (+2.0% spec, +3.9% gen) modestly favor value16; the alloc/decode-bound
+  `object_churn` (−1.5%), `json_roundtrip` (−1.2%), and `async_concurrent` (−0.9%) modestly
+  favor the 24-byte default. No workload is outside ±2% in spec mode. There is no clear
+  speed WIN.
+- **RSS A/B shows NO meaningful memory win.** Geomean v16/base = **1.001×** — flat. The 33%
+  shrink of each `Value` cell (24→16 B) does NOT move peak RSS on these workloads because
+  their peak is dominated by the ~12–14 MB runtime image and native buffers, not the live
+  `Value` array/stack footprint. A memory WIN would need a Value-array-dominated working-set
+  workload (very large arrays/objects of scalars); the profiling corpus does not contain one,
+  so the headline memory case for the 16-byte repr is **NOT demonstrated** by this data.
+- **Correctness is fully GREEN:** cross-binary 110/110 byte-identical, four-mode 444/0 (both
+  configs), 300k-case deep fuzz 0-divergence, Gate-12 spec/tw 4.03× and DBG 0.996× under
+  value16. ThinStr stays Miri-clean (Phase 2). ASO_FORMAT_VERSION unchanged at 28.
+
+**Reading:** the data LOOKS like a **WASH / lean-REJECT** against §8.1 — value16 is correct and
+behavior-invisible, but it is neither faster (geomean ~1.005× spec, inside noise; alloc-bound
+workloads slightly slower) NOR meaningfully lighter (RSS 1.001×, flat) on the measured corpus.
+This mirrors the prior 16-byte attempt's evidence-REJECT (`COMPACT_VALUE_RESULTS.md`). The
+SHIP/REJECT verdict is Phase 4's to render against the fixed §8.1 criteria — this section only
+supplies the honest numbers.
