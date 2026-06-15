@@ -32,6 +32,19 @@ pub enum Command {
         /// takes precedence over the env var. Ignored for `.aso` (always VM).
         #[arg(long = "tree-walker")]
         tree_walker: bool,
+        /// ELIDE §5: enable contract elision — drop statically-PROVEN runtime
+        /// type-contract checks (call-arg / annotated-let / declared-return) from the
+        /// executed bytecode/AST. Default-OFF on `run` (the per-run collector cost is
+        /// over the §5.1 startup budget; see `bench/ELIDE_RESULTS.md`). Behavior is
+        /// byte-identical either way — elision is invisible. Equivalent to
+        /// `ASCRIPT_ELIDE=1`. `ascript build` is the cost-free elide surface.
+        #[arg(long = "elide", conflicts_with = "no_elide")]
+        elide: bool,
+        /// ELIDE §5.2: force contract elision OFF (the permanent kill switch; wins
+        /// over `--elide`). Equivalent to `ASCRIPT_NO_ELIDE=1`. Redundant while the
+        /// measured default is already off, but kept stable for when the default flips.
+        #[arg(long = "no-elide")]
+        no_elide: bool,
         /// Offline-deterministic: resolve dependencies EXACTLY from `ascript.lock`
         /// (no network), failing on any drift, missing lock, or integrity
         /// mismatch. For CI / sandboxes.
@@ -81,6 +94,18 @@ pub enum Command {
         /// executable with `--native`).
         #[arg(long, short)]
         out: Option<String>,
+        /// ELIDE §5: enable contract elision in the compiled artifact — drop proven
+        /// runtime type-contract checks from the `.aso`/native bytecode. The win is
+        /// DURABLE (the `CallElided` opcode serializes; every later `run` of the
+        /// artifact keeps it) and the one-shot collector cost is amortised, so
+        /// `build --elide` is the recommended elide surface. Default-OFF (same as
+        /// `run`, §5.1). Behavior is byte-identical. Equivalent to `ASCRIPT_ELIDE=1`.
+        #[arg(long = "elide", conflicts_with = "no_elide")]
+        elide: bool,
+        /// ELIDE §5.2: force contract elision OFF (kill switch; wins over `--elide`).
+        /// Equivalent to `ASCRIPT_NO_ELIDE=1`.
+        #[arg(long = "no-elide")]
+        no_elide: bool,
         /// Strip the optional DBG debug section (module source + per-proto
         /// line/variable info). Default: debug info is INCLUDED.
         #[arg(long = "strip")]
@@ -165,6 +190,16 @@ pub enum Command {
     /// Run .as test files
     Test {
         files: Vec<String>,
+        /// ELIDE §5: enable contract elision for the (serial) test run. Default-OFF
+        /// (§5.1). Behavior is identical with or without this flag. Equivalent to
+        /// `ASCRIPT_ELIDE=1`. (The `--parallel` path runs each file in a worker
+        /// isolate, which never elides — full checks there, §4.6.)
+        #[arg(long = "elide", conflicts_with = "no_elide")]
+        elide: bool,
+        /// ELIDE §5.2: force contract elision OFF (kill switch; wins over `--elide`).
+        /// Equivalent to `ASCRIPT_NO_ELIDE=1`.
+        #[arg(long = "no-elide")]
+        no_elide: bool,
         /// Offline-deterministic: resolve dependencies EXACTLY from `ascript.lock`
         /// (no network), failing on drift / missing lock / integrity mismatch.
         #[arg(long = "locked")]

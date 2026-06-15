@@ -1071,6 +1071,21 @@ pub fn compile_source_with_elision_counted(
     compile_source_inner_counted(src, None, elide)
 }
 
+/// Compile `src` with BOTH a tree-shake `keep`-set AND an optional [`ElisionSet`]
+/// (ELIDE §4.2 ∩ self-contained-bundles Phase 2). Used by `ascript build`: a
+/// LIBRARY module is pruned to its `keep`-set (drop unreferenced declarations) AND
+/// has its proven contract checks elided in the SAME compile. The two transforms
+/// are orthogonal (pruning drops whole declarations; elision drops in-bytecode
+/// checks at kept sites), so the combined output is the prune of the elided chunk.
+/// `elide = None` ⇒ byte-identical to [`compile_source_with_keep`].
+pub fn compile_source_with_keep_and_elision(
+    src: &str,
+    keep: Option<&HashSet<Rc<str>>>,
+    elide: Option<&ElisionSet>,
+) -> Result<Chunk, CompileError> {
+    compile_source_inner(src, keep, elide)
+}
+
 /// The shared body of [`compile_source`] / [`compile_source_with_keep`] /
 /// [`compile_source_with_elision`]. When `keep` is `Some`, the top-level emit
 /// loop drops unreferenced top-level binding declarations (see

@@ -1890,3 +1890,153 @@ fn elide_collector_cost_envelope() {
     println!("NOTE: 'collector ceiling' = checker pipeline time (collector = same walk + set inserts).");
     println!("Task 4.1 decides whether option (a) (always-on) ships based on these numbers.");
 }
+
+// ELIDE Task 4.1 Step 1 — the REAL on-branch decision measurement.
+//
+//   cargo test --test check --release -- elide_decision_measurement --ignored --nocapture
+//
+// Unlike `elide_collector_cost_envelope` (which times the full checker pipeline as a
+// CEILING), this times the ACTUAL `elision_proofs` collector in isolation, then runs
+// the binary end-to-end A/B (elide-on default vs `--no-elide`) including the 5k-line
+// module — the numbers the §5.1 decision is recorded against.
+#[test]
+#[ignore]
+fn elide_decision_measurement() {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Instant;
+
+    fn walk_as(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk_as(&p, out);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("as") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut corpus: Vec<PathBuf> = Vec::new();
+    walk_as(Path::new("examples"), &mut corpus);
+    corpus.sort();
+
+    // Warm up.
+    let _ = ascript::check::infer::elision_proofs("let _ = 1\n");
+    const REPS: u32 = 20;
+
+    // ── (a) collector-only wall time per module ──────────────────────────────
+    let mut coll: Vec<(String, u64 /* µs median */, usize /* lines */)> = Vec::new();
+    for path in &corpus {
+        let Ok(src) = fs::read_to_string(path) else { continue };
+        let lines = src.lines().count();
+        let mut times = Vec::with_capacity(REPS as usize);
+        for _ in 0..REPS {
+            let t0 = Instant::now();
+            let _ = ascript::check::infer::elision_proofs(&src);
+            times.push(t0.elapsed().as_micros() as u64);
+        }
+        times.sort();
+        coll.push((path.display().to_string(), times[REPS as usize / 2], lines));
+    }
+    let mut all_us: Vec<u64> = coll.iter().map(|(_, u, _)| *u).collect();
+    all_us.sort();
+    let cmin = *all_us.first().unwrap_or(&0);
+    let cmax = *all_us.last().unwrap_or(&0);
+    let cmed = all_us[all_us.len() / 2];
+
+    // 5k-line synthetic module (same construction as the envelope harness).
+    let base = fs::read_to_string("examples/all_features.as").unwrap_or_default();
+    let base_lines = base.lines().count().max(1);
+    let needed = 5000usize.saturating_sub(base_lines).div_ceil(base_lines);
+    let mut big = String::with_capacity(base.len() * (needed + 1));
+    big.push_str(&base);
+    for i in 0..needed {
+        big.push_str(&format!("\nfn _big_wrap_{}() {{\n{}\n}}\n", i, base.replace('\n', "\n  ")));
+    }
+    let big_lines = big.lines().count();
+    let mut bt = Vec::with_capacity(REPS as usize);
+    for _ in 0..REPS {
+        let t0 = Instant::now();
+        let _ = ascript::check::infer::elision_proofs(&big);
+        bt.push(t0.elapsed().as_micros() as u64);
+    }
+    bt.sort();
+    let big_us = bt[REPS as usize / 2];
+
+    // ── (b) end-to-end A/B over compute-bound representatives + 5k module ────
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let run_iters = 9u32;
+    // Compute-bound files where startup is a small fraction (so the A/B reflects
+    // real execution, not constant spawn overhead). Plus call_heavy_typed (the
+    // headline) and the 5k module.
+    let big_path = std::env::temp_dir().join("elide_5k_decision.as");
+    fs::write(&big_path, &big).unwrap();
+    let mut ab_targets: Vec<PathBuf> = vec![
+        PathBuf::from("bench/profiling/call_heavy_typed.as"),
+        PathBuf::from("bench/profiling/call_heavy.as"),
+        PathBuf::from("examples/all_features.as"),
+        PathBuf::from("examples/structured_concurrency.as"),
+        big_path.clone(),
+    ];
+    ab_targets.retain(|p| p.exists());
+
+    fn median_run(bin: &str, path: &Path, extra: &[&str], iters: u32) -> u64 {
+        let mut t = Vec::with_capacity(iters as usize);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let _ = Command::new(bin).arg("run").args(extra).arg(path).output();
+            t.push(t0.elapsed().as_micros() as u64);
+        }
+        t.sort();
+        t[t.len() / 2]
+    }
+
+    // interleave on/off reps to cancel thermal drift across the pair
+    let mut ab: Vec<(String, u64 /* on µs */, u64 /* off µs */)> = Vec::new();
+    for p in &ab_targets {
+        let on = median_run(bin, p, &[], run_iters);
+        let off = median_run(bin, p, &["--no-elide"], run_iters);
+        ab.push((p.display().to_string(), on, off));
+    }
+
+    // ── print ─────────────────────────────────────────────────────────────────
+    println!();
+    println!("=== ELIDE Task 4.1: DECISION measurement (release, on-branch) ===");
+    println!("Reps: collector {REPS}/file, e2e {run_iters}/file (median)");
+    println!();
+    println!("--- (a) elision_proofs collector wall time per module ---");
+    println!("  min    = {:.3} ms ({} µs)", cmin as f64 / 1000.0, cmin);
+    println!("  median = {:.3} ms ({} µs)", cmed as f64 / 1000.0, cmed);
+    println!("  max    = {:.3} ms ({} µs)", cmax as f64 / 1000.0, cmax);
+    println!("  5k-line module ({big_lines} lines) = {:.3} ms ({big_us} µs)", big_us as f64 / 1000.0);
+    println!();
+    println!("--- per-file collector (median µs) ---");
+    println!("{:<58} {:>6} {:>8}", "file", "lines", "µs");
+    for (n, u, l) in &coll {
+        println!("{:<58} {:>6} {:>8}", n, l, u);
+    }
+    println!();
+    println!("--- (b) end-to-end A/B: elide-ON (default) vs --no-elide (median µs) ---");
+    println!("{:<58} {:>10} {:>10} {:>9}", "file", "on µs", "off µs", "regr %");
+    let mut log_ratios: Vec<f64> = Vec::new();
+    for (n, on, off) in &ab {
+        // regression of ON vs OFF: positive means ON is slower.
+        let regr = if *off > 0 { (*on as f64 - *off as f64) / *off as f64 * 100.0 } else { 0.0 };
+        println!("{:<58} {:>10} {:>10} {:>8.2}%", n, on, off, regr);
+        if *off > 0 && *on > 0 {
+            log_ratios.push((*on as f64 / *off as f64).ln());
+        }
+    }
+    let geomean = if log_ratios.is_empty() {
+        1.0
+    } else {
+        (log_ratios.iter().sum::<f64>() / log_ratios.len() as f64).exp()
+    };
+    println!();
+    println!("  A/B geomean (on/off) = {:.4}x  ({:+.2}% e2e)", geomean, (geomean - 1.0) * 100.0);
+    println!("  Spec §5.1 budget: ≤ 2% corpus geomean AND ≤ 1 ms collector for a ≤500-line module");
+    let _ = fs::remove_file(&big_path);
+}

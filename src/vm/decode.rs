@@ -582,6 +582,9 @@ fn is_block_terminator_op(op: Op) -> bool {
             | Op::Unwrap
             | Op::MatchNoArm
             | Op::Call
+            // ELIDE §4.2: CallElided is a call/suspension point exactly like Call —
+            // a basic-block terminator the peephole must never fuse across.
+            | Op::CallElided
             | Op::CallSpread
             | Op::CallMethod
             | Op::CallMethodSpread

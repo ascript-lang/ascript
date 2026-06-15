@@ -818,6 +818,18 @@ pub struct Vm {
     /// (the entry body + every nested fn, recursively) so a `(file, line)` can target
     /// any proto, not just the current frame.
     debug_protos: RefCell<Vec<Rc<crate::vm::chunk::FnProto>>>,
+    /// **ELIDE §4.2/§5.2 — contract-elision compile mode for IMPORTED modules.**
+    /// When `true`, `compile_module_file` runs the `ElisionSet` collector on each
+    /// imported module's source and compiles it via `compile_source_with_elision`
+    /// (proven contract checks dropped from the bytecode). When `false` (the
+    /// default, and the `--no-elide` / `ASCRIPT_NO_ELIDE=1` kill switch), imports
+    /// compile byte-identically to pre-ELIDE. The ENTRY module's elision is applied
+    /// by the runner before the VM exists; this flag governs only the import loader.
+    /// A `Cell` set after construction (like `module_dir`), never read on the hot
+    /// path — only at module-compile time. **NOT inherited by worker isolates** (a
+    /// worker `Interp`/`Vm` is built fresh with `elide=false`; worker slices keep
+    /// full checks, §4.6).
+    elide: std::cell::Cell<bool>,
 }
 
 /// DBG: the final path component of a `/`- or `\`-separated path (the file name),
@@ -955,6 +967,7 @@ impl Vm {
             last_fault_source: RefCell::new(None),
             instrument: RefCell::new(None),
             debug_protos: RefCell::new(Vec::new()),
+            elide: std::cell::Cell::new(false),
             sync_lane,
             lane_sync_ops: std::cell::Cell::new(0),
             lane_bursts: std::cell::Cell::new(0),
@@ -1469,6 +1482,22 @@ impl Vm {
     /// file's parent directory) so `import ... from "./mod"` resolves correctly.
     pub fn set_module_dir(&self, dir: std::path::PathBuf) {
         *self.module_dir.borrow_mut() = dir;
+    }
+
+    /// **ELIDE §4.2/§5.2** — enable contract elision for IMPORTED modules. When on,
+    /// `compile_module_file` runs the `ElisionSet` collector + compiles each import
+    /// via `compile_source_with_elision`. The default is `false` (the kill-switch
+    /// state). The runner sets this to the §5.1 decision value AFTER constructing the
+    /// VM (the entry module's elision is applied separately by the runner before the
+    /// VM exists). Worker isolates are built fresh and never call this, so worker
+    /// slices keep full checks (§4.6).
+    pub fn set_elide(&self, on: bool) {
+        self.elide.set(on);
+    }
+
+    /// Whether the import-loader compiles with contract elision (ELIDE §4.2).
+    pub fn elide(&self) -> bool {
+        self.elide.get()
     }
 
     /// **SELF-CONTAINED-BUNDLES Phase 1.** Install an in-memory [`ModuleArchive`] as the
@@ -2079,7 +2108,18 @@ impl Vm {
                 format!("cannot read module {}: {}", as_path.display(), e),
             )
         })?;
-        let chunk = crate::compile::compile_source(&src).map_err(|e| {
+        // ELIDE §4.2: when import-elision is on, run the per-module ElisionSet
+        // collector and compile this module with the proven contract checks dropped.
+        // Per-module scoping is by construction — the set is computed from THIS
+        // module's own source, so cross-module span collisions are impossible (§4.3).
+        // Off (the default / kill-switch) → byte-identical to pre-ELIDE.
+        let compiled = if self.elide.get() {
+            let set = crate::check::infer::elision_proofs(&src);
+            crate::compile::compile_source_with_elision(&src, Some(&set))
+        } else {
+            crate::compile::compile_source(&src)
+        };
+        let chunk = compiled.map_err(|e| {
             self.panic_at(
                 fiber,
                 fault_ip,
@@ -9895,6 +9935,13 @@ pub(crate) fn sync_lane_op(op: Op) -> bool {
             | Op::Closure
             // call (plain sync closure only; escalates for async/worker/generator/native)
             | Op::Call
+            // ELIDE §4.2: CallElided is dispatched IDENTICALLY to Call in the sync
+            // burst (only the contract-skip flag differs), so it MUST share Call's
+            // sync-lane admission — otherwise every proven call site escalates to the
+            // async driver and loses LANE's fast path (a measured ~19% regression on
+            // call-heavy code, untyped INCLUDED since an all-untyped-param call is a
+            // free-pass elide site). The §4.4 binder fast path handles it inline.
+            | Op::CallElided
             | Op::CallSpread
             // await (conditional — escalates only if the operand is a pending future;
             // a non-future operand or a resolved future completes inline per LANE §4)

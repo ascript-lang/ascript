@@ -109,6 +109,53 @@ where
         .expect("worker thread panicked")
 }
 
+/// **ELIDE §5 — the measured default for contract elision on the `run`/`build`/
+/// `test` SOURCE paths.**
+///
+/// The §5.1 DECISION (recorded with numbers in `bench/ELIDE_RESULTS.md` and the
+/// spec): the per-module collector cost is small in absolute terms (median 0.13 ms,
+/// and a real compute-bound A/B is a WIN — typed `call_heavy` −6%, untyped ≈0), BUT
+/// running it on EVERY source invocation fails BOTH §5.1 budget criteria as
+/// measured on the example corpus:
+/// - **≤ 2% corpus geomean:** measured **+6.99%** (68-file runnable example corpus,
+///   on/off, release) — the demo corpus is dominated by ms-runtime programs where a
+///   one-shot parse+resolve+infer collector pass is a large startup fraction.
+/// - **≤ 1 ms collector for a ≤500-line module:** the 266-line `all_features.as`
+///   already costs **1.42 ms** — over the absolute budget below 300 lines.
+///
+/// Per the spec's honesty mandate (plan Task 4.1 Step 2: "outside → default OFF …
+/// not a failure"), elision therefore ships **default-OFF**, opt-in via `--elide` /
+/// `ASCRIPT_ELIDE=1`. `ascript build` is the natural elide-on surface (a one-shot
+/// compile whose cost is amortised over every later run of the durable `.aso`).
+///
+/// Flip this one constant to make elision default-on (e.g. once the collector shares
+/// the compiler's parse+resolve, closing the startup gap). The kill-switch / opt-out
+/// path stays byte-identical to pre-ELIDE regardless.
+pub const ELIDE_DEFAULT_ON: bool = false;
+
+/// **ELIDE §5.2 — resolve whether contract elision is active for a source run.**
+///
+/// Precedence (most-specific wins, force-OFF beats opt-ON — the `--no-specialize`
+/// discipline):
+/// 1. `--no-elide` flag OR `ASCRIPT_NO_ELIDE=1` → **OFF** (explicit force-off).
+/// 2. `--elide` flag OR `ASCRIPT_ELIDE=1` → **ON** (the opt-in, since default-off).
+/// 3. otherwise → the measured [`ELIDE_DEFAULT_ON`] decision.
+///
+/// When this returns `false`, the collector never runs, the compiler is fed `None`,
+/// and the marker never marks — output bytecode and AST are byte-identical to
+/// pre-ELIDE (the zero-cost-when-off contract). When `true`, output is still
+/// byte-IDENTICAL behaviorally (elision is invisible); only proven checks are dropped.
+pub fn elide_enabled(elide_flag: bool, no_elide_flag: bool) -> bool {
+    // Force-off wins (defensive: an explicit kill switch always overrides opt-in).
+    if no_elide_flag || std::env::var("ASCRIPT_NO_ELIDE").as_deref() == Ok("1") {
+        return false;
+    }
+    if elide_flag || std::env::var("ASCRIPT_ELIDE").as_deref() == Ok("1") {
+        return true;
+    }
+    ELIDE_DEFAULT_ON
+}
+
 /// Run a `.as` file as the entry module (with import resolution relative to it).
 ///
 /// Returns the process exit code: `Ok(0)` for clean termination, `Ok(n)` when
@@ -122,7 +169,7 @@ where
 /// (only the script's own args — NOT the binary name or the file path).
 /// Pass `&[]` if the caller provides no trailing args.
 pub async fn run_file(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_with_packages(path, script_args, None, None).await
+    run_file_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
 }
 
 /// Like [`run_file`] (tree-walker) but installs a CLI-resolved package map (SP6)
@@ -134,6 +181,7 @@ pub async fn run_file_with_packages(
     script_args: &[String],
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<i32, AsError> {
     // CLI `run` streams `print` output live to stdout (so it appears immediately
     // and survives a later panic). Under `Live` there is no captured string, so
@@ -147,6 +195,11 @@ pub async fn run_file_with_packages(
     if let Some(map) = packages {
         interp.set_package_resolver(map);
     }
+    // ELIDE §4.3/§5: enable the per-module AST marking pass on the tree-walker.
+    // `load_module` runs `elision_proofs` + `mark_program` per module (entry AND
+    // imports flow through it), so per-module scoping is automatic. Off → the
+    // markers never run, byte-identical to pre-ELIDE.
+    interp.set_elide_mode(elide);
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(interp.load_module(path)).await;
@@ -177,7 +230,7 @@ pub async fn run_tests_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<TestSummary, AsError> {
-    run_tests_with_options(files, packages, caps, None, false, None).await
+    run_tests_with_options(files, packages, caps, None, false, None, ELIDE_DEFAULT_ON).await
 }
 
 /// DX D2 Task 5 — the test runner with the `--parallel[=N]` option.
@@ -198,6 +251,7 @@ pub async fn run_tests_with_options(
     parallel: Option<usize>,
     update_snapshots: bool,
     filter: Option<&str>,
+    elide: bool,
 ) -> Result<TestSummary, AsError> {
     // Parallelize only when asked for >1 isolate AND there is more than one file. A
     // single file in one isolate is the serial path with extra cost — degrade to serial
@@ -214,9 +268,13 @@ pub async fn run_tests_with_options(
             // DX D2 Task 10: the `--filter` is applied INSIDE each isolate (same parsed
             // filter raw, re-parsed per isolate across the airlock), so the filtered/
             // passed/failed aggregate is identical regardless of parallelism (§7).
+            // ELIDE §4.6: the parallel path dispatches each FILE to its own worker
+            // ISOLATE; worker slices NEVER elide (full checks in the isolate), so the
+            // `elide` decision is intentionally NOT propagated across the airlock here.
+            let _ = elide;
             run_tests_parallel(files, packages, caps, n, update_snapshots, filter).await
         }
-        _ => run_tests_serial(files, packages, caps, update_snapshots, filter).await,
+        _ => run_tests_serial(files, packages, caps, update_snapshots, filter, elide).await,
     }
 }
 
@@ -422,6 +480,7 @@ async fn run_tests_serial(
     caps: Option<crate::stdlib::caps::CapSet>,
     update_snapshots: bool,
     filter: Option<&str>,
+    elide: bool,
 ) -> Result<TestSummary, AsError> {
     // Parse the (CLI-validated) raw filter once for this serial run. A re-parse of an
     // already-validated filter cannot realistically fail, but a defensive `?` keeps the
@@ -432,6 +491,10 @@ async fn run_tests_serial(
     };
     let filter = filter.as_ref();
     let interp = Rc::new(Interp::new());
+    // ELIDE §4.3/§5: enable the per-module marking pass for the serial test run
+    // (each test FILE flows through `load_module`, which marks per-module). Off →
+    // byte-identical to pre-ELIDE.
+    interp.set_elide_mode(elide);
     if let Some(caps) = caps {
         interp.set_caps(caps);
     }
@@ -1558,13 +1621,15 @@ pub fn build_file(
     out: Option<&Path>,
     with_debug: bool,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<std::path::PathBuf, AsError> {
     // SELF-CONTAINED-BUNDLES (Task 1.5): a multi-module program is emitted as an
     // `ASCRIPTA` archive embedding the whole reachable import graph (so `run out.aso`
     // works from a directory WITHOUT the sources). A single-module program recompiles
     // the lone entry to a bare `ASO\0` chunk — byte-identical to the pre-archive
     // artifact, so existing `.aso` goldens/tests stay valid.
-    let (mut archive, report) = compile_archive(file, with_debug)?;
+    // ELIDE §4.2/§5: `build` elides under the same default / kill switch as `run`.
+    let (mut archive, report) = compile_archive(file, with_debug, elide)?;
     // SELF-CONTAINED-BUNDLES (Task 3.2, ARTIFACT-FORMAT RULE): emit an `ASCRIPTA` archive
     // when the graph has >1 module OR the caps are restricted (`caps.is_some()`); emit the
     // bare `ASO\0` chunk ONLY when single-module AND `caps` is `None`. This gives the
@@ -1591,7 +1656,7 @@ pub fn build_file(
         // single-module artifact stays byte-identical to the pre-archive output (and stays
         // decoupled from archive internals as Phase 2 evolves `compile_archive`). `build` is
         // a one-shot CLI compile, so re-compiling this one file is negligible.
-        compile_verified_aso_bytes(file, with_debug)? // bare ASO\0 — byte-identical to today
+        compile_verified_aso_bytes(file, with_debug, elide)? // bare ASO\0 — byte-identical to today
     };
     let out_path = match out {
         Some(p) => p.to_path_buf(),
@@ -1608,15 +1673,24 @@ pub fn build_file(
 /// loadable), then `to_bytes_with_debug`. Returns the verified `.aso` byte vector. The native
 /// bundle embeds these EXACT bytes, so the embedded payload is byte-identical to a `build`
 /// artifact (four-mode parity stays free; no `.aso` format change).
-fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, AsError> {
+fn compile_verified_aso_bytes(file: &Path, with_debug: bool, elide: bool) -> Result<Vec<u8>, AsError> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
     let src_info = Rc::new(SourceInfo {
         path: file.display().to_string(),
         text: src.clone(),
     });
-    let chunk = crate::compile::compile_source(&src)
-        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // ELIDE §4.2/§5: `ascript build` runs the collector under the same default /
+    // kill switch as `run`, so the produced `.aso`/native bundle KEEPS the win
+    // (the `CallElided` opcode is durable). Off → byte-identical to pre-ELIDE.
+    let chunk = if elide {
+        let set = crate::check::infer::elision_proofs(&src);
+        crate::compile::compile_source_with_elision(&src, Some(&set))
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    } else {
+        crate::compile::compile_source(&src)
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    };
     // DBG (v26): bind the module source onto the whole proto tree so a debug build
     // serializes line/variable info. Harmless for a `--strip` build (the source is
     // simply not written). `compile_source` does not bind a source itself.
@@ -1699,8 +1773,9 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
 pub fn compile_archive(
     entry: &Path,
     with_debug: bool,
+    elide: bool,
 ) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
-    compile_archive_with_shake(entry, with_debug, true)
+    compile_archive_with_shake(entry, with_debug, true, elide)
 }
 
 /// Like [`compile_archive`], but with the pass-2 TREE-SHAKE toggleable. This is the
@@ -1721,6 +1796,7 @@ pub fn compile_archive_with_shake(
     entry: &Path,
     with_debug: bool,
     shake: bool,
+    elide: bool,
 ) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
     use crate::vm::archive::ModuleArchive;
     use std::collections::HashMap;
@@ -1784,7 +1860,7 @@ pub fn compile_archive_with_shake(
         // uses, so the stored chunk always re-verifies). The stored bytes are what RUN
         // (the archive replaces the source tree), so debug info is preserved per the
         // caller's `with_debug` choice — NOT dropped — matching a single-module build.
-        let bytes = compile_verified_aso_bytes(&item.path, with_debug)?;
+        let bytes = compile_verified_aso_bytes(&item.path, with_debug, elide)?;
 
         // Decode the just-produced chunk to read its import table. These are OUR OWN
         // freshly-verified bytes, so this never sees hostile input.
@@ -1941,7 +2017,7 @@ pub fn compile_archive_with_shake(
                 continue;
             };
             let path = &module_paths[idx];
-            let pruned = compile_pruned_aso_bytes(path, keep, with_debug)?;
+            let pruned = compile_pruned_aso_bytes(path, keep, with_debug, elide)?;
             *bytes = pruned;
         }
     }
@@ -2057,6 +2133,7 @@ fn compile_pruned_aso_bytes(
     file: &Path,
     keep: &std::collections::HashSet<Rc<str>>,
     with_debug: bool,
+    elide: bool,
 ) -> Result<Vec<u8>, AsError> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
@@ -2064,7 +2141,15 @@ fn compile_pruned_aso_bytes(
         path: file.display().to_string(),
         text: src.clone(),
     });
-    let chunk = crate::compile::compile_source_with_keep(&src, keep)
+    // ELIDE §4.2: a LIBRARY module is pruned to its keep-set AND elided in one
+    // compile (the two transforms are orthogonal). Off → byte-identical to the
+    // pre-ELIDE pruned path.
+    let elide_set = if elide {
+        Some(crate::check::infer::elision_proofs(&src))
+    } else {
+        None
+    };
+    let chunk = crate::compile::compile_source_with_keep_and_elision(&src, Some(keep), elide_set.as_ref())
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
     if with_debug {
         chunk.set_module_source(&src_info);
@@ -2131,6 +2216,7 @@ pub fn build_native(
     out: Option<&Path>,
     target: Option<&str>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<std::path::PathBuf, AsError> {
     // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
     // naming the requested triple, never a silent ignore or a generic clap failure.
@@ -2146,7 +2232,7 @@ pub fn build_native(
     // `ASCRIPTA` archive embedding the whole import graph for a multi-module program
     // (so the bundled binary runs from an empty directory). The `stub || payload ||
     // footer` framing below is unchanged: the payload is opaque to the bundler.
-    let (mut archive, report) = compile_archive(file, true)?;
+    let (mut archive, report) = compile_archive(file, true, elide)?;
     // SELF-CONTAINED-BUNDLES (Task 3.2, ARTIFACT-FORMAT RULE — same rule as `build_file`):
     // bundle an `ASCRIPTA` archive when the graph has >1 module OR the caps are restricted
     // (`caps.is_some()`); bundle the bare `ASO\0` chunk ONLY when single-module AND `caps`
@@ -2175,7 +2261,7 @@ pub fn build_native(
         // from the as-passed `file` keeps the relative source path, so the single-module
         // bundle stays byte-identical to the pre-archive output. `build` is one-shot, so
         // re-compiling this one file is negligible.
-        compile_verified_aso_bytes(file, true)? // bare ASO\0 — byte-identical to today
+        compile_verified_aso_bytes(file, true, elide)? // bare ASO\0 — byte-identical to today
     };
 
     // Step 2: the stub is a byte-for-byte copy of the running runtime — but if THIS binary is
@@ -2560,7 +2646,7 @@ async fn run_entry_proto_to_exit(
 /// build source), the source is attached to a Tier-2 panic here so its diagnostic
 /// renders against the file the user just ran.
 pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_on_vm_with_packages(path, script_args, None, None).await
+    run_file_on_vm_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
 }
 
 /// DX D4 §5.1: collect ALL recoverable parse diagnostics for a `.as` source file
@@ -2651,6 +2737,7 @@ pub async fn run_file_on_vm_with_packages(
     script_args: &[String],
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -2662,8 +2749,18 @@ pub async fn run_file_on_vm_with_packages(
         path: path.display().to_string(),
         text: src.clone(),
     });
-    let chunk = crate::compile::compile_source(&src)
-        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // ELIDE §4.2/§5: compile the ENTRY module with contract elision when enabled.
+    // The collector runs on this module's own source; the compiler drops proven
+    // CheckLocal/return checks and emits CallElided at proven call sites. Off (the
+    // default kill-switch state) → byte-identical to pre-ELIDE compilation.
+    let chunk = if elide {
+        let set = crate::check::infer::elision_proofs(&src);
+        crate::compile::compile_source_with_elision(&src, Some(&set))
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    } else {
+        crate::compile::compile_source(&src)
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    };
     // Bind the entry module's source onto its whole proto tree (SP4 §3) so a
     // panic raised in any of its functions renders its caret in this file even
     // when the error propagates up from a different module's call site.
@@ -2693,6 +2790,10 @@ pub async fn run_file_on_vm_with_packages(
     // → with_lanes reading the same env). Speed-only, never observable behavior.
     let specialize = std::env::var("ASCRIPT_NO_SPECIALIZE").as_deref() != Ok("1");
     let vm = Vm::with_specialize(interp.clone(), specialize);
+    // ELIDE §4.2: propagate the elision decision to the import loader so imported
+    // modules are compiled with elision too (the entry module was already compiled
+    // with it above). Off → imports compile byte-identically to pre-ELIDE.
+    vm.set_elide(elide);
     // Resolve relative imports against the source file's directory.
     if let Some(dir) = path.parent() {
         vm.set_module_dir(dir.to_path_buf());

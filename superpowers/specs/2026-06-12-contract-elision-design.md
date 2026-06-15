@@ -377,6 +377,48 @@ for a typical (≤500-line) module.** Inside budget → (a) ships as default. Ou
 fall back to (b)'s flag shape *as the recorded decision*, with the spec's table updated — never
 a silent switch.
 
+### 5.1.1 THE MEASURED DECISION (Task 4.1, recorded 2026-06-16)
+
+**Verdict: DEFAULT-OFF, opt-in via `--elide` / `ASCRIPT_ELIDE=1` (the (b) flag shape).**
+The on-branch measurement (`bench/ELIDE_RESULTS.md` → "Decision measurement"; Apple M4,
+release) against the fixed §5.1 budget:
+
+| §5.1 criterion | budget | measured | verdict |
+|---|---|---|---|
+| example-corpus end-to-end geomean | ≤ 2% | **+6.99%** (68 runnable files, on/off) | **OVER** |
+| ≤500-line module collector cost | ≤ 1 ms | 0.130 ms median, but **1.42 ms** at 266 lines (`all_features.as`) | **OVER below ~300 lines** |
+
+Both criteria fail, so option (a) (always-on `run`) is NOT taken. The collector itself is
+cheap in absolute terms (median 0.13 ms/module) and a real **compute-bound** A/B is a WIN
+(typed `call_heavy` **−6%**; untyped / concurrent ≈0) — but `ascript run` does not type-check
+today, so default-on would add a second parse+resolve+infer pass to EVERY run's startup, and
+the example corpus is dominated by sub-10-ms demo programs where that fixed cost is a large
+proportional tax (`core_types.as` +112%, `system.as` +46%). Per the plan's honesty mandate,
+default-OFF is the correct recorded outcome, not a failure.
+
+`ELIDE_DEFAULT_ON = false` (`src/lib.rs`). The opt-in is `--elide` / `ASCRIPT_ELIDE=1` on
+`run`/`build`/`test`; the kill switch `--no-elide` / `ASCRIPT_NO_ELIDE=1` is the explicit
+force-off (wins over the opt-in). **`ascript build --elide` is the natural elide surface** —
+a one-shot compile whose collector cost is amortised over every later `run` of the durable
+`.aso` (the `Op::CallElided` opcode serializes, §4.2).
+
+**Remaining-plan implication:** later tasks written assuming inside-budget default-on are read
+with default-OFF. The differential elide axis (Task 4.3) drives the `--elide`/`vm_run_source_elided`
+path explicitly (independent of the run-path default), so its soundness coverage is unaffected;
+the perf A/B (Task 5.1) reports `--elide` vs `--no-elide`. A future task that shares the
+compiler's parse+resolve with the collector (eliminating the duplicate front-end pass) would
+close the startup gap and could flip `ELIDE_DEFAULT_ON` to `true` for `run` — a one-constant
+change behind the same kill switch.
+
+**In-branch fix (Gate 14) surfaced by this measurement:** the first A/B showed a +19%
+regression on UNTYPED `call_heavy.as` — impossible if elision were ≈0 on untyped code. An
+all-untyped-param call is a free-pass elide site that emits `Op::CallElided`, but
+`Op::CallElided` was missing from `sync_lane_op()` (`src/vm/run.rs`) and the DECODE
+block-terminator set (`src/vm/decode.rs`), so every elided call escalated out of LANE's sync
+fast lane. Fixed in-branch (CallElided shares `Op::Call`'s sync-lane admission + terminator
+status); post-fix untyped −1.96% (≈0), typed −5.97%. Guarded permanently by the elide-on ==
+elide-off differential (which now also exercises the sync lane).
+
 ### 5.2 The kill switch (permanent, mirrors `--no-specialize`)
 
 `--no-elide` CLI flag on `run`/`build`/`test` + `ASCRIPT_NO_ELIDE=1` env (exactly the
