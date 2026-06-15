@@ -1,7 +1,7 @@
 # Decoded Dispatch (DECODE) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to
-> implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every task
+> implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking. Every task
 > is executed by a **fresh implementer subagent**, then verified by an **independent reviewer
 > subagent** that runs the commands and probes edges before acceptance. A final **holistic
 > review** covers the whole branch before merge. A task is closed only when every box under it
@@ -98,10 +98,10 @@ PRE-LANE; Task 0 re-greps them.
 
 **Files:** none committed (notes only; fixes — if any divergence is found — are their own commits).
 
-- [ ] **Step 1:** `git checkout main && git pull && git checkout -b feat/decoded-dispatch`.
+- [x] **Step 1:** `git checkout main && git pull && git checkout -b feat/decoded-dispatch`.
   Confirm LANE is merged: `grep -n "fn run_loop_sync\|sync_lane" src/vm/run.rs`
   must hit. If not — **STOP**; this plan is blocked on LANE.
-- [ ] **Step 2:** Re-grep every spec §11 citation that Tasks below rely on and record the
+- [x] **Step 2:** Re-grep every spec §11 citation that Tasks below rely on and record the
   post-LANE line numbers in the task log: `Op::operand_width`, `Code::patch_byte`,
   `Chunk::patch_byte`, the six patch sites (`arm_coverage`, the two trap-arm un-patches,
   `apply_set_breakpoints`, `apply_clear_breakpoints`, `dap/launch.rs` entry patch),
@@ -109,10 +109,10 @@ PRE-LANE; Task 0 re-greps them.
   `struct_gen`/`define_user_global`/`update_user_global`, `run_loop_sync`'s burst arm list vs
   LANE spec §3 (record the name of any inner burst helper LANE factored — Task 4's `sync_burst`
   extraction reuses it).
-- [ ] **Step 3:** Baseline runs (evidence for later A/Bs): full suite green both configs;
+- [x] **Step 3:** Baseline runs (evidence for later A/Bs): full suite green both configs;
   `cargo test --release --test vm_bench -- --ignored --nocapture` recorded (pre-DECODE
   geomeans).
-- [ ] **Reviewer checkpoint:** reviewer confirms LANE presence, spot-checks 5 re-grepped
+- [x] **Reviewer checkpoint:** reviewer confirms LANE presence, spot-checks 5 re-grepped
   anchors, and that the baseline bench output is filed in the task log.
 
 ## Task 1: The invalidation chokepoint — `Chunk.patch_epoch` (+ inert decode slots)
@@ -121,7 +121,7 @@ PRE-LANE; Task 0 re-greps them.
 - Modify: `src/vm/chunk.rs`
 - Test: inline `#[test]`s in `src/vm/chunk.rs` + a tripwire test in `tests/vm_decode.rs` (new file)
 
-- [ ] **Step 1: Write the failing tests** (in `chunk.rs` `mod tests`):
+- [x] **Step 1: Write the failing tests** (in `chunk.rs` `mod tests`):
 
 ```rust
 #[test]
@@ -179,9 +179,9 @@ fn raw_code_patch_byte_has_no_callers_outside_chunk_rs() {
   the scan is green once the epoch lands. `set_breakpoint_shared` routes through
   `chunk.patch_byte` already — verified at `instrument.rs:268-280`.)
 
-- [ ] **Step 2: Run — expect FAIL** (`patch_epoch` doesn't exist):
+- [x] **Step 2: Run — expect FAIL** (`patch_epoch` doesn't exist):
   `cargo test --lib chunk::tests && cargo test --test vm_decode`
-- [ ] **Step 3: Implement** in `chunk.rs`:
+- [x] **Step 3: Implement** in `chunk.rs`:
   - Fields on `Chunk` (beside `overflow`): `pub patch_epoch: std::cell::Cell<u64>`,
     `pub decoded: RefCell<Option<Rc<crate::vm::decode::DecodedChunk>>>` (this task: declare the
     module with an empty placeholder struct? **NO placeholders** — declare the fields in THIS
@@ -191,10 +191,10 @@ fn raw_code_patch_byte_has_no_callers_outside_chunk_rs() {
     `self.patch_epoch.set(self.patch_epoch.get().saturating_add(1));` BEFORE delegating to
     `self.code.patch_byte(off, b)` (doc-comment: the DECODE §4.1 chokepoint — set AND restore
     both bump; any decoded/compiled artifact recording an older epoch is stale).
-- [ ] **Step 4: Run — expect PASS**; full `cargo test` + clippy, both configs (nothing else may
+- [x] **Step 4: Run — expect PASS**; full `cargo test` + clippy, both configs (nothing else may
   move — the epoch is write-only until Task 4).
-- [ ] **Step 5: Commit** — `feat(vm/decode): Chunk.patch_epoch — the byte-patch invalidation chokepoint (DECODE §4.1)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer greps all `patch_byte` callers and confirms each routes
+- [x] **Step 5: Commit** — `feat(vm/decode): Chunk.patch_epoch — the byte-patch invalidation chokepoint (DECODE §4.1)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer greps all `patch_byte` callers and confirms each routes
   through the bumping method; confirms `arm_coverage` on an N-line proto bumps the epoch N
   times (add a quick unit if not covered); confirms zero behavior change (full differential).
 
@@ -204,7 +204,7 @@ fn raw_code_patch_byte_has_no_callers_outside_chunk_rs() {
 - Modify: `src/vm/run.rs` (Vm fields/constructors), `src/lib.rs`
 - Test: `tests/vm_decode.rs`
 
-- [ ] **Step 1: Write the failing test:**
+- [x] **Step 1: Write the failing test:**
 
 ```rust
 #[tokio::test]
@@ -222,8 +222,8 @@ async fn decode_entry_points_exist_and_are_inert_pre_driver() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (entries don't exist).
-- [ ] **Step 3: Implement:**
+- [x] **Step 2: Run — expect FAIL** (entries don't exist).
+- [x] **Step 3: Implement:**
   - `Vm` fields beside `sync_lane`: `decode: bool`, `decode_inline: bool`, `decode_tos: bool`,
     `decode_threshold: u16` (the test knob; production default = `DECODE_THRESHOLD`, a
     `pub(crate) const` in `decode.rs` — placeholder value 8, **pinned by Task-11 data**),
@@ -237,9 +237,9 @@ async fn decode_entry_points_exist_and_are_inert_pre_driver() {
   - `src/lib.rs`: thread the four knobs through `vm_run_source_cfg`; add the five
     `#[doc(hidden)]` entries (stats returns a small `pub struct DecodeStats` — avoids a 9-tuple).
     Mention all three env vars beside `ASCRIPT_NO_SPECIALIZE` in the CLI `run` path comment.
-- [ ] **Step 4: Run — expect PASS**; clippy + full suite both configs.
-- [ ] **Step 5: Commit** — `feat(vm/decode): decode/decode_inline/decode_tos kill switches + stat counters + test entries (inert)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer greps that NO dispatch line changed; env handling
+- [x] **Step 4: Run — expect PASS**; clippy + full suite both configs.
+- [x] **Step 5: Commit** — `feat(vm/decode): decode/decode_inline/decode_tos kill switches + stat counters + test entries (inert)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer greps that NO dispatch line changed; env handling
   matches the `ASCRIPT_NO_SPECIALIZE`/`ASCRIPT_NO_SYNC_LANE` precedents; tests never set env.
 
 ## Task 3: `DecodedChunk` + the 1:1 decoder (no fusion, no inlining, not yet executed)
@@ -248,7 +248,7 @@ async fn decode_entry_points_exist_and_are_inert_pre_driver() {
 - Create: `src/vm/decode.rs`; modify `src/vm/mod.rs`, `src/vm/chunk.rs` (the two side slots)
 - Test: inline `#[test]`s in `src/vm/decode.rs`
 
-- [ ] **Step 1: Write the failing tests** (decoder correctness against the byte stream itself —
+- [x] **Step 1: Write the failing tests** (decoder correctness against the byte stream itself —
   the disassembler-walk idiom from `bcanalysis`):
 
 ```rust
@@ -328,8 +328,8 @@ fn decoder_refuses_anomalous_jump_targets() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (module doesn't exist).
-- [ ] **Step 3: Implement `src/vm/decode.rs`** per spec §2.2:
+- [x] **Step 2: Run — expect FAIL** (module doesn't exist).
+- [x] **Step 3: Implement `src/vm/decode.rs`** per spec §2.2:
 
 ```rust
 pub(crate) struct DecodedInstr { pub op: DOp, pub a: u32, pub b: u32, pub off: u32 }
@@ -375,10 +375,10 @@ pub(crate) fn byte_to_record(d: &DecodedChunk, off: u32) -> Option<u32> { /* bin
   `#[derive(Debug)]`-compatible via `impl fmt::Debug for DecodedChunk` printing record count).
   The escalation-op classifier reuses LANE's `sync_lane_op` (export it `pub(crate)` from
   `run.rs` — single source of truth; do NOT write a second allowlist).
-- [ ] **Step 4: Run — expect PASS**; clippy + full suite both configs (decoder is dead code so
+- [x] **Step 4: Run — expect PASS**; clippy + full suite both configs (decoder is dead code so
   far — allow `#[allow(dead_code)]` ONLY if clippy demands, removed in Task 4).
-- [ ] **Step 5: Commit** — `feat(vm/decode): DecodedChunk + 1:1 decoder, jump targets pre-resolved (DECODE §2)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer cross-checks the decode walk against `disasm_at`'s walk
+- [x] **Step 5: Commit** — `feat(vm/decode): DecodedChunk + 1:1 decoder, jump targets pre-resolved (DECODE §2)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer cross-checks the decode walk against `disasm_at`'s walk
   on a real compiled program (compile `fib` via the test compile path, decode, assert offs ==
   disasm offsets); probes `JumpIfArgSupplied` (u16+i16 — the jump operand is the SECOND word)
   and `DefineGlobal` (u16+u8) widening; confirms `Break` records when bytes are pre-patched.
@@ -491,7 +491,7 @@ async fn cross_module_panic_provenance_survives_the_hoisted_source_refresh() {
 - [x] **Step 5: Run — expect PASS**; then the FULL differential + property suite + clippy, both
   configs.
 - [x] **Step 6: Commit** — `feat(vm/decode): RecordSource — the sync driver executes pre-decoded records (DECODE §2.4-§2.5, §3)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer (a) audits every `sync_ip` call site — escalation,
+- [x] **Reviewer checkpoint:** reviewer (a) audits every `sync_ip` call site — escalation,
   finish, `Err`, frame push — and constructs a test where a burst escalates at a record whose
   PREVIOUS record was a jump (the likeliest off-by-one); (b) confirms `fiber.frame().ip` after
   a decoded escalation equals the byte-dispatch value (instrument both modes on the same
@@ -503,13 +503,13 @@ async fn cross_module_panic_provenance_survives_the_hoisted_source_refresh() {
 **Files:**
 - Modify: `tests/vm_differential.rs`, `tests/property.rs`, `fuzz/fuzz_targets/differential.rs`
 
-- [ ] **Step 1:** Extend the standing identity everywhere it runs (expression batteries,
+- [x] **Step 1:** Extend the standing identity everywhere it runs (expression batteries,
   program batteries, goldens, whole-corpus gate — extend the existing helper fns, never
   duplicate loops): add `vm_run_source_decoded_forced` and `vm_run_source_no_decode`
   projections (and `vm_run_source_decoded_no_inline` once Task 9 lands, plus
   `vm_run_source_decoded_no_tos` once Task 10 lands — leave a marked extension point). Both
   feature configs.
-- [ ] **Step 2:** The corpus coverage assertion (spec §8.3, the LANE §6.4 idiom):
+- [x] **Step 2:** The corpus coverage assertion (spec §8.3, the LANE §6.4 idiom):
 
 ```rust
 #[tokio::test]
@@ -530,18 +530,18 @@ async fn decoded_dispatch_actually_executes_on_the_corpus() {
 }
 ```
 
-- [ ] **Step 3:** Fuzz axis, same PR: `fuzz/fuzz_targets/differential.rs` adds the
+- [x] **Step 3:** Fuzz axis, same PR: `fuzz/fuzz_targets/differential.rs` adds the
   `vm_run_source_decoded_forced` + `vm_run_source_no_decode` projections to the per-input
   equality + crash report; mirror in `tests/property.rs` (the generated-program battery + the
   fixed-seed battery). `cd fuzz && cargo build` must compile.
-- [ ] **Step 4: Sabotage-test the tripwires** (reviewer repeats independently): temporarily
+- [x] **Step 4: Sabotage-test the tripwires** (reviewer repeats independently): temporarily
   make the frame-entry selection always choose byte dispatch → the coverage assertion FAILS;
   revert. Temporarily corrupt a jump-resolution off-by-one → the property battery or corpus
   FAILS; revert.
-- [ ] **Step 5: Run** — `cargo test --test vm_differential` + `--test property` (BOTH configs),
+- [x] **Step 5: Run** — `cargo test --test vm_differential` + `--test property` (BOTH configs),
   ≥10-min `cargo fuzz run differential` where available.
-- [ ] **Step 6: Commit** — `test(decode): decoded differential modes + fuzz axis + corpus coverage assertion (Gate 15)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer re-runs both sabotages, bumps the property case count,
+- [x] **Step 6: Commit** — `test(decode): decoded differential modes + fuzz axis + corpus coverage assertion (Gate 15)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer re-runs both sabotages, bumps the property case count,
   runs the fuzzer, and confirms the corpus assertion's printed share appears in CI logs.
 
 ## Task 6: The invalidation battery (the JIT-contract proof)
@@ -598,7 +598,7 @@ fn decoded_chunk_validity_unit_tests() {
 - [x] **Step 3:** Fix anything the battery surfaces (failing-test-first; in-branch).
 - [x] **Step 4: Run — expect PASS**; full suite both configs.
 - [x] **Step 5: Commit** — `test(decode): the byte-patch invalidation battery — breakpoints/coverage vs decoded streams (DECODE §4, §8.4)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer probes the edges: set a breakpoint on the SAME offset
+- [x] **Reviewer checkpoint:** reviewer probes the edges: set a breakpoint on the SAME offset
   twice (idempotent set — one epoch bump per patch call, side table keeps the true original);
   clear-all while parked (`apply_clear_breakpoints` restores N bytes = N bumps); break-on-entry
   (`dap/launch.rs` offset 0) on a program whose entry proto is already decoded by a previous
@@ -611,28 +611,28 @@ fn decoded_chunk_validity_unit_tests() {
   (cfg-gated counting), `src/lib.rs` (cfg-gated census entry)
 - Create: `tests/decode_census.rs`, `bench/DECODE_PAIR_CENSUS.md`
 
-- [ ] **Step 1:** Implement the counting mode, **fully `#[cfg(feature = "decode-census")]`**
+- [x] **Step 1:** Implement the counting mode, **fully `#[cfg(feature = "decode-census")]`**
   (compiled out of every default build — the JIT-spec §2.1 not-there discipline; zero Gate-12
   exposure): the record driver, when the feature is on AND a Vm census flag is set, records
   consecutive `(DOp, DOp)` pairs and triples (burst-local `prev`/`prev2`, flushed into a
   `RefCell<HashMap<(u16,u16,u16), u64>>` keyed by discriminants) **within basic blocks only**
   (reset `prev` at jumps/escalations/entry points — never count across a boundary fusion
   could not legally cross).
-- [ ] **Step 2:** `tests/decode_census.rs` — `#[ignore]`d, mirrors `vm_bench`'s big-stack
+- [x] **Step 2:** `tests/decode_census.rs` — `#[ignore]`d, mirrors `vm_bench`'s big-stack
   thread + current-thread-runtime idiom (`vm_bench.rs:374-392`): runs every
   `bench/profiling/*.as` + the runnable corpus (the `all_corpus_examples` enumeration) in
   forced-decode census mode, aggregates, prints the ranked pair/triple table with dynamic
   counts and % of total records.
-- [ ] **Step 3:** Run it:
+- [x] **Step 3:** Run it:
   `cargo test --release --features decode-census --test decode_census -- --ignored --nocapture`
   and commit the output verbatim (machine, date, command, table) as
   `bench/DECODE_PAIR_CENSUS.md`.
-- [ ] **Step 4:** Verify the default build is census-free: `cargo build` then
+- [x] **Step 4:** Verify the default build is census-free: `cargo build` then
   `grep` the census symbols out of `nm`/no — simpler: `cargo clippy --all-targets` (no
   feature) compiles the counting code OUT (confirm via `#[cfg]` review + the zero-cost bench
   re-run in Task 11).
-- [ ] **Step 5: Commit** — `feat(decode): decode-census feature + harness; commit pair/triple census data (DECODE §5.1)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer re-runs the census (numbers may differ slightly —
+- [x] **Step 5: Commit** — `feat(decode): decode-census feature + harness; commit pair/triple census data (DECODE §5.1)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer re-runs the census (numbers may differ slightly —
   RANKS must be stable), confirms the basic-block reset (no pair counted across a jump
   target — probe with a crafted two-block program), and that the default build contains no
   census code path.
@@ -644,7 +644,7 @@ fn decoded_chunk_validity_unit_tests() {
   record driver's extension match), `tests/vm_decode.rs`, `tests/vm_differential.rs`
   (re-run modes)
 
-- [ ] **Step 1:** From the committed census, select **≤ 8** fused forms that (a) rank top by
+- [x] **Step 1:** From the committed census, select **≤ 8** fused forms that (a) rank top by
   dynamic count, (b) fit the record payload (all base operands ≤ u16 — pack two per u32, spec
   §2.1; reserve one u32 word for the fault offset wherever a non-first component can panic),
   (c) compose ONLY shared-helper calls (spec §5.3 — a candidate needing reimplemented
@@ -664,7 +664,7 @@ pub(crate) const FUSION_CANDIDATES: &[FusedForm] = &[
 ];
 ```
 
-- [ ] **Step 2: Write the failing tests:**
+- [x] **Step 2: Write the failing tests:**
 
 ```rust
 #[tokio::test]
@@ -707,15 +707,15 @@ async fn adaptive_cache_keys_are_unchanged_under_fusion() {
 }
 ```
 
-- [ ] **Step 3: Run — expect FAIL**; implement the peephole (a single left-to-right pass over
+- [x] **Step 3: Run — expect FAIL**; implement the peephole (a single left-to-right pass over
   the 1:1 records using the Task-3 entry-point set; greedy longest-match against
   `FUSION_CANDIDATES`; fused record's `off` = first component's, fault word = the panicking
   component's) and the driver arms (each a straight composition of the existing shared
   helpers — `fiber.local`, `eval_binop_adaptive(fiber, fault_off, …)`, `ic_get_field`, …).
-- [ ] **Step 4: Run — expect PASS**; the FULL differential + property suites both configs (the
+- [x] **Step 4: Run — expect PASS**; the FULL differential + property suites both configs (the
   five-way modes now exercise fusion corpus-wide); the Task-5 sabotage for `fused_ops`
   (disable the peephole → assertion fails → revert).
-- [ ] **Step 5: Record the post-fusion RESIDUAL stack-traffic share (Unit D's gate input,
+- [x] **Step 5: Record the post-fusion RESIDUAL stack-traffic share (Unit D's gate input,
   spec §7.3):** run the dispatch-bound trio (`object_churn`, `call_heavy`, `func_pipeline`)
   through `vm_run_source_decode_stats` and record `stack_ops / decoded_ops` per workload in
   the task log + a dated stub section of `bench/DECODE_RESULTS.md` (Task 11 folds it into
@@ -723,8 +723,8 @@ async fn adaptive_cache_keys_are_unchanged_under_fusion() {
   temporarily emptied (a local one-off run, not a shipped switch) — the delta shows how much
   traffic fusion already removed. This number decides whether Unit D (Task 10) is even
   attempted at full depth or fast-tracked to a RECORD-REJECT verdict.
-- [ ] **Step 6: Commit** — `feat(vm/decode): data-driven superinstructions — reviewed FUSION_CANDIDATES + decode-time peephole (DECODE §5)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer verifies every shipped candidate against the committed
+- [x] **Step 6: Commit** — `feat(vm/decode): data-driven superinstructions — reviewed FUSION_CANDIDATES + decode-time peephole (DECODE §5)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer verifies every shipped candidate against the committed
   census (no candidate without a data line); diffs each fused arm against the sequence of
   unfused arms it replaces (helper-call-for-helper-call); probes: breakpoint set ON a fused
   middle's byte offset (epoch → re-decode → that run unfused → trap fires, output identical);
@@ -738,7 +738,7 @@ async fn adaptive_cache_keys_are_unchanged_under_fusion() {
   `DecodeCfg`), `tests/vm_decode.rs`, `tests/vm_differential.rs` (the no-inline mode joins the
   batteries)
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
 
 ```rust
 #[tokio::test]
@@ -840,7 +840,7 @@ async fn profiler_armed_disables_inline_segments_only() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL**; implement per spec §6:
+- [x] **Step 2: Run — expect FAIL**; implement per spec §6:
   - **Predicate** (in `decode.rs`, near the `bcanalysis` static-check style): the §6.1 clause
     list, verbatim, over the candidate site's `GET_GLOBAL f; …; CALL argc` byte shape and the
     resolved proto (resolution via a `DecodeCfg` callback the Vm supplies —
@@ -859,10 +859,10 @@ async fn profiler_armed_disables_inline_segments_only() {
     `inline_segments.non_empty() ⇒ instrument.borrow().is_none()` rule.
   - The differential/no-inline mode joins Task 5's batteries at the marked extension point;
     the fuzz/property projections re-run.
-- [ ] **Step 3: Run — expect PASS**; FULL suite + differential + property, both configs;
+- [x] **Step 3: Run — expect PASS**; FULL suite + differential + property, both configs;
   sabotage the guard (skip the identity leg → the `id_miss` test must FAIL → revert).
-- [ ] **Step 4: Commit** — `feat(vm/decode): speculative global-fn inlining — struct_gen+identity guard, single-branch fallback (DECODE §6)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer hunts the seams: a call site whose argc ≠ arity (must
+- [x] **Step 4: Commit** — `feat(vm/decode): speculative global-fn inlining — struct_gen+identity guard, single-branch fallback (DECODE §6)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer hunts the seams: a call site whose argc ≠ arity (must
   decode 1:1 and panic generically); a candidate with a typed param / default / rest / ret
   contract / cell slot (each must refuse — write a table-driven predicate test); nested
   inline-eligible calls (depth-1 rule holds); `stack.remove` vs the real arm's pop/push net
@@ -883,7 +883,7 @@ fusion already drove `stack_ops/decoded_ops` to noise on the dispatch-bound trio
 implementation steps, go straight to the Task-11 RECORD-REJECT verdict with that data, and
 close this task with the verdict logged. Otherwise proceed.
 
-- [ ] **Step 1: Write the failing tests** — the coverage/kill-switch pair plus **one named test
+- [x] **Step 1: Write the failing tests** — the coverage/kill-switch pair plus **one named test
   per §7.2 flush edge**, each engineered to cross its edge with a LIVE cached TOS:
 
 ```rust
@@ -1000,10 +1000,10 @@ print(total)
   (Implementer: validate program idioms against `examples/**` as usual; the per-edge ASSERTIONS
   are the contract, the programs may be reshaped — but each must demonstrably cross its edge
   with `tos` occupied, which the sabotage in Step 4 proves.)
-- [ ] **Step 2: Run — expect FAIL** (the counter assertions; the identity assertions should
+- [x] **Step 2: Run — expect FAIL** (the counter assertions; the identity assertions should
   already pass — if one fails BEFORE the feature, that is a pre-existing bug: stop and fix it
   first per the production-grade mandate).
-- [ ] **Step 3: Implement** (spec §7.1–§7.2): a burst-local `TosCache { tos: Option<Value> }`
+- [x] **Step 3: Implement** (spec §7.1–§7.2): a burst-local `TosCache { tos: Option<Value> }`
   accessor layer inside `RecordSource` ONLY (`push`/`pop`/`peek(n)` per §7.1; `decode_tos ==
   false` ⇒ the accessors pass straight through to `fiber.stack`). Flush
   (`if let Some(v) = tos.take() { fiber.stack.push(v) }` — idempotent) wired at EVERY §7.2
@@ -1013,13 +1013,13 @@ print(total)
   `InlineEnter`; before `return_from_frame`/`InlineExit`. Reviewer-greppable invariant: every
   `return` out of the record burst and every shared-helper call that takes `&mut Fiber` for
   call/return mechanics is preceded by a flush or operates through the accessor layer.
-- [ ] **Step 4: Sabotage-verify the battery, edge by edge:** comment out ONE edge's flush at a
+- [x] **Step 4: Sabotage-verify the battery, edge by edge:** comment out ONE edge's flush at a
   time; the matching named test (and only correctness, not the others' timing) must FAIL;
   restore. Paste the per-edge evidence in the task log. Then full suite + differential +
   property, BOTH configs; the fuzz/property no-tos projection added at the Task-5 extension
   point.
-- [ ] **Step 5: Commit** — `feat(vm/decode): Unit D — TOS register cache in the record burst, complete flush-edge contract (DECODE §7)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer independently re-derives the flush-edge list from the
+- [x] **Step 5: Commit** — `feat(vm/decode): Unit D — TOS register cache in the record burst, complete flush-edge contract (DECODE §7)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer independently re-derives the flush-edge list from the
   driver's exit edges and diffs it against §7.2 (a NEW exit edge added since the spec means a
   NEW flush + test — check none was missed); probes `peek(1)`-class under-TOS arms
   (`MapEntry`/`AppendArray`/`Swap`/`Rot3`/`SetIndex`) with TOS occupied; re-runs the corpus
@@ -1032,23 +1032,23 @@ print(total)
 - Modify: `tests/vm_bench.rs`; Create: `bench/DECODE_RESULTS.md`; Modify:
   `bench/PROFILING_RESULTS.md`
 
-- [ ] **Step 1:** `vm_bench.rs` gains `Engine::NoDecodeVm` (→ `vm_run_source_no_decode`) and a
+- [x] **Step 1:** `vm_bench.rs` gains `Engine::NoDecodeVm` (→ `vm_run_source_no_decode`) and a
   `decode_on_off` section after the lane section: per-bench decoded(default)/no-decode
   medians + speedups + geomean. GATE: decoded-on shows **no regression** on any bench
   (≥ 0.97× noise bound); the speedup is REPORTED.
-- [ ] **Step 2:** Full harness run —
+- [x] **Step 2:** Full harness run —
   `cargo test --release --test vm_bench -- --ignored --nocapture`. Required `[PASS]` rows:
   spec/tw geomean ≥ 2.0× (Gates 12/17), `dbg_zero_cost_gate` armed/none ≤ 1.05× (DECODE
   touches dispatch ⇒ mandatory re-run; per spec §6.6 the armed-idle config loses ONLY inline
   segments — record that delta explicitly in the header notes), cov/off re-reported, the new
   decode section. Append the dated GATE RESULT block to the file header (the standing
   convention).
-- [ ] **Step 3: Threshold A/B (spec §2.3):** with `bench/ab.sh` (same session): candidate
+- [x] **Step 3: Threshold A/B (spec §2.3):** with `bench/ab.sh` (same session): candidate
   built twice via env-free test knob? — no: run the SAME binary with
   `DECODE_THRESHOLD`-selecting env (add `ASCRIPT_DECODE_THRESHOLD` as a test-facing env read
   beside the kill switches) over the 8-workload corpus at threshold 0 vs 8 vs 32. Pin the
   shipped `DECODE_THRESHOLD` constant from the winner; record the table.
-- [ ] **Step 4: Same-session A/B (Gate 16):** baseline = merge-base worktree build, candidate
+- [x] **Step 4: Same-session A/B (Gate 16):** baseline = merge-base worktree build, candidate
   = branch (`bench/ab.sh <base> <cand> 7`); plus the three isolating A/Bs on the candidate
   binary alone: `ASCRIPT_NO_DECODE=1` vs default (Units A+B contribution),
   `ASCRIPT_NO_DECODE_INLINE=1` vs default (Unit C contribution, over `call_heavy` +
@@ -1057,12 +1057,12 @@ print(total)
   ordering). Profile ≥ 1 workload with the shipped profiler
   (`--profile cpu` — Gate-16 dogfooding). Peak RSS per workload + total decoded bytes
   (Gate 18) — an RSS regression is a bug to fix before merge.
-- [ ] **Step 5: THE UNIT-C VERDICT (spec §6.7):** if the isolated inline win is **< 2% geomean
+- [x] **Step 5: THE UNIT-C VERDICT (spec §6.7):** if the isolated inline win is **< 2% geomean
   on the call-heavy corpus**, Unit C is DROPPED: revert the Task-9 feature commits (keep the
   deps machinery + its tests — they are §4's), record the verdict + data in
   `bench/DECODE_RESULTS.md` and `goal-perf.md`. Either way the outcome is written down with
   numbers — never silent.
-- [ ] **Step 5b: THE UNIT-D VERDICT (spec §7.5) — both outcomes specified:**
+- [x] **Step 5b: THE UNIT-D VERDICT (spec §7.5) — both outcomes specified:**
   - **SHIP** iff the isolated tos-on win is **≥ 2% geomean on the dispatch-bound trio**
     (`object_churn` + `call_heavy` + `func_pipeline`) AND no workload anywhere regresses
     beyond the 0.97× noise bound. Record the table; `decode_tos` stays default-true with its
@@ -1074,14 +1074,14 @@ print(total)
     write the verdict + the residual-stack-traffic share + the A/B table into
     `bench/DECODE_RESULTS.md` and `goal-perf.md`. Honest single digits were the stated
     expectation — a near-zero result is a legitimate, documented outcome, never silent.
-- [ ] **Step 6:** Write `bench/DECODE_RESULTS.md` (machine/date/methodology, the A/B tables,
+- [x] **Step 6:** Write `bench/DECODE_RESULTS.md` (machine/date/methodology, the A/B tables,
   threshold table, the Task-8 residual-stack-traffic section, RSS + decoded-bytes table, the
   inline AND tos verdicts) and append the
   **post-DECODE re-profile** section to `bench/PROFILING_RESULTS.md` (bucket re-attribution
   on `object_churn`/`call_heavy` + the explicit **JIT gate verdict paragraph**: does dispatch
   still dominate? — `goal-perf.md`'s mandatory re-rank checkpoint).
-- [ ] **Step 7: Commit** — `bench(decode): Gate-12/17 re-runs + threshold A/B + same-session A/B + inline/tos verdicts + post-DECODE re-profile (Gates 16/18)` (house trailer).
-- [ ] **Reviewer checkpoint:** reviewer re-runs the harness independently; checks every number
+- [x] **Step 7: Commit** — `bench(decode): Gate-12/17 re-runs + threshold A/B + same-session A/B + inline/tos verdicts + post-DECODE re-profile (Gates 16/18)` (house trailer).
+- [x] **Reviewer checkpoint:** reviewer re-runs the harness independently; checks every number
   in the .md files against raw output; verifies baseline/candidate ran interleaved in one
   session; confirms the JIT-verdict paragraph follows from the data; if any bench regressed
   decoded-on beyond noise, that is a bug fixed here (likeliest: the frame-entry validity
@@ -1094,7 +1094,7 @@ print(total)
 - Modify: `CLAUDE.md`, `goal-perf.md`, `superpowers/roadmap.md`,
   `superpowers/specs/2026-06-12-decoded-dispatch-design.md` (status header)
 
-- [ ] **Step 1: The example** — `examples/advanced/decode_hot_loop.as`: a production-shaped,
+- [x] **Step 1: The example** — `examples/advanced/decode_hot_loop.as`: a production-shaped,
   fully error-handled hot loop over small global fns + an arithmetic pipeline (the
   inline+fusion happy path) AND the edge: a mutable-`let` callback rebound mid-run (the
   guard-miss path runs in an ordinary program). Deterministic, run-to-completion,
@@ -1102,7 +1102,7 @@ print(total)
   assertions). Verify on all four modes + `--tree-walker`. (The breakpoint-during-hot-loop
   edge lives in `tests/vm_decode.rs` — examples cannot drive the DAP; record that mapping
   here per Gate 9.)
-- [ ] **Step 2: Docs/status:**
+- [x] **Step 2: Docs/status:**
   - `CLAUDE.md`: a DECODE paragraph in the VM architecture notes (the decoded side
     representation + the `patch_epoch` chokepoint + "drop, never edit" + the kill switches
     beside `--no-specialize`/`ASCRIPT_NO_SYNC_LANE` (incl. `ASCRIPT_NO_DECODE_TOS` if Unit D
@@ -1117,35 +1117,35 @@ print(total)
     silent deviation; the §10 narrowings are already recorded — only NEW deltas go here).
   - User-facing `docs/`: engine-internal, no surface change — confirm no page is stale and
     record that this was checked (Gate 13).
-- [ ] **Step 3: FINAL GATES CHECKLIST** (every box requires pasted command output in the task
+- [x] **Step 3: FINAL GATES CHECKLIST** (every box requires pasted command output in the task
   log — evidence before assertions):
-  - [ ] `cargo clippy --all-targets` AND `cargo clippy --no-default-features --all-targets`
+  - [x] `cargo clippy --all-targets` AND `cargo clippy --no-default-features --all-targets`
         clean.
-  - [ ] `cargo test` AND `cargo test --no-default-features` green.
-  - [ ] `cargo test --test vm_differential` green BOTH configs (six-way identity — incl. the
+  - [x] `cargo test` AND `cargo test --no-default-features` green.
+  - [x] `cargo test --test vm_differential` green BOTH configs (six-way identity — incl. the
         no-tos mode if Unit D shipped — + corpus + the decoded/fused/inline/tos coverage
         assertions).
-  - [ ] `cargo test --test property` green both configs; `cd fuzz && cargo build` compiles; a
+  - [x] `cargo test --test property` green both configs; `cd fuzz && cargo build` compiles; a
         ≥10-min `cargo fuzz run differential` session where available, no findings (or
         findings fixed in-branch, failing-test-first).
-  - [ ] The invalidation battery AND (if Unit D shipped) the flush-edge battery green
+  - [x] The invalidation battery AND (if Unit D shipped) the flush-edge battery green
         (`cargo test --test vm_decode`), including the sabotage evidence (each tripwire and
         each flush edge shown to FAIL when its path is disabled).
-  - [ ] `cargo test --release --test vm_bench -- --ignored --nocapture`: spec/tw ≥ 2×,
+  - [x] `cargo test --release --test vm_bench -- --ignored --nocapture`: spec/tw ≥ 2×,
         `dbg_zero_cost_gate` ≤ 1.05×, decode section no-regression — all `[PASS]`; results
         recorded in the header block.
-  - [ ] `bench/DECODE_RESULTS.md` + `bench/DECODE_PAIR_CENSUS.md` + post-DECODE
+  - [x] `bench/DECODE_RESULTS.md` + `bench/DECODE_PAIR_CENSUS.md` + post-DECODE
         `PROFILING_RESULTS.md` committed; RSS + decoded-bytes + residual stack-traffic
         reported, no regression; the Unit-C and Unit-D verdicts recorded with numbers.
-  - [ ] Byte-identity of the untouched surfaces: `git diff main -- src/vm/aso.rs
+  - [x] Byte-identity of the untouched surfaces: `git diff main -- src/vm/aso.rs
         src/vm/verify.rs src/vm/disasm.rs src/interp.rs` empty (doc-only diffs justified
         line-by-line); `ASO_FORMAT_VERSION` unchanged; tree-sitter/fmt/LSP untouched (no
         surface change — recorded).
-  - [ ] No new `unwrap/expect/panic!` reachable from user input in touched code (reviewer
+  - [x] No new `unwrap/expect/panic!` reachable from user input in touched code (reviewer
         grep + a justification list for VM-bug-invariant panics mirroring existing ones).
-  - [ ] `examples/**` emits 0 `type-*` diagnostics in BOTH configs (Gate 5 — the new example
+  - [x] `examples/**` emits 0 `type-*` diagnostics in BOTH configs (Gate 5 — the new example
         included).
-- [ ] **Step 4: Holistic review** — a fresh reviewer subagent reviews the WHOLE branch diff
+- [x] **Step 4: Holistic review** — a fresh reviewer subagent reviews the WHOLE branch diff
   against the spec: record layout vs §2.2, the §3 ip-discipline at every driver exit, the §4
   epoch contract (incl. deps + the instrument rule), peephole boundary rule vs §5.2, fused
   arms as pure helper compositions, the §6.1 predicate clause-by-clause, guard completeness
@@ -1153,7 +1153,7 @@ print(total)
   (if Unit D shipped), SP3 depth accounting, and hunts latent bugs in neighbors
   (`entry_index` binary-search edges, `stack.remove` arithmetic, counter + TOS flush on `Err`,
   census basic-block resets). All findings fixed in-branch, failing-test-first, before merge.
-- [ ] **Step 5: Merge** — `git checkout main && git merge --no-ff feat/decoded-dispatch`
+- [x] **Step 5: Merge** — `git checkout main && git merge --no-ff feat/decoded-dispatch`
   (summary message, house trailer). Update `goal-perf.md` status table post-merge.
 
 ---
