@@ -11,6 +11,19 @@ negative; it is kept for its **invalidation contract** (the JIT prerequisite —
 > Honest single digits were the stated goal. A near-zero / negative result is a
 > legitimate, documented outcome — recorded here, never silent.
 
+## OWNER DECISION (2026-06-15, recorded verbatim — load-bearing)
+
+The owner reviewed this Task-11 evidence and decided: **SHIP DECODE default-ON,
+accepting the ~2.3% whole-program regression** (decode-on geomean **0.977×** vs
+decode-off; worst `func_pipeline` **0.933×**). DECODE's value is the **invalidation
+contract — the JIT prerequisite** (the spec's primary recorded purpose), exercised on
+the REAL execution path; the `ASCRIPT_NO_DECODE` kill switch is the escape hatch. This
+is a **CONSCIOUSLY-ACCEPTED, recorded trade against the "zero perf regression" gate**
+(owner-noted per AskUserQuestion, 2026-06-15). Units C+D dropped by evidence (inline
++0.45% < 2%; TOS −1.6%, object_churn −3.2%). The kill switch sits beside
+`--no-specialize` / `ASCRIPT_NO_SYNC_LANE` / `ASCRIPT_NO_CALL_FAST` as the complete
+pure-byte-path semantic floor.
+
 ## Machine / date / methodology
 
 - **Date:** 2026-06-14 (UTC)

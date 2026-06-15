@@ -408,6 +408,34 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   allocs/qualifying call; A3 → 31→15 allocs/element; spec/tw geomean **4.05×**; A/B geomean
   **1.000×** (func_pipeline +1.1%, call_heavy +1.6%); `dbg_zero_cost_gate` **1.005×**; RSS no
   regression.
+- **DECODE — pre-decoded instruction stream + superinstruction fusion + the byte-patch invalidation
+  contract** (VM-only; spec `superpowers/specs/2026-06-12-decoded-dispatch-design.md`). A per-`FnProto`,
+  **lazily-built decoded side representation** (`DecodedChunk` in `src/vm/decode.rs`: fixed-width op
+  records, operands widened, jump targets pre-resolved) that the LANE sync driver executes from instead of
+  re-decoding `Chunk.code` bytes. **`Chunk.code` is byte-identical** to before (disassembler / goldens /
+  `.aso` / `ASO_FORMAT_VERSION` 28 all unchanged — DECODE never mutates or reformats bytes). **Unit B —
+  superinstruction fusion:** a peephole over the decoded records rewrites hot adjacent op runs into ONE
+  fused record; the `FUSION_CANDIDATES` set is **data-driven from the committed op-pair census**
+  (`bench/DECODE_PAIR_CENSUS.md`) — it changes ONLY with refreshed committed census data, never guessed
+  (current forms: `GetLocal;GetProp`, `GetLocal;GetProp;Add`, `GetProp;Add`, `GetLocal;GetLocal`,
+  `GetLocal;Const`, `Const;GetLocal`). **§4 invalidation contract (the load-bearing deliverable — the JIT
+  prerequisite):** the ONLY thing that mutates bytes is `Op::Break` byte-patching (DBG); it routes through
+  the `Chunk.patch_epoch` chokepoint which **drops the decoded cache (never edits decoded records)** so a
+  live decoded stream is rebuilt from the patched bytes on the next decode — "drop, never edit." The
+  deps-epoch machinery is the same invalidation story a future JIT needs, built and tested here first
+  (`tests/vm_decode.rs` battery; the breakpoint-during-hot-loop edge lives there, not in an example).
+  **Kill switch:** `Vm.decode` (`bool`, default true; env `ASCRIPT_NO_DECODE=1`) — sits beside
+  `--no-specialize` / `ASCRIPT_NO_SYNC_LANE` / `ASCRIPT_NO_CALL_FAST` as the pure-byte-path floor;
+  `Vm::new_generic` does NOT disable decode (it's lane-side). **Seven-way differential identity:**
+  tree-walker == specialized == generic == lane-off == no-call-fast == decoded-forced (threshold 0) ==
+  no-decode, both feature configs (`vm_differential.rs`). **Owner-accepted trade:** Units A+B ship
+  **default-on accepting a ~2.3% whole-program regression** (decode-on geomean 0.977× vs decode-off; worst
+  `func_pipeline` 0.933×) — the invalidation contract is the value, the kill switch is the escape hatch
+  (recorded in `goal-perf.md` + `bench/DECODE_RESULTS.md`). **Units C (speculative global-fn inlining) and
+  D (top-of-stack register cache) were EVIDENCE-DROPPED** (reverted, not shipped — inline +0.45% < 2%
+  gate; TOS −1.6%, object_churn −3.2%); their `ASCRIPT_NO_DECODE_INLINE`/`ASCRIPT_NO_DECODE_TOS` env reads
+  + flags remain as INERT no-ops (documented inert in `docs/content/cli.md`). spec/tw geomean ≥ 2×;
+  `dbg_zero_cost_gate` ≈ 1.0×; no `.aso`/grammar/LSP/fmt change.
 
 ## Commands
 

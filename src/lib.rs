@@ -988,12 +988,11 @@ pub async fn vm_run_source_lane_stats_no_lane(
 
 /// **DECODE §8.3 — per-run stat bundle returned by the decode-stats test entries.**
 ///
-/// All counter fields start at 0 and stay 0 until the corresponding DECODE task
-/// wires them up:
-/// - Task 4 (RecordSource driver): `decoded_ops`, `decoded_bytes`, `stack_ops`
-/// - Task 8 (Unit B fusion):       `fused_ops`
-/// - Task 9 (Unit C inlining):     `inline_hits`, `inline_misses`
-/// - Task 10 (Unit D TOS cache):   `tos_ops`
+/// Wired counters:
+/// - RecordSource driver (Unit A): `decoded_ops`, `decoded_bytes`, `stack_ops`
+/// - Unit B fusion:                `fused_ops`
+/// - `inline_hits`/`inline_misses` (Unit C) and `tos_ops` (Unit D) stay 0 —
+///   those units were EVIDENCE-DROPPED, so the counters are permanently inert.
 ///
 /// The `output` and `exit_code` fields carry the program's normal result so the
 /// test can assert correctness while also inspecting the counters.
@@ -1011,16 +1010,16 @@ pub struct DecodeStats {
     pub decoded_ops: u64,
     /// Fused superinstruction records retired (Unit B).
     pub fused_ops: u64,
-    /// `InlineEnter` guard hits (Unit C).
+    /// INERT (Unit C evidence-dropped) — permanently 0.
     pub inline_hits: u64,
-    /// `InlineEnter` guard misses (Unit C).
+    /// INERT (Unit C evidence-dropped) — permanently 0.
     pub inline_misses: u64,
     /// Total bytes of decoded record streams resident in memory at end-of-run.
     pub decoded_bytes: u64,
-    /// Fiber-stack push + pop operations retired by the record driver (Unit D gate
-    /// input).
+    /// Fiber-stack push + pop operations retired by the record driver (the §7.3
+    /// stack-traffic gate input).
     pub stack_ops: u64,
-    /// Records retired with the TOS register cache active (Unit D).
+    /// INERT (Unit D evidence-dropped) — permanently 0.
     pub tos_ops: u64,
 }
 
@@ -1047,24 +1046,6 @@ pub async fn vm_run_source_decoded_forced(src: &str) -> Result<(String, Option<i
     vm_run_source_decode_cfg(src, true, true, true, 0).await
 }
 
-/// Like [`vm_run_source_decoded_forced`] but with DECODE INLINE DISABLED — Unit C
-/// inlining suppressed while decoding + Unit B fusion remain active.
-/// INERT until Task 9. `#[doc(hidden)]` — not a stable API.
-#[doc(hidden)]
-pub async fn vm_run_source_decoded_no_inline(src: &str) -> Result<(String, Option<i32>), AsError> {
-    // decode=ON, threshold=0, decode_inline=OFF.
-    vm_run_source_decode_cfg(src, true, false, true, 0).await
-}
-
-/// Like [`vm_run_source_decoded_forced`] but with DECODE TOS CACHE DISABLED — Unit D
-/// TOS caching suppressed while decoding + fusion + inlining remain active.
-/// INERT until Task 10. `#[doc(hidden)]` — not a stable API.
-#[doc(hidden)]
-pub async fn vm_run_source_decoded_no_tos(src: &str) -> Result<(String, Option<i32>), AsError> {
-    // decode=ON, threshold=0, decode_tos=OFF.
-    vm_run_source_decode_cfg(src, true, true, false, 0).await
-}
-
 /// DECODE §8.3: run `src` on the VM with DECODE FORCED (threshold=0) and return
 /// a [`DecodeStats`] bundle containing the program output + all stat counters.
 /// All counters are 0 until the corresponding task wires them up (INERT until
@@ -1083,14 +1064,6 @@ pub async fn vm_run_source_decode_stats(src: &str) -> Result<DecodeStats, AsErro
 pub async fn vm_run_source_decode_stats_no_decode(src: &str) -> Result<DecodeStats, AsError> {
     use crate::vm::Vm;
     vm_run_source_decode_stats_cfg(src, false, true, true, Vm::DECODE_THRESHOLD).await
-}
-
-/// DECODE §8.3 variant: like [`vm_run_source_decode_stats`] but with inline OFF.
-/// `#[doc(hidden)]` — not a stable API.
-#[cfg(any(test, feature = "fuzzgen", fuzzing))]
-#[doc(hidden)]
-pub async fn vm_run_source_decode_stats_no_inline(src: &str) -> Result<DecodeStats, AsError> {
-    vm_run_source_decode_stats_cfg(src, true, false, true, 0).await
 }
 
 /// **DECODE §5.1 (Unit B part 1): run `src` in CENSUS mode** — DECODE FORCED

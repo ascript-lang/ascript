@@ -482,12 +482,11 @@ pub struct ShapeStats {
 /// **DECODE — per-VM stat counters (anti-false-green, DECODE §8.3).**
 ///
 /// Compiled only under `#[cfg(any(test, feature = "fuzzgen", fuzzing))]` so
-/// the production build carries zero overhead. All fields start at 0 and stay 0
-/// until the corresponding DECODE task wires them up:
-/// - Task 4 (RecordSource): `decoded_ops`, `decoded_bytes`, `stack_ops`
-/// - Task 8 (Unit B fusion): `fused_ops`
-/// - Task 9 (Unit C inline): `inline_hits`, `inline_misses`
-/// - Task 10 (Unit D TOS):   `tos_ops`
+/// the production build carries zero overhead. Wired counters:
+/// - RecordSource (Unit A): `decoded_ops`, `decoded_bytes`, `stack_ops`
+/// - Unit B fusion:          `fused_ops`
+/// - `inline_hits`/`inline_misses` (Unit C) and `tos_ops` (Unit D) stay 0 —
+///   those units were EVIDENCE-DROPPED, so the counters are permanently inert.
 ///
 /// The public wrapper is [`DecodeStats`] in `lib.rs`, which bundles the counters
 /// together with the program output for the test entry points.
@@ -496,20 +495,19 @@ pub struct ShapeStats {
 pub struct DecodeStatsInner {
     /// Total records retired by the `RecordSource` driver across all bursts.
     pub decoded_ops: u64,
-    /// Fused superinstruction records retired (Unit B, Task 8).
+    /// Fused superinstruction records retired (Unit B).
     pub fused_ops: u64,
-    /// `InlineEnter` guard hits — the inlined body ran (Unit C, Task 9).
+    /// INERT (Unit C evidence-dropped) — would have counted inline guard hits.
     pub inline_hits: u64,
-    /// `InlineEnter` guard misses — fell back to the real `Op::Call` (Unit C, Task 9).
+    /// INERT (Unit C evidence-dropped) — would have counted inline guard misses.
     pub inline_misses: u64,
     /// Total bytes occupied by decoded record streams at the end of the run
-    /// (memory accounting gate input, Task 4+).
+    /// (memory accounting gate input).
     pub decoded_bytes: u64,
     /// Fiber-stack push + pop operations retired by the record driver — the
-    /// Unit-D §7.3 gate input (starts counting in Task 4, Task 8 sees the
-    /// post-fusion reduction, Task 10 sees the post-TOS residual).
+    /// §7.3 stack-traffic gate input (Unit B sees the post-fusion reduction).
     pub stack_ops: u64,
-    /// Records retired with the TOS register cache active (Unit D, Task 10).
+    /// INERT (Unit D evidence-dropped) — would have counted TOS-cached records.
     pub tos_ops: u64,
 }
 
@@ -706,30 +704,30 @@ pub struct Vm {
     /// streams and execute from them. When `false` (`ASCRIPT_NO_DECODE=1`),
     /// the VM always executes from `Chunk.code` bytes — byte-identical to the
     /// on path; only throughput may differ. Worker isolates inherit this flag
-    /// from the environment at construction time. INERT until Task 4 wires up
-    /// the `RecordSource` driver.
+    /// from the environment at construction time. The `RecordSource` driver
+    /// (Units A+B — decoded stream + fusion) honors it on the real hot path.
     decode: bool,
-    /// **DECODE Unit-C kill switch.** When `true` (the default), decoded
-    /// execution may speculatively inline small hot global fns behind the
-    /// `struct_gen` + identity guard. When `false` (`ASCRIPT_NO_DECODE_INLINE=1`),
-    /// inlining is suppressed — decoding continues, inline segments are skipped.
-    /// INERT until Task 9.
+    /// **DECODE Unit-C kill switch — INERT (Unit C evidence-dropped).** The
+    /// `ASCRIPT_NO_DECODE_INLINE` env read still populates this flag, but Unit C
+    /// (speculative global-fn inlining) was reverted by evidence, so nothing
+    /// consults it: it is a permanent no-op kept only so the env var keeps
+    /// parsing. Removing it cascades through the 8-arg `with_all_flags`/census
+    /// constructors for no behavioral gain.
     decode_inline: bool,
-    /// **DECODE Unit-D kill switch.** When `true` (the default), the record
-    /// burst may cache the top-of-stack in a Rust local (§7.2 flush-edge
-    /// contract). When `false` (`ASCRIPT_NO_DECODE_TOS=1`), TOS caching is
-    /// suppressed — the accessors pass straight through to `fiber.stack`. INERT
-    /// until Task 10.
+    /// **DECODE Unit-D kill switch — INERT (Unit D evidence-dropped).** As with
+    /// `decode_inline`: the `ASCRIPT_NO_DECODE_TOS` env read still populates this
+    /// flag, but Unit D (top-of-stack register caching) was reverted by evidence,
+    /// so nothing consults it — a permanent no-op kept only for env-var parity.
     decode_tos: bool,
     /// **DECODE warmth threshold (Task-11 A/B knob).** A proto must be entered
     /// at least this many times before its chunk is decoded. Production default
     /// = `DECODE_THRESHOLD` (placeholder 8, pinned by Task-11 A/B data).
-    /// Test entry points set this to 0 so decoding triggers immediately. INERT
-    /// until Task 4 consults it.
+    /// Test entry points set this to 0 so decoding triggers immediately.
     decode_threshold: u16,
-    /// **DECODE stat counters (anti-false-green, DECODE §8.3).** All counters are
-    /// 0 until Task 4 (records retired), Task 8 (fused), Task 9 (inline), and
-    /// Task 10 (tos) wire them up. Compiled only under test/fuzzgen/fuzzing.
+    /// **DECODE stat counters (anti-false-green, DECODE §8.3).** `decoded_ops`/
+    /// `decoded_bytes`/`stack_ops` are wired by the RecordSource driver and
+    /// `fused_ops` by Unit B; the `inline_*`/`tos_ops` counters stay 0 (Units
+    /// C/D evidence-dropped — inert). Compiled only under test/fuzzgen/fuzzing.
     /// See [`DecodeStatsInner`] for field semantics.
     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
     decode_stats: std::cell::Cell<crate::vm::run::DecodeStatsInner>,

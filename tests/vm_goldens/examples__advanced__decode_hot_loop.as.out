@@ -1,0 +1,9 @@
+# exit: none
+=== DECODE hot loop: decoded + fused dispatch ===
+pipeline total over 2000 iterations: 3158000
+
+=== guarded pipeline (recover around a malformed record) ===
+caught malformed record: index 999 out of bounds (len 0)
+clean guarded total: 60 (err: nil)
+
+result bucket: large

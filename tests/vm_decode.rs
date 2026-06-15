@@ -31,7 +31,9 @@ fn visit(dir: &Path, f: &mut dyn FnMut(&Path, &str)) {
 /// and their outputs are byte-identical to the default VM. Pre-Task-4 every
 /// counter was 0; Task 4 wires the RecordSource driver, so under the FORCED
 /// (threshold-0) stats entry point `decoded_ops`/`decoded_bytes`/`stack_ops` now
-/// rise above 0 while the FUSED/INLINE/TOS counters (Units B/C/D) stay 0.
+/// rise above 0; Unit B fusion fires (`fused_ops > 0`). The INLINE/TOS counters
+/// (Units C/D) stay 0 — those units were EVIDENCE-DROPPED, so the counters are
+/// permanently inert (kept only as the §8.3 zero-floor proof).
 #[tokio::test]
 async fn decode_entry_points_exist_and_are_byte_identical() {
     let src = "let s = 0\nfor (i in 0..100) { s = s + i }\nprint(s)";
@@ -43,7 +45,8 @@ async fn decode_entry_points_exist_and_are_byte_identical() {
     // Task 4: the FORCED stats entry point (threshold 0) retires records, so the
     // wired counters are positive. Task 8 (Unit B): the loop body
     // (`s = s + i`) contains a `GetLocal; ...; Add`-style accumulate shape, so
-    // fusion fires → `fused_ops > 0`. The Unit C/D counters stay 0.
+    // fusion fires → `fused_ops > 0`. The Unit C/D counters stay 0 — those units
+    // were evidence-dropped, so their counters are permanently inert.
     let st = ascript::vm_run_source_decode_stats(src).await.expect("stats ok");
     assert!(st.decoded_ops > 0, "RecordSource must retire records under forced decode");
     assert!(st.decoded_bytes > 0, "memory accounting must report");
@@ -52,7 +55,7 @@ async fn decode_entry_points_exist_and_are_byte_identical() {
     assert_eq!(
         (st.inline_hits, st.inline_misses, st.tos_ops),
         (0, 0, 0),
-        "Unit C/D counters stay 0 until their tasks land"
+        "Unit C/D counters stay 0 — those units were evidence-dropped (permanently inert)"
     );
 }
 

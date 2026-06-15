@@ -5760,8 +5760,9 @@ async fn ic_mixed_object_and_instance_same_site() {
 /// proto executes from records) and no-decode (`ASCRIPT_NO_DECODE` — the pure
 /// byte path) projections are the SIXTH and SEVENTH modes, added in the SAME PR
 /// as the kill switch so the decode path is a PERMANENT differential citizen.
-/// EXTENSION POINT: add `vm_run_source_decoded_no_inline` (Task 9) and
-/// `vm_run_source_decoded_no_tos` (Task 10) here as their fast paths land.
+/// (Units C/D — inline + TOS — were EVIDENCE-DROPPED, so the planned
+/// `decoded-no-inline`/`decoded-no-tos` modes never landed; the seven modes
+/// below are the complete identity for the shipped Units A+B.)
 async fn assert_three_way_matches(src: &str) {
     let tw = ascript::run_source_exit(src).await;
     let spec = ascript::vm_run_source(src).await;
