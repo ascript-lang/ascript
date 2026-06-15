@@ -42,24 +42,35 @@ fn project(r: Result<(String, Option<i32>), ascript::error::AsError>) -> Outcome
     }
 }
 
-/// The six engine projections for one program: tree-walker, specialized-VM (lane-on),
-/// generic-VM, `.aso` round-trip, specialized-VM (lane-off), and specialized-VM
-/// (no-call-fast). LANE §6.1 adds the lane-off axis; CALL §8.1 adds the no-call-fast
-/// axis so the proptest properties exercise all six modes on every generated program.
+/// The eight engine projections for one program: tree-walker, specialized-VM (lane-on),
+/// generic-VM, `.aso` round-trip, specialized-VM (lane-off), specialized-VM
+/// (no-call-fast), specialized-VM (decoded-forced), and specialized-VM (no-decode).
+/// LANE §6.1 adds the lane-off axis; CALL §8.1 adds the no-call-fast axis; DECODE §8.3
+/// (Gate 15) adds the decoded-forced + no-decode axes so the proptest properties
+/// exercise all eight modes on every generated program.
 ///
 /// (Type name kept as `FourWay` for minimal diff; the tuple has grown with each spec.)
-type FourWay = (Outcome, Outcome, Outcome, Outcome, Outcome, Outcome);
+type FourWay = (
+    Outcome,
+    Outcome,
+    Outcome,
+    Outcome,
+    Outcome,
+    Outcome,
+    Outcome,
+    Outcome,
+);
 
-/// Run `src` on all six engines (+ the `.aso` round-trip + lane-off + no-call-fast)
-/// on the worker stack and return their projected outcomes. Spawns ONE 512 MB worker
-/// thread per call — fine for a single program; for many programs prefer
-/// [`run_all_engines_batch`] to amortize the spawn.
+/// Run `src` on all eight engines (+ the `.aso` round-trip + lane-off + no-call-fast +
+/// decoded-forced + no-decode) on the worker stack and return their projected outcomes.
+/// Spawns ONE 512 MB worker thread per call — fine for a single program; for many
+/// programs prefer [`run_all_engines_batch`] to amortize the spawn.
 fn run_all_engines(src: &str) -> FourWay {
     let src = src.to_string();
     ascript::run_on_worker_stack(move || async move { run_four_way(&src).await })
 }
 
-/// The async core: run `src` on all six modes and project each outcome. Must be called
+/// The async core: run `src` on all eight modes and project each outcome. Must be called
 /// on the worker stack (the engines are `!Send` current-thread tokio with deep recursion).
 async fn run_four_way(src: &str) -> FourWay {
     let tw = project(ascript::run_source_exit(src).await);
@@ -70,7 +81,11 @@ async fn run_four_way(src: &str) -> FourWay {
     let nolane = project(ascript::vm_run_source_no_sync_lane(src).await);
     // CALL §8.1: no-call-fast must be byte-identical to all other modes.
     let nocf = project(ascript::vm_run_source_no_call_fast(src).await);
-    (tw, vm, gen, aso, nolane, nocf)
+    // DECODE §8.3 (Gate 15): decoded-forced (threshold 0) + no-decode must be
+    // byte-identical to all other modes — generated programs are checked decoded==byte.
+    let decfwd = project(ascript::vm_run_source_decoded_forced(src).await);
+    let nodec = project(ascript::vm_run_source_no_decode(src).await);
+    (tw, vm, gen, aso, nolane, nocf, decfwd, nodec)
 }
 
 /// Run a BATCH of programs through all five modes inside a SINGLE worker-stack thread,
@@ -125,7 +140,7 @@ proptest! {
     #[test]
     fn three_way_differential_over_generated_programs(bytes in prop::collection::vec(any::<u8>(), 64..768)) {
         let prog = fuzzgen::gen_program_from_bytes(&bytes);
-        let (tw, vm, gen, aso, nolane, nocf) = run_all_engines(&prog.source);
+        let (tw, vm, gen, aso, nolane, nocf, decfwd, nodec) = run_all_engines(&prog.source);
         prop_assert_eq!(
             &tw, &vm,
             "specialized-VM diverged from tree-walker\n--- program ---\n{}\n--- tw: {:?}\n--- vm: {:?}",
@@ -153,23 +168,37 @@ proptest! {
             "no-call-fast VM diverged from tree-walker\n--- program ---\n{}\n--- tw: {:?}\n--- nocf: {:?}",
             prog.source, tw, nocf
         );
+        // DECODE §8.3 (Gate 15): decoded-forced + no-decode must be byte-identical.
+        prop_assert_eq!(
+            &tw, &decfwd,
+            "decoded-forced VM diverged from tree-walker (a real DECODE record-driver bug)\n--- program ---\n{}\n--- tw: {:?}\n--- decfwd: {:?}",
+            prog.source, tw, decfwd
+        );
+        prop_assert_eq!(
+            &tw, &nodec,
+            "no-decode VM diverged from tree-walker\n--- program ---\n{}\n--- tw: {:?}\n--- nodec: {:?}",
+            prog.source, tw, nodec
+        );
     }
 
-    /// Expression-granularity differential: `print(<generated expr>)` agrees five-way
-    /// (tree-walker, specialized-VM, generic-VM, lane-off, no-call-fast). Sharper at
-    /// isolating an arithmetic/coercion/bitwise opcode divergence than the full program
-    /// generator.
+    /// Expression-granularity differential: `print(<generated expr>)` agrees seven-way
+    /// (tree-walker, specialized-VM, generic-VM, lane-off, no-call-fast, decoded-forced,
+    /// no-decode). Sharper at isolating an arithmetic/coercion/bitwise opcode divergence
+    /// than the full program generator.
     #[test]
     fn three_way_differential_over_generated_expressions(bytes in prop::collection::vec(any::<u8>(), 32..512)) {
         let mut u = arbitrary_unstructured(&bytes);
         let prog = fuzzgen::gen_expr_program(&mut u);
-        let (tw, vm, gen, _aso, nolane, nocf) = run_all_engines(&prog.source);
+        let (tw, vm, gen, _aso, nolane, nocf, decfwd, nodec) = run_all_engines(&prog.source);
         prop_assert_eq!(&tw, &vm, "expr specialized-VM divergence\n{}\ntw {:?}\nvm {:?}", prog.source, tw, vm);
         prop_assert_eq!(&tw, &gen, "expr generic-VM divergence\n{}\ntw {:?}\ngen {:?}", prog.source, tw, gen);
         // LANE §6.1: lane-off must be byte-identical.
         prop_assert_eq!(&tw, &nolane, "expr lane-off divergence\n{}\ntw {:?}\nnolane {:?}", prog.source, tw, nolane);
         // CALL §8.1: no-call-fast must be byte-identical.
         prop_assert_eq!(&tw, &nocf, "expr no-call-fast divergence\n{}\ntw {:?}\nnocf {:?}", prog.source, tw, nocf);
+        // DECODE §8.3 (Gate 15): decoded-forced + no-decode must be byte-identical.
+        prop_assert_eq!(&tw, &decfwd, "expr decoded-forced divergence (DECODE bug)\n{}\ntw {:?}\ndecfwd {:?}", prog.source, tw, decfwd);
+        prop_assert_eq!(&tw, &nodec, "expr no-decode divergence\n{}\ntw {:?}\nnodec {:?}", prog.source, tw, nodec);
     }
 }
 
@@ -193,7 +222,9 @@ fn three_way_differential_fixed_seed_battery() {
         })
         .collect();
     let results = run_all_engines_batch(progs.clone());
-    for (seed, ((tw, vm, gen, aso, nolane, nocf), src)) in results.iter().zip(progs.iter()).enumerate() {
+    for (seed, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec), src)) in
+        results.iter().zip(progs.iter()).enumerate()
+    {
         assert_eq!(
             tw, vm,
             "FIXED-seed {seed}: specialized-VM divergence\n--- program ---\n{src}"
@@ -215,6 +246,15 @@ fn three_way_differential_fixed_seed_battery() {
         assert_eq!(
             tw, nocf,
             "FIXED-seed {seed}: no-call-fast divergence\n--- program ---\n{src}"
+        );
+        // DECODE §8.3 (Gate 15): decoded-forced + no-decode must be byte-identical.
+        assert_eq!(
+            tw, decfwd,
+            "FIXED-seed {seed}: decoded-forced divergence (a real DECODE bug)\n--- program ---\n{src}"
+        );
+        assert_eq!(
+            tw, nodec,
+            "FIXED-seed {seed}: no-decode divergence\n--- program ---\n{src}"
         );
     }
 }
@@ -247,8 +287,11 @@ fn defer_coverage_assertion_gate15() {
         .collect();
     // Run through all engines (amortized in one worker-stack thread).
     let results = run_all_engines_batch(progs.clone());
-    // Confirm no divergences (the defer axis must not introduce a bug; also checks lane-off/nocf).
-    for (seed, ((tw, vm, gen, aso, nolane, nocf), src)) in results.iter().zip(progs.iter()).enumerate() {
+    // Confirm no divergences (the defer axis must not introduce a bug; also checks
+    // lane-off/nocf/decoded-forced/no-decode).
+    for (seed, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec), src)) in
+        results.iter().zip(progs.iter()).enumerate()
+    {
         assert_eq!(
             tw, vm,
             "Gate15 seed {seed}: specialized-VM divergence\n--- program ---\n{src}"
@@ -270,6 +313,15 @@ fn defer_coverage_assertion_gate15() {
         assert_eq!(
             tw, nocf,
             "Gate15 seed {seed}: no-call-fast divergence\n--- program ---\n{src}"
+        );
+        // DECODE §8.3 (Gate 15): decoded-forced + no-decode must be byte-identical.
+        assert_eq!(
+            tw, decfwd,
+            "Gate15 seed {seed}: decoded-forced divergence (a real DECODE bug)\n--- program ---\n{src}"
+        );
+        assert_eq!(
+            tw, nodec,
+            "Gate15 seed {seed}: no-decode divergence\n--- program ---\n{src}"
         );
     }
 
@@ -391,7 +443,9 @@ fn stress_differential_many_seeds() {
             })
             .collect();
         let results = run_all_engines_batch(progs.clone());
-        for (i, ((tw, vm, gen, aso, nolane, nocf), src)) in results.iter().zip(progs.iter()).enumerate() {
+        for (i, ((tw, vm, gen, aso, nolane, nocf, decfwd, nodec), src)) in
+            results.iter().zip(progs.iter()).enumerate()
+        {
             let seed = start + i as u64;
             if tw != vm {
                 diverged += 1;
@@ -415,10 +469,19 @@ fn stress_differential_many_seeds() {
                 diverged += 1;
                 eprintln!("DIVERGENCE seed {seed} no-call-fast\ntw {tw:?}\nnocf {nocf:?}\n--- src ---\n{src}\n");
             }
+            // DECODE §8.3 (Gate 15): decoded-forced + no-decode must be byte-identical.
+            if tw != decfwd {
+                diverged += 1;
+                eprintln!("DIVERGENCE seed {seed} decoded-forced (DECODE bug)\ntw {tw:?}\ndecfwd {decfwd:?}\n--- src ---\n{src}\n");
+            }
+            if tw != nodec {
+                diverged += 1;
+                eprintln!("DIVERGENCE seed {seed} no-decode\ntw {tw:?}\nnodec {nodec:?}\n--- src ---\n{src}\n");
+            }
         }
         start = end;
     }
-    assert_eq!(diverged, 0, "{diverged} six-way divergences over {n} seeds (see stderr)");
+    assert_eq!(diverged, 0, "{diverged} eight-way divergences over {n} seeds (see stderr)");
 }
 
 // ===========================================================================
@@ -455,11 +518,13 @@ fn saboteur_self_test_harness_can_fail() {
     let prog = fuzzgen::gen_program_from_bytes(&bytes);
 
     // OFF (default): the real engines agree — the harness reports NO divergence.
-    let (tw, vm, gen, _aso, nolane, nocf) = run_all_engines(&prog.source);
+    let (tw, vm, gen, _aso, nolane, nocf, decfwd, nodec) = run_all_engines(&prog.source);
     assert_eq!(tw, vm, "saboteur OFF: real engines must agree (else a real bug)");
     assert_eq!(tw, gen, "saboteur OFF: real engines must agree (else a real bug)");
     assert_eq!(tw, nolane, "saboteur OFF: lane-off must agree with tree-walker (else a real bug)");
     assert_eq!(tw, nocf, "saboteur OFF: no-call-fast must agree with tree-walker (else a real bug)");
+    assert_eq!(tw, decfwd, "saboteur OFF: decoded-forced must agree with tree-walker (else a real bug)");
+    assert_eq!(tw, nodec, "saboteur OFF: no-decode must agree with tree-walker (else a real bug)");
 
     // ON: the saboteur engine MUST be flagged as divergent by the same comparison the
     // differential uses. If this assertion ever fails, the harness's divergence detection

@@ -1,6 +1,22 @@
 # AScript Pre-Decoded Dispatch + Data-Driven Superinstructions + Speculative Global-Fn Inlining — Design (DECODE)
 
-- **Status:** Draft for review
+- **Status:** Implemented (Units A+B; Units C+D evidence-dropped) (merged <pending>)
+  - **Deltas from spec (recorded — no silent deviation):**
+    1. **Unit C (speculative global-fn inlining, §6) — DROPPED by evidence.** The Task-11 isolated
+       A/B showed +0.45% geomean on the call-heavy corpus, below the 2% ship gate; the feature commit
+       was reverted (`6fa54d3` reverts `bd95cd7`). The §4 deps-epoch invalidation machinery + battery
+       are KEPT (they are Unit A's, not Unit C's). The `ASCRIPT_NO_DECODE_INLINE` env read + `decode_inline`
+       flag remain as INERT no-ops (env-var/tooling parity only).
+    2. **Unit D (top-of-stack register cache, §7) — DROPPED by evidence.** Isolated A/B = −1.6% geomean
+       on the dispatch-bound trio (object_churn −3.2%, regressing past the 0.97 bound); reverted
+       (`2065217` reverts `4611291`). The `ASCRIPT_NO_DECODE_TOS` env read + `decode_tos` flag remain
+       INERT. The §7.2 flush-edge contract and its battery were reverted with the unit.
+    3. **Default-on regression ACCEPTED.** Units A+B ship default-on at geomean 0.977× (≈2.3% slower) on
+       the realistic corpus — a consciously-accepted owner trade (2026-06-15) against the "zero perf
+       regression" gate. DECODE's shipped value is the **invalidation contract** (the JIT prerequisite),
+       exercised on the real path; `ASCRIPT_NO_DECODE` is the escape hatch. See `goal-perf.md` EXECUTION
+       LOG + `bench/DECODE_RESULTS.md`.
+- **Status (original):** Draft for review
 - **Date:** 2026-06-12
 - **Code:** DECODE (the dispatch spec of the PERF campaign — see `goal-perf.md`)
 - **Depends on:** **LANE merged** (the sync driver `run_loop_sync` — exported contract:

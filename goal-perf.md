@@ -122,16 +122,19 @@ stated, results are measured.
 
 ### Dispatch — decode once, fuse what the data says, inline what guards allow
 
-- 🔒 **DECODE — Pre-decoded instruction stream + data-driven superinstructions + speculative
-  inlining.** A per-`FnProto`, lazily-built side representation (fixed-width op records, operands
-  widened, jump targets pre-resolved) following the `arith_cache` side-table precedent —
-  `Chunk.code` stays byte-identical (disassembler/goldens/differential untouched); `Op::Break`
-  byte-patching INVALIDATES the decoded cache (the same invalidation story a future JIT needs —
-  built and tested here first). Superinstruction selection is empirical: fusion pairs chosen from
-  shipped coverage/profiler data over the bench corpus, never guessed. Small hot global fns are
-  speculatively inlined at bytecode level behind the EXISTING global-version guard (`struct_gen`),
-  deopting to the generic call on guard failure. Depends on LANE (the sync driver is the primary
-  consumer).
+- ✅ **DECODE — Pre-decoded instruction stream + data-driven superinstructions (Units A+B);
+  speculative inlining + TOS cache evidence-dropped.** **MERGED (pending `--no-ff`).** A
+  per-`FnProto`, lazily-built side representation (fixed-width op records, operands widened, jump
+  targets pre-resolved) following the `arith_cache` side-table precedent — `Chunk.code` stays
+  byte-identical (disassembler/goldens/differential untouched); `Op::Break` byte-patching
+  INVALIDATES the decoded cache via the `patch_epoch` chokepoint (the same invalidation story a
+  future JIT needs — built and tested here first; THE primary recorded purpose). Superinstruction
+  selection is empirical: fusion pairs chosen from the committed op-pair census over the bench
+  corpus, never guessed. **Unit C (speculative global-fn inlining) and Unit D (TOS register cache)
+  were EVIDENCE-DROPPED** at the Task-11 gate (inline +0.45% < 2%; TOS −1.6%, object_churn −3.2%) —
+  reverted, not shipped. The owner SHIPPED Units A+B default-on accepting a ~2.3% whole-program
+  regression (the invalidation contract is the value, `ASCRIPT_NO_DECODE` is the escape hatch).
+  Depends on LANE (the sync driver is the primary consumer). See EXECUTION LOG.
   - Spec: `superpowers/specs/2026-06-12-decoded-dispatch-design.md`
   - Plan: `superpowers/plans/2026-06-12-decoded-dispatch.md`
 
@@ -522,6 +525,60 @@ stated, results are measured.
   modules" → corrected to domain-grouped). **Seam:** clap CLI surface extracted to `src/cli_surface.rs`
   (behavior-identical move — the introspection seam for tripwire 1; vm_differential proves engines
   untouched). Gate 19 added. No engine change, no `.aso` change, `ASO_FORMAT_VERSION` unchanged.
+
+- **DECODE** — ✅ **MERGED (pending `--no-ff`)** from `feat/decoded-dispatch`; **Task-11 evidence gate
+  executed — DOUBLE DROP by measurement; owner SHIPPED Units A+B default-on (recorded trade).**
+  Pre-decoded instruction stream (Unit A) + data-driven superinstruction fusion (Unit B) ship for their
+  **invalidation contract** (the byte-patch→drop-decoded-code `patch_epoch`/deps-epoch machinery — the
+  JIT prerequisite, the spec's PRIMARY recorded purpose), NOT for a measured end-to-end speedup. The two
+  speculative units BOTH failed their evidence gate and were reverted on their own same-session A/B data
+  (`bench/DECODE_RESULTS.md`, Apple M4, env-toggle A/B on ONE binary, 7 runs/median, 8-workload profiling
+  corpus). **No grammar change, no semantics change, `ASO_FORMAT_VERSION` unchanged at 28.**
+  - **OWNER DECISION (2026-06-15, recorded verbatim):** **SHIP DECODE default-ON, accepting the ~2.3%
+    whole-program regression** (decode-on geomean 0.977× vs decode-off; worst `func_pipeline` 0.933×).
+    DECODE's value is the **invalidation contract — the JIT prerequisite** (the spec's primary recorded
+    purpose), exercised on the REAL execution path; the `ASCRIPT_NO_DECODE` kill switch is the escape
+    hatch. This is a **CONSCIOUSLY-ACCEPTED, recorded trade against the "zero perf regression" gate**
+    (owner-noted per AskUserQuestion, 2026-06-15). Units C+D dropped by evidence (inline +0.45% < 2%;
+    TOS −1.6%, object_churn −3.2%). The kill switch sits beside `--no-specialize` /
+    `ASCRIPT_NO_SYNC_LANE` / `ASCRIPT_NO_CALL_FAST` as the complete byte-path floor.
+  - **Units A+B (kept) — `ASCRIPT_NO_DECODE=1` vs default, isolated:** geomean **0.977×** (decode-on is
+    ~2.3% SLOWER on the realistic corpus; worst `func_pipeline` −6.7%, `server_request` −5.0%). The
+    pre-decode warm-up + frame-entry validity-check cost is not repaid by the flatter record stream at
+    whole-program scale here. RSS flat (12–14 MB, no Gate-18 regression). Kept anyway: the deps-epoch
+    invalidation contract + byte-patch battery (`tests/vm_decode.rs`) are the JIT precondition and are
+    proven; the dispatch *speedup* a JIT would build on did not materialize from interpretation-level
+    pre-decode.
+  - **UNIT-C VERDICT (§6.7) — DROP.** Isolated speculative-inline win (`ASCRIPT_NO_DECODE_INLINE=1` vs
+    default) = **+0.45% geomean on the call-heavy corpus** (`func_pipeline` +0.1%, `call_heavy` +0.8%;
+    `object_churn` −2.7%) — **< 2% ship gate ⇒ DROPPED.** Reverted Task-9 feature commit `bd95cd7`
+    (revert `6fa54d3`); KEPT the deps-epoch machinery + battery (Unit A §4's, verified present). Clean
+    revert, zero conflicts.
+  - **UNIT-D VERDICT (§7.5) — RECORD-REJECT.** Isolated TOS-cache win (`ASCRIPT_NO_DECODE_TOS=1` vs
+    default) on the dispatch-bound trio = **−1.6% geomean** (object_churn **−3.2%, regresses past the
+    0.97 bound**, func_pipeline −1.8%, call_heavy +0.1%) — fails BOTH ship conditions (≥2% AND no
+    regression) ⇒ **RECORD-REJECT.** Reverted Task-10 feature commit `4611291` (revert `2065217`); the
+    `stack_ops`/`tos_ops` census counters stay as evidence. The Task-8 residual `stack/decoded` of >1.2
+    (object_churn) / ~1.5 (func_pipeline) was a real but non-sufficient signal — eliminating the residual
+    push/pop did not pay against the per-edge flush bookkeeping + accessor indirection on this M4.
+  - **Threshold A/B (§2.3):** thresholds 0/8/32 all within noise (0→8 = 1.001×, 32→8 = 0.999×) — **kept
+    `DECODE_THRESHOLD = 8`** (no winner, placeholder stands).
+  - **Gates (Task-12 final, branch green):** spec/tw geomean **4.02×** (≥2× Gate 12/17, 7/9 compute
+    benches ≥2×, 2 alloc-bound exempt); `dbg_zero_cost_gate` **1.003×** (≤1.05×); `decode_on_off`
+    microbench 1.014× REPORTED (owner-accepted; authoritative realistic A/B 0.977× in
+    `bench/DECODE_RESULTS.md`); `vm_differential` **444/0** BOTH feature configs (7-way: tw == spec ==
+    generic == lane-off == no-call-fast == decoded-forced == no-decode); `vm_decode` 12/0 (kept
+    battery — invalidation + fusion; the flush-edge battery was reverted with Unit D, no dangling
+    reference); `property` 27/0 BOTH configs + stress 2000 seeds 0 divergences; full suite + clippy
+    clean BOTH configs; `ASO_FORMAT_VERSION` 28 unchanged; no grammar/disasm/verify/`.aso`/LSP/fmt
+    change. New corpus example `examples/advanced/decode_hot_loop.as` (decoded+fused happy path),
+    7-way + golden recorded.
+  - **JIT-gate verdict (mandatory re-rank):** the Phase-0 ranking holds — `async_*` reactor/park-bound
+    (~70%+), `json_roundtrip` alloc/hash-bound, `workflow_loop` fsync-bound (96%), the dispatch-bound trio
+    already within a small constant of generic. Dispatch does NOT dominate whole-program time on the
+    realistic corpus, and interpretation-level pre-decode did not move it. The JIT precondition DECODE
+    delivers is the *invalidation contract* (shipped + proven), not a dispatch speedup; the JIT decision
+    remains evidence-gated downstream.
 
 ## Execution order
 

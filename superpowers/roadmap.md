@@ -636,6 +636,43 @@ Spec `superpowers/specs/2026-06-12-shape-storage-design.md`, plan
   geomean **4.20×**; DBG zero-cost gate **0.994×**; RSS: no regression.
 - **Differential:** `vm_differential` **443/0** (both feature configs). Four-mode identical.
 
+## DECODE — pre-decoded dispatch + superinstruction fusion + the JIT invalidation contract ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-decoded-dispatch-design.md`, plan
+`…/plans/2026-06-12-decoded-dispatch.md`. VM-only; tree-walker untouched; **no `.aso` change**
+(`ASO_FORMAT_VERSION` 28 unchanged), no grammar/disassembler/verifier/LSP/fmt change — `Chunk.code`
+stays byte-identical (DECODE is a side representation, never a byte rewrite).
+
+- **Shipped (Units A+B):** a per-`FnProto`, lazily-built `DecodedChunk` (`src/vm/decode.rs`:
+  fixed-width op records, operands widened, jump targets pre-resolved) that LANE's sync driver executes
+  from instead of re-decoding bytes (Unit A). **Unit B — data-driven superinstruction fusion:** a
+  peephole rewrites hot adjacent op runs into ONE fused record; the `FUSION_CANDIDATES` set is derived
+  from the **committed op-pair census** (`bench/DECODE_PAIR_CENSUS.md`), never guessed, and changes only
+  with refreshed committed data.
+- **§4 invalidation contract (THE primary deliverable — the JIT prerequisite):** the only byte mutation
+  is `Op::Break` patching (DBG), which routes through the `Chunk.patch_epoch` chokepoint that **drops the
+  decoded cache (never edits decoded records)** — "drop, never edit." A live decoded stream is rebuilt
+  from patched bytes on the next decode. This is exactly the invalidation story a future native JIT must
+  consume; built + battle-tested here first (`tests/vm_decode.rs`, incl. the breakpoint-during-hot-loop
+  edge — examples cannot drive the DAP).
+- **Units C + D — EVIDENCE-DROPPED (reverted, not shipped):** Unit C (speculative global-fn inlining)
+  isolated +0.45% < 2% ship gate; Unit D (top-of-stack register cache) isolated −1.6% geomean
+  (object_churn −3.2%, past the 0.97 bound). Both reverted on their own same-session A/B data; the §4
+  machinery + battery KEPT (they are Unit A's). The `ASCRIPT_NO_DECODE_INLINE`/`ASCRIPT_NO_DECODE_TOS`
+  env reads + flags remain INERT no-ops (documented inert in `docs/content/cli.md`).
+- **Kill switch:** `Vm.decode` (bool, default true) + env `ASCRIPT_NO_DECODE=1`, beside
+  `--no-specialize`/`ASCRIPT_NO_SYNC_LANE`/`ASCRIPT_NO_CALL_FAST` (the pure-byte-path floor).
+- **Honest perf outcome (OWNER-ACCEPTED trade, 2026-06-15):** Units A+B ship **default-on accepting a
+  ~2.3% whole-program regression** (decode-on geomean 0.977× vs decode-off; worst func_pipeline 0.933×).
+  The invalidation contract is the value; the kill switch is the escape hatch. spec/tw geomean ≥ 2×;
+  `dbg_zero_cost_gate` ≈ 1.0×. See `bench/DECODE_RESULTS.md`.
+- **Differential:** `vm_differential` **444/0** (both feature configs); **7-way** identity (tree-walker
+  == specialized == generic == lane-off == no-call-fast == decoded-forced == no-decode).
+- **JIT prerequisite delivered, JIT itself still downstream-evidence-gated:** the post-DECODE re-profile
+  confirms dispatch does NOT dominate whole-program time on the realistic corpus (async/alloc/fsync-bound
+  workloads lead); interpretation-level pre-decode did not move the dispatch share. The JIT decision
+  remains evidence-gated; what DECODE delivers is the *invalidation contract*, not a dispatch speedup.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

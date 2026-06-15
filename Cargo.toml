@@ -175,6 +175,18 @@ default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net"
 # the crate's self-dev-dependency for `tests/property.rs` (and by a `--cfg fuzzing` libFuzzer
 # build). Pulls `arbitrary`. Never in `default`, so production is byte-identical.
 fuzzgen = ["dep:arbitrary"]
+# DECODE §5.1 (Unit B part 1): the decoded-dispatch PAIR/TRIPLE census. NON-default —
+# the counting mode (the burst-local `prev`/`prev2` tracking + the `(DOp,DOp[,DOp])`
+# frequency tables) is FULLY `#[cfg(feature = "decode-census")]`, so a default
+# `cargo build`/`cargo test` compiles it OUT entirely (the JIT-spec §2.1 "not there"
+# discipline — ZERO Gate-12 hot-path exposure). Used ONLY by the `#[ignore]`d
+# `tests/decode_census.rs` harness, which runs the corpus in forced-decode mode and
+# prints the ranked pair/triple table whose top entries Task 8 fuses into
+# superinstructions. Pure / in-memory (a `HashMap` counter) — no deps. Changes NO
+# default behavior (census is feature-gated AND flag-gated → off unless the harness
+# arms it), so the four/five/seven-mode differential and `ASO_FORMAT_VERSION` are
+# untouched in any default or production build.
+decode-census = []
 # SRV §3/§4: std/shared — the shared, immutable, zero-copy read-only heap. The
 # `Value::Shared` VARIANT + `SharedNode` + the read-only dispatch are CORE (unconditional,
 # build under --no-default-features); only the `shared.freeze`/`shared.isShared` stdlib

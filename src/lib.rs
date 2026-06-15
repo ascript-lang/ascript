@@ -982,6 +982,277 @@ pub async fn vm_run_source_lane_stats_no_lane(
     vm_run_source_cfg_stats(src, true, false, false, false, true).await
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODE Task 2 — public wrapper struct + five test entry points
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **DECODE §8.3 — per-run stat bundle returned by the decode-stats test entries.**
+///
+/// Wired counters:
+/// - RecordSource driver (Unit A): `decoded_ops`, `decoded_bytes`, `stack_ops`
+/// - Unit B fusion:                `fused_ops`
+/// - `inline_hits`/`inline_misses` (Unit C) and `tos_ops` (Unit D) stay 0 —
+///   those units were EVIDENCE-DROPPED, so the counters are permanently inert.
+///
+/// The `output` and `exit_code` fields carry the program's normal result so the
+/// test can assert correctness while also inspecting the counters.
+///
+/// `#[doc(hidden)]` — test API only; not a stable public surface.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct DecodeStats {
+    /// Captured stdout of the program run.
+    pub output: String,
+    /// Process exit code, or `None` for a normal return.
+    pub exit_code: Option<i32>,
+    /// Total records retired by the `RecordSource` driver.
+    pub decoded_ops: u64,
+    /// Fused superinstruction records retired (Unit B).
+    pub fused_ops: u64,
+    /// INERT (Unit C evidence-dropped) — permanently 0.
+    pub inline_hits: u64,
+    /// INERT (Unit C evidence-dropped) — permanently 0.
+    pub inline_misses: u64,
+    /// Total bytes of decoded record streams resident in memory at end-of-run.
+    pub decoded_bytes: u64,
+    /// Fiber-stack push + pop operations retired by the record driver (the §7.3
+    /// stack-traffic gate input).
+    pub stack_ops: u64,
+    /// INERT (Unit D evidence-dropped) — permanently 0.
+    pub tos_ops: u64,
+}
+
+/// Like [`vm_run_source`] but with DECODE DISABLED — the `ASCRIPT_NO_DECODE=1`
+/// kill switch (DECODE Task 2). Observable behavior is byte-identical to
+/// [`vm_run_source`]; only throughput may differ once Task 4 wires up the driver.
+///
+/// Used by the differential test (`decode_entry_points_exist_and_are_inert_pre_driver`)
+/// and the DECODE-mode differential batteries. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_no_decode(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::Vm;
+    // specialize=true, sync_lane=true, call_fast=true; decode=OFF.
+    vm_run_source_decode_cfg(src, false, true, true, Vm::DECODE_THRESHOLD).await
+}
+
+/// Like [`vm_run_source`] but with DECODE FORCED on with threshold=0 — every
+/// proto is decoded immediately, regardless of warmth, so even short programs
+/// exercise the record driver once Task 4 lands. Pre-driver (INERT), this is
+/// byte-identical to [`vm_run_source`]. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_decoded_forced(src: &str) -> Result<(String, Option<i32>), AsError> {
+    // decode=ON, threshold=0 (always decode immediately).
+    vm_run_source_decode_cfg(src, true, true, true, 0).await
+}
+
+/// DECODE §8.3: run `src` on the VM with DECODE FORCED (threshold=0) and return
+/// a [`DecodeStats`] bundle containing the program output + all stat counters.
+/// All counters are 0 until the corresponding task wires them up (INERT until
+/// Task 4). `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_decode_stats(src: &str) -> Result<DecodeStats, AsError> {
+    vm_run_source_decode_stats_cfg(src, true, true, true, 0).await
+}
+
+/// DECODE §8.3 variant: like [`vm_run_source_decode_stats`] but with DECODE OFF.
+/// Used to prove `decoded_ops == 0` when the kill switch is active.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_decode_stats_no_decode(src: &str) -> Result<DecodeStats, AsError> {
+    use crate::vm::Vm;
+    vm_run_source_decode_stats_cfg(src, false, true, true, Vm::DECODE_THRESHOLD).await
+}
+
+/// **DECODE §5.1 (Unit B part 1): run `src` in CENSUS mode** — DECODE FORCED
+/// (threshold = 0, every proto decoded so the real record stream is seen) with the
+/// pair/triple census armed. Returns `(counts, total_records)` where a PAIR key is
+/// `(CENSUS_NO_PREV, prev, op)` and a TRIPLE key is `(prev2, prev, op)`; the harness
+/// (`tests/decode_census.rs`) merges per-program drains into a global aggregate and
+/// ranks them. FULLY `#[cfg(feature = "decode-census")]` — this entry point and the
+/// whole counting apparatus DO NOT EXIST in a default build (the JIT-spec §2.1
+/// "not there" discipline). `#[doc(hidden)]` — not a stable API.
+/// **DECODE §5.1: the PAIR sentinel** — the first key-slot value that marks a census
+/// entry as a 2-gram `(prev, op)` rather than a 3-gram `(prev2, prev, op)`. Re-exported
+/// for `tests/decode_census.rs` (the only consumer). `#[doc(hidden)]`.
+#[cfg(feature = "decode-census")]
+#[doc(hidden)]
+pub const CENSUS_NO_PREV: u16 = crate::vm::decode::CENSUS_NO_PREV;
+
+#[cfg(feature = "decode-census")]
+#[doc(hidden)]
+pub async fn vm_run_source_census(
+    src: &str,
+) -> Result<(crate::vm::decode::CensusCounts, u64), AsError> {
+    use crate::vm::value_ext::RunOutcome;
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(crate::vm::chunk::FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = crate::vm::value_ext::Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // decode FORCED on (threshold = 0): every proto decodes immediately so the
+    // record driver sees the real stream the census counts.
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, true, true, true, 0);
+    vm.arm_census();
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    // Surface a program error so the harness can SKIP the file (e.g. a feature-
+    // unavailable import) without aborting the whole census run.
+    match result {
+        Ok(RunOutcome::Done(_)) => {}
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => return Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => {}
+        Err(crate::interp::Control::Exit(_)) => {}
+    }
+    Ok(vm.take_census().unwrap_or_default())
+}
+
+/// Shared body for the DECODE test entries: runs `src` with explicit decode
+/// kill-switch values, no instrumentation (decode paths are orthogonal to DBG),
+/// and returns the plain `(output, exit_code)` pair.
+async fn vm_run_source_decode_cfg(
+    src: &str,
+    decode: bool,
+    decode_inline: bool,
+    decode_tos: bool,
+    decode_threshold: u16,
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::value_ext::RunOutcome;
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(crate::vm::chunk::FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = crate::vm::value_ext::Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // specialize=true, sync_lane=true, call_fast=true (production defaults);
+    // decode flags and threshold set explicitly — no env read (parallel-test hygiene).
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, decode_inline, decode_tos, decode_threshold);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    let pair = match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }?;
+    Ok(pair)
+}
+
+/// Shared body for the DECODE stats test entries: runs `src` with explicit decode
+/// flags and returns a [`DecodeStats`] bundle. Compiled only under
+/// `#[cfg(any(test, feature = "fuzzgen", fuzzing))]`.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+async fn vm_run_source_decode_stats_cfg(
+    src: &str,
+    decode: bool,
+    decode_inline: bool,
+    decode_tos: bool,
+    decode_threshold: u16,
+) -> Result<DecodeStats, AsError> {
+    use crate::vm::value_ext::RunOutcome;
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(crate::vm::chunk::FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = crate::vm::value_ext::Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, decode_inline, decode_tos, decode_threshold);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    // Read the DECODE stat counters before consuming result (they are already
+    // stable: the run is complete, no borrow outstanding).
+    let inner = vm.decode_stats_inner();
+    let pair = match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }?;
+    Ok(DecodeStats {
+        output: pair.0,
+        exit_code: pair.1,
+        decoded_ops: inner.decoded_ops,
+        fused_ops: inner.fused_ops,
+        inline_hits: inner.inline_hits,
+        inline_misses: inner.inline_misses,
+        decoded_bytes: inner.decoded_bytes,
+        stack_ops: inner.stack_ops,
+        tos_ops: inner.tos_ops,
+    })
+}
+
 /// FUZZ `.aso` round-trip seam (`#[doc(hidden)]` test API, not a stable surface):
 /// compile `src` to a [`Chunk`], serialize it to `.aso` bytes ([`vm::Chunk::to_bytes`]),
 /// deserialize + verify them back ([`vm::Chunk::from_bytes_verified`]), then run the
@@ -2283,6 +2554,88 @@ pub async fn run_file_on_vm_with_packages(
         Err(crate::interp::Control::Propagate(_)) => Ok(0),
         Err(crate::interp::Control::Exit(code)) => Ok(code),
     }
+}
+
+/// DECODE Task 4 (cross-module provenance test): run a `.as` FILE with an
+/// explicit decode kill-switch + warmth threshold, returning the same exit/error
+/// shape as [`run_file_on_vm_with_packages`]. Lets the §2.4 `last_fault_source`
+/// hoisting be asserted across a real module boundary (forced-decode vs byte).
+/// `#[doc(hidden)]` — test API only.
+#[doc(hidden)]
+pub async fn run_file_decode_cfg(
+    path: &Path,
+    decode: bool,
+    decode_threshold: u16,
+) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    chunk.set_module_source(&src_info);
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_worker_source(&src);
+    interp.install_self();
+    // Build a specialized VM, then override the decode kill switch + threshold so
+    // the test can FORCE decode (threshold 0) or DISABLE it independent of env.
+    let vm = Vm::with_all_flags(interp.clone(), true, true, true, decode, true, true, decode_threshold);
+    if let Some(dir) = path.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
+    local.run_until(interp.telemetry_flush_on_exit()).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(0),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(0),
+        Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
+/// DECODE Task 4: run a `.as` FILE with decode DISABLED (byte dispatch). See
+/// [`run_file_decode_cfg`]. `#[doc(hidden)]` — test API only.
+#[doc(hidden)]
+pub async fn run_file_no_decode(path: &Path) -> Result<i32, AsError> {
+    use crate::vm::Vm;
+    run_file_decode_cfg(path, false, Vm::DECODE_THRESHOLD).await
+}
+
+/// DECODE Task 4: run a `.as` FILE with decode FORCED on (threshold 0). See
+/// [`run_file_decode_cfg`]. `#[doc(hidden)]` — test API only.
+#[doc(hidden)]
+pub async fn run_file_decoded_forced(path: &Path) -> Result<i32, AsError> {
+    run_file_decode_cfg(path, true, 0).await
 }
 
 /// DBG Task 7: configuration for a CPU-profiled run, assembled from the

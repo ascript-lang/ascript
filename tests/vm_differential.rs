@@ -1249,6 +1249,25 @@ async fn vm_run_whole_corpus_matches_treewalker() {
             tw, nolane,
             "lane-off VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  lane-off:    {nolane:?}"
         );
+        // DECODE §8.3 (Gate 15): decoded-forced (decode ON, threshold 0 — every
+        // proto executes from records) must be byte-identical over the whole
+        // corpus. A divergence is a real DECODE record-driver bug.
+        let decfwd = ascript::vm_run_source_decoded_forced(&src)
+            .await
+            .unwrap_or_else(|e| panic!("decoded-forced VM failed on non-skipped {rel}: {e:?}"));
+        assert_eq!(
+            tw, decfwd,
+            "decoded-forced VM diverged from tree-walker for example `{rel}` — a real DECODE bug\n  tree-walker:    {tw:?}\n  decoded-forced: {decfwd:?}"
+        );
+        // DECODE §8.3 (Gate 15): no-decode (the kill switch — pure byte dispatch)
+        // must also be byte-identical.
+        let nodec = ascript::vm_run_source_no_decode(&src)
+            .await
+            .unwrap_or_else(|e| panic!("no-decode VM failed on non-skipped {rel}: {e:?}"));
+        assert_eq!(
+            tw, nodec,
+            "no-decode VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-decode:   {nodec:?}"
+        );
         ran += 1;
     }
     // Sanity: the gate must actually exercise the bulk of the corpus, and the
@@ -1268,8 +1287,75 @@ async fn vm_run_whole_corpus_matches_treewalker() {
         "expected the VM to run >={floor} examples byte-identically, ran {ran}"
     );
     eprintln!(
-        "whole-corpus gate: {ran} examples byte-identical (all also verified lane-off), \
-         {skipped} skipped, {feature_skipped} feature-skipped (modules unavailable in this build)"
+        "whole-corpus gate: {ran} examples byte-identical (all also verified lane-off + \
+         decoded-forced + no-decode), {skipped} skipped, {feature_skipped} feature-skipped \
+         (modules unavailable in this build)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DECODE §8.3 (Gate 15) — THE CORPUS COVERAGE ASSERTION (anti-false-green).
+//
+//  Wiring decoded-forced into the differential is only a real net if the decode
+//  path actually RAN. This non-ignored test runs the corpus through the
+//  decode-stats entry point (forced threshold=0) and asserts the record driver
+//  retired a non-trivial number of records — `decoded_ops > 0` (in fact a high
+//  floor over the whole corpus). If the frame-entry selection ever silently
+//  collapses to byte dispatch, this assertion FAILS even though every byte-
+//  identity check still passes (the byte path is correct — just dark). Mirrors
+//  SHAPE's `…exercises_both_modes…` and CALL's coverage tests; the LANE §6.4
+//  idiom. Counters not yet wired (fused_ops/inline/tos) are NOT asserted here —
+//  they land with Units B/C/D.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn decoded_dispatch_actually_executes_on_the_corpus() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut total_records: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_fused: u64 = 0;
+    let mut ran = 0usize;
+    for rel in all_corpus_examples() {
+        // The SAME enumeration + skip list as oracle #1.
+        if skip_reason(&rel).is_some() {
+            continue;
+        }
+        let path = std::path::Path::new(root).join(&rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+        if let Ok(st) = ascript::vm_run_source_decode_stats(&src).await {
+            total_records += st.decoded_ops;
+            total_bytes += st.decoded_bytes;
+            total_fused += st.fused_ops;
+            ran += 1;
+        }
+    }
+    println!(
+        "DECODE corpus coverage: {total_records} records / {total_bytes} decoded bytes \
+         / {total_fused} fused over {ran} programs"
+    );
+    assert!(ran > 30, "corpus enumeration broke (only {ran} programs ran)");
+    // DECODE §5 (Unit B, Gate 15): fusion must actually FIRE over the corpus — the
+    // peephole is not dead and fused arms execute. A fused record retires
+    // (`fused_ops`) on the dominant local/field/arith staging shapes, which the
+    // corpus exercises pervasively. Floor far above 0 (the silent-no-fusion value),
+    // well below the observed count, config-independent (fusion is CORE).
+    assert!(
+        total_fused > 1_000,
+        "Unit B fusion never fired over the corpus ({total_fused} fused records) — the peephole is dead or unwired"
+    );
+    // Anti-false-green floor. The corpus is overwhelmingly short, run-to-
+    // completion examples (no million-iteration hot loops), so the observed
+    // retirement is ~150K records / ~104 programs in BOTH feature configs (the
+    // decode driver is feature-independent CORE — `--no-default-features` strips
+    // stdlib MODULES but the bare-language protos still decode + execute). 50_000
+    // is a generous floor below the observed ~150K but vastly above the silent-
+    // collapse value of 0 — if frame-entry selection ever defaults to byte
+    // dispatch, this trips while every byte-identity check still passes.
+    assert!(
+        total_records > 50_000,
+        "decoded dispatch retired only {total_records} records — silently collapsed to byte dispatch"
     );
 }
 
@@ -1457,9 +1543,17 @@ async fn assert_opt_call_ok_three_way(src: &str) {
     let (nolane, nolane_code) = ascript::vm_run_source_no_sync_lane(src)
         .await
         .expect("lane-off ok");
+    let (decfwd, decfwd_code) = ascript::vm_run_source_decoded_forced(src)
+        .await
+        .expect("decoded-forced ok");
+    let (nodec, nodec_code) = ascript::vm_run_source_no_decode(src)
+        .await
+        .expect("no-decode ok");
     assert_eq!(vm_code, None, "no exit code expected for `{src}`");
     assert_eq!(gen_code, None, "no exit code expected for `{src}`");
     assert_eq!(nolane_code, None, "no exit code expected (lane-off) for `{src}`");
+    assert_eq!(decfwd_code, None, "no exit code expected (decoded-forced) for `{src}`");
+    assert_eq!(nodec_code, None, "no exit code expected (no-decode) for `{src}`");
     assert_eq!(
         tw, vm,
         "specialized VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
@@ -1472,16 +1566,27 @@ async fn assert_opt_call_ok_three_way(src: &str) {
         tw, nolane,
         "lane-off VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  nolane: {nolane:?}"
     );
+    // DECODE §8.3 (Gate 15): decoded-forced + no-decode must also match.
+    assert_eq!(
+        tw, decfwd,
+        "decoded-forced VM diverged from tree-walker for `{src}` — a real DECODE bug\n  tw: {tw:?}\n  decfwd: {decfwd:?}"
+    );
+    assert_eq!(
+        tw, nodec,
+        "no-decode VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  nodec: {nodec:?}"
+    );
 }
 
-/// Four-way ERROR assertion: all four engines panic with identical message + span.
+/// Six-way ERROR assertion: all engines panic with identical message + span.
 async fn assert_opt_call_error_three_way(src: &str) {
     let tw = ascript::run_source(src).await;
     let vm = ascript::vm_run_source(src).await;
     let gen = ascript::vm_run_source_generic(src).await;
     let nolane = ascript::vm_run_source_no_sync_lane(src).await;
-    match (tw, vm, gen, nolane) {
-        (Err(tw_err), Err(vm_err), Err(gen_err), Err(nolane_err)) => {
+    let decfwd = ascript::vm_run_source_decoded_forced(src).await;
+    let nodec = ascript::vm_run_source_no_decode(src).await;
+    match (tw, vm, gen, nolane, decfwd, nodec) {
+        (Err(tw_err), Err(vm_err), Err(gen_err), Err(nolane_err), Err(decfwd_err), Err(nodec_err)) => {
             assert_eq!(
                 tw_err.message, vm_err.message,
                 "specialized-VM panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
@@ -1512,9 +1617,30 @@ async fn assert_opt_call_error_three_way(src: &str) {
                 "lane-off panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  nolane: {:?}",
                 tw_err.message, tw_err.span, nolane_err.span
             );
+            // DECODE §8.3 (Gate 15): decoded-forced + no-decode must error identically.
+            assert_eq!(
+                tw_err.message, decfwd_err.message,
+                "decoded-forced panic message diverged for `{src}` — a real DECODE bug\n  tw: {:?}\n  decfwd: {:?}",
+                tw_err.message, decfwd_err.message
+            );
+            assert_eq!(
+                tw_err.span, decfwd_err.span,
+                "decoded-forced panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  decfwd: {:?}",
+                tw_err.message, tw_err.span, decfwd_err.span
+            );
+            assert_eq!(
+                tw_err.message, nodec_err.message,
+                "no-decode panic message diverged for `{src}`\n  tw: {:?}\n  nodec: {:?}",
+                tw_err.message, nodec_err.message
+            );
+            assert_eq!(
+                tw_err.span, nodec_err.span,
+                "no-decode panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  nodec: {:?}",
+                tw_err.message, tw_err.span, nodec_err.span
+            );
         }
-        (tw, vm, gen, nolane) => panic!(
-            "expected ALL FOUR engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm: {vm:?}\n  gen: {gen:?}\n  nolane: {nolane:?}"
+        (tw, vm, gen, nolane, decfwd, nodec) => panic!(
+            "expected ALL engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm: {vm:?}\n  gen: {gen:?}\n  nolane: {nolane:?}\n  decoded-forced: {decfwd:?}\n  no-decode: {nodec:?}"
         ),
     }
 }
@@ -5630,19 +5756,35 @@ async fn ic_mixed_object_and_instance_same_site() {
 /// previously exercised three-way identity now exercises four-way identity.
 /// CALL §8.1: the no-call-fast projection is the fifth mode — added in the SAME
 /// commit as the kill switch so coverage is wired before any fast path lands.
+/// DECODE §8.3 (Gate 15): the decoded-forced (decode ON, threshold 0 — every
+/// proto executes from records) and no-decode (`ASCRIPT_NO_DECODE` — the pure
+/// byte path) projections are the SIXTH and SEVENTH modes, added in the SAME PR
+/// as the kill switch so the decode path is a PERMANENT differential citizen.
+/// (Units C/D — inline + TOS — were EVIDENCE-DROPPED, so the planned
+/// `decoded-no-inline`/`decoded-no-tos` modes never landed; the seven modes
+/// below are the complete identity for the shipped Units A+B.)
 async fn assert_three_way_matches(src: &str) {
     let tw = ascript::run_source_exit(src).await;
     let spec = ascript::vm_run_source(src).await;
     let generic = ascript::vm_run_source_generic(src).await;
     let nolane = ascript::vm_run_source_no_sync_lane(src).await;
     let nocf = ascript::vm_run_source_no_call_fast(src).await;
+    let decfwd = ascript::vm_run_source_decoded_forced(src).await;
+    let nodec = ascript::vm_run_source_no_decode(src).await;
 
     let norm = |r: &Result<(String, Option<i32>), ascript::error::AsError>| match r {
         Ok((out, code)) => Ok((out.clone(), *code)),
         Err(e) => Err(e.to_string()),
     };
-    let (tw_n, spec_n, gen_n, nolane_n, nocf_n) =
-        (norm(&tw), norm(&spec), norm(&generic), norm(&nolane), norm(&nocf));
+    let (tw_n, spec_n, gen_n, nolane_n, nocf_n, decfwd_n, nodec_n) = (
+        norm(&tw),
+        norm(&spec),
+        norm(&generic),
+        norm(&nolane),
+        norm(&nocf),
+        norm(&decfwd),
+        norm(&nodec),
+    );
 
     // The load-bearing assertion of the whole task: generic == specialized.
     assert_eq!(
@@ -5674,6 +5816,22 @@ async fn assert_three_way_matches(src: &str) {
         tw_n, nocf_n,
         "VM (no-call-fast) diverged from the tree-walker.\n  src: {src:?}\n  \
          tree-walker:   {tw_n:?}\n  no-call-fast: {nocf_n:?}"
+    );
+    // DECODE §8.3 (Gate 15): decoded-forced (decode ON, threshold 0 — the proto
+    // executes from PRE-DECODED records) must be byte-identical to the byte path.
+    // A divergence here is a real bug in the DECODE record driver — fix the
+    // engine, never relax this assertion.
+    assert_eq!(
+        tw_n, decfwd_n,
+        "VM (decoded-forced) diverged from the tree-walker — a real DECODE record-driver bug.\n  src: {src:?}\n  \
+         tree-walker:     {tw_n:?}\n  decoded-forced:  {decfwd_n:?}"
+    );
+    // DECODE §8.3 (Gate 15): no-decode (the `ASCRIPT_NO_DECODE` kill switch — pure
+    // byte dispatch) must be byte-identical to all other modes.
+    assert_eq!(
+        tw_n, nodec_n,
+        "VM (no-decode) diverged from the tree-walker.\n  src: {src:?}\n  \
+         tree-walker: {tw_n:?}\n  no-decode:   {nodec_n:?}"
     );
 }
 
