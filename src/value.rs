@@ -1862,6 +1862,91 @@ pub enum Value {
     Shared(Arc<SharedNode>),
 }
 
+/// NANB §3.1.2 — the string-payload seam. `AStr` is the type name every site that
+/// constructs/holds a string payload out of a `Value` refers to, so the underlying
+/// representation can change behind the seam (Phase 1: `Rc<str>`; Phase 2(b):
+/// `ThinStr`) with ZERO call-site churn. `MapKey::Str` tracks the same alias.
+pub type AStr = Rc<str>;
+
+/// NANB §4.2 — the borrowed view of a `Value`'s logical kind. The variant set
+/// mirrors today's [`Value`] enum 1:1 so a match-site migration is textual:
+/// `match v { Value::X(p) => … }` becomes `match v.kind() { ValueKind::X(p) => … }`
+/// with bodies unchanged modulo one `&`/`*`. **Scalars are by-value (`Copy`);
+/// handles are borrowed** (`&'a`) — no refcount traffic crossing the seam. Once the
+/// repr is sealed (Task 1.7), `kind()` is the only window onto the storage, so the
+/// repr is free to change behind it. `Debug` is hand-written (handles aren't
+/// uniformly `Debug`) and mirrors [`Value`]'s own `Debug` shape.
+pub enum ValueKind<'a> {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Decimal(&'a Rc<Decimal>),
+    Str(&'a AStr),
+    Builtin(&'a AStr),
+    Function(&'a Rc<Function>),
+    Closure(&'a Cc<crate::vm::value_ext::Closure>),
+    Array(&'a Cc<ArrayCell>),
+    Object(&'a Cc<ObjectCell>),
+    Map(&'a Cc<MapCell>),
+    Set(&'a Cc<SetCell>),
+    Bytes(&'a Rc<RefCell<Vec<u8>>>),
+    #[cfg(feature = "data")]
+    Regex(&'a Rc<RegexHandle>),
+    Native(&'a Rc<NativeObject>),
+    NativeMethod(&'a Rc<NativeMethod>),
+    Enum(&'a Rc<EnumDef>),
+    EnumVariant(&'a Rc<EnumVariant>),
+    Class(&'a Rc<Class>),
+    Interface(&'a Rc<InterfaceDef>),
+    Instance(&'a Cc<RefCell<Instance>>),
+    BoundMethod(&'a Rc<BoundMethod>),
+    Super(&'a Rc<SuperRef>),
+    Future(&'a crate::task::SharedFuture),
+    Generator(&'a Rc<crate::coro::GeneratorHandle>),
+    GeneratorMethod(&'a Rc<GeneratorMethodData>),
+    ClassMethod(&'a Rc<ClassMethodData>),
+    Shared(&'a Arc<SharedNode>),
+}
+
+/// NANB §4.2 — the by-value mirror of [`ValueKind`] for CONSUMING matches: payloads
+/// are MOVED out of the `Value` (not borrowed), so the VM's consuming match sites
+/// avoid a clone. Produced by [`Value::into_kind`]. Scalars are by-value `Copy`;
+/// handles are owned (`Rc`/`Cc`/`Arc`) — the move transfers the same allocation, no
+/// refcount change (proved by `owned_kind_moves_without_refcount_change`).
+pub enum OwnedKind {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Decimal(Rc<Decimal>),
+    Str(AStr),
+    Builtin(AStr),
+    Function(Rc<Function>),
+    Closure(Cc<crate::vm::value_ext::Closure>),
+    Array(Cc<ArrayCell>),
+    Object(Cc<ObjectCell>),
+    Map(Cc<MapCell>),
+    Set(Cc<SetCell>),
+    Bytes(Rc<RefCell<Vec<u8>>>),
+    #[cfg(feature = "data")]
+    Regex(Rc<RegexHandle>),
+    Native(Rc<NativeObject>),
+    NativeMethod(Rc<NativeMethod>),
+    Enum(Rc<EnumDef>),
+    EnumVariant(Rc<EnumVariant>),
+    Class(Rc<Class>),
+    Interface(Rc<InterfaceDef>),
+    Instance(Cc<RefCell<Instance>>),
+    BoundMethod(Rc<BoundMethod>),
+    Super(Rc<SuperRef>),
+    Future(crate::task::SharedFuture),
+    Generator(Rc<crate::coro::GeneratorHandle>),
+    GeneratorMethod(Rc<GeneratorMethodData>),
+    ClassMethod(Rc<ClassMethodData>),
+    Shared(Arc<SharedNode>),
+}
+
 // VAL Task 0 / spec §6 — the `!Send`/`!Sync` lock, module-level (compile-time)
 // next to the `Value` definition so it fails the build, not just a test run, if a
 // future edit (VAL's own NaN-box, SRV's `Arc` leaf, or any variant-adder) ever
@@ -1965,6 +2050,292 @@ impl Value {
     #[inline]
     pub fn object(map: IndexMap<String, Value>) -> Value {
         Value::Object(ObjectCell::new(map))
+    }
+
+    // ── NANB Task 1.1: the API seam ──────────────────────────────────────────
+    // `kind()`/`into_kind()` are the borrowed/consuming windows onto the repr;
+    // the constructors below are TOTAL coverage of every variant. Over today's
+    // enum each is a trivial one-line re-projection (`#[inline(always)]`), so
+    // LLVM compiles `match v.kind()` to the same jump table as `match v`. Once
+    // the repr is sealed (Task 1.7), this is the ONLY way consumers touch it.
+
+    /// NANB §4.2 — borrowed view of this value's logical kind. Scalars by value,
+    /// handles by `&`. Total over every [`Value`] variant.
+    #[inline(always)]
+    pub fn kind(&self) -> ValueKind<'_> {
+        match self {
+            Value::Nil => ValueKind::Nil,
+            Value::Bool(b) => ValueKind::Bool(*b),
+            Value::Int(i) => ValueKind::Int(*i),
+            Value::Float(f) => ValueKind::Float(*f),
+            Value::Decimal(d) => ValueKind::Decimal(d),
+            Value::Str(s) => ValueKind::Str(s),
+            Value::Builtin(s) => ValueKind::Builtin(s),
+            Value::Function(f) => ValueKind::Function(f),
+            Value::Closure(c) => ValueKind::Closure(c),
+            Value::Array(a) => ValueKind::Array(a),
+            Value::Object(o) => ValueKind::Object(o),
+            Value::Map(m) => ValueKind::Map(m),
+            Value::Set(s) => ValueKind::Set(s),
+            Value::Bytes(b) => ValueKind::Bytes(b),
+            #[cfg(feature = "data")]
+            Value::Regex(r) => ValueKind::Regex(r),
+            Value::Native(n) => ValueKind::Native(n),
+            Value::NativeMethod(m) => ValueKind::NativeMethod(m),
+            Value::Enum(e) => ValueKind::Enum(e),
+            Value::EnumVariant(v) => ValueKind::EnumVariant(v),
+            Value::Class(c) => ValueKind::Class(c),
+            Value::Interface(i) => ValueKind::Interface(i),
+            Value::Instance(i) => ValueKind::Instance(i),
+            Value::BoundMethod(b) => ValueKind::BoundMethod(b),
+            Value::Super(s) => ValueKind::Super(s),
+            Value::Future(f) => ValueKind::Future(f),
+            Value::Generator(g) => ValueKind::Generator(g),
+            Value::GeneratorMethod(g) => ValueKind::GeneratorMethod(g),
+            Value::ClassMethod(c) => ValueKind::ClassMethod(c),
+            Value::Shared(s) => ValueKind::Shared(s),
+        }
+    }
+
+    /// NANB §4.2 — consuming deconstruction. Moves each payload out (no clone)
+    /// for the VM's owning matches. Total over every [`Value`] variant.
+    #[inline(always)]
+    pub fn into_kind(self) -> OwnedKind {
+        match self {
+            Value::Nil => OwnedKind::Nil,
+            Value::Bool(b) => OwnedKind::Bool(b),
+            Value::Int(i) => OwnedKind::Int(i),
+            Value::Float(f) => OwnedKind::Float(f),
+            Value::Decimal(d) => OwnedKind::Decimal(d),
+            Value::Str(s) => OwnedKind::Str(s),
+            Value::Builtin(s) => OwnedKind::Builtin(s),
+            Value::Function(f) => OwnedKind::Function(f),
+            Value::Closure(c) => OwnedKind::Closure(c),
+            Value::Array(a) => OwnedKind::Array(a),
+            Value::Object(o) => OwnedKind::Object(o),
+            Value::Map(m) => OwnedKind::Map(m),
+            Value::Set(s) => OwnedKind::Set(s),
+            Value::Bytes(b) => OwnedKind::Bytes(b),
+            #[cfg(feature = "data")]
+            Value::Regex(r) => OwnedKind::Regex(r),
+            Value::Native(n) => OwnedKind::Native(n),
+            Value::NativeMethod(m) => OwnedKind::NativeMethod(m),
+            Value::Enum(e) => OwnedKind::Enum(e),
+            Value::EnumVariant(v) => OwnedKind::EnumVariant(v),
+            Value::Class(c) => OwnedKind::Class(c),
+            Value::Interface(i) => OwnedKind::Interface(i),
+            Value::Instance(i) => OwnedKind::Instance(i),
+            Value::BoundMethod(b) => OwnedKind::BoundMethod(b),
+            Value::Super(s) => OwnedKind::Super(s),
+            Value::Future(f) => OwnedKind::Future(f),
+            Value::Generator(g) => OwnedKind::Generator(g),
+            Value::GeneratorMethod(g) => OwnedKind::GeneratorMethod(g),
+            Value::ClassMethod(c) => OwnedKind::ClassMethod(c),
+            Value::Shared(s) => OwnedKind::Shared(s),
+        }
+    }
+
+    // ── Total constructor coverage (NANB §4.2; extends the VAL Task-0 set) ────
+    // Each is a one-line wrap so call sites never name a `Value::` variant. The
+    // scalar `int`/`float`/`object` helpers already live above.
+
+    /// Construct the unit `nil` value.
+    #[inline]
+    pub fn nil() -> Value {
+        Value::Nil
+    }
+
+    /// Construct a `bool` value (named `bool_` to avoid the `bool` keyword).
+    #[inline]
+    pub fn bool_(b: bool) -> Value {
+        Value::Bool(b)
+    }
+
+    /// Construct a `Decimal` value (NUM's exact subtype, boxed behind `Rc`).
+    #[inline]
+    pub fn decimal(d: Decimal) -> Value {
+        Value::Decimal(Rc::new(d))
+    }
+
+    /// Construct a `Str` value from anything convertible into the [`AStr`] seam
+    /// (e.g. `&str`, `String`, `Rc<str>`).
+    #[inline]
+    pub fn str(s: impl Into<AStr>) -> Value {
+        Value::Str(s.into())
+    }
+
+    /// Construct a `Builtin` value (a named native function dispatched by name).
+    #[inline]
+    pub fn builtin(name: impl Into<AStr>) -> Value {
+        Value::Builtin(name.into())
+    }
+
+    /// Construct a `Function` value from a prepared `Rc<Function>`.
+    #[inline]
+    pub fn function(f: Rc<Function>) -> Value {
+        Value::Function(f)
+    }
+
+    /// Construct a `Closure` value from a prepared VM closure cell.
+    #[inline]
+    pub fn closure(c: Cc<crate::vm::value_ext::Closure>) -> Value {
+        Value::Closure(c)
+    }
+
+    /// Construct an `Array` value from a `Vec<Value>` (fresh, unfrozen cell).
+    #[inline]
+    pub fn array(vec: Vec<Value>) -> Value {
+        Value::Array(ArrayCell::new(vec))
+    }
+
+    /// Construct a `Map` value from an insertion-ordered key→value map.
+    #[inline]
+    pub fn map(map: IndexMap<MapKey, Value>) -> Value {
+        Value::Map(MapCell::new(map))
+    }
+
+    /// Construct a `Set` value from an insertion-ordered key set.
+    #[inline]
+    pub fn set(set: IndexSet<MapKey>) -> Value {
+        Value::Set(SetCell::new(set))
+    }
+
+    /// Construct a `Bytes` value from a mutable byte buffer.
+    #[inline]
+    pub fn bytes(b: Vec<u8>) -> Value {
+        Value::Bytes(Rc::new(RefCell::new(b)))
+    }
+
+    /// Construct a `Regex` value from a prepared handle.
+    #[cfg(feature = "data")]
+    #[inline]
+    pub fn regex(r: Rc<RegexHandle>) -> Value {
+        Value::Regex(r)
+    }
+
+    /// Construct a `Native` resource-handle value.
+    #[inline]
+    pub fn native(n: Rc<NativeObject>) -> Value {
+        Value::Native(n)
+    }
+
+    /// Construct a `NativeMethod` value (a method bound to a native handle).
+    #[inline]
+    pub fn native_method(m: Rc<NativeMethod>) -> Value {
+        Value::NativeMethod(m)
+    }
+
+    /// Construct an `Enum` value (an enum-definition descriptor).
+    #[inline]
+    pub fn enum_(e: Rc<EnumDef>) -> Value {
+        Value::Enum(e)
+    }
+
+    /// Construct an `EnumVariant` value.
+    #[inline]
+    pub fn enum_variant(v: Rc<EnumVariant>) -> Value {
+        Value::EnumVariant(v)
+    }
+
+    /// Construct a `Class` value.
+    #[inline]
+    pub fn class(c: Rc<Class>) -> Value {
+        Value::Class(c)
+    }
+
+    /// Construct an `Interface` value (a structural conformance descriptor).
+    #[inline]
+    pub fn interface(i: Rc<InterfaceDef>) -> Value {
+        Value::Interface(i)
+    }
+
+    /// Construct an `Instance` value from a prepared instance cell.
+    #[inline]
+    pub fn instance(i: Cc<RefCell<Instance>>) -> Value {
+        Value::Instance(i)
+    }
+
+    /// Construct a `BoundMethod` value.
+    #[inline]
+    pub fn bound_method(b: Rc<BoundMethod>) -> Value {
+        Value::BoundMethod(b)
+    }
+
+    /// Construct a `Super` reference value.
+    #[inline]
+    pub fn super_(s: Rc<SuperRef>) -> Value {
+        Value::Super(s)
+    }
+
+    /// Construct a `Future` value from a shared task handle.
+    #[inline]
+    pub fn future(f: crate::task::SharedFuture) -> Value {
+        Value::Future(f)
+    }
+
+    /// Construct a `Generator` value from a generator handle.
+    #[inline]
+    pub fn generator(g: Rc<crate::coro::GeneratorHandle>) -> Value {
+        Value::Generator(g)
+    }
+
+    /// Construct a `GeneratorMethod` value (a method bound to a generator handle).
+    #[inline]
+    pub fn generator_method(g: Rc<GeneratorMethodData>) -> Value {
+        Value::GeneratorMethod(g)
+    }
+
+    /// Construct a `ClassMethod` value (a static/`from` method bound to its class).
+    #[inline]
+    pub fn class_method(c: Rc<ClassMethodData>) -> Value {
+        Value::ClassMethod(c)
+    }
+
+    /// Construct a `Shared` value (SRV §3.2 — the frozen `Arc`-backed leaf).
+    #[inline]
+    pub fn shared(arc: Arc<SharedNode>) -> Value {
+        Value::Shared(arc)
+    }
+
+    // ── Borrowed extractors the migration needs ──────────────────────────────
+
+    /// Borrow the underlying `&str` of a `Str` value; `None` otherwise.
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Borrow the `Array` cell handle; `None` otherwise.
+    #[inline]
+    pub fn as_array(&self) -> Option<&Cc<ArrayCell>> {
+        match self {
+            Value::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Borrow the `Bytes` cell handle; `None` otherwise.
+    #[inline]
+    pub fn as_bytes(&self) -> Option<&Rc<RefCell<Vec<u8>>>> {
+        match self {
+            Value::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Test-only probe: the `Rc<str>` strong count of a `Str` value, used by
+    /// `owned_kind_moves_without_refcount_change` to prove `into_kind` moves
+    /// (rather than clones) the string payload. `None` for every non-`Str`.
+    #[cfg(test)]
+    #[inline]
+    pub fn str_strong_count(&self) -> Option<usize> {
+        match self {
+            Value::Str(s) => Some(Rc::strong_count(s)),
+            _ => None,
+        }
     }
 
     /// Extract the `i64` of an `Int` value EXACTLY — `None` for every other kind
@@ -2206,6 +2577,98 @@ impl fmt::Debug for Value {
     }
 }
 
+impl fmt::Debug for ValueKind<'_> {
+    /// Mirrors [`Value`]'s `Debug` shape — handles aren't uniformly `Debug`, so it
+    /// is hand-written. Used by the Task 1.1 view tests' `{other:?}` panic arms.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValueKind::Nil => write!(f, "Nil"),
+            ValueKind::Bool(b) => write!(f, "Bool({})", b),
+            ValueKind::Int(i) => write!(f, "Int({})", i),
+            ValueKind::Float(n) => write!(f, "Float({})", n),
+            ValueKind::Decimal(d) => write!(f, "Decimal({})", d),
+            ValueKind::Str(s) => write!(f, "Str({:?})", s),
+            ValueKind::Builtin(name) => write!(f, "Builtin({:?})", name),
+            ValueKind::Function(func) => {
+                write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
+            }
+            ValueKind::Closure(_) => write!(f, "Closure(<anonymous>)"),
+            ValueKind::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
+            ValueKind::Object(o) => write!(f, "Object(len {})", o.len()),
+            ValueKind::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            ValueKind::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
+            ValueKind::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
+            #[cfg(feature = "data")]
+            ValueKind::Regex(r) => write!(f, "Regex({:?})", r.source),
+            ValueKind::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
+            ValueKind::NativeMethod(m) => {
+                write!(f, "NativeMethod({}.{})", m.receiver.kind.type_name(), m.method)
+            }
+            ValueKind::Enum(e) => write!(f, "Enum({})", e.name),
+            ValueKind::EnumVariant(v) => match &v.payload {
+                None => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
+                Some(_) => write!(f, "EnumVariant({}.{}(..))", v.enum_name, v.name),
+            },
+            ValueKind::Class(c) => write!(f, "Class({})", c.name),
+            ValueKind::Interface(i) => write!(f, "Interface({})", i.name),
+            ValueKind::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
+            ValueKind::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
+            ValueKind::Super(_) => write!(f, "Super"),
+            ValueKind::Future(_) => write!(f, "Future"),
+            ValueKind::Generator(_) => write!(f, "Generator"),
+            ValueKind::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
+            ValueKind::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
+            ValueKind::Shared(n) => write!(f, "Shared({})", n.kind_name()),
+        }
+    }
+}
+
+impl fmt::Debug for OwnedKind {
+    /// Mirrors [`Value`]'s `Debug` shape (see [`ValueKind`]'s `Debug`). Used by the
+    /// Task 1.1 `into_kind` test's `{other:?}` panic arm.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OwnedKind::Nil => write!(f, "Nil"),
+            OwnedKind::Bool(b) => write!(f, "Bool({})", b),
+            OwnedKind::Int(i) => write!(f, "Int({})", i),
+            OwnedKind::Float(n) => write!(f, "Float({})", n),
+            OwnedKind::Decimal(d) => write!(f, "Decimal({})", d),
+            OwnedKind::Str(s) => write!(f, "Str({:?})", s),
+            OwnedKind::Builtin(name) => write!(f, "Builtin({:?})", name),
+            OwnedKind::Function(func) => {
+                write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
+            }
+            OwnedKind::Closure(_) => write!(f, "Closure(<anonymous>)"),
+            OwnedKind::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
+            OwnedKind::Object(o) => write!(f, "Object(len {})", o.len()),
+            OwnedKind::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            OwnedKind::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
+            OwnedKind::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
+            #[cfg(feature = "data")]
+            OwnedKind::Regex(r) => write!(f, "Regex({:?})", r.source),
+            OwnedKind::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
+            OwnedKind::NativeMethod(m) => {
+                write!(f, "NativeMethod({}.{})", m.receiver.kind.type_name(), m.method)
+            }
+            OwnedKind::Enum(e) => write!(f, "Enum({})", e.name),
+            OwnedKind::EnumVariant(v) => match &v.payload {
+                None => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
+                Some(_) => write!(f, "EnumVariant({}.{}(..))", v.enum_name, v.name),
+            },
+            OwnedKind::Class(c) => write!(f, "Class({})", c.name),
+            OwnedKind::Interface(i) => write!(f, "Interface({})", i.name),
+            OwnedKind::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
+            OwnedKind::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
+            OwnedKind::Super(_) => write!(f, "Super"),
+            OwnedKind::Future(_) => write!(f, "Future"),
+            OwnedKind::Generator(_) => write!(f, "Generator"),
+            OwnedKind::GeneratorMethod(g) => write!(f, "GeneratorMethod({})", g.name),
+            OwnedKind::ClassMethod(c) => write!(f, "ClassMethod({}.{})", c.class.name, c.name),
+            OwnedKind::Shared(n) => write!(f, "Shared({})", n.kind_name()),
+        }
+    }
+}
+
 /// NUM §4: render a `float` (`f64`) the way AScript prints/`str()`s it. Unlike
 /// Rust's `f64` Display (which prints `7.0` as `"7"`), a `float` ALWAYS shows at
 /// least one fractional digit so it is visually distinguishable from an `int`
@@ -2431,6 +2894,49 @@ mod tests {
         // These calls only typecheck if the borrowed field is the DEFAULT hasher.
         assert_eq!(hasher_type_of_map(&map.borrow()), TypeId::of::<SipState>());
         assert_eq!(hasher_type_of_set(&set.borrow()), TypeId::of::<SipState>());
+    }
+
+    // NANB Task 1.1 — the `ValueKind<'_>` borrowed view is TOTAL (one arm per
+    // `Value` variant) and FAITHFUL (reports the same logical kind, borrows the
+    // SAME handle / preserves the exact scalar bits, incl. a non-canonical NaN).
+    #[test]
+    fn value_kind_view_is_total_and_faithful() {
+        // The view BORROWS the same handle: pointer-identical to the accessor's clone.
+        let arr = Value::array(vec![Value::int(1)]);
+        match arr.kind() {
+            ValueKind::Array(a) => {
+                let cell = arr.as_array().expect("array accessor");
+                assert!(crate::gc::cc_ptr_eq(a, cell));
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+        assert!(matches!(Value::int(7).kind(), ValueKind::Int(7)));
+        assert!(matches!(Value::float(2.5).kind(), ValueKind::Float(f) if f == 2.5));
+        assert!(matches!(Value::str("hi").kind(), ValueKind::Str(s) if &**s == "hi"));
+        assert!(matches!(Value::nil().kind(), ValueKind::Nil));
+        assert!(matches!(Value::bool_(true).kind(), ValueKind::Bool(true)));
+        // NaN bit pattern preserved through construct→kind (the §7.5 seed property).
+        let weird_nan = f64::from_bits(0x7FF0_0000_0000_0001);
+        assert!(matches!(Value::float(weird_nan).kind(),
+            ValueKind::Float(f) if f.to_bits() == weird_nan.to_bits()));
+    }
+
+    // NANB Task 1.1 — `into_kind()` MOVES the payload out (no clone): the `Rc<str>`
+    // strong count is unchanged across `Value` → `OwnedKind::Str` (it would be +1
+    // momentarily if the projection cloned). After the owned payload drops, the
+    // probe is back at the start.
+    #[test]
+    fn owned_kind_moves_without_refcount_change() {
+        let v = Value::str("payload");
+        let before = v.str_strong_count().expect("str strong count");
+        match v.into_kind() {
+            OwnedKind::Str(s) => {
+                assert_eq!(&*s, "payload");
+                // The moved-out `Rc<str>` is the SAME allocation — still strong count 1.
+                assert_eq!(Rc::strong_count(&s), before);
+            }
+            other => panic!("wrong owned kind: {other:?}"),
+        }
     }
 
     // SHAPE §6.2: the demoted hostile-key object dict also keeps SipHash.
