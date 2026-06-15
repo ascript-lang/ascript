@@ -2,6 +2,10 @@
 //! array, object, map, set, enum, enum-variant, class, instance, bound-method,
 //! super-ref, future.
 
+// NANB Phase 2 — the single-allocation thin string (the one new `unsafe`, §3.1.1).
+// Not yet wired into `Value` (Task 2.2); the type + its tests stand alone here.
+pub mod thin_str;
+
 use crate::ast::Stmt;
 use crate::env::Environment;
 use gcmodule::{Cc, Trace, Tracer};

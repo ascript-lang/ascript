@@ -1688,3 +1688,75 @@ mod object_storage_property {
         );
     }
 }
+
+// ===========================================================================
+// NANB Phase 2 (Task 2.1) — ThinStr ↔ Rc<str> parity
+// ===========================================================================
+//
+// `ThinStr` is a single-allocation, header-length thin string built to be a drop-in for
+// `Rc<str>` *by content*. These properties prove, over arbitrary `String`s, that:
+//   - deref equals the source text (round-trip through the single allocation),
+//   - clone/drop N times leaves the strong count balanced (no leak, no double-free),
+//   - Display / Debug / Eq / Ord / Hash all AGREE with `Rc<str>::from(&s)` (the parity
+//     contract that lets Task 2.2 flip `AStr` from `Rc<str>` to `ThinStr` transparently).
+mod thin_str_property {
+    use ascript::value::thin_str::ThinStr;
+    use proptest::prelude::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::rc::Rc;
+
+    fn hash_of<T: Hash>(v: &T) -> u64 {
+        let mut h = DefaultHasher::new();
+        v.hash(&mut h);
+        h.finish()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// ∀ s: String — ThinStr derefs to s, clone/drop is balanced, and
+        /// Display/Debug/Eq/Ord/Hash agree with `Rc<str>::from(&s)`.
+        #[test]
+        fn thin_str_matches_rc_str(s in ".*", other in ".*") {
+            let t = ThinStr::from(s.as_str());
+            let rc: Rc<str> = Rc::from(s.as_str());
+
+            // Deref / len round-trip.
+            prop_assert_eq!(&*t, s.as_str());
+            prop_assert_eq!(t.len(), s.len());
+            prop_assert_eq!(t.is_empty(), s.is_empty());
+
+            // Display & Debug match the &str rendering (== Rc<str> rendering).
+            prop_assert_eq!(format!("{t}"), format!("{}", rc));
+            prop_assert_eq!(format!("{t:?}"), format!("{:?}", rc));
+
+            // Hash agrees with the str content (so it keys identically to Rc<str>,
+            // which hashes its `str` content the same way `String`/`&str` do).
+            prop_assert_eq!(hash_of(&t), hash_of(&s));
+            prop_assert_eq!(hash_of(&t), hash_of(&rc));
+
+            // Eq / Ord agree with the str comparison against an arbitrary other string.
+            let t2 = ThinStr::from(s.as_str());
+            let u = ThinStr::from(other.as_str());
+            prop_assert_eq!(&t, &t2);
+            prop_assert_eq!(t == u, s == other);
+            prop_assert_eq!(t.cmp(&u), s.as_str().cmp(other.as_str()));
+            prop_assert_eq!(
+                t.partial_cmp(&u),
+                s.as_str().partial_cmp(other.as_str())
+            );
+
+            // Clone/drop balance: many clones, all dropped, count returns to 1.
+            prop_assert_eq!(t.strong_count(), 1);
+            let clones: Vec<ThinStr> = (0..16).map(|_| t.clone()).collect();
+            prop_assert_eq!(t.strong_count(), 17);
+            // Every clone is the SAME content (shared allocation).
+            for c in &clones {
+                prop_assert_eq!(&**c, s.as_str());
+            }
+            drop(clones);
+            prop_assert_eq!(t.strong_count(), 1);
+        }
+    }
+}
