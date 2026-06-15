@@ -8849,8 +8849,16 @@ impl Vm {
                 {
                     // SAME rust_decimal op as apply_binop's decimal arm. Both
                     // operands are real Decimals (always finite), Add/Sub/Mul only
-                    // — no coercion, no div-by-zero.
-                    return Ok(decimal_fast(op, **x, **y));
+                    // — no coercion, no div-by-zero. `decimal_fast` returns `None`
+                    // on 96-bit-mantissa overflow; we then DEOPT to the shared
+                    // `apply_binop`, which raises the canonical Tier-2
+                    // `decimal <op> overflowed` panic (byte-identical message — a
+                    // bare operator would `panic!`/abort instead).
+                    if let Some(v) = decimal_fast(op, **x, **y) {
+                        return Ok(v);
+                    }
+                    let span = chunk.span_at(fault_ip);
+                    return crate::interp::apply_binop(op, a, b, span);
                 }
                 (ArithKind::ConcatStr, ValueKind::Str(x), ValueKind::Str(y))
                     if matches!(op, BinOp::Add) =>
@@ -9705,19 +9713,22 @@ fn number_fast(op: BinOp, a: f64, b: f64) -> Value {
 }
 
 /// Inline decimal arithmetic for the `ADD_DECIMAL`-family fast path (V11-T4).
-/// BYTE-IDENTICAL to [`crate::interp::apply_binop`]'s decimal Add/Sub/Mul arms.
-/// Restricted by the adaptive guard to Add/Sub/Mul over two real `Decimal`s
-/// (always finite), so there is no coercion, no non-finite check and no
-/// div-by-zero to defer — those operators/operands never specialize and always go
-/// generic.
+/// BYTE-IDENTICAL to [`crate::interp::apply_binop`]'s decimal Add/Sub/Mul arms:
+/// uses the CHECKED rust_decimal ops and returns `None` on 96-bit-mantissa
+/// overflow so the caller deopts to the shared `apply_binop` (which raises the
+/// canonical Tier-2 `decimal <op> overflowed` panic) — a bare operator would
+/// `panic!` and abort the thread. Restricted by the adaptive guard to Add/Sub/Mul
+/// over two real `Decimal`s (always finite), so there is no coercion, no
+/// non-finite check and no div-by-zero to defer.
 #[inline]
-fn decimal_fast(op: BinOp, a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
-    match op {
-        BinOp::Add => Value::decimal(a + b),
-        BinOp::Sub => Value::decimal(a - b),
-        BinOp::Mul => Value::decimal(a * b),
+fn decimal_fast(op: BinOp, a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Option<Value> {
+    let d = match op {
+        BinOp::Add => a.checked_add(b),
+        BinOp::Sub => a.checked_sub(b),
+        BinOp::Mul => a.checked_mul(b),
         _ => unreachable!("decimal_fast called with non-specializable op {op:?}"),
-    }
+    };
+    d.map(Value::decimal)
 }
 
 /// Map a unary-operator opcode to the shared [`UnOp`].

@@ -110,14 +110,22 @@ stated, results are measured.
   - Plan: `superpowers/plans/2026-06-12-shape-storage.md`
   - **MERGED to `main` (`--no-ff`).** See EXECUTION LOG. NANB is now unblocked.
 
-- 🔒 **NANB — 8-byte NaN-boxed `Value`.** The representation endgame VAL §3.2 sanctioned but
-  parked: `Value` becomes a single 8-byte NaN-boxed word (inline `float`; tagged inline `int`
-  within payload range with overflow escape; tagged `Cc`/`Rc` pointers for heap kinds; immediate
-  nil/bool). Clears the JIT spec's ≤16-byte precondition. The prior 16-byte thin-`Str` attempt was
-  REJECTED as a measured regression (`bench/COMPACT_VALUE_RESULTS.md`) — NANB must re-run that
-  evaluation gate and ship only on a measured win (Gate-12 style A/B, same session). Depends on
-  SHAPE (object internals stabilize first; avoids double-churn).
-  - Spec: `superpowers/specs/2026-06-12-nan-boxing-design.md`
+- ⚖️ **NANB — 16-byte two-word `Value` — EVIDENCE-REJECTED (Phase 1 seam SHIPPED).** The
+  representation endgame VAL §3.2 sanctioned but parked. **Outcome:** Phase 1 (the sealed `pub
+  struct Value(ValueRepr)` + `ValueKind`/`OwnedKind` view seam) is **MERGED to `main`** — proven
+  zero-cost (geomean spec/tw 4.07× == pre-NANB baseline 4.00×), size unchanged at 24 B,
+  `ASO_FORMAT_VERSION` 28. The 16-byte `value16` repr (Phases 2–3: `ThinStr` + `cfg(value16)`) was
+  built, proven behavior-invisible (cross-binary 110/110 byte-identical, four-mode 444/0 ×2 configs,
+  300k-case deep fuzz 0 divergence, Miri-clean) and measured same-session — then **evidence-REJECTED
+  by the reviewer-of-record against the fixed §8.1 SHIP criteria:** time geomean **1.005× spec** (bar
+  ≥1.02× — rides noise, FAIL), peak RSS **1.001× / flat** (bar ≥5% improvement, FAIL), STRING-subset
+  geomean not isolated (unconfirmable). Mirrors the prior thin-`Str` reject
+  (`bench/COMPACT_VALUE_RESULTS.md`). The `value16` repr stays frozen+flagged on `feat/value16` as
+  the cheap re-run path. The repr-independent decimal-overflow fix found by the fuzz campaign landed
+  separately on `main`. Verdict + numbers: `bench/NANB_RESULTS.md` "Phase 4". (8-byte NaN-box —
+  inline `float`, tagged inline `int`, tagged pointers — remains the double-gated future endgame,
+  unattempted.) Depended on SHAPE ✅.
+  - Spec: `superpowers/specs/2026-06-12-nan-boxing-design.md` (§8.1 verdict appended)
   - Plan: `superpowers/plans/2026-06-12-nan-boxing.md`
 
 ### Dispatch — decode once, fuse what the data says, inline what guards allow
@@ -194,13 +202,17 @@ stated, results are measured.
   spike on `json_roundtrip` + the server workload proving ≥20% allocation-time win without
   promotion-cost blowback.** v1 may narrow to compiler-PROVEN non-escaping allocations (Go-style
   escape analysis on `bcanalysis` facts) if the dynamic promotion spike fails its gate. Depends
-  on NANB (value representation must be final first).
+  on NANB (value representation must be final first) — **now SATISFIED: NANB evidence-rejected the
+  16-byte repr, so `Value` is final at 24 B; REGION is unblocked at that representation.**
   - Spec: `superpowers/specs/2026-06-12-task-regions-design.md`
   - Plan: `superpowers/plans/2026-06-12-task-regions.md`
 
 - 🔒 **JIT — Baseline Cranelift JIT (existing spec, still deferred).** The design stands at
   `superpowers/specs/2026-06-08-baseline-jit-design.md`. This campaign UPDATES its preconditions:
-  (1) NUM ✅; (2) the ≤16-byte value precondition is satisfied by **NANB**; (3) profiling must be
+  (1) NUM ✅; (2) the ≤16-byte value precondition is **UNMET — NANB evidence-REJECTED the 16-byte
+  repr** (`value16` showed no measured win, see NANB row); `Value` is **final at 24 B**, so the
+  JIT's ≤16-byte precondition does NOT hold and the JIT stays deferred unless its own re-profile
+  (precondition 3) overrides on dispatch-dominance grounds alone; (3) profiling must be
   re-run AFTER LANE+CALL+SHAPE+DECODE — only if dispatch then dominates does the JIT proceed.
   New addendum requirements discovered since the spec was written: `Op::Break`/coverage
   byte-patching must invalidate compiled code (DECODE builds and proves the invalidation
@@ -579,6 +591,36 @@ stated, results are measured.
     realistic corpus, and interpretation-level pre-decode did not move it. The JIT precondition DECODE
     delivers is the *invalidation contract* (shipped + proven), not a dispatch speedup; the JIT decision
     remains evidence-gated downstream.
+
+- **NANB** — ⚖️ **EVIDENCE-REJECTED (the 16-byte repr); Phase 1 seam ✅ MERGED to `main`.** Two
+  outcomes were first-class; PATH B (RECORD-REJECT) was executed because the measured A/B missed the
+  fixed §8.1 SHIP bar.
+  - **Phase 1 (the API seam) — SHIPPED on `main` (`7f4c862`, `--no-ff`).** `Value` became a sealed
+    `pub struct Value(ValueRepr)` (enum module-private) reached only through total constructors + the
+    `ValueKind`/`OwnedKind` borrowing/owning view (≈675 interp sites + 9 compile/repl/stdlib/worker
+    files migrated off enum-matching). Proven **zero-cost** (geomean spec/tw 4.07× == pre-NANB
+    baseline 4.00×; `dbg_zero_cost` 1.005×); size UNCHANGED at 24 B; `ASO_FORMAT_VERSION` 28; 444/0
+    four-mode both configs. This is the permanent hygiene win and the cheap re-run path.
+  - **Phases 2–3 (the `value16` 16-byte two-word repr: `ThinStr` single-alloc thin string + the
+    `cfg(value16)` `AStr` payload) — built, fully proven CORRECT, then evidence-REJECTED.**
+    Correctness GREEN: cross-BINARY 110/110 byte-identical (24 B vs 16 B, whole corpus,
+    stdout/stderr/exit diffed); four-mode `vm_differential` 444/0 ×2 feature configs under `value16`;
+    **300k-case deep fuzz × 8 engine modes, 0 divergences**; `ThinStr` Miri-clean; Gate-12 spec/tw
+    4.03× and DBG 0.996× under `value16`.
+  - **VERDICT (independent reviewer-of-record, against §8.1 fixed-before-measurement): STOP.**
+    Criterion 1 FAIL (time geomean **1.005× spec** < ≥1.02× — rides noise); criterion 3 FAIL (peak
+    RSS **1.001× / flat** < ≥5% improvement — the 24→16 B cell shrink is swamped by the ~12–14 MB
+    runtime image + native buffers on the corpus); criterion 2 unconfirmable (STRING-subset geomean
+    not isolated on the §8.2 string corpus); criteria 4 (tw 1.000×) + 5 (all correctness) PASS.
+    No measured win ⇒ reject, mirroring the prior thin-`Str` reject (`COMPACT_VALUE_RESULTS.md`).
+  - **Disposition:** `value16` repr NOT merged — frozen+flagged on `feat/value16` (pin commit). The
+    repr-INDEPENDENT decimal-overflow fix the fuzz campaign surfaced (`apply_binop`/VM `decimal_fast`
+    bare ops → checked ops raising recoverable Tier-2 `decimal <op> overflowed`; failing-test-first)
+    landed on `main` separately. JIT precondition 2 (≤16 B) annotated **UNMET at 24 B**; REGION
+    unblocked (representation final at 24 B). Numbers: `bench/NANB_RESULTS.md` "Phase 4"; spec §8.1
+    GATE-VERDICT appended. **Gates (PATH-B `main`-applicable subset):** `vm_differential` 444/0 both
+    configs; full suite + clippy clean both configs; `ASO_FORMAT_VERSION` 28 unchanged; no
+    grammar/`.aso`/LSP/fmt change.
 
 ## Execution order
 

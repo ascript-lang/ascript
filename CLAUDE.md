@@ -539,6 +539,14 @@ consumer-driven). A separate
 hashable `MapKey` canonicalizes numbers (−0.0→+0.0, NaN unified; an integral in-range `Float` folds to the
 equal `Int` key) for `Map` keys.
 
+**`Value` is a sealed `pub struct Value(ValueRepr)`** (the `enum ValueRepr` is module-private; NANB Phase 1)
+— construct/inspect only through the total constructors + the `ValueKind`/`OwnedKind` borrowing/owning view
+accessors, never by matching the enum. The seam is proven zero-cost (the view inlines away). `Value` is
+**`size_of` = 24 bytes and FINAL at 24** — the 16-byte two-word repr (`value16`/`ThinStr`) was built, proven
+behavior-invisible, and **evidence-REJECTED** against the NANB §8.1 SHIP criteria (no measured time or RSS
+win; `bench/NANB_RESULTS.md` "Phase 4", frozen on `feat/value16`). Do not re-litigate the 16-byte (or
+8-byte NaN-box) representation without NEW profiling evidence; `Value: !Send + !Sync` stays asserted.
+
 **Numeric model (NUM, `superpowers/specs/2026-06-08-numeric-model-design.md`).** Two numeric subtypes —
 `Int(i64)` (default for integer literals; `0x`/`0b`/`0o`/underscores) and `Float(f64)` — plus exact
 `Decimal`. Division is type-directed (`int/int` truncates); `+ - * **`/unary-`-` trap on i64 overflow

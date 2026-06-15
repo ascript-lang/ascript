@@ -494,6 +494,16 @@ COMPACT_VALUE_RESULTS format, `goal-perf.md`'s NANB row flips to evidence-reject
 numbers, the JIT spec's precondition-2 status is annotated (≤16 B then NOT met at 24 B — the JIT
 defers further unless its own re-profile says otherwise), and Phase 1 remains merged.
 
+> **GATE-VERDICT (2026-06-15, reviewer-of-record, against the criteria above as fixed): STOP —
+> EVIDENCE-REJECTED.** Criterion 1 FAIL (spec geomean **1.005×** < 1.02× — rides noise); criterion 3
+> FAIL (peak RSS **1.001× / flat** < ≥5% improvement); criterion 2 unconfirmable (STRING-subset
+> geomean not isolated on the §8.2 string corpus); criteria 4 (tw 1.000×) and 5 (correctness — 110/110
+> cross-binary, 444/0 four-mode ×2 configs, 300k-case 0-divergence fuzz, Miri-clean) PASS. The
+> `value16` 16-byte repr is correct and behavior-invisible but shows **no measured win**, mirroring the
+> thin-`Str` reject (`bench/COMPACT_VALUE_RESULTS.md`). Phase 1's seam remains merged on `main`; the
+> repr-independent decimal-overflow fix landed on `main`; the `value16` repr stays frozen on
+> `feat/value16`. Full numbers: `bench/NANB_RESULTS.md` "Phase 4". Do not re-run without new evidence.
+
 ### 8.2 The A/B protocol
 
 - **Workloads:** the full `bench/compact_value_bench.as` set (int_sum, fib_iter, array_walk,
