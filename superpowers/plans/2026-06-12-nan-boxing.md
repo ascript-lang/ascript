@@ -98,7 +98,7 @@ verdict (on REJECT the branch is left flagged, the VAL `c1571ec` precedent).
 - Modify: `src/value.rs`
 - Test: inline `#[test]`s in `src/value.rs`
 
-- [ ] **Step 1: Write the failing tests** (view totality + round-trip + zero-divergence with
+- [x] **Step 1: Write the failing tests** (view totality + round-trip + zero-divergence with
   direct matching):
 
 ```rust
@@ -137,9 +137,9 @@ fn owned_kind_moves_without_refcount_change() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (`kind`/`into_kind`/constructors don't exist):
+- [x] **Step 2: Run — expect FAIL** (`kind`/`into_kind`/constructors don't exist):
   `cargo test -p ascript value_kind_view`
-- [ ] **Step 3: Implement** in `src/value.rs`:
+- [x] **Step 3: Implement** in `src/value.rs`:
   - `pub type AStr = Rc<str>;` with a doc comment naming it the string-payload seam (spec §3.1.2).
   - `pub enum ValueKind<'a>` exactly as spec §4.2 (29 variants, `Regex` cfg-gated, scalars
     by-value `Copy`, handles `&'a`), `#[derive(Debug)]` where payloads allow (hand-write `Debug`
@@ -156,27 +156,27 @@ fn owned_kind_moves_without_refcount_change() {
     class_method(...) shared(arc)` — each `#[inline]`, each a one-line wrap. Plus the borrowed
     extractors the migration needs (`as_str() -> Option<&str>`, `as_array()`, `as_bytes()`, …)
     where they don't already exist.
-- [ ] **Step 4: Run — expect PASS**; `cargo test -p ascript` (lib tests) green; clippy clean.
-- [ ] **Step 5: Commit** — `git commit -m "feat(value): ValueKind/OwnedKind view + total constructors + AStr seam (repr unchanged)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 4: Run — expect PASS**; `cargo test -p ascript` (lib tests) green; clippy clean.
+- [x] **Step 5: Commit** — `git commit -m "feat(value): ValueKind/OwnedKind view + total constructors + AStr seam (repr unchanged)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.2: relocate `impl Trace for Value` into `value.rs` (zero behavior)
 
 **Files:** `src/gc.rs` (`:193-246` moves out), `src/value.rs` (receives it)
 
-- [ ] **Step 1:** Move the impl verbatim (typed arms: containers recurse, `EnumVariant` deref-
+- [x] **Step 1:** Move the impl verbatim (typed arms: containers recurse, `EnumVariant` deref-
   traces per ADT `gc.rs:210-217`, `Shared` explicit no-op, catch-all no-op). Leave a
   cross-reference comment at the old site: container `Trace` impls + `cc_addr`/`cc_ptr_eq` STAY
   in `gc.rs` (they take `&self`, never a `Value` word — spec §4.2). Rationale comment: the impl
   must see the private repr after Task 1.7's seal.
-- [ ] **Step 2:** The existing GC suites are the test: `cargo test -p ascript gc` + the V13
+- [x] **Step 2:** The existing GC suites are the test: `cargo test -p ascript gc` + the V13
   soundness/soak/Drop gates green, both feature configs.
-- [ ] **Step 3: Commit** — `git commit -m "refactor(gc): move Trace-for-Value beside the (soon-private) repr in value.rs" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 3: Commit** — `git commit -m "refactor(gc): move Trace-for-Value beside the (soon-private) repr in value.rs" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.3: migrate the VM (`src/vm/**`) to the view
 
 **Files:** `src/vm/run.rs` (435 refs — the hot one), `src/vm/{adapt,ic,fiber,aso,verify}.rs`
 
-- [ ] **Step 1:** Mechanical migration by the spec §4.3 rules. The two load-bearing shapes:
+- [x] **Step 1:** Mechanical migration by the spec §4.3 rules. The two load-bearing shapes:
   - the adaptive guard (`run.rs:5318`):
     `match (kind, &a, &b) { (ArithKind::Int, Value::Int(x), Value::Int(y)) => int_binop(op, *x, *y, span), … }`
     → `match (kind, a.kind(), b.kind()) { (ArithKind::Int, ValueKind::Int(x), ValueKind::Int(y)) => int_binop(op, x, y, span), … }`
@@ -185,28 +185,28 @@ fn owned_kind_moves_without_refcount_change() {
     audits this specifically).
   - `aso.rs` `write_value`/`read_value` (`:789/:871`): pattern arms → `kind()`, constructions →
     constructors. Wire bytes untouched by construction.
-- [ ] **Step 2:** Full `cargo test --test vm_differential` (both feature configs) — byte-identical;
+- [x] **Step 2:** Full `cargo test --test vm_differential` (both feature configs) — byte-identical;
   `cargo test --test aso` green (round-trip bytes unchanged).
-- [ ] **Step 3: Commit** — `git commit -m "refactor(vm): route Value matches through ValueKind/OwnedKind (mechanical, behavior-identical)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 3: Commit** — `git commit -m "refactor(vm): route Value matches through ValueKind/OwnedKind (mechanical, behavior-identical)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.4: migrate the tree-walker (`src/interp.rs`, 675 refs)
 
-- [ ] **Step 1:** Same rules; the big tuple-match `apply_binop` (`interp.rs:6924` area) and
+- [x] **Step 1:** Same rules; the big tuple-match `apply_binop` (`interp.rs:6924` area) and
   `type_name` (`:7763`) migrate to `kind()` pairs. The oracle's SEMANTICS must not move: the
   diff is mechanically `Value::X(p)` → `ValueKind::X(p)` + scrutinee `.kind()` + constructor
   renames — the reviewer reads the diff for any non-mechanical line.
-- [ ] **Step 2:** `cargo test --test vm_differential` both configs; `cargo test` default config.
-- [ ] **Step 3: Commit** — `git commit -m "refactor(interp): ValueKind migration (oracle semantics untouched)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 2:** `cargo test --test vm_differential` both configs; `cargo test` default config.
+- [x] **Step 3: Commit** — `git commit -m "refactor(interp): ValueKind migration (oracle semantics untouched)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.5: migrate the stdlib + serializers (`src/stdlib/**`, `src/worker/serialize.rs`)
 
-- [ ] **Step 1:** File-by-file (schema.rs 408 → ffi.rs 163 → net_http/object/fs/math/json/… ),
+- [x] **Step 1:** File-by-file (schema.rs 408 → ffi.rs 163 → net_http/object/fs/math/json/… ),
   then `src/worker/serialize.rs` (`encode_value`'s kind-tag walk + `non_sendable`'s
   classification match `:124-172`). The wire TAG_* constants and byte layout are untouched — the
   worker round-trip property suite is the proof.
-- [ ] **Step 2:** `cargo test` AND `cargo test --no-default-features` green (the cfg-gated
+- [x] **Step 2:** `cargo test` AND `cargo test --no-default-features` green (the cfg-gated
   modules — regex/tui/ai/telemetry arms — compile in both).
-- [ ] **Step 3: Commit** — `git commit -m "refactor(stdlib,worker): ValueKind migration (wire bytes byte-identical)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 3: Commit** — `git commit -m "refactor(stdlib,worker): ValueKind migration (wire bytes byte-identical)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.6: migrate the remainder + sweep to zero
 
@@ -214,53 +214,53 @@ fn owned_kind_moves_without_refcount_change() {
 `src/lsp/**`, `src/fuzzgen/**`, `src/det.rs` (expected no-op — it is `Value`-free), tests with
 direct `Value::` construction.
 
-- [ ] **Step 1:** Migrate everything remaining; finish with the sweep:
+- [x] **Step 1:** Migrate everything remaining; finish with the sweep:
   `rg -n 'Value::[A-Z]' src/ --glob '!src/value.rs'` → **zero hits** (constructors are lowercase;
   any uppercase variant path outside `value.rs` is a straggler).
-- [ ] **Step 2:** Full suite both configs green.
-- [ ] **Step 3: Commit** — `git commit -m "refactor(core): complete the ValueKind migration — zero variant paths outside value.rs" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 2:** Full suite both configs green.
+- [x] **Step 3: Commit** — `git commit -m "refactor(core): complete the ValueKind migration — zero variant paths outside value.rs" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.7: SEAL the representation — `pub struct Value(ValueRepr)`
 
 **Files:** `src/value.rs`
 
-- [ ] **Step 1: Write the failing probe** — a `compile_fail` doc-test (or `trybuild`-style
+- [x] **Step 1: Write the failing probe** — a `compile_fail` doc-test (or `trybuild`-style
   comment test) pinning that `Value::Int` is not nameable outside `value.rs`; plus keep
   `value_size_is_documented` asserting **24** (the seal must not change layout: a newtype over
   the enum is layout-identical).
-- [ ] **Step 2: Implement:** rename the enum to `enum ValueRepr` (private, NOT `pub(crate)` —
+- [x] **Step 2: Implement:** rename the enum to `enum ValueRepr` (private, NOT `pub(crate)` —
   module-private is the compiler-enforced seal, spec §4.2), wrap as
   `#[derive(Clone)] pub struct Value(ValueRepr);`. Repr-private impls (`PartialEq`, `Debug`,
   `Display`, `is_truthy`, `as_f64`/`as_int_exact`, `MapKey::from_value`, `frozen_kind`/
   `freeze_value`/`is_frozen_value`, `Trace`) match `self.0`. The `static_assertions::
   assert_not_impl_any!(Value: Send, Sync)` (`:1203`) stays verbatim.
-- [ ] **Step 3:** Build — **the compiler now finds every straggler the sweep missed**; fix all
+- [x] **Step 3:** Build — **the compiler now finds every straggler the sweep missed**; fix all
   (mechanically, same rules). Full suite + clippy, BOTH configs.
-- [ ] **Step 4: Commit** — `git commit -m "feat(value): seal the representation — Value is a struct over a private ValueRepr" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+- [x] **Step 4: Commit** — `git commit -m "feat(value): seal the representation — Value is a struct over a private ValueRepr" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.8: the Phase-1 zero-cost proof (Gate 12/17 + DBG)
 
 **Files:** none (measurement) / `tests/vm_bench.rs` re-run
 
-- [ ] **Step 1: Same-session sanity A/B** — build `main` and `feat/value-seam`
+- [x] **Step 1: Same-session sanity A/B** — build `main` and `feat/value-seam`
   (`--profile profiling`), run the `bench/compact_value_bench.as` HOT set + `bench/profiling/`
   workloads interleaved, 5 reps, both VM modes: **geomean must be ≈1.00× (within ±1%)**. The
   enum-view-inlines-away claim is verified here, not assumed (spec §8.2). If it regresses: the
   view/inlining is wrong — fix (`#[inline(always)]` audit, check a non-inlined `kind()` in the
   arith path via the profiler), never accept.
-- [ ] **Step 2:** `cargo test --test vm_bench` — spec/tw geomean ≥2× (Gate 17) AND
+- [x] **Step 2:** `cargo test --test vm_bench` — spec/tw geomean ≥2× (Gate 17) AND
   `dbg_zero_cost_gate` green (dispatch-arm text was touched → the DBG re-run rule applies).
-- [ ] **Step 3:** Record the numbers in the commit body (they also seed `bench/NANB_RESULTS.md`'s
+- [x] **Step 3:** Record the numbers in the commit body (they also seed `bench/NANB_RESULTS.md`'s
   Phase-1 section). **Commit** — `git commit -m "bench(value): Phase-1 seam zero-cost proof (geomean ~1.00x both modes; dbg gate green)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ### Task 1.9: Phase 1 holistic review + independent merge
 
-- [ ] **Step 1:** Holistic subagent over the ENTIRE seam diff: zero behavior change (full
+- [x] **Step 1:** Holistic subagent over the ENTIRE seam diff: zero behavior change (full
   four-mode differential both configs); zero non-mechanical lines in `interp.rs`/`run.rs` (read
   the diff); no new clone on a previously clone-free path (spot-audit `into_kind` call sites);
   the seal genuinely seals (`rg 'ValueRepr' src/ --glob '!src/value.rs'` → zero); `Trace`
   relocation preserved every arm; both clippy configs clean; the 1.8 numbers honest.
-- [ ] **Step 2:** Findings fixed before close. Merge `feat/value-seam` → `main` `--no-ff`
+- [x] **Step 2:** Findings fixed before close. Merge `feat/value-seam` → `main` `--no-ff`
   (message: the seam is hygiene that stands regardless of the Phase-4 verdict — spec §0). Phase 2
   branches from the post-merge `main`.
 
