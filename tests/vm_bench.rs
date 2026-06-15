@@ -207,6 +207,34 @@
 //!     recorded above passed every gate end-to-end (`vm_bench` exit 0).
 //!
 //! ───────────────────────────────────────────────────────────────────────────────
+//! GATE RESULT — PASS (recorded NANB Phase-1 Task 1.8, 2026-06-15, release; Apple M4).
+//! Phase 1 is a PURE REFACTOR: `Value` is now a sealed `pub struct Value(ValueRepr)`
+//! over a private `enum ValueRepr`; `size_of::<Value>()` is UNCHANGED at 24 bytes
+//! (the enum layout is identical, just renamed and wrapped). The `ValueKind`/`OwnedKind`
+//! view layer inlines away completely — the geomean is within noise of the DECODE
+//! Task-11 baseline (4.00×), confirming the seam adds zero representation cost.
+//!
+//!   benchmark                  kind     spec/tw   spec/gen
+//!   fib(30) recursion          compute    8.60x     1.28x
+//!   sum recursion (500 x2000)  compute    9.14x     1.28x
+//!   numeric loop (1e6)         compute    3.72x     1.07x
+//!   while loop (1e6)           compute    5.99x     1.23x
+//!   property r/w (1e6)         compute    4.15x     1.09x
+//!   method dispatch (1e6)      compute    4.10x     2.08x
+//!   string concat (50000)      alloc      1.40x     1.11x   (EXEMPT from >= 2x)
+//!   template build (50000)     alloc      1.18x     1.03x   (EXEMPT from >= 2x)
+//!   closure capture (1e6)      compute    6.27x     1.23x
+//!   geomean spec/tw = 4.07x   (DECODE Task-11 pre-NANB baseline 4.00x — UNCHANGED)
+//!
+//!   (a) COMPUTE-BOUND >= 2x spec/tw: PASS (all 7, min 3.72x).
+//!   (b) NO spec-vs-generic regression: PASS (every bench >= 0.97x spec/gen).
+//!   (c) DBG ZERO-COST GATE: armed/none geomean = 1.005x [PASS] (<= 1.05x bound).
+//!       The dispatch-arm text was touched by the NANB seam migration, so the re-run
+//!       rule applied — the gate holds with the new struct wrapper.
+//!   (d) size_of::<Value>() = 24 bytes (UNCHANGED — pure repr refactor, no cost).
+//!       ASO_FORMAT_VERSION = 28 (UNCHANGED — no opcode or layout change).
+//!
+//! ───────────────────────────────────────────────────────────────────────────────
 
 use std::time::{Duration, Instant};
 
