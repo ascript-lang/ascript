@@ -683,6 +683,13 @@ pub struct Interp {
     /// always call `set_snapshot_update`.
     #[allow(dead_code)]
     snapshots_touched: RefCell<std::collections::BTreeSet<PathBuf>>,
+    /// ELIDE §4.3 Task 3.2: when `true`, the tree-walker module loader runs
+    /// `elision_proofs` on each module's source and calls `mark_program` before
+    /// execution. Defaults to `false` — zero behavior change in normal runs.
+    /// Task 4.1 gates the default-on decision (measured §5.1 budget); for THIS
+    /// task the flag is exposed via `set_elide_mode` so tests can turn it on
+    /// without changing any existing run path. A `Cell` (never held across `.await`).
+    pub(crate) elide_mode: Cell<bool>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1065,6 +1072,9 @@ impl Interp {
             // never overwrites a changed snapshot and never deletes an orphan.
             snapshot_update: Cell::new(false),
             snapshots_touched: RefCell::new(std::collections::BTreeSet::new()),
+            // ELIDE §4.3 Task 3.2: marking pass is OFF by default so every existing
+            // run is byte-identical (Task 4.1 decides the default-on path).
+            elide_mode: Cell::new(false),
         }
     }
 
@@ -1101,6 +1111,16 @@ impl Interp {
     /// Consumed by `std/caps` `drop`/`dropAll` routing.
     pub(crate) fn caps_drop_allowed(&self) -> bool {
         self.caps_drop_allowed.get()
+    }
+
+    /// ELIDE §4.3 Task 3.2: enable/disable the AST marking pass on the tree-walker
+    /// module loader. When `true`, each module's source is run through
+    /// `elision_proofs` and `mark_program` before execution. Defaults to `false`
+    /// so every existing run is byte-identical (Task 4.1 decides the default-on
+    /// path). Exposed here so integration tests can turn it on without changing
+    /// any run path.
+    pub fn set_elide_mode(&self, on: bool) {
+        self.elide_mode.set(on);
     }
 
     /// DX D2 Task 8: enable/disable snapshot "update mode" (the `--update-snapshots`
@@ -2837,8 +2857,18 @@ impl Interp {
 
         let tokens =
             lexer::lex(&src).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
-        let program =
+        let mut program =
             parser::parse(&tokens).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
+        // ELIDE §4.3 Task 3.2: when the marking pass is enabled, run elision proofs
+        // on this module's source and mark the AST in place. The flag defaults to
+        // `false`; Task 4.1 decides the default-on path. The mark runs ONCE per
+        // module load (the cache above ensures we never re-enter this path).
+        if self.elide_mode.get() {
+            let set = crate::check::infer::elision_proofs(&src);
+            if !set.is_empty() {
+                crate::elide_mark::mark_program(&mut program, &set);
+            }
+        }
         // DEFER §2.3: run the module body via `exec_program` so a top-level `defer`
         // (in the entry module OR any imported module) installs + drains its defer
         // scope. The module body runs to completion during import and its defers run

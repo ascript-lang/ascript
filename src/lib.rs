@@ -18,6 +18,7 @@ pub mod diagnostics;
 // (`doc`, default-on) so `--no-default-features` builds none of it.
 #[cfg(feature = "doc")]
 pub mod doc;
+pub mod elide_mark;
 pub mod env;
 pub mod error;
 pub mod fmt;
@@ -770,6 +771,44 @@ pub async fn tw_run_stmts(
     }
 }
 
+/// ELIDE §4.3 Task 3.2 test seam: parse `src`, run `elision_proofs` to build the
+/// `ElisionSet`, call `mark_program` on the AST, then execute on the tree-walker.
+/// Returns `(output, MarkCounts)` on success or `Err(panic_message)` on Tier-2
+/// panic. The counts let callers assert count parity against `vm_run_source_elided`
+/// and the raw `ElisionSet::len()`.
+///
+/// `#[doc(hidden)]` test seam — not a public API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn tw_run_source_elided(src: &str) -> Result<(String, crate::elide_mark::MarkCounts), String> {
+    let tokens = match lexer::lex(src) {
+        Ok(t) => t,
+        Err(e) => return Err(e.message),
+    };
+    let mut program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => return Err(e.message),
+    };
+    let set = crate::check::infer::elision_proofs(src);
+    let counts = crate::elide_mark::mark_program(&mut program, &set);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Ok(_) | Err(crate::interp::Control::Propagate(_)) | Err(crate::interp::Control::Exit(_)) => {
+            Ok((interp.output(), counts))
+        }
+        Err(crate::interp::Control::Panic(e)) => Err(e.message),
+    }
+}
+
 /// Compile `src` to bytecode and run it on the VM, returning the value of the
 /// program's trailing expression (VM plan V1).
 ///
@@ -1117,6 +1156,59 @@ pub async fn vm_run_source_elided(src: &str) -> Result<(String, Option<i32>), As
     interp.install_self();
     interp.set_worker_source(src);
     let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// ELIDE §4.3 Task 3.2: like [`vm_run_source_elided`] but with VM specialization
+/// DISABLED (generic path). Used by the four-mode smoke test to confirm the
+/// generic-VM elided path produces byte-identical output.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_elided_generic(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::check::infer::elision_proofs;
+    use crate::compile::compile_source_with_elision;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let elide_set = elision_proofs(src);
+    let chunk = compile_source_with_elision(src, Some(&elide_set))
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // specialize=false → generic (non-specializing) path
+    let vm = Vm::with_flags(interp.clone(), false, true, true);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(vm.run(&mut fiber)).await;

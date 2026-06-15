@@ -1236,3 +1236,208 @@ fn compile_source_with_elision_counted(
 ) -> Result<(ascript::vm::chunk::Chunk, usize), ascript::compile::CompileError> {
     ascript::compile::compile_source_with_elision_counted(src, elide)
 }
+
+// ── Task 3.2: count parity + four-mode smoke ─────────────────────────────────
+
+/// Count parity helper: proves marks == consumed == |ElisionSet| for `src`.
+///
+/// Returns `(marks_total, consumed, set_len)` — the caller asserts all three
+/// are equal AND that `set_len > 0` (non-vacuous check).
+fn count_parity(src: &str) -> (usize, usize, usize) {
+    let set = ascript::check::infer::elision_proofs(src);
+    let set_len = set.len();
+
+    // Consumed: how many sites the VM compiler recognised in the ElisionSet.
+    let (_, consumed) = compile_source_with_elision_counted(src, Some(&set))
+        .unwrap_or_else(|e| panic!("compile failed: {:?}", e));
+
+    // Marks: parse + mark the AST + count.
+    let tokens = ascript::lexer::lex(src).expect("lex ok");
+    let mut program = ascript::parser::parse(&tokens).expect("parse ok");
+    let counts = ascript::elide_mark::mark_program(&mut program, &set);
+    let marks = counts.total();
+
+    (marks, consumed, set_len)
+}
+
+mod mark_parity {
+    use super::count_parity;
+
+    // ── Fixture 1: single typed call ─────────────────────────────────────────
+
+    #[test]
+    fn parity_single_call() {
+        // A simple typed function call — the elision collector should prove it
+        // and both the marker and compiler should recognise exactly 1 site.
+        let src = "fn add(a: int, b: int): int { a + b }\nlet r: int = add(1, 2)\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty for typed program (set_len=0 means span mismatch)"
+        );
+        assert_eq!(
+            marks, set_len,
+            "marker must hit every proven site (marks={marks} != |set|={set_len})"
+        );
+        assert_eq!(
+            consumed, set_len,
+            "compiler must consume every proven site (consumed={consumed} != |set|={set_len})"
+        );
+    }
+
+    // ── Fixture 2: multiple typed calls ──────────────────────────────────────
+
+    #[test]
+    fn parity_multiple_calls() {
+        // Several typed calls in sequence — all should be matched by both engines.
+        let src = "fn mul(x: int, y: int): int { x * y }\nfn neg(v: int): int { -v }\nlet a: int = mul(3, 4)\nlet b: int = neg(a)\nlet c: int = mul(b, 2)\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty for multi-call typed program (set_len=0)"
+        );
+        assert_eq!(marks, set_len, "marker miss: marks={marks} != |set|={set_len}");
+        assert_eq!(
+            consumed, set_len,
+            "compiler miss: consumed={consumed} != |set|={set_len}"
+        );
+    }
+
+    // ── Fixture 3: typed let + fn return ─────────────────────────────────────
+
+    #[test]
+    fn parity_typed_let_and_ret() {
+        // A typed let (initialiser span) + a function with an annotated return —
+        // exercises all three mark kinds (calls, lets, fn_rets).
+        let src = "fn double(n: int): int { n * 2 }\nlet result: int = double(5)\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty (typed let + typed fn return, set_len=0)"
+        );
+        assert_eq!(marks, set_len, "marker miss: marks={marks} != |set|={set_len}");
+        assert_eq!(
+            consumed, set_len,
+            "compiler miss: consumed={consumed} != |set|={set_len}"
+        );
+    }
+
+    // ── Fixture 4: nested typed calls ────────────────────────────────────────
+
+    #[test]
+    fn parity_nested_calls() {
+        let src = "fn inc(x: int): int { x + 1 }\nfn triple(x: int): int { x * 3 }\nlet r: int = inc(triple(2))\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty for nested typed calls (set_len=0)"
+        );
+        assert_eq!(marks, set_len, "marker miss: marks={marks} != |set|={set_len}");
+        assert_eq!(
+            consumed, set_len,
+            "compiler miss: consumed={consumed} != |set|={set_len}"
+        );
+    }
+}
+
+// ── Four-mode smoke: TW-marked == spec-VM elided == generic-VM elided == off ─
+
+mod four_mode_smoke {
+    /// A typed program where elision proofs fire. We verify that all four
+    /// execution modes produce byte-identical output, confirming:
+    /// - The tree-walker marking pass correctly skips contracts that have been proved
+    /// - The VM elided path skips contracts identically
+    /// - The generic (non-specializing) VM path agrees
+    /// - Turning elision off (default) still produces the same output
+    ///   (no semantic change — elision only removes redundant checks)
+    const TYPED_SRC: &str = "fn square(n: int): int { return n * n }\nlet x: int = square(4)\nprint(x)\n";
+
+    #[test]
+    fn four_mode_output_identical() {
+        let expected_output = "16\n";
+
+        // Mode 1: tree-walker with marking pass (tw_run_source_elided).
+        let tw_result: Result<(String, ascript::elide_mark::MarkCounts), String> =
+            ascript::run_on_worker_stack(|| async {
+                ascript::tw_run_source_elided(TYPED_SRC).await
+            });
+        let (tw_out, tw_counts) = tw_result
+            .unwrap_or_else(|e| panic!("tw_run_source_elided failed: {e}"));
+        assert_eq!(tw_out, expected_output, "tree-walker (marked) output mismatch");
+
+        // Mode 2: VM elided (spec path, specialization ON).
+        let vm_elided_out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ascript::vm_run_source_elided(TYPED_SRC)
+                    .await
+                    .unwrap_or_else(|e| panic!("vm_run_source_elided failed: {e}"))
+                    .0
+            });
+        assert_eq!(vm_elided_out, expected_output, "VM (elided) output mismatch");
+
+        // Mode 3: VM elided generic (specialization OFF).
+        let vm_generic_out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ascript::vm_run_source_elided_generic(TYPED_SRC)
+                    .await
+                    .unwrap_or_else(|e| panic!("vm_run_source_elided_generic failed: {e}"))
+                    .0
+            });
+        assert_eq!(
+            vm_generic_out, expected_output,
+            "VM generic (elided) output mismatch"
+        );
+
+        // Mode 4: elision OFF (normal run — semantic floor).
+        let vm_normal_out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ascript::vm_run_source(TYPED_SRC)
+                    .await
+                    .unwrap_or_else(|e| panic!("vm_run_source failed: {e}"))
+                    .0
+            });
+        assert_eq!(
+            vm_normal_out, expected_output,
+            "VM normal (elide-off) output mismatch"
+        );
+
+        // Guard: the marking pass found at least one site (non-vacuous smoke).
+        assert!(
+            tw_counts.total() > 0,
+            "marking pass found 0 sites on typed program — span convention is broken"
+        );
+    }
+
+    /// Confirm that elided and normal tree-walker runs produce byte-identical
+    /// output — elision must not change semantics.
+    #[test]
+    fn elided_matches_normal_tw() {
+        let normal_result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            ascript::tw_run_stmts({
+                let tokens = ascript::lexer::lex(TYPED_SRC).expect("lex");
+                ascript::parser::parse(&tokens).expect("parse")
+            })
+            .await
+        });
+        let elided_result: Result<(String, ascript::elide_mark::MarkCounts), String> =
+            ascript::run_on_worker_stack(|| async {
+                ascript::tw_run_source_elided(TYPED_SRC).await
+            });
+
+        let normal_out = normal_result.expect("normal run ok");
+        let (elided_out, _) = elided_result.expect("elided run ok");
+        assert_eq!(
+            normal_out, elided_out,
+            "elided output must match normal output (elision must not change semantics)"
+        );
+    }
+}
