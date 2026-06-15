@@ -290,6 +290,7 @@ dependencies = [
  "indexmap",
  "num_cpus",
  "rust_decimal",
+ "rustc-hash",
  "rustyline",
  "sha2",
  "stacker",
