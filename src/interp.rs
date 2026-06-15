@@ -5,7 +5,7 @@ use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::env::{AssignError, Environment};
 use crate::error::AsError;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 use crate::{lexer, parser};
 use async_recursion::async_recursion;
 use std::cell::{Cell, RefCell};
@@ -177,7 +177,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
 pub fn global_env() -> Environment {
     let env = Environment::global();
     for &name in BUILTIN_NAMES {
-        env.define(name, Value::Builtin(name.into()), false)
+        env.define(name, Value::builtin(name), false)
             .expect("global env starts empty");
     }
     env
@@ -186,7 +186,7 @@ pub fn global_env() -> Environment {
 /// Build a `[value, err]` Result pair.
 // pub(crate): used by std/* modules (std/convert) later in M10.
 pub(crate) fn make_pair(value: Value, err: Value) -> Value {
-    Value::Array(crate::value::ArrayCell::new(vec![value, err]))
+    Value::array(vec![value, err])
 }
 
 /// Build an error object `{ message: <msg> }`.
@@ -194,7 +194,7 @@ pub(crate) fn make_pair(value: Value, err: Value) -> Value {
 pub(crate) fn make_error(msg: Value) -> Value {
     let mut map = indexmap::IndexMap::new();
     map.insert("message".to_string(), msg);
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object(map)
 }
 
 #[derive(Clone)]
@@ -942,20 +942,20 @@ impl TestSummary {
             .iter()
             .map(|(name, message)| {
                 let mut f = indexmap::IndexMap::new();
-                f.insert("name".to_string(), Value::Str(Rc::from(name.as_str())));
-                f.insert("message".to_string(), Value::Str(Rc::from(message.as_str())));
+                f.insert("name".to_string(), Value::str(name.as_str()));
+                f.insert("message".to_string(), Value::str(message.as_str()));
                 Value::object(f)
             })
             .collect();
         let mut map = indexmap::IndexMap::new();
-        map.insert("passed".to_string(), Value::Int(self.passed as i64));
-        map.insert("failed".to_string(), Value::Int(self.failed as i64));
+        map.insert("passed".to_string(), Value::int(self.passed as i64));
+        map.insert("failed".to_string(), Value::int(self.failed as i64));
         // DX D2 Task 10: carry the filtered count across the airlock so a parallel isolate's
         // `--filter` skips aggregate correctly.
-        map.insert("filtered".to_string(), Value::Int(self.filtered as i64));
+        map.insert("filtered".to_string(), Value::int(self.filtered as i64));
         map.insert(
             "failures".to_string(),
-            Value::Array(crate::value::ArrayCell::new(failures)),
+            Value::array(failures),
         );
         Value::object(map)
     }
@@ -966,34 +966,34 @@ impl TestSummary {
     /// result is a clean error at the call site, never a panic).
     pub fn from_value(v: &Value) -> Option<TestSummary> {
         let obj = v.as_object()?;
-        let passed = match obj.get("passed")? {
-            Value::Int(n) if n >= 0 => n as usize,
+        let passed = match obj.get("passed")?.kind() {
+            ValueKind::Int(n) if n >= 0 => n as usize,
             _ => return None,
         };
-        let failed = match obj.get("failed")? {
-            Value::Int(n) if n >= 0 => n as usize,
+        let failed = match obj.get("failed")?.kind() {
+            ValueKind::Int(n) if n >= 0 => n as usize,
             _ => return None,
         };
         // DX D2 Task 10: `filtered` is tolerated-absent (default 0) for forward/back
         // compatibility of the airlock shape.
-        let filtered = match obj.get("filtered") {
-            Some(Value::Int(n)) if n >= 0 => n as usize,
+        let filtered = match obj.get("filtered").map(|v| v.into_kind()) {
+            Some(OwnedKind::Int(n)) if n >= 0 => n as usize,
             Some(_) => return None,
             None => 0,
         };
-        let arr = match obj.get("failures")? {
-            Value::Array(a) => a.borrow().clone(),
+        let arr = match obj.get("failures")?.kind() {
+            ValueKind::Array(a) => a.borrow().clone(),
             _ => return None,
         };
         let mut failures = Vec::with_capacity(arr.len());
         for entry in arr.iter() {
             let fobj = entry.as_object()?;
-            let name = match fobj.get("name")? {
-                Value::Str(s) => s.to_string(),
+            let name = match fobj.get("name")?.kind() {
+                ValueKind::Str(s) => s.to_string(),
                 _ => return None,
             };
-            let message = match fobj.get("message")? {
-                Value::Str(s) => s.to_string(),
+            let message = match fobj.get("message")?.kind() {
+                ValueKind::Str(s) => s.to_string(),
                 _ => return None,
             };
             failures.push((name, message));
@@ -1297,9 +1297,9 @@ impl Interp {
             .cli_args
             .borrow()
             .iter()
-            .map(|s| Value::Str(s.clone()))
+            .map(|s| Value::str(s.clone()))
             .collect();
-        Value::Array(crate::value::ArrayCell::new(args))
+        Value::array(args)
     }
 
     /// Register one newly-spawned async task: bump `inflight` (and the high-water
@@ -1611,8 +1611,8 @@ impl Interp {
         };
         match func {
             "setLevel" => {
-                let s = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
+                let s = match args.first().map(|v| v.kind()) {
+                    Some(ValueKind::Str(s)) => s.to_string(),
                     _ => {
                         return Err(AsError::at("log.setLevel expects a level string", span).into())
                     }
@@ -1620,14 +1620,14 @@ impl Interp {
                 match level_of(&s) {
                     Some(l) => {
                         self.set_log_level(l);
-                        Ok(Value::Nil)
+                        Ok(Value::nil())
                     }
                     None => Err(AsError::at(format!("unknown log level {:?}", s), span).into()),
                 }
             }
             "setFormat" => {
-                let s = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
+                let s = match args.first().map(|v| v.kind()) {
+                    Some(ValueKind::Str(s)) => s.to_string(),
                     _ => {
                         return Err(AsError::at(
                             "log.setFormat expects \"human\" or \"json\"",
@@ -1639,11 +1639,11 @@ impl Interp {
                 match s.as_str() {
                     "human" => {
                         self.set_log_format(LogFormat::Human);
-                        Ok(Value::Nil)
+                        Ok(Value::nil())
                     }
                     "json" => {
                         self.set_log_format(LogFormat::Json);
-                        Ok(Value::Nil)
+                        Ok(Value::nil())
                     }
                     o => Err(AsError::at(format!("unknown log format {:?}", o), span).into()),
                 }
@@ -1651,7 +1651,7 @@ impl Interp {
             "debug" | "info" | "warn" | "error" => {
                 let lvl = level_of(func).unwrap();
                 if lvl < self.log_level.get() {
-                    return Ok(Value::Nil);
+                    return Ok(Value::nil());
                 }
                 let mut parts: Vec<String> = Vec::new();
                 let mut fields = serde_json::Map::new();
@@ -1659,33 +1659,33 @@ impl Interp {
                 // A thunk is only honored as the FIRST arg. It is invoked lazily
                 // (after the level filter above) so a filtered call is free.
                 if matches!(
-                    args.first(),
+                    args.first().map(|v| v.kind()),
                     // A VM-compiled thunk is a `Value::Closure` — equally a deferred
                     // message callable (`call_value` dispatches it via the V4-T5
                     // bridge). Inert for the tree-walker (never makes a Closure).
-                    Some(Value::Function(_)) | Some(Value::Closure(_)) | Some(Value::Builtin(_))
+                    Some(ValueKind::Function(_)) | Some(ValueKind::Closure(_)) | Some(ValueKind::Builtin(_))
                 ) {
                     let r = self.call_value(args[0].clone(), vec![], span).await?;
                     // An `async fn` thunk returns a `Value::Future`; drive it to
                     // completion using the same mechanism as `await` (M17).
-                    let r = match r {
-                        Value::Future(f) => f.get().await?,
-                        other => other,
+                    let r = if let ValueKind::Future(f) = r.kind() {
+                        f.get().await?
+                    } else {
+                        r
                     };
                     parts.push(r.to_string());
                     iter.next(); // consume index 0
                 }
                 for a in iter {
-                    match a {
-                        Value::Object(o) => {
-                            for (k, val) in o.entries() {
-                                fields.insert(
-                                    k.to_string(),
-                                    crate::stdlib::json::to_json_lossy(&val, &mut Vec::new()),
-                                );
-                            }
+                    if let ValueKind::Object(o) = a.kind() {
+                        for (k, val) in o.entries() {
+                            fields.insert(
+                                k.to_string(),
+                                crate::stdlib::json::to_json_lossy(&val, &mut Vec::new()),
+                            );
                         }
-                        other => parts.push(other.to_string()),
+                    } else {
+                        parts.push(a.to_string());
                     }
                 }
                 let msg = parts.join(" ");
@@ -1718,7 +1718,7 @@ impl Interp {
                     }
                 };
                 self.emit_log(&line);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => Err(AsError::at(format!("std/log has no function '{}'", other), span).into()),
         }
@@ -1935,8 +1935,8 @@ impl Interp {
             indexmap::IndexMap::new(),
             ResourceState::TelemetrySpan(Box::new(open)),
         );
-        match handle {
-            Value::Native(n) => n.id,
+        match handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => unreachable!("register_resource yields a Native handle"),
         }
     }
@@ -2262,7 +2262,7 @@ impl Interp {
     ) -> Value {
         let id = self.next_id();
         self.resources.borrow_mut().insert(id, state);
-        Value::Native(std::rc::Rc::new(crate::value::NativeObject {
+        Value::native(std::rc::Rc::new(crate::value::NativeObject {
             id,
             kind,
             fields,
@@ -2280,7 +2280,7 @@ impl Interp {
         fields: indexmap::IndexMap<String, Value>,
     ) -> Value {
         let id = self.next_id();
-        Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
+        Value::native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
     }
 
     /// Drive a value to completion if it is a `Value::Future` (an `async fn`
@@ -2290,9 +2290,10 @@ impl Interp {
     /// re-surfaces here.
     #[cfg(feature = "ai")]
     pub(crate) async fn await_if_future(&self, v: Value) -> Result<Value, Control> {
-        match v {
-            Value::Future(f) => f.get().await,
-            other => Ok(other),
+        if let ValueKind::Future(f) = v.kind() {
+            f.get().await
+        } else {
+            Ok(v)
         }
     }
 
@@ -2303,11 +2304,10 @@ impl Interp {
     /// `map<K,Class>` fields project to their full nested schema.
     #[cfg(feature = "ai")]
     pub(crate) fn project_shape_json(&self, shape: &Value) -> serde_json::Value {
-        match shape {
-            Value::Class(c) => {
-                crate::stdlib::ai::json_schema::class_to_json_schema_env(c, &c.def_env)
-            }
-            other => crate::stdlib::ai::json_schema::schema_value_to_json_schema(other),
+        if let ValueKind::Class(c) = shape.kind() {
+            crate::stdlib::ai::json_schema::class_to_json_schema_env(c, &c.def_env)
+        } else {
+            crate::stdlib::ai::json_schema::schema_value_to_json_schema(shape)
         }
     }
 
@@ -2350,7 +2350,7 @@ impl Interp {
         // mechanism extended to actor spawn).
         let slice = crate::worker::build_class_slice_for_interp(self, &class.name)?;
         // Encode the init args as one array (preserving cross-arg sharing).
-        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let args_array = Value::array(args);
         let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
@@ -2385,7 +2385,7 @@ impl Interp {
 
         // Register the handle as a native resource (its Drop tears the isolate down).
         let mut fields = indexmap::IndexMap::new();
-        fields.insert("name".to_string(), Value::Str(class.name.clone().into()));
+        fields.insert("name".to_string(), Value::str(class.name.clone()));
         let handle = crate::worker::actor::WorkerActorHandle::new(
             tx,
             isolate,
@@ -2417,7 +2417,7 @@ impl Interp {
             cell.resolve(result);
         });
         fut.set_abort(bridge.abort_handle());
-        Ok(Value::Future(fut))
+        Ok(Value::future(fut))
     }
 
     /// An async method call on an actor handle (`await handle.method(args)`), OR the
@@ -2436,7 +2436,7 @@ impl Interp {
         // handle → dropping the IsolateHandle → channel close + thread join).
         if method == "close" {
             self.take_resource(native.id);
-            return Ok(Value::Nil);
+            return Ok(Value::nil());
         }
 
         // Sendability gate on the args (field-path panic).
@@ -2444,7 +2444,7 @@ impl Interp {
             crate::worker::serialize::check_sendable(a)
                 .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
         }
-        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let args_array = Value::array(args);
         let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
@@ -2544,7 +2544,7 @@ impl Interp {
             cell.resolve(result);
         });
         fut.set_abort(bridge.abort_handle());
-        Ok(Value::Future(fut))
+        Ok(Value::future(fut))
     }
 
     /// SP9 determinism (Task 12): wrap a REPLAYED actor-call boundary outcome into an
@@ -2565,11 +2565,11 @@ impl Interp {
                 Err(Control::Panic(AsError::at(msg, span)))
             }
             // An actor call never yields "done"; treat defensively as nil.
-            crate::det::BoundaryOutcome::Done => Ok(Value::Nil),
+            crate::det::BoundaryOutcome::Done => Ok(Value::nil()),
         };
         let fut = crate::task::SharedFuture::new();
         fut.cell().resolve(result);
-        Value::Future(fut)
+        Value::future(fut)
     }
 
     /// Workers Spec B §Task 6: build a streaming-generator handle for a `worker fn*`.
@@ -2607,7 +2607,7 @@ impl Interp {
         // mechanism extended to the worker-generator stream path).
         let slice = crate::worker::build_stream_slice_for_interp(self, entry_name)?;
         // Encode the call args as one array (preserving cross-arg sharing).
-        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let args_array = Value::array(args);
         let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
@@ -2630,7 +2630,7 @@ impl Interp {
             Box::new(driver),
             std::rc::Rc::downgrade(&self.rc()),
         );
-        Ok(Value::Generator(Rc::new(handle)))
+        Ok(Value::generator(Rc::new(handle)))
     }
 
     /// Run `f` with a shared borrow of the resource for `id` (handle methods that
@@ -3011,7 +3011,7 @@ impl Interp {
                     // `let x` / `let x: T` with no initializer binds nil. The type
                     // annotation is not enforced here: there is no value to check,
                     // and the language does not contract-check later assignments.
-                    None => Value::Nil,
+                    None => Value::nil(),
                 };
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -3024,26 +3024,25 @@ impl Interp {
                 ..
             } => {
                 let v = self.eval_expr(value, env).await?;
-                let items = match v {
-                    Value::Array(a) => a.borrow().clone(),
-                    other => {
-                        return Err(AsError::at(
-                            format!(
-                                "cannot destructure a non-array value of type {}",
-                                type_name(&other)
-                            ),
-                            value.span,
-                        )
-                        .into())
-                    }
+                let items = if let ValueKind::Array(a) = v.kind() {
+                    a.borrow().clone()
+                } else {
+                    return Err(AsError::at(
+                        format!(
+                            "cannot destructure a non-array value of type {}",
+                            type_name(&v)
+                        ),
+                        value.span,
+                    )
+                    .into());
                 };
                 for (i, name) in names.iter().enumerate() {
-                    let elem = items.get(i).cloned().unwrap_or(Value::Nil);
+                    let elem = items.get(i).cloned().unwrap_or(Value::nil());
                     env.define(name, elem, *mutable).map_err(AsError::new)?;
                 }
                 if let Some((rest_name, _)) = rest {
                     let tail: Vec<Value> = items.iter().skip(names.len()).cloned().collect();
-                    let arr = Value::Array(crate::value::ArrayCell::new(tail));
+                    let arr = Value::array(tail);
                     env.define(rest_name, arr, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -3056,7 +3055,7 @@ impl Interp {
                 ..
             } => {
                 let v = self.eval_expr(value, env).await?;
-                if !matches!(v, Value::Object(_) | Value::Instance(_)) {
+                if !matches!(v.kind(), ValueKind::Object(_) | ValueKind::Instance(_)) {
                     return Err(AsError::at(
                         format!(
                             "cannot destructure a non-object value of type {}",
@@ -3067,12 +3066,12 @@ impl Interp {
                     .into());
                 }
                 let get = |key: &str| -> Value {
-                    match &v {
-                        Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
-                        Value::Instance(i) => {
-                            i.borrow().get(key).unwrap_or(Value::Nil)
+                    match v.kind() {
+                        ValueKind::Object(o) => o.get(key).unwrap_or(Value::nil()),
+                        ValueKind::Instance(i) => {
+                            i.borrow().get(key).unwrap_or(Value::nil())
                         }
-                        _ => Value::Nil,
+                        _ => Value::nil(),
                     }
                 };
                 for b in bindings {
@@ -3083,15 +3082,15 @@ impl Interp {
                     let bound: std::collections::HashSet<&str> =
                         bindings.iter().map(|b| b.key.as_str()).collect();
                     let mut remaining = indexmap::IndexMap::new();
-                    match &v {
-                        Value::Object(o) => {
+                    match v.kind() {
+                        ValueKind::Object(o) => {
                             for (k, val) in o.entries() {
                                 if !bound.contains(k.as_ref()) {
                                     remaining.insert(k.to_string(), val);
                                 }
                             }
                         }
-                        Value::Instance(i) => {
+                        ValueKind::Instance(i) => {
                             for (k, val) in i.borrow().entries() {
                                 if !bound.contains(k.as_ref()) {
                                     remaining.insert(k.to_string(), val);
@@ -3100,7 +3099,7 @@ impl Interp {
                         }
                         _ => {}
                     }
-                    let obj = Value::Object(crate::value::ObjectCell::new(remaining));
+                    let obj = Value::object(remaining);
                     env.define(rest_name, obj, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -3210,15 +3209,15 @@ impl Interp {
                         .exec_for_await(var, iterable, body, env, iter.span)
                         .await;
                 }
-                let items: Vec<Value> = match iterable {
-                    Value::Array(arr) => arr.borrow().clone(),
-                    Value::Str(s) => s
+                let items: Vec<Value> = match iterable.kind() {
+                    ValueKind::Array(arr) => arr.borrow().clone(),
+                    ValueKind::Str(s) => s
                         .chars()
-                        .map(|c| Value::Str(c.to_string().into()))
+                        .map(|c| Value::str(c.to_string()))
                         .collect(),
                     // SRV §3.5: iterate a frozen array/string/set zero-copy (children
                     // yield as `Shared` views or scalars).
-                    Value::Shared(ref node) => match shared_iter_values(node) {
+                    ValueKind::Shared(node) => match shared_iter_values(node) {
                         Some(items) => items,
                         None => {
                             return Err(AsError::at(
@@ -3228,9 +3227,9 @@ impl Interp {
                             .into())
                         }
                     },
-                    other => {
+                    _ => {
                         return Err(AsError::at(
-                            format!("value of type {} is not iterable", type_name(&other)),
+                            format!("value of type {} is not iterable", type_name(&iterable)),
                             iter.span,
                         )
                         .into())
@@ -3250,7 +3249,7 @@ impl Interp {
             Stmt::Return(e) => {
                 let v = match e {
                     Some(e) => self.eval_expr(e, env).await?,
-                    None => Value::Nil,
+                    None => Value::nil(),
                 };
                 Ok(Flow::Return(v))
             }
@@ -3277,7 +3276,7 @@ impl Interp {
                         *span,
                     )));
                 }
-                let func = Value::Function(std::rc::Rc::new(crate::value::Function {
+                let func = Value::function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
                     ret: ret.clone(),
@@ -3305,10 +3304,10 @@ impl Interp {
                     let variant = if schema.has_payload() {
                         // A payload variant interns as an unsaturated CONSTRUCTOR
                         // (`ctor: true`); calling it constructs the payload value.
-                        Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
+                        Value::enum_variant(std::rc::Rc::new(crate::value::EnumVariant {
                             enum_name: name.clone(),
                             name: v.name.clone(),
-                            value: Value::Nil,
+                            value: Value::nil(),
                             payload: None,
                             ctor: true,
                         def: None,
@@ -3316,9 +3315,9 @@ impl Interp {
                     } else {
                         let backing = match &v.value {
                             Some(e) => self.eval_expr(e, env).await?,
-                            None => Value::Nil,
+                            None => Value::nil(),
                         };
-                        Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
+                        Value::enum_variant(std::rc::Rc::new(crate::value::EnumVariant {
                             enum_name: name.clone(),
                             name: v.name.clone(),
                             value: backing,
@@ -3330,7 +3329,7 @@ impl Interp {
                     map.insert(v.name.clone(), variant);
                     schemas.insert(v.name.clone(), schema);
                 }
-                let def = Value::Enum(std::rc::Rc::new(crate::value::EnumDef {
+                let def = Value::enum_(std::rc::Rc::new(crate::value::EnumDef {
                     name: name.clone(),
                     variants: map,
                     variant_schemas: schemas,
@@ -3347,8 +3346,8 @@ impl Interp {
                 ..
             } => {
                 let parent = match superclass {
-                    Some(sup_name) => match env.get(sup_name) {
-                        Some(Value::Class(c)) => Some(c),
+                    Some(sup_name) => match env.get(sup_name).map(|v| v.into_kind()) {
+                        Some(OwnedKind::Class(c)) => Some(c),
                         Some(_) => {
                             return Err(
                                 AsError::new(format!("'{}' is not a class", sup_name)).into()
@@ -3414,7 +3413,7 @@ impl Interp {
                         method_map.insert(m.name.clone(), method);
                     }
                 }
-                let class = Value::Class(std::rc::Rc::new(crate::value::Class {
+                let class = Value::class(std::rc::Rc::new(crate::value::Class {
                     name: name.clone(),
                     superclass: parent,
                     fields: field_map,
@@ -3446,7 +3445,7 @@ impl Interp {
                         crate::value::MethodReq { arity, has_rest },
                     );
                 }
-                let def = Value::Interface(std::rc::Rc::new(crate::value::InterfaceDef {
+                let def = Value::interface(std::rc::Rc::new(crate::value::InterfaceDef {
                     name: name.clone(),
                     own_methods,
                     extends: extends.clone(),
@@ -3494,18 +3493,18 @@ impl Interp {
                                 ))
                                 .into());
                             }
-                            let v = entry.env.get(name).unwrap_or(Value::Nil);
+                            let v = entry.env.get(name).unwrap_or(Value::nil());
                             env.define(name, v, false).map_err(AsError::new)?;
                         }
                     }
                     crate::ast::ImportNames::Namespace(alias) => {
                         let mut map = indexmap::IndexMap::new();
                         for name in entry.exports.borrow().iter() {
-                            map.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
+                            map.insert(name.clone(), entry.env.get(name).unwrap_or(Value::nil()));
                         }
                         env.define(
                             alias,
-                            Value::Object(crate::value::ObjectCell::new(map)),
+                            Value::object(map),
                             false,
                         )
                         .map_err(AsError::new)?;
@@ -3528,7 +3527,7 @@ impl Interp {
                     // `defer a?.m(args)` — optional-chain: nil receiver → no-op, per §3.1.
                     ExprKind::OptMember { object, name } => {
                         let recv = self.eval_expr(object, env).await?;
-                        if recv == Value::Nil {
+                        if recv == Value::nil() {
                             // Spec §3.1: nil opt-chain → whole defer is a no-op;
                             // arg expressions are NOT evaluated.
                             return Ok(Flow::Normal);
@@ -3625,11 +3624,11 @@ impl Interp {
         // (return / `?` / panic). A `Cell`, never held across an `.await`.
         let _expr_depth = DepthGuard::enter(&self.expr_depth, EXPR_NEST_LIMIT, expr.span)?;
         match &expr.kind {
-            ExprKind::Int(i) => Ok(Value::Int(*i)),
-            ExprKind::Float(n) => Ok(Value::Float(*n)),
-            ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
-            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
-            ExprKind::Nil => Ok(Value::Nil),
+            ExprKind::Int(i) => Ok(Value::int(*i)),
+            ExprKind::Float(n) => Ok(Value::float(*n)),
+            ExprKind::Str(s) => Ok(Value::str(s.as_str())),
+            ExprKind::Bool(b) => Ok(Value::bool_(*b)),
+            ExprKind::Nil => Ok(Value::nil()),
             ExprKind::Ident(name) => env.get(name).ok_or_else(|| {
                 AsError::at(format!("undefined variable '{}'", name), expr.span).into()
             }),
@@ -3661,7 +3660,7 @@ impl Interp {
                     }
                     BinOp::Coalesce => {
                         let l = self.eval_expr(lhs, env).await?;
-                        return if l == Value::Nil {
+                        return if l == Value::nil() {
                             self.eval_expr(rhs, env).await
                         } else {
                             Ok(l)
@@ -3678,7 +3677,7 @@ impl Interp {
                                 let l = self.eval_expr(lhs, env).await?;
                                 let yes = crate::interp::instanceof_reserved_type(&l, name)
                                     .unwrap_or(false);
-                                return Ok(Value::Bool(yes));
+                                return Ok(Value::bool_(yes));
                             }
                         }
                     }
@@ -3711,7 +3710,7 @@ impl Interp {
                     crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
                     crate::ast::ArrowBody::Expr(e) => vec![Stmt::Return(Some((**e).clone()))],
                 };
-                Ok(Value::Function(std::rc::Rc::new(crate::value::Function {
+                Ok(Value::function(std::rc::Rc::new(crate::value::Function {
                     name: None,
                     params: params.clone(),
                     ret: None,
@@ -3732,23 +3731,22 @@ impl Interp {
                         }
                         crate::ast::ArrayElem::Spread(x) => {
                             let v = self.eval_expr(x, env).await?;
-                            match v {
-                                Value::Array(a) => values.extend(a.borrow().iter().cloned()),
-                                other => {
-                                    return Err(AsError::at(
-                                        format!(
-                                            "can only spread an array into an array, got {}",
-                                            type_name(&other)
-                                        ),
-                                        x.span,
-                                    )
-                                    .into())
-                                }
+                            if let ValueKind::Array(a) = v.kind() {
+                                values.extend(a.borrow().iter().cloned())
+                            } else {
+                                return Err(AsError::at(
+                                    format!(
+                                        "can only spread an array into an array, got {}",
+                                        type_name(&v)
+                                    ),
+                                    x.span,
+                                )
+                                .into());
                             }
                         }
                     }
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(values)))
+                Ok(Value::array(values))
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
@@ -3760,27 +3758,24 @@ impl Interp {
                         }
                         crate::ast::ObjEntry::Spread(x) => {
                             let v = self.eval_expr(x, env).await?;
-                            match v {
-                                Value::Object(o) => {
-                                    for (k, val) in o.entries() {
-                                        map.insert(k.to_string(), val);
-                                    }
+                            if let ValueKind::Object(o) = v.kind() {
+                                for (k, val) in o.entries() {
+                                    map.insert(k.to_string(), val);
                                 }
-                                other => {
-                                    return Err(AsError::at(
-                                        format!(
-                                            "can only spread an object into an object, got {}",
-                                            type_name(&other)
-                                        ),
-                                        x.span,
-                                    )
-                                    .into())
-                                }
+                            } else {
+                                return Err(AsError::at(
+                                    format!(
+                                        "can only spread an object into an object, got {}",
+                                        type_name(&v)
+                                    ),
+                                    x.span,
+                                )
+                                .into());
                             }
                         }
                     }
                 }
-                Ok(Value::Object(crate::value::ObjectCell::new(map)))
+                Ok(Value::object(map))
             }
             ExprKind::Map(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
@@ -3798,7 +3793,7 @@ impl Interp {
                     // while keeping the key's first-seen position.
                     map.insert(key, value);
                 }
-                Ok(Value::Map(crate::value::MapCell::new(map)))
+                Ok(Value::map(map))
             }
             ExprKind::Template { parts } => {
                 let mut out = String::new();
@@ -3811,7 +3806,7 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Str(out.into()))
+                Ok(Value::str(out))
             }
             ExprKind::Match { subject, arms } => {
                 let subj = self.eval_expr(subject, env).await?;
@@ -3840,18 +3835,19 @@ impl Interp {
             }
             ExprKind::Await(inner) => {
                 let v = self.eval_expr(inner, env).await?;
-                match v {
-                    // Drive the future to completion; a panic/propagation raised in
-                    // the spawned task re-surfaces here (cross-task propagation).
-                    Value::Future(f) => f.get().await,
-                    // `await` on a non-future is identity (back-compat: `await 5` == 5).
-                    other => Ok(other),
+                // Drive the future to completion; a panic/propagation raised in
+                // the spawned task re-surfaces here (cross-task propagation).
+                // `await` on a non-future is identity (back-compat: `await 5` == 5).
+                if let ValueKind::Future(f) = v.kind() {
+                    f.get().await
+                } else {
+                    Ok(v)
                 }
             }
             ExprKind::Yield(operand) => {
                 let v = match operand {
                     Some(e) => self.eval_expr(e, env).await?,
-                    None => Value::Nil,
+                    None => Value::nil(),
                 };
                 // The generator currently being polled (top of the current-gen
                 // stack). Absent => `yield` was used outside any generator body.
@@ -3901,8 +3897,8 @@ impl Interp {
             ExprKind::Try(inner) => {
                 let v = self.eval_expr(inner, env).await?;
                 // Must be a 2-element Result pair [value, err].
-                let arr = match &v {
-                    Value::Array(a) if a.borrow().len() == 2 => a.clone(),
+                let arr = match v.kind() {
+                    ValueKind::Array(a) if a.borrow().len() == 2 => a.clone(),
                     _ => {
                         return Err(AsError::at(
                             "the ? operator requires a Result pair [value, err]",
@@ -3915,17 +3911,17 @@ impl Interp {
                     let b = arr.borrow();
                     (b[0].clone(), b[1].clone())
                 };
-                if err == Value::Nil {
+                if err == Value::nil() {
                     Ok(value)
                 } else {
                     // Early-return [nil, err] from the enclosing function.
-                    Err(Control::Propagate(make_pair(Value::Nil, err)))
+                    Err(Control::Propagate(make_pair(Value::nil(), err)))
                 }
             }
             ExprKind::Unwrap(inner) => {
                 let v = self.eval_expr(inner, env).await?;
-                let arr = match &v {
-                    Value::Array(a) if a.borrow().len() == 2 => a.clone(),
+                let arr = match v.kind() {
+                    ValueKind::Array(a) if a.borrow().len() == 2 => a.clone(),
                     _ => {
                         return Err(AsError::at(
                             "the ! operator requires a Result pair [value, err]",
@@ -3938,7 +3934,7 @@ impl Interp {
                     let b = arr.borrow();
                     (b[0].clone(), b[1].clone())
                 };
-                if err == Value::Nil {
+                if err == Value::nil() {
                     Ok(value)
                 } else {
                     // Promote the Tier-1 error to a Tier-2 panic, preserving the
@@ -4044,8 +4040,8 @@ impl Interp {
             }
             Pattern::Array(pats, rest) => {
                 // Snapshot the subject array (do not hold a borrow across awaits).
-                let items: Vec<Value> = match subject {
-                    Value::Array(a) => a.borrow().iter().cloned().collect(),
+                let items: Vec<Value> = match subject.kind() {
+                    ValueKind::Array(a) => a.borrow().iter().cloned().collect(),
                     _ => return Ok(false),
                 };
                 match rest {
@@ -4069,20 +4065,20 @@ impl Interp {
                     let remainder: Vec<Value> = items[pats.len()..].to_vec();
                     bindings.push((
                         rest_name.clone(),
-                        Value::Array(crate::value::ArrayCell::new(remainder)),
+                        Value::array(remainder),
                     ));
                 }
                 Ok(true)
             }
             Pattern::Object(entries, rest) => {
                 // Snapshot the subject's fields (Object or Instance).
-                let fields: indexmap::IndexMap<String, Value> = match subject {
-                    Value::Object(o) => o
+                let fields: indexmap::IndexMap<String, Value> = match subject.kind() {
+                    ValueKind::Object(o) => o
                         .entries()
                         .into_iter()
                         .map(|(k, v)| (k.to_string(), v))
                         .collect(),
-                    Value::Instance(i) => i.borrow().to_index_map(),
+                    ValueKind::Instance(i) => i.borrow().to_index_map(),
                     _ => return Ok(false),
                 };
                 for entry in entries {
@@ -4111,7 +4107,7 @@ impl Interp {
                     }
                     bindings.push((
                         rest_name.clone(),
-                        Value::Object(crate::value::ObjectCell::new(remaining)),
+                        Value::object(remaining),
                     ));
                 }
                 Ok(true)
@@ -4146,8 +4142,8 @@ impl Interp {
         // The subject must be an EnumVariant whose name == `variant` (and whose
         // `enum_name` == `enum_name` when the pattern is qualified). A constructor
         // (`ctor: true`) is not a constructed value and never matches.
-        let ev = match subject {
-            Value::EnumVariant(ev) if !ev.ctor => ev,
+        let ev = match subject.kind() {
+            ValueKind::EnumVariant(ev) if !ev.ctor => ev,
             _ => return Ok(false),
         };
         if ev.name.as_str() != variant.as_ref() {
@@ -4221,22 +4217,22 @@ impl Interp {
         match &expr.kind {
             ExprKind::OptMember { object, name } => {
                 let (obj, sc) = self.eval_chain(object, env).await?;
-                if sc || obj == Value::Nil {
-                    return Ok((Value::Nil, true));
+                if sc || obj == Value::nil() {
+                    return Ok((Value::nil(), true));
                 }
                 Ok((self.read_member(&obj, name, object.span)?, false))
             }
             ExprKind::Member { object, name } => {
                 let (obj, sc) = self.eval_chain(object, env).await?;
                 if sc {
-                    return Ok((Value::Nil, true));
+                    return Ok((Value::nil(), true));
                 }
                 Ok((self.read_member(&obj, name, object.span)?, false))
             }
             ExprKind::Index { object, index } => {
                 let (obj, sc) = self.eval_chain(object, env).await?;
                 if sc {
-                    return Ok((Value::Nil, true));
+                    return Ok((Value::nil(), true));
                 }
                 let idx = self.eval_expr(index, env).await?;
                 // Shared with the bytecode VM (`Op::GetIndex`) so the two engines
@@ -4260,7 +4256,7 @@ impl Interp {
                 if let ExprKind::Member { object, name } = &callee.kind {
                     let (recv, sc) = self.eval_chain(object, env).await?;
                     if sc {
-                        return Ok((Value::Nil, true));
+                        return Ok((Value::nil(), true));
                     }
                     // Call-position hooks (schema fluent-chain, workflow `ctx.<m>()`,
                     // `WorkerClass.spawn`, frozen `Value::Shared` reads, actor-handle
@@ -4289,7 +4285,7 @@ impl Interp {
 
                 let (callee_v, sc) = self.eval_chain(callee, env).await?;
                 if sc {
-                    return Ok((Value::Nil, true));
+                    return Ok((Value::nil(), true));
                 }
                 let (values, names) = self.eval_call_args_named(args, env).await?;
                 let v = self.call_value_named(callee_v, values, names, expr.span).await;
@@ -4315,18 +4311,17 @@ impl Interp {
                 crate::ast::CallArg::Pos(x) => values.push(self.eval_expr(x, env).await?),
                 crate::ast::CallArg::Spread(x) => {
                     let v = self.eval_expr(x, env).await?;
-                    match v {
-                        Value::Array(arr) => values.extend(arr.borrow().iter().cloned()),
-                        other => {
-                            return Err(AsError::at(
-                                format!(
-                                    "can only spread an array as call arguments, got {}",
-                                    type_name(&other)
-                                ),
-                                x.span,
-                            )
-                            .into())
-                        }
+                    if let ValueKind::Array(arr) = v.kind() {
+                        values.extend(arr.borrow().iter().cloned())
+                    } else {
+                        return Err(AsError::at(
+                            format!(
+                                "can only spread an array as call arguments, got {}",
+                                type_name(&v)
+                            ),
+                            x.span,
+                        )
+                        .into());
                     }
                 }
                 // A named argument is only meaningful in an enum-variant constructor
@@ -4367,23 +4362,20 @@ impl Interp {
                 }
                 crate::ast::CallArg::Spread(x) => {
                     let v = self.eval_expr(x, env).await?;
-                    match v {
-                        Value::Array(arr) => {
-                            for item in arr.borrow().iter() {
-                                values.push(item.clone());
-                                names.push(None);
-                            }
+                    if let ValueKind::Array(arr) = v.kind() {
+                        for item in arr.borrow().iter() {
+                            values.push(item.clone());
+                            names.push(None);
                         }
-                        other => {
-                            return Err(AsError::at(
-                                format!(
-                                    "can only spread an array as call arguments, got {}",
-                                    type_name(&other)
-                                ),
-                                x.span,
-                            )
-                            .into())
-                        }
+                    } else {
+                        return Err(AsError::at(
+                            format!(
+                                "can only spread an array as call arguments, got {}",
+                                type_name(&v)
+                            ),
+                            x.span,
+                        )
+                        .into());
                     }
                 }
                 crate::ast::CallArg::Named { name, value } => {
@@ -4407,19 +4399,18 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         if names.iter().any(|n| n.is_some()) {
-            match callee {
-                Value::EnumVariant(ev) => {
-                    self.construct_variant_args(&ev, values, &names, span).await
-                }
-                other => Err(AsError::at(
+            if let ValueKind::EnumVariant(ev) = callee.kind() {
+                self.construct_variant_args(ev, values, &names, span).await
+            } else {
+                Err(AsError::at(
                     format!(
                         "named arguments are only valid for enum-variant construction, \
                          not for {}",
-                        type_name(&other)
+                        type_name(&callee)
                     ),
                     span,
                 )
-                .into()),
+                .into())
             }
         } else {
             self.call_value(callee, values, span).await
@@ -4435,9 +4426,9 @@ impl Interp {
         name: &str,
         span: Span,
     ) -> Result<Value, AsError> {
-        match obj {
-            Value::Object(map) => Ok(map.get(name).unwrap_or(Value::Nil)),
-            Value::Enum(e) => {
+        match obj.kind() {
+            ValueKind::Object(map) => Ok(map.get(name).unwrap_or(Value::nil())),
+            ValueKind::Enum(e) => {
                 let variant = e.variants.get(name).cloned().ok_or_else(|| {
                     AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)
                 })?;
@@ -4445,12 +4436,12 @@ impl Interp {
                 // back-reference to this `EnumDef` (so a first-class `let mk =
                 // Shape.Circle` validates on call). The interned map entry has
                 // `def: None` (no `Rc` cycle); we clone it here with `def: Some`.
-                match &variant {
-                    Value::EnumVariant(ev) if ev.ctor => Ok(Value::EnumVariant(
+                match variant.kind() {
+                    ValueKind::EnumVariant(ev) if ev.ctor => Ok(Value::enum_variant(
                         std::rc::Rc::new(crate::value::EnumVariant {
                             enum_name: ev.enum_name.clone(),
                             name: ev.name.clone(),
-                            value: Value::Nil,
+                            value: Value::nil(),
                             payload: None,
                             ctor: true,
                             def: Some(e.clone()),
@@ -4459,8 +4450,8 @@ impl Interp {
                     _ => Ok(variant),
                 }
             }
-            Value::EnumVariant(v) => match name {
-                "name" => Ok(Value::Str(v.name.as_str().into())),
+            ValueKind::EnumVariant(v) => match name {
+                "name" => Ok(Value::str(v.name.as_str())),
                 // ADT §3.4: `.value` of a unit/scalar variant is the backing scalar
                 // (unchanged); of a PAYLOAD variant it is the payload-as-data — the
                 // STORED `Cc` Array (positional) / Object (named) handle (stable
@@ -4484,13 +4475,13 @@ impl Interp {
                     ))
                 }
             },
-            Value::Instance(inst) => {
+            ValueKind::Instance(inst) => {
                 let b = inst.borrow();
                 if let Some(v) = b.get(name) {
                     return Ok(v);
                 }
                 match crate::value::find_method(&b.class, name) {
-                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(
+                    Some((method, def_class)) => Ok(Value::bound_method(std::rc::Rc::new(
                         crate::value::BoundMethod {
                             receiver: obj.clone(),
                             method,
@@ -4498,12 +4489,12 @@ impl Interp {
                             name: name.to_string(),
                         },
                     ))),
-                    None => Ok(Value::Nil),
+                    None => Ok(Value::nil()),
                 }
             }
-            Value::Super(s) => match &s.start {
+            ValueKind::Super(s) => match &s.start {
                 Some(start) => match crate::value::find_method(start, name) {
-                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(
+                    Some((method, def_class)) => Ok(Value::bound_method(std::rc::Rc::new(
                         crate::value::BoundMethod {
                             receiver: s.receiver.clone(),
                             method,
@@ -4521,7 +4512,7 @@ impl Interp {
                     span,
                 )),
             },
-            Value::Native(n) => {
+            ValueKind::Native(n) => {
                 // `sse.lastEventId` is a LIVE property: the most recent `id:` seen,
                 // which `next()` keeps current on the resource (the handle's `fields`
                 // are immutable after minting, so it can't be a static field). Read it
@@ -4532,7 +4523,7 @@ impl Interp {
                         Some(ResourceState::SseStream(s)) => s.last_event_id().to_string(),
                         _ => String::new(),
                     });
-                    return Ok(Value::Str(id.into()));
+                    return Ok(Value::str(id));
                 }
                 if let Some(v) = n.fields.get(name) {
                     return Ok(v.clone());
@@ -4549,22 +4540,22 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::NativeMethod(std::rc::Rc::new(
+                Ok(Value::native_method(std::rc::Rc::new(
                     crate::value::NativeMethod {
                         receiver: n.clone(),
                         method: name.to_string(),
                     },
                 )))
             }
-            Value::Generator(g) => match name {
+            ValueKind::Generator(g) => match name {
                 // `gen.next` / `gen.close` are bound generator methods.
-                "next" => Ok(Value::GeneratorMethod(Rc::new(
+                "next" => Ok(Value::generator_method(Rc::new(
                     crate::value::GeneratorMethodData {
                         handle: g.clone(),
                         name: "next",
                     },
                 ))),
-                "close" => Ok(Value::GeneratorMethod(Rc::new(
+                "close" => Ok(Value::generator_method(Rc::new(
                     crate::value::GeneratorMethodData {
                         handle: g.clone(),
                         name: "close",
@@ -4580,9 +4571,9 @@ impl Interp {
             // chain → a bound static callable, ELSE (2) the built-in `from`, ELSE
             // (3) "class X has no static member 'name'". `ClassMethod` carries the
             // owned name; `call_value` dispatches it.
-            Value::Class(c) => {
+            ValueKind::Class(c) => {
                 if crate::value::find_static_method(c, name).is_some() || name == "from" {
-                    Ok(Value::ClassMethod(Rc::new(crate::value::ClassMethodData {
+                    Ok(Value::class_method(Rc::new(crate::value::ClassMethodData {
                         class: c.clone(),
                         name: name.into(),
                     })))
@@ -4596,8 +4587,8 @@ impl Interp {
             // SRV §3.5: a frozen `Shared` reads a named field of a frozen
             // object/instance → the child (as a `Shared` view or scalar); a missing
             // field → nil (matching `Object`). A frozen regex exposes `.source`.
-            Value::Shared(node) => shared_read_member(node, name, span),
-            Value::Nil => Err(AsError::at(
+            ValueKind::Shared(node) => shared_read_member(node, name, span),
+            ValueKind::Nil => Err(AsError::at(
                 format!("cannot read property '{}' of nil", name),
                 span,
             )),
@@ -4616,7 +4607,7 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        match callee {
+        match callee.into_kind() {
             // A VM closure (`native → VM` bridge): a native higher-order stdlib
             // function (e.g. `array.map`, a sort comparator, `recover`) is calling
             // a user callback that the VM produced. Re-enter the VM to run it on a
@@ -4625,26 +4616,26 @@ impl Interp {
             // `Value::Closure` can only exist if the VM created it, so the VM is
             // always registered here; a missing VM is a wiring bug (clear panic,
             // not UB).
-            Value::Closure(_) => {
+            OwnedKind::Closure(c) => {
                 let vm = self
                     .vm()
                     .expect("VM not registered for closure call (Interp::set_vm not called)");
-                vm.call_value(callee, args, span).await
+                vm.call_value(Value::closure(c), args, span).await
             }
-            Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
-            Value::Function(func) => self.call_function(func, args, span).await,
-            Value::Class(class) => self.construct(class, args, span).await,
-            Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
-            Value::NativeMethod(m) => self.call_native_method(m, args, span).await,
-            Value::GeneratorMethod(gm) => {
+            OwnedKind::Builtin(name) => self.call_builtin(&name, &args, span).await,
+            OwnedKind::Function(func) => self.call_function(func, args, span).await,
+            OwnedKind::Class(class) => self.construct(class, args, span).await,
+            OwnedKind::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
+            OwnedKind::NativeMethod(m) => self.call_native_method(m, args, span).await,
+            OwnedKind::GeneratorMethod(gm) => {
                 self.call_generator_method(&gm.handle, gm.name, args, span)
                     .await
             }
             // ADT: calling a payload-variant CONSTRUCTOR (`Shape.Circle(2.0)`)
             // validates arity + field types and produces a constructed variant.
             // Calling a UNIT variant is an error.
-            Value::EnumVariant(ev) => self.construct_variant(&ev, args, span).await,
-            Value::ClassMethod(cm) => {
+            OwnedKind::EnumVariant(ev) => self.construct_variant(&ev, args, span).await,
+            OwnedKind::ClassMethod(cm) => {
                 let (c, name) = (&cm.class, &cm.name);
                 // A user `static fn` (SP1 §3) takes precedence over the built-in
                 // `from` only if it exists; we resolved the name at read time, but
@@ -4654,8 +4645,8 @@ impl Interp {
                     self.call_static_method(method, defining, args, span, name)
                         .await
                 } else if &**name == "from" {
-                    let obj = args.first().cloned().unwrap_or(Value::Nil);
-                    let strict = matches!(args.get(1), Some(Value::Bool(true)));
+                    let obj = args.first().cloned().unwrap_or(Value::nil());
+                    let strict = matches!(args.get(1).map(|v| v.kind()), Some(ValueKind::Bool(true)));
                     self.validate_into(c, &obj, strict, "", span)
                         .await
                         .map_err(Control::from)
@@ -4902,11 +4893,11 @@ impl Interp {
         } else {
             crate::value::Payload::Positional(crate::value::ArrayCell::new(coerced))
         };
-        Ok(Value::EnumVariant(std::rc::Rc::new(
+        Ok(Value::enum_variant(std::rc::Rc::new(
             crate::value::EnumVariant {
                 enum_name: ev.enum_name.clone(),
                 name: ev.name.clone(),
-                value: Value::Nil,
+                value: Value::nil(),
                 payload: Some(payload),
                 ctor: false,
                 def: None,
@@ -4928,18 +4919,18 @@ impl Interp {
     ) -> Result<Value, Control> {
         match method {
             "next" => {
-                let input = args.into_iter().next().unwrap_or(Value::Nil);
+                let input = args.into_iter().next().unwrap_or(Value::nil());
                 // resume drives the body to its next yield; Err surfaces a body
                 // panic to the consumer, None is the done sentinel (→ nil).
                 match g.resume(input).await? {
                     Some(v) => Ok(v),
-                    None => Ok(Value::Nil),
+                    None => Ok(Value::nil()),
                 }
             }
             "close" => {
                 // Drop the body future: no further values; `next` now returns nil.
                 g.close();
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => Err(AsError::at(format!("generator has no method '{}'", other), span).into()),
         }
@@ -5126,12 +5117,12 @@ impl Interp {
         env: &Environment,
         span: Span,
     ) -> Result<Flow, Control> {
-        match iterable {
-            Value::Generator(g) => {
+        match iterable.kind() {
+            ValueKind::Generator(g) => {
                 loop {
                     // resume drives the body to its next yield; Err surfaces a body
                     // panic, None ends iteration.
-                    let item = match g.resume(Value::Nil).await? {
+                    let item = match g.resume(Value::nil()).await? {
                         Some(v) => v,
                         None => break,
                     };
@@ -5158,7 +5149,7 @@ impl Interp {
             // A native stream handle: iterate its recv/next method until the value
             // is nil (end-of-stream). Both WS (`recv`) and SSE (`next`) follow the
             // `[value, err]` contract where a nil value marks end-of-stream.
-            Value::Native(ref n) => {
+            ValueKind::Native(n) => {
                 let method = native_stream_method(n.kind).ok_or_else(|| {
                     AsError::at(
                         format!(
@@ -5169,28 +5160,28 @@ impl Interp {
                     )
                 })?;
                 loop {
-                    let bound = Value::NativeMethod(std::rc::Rc::new(crate::value::NativeMethod {
+                    let bound = Value::native_method(std::rc::Rc::new(crate::value::NativeMethod {
                         receiver: n.clone(),
                         method: method.to_string(),
                     }));
                     let pair = self.call_value(bound, Vec::new(), span).await?;
                     // The recv/next contract returns a `[value, err]` pair.
-                    let (value, err) = match &pair {
-                        Value::Array(a) if a.borrow().len() == 2 => {
+                    let (value, err) = match pair.kind() {
+                        ValueKind::Array(a) if a.borrow().len() == 2 => {
                             let b = a.borrow();
                             (b[0].clone(), b[1].clone())
                         }
                         // Defensive: a non-pair return ends iteration.
                         _ => break,
                     };
-                    if err != Value::Nil {
+                    if err != Value::nil() {
                         // Surface a stream error as a Tier-2 panic at the loop site.
                         let msg = error_message(&err);
                         return Err(
                             AsError::at(format!("for await stream error: {}", msg), span).into(),
                         );
                     }
-                    if value == Value::Nil {
+                    if value == Value::nil() {
                         break; // end-of-stream
                     }
                     let child = env.child();
@@ -5203,8 +5194,8 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            other => Err(AsError::at(
-                format!("value of type {} is not async-iterable", type_name(&other)),
+            _ => Err(AsError::at(
+                format!("value of type {} is not async-iterable", type_name(&iterable)),
                 span,
             )
             .into()),
@@ -5286,7 +5277,7 @@ impl Interp {
         let mut outcome: Result<Value, Control> =
             match crate::vm::stack::grow_future(self.exec(body, call_env)).await {
                 Ok(Flow::Return(v)) => Ok(v),
-                Ok(Flow::Normal) => Ok(Value::Nil),
+                Ok(Flow::Normal) => Ok(Value::nil()),
                 Ok(Flow::Break) => {
                     // Break outside a loop: propagate the error (no drain — the body
                     // never reached a clean exit). The defer list drops with call_env.
@@ -5363,11 +5354,11 @@ impl Interp {
         };
         if entry.awaited {
             // `defer await f()` — if the call returned a future, drive it now (§3.4).
-            if let Value::Future(f) = result_v {
+            if let ValueKind::Future(f) = result_v.kind() {
                 f.get().await.map(|_| ())?;
             }
             // Non-future + awaited is the identity rule (the language-wide rule).
-        } else if let Value::Future(_) = result_v {
+        } else if let ValueKind::Future(_) = result_v.kind() {
             // `defer f()` returned a future — §3.4 loud Tier-2 error.
             return Err(Control::Panic(AsError::at(
                 "deferred call returned a future that would be cancelled on drop — use 'defer await f()' or do async cleanup before exit",
@@ -5399,15 +5390,15 @@ impl Interp {
         {
             return true;
         }
-        if let Value::Class(c) = recv {
+        if let ValueKind::Class(c) = recv.kind() {
             if c.is_worker && name == "spawn" {
                 return true;
             }
         }
-        if matches!(recv, Value::Shared(_)) {
+        if matches!(recv.kind(), ValueKind::Shared(_)) {
             return true;
         }
-        if let Value::Native(n) = recv {
+        if let ValueKind::Native(n) = recv.kind() {
             if n.kind == crate::value::NativeKind::WorkerActor {
                 return true;
             }
@@ -5451,17 +5442,17 @@ impl Interp {
             return self.call_workflow_ctx(name, &wargs, span).await;
         }
         // Worker-class `.spawn` hook.
-        if let Value::Class(ref c) = recv {
+        if let ValueKind::Class(c) = recv.kind() {
             if c.is_worker && name == "spawn" {
                 return self.spawn_actor(c, args, span).await;
             }
         }
         // Shared-value member-call hook.
-        if let Value::Shared(ref node) = recv {
+        if let ValueKind::Shared(node) = recv.kind() {
             return call_shared(node, name, &args, span);
         }
         // Actor-handle async method-call hook.
-        if let Value::Native(ref n) = recv {
+        if let ValueKind::Native(n) = recv.kind() {
             if n.kind == crate::value::NativeKind::WorkerActor {
                 return self.actor_handle_call(n, name, args, span).await;
             }
@@ -5516,7 +5507,7 @@ impl Interp {
         if entries.is_empty() {
             return;
         }
-        let mut outcome: Result<Value, Control> = Ok(Value::Nil);
+        let mut outcome: Result<Value, Control> = Ok(Value::nil());
         self.run_defers(entries, &mut outcome).await;
         if let Err(Control::Panic(e)) = outcome {
             crate::diagnostics::report(&e);
@@ -5546,7 +5537,7 @@ impl Interp {
         }
         let mut outcome: Result<Value, Control> = match body_result {
             Ok(Flow::Return(v)) => Ok(v),
-            Ok(Flow::Normal) => Ok(Value::Nil),
+            Ok(Flow::Normal) => Ok(Value::nil()),
             Ok(Flow::Break) => Err(Control::Panic(AsError::at(
                 "'break' outside of a loop",
                 Span::new(0, 0),
@@ -5616,7 +5607,7 @@ impl Interp {
                 Box::pin(
                     async move { vm.run_function_body(func, args, call_env, span, what).await },
                 );
-            return Ok(Value::Generator(Rc::new(
+            return Ok(Value::generator(Rc::new(
                 crate::coro::GeneratorHandle::new(body),
             )));
         }
@@ -5682,7 +5673,7 @@ impl Interp {
             // Cooperatively yield if many tasks are in flight, so cancelled/finished
             // ones get reaped (bounds memory in a tight un-awaited loop).
             self.maybe_yield_for_inflight().await;
-            return Ok(Value::Future(fut));
+            return Ok(Value::future(fut));
         }
         self.run_function_body(func, args, call_env, span, what)
             .await
@@ -5718,7 +5709,7 @@ impl Interp {
         let instance = gcmodule::Cc::new(std::cell::RefCell::new(
             crate::value::Instance::from_dict(class.clone(), indexmap::IndexMap::new()),
         ));
-        let inst_val = Value::Instance(instance.clone());
+        let inst_val = Value::instance(instance.clone());
         // Pre-populate declared-field defaults (merged base-class first so a
         // subclass default overrides). `init` may then override; `.from` (Task 4)
         // handles its own defaults. Each default evals lazily in the def env of
@@ -5777,8 +5768,8 @@ impl Interp {
         path: &str,
         span: Span,
     ) -> Result<Value, AsError> {
-        let map = match obj {
-            Value::Object(m) => m.clone(),
+        let map = match obj.kind() {
+            ValueKind::Object(m) => m.clone(),
             _ => {
                 return Err(AsError::at(
                     format!(
@@ -5801,8 +5792,8 @@ impl Interp {
                 format!("{}.{}", path, fname)
             };
             let raw = map.get(fname);
-            let mut val = raw.unwrap_or(Value::Nil);
-            if val == Value::Nil {
+            let mut val = raw.unwrap_or(Value::nil());
+            if val == Value::nil() {
                 if let Some(def) = &fs.default {
                     // Resolve the default in the DECLARING class's def env (the
                     // scope where the field was written), consistent with
@@ -5855,7 +5846,7 @@ impl Interp {
             }
         }
 
-        Ok(Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
+        Ok(Value::instance(gcmodule::Cc::new(std::cell::RefCell::new(
             crate::value::Instance::from_dict(class.clone(), inst_fields),
         ))))
     }
@@ -5876,9 +5867,9 @@ impl Interp {
         r: Value,
         span: Span,
     ) -> Result<Value, Control> {
-        match &r {
-            Value::Class(cls) => Ok(Value::Bool(crate::value::is_instance_of(&l, cls))),
-            Value::Interface(iface) => Ok(Value::Bool(self.conforms(&l, iface)?)),
+        match r.kind() {
+            ValueKind::Class(cls) => Ok(Value::bool_(crate::value::is_instance_of(&l, cls))),
+            ValueKind::Interface(iface) => Ok(Value::bool_(self.conforms(&l, iface)?)),
             _ => Err(AsError::at(
                 "instanceof requires a class or interface on the right-hand side",
                 span,
@@ -5910,22 +5901,22 @@ impl Interp {
     ) -> Result<bool, Control> {
         use crate::ast::Type;
         match ty {
-            Type::Named(name) => match env.get(name) {
-                Some(Value::Interface(iface)) => self.conforms(value, &iface),
-                Some(Value::Class(cls)) => {
+            Type::Named(name) => match env.get(name).map(|v| v.into_kind()) {
+                Some(OwnedKind::Interface(iface)) => self.conforms(value, &iface),
+                Some(OwnedKind::Class(cls)) => {
                     Ok(crate::value::is_instance_of(value, &cls))
                 }
                 // Unresolved / non-class-non-interface name → today's permissive
                 // name-string match (gradual: a forward annotation stays silent).
                 _ => Ok(check_type(value, ty)),
             },
-            Type::Optional(inner) => Ok(*value == Value::Nil
+            Type::Optional(inner) => Ok(*value == Value::nil()
                 || self.check_type_env(value, inner, env)?),
             Type::Union(a, b) => {
                 Ok(self.check_type_env(value, a, env)? || self.check_type_env(value, b, env)?)
             }
-            Type::Array(elem) => match value {
-                Value::Array(arr) => {
+            Type::Array(elem) => match value.kind() {
+                ValueKind::Array(arr) => {
                     let items: Vec<Value> = arr.borrow().clone();
                     for it in &items {
                         if !self.check_type_env(it, elem, env)? {
@@ -5936,8 +5927,8 @@ impl Interp {
                 }
                 _ => Ok(false),
             },
-            Type::Map(k, v) => match value {
-                Value::Map(m) => {
+            Type::Map(k, v) => match value.kind() {
+                ValueKind::Map(m) => {
                     let entries: Vec<(crate::value::MapKey, Value)> =
                         m.borrow().iter().map(|(mk, mv)| (mk.clone(), mv.clone())).collect();
                     for (mk, mv) in &entries {
@@ -5969,7 +5960,7 @@ impl Interp {
         v: &Value,
         iface: &Rc<crate::value::InterfaceDef>,
     ) -> Result<bool, Control> {
-        let Value::Instance(inst) = v else {
+        let ValueKind::Instance(inst) = v.kind() else {
             // Only class instances can conform in v1 (objects/enums/natives → false).
             return Ok(false);
         };
@@ -6069,8 +6060,11 @@ impl Interp {
         let mut flat: indexmap::IndexMap<String, crate::value::MethodReq> = indexmap::IndexMap::new();
         for ext_name in &iface.extends {
             match iface.def_env.get(ext_name) {
-                Some(Value::Interface(parent)) => {
-                    let parent_flat = self.flatten_interface_inner(&parent, visited)?;
+                Some(other) if matches!(other.kind(), ValueKind::Interface(_)) => {
+                    let ValueKind::Interface(parent) = other.kind() else {
+                        unreachable!("guarded by the matches! above")
+                    };
+                    let parent_flat = self.flatten_interface_inner(parent, visited)?;
                     for (k, v) in parent_flat.iter() {
                         flat.insert(k.clone(), v.clone());
                     }
@@ -6122,34 +6116,32 @@ impl Interp {
         use crate::ast::Type;
         match ty {
             Type::Optional(inner) => {
-                if val == Value::Nil {
-                    Ok(Value::Nil)
+                if val == Value::nil() {
+                    Ok(Value::nil())
                 } else {
                     self.coerce_field(inner, val, env, strict, path, span).await
                 }
             }
-            Type::Named(name) => match (&val, env.get(name)) {
-                (Value::Object(_), Some(Value::Class(c))) => {
+            Type::Named(name) => match (val.kind(), env.get(name).map(|v| v.into_kind())) {
+                (ValueKind::Object(_), Some(OwnedKind::Class(c))) => {
                     self.validate_into(&c, &val, strict, path, span).await
                 }
                 _ => Ok(val),
             },
-            Type::Array(elem) => match &val {
-                Value::Array(a) => {
+            Type::Array(elem) => match val.kind() {
+                ValueKind::Array(a) => {
                     let items: Vec<Value> = a.borrow().clone();
                     let mut out = Vec::with_capacity(items.len());
                     for (i, it) in items.into_iter().enumerate() {
                         let p = format!("{}[{}]", path, i);
                         out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
                     }
-                    Ok(Value::Array(crate::value::ArrayCell::new(
-                        out,
-                    )))
+                    Ok(Value::array(out))
                 }
                 _ => Ok(val),
             },
-            Type::Map(_, vty) => match &val {
-                Value::Map(m) => {
+            Type::Map(_, vty) => match val.kind() {
+                ValueKind::Map(m) => {
                     let entries: Vec<(crate::value::MapKey, Value)> = m
                         .borrow()
                         .iter()
@@ -6169,7 +6161,7 @@ impl Interp {
                 // type. Insertion order is preserved. This closes the gap where a
                 // parsed-JSON `map<K, Class>` field would otherwise be an Object
                 // and fail the `map<K,V>` contract.
-                Value::Object(o) => {
+                ValueKind::Object(o) => {
                     // entries() works for both slab-mode and dict-mode objects.
                     let entries: Vec<(String, Value)> = o
                         .entries()
@@ -6203,7 +6195,7 @@ impl Interp {
             .define("self", bm.receiver.clone(), false)
             .map_err(AsError::new)?;
         // `super` lookup begins at the defining class's superclass.
-        let super_ref = Value::Super(std::rc::Rc::new(crate::value::SuperRef {
+        let super_ref = Value::super_(std::rc::Rc::new(crate::value::SuperRef {
             receiver: bm.receiver.clone(),
             start: bm.defining_class.superclass.clone(),
         }));
@@ -6225,7 +6217,7 @@ impl Interp {
                 Box::pin(async move {
                     vm.run_method_body(method, args, call_env, span, name).await
                 });
-            return Ok(Value::Generator(Rc::new(
+            return Ok(Value::generator(Rc::new(
                 crate::coro::GeneratorHandle::new(body),
             )));
         }
@@ -6259,7 +6251,7 @@ impl Interp {
             });
             fut.set_abort(handle.abort_handle());
             self.maybe_yield_for_inflight().await;
-            return Ok(Value::Future(fut));
+            return Ok(Value::future(fut));
         }
         let spec = BodySpec {
             params: &bm.method.params,
@@ -6304,7 +6296,7 @@ impl Interp {
             let what = name.to_string();
             let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
                 Box::pin(async move { vm.run_method_body(m, args, call_env, span, what).await });
-            return Ok(Value::Generator(Rc::new(
+            return Ok(Value::generator(Rc::new(
                 crate::coro::GeneratorHandle::new(body),
             )));
         }
@@ -6331,7 +6323,7 @@ impl Interp {
             });
             fut.set_abort(handle.abort_handle());
             self.maybe_yield_for_inflight().await;
-            return Ok(Value::Future(fut));
+            return Ok(Value::future(fut));
         }
         let spec = BodySpec {
             params: &method.params,
@@ -6371,10 +6363,10 @@ impl Interp {
     /// is terminal. Byte-identical across engines (the slice build + dispatch are the
     /// SAME mechanism `worker fn` uses; only the isolate lifecycle + caps differ).
     async fn call_run_in_worker(&self, args: &[Value], span: Span) -> Result<Value, Control> {
-        let callee = args.first().cloned().unwrap_or(Value::Nil);
+        let callee = args.first().cloned().unwrap_or(Value::nil());
         // The single payload arg (an array/object/scalar — structured-clone-sendable).
-        let input = args.get(1).cloned().unwrap_or(Value::Nil);
-        let opts = args.get(2).cloned().unwrap_or(Value::Nil);
+        let input = args.get(1).cloned().unwrap_or(Value::nil());
+        let opts = args.get(2).cloned().unwrap_or(Value::nil());
 
         // The callee must be a NAMED `worker fn` (we ship its slice by name).
         let entry_name = worker_fn_dispatch_name(&callee).ok_or_else(|| {
@@ -6434,17 +6426,17 @@ impl Interp {
         opts: &Value,
         span: Span,
     ) -> Result<Option<crate::stdlib::caps::CapSet>, Control> {
-        let opts_obj = match opts {
-            Value::Object(o) => o,
-            Value::Nil => return Ok(None),
+        let opts_obj = match opts.kind() {
+            ValueKind::Object(o) => o,
+            ValueKind::Nil => return Ok(None),
             _ => return Ok(None),
         };
         let caps_val = match opts_obj.get("caps") {
             Some(v) => v,
             None => return Ok(None),
         };
-        let caps_obj = match &caps_val {
-            Value::Object(o) => o.clone(),
+        let caps_obj = match caps_val.kind() {
+            ValueKind::Object(o) => o.clone(),
             _ => {
                 return Err(AsError::at(
                     "run_in_worker: opts.caps must be an object (e.g. { deny: [\"ffi\"] })"
@@ -6457,10 +6449,10 @@ impl Interp {
         // Start from the CALLER's current caps (denial is monotone — a worker can only
         // ever be MORE restricted than its dispatcher), then subtract opts.caps.deny.
         let mut set = self.caps();
-        if let Some(Value::Array(deny)) = caps_obj.get("deny") {
+        if let Some(OwnedKind::Array(deny)) = caps_obj.get("deny").map(|v| v.into_kind()) {
             for name in deny.borrow().iter() {
-                let name = match name {
-                    Value::Str(s) => s.to_string(),
+                let name = match name.kind() {
+                    ValueKind::Str(s) => s.to_string(),
                     _ => {
                         return Err(AsError::at(
                             "run_in_worker: opts.caps.deny must be an array of capability names"
@@ -6498,23 +6490,23 @@ impl Interp {
                     .join(" ");
                 line.push('\n');
                 self.push_output(&line);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "Ok" => {
-                let value = args.first().cloned().unwrap_or(Value::Nil);
-                Ok(make_pair(value, Value::Nil))
+                let value = args.first().cloned().unwrap_or(Value::nil());
+                Ok(make_pair(value, Value::nil()))
             }
             "Err" => {
-                let msg = args.first().cloned().unwrap_or(Value::Nil);
-                Ok(make_pair(Value::Nil, make_error(msg)))
+                let msg = args.first().cloned().unwrap_or(Value::nil());
+                Ok(make_pair(Value::nil(), make_error(msg)))
             }
             "assert" => {
-                let cond = args.first().cloned().unwrap_or(Value::Nil);
+                let cond = args.first().cloned().unwrap_or(Value::nil());
                 if cond.is_truthy() {
-                    Ok(Value::Nil)
+                    Ok(Value::nil())
                 } else {
                     let msg = match args.get(1) {
-                        Some(Value::Str(s)) => s.to_string(),
+                        Some(v) if v.as_str().is_some() => v.as_str().unwrap().to_string(),
                         Some(v) => v.to_string(),
                         None => "assertion failed".to_string(),
                     };
@@ -6522,12 +6514,12 @@ impl Interp {
                 }
             }
             "recover" => {
-                let callee = args.first().cloned().unwrap_or(Value::Nil);
+                let callee = args.first().cloned().unwrap_or(Value::nil());
                 match self.call_value(callee, Vec::new(), span).await {
-                    Ok(v) => Ok(make_pair(v, Value::Nil)),
+                    Ok(v) => Ok(make_pair(v, Value::nil())),
                     Err(Control::Panic(e)) => Ok(make_pair(
-                        Value::Nil,
-                        make_error(Value::Str(e.message.into())),
+                        Value::nil(),
+                        make_error(Value::str(e.message)),
                     )),
                     // A `?` propagation inside `fn` is already converted to fn's return
                     // value by call_function, so this is unreachable in practice; pass it through.
@@ -6569,27 +6561,27 @@ impl Interp {
             }
             "test" => {
                 let name = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
+                    Some(v) if v.as_str().is_some() => v.as_str().unwrap().to_string(),
                     Some(v) => v.to_string(),
                     None => "<unnamed>".to_string(),
                 };
-                let func = args.get(1).cloned().unwrap_or(Value::Nil);
+                let func = args.get(1).cloned().unwrap_or(Value::nil());
                 // Register only; `ascript test` runs these via run_registered_tests.
                 self.tests.borrow_mut().push((name, func));
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "len" => {
-                let v = args.first().cloned().unwrap_or(Value::Nil);
-                let n = match &v {
-                    Value::Str(s) => s.chars().count(),
-                    Value::Array(a) => a.borrow().len(),
-                    Value::Object(o) => o.len(),
-                    Value::Map(m) => m.borrow().len(),
-                    Value::Set(s) => s.borrow().len(),
-                    Value::Bytes(b) => b.borrow().len(),
+                let v = args.first().cloned().unwrap_or(Value::nil());
+                let n = match v.kind() {
+                    ValueKind::Str(s) => s.chars().count(),
+                    ValueKind::Array(a) => a.borrow().len(),
+                    ValueKind::Object(o) => o.len(),
+                    ValueKind::Map(m) => m.borrow().len(),
+                    ValueKind::Set(s) => s.borrow().len(),
+                    ValueKind::Bytes(b) => b.borrow().len(),
                     // SRV §3.5: `len()` of a frozen `Shared` reads the frozen
                     // container's length (zero-copy).
-                    Value::Shared(node) => match shared_len(node) {
+                    ValueKind::Shared(node) => match shared_len(node) {
                         Some(n) => n,
                         None => {
                             return Err(AsError::at(
@@ -6614,11 +6606,11 @@ impl Interp {
                     }
                 };
                 // NUM §4: a length/count is an `Int`.
-                Ok(Value::Int(n as i64))
+                Ok(Value::int(n as i64))
             }
             "type" => {
-                let v = args.first().cloned().unwrap_or(Value::Nil);
-                Ok(Value::Str(type_name(&v).into()))
+                let v = args.first().cloned().unwrap_or(Value::nil());
+                Ok(Value::str(type_name(&v)))
             }
             // NUM §4: `int(x)` conversion.
             //   float → int, truncated TOWARD ZERO (a non-finite float is a Tier-2 panic);
@@ -6627,13 +6619,15 @@ impl Interp {
             //            not a bug);
             //   bool   → 0/1 (matching `convert.toNumber`'s bool coercion).
             "int" => {
-                let v = args.first().cloned().unwrap_or(Value::Nil);
-                match &v {
-                    Value::Int(_) => Ok(v),
-                    Value::Float(f) => {
+                let v = args.first().cloned().unwrap_or(Value::nil());
+                if v.is_int_value() {
+                    return Ok(v);
+                }
+                match v.kind() {
+                    ValueKind::Float(f) => {
                         if !f.is_finite() {
                             return Err(AsError::at(
-                                format!("cannot convert non-finite float {} to int", format_number(*f)),
+                                format!("cannot convert non-finite float {} to int", format_number(f)),
                                 span,
                             )
                             .into());
@@ -6646,27 +6640,27 @@ impl Interp {
                         // while still admitting the largest representable in-range float
                         // (2^63 − 2048). The lower bound is exact (`i64::MIN as f64` == −2^63).
                         if t >= i64::MIN as f64 && t < -(i64::MIN as f64) {
-                            Ok(Value::Int(t as i64))
+                            Ok(Value::int(t as i64))
                         } else {
                             Err(AsError::at(
-                                format!("float {} is out of range for int (i64)", format_number(*f)),
+                                format!("float {} is out of range for int (i64)", format_number(f)),
                                 span,
                             )
                             .into())
                         }
                     }
-                    Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-                    Value::Str(s) => match s.trim().parse::<i64>() {
-                        Ok(n) => Ok(make_pair(Value::Int(n), Value::Nil)),
+                    ValueKind::Bool(b) => Ok(Value::int(if b { 1 } else { 0 })),
+                    ValueKind::Str(s) => match s.trim().parse::<i64>() {
+                        Ok(n) => Ok(make_pair(Value::int(n), Value::nil())),
                         Err(_) => Ok(make_pair(
-                            Value::Nil,
-                            make_error(Value::Str(
-                                format!("cannot parse '{}' as an int", s).into(),
+                            Value::nil(),
+                            make_error(Value::str(
+                                format!("cannot parse '{}' as an int", s),
                             )),
                         )),
                     },
-                    other => Err(AsError::at(
-                        format!("int() cannot convert {}", type_name(other)),
+                    _ => Err(AsError::at(
+                        format!("int() cannot convert {}", type_name(&v)),
                         span,
                     )
                     .into()),
@@ -6678,22 +6672,24 @@ impl Interp {
             //   string → parse, returning a Tier-1 `[float, err]` pair;
             //   bool   → 0.0/1.0.
             "float" => {
-                let v = args.first().cloned().unwrap_or(Value::Nil);
-                match &v {
-                    Value::Float(_) => Ok(v),
-                    Value::Int(i) => Ok(Value::Float(*i as f64)),
-                    Value::Bool(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
-                    Value::Str(s) => match s.trim().parse::<f64>() {
-                        Ok(n) => Ok(make_pair(Value::Float(n), Value::Nil)),
+                let v = args.first().cloned().unwrap_or(Value::nil());
+                if matches!(v.kind(), ValueKind::Float(_)) {
+                    return Ok(v);
+                }
+                match v.kind() {
+                    ValueKind::Int(i) => Ok(Value::float(i as f64)),
+                    ValueKind::Bool(b) => Ok(Value::float(if b { 1.0 } else { 0.0 })),
+                    ValueKind::Str(s) => match s.trim().parse::<f64>() {
+                        Ok(n) => Ok(make_pair(Value::float(n), Value::nil())),
                         Err(_) => Ok(make_pair(
-                            Value::Nil,
-                            make_error(Value::Str(
-                                format!("cannot parse '{}' as a float", s).into(),
+                            Value::nil(),
+                            make_error(Value::str(
+                                format!("cannot parse '{}' as a float", s),
                             )),
                         )),
                     },
-                    other => Err(AsError::at(
-                        format!("float() cannot convert {}", type_name(other)),
+                    _ => Err(AsError::at(
+                        format!("float() cannot convert {}", type_name(&v)),
                         span,
                     )
                     .into()),
@@ -6751,7 +6747,7 @@ impl Interp {
                         i += step;
                     }
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             other => {
                 if let Some((module, func)) = other.split_once('.') {
@@ -6840,13 +6836,13 @@ impl Interp {
         obj_span: Span,
         value_span: Span,
     ) -> Result<Value, Control> {
-        match obj {
-            Value::Object(map) => {
+        match obj.kind() {
+            ValueKind::Object(map) => {
                 check_not_frozen(obj, value_span)?;
                 map.borrow_mut().insert(name.to_string(), value.clone());
                 Ok(value)
             }
-            Value::Instance(inst) => {
+            ValueKind::Instance(inst) => {
                 check_not_frozen(obj, value_span)?;
                 let class = inst.borrow().class.clone();
                 // The field-type CONTRACT chokepoint — SHARED by the tree-walker
@@ -6866,7 +6862,7 @@ impl Interp {
             // `check_not_frozen`, NOT a bespoke string) — byte-identical to the VM
             // `store_property` guard. (`check_not_frozen` always errors here since a
             // Shared object/array reports a frozen kind.)
-            Value::Shared(_) => {
+            ValueKind::Shared(_) => {
                 check_not_frozen(obj, value_span)?;
                 // A Shared scalar reports no frozen kind → fall through to the
                 // generic "cannot set property" (a scalar was never assignable).
@@ -6903,26 +6899,26 @@ pub(crate) fn check_not_frozen(v: &Value, span: Span) -> Result<(), Control> {
 /// engines emit byte-identical diagnostics.
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Control> {
     match op {
-        UnOp::Neg => match v {
+        UnOp::Neg => match v.kind() {
             // `-int` is checked: `-i64::MIN` overflows → Tier-2 panic (NUM §3.2).
-            Value::Int(i) => match i.checked_neg() {
-                Some(n) => Ok(Value::Int(n)),
+            ValueKind::Int(i) => match i.checked_neg() {
+                Some(n) => Ok(Value::int(n)),
                 None => Err(AsError::at("integer overflow in '-'", span).into()),
             },
-            Value::Float(n) => Ok(Value::Float(-n)),
-            Value::Decimal(d) => Ok(Value::Decimal(Rc::new(-*d))),
+            ValueKind::Float(n) => Ok(Value::float(-n)),
+            ValueKind::Decimal(d) => Ok(Value::decimal(-**d)),
             _ => Err(AsError::at(
                 format!("cannot negate a non-number, got {}", type_name(&v)),
                 span,
             )
             .into()),
         },
-        UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
+        UnOp::Not => Ok(Value::bool_(!v.is_truthy())),
         // `~x` — int bitwise NOT (NUM §3.2). Int-only: a float (or any non-int)
         // operand is a Tier-2 panic.
-        UnOp::BitNot => match v {
-            Value::Int(i) => Ok(Value::Int(!i)),
-            Value::Float(_) => {
+        UnOp::BitNot => match v.kind() {
+            ValueKind::Int(i) => Ok(Value::int(!i)),
+            ValueKind::Float(_) => {
                 Err(AsError::at("bitwise op requires int operands, got float", span).into())
             }
             _ => Err(AsError::at(
@@ -7013,7 +7009,7 @@ pub(crate) fn resolve_step(
 /// (`impl Display for Value` → `write!("{}", n)`), so a number interpolated into a
 /// range panic message is identical across both engines.
 pub(crate) fn format_number(n: f64) -> String {
-    Value::Float(n).to_string()
+    Value::float(n).to_string()
 }
 
 /// NUM §4: produce a range loop counter `Value`. When `yields_int` is true the
@@ -7025,11 +7021,11 @@ pub(crate) fn format_number(n: f64) -> String {
 /// and the VM (which seeds Int slots when the bounds+step are Int) agree.
 pub(crate) fn range_counter_value(i: f64, yields_int: bool) -> Value {
     if yields_int {
-        if let Some(n) = (Value::Float(i)).as_int_exact() {
-            return Value::Int(n);
+        if let Some(n) = (Value::float(i)).as_int_exact() {
+            return Value::int(n);
         }
     }
-    Value::Float(i)
+    Value::float(i)
 }
 
 /// Materialize a range value `[lo .. hi)` / `[lo ..= hi]` into an eager
@@ -7065,7 +7061,7 @@ pub(crate) fn materialize_range_stepped(
         items.push(range_counter_value(i, yields_int));
         i += resolved;
     }
-    Ok(Value::Array(crate::value::ArrayCell::new(items)))
+    Ok(Value::array(items))
 }
 
 /// The direction-aware loop predicate shared by the for-range loop and value
@@ -7144,11 +7140,11 @@ pub(crate) fn range_pattern_contains(
 /// are byte-identical.
 pub(crate) fn instanceof_reserved_type(lhs: &Value, name: &str) -> Option<bool> {
     match name {
-        "int" => Some(matches!(lhs, Value::Int(_))),
-        "float" => Some(matches!(lhs, Value::Float(_))),
-        "number" => Some(matches!(lhs, Value::Int(_) | Value::Float(_))),
-        "string" => Some(matches!(lhs, Value::Str(_))),
-        "bool" => Some(matches!(lhs, Value::Bool(_))),
+        "int" => Some(matches!(lhs.kind(), ValueKind::Int(_))),
+        "float" => Some(matches!(lhs.kind(), ValueKind::Float(_))),
+        "number" => Some(matches!(lhs.kind(), ValueKind::Int(_) | ValueKind::Float(_))),
+        "string" => Some(matches!(lhs.kind(), ValueKind::Str(_))),
+        "bool" => Some(matches!(lhs.kind(), ValueKind::Bool(_))),
         _ => None,
     }
 }
@@ -7165,11 +7161,11 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
     match op {
         BinOp::Eq => {
             let eq = decimal_cross_eq(&l, &r, span)?;
-            return Ok(Value::Bool(eq));
+            return Ok(Value::bool_(eq));
         }
         BinOp::Ne => {
             let eq = decimal_cross_eq(&l, &r, span)?;
-            return Ok(Value::Bool(!eq));
+            return Ok(Value::bool_(!eq));
         }
         _ => {}
     }
@@ -7192,34 +7188,34 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
 
     // String concatenation: `+` joins two strings.
     if let BinOp::Add = op {
-        if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
-            return Ok(Value::Str(format!("{}{}", a, b).into()));
+        if let (ValueKind::Str(a), ValueKind::Str(b)) = (l.kind(), r.kind()) {
+            return Ok(Value::str(format!("{}{}", a, b)));
         }
     }
 
     // Decimal arithmetic/comparison: triggered when either operand is Decimal.
     // The other side is coerced (Number→Decimal; non-finite→Tier-2 panic;
     // non-number/non-decimal → fall through to error).
-    if matches!((&l, &r), (Value::Decimal(_), _) | (_, Value::Decimal(_))) {
+    if matches!((l.kind(), r.kind()), (ValueKind::Decimal(_), _) | (_, ValueKind::Decimal(_))) {
         use crate::stdlib::decimal::coerce_to_decimal;
         let da = coerce_to_decimal(&l, span)?;
         let db = coerce_to_decimal(&r, span)?;
         if let (Some(a), Some(b)) = (da, db) {
             let result = match op {
-                BinOp::Add => Value::Decimal(Rc::new(a + b)),
-                BinOp::Sub => Value::Decimal(Rc::new(a - b)),
-                BinOp::Mul => Value::Decimal(Rc::new(a * b)),
+                BinOp::Add => Value::decimal(a + b),
+                BinOp::Sub => Value::decimal(a - b),
+                BinOp::Mul => Value::decimal(a * b),
                 BinOp::Div => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal division by zero", span).into());
                     }
-                    Value::Decimal(Rc::new(a / b))
+                    Value::decimal(a / b)
                 }
                 BinOp::Mod => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal remainder by zero", span).into());
                     }
-                    Value::Decimal(Rc::new(a % b))
+                    Value::decimal(a % b)
                 }
                 // Ordering: both operands are already finite Decimals here
                 // (coerce_to_decimal above Tier-2-panics on a non-finite Number).
@@ -7227,10 +7223,10 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
                 // Infinity` is a lenient `false` (decimal_cross_eq), but `decimal
                 // < Infinity` panics — there is no sensible order. See
                 // decimal_cross_eq's doc.
-                BinOp::Lt => Value::Bool(a < b),
-                BinOp::Le => Value::Bool(a <= b),
-                BinOp::Gt => Value::Bool(a > b),
-                BinOp::Ge => Value::Bool(a >= b),
+                BinOp::Lt => Value::bool_(a < b),
+                BinOp::Le => Value::bool_(a <= b),
+                BinOp::Gt => Value::bool_(a > b),
+                BinOp::Ge => Value::bool_(a >= b),
                 // Pow: not defined for Decimal — Tier-2 panic.
                 BinOp::Pow => {
                     return Err(AsError::at(
@@ -7272,7 +7268,7 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
     // never see an int-only op. A non-number operand falls through to the generic
     // "operator requires two numbers" error below.
     if is_int_only_binop(op)
-        && (matches!(l, Value::Float(_)) || matches!(r, Value::Float(_)))
+        && (matches!(l.kind(), ValueKind::Float(_)) || matches!(r.kind(), ValueKind::Float(_)))
     {
         return Err(AsError::at(int_only_float_msg(op), span).into());
     }
@@ -7282,13 +7278,13 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
     //  - Int ⊕ Float    → promote the int to f64, result is Float (ordering exact).
     //  - Float ⊕ Float  → the IEEE float path.
     // Comparison across {Int,Float} is EXACT (no lossy cast) per NUM §3.3.
-    match (&l, &r) {
-        (Value::Int(a), Value::Int(b)) => int_binop(op, *a, *b, span),
+    match (l.kind(), r.kind()) {
+        (ValueKind::Int(a), ValueKind::Int(b)) => int_binop(op, a, b, span),
         // Mixed int/float: arithmetic promotes the int to float; ordering stays
         // exact (compare i64 against f64 without precision loss).
-        (Value::Int(i), Value::Float(f)) => mixed_binop(op, *i, *f, false),
-        (Value::Float(f), Value::Int(i)) => mixed_binop(op, *i, *f, true),
-        (Value::Float(a), Value::Float(b)) => Ok(float_binop(op, *a, *b)),
+        (ValueKind::Int(i), ValueKind::Float(f)) => mixed_binop(op, i, f, false),
+        (ValueKind::Float(f), ValueKind::Int(i)) => mixed_binop(op, i, f, true),
+        (ValueKind::Float(a), ValueKind::Float(b)) => Ok(float_binop(op, a, b)),
         _ => Err(AsError::at(
             format!(
                 "operator requires two numbers (or two decimals, or number and decimal), got {} and {}",
@@ -7343,16 +7339,16 @@ pub(crate) fn int_binop(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, 
     let overflow =
         |o: &str| -> Control { AsError::at(format!("integer overflow in '{o}'"), span).into() };
     let result = match op {
-        BinOp::Add => Value::Int(a.checked_add(b).ok_or_else(|| overflow("+"))?),
-        BinOp::Sub => Value::Int(a.checked_sub(b).ok_or_else(|| overflow("-"))?),
-        BinOp::Mul => Value::Int(a.checked_mul(b).ok_or_else(|| overflow("*"))?),
+        BinOp::Add => Value::int(a.checked_add(b).ok_or_else(|| overflow("+"))?),
+        BinOp::Sub => Value::int(a.checked_sub(b).ok_or_else(|| overflow("-"))?),
+        BinOp::Mul => Value::int(a.checked_mul(b).ok_or_else(|| overflow("*"))?),
         BinOp::Div => {
             if b == 0 {
                 return Err(AsError::at("integer division by zero", span).into());
             }
             // `checked_div` is `None` only for `i64::MIN / -1` (overflow). Truncates
             // toward zero (NUM §3.2): `7/2==3`, `-7/2==-3`.
-            Value::Int(a.checked_div(b).ok_or_else(|| overflow("/"))?)
+            Value::int(a.checked_div(b).ok_or_else(|| overflow("/"))?)
         }
         BinOp::Mod => {
             if b == 0 {
@@ -7360,28 +7356,28 @@ pub(crate) fn int_binop(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, 
             }
             // `checked_rem` is `None` only for `i64::MIN % -1` (overflow). Sign
             // follows the dividend (`-7 % 2 == -1`).
-            Value::Int(a.checked_rem(b).ok_or_else(|| overflow("%"))?)
+            Value::int(a.checked_rem(b).ok_or_else(|| overflow("%"))?)
         }
         BinOp::Pow => int_pow(a, b, span)?,
         // Comparison: int vs int is trivially exact.
-        BinOp::Lt => Value::Bool(a < b),
-        BinOp::Le => Value::Bool(a <= b),
-        BinOp::Gt => Value::Bool(a > b),
-        BinOp::Ge => Value::Bool(a >= b),
+        BinOp::Lt => Value::bool_(a < b),
+        BinOp::Le => Value::bool_(a <= b),
+        BinOp::Gt => Value::bool_(a > b),
+        BinOp::Ge => Value::bool_(a >= b),
         // Bitwise (NUM §3.2): int two's-complement. Never overflow-trap.
-        BinOp::BitAnd => Value::Int(a & b),
-        BinOp::BitOr => Value::Int(a | b),
-        BinOp::BitXor => Value::Int(a ^ b),
+        BinOp::BitAnd => Value::int(a & b),
+        BinOp::BitOr => Value::int(a | b),
+        BinOp::BitXor => Value::int(a ^ b),
         // Shifts (NUM §3.2): the rhs is the shift AMOUNT. `checked_shl`/`checked_shr`
         // return `None` ONLY when the amount is out of range (`< 0` or `>= 64`) —
         // bit-loss (e.g. `1 << 63 == i64::MIN`, `-1 << 1 == -2`) is a defined result,
         // not an overflow. `>>` is arithmetic (sign-extending) since `a` is `i64`.
-        BinOp::Shl => Value::Int(int_shift(a, b, true, span)?),
-        BinOp::Shr => Value::Int(int_shift(a, b, false, span)?),
+        BinOp::Shl => Value::int(int_shift(a, b, true, span)?),
+        BinOp::Shr => Value::int(int_shift(a, b, false, span)?),
         // Wrapping (NUM §3.2): two's-complement, never panic.
-        BinOp::WrapAdd => Value::Int(a.wrapping_add(b)),
-        BinOp::WrapSub => Value::Int(a.wrapping_sub(b)),
-        BinOp::WrapMul => Value::Int(a.wrapping_mul(b)),
+        BinOp::WrapAdd => Value::int(a.wrapping_add(b)),
+        BinOp::WrapSub => Value::int(a.wrapping_sub(b)),
+        BinOp::WrapMul => Value::int(a.wrapping_mul(b)),
         BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
             unreachable!("handled above apply_binop's numeric dispatch")
         }
@@ -7416,12 +7412,12 @@ pub(crate) fn int_shift(a: i64, b: i64, left: bool, span: Span) -> Result<i64, C
 fn int_pow(base: i64, exp: i64, span: Span) -> Result<Value, Control> {
     if (0..=i64::from(u32::MAX)).contains(&exp) {
         match base.checked_pow(exp as u32) {
-            Some(v) => Ok(Value::Int(v)),
+            Some(v) => Ok(Value::int(v)),
             None => Err(AsError::at("integer overflow in '**'", span).into()),
         }
     } else {
         // Negative exponent OR exponent > u32::MAX → float result.
-        Ok(Value::Float((base as f64).powf(exp as f64)))
+        Ok(Value::float((base as f64).powf(exp as f64)))
     }
 }
 
@@ -7429,16 +7425,16 @@ fn int_pow(base: i64, exp: i64, span: Span) -> Result<Value, Control> {
 /// pre-NUM behavior). Never panics — IEEE handles `/0`, `NaN`, `inf`.
 fn float_binop(op: BinOp, a: f64, b: f64) -> Value {
     match op {
-        BinOp::Add => Value::Float(a + b),
-        BinOp::Sub => Value::Float(a - b),
-        BinOp::Mul => Value::Float(a * b),
-        BinOp::Div => Value::Float(a / b),
-        BinOp::Mod => Value::Float(a % b),
-        BinOp::Pow => Value::Float(a.powf(b)),
-        BinOp::Lt => Value::Bool(a < b),
-        BinOp::Le => Value::Bool(a <= b),
-        BinOp::Gt => Value::Bool(a > b),
-        BinOp::Ge => Value::Bool(a >= b),
+        BinOp::Add => Value::float(a + b),
+        BinOp::Sub => Value::float(a - b),
+        BinOp::Mul => Value::float(a * b),
+        BinOp::Div => Value::float(a / b),
+        BinOp::Mod => Value::float(a % b),
+        BinOp::Pow => Value::float(a.powf(b)),
+        BinOp::Lt => Value::bool_(a < b),
+        BinOp::Le => Value::bool_(a <= b),
+        BinOp::Gt => Value::bool_(a > b),
+        BinOp::Ge => Value::bool_(a >= b),
         BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
             unreachable!("handled above apply_binop's numeric dispatch")
         }
@@ -7471,7 +7467,7 @@ fn mixed_binop(op: BinOp, i: i64, f: f64, float_first: bool) -> Result<Value, Co
     // INT relative to the FLOAT; flip it when the float was the left operand.
     let cmp = |want_lt: bool, want_eq: bool, want_gt: bool| -> Value {
         match crate::value::int_cmp_float(i, f) {
-            None => Value::Bool(false), // NaN is unordered: every `<`,`<=`,`>`,`>=` is false.
+            None => Value::bool_(false), // NaN is unordered: every `<`,`<=`,`>`,`>=` is false.
             Some(mut ord) => {
                 if float_first {
                     ord = ord.reverse();
@@ -7481,7 +7477,7 @@ fn mixed_binop(op: BinOp, i: i64, f: f64, float_first: bool) -> Result<Value, Co
                     Ordering::Equal => want_eq,
                     Ordering::Greater => want_gt,
                 };
-                Value::Bool(hit)
+                Value::bool_(hit)
             }
         }
     };
@@ -7513,22 +7509,22 @@ fn mixed_binop(op: BinOp, i: i64, f: f64, float_first: bool) -> Result<Value, Co
 /// not. (Mirrors IEEE-754, where NaN compares false for `==` and `<` alike, but we
 /// additionally choose to hard-error on the nonsensical ordering.)
 fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
-    match (l, r) {
+    match (l.kind(), r.kind()) {
         // Decimal vs Decimal: use the inner value's own equality.
-        (Value::Decimal(a), Value::Decimal(b)) => Ok(a == b),
+        (ValueKind::Decimal(a), ValueKind::Decimal(b)) => Ok(a == b),
         // NUM §4: Decimal vs Int — the int converts EXACTLY.
-        (Value::Decimal(a), Value::Int(i)) | (Value::Int(i), Value::Decimal(a)) => {
-            Ok(**a == rust_decimal::Decimal::from(*i))
+        (ValueKind::Decimal(a), ValueKind::Int(i)) | (ValueKind::Int(i), ValueKind::Decimal(a)) => {
+            Ok(**a == rust_decimal::Decimal::from(i))
         }
         // Decimal vs Float (or vice-versa): coerce the number to decimal.
-        (Value::Decimal(a), Value::Float(n)) | (Value::Float(n), Value::Decimal(a)) => {
+        (ValueKind::Decimal(a), ValueKind::Float(n)) | (ValueKind::Float(n), ValueKind::Decimal(a)) => {
             if !n.is_finite() {
                 // A non-finite float can never equal a finite decimal (lenient
                 // false; the ordering path panics instead — see fn doc comment).
                 return Ok(false);
             }
             use rust_decimal::prelude::FromPrimitive;
-            let b = rust_decimal::Decimal::from_f64(*n).ok_or_else(|| {
+            let b = rust_decimal::Decimal::from_f64(n).ok_or_else(|| {
                 AsError::at("cannot convert number to decimal for comparison", span)
             })?;
             Ok(**a == b)
@@ -7543,10 +7539,10 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
     // only when it is exactly integral (e.g. `arr[2.0]`); a non-integral float is the
     // Tier-2 panic `array index must be an int, got float`. Any number must be
     // non-negative; a non-number is `array index must be a number`.
-    match v {
-        Value::Int(i) => {
-            if *i >= 0 {
-                Ok(*i as usize)
+    match v.kind() {
+        ValueKind::Int(i) => {
+            if i >= 0 {
+                Ok(i as usize)
             } else {
                 Err(AsError::at(
                     "array index must be a non-negative integer",
@@ -7554,11 +7550,11 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
                 ))
             }
         }
-        Value::Float(n) => {
+        ValueKind::Float(n) => {
             if n.fract() != 0.0 {
                 Err(AsError::at("array index must be an int, got float", span))
-            } else if *n >= 0.0 {
-                Ok(*n as usize)
+            } else if n >= 0.0 {
+                Ok(n as usize)
             } else {
                 Err(AsError::at(
                     "array index must be a non-negative integer",
@@ -7593,8 +7589,8 @@ pub(crate) fn index_get(
     obj_span: Span,
     index_span: Span,
 ) -> Result<Value, AsError> {
-    match obj {
-        Value::Array(arr) => {
+    match obj.kind() {
+        ValueKind::Array(arr) => {
             let i = array_index(idx, index_span)?;
             let arr = arr.borrow();
             arr.get(i).cloned().ok_or_else(|| {
@@ -7604,15 +7600,15 @@ pub(crate) fn index_get(
                 )
             })
         }
-        Value::Object(map) => match idx {
-            Value::Str(key) => Ok(map.get(key.as_ref()).unwrap_or(Value::Nil)),
+        ValueKind::Object(map) => match idx.kind() {
+            ValueKind::Str(key) => Ok(map.get(key.as_ref()).unwrap_or(Value::nil())),
             _ => Err(AsError::at("object index must be a string", index_span)),
         },
         // SRV §3.5: a frozen `Shared` indexes like the data it froze — an array by
         // int → the child sub-node (re-wrapped as `Shared` if a container, else a
         // materialized scalar); an object/map by key → the child; OOB/missing → nil.
         // Descending stays zero-copy (a sub-container reads as a `Shared` view).
-        Value::Shared(node) => shared_index_get(node, idx, obj_span, index_span),
+        ValueKind::Shared(node) => shared_index_get(node, idx, obj_span, index_span),
         _ => Err(AsError::at("cannot index this value", obj_span)),
     }
 }
@@ -7622,15 +7618,15 @@ pub(crate) fn index_get(
 pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value {
     use crate::value::SharedNode;
     match &**child {
-        SharedNode::Nil => Value::Nil,
-        SharedNode::Bool(b) => Value::Bool(*b),
-        SharedNode::Int(i) => Value::Int(*i),
-        SharedNode::Float(f) => Value::Float(*f),
-        SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
-        SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
+        SharedNode::Nil => Value::nil(),
+        SharedNode::Bool(b) => Value::bool_(*b),
+        SharedNode::Int(i) => Value::int(*i),
+        SharedNode::Float(f) => Value::float(*f),
+        SharedNode::Decimal(d) => Value::decimal(*d),
+        SharedNode::Str(s) => Value::str(Rc::from(&**s)),
         // Containers (and the opaque Regex/EnumVariant/Instance frozen nodes) stay
         // shared — re-wrap the SAME `Arc` (a pointer bump, no copy).
-        _ => Value::Shared(child.clone()),
+        _ => Value::shared(child.clone()),
     }
 }
 
@@ -7654,38 +7650,38 @@ pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value 
 /// `--no-default-features`.
 #[cfg(feature = "data")]
 pub(crate) fn shared_to_value_shallow(node: &crate::value::SharedNode) -> Option<Value> {
-    use crate::value::{ArrayCell, MapCell, ObjectCell, SetCell, SharedNode};
+    use crate::value::SharedNode;
     Some(match node {
-        SharedNode::Nil => Value::Nil,
-        SharedNode::Bool(b) => Value::Bool(*b),
-        SharedNode::Int(i) => Value::Int(*i),
-        SharedNode::Float(f) => Value::Float(*f),
-        SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
-        SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
-        SharedNode::Bytes(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
+        SharedNode::Nil => Value::nil(),
+        SharedNode::Bool(b) => Value::bool_(*b),
+        SharedNode::Int(i) => Value::int(*i),
+        SharedNode::Float(f) => Value::float(*f),
+        SharedNode::Decimal(d) => Value::decimal(*d),
+        SharedNode::Str(s) => Value::str(Rc::from(&**s)),
+        SharedNode::Bytes(b) => Value::bytes(b.to_vec()),
         SharedNode::Array(a) => {
-            Value::Array(ArrayCell::new(a.iter().map(shared_child_to_value).collect()))
+            Value::array(a.iter().map(shared_child_to_value).collect())
         }
         SharedNode::Object(o) => {
             let mut m = indexmap::IndexMap::with_capacity(o.len());
             for (k, v) in o.iter() {
                 m.insert(k.to_string(), shared_child_to_value(v));
             }
-            Value::Object(ObjectCell::new(m))
+            Value::object(m)
         }
         SharedNode::Map(mp) => {
             let mut m = indexmap::IndexMap::with_capacity(mp.len());
             for (k, v) in mp.iter() {
                 m.insert(k.to_map_key(), shared_child_to_value(v));
             }
-            Value::Map(MapCell::new(m))
+            Value::map(m)
         }
         SharedNode::Set(s) => {
             let mut set = indexmap::IndexSet::with_capacity(s.len());
             for k in s.iter() {
                 set.insert(k.to_map_key());
             }
-            Value::Set(SetCell::new(set))
+            Value::set(set)
         }
         SharedNode::Instance { .. }
         | SharedNode::EnumVariant { .. }
@@ -7713,24 +7709,24 @@ pub(crate) fn shared_index_get(
                 )
             })
         }
-        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match idx {
-            Value::Str(key) => Ok(map
+        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match idx.kind() {
+            ValueKind::Str(key) => Ok(map
                 .iter()
                 .find(|(k, _)| &**k == key.as_ref())
                 .map(|(_, v)| shared_child_to_value(v))
-                .unwrap_or(Value::Nil)),
+                .unwrap_or(Value::nil())),
             _ => Err(AsError::at("object index must be a string", index_span)),
         },
         SharedNode::Map(map) => {
             let Some(key) = crate::value::MapKey::from_value(idx) else {
-                return Ok(Value::Nil);
+                return Ok(Value::nil());
             };
             let skey = SharedKey::from_map_key(&key);
             Ok(map
                 .iter()
                 .find(|(k, _)| *k == skey)
                 .map(|(_, v)| shared_child_to_value(v))
-                .unwrap_or(Value::Nil))
+                .unwrap_or(Value::nil()))
         }
         _ => Err(AsError::at("cannot index this value", obj_span)),
     }
@@ -7751,13 +7747,13 @@ pub(crate) fn shared_read_member(
             .iter()
             .find(|(k, _)| &**k == name)
             .map(|(_, v)| shared_child_to_value(v))
-            .unwrap_or(Value::Nil)),
+            .unwrap_or(Value::nil())),
         SharedNode::EnumVariant {
             enum_name,
             name: variant,
             value,
         } => match name {
-            "name" => Ok(Value::Str(Rc::from(&**variant))),
+            "name" => Ok(Value::str(Rc::from(&**variant))),
             "value" => Ok(shared_child_to_value(value)),
             // Named-payload field-access sugar: read the field off the frozen payload
             // object (mirroring the live `EnumVariant` `.field` sugar).
@@ -7774,7 +7770,7 @@ pub(crate) fn shared_read_member(
             }
         },
         SharedNode::Regex { source } => match name {
-            "source" => Ok(Value::Str(Rc::from(&**source))),
+            "source" => Ok(Value::str(Rc::from(&**source))),
             other => Err(AsError::at(
                 format!("frozen regex has no property '{}' (try 'source')", other),
                 span,
@@ -7851,25 +7847,25 @@ pub(crate) fn call_shared(
     match name {
         "len" | "size" => {
             if let Some(n) = shared_len(node) {
-                return Ok(Value::Int(n as i64));
+                return Ok(Value::int(n as i64));
             }
         }
         "has" => {
-            let key = args.first().cloned().unwrap_or(Value::Nil);
-            return Ok(Value::Bool(shared_has_key(node, &key)));
+            let key = args.first().cloned().unwrap_or(Value::nil());
+            return Ok(Value::bool_(shared_has_key(node, &key)));
         }
         "contains" => {
-            let key = args.first().cloned().unwrap_or(Value::Nil);
+            let key = args.first().cloned().unwrap_or(Value::nil());
             // Set membership (or array containment).
-            return Ok(Value::Bool(shared_contains(node, &key)));
+            return Ok(Value::bool_(shared_contains(node, &key)));
         }
         "get" => {
             // `get(k, default?)` — frozen object/map field, else the default (nil).
-            let key = args.first().cloned().unwrap_or(Value::Nil);
-            let default = args.get(1).cloned().unwrap_or(Value::Nil);
+            let key = args.first().cloned().unwrap_or(Value::nil());
+            let default = args.get(1).cloned().unwrap_or(Value::nil());
             let found = match node {
-                SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match &key {
-                    Value::Str(s) => map
+                SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match key.kind() {
+                    ValueKind::Str(s) => map
                         .iter()
                         .find(|(k, _)| &**k == s.as_ref())
                         .map(|(_, v)| shared_child_to_value(v)),
@@ -7887,12 +7883,12 @@ pub(crate) fn call_shared(
         }
         "keys" => {
             if let Some(keys) = shared_keys(node) {
-                return Ok(Value::Array(crate::value::ArrayCell::new(keys)));
+                return Ok(Value::array(keys));
             }
         }
         "values" => {
             if let Some(vals) = shared_values(node) {
-                return Ok(Value::Array(crate::value::ArrayCell::new(vals)));
+                return Ok(Value::array(vals));
             }
         }
         _ => {}
@@ -7928,8 +7924,8 @@ pub(crate) fn call_shared(
 fn shared_has_key(node: &crate::value::SharedNode, key: &Value) -> bool {
     use crate::value::{MapKey, SharedKey, SharedNode};
     match node {
-        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match key {
-            Value::Str(s) => map.iter().any(|(k, _)| &**k == s.as_ref()),
+        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match key.kind() {
+            ValueKind::Str(s) => map.iter().any(|(k, _)| &**k == s.as_ref()),
             _ => false,
         },
         SharedNode::Map(map) => MapKey::from_value(key)
@@ -7970,7 +7966,7 @@ fn shared_keys(node: &crate::value::SharedNode) -> Option<Vec<Value>> {
     use crate::value::SharedNode;
     match node {
         SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => {
-            Some(map.iter().map(|(k, _)| Value::Str(Rc::from(&**k))).collect())
+            Some(map.iter().map(|(k, _)| Value::str(Rc::from(&**k))).collect())
         }
         SharedNode::Map(map) => Some(map.iter().map(|(k, _)| k.to_value()).collect()),
         _ => None,
@@ -7998,7 +7994,7 @@ pub(crate) fn shared_iter_values(node: &crate::value::SharedNode) -> Option<Vec<
         SharedNode::Array(a) => Some(a.iter().map(shared_child_to_value).collect()),
         SharedNode::Str(s) => Some(
             s.chars()
-                .map(|c| Value::Str(c.to_string().into()))
+                .map(|c| Value::str(c.to_string()))
                 .collect(),
         ),
         SharedNode::Set(s) => Some(s.iter().map(|k| k.to_value()).collect()),
@@ -8037,8 +8033,8 @@ pub(crate) fn index_set(
             index_span,
         ));
     }
-    match obj {
-        Value::Array(arr) => {
+    match obj.kind() {
+        ValueKind::Array(arr) => {
             let i = array_index(idx, index_span)?;
             let mut arr = arr.borrow_mut();
             if i >= arr.len() {
@@ -8050,8 +8046,8 @@ pub(crate) fn index_set(
             arr[i] = value.clone();
             Ok(value)
         }
-        Value::Object(map) => match idx {
-            Value::Str(key) => {
+        ValueKind::Object(map) => match idx.kind() {
+            ValueKind::Str(key) => {
                 map.borrow_mut().insert(key.to_string(), value.clone());
                 Ok(value)
             }
@@ -8094,12 +8090,12 @@ pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'s
 /// `message` field, that field's value is rendered; otherwise the whole value is.
 /// Single source of truth shared by `expr!` (Unwrap) and `for await` error paths.
 pub(crate) fn error_message(err: &Value) -> String {
-    match err {
-        Value::Object(o) => o
+    match err.kind() {
+        ValueKind::Object(o) => o
             .get("message")
             .map(|m| m.to_string())
             .unwrap_or_else(|| err.to_string()),
-        other => other.to_string(),
+        _ => err.to_string(),
     }
 }
 
@@ -8108,9 +8104,9 @@ pub(crate) fn error_message(err: &Value) -> String {
 /// `Value::Function` and a VM `Value::Closure` (whose `proto` carries the name +
 /// `is_worker`). `run_in_worker`'s first arg must resolve through this.
 fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
-    match v {
-        Value::Function(f) if f.is_worker => f.name.as_ref().map(|n| n.to_string()),
-        Value::Closure(c) if c.proto.is_worker => {
+    match v.kind() {
+        ValueKind::Function(f) if f.is_worker => f.name.as_ref().map(|n| n.to_string()),
+        ValueKind::Closure(c) if c.proto.is_worker => {
             c.proto.chunk.name.as_ref().map(|n| n.to_string())
         }
         _ => None,
@@ -8118,37 +8114,37 @@ fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
 }
 
 pub(crate) fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Nil => "nil",
-        Value::Bool(_) => "bool",
-        Value::Int(_) => "int",
-        Value::Float(_) => "float",
-        Value::Decimal(_) => "decimal",
-        Value::Str(_) => "string",
-        Value::Builtin(_) | Value::Function(_) | Value::Closure(_) => "function",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-        Value::Map(_) => "map",
-        Value::Set(_) => "set",
-        Value::Bytes(_) => "bytes",
+    match v.kind() {
+        ValueKind::Nil => "nil",
+        ValueKind::Bool(_) => "bool",
+        ValueKind::Int(_) => "int",
+        ValueKind::Float(_) => "float",
+        ValueKind::Decimal(_) => "decimal",
+        ValueKind::Str(_) => "string",
+        ValueKind::Builtin(_) | ValueKind::Function(_) | ValueKind::Closure(_) => "function",
+        ValueKind::Array(_) => "array",
+        ValueKind::Object(_) => "object",
+        ValueKind::Map(_) => "map",
+        ValueKind::Set(_) => "set",
+        ValueKind::Bytes(_) => "bytes",
         #[cfg(feature = "data")]
-        Value::Regex(_) => "regex",
-        Value::Native(n) => n.kind.type_name(),
-        Value::NativeMethod(_) => "function",
-        Value::Enum(_) => "enum",
-        Value::EnumVariant(_) => "enum variant",
-        Value::Class(_) => "class",
-        Value::Interface(_) => "interface",
-        Value::Instance(_) => "instance",
-        Value::BoundMethod(_) | Value::Super(_) => "function",
-        Value::Future(_) => "future",
-        Value::Generator(_) => "generator",
-        Value::GeneratorMethod(..) => "function",
-        Value::ClassMethod(..) => "function",
+        ValueKind::Regex(_) => "regex",
+        ValueKind::Native(n) => n.kind.type_name(),
+        ValueKind::NativeMethod(_) => "function",
+        ValueKind::Enum(_) => "enum",
+        ValueKind::EnumVariant(_) => "enum variant",
+        ValueKind::Class(_) => "class",
+        ValueKind::Interface(_) => "interface",
+        ValueKind::Instance(_) => "instance",
+        ValueKind::BoundMethod(_) | ValueKind::Super(_) => "function",
+        ValueKind::Future(_) => "future",
+        ValueKind::Generator(_) => "generator",
+        ValueKind::GeneratorMethod(..) => "function",
+        ValueKind::ClassMethod(..) => "function",
         // SRV §3.5: a frozen `Shared` reports its UNDERLYING kind (a frozen routing
         // object is an `"object"`, a frozen array an `"array"`) — user code +
         // `instanceof` see it as the data it froze, not as a distinct "shared" type.
-        Value::Shared(n) => n.kind_name(),
+        ValueKind::Shared(n) => n.kind_name(),
     }
 }
 
@@ -8413,7 +8409,7 @@ pub(crate) fn check_call_args(
     // engine in the callee frame).
     let defaults = supplied..n_positional;
     for _ in defaults.clone() {
-        values.push(Value::Nil);
+        values.push(Value::nil());
     }
     // Collect the rest param's tail (any args beyond the positional count).
     if has_rest {
@@ -8445,9 +8441,7 @@ pub(crate) fn check_call_args(
             }
             rest_vals.push(a);
         }
-        values.push(Value::Array(crate::value::ArrayCell::new(
-            rest_vals,
-        )));
+        values.push(Value::array(rest_vals,));
     }
     Ok(BoundArgs {
         values,
@@ -8528,45 +8522,45 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         // NUM §4/§5: `number` is the union `int | float`; `int`/`float` accept only
         // their own subtype.
         Type::Number => value.is_number(),
-        Type::Int => matches!(value, Value::Int(_)),
-        Type::Float => matches!(value, Value::Float(_)),
-        Type::String => matches!(value, Value::Str(_)),
-        Type::Bool => matches!(value, Value::Bool(_)),
-        Type::Nil => matches!(value, Value::Nil),
-        Type::Object => matches!(value, Value::Object(_)),
+        Type::Int => matches!(value.kind(), ValueKind::Int(_)),
+        Type::Float => matches!(value.kind(), ValueKind::Float(_)),
+        Type::String => matches!(value.kind(), ValueKind::Str(_)),
+        Type::Bool => matches!(value.kind(), ValueKind::Bool(_)),
+        Type::Nil => matches!(value.kind(), ValueKind::Nil),
+        Type::Object => matches!(value.kind(), ValueKind::Object(_)),
         // A VM-produced `Closure` is the bytecode analog of a tree-walker
         // `Function`; both are first-class callables, so `: fn` typing accepts
         // either. (The tree-walker never produces a `Closure`, so adding it here
         // is behavior-preserving for the tree-walker and closes a real contract
         // gap for the VM, which routes through this shared `check_type`.)
         Type::Fn => matches!(
-            value,
-            Value::Function(_) | Value::Closure(_) | Value::Builtin(_)
+            value.kind(),
+            ValueKind::Function(_) | ValueKind::Closure(_) | ValueKind::Builtin(_)
         ),
-        Type::Error => matches!(value, Value::Object(_) | Value::Nil),
-        Type::Array(elem) => match value {
-            Value::Array(a) => a.borrow().iter().all(|v| check_type(v, elem)),
+        Type::Error => matches!(value.kind(), ValueKind::Object(_) | ValueKind::Nil),
+        Type::Array(elem) => match value.kind() {
+            ValueKind::Array(a) => a.borrow().iter().all(|v| check_type(v, elem)),
             _ => false,
         },
-        Type::Result(inner) => match value {
-            Value::Array(a) => {
+        Type::Result(inner) => match value.kind() {
+            ValueKind::Array(a) => {
                 let b = a.borrow();
                 b.len() == 2
-                    && (check_type(&b[0], inner) || matches!(b[0], Value::Nil))
+                    && (check_type(&b[0], inner) || matches!(b[0].kind(), ValueKind::Nil))
                     && check_type(&b[1], &Type::Error)
             }
             _ => false,
         },
-        Type::Tuple(types) => match value {
-            Value::Array(a) => {
+        Type::Tuple(types) => match value.kind() {
+            ValueKind::Array(a) => {
                 let b = a.borrow();
                 b.len() == types.len() && b.iter().zip(types.iter()).all(|(v, t)| check_type(v, t))
             }
             _ => false,
         },
         Type::Union(a, b) => check_type(value, a) || check_type(value, b),
-        Type::Named(name) => match value {
-            Value::Instance(inst) => {
+        Type::Named(name) => match value.kind() {
+            ValueKind::Instance(inst) => {
                 let mut cur = Some(inst.borrow().class.clone());
                 while let Some(c) = cur {
                     if &c.name == name {
@@ -8576,11 +8570,11 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
                 }
                 false
             }
-            Value::EnumVariant(v) => &v.enum_name == name,
+            ValueKind::EnumVariant(v) => &v.enum_name == name,
             _ => false,
         },
-        Type::Map(k, v) => match value {
-            Value::Map(m) => m
+        Type::Map(k, v) => match value.kind() {
+            ValueKind::Map(m) => m
                 .borrow()
                 .iter()
                 .all(|(mk, val)| check_type(&mk.to_value(), k) && check_type(val, v)),
@@ -8589,9 +8583,9 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         // A value satisfies `future<T>` iff it is a future. The inner `T` is the
         // type the future *resolves to*, which cannot be inspected until it is
         // awaited, so it is advisory/erased at the binding site.
-        Type::Future(_) => matches!(value, Value::Future(_)),
+        Type::Future(_) => matches!(value.kind(), ValueKind::Future(_)),
         // `T?` ≡ `T | nil`.
-        Type::Optional(inner) => check_type(value, inner) || matches!(value, Value::Nil),
+        Type::Optional(inner) => check_type(value, inner) || matches!(value.kind(), ValueKind::Nil),
         // TYPE §5.4: generics are RUNTIME-ERASED. A generic type PARAMETER (`T`)
         // carries no runtime obligation — it accepts every value, exactly like
         // `any`. The static checker enforces `T`'s consistency; the runtime does
@@ -8602,8 +8596,8 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         // callable at runtime — the param/return signature is erased (advisory,
         // static-only), so this is identical to `Type::Fn`.
         Type::FnSig(_, _) => matches!(
-            value,
-            Value::Function(_) | Value::Closure(_) | Value::Builtin(_)
+            value.kind(),
+            ValueKind::Function(_) | ValueKind::Closure(_) | ValueKind::Builtin(_)
         ),
     }
 }
@@ -8729,7 +8723,7 @@ mod tests {
             .run_until(async {
                 // `env` denied → the gate raises the recoverable denial panic.
                 let denied = interp
-                    .call_stdlib("env", "get", &[Value::Str("PATH".into())], Span::new(0, 0))
+                    .call_stdlib("env", "get", &[Value::str("PATH")], Span::new(0, 0))
                     .await;
                 match denied {
                     Err(Control::Panic(e)) => {
@@ -8739,10 +8733,10 @@ mod tests {
                 }
                 // A still-granted, ungated module (math) routes normally.
                 let ok = interp
-                    .call_stdlib("math", "abs", &[Value::Int(-3)], Span::new(0, 0))
+                    .call_stdlib("math", "abs", &[Value::int(-3)], Span::new(0, 0))
                     .await
                     .unwrap();
-                assert_eq!(ok, Value::Int(3));
+                assert_eq!(ok, Value::int(3));
             })
             .await;
     }
@@ -8767,7 +8761,7 @@ mod tests {
                     .call_stdlib(
                         "net",
                         "lookup",
-                        &[Value::Str("example.com".into())],
+                        &[Value::str("example.com")],
                         Span::new(0, 0),
                     )
                     .await;
@@ -8801,7 +8795,7 @@ mod tests {
                 // sqlite.open → Fs denied (would otherwise open/create a DB file).
                 #[cfg(feature = "sql")]
                 match interp
-                    .call_stdlib("sqlite", "open", &[Value::Str(":memory:".into())], Span::new(0, 0))
+                    .call_stdlib("sqlite", "open", &[Value::str(":memory:")], Span::new(0, 0))
                     .await
                 {
                     Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'fs' denied"),
@@ -8813,7 +8807,7 @@ mod tests {
                     .call_stdlib(
                         "postgres",
                         "connect",
-                        &[Value::Str("postgres://localhost/db".into())],
+                        &[Value::str("postgres://localhost/db")],
                         Span::new(0, 0),
                     )
                     .await
@@ -8827,7 +8821,7 @@ mod tests {
                     .call_stdlib(
                         "redis",
                         "connect",
-                        &[Value::Str("redis://localhost".into())],
+                        &[Value::str("redis://localhost")],
                         Span::new(0, 0),
                     )
                     .await
@@ -8905,7 +8899,7 @@ mod tests {
                     .call_stdlib(
                         "net",
                         "lookup",
-                        &[Value::Str("example.com".into())],
+                        &[Value::str("example.com")],
                         Span::new(0, 0),
                     )
                     .await;
@@ -8922,13 +8916,13 @@ mod tests {
                     .call_stdlib(
                         "net",
                         "lookup",
-                        &[Value::Str("localhost".into())],
+                        &[Value::str("localhost")],
                         Span::new(0, 0),
                     )
                     .await
                     .unwrap();
-                if let Value::Array(a) = ok {
-                    assert_eq!(a.borrow()[1], Value::Nil, "lookup should succeed, err=nil");
+                if let ValueKind::Array(a) = ok.kind() {
+                    assert_eq!(a.borrow()[1], Value::nil(), "lookup should succeed, err=nil");
                 } else {
                     panic!("expected [ips, err] pair");
                 }
@@ -8974,7 +8968,7 @@ mod tests {
                     .call_stdlib(
                         "net_http",
                         "get",
-                        &[Value::Str("http://8.8.8.8/".into())],
+                        &[Value::str("http://8.8.8.8/")],
                         Span::new(0, 0),
                     )
                     .await
@@ -8990,20 +8984,20 @@ mod tests {
                     .call_stdlib(
                         "net_udp",
                         "bind",
-                        &[Value::Str("127.0.0.1:0".into())],
+                        &[Value::str("127.0.0.1:0")],
                         Span::new(0, 0),
                     )
                     .await
                     .unwrap();
-                let sock = if let Value::Array(a) = &bind {
+                let sock = if let ValueKind::Array(a) = bind.kind() {
                     a.borrow()[0].clone()
                 } else {
                     panic!("bind should return a pair");
                 };
                 // Call `send(data, "8.8.8.8:53")` on the socket handle.
                 let m = std::rc::Rc::new(crate::value::NativeMethod {
-                    receiver: match &sock {
-                        Value::Native(n) => n.clone(),
+                    receiver: match sock.kind() {
+                        ValueKind::Native(n) => n.clone(),
                         _ => panic!("expected a native udp socket"),
                     },
                     method: "send".into(),
@@ -9012,8 +9006,8 @@ mod tests {
                     .call_native_method(
                         m,
                         vec![
-                            Value::Str("x".into()),
-                            Value::Str("8.8.8.8:53".into()),
+                            Value::str("x"),
+                            Value::str("8.8.8.8:53"),
                         ],
                         Span::new(0, 0),
                     )
@@ -9029,7 +9023,7 @@ mod tests {
                     .call_stdlib(
                         "net_ws",
                         "connect",
-                        &[Value::Str("ws://8.8.8.8:9000/".into())],
+                        &[Value::str("ws://8.8.8.8:9000/")],
                         Span::new(0, 0),
                     )
                     .await
@@ -9045,8 +9039,8 @@ mod tests {
                     .await
                     .unwrap();
                 let m = std::rc::Rc::new(crate::value::NativeMethod {
-                    receiver: match &server {
-                        Value::Native(n) => n.clone(),
+                    receiver: match server.kind() {
+                        ValueKind::Native(n) => n.clone(),
                         _ => panic!("expected a server handle"),
                     },
                     method: "bind".into(),
@@ -9054,7 +9048,7 @@ mod tests {
                 match i
                     .call_native_method(
                         m,
-                        vec![Value::Str("0.0.0.0".into()), Value::Int(0)],
+                        vec![Value::str("0.0.0.0"), Value::int(0)],
                         Span::new(0, 0),
                     )
                     .await
@@ -9085,13 +9079,13 @@ mod tests {
                     .call_stdlib(
                         "net_tcp",
                         "listen",
-                        &[Value::Str("127.0.0.1".into()), Value::Int(0)],
+                        &[Value::str("127.0.0.1"), Value::int(0)],
                         Span::new(0, 0),
                     )
                     .await
                     .unwrap();
-                let listener = if let Value::Array(a) = &pair {
-                    assert_eq!(a.borrow()[1], Value::Nil, "listen should succeed");
+                let listener = if let ValueKind::Array(a) = pair.kind() {
+                    assert_eq!(a.borrow()[1], Value::nil(), "listen should succeed");
                     a.borrow()[0].clone()
                 } else {
                     panic!("listen should return a pair");
@@ -9103,8 +9097,8 @@ mod tests {
                 // accept() on the open listener must now be denied — the per-handle
                 // re-check fires before any new connection is acquired.
                 let m = std::rc::Rc::new(crate::value::NativeMethod {
-                    receiver: match &listener {
-                        Value::Native(n) => n.clone(),
+                    receiver: match listener.kind() {
+                        ValueKind::Native(n) => n.clone(),
                         _ => panic!("expected a native listener"),
                     },
                     method: "accept".into(),
@@ -9136,14 +9130,14 @@ mod tests {
                 interp.caps_deny_all();
                 // listenerCount() still works — the handle has no governing cap.
                 let m = std::rc::Rc::new(crate::value::NativeMethod {
-                    receiver: match &emitter {
-                        Value::Native(n) => n.clone(),
+                    receiver: match emitter.kind() {
+                        ValueKind::Native(n) => n.clone(),
                         _ => panic!("expected a native emitter"),
                     },
                     method: "listenerCount".into(),
                 });
                 let r = interp
-                    .call_native_method(m, vec![Value::Str("x".into())], Span::new(0, 0))
+                    .call_native_method(m, vec![Value::str("x")], Span::new(0, 0))
                     .await;
                 assert!(r.is_ok(), "ungated handle must stay usable after dropAll: {r:?}");
             })
@@ -9178,8 +9172,8 @@ mod tests {
                         "fs",
                         "write",
                         &[
-                            Value::Str(allowed.to_string_lossy().to_string().into()),
-                            Value::Str("hi".into()),
+                            Value::str(allowed.to_string_lossy().to_string()),
+                            Value::str("hi"),
                         ],
                         Span::new(0, 0),
                     )
@@ -9191,8 +9185,8 @@ mod tests {
                         "fs",
                         "write",
                         &[
-                            Value::Str(outside.to_string_lossy().to_string().into()),
-                            Value::Str("nope".into()),
+                            Value::str(outside.to_string_lossy().to_string()),
+                            Value::str("nope"),
                         ],
                         Span::new(0, 0),
                     )
@@ -9208,7 +9202,7 @@ mod tests {
                     .call_stdlib(
                         "fs",
                         "exists",
-                        &[Value::Str(outside.to_string_lossy().to_string().into())],
+                        &[Value::str(outside.to_string_lossy().to_string())],
                         Span::new(0, 0),
                     )
                     .await;
@@ -9229,10 +9223,10 @@ mod tests {
         let interp = Interp::new();
         assert!(!interp.telemetry_active());
         assert!(interp
-            .telemetry_span_start("op", vec![("k".into(), Value::Float(1.0))])
+            .telemetry_span_start("op", vec![("k".into(), Value::float(1.0))])
             .is_none());
         // Setter/event/end on an arbitrary id are safe no-ops when inactive.
-        interp.telemetry_span_set(0, "k", Value::Nil);
+        interp.telemetry_span_set(0, "k", Value::nil());
         interp.telemetry_span_event(0, "e", vec![]);
         interp.telemetry_span_end(0, SpanStatus::Ok);
     }
@@ -9495,7 +9489,7 @@ print(y)
     async fn native_handle_fields_and_methods() {
         let interp = Interp::new();
         let mut fields = indexmap::IndexMap::new();
-        fields.insert("pid".to_string(), Value::Float(42.0));
+        fields.insert("pid".to_string(), Value::float(42.0));
         let h = interp.register_resource(
             crate::value::NativeKind::ChildProcess,
             fields,
@@ -9504,10 +9498,10 @@ print(y)
         assert_eq!(type_name(&h), "childProcess");
         assert_eq!(
             interp.read_member(&h, "pid", Span::new(0, 0)).unwrap(),
-            Value::Float(42.0)
+            Value::float(42.0)
         );
         let m = interp.read_member(&h, "wait", Span::new(0, 0)).unwrap();
-        assert!(matches!(m, Value::NativeMethod(_)));
+        assert!(matches!(m.kind(), ValueKind::NativeMethod(_)));
         assert_eq!(h.to_string(), format!("<native childProcess #{}>", 0));
         // The resource is in the table until taken.
         assert!(matches!(
@@ -9852,13 +9846,13 @@ print(y)
         // the runtime contract enforced on class fields / params / returns. Regression
         // for the bug where `int`/`float` parsed as Type::Named and `class C { x: int }`
         // panicked "expected int, got int".
-        assert!(check_type(&Value::Int(5), &Type::Int));
-        assert!(!check_type(&Value::Float(5.0), &Type::Int));
-        assert!(check_type(&Value::Float(2.5), &Type::Float));
-        assert!(!check_type(&Value::Int(5), &Type::Float));
-        assert!(check_type(&Value::Int(5), &Type::Number));
-        assert!(check_type(&Value::Float(2.5), &Type::Number));
-        assert!(!check_type(&Value::Str("x".into()), &Type::Int));
+        assert!(check_type(&Value::int(5), &Type::Int));
+        assert!(!check_type(&Value::float(5.0), &Type::Int));
+        assert!(check_type(&Value::float(2.5), &Type::Float));
+        assert!(!check_type(&Value::int(5), &Type::Float));
+        assert!(check_type(&Value::int(5), &Type::Number));
+        assert!(check_type(&Value::float(2.5), &Type::Number));
+        assert!(!check_type(&Value::str("x"), &Type::Int));
     }
 
     #[test]
@@ -9883,16 +9877,16 @@ print(y)
             local_names: Vec::new(),
             debug_name: None,
         });
-        let closure = Value::Closure(crate::vm::value_ext::Closure::new(proto));
+        let closure = Value::closure(crate::vm::value_ext::Closure::new(proto));
         assert!(
             check_type(&closure, &Type::Fn),
             "a VM Closure must satisfy a `: fn` contract"
         );
         // The tree-walker callables still satisfy `: fn`.
-        assert!(check_type(&Value::Builtin("len".into()), &Type::Fn));
+        assert!(check_type(&Value::builtin("len"), &Type::Fn));
         // A non-callable still fails the `: fn` contract (behavior preserved).
-        assert!(!check_type(&Value::Float(7.0), &Type::Fn));
-        assert!(!check_type(&Value::Str("x".into()), &Type::Fn));
+        assert!(!check_type(&Value::float(7.0), &Type::Fn));
+        assert!(!check_type(&Value::str("x"), &Type::Fn));
     }
 
     #[tokio::test]
@@ -10335,10 +10329,10 @@ print(bad[1].message)
     #[tokio::test]
     async fn optional_type_accepts_value_and_nil() {
         // nil and a number both satisfy number?; a string does not.
-        assert_eq!(eval_to_value("let x: number? = nil\nx").await, Value::Nil);
+        assert_eq!(eval_to_value("let x: number? = nil\nx").await, Value::nil());
         assert_eq!(
             eval_to_value("let x: number? = 7\nx").await,
-            Value::Float(7.0)
+            Value::float(7.0)
         );
     }
 
@@ -10640,8 +10634,8 @@ print(r[1])
 
     #[tokio::test]
     async fn unwrap_returns_value_on_ok_pair() {
-        assert_eq!(eval_to_value("[42, nil]!").await, Value::Float(42.0));
-        assert_eq!(eval_to_value("Ok(7)!").await, Value::Float(7.0));
+        assert_eq!(eval_to_value("[42, nil]!").await, Value::float(42.0));
+        assert_eq!(eval_to_value("Ok(7)!").await, Value::float(7.0));
     }
 
     #[tokio::test]
@@ -10864,9 +10858,10 @@ print(r[1])
     #[tokio::test]
     async fn evaluates_arithmetic_with_precedence() {
         // NUM §4: int-literal arithmetic yields `Int`.
-        match eval_to_value("1 + 2 * 3").await {
-            Value::Int(n) => assert_eq!(n, 7),
-            other => panic!("expected int, got {:?}", other),
+        let r = eval_to_value("1 + 2 * 3").await;
+        match r.kind() {
+            ValueKind::Int(n) => assert_eq!(n, 7),
+            _ => panic!("expected int, got {:?}", r),
         }
     }
 
@@ -10889,10 +10884,10 @@ print(r[1])
 
     #[tokio::test]
     async fn comparison_and_equality() {
-        assert_eq!(eval_to_value("1 < 2").await, Value::Bool(true));
-        assert_eq!(eval_to_value("2 == 2").await, Value::Bool(true));
-        assert_eq!(eval_to_value("1 != 2").await, Value::Bool(true));
-        assert_eq!(eval_to_value("\"a\" == \"a\"").await, Value::Bool(true));
+        assert_eq!(eval_to_value("1 < 2").await, Value::bool_(true));
+        assert_eq!(eval_to_value("2 == 2").await, Value::bool_(true));
+        assert_eq!(eval_to_value("1 != 2").await, Value::bool_(true));
+        assert_eq!(eval_to_value("\"a\" == \"a\"").await, Value::bool_(true));
     }
 
     #[tokio::test]
@@ -10900,7 +10895,7 @@ print(r[1])
         // `Str + Str` concatenates.
         assert_eq!(
             eval_to_value("\"a\" + \"b\"").await,
-            Value::Str("ab".into())
+            Value::str("ab")
         );
 
         // `Str + Number` must error (no coercion).
@@ -10918,18 +10913,18 @@ print(r[1])
 
     #[tokio::test]
     async fn exponent_evaluates() {
-        assert_eq!(eval_to_value("2 ** 10").await, Value::Float(1024.0));
+        assert_eq!(eval_to_value("2 ** 10").await, Value::float(1024.0));
     }
 
     #[tokio::test]
     async fn short_circuit_and_coalesce() {
-        assert_eq!(eval_to_value("false && nope").await, Value::Bool(false));
-        assert_eq!(eval_to_value("true || nope").await, Value::Bool(true));
+        assert_eq!(eval_to_value("false && nope").await, Value::bool_(false));
+        assert_eq!(eval_to_value("true || nope").await, Value::bool_(true));
         // NUM §4: int literals yield `Int`.
-        assert_eq!(eval_to_value("nil ?? 5").await, Value::Int(5));
-        assert_eq!(eval_to_value("3 ?? nope").await, Value::Int(3));
+        assert_eq!(eval_to_value("nil ?? 5").await, Value::int(5));
+        assert_eq!(eval_to_value("3 ?? nope").await, Value::int(3));
         // NUM §3.3: `0` is falsy, so `!0` is `true`.
-        assert_eq!(eval_to_value("!0").await, Value::Bool(true));
+        assert_eq!(eval_to_value("!0").await, Value::bool_(true));
     }
 
     #[tokio::test]
@@ -11112,7 +11107,7 @@ print(r[1])
 
     #[tokio::test]
     async fn print_is_a_resolvable_builtin_value() {
-        assert_eq!(eval_to_value("print").await, Value::Builtin("print".into()));
+        assert_eq!(eval_to_value("print").await, Value::builtin("print"));
     }
 
     #[tokio::test]
@@ -12827,48 +12822,48 @@ print(n?.m())
 
     #[tokio::test]
     async fn int_literals_eval_to_int() {
-        assert_eq!(eval_num("5").await, Value::Int(5));
-        assert_eq!(eval_num("0xFF").await, Value::Int(255));
-        assert_eq!(eval_num("0b1010").await, Value::Int(10));
-        assert_eq!(eval_num("0o17").await, Value::Int(15));
-        assert_eq!(eval_num("1_000").await, Value::Int(1000));
+        assert_eq!(eval_num("5").await, Value::int(5));
+        assert_eq!(eval_num("0xFF").await, Value::int(255));
+        assert_eq!(eval_num("0b1010").await, Value::int(10));
+        assert_eq!(eval_num("0o17").await, Value::int(15));
+        assert_eq!(eval_num("1_000").await, Value::int(1000));
     }
 
     #[tokio::test]
     async fn float_literals_eval_to_float() {
-        assert_eq!(eval_num("5.0").await, Value::Float(5.0));
-        assert_eq!(eval_num("1.5").await, Value::Float(1.5));
-        assert_eq!(eval_num("1e3").await, Value::Float(1000.0));
+        assert_eq!(eval_num("5.0").await, Value::float(5.0));
+        assert_eq!(eval_num("1.5").await, Value::float(1.5));
+        assert_eq!(eval_num("1e3").await, Value::float(1000.0));
     }
 
     #[tokio::test]
     async fn int_add_sub_mul_are_int() {
-        assert_eq!(eval_num("2 + 3").await, Value::Int(5));
-        assert_eq!(eval_num("7 - 10").await, Value::Int(-3));
-        assert_eq!(eval_num("6 * 7").await, Value::Int(42));
+        assert_eq!(eval_num("2 + 3").await, Value::int(5));
+        assert_eq!(eval_num("7 - 10").await, Value::int(-3));
+        assert_eq!(eval_num("6 * 7").await, Value::int(42));
     }
 
     #[tokio::test]
     async fn int_div_truncates_toward_zero() {
-        assert_eq!(eval_num("7 / 2").await, Value::Int(3));
-        assert_eq!(eval_num("-7 / 2").await, Value::Int(-3));
-        assert_eq!(eval_num("1 / 2").await, Value::Int(0));
+        assert_eq!(eval_num("7 / 2").await, Value::int(3));
+        assert_eq!(eval_num("-7 / 2").await, Value::int(-3));
+        assert_eq!(eval_num("1 / 2").await, Value::int(0));
     }
 
     #[tokio::test]
     async fn int_mod_sign_follows_dividend() {
-        assert_eq!(eval_num("7 % 2").await, Value::Int(1));
-        assert_eq!(eval_num("-7 % 2").await, Value::Int(-1));
+        assert_eq!(eval_num("7 % 2").await, Value::int(1));
+        assert_eq!(eval_num("-7 % 2").await, Value::int(-1));
     }
 
     #[tokio::test]
     async fn int_pow_int_and_negative_exponent() {
-        assert_eq!(eval_num("2 ** 10").await, Value::Int(1024));
-        assert_eq!(eval_num("0 ** 0").await, Value::Int(1));
-        assert_eq!(eval_num("(0 - 2) ** 3").await, Value::Int(-8));
-        assert_eq!(eval_num("2 ** 4").await, Value::Int(16));
+        assert_eq!(eval_num("2 ** 10").await, Value::int(1024));
+        assert_eq!(eval_num("0 ** 0").await, Value::int(1));
+        assert_eq!(eval_num("(0 - 2) ** 3").await, Value::int(-8));
+        assert_eq!(eval_num("2 ** 4").await, Value::int(16));
         // Negative exponent → float.
-        assert_eq!(eval_num("2 ** (0 - 1)").await, Value::Float(0.5));
+        assert_eq!(eval_num("2 ** (0 - 1)").await, Value::float(0.5));
     }
 
     #[tokio::test]
@@ -12904,7 +12899,7 @@ print(n?.m())
     #[tokio::test]
     async fn unary_neg_of_int_min_overflows() {
         let src = "0 - 9223372036854775807 - 1"; // i64::MIN
-        assert_eq!(eval_num(src).await, Value::Int(i64::MIN));
+        assert_eq!(eval_num(src).await, Value::int(i64::MIN));
         assert_eq!(
             eval_panic_msg("-(0 - 9223372036854775807 - 1)").await,
             "integer overflow in '-'"
@@ -12913,80 +12908,80 @@ print(n?.m())
 
     #[tokio::test]
     async fn mixed_int_float_promotes_to_float() {
-        assert_eq!(eval_num("1 + 1.0").await, Value::Float(2.0));
-        assert_eq!(eval_num("1.0 + 1").await, Value::Float(2.0));
-        assert_eq!(eval_num("7.0 / 2").await, Value::Float(3.5));
-        assert_eq!(eval_num("2 * 1.5").await, Value::Float(3.0));
+        assert_eq!(eval_num("1 + 1.0").await, Value::float(2.0));
+        assert_eq!(eval_num("1.0 + 1").await, Value::float(2.0));
+        assert_eq!(eval_num("7.0 / 2").await, Value::float(3.5));
+        assert_eq!(eval_num("2 * 1.5").await, Value::float(3.0));
     }
 
     #[tokio::test]
     async fn exact_cross_subtype_equality() {
-        assert_eq!(eval_num("1 == 1.0").await, Value::Bool(true));
-        assert_eq!(eval_num("1 != 1.0").await, Value::Bool(false));
+        assert_eq!(eval_num("1 == 1.0").await, Value::bool_(true));
+        assert_eq!(eval_num("1 != 1.0").await, Value::bool_(false));
         // Near 2^53, an int not exactly representable as f64 is NOT equal to the
         // rounded float: 9007199254740993 (2^53+1) vs 9007199254740992.0 (2^53).
         assert_eq!(
             eval_num("9007199254740993 == 9007199254740992.0").await,
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
     #[tokio::test]
     async fn exact_cross_subtype_ordering() {
-        assert_eq!(eval_num("2 < 2.5").await, Value::Bool(true));
-        assert_eq!(eval_num("2.5 > 2").await, Value::Bool(true));
-        assert_eq!(eval_num("3 <= 3.0").await, Value::Bool(true));
-        assert_eq!(eval_num("3 >= 3.0").await, Value::Bool(true));
+        assert_eq!(eval_num("2 < 2.5").await, Value::bool_(true));
+        assert_eq!(eval_num("2.5 > 2").await, Value::bool_(true));
+        assert_eq!(eval_num("3 <= 3.0").await, Value::bool_(true));
+        assert_eq!(eval_num("3 >= 3.0").await, Value::bool_(true));
         // Exact boundary: 2^53+1 > 2^53.0 (the int is strictly greater).
         assert_eq!(
             eval_num("9007199254740993 > 9007199254740992.0").await,
-            Value::Bool(true)
+            Value::bool_(true)
         );
         // NaN comparisons are all false.
-        assert_eq!(eval_num("1 < (0.0 / 0.0)").await, Value::Bool(false));
-        assert_eq!(eval_num("1 > (0.0 / 0.0)").await, Value::Bool(false));
+        assert_eq!(eval_num("1 < (0.0 / 0.0)").await, Value::bool_(false));
+        assert_eq!(eval_num("1 > (0.0 / 0.0)").await, Value::bool_(false));
     }
 
     #[tokio::test]
     async fn int_int_comparison_is_int_typed() {
-        assert_eq!(eval_num("1 < 2").await, Value::Bool(true));
-        assert_eq!(eval_num("2 == 2").await, Value::Bool(true));
-        assert_eq!(eval_num("3 >= 4").await, Value::Bool(false));
+        assert_eq!(eval_num("1 < 2").await, Value::bool_(true));
+        assert_eq!(eval_num("2 == 2").await, Value::bool_(true));
+        assert_eq!(eval_num("3 >= 4").await, Value::bool_(false));
     }
 
     // ---- NUM §3.2 bitwise / shift / wrapping operators --------------------
 
     #[tokio::test]
     async fn bitwise_and_or_xor() {
-        assert_eq!(eval_num("0xFF & 0b1010").await, Value::Int(10));
-        assert_eq!(eval_num("12 & 10").await, Value::Int(8));
-        assert_eq!(eval_num("12 | 10").await, Value::Int(14));
-        assert_eq!(eval_num("12 ^ 10").await, Value::Int(6));
+        assert_eq!(eval_num("0xFF & 0b1010").await, Value::int(10));
+        assert_eq!(eval_num("12 & 10").await, Value::int(8));
+        assert_eq!(eval_num("12 | 10").await, Value::int(14));
+        assert_eq!(eval_num("12 ^ 10").await, Value::int(6));
         // `|` in value position is bitwise-OR (not an or-pattern).
-        assert_eq!(eval_num("1 | 2").await, Value::Int(3));
+        assert_eq!(eval_num("1 | 2").await, Value::int(3));
     }
 
     #[tokio::test]
     async fn bitwise_not() {
-        assert_eq!(eval_num("~0").await, Value::Int(-1));
-        assert_eq!(eval_num("~5").await, Value::Int(-6));
+        assert_eq!(eval_num("~0").await, Value::int(-1));
+        assert_eq!(eval_num("~5").await, Value::int(-6));
     }
 
     #[tokio::test]
     async fn shifts_and_arithmetic_sign_extension() {
-        assert_eq!(eval_num("1 << 3").await, Value::Int(8));
-        assert_eq!(eval_num("(1 << 16) | 256").await, Value::Int(65792));
-        assert_eq!(eval_num("1 >> 0").await, Value::Int(1));
+        assert_eq!(eval_num("1 << 3").await, Value::int(8));
+        assert_eq!(eval_num("(1 << 16) | 256").await, Value::int(65792));
+        assert_eq!(eval_num("1 >> 0").await, Value::int(1));
         // `>>` is arithmetic (sign-extending): -8 >> 1 == -4.
-        assert_eq!(eval_num("(0 - 8) >> 1").await, Value::Int(-4));
+        assert_eq!(eval_num("(0 - 8) >> 1").await, Value::int(-4));
         // -1 << 1 == -2 (bit-loss into the sign bit does NOT trap).
-        assert_eq!(eval_num("(0 - 1) << 1").await, Value::Int(-2));
+        assert_eq!(eval_num("(0 - 1) << 1").await, Value::int(-2));
     }
 
     #[tokio::test]
     async fn shift_boundaries() {
         // 1 << 63 == i64::MIN (top bit set), a DEFINED result — not an overflow.
-        assert_eq!(eval_num("1 << 63").await, Value::Int(i64::MIN));
+        assert_eq!(eval_num("1 << 63").await, Value::int(i64::MIN));
         // 1 << 64 → amount >= 64 → panic.
         assert_eq!(eval_panic_msg("1 << 64").await, "shift amount out of range: 64");
         // A negative shift amount panics.
@@ -12999,18 +12994,18 @@ print(n?.m())
 
     #[tokio::test]
     async fn wrapping_never_panics() {
-        assert_eq!(eval_num("5 +% 3").await, Value::Int(8));
-        assert_eq!(eval_num("5 -% 8").await, Value::Int(-3));
-        assert_eq!(eval_num("6 *% 7").await, Value::Int(42));
+        assert_eq!(eval_num("5 +% 3").await, Value::int(8));
+        assert_eq!(eval_num("5 -% 8").await, Value::int(-3));
+        assert_eq!(eval_num("6 *% 7").await, Value::int(42));
         // i64::MAX +% 1 wraps to i64::MIN (vs the checked `+` which panics).
         assert_eq!(
             eval_num("9223372036854775807 +% 1").await,
-            Value::Int(i64::MIN)
+            Value::int(i64::MIN)
         );
         // i64::MAX * 2 wraps with `*%` (the checked `*` overflows).
         assert_eq!(
             eval_num("9223372036854775807 *% 2").await,
-            Value::Int(-2)
+            Value::int(-2)
         );
     }
 
@@ -13023,7 +13018,7 @@ print(n?.m())
         );
         assert_eq!(
             eval_num("9223372036854775807 +% 1").await,
-            Value::Int(i64::MIN)
+            Value::int(i64::MIN)
         );
     }
 
@@ -13055,14 +13050,14 @@ print(n?.m())
     #[tokio::test]
     async fn go_precedence_bitwise_vs_comparison_and_arithmetic() {
         // `a & b == c` parses as `(a & b) == c` (Go's binding). 6 & 2 == 2 → 2 == 2 → true.
-        assert_eq!(eval_num("6 & 2 == 2").await, Value::Bool(true));
+        assert_eq!(eval_num("6 & 2 == 2").await, Value::bool_(true));
         // `a | b == c` parses as `(a | b) == c`. 1 | 2 == 3 → 3 == 3 → true.
-        assert_eq!(eval_num("1 | 2 == 3").await, Value::Bool(true));
+        assert_eq!(eval_num("1 | 2 == 3").await, Value::bool_(true));
         // `+ -` bind TIGHTER than `|`: `1 | 2 + 1` is `1 | (2+1)` = 1|3 = 3.
-        assert_eq!(eval_num("1 | 2 + 1").await, Value::Int(3));
+        assert_eq!(eval_num("1 | 2 + 1").await, Value::int(3));
         // `<<`/`&` bind at the multiplicative tier (tighter than `+ -`):
         // `1 + 1 << 2` is `1 + (1<<2)` = 1 + 4 = 5.
-        assert_eq!(eval_num("1 + 1 << 2").await, Value::Int(5));
+        assert_eq!(eval_num("1 + 1 << 2").await, Value::int(5));
     }
 
     // ---- IFACE Task 2: conforms predicate + lazy flatten + cycle guard + cache ----
@@ -13124,13 +13119,13 @@ print(n?.m())
         // real run classes are load-time-immortal — §5.3 — so the verdict cache's
         // pointer keys never alias a freed-then-reallocated class; we mirror that here
         // to keep the test deterministic).
-        env.define(name, Value::Class(class.clone()), false).ok();
+        env.define(name, Value::class(class.clone()), false).ok();
         class
     }
 
     /// A bare instance of a class (no fields).
     fn iface_instance(class: std::rc::Rc<crate::value::Class>) -> Value {
-        Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
+        Value::instance(gcmodule::Cc::new(std::cell::RefCell::new(
             crate::value::Instance::from_dict(class, IndexMap::new()),
         )))
     }
@@ -13160,7 +13155,7 @@ print(n?.m())
             def_env: env.clone(),
             flat: std::cell::RefCell::new(None),
         });
-        env.define(name, Value::Interface(def.clone()), false)
+        env.define(name, Value::interface(def.clone()), false)
             .unwrap();
         def
     }
@@ -13178,9 +13173,9 @@ print(n?.m())
         let noread = iface_class(&env, "NoRead", vec![("write", iface_method(vec![iface_param("b", false, false)]))], None);
         assert!(!interp.conforms(&iface_instance(noread), &reader).unwrap());
         // Non-instance LHS → false (never an error).
-        assert!(!interp.conforms(&Value::Int(5), &reader).unwrap());
-        assert!(!interp.conforms(&Value::Nil, &reader).unwrap());
-        assert!(!interp.conforms(&Value::Object(crate::value::ObjectCell::new(IndexMap::new())), &reader).unwrap());
+        assert!(!interp.conforms(&Value::int(5), &reader).unwrap());
+        assert!(!interp.conforms(&Value::nil(), &reader).unwrap());
+        assert!(!interp.conforms(&Value::object(IndexMap::new()), &reader).unwrap());
     }
 
     #[test]
@@ -13504,7 +13499,7 @@ print(many([File(), File()]))
             SharedKey::Str("a".into()),
             Arc::new(SharedNode::Int(1)),
         )])));
-        Value::Shared(Arc::new(SharedNode::Object(Arc::new(vec![
+        Value::shared(Arc::new(SharedNode::Object(Arc::new(vec![
             ("region".into(), Arc::new(SharedNode::Str("us".into()))),
             ("limits".into(), limits),
             ("m".into(), m),
@@ -13512,8 +13507,8 @@ print(many([File(), File()]))
     }
 
     fn node_of(v: &Value) -> std::sync::Arc<crate::value::SharedNode> {
-        match v {
-            Value::Shared(n) => n.clone(),
+        match v.kind() {
+            ValueKind::Shared(n) => n.clone(),
             _ => panic!("not shared"),
         }
     }
@@ -13526,32 +13521,32 @@ print(many([File(), File()]))
         // member: scalar
         assert_eq!(
             shared_read_member(&n, "region", sp).unwrap(),
-            Value::Str("us".into())
+            Value::str("us")
         );
         // member: descend → Shared view (stays zero-copy → type "array")
         let limits = shared_read_member(&n, "limits", sp).unwrap();
-        assert!(matches!(limits, Value::Shared(_)));
+        assert!(matches!(limits.kind(), ValueKind::Shared(_)));
         assert_eq!(type_name(&limits), "array");
         // member missing → nil
-        assert_eq!(shared_read_member(&n, "nope", sp).unwrap(), Value::Nil);
+        assert_eq!(shared_read_member(&n, "nope", sp).unwrap(), Value::nil());
         // index: array by int
         let lnode = node_of(&limits);
         assert_eq!(
-            shared_index_get(&lnode, &Value::Int(0), sp, sp).unwrap(),
-            Value::Int(10)
+            shared_index_get(&lnode, &Value::int(0), sp, sp).unwrap(),
+            Value::int(10)
         );
         // index: OOB → error (matches live array)
-        assert!(shared_index_get(&lnode, &Value::Int(9), sp, sp).is_err());
+        assert!(shared_index_get(&lnode, &Value::int(9), sp, sp).is_err());
         // index: object by string key
         assert_eq!(
-            shared_index_get(&n, &Value::Str("region".into()), sp, sp).unwrap(),
-            Value::Str("us".into())
+            shared_index_get(&n, &Value::str("region"), sp, sp).unwrap(),
+            Value::str("us")
         );
         // index: map by key
         let mnode = node_of(&shared_read_member(&n, "m", sp).unwrap());
         assert_eq!(
-            shared_index_get(&mnode, &Value::Str("a".into()), sp, sp).unwrap(),
-            Value::Int(1)
+            shared_index_get(&mnode, &Value::str("a"), sp, sp).unwrap(),
+            Value::int(1)
         );
     }
 
@@ -13561,31 +13556,31 @@ print(many([File(), File()]))
         let n = node_of(&cfg);
         let sp = Span::new(0, 0);
         assert_eq!(
-            call_shared(&n, "has", &[Value::Str("region".into())], sp).unwrap(),
-            Value::Bool(true)
+            call_shared(&n, "has", &[Value::str("region")], sp).unwrap(),
+            Value::bool_(true)
         );
         assert_eq!(
-            call_shared(&n, "has", &[Value::Str("nope".into())], sp).unwrap(),
-            Value::Bool(false)
+            call_shared(&n, "has", &[Value::str("nope")], sp).unwrap(),
+            Value::bool_(false)
         );
         assert_eq!(
-            call_shared(&n, "get", &[Value::Str("region".into())], sp).unwrap(),
-            Value::Str("us".into())
+            call_shared(&n, "get", &[Value::str("region")], sp).unwrap(),
+            Value::str("us")
         );
         assert_eq!(
             call_shared(
                 &n,
                 "get",
-                &[Value::Str("x".into()), Value::Int(7)],
+                &[Value::str("x"), Value::int(7)],
                 sp
             )
             .unwrap(),
-            Value::Int(7)
+            Value::int(7)
         );
-        assert_eq!(call_shared(&n, "len", &[], sp).unwrap(), Value::Int(3));
+        assert_eq!(call_shared(&n, "len", &[], sp).unwrap(), Value::int(3));
         // keys
-        match call_shared(&n, "keys", &[], sp).unwrap() {
-            Value::Array(a) => assert_eq!(a.borrow().len(), 3),
+        match call_shared(&n, "keys", &[], sp).unwrap().kind() {
+            ValueKind::Array(a) => assert_eq!(a.borrow().len(), 3),
             _ => panic!(),
         }
     }
@@ -13596,14 +13591,14 @@ print(many([File(), File()]))
         let n = node_of(&cfg);
         let sp = Span::new(0, 0);
         // A mutating method → the SHIPPED `cannot mutate a frozen {kind}` message.
-        let err = call_shared(&n, "push", &[Value::Int(1)], sp).unwrap_err();
+        let err = call_shared(&n, "push", &[Value::int(1)], sp).unwrap_err();
         match err {
             Control::Panic(e) => assert_eq!(e.message, "cannot mutate a frozen object"),
             _ => panic!("expected panic"),
         }
         // On a frozen ARRAY, the same method names the array kind.
         let arr = node_of(&shared_read_member(&n, "limits", sp).unwrap());
-        let err = call_shared(&arr, "push", &[Value::Int(1)], sp).unwrap_err();
+        let err = call_shared(&arr, "push", &[Value::int(1)], sp).unwrap_err();
         assert!(
             matches!(err, Control::Panic(ref e) if e.message == "cannot mutate a frozen array")
         );
@@ -13617,8 +13612,8 @@ print(many([File(), File()]))
         let sp = Span::new(0, 0);
         let err = index_set(
             &cfg,
-            &Value::Str("region".into()),
-            Value::Str("eu".into()),
+            &Value::str("region"),
+            Value::str("eu"),
             sp,
             sp,
         )
@@ -13640,12 +13635,12 @@ print(many([File(), File()]))
         let sp = Span::new(0, 0);
         // A read-only structural method still works on the instance's fields.
         assert_eq!(
-            call_shared(&inst, "has", &[Value::Str("id".into())], sp).unwrap(),
-            Value::Bool(true)
+            call_shared(&inst, "has", &[Value::str("id")], sp).unwrap(),
+            Value::bool_(true)
         );
         assert_eq!(
             shared_read_member(&inst, "id", sp).unwrap(),
-            Value::Int(1)
+            Value::int(1)
         );
         // A user-method call → the DISTINCT diagnostic (NOT the mutation panic).
         let err = call_shared(&inst, "promote", &[], sp).unwrap_err();
@@ -13707,9 +13702,9 @@ print(many([File(), File()]))
     /// defensive guard that keeps a corrupt worker reply a clean error.
     #[test]
     fn test_summary_from_value_rejects_malformed() {
-        assert!(TestSummary::from_value(&Value::Int(5)).is_none());
+        assert!(TestSummary::from_value(&Value::int(5)).is_none());
         let mut m = indexmap::IndexMap::new();
-        m.insert("passed".to_string(), Value::Int(1));
+        m.insert("passed".to_string(), Value::int(1));
         // missing `failed` and `failures`
         assert!(TestSummary::from_value(&Value::object(m)).is_none());
     }
