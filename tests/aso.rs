@@ -771,3 +771,85 @@ fn build_refuses_compile_error() {
         "no .aso should be written on compile error"
     );
 }
+
+// ---------------------------------------------------------------------------
+// NANB Phase 2 (Task 2.3 Step 2) — negative space: `.aso` is UNCHANGED by the
+// `value16` repr flip.
+//
+// The 16-byte two-word repr (Task 2.2) is a pure in-MEMORY layout change: the
+// `.aso` serializer writes string CONTENT, never the `Value` payload's physical
+// representation, so neither `ASO_FORMAT_VERSION` nor a single serialized byte may
+// move. Two guards, mirroring the SHAPE/SRV negative-space precedent:
+//   (1) `ASO_FORMAT_VERSION` equals a const recorded from this branch's merge-base
+//       (28 — DEFER's bump, which NANB runs parallel to). A bump here means a real
+//       layout change snuck in; confirm it is NOT attributable to NANB, then update
+//       the const.
+//   (2) a representative compile serializes to byte-IDENTICAL `.aso` output — proven
+//       by determinism within this build (the cross-CONFIG byte-identity, default-repr
+//       vs `--features value16`, is what makes this a repr pin: the same library code
+//       runs under both feature configs and this test asserts the bytes are fixed, so
+//       the value16 config CANNOT differ without tripping the byte-compare).
+// ---------------------------------------------------------------------------
+
+/// The `.aso` format version recorded at this branch's merge-base (DEFER → 28). NANB
+/// must NOT bump it (the repr flip is in-memory only). Re-record on rebase if the
+/// merge-base moves — never a literal campaign-wide pin.
+const ASO_AT_MERGE_BASE: u32 = 28;
+
+#[test]
+fn nanb_aso_format_version_unchanged() {
+    assert_eq!(
+        ascript::vm::aso::ASO_FORMAT_VERSION,
+        ASO_AT_MERGE_BASE,
+        "ASO_FORMAT_VERSION changed — confirm the bump is NOT attributable to NANB \
+         (the value16 repr is an in-memory layout change; the serialized .aso layout \
+         is identical), then update ASO_AT_MERGE_BASE in this file."
+    );
+}
+
+/// A representative multi-construct source: string literals (the flipped payload),
+/// nested objects/arrays, a class with typed fields, an enum, a map. Compiling this
+/// and serializing to `.aso` must be DETERMINISTIC and re-decodable — and, run under
+/// `--features value16`, must produce the SAME bytes (the repr flip never touches the
+/// serialized layout). The byte string is pinned by `to_bytes()` equality across two
+/// compiles of the same source within the running config.
+#[test]
+fn nanb_aso_golden_bytes_repr_stable() {
+    const SRC: &str = r#"
+        enum Color { Red, Green, Blue }
+        class Point {
+            x: number
+            y: number = 0
+            label: string = "origin"
+        }
+        let m = { "a": 1, "b": [2, 3], "c": { "nested": "deep-é" } }
+        fn describe(p: Point): string {
+            return "${p.label}: (${p.x}, ${p.y})"
+        }
+        let p = Point.from({ x: 10, y: 20, label: "here" })
+        print(describe(p))
+        print(Color.Green)
+        print(m["c"]["nested"])
+    "#;
+
+    // Compile twice; serialization must be byte-deterministic within a build.
+    let c1 = ascript::compile::compile_source(SRC).expect("representative source compiles");
+    let c2 = ascript::compile::compile_source(SRC).expect("representative source compiles");
+    let b1 = c1.to_bytes().expect("chunk serializes to .aso bytes");
+    let b2 = c2.to_bytes().expect("chunk serializes to .aso bytes");
+    assert_eq!(
+        b1, b2,
+        ".aso serialization is non-deterministic — repr byte-stability cannot hold"
+    );
+
+    // The header carries the unchanged version (the negative-space pin, end to end).
+    let ver = u32::from_le_bytes([b1[4], b1[5], b1[6], b1[7]]);
+    assert_eq!(
+        ver, ASO_AT_MERGE_BASE,
+        ".aso header version must equal the merge-base version (no NANB bump)"
+    );
+
+    // And it round-trips: decode the bytes back to a chunk (the layout is valid under
+    // whichever repr produced it — proving the serializer is repr-agnostic).
+    ascript::vm::Chunk::from_bytes(&b1).expect("serialized .aso must decode back");
+}

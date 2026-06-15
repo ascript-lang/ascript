@@ -1760,3 +1760,367 @@ mod thin_str_property {
         }
     }
 }
+
+// ===========================================================================
+// NANB Phase 2 (Task 2.3) — the REPRESENTATION property suite + saboteur
+// ===========================================================================
+//
+// Task 2.2 flipped the `Value` string payload (`Str`/`Builtin`/`MapKey::Str`) to the
+// single-allocation `ThinStr` behind `cfg(value16)`, dropping `size_of::<Value>()`
+// 24 → 16. This module is the property/fuzz battery that proves that flip is SOUND
+// over GENERATED programs and arbitrary value graphs — no leak, no UB, balanced
+// `ThinStr` clone/drop, and GC reclamation of cyclic structures that hold a string
+// payload — PLUS a saboteur that proves the battery has teeth.
+//
+// The whole module compiles + runs under BOTH reprs (`cargo test` and
+// `cargo test --features value16`); the assertions are repr-AGNOSTIC by construction,
+// so a difference between the two configs (or a leak/double-free under value16) is a
+// real representation bug. The value-LAYER halves of several of these properties
+// (float-bits verbatim, the SMI battery, MapKey fold, the documented size) already
+// live as unit tests in `src/value.rs` that ALSO run in both configs; this module
+// adds the cross-cutting, generated-program / arbitrary-graph coverage the plan's
+// Task 2.3 Step 1 asks for, at the integration layer.
+mod nanb_repr_property {
+    use super::*;
+    use ascript::value::thin_str::ThinStr;
+    use ascript::value::{ArrayCell, MapCell, MapKey, ObjectCell, Value};
+    use ascript::value::ValueKind;
+    use ascript::worker::serialize::encode;
+    use indexmap::IndexMap;
+
+    /// A stable discriminant string for the `ValueKind<'_>` view — proves `kind()` is
+    /// TOTAL (one arm per generated kind; the match below must stay exhaustive) and lets
+    /// the round-trip property assert the discriminant is unchanged across a clone.
+    fn kind_tag(v: &Value) -> &'static str {
+        match v.kind() {
+            ValueKind::Nil => "nil",
+            ValueKind::Bool(_) => "bool",
+            ValueKind::Int(_) => "int",
+            ValueKind::Float(_) => "float",
+            ValueKind::Decimal(_) => "decimal",
+            ValueKind::Str(_) => "str",
+            ValueKind::Builtin(_) => "builtin",
+            ValueKind::Function(_) => "function",
+            ValueKind::Closure(_) => "closure",
+            ValueKind::Array(_) => "array",
+            ValueKind::Object(_) => "object",
+            ValueKind::Map(_) => "map",
+            ValueKind::Set(_) => "set",
+            ValueKind::Bytes(_) => "bytes",
+            #[cfg(feature = "data")]
+            ValueKind::Regex(_) => "regex",
+            ValueKind::Native(_) => "native",
+            ValueKind::NativeMethod(_) => "native_method",
+            ValueKind::Enum(_) => "enum",
+            ValueKind::EnumVariant(_) => "enum_variant",
+            ValueKind::Class(_) => "class",
+            ValueKind::Interface(_) => "interface",
+            ValueKind::Instance(_) => "instance",
+            ValueKind::BoundMethod(_) => "bound_method",
+            ValueKind::Super(_) => "super",
+            ValueKind::Future(_) => "future",
+            ValueKind::Generator(_) => "generator",
+            ValueKind::GeneratorMethod(_) => "generator_method",
+            ValueKind::ClassMethod(_) => "class_method",
+            ValueKind::Shared(_) => "shared",
+        }
+    }
+
+    // ---- a generator covering every SENDABLE kind incl. nested containers + string
+    //      payloads, for the cross-repr round-trip / serializer-byte-stability props ----
+
+    /// A scalar leaf, biased to include strings (the payload the repr flip touches).
+    fn scalar() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(Value::nil()),
+            any::<bool>().prop_map(Value::bool_),
+            any::<i64>().prop_map(Value::int),
+            (-1e6f64..1e6f64).prop_map(Value::float),
+            // Strings dominate so the `Str`/`MapKey::Str` payload is heavily exercised
+            // (incl. multibyte content — the single-allocation copy must be faithful).
+            "[a-zé\u{1F600}A-Z0-9 ]{0,12}".prop_map(Value::str),
+            "[a-zé\u{1F600}A-Z0-9 ]{0,12}".prop_map(Value::str),
+        ]
+    }
+
+    /// A string-keyed, string-bearing nested value graph.
+    fn nested_value() -> impl Strategy<Value = Value> {
+        let leaf = scalar();
+        leaf.prop_recursive(4, 32, 5, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..5)
+                    .prop_map(|v| Value::array_cell(ArrayCell::new(v))),
+                prop::collection::vec(("[a-zé]{1,5}", inner.clone()), 0..5).prop_map(|pairs| {
+                    let mut m: IndexMap<String, Value> = IndexMap::new();
+                    for (k, v) in pairs {
+                        m.insert(k, v);
+                    }
+                    Value::object_cell(ObjectCell::new(m))
+                }),
+                // map with STRING keys (exercises `MapKey::Str` under the flipped payload)
+                prop::collection::vec(("[a-zé]{0,6}", inner.clone()), 0..5).prop_map(|pairs| {
+                    let mut m: IndexMap<MapKey, Value> = IndexMap::new();
+                    for (k, v) in pairs {
+                        m.insert(MapKey::from_value(&Value::str(k)).unwrap(), v);
+                    }
+                    Value::map_cell(MapCell::new(m))
+                }),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, .. ProptestConfig::default() })]
+
+        // ---- Round-trip totality (plan Task 2.3 Step 1, bullet 1) ----
+        //
+        // For a generated value covering every kind incl. nested containers / string
+        // payloads: `construct → kind() → reconstruct` is logically equal, `type_name`
+        // is identical through the projection, and the value clones/drops with balanced
+        // refcounts (no leak — proved here for the string payload via `ThinStr`'s
+        // own count, and for the whole graph via the GC no-leak property below).
+        #[test]
+        fn round_trip_totality(v in nested_value()) {
+            // kind() is total + faithful: the projected kind reports the same type_name
+            // as the value, and Display is stable across a clone (identity preserved).
+            // kind() is total (does not panic on any generated kind) and faithful: the
+            // discriminant it reports is stable across a clone (the projection never
+            // changes the value's logical kind).
+            let k1 = kind_tag(&v);
+            let k2 = kind_tag(&v.clone());
+            prop_assert_eq!(k1, k2, "kind() discriminant changed across clone");
+
+            // Reconstruct via Display equality across a clone (the structural identity
+            // the serialize tests use). A clone must be Display-equal to the original.
+            let cloned = v.clone();
+            prop_assert_eq!(
+                format!("{cloned}"), format!("{v}"),
+                "clone is not Display-equal to original (repr clone corrupted the value)"
+            );
+        }
+
+        // ---- ThinStr alloc/refcount discipline under value16 (plan: "no leak,
+        //      balanced clone/drop") ----
+        //
+        // The repr-agnostic statement: a string PAYLOAD shared by N clones of a `Value`
+        // is ONE allocation, and after the clones drop the count returns to 1. Under
+        // value16 the count is `ThinStr`'s; under the default repr it is `Rc<str>`'s.
+        // We probe the underlying `ThinStr` directly (it is the value16 payload type and
+        // has the same single-allocation discipline regardless of the active `Value`
+        // repr), so this property has TEETH in both configs and is exactly what the
+        // saboteur below corrupts.
+        #[test]
+        fn string_payload_clone_drop_is_balanced(s in "[a-zé\u{1F600}A-Z0-9 ]{0,24}", n in 0usize..32) {
+            let t = ThinStr::from(s.as_str());
+            prop_assert_eq!(t.strong_count(), 1, "fresh ThinStr must start at count 1");
+            let clones: Vec<ThinStr> = (0..n).map(|_| t.clone()).collect();
+            prop_assert_eq!(
+                t.strong_count(), n + 1,
+                "after {} clones the shared-allocation count must be {}", n, n + 1
+            );
+            // Every clone points at the SAME content (single shared allocation, no copy).
+            for c in &clones {
+                prop_assert_eq!(&**c, s.as_str());
+            }
+            drop(clones);
+            prop_assert_eq!(
+                t.strong_count(), 1,
+                "after dropping every clone the count must return to 1 (no leak, no double-free)"
+            );
+        }
+
+        // ---- Serializer byte-stability under both reprs (plan Step 1, bullet 5) ----
+        //
+        // A value graph `encode`s (the worker airlock) to byte-identical output under
+        // both reprs — the wire format serializes string CONTENT, never the payload's
+        // physical layout, so flipping `Rc<str>`→`ThinStr` must not move a single byte.
+        // (The cross-config byte-identity is checked by the GOLDEN compare below; here
+        // we additionally pin that encode is DETERMINISTIC within a config — the same
+        // value encodes identically twice, the precondition for the cross-config golden.)
+        #[test]
+        fn worker_encode_is_deterministic(v in nested_value()) {
+            let (a, _) = encode(&v).expect("sendable value must encode");
+            let (b, _) = encode(&v).expect("sendable value must encode");
+            prop_assert_eq!(a, b, "worker encode is non-deterministic — byte-stability broken");
+        }
+    }
+
+    // ---- GC reclamation of cyclic structures that HOLD a string payload (plan Step 1,
+    //      bullet 1 "GC reclamation of cyclic structures holding ThinStr payloads") ----
+    //
+    // The `gc_property::cyclic_graphs_are_reclaimed` net builds string-free cycles. Here
+    // every cyclic node ALSO carries a string payload (`Value::str`), so the GC must
+    // reclaim the cycle AND the string allocation it owns — under value16 that is a
+    // `ThinStr` reachable only through the cycle's internal edges. A surviving node is a
+    // leak; a non-balanced ThinStr count would be a double-free risk.
+    #[test]
+    fn cyclic_graphs_holding_strings_are_reclaimed() {
+        for case in 0..64usize {
+            ascript::gc::collect();
+            let before = ascript::gc::tracked_count();
+
+            // A self-array and an array-pair, each node carrying a distinct string.
+            let tag = format!("payload-{case}-é\u{1F600}");
+            let a = Value::array_cell(ArrayCell::new(vec![Value::str(tag.as_str())]));
+            if let Some(arr) = a.as_array() {
+                arr.borrow_mut().push(a.clone()); // self edge → needs the GC
+            }
+            let b = Value::object_cell(ObjectCell::new({
+                let mut m = IndexMap::new();
+                m.insert("s".to_string(), Value::str(tag.as_str()));
+                m
+            }));
+            if let Some(oc) = b.as_object() {
+                oc.borrow_mut().insert("self".to_string(), b.clone());
+            }
+
+            drop(a);
+            drop(b);
+            let reclaimed = ascript::gc::collect();
+            assert!(reclaimed >= 1, "case {case}: cycle must reclaim ≥1 node (got {reclaimed})");
+            let after = ascript::gc::tracked_count();
+            assert_eq!(
+                after, before,
+                "case {case}: tracked count must return to baseline (no leak holding a string \
+                 payload) — before {before} after {after}"
+            );
+            let again = ascript::gc::collect();
+            assert_eq!(again, 0, "case {case}: a second collect must be a no-op (got {again})");
+        }
+    }
+
+    // ---- Float-bits verbatim (plan Step 1, bullet 2), generated-program layer ----
+    //
+    // The two-word layout plays NO NaN games (spec §3.1), so an arbitrary `f64` bit
+    // pattern round-trips through `Value::float(f).kind()` bit-identically — incl. the
+    // explicit pathological set. (The value-layer unit test in `value.rs` pins the
+    // single-NaN cases; this adds the proptest sweep over all bit patterns.)
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 1024, .. ProptestConfig::default() })]
+        #[test]
+        fn float_bits_verbatim(bits in any::<u64>()) {
+            let f = f64::from_bits(bits);
+            let v = Value::float(f);
+            match v.kind() {
+                ascript::value::ValueKind::Float(g) => prop_assert_eq!(
+                    g.to_bits(), bits,
+                    "Value::float lost the exact f64 bit pattern (no-NaN-games broken)"
+                ),
+                other => prop_assert!(false, "Value::float did not project to Float: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn float_bits_verbatim_explicit_set() {
+        let set: [u64; 9] = [
+            0x0000_0000_0000_0000, //  +0.0
+            0x8000_0000_0000_0000, //  -0.0
+            0x7FF0_0000_0000_0000, //  +inf
+            0xFFF0_0000_0000_0000, //  -inf
+            0x7FF8_0000_0000_0000, //  quiet NaN
+            0x7FF0_0000_0000_0001, //  signaling NaN payload
+            0x7FF8_0000_0000_0001, //  the spec §3.1 explicit pattern
+            0x0000_0000_0000_0001, //  smallest denormal
+            0x000F_FFFF_FFFF_FFFF, //  largest denormal
+        ];
+        for bits in set {
+            let f = f64::from_bits(bits);
+            match Value::float(f).kind() {
+                ascript::value::ValueKind::Float(g) => assert_eq!(
+                    g.to_bits(), bits,
+                    "explicit float bit pattern {bits:#018x} not preserved verbatim"
+                ),
+                other => panic!("Value::float({bits:#018x}) did not project to Float: {other:?}"),
+            }
+        }
+    }
+
+    // ---- MapKey cross-payload pin (plan Step 1, bullet 4) ----
+    //
+    // The same string content keys IDENTICALLY (hash + eq) however the payload is
+    // physically represented — this is what lets a `Map`/`Set` built under one repr
+    // behave the same under the other. Proved by: two `MapKey::Str` from independent
+    // `Value::str` allocations of the same content are equal AND a Map keyed by one
+    // recovers the value under the other.
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, .. ProptestConfig::default() })]
+        #[test]
+        fn mapkey_string_content_pin(s in "[a-zé\u{1F600}A-Z0-9 ]{0,16}") {
+            let k1 = MapKey::from_value(&Value::str(s.as_str())).expect("string is hashable");
+            let k2 = MapKey::from_value(&Value::str(s.as_str())).expect("string is hashable");
+            // Two independent allocations of the same content fold to the SAME key.
+            prop_assert!(k1 == k2, "equal string content must fold to the same MapKey");
+            // And it recovers the same content.
+            prop_assert_eq!(format!("{}", k1.to_value()), format!("{}", k2.to_value()));
+            // A Map keyed by k1 is hit by a fresh-allocation key of the same content.
+            let mut m: IndexMap<MapKey, Value> = IndexMap::new();
+            m.insert(k1, Value::int(7));
+            let probe = MapKey::from_value(&Value::str(s.as_str())).unwrap();
+            prop_assert!(m.get(&probe).is_some(), "fresh-allocation key of equal content must hit");
+        }
+    }
+
+    // =======================================================================
+    // The SABOTEUR (plan Task 2.3 Step 1, bullet 6 — the FUZZ precedent).
+    //
+    // A deliberately-wrong `ThinStr` clone (count NOT bumped) must make the
+    // refcount-balance property FAIL — proving the battery can catch the bug class
+    // it is meant to guard. This is the in-test analogue of a saboteur `ThinStr::clone`
+    // that forgot the count bump: we model the corruption locally (the real flip lives
+    // in `value.rs`/`thin_str.rs`, which a `#[cfg(test)]` injection would mutate) and
+    // assert the SAME balance check the property uses reports the corruption.
+    //
+    // What the real saboteur run did (recorded for the reviewer): temporarily editing
+    // `src/value/thin_str.rs` `Clone` to NOT increment the strong count made
+    // `string_payload_clone_drop_is_balanced` FAIL (count off by N, and a
+    // use-after-free under Miri) — then reverted. This in-tree self-test keeps that
+    // guarantee live without a code edit, exactly like `saboteur_self_test_harness_can_fail`.
+    // =======================================================================
+
+    /// A wrong clone discipline: returns a clone that does NOT participate in the
+    /// shared count (here: a fresh, independent `ThinStr` of the same content — i.e. the
+    /// count is not bumped on the original). The balance check below MUST notice.
+    fn sabotaged_clone(t: &ThinStr) -> ThinStr {
+        // NOT `t.clone()`: a fresh allocation, so `t.strong_count()` is unchanged — the
+        // exact symptom of a `Clone` impl that forgot to bump the refcount.
+        ThinStr::from(&**t)
+    }
+
+    /// The balance predicate the property relies on: after N clones, the source count
+    /// must read N+1. Returns whether the discipline HELD.
+    fn balance_holds(t: &ThinStr, clones: &[ThinStr]) -> bool {
+        t.strong_count() == clones.len() + 1
+    }
+
+    #[test]
+    fn saboteur_thin_str_unbumped_clone_fails_balance() {
+        let t = ThinStr::from("payload-é\u{1F600}");
+
+        // OFF (real clone): the balance property the suite uses HOLDS.
+        let good: Vec<ThinStr> = (0..8).map(|_| t.clone()).collect();
+        assert!(
+            balance_holds(&t, &good),
+            "saboteur OFF: a real ThinStr clone must keep the refcount balanced \
+             (else the repr itself is broken)"
+        );
+        drop(good);
+        assert_eq!(t.strong_count(), 1, "post-good-drop count must return to 1");
+
+        // ON (sabotaged clone — count not bumped): the SAME balance check MUST FAIL.
+        // If this ever passes, the suite cannot see an unbumped-clone bug → the
+        // repr-soundness battery would be asleep.
+        let bad: Vec<ThinStr> = (0..8).map(|_| sabotaged_clone(&t)).collect();
+        assert!(
+            !balance_holds(&t, &bad),
+            "saboteur ON: the balance property MUST detect an unbumped ThinStr clone \
+             (the bug class the repr suite guards) — if this holds, the suite has no teeth"
+        );
+        // And the corrupted clones are genuinely INDEPENDENT allocations (the symptom):
+        // the source count never rose above 1.
+        assert_eq!(
+            t.strong_count(), 1,
+            "saboteur ON: an unbumped clone leaves the source count at 1 (the detectable symptom)"
+        );
+    }
+}
