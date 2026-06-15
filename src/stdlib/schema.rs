@@ -50,7 +50,9 @@ use super::{arg, bi};
 use crate::error::AsError;
 use crate::interp::{make_pair, type_name, Control, Interp};
 use crate::span::Span;
-use crate::value::{OwnedKind, Value, ValueKind};
+use crate::value::{Value, ValueKind};
+#[cfg(feature = "data")]
+use crate::value::OwnedKind;
 use indexmap::IndexMap;
 use std::rc::Rc;
 
@@ -1645,6 +1647,7 @@ impl Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::OwnedKind;
 
     fn sp() -> Span {
         Span::new(0, 0)

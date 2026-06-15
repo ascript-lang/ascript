@@ -58,7 +58,7 @@
 
 use crate::interp::Control;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use crate::vm::bcanalysis::{
     collect_get_global_names, compute_closure, locate_class_group, top_level_defs, GroupMember,
     TopDef,
@@ -803,7 +803,7 @@ fn source_order_define_names(top: &Chunk) -> Vec<Rc<str>> {
         let width = op.operand_width();
         if op == Op::DefineGlobal {
             let idx = top.read_u16(ip + 1) as usize;
-            if let Some(Value::Str(name)) = top.consts.get(idx) {
+            if let Some(ValueKind::Str(name)) = top.consts.get(idx).map(|c| c.kind()) {
                 names.push(name.clone());
             }
         }
@@ -950,12 +950,12 @@ pub fn build_stream_slice_for_interp(
 /// [`TopDef::Const`] is built from a literal-producing op), so the `CONST` fallback
 /// stays inside the `.aso` literal-only pool invariant.
 fn emit_const_load(frag: &mut Chunk, v: Value, span: Span) {
-    match v {
-        Value::Nil => frag.emit(Op::Nil, span),
-        Value::Bool(true) => frag.emit(Op::True, span),
-        Value::Bool(false) => frag.emit(Op::False, span),
-        other => {
-            let idx = frag.add_const(other);
+    match v.kind() {
+        ValueKind::Nil => frag.emit(Op::Nil, span),
+        ValueKind::Bool(true) => frag.emit(Op::True, span),
+        ValueKind::Bool(false) => frag.emit(Op::False, span),
+        _ => {
+            let idx = frag.add_const(v);
             frag.emit_u16(Op::Const, idx, span);
         }
     }
@@ -964,6 +964,7 @@ fn emit_const_load(frag: &mut Chunk, v: Value, span: Span) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::OwnedKind;
     use crate::interp::Interp;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
@@ -984,7 +985,7 @@ mod tests {
                 let width = op.operand_width();
                 if op == Op::DefineGlobal {
                     let idx = chunk.read_u16(ip + 1) as usize;
-                    if let Some(Value::Str(name)) = chunk.consts.get(idx) {
+                    if let Some(ValueKind::Str(name)) = chunk.consts.get(idx).map(|c| c.kind()) {
                         names.insert(name.to_string());
                     }
                 }
@@ -1260,14 +1261,14 @@ mod tests {
             }
         ";
         let slice = build_slice_for_test(src, "g").await;
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(0.0)])
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::float(0.0)])
             .await
             .expect("runs");
-        match out {
-            Value::Array(arr) => {
+        match out.into_kind() {
+            OwnedKind::Array(arr) => {
                 let a = arr.borrow();
-                assert_eq!(a[0], Value::Bool(true), "Reader conformance across isolate");
-                assert_eq!(a[1], Value::Bool(true), "ReadWriter conformance across isolate");
+                assert_eq!(a[0], Value::bool_(true), "Reader conformance across isolate");
+                assert_eq!(a[1], Value::bool_(true), "ReadWriter conformance across isolate");
             }
             other => panic!("expected array, got {other:?}"),
         }

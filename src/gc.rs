@@ -323,7 +323,7 @@ impl Trace for Closure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{MapKey, ObjectCell, Value};
+    use crate::value::{MapKey, ObjectCell, Value, ValueKind};
     use crate::vm::chunk::{Chunk, FnProto};
     use gcmodule::{Trace, Tracer};
     use std::cell::Cell;
@@ -519,8 +519,8 @@ mod tests {
         // `Cc<RefCell<Vec<Value>>>` now has an internal edge from its own slot, so
         // dropping the external `a` leaves refcount 1 (the self-edge) → it is NOT
         // freed by refcounting and would leak without cycle collection.
-        let a = Value::Array(crate::value::ArrayCell::new(Vec::new()));
-        if let Value::Array(arr) = &a {
+        let a = Value::array(Vec::new());
+        if let ValueKind::Array(arr) = a.kind() {
             arr.borrow_mut().push(a.clone());
         }
         // The cycle is now live and tracked. Drop the only external reference.
@@ -678,8 +678,8 @@ mod tests {
 
         let mut held = Vec::with_capacity(N);
         for _ in 0..N {
-            let a = Value::Array(crate::value::ArrayCell::new(Vec::new()));
-            if let Value::Array(arr) = &a {
+            let a = Value::array(Vec::new());
+            if let ValueKind::Array(arr) = a.kind() {
                 arr.borrow_mut().push(a.clone()); // self-edge
             }
             held.push(a);
@@ -718,7 +718,7 @@ mod tests {
         for _ in 0..N {
             let a = Value::Object(ObjectCell::new(IndexMap::new()));
             let b = Value::Object(ObjectCell::new(IndexMap::new()));
-            if let (Value::Object(oa), Value::Object(ob)) = (&a, &b) {
+            if let (ValueKind::Object(oa), ValueKind::Object(ob)) = (a.kind(), b.kind()) {
                 oa.borrow_mut().insert("other".into(), b.clone());
                 ob.borrow_mut().insert("other".into(), a.clone());
             }
@@ -745,7 +745,7 @@ mod tests {
             };
             let a = mk();
             let b = mk();
-            if let (Value::Instance(ia), Value::Instance(ib)) = (&a, &b) {
+            if let (ValueKind::Instance(ia), ValueKind::Instance(ib)) = (a.kind(), b.kind()) {
                 ia.borrow_mut().insert("other", b.clone());
                 ib.borrow_mut().insert("other", a.clone());
             }
@@ -1000,8 +1000,8 @@ mod tests {
                 std::time::Duration::from_secs(1),
             ))),
         );
-        let id = match &handle {
-            Value::Native(n) => n.id,
+        let id = match handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => unreachable!("register_resource yields a Native handle"),
         };
         assert_eq!(
@@ -1057,8 +1057,8 @@ mod tests {
             indexmap::IndexMap::new(),
             ResourceState::Closed,
         );
-        let id = match &handle {
-            Value::Native(n) => n.id,
+        let id = match handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => unreachable!(),
         };
         assert_eq!(interp.resource_count(), baseline + 1);
@@ -1107,8 +1107,8 @@ mod tests {
                 std::time::Duration::from_secs(1),
             ))),
         );
-        let id = match &handle {
-            Value::Native(n) => n.id,
+        let id = match handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => unreachable!(),
         };
         assert_eq!(interp.resource_count(), baseline + 1);
@@ -1125,7 +1125,7 @@ mod tests {
             m.insert("conn".to_string(), handle.clone());
             Value::Object(ObjectCell::new(m))
         };
-        if let Value::Object(o) = &obj {
+        if let ValueKind::Object(o) = obj.kind() {
             o.borrow_mut().insert("self".to_string(), obj.clone());
         }
         // Drop every external reference to the cycle AND the standalone handle. The
@@ -1199,7 +1199,7 @@ mod tests {
             m.insert("conn".to_string(), handle.clone());
             Value::Object(ObjectCell::new(m))
         };
-        if let Value::Object(o) = &obj {
+        if let ValueKind::Object(o) = obj.kind() {
             o.borrow_mut().insert("self".to_string(), obj.clone());
         }
         drop(obj);

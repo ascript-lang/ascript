@@ -509,6 +509,7 @@ pub fn current_generator() -> Option<Rc<GeneratorHandle>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ValueKind;
     use crate::error::AsError;
     use tokio::task::LocalSet;
 
@@ -682,11 +683,12 @@ mod tests {
             let inner = make_gen(vec![1.0, 2.0]);
             let inner_for_body = inner.clone();
             let outer_body: BodyFuture = Box::pin(async move {
-                while let Some(Value::Float(n)) = inner_for_body.resume(Value::Nil).await? {
+                while let Some(v) = inner_for_body.resume(Value::nil()).await? {
+                    let ValueKind::Float(n) = v.kind() else { break };
                     let g = current_generator().unwrap();
-                    g.yield_(Value::Float(n * 2.0)).await;
+                    g.yield_(Value::float(n * 2.0)).await;
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             });
             let outer = Rc::new(GeneratorHandle::new(outer_body));
             assert_eq!(

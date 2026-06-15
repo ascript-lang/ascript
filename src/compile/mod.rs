@@ -24,7 +24,7 @@ use crate::syntax::resolve::types::{Resolution, ResolveResult};
 use crate::syntax::parser::parse;
 use crate::syntax::tree_builder::build_tree;
 use crate::syntax::{first_syntax_error_in, resolve::resolve};
-use crate::value::Value;
+use crate::value::{OwnedKind, Value};
 use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc};
 use crate::vm::opcode::Op;
 use cstree::text::TextRange;
@@ -367,12 +367,12 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     // records CHAR spans). See the module note on the reparse subsystem.
     let span = node_span_bytes(expr);
     let kind = match expr {
-        Expr::Literal(lit) => match literal_const_value(lit)? {
-            Value::Int(i) => ExprKind::Int(i),
-            Value::Float(n) => ExprKind::Float(n),
-            Value::Str(s) => ExprKind::Str(s.to_string()),
-            Value::Bool(b) => ExprKind::Bool(b),
-            Value::Nil => ExprKind::Nil,
+        Expr::Literal(lit) => match literal_const_value(lit)?.into_kind() {
+            OwnedKind::Int(i) => ExprKind::Int(i),
+            OwnedKind::Float(n) => ExprKind::Float(n),
+            OwnedKind::Str(s) => ExprKind::Str(s.to_string()),
+            OwnedKind::Bool(b) => ExprKind::Bool(b),
+            OwnedKind::Nil => ExprKind::Nil,
             other => {
                 return Err(CompileError::new(
                     format!("unsupported literal default value {other:?}"),
@@ -2618,7 +2618,7 @@ impl Compiler {
                 let operand = un.expr().ok_or_else(|| {
                     CompileError::new("unary minus has no operand", node_span(un))
                 })?;
-                match self.const_eval_enum_backing(&operand)? {
+                match self.const_eval_enum_backing(&operand)?.into_kind() {
                     // NUM split: integer literals are `Value::Int`. Negate with
                     // `checked_neg` so a literal `i64::MIN` backing is a clean
                     // CompileError, not a Rust panic — mirroring the NUM model's
@@ -2626,13 +2626,13 @@ impl Compiler {
                     // out-of-range integer LITERAL `9223372036854775808` is already
                     // rejected by `literal_const_value`, so this guard is belt-and-
                     // suspenders against any future const-folding path reaching here.)
-                    Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
+                    OwnedKind::Int(n) => n.checked_neg().map(Value::int).ok_or_else(|| {
                         CompileError::new(
                             "integer overflow negating enum backing value",
                             node_span(un),
                         )
                     }),
-                    Value::Float(n) => Ok(Value::Float(-n)),
+                    OwnedKind::Float(n) => Ok(Value::float(-n)),
                     _ => Err(CompileError::new(
                         "enum variant backing value must be a number or string literal",
                         node_span(un),
@@ -6588,8 +6588,8 @@ mod tests {
     }
 
     async fn eval_string(src: &str) -> String {
-        match crate::vm_eval_source(src).await.expect("evaluates") {
-            Value::Str(s) => s.to_string(),
+        match crate::vm_eval_source(src).await.expect("evaluates").into_kind() {
+            OwnedKind::Str(s) => s.to_string(),
             other => panic!("expected Str, got {other:?}"),
         }
     }

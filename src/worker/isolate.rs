@@ -10,7 +10,7 @@
 //! materialized into the isolate's `Vm` exactly once; subsequent requests for the
 //! same `fn_id` reuse the already-defined globals.
 
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use crate::vm::chunk::{Chunk, FnProto};
 use crate::vm::value_ext::{Closure, RunOutcome};
 use crate::vm::Vm;
@@ -478,11 +478,11 @@ pub(crate) fn decode_args_with_shared(
 ) -> Result<Vec<Value>, String> {
     let decoded =
         crate::worker::serialize::decode_with_shared(bytes, shared, interp).map_err(|e| e.message())?;
-    match decoded {
-        Value::Array(a) => Ok(a.borrow().clone()),
-        other => Err(format!(
+    match decoded.kind() {
+        ValueKind::Array(a) => Ok(a.borrow().clone()),
+        _ => Err(format!(
             "worker args payload did not decode to an array (got {})",
-            crate::interp::type_name(&other)
+            crate::interp::type_name(&decoded)
         )),
     }
 }
@@ -513,10 +513,10 @@ mod tests {
             while let Some(msg) = rx.recv().await {
                 // Decode the shipped bytes against THIS isolate's own interp, double the
                 // number, and report it back over the `Send` back-channel.
-                if let Ok(Value::Float(n)) =
-                    crate::worker::serialize::decode(&msg, &interp)
-                {
-                    let _ = result_tx.send(n * 2.0);
+                if let Ok(v) = crate::worker::serialize::decode(&msg, &interp) {
+                    if let ValueKind::Float(n) = v.kind() {
+                        let _ = result_tx.send(n * 2.0);
+                    }
                 }
             }
             // Inbound channel closed (handle dropped) → body returns → thread can exit.

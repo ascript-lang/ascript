@@ -143,7 +143,7 @@ mod tests {
     fn defines_and_gets() {
         let env = Environment::global();
         env.define("x", Value::Float(5.0), true).unwrap();
-        assert!(matches!(env.get("x"), Some(Value::Float(n)) if n == 5.0));
+        assert!(matches!(env.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 5.0));
     }
 
     #[test]
@@ -158,10 +158,10 @@ mod tests {
         let parent = Environment::global();
         parent.define("x", Value::Float(1.0), true).unwrap();
         let child = parent.child();
-        assert!(matches!(child.get("x"), Some(Value::Float(n)) if n == 1.0));
+        assert!(matches!(child.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 1.0));
         child.define("x", Value::Float(9.0), true).unwrap();
-        assert!(matches!(child.get("x"), Some(Value::Float(n)) if n == 9.0));
-        assert!(matches!(parent.get("x"), Some(Value::Float(n)) if n == 1.0));
+        assert!(matches!(child.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 9.0));
+        assert!(matches!(parent.get("x").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 1.0));
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
         parent.define("c", Value::Float(2.0), false).unwrap();
         let child = parent.child();
         child.assign("m", Value::Float(10.0)).unwrap();
-        assert!(matches!(parent.get("m"), Some(Value::Float(n)) if n == 10.0));
+        assert!(matches!(parent.get("m").map(|v| v.into_kind()), Some(crate::value::OwnedKind::Float(n)) if n == 10.0));
         assert_eq!(
             child.assign("c", Value::Float(3.0)),
             Err(AssignError::Immutable)

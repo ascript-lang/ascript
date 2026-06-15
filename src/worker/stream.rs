@@ -36,7 +36,7 @@
 //! join) — `gen.close()` / dropping the `Value::Generator` reclaims the isolate, no
 //! zombie thread (mirrors the local generator's clean-drop guarantee).
 
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use std::rc::Rc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -289,7 +289,7 @@ async fn build_producer(
         .call_value(entry, arg_values, crate::span::Span::new(0, 0))
         .await
     {
-        Ok(v @ Value::Generator(_)) => Ok(v),
+        Ok(v) if matches!(v.kind(), ValueKind::Generator(_)) => Ok(v),
         Ok(other) => Err(format!(
             "streaming generator entry '{entry_name}' did not produce a generator (got {})",
             crate::interp::type_name(&other)
@@ -318,7 +318,7 @@ async fn resume_producer(
         Ok(v) => v,
         Err(e) => return StreamReply::Panic(e.message()),
     };
-    let Value::Generator(handle) = gen else {
+    let ValueKind::Generator(handle) = gen.kind() else {
         return StreamReply::Panic("streaming generator producer is not a generator".to_string());
     };
     match handle.resume(injected).await {
