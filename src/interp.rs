@@ -5231,7 +5231,7 @@ impl Interp {
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
         // IFACE: thread the callee frame env so a `Type::Named` param contract resolves
         // env-aware (interface → structural conforms; class → nominal).
-        let bound = check_call_args(params, args, span, what, Some(self), Some(call_env))?;
+        let bound = check_call_args(params, args, span, what, Some(self), Some(call_env), false)?;
         let defaults = bound.defaults.clone();
         // Bind the SUPPLIED params (and the rest array) — but NOT the omitted
         // defaulted positions, whose `bound.values` entries are placeholders. They
@@ -8359,6 +8359,7 @@ pub(crate) fn check_call_args_in_place(
     what: &str,
     interp: Option<&Interp>,
     env: Option<&Environment>,
+    elide_contracts: bool,
 ) -> Result<usize, Control> {
     // Caller guarantees this; catch bugs early in debug builds.
     debug_assert!(!params.last().is_some_and(|p| p.rest));
@@ -8369,11 +8370,14 @@ pub(crate) fn check_call_args_in_place(
         .count();
     check_call_arity(params, n_positional, false, min, args.len(), span, what)?;
     // Contract-check the supplied args (left-to-right, same order as check_call_args).
-    let supplied = args.len().min(n_positional);
-    for (p, a) in params[..supplied].iter().zip(args[..supplied].iter()) {
-        check_param_contract(p, a, span, interp, env)?;
+    // ELIDE §4.4: per-param type checks are skipped when elide_contracts is true.
+    if !elide_contracts {
+        let supplied = args.len().min(n_positional);
+        for (p, a) in params[..supplied].iter().zip(args[..supplied].iter()) {
+            check_param_contract(p, a, span, interp, env)?;
+        }
     }
-    Ok(supplied)
+    Ok(args.len().min(n_positional))
 }
 
 pub(crate) fn check_call_args(
@@ -8390,6 +8394,10 @@ pub(crate) fn check_call_args(
     // pre-IFACE behavior, byte-identical for non-interface code).
     interp: Option<&Interp>,
     env: Option<&Environment>,
+    // ELIDE §4.4: when true, skip per-param and rest-element type-contract checks.
+    // Arity, defaults, and rest collection are NEVER skipped. Only CallElided dispatch
+    // passes true; every other call site passes false.
+    elide_contracts: bool,
 ) -> Result<BoundArgs, Control> {
     let has_rest = params.last().is_some_and(|p| p.rest);
     // Count of POSITIONAL params (excludes a trailing `...rest`).
@@ -8407,6 +8415,7 @@ pub(crate) fn check_call_args(
         .count();
 
     // Arity check — delegates to the shared core so both callers use identical wording.
+    // ELIDE §4.4: arity is NEVER skipped (only type-contract checks are).
     check_call_arity(params, n_positional, has_rest, min, args.len(), span, what)?;
 
     let mut values: Vec<Value> = Vec::with_capacity(params.len());
@@ -8416,8 +8425,10 @@ pub(crate) fn check_call_args(
     let supplied = it.len().min(n_positional);
     for p in &params[..supplied] {
         let a = it.next().unwrap();
-        // Per-param contract check — delegates to the shared core.
-        check_param_contract(p, &a, span, interp, env)?;
+        // Per-param contract check — ELIDE §4.4: skipped when elide_contracts is true.
+        if !elide_contracts {
+            check_param_contract(p, &a, span, interp, env)?;
+        }
         values.push(a);
     }
     // Placeholders for the omitted trailing defaulted positions (filled by the
@@ -8445,13 +8456,18 @@ pub(crate) fn check_call_args(
         };
         let mut rest_vals = Vec::new();
         for a in it {
-            if let Some(t) = elem_ty {
-                let ok = match (interp, env) {
-                    (Some(itp), Some(e)) => itp.check_type_env(&a, t, e)?,
-                    _ => check_type(&a, t),
-                };
-                if !ok {
-                    return Err(contract_panic(t, &a, span));
+            // Rest-element type check — ELIDE §4.4: skipped when elide_contracts is true.
+            // Note: eligibility excludes rest-param callees, so elide_contracts is never
+            // true here in practice; the guard is kept for defence-in-depth.
+            if !elide_contracts {
+                if let Some(t) = elem_ty {
+                    let ok = match (interp, env) {
+                        (Some(itp), Some(e)) => itp.check_type_env(&a, t, e)?,
+                        _ => check_type(&a, t),
+                    };
+                    if !ok {
+                        return Err(contract_panic(t, &a, span));
+                    }
                 }
             }
             rest_vals.push(a);
@@ -8516,7 +8532,7 @@ pub(crate) fn auto_init_bindings(
     // and spans are byte-identical to a hand-written `init(x, y)`. This free fn has no
     // engine/env (constructor field contracts resolve names via validate_into / the
     // env-aware field-set path), so pass `None` — env-free `check_type` for any Named.
-    let bound = check_call_args(&params, args, span, class_name, None, None)?;
+    let bound = check_call_args(&params, args, span, class_name, None, None, false)?;
     // Take only the supplied positional args (contract-checked by
     // `check_call_args`); pair each with its field name. Omitted defaulted fields
     // keep the default the caller already applied.
@@ -14841,5 +14857,152 @@ print("after-drop")
             "§4.3: async fn* last-handle drop must NOT run defers; got: {out2:?}"
         );
         assert!(out2.contains("after-drop"), "program continued: {out2:?}");
+    }
+
+    // ── ELIDE §4.4: check_call_args / check_call_args_in_place elide_contracts mode ──
+
+    /// Helper: build a typed positional Param with no default and no rest.
+    fn typed_param(name: &str, ty: crate::ast::Type) -> crate::ast::Param {
+        crate::ast::Param {
+            name: name.to_string(),
+            ty: Some(ty),
+            name_span: Span::new(0, 0),
+            rest: false,
+            default: None,
+        }
+    }
+
+    /// ELIDE §4.4 (a): a wrong-typed arg passes through UNCHECKED when
+    /// elide_contracts=true; the result contains the original value unchanged.
+    #[test]
+    fn elide_contracts_skips_type_check() {
+        use crate::ast::Type;
+        // param `x: int` but we pass a string — normally a Tier-2 panic.
+        let params = vec![typed_param("x", Type::Int)];
+        let args = vec![Value::str("wrong")];
+        // With elide=false this should fail.
+        let err = check_call_args(&params, args.clone(), Span::new(0, 0), "f", None, None, false);
+        assert!(err.is_err(), "elide=false must reject a wrong-typed arg");
+        // With elide=true the same call must succeed and return the value unchanged.
+        let ok = check_call_args(&params, args, Span::new(0, 0), "f", None, None, true)
+            .expect("elide=true must pass a wrong-typed arg through unchecked");
+        assert_eq!(ok.supplied, 1);
+        assert!(
+            matches!(ok.values[0].kind(), crate::value::ValueKind::Str(_)),
+            "value must be the original string, not coerced"
+        );
+    }
+
+    /// ELIDE §4.4 (b): arity errors STILL fire even when elide_contracts=true.
+    #[test]
+    fn elide_contracts_preserves_arity_check() {
+        use crate::ast::Type;
+        // fn f(x: int) — called with zero args.
+        let params = vec![typed_param("x", Type::Int)];
+        let err_false = check_call_args(&params, vec![], Span::new(0, 0), "f", None, None, false);
+        let err_true  = check_call_args(&params, vec![], Span::new(0, 0), "f", None, None, true);
+        assert!(err_false.is_err(), "elide=false: arity must be enforced");
+        assert!(err_true.is_err(),  "elide=true: arity must STILL be enforced");
+        // Both messages must be byte-identical.
+        let msg_false = format!("{:?}", err_false.err().unwrap());
+        let msg_true  = format!("{:?}", err_true.err().unwrap());
+        assert_eq!(msg_false, msg_true, "arity panic message must be identical regardless of elide_contracts");
+    }
+
+    /// ELIDE §4.4 (c): default placeholders are still produced correctly when
+    /// elide_contracts=true — the engine-side default evaluation depends on them.
+    #[test]
+    fn elide_contracts_keeps_defaults() {
+        use crate::ast::Type;
+        // fn f(a: int, b: int = <default>) — call with 1 arg.
+        // Build b with a sentinel default so check_call_args treats it as optional.
+        let sentinel_default = crate::ast::Expr {
+            kind: crate::ast::ExprKind::Nil,
+            span: Span::new(0, 0),
+        };
+        let params = vec![
+            typed_param("a", Type::Int),
+            crate::ast::Param {
+                name: "b".to_string(),
+                ty: Some(Type::Int),
+                name_span: Span::new(0, 0),
+                rest: false,
+                default: Some(sentinel_default),
+            },
+        ];
+        let args = vec![Value::int(42)];
+        let bound = check_call_args(&params, args, Span::new(0, 0), "f", None, None, true)
+            .expect("elide=true with one arg for a two-param (one defaulted) fn must succeed");
+        assert_eq!(bound.supplied, 1, "supplied must be 1");
+        assert_eq!(bound.values.len(), 2, "values must have placeholders for all params");
+        assert!(
+            matches!(bound.values[0].kind(), crate::value::ValueKind::Int(42)),
+            "supplied arg must be preserved"
+        );
+        assert!(
+            matches!(bound.values[1].kind(), crate::value::ValueKind::Nil),
+            "defaulted placeholder must be Nil"
+        );
+        assert!(bound.defaults.contains(&1), "defaults range must cover the omitted slot");
+    }
+
+    /// ELIDE §4.4 (d): rest collection still works (value collected, no type check).
+    #[test]
+    fn elide_contracts_keeps_rest_collection() {
+        use crate::ast::Type;
+        // fn f(a: int, ...rest: array<int>) — call with wrong rest elements.
+        let params = vec![
+            typed_param("a", Type::Int),
+            crate::ast::Param {
+                name: "rest".to_string(),
+                ty: Some(Type::Array(Box::new(Type::Int))),
+                name_span: Span::new(0, 0),
+                rest: true,
+                default: None,
+            },
+        ];
+        // With elide=false: passing a string as a rest element must fail.
+        let args_bad = vec![Value::int(1), Value::str("oops")];
+        let err = check_call_args(&params, args_bad.clone(), Span::new(0, 0), "f", None, None, false);
+        assert!(err.is_err(), "elide=false must reject a wrong-typed rest element");
+        // With elide=true: same call must succeed and collect the rest array.
+        let ok = check_call_args(&params, args_bad, Span::new(0, 0), "f", None, None, true)
+            .expect("elide=true must collect rest elements unchecked");
+        assert_eq!(ok.supplied, 1, "supplied positional = 1");
+        // The rest array is the last value.
+        let rest_v = &ok.values[ok.values.len() - 1];
+        let arr = match rest_v.kind() {
+            crate::value::ValueKind::Array(a) => a.borrow().clone(),
+            other => panic!("expected Array, got {other:?}"),
+        };
+        assert_eq!(arr.len(), 1, "rest array must contain 1 element");
+        assert!(
+            matches!(arr[0].kind(), crate::value::ValueKind::Str(_)),
+            "rest element is the original string value"
+        );
+    }
+
+    /// ELIDE §4.4: check_call_args_in_place with elide_contracts=true skips type
+    /// checks but preserves arity enforcement.
+    #[test]
+    fn elide_contracts_in_place_skips_type_check_preserves_arity() {
+        use crate::ast::Type;
+        let params = vec![typed_param("x", Type::Int)];
+        // Wrong type — must be rejected with elide=false.
+        let stack = vec![Value::str("bad")];
+        let err = check_call_args_in_place(&params, &stack, Span::new(0, 0), "f", None, None, false);
+        assert!(err.is_err(), "in_place elide=false must reject wrong type");
+        // Same args, elide=true — must pass.
+        let supplied = check_call_args_in_place(&params, &stack, Span::new(0, 0), "f", None, None, true)
+            .expect("in_place elide=true must pass wrong-typed arg");
+        assert_eq!(supplied, 1);
+        // Arity: 0 args for 1 required param must still fail with elide=true.
+        let empty: &[Value] = &[];
+        let arity_err = check_call_args_in_place(&params, empty, Span::new(0, 0), "f", None, None, true);
+        assert!(arity_err.is_err(), "in_place elide=true must still enforce arity");
+        // Arity messages match between elide=true and elide=false.
+        let msg_false = format!("{:?}", check_call_args_in_place(&params, empty, Span::new(0, 0), "f", None, None, false).err().unwrap());
+        let msg_true  = format!("{:?}", arity_err.err().unwrap());
+        assert_eq!(msg_false, msg_true, "arity message must be identical regardless of elide_contracts");
     }
 }

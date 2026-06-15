@@ -1675,6 +1675,9 @@ impl Vm {
         argc: usize,
         callee_idx: usize,
         call_span: Span,
+        // ELIDE §4.4: when true, skip per-param type-contract checks. Only the
+        // Op::CallElided dispatch paths pass true; all other callers pass false.
+        elide_contracts: bool,
     ) -> Result<(), Control> {
         // `what` mirrors the tree-walker's `func.name.as_deref().unwrap_or("function")`
         // so the wording of arity/contract panics matches byte-for-byte.
@@ -1696,6 +1699,7 @@ impl Vm {
             what,
             Some(&self.interp),
             Some(&self.class_env()),
+            elide_contracts,
         )?;
         // The args/rest array are gone from the stack; the new frame's window starts
         // where the callee value was.
@@ -3970,16 +3974,16 @@ impl Vm {
                     // closure: push a new CallFrame (sync, no await) and continue.
                     // Any other callee kind: restore ip to fault_ip and escalate to async.
                     //
-                    // ELIDE §4.2: CallElided is semantically identical to Call here —
-                    // Task 2.2 will thread `elide = true` into push_closure_frame / the
-                    // in-place binder to skip per-arg contract checks at this site.
+                    // ELIDE §4.4: CallElided is semantically identical to Call here; the
+                    // elide flag threads into the binder to skip per-param type-contract
+                    // checks at statically-proven sites (Task 2.2).
                     //
                     // INVARIANT: we must NOT pop anything from the stack before
                     // confirming the callee is sync-eligible, so that escalation
                     // leaves the stack completely untouched.
+                    // ELIDE §4.4: CallElided dispatch sets elide=true so the shared binder
+                    // skips per-param type-contract checks at this site.
                     let elide = matches!(op, Op::CallElided);
-                    // ELIDE: Task 2.2 threads 'elide' here
-                    let _ = elide;
                     if matches!(op, Op::CallSpread) {
                         // Stack is `[..., callee, argsArray]`. Peek callee at index -2.
                         let callee_ref = &fiber.stack[fiber.stack.len() - 2];
@@ -4022,7 +4026,7 @@ impl Vm {
                         // CallSpread is rare enough and rest-eligible that we keep the
                         // simpler path for clarity; the A2 fast path targets the common
                         // Op::Call shape where args are already individually on the stack).
-                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span, false)?;
                     } else {
                         // Op::Call: argc is the static operand.
                         let argc =
@@ -4055,6 +4059,7 @@ impl Vm {
                                 callee.proto.chunk.name.as_deref().unwrap_or("function"),
                                 Some(&self.interp),
                                 Some(&self.class_env()),
+                                elide,
                             )?;
                             fiber.stack.remove(callee_idx);
                             let slot_base = callee_idx;
@@ -4090,7 +4095,7 @@ impl Vm {
                             });
                             self.publish_profile_frames(fiber);
                         } else {
-                            self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                            self.push_closure_frame(fiber, callee, argc, callee_idx, call_span, elide)?;
                         }
                     }
                     // Continue the loop in the new (or returned-to) frame.
@@ -4686,12 +4691,9 @@ impl Vm {
                     // (arity/contracts then apply to the flattened list, byte-
                     // identical to the tree-walker's `eval_call_args` → call).
                     //
-                    // ELIDE §4.2: CallElided is semantically identical to Call in this arm.
-                    // Task 2.2 will thread `elide = true` into the binder calls below to
-                    // skip per-arg contract checks at statically-proven sites.
+                    // ELIDE §4.4: CallElided sets elide=true so the shared binder skips
+                    // per-param type-contract checks at statically-proven sites.
                     let elide = matches!(op, Op::CallElided);
-                    // ELIDE: Task 2.2 threads 'elide' here
-                    let _ = elide;
                     let argc = if matches!(op, Op::CallSpread) {
                         let args_arr = fiber.pop();
                         let args_ty = crate::interp::type_name(&args_arr);
@@ -4788,6 +4790,7 @@ impl Vm {
                                 what,
                                 Some(&self.interp),
                                 Some(&self.class_env()),
+                                false,
                             )?;
                             // Build a NOT-STARTED one-frame Fiber for the closure and
                             // place the bound params into its slots (cell slot → cell,
@@ -4899,6 +4902,7 @@ impl Vm {
                                     callee.proto.chunk.name.as_deref().unwrap_or("function"),
                                     Some(&self.interp),
                                     Some(&self.class_env()),
+                                    elide,
                                 )?;
                                 // Drop the callee value; the `argc` args shift down one
                                 // slot to start AT slot_base (an argc-element memmove,
@@ -4953,7 +4957,7 @@ impl Vm {
                                 // contracts, allocates cells, pushes the CallFrame (one
                                 // enter_frame_depth — SP3 §B), publishes profiler frames.
                                 self.push_closure_frame(
-                                    fiber, callee, argc, callee_idx, call_span,
+                                    fiber, callee, argc, callee_idx, call_span, elide,
                                 )?;
                             }
                             // Continue the loop in the new frame.
@@ -7909,7 +7913,7 @@ impl Vm {
                 if closure.proto.is_generator {
                     let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
                     let bound =
-                        crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+                        crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
                     let mut gfiber = Fiber::new(closure);
                     gfiber.frame_mut().ret_span = span;
                     gfiber.frame_mut().argc = bound.supplied;
@@ -7933,7 +7937,7 @@ impl Vm {
                 // Arity + per-param contracts + rest collection, shared verbatim
                 // with the tree-walker and the `Op::Call` arm.
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
                 // CALL §4 A3: take a pooled fiber (or allocate a fresh one when
                 // the pool is empty or call_fast=false). `take_pooled_fiber` pops
                 // the fiber from the pool so nested re-entrant calls grab a DIFFERENT
@@ -8365,7 +8369,7 @@ impl Vm {
             if !closure.proto.is_async && !closure.proto.is_generator {
                 let what = closure.proto.chunk.name.as_deref().unwrap_or("method");
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
                 let slot_base = fiber.stack.len();
                 let slot_count = closure.proto.chunk.slot_count as usize;
                 let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
@@ -9229,7 +9233,7 @@ impl Vm {
         // Bind the user args (arity + per-param contracts + rest) against the
         // method's declared params (which EXCLUDE self) — shared with every call
         // path. The bound values land in slots 1.. (self is slot 0).
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
         // A generator method (`fn*` / `async fn*`) is NOT run inline: it binds `self`
         // and args into a NOT-STARTED fiber and wraps it in a VM-backed
         // `GeneratorHandle`, returning a `Value::generator` immediately — exactly like
@@ -9343,7 +9347,7 @@ impl Vm {
             return Ok(Value::future(fut));
         }
         let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
         // `static fn*` / `static async fn*`: build a NOT-STARTED fiber, bind args
         // into slots 0.., wrap in a VM `GeneratorHandle`. No receiver/self slot.
         if closure.proto.is_generator {

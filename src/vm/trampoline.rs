@@ -131,6 +131,7 @@ impl CallbackTrampoline {
             what,
             Some(self.vm.interp()),
             Some(&self.vm.class_env()),
+            false,
         )?;
 
         // THE RESET INVARIANT (CALL §5.4): one fresh frame @ip0, slot_count Nil
