@@ -38,7 +38,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -48,7 +48,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn obj(map: indexmap::IndexMap<String, Value>) -> Value {
@@ -74,7 +74,7 @@ impl Interp {
                             indexmap::IndexMap::new(),
                             ResourceState::SqliteConnection(conn),
                         );
-                        Ok(make_pair(handle, Value::Nil))
+                        Ok(make_pair(handle, Value::nil()))
                     }
                     Err(e) => Ok(err_pair(format!("sqlite.open failed: {}", e))),
                 }
@@ -113,7 +113,7 @@ impl Interp {
         // double close is itself a "use after close".
         if method == "close" {
             return match self.take_resource(id) {
-                Some(_) => Ok(Value::Nil),
+                Some(_) => Ok(Value::nil()),
                 None => Err(use_after_close(span)),
             };
         }
@@ -129,7 +129,7 @@ impl Interp {
                 let params = parse_params(args.get(1), span, "connection.exec")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
                 match exec_sql(&conn, &sql, &params) {
-                    Ok(changes) => Ok(make_pair(Value::Int(changes as i64), Value::Nil)),
+                    Ok(changes) => Ok(make_pair(Value::int(changes as i64), Value::nil())),
                     Err(e) => Ok(err_pair(format!("connection.exec failed: {}", e))),
                 }
             }
@@ -140,7 +140,7 @@ impl Interp {
                 match query_sql(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(
                         Value::Array(crate::value::ArrayCell::new(rows)),
-                        Value::Nil,
+                        Value::nil(),
                     )),
                     Err(e) => Ok(err_pair(format!("connection.query failed: {}", e))),
                 }
@@ -164,7 +164,7 @@ impl Interp {
                         sql: sql.to_string(),
                     },
                 );
-                Ok(make_pair(handle, Value::Nil))
+                Ok(make_pair(handle, Value::nil()))
             }
             "begin" => self.conn_exec_simple(id, "BEGIN", "connection.begin"),
             "commit" => self.conn_exec_simple(id, "COMMIT", "connection.commit"),
@@ -176,7 +176,7 @@ impl Interp {
     fn conn_exec_simple(&self, id: u64, sql: &str, ctx: &str) -> Result<Value, Control> {
         let conn = self.sqlite_conn(id).expect("checked present");
         match conn.execute(sql, []) {
-            Ok(_) => Ok(make_pair(Value::Nil, Value::Nil)),
+            Ok(_) => Ok(make_pair(Value::nil(), Value::nil())),
             Err(e) => Ok(err_pair(format!("{} failed: {}", ctx, e))),
         }
     }
@@ -206,7 +206,7 @@ impl Interp {
                 let params = parse_params(args.first(), span, "statement.run")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match exec_cached(&conn, &sql, &params) {
-                    Ok(changes) => Ok(make_pair(Value::Int(changes as i64), Value::Nil)),
+                    Ok(changes) => Ok(make_pair(Value::int(changes as i64), Value::nil())),
                     Err(e) => Ok(err_pair(format!("statement.run failed: {}", e))),
                 }
             }
@@ -216,7 +216,7 @@ impl Interp {
                 match query_cached(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(
                         Value::Array(crate::value::ArrayCell::new(rows)),
-                        Value::Nil,
+                        Value::nil(),
                     )),
                     Err(e) => Ok(err_pair(format!("statement.all failed: {}", e))),
                 }
@@ -239,26 +239,26 @@ enum Params {
 
 /// Convert an AScript value used as a bind parameter into a SQLite value.
 fn to_sql(v: &Value, span: Span, ctx: &str) -> Result<SqlValue, Control> {
-    Ok(match v {
-        Value::Nil => SqlValue::Null,
-        Value::Bool(b) => SqlValue::Integer(if *b { 1 } else { 0 }),
+    Ok(match v.kind() {
+        ValueKind::Nil => SqlValue::Null,
+        ValueKind::Bool(b) => SqlValue::Integer(if b { 1 } else { 0 }),
         // NUM §4: an `Int` binds directly as a SQL INTEGER.
-        Value::Int(i) => SqlValue::Integer(*i),
-        Value::Float(n) => {
+        ValueKind::Int(i) => SqlValue::Integer(i),
+        ValueKind::Float(n) => {
             if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.2e18 {
-                SqlValue::Integer(*n as i64)
+                SqlValue::Integer(n as i64)
             } else {
-                SqlValue::Real(*n)
+                SqlValue::Real(n)
             }
         }
-        Value::Str(s) => SqlValue::Text(s.to_string()),
-        Value::Bytes(b) => SqlValue::Blob(b.borrow().clone()),
-        other => {
+        ValueKind::Str(s) => SqlValue::Text(s.to_string()),
+        ValueKind::Bytes(b) => SqlValue::Blob(b.borrow().clone()),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "{}: cannot bind a {} as a SQL parameter",
                     ctx,
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(v)
                 ),
                 span,
             )
@@ -270,16 +270,16 @@ fn to_sql(v: &Value, span: Span, ctx: &str) -> Result<SqlValue, Control> {
 /// Parse the optional second argument (params) into a `Params`. A missing/nil arg
 /// is `None`; an array is positional; an object is named. Anything else is Tier-2.
 fn parse_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Params, Control> {
-    match v {
-        None | Some(Value::Nil) => Ok(Params::None),
-        Some(Value::Array(a)) => {
+    match v.map(|v| (v, v.kind())) {
+        None | Some((_, ValueKind::Nil)) => Ok(Params::None),
+        Some((_, ValueKind::Array(a))) => {
             let mut out = Vec::new();
             for item in a.borrow().iter() {
                 out.push(to_sql(item, span, ctx)?);
             }
             Ok(Params::Positional(out))
         }
-        Some(Value::Object(o)) => {
+        Some((_, ValueKind::Object(o))) => {
             let mut out = Vec::new();
             for (k, val) in o.entries() {
                 // Accept both ":name" and "name" keys; rusqlite wants the ":" form.
@@ -292,7 +292,7 @@ fn parse_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Params, Cont
             }
             Ok(Params::Named(out))
         }
-        Some(other) => Err(AsError::at(
+        Some((other, _)) => Err(AsError::at(
             format!(
                 "{} params must be an array or an object, got {}",
                 ctx,
@@ -307,11 +307,11 @@ fn parse_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Params, Cont
 /// Map a borrowed SQLite column value into an AScript value.
 fn from_sql(v: ValueRef<'_>) -> Value {
     match v {
-        ValueRef::Null => Value::Nil,
+        ValueRef::Null => Value::nil(),
         // NUM §4: a SQLite INTEGER column is an `Int`; a REAL stays a `Float`.
-        ValueRef::Integer(i) => Value::Int(i),
-        ValueRef::Real(r) => Value::Float(r),
-        ValueRef::Text(t) => Value::Str(String::from_utf8_lossy(t).into_owned().into()),
+        ValueRef::Integer(i) => Value::int(i),
+        ValueRef::Real(r) => Value::float(r),
+        ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t).into_owned()),
         ValueRef::Blob(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
     }
 }
@@ -392,7 +392,7 @@ fn collect_rows(
 
 #[cfg(test)]
 mod tests {
-    use crate::value::Value;
+    use crate::value::{Value, ValueKind};
 
     /// Run an AScript program and return its captured output.
     async fn run(src: &str) -> String {
@@ -617,16 +617,16 @@ print(conn)
         let pair = interp
             .call_sqlite_open(
                 "open",
-                &[Value::Str(":memory:".into())],
+                &[Value::str(":memory:")],
                 crate::span::Span::new(0, 0),
             )
             .unwrap();
-        let conn_handle = match &pair {
-            Value::Array(a) => a.borrow()[0].clone(),
+        let conn_handle = match pair.kind() {
+            ValueKind::Array(a) => a.borrow()[0].clone(),
             _ => panic!("expected pair"),
         };
-        let id = match &conn_handle {
-            Value::Native(n) => n.id,
+        let id = match conn_handle.kind() {
+            ValueKind::Native(n) => n.id,
             _ => panic!("expected native handle"),
         };
         assert!(interp.with_resource(id, |r| matches!(

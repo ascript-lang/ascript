@@ -24,7 +24,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -32,7 +32,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 impl Interp {
@@ -64,7 +64,7 @@ impl Interp {
             indexmap::IndexMap::new(),
             ResourceState::RedisConnection(Box::new(conn)),
         );
-        Ok(make_pair(handle, Value::Nil))
+        Ok(make_pair(handle, Value::nil()))
     }
 
     /// Dispatch a method on a Redis connection handle.
@@ -80,7 +80,7 @@ impl Interp {
             "close" => {
                 // Dropping the connection closes it.
                 self.take_resource(id);
-                return Ok(Value::Nil);
+                return Ok(Value::nil());
             }
             "command" => {
                 let name = want_string(&arg(&args, 0), span, "connection.command")?.to_string();
@@ -101,37 +101,37 @@ impl Interp {
         // Build the redis command, binding each arg as a string/number/bytes.
         let mut command = redis::cmd(&cmd);
         for a in &cmd_args {
-            match a {
-                Value::Str(s) => {
+            match a.kind() {
+                ValueKind::Str(s) => {
                     command.arg(s.as_ref());
                 }
                 // NUM §4: an `Int` binds as an integer argument directly.
-                Value::Int(i) => {
-                    command.arg(*i);
+                ValueKind::Int(i) => {
+                    command.arg(i);
                 }
-                Value::Float(n) => {
+                ValueKind::Float(n) => {
                     // Integers as integers; fractions as their text form.
                     if n.fract() == 0.0 && n.is_finite() {
-                        command.arg(*n as i64);
+                        command.arg(n as i64);
                     } else {
                         command.arg(n.to_string());
                     }
                 }
-                Value::Bool(b) => {
-                    command.arg(if *b { 1i64 } else { 0i64 });
+                ValueKind::Bool(b) => {
+                    command.arg(if b { 1i64 } else { 0i64 });
                 }
-                Value::Bytes(b) => {
+                ValueKind::Bytes(b) => {
                     command.arg(b.borrow().as_slice());
                 }
-                Value::Nil => {
+                ValueKind::Nil => {
                     command.arg("");
                 }
-                other => {
+                _ => {
                     return Err(AsError::at(
                         format!(
                             "connection.{}: cannot use a {} as a Redis argument",
                             m.method,
-                            crate::interp::type_name(other)
+                            crate::interp::type_name(a)
                         ),
                         span,
                     )
@@ -154,7 +154,7 @@ impl Interp {
             command.query_async(conn.as_mut()).await;
         self.return_resource(id, ResourceState::RedisConnection(conn));
         match result {
-            Ok(v) => Ok(make_pair(redis_to_value(&v), Value::Nil)),
+            Ok(v) => Ok(make_pair(redis_to_value(&v), Value::nil())),
             Err(e) => Ok(err_pair(format!("connection.{} failed: {}", m.method, e))),
         }
     }
@@ -164,39 +164,40 @@ impl Interp {
 fn redis_to_value(v: &redis::Value) -> Value {
     use std::cell::RefCell;
     match v {
-        redis::Value::Nil => Value::Nil,
+        redis::Value::Nil => Value::nil(),
         // NUM §4: a Redis integer reply decodes to `Int`.
-        redis::Value::Int(i) => Value::Int(*i),
+        redis::Value::Int(i) => Value::int(*i),
         redis::Value::BulkString(bytes) => match std::str::from_utf8(bytes) {
-            Ok(s) => Value::Str(s.into()),
+            Ok(s) => Value::str(s),
             Err(_) => Value::Bytes(Rc::new(RefCell::new(bytes.clone()))),
         },
         redis::Value::Array(items) => {
             Value::Array(crate::value::ArrayCell::new(items.iter().map(redis_to_value).collect()))
         }
-        redis::Value::SimpleString(s) => Value::Str(s.as_str().into()),
-        redis::Value::Okay => Value::Str("OK".into()),
+        redis::Value::SimpleString(s) => Value::str(s.as_str()),
+        redis::Value::Okay => Value::str("OK"),
         redis::Value::Map(pairs) => {
             // A RESP3 map → an Object when all keys stringify, else an array of pairs.
             let mut m = indexmap::IndexMap::new();
             for (k, val) in pairs {
-                let key = match redis_to_value(k) {
-                    Value::Str(s) => s.to_string(),
-                    other => format!("{}", other),
+                let kv = redis_to_value(k);
+                let key = match kv.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => format!("{}", kv),
                 };
                 m.insert(key, redis_to_value(val));
             }
             Value::Object(crate::value::ObjectCell::new(m))
         }
-        redis::Value::Double(d) => Value::Float(*d),
-        redis::Value::Boolean(b) => Value::Bool(*b),
-        redis::Value::BigNumber(n) => Value::Str(n.to_string().into()),
-        redis::Value::VerbatimString { text, .. } => Value::Str(text.as_str().into()),
+        redis::Value::Double(d) => Value::float(*d),
+        redis::Value::Boolean(b) => Value::bool_(*b),
+        redis::Value::BigNumber(n) => Value::str(n.to_string()),
+        redis::Value::VerbatimString { text, .. } => Value::str(text.as_str()),
         redis::Value::Set(items) => {
             Value::Array(crate::value::ArrayCell::new(items.iter().map(redis_to_value).collect()))
         }
         // Push/Attribute and any future RESP3 variants: best-effort Nil.
-        _ => Value::Nil,
+        _ => Value::nil(),
     }
 }
 
@@ -211,26 +212,26 @@ mod tests {
 
     #[test]
     fn reply_map_basic_kinds() {
-        assert_eq!(redis_to_value(&redis::Value::Nil), Value::Nil);
-        assert_eq!(redis_to_value(&redis::Value::Int(7)), Value::Int(7));
-        assert_eq!(redis_to_value(&redis::Value::Okay), Value::Str("OK".into()));
+        assert_eq!(redis_to_value(&redis::Value::Nil), Value::nil());
+        assert_eq!(redis_to_value(&redis::Value::Int(7)), Value::int(7));
+        assert_eq!(redis_to_value(&redis::Value::Okay), Value::str("OK"));
         assert_eq!(
             redis_to_value(&redis::Value::SimpleString("PONG".into())),
-            Value::Str("PONG".into())
+            Value::str("PONG")
         );
         assert_eq!(
             redis_to_value(&redis::Value::BulkString(b"hello".to_vec())),
-            Value::Str("hello".into())
+            Value::str("hello")
         );
         // Non-UTF-8 bulk string → Bytes.
-        match redis_to_value(&redis::Value::BulkString(vec![0xff, 0x00])) {
-            Value::Bytes(b) => assert_eq!(*b.borrow(), vec![0xff, 0x00]),
+        match redis_to_value(&redis::Value::BulkString(vec![0xff, 0x00])).kind() {
+            ValueKind::Bytes(b) => assert_eq!(*b.borrow(), vec![0xff, 0x00]),
             other => panic!("expected bytes, got {:?}", other),
         }
         // Array recursion.
         let arr = redis::Value::Array(vec![redis::Value::Int(1), redis::Value::Int(2)]);
-        match redis_to_value(&arr) {
-            Value::Array(a) => assert_eq!(a.borrow().len(), 2),
+        match redis_to_value(&arr).kind() {
+            ValueKind::Array(a) => assert_eq!(a.borrow().len(), 2),
             other => panic!("expected array, got {:?}", other),
         }
     }
@@ -246,15 +247,15 @@ mod tests {
                 let pair = interp
                     .call_redis(
                         "connect",
-                        &[Value::Str("redis://127.0.0.1:1".into())],
+                        &[Value::str("redis://127.0.0.1:1")],
                         sp(),
                     )
                     .await
                     .expect("connect must not panic on a dead port");
-                if let Value::Array(a) = &pair {
+                if let ValueKind::Array(a) = pair.kind() {
                     let b = a.borrow();
-                    assert_eq!(b[0], Value::Nil);
-                    assert!(matches!(b[1], Value::Object(_)), "err slot should be set");
+                    assert_eq!(b[0], Value::nil());
+                    assert!(matches!(b[1].kind(), ValueKind::Object(_)), "err slot should be set");
                 } else {
                     panic!("expected a [value, err] pair");
                 }
@@ -275,16 +276,16 @@ mod tests {
                 interp.install_self();
                 let key = format!("sp5:redis:{}", uuid::Uuid::new_v4().simple());
                 let pair = interp
-                    .call_redis("connect", &[Value::Str(url.clone().into())], sp())
+                    .call_redis("connect", &[Value::str(url.clone())], sp())
                     .await
                     .unwrap();
-                let conn = match &pair {
-                    Value::Array(a) => a.borrow()[0].clone(),
+                let conn = match pair.kind() {
+                    ValueKind::Array(a) => a.borrow()[0].clone(),
                     _ => panic!("connect pair"),
                 };
                 let m = |method: &str| -> Rc<NativeMethod> {
-                    match &conn {
-                        Value::Native(n) => Rc::new(NativeMethod {
+                    match conn.kind() {
+                        ValueKind::Native(n) => Rc::new(NativeMethod {
                             receiver: n.clone(),
                             method: method.to_string(),
                         }),
@@ -295,24 +296,24 @@ mod tests {
                 interp
                     .call_redis_method(
                         &m("set"),
-                        vec![Value::Str(key.clone().into()), Value::Str("v1".into())],
+                        vec![Value::str(key.clone()), Value::str("v1")],
                         sp(),
                     )
                     .await
                     .unwrap();
                 // get key → "v1"
                 let got = interp
-                    .call_redis_method(&m("get"), vec![Value::Str(key.clone().into())], sp())
+                    .call_redis_method(&m("get"), vec![Value::str(key.clone())], sp())
                     .await
                     .unwrap();
-                if let Value::Array(a) = &got {
+                if let ValueKind::Array(a) = got.kind() {
                     let b = a.borrow();
-                    assert_eq!(b[1], Value::Nil);
-                    assert_eq!(b[0], Value::Str("v1".into()));
+                    assert_eq!(b[1], Value::nil());
+                    assert_eq!(b[0], Value::str("v1"));
                 }
                 // cleanup
                 interp
-                    .call_redis_method(&m("del"), vec![Value::Str(key.clone().into())], sp())
+                    .call_redis_method(&m("del"), vec![Value::str(key.clone())], sp())
                     .await
                     .unwrap();
                 interp.call_redis_method(&m("close"), vec![], sp()).await.unwrap();

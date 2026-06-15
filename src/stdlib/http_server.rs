@@ -90,7 +90,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, OwnedKind, Value, ValueKind};
 use indexmap::IndexMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -173,7 +173,7 @@ fn route_schemas_from_arg(arg: &Value) -> Option<RouteSchemas> {
         });
     }
     // Options object: read params/query/body if each is a schema value.
-    if let Value::Object(o) = arg {
+    if let ValueKind::Object(o) = arg.kind() {
         let pick = |key: &str| -> Option<Value> {
             let v = o.get(key);
             match v {
@@ -228,11 +228,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn obj(map: IndexMap<String, Value>) -> Value {
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object(map)
 }
 
 // ── SRV Part A — multi-isolate REUSEPORT serve helpers ────────────────────────
@@ -268,7 +268,7 @@ impl ServeOpts {
             host: String::from("127.0.0.1"),
             port: None,
         };
-        if let Value::Object(obj) = arg(args, 0) {
+        if let ValueKind::Object(obj) = arg(args, 0).kind() {
             if let Some(n) = obj.get("maxRequests").and_then(|v| v.as_f64()) {
                 if n >= 0.0 {
                     o.max_requests = Some(n as usize);
@@ -295,14 +295,14 @@ impl ServeOpts {
                 }
             }
             if let Some(s) = obj.get("setup") {
-                if !matches!(s, Value::Nil) {
+                if !matches!(s.kind(), ValueKind::Nil) {
                     o.setup_fn = Some(s);
                 }
             }
-            if let Some(Value::Array(a)) = obj.get("args") {
+            if let Some(OwnedKind::Array(a)) = obj.get("args").map(|x| x.into_kind()) {
                 o.setup_args = a.borrow().clone();
             }
-            if let Some(Value::Str(h)) = obj.get("host") {
+            if let Some(OwnedKind::Str(h)) = obj.get("host").map(|x| x.into_kind()) {
                 o.host = h.to_string();
             }
             if let Some(n) = obj.get("port").and_then(|v| v.as_f64()) {
@@ -383,9 +383,9 @@ fn bind_reuseport(_host: &str, _port: u16) -> std::io::Result<std::net::TcpListe
 /// `proto.chunk.name` + `proto.is_worker`). Returns `None` for a non-worker fn or an
 /// anonymous one.
 fn worker_fn_entry_name(v: &Value) -> Option<String> {
-    match v {
-        Value::Function(f) if f.is_worker => f.name.clone(),
-        Value::Closure(c) if c.proto.is_worker => c.proto.chunk.name.clone(),
+    match v.kind() {
+        ValueKind::Function(f) if f.is_worker => f.name.clone(),
+        ValueKind::Closure(c) if c.proto.is_worker => c.proto.chunk.name.clone(),
         _ => None,
     }
 }
@@ -393,8 +393,8 @@ fn worker_fn_entry_name(v: &Value) -> Option<String> {
 /// Extract the resource id from a server handle `Value::Native(HttpServer)` (what
 /// `server.create()` returns). `None` for any other value.
 fn server_handle_id(v: &Value) -> Option<u64> {
-    match v {
-        Value::Native(n) if n.kind == NativeKind::HttpServer => Some(n.id),
+    match v.kind() {
+        ValueKind::Native(n) if n.kind == NativeKind::HttpServer => Some(n.id),
         _ => None,
     }
 }
@@ -607,7 +607,7 @@ fn split_target(target: &str) -> (String, Value) {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        query.insert(url_decode(k), Value::Str(url_decode(v).into()));
+        query.insert(url_decode(k), Value::str(url_decode(v)));
     }
     (path, obj(query))
 }
@@ -654,7 +654,7 @@ fn match_route(pattern: &str, path: &str) -> Option<IndexMap<String, Value>> {
     let mut params = IndexMap::new();
     for (p, a) in pat.iter().zip(act.iter()) {
         if let Some(name) = p.strip_prefix(':') {
-            params.insert(name.to_string(), Value::Str(url_decode(a).into()));
+            params.insert(name.to_string(), Value::str(url_decode(a)));
         } else if p != a {
             return None;
         }
@@ -722,16 +722,16 @@ fn validation_error_response(path: &str, message: &str, where_part: &str) -> Htt
 /// cloning it under a short borrow (no borrow held across the subsequent await).
 #[cfg(feature = "data")]
 fn read_request_field(request: &Value, key: &str) -> Value {
-    match request {
-        Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
-        _ => Value::Nil,
+    match request.kind() {
+        ValueKind::Object(o) => o.get(key).unwrap_or(Value::nil()),
+        _ => Value::nil(),
     }
 }
 
 /// Replace a top-level field in the request object with the coerced/validated value.
 #[cfg(feature = "data")]
 fn set_request_field(request: &Value, key: &str, value: Value) {
-    if let Value::Object(o) = request {
+    if let ValueKind::Object(o) = request.kind() {
         o.borrow_mut().insert(key.to_string(), value);
     }
 }
@@ -748,9 +748,9 @@ fn route_schema_failure(
     match e {
         ParseFail::Mismatch(err_obj_val) => {
             let get = |k: &str| -> String {
-                match &err_obj_val {
-                    Value::Object(o) => match o.get(k) {
-                        Some(Value::Str(s)) => s.to_string(),
+                match err_obj_val.kind() {
+                    ValueKind::Object(o) => match o.get(k).map(|x| x.into_kind()) {
+                        Some(OwnedKind::Str(s)) => s.to_string(),
                         _ => String::new(),
                     },
                     _ => String::new(),
@@ -832,18 +832,18 @@ fn validate_header(name: &str, val: &str, span: Span) -> Result<(), Control> {
 /// `validate_header` (response-splitting guard). The server-built headers
 /// (`content-type`, etc.) are constant tokens and always pass.
 fn value_to_response(v: &Value, span: Span) -> Result<HttpResponse, Control> {
-    match v {
-        Value::Str(s) => Ok(HttpResponse {
+    match v.kind() {
+        ValueKind::Str(s) => Ok(HttpResponse {
             status: 200,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
             body: s.as_bytes().to_vec(),
         }),
-        Value::Array(a) => {
+        ValueKind::Array(a) => {
             // A Result pair `[value, err]`.
             let a = a.borrow();
             if a.len() == 2 {
                 let err = &a[1];
-                if !matches!(err, Value::Nil) {
+                if !matches!(err.kind(), ValueKind::Nil) {
                     let msg = error_message(err);
                     return Ok(HttpResponse {
                         status: 500,
@@ -860,13 +860,13 @@ fn value_to_response(v: &Value, span: Span) -> Result<HttpResponse, Control> {
                 body: v.to_string().into_bytes(),
             })
         }
-        Value::Object(o) => {
+        ValueKind::Object(o) => {
             let status = match o.get("status").and_then(|v| v.as_f64()) {
                 Some(n) => n as u16,
                 _ => 200,
             };
             let mut headers: Vec<(String, String)> = Vec::new();
-            if let Some(Value::Object(h)) = o.get("headers") {
+            if let Some(ValueKind::Object(h)) = o.get("headers").as_ref().map(|x| x.kind()) {
                 for (k, val) in h.entries() {
                     let val = val.to_string();
                     // Reject CRLF in handler-supplied header names/values BEFORE they
@@ -876,10 +876,13 @@ fn value_to_response(v: &Value, span: Span) -> Result<HttpResponse, Control> {
                 }
             }
             let body = match o.get("body") {
-                Some(Value::Str(s)) => s.as_bytes().to_vec(),
-                Some(Value::Bytes(b)) => b.borrow().clone(),
-                Some(Value::Nil) | None => Vec::new(),
-                Some(other) => other.to_string().into_bytes(),
+                None => Vec::new(),
+                Some(b) => match b.kind() {
+                    ValueKind::Str(s) => s.as_bytes().to_vec(),
+                    ValueKind::Bytes(bytes) => bytes.borrow().clone(),
+                    ValueKind::Nil => Vec::new(),
+                    _ => b.to_string().into_bytes(),
+                },
             };
             if !headers
                 .iter()
@@ -894,15 +897,15 @@ fn value_to_response(v: &Value, span: Span) -> Result<HttpResponse, Control> {
                 body,
             })
         }
-        Value::Nil => Ok(HttpResponse {
+        ValueKind::Nil => Ok(HttpResponse {
             status: 200,
             headers: Vec::new(),
             body: Vec::new(),
         }),
-        other => Ok(HttpResponse {
+        _ => Ok(HttpResponse {
             status: 200,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
-            body: other.to_string().into_bytes(),
+            body: v.to_string().into_bytes(),
         }),
     }
 }
@@ -911,7 +914,7 @@ fn value_to_response(v: &Value, span: Span) -> Result<HttpResponse, Control> {
 /// carries the function's would-be return — usually a `[nil, err]` Result pair, in
 /// which case the second element is the error; otherwise the value stands in.
 fn propagated_error(v: &Value) -> Value {
-    if let Value::Array(a) = v {
+    if let ValueKind::Array(a) = v.kind() {
         let a = a.borrow();
         if a.len() == 2 {
             return a[1].clone();
@@ -922,13 +925,13 @@ fn propagated_error(v: &Value) -> Value {
 
 /// Pull a human-readable message out of an error value (`{message}` object or string).
 fn error_message(err: &Value) -> String {
-    match err {
-        Value::Object(o) => match o.get("message") {
-            Some(Value::Str(s)) => s.to_string(),
+    match err.kind() {
+        ValueKind::Object(o) => match o.get("message").map(|x| x.into_kind()) {
+            Some(OwnedKind::Str(s)) => s.to_string(),
             _ => err.to_string(),
         },
-        Value::Str(s) => s.to_string(),
-        other => other.to_string(),
+        ValueKind::Str(s) => s.to_string(),
+        _ => err.to_string(),
     }
 }
 
@@ -1011,12 +1014,12 @@ impl Interp {
             }
             // Internal terminal "handler" used when no route matched: returns a 404.
             // (Runs after any middleware, so middleware still sees unmatched requests.)
-            "__not_found" => Ok(Value::Object(crate::value::ObjectCell::new({
+            "__not_found" => Ok(Value::object({
                 let mut m = IndexMap::new();
-                m.insert("status".to_string(), Value::Int(404));
-                m.insert("body".to_string(), Value::Str("not found".into()));
+                m.insert("status".to_string(), Value::int(404));
+                m.insert("body".to_string(), Value::str("not found"));
                 m
-            }))),
+            })),
             _ => {
                 Err(AsError::at(format!("std/http/server has no function '{}'", func), span).into())
             }
@@ -1145,7 +1148,7 @@ impl Interp {
                             None => return Ok(err_pair("server.bind: server is closed".into())),
                         }
                         // NUM §4: a bound port is an `Int`.
-                        Ok(make_pair(Value::Int(i64::from(bound)), Value::Nil))
+                        Ok(make_pair(Value::int(i64::from(bound)), Value::nil()))
                     }
                     Err(e) => Ok(err_pair(format!("server.bind on {} failed: {}", addr, e))),
                 }
@@ -1165,8 +1168,8 @@ impl Interp {
                     )
                     .await?;
                 // If bind returned an error pair, propagate it.
-                if let Value::Array(a) = &bound {
-                    if !matches!(a.borrow().get(1), Some(Value::Nil)) {
+                if let ValueKind::Array(a) = bound.kind() {
+                    if !matches!(a.borrow().get(1).map(|x| x.kind()), Some(ValueKind::Nil)) {
                         return Ok(bound);
                     }
                 }
@@ -1175,7 +1178,7 @@ impl Interp {
             }
             "close" => {
                 self.take_resource(id);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => Err(AsError::at(format!("httpServer has no method '{}'", other), span).into()),
         }
@@ -1415,7 +1418,7 @@ impl Interp {
             let _ = handle.await;
         }
 
-        Ok(make_pair(Value::Nil, Value::Nil))
+        Ok(make_pair(Value::nil(), Value::nil()))
     }
 
     /// SRV Part A — the multi-isolate REUSEPORT serve path. Spawns `n` shared-nothing
@@ -1513,7 +1516,7 @@ impl Interp {
             crate::worker::serialize::check_sendable(a)
                 .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
         }
-        let args_array = Value::Array(crate::value::ArrayCell::new(setup_args));
+        let args_array = Value::array(setup_args);
         let (encoded_args, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
 
@@ -1641,7 +1644,7 @@ impl Interp {
 
         match first_err {
             Some(e) => Ok(err_pair(e)),
-            None => Ok(make_pair(Value::Nil, Value::Nil)),
+            None => Ok(make_pair(Value::nil(), Value::nil())),
         }
     }
 
@@ -1749,7 +1752,7 @@ impl Interp {
         #[cfg(feature = "log")]
         {
             let _ = self
-                .call_log("warn", &[Value::Str(msg.into())], Span::new(0, 0))
+                .call_log("warn", &[Value::str(msg)], Span::new(0, 0))
                 .await;
         }
         #[cfg(not(feature = "log"))]
@@ -1875,15 +1878,15 @@ impl Interp {
         let raw_body = String::from_utf8_lossy(&req.body).into_owned();
         let mut headers_obj = IndexMap::new();
         for (k, v) in &req.headers {
-            headers_obj.insert(k.to_ascii_lowercase(), Value::Str(v.clone().into()));
+            headers_obj.insert(k.to_ascii_lowercase(), Value::str(v.clone()));
         }
         let mut req_obj = IndexMap::new();
-        req_obj.insert("method".to_string(), Value::Str(req.method.clone().into()));
-        req_obj.insert("path".to_string(), Value::Str(path.clone().into()));
+        req_obj.insert("method".to_string(), Value::str(req.method.clone()));
+        req_obj.insert("path".to_string(), Value::str(path.clone()));
         req_obj.insert("query".to_string(), query);
         req_obj.insert("headers".to_string(), obj(headers_obj));
         req_obj.insert("params".to_string(), obj(params));
-        req_obj.insert("body".to_string(), Value::Str(raw_body.clone().into()));
+        req_obj.insert("body".to_string(), Value::str(raw_body.clone()));
         let request = obj(req_obj);
 
         // Schema validation (SP5 §2 typed routes): if the matched route declares
@@ -1934,12 +1937,12 @@ impl Interp {
                 };
                 match self.parse_value(&schema, &decoded, "", false, span).await {
                     Ok(validated) => {
-                        if let Value::Object(ref ro) = request {
+                        if let ValueKind::Object(ro) = request.kind() {
                             let mut map = ro.borrow_mut();
                             map.insert("body".to_string(), validated);
                             map.insert(
                                 "rawBody".to_string(),
-                                Value::Str(raw_body.clone().into()),
+                                Value::str(raw_body.clone()),
                             );
                         }
                     }
@@ -1998,8 +2001,11 @@ impl Interp {
             .run_chain(middleware, 0, handler, request, dispatch_id, span)
             .await
         {
-            Ok(Value::Future(f)) => f.get().await,
-            other => other,
+            Ok(v) => match v.kind() {
+                ValueKind::Future(f) => f.get().await,
+                _ => Ok(v),
+            },
+            err => err,
         };
         // A short-circuiting middleware (one that returns without calling `next`)
         // leaves its un-consumed `HttpNext` continuation in the resource table;
@@ -2065,8 +2071,8 @@ impl Interp {
             IndexMap::new(),
             ResourceState::HttpNext(Box::new(next_state)),
         );
-        let next = match &next_handle {
-            Value::Native(n) => Value::NativeMethod(Rc::new(NativeMethod {
+        let next = match next_handle.kind() {
+            ValueKind::Native(n) => Value::NativeMethod(Rc::new(NativeMethod {
                 receiver: n.clone(),
                 method: "call".into(),
             })),
@@ -2094,7 +2100,7 @@ impl Interp {
             }
         };
         let request = match args.first() {
-            Some(v) if !matches!(v, Value::Nil) => v.clone(),
+            Some(v) if !matches!(v.kind(), ValueKind::Nil) => v.clone(),
             _ => state.request,
         };
         self.run_chain(
@@ -2125,16 +2131,16 @@ pub struct NextState {
 /// Is `v` something `call_value` can invoke?
 fn is_callable(v: &Value) -> bool {
     matches!(
-        v,
+        v.kind(),
         // `Value::Closure` is the VM's compiled-function value — `call_value` (the
         // V4-T5 bridge) dispatches it to the VM. A route handler / middleware passed
         // from a VM program is a Closure; accept it like any other callable.
-        Value::Function(_)
-            | Value::Closure(_)
-            | Value::Builtin(_)
-            | Value::Class(_)
-            | Value::BoundMethod(_)
-            | Value::NativeMethod(_)
+        ValueKind::Function(_)
+            | ValueKind::Closure(_)
+            | ValueKind::Builtin(_)
+            | ValueKind::Class(_)
+            | ValueKind::BoundMethod(_)
+            | ValueKind::NativeMethod(_)
     )
 }
 

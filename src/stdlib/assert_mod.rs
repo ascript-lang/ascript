@@ -18,7 +18,7 @@ use crate::error::AsError;
 use crate::interp::{make_error, Control, Interp};
 use crate::span::Span;
 use crate::stdlib::object::deep_equal;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 use rust_decimal::prelude::ToPrimitive;
 
 // ── structural diff (spec §6.5) ──────────────────────────────────────────────
@@ -76,8 +76,8 @@ fn diff_inner(
         diff_change_line(path, a, b, out);
         return;
     }
-    match (a, b) {
-        (Value::Array(x), Value::Array(y)) => {
+    match (a.kind(), b.kind()) {
+        (ValueKind::Array(x), ValueKind::Array(y)) => {
             // Cycle guard mirroring deep_equal: a revisited pair is "equal".
             if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return;
@@ -98,7 +98,7 @@ fn diff_inner(
                 out.push_str(&format!("+ {}[{}]: {}\n", path, i, y[i]));
             }
         }
-        (Value::Object(x), Value::Object(y)) => {
+        (ValueKind::Object(x), ValueKind::Object(y)) => {
             if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return;
             }
@@ -354,7 +354,7 @@ impl Interp {
                 if !deep_equal(&a, &b) {
                     return Err(fail(eq_fail_message(&a, &b), msg.as_deref(), span));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.deepEq(a, b, msg?) — alias for assert.eq ──────────────
             //
@@ -368,7 +368,7 @@ impl Interp {
                 if !deep_equal(&a, &b) {
                     return Err(fail(eq_fail_message(&a, &b), msg.as_deref(), span));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.matches(value, regex) ─────────────────────────────────
             //
@@ -382,8 +382,8 @@ impl Interp {
             #[cfg(feature = "data")]
             "matches" => {
                 let value = arg(args, 0);
-                let s = match &value {
-                    Value::Str(s) => s.to_string(),
+                let s = match value.kind() {
+                    ValueKind::Str(s) => s.to_string(),
                     _ => {
                         return Err(AsError::at(
                             format!(
@@ -396,9 +396,9 @@ impl Interp {
                     }
                 };
                 let pat_val = arg(args, 1);
-                let (re, pat_src) = match &pat_val {
-                    Value::Regex(r) => (r.re.clone(), r.source.clone()),
-                    Value::Str(p) => match regex::Regex::new(p) {
+                let (re, pat_src) = match pat_val.kind() {
+                    ValueKind::Regex(r) => (r.re.clone(), r.source.clone()),
+                    ValueKind::Str(p) => match regex::Regex::new(p) {
                         Ok(re) => (re, p.to_string()),
                         Err(e) => {
                             return Err(AsError::at(
@@ -429,7 +429,7 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.ne(a, b, msg?) ─────────────────────────────────────────
             "ne" => {
@@ -443,7 +443,7 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.isTrue(x) ──────────────────────────────────────────────
             "isTrue" => {
@@ -455,7 +455,7 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.isFalse(x) ─────────────────────────────────────────────
             "isFalse" => {
@@ -467,27 +467,27 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.isNil(x) ───────────────────────────────────────────────
             "isNil" => {
                 let x = arg(args, 0);
-                if x != Value::Nil {
+                if x != Value::nil() {
                     return Err(fail(
                         format!("assert.isNil failed: expected nil, got {}", x),
                         None,
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.notNil(x) ──────────────────────────────────────────────
             "notNil" => {
                 let x = arg(args, 0);
-                if x == Value::Nil {
+                if x == Value::nil() {
                     return Err(fail("assert.notNil failed: got nil", None, span));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.gt / gte / lt / lte ────────────────────────────────────
             "gt" | "gte" | "lt" | "lte" => {
@@ -508,17 +508,17 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.contains(haystack, needle) ─────────────────────────────
             "contains" => {
                 let haystack = arg(args, 0);
                 let needle = arg(args, 1);
-                let found = match &haystack {
-                    Value::Str(s) => {
+                let found = match haystack.kind() {
+                    ValueKind::Str(s) => {
                         // needle must be a string for substring search
-                        match &needle {
-                            Value::Str(n) => s.contains(n.as_ref()),
+                        match needle.kind() {
+                            ValueKind::Str(n) => s.contains(n.as_ref()),
                             _ => {
                                 return Err(AsError::at(
                                     format!(
@@ -531,14 +531,14 @@ impl Interp {
                             }
                         }
                     }
-                    Value::Array(a) => {
+                    ValueKind::Array(a) => {
                         // membership by == (Value PartialEq)
                         a.borrow().iter().any(|elem| deep_equal(elem, &needle))
                     }
-                    Value::Object(o) => {
+                    ValueKind::Object(o) => {
                         // key presence — needle must be a string
-                        match &needle {
-                            Value::Str(k) => o.contains_key(k.as_ref()),
+                        match needle.kind() {
+                            ValueKind::Str(k) => o.contains_key(k.as_ref()),
                             _ => {
                                 return Err(AsError::at(
                                     format!(
@@ -551,7 +551,7 @@ impl Interp {
                             }
                         }
                     }
-                    Value::Map(m) => {
+                    ValueKind::Map(m) => {
                         // key presence — needle must be a hashable map key
                         match crate::value::MapKey::from_value(&needle) {
                             Some(k) => m.borrow().contains_key(&k),
@@ -585,7 +585,7 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.approxEq(a, b, epsilon?) ──────────────────────────────
             "approxEq" => {
@@ -593,16 +593,17 @@ impl Interp {
                 let b = arg(args, 1);
                 // Both Number and Decimal are accepted (consistent with gt/gte/lt/lte).
                 let (an, bn) = numeric_pair(&a, &b, "approxEq", span)?;
-                let epsilon = match arg(args, 2) {
-                    Value::Nil => 1e-9_f64,
+                let eps_val = arg(args, 2);
+                let epsilon = match eps_val.kind() {
+                    ValueKind::Nil => 1e-9_f64,
                     // NUM §4: accept BOTH numeric subtypes.
-                    ref v if v.is_number() => v.as_f64().unwrap_or(f64::NAN),
-                    Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
-                    v => {
+                    _ if eps_val.is_number() => eps_val.as_f64().unwrap_or(f64::NAN),
+                    ValueKind::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
+                    _ => {
                         return Err(AsError::at(
                             format!(
                                 "assert.approxEq epsilon expects a number, got {}",
-                                crate::interp::type_name(&v)
+                                crate::interp::type_name(&eps_val)
                             ),
                             span,
                         )
@@ -622,7 +623,7 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             // ── assert.throws(fn) -> errValue ─────────────────────────────────
             //
@@ -635,13 +636,16 @@ impl Interp {
                 let call_result = self.call_value(callee, vec![], span).await;
                 // Drive any returned future to completion (async fn path).
                 let result: Result<Value, Control> = match call_result {
-                    Ok(Value::Future(f)) => f.get().await,
+                    Ok(v) if matches!(v.kind(), ValueKind::Future(_)) => match v.into_kind() {
+                        OwnedKind::Future(f) => f.get().await,
+                        _ => unreachable!(),
+                    },
                     other => other,
                 };
                 match result {
                     Err(Control::Panic(e)) => {
                         // Return the error value (same shape recover returns).
-                        Ok(make_error(Value::Str(e.message.into())))
+                        Ok(make_error(Value::str(e.message)))
                     }
                     Err(other) => {
                         // Propagate / Exit pass through unchanged.
@@ -665,13 +669,14 @@ impl Interp {
             // shape of assert.throws exactly.
             "throwsWith" => {
                 let callee = arg(args, 0);
-                let needle = match arg(args, 1) {
-                    Value::Str(s) => s.to_string(),
-                    v => {
+                let needle_val = arg(args, 1);
+                let needle = match needle_val.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => {
                         return Err(AsError::at(
                             format!(
                                 "assert.throwsWith: substr must be a string, got {}",
-                                crate::interp::type_name(&v)
+                                crate::interp::type_name(&needle_val)
                             ),
                             span,
                         )
@@ -680,14 +685,17 @@ impl Interp {
                 };
                 let call_result = self.call_value(callee, vec![], span).await;
                 let result: Result<Value, Control> = match call_result {
-                    Ok(Value::Future(f)) => f.get().await,
+                    Ok(v) if matches!(v.kind(), ValueKind::Future(_)) => match v.into_kind() {
+                        OwnedKind::Future(f) => f.get().await,
+                        _ => unreachable!(),
+                    },
                     other => other,
                 };
                 match result {
                     Err(Control::Panic(e)) => {
                         let actual = e.message.clone();
                         if actual.contains(&needle) {
-                            Ok(make_error(Value::Str(actual.into())))
+                            Ok(make_error(Value::str(actual)))
                         } else {
                             Err(AsError::at(
                                 format!(
@@ -716,8 +724,8 @@ impl Interp {
             #[cfg(all(feature = "sys", feature = "data"))]
             "snapshot" => {
                 let name_val = arg(args, 0);
-                let name = match &name_val {
-                    Value::Str(s) => s.to_string(),
+                let name = match name_val.kind() {
+                    ValueKind::Str(s) => s.to_string(),
                     _ => {
                         return Err(AsError::at(
                             format!(
@@ -773,7 +781,7 @@ impl Interp {
                     Ok(pass) => {
                         // Record the touched `.snap` file for post-run orphan detection.
                         self.record_snapshot_touched(pass.file);
-                        Ok(Value::Nil)
+                        Ok(Value::nil())
                     }
                     Err(msg) => Err(AsError::at(msg, span).into()),
                 }
@@ -788,18 +796,21 @@ impl Interp {
 /// Extract an optional user-provided message string (3rd/2nd arg etc.).
 fn opt_str(args: &[Value], i: usize) -> Option<String> {
     match args.get(i) {
-        Some(Value::Str(s)) => Some(s.to_string()),
-        Some(Value::Nil) | None => None,
-        Some(v) => Some(v.to_string()),
+        Some(v) => match v.kind() {
+            ValueKind::Str(s) => Some(s.to_string()),
+            ValueKind::Nil => None,
+            _ => Some(v.to_string()),
+        },
+        None => None,
     }
 }
 
 /// Unwrap both values as numbers; panics with a clear message if either is not.
 fn numeric_pair(a: &Value, b: &Value, func: &str, span: Span) -> Result<(f64, f64), Control> {
     // NUM §4: accept BOTH numeric subtypes (and Decimal).
-    let an = match a {
-        v if v.is_number() => v.as_f64().unwrap_or(f64::NAN),
-        Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
+    let an = match a.kind() {
+        _ if a.is_number() => a.as_f64().unwrap_or(f64::NAN),
+        ValueKind::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
         _ => {
             return Err(AsError::at(
                 format!(
@@ -812,9 +823,9 @@ fn numeric_pair(a: &Value, b: &Value, func: &str, span: Span) -> Result<(f64, f6
             .into())
         }
     };
-    let bn = match b {
-        v if v.is_number() => v.as_f64().unwrap_or(f64::NAN),
-        Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
+    let bn = match b.kind() {
+        _ if b.is_number() => b.as_f64().unwrap_or(f64::NAN),
+        ValueKind::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
         _ => {
             return Err(AsError::at(
                 format!(
@@ -1316,18 +1327,18 @@ A.eq(1, 1)
         use super::structural_diff;
         use crate::value::{ArrayCell, ObjectCell, Value};
         // Scalars.
-        assert_eq!(structural_diff(&Value::Int(1), &Value::Int(1)), "");
+        assert_eq!(structural_diff(&Value::int(1), &Value::int(1)), "");
         // 1 vs 1.0 — deep_equal-equal → empty diff (no spurious change).
-        assert_eq!(structural_diff(&Value::Int(1), &Value::Float(1.0)), "");
+        assert_eq!(structural_diff(&Value::int(1), &Value::float(1.0)), "");
         // Deep arrays.
-        let a = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2)]));
-        let b = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2)]));
+        let a = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
+        let b = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
         assert_eq!(structural_diff(&a, &b), "");
         // Objects (insertion order).
         let mut o1 = indexmap::IndexMap::new();
-        o1.insert("a".to_string(), Value::Int(1));
+        o1.insert("a".to_string(), Value::int(1));
         let mut o2 = indexmap::IndexMap::new();
-        o2.insert("a".to_string(), Value::Int(1));
+        o2.insert("a".to_string(), Value::int(1));
         assert_eq!(
             structural_diff(&Value::Object(ObjectCell::new(o1)), &Value::Object(ObjectCell::new(o2))),
             ""
@@ -1339,13 +1350,13 @@ A.eq(1, 1)
         use super::structural_diff;
         use crate::value::{ObjectCell, Value};
         let mut a = indexmap::IndexMap::new();
-        a.insert("keep".to_string(), Value::Int(1));
-        a.insert("change".to_string(), Value::Int(2));
-        a.insert("gone".to_string(), Value::Int(3));
+        a.insert("keep".to_string(), Value::int(1));
+        a.insert("change".to_string(), Value::int(2));
+        a.insert("gone".to_string(), Value::int(3));
         let mut b = indexmap::IndexMap::new();
-        b.insert("keep".to_string(), Value::Int(1));
-        b.insert("change".to_string(), Value::Int(9));
-        b.insert("extra".to_string(), Value::Int(4));
+        b.insert("keep".to_string(), Value::int(1));
+        b.insert("change".to_string(), Value::int(9));
+        b.insert("extra".to_string(), Value::int(4));
         let d = structural_diff(&Value::Object(ObjectCell::new(a)), &Value::Object(ObjectCell::new(b)));
         assert!(d.contains(".change: 2 → 9"), "change: {d}");
         assert!(d.contains("- .gone: 3"), "remove: {d}");
@@ -1358,13 +1369,13 @@ A.eq(1, 1)
         use super::structural_diff;
         use crate::value::{ArrayCell, Value};
         // index change
-        let a = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2)]));
-        let b = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(7)]));
+        let a = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2)]));
+        let b = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(7)]));
         let d = structural_diff(&a, &b);
         assert!(d.contains("[1]: 2 → 7"), "index change: {d}");
         // length difference (extra in a → removed)
-        let a2 = Value::Array(ArrayCell::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
-        let b2 = Value::Array(ArrayCell::new(vec![Value::Int(1)]));
+        let a2 = Value::Array(ArrayCell::new(vec![Value::int(1), Value::int(2), Value::int(3)]));
+        let b2 = Value::Array(ArrayCell::new(vec![Value::int(1)]));
         let d2 = structural_diff(&a2, &b2);
         assert!(d2.contains("- [1]: 2"), "removed idx 1: {d2}");
         assert!(d2.contains("- [2]: 3"), "removed idx 2: {d2}");
@@ -1381,7 +1392,7 @@ A.eq(1, 1)
         // { users: [ { name: "a" } ] } vs { users: [ { name: "b" } ] }
         let mk = |name: &str| {
             let mut inner = indexmap::IndexMap::new();
-            inner.insert("name".to_string(), Value::Str(name.into()));
+            inner.insert("name".to_string(), Value::str(name));
             let arr = Value::Array(ArrayCell::new(vec![Value::Object(ObjectCell::new(inner))]));
             let mut top = indexmap::IndexMap::new();
             top.insert("users".to_string(), arr);

@@ -21,7 +21,7 @@ use super::{arg, bi};
 use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
 use indexmap::IndexMap;
 use std::rc::Rc;
 
@@ -50,7 +50,10 @@ impl EventsState {
 }
 
 fn is_callable(v: &Value) -> bool {
-    matches!(v, Value::Function(_) | Value::Builtin(_) | Value::Closure(_))
+    matches!(
+        v.kind(),
+        ValueKind::Function(_) | ValueKind::Builtin(_) | ValueKind::Closure(_)
+    )
 }
 
 impl Interp {
@@ -103,7 +106,7 @@ impl Interp {
                         });
                     }
                 });
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "off" => {
                 let event = want_event(&arg(&args, 0), span, "off")?;
@@ -117,7 +120,8 @@ impl Interp {
                             }
                             match &target {
                                 // No fn given → remove all for this event.
-                                None | Some(Value::Nil) => false,
+                                None => false,
+                                Some(t) if matches!(t.kind(), ValueKind::Nil) => false,
                                 // Remove the listener that is identity-equal to `target`.
                                 Some(t) => l.callback != *t,
                             }
@@ -127,7 +131,7 @@ impl Interp {
                     _ => 0,
                 });
                 // NUM §4: a count of removed listeners is an `int`.
-                Ok(Value::Int(removed as i64))
+                Ok(Value::int(removed as i64))
             }
             "listenerCount" => {
                 let event = want_event(&arg(&args, 0), span, "listenerCount")?;
@@ -138,7 +142,7 @@ impl Interp {
                     _ => 0,
                 });
                 // NUM §4: a listener count is an `int`.
-                Ok(Value::Int(n as i64))
+                Ok(Value::int(n as i64))
             }
             "emit" => {
                 let event = want_event(&arg(&args, 0), span, "emit")?;
@@ -165,12 +169,12 @@ impl Interp {
                     let result = self.call_value(cb, call_args.clone(), span).await?;
                     // An `async fn` listener returns a Future; drive it to
                     // completion so listeners are awaited in registration order.
-                    if let Value::Future(f) = result {
+                    if let crate::value::OwnedKind::Future(f) = result.into_kind() {
                         f.get().await?;
                     }
                 }
                 // NUM §4: a count of invoked listeners is an `int`.
-                Ok(Value::Int(count as i64))
+                Ok(Value::int(count as i64))
             }
             other => Err(AsError::at(format!("emitter has no method '{}'", other), span).into()),
         }
@@ -179,13 +183,13 @@ impl Interp {
 
 /// The event name must be a string.
 fn want_event(v: &Value, span: Span, ctx: &str) -> Result<String, Control> {
-    match v {
-        Value::Str(s) => Ok(s.to_string()),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.to_string()),
+        _ => Err(AsError::at(
             format!(
                 "events.{}: event name must be a string, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )

@@ -4,7 +4,7 @@ use super::{arg, bi, want_number, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -28,20 +28,20 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "parseNumber" => {
             let s = want_string(&arg(args, 0), span, &ctx("parseNumber"))?;
             match s.trim().parse::<f64>() {
-                Ok(n) => Ok(make_pair(Value::Float(n), Value::Nil)),
+                Ok(n) => Ok(make_pair(Value::float(n), Value::nil())),
                 Err(_) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(
-                        format!("cannot parse '{}' as a number", s).into(),
+                    Value::nil(),
+                    make_error(Value::str(
+                        format!("cannot parse '{}' as a number", s),
                     )),
                 )),
             }
         }
         "parseInt" => {
             let s = want_string(&arg(args, 0), span, &ctx("parseInt"))?;
-            let radix = match args.get(1) {
-                None | Some(Value::Nil) => 10u32,
-                Some(v) => want_number(v, span, &ctx("parseInt"))? as u32,
+            let radix = match args.get(1).map(|v| v.kind()) {
+                None | Some(ValueKind::Nil) => 10u32,
+                Some(_) => want_number(&args[1], span, &ctx("parseInt"))? as u32,
             };
             if !(2..=36).contains(&radix) {
                 return Err(
@@ -50,16 +50,16 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             }
             match i64::from_str_radix(s.trim(), radix) {
                 // NUM §4: `parseInt` yields an `Int`.
-                Ok(n) => Ok(make_pair(Value::Int(n), Value::Nil)),
+                Ok(n) => Ok(make_pair(Value::int(n), Value::nil())),
                 Err(_) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(
-                        format!("cannot parse '{}' as an integer (radix {})", s, radix).into(),
+                    Value::nil(),
+                    make_error(Value::str(
+                        format!("cannot parse '{}' as an integer (radix {})", s, radix),
                     )),
                 )),
             }
         }
-        "toString" => Ok(Value::Str(arg(args, 0).to_string().into())),
+        "toString" => Ok(Value::str(arg(args, 0).to_string())),
         // toNumber: coerce-or-panic (Tier-2). Unlike parseNumber, a string that won't parse PANICS,
         // because toNumber's contract is "this IS a number-like value" — use parseNumber for untrusted input.
         "toNumber" => {
@@ -70,16 +70,16 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             if v.is_number() {
                 return Ok(v);
             }
-            let n = match &v {
-                Value::Bool(b) => {
-                    if *b {
+            let n = match v.kind() {
+                ValueKind::Bool(b) => {
+                    if b {
                         1.0
                     } else {
                         0.0
                     }
                 }
-                Value::Nil => 0.0,
-                Value::Str(s) => match s.trim().parse::<f64>() {
+                ValueKind::Nil => 0.0,
+                ValueKind::Str(s) => match s.trim().parse::<f64>() {
                     Ok(n) => n,
                     Err(_) => {
                         return Err(AsError::at(
@@ -100,9 +100,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     .into())
                 }
             };
-            Ok(Value::Float(n))
+            Ok(Value::float(n))
         }
-        "toBool" => Ok(Value::Bool(arg(args, 0).is_truthy())),
+        "toBool" => Ok(Value::bool_(arg(args, 0).is_truthy())),
         _ => Err(AsError::at(format!("std/convert has no function '{}'", func), span).into()),
     }
 }
@@ -114,7 +114,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     #[test]
@@ -128,13 +128,13 @@ mod tests {
     #[test]
     fn parse_int_radix() {
         assert_eq!(
-            call("parseInt", &[s("ff"), Value::Float(16.0)], sp())
+            call("parseInt", &[s("ff"), Value::float(16.0)], sp())
                 .unwrap()
                 .to_string(),
             "[255, nil]"
         );
         assert_eq!(
-            call("parseInt", &[s("101"), Value::Float(2.0)], sp())
+            call("parseInt", &[s("101"), Value::float(2.0)], sp())
                 .unwrap()
                 .to_string(),
             "[5, nil]"
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn parse_int_bad_radix_panics() {
         assert!(matches!(
-            call("parseInt", &[s("1"), Value::Float(99.0)], sp()),
+            call("parseInt", &[s("1"), Value::float(99.0)], sp()),
             Err(Control::Panic(_))
         ));
     }
@@ -157,29 +157,29 @@ mod tests {
     fn coercions() {
         // NUM §4: a `float` stringifies with a decimal.
         assert_eq!(
-            call("toString", &[Value::Float(7.0)], sp()).unwrap(),
+            call("toString", &[Value::float(7.0)], sp()).unwrap(),
             s("7.0")
         );
         assert_eq!(
-            call("toNumber", &[Value::Bool(true)], sp()).unwrap(),
-            Value::Float(1.0)
+            call("toNumber", &[Value::bool_(true)], sp()).unwrap(),
+            Value::float(1.0)
         );
         assert_eq!(
             call("toNumber", &[s(" 42 ")], sp()).unwrap(),
-            Value::Float(42.0)
+            Value::float(42.0)
         );
         // NUM §3.3: `0.0` is falsy.
         assert_eq!(
-            call("toBool", &[Value::Float(0.0)], sp()).unwrap(),
-            Value::Bool(false)
+            call("toBool", &[Value::float(0.0)], sp()).unwrap(),
+            Value::bool_(false)
         );
         assert_eq!(
-            call("toBool", &[Value::Float(2.5)], sp()).unwrap(),
-            Value::Bool(true)
+            call("toBool", &[Value::float(2.5)], sp()).unwrap(),
+            Value::bool_(true)
         );
         assert_eq!(
-            call("toBool", &[Value::Nil], sp()).unwrap(),
-            Value::Bool(false)
+            call("toBool", &[Value::nil()], sp()).unwrap(),
+            Value::bool_(false)
         );
     }
 
@@ -218,7 +218,7 @@ mod tests {
         assert!(over.to_string().starts_with("[nil, {message:"));
         // parseNumber on a non-string arg → Tier-2 panic (want_string)
         assert!(matches!(
-            call("parseNumber", &[Value::Float(1.0)], sp),
+            call("parseNumber", &[Value::float(1.0)], sp),
             Err(Control::Panic(_))
         ));
         // toString on a compound value
@@ -226,7 +226,7 @@ mod tests {
             call(
                 "toString",
                 &[Value::Array(crate::value::ArrayCell::new(
-                    vec![Value::Float(1.0), Value::Float(2.0)]
+                    vec![Value::float(1.0), Value::float(2.0)]
                 ))],
                 sp
             )

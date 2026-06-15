@@ -17,7 +17,7 @@ use super::{arg, bi, want_bytes};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use ciborium::value::Value as Cb;
 use indexmap::IndexMap;
 
@@ -28,16 +28,16 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// AScript `Value` → `ciborium::value::Value`. Err(String) on an unrepresentable
 /// handle or a reference cycle.
 pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
-    match v {
-        Value::Nil => Ok(Cb::Null),
-        Value::Bool(b) => Ok(Cb::Bool(*b)),
+    match v.kind() {
+        ValueKind::Nil => Ok(Cb::Null),
+        ValueKind::Bool(b) => Ok(Cb::Bool(b)),
         // NUM §4: an `Int` encodes as a CBOR integer directly.
-        Value::Int(i) => Ok(Cb::Integer((*i).into())),
-        Value::Float(n) => Ok(number_to_cbor(*n)),
-        Value::Decimal(d) => Ok(Cb::Text(d.to_string())),
-        Value::Str(s) => Ok(Cb::Text(s.to_string())),
-        Value::Bytes(b) => Ok(Cb::Bytes(b.borrow().clone())),
-        Value::Array(a) => {
+        ValueKind::Int(i) => Ok(Cb::Integer(i.into())),
+        ValueKind::Float(n) => Ok(number_to_cbor(n)),
+        ValueKind::Decimal(d) => Ok(Cb::Text(d.to_string())),
+        ValueKind::Str(s) => Ok(Cb::Text(s.to_string())),
+        ValueKind::Bytes(b) => Ok(Cb::Bytes(b.borrow().clone())),
+        ValueKind::Array(a) => {
             let ptr = crate::gc::cc_addr(a);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to CBOR".into());
@@ -50,7 +50,7 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
             seen.pop();
             Ok(Cb::Array(out))
         }
-        Value::Set(s) => {
+        ValueKind::Set(s) => {
             let ptr = crate::gc::cc_addr(s);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to CBOR".into());
@@ -63,7 +63,7 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
             seen.pop();
             Ok(Cb::Array(out))
         }
-        Value::Object(o) => {
+        ValueKind::Object(o) => {
             let ptr = crate::gc::cc_addr(o);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to CBOR".into());
@@ -77,7 +77,7 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
             seen.pop();
             Ok(Cb::Map(pairs))
         }
-        Value::Map(m) => {
+        ValueKind::Map(m) => {
             let ptr = crate::gc::cc_addr(m);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to CBOR".into());
@@ -93,16 +93,16 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
         // SRV §3: a frozen value encodes like its underlying kind. Frozen containers
         // materialize one level + recurse; instance/enum-variant/regex error like a
         // live one (no live arm exists for them either).
-        Value::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
+        ValueKind::Shared(node) => match crate::interp::shared_to_value_shallow(node) {
             Some(live) => to_cbor(&live, seen),
             None => Err(format!(
                 "cannot serialize a value of type {} to CBOR",
                 node.kind_name()
             )),
         },
-        other => Err(format!(
+        _ => Err(format!(
             "cannot serialize a value of type {} to CBOR",
-            crate::interp::type_name(other)
+            crate::interp::type_name(v)
         )),
     }
 }
@@ -126,21 +126,21 @@ fn number_to_cbor(n: f64) -> Cb {
 /// key is text, else to `Map`.
 pub(crate) fn from_cbor(cb: &Cb) -> Value {
     match cb {
-        Cb::Null => Value::Nil,
+        Cb::Null => Value::nil(),
         // Undefined has no AScript equivalent → nil.
-        Cb::Bool(b) => Value::Bool(*b),
+        Cb::Bool(b) => Value::bool_(*b),
         Cb::Integer(i) => {
             // NUM §4: a CBOR integer decodes to `Int` when it fits `i64`; a value
             // outside `i64` range is preserved as `Float` (the only lossy edge).
             let n: i128 = (*i).into();
             if n >= i64::MIN as i128 && n <= i64::MAX as i128 {
-                Value::Int(n as i64)
+                Value::int(n as i64)
             } else {
-                Value::Float(n as f64)
+                Value::float(n as f64)
             }
         }
-        Cb::Float(f) => Value::Float(*f),
-        Cb::Text(s) => Value::Str(s.as_str().into()),
+        Cb::Float(f) => Value::float(*f),
+        Cb::Text(s) => Value::str(s.as_str()),
         Cb::Bytes(b) => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
         Cb::Array(a) => {
             Value::Array(crate::value::ArrayCell::new(a.iter().map(from_cbor).collect()))
@@ -168,7 +168,7 @@ pub(crate) fn from_cbor(cb: &Cb) -> Value {
         // A tagged value: use the inner value (the tag semantics are not modeled).
         Cb::Tag(_, inner) => from_cbor(inner),
         // ciborium::value::Value is non_exhaustive; any future variant → nil.
-        _ => Value::Nil,
+        _ => Value::nil(),
     }
 }
 
@@ -188,10 +188,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let buf = bytes.borrow();
             let slice: &[u8] = &buf;
             match ciborium::from_reader::<Cb, _>(slice) {
-                Ok(cb) => Ok(make_pair(from_cbor(&cb), Value::Nil)),
+                Ok(cb) => Ok(make_pair(from_cbor(&cb), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid CBOR: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid CBOR: {}", e))),
                 )),
             }
         }
@@ -210,10 +210,10 @@ mod tests {
     fn roundtrip(v: Value) -> Value {
         let bytes = call("encode", &[v], sp()).unwrap();
         let pair = call("decode", &[bytes], sp()).unwrap();
-        match pair {
-            Value::Array(a) => {
+        match pair.kind() {
+            ValueKind::Array(a) => {
                 let b = a.borrow();
-                assert_eq!(b[1], Value::Nil, "decode err should be nil");
+                assert_eq!(b[1], Value::nil(), "decode err should be nil");
                 b[0].clone()
             }
             _ => panic!("decode did not return a pair"),
@@ -222,19 +222,19 @@ mod tests {
 
     #[test]
     fn roundtrip_primitives() {
-        assert_eq!(roundtrip(Value::Float(42.0)), Value::Float(42.0));
-        assert_eq!(roundtrip(Value::Float(3.5)), Value::Float(3.5));
-        assert_eq!(roundtrip(Value::Float(-7.0)), Value::Float(-7.0));
-        assert_eq!(roundtrip(Value::Str("hi".into())), Value::Str("hi".into()));
-        assert_eq!(roundtrip(Value::Bool(false)), Value::Bool(false));
-        assert_eq!(roundtrip(Value::Nil), Value::Nil);
+        assert_eq!(roundtrip(Value::float(42.0)), Value::float(42.0));
+        assert_eq!(roundtrip(Value::float(3.5)), Value::float(3.5));
+        assert_eq!(roundtrip(Value::float(-7.0)), Value::float(-7.0));
+        assert_eq!(roundtrip(Value::str("hi")), Value::str("hi"));
+        assert_eq!(roundtrip(Value::bool_(false)), Value::bool_(false));
+        assert_eq!(roundtrip(Value::nil()), Value::nil());
     }
 
     #[test]
     fn roundtrip_bytes() {
-        let b = Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(vec![0, 1, 254, 255])));
-        match roundtrip(b) {
-            Value::Bytes(out) => assert_eq!(*out.borrow(), vec![0, 1, 254, 255]),
+        let b = Value::bytes(vec![0, 1, 254, 255]);
+        match roundtrip(b).kind() {
+            ValueKind::Bytes(out) => assert_eq!(*out.borrow(), vec![0, 1, 254, 255]),
             other => panic!("expected bytes, got {:?}", other),
         }
     }
@@ -242,15 +242,15 @@ mod tests {
     #[test]
     fn roundtrip_nested_object() {
         let mut m = IndexMap::new();
-        m.insert("ok".to_string(), Value::Bool(true));
+        m.insert("ok".to_string(), Value::bool_(true));
         m.insert(
             "xs".to_string(),
-            Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)])),
+            Value::array(vec![Value::float(1.0)]),
         );
-        let obj = Value::Object(crate::value::ObjectCell::new(m));
-        match roundtrip(obj) {
-            Value::Object(o) => {
-                assert_eq!(o.get("ok"), Some(Value::Bool(true)));
+        let obj = Value::object(m);
+        match roundtrip(obj).kind() {
+            ValueKind::Object(o) => {
+                assert_eq!(o.get("ok"), Some(Value::bool_(true)));
             }
             other => panic!("expected object, got {:?}", other),
         }
@@ -260,40 +260,38 @@ mod tests {
     fn roundtrip_number_keyed_map_stays_map() {
         let mut m: IndexMap<crate::value::MapKey, Value> = IndexMap::new();
         m.insert(
-            crate::value::MapKey::from_value(&Value::Float(7.0)).unwrap(),
-            Value::Str("seven".into()),
+            crate::value::MapKey::from_value(&Value::float(7.0)).unwrap(),
+            Value::str("seven"),
         );
-        assert!(matches!(roundtrip(Value::Map(crate::value::MapCell::new(m))), Value::Map(_)));
+        assert!(matches!(roundtrip(Value::map(m)).kind(), ValueKind::Map(_)));
     }
 
     #[test]
     fn malformed_bytes_is_tier1_err() {
         // 0x1f is a reserved/ill-formed additional-info → decode error.
-        let bad = Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(vec![0x1f])));
+        let bad = Value::bytes(vec![0x1f]);
         let pair = call("decode", &[bad], sp()).unwrap();
-        if let Value::Array(a) = pair {
+        if let ValueKind::Array(a) = pair.kind() {
             let b = a.borrow();
-            assert_eq!(b[0], Value::Nil);
-            assert!(matches!(b[1], Value::Object(_)), "err should be set");
+            assert_eq!(b[0], Value::nil());
+            assert!(matches!(b[1].kind(), ValueKind::Object(_)), "err should be set");
         }
     }
 
     #[test]
     fn encode_function_is_tier2_panic() {
-        assert!(call("encode", &[Value::Builtin("math.abs".into())], sp()).is_err());
+        assert!(call("encode", &[Value::builtin("math.abs")], sp()).is_err());
     }
 
     #[test]
     fn fixture_decodes_to_expected() {
         // Canonical CBOR: map{1} "a":1 → a1 61 61 01
-        let fixture = Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(vec![
-            0xa1, 0x61, 0x61, 0x01,
-        ])));
+        let fixture = Value::bytes(vec![0xa1, 0x61, 0x61, 0x01]);
         let pair = call("decode", &[fixture], sp()).unwrap();
-        if let Value::Array(a) = pair {
+        if let ValueKind::Array(a) = pair.kind() {
             let b = a.borrow();
-            match &b[0] {
-                Value::Object(o) => assert_eq!(o.get("a"), Some(Value::Float(1.0))),
+            match b[0].kind() {
+                ValueKind::Object(o) => assert_eq!(o.get("a"), Some(Value::float(1.0))),
                 other => panic!("expected object, got {:?}", other),
             }
         }
@@ -306,24 +304,21 @@ mod tests {
     fn frozen_container_encodes_like_live() {
         use crate::stdlib::shared;
         let mut m = indexmap::IndexMap::new();
-        m.insert("a".to_string(), Value::Int(1));
+        m.insert("a".to_string(), Value::int(1));
         m.insert(
             "xs".to_string(),
-            Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Int(2),
-                Value::Int(3),
-            ])),
+            Value::array(vec![Value::int(2), Value::int(3)]),
         );
-        let live = Value::Object(crate::value::ObjectCell::new(m));
+        let live = Value::object(m);
         let frozen = shared::freeze(&live, sp()).unwrap();
         // Encoding is deterministic: the frozen object must encode to the SAME bytes
         // as the live one (Value::Object `==` is identity, so compare the bytes).
-        let bytes_of = |v: Value| match call("encode", &[v], sp()).unwrap() {
-            Value::Bytes(b) => b.borrow().clone(),
+        let bytes_of = |v: Value| match call("encode", &[v], sp()).unwrap().kind() {
+            ValueKind::Bytes(b) => b.borrow().clone(),
             _ => panic!("encode did not return bytes"),
         };
         assert_eq!(bytes_of(live.clone()), bytes_of(frozen));
-        assert!(matches!(roundtrip(live), Value::Object(_)));
-        assert!(call("encode", &[shared::freeze(&Value::Int(7), sp()).unwrap()], sp()).is_ok());
+        assert!(matches!(roundtrip(live).kind(), ValueKind::Object(_)));
+        assert!(call("encode", &[shared::freeze(&Value::int(7), sp()).unwrap()], sp()).is_ok());
     }
 }

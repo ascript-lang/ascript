@@ -38,7 +38,7 @@ use super::{arg, bi, want_number};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, Value};
+use crate::value::{NativeKind, Value, ValueKind};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -168,13 +168,13 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn ok_send() -> Value {
-    make_pair(Value::Bool(true), Value::Nil)
+    make_pair(Value::bool_(true), Value::nil())
 }
 
 fn err_closed() -> Value {
     make_pair(
-        Value::Bool(false),
-        make_error(Value::Str("sync.send: channel is closed".into())),
+        Value::bool_(false),
+        make_error(Value::str("sync.send: channel is closed")),
     )
 }
 
@@ -248,10 +248,11 @@ impl Interp {
     // ── sync.channel ─────────────────────────────────────────────────────────
 
     fn sync_channel(&self, args: &[Value], span: Span) -> Result<Value, Control> {
-        let capacity = match arg(args, 0) {
-            Value::Nil => 0usize, // omitted → unbounded
-            v => {
-                let n = want_number(&v, span, "sync.channel capacity")?;
+        let cap_arg = arg(args, 0);
+        let capacity = match cap_arg.kind() {
+            ValueKind::Nil => 0usize, // omitted → unbounded
+            _ => {
+                let n = want_number(&cap_arg, span, "sync.channel capacity")?;
                 if n < 0.0 || n.fract() != 0.0 {
                     return Err(AsError::at(
                         "sync.channel capacity must be a non-negative integer",
@@ -385,7 +386,7 @@ impl Interp {
                     ch.not_full.notify_one();
                     return Ok(v);
                 }
-                Action::Closed => return Ok(Value::Nil),
+                Action::Closed => return Ok(Value::nil()),
                 Action::WaitEmpty => {
                     // Park until a value is pushed (or the channel closes).
                     //
@@ -431,9 +432,9 @@ impl Interp {
                     Some(v) => {
                         drop(inner);
                         ch.not_full.notify_one();
-                        Ok(make_pair(v, Value::Bool(true)))
+                        Ok(make_pair(v, Value::bool_(true)))
                     }
-                    None => Ok(make_pair(Value::Nil, Value::Bool(false))),
+                    None => Ok(make_pair(Value::nil(), Value::bool_(false))),
                 }
             }
         }
@@ -455,7 +456,7 @@ impl Interp {
                 ch.not_empty.notify_waiters();
                 // Wake all parked bounded senders (they will see `closed=true`).
                 ch.not_full.notify_waiters();
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
         }
     }
@@ -502,7 +503,7 @@ impl Interp {
                 let mut avail = sem.available.borrow_mut();
                 if *avail > 0 {
                     *avail -= 1;
-                    return Ok(Value::Nil);
+                    return Ok(Value::nil());
                 }
             } // borrow released
 
@@ -555,7 +556,7 @@ impl Interp {
                 if grew {
                     sem.permit_available.notify_one();
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
         }
     }
@@ -594,7 +595,7 @@ impl Interp {
             Some(sem) => {
                 // NUM §4: a permit count is an `int`.
                 let count = *sem.available.borrow() as i64;
-                Ok(Value::Int(count))
+                Ok(Value::int(count))
             }
         }
     }
@@ -607,8 +608,8 @@ impl Interp {
     /// one method: `limiter.acquire()` — async, awaits until a token is available.
     fn sync_rate_limiter(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let opts = arg(args, 0);
-        let (count, window_ms) = match &opts {
-            Value::Object(obj) => {
+        let (count, window_ms) = match opts.kind() {
+            ValueKind::Object(obj) => {
                 if let Some(ps) = obj.get("perSecond") {
                     let n = want_number(&ps, span, "sync.rateLimiter perSecond")?;
                     if n < 1.0 || n.fract() != 0.0 {
@@ -620,8 +621,8 @@ impl Interp {
                     }
                     (n as usize, 1000u64)
                 } else {
-                    let count_v = obj.get("count").unwrap_or(Value::Nil);
-                    let window_v = obj.get("windowMs").unwrap_or(Value::Nil);
+                    let count_v = obj.get("count").unwrap_or(Value::nil());
+                    let window_v = obj.get("windowMs").unwrap_or(Value::nil());
                     let c = want_number(&count_v, span, "sync.rateLimiter count")?;
                     let w = want_number(&window_v, span, "sync.rateLimiter windowMs")?;
                     if c < 1.0 || c.fract() != 0.0 {
@@ -641,11 +642,11 @@ impl Interp {
                     (c as usize, w as u64)
                 }
             }
-            other => {
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "sync.rateLimiter expects an options object, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&opts)
                     ),
                     span,
                 )
@@ -722,7 +723,7 @@ impl Interp {
             }; // borrows released
 
             match action {
-                Action::Took => return Ok(Value::Nil),
+                Action::Took => return Ok(Value::nil()),
                 Action::Wait { sleep_ms } => {
                     // Lost-wakeup-safe park (mirrors semaphore acquire):
                     // enable() the notified() future (registering the waiter NOW)
@@ -762,13 +763,13 @@ impl Interp {
 
 /// Extract the handle `id` from a `Value::Native(Channel)` argument.
 fn require_channel_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
-    match v {
-        Value::Native(obj) if obj.kind == NativeKind::Channel => Ok(obj.id),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Native(obj) if obj.kind == NativeKind::Channel => Ok(obj.id),
+        _ => Err(AsError::at(
             format!(
                 "{} expects a channel, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -778,13 +779,13 @@ fn require_channel_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> 
 
 /// Extract the handle `id` from a `Value::Native(Semaphore)` argument.
 fn require_semaphore_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
-    match v {
-        Value::Native(obj) if obj.kind == NativeKind::Semaphore => Ok(obj.id),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Native(obj) if obj.kind == NativeKind::Semaphore => Ok(obj.id),
+        _ => Err(AsError::at(
             format!(
                 "{} expects a semaphore, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )

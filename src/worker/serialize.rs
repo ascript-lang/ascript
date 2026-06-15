@@ -29,7 +29,7 @@
 //! filled, so a forward `Ref` resolves to the same (cycle-capable) handle.
 
 use crate::interp::Interp;
-use crate::value::{MapKey, Value};
+use crate::value::{MapKey, OwnedKind, Value, ValueKind};
 use std::collections::HashMap;
 
 /// A value that cannot cross an isolate boundary (our DataCloneError analog).
@@ -120,35 +120,35 @@ pub fn check_sendable(v: &Value) -> Result<(), SendError> {
 
 /// The kind name + hint for a non-sendable value, or `None` if it is sendable.
 fn unsendable_kind(v: &Value) -> Option<(&'static str, Option<&'static str>)> {
-    match v {
-        Value::Nil
-        | Value::Bool(_)
-        | Value::Int(_)
-        | Value::Float(_)
-        | Value::Decimal(_)
-        | Value::Str(_)
-        | Value::Bytes(_)
-        | Value::Array(_)
-        | Value::Object(_)
-        | Value::Map(_)
-        | Value::Set(_)
-        | Value::EnumVariant(_)
-        | Value::Instance(_) => None,
+    match v.kind() {
+        ValueKind::Nil
+        | ValueKind::Bool(_)
+        | ValueKind::Int(_)
+        | ValueKind::Float(_)
+        | ValueKind::Decimal(_)
+        | ValueKind::Str(_)
+        | ValueKind::Bytes(_)
+        | ValueKind::Array(_)
+        | ValueKind::Object(_)
+        | ValueKind::Map(_)
+        | ValueKind::Set(_)
+        | ValueKind::EnumVariant(_)
+        | ValueKind::Instance(_) => None,
         // SRV §3.7: a frozen `Shared` is THE sendable-by-pointer value — it crosses
         // by an `Arc` clone (zero copy), never a structured-clone walk. Sendable leaf.
-        Value::Shared(_) => None,
+        ValueKind::Shared(_) => None,
         #[cfg(feature = "data")]
-        Value::Regex(_) => None,
+        ValueKind::Regex(_) => None,
 
-        Value::Function(_) => Some(("function", None)),
-        Value::Builtin(_) => Some(("function", None)),
-        Value::Closure(_) => Some(("function", None)),
-        Value::BoundMethod(_) => Some(("function", None)),
-        Value::ClassMethod(..) => Some(("function", None)),
-        Value::GeneratorMethod(..) => Some(("function", None)),
+        ValueKind::Function(_) => Some(("function", None)),
+        ValueKind::Builtin(_) => Some(("function", None)),
+        ValueKind::Closure(_) => Some(("function", None)),
+        ValueKind::BoundMethod(_) => Some(("function", None)),
+        ValueKind::ClassMethod(..) => Some(("function", None)),
+        ValueKind::GeneratorMethod(..) => Some(("function", None)),
 
-        Value::NativeMethod(_) => Some(("native", None)),
-        Value::Native(n) => {
+        ValueKind::NativeMethod(_) => Some(("native", None)),
+        ValueKind::Native(n) => {
             // Event emitters and std/sync channels are isolate-local; nudge the
             // author toward worker results / actor messages.
             let hint = matches!(
@@ -159,17 +159,17 @@ fn unsendable_kind(v: &Value) -> Option<(&'static str, Option<&'static str>)> {
             Some(("native", hint))
         }
 
-        Value::Future(_) => Some(("future", None)),
-        Value::Generator(_) => Some(("generator", None)),
+        ValueKind::Future(_) => Some(("future", None)),
+        ValueKind::Generator(_) => Some(("generator", None)),
 
-        Value::Class(_) => Some(("class", None)),
+        ValueKind::Class(_) => Some(("class", None)),
         // IFACE (C5): an interface descriptor is code, non-sendable as a VALUE. This
         // arm makes `check_sendable` reject it with a field path, so `encode_value`'s
         // catch-all `unreachable!` is never reached. (Interfaces cross isolates via
         // code-shipping, Task 8 — not the value serializer.)
-        Value::Interface(_) => Some(("interface", None)),
-        Value::Enum(_) => Some(("enum", None)),
-        Value::Super(_) => Some(("super", None)),
+        ValueKind::Interface(_) => Some(("interface", None)),
+        ValueKind::Enum(_) => Some(("enum", None)),
+        ValueKind::Super(_) => Some(("super", None)),
     }
 }
 
@@ -185,8 +185,8 @@ fn check_inner(
             hint,
         });
     }
-    match v {
-        Value::Array(a) => {
+    match v.kind() {
+        ValueKind::Array(a) => {
             let id = crate::gc::cc_addr(a);
             if seen.insert(id, ()).is_some() {
                 return Ok(());
@@ -198,7 +198,7 @@ fn check_inner(
                 path.truncate(len);
             }
         }
-        Value::Object(o) => {
+        ValueKind::Object(o) => {
             let id = crate::gc::cc_addr(o);
             if seen.insert(id, ()).is_some() {
                 return Ok(());
@@ -211,7 +211,7 @@ fn check_inner(
                 path.truncate(len);
             }
         }
-        Value::Map(m) => {
+        ValueKind::Map(m) => {
             let id = crate::gc::cc_addr(m);
             if seen.insert(id, ()).is_some() {
                 return Ok(());
@@ -223,7 +223,7 @@ fn check_inner(
                 path.truncate(len);
             }
         }
-        Value::Set(s) => {
+        ValueKind::Set(s) => {
             let id = crate::gc::cc_addr(s);
             if seen.insert(id, ()).is_some() {
                 return Ok(());
@@ -231,7 +231,7 @@ fn check_inner(
             // Set elements are `MapKey`s — always scalar/sendable — so there is
             // nothing further to recurse into; registering the id is enough.
         }
-        Value::Instance(inst) => {
+        ValueKind::Instance(inst) => {
             let id = crate::gc::cc_addr(inst);
             if seen.insert(id, ()).is_some() {
                 return Ok(());
@@ -244,7 +244,7 @@ fn check_inner(
                 path.truncate(len);
             }
         }
-        Value::EnumVariant(ev) => {
+        ValueKind::EnumVariant(ev) => {
             // The backing value of a variant must also be sendable.
             let len = path.len();
             path.push_str(".value");
@@ -443,29 +443,29 @@ fn intern(ids: &mut HashMap<usize, u32>, ptr: usize) -> Result<u32, u32> {
 }
 
 fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
-    match v {
-        Value::Nil => w.u8(TAG_NIL),
-        Value::Bool(b) => {
+    match v.kind() {
+        ValueKind::Nil => w.u8(TAG_NIL),
+        ValueKind::Bool(b) => {
             w.u8(TAG_BOOL);
-            w.u8(*b as u8);
+            w.u8(b as u8);
         }
-        Value::Int(i) => {
+        ValueKind::Int(i) => {
             w.u8(TAG_INT);
-            w.u64(*i as u64);
+            w.u64(i as u64);
         }
-        Value::Float(n) => {
+        ValueKind::Float(n) => {
             w.u8(TAG_NUMBER);
             w.u64(n.to_bits());
         }
-        Value::Decimal(d) => {
+        ValueKind::Decimal(d) => {
             w.u8(TAG_DECIMAL);
             w.str(&d.to_string());
         }
-        Value::Str(s) => {
+        ValueKind::Str(s) => {
             w.u8(TAG_STR);
             w.str(s);
         }
-        Value::Bytes(b) => match intern(ids, std::rc::Rc::as_ptr(b) as *const () as usize) {
+        ValueKind::Bytes(b) => match intern(ids, std::rc::Rc::as_ptr(b) as *const () as usize) {
             Ok(id) => {
                 w.u8(TAG_BYTES);
                 w.u32(id);
@@ -473,7 +473,7 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             }
             Err(existing) => emit_ref(w, existing),
         },
-        Value::Array(a) => match intern(ids, crate::gc::cc_addr(a)) {
+        ValueKind::Array(a) => match intern(ids, crate::gc::cc_addr(a)) {
             Ok(id) => {
                 w.u8(TAG_ARRAY);
                 w.u32(id);
@@ -485,7 +485,7 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             }
             Err(existing) => emit_ref(w, existing),
         },
-        Value::Object(o) => match intern(ids, crate::gc::cc_addr(o)) {
+        ValueKind::Object(o) => match intern(ids, crate::gc::cc_addr(o)) {
             Ok(id) => {
                 w.u8(TAG_OBJECT);
                 w.u32(id);
@@ -498,7 +498,7 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             }
             Err(existing) => emit_ref(w, existing),
         },
-        Value::Map(m) => match intern(ids, crate::gc::cc_addr(m)) {
+        ValueKind::Map(m) => match intern(ids, crate::gc::cc_addr(m)) {
             Ok(id) => {
                 w.u8(TAG_MAP);
                 w.u32(id);
@@ -516,7 +516,7 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             }
             Err(existing) => emit_ref(w, existing),
         },
-        Value::Set(s) => match intern(ids, crate::gc::cc_addr(s)) {
+        ValueKind::Set(s) => match intern(ids, crate::gc::cc_addr(s)) {
             Ok(id) => {
                 w.u8(TAG_SET);
                 w.u32(id);
@@ -528,7 +528,7 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             }
             Err(existing) => emit_ref(w, existing),
         },
-        Value::EnumVariant(ev) => {
+        ValueKind::EnumVariant(ev) => {
             w.u8(TAG_ENUM);
             w.str(&ev.enum_name);
             w.str(&ev.name);
@@ -550,12 +550,12 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             }
         }
         #[cfg(feature = "data")]
-        Value::Regex(r) => {
+        ValueKind::Regex(r) => {
             w.u8(TAG_REGEX);
             // Flags are inline in the pattern (`(?i)…`), so source alone round-trips.
             w.str(&r.source);
         }
-        Value::Instance(inst) => match intern(ids, crate::gc::cc_addr(inst)) {
+        ValueKind::Instance(inst) => match intern(ids, crate::gc::cc_addr(inst)) {
             Ok(id) => {
                 w.u8(TAG_INSTANCE);
                 w.u32(id);
@@ -578,7 +578,7 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
         // SRV §3.7(b): a frozen `Shared` crosses by an `Arc` clone — push it into the
         // side-vector and write its index. NO deep walk of the frozen graph (the whole
         // point: a 5 MB frozen table costs one atomic bump, independent of size).
-        Value::Shared(arc) => {
+        ValueKind::Shared(arc) => {
             let idx = w.shared.len() as u32;
             w.shared.push(arc.clone());
             w.u8(TAG_SHARED);
@@ -631,10 +631,10 @@ fn decode_value(
 ) -> Result<Value, SendError> {
     let tag = r.u8()?;
     match tag {
-        TAG_NIL => Ok(Value::Nil),
-        TAG_BOOL => Ok(Value::Bool(r.u8()? != 0)),
-        TAG_INT => Ok(Value::Int(r.u64()? as i64)),
-        TAG_NUMBER => Ok(Value::Float(f64::from_bits(r.u64()?))),
+        TAG_NIL => Ok(Value::nil()),
+        TAG_BOOL => Ok(Value::bool_(r.u8()? != 0)),
+        TAG_INT => Ok(Value::int(r.u64()? as i64)),
+        TAG_NUMBER => Ok(Value::float(f64::from_bits(r.u64()?))),
         TAG_DECIMAL => {
             use rust_decimal::prelude::*;
             let s = r.str()?;
@@ -647,7 +647,7 @@ fn decode_value(
             // not the pointer); only the in-memory wrap is now `Rc`.
             Ok(Value::Decimal(std::rc::Rc::new(d)))
         }
-        TAG_STR => Ok(Value::Str(r.str()?.into())),
+        TAG_STR => Ok(Value::str(r.str()?)),
         TAG_BYTES => {
             let id = r.u32()? as usize;
             let cell = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -756,8 +756,8 @@ fn decode_value(
                     // table) and rebuild a constructed variant. Compares STRUCTURALLY,
                     // so a fresh allocation is correct (no re-interning needed).
                     let arr = decode_value(r, table, shared, interp)?;
-                    let cell = match arr {
-                        Value::Array(a) => a,
+                    let cell = match arr.into_kind() {
+                        OwnedKind::Array(a) => a,
                         _ => {
                             return Err(SendError {
                                 kind: "decode",
@@ -770,7 +770,7 @@ fn decode_value(
                         crate::value::EnumVariant {
                             enum_name,
                             name,
-                            value: Value::Nil,
+                            value: Value::nil(),
                             payload: Some(crate::value::Payload::Positional(cell)),
                             ctor: false,
                             def: None,
@@ -780,8 +780,8 @@ fn decode_value(
                 2 => {
                     // NAMED payload: decode the Object and rebuild a constructed variant.
                     let obj = decode_value(r, table, shared, interp)?;
-                    let cell = match obj {
-                        Value::Object(o) => o,
+                    let cell = match obj.into_kind() {
+                        OwnedKind::Object(o) => o,
                         _ => {
                             return Err(SendError {
                                 kind: "decode",
@@ -794,7 +794,7 @@ fn decode_value(
                         crate::value::EnumVariant {
                             enum_name,
                             name,
-                            value: Value::Nil,
+                            value: Value::nil(),
                             payload: Some(crate::value::Payload::Named(cell)),
                             ctor: false,
                             def: None,
@@ -893,8 +893,8 @@ fn register(table: &mut Vec<Value>, id: usize, v: Value) -> Result<(), SendError
 fn reintern_unit_variant(interp: &Interp, enum_name: &str, name: &str) -> Option<Value> {
     // The receiver isolate runs on the VM, so the enum const is a VM user-global.
     let vm = interp.vm()?;
-    match vm.user_global(enum_name) {
-        Some(Value::Enum(def)) => def.variants.get(name).cloned(),
+    match vm.user_global(enum_name).map(|v| v.into_kind()) {
+        Some(OwnedKind::Enum(def)) => def.variants.get(name).cloned(),
         _ => None,
     }
 }
@@ -927,7 +927,7 @@ fn resolve_class(_interp: &Interp, name: &str) -> std::rc::Rc<crate::value::Clas
 mod tests {
     use super::*;
     use crate::interp::Interp;
-    use crate::value::{ArrayCell, MapCell, MapKey, ObjectCell, SetCell, Value};
+    use crate::value::{ArrayCell, MapKey, ObjectCell, OwnedKind, Value, ValueKind};
     use indexmap::{IndexMap, IndexSet};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -937,34 +937,34 @@ mod tests {
     // sees at runtime). ---
 
     fn arr(v: Vec<Value>) -> Value {
-        Value::Array(ArrayCell::new(v))
+        Value::array(v)
     }
     fn obj(entries: &[(&str, Value)]) -> Value {
         let mut m = IndexMap::new();
         for (k, v) in entries {
             m.insert(k.to_string(), v.clone());
         }
-        Value::Object(ObjectCell::new(m))
+        Value::object(m)
     }
     fn map(entries: Vec<(Value, Value)>) -> Value {
         let mut m = IndexMap::new();
         for (k, v) in entries {
             m.insert(MapKey::from_value(&k).unwrap(), v);
         }
-        Value::Map(MapCell::new(m))
+        Value::map(m)
     }
     fn set(elems: Vec<Value>) -> Value {
         let mut s = IndexSet::new();
         for e in elems {
             s.insert(MapKey::from_value(&e).unwrap());
         }
-        Value::Set(SetCell::new(s))
+        Value::set(s)
     }
     fn num(n: f64) -> Value {
-        Value::Float(n)
+        Value::float(n)
     }
     fn str(s: &str) -> Value {
-        Value::Str(s.into())
+        Value::str(s)
     }
 
     fn rt(v: &Value) -> Value {
@@ -977,10 +977,10 @@ mod tests {
     fn roundtrips_scalars() {
         use rust_decimal::prelude::*;
         for v in [
-            Value::Nil,
-            Value::Bool(true),
-            Value::Float(3.5),
-            Value::Str("hi".into()),
+            Value::nil(),
+            Value::bool_(true),
+            Value::float(3.5),
+            Value::str("hi"),
             Value::Decimal(Rc::new(Decimal::from_str("0.1").unwrap())),
         ] {
             assert_eq!(rt(&v), v);
@@ -1010,7 +1010,7 @@ mod tests {
         let m = map(vec![(num(-0.0), str("a")), (num(0.0), str("b"))]);
         // The source itself is already a single entry (MapKey canonicalizes on insert).
         let back = rt(&m);
-        if let Value::Map(map) = &back {
+        if let ValueKind::Map(map) = back.kind() {
             assert_eq!(map.borrow().len(), 1);
             let v = map.borrow().get(&MapKey::from_value(&num(0.0)).unwrap()).cloned();
             assert_eq!(v, Some(str("b")));
@@ -1021,9 +1021,9 @@ mod tests {
 
     #[test]
     fn bytes_roundtrip() {
-        let b = Value::Bytes(Rc::new(RefCell::new(vec![1u8, 2, 3, 255])));
+        let b = Value::bytes(vec![1u8, 2, 3, 255]);
         let back = rt(&b);
-        if let Value::Bytes(bb) = &back {
+        if let ValueKind::Bytes(bb) = back.kind() {
             assert_eq!(&*bb.borrow(), &[1u8, 2, 3, 255]);
         } else {
             panic!("expected bytes");
@@ -1037,10 +1037,10 @@ mod tests {
         let a = ArrayCell::new(Vec::new());
         a.borrow_mut().push(Value::Array(a.clone()));
         let back = rt(&Value::Array(a));
-        if let Value::Array(arr) = &back {
+        if let ValueKind::Array(arr) = back.kind() {
             let inner = arr.borrow()[0].clone();
             assert!(
-                matches!(&inner, Value::Array(inner) if crate::gc::cc_ptr_eq(arr, inner)),
+                matches!(inner.kind(), ValueKind::Array(inner) if crate::gc::cc_ptr_eq(arr, inner)),
                 "decoded array's first element must be the array itself"
             );
         } else {
@@ -1055,9 +1055,9 @@ mod tests {
         o.borrow_mut()
             .insert("self".to_string(), Value::Object(o.clone()));
         let back = rt(&Value::Object(o));
-        if let Value::Object(obj) = &back {
+        if let ValueKind::Object(obj) = back.kind() {
             let inner = obj.get("self").unwrap();
-            assert!(matches!(&inner, Value::Object(i) if crate::gc::cc_ptr_eq(obj, i)));
+            assert!(matches!(inner.kind(), ValueKind::Object(i) if crate::gc::cc_ptr_eq(obj, i)));
         } else {
             panic!("expected object");
         }
@@ -1085,7 +1085,7 @@ mod tests {
         )));
         let back = rt(&inst);
         assert_eq!(format!("{back}"), format!("{inst}"));
-        if let Value::Instance(i) = &back {
+        if let ValueKind::Instance(i) = back.kind() {
             let b = i.borrow();
             assert_eq!(b.class.name, "P");
             assert_eq!(b.get("x"), Some(num(1.0)));
@@ -1107,7 +1107,7 @@ mod tests {
         }));
         let back = rt(&v);
         assert_eq!(format!("{back}"), format!("{v}"));
-        if let Value::EnumVariant(ev) = &back {
+        if let ValueKind::EnumVariant(ev) = back.kind() {
             assert_eq!(ev.enum_name, "Color");
             assert_eq!(ev.name, "Green");
         } else {
@@ -1121,7 +1121,7 @@ mod tests {
         Value::EnumVariant(Rc::new(crate::value::EnumVariant {
             enum_name: en.to_string(),
             name: name.to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(crate::value::Payload::Positional(
                 crate::value::ArrayCell::new(items),
             )),
@@ -1137,7 +1137,7 @@ mod tests {
         Value::EnumVariant(Rc::new(crate::value::EnumVariant {
             enum_name: en.to_string(),
             name: name.to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(crate::value::Payload::Named(crate::value::ObjectCell::new(m))),
             ctor: false,
             def: None,
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn adt_positional_payload_roundtrips_structurally() {
-        let v = pos_var("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        let v = pos_var("Shape", "Pair", vec![Value::int(3), Value::int(4)]);
         let back = rt(&v);
         // Structural equality holds after the round-trip (fresh allocation, same data).
         assert_eq!(back, v);
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn adt_named_payload_roundtrips_structurally() {
-        let v = named_var("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
+        let v = named_var("Shape", "Circle", vec![("radius", Value::float(2.0))]);
         let back = rt(&v);
         assert_eq!(back, v);
         assert_eq!(format!("{back}"), "Shape.Circle(radius: 2.0)");
@@ -1164,14 +1164,14 @@ mod tests {
     #[test]
     fn adt_payload_variant_nested_in_object_and_map() {
         // A payload variant nested as an Object field and a Map value round-trips.
-        let circle = named_var("Shape", "Circle", vec![("radius", Value::Float(1.5))]);
+        let circle = named_var("Shape", "Circle", vec![("radius", Value::float(1.5))]);
         let mut obj = IndexMap::new();
         obj.insert("shape".to_string(), circle.clone());
-        let o = Value::Object(crate::value::ObjectCell::new(obj));
+        let o = Value::object(obj);
         let back = rt(&o);
         // Objects are identity-equal containers, so compare the nested variant (which
         // IS structural). The decoded object must hold an equal `Circle(radius: 1.5)`.
-        if let Value::Object(ob) = &back {
+        if let ValueKind::Object(ob) = back.kind() {
             let inner = ob.get("shape").expect("shape field");
             assert_eq!(inner, circle);
         } else {
@@ -1187,7 +1187,7 @@ mod tests {
         let v = Value::EnumVariant(Rc::new(crate::value::EnumVariant {
             enum_name: "Json".to_string(),
             name: "Arr".to_string(),
-            value: Value::Nil,
+            value: Value::nil(),
             payload: Some(crate::value::Payload::Positional(arr.clone())),
             ctor: false,
             def: None,
@@ -1199,7 +1199,7 @@ mod tests {
         let back = decode(&bytes, &interp).expect("cyclic payload decodes");
         // The decoded variant carries a positional payload whose first element is the
         // variant itself (structural identity → the back-edge is present).
-        if let Value::EnumVariant(ev) = &back {
+        if let ValueKind::EnumVariant(ev) = back.kind() {
             match &ev.payload {
                 Some(crate::value::Payload::Positional(a)) => {
                     assert_eq!(a.borrow().len(), 1);
@@ -1215,8 +1215,8 @@ mod tests {
     fn adt_non_sendable_payload_is_a_path_error() {
         // A payload holding a non-sendable kind (a function) is the recoverable
         // path-error, with the path threaded through the payload.
-        let nonsend = Value::Builtin("print".into());
-        let v = pos_var("E", "V", vec![Value::Int(1), nonsend]);
+        let nonsend = Value::builtin("print");
+        let v = pos_var("E", "V", vec![Value::int(1), nonsend]);
         let err = check_sendable(&v).expect_err("a function payload is not sendable");
         assert_eq!(err.kind, "function");
         assert!(
@@ -1235,7 +1235,7 @@ mod tests {
             source: "(?i)ab+c".to_string(),
         }));
         let back = rt(&v);
-        if let Value::Regex(r) = &back {
+        if let ValueKind::Regex(r) = back.kind() {
             assert_eq!(r.source, "(?i)ab+c");
             assert!(r.re.is_match("ABBC"));
         } else {
@@ -1408,8 +1408,8 @@ mod tests {
     #[test]
     fn shared_round_trips_by_arc_bump_not_copy() {
         let s = shared_val();
-        let arc_before = match &s {
-            Value::Shared(a) => a.clone(),
+        let arc_before = match s.kind() {
+            ValueKind::Shared(a) => a.clone(),
             _ => unreachable!(),
         };
         // Encode: one TAG_SHARED + index; the side-vector holds the SAME Arc (no walk).
@@ -1421,9 +1421,9 @@ mod tests {
         // Decode (same-thread inline path): the OUTGOING Arc pointer is PRESERVED.
         let interp = Interp::new();
         let back = decode_with_shared(&bytes, &shared, &interp).unwrap();
-        match back {
-            Value::Shared(a) => assert!(
-                std::sync::Arc::ptr_eq(&a, &arc_before),
+        match back.kind() {
+            ValueKind::Shared(a) => assert!(
+                std::sync::Arc::ptr_eq(a, &arc_before),
                 "inline path preserves Arc identity (zero copy)"
             ),
             _ => panic!("expected Shared"),
@@ -1435,16 +1435,16 @@ mod tests {
         // A Shared nested inside a normal sendable object round-trips correctly.
         let mut m = IndexMap::new();
         m.insert("cfg".to_string(), shared_val());
-        m.insert("n".to_string(), Value::Int(1));
-        let obj = Value::Object(ObjectCell::new(m));
+        m.insert("n".to_string(), Value::int(1));
+        let obj = Value::object(m);
         let (bytes, shared) = encode(&obj).unwrap();
         assert_eq!(shared.len(), 1);
         let interp = Interp::new();
         let back = decode_with_shared(&bytes, &shared, &interp).unwrap();
-        match back {
-            Value::Object(o) => {
-                assert!(matches!(o.get("cfg"), Some(Value::Shared(_))));
-                assert_eq!(o.get("n"), Some(Value::Int(1)));
+        match back.kind() {
+            ValueKind::Object(o) => {
+                assert!(matches!(o.get("cfg").map(|v| v.into_kind()), Some(OwnedKind::Shared(_))));
+                assert_eq!(o.get("n"), Some(Value::int(1)));
             }
             _ => panic!(),
         }

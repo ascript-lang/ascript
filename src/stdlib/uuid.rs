@@ -5,6 +5,8 @@ use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
 use crate::value::Value;
+#[cfg(test)]
+use crate::value::OwnedKind;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![("v4", bi("uuid.v4")), ("v7", bi("uuid.v7"))]
@@ -17,8 +19,8 @@ pub fn call(
     span: Span,
 ) -> Result<Value, Control> {
     match func {
-        "v4" => Ok(Value::Str(v4(interp).to_string().into())),
-        "v7" => Ok(Value::Str(v7(interp).to_string().into())),
+        "v4" => Ok(Value::str(v4(interp).to_string())),
+        "v7" => Ok(Value::str(v7(interp).to_string())),
         _ => Err(AsError::at(format!("std/uuid has no function '{}'", func), span).into()),
     }
 }
@@ -79,7 +81,7 @@ mod tests {
     #[test]
     fn v4_v7_format() {
         let v4 = call("v4", &[], sp()).unwrap();
-        if let Value::Str(s) = v4 {
+        if let OwnedKind::Str(s) = v4.into_kind() {
             assert_eq!(s.len(), 36);
             assert_eq!(s.chars().filter(|&c| c == '-').count(), 4);
             assert_eq!(&s[14..15], "4"); // version nibble
@@ -90,7 +92,7 @@ mod tests {
         let b = call("v4", &[], sp()).unwrap();
         assert_ne!(a, b); // random → distinct
         let v7 = call("v7", &[], sp()).unwrap();
-        if let Value::Str(s) = v7 {
+        if let OwnedKind::Str(s) = v7.into_kind() {
             assert_eq!(&s[14..15], "7");
         } else {
             panic!();
@@ -118,7 +120,7 @@ mod tests {
         assert_eq!(call_det("v7", 42), call_det("v7", 42));
         assert_ne!(call_det("v7", 42), call_det("v7", 7));
         // Still a well-formed v7 string.
-        if let Value::Str(s) = call_det("v7", 42) {
+        if let OwnedKind::Str(s) = call_det("v7", 42).into_kind() {
             assert_eq!(s.len(), 36);
             assert_eq!(&s[14..15], "7");
         } else {

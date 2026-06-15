@@ -21,10 +21,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "parse" => {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
             match serde_yaml::from_str::<serde_json::Value>(&s) {
-                Ok(jv) => Ok(make_pair(to_ascript(&jv), Value::Nil)),
+                Ok(jv) => Ok(make_pair(to_ascript(&jv), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid YAML: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid YAML: {}", e))),
                 )),
             }
         }
@@ -32,15 +32,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let v = arg(args, 0);
             match from_ascript(&v, &mut Vec::new()) {
                 Ok(jv) => match serde_yaml::to_string(&jv) {
-                    Ok(text) => Ok(make_pair(Value::Str(text.into()), Value::Nil)),
+                    Ok(text) => Ok(make_pair(Value::str(text), Value::nil())),
                     Err(e) => Ok(make_pair(
-                        Value::Nil,
-                        make_error(Value::Str(
-                            format!("cannot serialize to YAML: {}", e).into(),
+                        Value::nil(),
+                        make_error(Value::str(
+                            format!("cannot serialize to YAML: {}", e),
                         )),
                     )),
                 },
-                Err(msg) => Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into())))),
+                Err(msg) => Ok(make_pair(Value::nil(), make_error(Value::str(msg)))),
             }
         }
         _ => Err(AsError::at(format!("std/yaml has no function '{}'", func), span).into()),
@@ -54,7 +54,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     #[test]
@@ -78,8 +78,8 @@ mod tests {
     fn stringify_roundtrip() {
         // Stringify a value and parse it back; data is preserved.
         let mut m = indexmap::IndexMap::new();
-        m.insert("x".to_string(), Value::Float(1.0));
-        let obj = Value::Object(crate::value::ObjectCell::new(m));
+        m.insert("x".to_string(), Value::float(1.0));
+        let obj = Value::object(m);
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         assert_eq!(out.to_string(), "[\"x: 1.0\\n\", nil]");
         // round-trip back through parse

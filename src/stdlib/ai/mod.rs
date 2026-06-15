@@ -31,7 +31,7 @@
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 
 mod request;
 mod response;
@@ -93,8 +93,8 @@ pub(crate) async fn call_method(
     match m.receiver.kind {
         NativeKind::AiProvider => match m.method.as_str() {
             "model" => {
-                let id = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
+                let id = match args.first().map(|v| v.kind()) {
+                    Some(ValueKind::Str(s)) => s.to_string(),
                     _ => {
                         return Err(AsError::at(
                             "provider.model(id): 'id' must be a string",
@@ -131,7 +131,7 @@ pub(crate) async fn call_method(
 /// a single Tier-1 pair.
 async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     let opts = match args.first() {
-        Some(v @ Value::Object(_)) | Some(v @ Value::Instance(_)) => v.clone(),
+        Some(v) if matches!(v.kind(), ValueKind::Object(_) | ValueKind::Instance(_)) => v.clone(),
         _ => {
             return Err(AsError::at(
                 "ai.generate(opts): expected an options object with a 'model'",
@@ -141,14 +141,14 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
         }
     };
     let model_arg = request::get_field(&opts, "model");
-    if matches!(model_arg, Value::Nil) {
+    if matches!(model_arg.kind(), ValueKind::Nil) {
         return Err(AsError::at("ai.generate: 'model' is required", span).into());
     }
     let resolved = request::resolve_model(&model_arg, span)?;
 
     // Missing credential → Tier-1 `[nil, err]` (expected operational failure).
     if let Some(err) = request::credential_missing_error(&resolved) {
-        return Ok(crate::interp::make_pair(Value::Nil, err));
+        return Ok(crate::interp::make_pair(Value::nil(), err));
     }
 
     let mut chat_req = request::build_chat_request(&opts, span)?;
@@ -160,15 +160,15 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
     // prompt (the always-available fallback, spec §7.2), then decode the result text
     // via `validate_into`/`parse_value`, fusing decode + shape into ONE Tier-1 pair.
     let shape = request::get_field(&opts, "shape");
-    let shape_type = match &shape {
-        Value::Class(_) => Some(shape.clone()),
-        other if crate::stdlib::schema::schema_kind(other).is_some() => Some(shape.clone()),
-        Value::Nil => None,
-        other => {
+    let shape_type = match shape.kind() {
+        ValueKind::Class(_) => Some(shape.clone()),
+        _ if crate::stdlib::schema::schema_kind(&shape).is_some() => Some(shape.clone()),
+        ValueKind::Nil => None,
+        _ => {
             return Err(AsError::at(
                 format!(
                     "ai.generate: 'shape' must be a class or a std/schema, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(&shape)
                 ),
                 span,
             )
@@ -222,11 +222,11 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
         return Ok(match loop_result {
             Ok((neutral, steps)) => {
                 telemetry::close_chat_span(interp, span_id, Some(&neutral), false);
-                crate::interp::make_pair(response::out_object(&neutral, steps), Value::Nil)
+                crate::interp::make_pair(response::out_object(&neutral, steps), Value::nil())
             }
             Err(err) => {
                 telemetry::close_chat_span(interp, span_id, None, true);
-                crate::interp::make_pair(Value::Nil, err)
+                crate::interp::make_pair(Value::nil(), err)
             }
         });
     }
@@ -246,7 +246,7 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
         Err(e) => {
             telemetry::close_chat_span(interp, span_id, None, true);
             return Ok(crate::interp::make_pair(
-                Value::Nil,
+                Value::nil(),
                 response::error_to_value(&e),
             ));
         }
@@ -257,12 +257,12 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
     // No shape → the plain `out` object.
     let Some(st) = shape_type else {
         let out = response::out_object(&neutral, Vec::new());
-        return Ok(crate::interp::make_pair(out, Value::Nil));
+        return Ok(crate::interp::make_pair(out, Value::nil()));
     };
 
     // shape: → parse the model's text as JSON, then validate-into the shape, fusing a
     // decode failure and a shape mismatch into ONE Tier-1 [value, err] pair.
-    let parsed_pair = crate::stdlib::json::call("parse", &[Value::Str(neutral.text.clone().into())], span)?;
+    let parsed_pair = crate::stdlib::json::call("parse", &[Value::str(neutral.text.clone())], span)?;
     interp.typed_decode(parsed_pair, &st, false, "", span).await
 }
 
@@ -276,7 +276,7 @@ async fn embed(
     span: Span,
 ) -> Result<Value, Control> {
     let opts = match args.first() {
-        Some(v @ Value::Object(_)) | Some(v @ Value::Instance(_)) => v.clone(),
+        Some(v) if matches!(v.kind(), ValueKind::Object(_) | ValueKind::Instance(_)) => v.clone(),
         _ => {
             return Err(AsError::at(
                 "ai.embed(opts): expected an options object with a 'model'",
@@ -286,25 +286,25 @@ async fn embed(
         }
     };
     let model_arg = request::get_field(&opts, "model");
-    if matches!(model_arg, Value::Nil) {
+    if matches!(model_arg.kind(), ValueKind::Nil) {
         return Err(AsError::at("ai.embed: 'model' is required", span).into());
     }
     let resolved = request::resolve_model(&model_arg, span)?;
     if let Some(err) = request::credential_missing_error(&resolved) {
-        return Ok(crate::interp::make_pair(Value::Nil, err));
+        return Ok(crate::interp::make_pair(Value::nil(), err));
     }
 
     let inputs: Vec<String> = if many {
-        match request::get_field(&opts, "values") {
-            Value::Array(a) => a
+        match request::get_field(&opts, "values").into_kind() {
+            OwnedKind::Array(a) => a
                 .borrow()
                 .iter()
-                .map(|v| match v {
-                    Value::Str(s) => Ok(s.to_string()),
-                    other => Err(AsError::at(
+                .map(|v| match v.kind() {
+                    ValueKind::Str(s) => Ok(s.to_string()),
+                    _ => Err(AsError::at(
                         format!(
                             "ai.embedMany: 'values' must be an array of strings, got a {}",
-                            crate::interp::type_name(other)
+                            crate::interp::type_name(v)
                         ),
                         span,
                     )),
@@ -316,8 +316,8 @@ async fn embed(
             }
         }
     } else {
-        match request::get_field(&opts, "value") {
-            Value::Str(s) => vec![s.to_string()],
+        match request::get_field(&opts, "value").kind() {
+            ValueKind::Str(s) => vec![s.to_string()],
             _ => return Err(AsError::at("ai.embed: 'value' must be a string", span).into()),
         }
     };
@@ -337,13 +337,13 @@ async fn embed(
             telemetry::close_embed_span(interp, span_id, input_tokens, false);
             Ok(crate::interp::make_pair(
                 response::embed_object(&resp, many),
-                Value::Nil,
+                Value::nil(),
             ))
         }
         Err(e) => {
             telemetry::close_embed_span(interp, span_id, None, true);
             Ok(crate::interp::make_pair(
-                Value::Nil,
+                Value::nil(),
                 response::error_to_value(&e),
             ))
         }

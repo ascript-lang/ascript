@@ -31,7 +31,7 @@ use super::{arg, want_number};
 use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, OwnedKind, Value, ValueKind};
 use std::rc::Rc;
 use tokio::task::AbortHandle;
 
@@ -126,8 +126,8 @@ pub fn create_debounce(interp: &Interp, args: &[Value], span: Span) -> Result<Va
         ResourceState::DebounceWrapper(state),
     );
     // Return a NativeMethod so `wrapper(args)` is valid in call position.
-    let obj = match native {
-        Value::Native(ref o) => o.clone(),
+    let obj = match native.kind() {
+        ValueKind::Native(o) => o.clone(),
         _ => unreachable!(),
     };
     Ok(Value::NativeMethod(Rc::new(NativeMethod {
@@ -154,8 +154,8 @@ pub fn create_throttle(interp: &Interp, args: &[Value], span: Span) -> Result<Va
         indexmap::IndexMap::new(),
         ResourceState::ThrottleWrapper(state),
     );
-    let obj = match native {
-        Value::Native(ref o) => o.clone(),
+    let obj = match native.kind() {
+        ValueKind::Native(o) => o.clone(),
         _ => unreachable!(),
     };
     Ok(Value::NativeMethod(Rc::new(NativeMethod {
@@ -196,7 +196,7 @@ impl Interp {
         iv.tick().await;
         // Put the interval back.
         self.return_resource(id, ResourceState::Interval(iv));
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }
 
     /// Handle a bare call on a `DebounceWrapper` handle (method == "call").
@@ -252,8 +252,10 @@ impl Interp {
             // otherwise an async callback would silently never run. (Mirror of
             // `task.retry`.) The driven future's result/panic is swallowed:
             // a debounced fire is a deferred side-effect, not an awaited value.
-            if let Ok(Value::Future(f)) = vm.call_value(func, args, Span::new(0, 0)).await {
-                let _ = f.get().await;
+            if let Ok(v) = vm.call_value(func, args, Span::new(0, 0)).await {
+                if let OwnedKind::Future(f) = v.into_kind() {
+                    let _ = f.get().await;
+                }
             }
         });
 
@@ -263,7 +265,7 @@ impl Interp {
         // Return state to the table before yielding.
         self.return_resource(id, ResourceState::DebounceWrapper(state));
 
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }
 
     /// Handle a bare call on a `ThrottleWrapper` handle (method == "call").
@@ -321,12 +323,14 @@ impl Interp {
             // Calling an `async fn` returns Ok(Value::Future(..)) WITHOUT running
             // the body, so drive that inner future to completion here — otherwise
             // an async callback would silently never run. (Mirror of `task.retry`.)
-            if let Ok(Value::Future(fut)) = self.call_value(f, args, span).await {
-                let _ = fut.get().await;
+            if let Ok(v) = self.call_value(f, args, span).await {
+                if let OwnedKind::Future(fut) = v.into_kind() {
+                    let _ = fut.get().await;
+                }
             }
         }
 
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }
 }
 
@@ -359,7 +363,7 @@ mod tests {
                 // Build a DebounceState holding this task's AbortHandle, then
                 // drop it immediately (before the 30ms fire).
                 let state = DebounceState {
-                    func: Value::Nil,
+                    func: Value::nil(),
                     ms: 30,
                     pending: Some(jh.abort_handle()),
                 };

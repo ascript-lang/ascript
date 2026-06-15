@@ -265,14 +265,14 @@ impl TelemetryState {
     /// `service.version`, and `deployment.environment.name` folded in.
     pub fn resource_attributes(&self) -> Vec<(String, Value)> {
         let mut out: Vec<(String, Value)> = Vec::new();
-        out.push(("service.name".to_string(), Value::Str(self.service.as_str().into())));
+        out.push(("service.name".to_string(), Value::str(self.service.as_str())));
         if let Some(v) = &self.version {
-            out.push(("service.version".to_string(), Value::Str(v.as_str().into())));
+            out.push(("service.version".to_string(), Value::str(v.as_str())));
         }
         if let Some(e) = &self.env {
             out.push((
                 "deployment.environment.name".to_string(),
-                Value::Str(e.as_str().into()),
+                Value::str(e.as_str()),
             ));
         }
         for (k, v) in &self.resource {

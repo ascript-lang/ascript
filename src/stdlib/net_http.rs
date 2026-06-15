@@ -94,7 +94,7 @@ use super::{arg, bi, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
-use crate::value::{NativeKind, NativeMethod, Value};
+use crate::value::{NativeKind, NativeMethod, OwnedKind, Value, ValueKind};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -120,16 +120,18 @@ impl BodyMode {
     fn parse(opts: &Value, span: Span) -> Result<BodyMode, Control> {
         match opt_field(opts, "bodyMode") {
             None => Ok(BodyMode::Str),
-            Some(Value::Str(s)) if s.as_ref() == "string" => Ok(BodyMode::Str),
-            Some(Value::Str(s)) if s.as_ref() == "bytes" => Ok(BodyMode::Bytes),
-            Some(other) => Err(AsError::at(
-                format!(
-                    "net/http bodyMode must be \"string\" or \"bytes\", got {}",
-                    crate::interp::type_name(&other)
-                ),
-                span,
-            )
-            .into()),
+            Some(other) => match other.kind() {
+                ValueKind::Str(s) if s.as_ref() == "string" => Ok(BodyMode::Str),
+                ValueKind::Str(s) if s.as_ref() == "bytes" => Ok(BodyMode::Bytes),
+                _ => Err(AsError::at(
+                    format!(
+                        "net/http bodyMode must be \"string\" or \"bytes\", got {}",
+                        crate::interp::type_name(&other)
+                    ),
+                    span,
+                )
+                .into()),
+            },
         }
     }
 
@@ -137,7 +139,7 @@ impl BodyMode {
     fn wrap(self, bytes: Vec<u8>) -> Value {
         match self {
             BodyMode::Bytes => Value::Bytes(Rc::new(RefCell::new(bytes))),
-            BodyMode::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned().into()),
+            BodyMode::Str => Value::str(String::from_utf8_lossy(&bytes).into_owned()),
         }
     }
 }
@@ -331,22 +333,22 @@ impl SseState {
         let mut map = IndexMap::new();
         map.insert(
             "event".to_string(),
-            Value::Str(ev.event.unwrap_or_else(|| "message".to_string()).into()),
+            Value::str(ev.event.unwrap_or_else(|| "message".to_string())),
         );
-        map.insert("data".to_string(), Value::Str(ev.data.join("\n").into()));
+        map.insert("data".to_string(), Value::str(ev.data.join("\n")));
         map.insert(
             "id".to_string(),
             match ev.id {
-                Some(id) => Value::Str(id.into()),
-                None => Value::Nil,
+                Some(id) => Value::str(id),
+                None => Value::nil(),
             },
         );
         map.insert(
             "retry".to_string(),
             match ev.retry {
                 // NUM §4: a retry interval (ms) is an integer → `Int`.
-                Some(ms) => Value::Int(ms as i64),
-                None => Value::Nil,
+                Some(ms) => Value::int(ms as i64),
+                None => Value::nil(),
             },
         );
         Some(obj(map))
@@ -427,16 +429,19 @@ fn strict_num_field(
     match o.get(key) {
         // NUM §4: accept BOTH numeric subtypes (`Int` and `Float`).
         Some(v) if v.is_number() => Ok(v.as_f64()),
-        Some(Value::Nil) | None => Ok(None),
-        Some(other) => Err(AsError::at(
-            format!(
-                "net/http {} expects a number, got {}",
-                ctx,
-                crate::interp::type_name(&other)
-            ),
-            span,
-        )
-        .into()),
+        None => Ok(None),
+        Some(other) => match other.kind() {
+            ValueKind::Nil => Ok(None),
+            _ => Err(AsError::at(
+                format!(
+                    "net/http {} expects a number, got {}",
+                    ctx,
+                    crate::interp::type_name(&other)
+                ),
+                span,
+            )
+            .into()),
+        },
     }
 }
 
@@ -461,13 +466,13 @@ fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control>
         Some(v) => v,
         None => return Ok(None),
     };
-    let o = match &r {
-        Value::Object(o) => o.clone(),
-        other => {
+    let o = match r.kind() {
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "net/http retry expects an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(&r)
                 ),
                 span,
             )
@@ -479,10 +484,10 @@ fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control>
     let max = strict_num_field(&o, "max", "retry.max", span)?
         .unwrap_or(0.0)
         .max(0.0) as u32;
-    let exponential = match o.get("backoff") {
-        Some(Value::Nil) | None => true, // default exponential
-        Some(Value::Str(s)) if s.as_ref() == "exponential" => true,
-        Some(Value::Str(s)) if s.as_ref() == "constant" => false,
+    let exponential = match o.get("backoff").map(|x| x.into_kind()) {
+        Some(OwnedKind::Nil) | None => true, // default exponential
+        Some(OwnedKind::Str(s)) if s.as_ref() == "exponential" => true,
+        Some(OwnedKind::Str(s)) if s.as_ref() == "constant" => false,
         Some(_) => {
             return Err(AsError::at(
                 "net/http retry.backoff expects \"exponential\" or \"constant\"",
@@ -495,37 +500,40 @@ fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control>
         .unwrap_or(100.0)
         .max(0.0) as u64;
     let retry_on = match o.get("retryOn") {
-        Some(Value::Nil) | None => Vec::new(),
-        Some(Value::Array(a)) => {
-            let mut out = Vec::new();
-            for v in a.borrow().iter() {
-                // NUM §4: a status code may be an `Int` or `Float`.
-                match v.as_f64() {
-                    Some(n) => out.push(n as u16),
-                    None => {
-                        return Err(AsError::at(
-                            format!(
+        None => Vec::new(),
+        Some(x) => match x.kind() {
+            ValueKind::Nil => Vec::new(),
+            ValueKind::Array(a) => {
+                let mut out = Vec::new();
+                for v in a.borrow().iter() {
+                    // NUM §4: a status code may be an `Int` or `Float`.
+                    match v.as_f64() {
+                        Some(n) => out.push(n as u16),
+                        None => {
+                            return Err(AsError::at(
+                                format!(
                             "net/http retry.retryOn expects an array of numbers, got a {} entry",
                             crate::interp::type_name(v)
                         ),
-                            span,
-                        )
-                        .into())
+                                span,
+                            )
+                            .into())
+                        }
                     }
                 }
+                out
             }
-            out
-        }
-        Some(other) => {
-            return Err(AsError::at(
-                format!(
-                    "net/http retry.retryOn expects an array of numbers, got {}",
-                    crate::interp::type_name(&other)
-                ),
-                span,
-            )
-            .into())
-        }
+            _ => {
+                return Err(AsError::at(
+                    format!(
+                        "net/http retry.retryOn expects an array of numbers, got {}",
+                        crate::interp::type_name(&x)
+                    ),
+                    span,
+                )
+                .into())
+            }
+        },
     };
     Ok(Some(RetryConfig {
         max,
@@ -573,13 +581,13 @@ fn build_client_inner(
     // timeout in its stable API, so `read` is folded into the total timeout (if
     // `total` is not itself set); the connect timeout is applied independently.
     if let Some(t) = opt_field(opts, "timeout") {
-        let o = match &t {
-            Value::Object(o) => o.clone(),
-            other => {
+        let o = match t.kind() {
+            ValueKind::Object(o) => o.clone(),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "net/http timeout expects an object, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&t)
                     ),
                     span,
                 )
@@ -603,10 +611,11 @@ fn build_client_inner(
     if force_no_redirect {
         b = b.redirect(reqwest::redirect::Policy::none());
     } else if let Some(r) = opt_field(opts, "redirect") {
-        let policy = match &r {
-            Value::Str(s) if s.as_ref() == "none" => reqwest::redirect::Policy::none(),
-            Value::Object(o) => {
-                let follow = !matches!(o.get("follow"), Some(Value::Bool(false)));
+        let policy = match r.kind() {
+            ValueKind::Str(s) if s.as_ref() == "none" => reqwest::redirect::Policy::none(),
+            ValueKind::Object(o) => {
+                let follow =
+                    !matches!(o.get("follow").map(|x| x.into_kind()), Some(OwnedKind::Bool(false)));
                 if !follow {
                     reqwest::redirect::Policy::none()
                 } else {
@@ -614,11 +623,11 @@ fn build_client_inner(
                     reqwest::redirect::Policy::limited(max)
                 }
             }
-            other => {
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "net/http redirect expects an object or \"none\", got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&r)
                     ),
                     span,
                 )
@@ -630,14 +639,20 @@ fn build_client_inner(
 
     // decompress (default true). false → disable all transparent decoders, which
     // also stops reqwest from advertising Accept-Encoding.
-    if matches!(opt_field(opts, "decompress"), Some(Value::Bool(false))) {
+    if matches!(
+        opt_field(opts, "decompress").map(|x| x.into_kind()),
+        Some(OwnedKind::Bool(false))
+    ) {
         b = b.no_gzip().no_brotli().no_deflate().no_zstd();
     }
 
     // cookies: true → a per-client cookie jar (persists/sends across redirects +
     // connection reuse within this request's client). A shared cross-request jar
     // handle is a documented follow-up.
-    if matches!(opt_field(opts, "cookies"), Some(Value::Bool(true))) {
+    if matches!(
+        opt_field(opts, "cookies").map(|x| x.into_kind()),
+        Some(OwnedKind::Bool(true))
+    ) {
         b = b.cookie_store(true);
     }
 
@@ -704,13 +719,13 @@ fn apply_tls(
     tls: &Value,
     span: Span,
 ) -> Result<reqwest::ClientBuilder, Control> {
-    let o = match tls {
-        Value::Object(o) => o.clone(),
-        other => {
+    let o = match tls.kind() {
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "net/http tls expects an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(tls)
                 ),
                 span,
             )
@@ -755,11 +770,14 @@ fn apply_tls(
         b = b.min_tls_version(v);
     }
     // sni: toggle TLS SNI (default on).
-    if let Some(Value::Bool(sni)) = o.get("sni") {
+    if let Some(OwnedKind::Bool(sni)) = o.get("sni").map(|x| x.into_kind()) {
         b = b.tls_sni(sni);
     }
     // insecure: disable certificate verification (flagged above).
-    if matches!(o.get("insecure"), Some(Value::Bool(true))) {
+    if matches!(
+        o.get("insecure").map(|x| x.into_kind()),
+        Some(OwnedKind::Bool(true))
+    ) {
         b = b.danger_accept_invalid_certs(true);
     }
     Ok(b)
@@ -799,7 +817,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 fn bytes_value(b: Vec<u8>) -> Value {
@@ -807,14 +825,15 @@ fn bytes_value(b: Vec<u8>) -> Value {
 }
 
 fn obj(map: IndexMap<String, Value>) -> Value {
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object(map)
 }
 
 /// Pull `opts.<key>` (an object) when present and non-nil.
 fn opt_field(opts: &Value, key: &str) -> Option<Value> {
-    match opts {
-        Value::Object(o) => match o.get(key) {
-            Some(Value::Nil) | None => None,
+    match opts.kind() {
+        ValueKind::Object(o) => match o.get(key) {
+            None => None,
+            Some(v) if matches!(v.kind(), ValueKind::Nil) => None,
             Some(v) => Some(v),
         },
         _ => None,
@@ -828,14 +847,14 @@ fn value_to_query_pairs(
     span: Span,
     ctx: &str,
 ) -> Result<Vec<(String, String)>, Control> {
-    let o = match v {
-        Value::Object(o) => o,
-        other => {
+    let o = match v.kind() {
+        ValueKind::Object(o) => o,
+        _ => {
             return Err(AsError::at(
                 format!(
                     "{} expects an object, got {}",
                     ctx,
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(v)
                 ),
                 span,
             )
@@ -844,8 +863,8 @@ fn value_to_query_pairs(
     };
     let mut pairs = Vec::new();
     for (k, val) in o.entries() {
-        match &val {
-            Value::Array(a) => {
+        match val.kind() {
+            ValueKind::Array(a) => {
                 for item in a.borrow().iter() {
                     pairs.push((k.to_string(), scalar_to_string(item, span, ctx)?));
                 }
@@ -858,15 +877,15 @@ fn value_to_query_pairs(
 
 /// Render a scalar (string/number/bool/nil) into its query/form string form.
 fn scalar_to_string(v: &Value, span: Span, ctx: &str) -> Result<String, Control> {
-    match v {
-        Value::Str(s) => Ok(s.to_string()),
-        Value::Float(_) | Value::Bool(_) => Ok(v.to_string()),
-        Value::Nil => Ok(String::new()),
-        other => Err(AsError::at(
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.to_string()),
+        ValueKind::Float(_) | ValueKind::Bool(_) => Ok(v.to_string()),
+        ValueKind::Nil => Ok(String::new()),
+        _ => Err(AsError::at(
             format!(
                 "{} value must be a string/number/bool, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -963,13 +982,13 @@ impl Interp {
 
         // headers: object of string→string. `auth:` is a sibling helper key.
         if let Some(h) = opt_field(opts, "headers") {
-            let map = match &h {
-                Value::Object(o) => o,
-                other => {
+            let map = match h.kind() {
+                ValueKind::Object(o) => o,
+                _ => {
                     return Err(AsError::at(
                         format!(
                             "net/http headers expects an object, got {}",
-                            crate::interp::type_name(other)
+                            crate::interp::type_name(&h)
                         ),
                         span,
                     )
@@ -1007,8 +1026,10 @@ impl Interp {
         };
 
         // errorOnStatus: a non-2xx response becomes a Tier-1 err instead of a resp.
-        if matches!(opt_field(opts, "errorOnStatus"), Some(Value::Bool(true)))
-            && !resp.status().is_success()
+        if matches!(
+            opt_field(opts, "errorOnStatus").map(|x| x.into_kind()),
+            Some(OwnedKind::Bool(true))
+        ) && !resp.status().is_success()
         {
             return Ok(err_pair(format!(
                 "net/http {} {} returned status {}",
@@ -1020,15 +1041,18 @@ impl Interp {
 
         // stream:true → don't buffer; expose `resp.body` as an HttpBody reader and
         // do NOT store the response for the buffered text/bytes/json accessors.
-        let stream = matches!(opt_field(opts, "stream"), Some(Value::Bool(true)));
+        let stream = matches!(
+            opt_field(opts, "stream").map(|x| x.into_kind()),
+            Some(OwnedKind::Bool(true))
+        );
         if stream {
             let mode = BodyMode::parse(opts, span)?;
             Ok(make_pair(
                 self.http_streaming_response_value(resp, mode),
-                Value::Nil,
+                Value::nil(),
             ))
         } else {
-            Ok(make_pair(self.http_response_value(resp), Value::Nil))
+            Ok(make_pair(self.http_response_value(resp), Value::nil()))
         }
     }
 
@@ -1115,13 +1139,13 @@ impl Interp {
         auth: &Value,
         span: Span,
     ) -> Result<reqwest::RequestBuilder, Control> {
-        let o = match auth {
-            Value::Object(o) => o,
-            other => {
+        let o = match auth.kind() {
+            ValueKind::Object(o) => o,
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "net/http auth expects an object, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(auth)
                     ),
                     span,
                 )
@@ -1136,13 +1160,14 @@ impl Interp {
             let arr = super::want_array(&basic, span, "net/http auth.basic")?;
             let arr = arr.borrow();
             let user = want_string(
-                arr.first().unwrap_or(&Value::Nil),
+                arr.first().unwrap_or(&Value::nil()),
                 span,
                 "net/http auth.basic[0]",
             )?;
             let pass = arr.get(1).cloned();
             let pass = match pass {
-                Some(Value::Nil) | None => None,
+                None => None,
+                Some(p) if matches!(p.kind(), ValueKind::Nil) => None,
                 Some(p) => Some(want_string(&p, span, "net/http auth.basic[1]")?.to_string()),
             };
             return Ok(rb.basic_auth(user.to_string(), pass));
@@ -1161,10 +1186,10 @@ impl Interp {
         body: &Value,
         span: Span,
     ) -> Result<reqwest::RequestBuilder, Control> {
-        match body {
-            Value::Str(s) => Ok(rb.body(s.to_string())),
-            Value::Bytes(b) => Ok(rb.body(b.borrow().clone())),
-            Value::Object(o) => {
+        match body.kind() {
+            ValueKind::Str(s) => Ok(rb.body(s.to_string())),
+            ValueKind::Bytes(b) => Ok(rb.body(b.borrow().clone())),
+            ValueKind::Object(o) => {
                 // Pull out the single recognized shape upfront (accessor API returns owned
                 // Values so no borrow held across the {stream} await path).
                 let (jv, form, mp, stream) = (
@@ -1203,10 +1228,10 @@ impl Interp {
                 )
                 .into())
             }
-            other => Err(AsError::at(
+            _ => Err(AsError::at(
                 format!(
                     "net/http body must be a string, bytes, or an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(body)
                 ),
                 span,
             )
@@ -1238,9 +1263,9 @@ impl Interp {
         source: &Value,
         span: Span,
     ) -> Result<reqwest::RequestBuilder, Control> {
-        match source {
+        match source.kind() {
             // (a) bytes → a true streamed body (single chunk).
-            Value::Bytes(b) => {
+            ValueKind::Bytes(b) => {
                 let data = b.borrow().clone();
                 let chunk =
                     Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(data));
@@ -1248,7 +1273,7 @@ impl Interp {
                 Ok(rb.body(reqwest::Body::wrap_stream(stream)))
             }
             // (b) a reader native handle → drain fully (buffered-then-sent).
-            Value::Native(n)
+            ValueKind::Native(n)
                 if matches!(
                     n.kind,
                     NativeKind::Reader | NativeKind::TcpStream | NativeKind::HttpBody
@@ -1259,17 +1284,17 @@ impl Interp {
             }
             // (c) an async-generator fn → call to exhaustion (buffered-then-sent).
             // `Value::Closure` is the VM's compiled-function value (V4-T5 bridge).
-            Value::Function(_)
-            | Value::Closure(_)
-            | Value::Builtin(_)
-            | Value::BoundMethod(_) => {
+            ValueKind::Function(_)
+            | ValueKind::Closure(_)
+            | ValueKind::Builtin(_)
+            | ValueKind::BoundMethod(_) => {
                 let bytes = self.drain_generator(source.clone(), span).await?;
                 Ok(rb.body(bytes))
             }
-            other => Err(AsError::at(
+            _ => Err(AsError::at(
                 format!(
                     "net/http body.stream expects bytes, a reader handle, or a generator fn, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(source)
                 ),
                 span,
             )
@@ -1289,14 +1314,14 @@ impl Interp {
             method: "readToEnd".to_string(),
         });
         let v = self.call_native_method(m, Vec::new(), span).await?;
-        match v {
-            Value::Bytes(b) => Ok(b.borrow().clone()),
-            Value::Str(s) => Ok(s.as_bytes().to_vec()),
-            Value::Nil => Ok(Vec::new()),
-            other => Err(AsError::at(
+        match v.kind() {
+            ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+            ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
+            ValueKind::Nil => Ok(Vec::new()),
+            _ => Err(AsError::at(
                 format!(
                     "net/http body.stream reader yielded a non-bytes value: {}",
-                    crate::interp::type_name(&other)
+                    crate::interp::type_name(&v)
                 ),
                 span,
             )
@@ -1313,33 +1338,33 @@ impl Interp {
         loop {
             let r = self.call_value(gen.clone(), Vec::new(), span).await?;
             // A generator yields `[chunk, err]` (or a bare chunk / nil to end).
-            let (chunk, err) = match &r {
-                Value::Nil => (Value::Nil, Value::Nil),
-                Value::Array(a) => {
+            let (chunk, err) = match r.kind() {
+                ValueKind::Nil => (Value::nil(), Value::nil()),
+                ValueKind::Array(a) => {
                     let a = a.borrow();
                     (
-                        a.first().cloned().unwrap_or(Value::Nil),
-                        a.get(1).cloned().unwrap_or(Value::Nil),
+                        a.first().cloned().unwrap_or(Value::nil()),
+                        a.get(1).cloned().unwrap_or(Value::nil()),
                     )
                 }
-                other => (other.clone(), Value::Nil),
+                _ => (r.clone(), Value::nil()),
             };
-            if !matches!(err, Value::Nil) {
+            if !matches!(err.kind(), ValueKind::Nil) {
                 return Err(AsError::at(
                     format!("net/http body.stream generator returned an error: {}", err),
                     span,
                 )
                 .into());
             }
-            match chunk {
-                Value::Nil => return Ok(out), // end of stream
-                Value::Bytes(b) => out.extend_from_slice(&b.borrow()),
-                Value::Str(s) => out.extend_from_slice(s.as_bytes()),
-                other => {
+            match chunk.kind() {
+                ValueKind::Nil => return Ok(out), // end of stream
+                ValueKind::Bytes(b) => out.extend_from_slice(&b.borrow()),
+                ValueKind::Str(s) => out.extend_from_slice(s.as_bytes()),
+                _ => {
                     return Err(AsError::at(
                         format!(
                             "net/http body.stream generator chunk must be bytes/string, got {}",
-                            crate::interp::type_name(&other)
+                            crate::interp::type_name(&chunk)
                         ),
                         span,
                     )
@@ -1356,13 +1381,13 @@ impl Interp {
         let status = resp.status();
         let mut fields = IndexMap::new();
         // NUM §4: an HTTP status code is an `Int`.
-        fields.insert("status".to_string(), Value::Int(i64::from(status.as_u16())));
-        fields.insert("ok".to_string(), Value::Bool(status.is_success()));
+        fields.insert("status".to_string(), Value::int(i64::from(status.as_u16())));
+        fields.insert("ok".to_string(), Value::bool_(status.is_success()));
         fields.insert(
             "version".to_string(),
-            Value::Str(http_version_str(resp.version()).into()),
+            Value::str(http_version_str(resp.version())),
         );
-        fields.insert("url".to_string(), Value::Str(resp.url().as_str().into()));
+        fields.insert("url".to_string(), Value::str(resp.url().as_str()));
 
         // headers: object of lowercased name → value (last value wins on repeats,
         // except Set-Cookie which we fold into `cookies` below).
@@ -1373,10 +1398,10 @@ impl Interp {
             let val = value.to_str().unwrap_or("").to_string();
             if key == "set-cookie" {
                 if let Some((k, v)) = parse_set_cookie(&val) {
-                    cookies.insert(k, Value::Str(v.into()));
+                    cookies.insert(k, Value::str(v));
                 }
             }
-            headers.insert(key, Value::Str(val.into()));
+            headers.insert(key, Value::str(val));
         }
         fields.insert("headers".to_string(), obj(headers));
         fields.insert("cookies".to_string(), obj(cookies));
@@ -1420,7 +1445,7 @@ impl Interp {
         // in fields) reports the clear "not available on a streaming response" error.
         let handle =
             self.register_resource(NativeKind::HttpResponse, fields, ResourceState::Closed);
-        if let Value::Native(n) = &handle {
+        if let ValueKind::Native(n) = handle.kind() {
             self.take_resource(n.id);
         }
         handle
@@ -1458,11 +1483,11 @@ impl Interp {
                 };
                 match method {
                     "text" => match resp.text().await {
-                        Ok(s) => Ok(make_pair(Value::Str(s.into()), Value::Nil)),
+                        Ok(s) => Ok(make_pair(Value::str(s), Value::nil())),
                         Err(e) => Ok(err_pair(format!("response.text failed: {}", e))),
                     },
                     "bytes" => match resp.bytes().await {
-                        Ok(b) => Ok(make_pair(bytes_value(b.to_vec()), Value::Nil)),
+                        Ok(b) => Ok(make_pair(bytes_value(b.to_vec()), Value::nil())),
                         Err(e) => Ok(err_pair(format!("response.bytes failed: {}", e))),
                     },
                     "json" => match resp.bytes().await {
@@ -1477,11 +1502,14 @@ impl Interp {
                                 //
                                 // Disambiguation is unambiguous: Value::Class vs
                                 // tagged-Object (Object with __kind) vs absent.
-                                if let Some(Value::Class(c)) = args.first() {
+                                if let Some(ValueKind::Class(c)) = args.first().map(|x| x.kind()) {
                                     // Class path: validate_into.
-                                    let strict = matches!(args.get(1), Some(Value::Bool(true)));
+                                    let strict = matches!(
+                                        args.get(1).map(|x| x.kind()),
+                                        Some(ValueKind::Bool(true))
+                                    );
                                     match self.validate_into(c, &val, strict, "", span).await {
-                                        Ok(inst) => Ok(make_pair(inst, Value::Nil)),
+                                        Ok(inst) => Ok(make_pair(inst, Value::nil())),
                                         Err(e) => Ok(err_pair(e.message)),
                                     }
                                 } else if let Some(schema_val) = args.first() {
@@ -1492,9 +1520,9 @@ impl Interp {
                                             .parse_value(&schema_val, &val, "", false, span)
                                             .await
                                         {
-                                            Ok(v) => Ok(make_pair(v, Value::Nil)),
+                                            Ok(v) => Ok(make_pair(v, Value::nil())),
                                             Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
-                                                Ok(make_pair(Value::Nil, e))
+                                                Ok(make_pair(Value::nil(), e))
                                             }
                                             Err(
                                                 crate::stdlib::schema::ParseFail::InvalidSchema(
@@ -1507,10 +1535,10 @@ impl Interp {
                                         }
                                     } else {
                                         // Non-schema non-class first arg: return raw value.
-                                        Ok(make_pair(val, Value::Nil))
+                                        Ok(make_pair(val, Value::nil()))
                                     }
                                 } else {
-                                    Ok(make_pair(val, Value::Nil))
+                                    Ok(make_pair(val, Value::nil()))
                                 }
                             }
                             Err(e) => Ok(err_pair(format!("response.json failed: {}", e))),
@@ -1543,7 +1571,8 @@ impl Interp {
         match m.method.as_str() {
             "read" => {
                 let n = match args.first() {
-                    None | Some(Value::Nil) => DEFAULT_CHUNK,
+                    None => DEFAULT_CHUNK,
+                    Some(v) if matches!(v.kind(), ValueKind::Nil) => DEFAULT_CHUNK,
                     // Guard before the cast: an `Inf`/`NaN`/out-of-range `n` would cast
                     // to `usize::MAX` and abort the host via `buf.reserve(n)`.
                     Some(v) => super::want_count(v, span, "body.read", super::MAX_ALLOC_COUNT)?,
@@ -1559,7 +1588,7 @@ impl Interp {
                     });
                     return match mode {
                         Some(mode) => Ok(mode.wrap(Vec::new())),
-                        None => Ok(Value::Nil), // gone → EOF
+                        None => Ok(Value::nil()), // gone → EOF
                     };
                 }
                 // Take the body OUT so no table borrow is held across the await.
@@ -1569,13 +1598,13 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(Value::Nil); // gone → EOF
+                        return Ok(Value::nil()); // gone → EOF
                     }
                 };
                 let mode = body.mode;
                 let mut buf = Vec::new();
                 match body.read_upto(n, &mut buf).await {
-                    Ok(0) => Ok(Value::Nil), // EOF: drop the body
+                    Ok(0) => Ok(Value::nil()), // EOF: drop the body
                     Ok(_) => {
                         self.return_resource(id, ResourceState::HttpBody(body));
                         Ok(mode.wrap(buf))
@@ -1590,13 +1619,13 @@ impl Interp {
                         if let Some(o) = other {
                             self.return_resource(id, o);
                         }
-                        return Ok(Value::Nil); // gone → EOF
+                        return Ok(Value::nil()); // gone → EOF
                     }
                 };
                 let mode = body.mode;
                 let mut buf = Vec::new();
                 match body.read_line_bytes(&mut buf).await {
-                    Ok(0) => Ok(Value::Nil), // EOF: drop the body
+                    Ok(0) => Ok(Value::nil()), // EOF: drop the body
                     Ok(_) => {
                         // Strip a single trailing '\n' and an optional preceding '\r'.
                         if buf.last() == Some(&b'\n') {
@@ -1666,7 +1695,7 @@ impl Interp {
                         n.notify_one();
                     }
                 });
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => {
                 Err(AsError::at(format!("cancelHandle has no method '{}'", other), span).into())
@@ -1684,17 +1713,17 @@ impl Interp {
             Some(v) => v,
             None => return Ok(None),
         };
-        match &c {
-            Value::Native(n) if n.kind == NativeKind::CancelHandle => {
+        match c.kind() {
+            ValueKind::Native(n) if n.kind == NativeKind::CancelHandle => {
                 Ok(self.with_resource(n.id, |r| match r {
                     Some(ResourceState::CancelToken(notify)) => Some(notify.clone()),
                     _ => None,
                 }))
             }
-            other => Err(AsError::at(
+            _ => Err(AsError::at(
                 format!(
                     "net/http cancel expects a cancelToken() handle, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(&c)
                 ),
                 span,
             )
@@ -1720,7 +1749,10 @@ impl Interp {
             headers,
             auth,
             // Auto-reconnect default ON; `reconnect:false` disables.
-            enabled: !matches!(opt_field(opts, "reconnect"), Some(Value::Bool(false))),
+            enabled: !matches!(
+                opt_field(opts, "reconnect").map(|x| x.into_kind()),
+                Some(OwnedKind::Bool(false))
+            ),
             retry_default_ms: strict_num_field_v(opts, "retryDefault", "sse.retryDefault", span)?
                 .unwrap_or(3000.0)
                 .max(0.0) as u64,
@@ -1747,7 +1779,7 @@ impl Interp {
             IndexMap::new(),
             ResourceState::SseStream(Box::new(state)),
         );
-        Ok(make_pair(handle, Value::Nil))
+        Ok(make_pair(handle, Value::nil()))
     }
 
     /// Issue one SSE GET (initial or reconnect). `last_event_id` (when Some/non-empty)
@@ -1796,7 +1828,7 @@ impl Interp {
                 // Drop the resource (and its underlying connection); subsequent
                 // next() finds no resource and returns nil.
                 self.take_resource(id);
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             other => Err(AsError::at(format!("sseStream has no method '{}'", other), span).into()),
         }
@@ -1816,7 +1848,7 @@ impl Interp {
                     if let Some(o) = other {
                         self.return_resource(id, o);
                     }
-                    return Ok(Value::Nil); // closed/gone → ended
+                    return Ok(Value::nil()); // closed/gone → ended
                 }
             };
             let line = {
@@ -1847,7 +1879,7 @@ impl Interp {
                     let ev = state.take_event();
                     self.return_resource(id, ResourceState::SseStream(state));
                     if let Some(ev) = ev {
-                        return Ok(make_pair(ev, Value::Nil));
+                        return Ok(make_pair(ev, Value::nil()));
                     }
                     // else: stray blank line, keep reading.
                 }
@@ -1862,12 +1894,12 @@ impl Interp {
                     // Put the state back so `sse_reconnect` can read its plan.
                     self.return_resource(id, ResourceState::SseStream(state));
                     if let Some(ev) = ev {
-                        return Ok(make_pair(ev, Value::Nil));
+                        return Ok(make_pair(ev, Value::nil()));
                     }
                     if !self.sse_reconnect(id, span).await? {
                         // No reconnect (off / cap reached / connect failed) → ended.
                         self.take_resource(id);
-                        return Ok(Value::Nil);
+                        return Ok(Value::nil());
                     }
                     // Reconnected: loop to read from the fresh body.
                 }
@@ -1934,13 +1966,13 @@ impl Interp {
 fn sse_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>, Control> {
     let mut out = Vec::new();
     if let Some(h) = opt_field(opts, "headers") {
-        let map = match &h {
-            Value::Object(o) => o,
-            other => {
+        let map = match h.kind() {
+            ValueKind::Object(o) => o,
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "net/http sse headers expects an object, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&h)
                     ),
                     span,
                 )
@@ -1961,13 +1993,13 @@ fn sse_auth(opts: &Value, span: Span) -> Result<Option<SseAuth>, Control> {
         Some(v) => v,
         None => return Ok(None),
     };
-    let o = match &a {
-        Value::Object(o) => o.clone(),
-        other => {
+    let o = match a.kind() {
+        ValueKind::Object(o) => o.clone(),
+        _ => {
             return Err(AsError::at(
                 format!(
                     "net/http sse auth expects an object, got {}",
-                    crate::interp::type_name(other)
+                    crate::interp::type_name(&a)
                 ),
                 span,
             )
@@ -1982,12 +2014,13 @@ fn sse_auth(opts: &Value, span: Span) -> Result<Option<SseAuth>, Control> {
         let arr = super::want_array(&basic, span, "net/http sse auth.basic")?;
         let arr = arr.borrow();
         let user = want_string(
-            arr.first().unwrap_or(&Value::Nil),
+            arr.first().unwrap_or(&Value::nil()),
             span,
             "net/http sse auth.basic[0]",
         )?;
         let pass = match arr.get(1) {
-            Some(Value::Nil) | None => None,
+            None => None,
+            Some(p) if matches!(p.kind(), ValueKind::Nil) => None,
             Some(p) => Some(want_string(p, span, "net/http sse auth.basic[1]")?.to_string()),
         };
         return Ok(Some(SseAuth::Basic(user.to_string(), pass)));
@@ -2050,13 +2083,13 @@ fn build_multipart(mp: &Value, span: Span) -> Result<reqwest::multipart::Form, C
     let arr = super::want_array(mp, span, "net/http body.multipart")?;
     let mut form = reqwest::multipart::Form::new();
     for entry in arr.borrow().iter() {
-        let o = match entry {
-            Value::Object(o) => o,
-            other => {
+        let o = match entry.kind() {
+            ValueKind::Object(o) => o,
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "net/http multipart part must be an object, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(entry)
                     ),
                     span,
                 )
@@ -2068,14 +2101,14 @@ fn build_multipart(mp: &Value, span: Span) -> Result<reqwest::multipart::Form, C
             None => return Err(AsError::at("net/http multipart part requires a name", span).into()),
         };
         if let Some(data) = o.get("data") {
-            let bytes = match data {
-                Value::Str(s) => s.as_bytes().to_vec(),
-                Value::Bytes(b) => b.borrow().clone(),
-                other => {
+            let bytes = match data.kind() {
+                ValueKind::Str(s) => s.as_bytes().to_vec(),
+                ValueKind::Bytes(b) => b.borrow().clone(),
+                _ => {
                     return Err(AsError::at(
                         format!(
                             "net/http multipart data must be string/bytes, got {}",
-                            crate::interp::type_name(&other)
+                            crate::interp::type_name(&data)
                         ),
                         span,
                     )

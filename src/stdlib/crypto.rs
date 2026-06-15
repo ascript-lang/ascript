@@ -10,7 +10,7 @@ use super::{arg, bi, want_number, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -44,9 +44,9 @@ fn bytes_val(v: Vec<u8>) -> Value {
 
 /// Accept bytes OR a string (encoded as UTF-8) as a source of raw bytes.
 fn source_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
-    match v {
-        Value::Bytes(b) => Ok(b.borrow().clone()),
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
+    match v.kind() {
+        ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
         _ => Err(AsError::at(
             format!(
                 "{} expects bytes or a string, got {}",
@@ -70,17 +70,17 @@ pub fn call(
         "sha256" => {
             let src = source_bytes(&arg(args, 0), span, &ctx("sha256"))?;
             let digest = Sha256::digest(&src);
-            Ok(Value::Str(hex::encode(digest).into()))
+            Ok(Value::str(hex::encode(digest)))
         }
         "sha512" => {
             let src = source_bytes(&arg(args, 0), span, &ctx("sha512"))?;
             let digest = Sha512::digest(&src);
-            Ok(Value::Str(hex::encode(digest).into()))
+            Ok(Value::str(hex::encode(digest)))
         }
         "md5" => {
             let src = source_bytes(&arg(args, 0), span, &ctx("md5"))?;
             let digest = Md5::digest(&src);
-            Ok(Value::Str(hex::encode(digest).into()))
+            Ok(Value::str(hex::encode(digest)))
         }
         "hmacSha256" => {
             let key = source_bytes(&arg(args, 0), span, &ctx("hmacSha256"))?;
@@ -91,7 +91,7 @@ pub fn call(
                 Hmac::<Sha256>::new_from_slice(&key).expect("HMAC accepts any key length");
             mac.update(&data);
             let tag = mac.finalize().into_bytes();
-            Ok(Value::Str(hex::encode(tag).into()))
+            Ok(Value::str(hex::encode(tag)))
         }
         "randomBytes" => {
             let n = want_number(&arg(args, 0), span, &ctx("randomBytes"))?;
@@ -129,16 +129,16 @@ pub fn call(
                 Ok(s) => s,
                 Err(e) => {
                     return Ok(make_pair(
-                        Value::Nil,
-                        make_error(Value::Str(format!("argon2 salt encode failed: {}", e).into())),
+                        Value::nil(),
+                        make_error(Value::str(format!("argon2 salt encode failed: {}", e))),
                     ))
                 }
             };
             match Argon2::default().hash_password(&pw, &salt) {
-                Ok(hash) => Ok(make_pair(Value::Str(hash.to_string().into()), Value::Nil)),
+                Ok(hash) => Ok(make_pair(Value::str(hash.to_string()), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("argon2 hash failed: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("argon2 hash failed: {}", e))),
                 )),
             }
         }
@@ -149,12 +149,13 @@ pub fn call(
             let ok = PasswordHash::new(&phc)
                 .map(|parsed| Argon2::default().verify_password(&pw, &parsed).is_ok())
                 .unwrap_or(false);
-            Ok(Value::Bool(ok))
+            Ok(Value::bool_(ok))
         }
         "bcryptHash" => {
             let pw = source_bytes(&arg(args, 0), span, &ctx("bcryptHash"))?;
             let cost = match args.get(1) {
-                None | Some(Value::Nil) => bcrypt::DEFAULT_COST,
+                None => bcrypt::DEFAULT_COST,
+                Some(v) if matches!(v.kind(), ValueKind::Nil) => bcrypt::DEFAULT_COST,
                 Some(v) => {
                     let c = want_number(v, span, &ctx("bcryptHash"))?;
                     // bcrypt's valid cost range is 4..=31; reject anything else
@@ -180,10 +181,10 @@ pub fn call(
                 OsRng.fill_bytes(&mut salt_bytes);
             }
             match bcrypt::hash_with_salt(&pw, cost, salt_bytes) {
-                Ok(parts) => Ok(make_pair(Value::Str(parts.to_string().into()), Value::Nil)),
+                Ok(parts) => Ok(make_pair(Value::str(parts.to_string()), Value::nil())),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("bcrypt hash failed: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("bcrypt hash failed: {}", e))),
                 )),
             }
         }
@@ -192,18 +193,18 @@ pub fn call(
             let hash = want_string(&arg(args, 1), span, &ctx("bcryptVerify"))?;
             // A malformed hash or a non-match both verify as `false`.
             let ok = bcrypt::verify(&pw, &hash).unwrap_or(false);
-            Ok(Value::Bool(ok))
+            Ok(Value::bool_(ok))
         }
         "crc32" => {
             let bytes = source_bytes(&arg(args, 0), span, &ctx("crc32"))?;
             let mut h = crc32fast::Hasher::new();
             h.update(&bytes);
-            Ok(Value::Float(h.finalize() as f64))
+            Ok(Value::float(h.finalize() as f64))
         }
         "xxhash" => {
             let bytes = source_bytes(&arg(args, 0), span, &ctx("xxhash"))?;
             let digest = xxhash_rust::xxh64::xxh64(&bytes, 0);
-            Ok(Value::Str(format!("{:016x}", digest).into()))
+            Ok(Value::str(format!("{:016x}", digest)))
         }
         _ => Err(AsError::at(format!("std/crypto has no function '{}'", func), span).into()),
     }
@@ -216,7 +217,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
     /// Dispatch with a fresh non-deterministic `Interp` (the default real-RNG path).
     fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -271,10 +272,10 @@ mod tests {
 
     #[test]
     fn random_bytes_len_and_distinct() {
-        let a = call("randomBytes", &[Value::Float(16.0)], sp()).unwrap();
-        let b = call("randomBytes", &[Value::Float(16.0)], sp()).unwrap();
-        match (&a, &b) {
-            (Value::Bytes(ba), Value::Bytes(bb)) => {
+        let a = call("randomBytes", &[Value::float(16.0)], sp()).unwrap();
+        let b = call("randomBytes", &[Value::float(16.0)], sp()).unwrap();
+        match (a.kind(), b.kind()) {
+            (ValueKind::Bytes(ba), ValueKind::Bytes(bb)) => {
                 assert_eq!(ba.borrow().len(), 16);
                 assert_eq!(bb.borrow().len(), 16);
                 // Two 16-byte CSPRNG draws are overwhelmingly unlikely to match.
@@ -287,60 +288,60 @@ mod tests {
     #[test]
     fn random_bytes_bounds_are_tier2() {
         // Negative length is rejected.
-        assert!(call("randomBytes", &[Value::Float(-1.0)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::float(-1.0)], sp()).is_err());
         // A huge length would saturate `as usize` into an alloc-abort; reject it.
-        assert!(call("randomBytes", &[Value::Float(1e30)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::float(1e30)], sp()).is_err());
         // Fractional (non-integer) lengths are rejected.
-        assert!(call("randomBytes", &[Value::Float(1.5)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::float(1.5)], sp()).is_err());
         // Non-finite lengths are rejected.
-        assert!(call("randomBytes", &[Value::Float(f64::NAN)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::float(f64::NAN)], sp()).is_err());
         // The cap itself is allowed; one past it is not.
-        assert!(call("randomBytes", &[Value::Float(16_777_217.0)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::float(16_777_217.0)], sp()).is_err());
     }
 
     #[test]
     fn bcrypt_cost_bounds_are_tier2() {
         // bcrypt's valid cost range is 4..=31; out-of-range is a Tier-2 panic.
-        assert!(call("bcryptHash", &[s("pw"), Value::Float(99.0)], sp()).is_err());
-        assert!(call("bcryptHash", &[s("pw"), Value::Float(3.0)], sp()).is_err());
-        assert!(call("bcryptHash", &[s("pw"), Value::Float(4.5)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::float(99.0)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::float(3.0)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::float(4.5)], sp()).is_err());
     }
 
     #[test]
     fn argon2_password_roundtrip() {
         let pair = call("hashPassword", &[s("secret")], sp()).unwrap();
-        let (phc, err) = match &pair {
-            Value::Array(a) => {
+        let (phc, err) = match pair.kind() {
+            ValueKind::Array(a) => {
                 let v = a.borrow();
                 (v[0].clone(), v[1].clone())
             }
             _ => panic!("hashPassword should return a pair"),
         };
-        assert_eq!(err, Value::Nil);
-        let phc_str = match &phc {
-            Value::Str(s) => s.to_string(),
+        assert_eq!(err, Value::nil());
+        let phc_str = match phc.kind() {
+            ValueKind::Str(s) => s.to_string(),
             _ => panic!("phc should be a string"),
         };
         assert!(phc_str.starts_with("$argon2"));
         assert_eq!(
             call("verifyPassword", &[s("secret"), s(&phc_str)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("verifyPassword", &[s("wrong"), s(&phc_str)], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
     /// Extract the hash string out of a `hashPassword`/`bcryptHash` `[value, err]`
     /// pair (an argon2 PHC string or a bcrypt `$2b$…` string — both `[Str, Nil]`).
     fn hash_of(pair: &Value) -> String {
-        match pair {
-            Value::Array(a) => {
+        match pair.kind() {
+            ValueKind::Array(a) => {
                 let v = a.borrow();
-                assert_eq!(v[1], Value::Nil, "password hashing errored: {:?}", v[1]);
-                match &v[0] {
-                    Value::Str(s) => s.to_string(),
+                assert_eq!(v[1], Value::nil(), "password hashing errored: {:?}", v[1]);
+                match v[0].kind() {
+                    ValueKind::Str(s) => s.to_string(),
                     _ => panic!("hash should be a string"),
                 }
             }
@@ -371,11 +372,11 @@ mod tests {
         let phc = run(42);
         assert_eq!(
             call("verifyPassword", &[s("secret"), s(&phc)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("verifyPassword", &[s("wrong"), s(&phc)], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
@@ -389,11 +390,11 @@ mod tests {
         // Both still verify (verifyPassword reads the salt from the stored hash).
         assert_eq!(
             call("verifyPassword", &[s("secret"), s(&a)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("verifyPassword", &[s("secret"), s(&b)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
     }
 
@@ -406,41 +407,41 @@ mod tests {
                 sp()
             )
             .unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
     #[test]
     fn bcrypt_roundtrip() {
         let pair = call("bcryptHash", &[s("secret")], sp()).unwrap();
-        let (hash, err) = match &pair {
-            Value::Array(a) => {
+        let (hash, err) = match pair.kind() {
+            ValueKind::Array(a) => {
                 let v = a.borrow();
                 (v[0].clone(), v[1].clone())
             }
             _ => panic!("bcryptHash should return a pair"),
         };
-        assert_eq!(err, Value::Nil);
-        let hash_str = match &hash {
-            Value::Str(s) => s.to_string(),
+        assert_eq!(err, Value::nil());
+        let hash_str = match hash.kind() {
+            ValueKind::Str(s) => s.to_string(),
             _ => panic!("bcrypt hash should be a string"),
         };
         assert_eq!(
             call("bcryptVerify", &[s("secret"), s(&hash_str)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("bcryptVerify", &[s("wrong"), s(&hash_str)], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
     #[test]
     fn bcrypt_custom_cost() {
-        let pair = call("bcryptHash", &[s("pw"), Value::Float(4.0)], sp()).unwrap();
-        let hash_str = match &pair {
-            Value::Array(a) => match &a.borrow()[0] {
-                Value::Str(s) => s.to_string(),
+        let pair = call("bcryptHash", &[s("pw"), Value::float(4.0)], sp()).unwrap();
+        let hash_str = match pair.kind() {
+            ValueKind::Array(a) => match a.borrow()[0].kind() {
+                ValueKind::Str(s) => s.to_string(),
                 _ => panic!("expected string"),
             },
             _ => panic!("expected pair"),
@@ -466,7 +467,7 @@ mod tests {
                 &super::call(
                     &interp,
                     "bcryptHash",
-                    &[s("secret"), Value::Float(4.0)],
+                    &[s("secret"), Value::float(4.0)],
                     sp(),
                 )
                 .unwrap(),
@@ -478,11 +479,11 @@ mod tests {
         assert!(hash.starts_with("$2"), "got {}", hash);
         assert_eq!(
             call("bcryptVerify", &[s("secret"), s(&hash)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("bcryptVerify", &[s("wrong"), s(&hash)], sp()).unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
@@ -490,17 +491,17 @@ mod tests {
     /// `bcryptHash(samePw)` calls produce DIFFERENT hashes (no security regression).
     #[test]
     fn bcrypt_random_salt_in_default_mode() {
-        let a = hash_of(&call("bcryptHash", &[s("secret"), Value::Float(4.0)], sp()).unwrap());
-        let b = hash_of(&call("bcryptHash", &[s("secret"), Value::Float(4.0)], sp()).unwrap());
+        let a = hash_of(&call("bcryptHash", &[s("secret"), Value::float(4.0)], sp()).unwrap());
+        let b = hash_of(&call("bcryptHash", &[s("secret"), Value::float(4.0)], sp()).unwrap());
         assert_ne!(a, b, "default-mode bcrypt salt must be random");
         // Both still verify (bcryptVerify reads the salt from the stored hash).
         assert_eq!(
             call("bcryptVerify", &[s("secret"), s(&a)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             call("bcryptVerify", &[s("secret"), s(&b)], sp()).unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
     }
 
@@ -510,10 +511,10 @@ mod tests {
         let result = call("crc32", &[s("hello")], sp()).unwrap();
         // We'll verify it's the correct CRC-32 value; the exact constant will be
         // confirmed by the implementation (907060870 = 0x3610A686).
-        assert_eq!(result, Value::Float(907060870.0));
+        assert_eq!(result, Value::float(907060870.0));
         // xxhash returns a 16-char lowercase hex string (xxh64)
         let r = call("xxhash", &[s("hello")], sp()).unwrap();
-        if let Value::Str(ref hex_str) = r {
+        if let ValueKind::Str(hex_str) = r.kind() {
             assert_eq!(hex_str.len(), 16);
             assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()));
         } else {
@@ -522,7 +523,7 @@ mod tests {
         // Pinned known vector: canonical xxh64("hello", seed=0) = 0x26c7827d889f6da3.
         assert_eq!(
             call("xxhash", &[s("hello")], sp()).unwrap(),
-            Value::Str("26c7827d889f6da3".into())
+            Value::str("26c7827d889f6da3")
         );
         // bytes input also works for crc32
         assert_eq!(
@@ -532,7 +533,7 @@ mod tests {
                 sp()
             )
             .unwrap(),
-            Value::Float(907060870.0)
+            Value::float(907060870.0)
         );
         // bytes input also works for xxhash
         let r2 = call(
@@ -548,12 +549,12 @@ mod tests {
     #[test]
     fn arg_type_misuse_is_tier2_panic() {
         // A number is not a valid data source → Tier-2 (Control error).
-        assert!(call("sha256", &[Value::Float(42.0)], sp()).is_err());
-        assert!(call("md5", &[Value::Bool(true)], sp()).is_err());
+        assert!(call("sha256", &[Value::float(42.0)], sp()).is_err());
+        assert!(call("md5", &[Value::bool_(true)], sp()).is_err());
         // hmac with a non-string/bytes key.
-        assert!(call("hmacSha256", &[Value::Float(1.0), s("x")], sp()).is_err());
+        assert!(call("hmacSha256", &[Value::float(1.0), s("x")], sp()).is_err());
         // The checksum arms reject non-string/bytes input too.
-        assert!(call("crc32", &[Value::Float(1.0)], sp()).is_err());
-        assert!(call("xxhash", &[Value::Float(1.0)], sp()).is_err());
+        assert!(call("crc32", &[Value::float(1.0)], sp()).is_err());
+        assert!(call("xxhash", &[Value::float(1.0)], sp()).is_err());
     }
 }

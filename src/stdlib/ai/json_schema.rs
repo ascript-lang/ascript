@@ -20,7 +20,7 @@
 use serde_json::{json, Map, Value as J};
 
 use crate::ast::Type;
-use crate::value::{Class, Value};
+use crate::value::{Class, OwnedKind, Value, ValueKind};
 
 /// Project a class into a JSON Schema object (`{type:"object", properties, required,
 /// additionalProperties:false}`). Walks the superclass chain (own fields override).
@@ -73,8 +73,8 @@ fn class_to_json_schema_env_inner(
             // Cycle — emit an open object to terminate.
             return Some(json!({"type": "object"}));
         }
-        match env_clone.get(name) {
-            Some(Value::Class(nested)) => {
+        match env_clone.get(name).map(Value::into_kind) {
+            Some(OwnedKind::Class(nested)) => {
                 // Fresh visited set per branch (snapshot + this class) so siblings
                 // referencing the same class each get a full projection, while a true
                 // cycle (a class reachable from itself) still terminates.
@@ -194,9 +194,9 @@ fn make_nullable(schema: &mut J) {
 /// schema objects yield an open `{}` (accept-anything) rather than erroring, since
 /// the decode step re-validates.
 pub fn schema_value_to_json_schema(schema: &Value) -> J {
-    let kind = match schema {
-        Value::Object(o) => match o.get("__kind") {
-            Some(Value::Str(s)) => s.to_string(),
+    let kind = match schema.kind() {
+        ValueKind::Object(o) => match o.get("__kind").map(Value::into_kind) {
+            Some(OwnedKind::Str(s)) => s.to_string(),
             _ => return json!({}),
         },
         _ => return json!({}),
@@ -211,7 +211,7 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
             if let Some(n) = field_num(schema, "maxLength") {
                 m.insert("maxLength".to_string(), json!(n as i64));
             }
-            if let Some(Value::Str(p)) = field(schema, "pattern") {
+            if let Some(OwnedKind::Str(p)) = field(schema, "pattern").map(Value::into_kind) {
                 m.insert("pattern".to_string(), J::String(p.to_string()));
             }
             J::Object(m)
@@ -231,12 +231,12 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "nil" => json!({"type": "null"}),
         "any" => json!({}),
         "literal" => {
-            let v = field(schema, "value").unwrap_or(Value::Nil);
+            let v = field(schema, "value").unwrap_or(Value::nil());
             json!({ "const": value_to_json(&v) })
         }
         "oneOf" => {
-            let vals = match field(schema, "values") {
-                Some(Value::Array(a)) => a.borrow().iter().map(value_to_json).collect::<Vec<_>>(),
+            let vals = match field(schema, "values").map(Value::into_kind) {
+                Some(OwnedKind::Array(a)) => a.borrow().iter().map(value_to_json).collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
             json!({ "enum": vals })
@@ -252,7 +252,7 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "object" => {
             let mut properties = Map::new();
             let mut required: Vec<J> = Vec::new();
-            if let Some(Value::Object(fields)) = field(schema, "fields") {
+            if let Some(OwnedKind::Object(fields)) = field(schema, "fields").map(Value::into_kind) {
                 for (name, fschema) in fields.entries() {
                     let js = schema_value_to_json_schema(&fschema);
                     let optional = schema_is_optional(&fschema);
@@ -262,7 +262,7 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
                     }
                 }
             }
-            let strict = matches!(field(schema, "strict"), Some(Value::Bool(true)));
+            let strict = matches!(field(schema, "strict").map(Value::into_kind), Some(OwnedKind::Bool(true)));
             let mut m = Map::new();
             m.insert("type".to_string(), J::String("object".to_string()));
             m.insert("properties".to_string(), J::Object(properties));
@@ -279,8 +279,8 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
             inner
         }
         "union" => {
-            let opts = match field(schema, "options") {
-                Some(Value::Array(a)) => a
+            let opts = match field(schema, "options").map(Value::into_kind) {
+                Some(OwnedKind::Array(a)) => a
                     .borrow()
                     .iter()
                     .map(schema_value_to_json_schema)
@@ -295,13 +295,13 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
 
 /// Is a `std/schema` value the `optional` kind (so its object field is not required)?
 fn schema_is_optional(schema: &Value) -> bool {
-    matches!(schema, Value::Object(o)
-        if matches!(o.get("__kind"), Some(Value::Str(s)) if s.as_ref() == "optional"))
+    matches!(schema.kind(), ValueKind::Object(o)
+        if matches!(o.get("__kind").map(Value::into_kind), Some(OwnedKind::Str(s)) if s.as_ref() == "optional"))
 }
 
 fn field(v: &Value, key: &str) -> Option<Value> {
-    match v {
-        Value::Object(o) => o.get(key),
+    match v.kind() {
+        ValueKind::Object(o) => o.get(key),
         _ => None,
     }
 }
@@ -312,13 +312,13 @@ fn field_num(v: &Value, key: &str) -> Option<f64> {
 }
 
 fn value_to_json(v: &Value) -> J {
-    match v {
-        Value::Nil => J::Null,
-        Value::Bool(b) => J::Bool(*b),
+    match v.kind() {
+        ValueKind::Nil => J::Null,
+        ValueKind::Bool(b) => J::Bool(b),
         // NUM §4: an `Int` emits as a JSON integer; a `Float` as a JSON number.
-        Value::Int(i) => json!(i),
-        Value::Float(n) => json!(n),
-        Value::Str(s) => J::String(s.to_string()),
+        ValueKind::Int(i) => json!(i),
+        ValueKind::Float(n) => json!(n),
+        ValueKind::Str(s) => J::String(s.to_string()),
         _ => J::Null,
     }
 }
@@ -420,11 +420,11 @@ mod tests {
 
     fn schema_obj(kind: &str, extra: Vec<(&str, Value)>) -> Value {
         let mut m: IndexMap<String, Value> = IndexMap::new();
-        m.insert("__kind".to_string(), Value::Str(kind.into()));
+        m.insert("__kind".to_string(), Value::str(kind));
         for (k, v) in extra {
             m.insert(k.to_string(), v);
         }
-        Value::Object(crate::value::ObjectCell::new(m))
+        Value::object(m)
     }
 
     fn obj(entries: Vec<(&str, Value)>) -> Value {
@@ -432,11 +432,11 @@ mod tests {
         for (k, v) in entries {
             m.insert(k.to_string(), v);
         }
-        Value::Object(crate::value::ObjectCell::new(m))
+        Value::object(m)
     }
 
     fn arr(items: Vec<Value>) -> Value {
-        Value::Array(crate::value::ArrayCell::new(items))
+        Value::array(items)
     }
 
     #[test]
@@ -444,8 +444,8 @@ mod tests {
         let s = schema_obj(
             "string",
             vec![
-                ("minLength", Value::Float(3.0)),
-                ("pattern", Value::Str("^a".into())),
+                ("minLength", Value::float(3.0)),
+                ("pattern", Value::str("^a")),
             ],
         );
         let js = schema_value_to_json_schema(&s);
@@ -458,7 +458,7 @@ mod tests {
     fn schema_number_min_max() {
         let s = schema_obj(
             "number",
-            vec![("min", Value::Float(0.0)), ("max", Value::Float(10.0))],
+            vec![("min", Value::float(0.0)), ("max", Value::float(10.0))],
         );
         let js = schema_value_to_json_schema(&s);
         assert_eq!(js["type"], "number");
@@ -473,7 +473,7 @@ mod tests {
             "oneOf",
             vec![(
                 "values",
-                arr(vec![Value::Str("pos".into()), Value::Str("neg".into())]),
+                arr(vec![Value::str("pos"), Value::str("neg")]),
             )],
         );
         let score = schema_obj("number", vec![]);

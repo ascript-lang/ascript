@@ -5,7 +5,7 @@ use super::{arg, bi, clamp_index, want_array, want_number};
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::{MapKey, Value};
+use crate::value::{MapKey, Value, ValueKind};
 use indexmap::IndexMap;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -59,7 +59,7 @@ impl Interp {
                     let v = cb.call1(item).await?;
                     out.push(v);
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "filter" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("filter"))?;
@@ -73,7 +73,7 @@ impl Interp {
                         out.push(item);
                     }
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "reduce" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("reduce"))?;
@@ -93,92 +93,92 @@ impl Interp {
                 let mut b = arr.borrow_mut();
                 b.push(item);
                 // NUM §4: the new length is an `Int`.
-                Ok(Value::Int(b.len() as i64))
+                Ok(Value::int(b.len() as i64))
             }
             "pop" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("pop"))?;
                 crate::interp::check_not_frozen(&arg(args, 0), span)?;
                 let popped = arr.borrow_mut().pop();
-                Ok(popped.unwrap_or(Value::Nil))
+                Ok(popped.unwrap_or(Value::nil()))
             }
             "slice" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("slice"))?;
                 let b = arr.borrow();
                 let len = b.len();
                 let start = clamp_index(want_number(&arg(args, 1), span, &ctx("slice"))?, len);
-                let end = match args.get(2) {
-                    None | Some(Value::Nil) => len,
-                    Some(v) => clamp_index(want_number(v, span, &ctx("slice"))?, len),
+                let end = match args.get(2).map(|v| v.kind()) {
+                    None | Some(ValueKind::Nil) => len,
+                    Some(_) => clamp_index(want_number(&args[2], span, &ctx("slice"))?, len),
                 };
                 let out: Vec<Value> = if start < end {
                     b[start..end].to_vec()
                 } else {
                     Vec::new()
                 };
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "contains" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("contains"))?;
                 let needle = arg(args, 1);
                 let found = arr.borrow().contains(&needle);
-                Ok(Value::Bool(found))
+                Ok(Value::bool_(found))
             }
             "get" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("get"))?;
                 let i = want_number(&arg(args, 1), span, &ctx("get"))?;
                 if i < 0.0 || i.fract() != 0.0 {
-                    return Ok(Value::Nil);
+                    return Ok(Value::nil());
                 }
                 let got = arr.borrow().get(i as usize).cloned();
-                Ok(got.unwrap_or(Value::Nil))
+                Ok(got.unwrap_or(Value::nil()))
             }
             "sort" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("sort"))?;
                 let mut items = arr.borrow().clone();
                 let cmp = args.get(1).cloned();
-                match cmp {
-                    Some(Value::Nil) | None => {
-                        sort_default(&mut items, span)?;
-                    }
-                    Some(f) => {
-                        // Insertion sort driven by the async comparator: insert each
-                        // item before the first existing element it compares < 0 against.
-                        // O(n^2), acceptable because each comparison is an async user-
-                        // callback call (a standard borrow-free sort is awkward with an
-                        // async comparator). Stable: insertion stops at the first strictly
-                        // negative compare, so equal-key elements keep their input order.
-                        let mut sorted: Vec<Value> = Vec::with_capacity(items.len());
-                        let mut cb = self.callback_driver(f, span);
-                        for item in items.into_iter() {
-                            let mut lo = 0usize;
-                            while lo < sorted.len() {
-                                let r = cb
-                                    .call2(item.clone(), sorted[lo].clone())
-                                    .await?;
-                                let n = match r.as_f64() {
-                                    Some(n) => n,
-                                    None => {
-                                        return Err(AsError::at(
-                                            format!(
+                let cmp_is_some = cmp
+                    .as_ref()
+                    .map(|v| !matches!(v.kind(), ValueKind::Nil))
+                    .unwrap_or(false);
+                if !cmp_is_some {
+                    sort_default(&mut items, span)?;
+                } else {
+                    let f = cmp.unwrap();
+                    // Insertion sort driven by the async comparator: insert each
+                    // item before the first existing element it compares < 0 against.
+                    // O(n^2), acceptable because each comparison is an async user-
+                    // callback call (a standard borrow-free sort is awkward with an
+                    // async comparator). Stable: insertion stops at the first strictly
+                    // negative compare, so equal-key elements keep their input order.
+                    let mut sorted: Vec<Value> = Vec::with_capacity(items.len());
+                    let mut cb = self.callback_driver(f, span);
+                    for item in items.into_iter() {
+                        let mut lo = 0usize;
+                        while lo < sorted.len() {
+                            let r = cb.call2(item.clone(), sorted[lo].clone()).await?;
+                            let n = match r.as_f64() {
+                                Some(n) => n,
+                                None => {
+                                    return Err(AsError::at(
+                                        format!(
                                             "array.sort comparator must return a number, got {}",
                                             crate::interp::type_name(&r)
                                         ),
-                                            span,
-                                        )
-                                        .into())
-                                    }
-                                };
-                                if n < 0.0 {
-                                    break;
+                                        span,
+                                    )
+                                    .into())
                                 }
-                                lo += 1;
+                            };
+                            if n < 0.0 {
+                                break;
                             }
-                            sorted.insert(lo, item);
+                            lo += 1;
                         }
-                        items = sorted;
+                        sorted.insert(lo, item);
                     }
+                    items = sorted;
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(items)))
+                Ok(Value::array(items))
             }
             "find" => {
                 let a = want_array(&arg(args, 0), span, &ctx("find"))?;
@@ -190,7 +190,7 @@ impl Interp {
                         return Ok(item);
                     }
                 }
-                Ok(Value::Nil)
+                Ok(Value::nil())
             }
             "findIndex" => {
                 let a = want_array(&arg(args, 0), span, &ctx("findIndex"))?;
@@ -200,10 +200,10 @@ impl Interp {
                 for (i, item) in items.into_iter().enumerate() {
                     if cb.call1(item).await?.is_truthy() {
                         // NUM §4: an index is an `Int`.
-                        return Ok(Value::Int(i as i64));
+                        return Ok(Value::int(i as i64));
                     }
                 }
-                Ok(Value::Int(-1))
+                Ok(Value::int(-1))
             }
             "some" => {
                 let a = want_array(&arg(args, 0), span, &ctx("some"))?;
@@ -212,10 +212,10 @@ impl Interp {
                 let mut cb = self.callback_driver(f, span);
                 for item in items.into_iter() {
                     if cb.call1(item).await?.is_truthy() {
-                        return Ok(Value::Bool(true));
+                        return Ok(Value::bool_(true));
                     }
                 }
-                Ok(Value::Bool(false))
+                Ok(Value::bool_(false))
             }
             "every" => {
                 let a = want_array(&arg(args, 0), span, &ctx("every"))?;
@@ -224,24 +224,24 @@ impl Interp {
                 let mut cb = self.callback_driver(f, span);
                 for item in items.into_iter() {
                     if !cb.call1(item).await?.is_truthy() {
-                        return Ok(Value::Bool(false));
+                        return Ok(Value::bool_(false));
                     }
                 }
-                Ok(Value::Bool(true))
+                Ok(Value::bool_(true))
             }
             "indexOf" => {
                 let a = want_array(&arg(args, 0), span, &ctx("indexOf"))?;
                 let needle = arg(args, 1);
                 let idx = a.borrow().iter().position(|x| *x == needle);
                 // NUM §4: an index is an `Int`.
-                Ok(Value::Int(idx.map(|i| i as i64).unwrap_or(-1)))
+                Ok(Value::int(idx.map(|i| i as i64).unwrap_or(-1)))
             }
             "flat" => {
                 let a = want_array(&arg(args, 0), span, &ctx("flat"))?;
-                let depth = match args.get(1) {
-                    None | Some(Value::Nil) => 1usize,
-                    Some(v) => {
-                        let d = want_number(v, span, &ctx("flat"))?;
+                let depth = match args.get(1).map(|v| v.kind()) {
+                    None | Some(ValueKind::Nil) => 1usize,
+                    Some(_) => {
+                        let d = want_number(&args[1], span, &ctx("flat"))?;
                         if d < 0.0 || d.fract() != 0.0 {
                             return Err(AsError::at(
                                 "array.flat depth must be a non-negative integer",
@@ -254,7 +254,7 @@ impl Interp {
                 };
                 let mut out = Vec::new();
                 flatten_into(&a.borrow(), depth, &mut out);
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "flatMap" => {
                 let a = want_array(&arg(args, 0), span, &ctx("flatMap"))?;
@@ -264,18 +264,19 @@ impl Interp {
                 let mut out = Vec::new();
                 for item in items.into_iter() {
                     let mapped = cb.call1(item).await?;
-                    match mapped {
-                        Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
-                        other => out.push(other),
+                    if let ValueKind::Array(inner) = mapped.kind() {
+                        out.extend(inner.borrow().iter().cloned());
+                    } else {
+                        out.push(mapped);
                     }
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "reverse" => {
                 let a = want_array(&arg(args, 0), span, &ctx("reverse"))?;
                 let mut items = a.borrow().clone();
                 items.reverse();
-                Ok(Value::Array(crate::value::ArrayCell::new(items)))
+                Ok(Value::array(items))
             }
             "concat" => {
                 let a = want_array(&arg(args, 0), span, &ctx("concat"))?;
@@ -284,16 +285,16 @@ impl Interp {
                     let more = want_array(extra, span, &format!("array.concat arg {}", i))?;
                     out.extend(more.borrow().iter().cloned());
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "first" => {
                 let a = want_array(&arg(args, 0), span, &ctx("first"))?;
-                let val = a.borrow().first().cloned().unwrap_or(Value::Nil);
+                let val = a.borrow().first().cloned().unwrap_or(Value::nil());
                 Ok(val)
             }
             "last" => {
                 let a = want_array(&arg(args, 0), span, &ctx("last"))?;
-                let val = a.borrow().last().cloned().unwrap_or(Value::Nil);
+                let val = a.borrow().last().cloned().unwrap_or(Value::nil());
                 Ok(val)
             }
             "unique" => {
@@ -304,7 +305,7 @@ impl Interp {
                         out.push(item.clone());
                     }
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "take" => {
                 let a = want_array(&arg(args, 0), span, &ctx("take"))?;
@@ -315,7 +316,7 @@ impl Interp {
                     (nf as usize).min(a.borrow().len())
                 };
                 let out = a.borrow()[..k].to_vec();
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "drop" => {
                 let a = want_array(&arg(args, 0), span, &ctx("drop"))?;
@@ -326,7 +327,7 @@ impl Interp {
                     (nf as usize).min(a.borrow().len())
                 };
                 let out = a.borrow()[k..].to_vec();
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "chunk" => {
                 let a = want_array(&arg(args, 0), span, &ctx("chunk"))?;
@@ -340,9 +341,9 @@ impl Interp {
                 let out: Vec<Value> = a
                     .borrow()
                     .chunks(n)
-                    .map(|c| Value::Array(crate::value::ArrayCell::new(c.to_vec())))
+                    .map(|c| Value::array(c.to_vec()))
                     .collect();
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "zip" => {
                 if args.is_empty() {
@@ -360,9 +361,9 @@ impl Interp {
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
                     let tuple: Vec<Value> = cols.iter().map(|c| c[i].clone()).collect();
-                    out.push(Value::Array(crate::value::ArrayCell::new(tuple)));
+                    out.push(Value::array(tuple));
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                Ok(Value::array(out))
             }
             "groupBy" => {
                 let a = want_array(&arg(args, 0), span, &ctx("groupBy"))?;
@@ -380,9 +381,9 @@ impl Interp {
                 }
                 let map: IndexMap<MapKey, Value> = groups
                     .into_iter()
-                    .map(|(k, v)| (k, Value::Array(crate::value::ArrayCell::new(v))))
+                    .map(|(k, v)| (k, Value::array(v)))
                     .collect();
-                Ok(Value::Map(crate::value::MapCell::new(map)))
+                Ok(Value::map(map))
             }
             "partition" => {
                 let a = want_array(&arg(args, 0), span, &ctx("partition"))?;
@@ -397,10 +398,10 @@ impl Interp {
                         fail.push(item);
                     }
                 }
-                Ok(Value::Array(crate::value::ArrayCell::new(vec![
-                    Value::Array(crate::value::ArrayCell::new(pass)),
-                    Value::Array(crate::value::ArrayCell::new(fail)),
-                ])))
+                Ok(Value::array(vec![
+                    Value::array(pass),
+                    Value::array(fail),
+                ]))
             }
             _ => Err(AsError::at(format!("std/array has no function '{}'", func), span).into()),
         }
@@ -410,9 +411,11 @@ impl Interp {
 /// Flatten `items` to `depth` levels into `out`.
 fn flatten_into(items: &[Value], depth: usize, out: &mut Vec<Value>) {
     for item in items {
-        match item {
-            Value::Array(inner) if depth > 0 => flatten_into(&inner.borrow(), depth - 1, out),
-            other => out.push(other.clone()),
+        match item.kind() {
+            ValueKind::Array(inner) if depth > 0 => {
+                flatten_into(&inner.borrow(), depth - 1, out)
+            }
+            _ => out.push(item.clone()),
         }
     }
 }
@@ -422,7 +425,7 @@ fn sort_default(items: &mut [Value], span: Span) -> Result<(), Control> {
     // NUM §4: a number array may mix `Int` and `Float`; both count as numbers and
     // sort by their f64 value (cross-type ordering is well-defined).
     let all_numbers = items.iter().all(|v| v.is_number());
-    let all_strings = items.iter().all(|v| matches!(v, Value::Str(_)));
+    let all_strings = items.iter().all(|v| matches!(v.kind(), ValueKind::Str(_)));
     if all_numbers {
         items.sort_by(|a, b| match (a.as_f64(), b.as_f64()) {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
@@ -430,8 +433,8 @@ fn sort_default(items: &mut [Value], span: Span) -> Result<(), Control> {
         });
         Ok(())
     } else if all_strings {
-        items.sort_by(|a, b| match (a, b) {
-            (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        items.sort_by(|a, b| match (a.kind(), b.kind()) {
+            (ValueKind::Str(x), ValueKind::Str(y)) => x.cmp(y),
             _ => std::cmp::Ordering::Equal,
         });
         Ok(())
@@ -452,10 +455,10 @@ mod tests {
         Span::new(0, 0)
     }
     fn n(x: f64) -> Value {
-        Value::Float(x)
+        Value::float(x)
     }
     fn arr(xs: Vec<Value>) -> Value {
-        Value::Array(crate::value::ArrayCell::new(xs))
+        Value::array(xs)
     }
 
     /// Compile a single AScript expression (e.g. an arrow function) to a runtime
@@ -500,7 +503,7 @@ mod tests {
                 .call_array("pop", std::slice::from_ref(&a), sp())
                 .await
                 .unwrap(),
-            Value::Nil
+            Value::nil()
         );
     }
 
@@ -520,21 +523,21 @@ mod tests {
                 .call_array("get", &[a.clone(), n(9.0)], sp())
                 .await
                 .unwrap(),
-            Value::Nil
+            Value::nil()
         );
         assert_eq!(
             interp
                 .call_array("get", &[a.clone(), n(-1.0)], sp())
                 .await
                 .unwrap(),
-            Value::Nil
+            Value::nil()
         );
         assert_eq!(
             interp
                 .call_array("get", &[a.clone(), n(1.5)], sp())
                 .await
                 .unwrap(),
-            Value::Nil
+            Value::nil()
         );
     }
 
@@ -547,14 +550,14 @@ mod tests {
                 .call_array("contains", &[a.clone(), n(2.0)], sp())
                 .await
                 .unwrap(),
-            Value::Bool(true)
+            Value::bool_(true)
         );
         assert_eq!(
             interp
                 .call_array("contains", &[a.clone(), n(5.0)], sp())
                 .await
                 .unwrap(),
-            Value::Bool(false)
+            Value::bool_(false)
         );
     }
 
@@ -592,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn sort_default_rejects_mixed() {
         let interp = Interp::new();
-        let a = arr(vec![n(1.0), Value::Str("x".into())]);
+        let a = arr(vec![n(1.0), Value::str("x")]);
         assert!(matches!(
             interp.call_array("sort", &[a], sp()).await,
             Err(Control::Panic(_))
@@ -666,19 +669,20 @@ mod tests {
         // Group by parity; the IndexMap preserves first-seen key order ("odd" then "even").
         let f = val(&interp, r#"(x) => x % 2 == 0 ? "even" : "odd""#).await;
         let result = interp.call_array("groupBy", &[a, f], sp()).await.unwrap();
-        let map = match &result {
-            Value::Map(m) => m.borrow(),
-            other => panic!("expected map, got {}", other),
+        let map_cell = match result.kind() {
+            ValueKind::Map(m) => m.clone(),
+            _ => panic!("expected map, got {}", result),
         };
+        let map = map_cell.borrow();
         assert_eq!(map.len(), 2);
         assert_eq!(
-            map.get(&MapKey::from_value(&Value::Str("odd".into())).unwrap())
+            map.get(&MapKey::from_value(&Value::str("odd")).unwrap())
                 .unwrap()
                 .to_string(),
             "[1.0, 3.0, 5.0]"
         );
         assert_eq!(
-            map.get(&MapKey::from_value(&Value::Str("even".into())).unwrap())
+            map.get(&MapKey::from_value(&Value::str("even")).unwrap())
                 .unwrap()
                 .to_string(),
             "[2.0, 4.0]"
@@ -766,7 +770,7 @@ mod tests {
                 .call_array("first", &[arr(vec![])], sp())
                 .await
                 .unwrap(),
-            Value::Nil
+            Value::nil()
         );
         assert_eq!(
             interp

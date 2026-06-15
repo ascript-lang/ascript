@@ -10,7 +10,7 @@ use super::{arg, bi, want_array, want_bytes};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -40,9 +40,9 @@ fn bytes_val(v: Vec<u8>) -> Value {
 
 /// Accept bytes OR a string (encoded as UTF-8) as a source of raw bytes.
 fn source_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
-    match v {
-        Value::Bytes(b) => Ok(b.borrow().clone()),
-        Value::Str(s) => Ok(s.as_bytes().to_vec()),
+    match v.kind() {
+        ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
         _ => Err(AsError::at(
             format!(
                 "{} expects bytes or a string, got {}",
@@ -56,7 +56,7 @@ fn source_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
 }
 
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -76,7 +76,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mut dec = flate2::read::GzDecoder::new(&raw[..]);
             let mut out = Vec::new();
             match dec.read_to_end(&mut out) {
-                Ok(_) => Ok(make_pair(bytes_val(out), Value::Nil)),
+                Ok(_) => Ok(make_pair(bytes_val(out), Value::nil())),
                 Err(e) => Ok(err_pair(format!("gunzip failed: {}", e))),
             }
         }
@@ -95,7 +95,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mut dec = flate2::read::DeflateDecoder::new(&raw[..]);
             let mut out = Vec::new();
             match dec.read_to_end(&mut out) {
-                Ok(_) => Ok(make_pair(bytes_val(out), Value::Nil)),
+                Ok(_) => Ok(make_pair(bytes_val(out), Value::nil())),
                 Err(e) => Ok(err_pair(format!("inflate failed: {}", e))),
             }
         }
@@ -103,7 +103,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let entries = want_array(&arg(args, 0), span, &ctx("zipCreate"))?;
             let entries = entries.borrow().clone();
             match build_zip(&entries, span) {
-                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::Nil)),
+                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::nil())),
                 Err(ZipBuildError::Type(c)) => Err(c),
                 Err(ZipBuildError::Tier1(msg)) => Ok(err_pair(msg)),
             }
@@ -114,7 +114,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             match extract_zip(&raw) {
                 Ok(arr) => Ok(make_pair(
                     Value::Array(crate::value::ArrayCell::new(arr)),
-                    Value::Nil,
+                    Value::nil(),
                 )),
                 Err(msg) => Ok(err_pair(msg)),
             }
@@ -133,7 +133,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let src = want_bytes(&arg(args, 0), span, &ctx("zstdDecompress"))?;
             let raw = src.borrow().clone();
             match zstd::decode_all(&raw[..]) {
-                Ok(out) => Ok(make_pair(bytes_val(out), Value::Nil)),
+                Ok(out) => Ok(make_pair(bytes_val(out), Value::nil())),
                 Err(e) => Ok(err_pair(format!("zstdDecompress failed: {}", e))),
             }
         }
@@ -157,7 +157,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mut out = Vec::new();
             let mut dec = brotli::Decompressor::new(&raw[..], 4096);
             match dec.read_to_end(&mut out) {
-                Ok(_) => Ok(make_pair(bytes_val(out), Value::Nil)),
+                Ok(_) => Ok(make_pair(bytes_val(out), Value::nil())),
                 Err(e) => Ok(err_pair(format!("brotliDecompress failed: {}", e))),
             }
         }
@@ -166,7 +166,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let entries = want_array(&arg(args, 0), span, &ctx("tarCreate"))?;
             let entries = entries.borrow().clone();
             match build_tar(&entries, span) {
-                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::Nil)),
+                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::nil())),
                 Err(ZipBuildError::Type(c)) => Err(c),
                 Err(ZipBuildError::Tier1(msg)) => Ok(err_pair(msg)),
             }
@@ -177,7 +177,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             match extract_tar(&raw) {
                 Ok(arr) => Ok(make_pair(
                     Value::Array(crate::value::ArrayCell::new(arr)),
-                    Value::Nil,
+                    Value::nil(),
                 )),
                 Err(msg) => Ok(err_pair(msg)),
             }
@@ -189,15 +189,19 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 /// Optional integer level/quality 2nd arg. `None` → use the codec default. A
 /// non-number (other than absent/nil) is a Tier-2 arg-type misuse.
 fn opt_level(v: Option<&Value>, span: Span, ctx: &str) -> Result<Option<i64>, Control> {
-    match v {
-        None | Some(Value::Nil) => Ok(None),
+    let v = match v {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    match v.kind() {
+        ValueKind::Nil => Ok(None),
         // NUM §4: accept BOTH numeric subtypes.
-        Some(v) if v.is_number() => Ok(v.as_f64().map(|n| n as i64)),
-        Some(other) => Err(AsError::at(
+        _ if v.is_number() => Ok(v.as_f64().map(|n| n as i64)),
+        _ => Err(AsError::at(
             format!(
                 "compress.{} level must be a number, got {}",
                 ctx,
-                crate::interp::type_name(other)
+                crate::interp::type_name(v)
             ),
             span,
         )
@@ -208,8 +212,8 @@ fn opt_level(v: Option<&Value>, span: Span, ctx: &str) -> Result<Option<i64>, Co
 /// Pull `(name, data)` out of a `{name, data}` entry object — the SAME entry
 /// shape used by zip — returning a Tier-2 type error on a malformed entry.
 fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<u8>), ZipBuildError> {
-    let obj = match entry {
-        Value::Object(o) => o.clone(),
+    let obj = match entry.kind() {
+        ValueKind::Object(o) => o.clone(),
         _ => {
             return Err(ZipBuildError::Type(
                 AsError::at(
@@ -224,15 +228,16 @@ fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<
             ))
         }
     };
-    let name = match obj.get("name") {
-        Some(Value::Str(s)) => s.to_string(),
-        other => {
+    let name_field = obj.get("name");
+    let name = match name_field.as_ref().map(|v| v.kind()) {
+        Some(ValueKind::Str(s)) => s.to_string(),
+        _ => {
             return Err(ZipBuildError::Type(
                 AsError::at(
                     format!(
                         "compress.{} entry.name must be a string, got {}",
                         ctx,
-                        crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
+                        crate::interp::type_name(name_field.as_ref().unwrap_or(&Value::Nil))
                     ),
                     span,
                 )
@@ -240,16 +245,17 @@ fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<
             ))
         }
     };
-    let data = match obj.get("data") {
-        Some(Value::Bytes(b)) => b.borrow().clone(),
-        Some(Value::Str(s)) => s.as_bytes().to_vec(),
-        other => {
+    let data_field = obj.get("data");
+    let data = match data_field.as_ref().map(|v| v.kind()) {
+        Some(ValueKind::Bytes(b)) => b.borrow().clone(),
+        Some(ValueKind::Str(s)) => s.as_bytes().to_vec(),
+        _ => {
             return Err(ZipBuildError::Type(
                 AsError::at(
                     format!(
                         "compress.{} entry.data must be bytes or a string, got {}",
                         ctx,
-                        crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
+                        crate::interp::type_name(data_field.as_ref().unwrap_or(&Value::Nil))
                     ),
                     span,
                 )
@@ -298,7 +304,7 @@ fn extract_tar(raw: &[u8]) -> Result<Vec<Value>, String> {
             .read_to_end(&mut data)
             .map_err(|e| format!("tarExtract failed: {}", e))?;
         let mut obj = indexmap::IndexMap::new();
-        obj.insert("name".to_string(), Value::Str(name.into()));
+        obj.insert("name".to_string(), Value::str(name));
         obj.insert("data".to_string(), bytes_val(data));
         out.push(Value::Object(crate::value::ObjectCell::new(obj)));
     }
@@ -318,8 +324,8 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
     let mut writer = ZipWriter::new(cursor);
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     for entry in entries {
-        let obj = match entry {
-            Value::Object(o) => o.clone(),
+        let obj = match entry.kind() {
+            ValueKind::Object(o) => o.clone(),
             _ => {
                 return Err(ZipBuildError::Type(
                     AsError::at(
@@ -333,14 +339,15 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
                 ))
             }
         };
-        let name = match obj.get("name") {
-            Some(Value::Str(s)) => s.to_string(),
-            other => {
+        let name_field = obj.get("name");
+        let name = match name_field.as_ref().map(|v| v.kind()) {
+            Some(ValueKind::Str(s)) => s.to_string(),
+            _ => {
                 return Err(ZipBuildError::Type(
                     AsError::at(
                         format!(
                             "compress.zipCreate entry.name must be a string, got {}",
-                            crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
+                            crate::interp::type_name(name_field.as_ref().unwrap_or(&Value::Nil))
                         ),
                         span,
                     )
@@ -348,15 +355,16 @@ fn build_zip(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
                 ))
             }
         };
-        let data = match obj.get("data") {
-            Some(Value::Bytes(b)) => b.borrow().clone(),
-            Some(Value::Str(s)) => s.as_bytes().to_vec(),
-            other => {
+        let data_field = obj.get("data");
+        let data = match data_field.as_ref().map(|v| v.kind()) {
+            Some(ValueKind::Bytes(b)) => b.borrow().clone(),
+            Some(ValueKind::Str(s)) => s.as_bytes().to_vec(),
+            _ => {
                 return Err(ZipBuildError::Type(
                     AsError::at(
                         format!(
                             "compress.zipCreate entry.data must be bytes or a string, got {}",
-                            crate::interp::type_name(other.as_ref().unwrap_or(&Value::Nil))
+                            crate::interp::type_name(data_field.as_ref().unwrap_or(&Value::Nil))
                         ),
                         span,
                     )
@@ -392,7 +400,7 @@ fn extract_zip(raw: &[u8]) -> Result<Vec<Value>, String> {
         file.read_to_end(&mut data)
             .map_err(|e| format!("zipExtract failed: {}", e))?;
         let mut obj = indexmap::IndexMap::new();
-        obj.insert("name".to_string(), Value::Str(name.into()));
+        obj.insert("name".to_string(), Value::str(name));
         obj.insert("data".to_string(), bytes_val(data));
         out.push(Value::Object(crate::value::ObjectCell::new(obj)));
     }
@@ -406,34 +414,34 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
     fn b(v: Vec<u8>) -> Value {
         Value::Bytes(Rc::new(RefCell::new(v)))
     }
     fn as_bytes(v: &Value) -> Vec<u8> {
-        match v {
-            Value::Bytes(b) => b.borrow().clone(),
+        match v.kind() {
+            ValueKind::Bytes(b) => b.borrow().clone(),
             _ => panic!("expected bytes, got {:?}", v),
         }
     }
     /// Pull `[value, nil]` apart, asserting the err slot is nil.
     fn ok_value(v: Value) -> Value {
-        match v {
-            Value::Array(a) => {
+        match v.kind() {
+            ValueKind::Array(a) => {
                 let a = a.borrow();
                 assert_eq!(a.len(), 2, "expected a [value, err] pair");
-                assert_eq!(a[1], Value::Nil, "expected nil err, got {:?}", a[1]);
+                assert_eq!(a[1], Value::nil(), "expected nil err, got {:?}", a[1]);
                 a[0].clone()
             }
             _ => panic!("expected a pair, got {:?}", v),
         }
     }
     fn is_tier1_err(v: &Value) -> bool {
-        match v {
-            Value::Array(a) => {
+        match v.kind() {
+            ValueKind::Array(a) => {
                 let a = a.borrow();
-                a.len() == 2 && a[0] == Value::Nil && a[1] != Value::Nil
+                a.len() == 2 && a[0] == Value::nil() && a[1] != Value::nil()
             }
             _ => false,
         }
@@ -501,14 +509,14 @@ mod tests {
         let zipped = ok_value(call("zipCreate", &[entries], sp()).unwrap());
         let extracted = ok_value(call("zipExtract", &[zipped], sp()).unwrap());
 
-        let arr = match &extracted {
-            Value::Array(a) => a.borrow(),
+        let arr = match extracted.kind() {
+            ValueKind::Array(a) => a.borrow(),
             _ => panic!("expected array"),
         };
         assert_eq!(arr.len(), 2);
         let get = |v: &Value, k: &str| -> Value {
-            match v {
-                Value::Object(o) => o.get(k).unwrap(),
+            match v.kind() {
+                ValueKind::Object(o) => o.get(k).unwrap(),
                 _ => panic!("expected object"),
             }
         };
@@ -538,7 +546,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "expects bytes or a string")]
     fn gzip_number_is_tier2_panic() {
-        call("gzip", &[Value::Float(42.0)], sp()).unwrap();
+        call("gzip", &[Value::float(42.0)], sp()).unwrap();
     }
 
     // ── SP5 §5: zstd / brotli / tar ───────────────────────────────────────────
@@ -565,7 +573,7 @@ mod tests {
 
     #[test]
     fn zstd_level_arg_roundtrips() {
-        let zc = call("zstdCompress", &[s("level test data"), Value::Float(19.0)], sp()).unwrap();
+        let zc = call("zstdCompress", &[s("level test data"), Value::float(19.0)], sp()).unwrap();
         let back = ok_value(call("zstdDecompress", std::slice::from_ref(&zc), sp()).unwrap());
         assert_eq!(as_bytes(&back), b"level test data".to_vec());
     }
@@ -628,14 +636,14 @@ mod tests {
         ]));
         let tarred = ok_value(call("tarCreate", &[entries], sp()).unwrap());
         let extracted = ok_value(call("tarExtract", &[tarred], sp()).unwrap());
-        let arr = match &extracted {
-            Value::Array(a) => a.borrow(),
+        let arr = match extracted.kind() {
+            ValueKind::Array(a) => a.borrow(),
             _ => panic!("expected array"),
         };
         assert_eq!(arr.len(), 2);
         let get = |v: &Value, k: &str| -> Value {
-            match v {
-                Value::Object(o) => o.get(k).unwrap(),
+            match v.kind() {
+                ValueKind::Object(o) => o.get(k).unwrap(),
                 _ => panic!("expected object"),
             }
         };
@@ -655,7 +663,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be an object")]
     fn tar_create_bad_entry_is_tier2_panic() {
-        let entries = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
+        let entries = Value::Array(crate::value::ArrayCell::new(vec![Value::float(1.0)]));
         call("tarCreate", &[entries], sp()).unwrap();
     }
 

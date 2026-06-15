@@ -10,7 +10,7 @@ use super::{arg, bi, want_object, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 use indexmap::IndexMap;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -29,9 +29,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// Wrap a `&str` as `Value::Str`, or `Value::Nil` when the string is empty.
 fn str_or_nil(s: &str) -> Value {
     if s.is_empty() {
-        Value::Nil
+        Value::nil()
     } else {
-        Value::Str(s.into())
+        Value::str(s)
     }
 }
 
@@ -58,45 +58,45 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     // scheme's default; we expose it as nil in that case too.
                     // NUM §4: a port is an `Int`.
                     let port: Value = match u.port() {
-                        Some(p) => Value::Int(i64::from(p)),
-                        None => Value::Nil,
+                        Some(p) => Value::int(i64::from(p)),
+                        None => Value::nil(),
                     };
                     // username / password: url crate returns "" (not None) when absent
                     let username = str_or_nil(u.username());
                     let password = match u.password() {
                         Some(pw) => str_or_nil(pw),
-                        None => Value::Nil,
+                        None => Value::nil(),
                     };
                     // host: for file:// URLs there may be no host string
                     let host = match u.host_str() {
                         Some(h) => str_or_nil(h),
-                        None => Value::Nil,
+                        None => Value::nil(),
                     };
                     // query: raw query string (not decoded), or nil when absent
                     let query = match u.query() {
                         Some(q) => str_or_nil(q),
-                        None => Value::Nil,
+                        None => Value::nil(),
                     };
                     // fragment, or nil when absent
                     let fragment = match u.fragment() {
                         Some(f) => str_or_nil(f),
-                        None => Value::Nil,
+                        None => Value::nil(),
                     };
                     let obj = make_obj(vec![
-                        ("scheme", Value::Str(u.scheme().into())),
+                        ("scheme", Value::str(u.scheme())),
                         ("host", host),
                         ("port", port),
-                        ("path", Value::Str(u.path().into())),
+                        ("path", Value::str(u.path())),
                         ("query", query),
                         ("fragment", fragment),
                         ("username", username),
                         ("password", password),
                     ]);
-                    Ok(make_pair(obj, Value::Nil))
+                    Ok(make_pair(obj, Value::nil()))
                 }
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(format!("invalid URL: {}", e).into())),
+                    Value::nil(),
+                    make_error(Value::str(format!("invalid URL: {}", e))),
                 )),
             }
         }
@@ -110,7 +110,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             // Use the url crate's built-in `form_urlencoded` parser so decoding
             // is consistent with how `url.parse` interprets query strings.
             for (k, v) in ::url::form_urlencoded::parse(s.as_bytes()) {
-                m.insert(k.into_owned(), Value::Str(v.into_owned().into()));
+                m.insert(k.into_owned(), Value::str(v.into_owned()));
             }
             Ok(Value::Object(crate::value::ObjectCell::new(m)))
         }
@@ -122,25 +122,25 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let o = want_object(&arg(args, 0), span, &ctx("buildQuery"))?;
             let mut ser = ::url::form_urlencoded::Serializer::new(String::new());
             for (k, v) in o.entries() {
-                let val = match &v {
-                    Value::Str(s) => s.to_string(),
+                let val = match v.kind() {
+                    ValueKind::Str(s) => s.to_string(),
                     // NUM §4: an `Int` formats without a decimal point.
-                    Value::Int(_) => v.to_string(),
-                    Value::Float(n) => {
+                    ValueKind::Int(_) => v.to_string(),
+                    ValueKind::Float(n) => {
                         // integer-valued numbers without trailing ".0"
                         if n.fract() == 0.0 && n.is_finite() {
-                            format!("{}", *n as i64)
+                            format!("{}", n as i64)
                         } else {
                             format!("{}", n)
                         }
                     }
-                    Value::Bool(b) => b.to_string(),
-                    Value::Nil => String::new(),
-                    other => {
+                    ValueKind::Bool(b) => b.to_string(),
+                    ValueKind::Nil => String::new(),
+                    _ => {
                         return Err(AsError::at(
                             format!(
                                 "url.buildQuery: object value must be a string, got {}",
-                                crate::interp::type_name(other)
+                                crate::interp::type_name(&v)
                             ),
                             span,
                         )
@@ -149,7 +149,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 };
                 ser.append_pair(k.as_ref(), &val);
             }
-            Ok(Value::Str(ser.finish().into()))
+            Ok(Value::str(ser.finish()))
         }
 
         // ── url.build(obj) -> [string, err] ───────────────────────────────
@@ -158,8 +158,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "build" => {
             let o = want_object(&arg(args, 0), span, &ctx("build"))?;
             let get_str = |key: &str| -> Option<String> {
-                match o.get(key) {
-                    Some(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
+                match o.get(key).map(|v| v.into_kind()) {
+                    Some(OwnedKind::Str(s)) if !s.is_empty() => Some(s.to_string()),
                     _ => None,
                 }
             };
@@ -172,8 +172,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 Some(s) => s,
                 None => {
                     return Ok(make_pair(
-                        Value::Nil,
-                        make_error(Value::Str("url.build: 'scheme' is required".into())),
+                        Value::nil(),
+                        make_error(Value::str("url.build: 'scheme' is required")),
                     ))
                 }
             };
@@ -193,10 +193,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             };
             match ::url::Url::parse(&base) {
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(
-                        format!("url.build: invalid base '{}': {}", base, e).into(),
-                    )),
+                    Value::nil(),
+                    make_error(Value::str(format!(
+                        "url.build: invalid base '{}': {}",
+                        base, e
+                    ))),
                 )),
                 Ok(mut u) => {
                     // Set path
@@ -219,7 +220,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     if let Some(pass) = &password {
                         let _ = u.set_password(Some(pass));
                     }
-                    Ok(make_pair(Value::Str(u.as_str().into()), Value::Nil))
+                    Ok(make_pair(Value::str(u.as_str()), Value::nil()))
                 }
             }
         }
@@ -231,7 +232,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let encoded =
                 percent_encoding::utf8_percent_encode(&s, percent_encoding::NON_ALPHANUMERIC)
                     .to_string();
-            Ok(Value::Str(encoded.into()))
+            Ok(Value::str(encoded))
         }
 
         // ── url.decode(s) -> string ────────────────────────────────────────
@@ -243,14 +244,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, &ctx("decode"))?;
             match percent_encoding::percent_decode_str(&s).decode_utf8() {
                 Ok(decoded) => Ok(make_pair(
-                    Value::Str(decoded.into_owned().into()),
-                    Value::Nil,
+                    Value::str(decoded.into_owned()),
+                    Value::nil(),
                 )),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
-                    make_error(Value::Str(
-                        format!("url.decode: invalid percent-encoding: {}", e).into(),
-                    )),
+                    Value::nil(),
+                    make_error(Value::str(format!(
+                        "url.decode: invalid percent-encoding: {}",
+                        e
+                    ))),
                 )),
             }
         }
@@ -269,26 +271,26 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
     /// Pull a named field from a `Value::Object`.
     fn field(obj: &Value, key: &str) -> Value {
-        match obj {
-            Value::Object(o) => o.get(key).unwrap_or(Value::Nil),
+        match obj.kind() {
+            ValueKind::Object(o) => o.get(key).unwrap_or(Value::nil()),
             _ => panic!("not an object: {:?}", obj),
         }
     }
     /// Extract index 0 from a `[val, err]` pair.
     fn ok_val(pair: &Value) -> Value {
-        match pair {
-            Value::Array(a) => a.borrow()[0].clone(),
+        match pair.kind() {
+            ValueKind::Array(a) => a.borrow()[0].clone(),
             _ => panic!("not a pair"),
         }
     }
     /// Extract index 1 (the err slot) from a `[val, err]` pair.
     fn err_val(pair: &Value) -> Value {
-        match pair {
-            Value::Array(a) => a.borrow()[1].clone(),
+        match pair.kind() {
+            ValueKind::Array(a) => a.borrow()[1].clone(),
             _ => panic!("not a pair"),
         }
     }
@@ -304,11 +306,11 @@ mod tests {
         )
         .unwrap();
         let obj = ok_val(&pair);
-        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(err_val(&pair), Value::nil());
 
         assert_eq!(field(&obj, "scheme"), s("https"));
         assert_eq!(field(&obj, "host"), s("host"));
-        assert_eq!(field(&obj, "port"), Value::Float(8080.0));
+        assert_eq!(field(&obj, "port"), Value::float(8080.0));
         assert_eq!(field(&obj, "path"), s("/a/b"));
         assert_eq!(field(&obj, "query"), s("x=1&y=2"));
         assert_eq!(field(&obj, "fragment"), s("frag"));
@@ -321,22 +323,22 @@ mod tests {
         // A URL with no port, no query, no fragment, no credentials.
         let pair = call("parse", &[s("https://example.com/path")], sp()).unwrap();
         let obj = ok_val(&pair);
-        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(err_val(&pair), Value::nil());
 
         assert_eq!(field(&obj, "scheme"), s("https"));
         assert_eq!(field(&obj, "host"), s("example.com"));
-        assert_eq!(field(&obj, "port"), Value::Nil);
+        assert_eq!(field(&obj, "port"), Value::nil());
         assert_eq!(field(&obj, "path"), s("/path"));
-        assert_eq!(field(&obj, "query"), Value::Nil);
-        assert_eq!(field(&obj, "fragment"), Value::Nil);
-        assert_eq!(field(&obj, "username"), Value::Nil);
-        assert_eq!(field(&obj, "password"), Value::Nil);
+        assert_eq!(field(&obj, "query"), Value::nil());
+        assert_eq!(field(&obj, "fragment"), Value::nil());
+        assert_eq!(field(&obj, "username"), Value::nil());
+        assert_eq!(field(&obj, "password"), Value::nil());
     }
 
     #[test]
     fn parse_invalid_url() {
         let pair = call("parse", &[s("not a url")], sp()).unwrap();
-        assert_eq!(ok_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::nil());
         // err slot should be a {message:...} object
         assert!(pair.to_string().starts_with("[nil, {message:"));
     }
@@ -347,8 +349,8 @@ mod tests {
     fn parse_query_last_wins() {
         // "a=1&b=2&a=3" — second 'a' wins
         let obj = call("parseQuery", &[s("a=1&b=2&a=3")], sp()).unwrap();
-        match &obj {
-            Value::Object(o) => {
+        match obj.kind() {
+            ValueKind::Object(o) => {
                 assert_eq!(o.get("a"), Some(s("3")));
                 assert_eq!(o.get("b"), Some(s("2")));
             }
@@ -366,8 +368,8 @@ mod tests {
     #[test]
     fn parse_query_empty() {
         let obj = call("parseQuery", &[s("")], sp()).unwrap();
-        match &obj {
-            Value::Object(o) => assert!(o.is_empty()),
+        match obj.kind() {
+            ValueKind::Object(o) => assert!(o.is_empty()),
             _ => panic!("expected object"),
         }
     }
@@ -417,14 +419,14 @@ mod tests {
         // decode ALWAYS returns a Tier-1 [string, err] pair: [decoded, nil] on success
         let pair = call("decode", std::slice::from_ref(&encoded), sp()).unwrap();
         assert_eq!(ok_val(&pair), s("a b&c"));
-        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(err_val(&pair), Value::nil());
     }
 
     #[test]
     fn decode_invalid_is_tier1_err() {
         // %FF is not valid UTF-8 → [nil, <err>]
         let pair = call("decode", &[s("%FF")], sp()).unwrap();
-        assert_eq!(ok_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::nil());
         assert!(pair.to_string().starts_with("[nil, {message:"));
     }
 
@@ -449,7 +451,7 @@ mod tests {
         m.insert("path".to_string(), s("/p"));
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         let pair = call("build", &[obj], sp()).unwrap();
-        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(err_val(&pair), Value::nil());
         let result = ok_val(&pair);
         assert_eq!(result, s("https://x/p"));
     }
@@ -460,7 +462,7 @@ mod tests {
         let mut m = IndexMap::new();
         m.insert("scheme".to_string(), s("http"));
         m.insert("host".to_string(), s("example.com"));
-        m.insert("port".to_string(), Value::Float(9090.0));
+        m.insert("port".to_string(), Value::float(9090.0));
         m.insert("path".to_string(), s("/api/v1"));
         m.insert("query".to_string(), s("key=val"));
         let obj = Value::Object(crate::value::ObjectCell::new(m));
@@ -469,7 +471,7 @@ mod tests {
         let parsed = ok_val(&parsed_pair);
         assert_eq!(field(&parsed, "scheme"), s("http"));
         assert_eq!(field(&parsed, "host"), s("example.com"));
-        assert_eq!(field(&parsed, "port"), Value::Float(9090.0));
+        assert_eq!(field(&parsed, "port"), Value::float(9090.0));
         assert_eq!(field(&parsed, "path"), s("/api/v1"));
         assert_eq!(field(&parsed, "query"), s("key=val"));
     }
@@ -480,7 +482,7 @@ mod tests {
         m.insert("host".to_string(), s("x"));
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         let pair = call("build", &[obj], sp()).unwrap();
-        assert_eq!(ok_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::nil());
         assert!(pair.to_string().contains("scheme"));
     }
 }

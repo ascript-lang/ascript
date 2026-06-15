@@ -15,7 +15,7 @@ use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp};
 use crate::span::Span;
 use crate::task::SharedFuture;
-use crate::value::Value;
+use crate::value::{OwnedKind, Value, ValueKind};
 
 /// Aborts a `spawn_local` task when dropped. Used by `race` to cancel the resolver
 /// tasks (and thereby the losing futures) once a winner is decided.
@@ -41,12 +41,12 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 
 /// Build a `[value, nil]` ok Result pair.
 fn ok_pair(value: Value) -> Value {
-    make_pair(value, Value::Nil)
+    make_pair(value, Value::nil())
 }
 
 /// Build a `[nil, {message}]` error Result pair.
 fn err_pair(msg: String) -> Value {
-    make_pair(Value::Nil, make_error(Value::Str(msg.into())))
+    make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
 impl Interp {
@@ -74,39 +74,44 @@ impl Interp {
     /// a sync return value is wrapped in an already-resolved future).
     async fn task_spawn(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let v = arg(args, 0);
-        match v {
-            // `spawn` is the explicit opt-out of cancel-on-drop: detach the backing
-            // task so it runs to completion (fire-and-forget) regardless of whether
-            // the returned handle is awaited or dropped.
-            Value::Future(f) => {
-                f.detach();
-                Ok(Value::Future(f))
-            }
-            // `Value::Closure` is the VM's compiled-function value (V4-T5 bridge);
-            // `task.spawn(closure)` must invoke it like any other callable.
-            callable @ (Value::Function(_)
-            | Value::Closure(_)
-            | Value::Builtin(_)
-            | Value::BoundMethod(_)
-            | Value::NativeMethod(_)) => {
-                let r = self.call_value(callable, Vec::new(), span).await?;
-                match r {
-                    Value::Future(f) => {
-                        f.detach();
-                        Ok(Value::Future(f))
-                    }
-                    other => Ok(Value::Future(SharedFuture::resolved(Ok(other)))),
-                }
-            }
-            other => Err(AsError::at(
-                format!(
-                    "task.spawn expects a future or a 0-argument function, got {}",
-                    crate::interp::type_name(&other)
-                ),
-                span,
-            )
-            .into()),
+        // `spawn` is the explicit opt-out of cancel-on-drop: detach the backing
+        // task so it runs to completion (fire-and-forget) regardless of whether
+        // the returned handle is awaited or dropped.
+        if matches!(v.kind(), ValueKind::Future(_)) {
+            let OwnedKind::Future(f) = v.into_kind() else {
+                unreachable!()
+            };
+            f.detach();
+            return Ok(Value::future(f));
         }
+        // `Value::Closure` is the VM's compiled-function value (V4-T5 bridge);
+        // `task.spawn(closure)` must invoke it like any other callable.
+        if matches!(
+            v.kind(),
+            ValueKind::Function(_)
+                | ValueKind::Closure(_)
+                | ValueKind::Builtin(_)
+                | ValueKind::BoundMethod(_)
+                | ValueKind::NativeMethod(_)
+        ) {
+            let r = self.call_value(v, Vec::new(), span).await?;
+            if matches!(r.kind(), ValueKind::Future(_)) {
+                let OwnedKind::Future(f) = r.into_kind() else {
+                    unreachable!()
+                };
+                f.detach();
+                return Ok(Value::future(f));
+            }
+            return Ok(Value::future(SharedFuture::resolved(Ok(r))));
+        }
+        Err(AsError::at(
+            format!(
+                "task.spawn expects a future or a 0-argument function, got {}",
+                crate::interp::type_name(&v)
+            ),
+            span,
+        )
+        .into())
     }
 
     /// `gather([futures]) -> [values]`. Awaits every element in order; non-future
@@ -117,14 +122,16 @@ impl Interp {
         let items: Vec<Value> = array.borrow().clone();
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            match item {
-                Value::Future(f) => out.push(f.get().await?),
-                other => out.push(other),
+            if matches!(item.kind(), ValueKind::Future(_)) {
+                let OwnedKind::Future(f) = item.into_kind() else {
+                    unreachable!()
+                };
+                out.push(f.get().await?);
+            } else {
+                out.push(item);
             }
         }
-        Ok(Value::Array(crate::value::ArrayCell::new(
-            out,
-        )))
+        Ok(Value::array(out))
     }
 
     /// `race([futures]) -> value`. Resolves to the first input future to complete
@@ -142,17 +149,19 @@ impl Interp {
         let winner = SharedFuture::new();
         let mut resolver_guards: Vec<AbortOnDrop> = Vec::new();
         for item in items {
-            match item {
-                Value::Future(f) => {
-                    let w = winner.clone();
-                    let jh = tokio::task::spawn_local(async move {
-                        let r = f.get().await;
-                        w.resolve(r);
-                    });
-                    resolver_guards.push(AbortOnDrop(jh.abort_handle()));
-                }
+            if matches!(item.kind(), ValueKind::Future(_)) {
+                let OwnedKind::Future(f) = item.into_kind() else {
+                    unreachable!()
+                };
+                let w = winner.clone();
+                let jh = tokio::task::spawn_local(async move {
+                    let r = f.get().await;
+                    w.resolve(r);
+                });
+                resolver_guards.push(AbortOnDrop(jh.abort_handle()));
+            } else {
                 // A non-future element is already "done": it wins instantly.
-                other => winner.resolve(Ok(other)),
+                winner.resolve(Ok(item));
             }
         }
         let result = winner.get().await;
@@ -173,10 +182,14 @@ impl Interp {
             return Err(AsError::at("task.timeout duration must be non-negative", span).into());
         }
         let v = arg(args, 1);
-        let fut = match v {
-            Value::Future(f) => f,
+        let fut = if matches!(v.kind(), ValueKind::Future(_)) {
+            let OwnedKind::Future(f) = v.into_kind() else {
+                unreachable!()
+            };
+            f
+        } else {
             // A non-future second arg is already complete: never times out.
-            other => return Ok(ok_pair(other)),
+            return Ok(ok_pair(v));
         };
         tokio::select! {
             r = fut.get() => match r {
@@ -205,9 +218,9 @@ impl Interp {
         let opts = arg(args, 1);
 
         // Parse options.
-        let (attempts, base_ms, max_ms, jitter) = match &opts {
-            Value::Nil => (3usize, 100u64, None::<u64>, false),
-            Value::Object(o) => {
+        let (attempts, base_ms, max_ms, jitter) = match opts.kind() {
+            ValueKind::Nil => (3usize, 100u64, None::<u64>, false),
+            ValueKind::Object(o) => {
                 let attempts = match o.get("attempts") {
                     Some(v) => {
                         let n = super::want_number(&v, span, "task.retry attempts")?;
@@ -250,14 +263,14 @@ impl Interp {
                     }
                     None => None,
                 };
-                let jitter = matches!(o.get("jitter"), Some(Value::Bool(true)));
+                let jitter = matches!(o.get("jitter").as_ref().map(Value::kind), Some(ValueKind::Bool(true)));
                 (attempts, base_ms, max_ms, jitter)
             }
-            other => {
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "task.retry opts must be an object or nil, got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&opts)
                     ),
                     span,
                 )
@@ -273,7 +286,12 @@ impl Interp {
             // completion by awaiting it before inspecting the result.
             let call_result = self.call_value(func.clone(), vec![], span).await;
             let result = match call_result {
-                Ok(Value::Future(f)) => f.get().await,
+                Ok(v) if matches!(v.kind(), ValueKind::Future(_)) => {
+                    let OwnedKind::Future(f) = v.into_kind() else {
+                        unreachable!()
+                    };
+                    f.get().await
+                }
                 other => other,
             };
             match result {
@@ -331,13 +349,13 @@ impl Interp {
         let bus = arg(args, 1);
 
         // Validate gen is a Generator.
-        let gen = match gen_val {
-            Value::Generator(ref g) => g.clone(),
-            other => {
+        let gen = match gen_val.kind() {
+            ValueKind::Generator(g) => g.clone(),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "task.pipe: first argument must be a generator, got {}",
-                        crate::interp::type_name(&other)
+                        crate::interp::type_name(&gen_val)
                     ),
                     span,
                 )
@@ -346,13 +364,13 @@ impl Interp {
         };
 
         // Validate bus is a Native Events handle.
-        let native_obj = match &bus {
-            Value::Native(n) if n.kind == crate::value::NativeKind::Events => n.clone(),
-            other => {
+        let native_obj = match bus.kind() {
+            ValueKind::Native(n) if n.kind == crate::value::NativeKind::Events => n.clone(),
+            _ => {
                 return Err(AsError::at(
                     format!(
                         "task.pipe: second argument must be an event bus (emitter), got {}",
-                        crate::interp::type_name(other)
+                        crate::interp::type_name(&bus)
                     ),
                     span,
                 )
@@ -362,25 +380,27 @@ impl Interp {
 
         // Consume the generator: drive it one step at a time, fan each item onto the bus.
         loop {
-            let item = match gen.resume(Value::Nil).await? {
+            let item = match gen.resume(Value::nil()).await? {
                 Some(v) => v,
                 None => break,
             };
 
             // Extract e.kind — must be a string field on an Object.
-            let kind: std::rc::Rc<str> = match &item {
-                Value::Object(o) => match o.get("kind") {
-                    Some(Value::Str(s)) => s.clone(),
-                    Some(ref other) => {
-                        return Err(AsError::at(
-                            format!(
-                                "task.pipe: yielded item's 'kind' field must be a string, got {}",
-                                crate::interp::type_name(other)
-                            ),
-                            span,
-                        )
-                        .into());
-                    }
+            let kind: std::rc::Rc<str> = match item.kind() {
+                ValueKind::Object(o) => match o.get("kind") {
+                    Some(k) => match k.kind() {
+                        ValueKind::Str(s) => s.clone(),
+                        _ => {
+                            return Err(AsError::at(
+                                format!(
+                                    "task.pipe: yielded item's 'kind' field must be a string, got {}",
+                                    crate::interp::type_name(&k)
+                                ),
+                                span,
+                            )
+                            .into());
+                        }
+                    },
                     None => {
                         return Err(AsError::at(
                             "task.pipe: yielded item must have a 'kind' string field",
@@ -389,18 +409,20 @@ impl Interp {
                         .into());
                     }
                 },
-                Value::Instance(inst) => match inst.borrow().get("kind") {
-                    Some(Value::Str(s)) => s.clone(),
-                    Some(other) => {
-                        return Err(AsError::at(
-                            format!(
-                                "task.pipe: yielded item's 'kind' field must be a string, got {}",
-                                crate::interp::type_name(&other)
-                            ),
-                            span,
-                        )
-                        .into());
-                    }
+                ValueKind::Instance(inst) => match inst.borrow().get("kind") {
+                    Some(k) => match k.kind() {
+                        ValueKind::Str(s) => s.clone(),
+                        _ => {
+                            return Err(AsError::at(
+                                format!(
+                                    "task.pipe: yielded item's 'kind' field must be a string, got {}",
+                                    crate::interp::type_name(&k)
+                                ),
+                                span,
+                            )
+                            .into());
+                        }
+                    },
                     None => {
                         return Err(AsError::at(
                             "task.pipe: yielded item must have a 'kind' string field",
@@ -409,11 +431,11 @@ impl Interp {
                         .into());
                     }
                 },
-                other => {
+                _ => {
                     return Err(AsError::at(
                         format!(
                             "task.pipe: yielded value must be an object with a 'kind' field, got {}",
-                            crate::interp::type_name(other)
+                            crate::interp::type_name(&item)
                         ),
                         span,
                     )
@@ -428,15 +450,15 @@ impl Interp {
                 method: "emit".to_string(),
             });
             let result = self
-                .call_native_method(emit_method, vec![Value::Str(kind), item], span)
+                .call_native_method(emit_method, vec![Value::str(kind), item], span)
                 .await?;
             // emit may return a Future (async listeners) — drive it to completion.
-            if let Value::Future(f) = result {
+            if let OwnedKind::Future(f) = result.into_kind() {
                 f.get().await?;
             }
         }
 
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }
 }
 

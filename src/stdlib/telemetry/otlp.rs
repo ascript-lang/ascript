@@ -14,7 +14,7 @@ use super::model::{
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 use serde_json::{json, Map, Value as J};
 
 /// OTLP aggregation temporality: cumulative (v1).
@@ -116,22 +116,22 @@ pub async fn flush(interp: &Interp, state: &mut TelemetryState) -> Result<(), St
 /// An OTLP `AnyValue` for an attribute value (string/int/double/bool; everything
 /// else → `stringValue` via display, which is total and never panics).
 fn any_value(v: &Value) -> J {
-    match v {
-        Value::Bool(b) => json!({ "boolValue": b }),
+    match v.kind() {
+        ValueKind::Bool(b) => json!({ "boolValue": b }),
         // NUM §4: an `Int` maps directly to OTLP intValue.
-        Value::Int(i) => json!({ "intValue": i.to_string() }),
-        Value::Float(n) => {
+        ValueKind::Int(i) => json!({ "intValue": i.to_string() }),
+        ValueKind::Float(n) => {
             // Integral numbers → intValue (as a string, proto3 64-bit mapping);
             // fractional → doubleValue.
             if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.007_199_254_740_992e15 {
-                json!({ "intValue": (*n as i64).to_string() })
+                json!({ "intValue": (n as i64).to_string() })
             } else {
                 json!({ "doubleValue": n })
             }
         }
-        Value::Str(s) => json!({ "stringValue": s.as_ref() }),
-        Value::Nil => json!({ "stringValue": "" }),
-        other => json!({ "stringValue": other.to_string() }),
+        ValueKind::Str(s) => json!({ "stringValue": s.as_ref() }),
+        ValueKind::Nil => json!({ "stringValue": "" }),
+        _ => json!({ "stringValue": v.to_string() }),
     }
 }
 
@@ -308,7 +308,7 @@ pub fn serialize_logs(resource: &[(String, Value)], events: &[AnalyticsEvent]) -
             let mut attrs = e.properties.clone();
             attrs.push((
                 "distinct.id".to_string(),
-                Value::Str(e.distinct_id.as_str().into()),
+                Value::str(e.distinct_id.as_str()),
             ));
             json!({
                 "timeUnixNano": e.time_unix_nano.to_string(),

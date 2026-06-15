@@ -4,7 +4,7 @@ use super::{arg, bi, want_array, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{Value, ValueKind};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -14,10 +14,10 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(crate::value::ArrayCell::new(v))
+    Value::array(v)
 }
 fn str_v(s: &str) -> Value {
-    Value::Str(s.into())
+    Value::str(s)
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -25,7 +25,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "parse" => {
             let text = want_string(&arg(args, 0), span, &ctx("parse"))?;
-            let header = matches!(args.get(1), Some(Value::Object(o)) if matches!(o.get("header"), Some(Value::Bool(true))));
+            let header = matches!(args.get(1).map(|v| v.kind()), Some(ValueKind::Object(o)) if matches!(o.get("header").as_ref().map(|v| v.kind()), Some(ValueKind::Bool(true))));
             // parse is lenient — irregular quoting/ragged rows are coerced rather
             // than rejected; only genuine reader errors (I/O or UTF-8) reach the
             // Tier-1 err branch below. This matches the csv crate's permissive
@@ -40,7 +40,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     Ok(r) => records.push(r.iter().map(|s| s.to_string()).collect()),
                     Err(e) => {
                         return Ok(make_pair(
-                            Value::Nil,
+                            Value::nil(),
                             make_error(str_v(&format!("invalid CSV: {}", e))),
                         ))
                     }
@@ -61,7 +61,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                                     str_v(row.get(i).map(|s| s.as_str()).unwrap_or("")),
                                 );
                             }
-                            Value::Object(crate::value::ObjectCell::new(o))
+                            Value::object(o)
                         })
                         .collect()
                 }
@@ -71,7 +71,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     .map(|row| arr(row.iter().map(|s| str_v(s)).collect()))
                     .collect()
             };
-            Ok(make_pair(arr(rows), Value::Nil))
+            Ok(make_pair(arr(rows), Value::nil()))
         }
         "stringify" => {
             let rows = want_array(&arg(args, 0), span, &ctx("stringify"))?;
@@ -82,25 +82,25 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .terminator(csv::Terminator::Any(b'\n'))
                 .from_writer(vec![]);
             // Detect array-of-objects vs array-of-arrays from the first row.
-            let as_objects = matches!(rows.first(), Some(Value::Object(_)));
+            let as_objects = matches!(rows.first().map(|v| v.kind()), Some(ValueKind::Object(_)));
             if as_objects {
                 // header = keys of the first object (insertion order)
-                let header: Vec<String> = match rows.first() {
-                    Some(Value::Object(o)) => o.keys_snapshot(),
+                let header: Vec<String> = match rows.first().map(|v| v.kind()) {
+                    Some(ValueKind::Object(o)) => o.keys_snapshot(),
                     _ => Vec::new(),
                 };
                 if wtr.write_record(&header).is_err() {
-                    return Ok(make_pair(Value::Nil, make_error(str_v("CSV write error"))));
+                    return Ok(make_pair(Value::nil(), make_error(str_v("CSV write error"))));
                 }
                 // Writing to an in-memory Vec is infallible, so data-row write
                 // results are intentionally dropped (`let _ =`); any flush error
                 // surfaces via `into_inner()` below.
                 for row in rows.iter() {
-                    let o = match row {
-                        Value::Object(o) => o,
+                    let o = match row.kind() {
+                        ValueKind::Object(o) => o,
                         _ => {
                             return Ok(make_pair(
-                                Value::Nil,
+                                Value::nil(),
                                 make_error(str_v(
                                     "csv.stringify: mixed row kinds (expected all objects)",
                                 )),
@@ -115,10 +115,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 }
             } else {
                 for row in rows.iter() {
-                    let r = match row {
-                        Value::Array(a) => a,
+                    let r = match row.kind() {
+                        ValueKind::Array(a) => a,
                         _ => return Ok(make_pair(
-                            Value::Nil,
+                            Value::nil(),
                             make_error(str_v(
                                 "csv.stringify expects an array of arrays or an array of objects",
                             )),
@@ -132,10 +132,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             match wtr.into_inner() {
                 Ok(bytes) => Ok(make_pair(
                     str_v(&String::from_utf8_lossy(&bytes)),
-                    Value::Nil,
+                    Value::nil(),
                 )),
                 Err(e) => Ok(make_pair(
-                    Value::Nil,
+                    Value::nil(),
                     make_error(str_v(&format!("CSV write error: {}", e))),
                 )),
             }
@@ -151,7 +151,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn s(x: &str) -> Value {
-        Value::Str(x.into())
+        Value::str(x)
     }
 
     #[test]
@@ -161,12 +161,12 @@ mod tests {
             .to_string()
             .starts_with("[[[\"a\", \"b\"], [\"1\", \"2\"], [\"3\", \"4\"]], nil]"));
         let mut opt = indexmap::IndexMap::new();
-        opt.insert("header".to_string(), Value::Bool(true));
+        opt.insert("header".to_string(), Value::bool_(true));
         let withhdr = call(
             "parse",
             &[
                 s("name,age\nAda,36"),
-                Value::Object(crate::value::ObjectCell::new(opt)),
+                Value::object(opt),
             ],
             sp(),
         )
@@ -180,7 +180,7 @@ mod tests {
     fn stringify_arrays_and_objects() {
         let data = arr(vec![
             arr(vec![s("x"), s("y")]),
-            arr(vec![Value::Float(1.0), Value::Float(2.0)]),
+            arr(vec![Value::float(1.0), Value::float(2.0)]),
         ]);
         let out = call("stringify", std::slice::from_ref(&data), sp()).unwrap();
         assert_eq!(out.to_string(), "[\"x,y\\n1.0,2.0\\n\", nil]");

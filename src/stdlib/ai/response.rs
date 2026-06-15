@@ -82,31 +82,31 @@ pub(crate) fn neutral_from_genai(resp: ChatResponse) -> NeutralResponse {
 /// the tool loop (empty for a single non-tool turn).
 pub(crate) fn out_object(n: &NeutralResponse, steps: Vec<Value>) -> Value {
     let mut map = indexmap::IndexMap::new();
-    map.insert("text".to_string(), Value::Str(n.text.clone().into()));
+    map.insert("text".to_string(), Value::str(n.text.clone()));
     map.insert(
         "finishReason".to_string(),
         match &n.finish_reason {
-            Some(s) => Value::Str(s.clone().into()),
-            None => Value::Nil,
+            Some(s) => Value::str(s.clone()),
+            None => Value::nil(),
         },
     );
     map.insert("usage".to_string(), usage_object(n));
     map.insert(
         "toolCalls".to_string(),
-        Value::Array(crate::value::ArrayCell::new(tool_calls_value(n))),
+        Value::array(tool_calls_value(n)),
     );
     map.insert(
         "steps".to_string(),
-        Value::Array(crate::value::ArrayCell::new(steps)),
+        Value::array(steps),
     );
     map.insert(
         "raw".to_string(),
         match &n.raw {
             Some(j) => crate::stdlib::json::to_ascript(j),
-            None => Value::Nil,
+            None => Value::nil(),
         },
     );
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object(map)
 }
 
 /// The `toolCalls` array value (`[{id, name, arguments}]`).
@@ -115,13 +115,13 @@ pub(crate) fn tool_calls_value(n: &NeutralResponse) -> Vec<Value> {
         .iter()
         .map(|tc| {
             let mut m = indexmap::IndexMap::new();
-            m.insert("id".to_string(), Value::Str(tc.call_id.clone().into()));
-            m.insert("name".to_string(), Value::Str(tc.name.clone().into()));
+            m.insert("id".to_string(), Value::str(tc.call_id.clone()));
+            m.insert("name".to_string(), Value::str(tc.name.clone()));
             m.insert(
                 "arguments".to_string(),
                 crate::stdlib::json::to_ascript(&tc.args_json),
             );
-            Value::Object(crate::value::ObjectCell::new(m))
+            Value::object(m)
         })
         .collect()
 }
@@ -131,14 +131,14 @@ fn usage_object(n: &NeutralResponse) -> Value {
     m.insert("inputTokens".to_string(), opt_num(n.input_tokens));
     m.insert("outputTokens".to_string(), opt_num(n.output_tokens));
     m.insert("totalTokens".to_string(), opt_num(n.total_tokens));
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }
 
 fn opt_num(v: Option<i64>) -> Value {
     match v {
         // NUM §4: a token count is an `int`.
-        Some(n) => Value::Int(n),
-        None => Value::Nil,
+        Some(n) => Value::int(n),
+        None => Value::nil(),
     }
 }
 
@@ -154,14 +154,14 @@ pub(crate) fn embed_object(resp: &genai::embed::EmbedResponse, many: bool) -> Va
             .collect();
         m.insert(
             "embeddings".to_string(),
-            Value::Array(crate::value::ArrayCell::new(arrs)),
+            Value::array(arrs),
         );
     } else {
         let v = resp
             .embeddings
             .first()
             .map(|e| vector_value(&e.vector))
-            .unwrap_or_else(|| Value::Array(crate::value::ArrayCell::new(Vec::new())));
+            .unwrap_or_else(|| Value::array(Vec::new()));
         m.insert("embedding".to_string(), v);
     }
     let mut usage = indexmap::IndexMap::new();
@@ -169,33 +169,33 @@ pub(crate) fn embed_object(resp: &genai::embed::EmbedResponse, many: bool) -> Va
         "inputTokens".to_string(),
         match resp.usage.prompt_tokens {
             // NUM §4: a token count is an `int`.
-            Some(n) => Value::Int(n as i64),
-            None => Value::Nil,
+            Some(n) => Value::int(n as i64),
+            None => Value::nil(),
         },
     );
     m.insert(
         "usage".to_string(),
-        Value::Object(crate::value::ObjectCell::new(usage)),
+        Value::object(usage),
     );
-    Value::Object(crate::value::ObjectCell::new(m))
+    Value::object(m)
 }
 
 fn vector_value(v: &[f32]) -> Value {
-    Value::Array(crate::value::ArrayCell::new(
-        v.iter().map(|f| Value::Float(*f as f64)).collect(),
-    ))
+    Value::array(
+        v.iter().map(|f| Value::float(*f as f64)).collect(),
+    )
 }
 
 /// Map a genai `Error` to the AScript Tier-1 `err` object `{message, status?}`.
 pub(crate) fn error_to_value(err: &genai::Error) -> Value {
     let mut map = indexmap::IndexMap::new();
     let (message, status) = describe_error(err);
-    map.insert("message".to_string(), Value::Str(message.into()));
+    map.insert("message".to_string(), Value::str(message));
     if let Some(s) = status {
         // NUM §4: an HTTP status code is an `Int`.
-        map.insert("status".to_string(), Value::Int(i64::from(s)));
+        map.insert("status".to_string(), Value::int(i64::from(s)));
     }
-    Value::Object(crate::value::ObjectCell::new(map))
+    Value::object(map)
 }
 
 /// Extract a human message + optional HTTP status from a genai error, digging into
