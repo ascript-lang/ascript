@@ -804,7 +804,8 @@ fn source_order_define_names(top: &Chunk) -> Vec<Rc<str>> {
         if op == Op::DefineGlobal {
             let idx = top.read_u16(ip + 1) as usize;
             if let Some(ValueKind::Str(name)) = top.consts.get(idx).map(|c| c.kind()) {
-                names.push(name.clone());
+                // NANB Task 2.2: COLD (worker code-ship analysis) — zero-cost under default.
+                names.push(crate::value::astr_to_rc(name));
             }
         }
         ip += 1 + width;

@@ -175,6 +175,12 @@ default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net"
 # the crate's self-dev-dependency for `tests/property.rs` (and by a `--cfg fuzzing` libFuzzer
 # build). Pulls `arbitrary`. Never in `default`, so production is byte-identical.
 fuzzgen = ["dep:arbitrary"]
+# NANB Task 2.2: flip the `Value` string-payload repr to the single-word `ThinStr`
+# (`AStr = ThinStr`, `MapKey::Str(ThinStr)`) so `size_of::<Value>()` drops 24 → 16.
+# Pure REPR change — behavior, output, and the `.aso`/worker wire format (string
+# CONTENT, not the repr) are byte-identical to the default. NON-default (opt-in); the
+# 4-way matrix (× value16-on/off) must stay byte-identical.
+value16 = []
 # DECODE §5.1 (Unit B part 1): the decoded-dispatch PAIR/TRIPLE census. NON-default —
 # the counting mode (the burst-local `prev`/`prev2` tracking + the `(DOp,DOp[,DOp])`
 # frequency tables) is FULLY `#[cfg(feature = "decode-census")]`, so a default

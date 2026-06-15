@@ -385,8 +385,11 @@ impl Interp {
                 None => break,
             };
 
-            // Extract e.kind — must be a string field on an Object.
-            let kind: std::rc::Rc<str> = match item.kind() {
+            // Extract e.kind — must be a string field on an Object. NANB Task 2.2:
+            // typed as the `AStr` seam (not `Rc<str>`), so the `s.clone()` arms carry
+            // the payload through to `Value::str(kind)` below with ZERO conversion in
+            // BOTH configs (the hot per-item bus-fan-out path stays copy-free).
+            let kind: crate::value::AStr = match item.kind() {
                 ValueKind::Object(o) => match o.get("kind") {
                     Some(k) => match k.kind() {
                         ValueKind::Str(s) => s.clone(),

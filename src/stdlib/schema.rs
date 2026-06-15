@@ -54,7 +54,6 @@ use crate::value::{Value, ValueKind};
 #[cfg(feature = "data")]
 use crate::value::OwnedKind;
 use indexmap::IndexMap;
-use std::rc::Rc;
 
 // ── public exports ────────────────────────────────────────────────────────────
 
@@ -149,7 +148,10 @@ fn err_obj(path: &str, message: String) -> Value {
 ///
 /// `pub(crate)` so that `mod.rs` can detect a schema value as the 2nd arg of
 /// `json.parse(text, schema)` without importing the entire engine.
-pub(crate) fn schema_kind(schema: &Value) -> Option<Rc<str>> {
+// NANB Task 2.2: returns the `AStr` seam (not `Rc<str>`) so the `s.clone()` arm is a
+// zero-cost refcount bump in BOTH configs (no `ThinStr → Rc<str>` copy). Every caller
+// consumes it via `.as_ref()`/`.as_deref()`/`.is_some()`, all seam-agnostic.
+pub(crate) fn schema_kind(schema: &Value) -> Option<crate::value::AStr> {
     match schema.kind() {
         ValueKind::Object(o) => match o.get("__kind").as_ref().map(|v| v.kind()) {
             Some(ValueKind::Str(s)) => Some(s.clone()),

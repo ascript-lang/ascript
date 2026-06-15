@@ -112,7 +112,9 @@ pub(crate) fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
                     .last()
                     .unwrap_or(0);
                 let def = classify_binding(top, prev, stmt_start, ip);
-                defs.entry(name.clone()).or_insert(def);
+                // NANB Task 2.2: COLD (bytecode analysis, once per build) — `astr_to_rc`
+                // is a zero-cost `clone` in the default config; a copy only under value16.
+                defs.entry(crate::value::astr_to_rc(name)).or_insert(def);
             }
         }
 
@@ -287,7 +289,8 @@ pub(crate) fn collect_get_global_names(chunk: &Chunk, out: &mut Vec<Rc<str>>) {
         if op == Op::GetGlobal {
             let idx = chunk.read_u16(ip + 1) as usize;
             if let Some(ValueKind::Str(name)) = chunk.consts.get(idx).map(Value::kind) {
-                out.push(name.clone());
+                // NANB Task 2.2: COLD analysis path — zero-cost clone under default repr.
+                out.push(crate::value::astr_to_rc(name));
             }
         }
         ip += 1 + width;
@@ -315,7 +318,8 @@ pub(crate) fn collect_range_refs(top: &Chunk, start: usize, end: usize, out: &mu
             Op::GetGlobal => {
                 let idx = top.read_u16(ip + 1) as usize;
                 if let Some(ValueKind::Str(name)) = top.consts.get(idx).map(Value::kind) {
-                    out.push(name.clone());
+                    // NANB Task 2.2: COLD analysis path — zero-cost clone under default.
+                    out.push(crate::value::astr_to_rc(name));
                 }
             }
             Op::Closure => {
@@ -608,7 +612,8 @@ fn decode_class_group(
 
 fn class_name_from_const(top: &Chunk, operand: u16) -> Result<Rc<str>, Control> {
     match top.consts.get(operand as usize).map(Value::kind) {
-        Some(ValueKind::Str(s)) => Ok(s.clone()),
+        // NANB Task 2.2: COLD (class-decl analysis) — zero-cost clone under default repr.
+        Some(ValueKind::Str(s)) => Ok(crate::value::astr_to_rc(s)),
         _ => Err(panic_build("superclass GET_GLOBAL has no name constant")),
     }
 }

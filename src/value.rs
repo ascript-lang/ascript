@@ -724,7 +724,10 @@ pub enum MapKey {
     /// FOLDS into this variant so `Int(1)` and `Float(1.0)` are the SAME key.
     Int(i64),
     Num(u64), // canonicalized f64 bits (−0.0→+0.0, all NaNs→one canonical NaN)
-    Str(Rc<str>),
+    /// NANB Task 2.2: tracks the [`AStr`] seam (`Rc<str>` default, `ThinStr` under
+    /// `cfg(value16)`). `from_value` clones the value's `Str` payload (a refcount bump
+    /// in BOTH configs); content `Eq`/`Hash` are identical, so keys collide identically.
+    Str(AStr),
     /// Exact decimal key. Distinct from `Num`/`Int` — `Decimal("0.1")` ≠ `Num(0.1f64)`,
     /// `Decimal("1")` ≠ `Int(1)` (Decimal is exact and opt-in; never folded).
     Decimal(Decimal),
@@ -1615,7 +1618,10 @@ impl SharedKey {
             SharedKey::Bool(b) => MapKey::Bool(*b),
             SharedKey::Int(i) => MapKey::Int(*i),
             SharedKey::Num(bits) => MapKey::Num(*bits),
-            SharedKey::Str(s) => MapKey::Str(Rc::from(&**s)),
+            // NANB Task 2.2: route through the `AStr` seam (`Rc<str>` default, `ThinStr`
+            // under `value16`) — `&**s` is the `&str` content both `From`s accept. COLD:
+            // re-materializing a frozen-map key for a read, not a dispatch hot path.
+            SharedKey::Str(s) => MapKey::Str(AStr::from(&**s)),
             SharedKey::Decimal(d) => MapKey::Decimal(*d),
         }
     }
@@ -1814,9 +1820,13 @@ enum ValueRepr {
     /// Map-key fold). (The enum reaches 16 only once `Str` is ALSO thinned —
     /// Stage 3 / Task 9; see `value_size_is_documented`.)
     Decimal(Rc<Decimal>),
-    Str(Rc<str>),
-    /// A native built-in function, dispatched by name in the interpreter.
-    Builtin(Rc<str>),
+    /// NANB Task 2.2: the string payload is the [`AStr`] seam (`Rc<str>` by default,
+    /// `ThinStr` under `cfg(value16)`). A `ThinStr` is ONE word (single allocation),
+    /// so under `value16` this is the widest payload at 8 bytes → the 16-byte enum.
+    Str(AStr),
+    /// A native built-in function, dispatched by name in the interpreter. Name is the
+    /// [`AStr`] seam (see `Str`).
+    Builtin(AStr),
     /// A user-defined function carrying its closure environment.
     Function(Rc<Function>),
     /// A bytecode-VM closure: a function prototype plus its captured upvalue
@@ -1889,7 +1899,51 @@ enum ValueRepr {
 /// constructs/holds a string payload out of a `Value` refers to, so the underlying
 /// representation can change behind the seam (Phase 1: `Rc<str>`; Phase 2(b):
 /// `ThinStr`) with ZERO call-site churn. `MapKey::Str` tracks the same alias.
+///
+/// NANB Task 2.2: under `cfg(value16)`, `AStr` is the single-word [`ThinStr`] (one
+/// `std::alloc` allocation, `[StrHeader | utf8]`) so `Str`/`Builtin` fit a single
+/// word and `size_of::<Value>()` drops 24 → 16. `ThinStr` has full `Rc<str>` parity
+/// (`Deref<str>` + content `Eq`/`Ord`/`Hash`/`Display`/`Debug` + `From<&str>`/
+/// `From<String>`/`From<Rc<str>>`), so the flip is INVISIBLE to behavior — both
+/// configs produce byte-identical output. Default-OFF keeps the fat `Rc<str>`.
+#[cfg(feature = "value16")]
+pub type AStr = thin_str::ThinStr;
+#[cfg(not(feature = "value16"))]
 pub type AStr = Rc<str>;
+
+/// NANB Task 2.2 — convert an [`AStr`] payload to the `Rc<str>` the engine's
+/// `Rc<str>`-keyed infrastructure (object/global keys, named-arg lists, defer method
+/// names, bytecode-analysis name vectors) wants. **Zero-cost in the default config**
+/// (`AStr = Rc<str>` → a plain refcount-bumping `clone`, byte-identical to today); a
+/// single allocate-and-copy under `cfg(value16)` (`ThinStr → Rc<str>` at the
+/// const-pool → key boundary). Routing every boundary through this ONE seam keeps the
+/// default path provably unchanged and makes the value16 copy auditable.
+#[inline]
+pub fn astr_to_rc(s: &AStr) -> Rc<str> {
+    #[cfg(feature = "value16")]
+    {
+        Rc::from(&**s)
+    }
+    #[cfg(not(feature = "value16"))]
+    {
+        s.clone()
+    }
+}
+
+/// Test-only: the strong refcount of an [`AStr`], seam-agnostic. `Rc<str>` uses the
+/// associated `Rc::strong_count`; `ThinStr` exposes an inherent `strong_count()`.
+#[cfg(test)]
+#[inline]
+fn astr_strong_count(s: &AStr) -> usize {
+    #[cfg(feature = "value16")]
+    {
+        s.strong_count()
+    }
+    #[cfg(not(feature = "value16"))]
+    {
+        Rc::strong_count(s)
+    }
+}
 
 /// NANB §4.2 — the borrowed view of a `Value`'s logical kind. The variant set
 /// mirrors today's [`Value`] enum 1:1 so a match-site migration is textual:
@@ -2399,7 +2453,9 @@ impl Value {
     #[inline]
     pub fn str_strong_count(&self) -> Option<usize> {
         match &self.0 {
-            ValueRepr::Str(s) => Some(Rc::strong_count(s)),
+            // NANB Task 2.2: both `Rc<str>` and `ThinStr` expose a strong count — the
+            // seam-agnostic helper below (`astr_strong_count`) picks the right call.
+            ValueRepr::Str(s) => Some(astr_strong_count(s)),
             _ => None,
         }
     }
@@ -3060,8 +3116,10 @@ mod tests {
         match v.into_kind() {
             OwnedKind::Str(s) => {
                 assert_eq!(&*s, "payload");
-                // The moved-out `Rc<str>` is the SAME allocation — still strong count 1.
-                assert_eq!(Rc::strong_count(&s), before);
+                // The moved-out `AStr` is the SAME allocation — still strong count 1.
+                // (`astr_strong_count`: seam-aware so it works for both `Rc<str>` and
+                // `ThinStr`.)
+                assert_eq!(astr_strong_count(&s), before);
             }
             other => panic!("wrong owned kind: {other:?}"),
         }
@@ -3140,6 +3198,15 @@ mod tests {
         // Size progression: 32 → 24 [Task 1: fat method bindings boxed] → 24
         // [Task 2: Decimal boxed, now fat-`Str`-limited] → 16 [thin-`Str`] → 8
         // [NaN-box, gated].
+        //
+        // NANB Task 2.2: under `cfg(value16)` the `Str`/`Builtin` payloads flip to the
+        // single-word `ThinStr` (`AStr = ThinStr`), so the widest payload is now one
+        // word → `round_up(8) + 8-byte tag` = **16**. Default-OFF builds keep the fat
+        // `Rc<str>` payload at **24**. (8 bytes is the gated NaN-box follow-up, spec
+        // §3.2 — NOT this layout.)
+        #[cfg(feature = "value16")]
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        #[cfg(not(feature = "value16"))]
         assert_eq!(std::mem::size_of::<Value>(), 24);
     }
 

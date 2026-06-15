@@ -397,7 +397,8 @@ fn member_name_at(chunk: &Chunk, op_ip: usize) -> Option<Rc<str>> {
     }
     let idx = chunk.read_u16(name_ip) as usize;
     match chunk.consts.get(idx).map(|v| v.kind()) {
-        Some(crate::value::ValueKind::Str(name)) => Some(name.clone()),
+        // NANB Task 2.2: COLD (tree-shake analysis) — zero-cost clone under default repr.
+        Some(crate::value::ValueKind::Str(name)) => Some(crate::value::astr_to_rc(name)),
         _ => None,
     }
 }

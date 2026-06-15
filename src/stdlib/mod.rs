@@ -899,7 +899,12 @@ pub(crate) fn want_count(v: &Value, span: Span, ctx: &str, max: f64) -> Result<u
 /// that the allocation itself cannot abort the host.
 pub(crate) const MAX_ALLOC_COUNT: f64 = u32::MAX as f64;
 
-pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
+// NANB Task 2.2: returns the `AStr` seam (not `Rc<str>`), so the `s.clone()` arm stays
+// a zero-cost refcount bump in BOTH configs (no `ThinStr → Rc<str>` copy on this widely
+// used per-call stdlib arg-coercion path). Callers consume it through `Deref<str>`
+// (`&s`/`s.as_ref()`) or `Value::str(s)` (`Into<AStr>`) — seam-agnostic. The handful of
+// callers that genuinely need an owned `Rc<str>` route through `value::astr_to_rc`.
+pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<crate::value::AStr, Control> {
     match v.kind() {
         ValueKind::Str(s) => Ok(s.clone()),
         _ => Err(AsError::at(

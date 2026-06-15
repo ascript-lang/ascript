@@ -2976,7 +2976,13 @@ impl Vm {
                     // hook receivers keep DeferKind::Method so call-site hooks fire at
                     // drain time (which happens async via run_loop's Op::Return path).
                     let kind = if self.interp.member_call_is_hook(&recv, &name) {
-                        crate::interp::DeferKind::Method { recv, name }
+                        crate::interp::DeferKind::Method {
+                            recv,
+                            // NANB Task 2.2: COLD (a deferred method call — rare). The
+                            // const-pool `AStr` name → `Rc<str>` for `DeferKind::Method`;
+                            // `astr_to_rc` is a zero-cost clone in the default config.
+                            name: crate::value::astr_to_rc(&name),
+                        }
                     } else {
                         let callee = self.vm_read_member(&recv, &name, span)?;
                         crate::interp::DeferKind::Call { callee }
@@ -3591,7 +3597,11 @@ impl Vm {
 
                 Op::ObjectRest => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let bound: std::collections::HashSet<Rc<str>> =
+                    // NANB Task 2.2: the bound-key set is typed on the `AStr` seam (not
+                    // `Rc<str>`), so the `s.clone()` collect is a zero-cost refcount bump
+                    // in BOTH configs and `bound.contains(k.as_ref())` still works
+                    // (`AStr: Borrow<str>`) — the object-rest filter stays copy-free.
+                    let bound: std::collections::HashSet<crate::value::AStr> =
                         match fiber.frame().closure.proto.chunk.consts[idx].kind() {
                             ValueKind::Array(keys) => keys
                                 .borrow()
@@ -4990,7 +5000,11 @@ impl Vm {
                             .borrow()
                             .iter()
                             .map(|v| match v.kind() {
-                                ValueKind::Str(s) => Some(s.clone()),
+                                // NANB Task 2.2: the named-arg list is `Rc<str>`-typed
+                                // (shared with the tree-walker's `construct_variant_args`
+                                // path). COLD-moderate — only named ENUM construction
+                                // reaches here. `astr_to_rc`: zero-cost clone in default.
+                                ValueKind::Str(s) => Some(crate::value::astr_to_rc(s)),
                                 _ => None,
                             })
                             .collect(),
@@ -5128,7 +5142,11 @@ impl Vm {
                             .borrow()
                             .iter()
                             .map(|v| match v.kind() {
-                                ValueKind::Str(s) => Some(s.clone()),
+                                // NANB Task 2.2: the named-arg list is `Rc<str>`-typed
+                                // (shared with the tree-walker's `construct_variant_args`
+                                // path). COLD-moderate — only named ENUM construction
+                                // reaches here. `astr_to_rc`: zero-cost clone in default.
+                                ValueKind::Str(s) => Some(crate::value::astr_to_rc(s)),
                                 _ => None,
                             })
                             .collect(),
@@ -5957,7 +5975,11 @@ impl Vm {
                                 if is_global {
                                     // An imported name is an IMMUTABLE module global
                                     // (tree-walker `define(..., false)`).
-                                    self.define_user_global(Rc::from(name.as_str()), v, false);
+                                    self.define_user_global(
+                                        crate::value::AStr::from(name.as_str()),
+                                        v,
+                                        false,
+                                    );
                                 } else if is_cell {
                                     fiber.set_local_cell(slot as usize, v);
                                 } else {
@@ -5979,7 +6001,11 @@ impl Vm {
                             self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
                             if is_global {
                                 // A namespace alias is an IMMUTABLE module global.
-                                self.define_user_global(Rc::from(alias.as_str()), ns, false);
+                                self.define_user_global(
+                                    crate::value::AStr::from(alias.as_str()),
+                                    ns,
+                                    false,
+                                );
                             } else if is_cell {
                                 fiber.set_local_cell(slot as usize, ns);
                             } else {
@@ -6130,7 +6156,11 @@ impl Vm {
                     // order — the object-rest collector (excludes already-bound SOURCE
                     // keys).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
-                    let bound: std::collections::HashSet<Rc<str>> =
+                    // NANB Task 2.2: the bound-key set is typed on the `AStr` seam (not
+                    // `Rc<str>`), so the `s.clone()` collect is a zero-cost refcount bump
+                    // in BOTH configs and `bound.contains(k.as_ref())` still works
+                    // (`AStr: Borrow<str>`) — the object-rest filter stays copy-free.
+                    let bound: std::collections::HashSet<crate::value::AStr> =
                         match fiber.frame().closure.proto.chunk.consts[idx].kind() {
                             ValueKind::Array(keys) => keys
                                 .borrow()
@@ -6554,7 +6584,13 @@ impl Vm {
                     // `call_method_recv`'s hook dispatch fires at drain time (spec §3.1
                     // — pre-binding would silently skip the hooks).
                     let kind = if self.interp.member_call_is_hook(&recv, &name) {
-                        crate::interp::DeferKind::Method { recv, name }
+                        crate::interp::DeferKind::Method {
+                            recv,
+                            // NANB Task 2.2: COLD (a deferred method call — rare). The
+                            // const-pool `AStr` name → `Rc<str>` for `DeferKind::Method`;
+                            // `astr_to_rc` is a zero-cost clone in the default config.
+                            name: crate::value::astr_to_rc(&name),
+                        }
                     } else {
                         // Resolve the method to a BoundMethod/Closure/etc. now.
                         // If the lookup fails (e.g. the method does not exist), surface
@@ -8598,7 +8634,12 @@ impl Vm {
     /// Define (create/overwrite) a module-scope user-global with its REASSIGNABILITY
     /// (`mutable` = a `let`; `false` = `const`/`fn`/`class`/`enum`/`import`) and bump
     /// the version.
-    fn define_user_global(&self, name: Rc<str>, value: Value, mutable: bool) {
+    fn define_user_global(&self, name: crate::value::AStr, value: Value, mutable: bool) {
+        // NANB Task 2.2: `name` is the `AStr` seam (a const-pool `Str` payload). The
+        // user-globals map keys on `Rc<str>`; convert ONCE here via `astr_to_rc`
+        // (zero-cost clone in the default config, one copy under value16). COLD — runs
+        // once per top-level binding definition, never on the dispatch hot path.
+        let name: Rc<str> = crate::value::astr_to_rc(&name);
         self.user_globals.borrow_mut().insert(
             name.clone(),
             GlobalSlot {
@@ -9481,7 +9522,13 @@ impl Vm {
         record: bool,
     ) -> Result<(), Control> {
         // Pop `n` (key, value) pairs in source order (stack: vN,kN,…,v1,k1).
-        let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::nil()); n];
+        // NANB Task 2.2: keys carried as the `AStr` seam, NOT `Rc<str>`. The keys are
+        // only ever borrowed as `&str` here (`k.to_string()` for the dup-fold lookup,
+        // `k.as_ref()` for the shape registry, which interns its OWN canonical key list)
+        // — they never become the object's stored keys. So `OwnedKind::Str(s) => s` is a
+        // zero-cost move in BOTH configs: the hot object-literal path stays copy-free.
+        let mut pairs: Vec<(crate::value::AStr, Value)> =
+            vec![(crate::value::AStr::from(""), Value::nil()); n];
         for slot in pairs.iter_mut().rev() {
             let value = fiber.pop();
             let key = match fiber.pop().into_kind() {
@@ -9499,7 +9546,7 @@ impl Vm {
         // Fold duplicates into an ordered (key, value) sequence: first occurrence
         // wins position, last occurrence wins value — exactly IndexMap::insert.
         // `slot_of_src[i]` is the final slab slot for the i-th SOURCE pair.
-        let mut order: Vec<Rc<str>> = Vec::with_capacity(n);
+        let mut order: Vec<crate::value::AStr> = Vec::with_capacity(n);
         let mut vals: indexmap::IndexMap<String, Value> = indexmap::IndexMap::with_capacity(n);
         let mut slot_of_src: Vec<u16> = Vec::with_capacity(n);
         let mut had_dup = false;
