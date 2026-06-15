@@ -1662,9 +1662,9 @@ mod tests {
         // Push a fake callee + 2 args (3 Nil consts) so the verifier's stack
         // depth accounting starts satisfied, then emit the CallElided.
         let idx = c.add_const(Value::nil());
-        c.emit_u16(Op::Const, idx as u16, s());
-        c.emit_u16(Op::Const, idx as u16, s());
-        c.emit_u16(Op::Const, idx as u16, s());
+        c.emit_u16(Op::Const, idx, s());
+        c.emit_u16(Op::Const, idx, s());
+        c.emit_u16(Op::Const, idx, s());
         c.emit_u8(Op::CallElided, 2, s());
         c.emit(Op::Return, s());
         // verify() must accept this chunk without error.
