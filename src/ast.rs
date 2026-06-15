@@ -33,6 +33,13 @@ pub enum ExprKind {
     Call {
         callee: Box<Expr>,
         args: Vec<CallArg>,
+        /// ELIDE §4.3: when true, the tree-walker's per-param type-contract checks
+        /// are skipped for this call site (arity, defaults, and rest collection are
+        /// still enforced). Set to `true` only by the marking pass in `src/elide_mark.rs`
+        /// after the `ElisionSet` static proof has been computed. Constructed as
+        /// `false` by both the legacy parser and the CST builder; Display and fmt
+        /// output are unaffected (the field is invisible to the formatter).
+        elide_args: bool,
     },
     Assign {
         target: Box<Expr>,
@@ -758,7 +765,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Ident(name) => write!(f, "{}", name),
             ExprKind::Unary { op, expr } => write!(f, "({} {})", op, expr),
             ExprKind::Binary { op, lhs, rhs } => write!(f, "({} {} {})", op, lhs, rhs),
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, .. } => {
                 write!(f, "(call {}", callee)?;
                 for a in args {
                     match a {

@@ -1065,6 +1065,169 @@ mod compiler {
     }
 }
 
+// ===========================================================================
+// Task 3.1 — tree-walker `elide_args` flag on `ExprKind::Call` (spec §4.3)
+//
+// These tests verify that the tree-walker correctly honours `elide_args: true`
+// on a `Call` AST node:
+//
+//   (a) A wrong-typed argument PASSES when `elide_args = true` — the per-param
+//       type-contract check is skipped, so the function body receives the value
+//       unchanged.
+//   (b) The UNMARKED twin (identical source, `elide_args = false` from the parser)
+//       PANICS with "type contract violated".
+//   (c) Arity errors STILL fire even when `elide_args = true` — the flag only
+//       skips type checks, not arity enforcement.
+//   (d) `elide_args` is invisible to the formatter / display: printing the marked
+//       call produces the same string as the unmarked call.
+//
+// The tests directly mutate the parsed AST — the only way to set `elide_args =
+// true` before the marking pass exists — and drive execution via the same
+// tree-walker path as `run_source_exit`.
+// ===========================================================================
+
+mod tw_elide {
+    use ascript::ast::{ExprKind, Stmt};
+
+    /// Parse `src` into a `Vec<Stmt>` via the legacy parser (called INSIDE the
+    /// worker thread — `Vec<Stmt>` is `!Send` because it contains `Rc<str>`).
+    fn parse(src: &str) -> Vec<Stmt> {
+        let tokens = ascript::lexer::lex(src).expect("lex ok");
+        ascript::parser::parse(&tokens).expect("parse ok")
+    }
+
+    // ── (a) wrong-typed arg passes when elide_args = true ────────────────────
+
+    #[test]
+    fn tw_elide_skips_type_check_on_marked_call() {
+        // `fn f(p: int){} f("wrong")` — the parser produces `elide_args: false`.
+        // We mutate the last Stmt::Expr to set `elide_args = true` and expect the
+        // tree-walker to accept the call without panicking.
+        //
+        // Parse + mutate + run all happen inside the worker closure so that the
+        // `!Send` `Vec<Stmt>` (contains `Rc<str>`) never crosses a thread boundary.
+        let result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            let src = "fn f(p: int){}\nf(\"wrong\")\n";
+            let mut stmts = parse(src);
+
+            // The last statement is `Stmt::Expr(f("wrong"))`. Find and mutate.
+            let last = stmts.last_mut().expect("non-empty program");
+            if let Stmt::Expr(expr) = last {
+                if let ExprKind::Call { elide_args, .. } = &mut expr.kind {
+                    *elide_args = true;
+                } else {
+                    panic!("expected Call expr in last statement, got {:?}", expr.kind);
+                }
+            } else {
+                panic!("expected Stmt::Expr as last statement");
+            }
+
+            ascript::tw_run_stmts(stmts).await
+        });
+
+        assert!(
+            result.is_ok(),
+            "elide_args=true must skip type check — expected Ok, got Err({:?})",
+            result.err()
+        );
+    }
+
+    // ── (b) unmarked twin panics ──────────────────────────────────────────────
+
+    #[test]
+    fn tw_unmarked_twin_still_panics() {
+        // Identical source, but WITHOUT mutating elide_args (stays false from
+        // the parser). The tree-walker MUST panic on the type mismatch.
+        let result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            let src = "fn f(p: int){}\nf(\"wrong\")\n";
+            let stmts = parse(src); // elide_args = false (default from parser)
+            ascript::tw_run_stmts(stmts).await
+        });
+
+        assert!(
+            result.is_err(),
+            "elide_args=false must enforce type check — expected Err, got Ok({:?})",
+            result.ok()
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("type contract violated"),
+            "expected 'type contract violated' in error message, got: {msg:?}"
+        );
+    }
+
+    // ── (c) arity error still fires when elide_args = true ───────────────────
+
+    #[test]
+    fn tw_elide_preserves_arity_check() {
+        // `fn g(p: int){} g()` — wrong arity, even with elide_args = true the
+        // arity error must fire.
+        let result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            let src = "fn g(p: int){}\ng()\n";
+            let mut stmts = parse(src);
+
+            // Mutate the call to g() to set elide_args = true.
+            let last = stmts.last_mut().expect("non-empty program");
+            if let Stmt::Expr(expr) = last {
+                if let ExprKind::Call { elide_args, .. } = &mut expr.kind {
+                    *elide_args = true;
+                } else {
+                    panic!("expected Call expr");
+                }
+            }
+
+            ascript::tw_run_stmts(stmts).await
+        });
+
+        assert!(
+            result.is_err(),
+            "arity check must still fire even when elide_args=true — expected Err, got Ok"
+        );
+        let msg = result.unwrap_err();
+        // The arity message contains "expected" and "got" (from `check_call_args`).
+        assert!(
+            msg.contains("expected") && msg.contains("got"),
+            "expected arity message (contains 'expected' and 'got'), got: {msg:?}"
+        );
+    }
+
+    // ── (d) elide_args is invisible to Display / fmt ──────────────────────────
+
+    #[test]
+    fn tw_elide_args_invisible_to_display() {
+        // Printing the Call expr with elide_args=true must produce the same string
+        // as with elide_args=false (the field is omitted from Display by design).
+        // This runs on the MAIN thread (no async needed, no `!Send` crossing).
+        let src = "fn f(p: int){}\nf(1)\n";
+        let stmts_unmarked = parse(src);
+        let mut stmts_marked = parse(src);
+
+        // Mutate last stmt's Call to set elide_args = true.
+        if let Stmt::Expr(expr) = stmts_marked.last_mut().unwrap() {
+            if let ExprKind::Call { elide_args, .. } = &mut expr.kind {
+                *elide_args = true;
+            }
+        }
+
+        // Compare Display output of the last expr (the Call node).
+        let display_unmarked = if let Stmt::Expr(e) = stmts_unmarked.last().unwrap() {
+            format!("{}", e.kind)
+        } else {
+            panic!("expected Stmt::Expr")
+        };
+        let display_marked = if let Stmt::Expr(e) = stmts_marked.last().unwrap() {
+            format!("{}", e.kind)
+        } else {
+            panic!("expected Stmt::Expr")
+        };
+
+        assert_eq!(
+            display_unmarked, display_marked,
+            "elide_args must be invisible to Display: {display_unmarked:?} vs {display_marked:?}"
+        );
+    }
+}
+
 /// Helper used only in the compiler-consumption tests: compiles with an elision set
 /// and also returns the consumed count. Exposed for tests via the `ascript` crate.
 fn compile_source_with_elision_counted(

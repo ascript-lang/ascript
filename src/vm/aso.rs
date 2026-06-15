@@ -1295,7 +1295,7 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             write_expr(w, object)?;
             write_expr(w, index)?;
         }
-        ExprKind::Call { callee, args } => {
+        ExprKind::Call { callee, args, .. } => {
             w.u8(EX_CALL);
             write_expr(w, callee)?;
             w.len(args.len());
@@ -1582,7 +1582,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
                 };
                 args.push(a);
             }
-            ExprKind::Call { callee, args }
+            ExprKind::Call { callee, args, elide_args: false }
         }
         EX_BINARY => {
             let op = binop_from_tag(r.u8()?)?;

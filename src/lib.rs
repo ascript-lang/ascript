@@ -740,6 +740,36 @@ pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), A
     }
 }
 
+/// ELIDE §4.3 test seam: run a pre-parsed (and possibly AST-mutated) `Vec<Stmt>`
+/// on the tree-walker. Returns `Ok(output)` on success or `Err(panic_message)`
+/// on a Tier-2 panic. Used by `tests/elide.rs` Task 3.1 to inject `elide_args =
+/// true` on `ExprKind::Call` nodes before execution — the marking pass sets the
+/// flag in production; this seam lets tests do it surgically without needing access
+/// to `pub(crate)` internals.
+///
+/// `#[doc(hidden)]` test seam — not a public API.
+#[doc(hidden)]
+pub async fn tw_run_stmts(
+    stmts: Vec<crate::ast::Stmt>,
+) -> Result<String, String> {
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&stmts, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Ok(_) | Err(crate::interp::Control::Propagate(_)) | Err(crate::interp::Control::Exit(_)) => {
+            Ok(interp.output())
+        }
+        Err(crate::interp::Control::Panic(e)) => Err(e.message),
+    }
+}
+
 /// Compile `src` to bytecode and run it on the VM, returning the value of the
 /// program's trailing expression (VM plan V1).
 ///

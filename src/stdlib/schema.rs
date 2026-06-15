@@ -2863,6 +2863,7 @@ mod tests {
                     kind: ExprKind::Bool(false),
                     span: S::new(0, 0),
                 })],
+                elide_args: false,
             },
             span: S::new(0, 0),
         };

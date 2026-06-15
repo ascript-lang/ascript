@@ -597,7 +597,7 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             }
             write_expr(out, rhs, rp);
         }
-        ExprKind::Call { callee, args } => {
+        ExprKind::Call { callee, args, .. } => {
             write_expr(out, callee, PREC_POSTFIX);
             out.push('(');
             for (i, a) in args.iter().enumerate() {

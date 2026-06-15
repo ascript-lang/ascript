@@ -3519,7 +3519,7 @@ impl Interp {
                 //
                 // `call` is guaranteed `ExprKind::Call { callee, args }` by the parser.
                 // Never hold a `RefCell` borrow across `.await`.
-                let ExprKind::Call { callee, args } = &call.kind else {
+                let ExprKind::Call { callee, args, .. } = &call.kind else {
                     // Parser guarantee — structurally unreachable.
                     return Err(AsError::at("defer: internal error: not a call", *span).into());
                 };
@@ -4240,7 +4240,7 @@ impl Interp {
                 let v = index_get(&obj, &idx, object.span, expr.span)?;
                 Ok((v, false))
             }
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, elide_args } => {
                 // Fluent schema method-chaining hook: a Call whose callee is a
                 // plain `Member { object, name }` (NOT `OptMember`) where the
                 // evaluated `object` is a schema value and `name` is a schema
@@ -4277,9 +4277,12 @@ impl Interp {
                     // enum-variant prop, …), and only THEN evaluate the args, so
                     // a member-read error preempts arg evaluation / side effects.
                     // (This is the only path that supports NAMED args.)
+                    // ELIDE §4.3: member calls are ineligible for elision (elide_args
+                    // is always false here by construction — the marking pass only
+                    // marks plain non-member Call nodes); pass false defensively.
                     let callee_v = self.read_member(&recv, name, object.span)?;
                     let (values, names) = self.eval_call_args_named(args, env).await?;
-                    let v = self.call_value_named(callee_v, values, names, expr.span).await;
+                    let v = self.call_value_named(callee_v, values, names, expr.span, false).await;
                     return Ok((v?, false));
                 }
 
@@ -4288,7 +4291,11 @@ impl Interp {
                     return Ok((Value::nil(), true));
                 }
                 let (values, names) = self.eval_call_args_named(args, env).await?;
-                let v = self.call_value_named(callee_v, values, names, expr.span).await;
+                // ELIDE §4.3: thread the elide_args flag from the AST node.
+                // When true (set by the marking pass for a statically-proven call),
+                // per-param type-contract checks are skipped inside call_value_elided
+                // → call_function → run_body → check_call_args.
+                let v = self.call_value_named(callee_v, values, names, expr.span, *elide_args).await;
                 Ok((v?, false))
             }
             _ => Ok((self.eval_expr(expr, env).await?, false)),
@@ -4397,6 +4404,11 @@ impl Interp {
         values: Vec<Value>,
         names: Vec<Option<std::rc::Rc<str>>>,
         span: Span,
+        // ELIDE §4.3: threaded from the `ExprKind::Call` evaluator. Named-arg calls
+        // are ineligible for elision (the eligibility predicate excludes them), so
+        // when any name is Some this is effectively always false. Positional calls
+        // thread it through to `call_value_elided`.
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         if names.iter().any(|n| n.is_some()) {
             if let ValueKind::EnumVariant(ev) = callee.kind() {
@@ -4413,7 +4425,7 @@ impl Interp {
                 .into())
             }
         } else {
-            self.call_value(callee, values, span).await
+            self.call_value_elided(callee, values, span, elide_contracts).await
         }
     }
 
@@ -4607,6 +4619,26 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        self.call_value_elided(callee, args, span, false).await
+    }
+
+    /// ELIDE §4.3: the real body of `call_value`. When `elide_contracts` is true,
+    /// per-param type-contract checks are skipped inside the plain-`Function` branch
+    /// (the only branch a proven call site can reach — worker/generator/async paths are
+    /// excluded by the ELIDE eligibility predicate). Every other branch ignores the flag
+    /// (passes `false` onward) as a defensive measure: a stray `true` from a future
+    /// marking-pass bug can never skip a check that matters outside the plain-fn path.
+    ///
+    /// Arity errors, rest collection, and default evaluation are NEVER skipped —
+    /// only per-param type-contract checks.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn call_value_elided(
+        &self,
+        callee: Value,
+        args: Vec<Value>,
+        span: Span,
+        elide_contracts: bool,
+    ) -> Result<Value, Control> {
         match callee.into_kind() {
             // A VM closure (`native → VM` bridge): a native higher-order stdlib
             // function (e.g. `array.map`, a sort comparator, `recover`) is calling
@@ -4616,14 +4648,23 @@ impl Interp {
             // `Value::closure` can only exist if the VM created it, so the VM is
             // always registered here; a missing VM is a wiring bug (clear panic,
             // not UB).
+            // Defensive: Closure → VM path, elide_contracts ignored (VM handles it
+            // via Op::CallElided; the tree-walker never produces a Closure callee).
             OwnedKind::Closure(c) => {
                 let vm = self
                     .vm()
                     .expect("VM not registered for closure call (Interp::set_vm not called)");
                 vm.call_value(Value::closure(c), args, span).await
             }
+            // Defensive: builtins, constructors, bound methods, native methods,
+            // generator methods, enum constructors, class static methods — none of
+            // these are plain `Function` callees, so elide_contracts is always false
+            // for them regardless of the flag (the ELIDE eligibility predicate only
+            // proves plain non-async/non-generator/non-worker fn calls).
             OwnedKind::Builtin(name) => self.call_builtin(&name, &args, span).await,
-            OwnedKind::Function(func) => self.call_function(func, args, span).await,
+            OwnedKind::Function(func) => {
+                self.call_function(func, args, span, elide_contracts).await
+            }
             OwnedKind::Class(class) => self.construct(class, args, span).await,
             OwnedKind::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
             OwnedKind::NativeMethod(m) => self.call_native_method(m, args, span).await,
@@ -5212,6 +5253,11 @@ impl Interp {
         call_env: &Environment,
         span: Span,
         what: &str,
+        // ELIDE §4.3: when true, per-param type-contract checks are skipped. Arity,
+        // defaults, and rest collection are NEVER skipped. Method-invoke callers
+        // always pass false (methods are not elidable in v1 — the marking pass only
+        // marks plain non-member Call nodes).
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         // SP3 §B: `run_body` is the single funnel EVERY script call (function,
         // method, generator-step body, async body) passes through — and it is the
@@ -5231,7 +5277,8 @@ impl Interp {
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
         // IFACE: thread the callee frame env so a `Type::Named` param contract resolves
         // env-aware (interface → structural conforms; class → nominal).
-        let bound = check_call_args(params, args, span, what, Some(self), Some(call_env), false)?;
+        // ELIDE §4.3: elide_contracts is threaded through from call_value_elided.
+        let bound = check_call_args(params, args, span, what, Some(self), Some(call_env), elide_contracts)?;
         let defaults = bound.defaults.clone();
         // Bind the SUPPLIED params (and the rest array) — but NOT the omitted
         // defaulted positions, whose `bound.values` entries are placeholders. They
@@ -5569,6 +5616,13 @@ impl Interp {
         func: Rc<crate::value::Function>,
         args: Vec<Value>,
         span: Span,
+        // ELIDE §4.3: when true, per-param type-contract checks are skipped inside
+        // `run_body` (arity, defaults, and rest collection are still enforced).
+        // Worker, generator, and async branches ignore this flag (they either dispatch
+        // to a separate isolate or spawn an independent future — the eligibility
+        // predicate excludes them from elision). The plain sync-fn branch threads it
+        // through to `run_function_body` → `run_body` → `check_call_args`.
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         let call_env = func.closure.child();
         let what = func.name.as_deref().unwrap_or("function").to_string();
@@ -5605,7 +5659,8 @@ impl Interp {
             let func = func.clone();
             let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
                 Box::pin(
-                    async move { vm.run_function_body(func, args, call_env, span, what).await },
+                    // Generators are excluded from ELIDE eligibility → always false.
+                    async move { vm.run_function_body(func, args, call_env, span, what, false).await },
                 );
             return Ok(Value::generator(Rc::new(
                 crate::coro::GeneratorHandle::new(body),
@@ -5658,14 +5713,15 @@ impl Interp {
                 let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
+                // Async fns are excluded from ELIDE eligibility → always false.
                 #[cfg(feature = "telemetry")]
                 let r = crate::interp::telemetry_scope(
                     telem_parent,
-                    vm.run_function_body(func, args, call_env, span, what),
+                    vm.run_function_body(func, args, call_env, span, what, false),
                 )
                 .await;
                 #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_function_body(func, args, call_env, span, what).await;
+                let r = vm.run_function_body(func, args, call_env, span, what, false).await;
                 cell.resolve(r);
             });
             // Cancel-on-drop: dropping the last handle aborts this task.
@@ -5675,13 +5731,18 @@ impl Interp {
             self.maybe_yield_for_inflight().await;
             return Ok(Value::future(fut));
         }
-        self.run_function_body(func, args, call_env, span, what)
+        self.run_function_body(func, args, call_env, span, what, elide_contracts)
             .await
     }
 
     /// Run a (already-prepared) function body, owning the `Rc<Function>` for the
     /// whole frame so the `BodySpec` borrow stays local. Used both inline (sync
     /// functions) and from a spawned `'static` task (async functions).
+    ///
+    /// `elide_contracts` is threaded from ELIDE §4.3: when true, per-param
+    /// type-contract checks are skipped inside `run_body`. Async and generator
+    /// spawned tasks always call this with `false` (those paths are excluded from
+    /// the ELIDE eligibility predicate).
     #[async_recursion(?Send)]
     async fn run_function_body(
         &self,
@@ -5690,13 +5751,15 @@ impl Interp {
         call_env: Environment,
         span: Span,
         what: String,
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         let spec = BodySpec {
             params: &func.params,
             ret: &func.ret,
             body: &func.body,
         };
-        self.run_body(spec, args, &call_env, span, &what).await
+        self.run_body(spec, args, &call_env, span, &what, elide_contracts)
+            .await
     }
 
     #[async_recursion(?Send)]
@@ -6258,7 +6321,7 @@ impl Interp {
             ret: &bm.method.ret,
             body: &bm.method.body,
         };
-        self.run_body(spec, args, &call_env, span, &bm.name).await
+        self.run_body(spec, args, &call_env, span, &bm.name, false).await
     }
 
     /// Dispatch a STATIC method `C.name(args)` (SP1 §3). Unlike `invoke_method`
@@ -6330,7 +6393,7 @@ impl Interp {
             ret: &method.ret,
             body: &method.body,
         };
-        self.run_body(spec, args, &call_env, span, name).await
+        self.run_body(spec, args, &call_env, span, name, false).await
     }
 
     /// Run a method body owning the `Rc<Method>` for the whole frame (so the
@@ -6349,7 +6412,7 @@ impl Interp {
             ret: &method.ret,
             body: &method.body,
         };
-        self.run_body(spec, args, &call_env, span, &what).await
+        self.run_body(spec, args, &call_env, span, &what, false).await
     }
 
     /// FFI §4.5a — `run_in_worker(fn, input, opts?)`: dispatch a `worker fn` and, when

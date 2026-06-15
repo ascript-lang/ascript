@@ -639,6 +639,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             ExprKind::Call {
                 callee: Box::new(cst_default_expr(&callee)?),
                 args,
+                elide_args: false,
             }
         }
         Expr::TernaryExpr(t) => {
