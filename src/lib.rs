@@ -1046,6 +1046,61 @@ pub async fn vm_run_source_decoded_forced(src: &str) -> Result<(String, Option<i
     vm_run_source_decode_cfg(src, true, true, true, 0).await
 }
 
+/// ELIDE §4.2 / §5.1: compile `src` with contract-elision (proven sites identified
+/// by the static checker are compiled without the corresponding runtime checks),
+/// then run on the VM with full specialization. Observable output is byte-identical
+/// to [`vm_run_source`] for programs the elision predicate is sound for — a
+/// behavioral regression means the proof predicate is wrong, not the run path.
+///
+/// Used by the ELIDE end-to-end tests in `tests/elide.rs` and the differential
+/// correctness gate (Phase 4). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_elided(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::check::infer::elision_proofs;
+    use crate::compile::compile_source_with_elision;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let elide_set = elision_proofs(src);
+    let chunk = compile_source_with_elision(src, Some(&elide_set))
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
 /// DECODE §8.3: run `src` on the VM with DECODE FORCED (threshold=0) and return
 /// a [`DecodeStats`] bundle containing the program output + all stat counters.
 /// All counters are 0 until the corresponding task wires them up (INERT until

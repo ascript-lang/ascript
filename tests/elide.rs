@@ -809,3 +809,267 @@ mod neutrality {
         assert_eq!(checked, files.len(), "every example must be checked");
     }
 }
+
+// ===========================================================================
+// Task 2.3 — Compiler consumption of ElisionSet (spec §4.2)
+//
+// These tests verify that `compile_source_with_elision` correctly:
+//   (a) skips CHECK_LOCAL for a proven let but NOT for an unproven one;
+//   (b) emits CALL_ELIDED at a proven call site, CALL at a gradual one;
+//   (c) sets proto.ret = None for a proven fn-return, Some(_) for unproven;
+//   (d) is byte-identical to compile_source when elide = None.
+//
+// Span-match PROOF: if CALL_ELIDED never appears in a typed compile the spans
+// don't match — this is an actual failure, not a latent miss.
+// ===========================================================================
+
+mod compiler {
+    use ascript::check::infer::elision_proofs;
+    use ascript::compile::{compile_source, compile_source_with_elision};
+    use ascript::vm::disasm::disasm;
+
+    // ---- (d) None elision-set ⇒ byte-identical to compile_source ----------
+
+    #[test]
+    fn none_elision_set_is_byte_identical() {
+        // A typed program (so an elision COULD fire if wired) — but with None,
+        // the output must be identical to compile_source.
+        let src = "fn f(p: int): int { return p }\nlet x: int = 5\nf(x)\n";
+        let chunk_default = compile_source(src).expect("compile_source ok");
+        let chunk_none = compile_source_with_elision(src, None).expect("compile_source_with_elision(None) ok");
+        // Compare the serialized disasm strings (fully recursive, includes protos).
+        let d_default = disasm(&chunk_default);
+        let d_none    = disasm(&chunk_none);
+        assert_eq!(
+            d_default, d_none,
+            "compile_source_with_elision(None) must produce byte-identical output to compile_source"
+        );
+        // Also compare the raw bytecode bytes of the top chunk.
+        assert_eq!(
+            chunk_default.code.as_slice(),
+            chunk_none.code.as_slice(),
+            "top-chunk bytecode bytes must be identical"
+        );
+    }
+
+    // ---- (a) CHECK_LOCAL skipped for proven let, kept for unproven ----------
+
+    #[test]
+    fn check_local_skipped_for_proven_let() {
+        // `let x: int = 5` — annotation ElideSafe, literal anchored, Yes ⇒ proven.
+        // `let y = 5` — no annotation ⇒ no check to skip.
+        // A separate `let z: int = get()` — `get()` is not anchored ⇒ NOT proven,
+        // but that would need a more complex setup; use an unannotated `let` as the
+        // "unproven" control case.
+        let src = "let x: int = 5\nlet y = 5\n";
+        let set = elision_proofs(src);
+        // `let x: int = 5`: proven ⇒ in set.lets
+        assert!(!set.lets.is_empty(), "expected `let x: int = 5` to be in set.lets");
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let chunk_plain  = compile_source(src).expect("compile_source ok");
+
+        let dis_elided = disasm(&chunk_elided);
+        let dis_plain  = disasm(&chunk_plain);
+
+        // The elided chunk must NOT contain CHECK_LOCAL (the annotation check was proven).
+        assert!(
+            !dis_elided.contains("CHECK_LOCAL"),
+            "CHECK_LOCAL must be absent from the elided disasm:\n{dis_elided}"
+        );
+        // The plain chunk MUST contain CHECK_LOCAL (no elision).
+        assert!(
+            dis_plain.contains("CHECK_LOCAL"),
+            "CHECK_LOCAL must be present in the plain disasm:\n{dis_plain}"
+        );
+    }
+
+    #[test]
+    fn check_local_kept_for_unproven_let_mutated() {
+        // `let x: int = 5; x = 7` — mutated ⇒ not anchored ⇒ NOT proven. The CHECK_LOCAL
+        // must remain even when an elision set is threaded through.
+        let src = "let x: int = 5\nx = 7\n";
+        let set = elision_proofs(src);
+        // The let MUST NOT be in set.lets (mutated binding).
+        assert!(set.lets.is_empty(), "mutated annotated let must not be in set.lets; set={set:?}");
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let dis_elided = disasm(&chunk_elided);
+        assert!(
+            dis_elided.contains("CHECK_LOCAL"),
+            "CHECK_LOCAL must remain for an unproven (mutated) let:\n{dis_elided}"
+        );
+    }
+
+    // ---- (b) CALL_ELIDED at proven call site, CALL at gradual one ----------
+
+    #[test]
+    fn call_elided_for_proven_call() {
+        // `fn f(p: int){} f(5)` — literal arg to typed param, no spread/named/rest.
+        // The collector MUST prove this call and the compiler MUST emit CALL_ELIDED.
+        let src = "fn f(p: int){}\nf(5)\n";
+        let set = elision_proofs(src);
+        assert!(!set.calls.is_empty(), "f(5) must be proven; set.calls={:?}", set.calls);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let dis_elided = disasm(&chunk_elided);
+
+        assert!(
+            dis_elided.contains("CALL_ELIDED"),
+            "CALL_ELIDED must appear in the elided disasm for a proven call;\n\
+             If it never appears, the compiler's call span does not match the collector's key.\n\
+             disasm:\n{dis_elided}\nset.calls: {:?}", set.calls
+        );
+        // The un-elided (None) compile must NOT have CALL_ELIDED.
+        let dis_plain = disasm(&compile_source(src).expect("ok"));
+        assert!(
+            !dis_plain.contains("CALL_ELIDED"),
+            "plain compile must not contain CALL_ELIDED:\n{dis_plain}"
+        );
+    }
+
+    #[test]
+    fn call_kept_for_gradual_call() {
+        // Probe-3 pattern: mutated binding ⇒ not anchored ⇒ collector produces no call key.
+        // With the set threaded in, the compiler must keep a plain CALL (not CALL_ELIDED).
+        let src = "fn f(p: int){}\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        let set = elision_proofs(src);
+        assert!(set.calls.is_empty(), "probe-3 call must NOT be proven; set={:?}", set);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let dis_elided = disasm(&chunk_elided);
+        assert!(
+            !dis_elided.contains("CALL_ELIDED"),
+            "CALL_ELIDED must NOT appear for a gradual (mutated-binding) call:\n{dis_elided}"
+        );
+        // The CALL opcode must still be present.
+        assert!(
+            dis_elided.contains("CALL "),
+            "plain CALL must remain for a gradual call:\n{dis_elided}"
+        );
+    }
+
+    // ---- (c) proto.ret = None for proven fn-return -------------------------
+
+    #[test]
+    fn proto_ret_none_for_proven_fn_return() {
+        // `fn g(): int { return 1 }` — ElideSafe return, literal anchored, always returns.
+        // Collector must put `g` in fn_rets; compiler must set proto.ret = None.
+        let src = "fn g(): int { return 1 }\n";
+        let set = elision_proofs(src);
+        assert!(!set.fn_rets.is_empty(), "g's return must be proven; set.fn_rets={:?}", set.fn_rets);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        // The proto for `g` is in chunk.protos (top-level fns compile to protos in
+        // the top chunk's proto table, not the const pool).
+        let proto = chunk_elided
+            .protos
+            .first()
+            .expect("g's FnProto must be in chunk.protos");
+        assert!(
+            proto.ret.is_none(),
+            "proven fn's proto.ret must be None (elided return contract); got {:?}", proto.ret
+        );
+    }
+
+    #[test]
+    fn proto_ret_some_for_non_proven_fn() {
+        // `fn h(c: bool): int { if (c) { return 1 } }` — non-total body, nil not Yes against int.
+        // NOT proven ⇒ proto.ret must remain Some(int).
+        let src = "fn h(c: bool): int { if (c) { return 1 } }\n";
+        let set = elision_proofs(src);
+        assert!(set.fn_rets.is_empty(), "non-total fn must NOT be in fn_rets; set={:?}", set);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let proto = chunk_elided
+            .protos
+            .first()
+            .expect("h's FnProto must be in chunk.protos");
+        assert!(
+            proto.ret.is_some(),
+            "non-proven fn's proto.ret must remain Some(_); got None"
+        );
+    }
+
+    // ---- consumed_count ⇒ matches len(ElisionSet) when all sites apply -----
+
+    #[test]
+    fn consumed_count_matches_elision_set_len() {
+        // A fully-typed program with a proven call + proven let + proven fn-ret.
+        let src = "fn g(): int { return 1 }\nfn f(p: int){}\nlet x: int = 5\nf(x)\ng()\n";
+        let set = elision_proofs(src);
+        let set_len = set.len();
+        assert!(set_len > 0, "expected at least one proven site");
+
+        let (chunk, consumed) = super::compile_source_with_elision_counted(src, Some(&set))
+            .expect("compile ok");
+        // consumed must equal the number of proven sites that were actually applied.
+        // For a simple single-module program where every key is in-scope, consumed == set_len.
+        assert_eq!(
+            consumed, set_len,
+            "consumed_count ({consumed}) must equal ElisionSet::len ({set_len})"
+        );
+        // Verify the disasm contains CALL_ELIDED (the call was actually consumed).
+        let dis = disasm(&chunk);
+        assert!(dis.contains("CALL_ELIDED"), "CALL_ELIDED must appear:\n{dis}");
+    }
+
+    // ---- end-to-end: vm_run_source_elided output == vm_run_source ----------
+
+    #[test]
+    fn vm_run_source_elided_same_output_typed_program() {
+        // A typed program that produces observable output — the elided version must
+        // produce byte-identical output to the normal run.
+        // `AsError` is `!Send` (holds `Rc<SourceInfo>`); reduce to `String` inside the
+        // worker closure so the return type is `Send`.
+        let src = "fn add(a: int, b: int): int { return a + b }\nprint(add(3, 4))\n";
+        type Summary = Result<(String, Option<i32>), String>;
+        let (out_normal, out_elided): (Summary, Summary) = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                let summarize = |r: Result<(String, Option<i32>), ascript::error::AsError>| -> Summary {
+                    r.map_err(|e| e.message)
+                };
+                let normal = summarize(ascript::vm_run_source(&src).await);
+                let elided = summarize(ascript::vm_run_source_elided(&src).await);
+                (normal, elided)
+            }
+        });
+        assert_eq!(
+            out_normal, out_elided,
+            "vm_run_source_elided must produce byte-identical output:\nnormal: {out_normal:?}\nelided: {out_elided:?}"
+        );
+    }
+
+    #[test]
+    fn vm_run_source_elided_gradual_boundary_still_panics() {
+        // Probe-3: mutated binding ⇒ call NOT elided ⇒ must STILL panic.
+        // `AsError` is `!Send`; reduce to `Result<_, String>` inside the closure.
+        let src = "fn f(p: int){ return p }\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "probe-3 program must still panic under vm_run_source_elided (gradual boundary kept)"
+        );
+    }
+}
+
+/// Helper used only in the compiler-consumption tests: compiles with an elision set
+/// and also returns the consumed count. Exposed for tests via the `ascript` crate.
+fn compile_source_with_elision_counted(
+    src: &str,
+    elide: Option<&ascript::check::infer::elide::ElisionSet>,
+) -> Result<(ascript::vm::chunk::Chunk, usize), ascript::compile::CompileError> {
+    ascript::compile::compile_source_with_elision_counted(src, elide)
+}

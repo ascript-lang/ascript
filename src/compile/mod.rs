@@ -8,6 +8,7 @@
 //! flow, calls, and the richer literal grammar (templates, escapes, hex/binary/
 //! scientific numbers) land in V2+.
 
+use crate::check::infer::elide::ElisionSet;
 use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_template_body};
 use crate::span::Span;
 use crate::syntax::ast::{
@@ -1008,7 +1009,7 @@ fn short_circuit_op(op: SyntaxKind) -> Option<Op> {
 /// expression and emitting `RETURN`. The source is parsed exactly once: the
 /// gate reads the errors off the `Parse` and the same `Parse` becomes the tree.
 pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
-    compile_source_inner(src, None)
+    compile_source_inner(src, None, None)
 }
 
 /// Compile `src` into a top-level [`Chunk`], PRUNING unreferenced top-level
@@ -1038,17 +1039,58 @@ pub fn compile_source_with_keep(
     src: &str,
     keep: &HashSet<Rc<str>>,
 ) -> Result<Chunk, CompileError> {
-    compile_source_inner(src, Some(keep))
+    compile_source_inner(src, Some(keep), None)
 }
 
-/// The shared body of [`compile_source`] / [`compile_source_with_keep`]. When
-/// `keep` is `Some`, the top-level emit loop drops unreferenced top-level binding
-/// declarations (see [`compile_source_with_keep`]); when `None`, every top-level
-/// statement is emitted (the unchanged default `run`/`build` path).
+/// Compile `src` with an optional [`ElisionSet`] (ELIDE §4.2).
+///
+/// When `elide` is `Some`, the compiler applies proven-site elision:
+/// - Proven `let` initialisers skip the `CHECK_LOCAL` emission (row 2).
+/// - Proven fn-return contracts drop `proto.ret = None` at the proto builder (row 3).
+/// - Proven call sites emit `Op::CallElided` instead of `Op::Call` (row 1) —
+///   ONLY for plain non-spread/non-named/non-method calls (the exact three
+///   `Op::Call` sites listed in the spec §4.2).
+///
+/// When `elide` is `None` the output is **byte-identical** to [`compile_source`].
+pub fn compile_source_with_elision(
+    src: &str,
+    elide: Option<&ElisionSet>,
+) -> Result<Chunk, CompileError> {
+    compile_source_inner(src, None, elide)
+}
+
+/// Like [`compile_source_with_elision`] but also returns the number of proven
+/// sites that were actually consumed (matched and applied) from `elide`.
+///
+/// Used by the count-parity gate (ELIDE §6.4): `consumed == ElisionSet::len()`.
+pub fn compile_source_with_elision_counted(
+    src: &str,
+    elide: Option<&ElisionSet>,
+) -> Result<(Chunk, usize), CompileError> {
+    compile_source_inner_counted(src, None, elide)
+}
+
+/// The shared body of [`compile_source`] / [`compile_source_with_keep`] /
+/// [`compile_source_with_elision`]. When `keep` is `Some`, the top-level emit
+/// loop drops unreferenced top-level binding declarations (see
+/// [`compile_source_with_keep`]); when `None`, every top-level statement is
+/// emitted (the unchanged default `run`/`build` path).
+///
+/// `elide` is threaded through to the `Compiler` struct; `None` ⇒ byte-identical
+/// output to the pre-ELIDE path (the kill-switch invariant).
 fn compile_source_inner(
     src: &str,
     keep: Option<&HashSet<Rc<str>>>,
+    elide: Option<&ElisionSet>,
 ) -> Result<Chunk, CompileError> {
+    compile_source_inner_counted(src, keep, elide).map(|(chunk, _)| chunk)
+}
+
+fn compile_source_inner_counted(
+    src: &str,
+    keep: Option<&HashSet<Rc<str>>>,
+    elide: Option<&ElisionSet>,
+) -> Result<(Chunk, usize), CompileError> {
     // The CST parser is error-RECOVERING: it never aborts, it records a
     // diagnostic and patches a best-effort tree (e.g. an anonymous `fn(){...}`
     // EXPRESSION — not a language construct — recovers into a name-less,
@@ -1127,6 +1169,8 @@ fn compile_source_inner(
         next_temp,
         cur_cells,
         compile_depth: 0,
+        elide: elide.cloned(),
+        consumed: 0,
     };
 
     // V2 supports a sequence of statements whose meaningful tail is an
@@ -1190,7 +1234,7 @@ fn compile_source_inner(
         return Err(limit.into_compile_error());
     }
 
-    Ok(compiler.chunk)
+    Ok((compiler.chunk, compiler.consumed))
 }
 
 /// The wrapped CST node of a `Stmt` (the enum does not expose a single `syntax()`
@@ -1283,6 +1327,16 @@ struct Compiler {
     /// as an `AsError` with that message, byte-identical (stdout+exit) to the
     /// tree-walker's runtime panic.
     compile_depth: u32,
+    /// ELIDE §4.2: the optional proven-site set for this compile. When `Some`, the
+    /// compiler checks each candidate emission site against the corresponding
+    /// sub-set and applies elision (skip `CHECK_LOCAL`, drop `proto.ret`, emit
+    /// `CALL_ELIDED`). When `None` the output is byte-identical to the pre-ELIDE
+    /// path (the `None` ⇒ byte-identical kill-switch invariant).
+    elide: Option<ElisionSet>,
+    /// ELIDE §4.2 / §6.4: count of proven sites actually consumed (matched and
+    /// applied) during this compile. Equals `ElisionSet::len()` when every key
+    /// in the set is reachable in the source (the count-parity gate).
+    consumed: usize,
 }
 
 impl Compiler {
@@ -3423,6 +3477,34 @@ impl Compiler {
         // name for `fn f(){}` and methods (`greet`); anonymous arrows / fn-expressions
         // have no Ident token → `None` (the snapshot then falls back to "fn@L<line>").
         let debug_name = fn_name_token_text(fn_node).map(Rc::from);
+        // ELIDE §4.2 row 3: if the fn's name-token char-span key is in
+        // `self.elide.fn_rets`, the return contract is provably satisfied for every
+        // call — drop `proto.ret` so the VM skips the return-type check.
+        let effective_ret = if let Some(elide) = &self.elide {
+            let name_key = fn_node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .find(|t| t.kind() == SyntaxKind::Ident)
+                .map(|t| {
+                    let r = t.text_range();
+                    (
+                        byte_to_char(usize::from(r.start())) as u32,
+                        byte_to_char(usize::from(r.end())) as u32,
+                    )
+                });
+            if let Some(key) = name_key {
+                if elide.fn_rets.contains(&key) {
+                    self.consumed += 1;
+                    None // elide the return contract
+                } else {
+                    ret_type
+                }
+            } else {
+                ret_type
+            }
+        } else {
+            ret_type
+        };
         Ok(Rc::new(FnProto {
             chunk: body_chunk,
             arity,
@@ -3432,7 +3514,7 @@ impl Compiler {
             is_worker,
             owning_class: None,
             params: proto_params,
-            ret: ret_type,
+            ret: effective_ret,
             local_names,
             debug_name,
         }))
@@ -4101,12 +4183,38 @@ impl Compiler {
     /// The op's span is the initializer EXPRESSION's trivia-trimmed code span, so a
     /// mismatch panic anchors EXACTLY where the tree-walker's `Stmt::Let` does
     /// (`value.span`), byte-for-byte.
+    ///
+    /// ELIDE §4.2 row 2: if the initializer's span key is in `self.elide.lets`, the
+    /// check is provably redundant — skip emission entirely and count the consumption.
     fn emit_check_local(&mut self, ty: Option<crate::ast::Type>, init: &Expr) {
         if let Some(ty) = ty {
+            let span = node_code_span(init);
+            let key = (span.start as u32, span.end as u32);
+            if let Some(elide) = &self.elide {
+                if elide.lets.contains(&key) {
+                    self.consumed += 1;
+                    return; // proven — skip the CHECK_LOCAL emission
+                }
+            }
             let idx = self.chunk.add_type_const(ty);
-            self.chunk
-                .emit_u16(Op::CheckLocal, idx, node_code_span(init));
+            self.chunk.emit_u16(Op::CheckLocal, idx, span);
         }
+    }
+
+    /// ELIDE §4.2 row 1: resolve the opcode for a plain (non-spread, non-method,
+    /// non-named-arg, non-super) call site. When `self.elide` is `Some` and `span`'s
+    /// key is in `elide.calls`, the call's argument contracts are provably satisfied
+    /// — emit `Op::CallElided` and count the consumption. Otherwise fall back to the
+    /// default `Op::Call` (byte-identical to the pre-ELIDE path).
+    fn elide_call_op(&mut self, span: Span) -> Op {
+        let key = (span.start as u32, span.end as u32);
+        if let Some(elide) = &self.elide {
+            if elide.calls.contains(&key) {
+                self.consumed += 1;
+                return Op::CallElided;
+            }
+        }
+        Op::Call
     }
 
     /// Whether the declaration at `decl_range` binds a MODULE-SCOPE user-global, per
@@ -5078,7 +5186,9 @@ impl Compiler {
                         })?;
                     }
                 }
-                self.chunk.emit_u8(Op::Call, argc, span);
+                // ELIDE §4.2 row 1: emit CALL_ELIDED when the call span is proven.
+                let call_op = self.elide_call_op(span);
+                self.chunk.emit_u8(call_op, argc, span);
                 Ok(())
             }
             // `recv.b` — plain member read link in a sink chain.
@@ -5230,7 +5340,9 @@ impl Compiler {
             }
         }
 
-        self.chunk.emit_u8(Op::Call, argc, span);
+        // ELIDE §4.2 row 1: emit CALL_ELIDED when the call span is proven.
+        let call_op = self.elide_call_op(span);
+        self.chunk.emit_u8(call_op, argc, span);
         Ok(())
     }
 
