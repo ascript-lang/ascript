@@ -9,6 +9,7 @@
 //! environment + narrowing overlay), and [`pass`] (the synthesis/checking/
 //! narrowing visitor that emits diagnostics).
 
+pub mod elide;
 pub mod env;
 pub mod pass;
 pub mod table;

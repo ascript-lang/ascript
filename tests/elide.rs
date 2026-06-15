@@ -265,3 +265,202 @@ fn probe_object_contract_rejects_instances() {
 
     let _ = std::fs::remove_file(&file);
 }
+
+// ---------------------------------------------------------------------------
+// ELIDE Task 1.2 — the kind-table battery (spec §6.7)
+// ---------------------------------------------------------------------------
+//
+// The anchoring proof (A) relies on `arith_result_kind` MIRRORING the runtime's
+// NUM promotion EXACTLY: for every operand-kind pair × operator the table claims
+// a definite result kind, the runtime must actually produce a value of that kind.
+//
+// This battery generates ONE program (a single VM invocation) that, for every
+// concrete operand-kind pair × operator the table maps to `Some(kind)`, computes
+// the op on representative literals and prints `type(result)`. It then asserts the
+// printed runtime kind equals the table's `ResultKind`. Synth-vs-runtime is pinned
+// EXHAUSTIVELY over the concrete operand-kind matrix.
+//
+// `OperandKind::Number` is omitted from the runtime side: `number` is an
+// annotation SUPERTYPE with no literal form (a value is always concretely int or
+// float at runtime), and the table already returns `None` for every `Number`
+// operand — so there is no runtime obligation to pin for it.
+
+use ascript::check::infer::elide::{arith_result_kind, ArithOp, OperandKind, ResultKind};
+
+/// A representative `.as` literal expression for a concrete operand kind, plus a
+/// SECOND distinct literal (so e.g. `5 / 2` exercises the truncating int division
+/// rather than a trivial `x / x`).
+fn operand_literals(k: OperandKind) -> Option<(&'static str, &'static str)> {
+    match k {
+        OperandKind::Int => Some(("5", "2")),
+        OperandKind::Float => Some(("5.0", "2.0")),
+        OperandKind::String => Some(("\"a\"", "\"b\"")),
+        OperandKind::Bool => Some(("true", "false")),
+        OperandKind::Nil => Some(("nil", "nil")),
+        // `number` has no literal form (see the module note) — skip on the runtime
+        // side; the table already returns None for it.
+        OperandKind::Number => None,
+    }
+}
+
+/// The surface operator(s) covered by an `ArithOp` family. Each concrete operator
+/// must, for a kind pair the table maps to `Some`, produce that exact runtime kind.
+fn surface_ops(op: ArithOp) -> &'static [&'static str] {
+    match op {
+        // `+` is its own family (string-concat overload).
+        ArithOp::Add => &["+"],
+        // strictly-numeric arithmetic (float-accepting), incl. the truncating `/`,
+        // `%`, `**`.
+        ArithOp::NumericArith => &["-", "*", "/", "%", "**"],
+        // explicit overflow-WRAPPING arithmetic — int-only.
+        ArithOp::WrappingArith => &["+%", "-%", "*%"],
+        // bitwise / shift.
+        ArithOp::Bitwise => &["&", "|", "^", "<<", ">>"],
+        // comparison / membership (instanceof needs a type RHS, covered separately).
+        ArithOp::Comparison => &["==", "!=", "<", "<=", ">", ">="],
+        // logical / coalesce — never anchored; covered by a `None` assertion, not a
+        // runtime program.
+        ArithOp::Logical => &[],
+    }
+}
+
+/// Whether a concrete surface operator actually PRODUCES a value (vs panics
+/// before the site) for the given concrete operand kinds. The spec (§2.3) permits
+/// a "panic-before-site" for anchoring (a panic is not a wrong elision), so the
+/// battery only pins the cases that genuinely yield a value:
+/// - ORDERING comparisons (`< <= > >=`) require two numbers — a cross-type or
+///   non-number pair panics (`operator requires two numbers …`).
+/// - EQUALITY (`== !=`) works on any operand pair (→ bool).
+///
+/// All other families' Some-cases already imply value-producing operand kinds.
+fn runtime_produces_value(sop: &str, lhs: OperandKind, rhs: OperandKind) -> bool {
+    let numeric = |k: OperandKind| matches!(k, OperandKind::Int | OperandKind::Float);
+    match sop {
+        "<" | "<=" | ">" | ">=" => numeric(lhs) && numeric(rhs),
+        _ => true,
+    }
+}
+
+fn result_kind_name(k: ResultKind) -> &'static str {
+    match k {
+        ResultKind::Int => "int",
+        ResultKind::Float => "float",
+        ResultKind::String => "string",
+        ResultKind::Bool => "bool",
+    }
+}
+
+#[test]
+fn kind_table_battery_mirrors_runtime_num_promotion() {
+    let concrete_kinds = [
+        OperandKind::Int,
+        OperandKind::Float,
+        OperandKind::String,
+        OperandKind::Bool,
+        OperandKind::Nil,
+    ];
+    let families = [
+        ArithOp::Add,
+        ArithOp::NumericArith,
+        ArithOp::WrappingArith,
+        ArithOp::Bitwise,
+        ArithOp::Comparison,
+        ArithOp::Logical,
+    ];
+
+    // Build one program that prints the runtime kind of each anchored case, and a
+    // parallel `expected` vector of the table's claimed kind names.
+    let mut program = String::new();
+    let mut expected: Vec<&'static str> = Vec::new();
+    let mut cases: Vec<String> = Vec::new();
+
+    for &op in &families {
+        for &lhs in &concrete_kinds {
+            for &rhs in &concrete_kinds {
+                let Some(rk) = arith_result_kind(op, lhs, rhs) else {
+                    continue; // table says NOT anchored → no runtime obligation.
+                };
+                let (Some((la, _)), Some((_, rb))) =
+                    (operand_literals(lhs), operand_literals(rhs))
+                else {
+                    continue; // no literal form (e.g. Number) — skip.
+                };
+                for sop in surface_ops(op) {
+                    if !runtime_produces_value(sop, lhs, rhs) {
+                        continue; // panic-before-site — not a value-producing case.
+                    }
+                    let expr = format!("{la} {sop} {rb}");
+                    program.push_str(&format!("print(type({expr}))\n"));
+                    expected.push(result_kind_name(rk));
+                    cases.push(format!("{la} {sop} {rb}  (table: {})", result_kind_name(rk)));
+                }
+            }
+        }
+    }
+
+    assert!(
+        !expected.is_empty(),
+        "battery produced no cases — generator is broken"
+    );
+
+    // Run the whole battery in ONE VM invocation on a worker-stack runtime (the
+    // `!Send` idiom the differential uses).
+    let out = ascript::run_on_worker_stack({
+        let src = program.clone();
+        move || async move {
+            ascript::vm_run_source(&src)
+                .await
+                .expect("kind-table battery program failed to run")
+                .0
+        }
+    });
+
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} result lines, got {}\nprogram:\n{program}\noutput:\n{out}",
+        expected.len(),
+        lines.len()
+    );
+
+    for (i, (got, want)) in lines.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            got, want,
+            "case `{}`: arith_result_kind says `{want}`, runtime `type()` says `{got}`",
+            cases[i]
+        );
+    }
+
+    // Sanity: the battery is non-trivial (covers ~100 micro-cases, the spec's
+    // exhaustive-pin requirement).
+    assert!(
+        expected.len() >= 80,
+        "battery should pin ~100 cases, only pinned {}",
+        expected.len()
+    );
+}
+
+#[test]
+fn kind_table_logical_ops_never_anchored() {
+    // The logical/coalesce trio is NEVER anchored — `arith_result_kind` returns
+    // None for EVERY operand pair (pinned here so a future table edit can't
+    // silently anchor them).
+    let kinds = [
+        OperandKind::Int,
+        OperandKind::Float,
+        OperandKind::Number,
+        OperandKind::String,
+        OperandKind::Bool,
+        OperandKind::Nil,
+    ];
+    for &lhs in &kinds {
+        for &rhs in &kinds {
+            assert_eq!(
+                arith_result_kind(ArithOp::Logical, lhs, rhs),
+                None,
+                "logical {lhs:?} ∘ {rhs:?} must never be anchored"
+            );
+        }
+    }
+}
