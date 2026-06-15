@@ -485,6 +485,63 @@ fn stress_differential_many_seeds() {
 }
 
 // ===========================================================================
+// FUZZ regression — decimal arithmetic overflow must be a recoverable Tier-2
+// panic, NOT a `rust_decimal` library `panic!` that aborts the worker thread.
+// ===========================================================================
+//
+// The NANB Phase-3 300k stress campaign (FUZZ_STRESS_N=300000, value16 repr)
+// crashed with `Multiplication overflowed` from rust_decimal-1.42.0
+// (arithmetic_impls.rs:232) propagated as `worker thread panicked: Any { .. }`.
+// Root cause (REPR-INDEPENDENT — reproduces byte-identically on the 24-byte
+// default AND the 16-byte value16 binary): `apply_binop`'s decimal arm used the
+// bare `+ - * / %` operators, which `panic!` on 96-bit-mantissa overflow instead
+// of returning a Tier-2 `AsError`. A Tier-2 bug must be a clean recoverable panic
+// (catchable by `recover`), identical on every engine — never a process abort.
+// Gate 0: this regression test is committed BEFORE the fix.
+const DECIMAL_OVERFLOW_SRC: &str = r#"import * as decimal from "std/decimal"
+let a = decimal.from("79228162514264337593543950335")
+let b = decimal.from("79228162514264337593543950335")
+print(a * b)
+"#;
+
+#[test]
+fn decimal_multiply_overflow_is_recoverable_not_a_process_abort() {
+    // All eight engine modes must agree AND must produce a clean Tier-2 panic
+    // (an `Outcome::Panic`, projected from `AsError`) — NOT abort the worker.
+    // Before the fix this test never returns: the rust_decimal `panic!` unwinds
+    // the worker thread and aborts the run.
+    let (tw, vm, gen, aso, nolane, nocf, decfwd, nodec) = run_all_engines(DECIMAL_OVERFLOW_SRC);
+    for (label, out) in [
+        ("tree-walker", &tw),
+        ("specialized-VM", &vm),
+        ("generic-VM", &gen),
+        (".aso", &aso),
+        ("lane-off", &nolane),
+        ("no-call-fast", &nocf),
+        ("decoded-forced", &decfwd),
+        ("no-decode", &nodec),
+    ] {
+        match out {
+            Outcome::Panic { message } => assert!(
+                message.contains("decimal") && message.contains("overflow"),
+                "{label}: expected a 'decimal ... overflow' Tier-2 message, got {message:?}"
+            ),
+            Outcome::Ok { .. } => panic!(
+                "{label}: decimal multiplication overflow must be a Tier-2 panic, got Ok"
+            ),
+        }
+    }
+    // Byte-identical across all modes (the four-mode × lane × call × decode gate).
+    assert_eq!(tw, vm, "decimal overflow: tree-walker vs specialized-VM");
+    assert_eq!(tw, gen, "decimal overflow: tree-walker vs generic-VM");
+    assert_eq!(tw, aso, "decimal overflow: tree-walker vs .aso");
+    assert_eq!(tw, nolane, "decimal overflow: tree-walker vs lane-off");
+    assert_eq!(tw, nocf, "decimal overflow: tree-walker vs no-call-fast");
+    assert_eq!(tw, decfwd, "decimal overflow: tree-walker vs decoded-forced");
+    assert_eq!(tw, nodec, "decimal overflow: tree-walker vs no-decode");
+}
+
+// ===========================================================================
 // Task 7 — the planted-bug SABOTEUR self-test (spec §7)
 // ===========================================================================
 //

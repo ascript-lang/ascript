@@ -7201,21 +7201,36 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         let da = coerce_to_decimal(&l, span)?;
         let db = coerce_to_decimal(&r, span)?;
         if let (Some(a), Some(b)) = (da, db) {
+            // Decimal arithmetic uses the CHECKED rust_decimal ops: the bare
+            // `+ - * / %` operators `panic!` on 96-bit-mantissa overflow (a hard
+            // process abort, not catchable by `recover` and divergent from a
+            // Tier-2 contract). `checked_*` returns `None` on overflow, which we
+            // raise as a recoverable Tier-2 panic from this SHARED site (both
+            // engines reach it → byte-identical).
+            let dec_overflow = |what: &str| AsError::at(format!("decimal {what} overflowed"), span);
             let result = match op {
-                BinOp::Add => Value::decimal(a + b),
-                BinOp::Sub => Value::decimal(a - b),
-                BinOp::Mul => Value::decimal(a * b),
+                BinOp::Add => {
+                    Value::decimal(a.checked_add(b).ok_or_else(|| dec_overflow("addition"))?)
+                }
+                BinOp::Sub => Value::decimal(
+                    a.checked_sub(b)
+                        .ok_or_else(|| dec_overflow("subtraction"))?,
+                ),
+                BinOp::Mul => Value::decimal(
+                    a.checked_mul(b)
+                        .ok_or_else(|| dec_overflow("multiplication"))?,
+                ),
                 BinOp::Div => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal division by zero", span).into());
                     }
-                    Value::decimal(a / b)
+                    Value::decimal(a.checked_div(b).ok_or_else(|| dec_overflow("division"))?)
                 }
                 BinOp::Mod => {
                     if b.is_zero() {
                         return Err(AsError::at("decimal remainder by zero", span).into());
                     }
-                    Value::decimal(a % b)
+                    Value::decimal(a.checked_rem(b).ok_or_else(|| dec_overflow("remainder"))?)
                 }
                 // Ordering: both operands are already finite Decimals here
                 // (coerce_to_decimal above Tier-2-panics on a non-finite Number).
