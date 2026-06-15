@@ -123,7 +123,7 @@ stated, results are measured.
 ### Dispatch — decode once, fuse what the data says, inline what guards allow
 
 - ✅ **DECODE — Pre-decoded instruction stream + data-driven superinstructions (Units A+B);
-  speculative inlining + TOS cache evidence-dropped.** **MERGED (pending `--no-ff`).** A
+  speculative inlining + TOS cache evidence-dropped.** **MERGED to `main` (`--no-ff`, `9a4cd76`).** A
   per-`FnProto`, lazily-built side representation (fixed-width op records, operands widened, jump
   targets pre-resolved) following the `arith_cache` side-table precedent — `Chunk.code` stays
   byte-identical (disassembler/goldens/differential untouched); `Op::Break` byte-patching
@@ -526,7 +526,7 @@ stated, results are measured.
   (behavior-identical move — the introspection seam for tripwire 1; vm_differential proves engines
   untouched). Gate 19 added. No engine change, no `.aso` change, `ASO_FORMAT_VERSION` unchanged.
 
-- **DECODE** — ✅ **MERGED (pending `--no-ff`)** from `feat/decoded-dispatch`; **Task-11 evidence gate
+- **DECODE** — ✅ **MERGED to `main` (`--no-ff`, `9a4cd76`)** from `feat/decoded-dispatch`; **Task-11 evidence gate
   executed — DOUBLE DROP by measurement; owner SHIPPED Units A+B default-on (recorded trade).**
   Pre-decoded instruction stream (Unit A) + data-driven superinstruction fusion (Unit B) ship for their
   **invalidation contract** (the byte-patch→drop-decoded-code `patch_epoch`/deps-epoch machinery — the
