@@ -51,11 +51,12 @@ fn repo_root() -> &'static Path {
 ///
 /// This literal pin trips on ANY bump, forcing each bumping feature to
 /// consciously update it and confirm the bump is not from SHAPE. The current
-/// value is 28: DEFER bumped 27→28 (adding `DeferPush`/`DeferPushMethod`
-/// opcodes) before this branch; SHAPE kept it at 28.
+/// value is 29: DEFER bumped 27→28 (adding `DeferPush`/`DeferPushMethod`
+/// opcodes) before this branch; SHAPE kept it at 28; ELIDE bumped 28→29
+/// (adding `CallElided`) on `feat/contract-elision`.
 #[test]
 fn aso_format_version_is_unchanged_by_shape() {
-    const ASO_AT_MERGE_BASE: u32 = 28;
+    const ASO_AT_MERGE_BASE: u32 = 29;
     assert_eq!(
         ascript::vm::aso::ASO_FORMAT_VERSION,
         ASO_AT_MERGE_BASE,
@@ -65,10 +66,13 @@ fn aso_format_version_is_unchanged_by_shape() {
     );
 }
 
-/// SHAPE added zero opcodes — the `Op` enum variant count must stay at 120.
+/// SHAPE added zero opcodes — the `Op` enum variant count must stay at 120
+/// at the SHAPE merge base. ELIDE later added `Op::CallElided` (byte 120),
+/// raising the count to 121. Update this comment and `EXPECTED_OP_COUNT` only
+/// when a non-SHAPE feature adds a new opcode.
 ///
-/// The `Op` enum is `#[repr(u8)]`; its last variant is `DeferPushMethod` with
-/// discriminant 119 (0-indexed), giving exactly 120 variants. SHAPE is a pure
+/// The `Op` enum is `#[repr(u8)]`; SHAPE left the last variant as `DeferPushMethod`
+/// (discriminant 119, 0-indexed) = 120 variants. SHAPE is a pure
 /// storage-representation change: object/instance field access still routes
 /// through the same `GetProp`/`SetProp`/`GetIndex`/`SetIndex` opcodes, which
 /// now consult the shape registry internally — no new dispatch byte is needed.
@@ -78,10 +82,10 @@ fn aso_format_version_is_unchanged_by_shape() {
 #[test]
 fn op_variant_count_is_unchanged_by_shape() {
     /// Expected number of `Op` variants (last discriminant + 1).
-    /// `DeferPushMethod` is the last variant; it was assigned discriminant 119
-    /// by the `#[repr(u8)]` enum ordering (counted from the `from_u8` match in
-    /// `src/vm/opcode.rs`, which has exactly 120 arms). SHAPE added none.
-    const EXPECTED_OP_COUNT: usize = 120;
+    /// SHAPE kept this at 120 (last variant `DeferPushMethod`, discriminant 119).
+    /// ELIDE added `CallElided` (discriminant 120) on `feat/contract-elision`,
+    /// raising the count to 121. Update here only for non-SHAPE additions.
+    const EXPECTED_OP_COUNT: usize = 121;
     // Count via `from_u8` over every possible discriminant: a new opcode is only
     // usable once it has a `from_u8` arm, so this trips on a variant added
     // ANYWHERE in the enum — inserted before the last variant, appended after it,
@@ -97,11 +101,12 @@ fn op_variant_count_is_unchanged_by_shape() {
          happen inside existing GetProp/SetProp/GetIndex/SetIndex arms); update \
          EXPECTED_OP_COUNT only if a non-SHAPE feature adds the new opcode."
     );
-    // Complementary sanity pin: `DeferPushMethod` remains the last variant (119).
+    // Complementary sanity pin: `CallElided` is now the last variant (120).
+    // (Before ELIDE: `DeferPushMethod` was 119 = the last.)
     assert_eq!(
-        ascript::vm::opcode::Op::DeferPushMethod as u16 + 1,
+        ascript::vm::opcode::Op::CallElided as u16 + 1,
         EXPECTED_OP_COUNT as u16,
-        "DeferPushMethod is no longer the last Op variant"
+        "CallElided is no longer the last Op variant"
     );
 }
 

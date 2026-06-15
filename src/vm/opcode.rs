@@ -646,6 +646,26 @@ pub enum Op {
     /// jump that skips arg eval + push entirely, mirroring existing opt-chain
     /// lowering), so the nil-receiver case never reaches this op.
     DeferPushMethod,
+
+    // ---- ELIDE §4.2 — elided call-site opcode --------------------------------
+    /// `CALL_ELIDED(u8 argc)` — ELIDE §4.2: semantically identical to [`Op::Call`]
+    /// but signals that the checker PROVED the per-arg parameter contracts can never
+    /// fire at this call site ((E)+(Y)+(A) predicate, spec §2). The runtime is
+    /// therefore permitted to skip the per-arg `check_type_env`/`check_type` calls
+    /// inside `check_call_args` while keeping arity validation, default-range
+    /// computation, and rest collection byte-for-byte identical to `Op::Call`.
+    ///
+    /// Operand shape: one `u8` argc (identical to [`Op::Call`]). Stack effect:
+    /// `pops (argc + 1)` (callee + args), `pushes 1` (result) — identical to `Call`.
+    ///
+    /// Dispatched by the `Op::Call | Op::CallSpread | Op::CallElided` arm in
+    /// `run_loop`; `let elide = matches!(op, Op::CallElided)` selects the faster
+    /// binder once Task 2.2 threads the flag. Until then, `false` is passed so
+    /// behavior is byte-identical to `Op::Call` (inert — no emission yet).
+    ///
+    /// The opcode is serialized into `.aso` artifacts (built by `ascript build`)
+    /// so that deployed bundles keep the win. `ASO_FORMAT_VERSION` bumped 28 → 29.
+    CallElided,
 }
 
 impl Op {
@@ -797,6 +817,7 @@ impl Op {
             x if x == Break as u8 => Break,
             x if x == DeferPush as u8 => DeferPush,
             x if x == DeferPushMethod as u8 => DeferPushMethod,
+            x if x == CallElided as u8 => CallElided,
 
             _ => return None,
         })
@@ -821,7 +842,7 @@ impl Op {
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
 
             // u8-operand ops.
-            Call | MatchRange | RangeStepValue | RangeResolveStep | RangeHasNext => 1,
+            Call | CallElided | MatchRange | RangeStepValue | RangeResolveStep | RangeHasNext => 1,
 
             // u16 + u8 operand op.
             // DEFINE_GLOBAL: u16 name-const index + u8 mutability flag (1 = `let`,
@@ -1045,6 +1066,7 @@ mod tests {
         Op::Break,
         Op::DeferPush,
         Op::DeferPushMethod,
+        Op::CallElided,
     ];
 
     #[test]
@@ -1086,12 +1108,35 @@ mod tests {
         assert_eq!(Op::Loop.operand_width(), 2);
         // u8 operand.
         assert_eq!(Op::Call.operand_width(), 1);
+        // ELIDE §4.2: CallElided has the same u8 operand as Call.
+        assert_eq!(Op::CallElided.operand_width(), 1);
         // zero-operand ops.
         assert_eq!(Op::Nil.operand_width(), 0);
         assert_eq!(Op::Add.operand_width(), 0);
         assert_eq!(Op::Return.operand_width(), 0);
         assert_eq!(Op::GetIndex.operand_width(), 0);
         assert_eq!(Op::Await.operand_width(), 0);
+    }
+
+    #[test]
+    fn call_elided_round_trips_and_has_u8_operand() {
+        // ELIDE §4.2: CallElided must round-trip, have a u8 operand (same as Call),
+        // and occupy the next free byte after DeferPushMethod.
+        let expected_byte = Op::DeferPushMethod as u8 + 1;
+        assert_eq!(
+            Op::CallElided as u8, expected_byte,
+            "CallElided must be the next free byte after DeferPushMethod"
+        );
+        assert_eq!(
+            Op::from_u8(Op::CallElided as u8),
+            Some(Op::CallElided),
+            "CallElided from_u8 round-trip failed"
+        );
+        assert_eq!(
+            Op::CallElided.operand_width(),
+            Op::Call.operand_width(),
+            "CallElided must have the same operand_width as Call"
+        );
     }
 
     #[test]

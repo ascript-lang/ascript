@@ -95,7 +95,7 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let _ = write!(line, "{disp:>5} ; -> {target:04}");
         }
         // u8 call argument count.
-        Op::Call => {
+        Op::Call | Op::CallElided => {
             let argc = chunk.read_u8(at + 1);
             let _ = write!(line, "{argc:>5}");
         }
@@ -357,6 +357,7 @@ fn op_name(op: Op) -> &'static str {
         DeferPush => "DEFER_PUSH",
         DeferPushMethod => "DEFER_PUSH_METHOD",
         Break => "BREAK",
+        CallElided => "CALL_ELIDED",
     }
 }
 
@@ -525,5 +526,18 @@ mod tests {
         let line = disasm_at(&c, &mut off);
         assert_eq!(off, 1, "undecodable byte advances exactly 1");
         assert!(line.contains("?? 255"), "got {line:?}");
+    }
+
+    #[test]
+    fn disasm_call_elided_shows_argc() {
+        // ELIDE §4.2: CALL_ELIDED has the same u8 operand as CALL.
+        let mut c = Chunk::new();
+        c.emit_u8(Op::CallElided, 2, s());
+        let text = disasm(&c);
+        let line = text.lines().find(|l| l.contains("CALL_ELIDED")).unwrap_or_else(|| {
+            panic!("CALL_ELIDED not found in disasm:\n{text}")
+        });
+        // The argc should appear in the output.
+        assert!(line.trim_end().ends_with("2"), "got {line:?}");
     }
 }

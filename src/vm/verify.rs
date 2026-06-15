@@ -263,6 +263,8 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 
         // ---- calls ----
         Call => Effect::new(argc_or_n + 1, 1),
+        // ELIDE §4.2: CallElided has identical stack effect to Call — same pops/pushes.
+        CallElided => Effect::new(argc_or_n + 1, 1),
         CallMethod => Effect::new(argc_or_n + 1, 1),
         // CALL_NAMED: pops the callee + `argc` arg values, pushes 1 result.
         CallNamed => Effect::new(argc_or_n + 1, 1),
@@ -903,7 +905,8 @@ fn jump_target(chunk: &Chunk, operand_at: usize) -> usize {
 /// is static.
 fn count_operand(chunk: &Chunk, op: Op, operand_at: usize) -> usize {
     match op {
-        Op::Call => chunk.read_u8(operand_at) as usize,
+        // ELIDE §4.2: CallElided carries the same u8 argc operand as Call.
+        Op::Call | Op::CallElided => chunk.read_u8(operand_at) as usize,
         // CALL_METHOD / CALL_NAMED: u16 const index then u8 argc.
         Op::CallMethod | Op::CallNamed => chunk.read_u8(operand_at + 2) as usize,
         Op::NewArray | Op::NewObject | Op::Template => chunk.read_u16(operand_at) as usize,
@@ -1643,7 +1646,43 @@ mod tests {
     }
 
     #[test]
-    fn aso_format_version_is_28() {
-        assert_eq!(crate::vm::aso::ASO_FORMAT_VERSION, 28);
+    fn aso_format_version_is_29() {
+        // ELIDE §4.2: bumped 28→29 when Op::CallElided was added.
+        assert_eq!(crate::vm::aso::ASO_FORMAT_VERSION, 29);
+    }
+
+    // ── ELIDE §4.2 — CallElided verifier tests ────────────────────────────────
+
+    /// `CallElided argc=2` must verify successfully and produce the same net
+    /// stack effect as `Call argc=2`: one push (the return value) consuming
+    /// 3 stack slots (callee + 2 args).
+    #[test]
+    fn call_elided_verifies_and_matches_call_stack_effect() {
+        let mut c = Chunk::new();
+        // Push a fake callee + 2 args (3 Nil consts) so the verifier's stack
+        // depth accounting starts satisfied, then emit the CallElided.
+        let idx = c.add_const(Value::nil());
+        c.emit_u16(Op::Const, idx as u16, s());
+        c.emit_u16(Op::Const, idx as u16, s());
+        c.emit_u16(Op::Const, idx as u16, s());
+        c.emit_u8(Op::CallElided, 2, s());
+        c.emit(Op::Return, s());
+        // verify() must accept this chunk without error.
+        verify(&c).expect("CallElided argc=2 must verify cleanly (ELIDE §4.2)");
+    }
+
+    /// A `CallElided` with no operand byte (truncated) must be REJECTED by the
+    /// verifier the same way a truncated `Call` is.
+    #[test]
+    fn call_elided_truncated_is_rejected() {
+        let mut c = Chunk::new();
+        // Emit the raw opcode byte ONLY — no argc operand.
+        c.code.push(Op::CallElided as u8);
+        c.spans.push((0, s()));
+        let result = verify(&c);
+        assert!(
+            result.is_err(),
+            "truncated CallElided (no operand byte) must fail verification"
+        );
     }
 }

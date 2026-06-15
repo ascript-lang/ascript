@@ -29,12 +29,24 @@ built=0
 skipped=0
 # server_multicore binds a port + blocks at runtime, but `build` only COMPILES (never runs),
 # so it serializes fine and is a valid, useful seed — no skip needed for the build step.
+#
+# Multi-module entry points (files that import local './' modules) produce an ASCRIPTA bundle
+# rather than a plain .aso file.  The aso_roundtrip fuzzer only accepts plain .aso files, so
+# we detect the ASCRIPTA magic header (0x41 0x53 0x43 0x52) after the build and skip bundles.
+# This avoids a version-mismatch false-positive in `aso_seed_corpus_is_present_and_current`.
 while IFS= read -r src; do
   rel="${src#"$REPO_ROOT"/examples/}"
   name="ex_$(echo "$rel" | tr '/' '_' | sed 's/\.as$//')"
   out="$CORPUS_DIR/$name.aso"
   if "$BIN" build "$src" -o "$out" >/dev/null 2>&1; then
-    built=$((built + 1))
+    # Skip ASCRIPTA bundles (multi-module programs) — not valid aso_roundtrip seeds.
+    if [[ "$(xxd -p -l 4 "$out" 2>/dev/null)" == "41534352" ]]; then
+      rm -f "$out"
+      skipped=$((skipped + 1))
+      echo "  skip (bundle output, not plain .aso): $rel" >&2
+    else
+      built=$((built + 1))
+    fi
   else
     skipped=$((skipped + 1))
     echo "  skip (build failed): $rel" >&2

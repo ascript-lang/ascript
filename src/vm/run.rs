@@ -467,6 +467,7 @@ fn op_is_block_terminator(op: Op) -> bool {
             | Op::MatchNoArm
             // calls + suspension points (frame/reactor/debugger transfer)
             | Op::Call
+            | Op::CallElided
             | Op::CallSpread
             | Op::CallMethod
             | Op::CallMethodSpread
@@ -3961,17 +3962,24 @@ impl Vm {
                     fiber.push(Value::closure(closure));
                 }
 
-                // ── Call / CallSpread (plain sync closure only) ───────────────
-                Op::Call | Op::CallSpread => {
+                // ── Call / CallElided / CallSpread (plain sync closure only) ─────
+                Op::Call | Op::CallElided | Op::CallSpread => {
                     // For CallSpread: peek at the callee before popping the args array.
-                    // For Call: peek at the callee using the static argc operand.
+                    // For Call / CallElided: peek at the callee using the static argc operand.
                     // If the callee is a plain (non-async, non-worker, non-generator)
                     // closure: push a new CallFrame (sync, no await) and continue.
                     // Any other callee kind: restore ip to fault_ip and escalate to async.
                     //
+                    // ELIDE §4.2: CallElided is semantically identical to Call here —
+                    // Task 2.2 will thread `elide = true` into push_closure_frame / the
+                    // in-place binder to skip per-arg contract checks at this site.
+                    //
                     // INVARIANT: we must NOT pop anything from the stack before
                     // confirming the callee is sync-eligible, so that escalation
                     // leaves the stack completely untouched.
+                    let elide = matches!(op, Op::CallElided);
+                    // ELIDE: Task 2.2 threads 'elide' here
+                    let _ = elide;
                     if matches!(op, Op::CallSpread) {
                         // Stack is `[..., callee, argsArray]`. Peek callee at index -2.
                         let callee_ref = &fiber.stack[fiber.stack.len() - 2];
@@ -4667,16 +4675,23 @@ impl Vm {
                     ));
                 }
 
-                Op::Call | Op::CallSpread => {
-                    // `Op::Call` carries a STATIC `u8` argc; `Op::CallSpread` carries
-                    // none — its arguments arrived as a single runtime `Value::array_cell`
-                    // (built by the array/spread builder ops) sitting on top of the
-                    // callee `[..., callee, argsArray]`. For `CallSpread` we POP the
-                    // args array and re-push its elements as individual stack slots,
+                Op::Call | Op::CallElided | Op::CallSpread => {
+                    // `Op::Call`/`Op::CallElided` carry a STATIC `u8` argc; `Op::CallSpread`
+                    // carries none — its arguments arrived as a single runtime
+                    // `Value::array_cell` (built by the array/spread builder ops) sitting
+                    // on top of the callee `[..., callee, argsArray]`. For `CallSpread` we
+                    // POP the args array and re-push its elements as individual stack slots,
                     // so the stack becomes `[..., callee, arg0, .., arg{n-1}]` — the
                     // EXACT shape `Op::Call` expects — and dispatch is shared below
                     // (arity/contracts then apply to the flattened list, byte-
                     // identical to the tree-walker's `eval_call_args` → call).
+                    //
+                    // ELIDE §4.2: CallElided is semantically identical to Call in this arm.
+                    // Task 2.2 will thread `elide = true` into the binder calls below to
+                    // skip per-arg contract checks at statically-proven sites.
+                    let elide = matches!(op, Op::CallElided);
+                    // ELIDE: Task 2.2 threads 'elide' here
+                    let _ = elide;
                     let argc = if matches!(op, Op::CallSpread) {
                         let args_arr = fiber.pop();
                         let args_ty = crate::interp::type_name(&args_arr);
