@@ -28,7 +28,7 @@ runs (the `ElisionSet` is per-module, dropped after compile/marking).
 
 | workload             | median ms | RSS MB |
 |----------------------|----------:|-------:|
-| call_heavy           |      2168 |     12 |
+| call_heavy           |      1092 |     12 |
 | call_heavy_typed     |      1215 |     12 |
 | object_churn         |      2300 |     12 |
 | json_roundtrip       |      2788 |     12 |
@@ -41,7 +41,7 @@ Notes:
 - Both files pass `ascript check` with zero `type-*` diagnostics and are
   fmt-idempotent (verified 2026-06-15).
 - Both run byte-identically on VM and tree-walker:
-  - `call_heavy`:       sum=2000000000 (VM ≈1156ms, TW ≈9167ms)
+  - `call_heavy`:       sum=2000000000 (VM ≈1092ms, TW ≈9167ms)
   - `call_heavy_typed`: sum=2000000000 (VM ≈1222ms, TW ≈8967ms)
 
 ### CPU profile artifact: `call_heavy_typed.as` (pre-ELIDE)

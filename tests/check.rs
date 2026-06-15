@@ -1748,7 +1748,7 @@ fn elide_collector_cost_envelope() {
     // top-level wrapper fn names until we reach ≥5000 lines.
     let base = fs::read_to_string("examples/all_features.as").unwrap_or_default();
     let base_lines = base.lines().count();
-    let needed = (5000usize.saturating_sub(base_lines) + base_lines - 1) / base_lines;
+    let needed = 5000usize.saturating_sub(base_lines).div_ceil(base_lines);
     let mut big_src = String::with_capacity(base.len() * (needed + 1));
     big_src.push_str(&base);
     for i in 0..needed {
