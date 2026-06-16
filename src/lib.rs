@@ -3166,6 +3166,24 @@ pub async fn run_file_on_vm_with_packages(
     // end (env `ASCRIPT_REGION_PROBE_OUT`; absent → no output). Dev-only.
     #[cfg(feature = "region-probe")]
     crate::vm::region_probe::dump();
+    // REGION Phase-2 A/B (spec §5.5): dump the recycler pool counters at program
+    // end when `ASCRIPT_REGION_STATS` is set, so the bench harness can read the
+    // recycled/reused/overflow/miss yield off the REAL CLI binary it is timing
+    // (the same VM instance the wall-clock measures). One stderr line, machine-
+    // parseable. Feature-gated + env-gated → byte-invisible to a default build and
+    // to a region-spike build that does not set the env. Dev/bench-only.
+    #[cfg(feature = "region-spike")]
+    if std::env::var("ASCRIPT_REGION_STATS").as_deref() == Ok("1") {
+        let (recycled, reused, overflow, miss) = vm.region_stats();
+        eprintln!(
+            "REGION_STATS active={} recycled={} reused={} overflow={} miss={}",
+            vm.region_active(),
+            recycled,
+            reused,
+            overflow,
+            miss
+        );
+    }
     match result {
         Ok(RunOutcome::Done(_)) => Ok(0),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
