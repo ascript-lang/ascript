@@ -14,6 +14,7 @@ pub mod testrun;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
+use crate::worker::isolate::ChunkJob;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -84,10 +85,35 @@ pub struct WorkerCodeSlice {
 ///     result against `interp`, and resolves the future. `set_abort` wires
 ///     cancel-on-drop: dropping the last `Value::future` aborts the bridge, which
 ///     drops the abort sender, which the isolate `select!`s on to cancel its run.
+///
+/// Public signature is UNCHANGED — delegates to `dispatch_worker_job` with `None`
+/// (no chunk job) so all existing callers are byte-identical.
 pub fn dispatch_worker(
     interp: &Interp,
     slice: WorkerCodeSlice,
     args: Vec<Value>,
+    span: Span,
+) -> Result<Value, Control> {
+    dispatch_worker_job(interp, slice, args, None, span)
+}
+
+/// PAR (spec §3.3): the core dispatch path, parameterised over an optional chunk job.
+///
+/// When `chunk` is `None` this is the exact pre-PAR path (byte-for-byte: same
+/// sendability gate, same encode-as-one-array, same caps floor, same bridge — the
+/// `None` branch in `isolate_loop` and `run_slice_inline` restores today's behaviour).
+///
+/// When `chunk` is `Some`, the isolate runs the native chunk DRIVER (`run_chunk_job`)
+/// over the decoded data arg instead of a single entry call, and `run_slice_inline`
+/// mirrors the same decomposition (venue-invariance §5.1).
+///
+/// Separated from `dispatch_worker` so Phase-2 `task.pmap`/`task.preduce` can call
+/// it directly without touching `dispatch_worker`'s public signature.
+pub(crate) fn dispatch_worker_job(
+    interp: &Interp,
+    slice: WorkerCodeSlice,
+    args: Vec<Value>,
+    chunk: Option<ChunkJob>,
     span: Span,
 ) -> Result<Value, Control> {
     // --- Inline nesting: run on the current isolate, no re-dispatch. ---
@@ -139,8 +165,8 @@ pub fn dispatch_worker(
         caps: Box::new(interp.caps()),
         reply: reply_tx,
         abort: abort_rx,
-        // PAR §3.3.2: plain dispatch has no chunk job (None = today's exact path).
-        chunk: None,
+        // PAR §3.3.2: thread the chunk job through to the isolate (None = pre-PAR path).
+        chunk,
     };
     let inflight = match pool::dispatch(req) {
         Ok(inflight) => inflight,
@@ -158,6 +184,8 @@ pub fn dispatch_worker(
                 &req.args,
                 &req.shared,
                 *req.caps,
+                // PAR §3.5: forward the chunk job to the inline path (venue-invariance §5.1).
+                req.chunk,
                 span,
             );
         }
@@ -252,6 +280,11 @@ pub fn dispatch_worker_inline(
 /// slice run, no access to the caller's heap), so the result is byte-identical to the
 /// parallel path; only the parallelism is lost.
 ///
+/// PAR (spec §5.1, venue-invariance): when `chunk` is `Some`, the spawned task routes
+/// through the SAME `run_chunk_job` decomposition as the pooled path, so the result is
+/// byte-identical regardless of whether the job ran on a pool isolate or was degraded to
+/// inline execution. The `None` path is today's exact pre-PAR call.
+///
 /// Returns a `Value::future` that resolves with the worker's result (scheduled on the
 /// caller's `LocalSet`, like any async call).
 fn run_slice_inline(
@@ -261,6 +294,7 @@ fn run_slice_inline(
     encoded_args: &[u8],
     encoded_shared: &[std::sync::Arc<crate::value::SharedNode>],
     caps: crate::stdlib::caps::CapSet,
+    chunk: Option<ChunkJob>,
     span: Span,
 ) -> Result<Value, Control> {
     // Build a fresh, shared-nothing Interp/Vm on THIS thread.
@@ -308,16 +342,28 @@ fn run_slice_inline(
                 return;
             }
         };
-        let r = match vm.call_value(entry, args, span).await {
-            Ok(v) => Ok(v),
-            // A top-level `?` propagation inside the worker body ends with nil (matches
-            // the isolate's WorkerReply handling).
-            Err(Control::Propagate(_)) => Ok(Value::nil()),
-            Err(Control::Exit(_)) => Err(Control::Panic(crate::error::AsError::at(
-                "exit() is not allowed inside a worker".to_string(),
-                span,
-            ))),
-            Err(other) => Err(other),
+        // PAR §5.1 (venue-invariance): when a chunk job was requested, run the SAME
+        // `run_chunk_job` decomposition as the pooled path (data is the first decoded arg).
+        // The None path restores the pre-PAR single-call behaviour byte-for-byte.
+        let r = match chunk {
+            Some(ref job) => {
+                let data = args.into_iter().next().unwrap_or_else(Value::nil);
+                match isolate::run_chunk_job(&vm, entry, data, job, span).await {
+                    Ok(v) => Ok(v),
+                    Err(other) => Err(other),
+                }
+            }
+            None => match vm.call_value(entry, args, span).await {
+                Ok(v) => Ok(v),
+                // A top-level `?` propagation inside the worker body ends with nil (matches
+                // the isolate's WorkerReply handling).
+                Err(Control::Propagate(_)) => Ok(Value::nil()),
+                Err(Control::Exit(_)) => Err(Control::Panic(crate::error::AsError::at(
+                    "exit() is not allowed inside a worker".to_string(),
+                    span,
+                ))),
+                Err(other) => Err(other),
+            },
         };
         cell.resolve(r);
     });
@@ -512,5 +558,59 @@ mod tests {
         let guard = InflightGuard(counter.clone());
         drop(guard);
         assert_eq!(counter.get(), 0, "saturating_sub must not underflow");
+    }
+
+    // ── PAR Task 1.2: end-to-end pooled chunk dispatch ───────────────────────
+
+    /// PAR Task 1.2 Step 1: end-to-end POOLED chunk dispatch.
+    /// Builds a slice for `worker fn double`, dispatches it with a `ChunkJob{Map,0,3}`
+    /// and plain data `[1,2,3]`, awaits the future on a `LocalSet`, asserts `[2,4,6]`.
+    ///
+    /// Exercises `dispatch_worker_job(... Some(ChunkJob{Map,0,3}) ...)` → pool isolate
+    /// → `run_chunk_job` → reply decode.
+    #[test]
+    fn dispatch_worker_job_pooled_map_chunk() {
+        use super::{
+            build_code_slice, dispatch_worker_job,
+            isolate::{ChunkJob, ChunkKind},
+        };
+        use crate::value::Value;
+
+        let src = "worker fn double(x) { return x * 2 }";
+        let top = crate::compile::compile_source(src).expect("source compiles");
+        let slice = build_code_slice(&top, "double", None).expect("slice builds");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        let local = tokio::task::LocalSet::new();
+
+        local.block_on(&rt, async {
+            // Build a fresh interp for the caller-side bridge (pool dispatches from here).
+            let interp = std::rc::Rc::new(crate::interp::Interp::new());
+            interp.install_self();
+
+            // data = [1, 2, 3] — shipped as the single arg; chunk driver indexes into it.
+            let data = Value::array_cell(crate::value::ArrayCell::new(vec![
+                Value::int(1),
+                Value::int(2),
+                Value::int(3),
+            ]));
+
+            let job = ChunkJob { kind: ChunkKind::Map, start: 0, end: 3 };
+            let span = crate::span::Span::new(0, 0);
+
+            let fut_val = dispatch_worker_job(&interp, slice, vec![data], Some(job), span)
+                .expect("dispatch_worker_job succeeds");
+
+            // Drive the returned future to completion on the LocalSet.
+            let result = match fut_val.kind() {
+                crate::value::ValueKind::Future(f) => f.get().await,
+                other => panic!("expected Future, got {other:?}"),
+            };
+            let out = result.expect("chunk job must succeed");
+            assert_eq!(format!("{out}"), "[2, 4, 6]", "chunk map result must be [2, 4, 6]");
+        });
     }
 }
