@@ -7,6 +7,7 @@
 //! `src/vm/run.rs`.
 
 use crate::vm::instrument::{DebugCommand, DebugEvent, DebuggerHook, Instrumentation};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -168,6 +169,7 @@ async fn run_program(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
 
     // Register the whole proto tree so the parked VM can resolve any (file,line).

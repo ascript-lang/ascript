@@ -968,6 +968,7 @@ mod tests {
     use crate::interp::Interp;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
+    use std::cell::RefCell;
 
     /// Extension methods the plan's tests use on a built slice.
     impl WorkerCodeSlice {
@@ -1027,6 +1028,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
 

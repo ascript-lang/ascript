@@ -3727,6 +3727,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let a = Closure::new(proto);
         let cv = Value::closure(a.clone());
@@ -3757,6 +3758,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         }));
         assert_ne!(Value::closure(a), Value::closure(b));
 

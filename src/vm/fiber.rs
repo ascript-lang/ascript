@@ -307,6 +307,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         Closure::new(proto)
     }
@@ -328,6 +329,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         Closure::new(proto)
     }

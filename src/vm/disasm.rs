@@ -367,6 +367,7 @@ mod tests {
     use crate::span::Span;
     use crate::value::Value;
     use crate::vm::chunk::{Chunk, FnProto};
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     fn s() -> Span {
@@ -465,6 +466,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
 
         let mut c = Chunk::new();

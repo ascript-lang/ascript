@@ -253,6 +253,7 @@ mod tests {
     use crate::vm::fiber::Fiber;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     /// Compile `src`, run it to completion on a VM with `call_fast=cf`.
@@ -275,6 +276,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -315,6 +317,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -561,6 +564,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());

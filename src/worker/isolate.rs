@@ -14,7 +14,7 @@ use crate::value::{Value, ValueKind};
 use crate::vm::chunk::{Chunk, FnProto};
 use crate::vm::value_ext::{Closure, RunOutcome};
 use crate::vm::Vm;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use tokio::sync::{mpsc, oneshot};
@@ -660,6 +660,7 @@ pub(crate) async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Resul
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -726,6 +727,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
 

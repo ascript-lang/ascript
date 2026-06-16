@@ -599,6 +599,16 @@ pub struct FnProto {
     /// `ASO_FORMAT_VERSION` bump). `None` for anonymous arrow/fn-expression protos
     /// and the bottom script proto.
     pub name_span: Option<crate::span::Span>,
+    /// REGION §3.1 kill-site bitmap: a `bool` per code byte, `true` iff the byte
+    /// is a kill site selected by [`crate::vm::bcanalysis::region_candidates`].
+    /// Built LAZILY on first region-mode execution (the `arith_caches` side-table
+    /// precedent). NOT serialized into `.aso` — rebuilt from bytecode on each run;
+    /// `ASO_FORMAT_VERSION` is unchanged. `None` until first region-mode execution.
+    ///
+    /// Interior `RefCell` mirrors the `field_ics`/`arith_caches` pattern: the run
+    /// loop mutates through a shared `Rc<FnProto>` borrow, so `&mut self` is
+    /// unavailable.
+    pub region_kills: RefCell<Option<Box<[bool]>>>,
 }
 
 impl Chunk {
@@ -1292,6 +1302,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         assert_eq!(c.add_proto(p.clone()), 0);
         assert_eq!(c.add_proto(p), 1);

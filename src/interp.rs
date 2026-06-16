@@ -10123,6 +10123,7 @@ print(y)
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Value::closure(crate::vm::value_ext::Closure::new(proto));
         assert!(

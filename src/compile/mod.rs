@@ -9,6 +9,7 @@
 //! scientific numbers) land in V2+.
 
 use crate::check::infer::elide::ElisionSet;
+use std::cell::RefCell;
 use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_template_body};
 use crate::span::Span;
 use crate::syntax::ast::{
@@ -3286,6 +3287,7 @@ impl Compiler {
             local_names,
             debug_name: None,
             name_span: None, // field-default proto has no fn name token
+            region_kills: RefCell::new(None),
         }))
     }
 
@@ -3548,6 +3550,7 @@ impl Compiler {
             local_names,
             debug_name,
             name_span,
+            region_kills: RefCell::new(None),
         }))
     }
 

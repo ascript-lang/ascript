@@ -63,6 +63,7 @@ pub mod worker;
 
 use crate::error::{AsError, SourceInfo};
 use crate::interp::Interp;
+use std::cell::RefCell;
 pub use crate::interp::TestSummary;
 #[cfg(feature = "telemetry")]
 pub use crate::stdlib::telemetry::model::CapturedRequest;
@@ -424,6 +425,7 @@ async fn run_one_file_with_coverage(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     // Arm coverage over the entry proto tree BEFORE running (patches each line's first
     // offset to Op::Break; the cold trap arm recovers + records each line on first hit).
@@ -931,6 +933,7 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
 
@@ -1035,6 +1038,7 @@ pub async fn vm_run_source_call_fast_stats(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1091,6 +1095,7 @@ pub async fn vm_run_source_obj_mode_stats(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1244,6 +1249,7 @@ pub async fn vm_run_source_elided(src: &str) -> Result<(String, Option<i32>), As
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto.clone());
     let interp = Rc::new(Interp::new());
@@ -1297,6 +1303,7 @@ pub async fn vm_run_source_elided_generic(src: &str) -> Result<(String, Option<i
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto.clone());
     let interp = Rc::new(Interp::new());
@@ -1352,6 +1359,7 @@ pub async fn vm_run_source_paranoid(src: &str) -> Result<(String, Option<i32>), 
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto.clone());
     let interp = Rc::new(Interp::new());
@@ -1427,6 +1435,7 @@ pub async fn vm_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto.clone());
     let interp = Rc::new(Interp::new());
@@ -1593,6 +1602,7 @@ pub async fn vm_run_source_census(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1651,6 +1661,7 @@ async fn vm_run_source_decode_cfg(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1707,6 +1718,7 @@ async fn vm_run_source_decode_stats_cfg(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1783,6 +1795,7 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1844,6 +1857,7 @@ pub async fn aso_runnable_accept(bytes: &[u8]) {
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = crate::vm::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -2860,6 +2874,7 @@ async fn run_entry_proto_to_exit(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -3074,6 +3089,7 @@ pub async fn run_file_on_vm_with_packages(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -3149,6 +3165,7 @@ pub async fn run_file_decode_cfg(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -3272,6 +3289,7 @@ pub async fn run_file_on_vm_profiled(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -3417,6 +3435,7 @@ async fn vm_run_source_cfg_stats(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto.clone());
 
@@ -3511,6 +3530,7 @@ pub async fn vm_run_file_captured(entry: &Path) -> Result<(String, Option<i32>),
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
 
@@ -3601,6 +3621,7 @@ pub async fn run_archive(
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);

@@ -673,6 +673,7 @@ mod tests {
     use super::*;
     use crate::span::Span;
     use crate::value::Value;
+    use std::cell::RefCell;
 
     fn s(a: usize, b: usize) -> Span {
         Span::new(a, b)
@@ -854,6 +855,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let embed_epoch = foreign.chunk.patch_epoch.get();
 

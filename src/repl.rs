@@ -29,6 +29,7 @@
 //! Each line is evaluated inside a `tokio::task::LocalSet` so spawned tasks join
 //! before the prompt returns.
 
+use std::cell::RefCell;
 use std::io::{BufRead, IsTerminal};
 use std::rc::Rc;
 
@@ -239,6 +240,7 @@ async fn eval_line_vm(vm: &Rc<Vm>, line: &str, session_src: &mut String) -> bool
         local_names: Vec::new(),
         debug_name: None,
         name_span: None,
+        region_kills: RefCell::new(None),
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);

@@ -44,6 +44,7 @@ use crate::span::Span;
 use crate::syntax::resolve::types::UpvalueDescriptor;
 use crate::value::{Class, FieldSchema, Value, ValueKind};
 use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc, InterfaceProto};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 /// The `.aso` file magic: `ASO\0`.
@@ -1036,6 +1037,7 @@ fn read_proto(r: &mut Reader, with_debug: bool) -> Result<FnProto, AsoError> {
         local_names,
         debug_name,
         name_span: None,
+        region_kills: RefCell::new(None),
     })
 }
 
@@ -2118,6 +2120,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -2298,6 +2301,7 @@ run()
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto, false).unwrap();
@@ -2321,6 +2325,7 @@ run()
                 local_names: Vec::new(),
                 debug_name: None,
                 name_span: None,
+                region_kills: RefCell::new(None),
             }
         };
         let mut w2 = Writer::new();
@@ -2347,6 +2352,7 @@ run()
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto_with, false).unwrap();
@@ -2369,6 +2375,7 @@ run()
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         };
         let mut w2 = Writer::new();
         write_proto(&mut w2, &proto_none, false).unwrap();
@@ -2470,6 +2477,7 @@ run()
             local_names: vec![(0, Rc::from("a")), (1, Rc::from("b"))],
             debug_name: Some(Rc::from("greet")),
             name_span: None,
+            region_kills: RefCell::new(None),
         };
         let mut root = Chunk::new();
         root.code = vec![crate::vm::opcode::Op::Nil as u8, crate::vm::opcode::Op::Return as u8].into();

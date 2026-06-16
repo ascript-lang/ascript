@@ -2067,6 +2067,7 @@ impl Vm {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let mut module_fiber = Fiber::new(closure);
@@ -10014,6 +10015,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10376,6 +10378,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10430,6 +10433,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10591,6 +10595,7 @@ mod tests {
                 local_names: Vec::new(),
                 debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
 
@@ -10791,6 +10796,7 @@ mod tests {
                 local_names: Vec::new(),
                 debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
             let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
@@ -10905,6 +10911,7 @@ mod tests {
                 local_names: Vec::new(),
                 debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
             });
             let closure = Closure::new(top_proto);
             let mut fiber = Fiber::new(closure);
@@ -10982,6 +10989,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         vm.register_debug_protos(&entry);
         (entry, src_info)
@@ -11013,6 +11021,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let local = LocalSet::new();
@@ -11057,6 +11066,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let local = LocalSet::new();
@@ -11876,6 +11886,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto.clone());
         let mut fiber = Fiber::new(closure);
@@ -12312,6 +12323,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -12639,6 +12651,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -12667,6 +12680,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -13006,6 +13020,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -13062,6 +13077,7 @@ mod tests {
             local_names: Vec::new(),
             debug_name: None,
             name_span: None,
+            region_kills: RefCell::new(None),
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
