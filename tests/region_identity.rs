@@ -54,7 +54,8 @@
 //!   - cc_ptr_eq arms: were :1414-1419/:1463, now :2523-2527/:2571
 //!   - `MapKey::from_value`: was :241 (the _ => None arm), now :768 (same arm, renumbered)
 //!   - `ObjectCell`: was :24, not audited further (constructor seam, not identity-related)
-//!   Verdict text in each row is UNCHANGED — only anchors moved.
+//!
+//! Verdict text in each row is UNCHANGED — only anchors moved.
 
 use std::process::Command;
 
