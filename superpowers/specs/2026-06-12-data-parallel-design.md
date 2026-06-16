@@ -494,8 +494,14 @@ unit tests in the in-process style of `dispatch.rs`'s `run_slice_in_fresh_isolat
    `init = 100`) still exact (the §3.3.3 once-only `init` property).
 6. **Frozen vs unfrozen parity:** same scalar data both ways → identical results; the
    semantic deltas pinned: frozen object element mutation panics / plain copy mutation is
-   local and silent; frozen instance method call → the SRV distinct diagnostic / plain
-   instance method works.
+   local and silent; frozen instance method call → the SRV distinct diagnostic.
+   > **CORRECTION (Task 2.2, 2026-06-16):** the original "plain instance method works" claim
+   > overstated the shipped Spec-A airlock. A class INSTANCE crosses the worker boundary as a
+   > **field-only shell** (`resolve_class` ships fields, not methods — a documented Spec A
+   > limitation, true of EVERY `worker fn` call, not PAR-specific), so a method call on a
+   > plain-instance element raises `value is not callable` while field access works. PAR
+   > inherits this unchanged; the battery pins the ACTUAL behavior. Cross-airlock method
+   > shipping is a future (Spec B) item, out of PAR scope.
 7. **Non-sendable capture/diagnostics:** closure inside plain data → field-path send panic;
    non-`worker fn` callback → the §2.2 panic; `f` returning a closure → encode panic;
    non-sendable `init` → up-front panic.
