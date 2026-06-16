@@ -1049,8 +1049,10 @@ pub fn compile_source_with_keep(
 /// - Proven `let` initialisers skip the `CHECK_LOCAL` emission (row 2).
 /// - Proven fn-return contracts drop `proto.ret = None` at the proto builder (row 3).
 /// - Proven call sites emit `Op::CallElided` instead of `Op::Call` (row 1) —
-///   ONLY for plain non-spread/non-named/non-method calls (the exact three
-///   `Op::Call` sites listed in the spec §4.2).
+///   ONLY for plain non-spread/non-named/non-method calls. Of the `Op::Call`
+///   emission sites, the two plain-call sites route through `elide_call_op`; the
+///   `super`/method-dispatch site is deliberately excluded (never a row-1 plain
+///   call). See spec §4.2.
 ///
 /// When `elide` is `None` the output is **byte-identical** to [`compile_source`].
 pub fn compile_source_with_elision(

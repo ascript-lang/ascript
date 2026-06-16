@@ -3030,6 +3030,17 @@ pub async fn run_file_on_vm_with_packages(
         interp.set_package_resolver(map);
     }
     interp.install_self();
+    // ELIDE §6.3 paranoid mode (default VM CLI path): when active, build the entry
+    // module's ElisionSet and install it for contract-failure-path lookup. Paranoid
+    // runs elide-OFF (the entry/import compiles above keep all checks because the
+    // user opts in via ASCRIPT_ELIDE_PARANOID without --elide), so the set is
+    // consulted ONLY when a retained check fails — zero hot-path cost. Mirrors the
+    // tree-walker path in `run_file_with_packages`. Multi-module: covers the entry
+    // module (imports get their own passes); sufficient for the §6 correctness gate.
+    if paranoid_enabled() {
+        let paranoid_set = crate::check::infer::elision_proofs(&src);
+        interp.set_paranoid_set(paranoid_set);
+    }
     // VAL Task 4 (Gate 12 bench seam): `ASCRIPT_NO_SPECIALIZE=1` runs the CLI on
     // the GENERIC VM (every IC / adaptive-arith / global fast path skipped),
     // exactly as `vm_run_source_generic` does in tests. The two modes are asserted
