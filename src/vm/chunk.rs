@@ -592,6 +592,13 @@ pub struct FnProto {
     /// frame (without it the snapshot falls back to "<script>" / "fn@L<line>").
     /// Not serialized this task — reconstructed/serialized in Task 6 (`.aso` unchanged).
     pub debug_name: Option<Rc<str>>,
+    /// ELIDE §6.3 paranoid mode: the CHAR-offset span of this function's NAME
+    /// token (the identifier in `fn <name>(...)`). Used by `return_from_frame` to
+    /// look up the `fn_rets` set in the per-module [`ElisionSet`] when paranoid
+    /// mode is active. Runtime-only — NEVER serialized (no `.aso` change, no
+    /// `ASO_FORMAT_VERSION` bump). `None` for anonymous arrow/fn-expression protos
+    /// and the bottom script proto.
+    pub name_span: Option<crate::span::Span>,
 }
 
 impl Chunk {
@@ -1284,6 +1291,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         assert_eq!(c.add_proto(p.clone()), 0);
         assert_eq!(c.add_proto(p), 1);

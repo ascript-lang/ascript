@@ -853,6 +853,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let embed_epoch = foreign.chunk.patch_epoch.get();
 

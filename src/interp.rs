@@ -19,6 +19,10 @@ struct BodySpec<'a> {
     params: &'a [crate::ast::Param],
     ret: &'a Option<crate::ast::Type>,
     body: &'a [Stmt],
+    /// ELIDE §6.3 paranoid mode: the char-offset span of the fn's NAME token,
+    /// for `fn_rets` paranoid lookup at the return-type check site. `None` for
+    /// anonymous arrows / fn-expressions / methods (not in `fn_rets`).
+    name_span: Option<crate::span::Span>,
 }
 
 /// Non-local control-flow signal produced while executing statements.
@@ -690,6 +694,15 @@ pub struct Interp {
     /// task the flag is exposed via `set_elide_mode` so tests can turn it on
     /// without changing any existing run path. A `Cell` (never held across `.await`).
     pub(crate) elide_mode: Cell<bool>,
+    /// ELIDE §6.3 paranoid mode: when `Some(set)`, any contract failure at a site
+    /// whose span appears in `set` escalates to an "ELIDE proof violated" panic
+    /// (indicating a checker soundness bug). The set is built by merging the
+    /// per-module [`ElisionSet`]s collected during the proof phase. Consulted ONLY
+    /// on the contract-failure paths — ZERO hot-path cost (the lookup happens only
+    /// when a check is ALREADY failing, i.e. about to panic anyway). A `RefCell`
+    /// (never held across `.await` since all lookup sites are sync). `None` when
+    /// paranoid mode is off (the default) — the check short-circuits immediately.
+    pub(crate) paranoid_set: RefCell<Option<crate::check::infer::elide::ElisionSet>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1075,6 +1088,10 @@ impl Interp {
             // ELIDE §4.3 Task 3.2: marking pass is OFF by default so every existing
             // run is byte-identical (Task 4.1 decides the default-on path).
             elide_mode: Cell::new(false),
+            // ELIDE §6.3 paranoid mode: OFF by default. Enabled by
+            // `set_paranoid_set` / `ASCRIPT_ELIDE_PARANOID=1`. When off, all
+            // contract-failure paths are entirely unaffected (zero cost).
+            paranoid_set: RefCell::new(None),
         }
     }
 
@@ -1121,6 +1138,65 @@ impl Interp {
     /// any run path.
     pub fn set_elide_mode(&self, on: bool) {
         self.elide_mode.set(on);
+    }
+
+    /// ELIDE §6.3: install a merged [`ElisionSet`] for paranoid-mode proof
+    /// verification. Called once before execution when `ASCRIPT_ELIDE_PARANOID=1`
+    /// is set. The set is built from all per-module proof results; any contract
+    /// failure at a proven site is escalated to the soundness-bug message instead
+    /// of the normal panic.
+    pub fn set_paranoid_set(&self, set: crate::check::infer::elide::ElisionSet) {
+        *self.paranoid_set.borrow_mut() = Some(set);
+    }
+
+    /// ELIDE §6.3 test-only seam: inject a FAKE call-site span into the paranoid
+    /// set (simulating a checker soundness bug — a span the predicate would NOT
+    /// have proven). Used by `tests/elide.rs` to verify the escalation path fires.
+    /// Only reachable from `#[cfg(any(test, feature = "fuzzgen", fuzzing))]` callers.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    pub fn inject_paranoid_call_span(&self, start: u32, end: u32) {
+        let mut guard = self.paranoid_set.borrow_mut();
+        let set = guard.get_or_insert_with(crate::check::infer::elide::ElisionSet::default);
+        set.calls.insert((start, end));
+    }
+
+    /// ELIDE §6.3: check whether a contract failure at `span` should be escalated
+    /// to a paranoid proof-violation panic. Returns `Some(Control::Panic(…))` when
+    /// paranoid mode is active AND the span is in the proven set (checker soundness
+    /// bug); returns `None` otherwise (caller falls through to the normal panic).
+    ///
+    /// Consulted ONLY when a contract check is ALREADY failing — zero hot-path cost.
+    pub(crate) fn maybe_paranoid_escalate(
+        &self,
+        ty: &crate::ast::Type,
+        value: &Value,
+        span: crate::span::Span,
+    ) -> Option<Control> {
+        let guard = self.paranoid_set.borrow();
+        let set = guard.as_ref()?;
+        let key = (span.start as u32, span.end as u32);
+        if set.calls.contains(&key)
+            || set.lets.contains(&key)
+            || set.fn_rets.contains(&key)
+        {
+            Some(
+                AsError::at(
+                    format!(
+                        "ELIDE proof violated (checker soundness bug): \
+                         proven site at {}:{} failed — expected {}, got {} ({})",
+                        span.start,
+                        span.end,
+                        ty,
+                        type_name(value),
+                        value,
+                    ),
+                    span,
+                )
+                .into(),
+            )
+        } else {
+            None
+        }
     }
 
     /// DX D2 Task 8: enable/disable snapshot "update mode" (the `--update-snapshots`
@@ -3033,6 +3109,10 @@ impl Interp {
                             // IFACE: env-aware so a `let x: Reader = …` interface
                             // annotation resolves the name to its descriptor.
                             if !self.check_type_env(&v, ty, env)? {
+                                // §6.3 paranoid: escalate if this let-site was proven.
+                                if let Some(e) = self.maybe_paranoid_escalate(ty, &v, value.span) {
+                                    return Err(e);
+                                }
                                 return Err(contract_panic(ty, &v, value.span));
                             }
                         }
@@ -3294,6 +3374,7 @@ impl Interp {
                 is_generator,
                 is_worker,
                 span,
+                name_span: fn_name_span,
                 ..
             } => {
                 // `worker async fn` is not a valid combination (a worker already returns
@@ -3315,6 +3396,8 @@ impl Interp {
                     is_async: *is_async,
                     is_generator: *is_generator,
                     is_worker: *is_worker,
+                    // §6.3 paranoid: carry the fn name-token span for fn_rets lookup.
+                    name_span: Some(*fn_name_span),
                 }));
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -3750,6 +3833,7 @@ impl Interp {
                     is_generator: *is_generator,
                     // Arrows are never `worker` (no `worker` arrow syntax).
                     is_worker: false,
+                    name_span: None, // anonymous arrow: no name token
                 })))
             }
             ExprKind::Array(items) => {
@@ -5302,7 +5386,7 @@ impl Interp {
         // live `eval_expr` frames do NOT count against the callee's body nesting.
         // This keeps deep recursion bounded SOLELY by `call_depth` on both engines.
         let _expr_reset = ExprDepthReset::enter(&self.expr_depth);
-        let BodySpec { params, ret, body } = spec;
+        let BodySpec { params, ret, body, name_span: fn_name_span } = spec;
         // Arity + parameter contracts + rest collection. Shared verbatim with the
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
         // IFACE: thread the callee frame env so a `Type::Named` param contract resolves
@@ -5387,6 +5471,13 @@ impl Interp {
             // IFACE: env-aware return-type contract (interface/class names resolve via
             // the callee frame's env chain → def env → module globals).
             if !self.check_type_env(&result, ty, call_env)? {
+                // §6.3 paranoid: if the fn's name span is in the proven fn_rets set,
+                // the checker certified this return would always pass — escalate.
+                if let Some(ns) = fn_name_span {
+                    if let Some(e) = self.maybe_paranoid_escalate(ty, &result, ns) {
+                        return Err(e);
+                    }
+                }
                 return Err(contract_panic(ty, &result, span));
             }
         }
@@ -5787,6 +5878,7 @@ impl Interp {
             params: &func.params,
             ret: &func.ret,
             body: &func.body,
+            name_span: func.name_span,
         };
         self.run_body(spec, args, &call_env, span, &what, elide_contracts)
             .await
@@ -6350,6 +6442,7 @@ impl Interp {
             params: &bm.method.params,
             ret: &bm.method.ret,
             body: &bm.method.body,
+            name_span: None, // methods are not in fn_rets
         };
         self.run_body(spec, args, &call_env, span, &bm.name, false).await
     }
@@ -6422,6 +6515,7 @@ impl Interp {
             params: &method.params,
             ret: &method.ret,
             body: &method.body,
+            name_span: None, // methods are not in fn_rets
         };
         self.run_body(spec, args, &call_env, span, name, false).await
     }
@@ -6441,6 +6535,7 @@ impl Interp {
             params: &method.params,
             ret: &method.ret,
             body: &method.body,
+            name_span: None, // methods are not in fn_rets
         };
         self.run_body(spec, args, &call_env, span, &what, false).await
     }
@@ -8431,6 +8526,12 @@ fn check_param_contract(
             _ => check_type(a, ty),
         };
         if !ok {
+            // §6.3 paranoid: escalate if this call-site was proven.
+            if let Some(itp) = interp {
+                if let Some(e) = itp.maybe_paranoid_escalate(ty, a, span) {
+                    return Err(e);
+                }
+            }
             return Err(contract_panic(ty, a, span));
         }
     }
@@ -10000,6 +10101,7 @@ print(y)
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Value::closure(crate::vm::value_ext::Closure::new(proto));
         assert!(

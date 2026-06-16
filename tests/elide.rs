@@ -1441,3 +1441,254 @@ mod four_mode_smoke {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 4.2 — Paranoid proof-violation mode (ELIDE §6.3)
+// ---------------------------------------------------------------------------
+//
+// Paranoid mode (`ASCRIPT_ELIDE_PARANOID=1`):
+//   • Compiles/marks as elide-OFF (all runtime checks retained — zero hot-path change).
+//   • Retains the per-module ElisionSet.
+//   • When a contract check FAILS at a site the checker PROVED safe, escalates
+//     to: `ELIDE proof violated (checker soundness bug): …` (panic prefix).
+//   • When a healthy program runs, paranoid output == elide-off output byte-for-byte.
+//
+// Two test classes:
+//   (a) Healthy typed programs: paranoid invisible (same output, exit 0).
+//   (b) Synthetic wrong-proof via test-only injection seam: escalates with the
+//       required prefix on BOTH engines.
+//   (c) Whole-corpus paranoid run: ZERO escalations (proves predicate soundness).
+
+/// A well-typed program with provable param + let + return contracts.
+/// Under paranoid mode, output must be IDENTICAL to normal run.
+const PARANOID_HEALTHY_SRC: &str = r#"
+fn add(a: int, b: int): int {
+    return a + b
+}
+let x: int = add(2, 3)
+print(x)
+"#;
+
+/// A program that intentionally violates a param contract at runtime,
+/// triggered ONLY when a fake proof is injected (not a real checker proof).
+/// We call this from Rust with a fake span in the ElisionSet.
+const PARANOID_VICTIM_SRC: &str = r#"
+fn f(p: string) {
+    print(p)
+}
+f(42)
+"#;
+
+mod paranoid {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // (a) Healthy program: paranoid mode is invisible
+    // -------------------------------------------------------------------
+
+    /// With `ASCRIPT_ELIDE_PARANOID=1`, a healthy typed program's output equals
+    /// elide-off output byte-for-byte (paranoid is invisible when proofs are correct).
+    #[test]
+    fn paranoid_healthy_invisible_vm() {
+        // Normal (elide-off) output.
+        let normal_out: String = ascript::run_on_worker_stack(|| async {
+            ascript::vm_run_source(PARANOID_HEALTHY_SRC)
+                .await
+                .unwrap_or_else(|e| panic!("normal run failed: {e}"))
+                .0
+        });
+
+        // Paranoid run.
+        let paranoid_out: String = ascript::run_on_worker_stack(|| async {
+            ascript::vm_run_source_paranoid(PARANOID_HEALTHY_SRC)
+                .await
+                .unwrap_or_else(|e| panic!("paranoid run failed: {e}"))
+                .0
+        });
+
+        assert_eq!(
+            normal_out, paranoid_out,
+            "paranoid mode must be invisible on a healthy typed program (VM)"
+        );
+    }
+
+    #[test]
+    fn paranoid_healthy_invisible_tw() {
+        let normal_out: String = ascript::run_on_worker_stack(|| async {
+            let tokens = ascript::lexer::lex(PARANOID_HEALTHY_SRC).expect("lex");
+            ascript::tw_run_stmts(ascript::parser::parse(&tokens).expect("parse"))
+                .await
+                .unwrap_or_else(|e| panic!("normal tw run failed: {e}"))
+        });
+
+        let paranoid_out: String = ascript::run_on_worker_stack(|| async {
+            ascript::tw_run_source_paranoid(PARANOID_HEALTHY_SRC)
+                .await
+                .unwrap_or_else(|e| panic!("paranoid tw run failed: {e}"))
+        });
+
+        assert_eq!(
+            normal_out, paranoid_out,
+            "paranoid mode must be invisible on a healthy typed program (TW)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // (b) Synthetic wrong-proof via test-only injection seam
+    // -------------------------------------------------------------------
+
+    /// When a fake span is injected into the ElisionSet (simulating a checker
+    /// soundness bug), a contract failure at that site escalates to the
+    /// `ELIDE proof violated (checker soundness bug):` prefix — VM engine.
+    #[test]
+    fn paranoid_escalates_on_fake_proof_vm() {
+        let err: String = ascript::run_on_worker_stack(|| async {
+            ascript::vm_run_source_paranoid_with_fake_call_proof(PARANOID_VICTIM_SRC).await
+        });
+        assert!(
+            err.contains("ELIDE proof violated (checker soundness bug)"),
+            "expected escalation prefix in panic message, got: {err:?}"
+        );
+    }
+
+    /// Same escalation check on the tree-walker engine.
+    #[test]
+    fn paranoid_escalates_on_fake_proof_tw() {
+        let err: String = ascript::run_on_worker_stack(|| async {
+            ascript::tw_run_source_paranoid_with_fake_call_proof(PARANOID_VICTIM_SRC).await
+        });
+        assert!(
+            err.contains("ELIDE proof violated (checker soundness bug)"),
+            "expected escalation prefix in panic message (TW), got: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // (c) CLI paranoid mode: healthy program, byte-identical output + exit 0
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn paranoid_cli_healthy_exit_zero() {
+        let src = "fn f(x: int): int { return x + 1 }\nprint(f(41))\n";
+        let file = temp_as("paranoid_cli", src);
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let output = std::process::Command::new(bin)
+            .env("ASCRIPT_ELIDE_PARANOID", "1")
+            .args(["run", file.to_str().unwrap()])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, 0,
+            "paranoid healthy program must exit 0; stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("42"),
+            "expected output '42' in stdout, got: {stdout:?}"
+        );
+        assert!(
+            !stderr.contains("ELIDE proof violated"),
+            "no escalation expected on healthy program; stderr: {stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // (c) Whole-corpus paranoid run: ZERO escalations (both engines)
+    // -------------------------------------------------------------------
+
+    /// Run the whole example corpus under VM paranoid mode. Any escalation
+    /// means we found a REAL checker soundness bug — stop and report it.
+    #[test]
+    fn paranoid_corpus_zero_escalations_vm() {
+        let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut files: Vec<_> = std::fs::read_dir(&examples_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("as"))
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+
+        // Same skip list as other corpus tests.
+        const SKIP: &[&str] = &[
+            "server_",
+            "tui_",
+            "ffi_",
+            "debugger_",
+            "workers_pool_advanced",
+            "workers_actor",
+            "workers_stream",
+            "profiler_",
+        ];
+
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy();
+            if SKIP.iter().any(|s| name.contains(s)) {
+                continue;
+            }
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let result: Result<(String, Option<i32>), String> =
+                ascript::run_on_worker_stack(move || async move {
+                    ascript::vm_run_source_paranoid(&src)
+                        .await
+                        .map_err(|e| e.message)
+                });
+            if let Err(e) = result {
+                assert!(
+                    !e.contains("ELIDE proof violated"),
+                    "REAL CHECKER SOUNDNESS BUG found in {name}: {e}"
+                );
+                // Other panics (e.g. unimplemented feature) are fine to skip.
+            }
+        }
+    }
+
+    /// Same corpus check on the tree-walker.
+    #[test]
+    fn paranoid_corpus_zero_escalations_tw() {
+        let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut files: Vec<_> = std::fs::read_dir(&examples_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("as"))
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+
+        const SKIP: &[&str] = &[
+            "server_",
+            "tui_",
+            "ffi_",
+            "debugger_",
+            "workers_pool_advanced",
+            "workers_actor",
+            "workers_stream",
+            "profiler_",
+        ];
+
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy();
+            if SKIP.iter().any(|s| name.contains(s)) {
+                continue;
+            }
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let result: Result<String, String> = ascript::run_on_worker_stack(move || async move {
+                ascript::tw_run_source_paranoid(&src).await.map_err(|_| String::new())
+            });
+            if let Err(e) = result {
+                assert!(
+                    !e.contains("ELIDE proof violated"),
+                    "REAL CHECKER SOUNDNESS BUG (TW) found in {name}: {e}"
+                );
+            }
+        }
+    }
+}

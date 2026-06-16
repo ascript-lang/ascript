@@ -1026,6 +1026,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
 

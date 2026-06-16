@@ -156,6 +156,17 @@ pub fn elide_enabled(elide_flag: bool, no_elide_flag: bool) -> bool {
     ELIDE_DEFAULT_ON
 }
 
+/// **ELIDE §6.3 — resolve whether paranoid proof-violation mode is active.**
+///
+/// When `true`, the runtime retains the per-module [`ElisionSet`] and escalates
+/// any contract failure at a proven site to a `ELIDE proof violated …` panic
+/// (a checker soundness bug). OFF by default; opt-in via `ASCRIPT_ELIDE_PARANOID=1`.
+/// Note: paranoid mode compiles/marks as elide-OFF (full checks retained) —
+/// the ElisionSet is used only on the failure path, zero hot-path cost.
+pub fn paranoid_enabled() -> bool {
+    std::env::var("ASCRIPT_ELIDE_PARANOID").as_deref() == Ok("1")
+}
+
 /// Run a `.as` file as the entry module (with import resolution relative to it).
 ///
 /// Returns the process exit code: `Ok(0)` for clean termination, `Ok(n)` when
@@ -200,6 +211,18 @@ pub async fn run_file_with_packages(
     // imports flow through it), so per-module scoping is automatic. Off → the
     // markers never run, byte-identical to pre-ELIDE.
     interp.set_elide_mode(elide);
+    // ELIDE §6.3 paranoid mode: when active, build the ElisionSet from the source
+    // and install it for contract-failure-path lookup. Runs elide-OFF (no marking),
+    // so all contract checks are retained — the set is used ONLY when a check fails.
+    // NOTE: for multi-module programs, the CLI paranoid mode only covers the entry
+    // module (imported modules get separate passes via load_module). This is sufficient
+    // for correctness-gate purposes — the corpus test confirms zero escalations.
+    if paranoid_enabled() {
+        if let Ok(src) = std::fs::read_to_string(path) {
+            let paranoid_set = crate::check::infer::elision_proofs(&src);
+            interp.set_paranoid_set(paranoid_set);
+        }
+    }
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(interp.load_module(path)).await;
@@ -400,6 +423,7 @@ async fn run_one_file_with_coverage(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     // Arm coverage over the entry proto tree BEFORE running (patches each line's first
     // offset to Op::Break; the cold trap arm recovers + records each line on first hit).
@@ -903,6 +927,7 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
 
@@ -1006,6 +1031,7 @@ pub async fn vm_run_source_call_fast_stats(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1061,6 +1087,7 @@ pub async fn vm_run_source_obj_mode_stats(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1213,6 +1240,7 @@ pub async fn vm_run_source_elided(src: &str) -> Result<(String, Option<i32>), As
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto.clone());
     let interp = Rc::new(Interp::new());
@@ -1265,6 +1293,7 @@ pub async fn vm_run_source_elided_generic(src: &str) -> Result<(String, Option<i
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto.clone());
     let interp = Rc::new(Interp::new());
@@ -1283,6 +1312,219 @@ pub async fn vm_run_source_elided_generic(src: &str) -> Result<(String, Option<i
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// ELIDE §6.3: compile `src` WITHOUT elision (paranoid mode runs elide-OFF) but
+/// build the [`ElisionSet`] from the proof phase and install it on the `Interp`
+/// for contract-failure-path paranoid lookup. Returns `(output, exit_code)`.
+/// Any proven site that fails at runtime escalates to "ELIDE proof violated …".
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_paranoid(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::check::infer::elision_proofs;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    // Paranoid = elide-OFF compile (full checks retained) + ElisionSet retained.
+    let paranoid_set = elision_proofs(src);
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    interp.set_paranoid_set(paranoid_set);
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// ELIDE §6.3 test-only helper: parse `src` with the legacy parser and return the
+/// span of the first top-level `ExprKind::Call` statement. Panics if none found.
+/// Used so the injection seam injects the EXACT same span the runtime uses for the
+/// call — matching by the same char-offset key that [`Interp::maybe_paranoid_escalate`]
+/// looks up in the `calls` set.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+fn first_call_span_in_source(src: &str) -> crate::span::Span {
+    use crate::ast::{ExprKind, Stmt};
+    let tokens = lexer::lex(src).expect("lex in first_call_span_in_source");
+    let stmts = parser::parse(&tokens).expect("parse in first_call_span_in_source");
+    for stmt in &stmts {
+        if let Stmt::Expr(expr) = stmt {
+            if matches!(&expr.kind, ExprKind::Call { .. }) {
+                return expr.span;
+            }
+        }
+    }
+    panic!("no top-level Call expression found in source");
+}
+
+/// ELIDE §6.3 test-only: like [`vm_run_source_paranoid`] but additionally injects
+/// a FAKE call-site proof span so the FIRST contract failure at the call expression
+/// is treated as a proven site and escalates. The fake span is calculated from the
+/// source by finding the FIRST top-level `Call` expression using the legacy parser,
+/// ensuring it matches the span the runtime anchors contract panics to.
+///
+/// This simulates a checker soundness bug (the checker claimed a call was safe when
+/// it is not). Expected to return the panic message containing the escalation prefix.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
+    use crate::check::infer::elision_proofs;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::Closure;
+    use crate::vm::Vm;
+
+    let paranoid_set = elision_proofs(src);
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| e.message)
+        .unwrap_or_else(|e| panic!("compile failed: {e}"));
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    interp.set_paranoid_set(paranoid_set);
+    // Inject a FAKE proof: find the first top-level call expression span using the
+    // legacy parser (the same char-offset convention the runtime uses) and inject it
+    // into the `calls` set. This ensures `maybe_paranoid_escalate` sees an exact match
+    // when the contract fails, triggering the "ELIDE proof violated" escalation.
+    let call_span = first_call_span_in_source(src);
+    interp.inject_paranoid_call_span(call_span.start as u32, call_span.end as u32);
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Err(crate::interp::Control::Panic(e)) => e.message,
+        Ok(_) => String::from("(no panic — escalation did not fire)"),
+        Err(crate::interp::Control::Propagate(_)) => String::from("(propagated — no panic)"),
+        Err(crate::interp::Control::Exit(_)) => String::from("(exit — no panic)"),
+    }
+}
+
+/// ELIDE §6.3 tree-walker paranoid run: like [`vm_run_source_paranoid`] but on
+/// the tree-walker engine. Returns the captured output, or `Err(message)` on panic.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn tw_run_source_paranoid(src: &str) -> Result<String, String> {
+    use crate::check::infer::elision_proofs;
+
+    let tokens = match lexer::lex(src) {
+        Ok(t) => t,
+        Err(e) => return Err(e.message),
+    };
+    let program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => return Err(e.message),
+    };
+    // Paranoid = elide-OFF (no mark_program call) + ElisionSet retained.
+    let paranoid_set = elision_proofs(src);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_paranoid_set(paranoid_set);
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Ok(_) | Err(crate::interp::Control::Propagate(_)) | Err(crate::interp::Control::Exit(_)) => {
+            Ok(interp.output())
+        }
+        Err(crate::interp::Control::Panic(e)) => Err(e.message),
+    }
+}
+
+/// ELIDE §6.3 test-only (TW): like [`tw_run_source_paranoid`] but additionally
+/// injects a FAKE call-site proof span to trigger escalation on contract failure.
+/// Returns the panic message string. `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn tw_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
+    use crate::check::infer::elision_proofs;
+
+    let tokens = match lexer::lex(src) {
+        Ok(t) => t,
+        Err(e) => return format!("lex error: {e}"),
+    };
+    let program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => return format!("parse error: {e}"),
+    };
+    let paranoid_set = elision_proofs(src);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_paranoid_set(paranoid_set);
+    // Inject a FAKE proof: find the first top-level call expression span (the same
+    // char-offset convention the tree-walker uses for `expr.span`) and inject it into
+    // the `calls` set so `maybe_paranoid_escalate` sees an exact match.
+    let call_span = first_call_span_in_source(src);
+    interp.inject_paranoid_call_span(call_span.start as u32, call_span.end as u32);
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Err(crate::interp::Control::Panic(e)) => e.message,
+        Ok(_) => String::from("(no panic — escalation did not fire)"),
+        Err(crate::interp::Control::Propagate(_)) => String::from("(propagated — no panic)"),
+        Err(crate::interp::Control::Exit(_)) => String::from("(exit — no panic)"),
     }
 }
 
@@ -1347,6 +1589,7 @@ pub async fn vm_run_source_census(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1404,6 +1647,7 @@ async fn vm_run_source_decode_cfg(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1459,6 +1703,7 @@ async fn vm_run_source_decode_stats_cfg(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1534,6 +1779,7 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1594,6 +1840,7 @@ pub async fn aso_runnable_accept(bytes: &[u8]) {
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -2609,6 +2856,7 @@ async fn run_entry_proto_to_exit(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -2811,6 +3059,7 @@ pub async fn run_file_on_vm_with_packages(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -2881,6 +3130,7 @@ pub async fn run_file_decode_cfg(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -3003,6 +3253,7 @@ pub async fn run_file_on_vm_profiled(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -3147,6 +3398,7 @@ async fn vm_run_source_cfg_stats(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto.clone());
 
@@ -3236,6 +3488,7 @@ pub async fn vm_run_file_captured(entry: &Path) -> Result<(String, Option<i32>),
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
 
@@ -3325,6 +3578,7 @@ pub async fn run_archive(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);

@@ -2066,6 +2066,7 @@ impl Vm {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut module_fiber = Fiber::new(closure);
@@ -3934,6 +3935,10 @@ impl Vm {
                     if let Some(ty) = ty {
                         let v = fiber.peek(0).clone();
                         if !crate::interp::check_type(&v, &ty) {
+                            // §6.3 paranoid: the call-site span is in `calls` set.
+                            if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                                return Err(e);
+                            }
                             return Err(crate::interp::contract_panic(&ty, &v, span));
                         }
                     }
@@ -3954,6 +3959,10 @@ impl Vm {
                     };
                     let v = fiber.peek(0).clone();
                     if !crate::interp::check_type(&v, &ty) {
+                        // §6.3 paranoid: the let initializer span is in `lets` set.
+                        if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                            return Err(e);
+                        }
                         return Err(crate::interp::contract_panic(&ty, &v, span));
                     }
                 }
@@ -5430,6 +5439,10 @@ impl Vm {
                     if let Some(ty) = ty {
                         let v = fiber.peek(0).clone();
                         if !crate::interp::check_type(&v, &ty) {
+                            // §6.3 paranoid: call-site span in `calls` set.
+                            if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                                return Err(e);
+                            }
                             return Err(crate::interp::contract_panic(&ty, &v, span));
                         }
                     }
@@ -5457,6 +5470,10 @@ impl Vm {
                     };
                     let v = fiber.peek(0).clone();
                     if !crate::interp::check_type(&v, &ty) {
+                        // §6.3 paranoid: let initializer span in `lets` set.
+                        if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                            return Err(e);
+                        }
                         return Err(crate::interp::contract_panic(&ty, &v, span));
                     }
                 }
@@ -9681,6 +9698,12 @@ impl Vm {
             .expect("return/propagate with no active frame (VM bug)");
         if let Some(ret_ty) = &frame.closure.proto.ret {
             if !crate::interp::check_type(&value, ret_ty) {
+                // §6.3 paranoid: the fn name span is in `fn_rets` set.
+                if let Some(ns) = frame.closure.proto.name_span {
+                    if let Some(e) = self.interp.maybe_paranoid_escalate(ret_ty, &value, ns) {
+                        return Err(e);
+                    }
+                }
                 return Err(crate::interp::contract_panic(
                     ret_ty,
                     &value,
@@ -9972,6 +9995,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10333,6 +10357,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10386,6 +10411,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10546,6 +10572,7 @@ mod tests {
                 ret: None,
                 local_names: Vec::new(),
                 debug_name: None,
+            name_span: None,
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
 
@@ -10745,6 +10772,7 @@ mod tests {
                 ret: None,
                 local_names: Vec::new(),
                 debug_name: None,
+            name_span: None,
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
             let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
@@ -10858,6 +10886,7 @@ mod tests {
                 ret: None,
                 local_names: Vec::new(),
                 debug_name: None,
+            name_span: None,
             });
             let closure = Closure::new(top_proto);
             let mut fiber = Fiber::new(closure);
@@ -10934,6 +10963,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         vm.register_debug_protos(&entry);
         (entry, src_info)
@@ -10964,6 +10994,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let local = LocalSet::new();
@@ -11007,6 +11038,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let local = LocalSet::new();
@@ -11825,6 +11857,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto.clone());
         let mut fiber = Fiber::new(closure);
@@ -12257,6 +12290,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -12583,6 +12617,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -12610,6 +12645,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -12948,6 +12984,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -13003,6 +13040,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);

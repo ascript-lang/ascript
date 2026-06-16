@@ -3283,6 +3283,7 @@ impl Compiler {
             ret: None,
             local_names,
             debug_name: None,
+            name_span: None, // field-default proto has no fn name token
         }))
     }
 
@@ -3496,18 +3497,29 @@ impl Compiler {
         // ELIDE §4.2 row 3: if the fn's name-token char-span key is in
         // `self.elide.fn_rets`, the return contract is provably satisfied for every
         // call — drop `proto.ret` so the VM skips the return-type check.
+        //
+        // §6.3 paranoid mode: also capture the CHAR-offset span of the fn name token
+        // so `return_from_frame` can do the `fn_rets` paranoid lookup. This field is
+        // runtime-only (not serialized) — no `.aso` bump.
+        let name_token = fn_node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == SyntaxKind::Ident);
+        let name_span = name_token.as_ref().map(|t| {
+            let r = t.text_range();
+            crate::span::Span::new(
+                byte_to_char(usize::from(r.start())),
+                byte_to_char(usize::from(r.end())),
+            )
+        });
         let effective_ret = if let Some(elide) = &self.elide {
-            let name_key = fn_node
-                .children_with_tokens()
-                .filter_map(|el| el.into_token())
-                .find(|t| t.kind() == SyntaxKind::Ident)
-                .map(|t| {
-                    let r = t.text_range();
-                    (
-                        byte_to_char(usize::from(r.start())) as u32,
-                        byte_to_char(usize::from(r.end())) as u32,
-                    )
-                });
+            let name_key = name_token.map(|t| {
+                let r = t.text_range();
+                (
+                    byte_to_char(usize::from(r.start())) as u32,
+                    byte_to_char(usize::from(r.end())) as u32,
+                )
+            });
             if let Some(key) = name_key {
                 if elide.fn_rets.contains(&key) {
                     self.consumed += 1;
@@ -3533,6 +3545,7 @@ impl Compiler {
             ret: effective_ret,
             local_names,
             debug_name,
+            name_span,
         }))
     }
 
