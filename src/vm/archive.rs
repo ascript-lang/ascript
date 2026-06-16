@@ -218,6 +218,15 @@ impl ModuleArchive {
     ///
     /// The embedded `CapSet` is length-prefixed (via its own [`CapSet::to_bytes`] codec) so
     /// `decode` knows exactly where it ends without relying on its trailing-data tolerance.
+    ///
+    /// **Trailing-sections contract (WARM §3.4):** zero or more self-described trailing
+    /// sections MAY be appended after the module table without bumping [`ARCHIVE_VERSION`].
+    /// Each trailing section is self-framed: an 8-byte magic tag, a u16 version, a u32
+    /// payload length, and the payload bytes. An unrecognised trailing section MUST be
+    /// skipped; a reader MUST NOT require `pos == len` after the last module entry. This
+    /// property is pinned by the `decode_ignores_trailing_sections` test and is the
+    /// mechanism that makes the Unit-B PGO section forward-compatible with pre-WARM
+    /// runtimes — they run a PGO-carrying archive correctly by ignoring the unknown section.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&ARCHIVE_MAGIC);
@@ -243,6 +252,15 @@ impl ModuleArchive {
     /// Parse a [`ModuleArchive`] from `b`. `b` is UNTRUSTED: every read is bounds-checked and
     /// every count/length is capped before allocation, so a malformed or hostile archive yields
     /// an [`ArchiveError`], NEVER a panic.
+    ///
+    /// **Trailing-sections contract (WARM §3.4):** this decoder reads magic, version,
+    /// manifest, and the module table, then returns — it does NOT require `pos == len`
+    /// after the last module entry. Any bytes that follow (whether a self-described
+    /// future section such as `ASPGO\0\0\0 · u16 · u32 · payload` or arbitrary junk)
+    /// are silently ignored. A reader MUST NOT fail on trailing bytes; unknown sections
+    /// MUST be skipped. This property is pinned by the `decode_ignores_trailing_sections`
+    /// test and is what makes the WARM Unit-B PGO section forward-compatible without an
+    /// `ARCHIVE_VERSION` bump.
     pub fn decode(b: &[u8]) -> Result<ModuleArchive, ArchiveError> {
         let mut r = Reader::new(b);
 
@@ -641,5 +659,34 @@ mod tests {
         b.extend_from_slice(&[0u8; 32]); // shake digest
         write_len(&mut b, 1); // module_count = 1
         b
+    }
+
+    /// WARM §3.4 — the trailing-sections CONTRACT. A v1 reader MUST decode an archive
+    /// that carries trailing bytes after the module table and IGNORE them (this is what
+    /// makes the WARM Unit-B PGO section forward-compatible with already-shipped runtimes
+    /// without an `ARCHIVE_VERSION` bump). This was implicit; WARM makes it contractual.
+    #[test]
+    fn decode_ignores_trailing_sections() {
+        let arch = ModuleArchive::new(
+            0,
+            CapSet::all_granted(),
+            [0u8; 32],
+            vec![("main.as".to_string(), vec![1, 2, 3])],
+        );
+        let mut bytes = arch.encode();
+        // Append a future self-described section: magic(8) · version(u16) · len(u32) · payload.
+        bytes.extend_from_slice(b"ASPGO\0\0\0");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let back = ModuleArchive::decode(&bytes).expect("trailing sections must be ignored");
+        assert_eq!(back, arch);
+        // Garbage trailing bytes (not even a section frame) are equally ignored.
+        let mut junk = arch.encode();
+        junk.extend_from_slice(&[0xFF; 7]);
+        assert_eq!(
+            ModuleArchive::decode(&junk).expect("junk tail ignored"),
+            arch
+        );
     }
 }
