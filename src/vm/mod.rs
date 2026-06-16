@@ -17,6 +17,8 @@ pub mod fiber;
 pub mod ic;
 pub mod instrument;
 pub mod opcode;
+/// REGION kill-site strong-count accessor + count-semantics pin tests (spec §3.3).
+pub mod region;
 /// REGION Phase-0 allocation-lifetime probe (spec §5.2). Dev-only — compiled OUT
 /// unless `--features region-probe`.
 #[cfg(feature = "region-probe")]

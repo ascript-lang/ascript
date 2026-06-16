@@ -1,0 +1,51 @@
+# Local vendored copy of gcmodule 0.3.3 (crates.io checksum
+# aea43e9f1a437124f44a401fc74936a20a8d3fe4f95ba3e8f84fcc6193b0ed25), used as a
+# `[patch.crates-io]` target ONLY to expose ONE additional public accessor —
+# `Cc::strong_count()` — needed by the REGION spike's kill-site deadness proof
+# (spec §3.3). The upstream `Cc::ref_count()` is `pub(crate)`; there is no public
+# path from a `Cc<T>` handle to its strong count, so the spike vendors the crate
+# locally rather than forking an external repo (least-outward for a branch-only
+# spike). The PRODUCTION dependency decision (upstream PR vs official vendor,
+# spec G6) is DEFERRED to a REGION GO outcome (Phase 3); the spike does not ship.
+#
+# `gcmodule_derive` is NOT vendored — it stays the unmodified crates.io `=0.3.3`
+# crate (only the main `gcmodule` crate is patched).
+#
+# Empty `[workspace]` so a plain `cargo build` in the parent repo does not absorb
+# this crate as a workspace member (it is built only as a patched dependency),
+# mirroring `tree-sitter-ascript/` and `fuzz/`.
+
+[package]
+edition = "2018"
+name = "gcmodule"
+version = "0.3.3"
+authors = ["Jun Wu <quark@lihdd.net>"]
+description = "Cyclic garbage collection inspired by CPython's gc implementation."
+readme = "README.md"
+keywords = ["gc", "garbage", "cycle", "rc"]
+categories = ["memory-management"]
+license = "MIT"
+repository = "https://github.com/quark-zju/gcmodule"
+publish = false
+
+[dependencies.gcmodule_derive]
+version = "=0.3.3"
+optional = true
+
+[dependencies.parking_lot]
+version = "0.10"
+optional = true
+
+[dev-dependencies.quickcheck]
+version = "0.9"
+default-features = false
+
+[features]
+debug = []
+default = ["derive", "sync"]
+derive = ["gcmodule_derive"]
+nightly = []
+sync = ["parking_lot"]
+testutil = []
+
+[workspace]

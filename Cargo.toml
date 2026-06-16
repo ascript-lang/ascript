@@ -331,3 +331,13 @@ await_holding_refcell_ref = "deny"
 inherits = "release"
 debug = true
 strip = false
+
+# REGION spike (spec §3.3): a LOCAL path-patch of gcmodule 0.3.3 that adds ONE
+# public accessor, `Cc::strong_count()`, for the kill-site deadness proof. Upstream
+# `Cc::ref_count()` is `pub(crate)` with no public path from a `Cc<T>` handle, so the
+# strong count is unreadable without this. Branch-only, self-contained (no external
+# repo, no network fork) — least-outward for a spike that may NO-GO at Phase 2. The
+# PRODUCTION dependency decision (upstream PR vs official vendor, spec G6) is DEFERRED
+# to a REGION GO outcome (Phase 3); the spike does not ship. See vendor/gcmodule/.
+[patch.crates-io]
+gcmodule = { path = "vendor/gcmodule" }
