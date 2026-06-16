@@ -175,6 +175,16 @@ default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net"
 # the crate's self-dev-dependency for `tests/property.rs` (and by a `--cfg fuzzing` libFuzzer
 # build). Pulls `arbitrary`. Never in `default`, so production is byte-identical.
 fuzzgen = ["dep:arbitrary"]
+# REGION Phase 0 (spec §5.2): the `region-probe` allocation-lifetime instrument. NON-default,
+# dev-only. Under this feature each container cell (`ObjectCell`/`ArrayCell`/`MapCell`/`SetCell`/
+# `Instance`) gains a `probe: Cell<region_probe::Birth>` field + a `Drop` impl that accounts
+# birth/death keyed by task identity (per-allocation, split by literal/native site class and
+# in-task/escaped death). ZERO overhead when off: every probe field, Drop impl, birth/death call,
+# and task bracket is `#[cfg(feature = "region-probe")]`, so a default build is byte-identical to
+# pre-REGION (the four-mode differential proves it). Pure / in-memory (thread-locals) — no deps,
+# no `.aso` change, no grammar change. Measures the VM only (region activation is VM-only); the
+# tree-walker literal sites are NOT classified `Literal` in v1.
+region-probe = []
 # DECODE §5.1 (Unit B part 1): the decoded-dispatch PAIR/TRIPLE census. NON-default —
 # the counting mode (the burst-local `prev`/`prev2` tracking + the `(DOp,DOp[,DOp])`
 # frequency tables) is FULLY `#[cfg(feature = "decode-census")]`, so a default

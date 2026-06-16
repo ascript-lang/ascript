@@ -3087,6 +3087,10 @@ pub async fn run_file_on_vm_with_packages(
     local.await; // drain spawned tasks (structured join)
                  // End-of-program cycle collection (V13-T3): see `run_aso_file`.
     crate::gc::collect();
+    // REGION probe (spec §5.2): dump the allocation-lifetime histogram at program
+    // end (env `ASCRIPT_REGION_PROBE_OUT`; absent → no output). Dev-only.
+    #[cfg(feature = "region-probe")]
+    crate::vm::region_probe::dump();
     match result {
         Ok(RunOutcome::Done(_)) => Ok(0),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
@@ -3449,6 +3453,10 @@ async fn vm_run_source_cfg_stats(
                  // output is already captured on `interp`, so a final sweep of dead
                  // cycles is observably invisible.
     crate::gc::collect();
+    // REGION probe (spec §5.2): dump the allocation-lifetime histogram at program
+    // end (env `ASCRIPT_REGION_PROBE_OUT`; absent → no output). Dev-only.
+    #[cfg(feature = "region-probe")]
+    crate::vm::region_probe::dump();
     // LANE §6.4: read counters after the run completes (Task 4 wires these up;
     // for now they are always 0).
     let lane_sync_ops = vm.lane_sync_ops();

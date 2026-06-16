@@ -17,12 +17,30 @@ pub mod fiber;
 pub mod ic;
 pub mod instrument;
 pub mod opcode;
+/// REGION Phase-0 allocation-lifetime probe (spec §5.2). Dev-only — compiled OUT
+/// unless `--features region-probe`.
+#[cfg(feature = "region-probe")]
+pub mod region_probe;
 pub mod run;
 pub mod shape;
 pub(crate) mod trampoline;
 pub mod stack;
 pub mod value_ext;
 pub mod verify;
+
+/// REGION probe (spec §5.2): reclassify the freshly-pushed top-of-stack container
+/// cell's birth site as `Literal`. Called by the `Op::NewObject`/`Op::NewArray`
+/// handlers (both lanes). Dev-only — compiled OUT unless `--features region-probe`.
+#[cfg(feature = "region-probe")]
+#[inline]
+pub(crate) fn region_probe_mark_top(fiber: &fiber::Fiber) {
+    use crate::value::ValueKind;
+    match fiber.peek(0).kind() {
+        ValueKind::Object(o) => o.region_mark_literal(),
+        ValueKind::Array(a) => a.region_mark_literal(),
+        _ => {}
+    }
+}
 
 pub use chunk::{Chunk, FnProto};
 pub use disasm::{disasm, disasm_at};

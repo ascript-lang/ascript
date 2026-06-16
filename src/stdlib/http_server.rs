@@ -1389,6 +1389,11 @@ impl Interp {
             // for the task's whole lifetime, then dropped (released) on completion.
             let handle = tokio::task::spawn_local(async move {
                 let _permit = permit;
+                // REGION probe (spec §5.2): bracket each per-request handler task so
+                // allocations born servicing this connection are attributed to a fresh
+                // task and retired on drop — the same seam `RegionScope` will use.
+                #[cfg(feature = "region-probe")]
+                let _region_task = crate::vm::region_probe::enter_task();
                 vm.handle_connection(id, stream, max_body, timeout_ms, span)
                     .await;
             });

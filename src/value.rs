@@ -243,6 +243,19 @@ pub struct ObjectCell {
     /// await-holding-borrow risk; it is `Copy` and adds no GC-traceable edge, so
     /// `Value::trace`/the cycle collector are unaffected.
     pub frozen: Cell<bool>,
+    /// REGION Phase-0 probe field (spec §5.2). Birth record (task + site class),
+    /// defaulted `Native`; the VM literal handlers reclassify to `Literal`. STRICTLY
+    /// `#[cfg]`-gated — absent (and the `Drop` impl below absent) in a default build,
+    /// so layout/drop-timing are byte-identical to pre-REGION.
+    #[cfg(feature = "region-probe")]
+    pub probe: std::cell::Cell<crate::vm::region_probe::Birth>,
+}
+
+#[cfg(feature = "region-probe")]
+impl Drop for ObjectCell {
+    fn drop(&mut self) {
+        crate::vm::region_probe::death(crate::vm::region_probe::ProbeKind::Object, self.probe.get());
+    }
 }
 
 impl ObjectCell {
@@ -253,6 +266,8 @@ impl ObjectCell {
             storage: RefCell::new(ObjectStorage::Dict(map)),
             shape: Cell::new(0),
             frozen: Cell::new(false),
+            #[cfg(feature = "region-probe")]
+            probe: std::cell::Cell::new(crate::vm::region_probe::Birth::default()),
         })
     }
 
@@ -273,6 +288,8 @@ impl ObjectCell {
             storage: RefCell::new(ObjectStorage::Slab { keys, values }),
             shape: Cell::new(shape),
             frozen: Cell::new(false),
+            #[cfg(feature = "region-probe")]
+            probe: std::cell::Cell::new(crate::vm::region_probe::Birth::default()),
         })
     }
 
@@ -344,6 +361,15 @@ impl ObjectCell {
     /// Mark this object frozen (one-way; idempotent).
     pub fn freeze(&self) {
         self.frozen.set(true);
+    }
+
+    /// REGION Phase-0 probe: reclassify this cell's birth site as `Literal` (a VM
+    /// `Op::NewObject` handler). No-op semantics outside `region-probe`.
+    #[cfg(feature = "region-probe")]
+    pub fn region_mark_literal(&self) {
+        self.probe.set(crate::vm::region_probe::birth(
+            crate::vm::region_probe::SiteClass::Literal,
+        ));
     }
 
     // ── SHAPE Task 2.2 — mode-branching accessor bodies ─────────────────────
@@ -596,6 +622,17 @@ impl Trace for ObjectCell {
 pub struct ArrayCell {
     pub vec: RefCell<Vec<Value>>,
     pub frozen: Cell<bool>,
+    /// REGION Phase-0 probe field (spec §5.2). See [`ObjectCell::probe`]. Strictly
+    /// `#[cfg]`-gated; absent in a default build.
+    #[cfg(feature = "region-probe")]
+    pub probe: std::cell::Cell<crate::vm::region_probe::Birth>,
+}
+
+#[cfg(feature = "region-probe")]
+impl Drop for ArrayCell {
+    fn drop(&mut self) {
+        crate::vm::region_probe::death(crate::vm::region_probe::ProbeKind::Array, self.probe.get());
+    }
 }
 
 impl ArrayCell {
@@ -604,7 +641,18 @@ impl ArrayCell {
         Cc::new(ArrayCell {
             vec: RefCell::new(vec),
             frozen: Cell::new(false),
+            #[cfg(feature = "region-probe")]
+            probe: std::cell::Cell::new(crate::vm::region_probe::Birth::default()),
         })
+    }
+
+    /// REGION Phase-0 probe: reclassify this cell's birth site as `Literal` (a VM
+    /// `Op::NewArray` handler). No-op semantics outside `region-probe`.
+    #[cfg(feature = "region-probe")]
+    pub fn region_mark_literal(&self) {
+        self.probe.set(crate::vm::region_probe::birth(
+            crate::vm::region_probe::SiteClass::Literal,
+        ));
     }
 
     /// Immutable borrow of the element vector (drop-in for the old
@@ -643,6 +691,17 @@ pub struct MapCell {
     pub map: RefCell<IndexMap<MapKey, Value>>,
     /// `object.freeze` flag (SP2 §4). Defaults `false`. See [`ObjectCell::frozen`].
     pub frozen: Cell<bool>,
+    /// REGION Phase-0 probe field (spec §5.2). See [`ObjectCell::probe`]. Strictly
+    /// `#[cfg]`-gated; absent in a default build.
+    #[cfg(feature = "region-probe")]
+    pub probe: std::cell::Cell<crate::vm::region_probe::Birth>,
+}
+
+#[cfg(feature = "region-probe")]
+impl Drop for MapCell {
+    fn drop(&mut self) {
+        crate::vm::region_probe::death(crate::vm::region_probe::ProbeKind::Map, self.probe.get());
+    }
 }
 
 impl MapCell {
@@ -651,6 +710,8 @@ impl MapCell {
         Cc::new(MapCell {
             map: RefCell::new(map),
             frozen: Cell::new(false),
+            #[cfg(feature = "region-probe")]
+            probe: std::cell::Cell::new(crate::vm::region_probe::Birth::default()),
         })
     }
 
@@ -681,6 +742,17 @@ pub struct SetCell {
     pub set: RefCell<IndexSet<MapKey>>,
     /// `object.freeze` flag (SP2 §4). Defaults `false`. See [`ObjectCell::frozen`].
     pub frozen: Cell<bool>,
+    /// REGION Phase-0 probe field (spec §5.2). See [`ObjectCell::probe`]. Strictly
+    /// `#[cfg]`-gated; absent in a default build.
+    #[cfg(feature = "region-probe")]
+    pub probe: std::cell::Cell<crate::vm::region_probe::Birth>,
+}
+
+#[cfg(feature = "region-probe")]
+impl Drop for SetCell {
+    fn drop(&mut self) {
+        crate::vm::region_probe::death(crate::vm::region_probe::ProbeKind::Set, self.probe.get());
+    }
 }
 
 impl SetCell {
@@ -689,6 +761,8 @@ impl SetCell {
         Cc::new(SetCell {
             set: RefCell::new(set),
             frozen: Cell::new(false),
+            #[cfg(feature = "region-probe")]
+            probe: std::cell::Cell::new(crate::vm::region_probe::Birth::default()),
         })
     }
 
@@ -949,6 +1023,22 @@ pub struct Instance {
     /// engine can set/read it without a mutable instance borrow; see
     /// [`ObjectCell::frozen`].
     pub frozen: Cell<bool>,
+    /// REGION Phase-0 probe field (spec §5.2). See [`ObjectCell::probe`]. Strictly
+    /// `#[cfg]`-gated; absent in a default build. Instances are never VM-literal
+    /// (no `Op::NewObject`), so this stays `Native` in v1 — but the field + Drop are
+    /// wired so the histogram accounts instance births/deaths uniformly.
+    #[cfg(feature = "region-probe")]
+    pub probe: Cell<crate::vm::region_probe::Birth>,
+}
+
+#[cfg(feature = "region-probe")]
+impl Drop for Instance {
+    fn drop(&mut self) {
+        crate::vm::region_probe::death(
+            crate::vm::region_probe::ProbeKind::Instance,
+            self.probe.get(),
+        );
+    }
 }
 
 impl Instance {
@@ -961,6 +1051,8 @@ impl Instance {
             fields: ObjectStorage::Dict(fields),
             shape_id: Cell::new(0),
             frozen: Cell::new(false),
+            #[cfg(feature = "region-probe")]
+            probe: Cell::new(crate::vm::region_probe::Birth::default()),
         }
     }
 
@@ -975,6 +1067,8 @@ impl Instance {
             },
             shape_id: Cell::new(0),
             frozen: Cell::new(false),
+            #[cfg(feature = "region-probe")]
+            probe: Cell::new(crate::vm::region_probe::Birth::default()),
         }
     }
 

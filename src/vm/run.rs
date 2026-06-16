@@ -3282,6 +3282,9 @@ impl Vm {
                         *slot = fiber.pop();
                     }
                     fiber.push(Value::array(values));
+                    // REGION probe (spec §5.2): classify this VM literal as Literal.
+                    #[cfg(feature = "region-probe")]
+                    crate::vm::region_probe_mark_top(fiber);
                 }
 
                 Op::NewObject => {
@@ -3290,6 +3293,9 @@ impl Vm {
                     // panic span); the operand at `operand_at` is the pair count.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     self.exec_new_object(fiber, fault_ip, n)?;
+                    // REGION probe (spec §5.2): classify this VM literal as Literal.
+                    #[cfg(feature = "region-probe")]
+                    crate::vm::region_probe_mark_top(fiber);
                 }
 
                 Op::NewMap => {
@@ -4913,6 +4919,9 @@ impl Vm {
                             let guard = self.interp.inflight_guard();
                             let handle = tokio::task::spawn_local(async move {
                                 let _g = guard;
+                                // REGION probe (spec §5.2): bracket this VM async task body.
+                                #[cfg(feature = "region-probe")]
+                                let _region_task = crate::vm::region_probe::enter_task();
                                 let r =
                                     vm.call_value(Value::closure(callee), args, call_span).await;
                                 cell.resolve(r);
@@ -5489,6 +5498,9 @@ impl Vm {
                         *slot = fiber.pop();
                     }
                     fiber.push(Value::array(values));
+                    // REGION probe (spec §5.2): classify this VM literal as Literal.
+                    #[cfg(feature = "region-probe")]
+                    crate::vm::region_probe_mark_top(fiber);
                 }
 
                 Op::NewObject => {
@@ -5498,6 +5510,9 @@ impl Vm {
                     // offset; the operand is the pair count.
                     let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     self.exec_new_object(fiber, fault_ip, n)?;
+                    // REGION probe (spec §5.2): classify this VM literal as Literal.
+                    #[cfg(feature = "region-probe")]
+                    crate::vm::region_probe_mark_top(fiber);
                 }
 
                 Op::NewMap => {
@@ -9396,6 +9411,9 @@ impl Vm {
             let guard = self.interp.inflight_guard();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                // REGION probe (spec §5.2): bracket this VM async-fn task body.
+                #[cfg(feature = "region-probe")]
+                let _region_task = crate::vm::region_probe::enter_task();
                 let r = vm.call_value(Value::closure(closure), args, span).await;
                 cell.resolve(r);
             });
@@ -12265,6 +12283,9 @@ mod tests {
         let fut = crate::task::SharedFuture::new();
         let cell = fut.cell();
         let handle = tokio::task::spawn_local(async move {
+            // REGION probe (spec §5.2): bracket this VM-produced-future task body.
+            #[cfg(feature = "region-probe")]
+            let _region_task = crate::vm::region_probe::enter_task();
             let r = vm2.call_value(closure, args, s()).await;
             cell.resolve(r);
         });

@@ -5832,6 +5832,12 @@ impl Interp {
             let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                // REGION probe (spec §5.2): bracket this spawned task body so
+                // allocations born here are attributed to a fresh task id and the
+                // guard retires it on drop (incl. cancel-on-drop). Plain owned RAII
+                // value — held across the body's `.await`s, no `RefCell` borrow.
+                #[cfg(feature = "region-probe")]
+                let _region_task = crate::vm::region_probe::enter_task();
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
                 // Async fns are excluded from ELIDE eligibility → always false.
@@ -6422,6 +6428,9 @@ impl Interp {
             let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                // REGION probe (spec §5.2): bracket this spawned method-body task.
+                #[cfg(feature = "region-probe")]
+                let _region_task = crate::vm::region_probe::enter_task();
                 // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
                 // `run_method_body`'s frame, so nothing escapes the `'static` task.
                 #[cfg(feature = "telemetry")]
@@ -6497,6 +6506,9 @@ impl Interp {
             let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                // REGION probe (spec §5.2): bracket this spawned static-method-body task.
+                #[cfg(feature = "region-probe")]
+                let _region_task = crate::vm::region_probe::enter_task();
                 #[cfg(feature = "telemetry")]
                 let r = crate::interp::telemetry_scope(
                     telem_parent,
