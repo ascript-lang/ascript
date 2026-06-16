@@ -125,6 +125,153 @@ Returns when the generator is exhausted. Use this to connect a `worker fn*` stre
 pull loop. See [Workers & parallelism](../language/workers) for the full inter-isolate streaming
 pattern.
 
+## Data parallelism — `task.pmap` / `task.preduce`
+
+```ascript
+import * as task from "std/task"
+import * as shared from "std/shared"
+
+worker fn score(row) { return row.weight * row.hits }
+worker fn add(a, b)  { return a + b }
+
+let rows  = shared.freeze(loadRows())              // happy path: frozen = zero-copy hand-off
+let out   = await task.pmap(rows, score)           // future<array>, results in INPUT order
+let total = await task.preduce(out, add, 0)        // future<T>
+```
+
+`task.pmap` and `task.preduce` distribute an array across the existing worker pool, running the
+callback inside isolates **one chunk per dispatch** (amortising the per-round-trip overhead over
+many elements) and merging results **in input order**.
+
+| Function | Signature | Behavior |
+|---|---|---|
+| `pmap` | `pmap(data, f, opts?) -> future<array>` | Apply `f` to every element of `data`; return results **in input order**, never completion order. |
+| `preduce` | `preduce(data, f, init, opts?) -> future<T>` | Parallel reduction. Each chunk is folded with `f` seeded by the chunk's first element; partials are combined with one final fold `f(…f(f(init, p0), p1)…)`. `init` participates **exactly once**. |
+
+Both return an ordinary `future<…>` and compose with `await`, `task.timeout`, `task.race`,
+`task.spawn`, and structured cancel-on-drop.
+
+**Empty input:** `pmap([])` resolves to `[]`; `preduce([], f, init)` resolves to `init` — in
+both cases without touching the pool.
+
+**The callback `f`** must be a **named, top-level `worker fn`** — the same rule as
+`run_in_worker`. An arrow, anonymous fn, plain (non-`worker`) fn, or builtin is a Tier-2 panic:
+
+```
+task.pmap expects a named `worker fn` as its callback (got function)
+```
+
+**Options** (both functions):
+
+```ascript
+{ chunks?: int >= 1,    // number of chunks to dispatch (default: pool size = num_cpus / $ASCRIPT_WORKERS)
+  minChunk?: int >= 1 } // minimum elements per chunk (default: 1)
+```
+
+### Chunk plan formula
+
+Chunk boundaries are **deterministic** given `(len, cap, minChunk)` and are a **documented part
+of the contract** (makes `preduce` reproducible across runs):
+
+```
+cap        = opts.chunks   if given (int ≥ 1)
+             else pool cap                      // $ASCRIPT_WORKERS if set, else num_cpus
+chunk_size = max(opts.minChunk ?? 1, ceil(len / cap))
+chunks     = ceil(len / chunk_size)
+chunk i    = [i * chunk_size, min((i+1) * chunk_size, len))    // i = 0 .. chunks-1
+```
+
+The default chunk count equals the pool size (≈ core count) so total dispatch overhead is bounded
+at ≈ `cores × 0.23 ms` warm regardless of array length.
+
+### `preduce` contract
+
+> **`preduce` contract.** `f` must be **associative** for `preduce(data, f, init)` to equal
+> the sequential `reduce`. Chunk boundaries are deterministic given the input length and the
+> chunk count (the published formula above), so even a non-associative `f` is
+> **reproducible** — byte-identical across runs and across all engine modes on the same
+> machine/configuration — it is just not equal to the sequential fold. The default chunk
+> count is the machine's worker-pool size; pass `{chunks: N}` to pin results across machines.
+
+### Frozen vs plain input
+
+The input form determines crossing semantics. You choose explicitly:
+
+| Input | How it crosses | Semantics inside `f` | Performance |
+|---|---|---|---|
+| `shared.freeze(arr)` — `Value::Shared` array | One `Arc` pointer bump per chunk dispatch (O(1), size-independent, ~0.15 ms flat) | Read-only frozen view. Elements are zero-copy. Mutation is a panic: `cannot mutate a frozen <kind>`. | Best for large, read-only element data. |
+| Plain `Value::Array` | Per-chunk structured-clone of the element slice (total cost = one full copy of the input, same class as one freeze walk) | Each chunk isolate owns a **mutable private copy**. Element-local mutation is legal. | Fine for small arrays or when elements are mutated per-call. |
+| Frozen instance element (from a frozen array) | Arc bump | Fields readable zero-copy. Methods are **not** available: `method '<name>' is not available on a frozen instance …` | Use plain array if the callback calls instance methods. |
+| Plain instance element (from a plain array) | Structured clone (fields only — a documented Spec A limitation of the worker airlock) | Fields readable. Methods are **not** available across the boundary: `value is not callable`. | Fields-only access on either path; methods require the caller side. |
+| Cyclic plain array | Works — `TAG_REF` airlock copy preserves cycles | Per-chunk mutable copy | — |
+| Attempt to `shared.freeze` a cyclic value | `shared.freeze` rejects cycles at the freeze call | — | Freeze before passing to `pmap`. |
+| Non-array or `Shared` non-array | Tier-2 panic: `task.pmap expects an array or a frozen array (got <kind>)` | — | — |
+
+**Guidance:** for large read-only element data, `shared.freeze` first (pays ~0.52 ms / 10k entries
+once, then flat per dispatch). For small arrays or elements that `f` mutates, pass the plain array.
+
+### Error and cancellation semantics
+
+- **Callback panic:** the orchestrator awaits chunks in **input order**, so the reported panic
+  is always the first failing chunk **by input order**, never completion order. On the first panic
+  all remaining chunk futures are dropped.
+- **Dropped chunk futures:** a chunk still queued on an isolate is cancelled before it runs. A
+  chunk **already executing** runs to completion — it is CPU-bound and never yields; its reply is
+  discarded. This is today's pooled-worker cancellation semantics, inherited unchanged.
+- **`?` inside `f`:** a `?`-propagation inside the callback body is converted to `Ok([nil, err])`
+  by the isolate before `call_value` returns, so that element's result in the `pmap` output is the
+  `[nil, err]` pair — identical to a direct `worker fn` call. The docs recommend returning
+  `[value, err]` pairs as data when per-element fallibility matters; they merge in order like any
+  value.
+- **Timeout / race / detach:** `task.timeout(ms, task.pmap(...))` drops the pmap future on
+  timeout → cancel-on-drop aborts the orchestrator → chunk futures drop → the cancellation
+  semantics above. `task.spawn(task.pmap(...))` detaches.
+- **Pool exhaustion:** graceful degradation — a chunk that cannot be dispatched to the pool runs
+  inline on the caller; the result is identical.
+
+### Capabilities
+
+`pmap`/`preduce` run under the **pooled** `worker fn` capability model: each chunk inherits the
+dispatching isolate's `CapSet` as a read-only floor, and `caps.drop` is **refused** inside the
+callback (pooled-worker rule). `pmap` takes no `caps` option and does not create a sandbox. For a
+cap-reduced parallel job, use `run_in_worker(f, input, {caps})` per item — see
+[`std/caps`](caps).
+
+### Break-even and performance guidance
+
+`pmap` pays a fixed overhead of approximately `chunks × 0.23 ms` warm dispatch cost (from the
+worker pool bench) plus the input copy/freeze cost, regardless of array length. For small or
+trivial per-element work this overhead dominates and a sequential `for` loop wins. The measured
+break-even (per-element duration below which sequential is faster) is published in
+`bench/DATA_PARALLEL_RESULTS.md`. On an Apple M4 with W=4 and 32 chunks, pmap wins
+starting somewhere between 0 and ~1 000 tight-loop iterations per element (≈20 µs per
+element total sequential time); at 10 000 iterations it is already 3.4× faster than
+sequential. Rule of thumb: if each element takes at least ~1 ms of CPU work, pmap pays
+off at W≥2.
+
+```ascript
+import * as task from "std/task"
+import * as shared from "std/shared"
+
+worker fn score(row) { return row.weight * row.hits }
+worker fn add(a, b)  { return a + b }
+
+// Freeze once, reuse across multiple pmap calls.
+let dataset = shared.freeze(loadDataset())
+
+// Parallel map — results in input order.
+let scores = await task.pmap(dataset, score)
+
+// Parallel reduction — associative combiner equals sequential reduce.
+let total = await task.preduce(scores, add, 0)
+
+// Pin chunks for cross-machine reproducibility with a non-associative combiner.
+let pinned = await task.preduce(scores, add, 0, { chunks: 4 })
+
+// Compose with timeout — cancels the whole pipeline if it overruns.
+let [result, err] = await task.timeout(5000, task.pmap(dataset, score))
+```
+
 ## `std/sync` — channels, semaphores, and rate limiters
 
 `std/sync` provides primitives for coordinating between concurrent tasks. No feature gate —

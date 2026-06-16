@@ -1,0 +1,7 @@
+# exit: none
+processed: 12 rows
+successes: 10, failures: 2
+  failed id=2: non-positive value
+  failed id=7: non-positive weight
+aggregate score: 143
+verified: true

@@ -437,6 +437,21 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   + flags remain as INERT no-ops (documented inert in `docs/content/cli.md`). spec/tw geomean ≥ 2×;
   `dbg_zero_cost_gate` ≈ 1.0×; no `.aso`/grammar/LSP/fmt change.
 
+- **PAR — data-parallel primitives** (stdlib-only; spec `superpowers/specs/2026-06-12-data-parallel-design.md`).
+  `task.pmap(data, f, opts?) -> future<array>` + `task.preduce(data, f, init, opts?) -> future<T>`: chunk an
+  array across the existing worker pool, run `f` per chunk in isolates, merge results. **No syntax, no opcode,
+  no `.aso` change (`ASO_FORMAT_VERSION` stays 29); no new worker-wire tag** — `ChunkJob` rides `WorkerRequest`
+  as plain `Send` fields; a native `run_chunk_job` driver runs inside each isolate. **Input:** frozen array →
+  `Arc`-bump (TAG_SHARED, O(1)); plain array → per-chunk structured-clone copy. **No auto-freeze** — the
+  shipped decision is freeze-or-copy, explicit; non-array → Tier-2 panic. **Callback** = named top-level
+  `worker fn` only; a `static worker fn` is rejected at the gate (§2.2 message). Chunk plan CONTRACTUAL:
+  `chunk_size = max(minChunk, ceil(len/cap))`; opts `{chunks?, minChunk?}`. `preduce`: each chunk folds seeded
+  by its own first element; `init` participates EXACTLY once (final combine). Input-order merge; first-by-input-order
+  errors; venue-invariant nesting; cancel-on-drop. **Worker `?`** yields the `[nil,err]` pair (not nil). Plain
+  instances cross the airlock field-only (methods not shipped — Spec A limitation). **Headline
+  (`bench/DATA_PARALLEL_RESULTS.md`):** scaling **4.28× @ 8 workers**; frozen input 2.01× faster than plain at
+  1M; break-even ~1000 LCG-iters/element; Gate-12 spec/tw 3.85×.
+
 - **ELIDE — contract elision via static proof** (both engines; spec
   `superpowers/specs/2026-06-12-contract-elision-design.md`). When the TYPE checker PROVES a call
   site's arguments / an annotated `let` / a fn's returns satisfy their contracts under the strict

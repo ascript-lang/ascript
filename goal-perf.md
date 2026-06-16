@@ -165,13 +165,14 @@ stated, results are measured.
 
 ### Multi-core — the ×cores lever (from shipped pieces)
 
-- 🔒 **PAR — Data-parallel primitives over the frozen shared heap.** `task.pmap(arr, f)` /
-  `task.preduce(arr, f, init)` (std-lib, no syntax): chunk a `shared.freeze`-frozen array across
-  the worker pool (zero-copy reads via the `TAG_SHARED` airlock path), run the callback in
-  isolates, merge results. Unfrozen inputs take a freeze-or-copy documented path; non-sendable
-  callbacks are the existing field-path panic. Builds entirely on `src/worker/` + `std/shared` +
-  the pool-side archive cache. Rayon-class throughput for batch work — a ×cores lever no
-  baseline JIT can match.
+- ✅ **PAR — Data-parallel primitives over the worker pool. MERGED to `main` (`--no-ff`). See EXECUTION LOG.**
+  `task.pmap(arr, f)` /
+  `task.preduce(arr, f, init)` (std-lib, no syntax): chunk an array across the worker pool, run
+  the callback in isolates, merge results. **Input: frozen array → `Arc`-bump zero-copy (TAG_SHARED
+  airlock); plain array → per-chunk structured-clone copy. No auto-freeze** — freeze-or-copy is
+  explicit and the shipped decision. Non-sendable callbacks are the existing field-path panic. Builds
+  entirely on `src/worker/` + `std/shared` + the pool-side archive cache. Rayon-class throughput for
+  batch work — a ×cores lever no baseline JIT can match.
   - Spec: `superpowers/specs/2026-06-12-data-parallel-design.md`
   - Plan: `superpowers/plans/2026-06-12-data-parallel.md`
 
@@ -660,6 +661,37 @@ stated, results are measured.
   `bench/ELIDE_RESULTS.md` (baseline/envelope/decision/headline), CLAUDE.md + roadmap + spec §5.1.1.
   REPL / worker isolates / DAP / `--parallel` keep FULL checks (never elide). "Raw `Yes` is not a proof"
   recorded as a warning for future checker work.
+
+- **PAR** — ✅ **MERGED to `main` (`--no-ff`).** Data-parallel primitives over the shipped worker pool:
+  `task.pmap(data, f, opts?) -> future<array>` + `task.preduce(data, f, init, opts?) -> future<T>`,
+  ordinary `std/task` functions. **STDLIB-ONLY — no syntax, no opcode, no `.aso` change (`ASO_FORMAT_VERSION`
+  stays 29), no new worker-wire tag** (`tests/par_negative_space.rs` pins all three). `ChunkJob` rides
+  `WorkerRequest` as plain `Send` fields; a native `run_chunk_job` driver in the isolate loop maps/reduces a
+  chunk's slice; `dispatch_worker`'s public signature is unchanged (delegates to `dispatch_worker_job(.., None)`).
+  **Input (the §3.1 freeze-or-copy decision, NOT auto-freeze):** a frozen array → `Arc`-bump zero-copy
+  (TAG_SHARED, O(1)/chunk, 2.01× faster at 1M); a plain array → per-chunk structured-clone copy. Callback = a
+  **named TOP-LEVEL `worker fn`** (a `static worker fn` is rejected at the `worker_fn_dispatch_name` value gate
+  with the §2.2 message — fixed in-branch, byte-identical both engines, also fixing `run_in_worker`'s latent
+  leak). Input-order merge; first-by-input-order errors; venue-invariant inline nesting (an isolate runs the
+  SAME chunk decomposition, never blocks on its own pool); cancel-on-drop. **`preduce`:** each chunk folds
+  seeded by its own first element; `init` participates EXACTLY once (the single final combine); `f` must be
+  associative to equal sequential reduce (the §3.8 contract, byte-identical reproducibility under pinned
+  `{chunks}`). 5 phases, subagent-driven (fresh implementer + independent opus reviewer per task; per-phase +
+  whole-effort holistic). **Two spec PROSE corrections recorded in-branch** (both match shipped reality, no
+  recorded-semantics change): a worker body `?` yields the `[nil, err]` PAIR (run_body converts Propagate→Ok;
+  the isolate Propagate→nil arm is dead, kept to mirror), and plain instances cross the airlock FIELD-ONLY
+  (methods not shipped — a Spec A limitation, not PAR). **Headline (`bench/DATA_PARALLEL_RESULTS.md`):** scaling
+  **4.28× @ 8 workers** (1.94×/3.16×/4.28× at 2/4/8), ≈ the hand-rolled `gather(map)`; break-even ~1000
+  LCG-iters/element (below it sequential wins — the honest non-goal); frozen-vs-plain 2.01× at 1M; **Gate-12
+  spec/tw geomean 3.87× ≥ 2×** (PAR touched no engine path — proof, not assumption). **Gates:** the new
+  examples join the whole-corpus differential four-mode byte-identical; `vm_differential` 444/0 both feature
+  configs; full suite + clippy clean both configs; Gate-5 0 `type-*` on `examples/**` both configs (incl. 2
+  new examples); `par_negative_space` (ASO 29 / wire-tag / opcode-count pins) green; the §4 failure-mode table
+  re-probed row-for-row VM==tree-walker. Docs: `async.md` "Data parallelism" (verbatim §3.8 contract + chunk
+  formula), `workers.md`, README, CLAUDE.md + roadmap. **Recorded pre-existing (NOT a PAR blocker, route to a
+  future worker-hardening task):** two DIFFERENT `worker fn`s sharing a top-level helper hit a `DefineGlobal`
+  redeclaration panic on a WARM pool isolate — reproduces with plain pooled `worker fn` calls (zero PAR
+  involvement); the worker code-shipping slice re-defines an already-defined top-level helper.
 
 ## Execution order
 
