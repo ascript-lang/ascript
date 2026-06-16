@@ -83,6 +83,9 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/ffi", "call") => 1,
         // std/task — pipe requires exactly 2 args (generator + event bus).
         ("std/task", "pipe") => 2,
+        // PAR (spec §2.1): pmap(data, f, opts?) min 2; preduce(data, f, init, opts?) min 3.
+        ("std/task", "pmap") => 2,
+        ("std/task", "preduce") => 3,
         // std/string — NUM code-point helpers (fixed required arity).
         ("std/string", "codepoints") => 1,
         ("std/string", "from_codepoints") => 1,
@@ -159,6 +162,8 @@ mod tests {
             ("std/ffi", "symbol"),
             ("std/ffi", "call"),
             ("std/task", "pipe"),
+            ("std/task", "pmap"),
+            ("std/task", "preduce"),
             ("std/string", "codepoints"),
             ("std/string", "from_codepoints"),
             ("std/string", "code_at"),

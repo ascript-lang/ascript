@@ -36,6 +36,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("timeout", bi("task.timeout")),
         ("retry", bi("task.retry")),
         ("pipe", bi("task.pipe")),
+        // PAR (spec §2.1)
+        ("pmap", bi("task.pmap")),
+        ("preduce", bi("task.preduce")),
     ]
 }
 
@@ -65,6 +68,9 @@ impl Interp {
             "timeout" => self.task_timeout(args, span).await,
             "retry" => self.task_retry(args, span).await,
             "pipe" => self.task_pipe(args, span).await,
+            // PAR §2.1 — Task 2.1 ships validation; orchestration (Task 2.2) is pending.
+            "pmap" => self.task_pmap_validate(args, span).await,
+            "preduce" => self.task_preduce_validate(args, span).await,
             _ => Err(AsError::at(format!("unknown function 'task.{}'", func), span).into()),
         }
     }
@@ -334,6 +340,54 @@ impl Interp {
         Err(Control::Panic(last_panic.expect("at least one attempt")))
     }
 
+    // ── PAR Task 2.1: validation stubs ───────────────────────────────────────
+    // Full orchestration (Task 2.2) is not yet implemented. These methods perform
+    // ALL synchronous validation (input classification, callback name check, opts
+    // parsing) — which is what Task 2.1 tests — then return an unimplemented error.
+    // Task 2.2 will replace the body after the validation block with real dispatch.
+
+    /// `task.pmap(data, f, opts?) -> future<array>` — validation only (Task 2.1).
+    async fn task_pmap_validate(
+        &self,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Step 1: classify input (panics for non-array/non-frozen-array input).
+        let _input = classify_par_input(&arg(args, 0), "task.pmap", span)?;
+        // Step 2: validate callback (panics for non-named-worker-fn).
+        let _entry_name = par_callback_name(&arg(args, 1), "task.pmap", span)?;
+        // Step 3: parse opts (panics for invalid opts).
+        let (_cap, _min_chunk) = par_opts(&arg(args, 2), "task.pmap", span)?;
+        // Orchestration (Task 2.2) not yet implemented.
+        Err(AsError::at(
+            "task.pmap: orchestration not yet implemented (Task 2.2 pending)",
+            span,
+        )
+        .into())
+    }
+
+    /// `task.preduce(data, f, init, opts?) -> future<T>` — validation only (Task 2.1).
+    async fn task_preduce_validate(
+        &self,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Step 1: classify input.
+        let _input = classify_par_input(&arg(args, 0), "task.preduce", span)?;
+        // Step 2: validate callback.
+        let _entry_name = par_callback_name(&arg(args, 1), "task.preduce", span)?;
+        // Step 3: init arg (position 2) — sendability checked up front in Task 2.3.
+        let _init = arg(args, 2);
+        // Step 4: parse opts.
+        let (_cap, _min_chunk) = par_opts(&arg(args, 3), "task.preduce", span)?;
+        // Orchestration (Task 2.3) not yet implemented.
+        Err(AsError::at(
+            "task.preduce: orchestration not yet implemented (Task 2.3 pending)",
+            span,
+        )
+        .into())
+    }
+
     /// `pipe(gen, bus)` — consume a (worker) generator and re-emit each yielded
     /// item on a local event bus.
     ///
@@ -461,6 +515,208 @@ impl Interp {
         Ok(Value::nil())
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAR §3.1/§3.3.1 — chunk planner + input classification + callback validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// PAR spec §3.3.1: compute the contractual chunk boundaries for a parallel
+/// operation over `len` elements. The formula is PUBLISHED in the docs and is
+/// part of the `preduce` reproducibility contract — never change it silently.
+///
+/// ```text
+/// chunk_size = max(min_chunk, ceil(len / cap))
+/// chunks     = ceil(len / chunk_size)
+/// chunk i    = [i * chunk_size, min((i+1) * chunk_size, len))
+/// ```
+///
+/// Returns an empty `Vec` for `len == 0` (callers must fast-path empty).
+// Used by the orchestrator (Task 2.2). Suppress dead_code until then.
+#[allow(dead_code)]
+pub(crate) fn chunk_plan(len: usize, cap: usize, min_chunk: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let cap = cap.max(1);
+    let min_chunk = min_chunk.max(1);
+    // ceil(len / cap)
+    let raw_chunk_size = len.div_ceil(cap);
+    let chunk_size = raw_chunk_size.max(min_chunk);
+    // ceil(len / chunk_size)
+    let num_chunks = len.div_ceil(chunk_size);
+    let mut plan = Vec::with_capacity(num_chunks);
+    let mut start = 0;
+    while start < len {
+        let end = (start + chunk_size).min(len);
+        plan.push((start, end));
+        start = end;
+    }
+    plan
+}
+
+/// PAR spec §3.3.1: resolve the worker-pool cap for default chunk count.
+/// Mirrors `src/worker/pool.rs:59-64` — does NOT couple to private pool state.
+pub(crate) fn pool_cap() -> usize {
+    std::env::var("ASCRIPT_WORKERS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(num_cpus::get)
+        .max(1)
+}
+
+/// PAR spec §3.1: the two accepted input forms. Created synchronously inside
+/// `task.pmap`/`task.preduce` — the input is SNAPSHOTTED at call time so mutating
+/// the source array after calling pmap/preduce cannot affect the result.
+// Fields are consumed by Task 2.2 (orchestrator). Suppress dead_code until then.
+#[allow(dead_code)]
+pub(crate) enum ParInput {
+    /// A `Value::Shared` whose frozen node is a `SharedNode::Array` (PAR §3.1 happy
+    /// path). The WHOLE shared value is shipped to each chunk via the `TAG_SHARED`
+    /// side-vector (O(1) `Arc` bump per chunk); the chunk receives `(start, end)`
+    /// index bounds and reads elements zero-copy via the shipped SRV readers.
+    Frozen { shared: Value, len: usize },
+    /// A plain `Value::Array`. Elements are snapshotted here (clone out of the
+    /// `ArrayCell` borrow — never hold the borrow across an `.await`) so per-chunk
+    /// slices can be built from owned `Vec<Value>` slices without re-borrowing.
+    Plain { elems: Vec<Value> },
+}
+
+impl ParInput {
+    /// Number of elements in the input. Used by the orchestrator (Task 2.2).
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ParInput::Frozen { len, .. } => *len,
+            ParInput::Plain { elems } => elems.len(),
+        }
+    }
+}
+
+/// PAR spec §3.1: classify the input for `task.pmap`/`task.preduce`. `fn_name` is
+/// `"task.pmap"` or `"task.preduce"` and is used in the panic message.
+///
+/// Accepted:
+/// - `Value::Shared` whose inner node is `SharedNode::Array` → `ParInput::Frozen`
+/// - `Value::Array` → `ParInput::Plain` (elements snapshotted at call time)
+///
+/// Rejected (Tier-2 panic):
+/// - `Value::Shared` of a non-array node → `"<fn_name> expects an array or a frozen
+///    array (got frozen <kind>)"`
+/// - anything else → `"<fn_name> expects an array or a frozen array (got <kind>)"`
+pub(crate) fn classify_par_input(
+    v: &Value,
+    fn_name: &str,
+    span: Span,
+) -> Result<ParInput, Control> {
+    use crate::value::SharedNode;
+    match v.kind() {
+        ValueKind::Array(a) => {
+            // Snapshot the elements now — never hold the borrow across an await.
+            let elems: Vec<Value> = a.borrow().clone();
+            Ok(ParInput::Plain { elems })
+        }
+        ValueKind::Shared(node) => {
+            // Only a frozen ARRAY is accepted; other frozen kinds are rejected with
+            // the "frozen <kind>" suffix per the spec §4 table.
+            if let SharedNode::Array(arr) = node.as_ref() {
+                let len = arr.len();
+                Ok(ParInput::Frozen {
+                    shared: v.clone(),
+                    len,
+                })
+            } else {
+                Err(AsError::at(
+                    format!(
+                        "{fn_name} expects an array or a frozen array (got frozen {})",
+                        node.kind_name()
+                    ),
+                    span,
+                )
+                .into())
+            }
+        }
+        _ => Err(AsError::at(
+            format!(
+                "{fn_name} expects an array or a frozen array (got {})",
+                crate::interp::type_name(v)
+            ),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// PAR spec §2.2: validate the callback is a named `worker fn` and return its
+/// dispatch name. Reuses `worker_fn_dispatch_name` (promoted to `pub(crate)`) —
+/// never duplicated. `fn_name` is `"task.pmap"` or `"task.preduce"`.
+pub(crate) fn par_callback_name(
+    f: &Value,
+    fn_name: &str,
+    span: Span,
+) -> Result<String, Control> {
+    crate::interp::worker_fn_dispatch_name(f).ok_or_else(|| {
+        AsError::at(
+            format!(
+                "{fn_name} expects a named `worker fn` as its callback (got {})",
+                crate::interp::type_name(f)
+            ),
+            span,
+        )
+        .into()
+    })
+}
+
+/// PAR spec §3.3.1: parse `{chunks?, minChunk?}` opts. Returns `(cap, min_chunk)`.
+/// Unknown keys are ignored (mirroring other stdlib opts). A present key that is not
+/// a positive integer is a Tier-2 panic mirroring `task.retry`'s validation style.
+/// A `nil` opts arg returns the pool-cap default and `min_chunk = 1`.
+pub(crate) fn par_opts(opts: &Value, fn_name: &str, span: Span) -> Result<(usize, usize), Control> {
+    match opts.kind() {
+        ValueKind::Nil => Ok((pool_cap(), 1)),
+        ValueKind::Object(o) => {
+            let cap = match o.get("chunks") {
+                Some(v) => {
+                    let n = super::want_number(&v, span, &format!("{fn_name} chunks"))?;
+                    if n < 1.0 || n.fract() != 0.0 {
+                        return Err(AsError::at(
+                            format!("{fn_name}: chunks must be a positive integer"),
+                            span,
+                        )
+                        .into());
+                    }
+                    n as usize
+                }
+                None => pool_cap(),
+            };
+            let min_chunk = match o.get("minChunk") {
+                Some(v) => {
+                    let n = super::want_number(&v, span, &format!("{fn_name} minChunk"))?;
+                    if n < 1.0 || n.fract() != 0.0 {
+                        return Err(AsError::at(
+                            format!("{fn_name}: minChunk must be a positive integer"),
+                            span,
+                        )
+                        .into());
+                    }
+                    n as usize
+                }
+                None => 1,
+            };
+            Ok((cap, min_chunk))
+        }
+        _ => Err(AsError::at(
+            format!(
+                "{fn_name} opts must be an object or nil, got {}",
+                crate::interp::type_name(opts)
+            ),
+            span,
+        )
+        .into()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Minimal xorshift64* PRNG for retry jitter. Thread-local, seeded from the
 /// system clock. NOT cryptographic — adequate for backoff jitter only.
@@ -632,5 +888,256 @@ print(err != nil)
 "#)
         .await;
         assert_eq!(out, "true\n");
+    }
+
+    // ── PAR Task 2.1: chunk_plan formula tests ──────────────────────────────
+    // These pin the contractual formula from spec §3.3.1 EXACTLY. The formula:
+    //   chunk_size = max(min_chunk, ceil(len / cap))
+    //   boundaries = consecutive (0..len).step_by(chunk_size) pairs
+
+    #[test]
+    fn chunk_plan_contract() {
+        use super::chunk_plan;
+        // (10, 4, 1): chunk_size = max(1, ceil(10/4)) = max(1, 3) = 3
+        assert_eq!(
+            chunk_plan(10, 4, 1),
+            vec![(0, 3), (3, 6), (6, 9), (9, 10)]
+        );
+        // (3, 8, 1): chunk_size = max(1, ceil(3/8)) = max(1, 1) = 1 (chunks > len clamps)
+        assert_eq!(
+            chunk_plan(3, 8, 1),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+        // (100, 8, 16): chunk_size = max(16, ceil(100/8)) = max(16, 13) = 16
+        assert_eq!(
+            chunk_plan(100, 8, 16),
+            vec![(0, 16), (16, 32), (32, 48), (48, 64), (64, 80), (80, 96), (96, 100)]
+        );
+        // (5, 1, 1): chunk_size = max(1, ceil(5/1)) = 5
+        assert_eq!(chunk_plan(5, 1, 1), vec![(0, 5)]);
+        // empty
+        assert!(chunk_plan(0, 8, 1).is_empty());
+    }
+
+    // ── PAR Task 2.1: ParInput classification tests ─────────────────────────
+
+    #[test]
+    fn par_input_plain_array_classifies() {
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::classify_par_input;
+
+        let arr = Value::array(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        let span = Span::new(0, 0);
+        let input = classify_par_input(&arr, "task.pmap", span).expect("should classify plain array");
+        assert_eq!(input.len(), 3);
+        assert!(matches!(input, super::ParInput::Plain { .. }));
+    }
+
+    #[test]
+    fn par_input_non_array_panics_with_correct_message() {
+        use crate::interp::Control;
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::classify_par_input;
+
+        let span = Span::new(0, 0);
+        // A plain object
+        let obj = Value::object(indexmap::IndexMap::new());
+        let result = classify_par_input(&obj, "task.pmap", span);
+        let Err(Control::Panic(e)) = result else { panic!("expected Panic, got Ok") };
+        assert!(
+            e.message.contains("task.pmap expects an array or a frozen array (got object)"),
+            "unexpected message: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn par_input_nil_panics_with_correct_message() {
+        use crate::interp::Control;
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::classify_par_input;
+
+        let span = Span::new(0, 0);
+        let result = classify_par_input(&Value::nil(), "task.preduce", span);
+        let Err(Control::Panic(e)) = result else { panic!("expected Panic, got Ok") };
+        assert!(
+            e.message.contains("task.preduce expects an array or a frozen array (got nil)"),
+            "unexpected message: {}",
+            e.message
+        );
+    }
+
+    // ── PAR Task 2.1: callback validation tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn par_callback_non_worker_fn_panics() {
+        // A non-worker fn callback panics with the correct message.
+        let out = run(r#"
+import * as task from "std/task"
+fn plain(x) { return x }
+let [v, err] = recover(() => task.pmap([1, 2], plain))
+print(err.message)
+"#)
+        .await;
+        assert!(
+            out.contains("task.pmap expects a named `worker fn` as its callback"),
+            "unexpected output: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn par_callback_arrow_fn_panics() {
+        // An arrow (lambda) callback panics with the correct message.
+        let out = run(r#"
+import * as task from "std/task"
+let [v, err] = recover(() => task.pmap([1, 2], (x) => x * 2))
+print(err.message)
+"#)
+        .await;
+        assert!(
+            out.contains("task.pmap expects a named `worker fn` as its callback"),
+            "unexpected output: {out}"
+        );
+    }
+
+    // ── PAR Task 2.1: opts parsing tests ────────────────────────────────────
+
+    #[test]
+    fn par_opts_nil_gives_defaults() {
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::{par_opts, pool_cap};
+
+        let span = Span::new(0, 0);
+        let (cap, min_chunk) = par_opts(&Value::nil(), "task.pmap", span)
+            .expect("nil opts should parse");
+        assert_eq!(cap, pool_cap(), "nil opts cap should equal pool_cap()");
+        assert_eq!(min_chunk, 1);
+    }
+
+    #[test]
+    fn par_opts_chunks_parses() {
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::par_opts;
+        use indexmap::IndexMap;
+
+        let span = Span::new(0, 0);
+        let mut m = IndexMap::new();
+        m.insert("chunks".to_string(), Value::int(4));
+        let opts = Value::object(m);
+        let (cap, min_chunk) = par_opts(&opts, "task.pmap", span)
+            .expect("opts with chunks=4 should parse");
+        assert_eq!(cap, 4);
+        assert_eq!(min_chunk, 1);
+    }
+
+    #[test]
+    fn par_opts_min_chunk_parses() {
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::par_opts;
+        use indexmap::IndexMap;
+
+        let span = Span::new(0, 0);
+        let mut m = IndexMap::new();
+        m.insert("minChunk".to_string(), Value::int(16));
+        let opts = Value::object(m);
+        let (cap, min_chunk) = par_opts(&opts, "task.pmap", span)
+            .expect("opts with minChunk=16 should parse");
+        assert_eq!(min_chunk, 16);
+        let _ = cap; // cap is pool_cap()
+    }
+
+    #[test]
+    fn par_opts_zero_chunks_panics() {
+        use crate::interp::Control;
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::par_opts;
+        use indexmap::IndexMap;
+
+        let span = Span::new(0, 0);
+        let mut m = IndexMap::new();
+        m.insert("chunks".to_string(), Value::int(0));
+        let opts = Value::object(m);
+        let err = par_opts(&opts, "task.pmap", span).unwrap_err();
+        let Control::Panic(e) = err else { panic!("expected Panic") };
+        assert!(
+            e.message.contains("task.pmap: chunks must be a positive integer"),
+            "unexpected message: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn par_opts_fractional_min_chunk_panics() {
+        use crate::interp::Control;
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::par_opts;
+        use indexmap::IndexMap;
+
+        let span = Span::new(0, 0);
+        let mut m = IndexMap::new();
+        m.insert("minChunk".to_string(), Value::float(1.5));
+        let opts = Value::object(m);
+        let err = par_opts(&opts, "task.pmap", span).unwrap_err();
+        let Control::Panic(e) = err else { panic!("expected Panic") };
+        assert!(
+            e.message.contains("task.pmap: minChunk must be a positive integer"),
+            "unexpected message: {}",
+            e.message
+        );
+    }
+
+    // ── PAR Task 2.1: frozen-array classification (feature-gated) ───────────
+
+    #[cfg(feature = "shared")]
+    #[test]
+    fn par_input_frozen_array_classifies() {
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::classify_par_input;
+        use std::sync::Arc;
+
+        let inner: Vec<crate::value::SharedValue> = vec![
+            Arc::new(crate::value::SharedNode::Int(1)),
+            Arc::new(crate::value::SharedNode::Int(2)),
+            Arc::new(crate::value::SharedNode::Int(3)),
+        ];
+        let shared = Value::shared(Arc::new(crate::value::SharedNode::Array(Arc::from(
+            inner.into_boxed_slice(),
+        ))));
+        let span = Span::new(0, 0);
+        let input = classify_par_input(&shared, "task.pmap", span)
+            .expect("frozen array should classify as Frozen");
+        assert!(matches!(input, super::ParInput::Frozen { len: 3, .. }));
+    }
+
+    #[cfg(feature = "shared")]
+    #[test]
+    fn par_input_frozen_non_array_panics_with_frozen_kind_message() {
+        use crate::interp::Control;
+        use crate::span::Span;
+        use crate::value::Value;
+        use super::classify_par_input;
+        use std::sync::Arc;
+
+        // Build a frozen object (not array). SharedMap = Vec<(Arc<str>, SharedValue)>
+        let shared = Value::shared(Arc::new(crate::value::SharedNode::Object(Arc::new(
+            Vec::<(Arc<str>, crate::value::SharedValue)>::new(),
+        ))));
+        let span = Span::new(0, 0);
+        let result = classify_par_input(&shared, "task.pmap", span);
+        let Err(Control::Panic(e)) = result else { panic!("expected Panic, got Ok") };
+        assert!(
+            e.message.contains("task.pmap expects an array or a frozen array (got frozen object)"),
+            "unexpected message: {}",
+            e.message
+        );
     }
 }

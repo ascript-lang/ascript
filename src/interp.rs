@@ -8306,7 +8306,8 @@ pub(crate) fn error_message(err: &Value) -> String {
 /// a named worker fn. Handles both engine representations — a tree-walker
 /// `Value::function` and a VM `Value::closure` (whose `proto` carries the name +
 /// `is_worker`). `run_in_worker`'s first arg must resolve through this.
-fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
+/// PAR §2.2: also used by `task.pmap`/`task.preduce` to validate and resolve the callback.
+pub(crate) fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
     match v.kind() {
         ValueKind::Function(f) if f.is_worker => f.name.as_ref().map(|n| n.to_string()),
         ValueKind::Closure(c) if c.proto.is_worker => {
