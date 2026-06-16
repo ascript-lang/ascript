@@ -152,10 +152,13 @@ stated, results are measured.
   call site's arguments satisfy the callee's annotations (or a field assignment its schema), the
   compiler emits an unchecked call/store; checks remain at every unproven (gradual) boundary —
   sound gradual typing where annotations BUY performance (the loop TypeScript/Sorbet structurally
-  cannot close; Static Python/Cinder precedent). Strictly compiler+checker work: the tree-walker
-  keeps full checks, and elision must be OBSERVABLY invisible (a program that passes checks
-  behaves identically; one that would fail them is, by proof, unreachable — the differential
-  corpus + fuzzer enforce this). `--no-elide` kill switch mirrors `--no-specialize`.
+  cannot close; Static Python/Cinder precedent). Both engines elide identically — the VM via
+  `Op::CallElided` + skipped `Op::CheckLocal` + `proto.ret=None`; the tree-walker via a
+  per-module AST marking pass (`Call.elide_args` / `Stmt::Fn.ret=None`) — so elision is
+  OBSERVABLY invisible by construction (a program that passes checks behaves identically; one
+  that would fail them is, by proof, unreachable — the elide-on vs elide-off differential axis
+  + paranoid mode enforce this). `--no-elide` / `ASCRIPT_NO_ELIDE=1` kill switch; default-OFF
+  opt-in via `--elide` / `ASCRIPT_ELIDE=1`. `--no-elide` kill switch mirrors `--no-specialize`.
   - Spec: `superpowers/specs/2026-06-12-contract-elision-design.md`
   - Plan: `superpowers/plans/2026-06-12-contract-elision.md`
 
