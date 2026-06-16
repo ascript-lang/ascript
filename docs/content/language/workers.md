@@ -500,6 +500,48 @@ just single-core on Windows — never a silent drop.
 
 ---
 
+## Data parallelism: `task.pmap`
+
+The hand-rolled pattern for parallel map is:
+
+```ascript
+import * as task from "std/task"
+import * as array from "std/array"
+
+worker fn score(row) { return row.weight * row.hits }
+
+// Hand-rolled: one pool round-trip per element (~0.23 ms each — swamps small per-element work).
+let futures = array.map(rows, score)
+let results = await task.gather(futures)
+```
+
+`task.pmap` replaces that with a single call that **chunks** the input across the pool (one
+round-trip per chunk, not per element) and merges results **in input order**:
+
+```ascript
+import * as task from "std/task"
+import * as shared from "std/shared"
+
+worker fn score(row) { return row.weight * row.hits }
+worker fn add(a, b)  { return a + b }
+
+// Freeze large read-only input once — crosses each chunk dispatch as one Arc pointer bump.
+let rows  = shared.freeze(loadRows())
+let out   = await task.pmap(rows, score)           // one line; input order guaranteed
+let total = await task.preduce(out, add, 0)        // parallel fold with associative combiner
+```
+
+The upgrade is one line; the result is byte-identical to the sequential version for an associative
+combiner. For large datasets the `shared.freeze` step (see [Shared read-only heap](../stdlib/shared))
+eliminates per-chunk deep copies — the frozen array crosses each dispatch as a single `Arc` pointer
+bump at flat cost regardless of size.
+
+See the full [`std/task` reference](../stdlib/async#data-parallelism----taskpmap--taskpreduce) for
+the chunk-plan formula, the `preduce` associativity contract, the frozen-vs-plain input table,
+error/cancel semantics, and break-even guidance.
+
+---
+
 See also: [Modules & async](modules-async) for the single-isolate `async`/`await`/generator
 model, [`std/task`](../stdlib/async) for `gather`/`race`/`pipe`, and [Shared read-only
 heap](../stdlib/shared) for `shared.freeze`.
