@@ -293,10 +293,17 @@ select!-raced run future is `run_chunk_job(vm, entry, data, job)` instead of one
   shipped SRV readers) or a plain array index clone — both engine-shared `Value`-layer reads.
 - Per-element control flow mirrors the worker top-level rules **exactly**
   (`isolate.rs:398-414`): `Ok(v)` → the element result (a returned `Value::Future` is driven
-  to completion first, the `task.spawn` rule); `Err(Propagate(_))` → that element's result is
-  `nil` (today's "top-level `?` in a worker body ends with nil"); `Err(Panic)` → the chunk
+  to completion first, the `task.spawn` rule); `Err(Panic)` → the chunk
   replies `WorkerReply::Panic` (first element to panic aborts the rest of the chunk);
   `Err(Exit)` → the existing `exit() is not allowed inside a worker` panic.
+  > **CORRECTION (Phase-0 pin, 2026-06-16):** the `Err(Propagate(_)) → nil` arm in the
+  > isolate loop is **dead code** — `run_body` (`interp.rs:5452`) converts a body-level
+  > `?`-propagation to `Ok([nil, err])` BEFORE `call_value` returns, so a `worker fn`
+  > element that ends in `?` yields the `[nil, err]` **pair**, never a raw `Propagate`. The
+  > driver keeps the (dead) arm to mirror `isolate_loop` byte-for-byte, but the OBSERVABLE
+  > per-element result of a propagating callback is the pair — **identical to a direct
+  > worker call / the hand-rolled `gather(map(data, f))`**, which is exactly the
+  > venue-invariance (§5.1) the design requires. The §4 table row is corrected to match.
 - Inside the isolate, calling the `worker fn` entry runs it **as a plain closure** — the
   `in_isolate()` guard on the VM's higher-order re-dispatch path already guarantees no
   recursive pool dispatch (`src/vm/run.rs:4491-4497`).
@@ -355,8 +362,9 @@ snapshot the input, compute the chunk plan, build the slice once, and dispatch e
   cancellation semantics, inherited unchanged and documented as such — PAR adds no
   preemption. The `InflightGuard` keeps the pool's load accounting correct on every
   cancellation path (`mod.rs:20-32`).
-- **`?`-propagation inside `f`**: per element → `nil` result for that element (§3.3.2),
-  exactly the shipped worker top-level rule. The docs recommend returning `[value, err]`
+- **`?`-propagation inside `f`**: per element → the `[nil, err]` **pair** for that element
+  (§3.3.2 CORRECTION — `run_body` converts the propagation to `Ok(pair)`; identical to a
+  direct worker call), exactly the shipped worker top-level rule. The docs recommend returning `[value, err]`
   pairs as data when per-element fallibility matters (they merge in order like any value).
 - **Timeout / race / detach** compose for free because `pmap` returns a normal
   `Value::Future`: `task.timeout(ms, task.pmap(...))` drops the pmap future on timeout →
@@ -423,7 +431,7 @@ The `preduce` contract is stated verbatim in the docs:
 | cyclic plain `data` | works (TAG_REF airlock copy) | §3.1 |
 | cyclic data the user tries to freeze | `shared.freeze` cycle panic at the user's freeze call | shipped SRV behavior |
 | callback panics on element `j` of chunk `i` | chunk `i` replies Panic; pmap re-raises the first panicking chunk **by input order**; later chunks cancelled | §3.5 |
-| `?` propagation inside `f` | that element's result is `nil` | §3.3.2 |
+| `?` propagation inside `f` | that element's result is the `[nil, err]` pair (§3.3.2 correction: `run_body` converts it to `Ok(pair)`) | §3.3.2 |
 | `exit()` inside `f` | `exit() is not allowed inside a worker` panic | shipped, `isolate.rs:411` |
 | `f` returns a non-sendable | encode-time field-path panic from the chunk | §3.7 |
 | caller drops / times out the pmap future | orchestrator aborted; queued chunks never run; in-flight chunks finish-and-discard (documented) | §3.5 |
@@ -491,7 +499,7 @@ unit tests in the in-process style of `dispatch.rs`'s `run_slice_in_fresh_isolat
 7. **Non-sendable capture/diagnostics:** closure inside plain data → field-path send panic;
    non-`worker fn` callback → the §2.2 panic; `f` returning a closure → encode panic;
    non-sendable `init` → up-front panic.
-8. **`?` inside `f`** → `nil` element; `[value, err]` pairs merge as data.
+8. **`?` inside `f`** → the `[nil, err]` pair element (identical to a direct worker call); `[value, err]` pairs merge as data.
 9. **Cancellation:** `task.timeout(small, pmap(slow))` returns the timeout pair; queued
    chunks never execute (observable via a per-chunk side-effect file/counter in the isolate —
    assert fewer than `chunks` markers); the pmap future dropped un-awaited cancels.
@@ -564,7 +572,7 @@ tag set, `Vm.instrument`.
 
 **Examples (Gate 9 — happy AND edge):**
 - `examples/data_parallel.as` — intro: `pmap` over numbers, `preduce` sum, a panicking
-  callback caught with `recover`, the empty-array edge, `?`-in-callback → `nil`.
+  callback caught with `recover`, the empty-array edge, `?`-in-callback → the `[nil, err]` pair.
 - `examples/advanced/data_parallel_pipeline.as` — production-shaped: freeze a dataset,
   `pmap` transform with `[value, err]` per-element error handling, `preduce` aggregate,
   `task.timeout` around the whole pipeline, fully error-handled, order-deterministic output.
