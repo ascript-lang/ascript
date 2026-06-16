@@ -568,4 +568,69 @@ print(counter[0])
         // result is the array [nil, {message:...}], type is "array"; counter == 1 (no retry)
         assert_eq!(out, "array\n1\n");
     }
+
+    // ── PAR Phase 0 pins — shipped semantics the pmap/preduce design composes (spec §3) ──
+
+    /// Pin 1: A top-level `?` propagation inside a worker fn body resolves the call to the
+    /// propagated [nil, err] pair — NOT nil.
+    ///
+    /// SPEC-VS-REALITY NOTE: The PAR plan (Task 0.1) and spec §3 state that `Propagate` from
+    /// a worker body maps to nil (citing `isolate_loop`'s Propagate arm). That arm is dead
+    /// code: `run_body` (src/interp.rs:5452) converts `Control::Propagate(v)` to `Ok(v)` —
+    /// returning the pair — before `call_value` returns, so the isolate boundary never sees
+    /// a raw `Propagate`. Both engines (tree-walker and VM) and both isolate paths (pool and
+    /// dedicated run_in_worker) exhibit `[nil, err]` as the result, not nil.
+    ///
+    /// Consequence for PAR: the chunk driver's per-element "Propagate → nil" rule in spec §3
+    /// is also unreachable. The chunk driver will receive `Ok([nil, err])` from the element
+    /// call, not `Err(Propagate)` — so a propagated error is transparent to pmap (the output
+    /// array element will hold the pair, like any other return value). The PAR spec's
+    /// "Propagate → nil element" needs to be revised before Phase 1 implementation.
+    #[tokio::test]
+    async fn pin_worker_propagate_yields_nil() {
+        // The worker fn uses `?` on a [nil, err] pair; `run_body` converts the propagation
+        // to Ok([nil, err]) before the isolate boundary, so the result is the pair, not nil.
+        let out = run(r#"
+worker fn t(x) {
+    let [v, e] = [nil, {message: "nope"}]
+    let r = [v, e]?
+    return 1
+}
+print(await t(0))
+"#)
+        .await;
+        // ACTUAL behavior: the propagated pair is the worker's return value (not nil).
+        assert_eq!(out, "[nil, {message: \"nope\"}]\n");
+    }
+
+    /// Pin 2: A frozen (shared.freeze) array arg crosses the worker airlock via the TAG_SHARED
+    /// side-vector (Arc bump, not a deep clone) and is readable per-element inside the worker
+    /// body. PAR §3.1 relies on this — frozen input to pmap crosses per-chunk for ~free.
+    /// Gated on `feature = "shared"` (std/shared is not core; workers are core).
+    #[cfg(feature = "shared")]
+    #[tokio::test]
+    async fn pin_frozen_array_arg_crosses_and_reads_in_worker() {
+        let out = run(r#"
+import * as shared from "std/shared"
+worker fn pick(arr, i) { return arr[i] * 10 }
+let f = shared.freeze([1, 2, 3])
+print(await pick(f, 1))
+"#)
+        .await;
+        assert_eq!(out, "20\n");
+    }
+
+    /// Pin 3: run_in_worker's named-worker-fn-only callback rule (spec §2.2). Passing a
+    /// non-worker arrow panics with a recoverable Tier-2 panic. PAR's pmap/preduce will
+    /// mirror this rule (same worker_fn_dispatch_name check). run_in_worker is a bare global
+    /// (BUILTIN_NAMES, interp.rs:178) — no import needed.
+    #[tokio::test]
+    async fn pin_worker_fn_dispatch_name_rules() {
+        let out = run(r#"
+let [v, err] = recover(() => run_in_worker((x) => x, 1))
+print(err != nil)
+"#)
+        .await;
+        assert_eq!(out, "true\n");
+    }
 }
