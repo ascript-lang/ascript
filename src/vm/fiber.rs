@@ -179,6 +179,21 @@ impl Fiber {
             .expect("Fiber::local slot out of bounds (compiler bug)")
     }
 
+    /// REGION §3.1: mutable access to local slot `slot` of the current frame, so a
+    /// kill-site can `std::mem::replace` the dying (about-to-be-overwritten) value
+    /// out without an extra clone. Same indexing as [`local`](Self::local).
+    ///
+    /// # Panics
+    /// If the resulting index is out of bounds (a VM bug, not user error).
+    #[cfg(feature = "region-spike")]
+    pub fn local_mut(&mut self, slot: usize) -> &mut Value {
+        let base = self.frame().slot_base;
+        let idx = base + slot;
+        self.stack
+            .get_mut(idx)
+            .expect("Fiber::local_mut slot out of bounds (compiler bug)")
+    }
+
     /// Write local slot `slot` of the current frame.
     ///
     /// # Panics

@@ -185,6 +185,19 @@ fuzzgen = ["dep:arbitrary"]
 # no `.aso` change, no grammar change. Measures the VM only (region activation is VM-only); the
 # tree-walker literal sites are NOT classified `Literal` in v1.
 region-probe = []
+# REGION Phase 1 (spec §3): the `region-spike` proven-dead `ObjectCell` recycler. NON-default,
+# spike-local during bring-up (productionization to default-on is conditional on a recorded GO,
+# plan Phase 3). Under this feature the `Vm` gains a `region: Option<RefCell<RegionPool>>` (a
+# per-isolate pool of dead `Cc<ObjectCell>`s), the `Op::NewObject` alloc-site pops a recycled cell,
+# and the `SetLocal`/`Pop` kill-sites flagged by `region_candidates` recycle the dying value when
+# `strong_count() == 1` (the runtime deadness proof). ZERO overhead when off: the `RegionPool` type,
+# the `Vm.region` field, and every kill/alloc-site branch are `#[cfg(feature = "region-spike")]`, so
+# a default build is byte-identical to pre-REGION (the differential proves 444/0 both configs).
+# Region mode is active iff: `specialize` (VM specialized mode) AND `region-spike` built AND
+# `ASCRIPT_NO_REGIONS` unset (the permanent kill switch). BYTE-INVISIBLE by construction — a
+# recycled cell produces identical program output to a fresh cell (proven by region-on == region-off
+# differential). No `.aso` change, no grammar change.
+region-spike = []
 # DECODE §5.1 (Unit B part 1): the decoded-dispatch PAIR/TRIPLE census. NON-default —
 # the counting mode (the burst-local `prev`/`prev2` tracking + the `(DOp,DOp[,DOp])`
 # frequency tables) is FULLY `#[cfg(feature = "decode-census")]`, so a default

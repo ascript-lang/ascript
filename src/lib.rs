@@ -1062,6 +1062,65 @@ pub async fn vm_run_source_call_fast_stats(
     Ok((pair.0, pair.1, stats))
 }
 
+/// REGION §3 (Task 1.3): like [`vm_run_source`] but runs with the proven-dead
+/// `ObjectCell` recycler ACTIVE (specialized VM, region mode on) and returns the
+/// pool stats `(recycled, reused, overflow, miss)` after the run. Used by the
+/// region tests to assert the loop-churn coverage (`recycled > 0 && reused > 0`),
+/// that an escaping object misses, and that output is byte-identical to a
+/// region-off run. `#[doc(hidden)]` — spike-local, not a stable API.
+#[cfg(feature = "region-spike")]
+#[doc(hidden)]
+pub async fn vm_run_source_region_stats(
+    src: &str,
+) -> Result<(String, Option<i32>, (u64, u64, u64, u64)), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+        region_kills: RefCell::new(None),
+    });
+    let closure = Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // specialize=true → region mode ACTIVE (ASCRIPT_NO_REGIONS must be unset).
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    debug_assert!(vm.region_active(), "region mode must be active for the stats entry point (is ASCRIPT_NO_REGIONS set?)");
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    let stats = vm.region_stats();
+    let pair = match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }?;
+    Ok((pair.0, pair.1, stats))
+}
+
 /// SHAPE §3.5: like [`vm_run_source`] but also returns the storage-mode counters
 /// `(slab_constructed, dict_constructed, demotions)` after the run completes.
 /// Used by `tests/vm_differential.rs` to assert Gate 15 (both modes + demotion

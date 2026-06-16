@@ -830,6 +830,24 @@ pub struct Vm {
     /// worker `Interp`/`Vm` is built fresh with `elide=false`; worker slices keep
     /// full checks, §4.6).
     elide: std::cell::Cell<bool>,
+    /// **REGION §3.4 — the proven-dead `ObjectCell` recycler pool.** `Some` IFF
+    /// region mode is active: `specialize` (the VM specialized fast paths are on,
+    /// mirroring every other PERF fast path) AND the `region-spike` feature is built
+    /// AND `ASCRIPT_NO_REGIONS` is unset (the permanent kill switch, Gate 15,
+    /// mirroring `--no-specialize`). RESOLVED ONCE at construction (the env is never
+    /// read on the hot path) — so the off-path in every handler is a single
+    /// predictable `if let Some(pool) = &self.region` branch, taken ONLY at flagged
+    /// kill offsets and at `Op::NewObject`. The tree-walker and the generic
+    /// (`!specialize`) VM are PERMANENT plain-allocator oracles (`region == None`),
+    /// so a region BUG presents as a specialized-vs-oracle differential divergence —
+    /// the failure class the differential exists to catch (the IC/adaptive posture).
+    ///
+    /// The field DOES NOT EXIST in a non-`region-spike` build (the JIT-spec "not
+    /// there" discipline — zero Gate-12 exposure; the default build is byte-identical
+    /// to pre-REGION). `RefCell` because a `&self` handler borrows the pool for a
+    /// short synchronous kill/alloc/trim — NEVER held across `.await`.
+    #[cfg(feature = "region-spike")]
+    region: Option<RefCell<crate::vm::region::RegionPool>>,
 }
 
 /// DBG: the final path component of a `/`- or `\`-separated path (the file name),
@@ -984,6 +1002,16 @@ impl Vm {
             decode_stats: std::cell::Cell::new(DecodeStatsInner::default()),
             #[cfg(feature = "decode-census")]
             census: RefCell::new(None),
+            // REGION §3.4: resolve region mode ONCE. Active iff specialized AND the
+            // kill switch is unset (the feature gate is the `#[cfg]` itself).
+            #[cfg(feature = "region-spike")]
+            region: if specialize
+                && std::env::var("ASCRIPT_NO_REGIONS").as_deref() != Ok("1")
+            {
+                Some(RefCell::new(crate::vm::region::RegionPool::new()))
+            } else {
+                None
+            },
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -1050,6 +1078,148 @@ impl Vm {
     #[inline]
     pub(crate) fn bump_trampoline_escalation(&self) {
         self.bump_stat(|s| s.trampoline_escalations += 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // REGION §3 — kill-site / alloc-site / task-trim helpers (region-spike only)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// REGION §3.1 KILL-SITE: at a flagged `SetLocal`-overwrite / `Pop` offset, try
+    /// to recycle the dying value into the per-`Vm` pool. The pool's
+    /// `try_recycle` runs the `strong_count() == 1` deadness proof; a miss / full
+    /// pool hands the value back, which is then dropped here normally. No-op (and
+    /// the value dropped) when region mode is off. The pool borrow is scoped to this
+    /// synchronous body — NEVER held across `.await`.
+    #[cfg(feature = "region-spike")]
+    #[inline]
+    fn region_kill(&self, dying: crate::value::Value) {
+        if let Some(pool) = &self.region {
+            // try_recycle returns Some(value) on a miss → drop it here; None when
+            // pooled. Either way the value's fate is resolved synchronously.
+            let _ = pool.borrow_mut().try_recycle(dying);
+        }
+        // When region is None this fn is never reached (the call site is gated on
+        // the flagged-offset check, which is gated on `region.is_some()`).
+    }
+
+    /// REGION §3.1: whether the dying value at `fault_ip` in the current frame's
+    /// proto is a FLAGGED kill site (a `region_candidates` selection). Builds the
+    /// per-`Chunk` `region_kills` bitmap LAZILY on first region-mode execution (the
+    /// `arith_caches` side-table precedent — no `.aso` touch). Returns `false` when
+    /// region mode is off (fast: `self.region` is `None`).
+    #[cfg(feature = "region-spike")]
+    #[inline]
+    fn region_is_kill_site(&self, fiber: &Fiber, fault_ip: usize) -> bool {
+        if self.region.is_none() {
+            return false;
+        }
+        let proto = &fiber.frame().closure.proto;
+        // Lazily build the per-proto kill bitmap once (the `region_kills` field is
+        // on `FnProto`, the `arith_caches` side-table precedent — rebuilt from
+        // bytecode, never serialized).
+        {
+            let built = proto.region_kills.borrow().is_some();
+            if !built {
+                let plan = crate::vm::bcanalysis::region_candidates(proto);
+                let mut bitmap = vec![false; proto.chunk.code.len()].into_boxed_slice();
+                for off in plan.kills {
+                    if off < bitmap.len() {
+                        bitmap[off] = true;
+                    }
+                }
+                *proto.region_kills.borrow_mut() = Some(bitmap);
+            }
+        }
+        proto
+            .region_kills
+            .borrow()
+            .as_ref()
+            .map(|b| fault_ip < b.len() && b[fault_ip])
+            .unwrap_or(false)
+    }
+
+    /// REGION §3.4 TASK-TRIM: trim the per-`Vm` pool toward its floor at task exit
+    /// (called by [`crate::vm::region::RegionScope`]'s `Drop`). No-op when region
+    /// mode is off.
+    #[cfg(feature = "region-spike")]
+    pub(crate) fn region_trim(&self) {
+        if let Some(pool) = &self.region {
+            pool.borrow_mut().trim();
+        }
+    }
+
+    /// REGION: a weak handle to this `Vm` for a [`RegionScope`](crate::vm::region::RegionScope).
+    #[cfg(feature = "region-spike")]
+    pub(crate) fn region_scope(&self) -> crate::vm::region::RegionScope {
+        crate::vm::region::RegionScope::new(self.self_weak.borrow().clone())
+    }
+
+    /// REGION (test/inspection): snapshot the pool stats `(recycled, reused,
+    /// overflow, miss)`, or all-zero when region mode is off.
+    #[cfg(feature = "region-spike")]
+    #[doc(hidden)]
+    pub fn region_stats(&self) -> (u64, u64, u64, u64) {
+        match &self.region {
+            Some(pool) => {
+                let p = pool.borrow();
+                (
+                    p.stats.recycled(),
+                    p.stats.reused(),
+                    p.stats.overflow(),
+                    p.stats.miss(),
+                )
+            }
+            None => (0, 0, 0, 0),
+        }
+    }
+
+    /// REGION (test/inspection): whether region mode is active on this `Vm`.
+    #[cfg(feature = "region-spike")]
+    #[doc(hidden)]
+    pub fn region_active(&self) -> bool {
+        self.region.is_some()
+    }
+
+    /// REGION §3.1 ALLOC-SITE: build a slab-mode `Op::NewObject` result, REUSING a
+    /// pooled dead cell when region mode is on and one is available, else freshly
+    /// allocating. The reused cell is reset (`region_reset_to_slab`) onto the SAME
+    /// `shape` verdict + key list a fresh cell would take — so the recycled cell is
+    /// byte-identical to a freshly-allocated one (no shape-id staleness; this is the
+    /// IDENTICAL shape-assignment path). When region mode is off this is exactly
+    /// `ObjectCell::new_slab`.
+    #[cfg(feature = "region-spike")]
+    #[inline]
+    fn region_obtain_slab(
+        &self,
+        keys: Rc<[Rc<str>]>,
+        values: Vec<Value>,
+        shape: u32,
+    ) -> Cc<crate::value::ObjectCell> {
+        if let Some(pool) = &self.region {
+            if let Some(cc) = pool.borrow_mut().take_object() {
+                cc.region_reset_to_slab(keys, values, shape);
+                return cc;
+            }
+        }
+        crate::value::ObjectCell::new_slab(keys, values, shape)
+    }
+
+    /// REGION §3.1 ALLOC-SITE: the dict-mode (cap-refused `Negative`) analog of
+    /// [`region_obtain_slab`](Self::region_obtain_slab). Reuses a pooled cell reset
+    /// to dict storage at shape 0, exactly as `ObjectCell::new(map)` would produce.
+    #[cfg(feature = "region-spike")]
+    #[inline]
+    fn region_obtain_dict(
+        &self,
+        map: indexmap::IndexMap<String, Value>,
+    ) -> Cc<crate::value::ObjectCell> {
+        if let Some(pool) = &self.region {
+            if let Some(cc) = pool.borrow_mut().take_object() {
+                cc.region_reset_to_dict(map);
+                return cc;
+            }
+        }
+        crate::value::ObjectCell::new(map)
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -2422,6 +2592,18 @@ impl Vm {
                 Op::True => fiber.push(Value::bool_(true)),
                 Op::False => fiber.push(Value::bool_(false)),
                 Op::Pop => {
+                    // REGION §3.1 kill-site: a flagged scope-end `Pop` of a dead
+                    // local object recycles the popped value (the `strong_count()==1`
+                    // proof runs in the pool). v1's `region_candidates` records only
+                    // `SetLocal` offsets, so this branch is currently never flagged —
+                    // wired for forward-compat with the staged Pop-kill site class.
+                    #[cfg(feature = "region-spike")]
+                    if self.region_is_kill_site(fiber, fault_ip) {
+                        self.region_kill(fiber.pop());
+                    } else {
+                        fiber.pop();
+                    }
+                    #[cfg(not(feature = "region-spike"))]
                     fiber.pop();
                 }
                 Op::Dup => {
@@ -2612,6 +2794,16 @@ impl Vm {
                     let slot =
                         fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.pop();
+                    // REGION §3.1 kill-site: at a flagged `SetLocal s` (the loop
+                    // back-edge `NewObject; SetLocal s` reuse shape) the value being
+                    // OVERWRITTEN in slot `s` dies here. Capture it before the store
+                    // and try to recycle (the `strong_count()==1` deadness proof
+                    // runs in the pool). Off-path is a single predictable branch.
+                    #[cfg(feature = "region-spike")]
+                    if self.region_is_kill_site(fiber, fault_ip) {
+                        let dying = std::mem::replace(fiber.local_mut(slot), Value::nil());
+                        self.region_kill(dying);
+                    }
                     fiber.set_local(slot, v);
                 }
 
@@ -4281,6 +4473,15 @@ impl Vm {
                 Op::True => fiber.push(Value::bool_(true)),
                 Op::False => fiber.push(Value::bool_(false)),
                 Op::Pop => {
+                    // REGION §3.1 kill-site (async lane mirror of the sync lane).
+                    // v1 flags only `SetLocal` offsets, so this is never flagged yet.
+                    #[cfg(feature = "region-spike")]
+                    if self.region_is_kill_site(fiber, fault_ip) {
+                        self.region_kill(fiber.pop());
+                    } else {
+                        fiber.pop();
+                    }
+                    #[cfg(not(feature = "region-spike"))]
                     fiber.pop();
                 }
                 Op::Dup => {
@@ -4500,6 +4701,14 @@ impl Vm {
                     // remains as the expression's result (see `compile_assign`).
                     let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.pop();
+                    // REGION §3.1 kill-site (async lane mirror of the sync lane): the
+                    // value being OVERWRITTEN in slot `s` dies at a flagged
+                    // `SetLocal s`. Capture-and-recycle before the store.
+                    #[cfg(feature = "region-spike")]
+                    if self.region_is_kill_site(fiber, fault_ip) {
+                        let dying = std::mem::replace(fiber.local_mut(slot), Value::nil());
+                        self.region_kill(dying);
+                    }
                     fiber.set_local(slot, v);
                 }
 
@@ -4923,6 +5132,9 @@ impl Vm {
                                 // REGION probe (spec §5.2): bracket this VM async task body.
                                 #[cfg(feature = "region-probe")]
                                 let _region_task = crate::vm::region_probe::enter_task();
+                                // REGION §3.4: trim the per-Vm pool at task exit.
+                                #[cfg(feature = "region-spike")]
+                                let _region_scope = vm.region_scope();
                                 let r =
                                     vm.call_value(Value::closure(callee), args, call_span).await;
                                 cell.resolve(r);
@@ -9415,6 +9627,11 @@ impl Vm {
                 // REGION probe (spec §5.2): bracket this VM async-fn task body.
                 #[cfg(feature = "region-probe")]
                 let _region_task = crate::vm::region_probe::enter_task();
+                // REGION §3.4: trim the per-Vm pool when this task body exits
+                // (normal return OR cancel-on-drop — abort runs destructors). A plain
+                // owned guard across the body's awaits; no RefCell borrow is held.
+                #[cfg(feature = "region-spike")]
+                let _region_scope = vm.region_scope();
                 let r = vm.call_value(Value::closure(closure), args, span).await;
                 cell.resolve(r);
             });
@@ -9550,6 +9767,11 @@ impl Vm {
                             }
                         }
                     }
+                    // REGION §3.1: reuse a pooled dead cell when available — the
+                    // reused cell takes the IDENTICAL shape path (same `shape`).
+                    #[cfg(feature = "region-spike")]
+                    let cell = self.region_obtain_slab(keys, values, shape);
+                    #[cfg(not(feature = "region-spike"))]
                     let cell = crate::value::ObjectCell::new_slab(keys, values, shape);
                     // SHAPE §3.5: count this warm-hit slab build.
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
@@ -9659,7 +9881,15 @@ impl Vm {
                     // SHAPE §3.5: count this generic-path slab build.
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                     self.bump_shape_stat(|s| s.obj_slab_constructed += 1);
-                    crate::value::ObjectCell::new_slab(keys, values, shape)
+                    // REGION §3.1: reuse a pooled dead cell — identical shape path.
+                    #[cfg(feature = "region-spike")]
+                    {
+                        self.region_obtain_slab(keys, values, shape)
+                    }
+                    #[cfg(not(feature = "region-spike"))]
+                    {
+                        crate::value::ObjectCell::new_slab(keys, values, shape)
+                    }
                 }
                 None => {
                     drop(reg);
@@ -9679,7 +9909,15 @@ impl Vm {
                     // SHAPE §3.5: count this fresh-dict build (cap refused).
                     #[cfg(any(test, feature = "fuzzgen", fuzzing))]
                     self.bump_shape_stat(|s| s.obj_dict_constructed += 1);
-                    crate::value::ObjectCell::new(map)
+                    // REGION §3.1: reuse a pooled dead cell — identical dict path.
+                    #[cfg(feature = "region-spike")]
+                    {
+                        self.region_obtain_dict(map)
+                    }
+                    #[cfg(not(feature = "region-spike"))]
+                    {
+                        crate::value::ObjectCell::new(map)
+                    }
                 }
             }
         };
@@ -12297,6 +12535,9 @@ mod tests {
             // REGION probe (spec §5.2): bracket this VM-produced-future task body.
             #[cfg(feature = "region-probe")]
             let _region_task = crate::vm::region_probe::enter_task();
+            // REGION §3.4: trim the per-Vm pool at task exit.
+            #[cfg(feature = "region-spike")]
+            let _region_scope = vm2.region_scope();
             let r = vm2.call_value(closure, args, s()).await;
             cell.resolve(r);
         });

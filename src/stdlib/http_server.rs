@@ -1394,6 +1394,13 @@ impl Interp {
                 // task and retired on drop — the same seam `RegionScope` will use.
                 #[cfg(feature = "region-probe")]
                 let _region_task = crate::vm::region_probe::enter_task();
+                // REGION §3.4: trim the per-Vm pool at request end (beside the
+                // existing gc safe point) — bounds request-shaped pool growth. `vm`
+                // here is the `Rc<Interp>`; the region pool lives on the `Vm`, reached
+                // via the registered weak. A plain owned guard across the handler's
+                // awaits — no RefCell borrow held.
+                #[cfg(feature = "region-spike")]
+                let _region_scope = vm.vm().map(|v| v.region_scope());
                 vm.handle_connection(id, stream, max_body, timeout_ms, span)
                     .await;
             });

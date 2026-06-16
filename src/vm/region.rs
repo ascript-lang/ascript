@@ -29,6 +29,213 @@ pub fn object_cell_strong_count(cell: &gcmodule::Cc<crate::value::ObjectCell>) -
     cell.strong_count()
 }
 
+// ---------------------------------------------------------------------------
+// REGION §3 — the proven-dead `ObjectCell` recycler (the `region-spike` engine
+// change the Phase-2 A/B measures).
+//
+// The pool captures dead object cells at flagged kill sites (`SetLocal`
+// overwrite / `Pop`, selected by `region_candidates`) when the dying value is a
+// uniquely-owned `Value::Object` (`strong_count() == 1` — the runtime deadness
+// proof), and hands them back at `Op::NewObject` instead of `Cc::new`. Pooled
+// cells stay in gcmodule's object space (their `Trace` visits an emptied
+// container → nothing), capacity-only, bounded by `cap`. NO unsafe.
+//
+// Soundness rests ENTIRELY on the `strong_count() == 1` guard, never on the
+// static analysis (spec §3.3): a self-edge / live alias has count ≥ 2 → the
+// check misses → the normal drop path → the cycle collector reclaims as today.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "region-spike")]
+pub use spike::{RegionPool, RegionScope, RegionStats};
+
+#[cfg(feature = "region-spike")]
+mod spike {
+    use crate::value::{ObjectCell, OwnedKind, Value};
+    use gcmodule::Cc;
+    use std::cell::Cell;
+
+    /// Default per-`Vm` pool capacity (spec §2.4). Overridable via
+    /// `ASCRIPT_REGION_POOL_CAP`; a recycle into a full pool falls through to the
+    /// normal drop (overflow stat bumped). Bounds memory held across a task's awaits.
+    pub const DEFAULT_REGION_POOL_CAP: usize = 256;
+
+    /// Read `ASCRIPT_REGION_POOL_CAP` (parseable, > 0) or the default. Resolved once
+    /// at pool construction so the env is not read on the hot path.
+    fn resolved_cap() -> usize {
+        std::env::var("ASCRIPT_REGION_POOL_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(DEFAULT_REGION_POOL_CAP)
+    }
+
+    /// REGION §6.7 / Gate-18 coverage counters. `Cell<u64>` so a `&self` pool can
+    /// bump them on the synchronous kill/alloc paths (never across `.await`).
+    /// Asserted in the coverage tests (anti-false-green, Gate 15).
+    #[derive(Default)]
+    pub struct RegionStats {
+        /// Cells captured into the pool at a kill site (a successful recycle).
+        recycled: Cell<u64>,
+        /// Cells handed back at `Op::NewObject` (a successful reuse).
+        reused: Cell<u64>,
+        /// Recycle attempts refused because the pool was full (the value was dropped
+        /// normally). A growing overflow is the §2.4 memory-pressure signal.
+        overflow: Cell<u64>,
+        /// Kill-site checks that found the dying value NOT uniquely owned
+        /// (`strong_count() != 1`) or not a `Value::Object` — the normal drop path.
+        miss: Cell<u64>,
+    }
+
+    impl RegionStats {
+        pub fn recycled(&self) -> u64 {
+            self.recycled.get()
+        }
+        pub fn reused(&self) -> u64 {
+            self.reused.get()
+        }
+        pub fn overflow(&self) -> u64 {
+            self.overflow.get()
+        }
+        pub fn miss(&self) -> u64 {
+            self.miss.get()
+        }
+        #[inline]
+        fn bump(c: &Cell<u64>) {
+            c.set(c.get() + 1);
+        }
+    }
+
+    /// Per-`Vm` (per-isolate) pool of proven-dead `Cc<ObjectCell>`s (spec §3.1).
+    pub struct RegionPool {
+        /// The recycled cells. A `Vec` used as a LIFO stack (the most-recently-freed
+        /// cell is the hottest in cache). Bounded by `cap`.
+        objects: Vec<Cc<ObjectCell>>,
+        /// Maximum pooled cells (`ASCRIPT_REGION_POOL_CAP`, default 256).
+        cap: usize,
+        /// Gate-18 stats.
+        pub stats: RegionStats,
+    }
+
+    impl Default for RegionPool {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl RegionPool {
+        /// A fresh empty pool with the env-resolved cap.
+        pub fn new() -> Self {
+            RegionPool {
+                objects: Vec::new(),
+                cap: resolved_cap(),
+                stats: RegionStats::default(),
+            }
+        }
+
+        /// The number of currently-pooled cells (test/inspection only).
+        pub fn len(&self) -> usize {
+            self.objects.len()
+        }
+
+        /// `true` when the pool holds no cells.
+        pub fn is_empty(&self) -> bool {
+            self.objects.is_empty()
+        }
+
+        /// The configured cap.
+        pub fn cap(&self) -> usize {
+            self.cap
+        }
+
+        /// KILL-SITE path (spec §3.1/§3.3). `dying` is the value just removed from
+        /// its slot/stack at a flagged kill offset. Returns `Some(value)` to hand
+        /// back if NOT recyclable (the caller drops it normally); returns `None`
+        /// when the cell was captured into the pool (the caller does nothing).
+        ///
+        /// Recyclable iff: `dying` is a `Value::Object`, its `Cc` is uniquely owned
+        /// (`strong_count() == 1` — the deadness proof: no live alias, no container
+        /// edge, no upvalue, no Rust temporary holds it), AND the pool has room.
+        /// On success the cell is emptied IN PLACE (capacity retained — the win) and
+        /// pushed.
+        pub fn try_recycle(&mut self, dying: Value) -> Option<Value> {
+            // Borrow the Cc to probe the count WITHOUT consuming `dying` (so a miss
+            // hands the original value back unmoved).
+            {
+                let crate::value::ValueKind::Object(cc) = dying.kind() else {
+                    RegionStats::bump(&self.stats.miss);
+                    return Some(dying);
+                };
+                if super::object_cell_strong_count(cc) != 1 {
+                    RegionStats::bump(&self.stats.miss);
+                    return Some(dying);
+                }
+            }
+            if self.objects.len() >= self.cap {
+                RegionStats::bump(&self.stats.overflow);
+                return Some(dying);
+            }
+            // Proven dead + room: take the owned Cc and pool it.
+            let OwnedKind::Object(cc) = dying.into_kind() else {
+                // Unreachable — `kind()` above already proved Object; keep total.
+                unreachable!("region try_recycle: kind() said Object but into_kind() did not");
+            };
+            cc.region_clear_for_pool();
+            self.objects.push(cc);
+            RegionStats::bump(&self.stats.recycled);
+            None
+        }
+
+        /// ALLOC-SITE path (spec §3.1). `Op::NewObject` in region mode pops a pooled
+        /// cell if available. The CALLER then resets it (`region_reset_to_slab` /
+        /// `region_reset_to_dict`) onto the SAME shape verdict a fresh cell takes,
+        /// so the reused cell is byte-identical to a freshly-allocated one (no
+        /// shape-id staleness). Returns `None` when the pool is empty (the caller
+        /// falls back to `Cc::new`).
+        pub fn take_object(&mut self) -> Option<Cc<ObjectCell>> {
+            let cc = self.objects.pop()?;
+            RegionStats::bump(&self.stats.reused);
+            Some(cc)
+        }
+
+        /// TASK-END trim (spec §2.4) — release the pool down to a floor (`cap / 8`)
+        /// so a long-lived/finished task does not pin the full capacity. Called by
+        /// [`RegionScope::drop`]. Dropped cells fall to the normal refcount/collector
+        /// reclaim path.
+        pub fn trim(&mut self) {
+            self.objects.truncate(self.cap / 8);
+        }
+    }
+
+    /// RAII task-region guard (spec §3.4). Created at each `spawn_local` task body
+    /// and the `http.serve` per-request handler; its `Drop` trims the per-`Vm` pool
+    /// toward a floor (memory bounding — NOT correctness; recycled cells are proven
+    /// dead, so cross-task reuse within an isolate is harmless). Cancel-on-drop tasks
+    /// trim via this same `Drop` (abort runs destructors).
+    ///
+    /// Holds a `std::rc::Weak<crate::vm::Vm>` (NOT a strong `Rc`) so the guard never
+    /// keeps the `Vm` alive past its own lifetime; the trim is a no-op if the `Vm` is
+    /// already gone. A plain owned value across the body's `.await`s — no `RefCell`
+    /// borrow is held, so the no-borrow-across-await invariant is untouched.
+    pub struct RegionScope {
+        vm: std::rc::Weak<crate::vm::Vm>,
+    }
+
+    impl RegionScope {
+        /// Bracket a task with a region-trim guard. `vm` is held weakly.
+        pub fn new(vm: std::rc::Weak<crate::vm::Vm>) -> Self {
+            RegionScope { vm }
+        }
+    }
+
+    impl Drop for RegionScope {
+        fn drop(&mut self) {
+            if let Some(vm) = self.vm.upgrade() {
+                vm.region_trim();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::object_cell_strong_count;
@@ -94,10 +301,10 @@ mod tests {
         assert_eq!(object_cell_strong_count(&a), 1);
     }
 
-    // TODO (Task 1.3): the self-referential kill-point case — build `obj.me = obj`
-    // through the engine so the cell holds a Value::Object edge back to itself,
-    // then assert strong_count >= 2 at the would-be kill point (a self-cycle is a
-    // live alias and MUST NOT be recycled). Deferred to Task 1.3: constructing a
-    // cyclic object via the engine needs VM/value-mutation machinery not wired in
-    // this accessor-only task. Not load-bearing for the count-semantics pin here.
+    // Task 1.3: the self-referential kill-point case (`obj.me = obj` → strong_count
+    // >= 2 at the would-be kill point, a self-cycle that MUST NOT be recycled) is
+    // exercised end-to-end through the engine in `tests/region.rs`
+    // (`self_referential_object_is_not_recycled`), where the VM/value-mutation
+    // machinery is available. The count-semantics pins above are the accessor-level
+    // ground truth that test builds on.
 }

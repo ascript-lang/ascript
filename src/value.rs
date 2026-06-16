@@ -353,6 +353,56 @@ impl ObjectCell {
         })
     }
 
+    /// REGION §3.1 — reset a recycled cell to the EXACT state a freshly
+    /// `ObjectCell::new_slab(keys, values, shape)` cell would have: slab storage,
+    /// the given `shape`, and `frozen` cleared. Used ONLY by the region recycler at
+    /// `Op::NewObject` reuse; the kill-site already cleared the prior contents and
+    /// proved `strong_count() == 1` (sole owner), so overwriting storage in place is
+    /// sound. The reused cell takes the IDENTICAL shape-assignment path a fresh cell
+    /// takes (the `shape` arg is the registry verdict — no shape-id staleness).
+    ///
+    /// # Panics (debug)
+    /// Panics if `keys.len() != values.len()` (the slab invariant).
+    #[cfg(feature = "region-spike")]
+    pub(crate) fn region_reset_to_slab(&self, keys: Rc<[Rc<str>]>, values: Vec<Value>, shape: u32) {
+        debug_assert_eq!(
+            keys.len(),
+            values.len(),
+            "region_reset_to_slab: keys.len()={} != values.len()={}",
+            keys.len(),
+            values.len()
+        );
+        *self.storage.borrow_mut() = ObjectStorage::Slab { keys, values };
+        self.shape.set(shape);
+        self.frozen.set(false);
+    }
+
+    /// REGION §3.1 — reset a recycled cell to the EXACT state a freshly
+    /// `ObjectCell::new(map)` cell would have: dict storage, shape `0`
+    /// (EMPTY_SHAPE), and `frozen` cleared. The cap-refused (`Negative`) fallback
+    /// analog of [`region_reset_to_slab`](Self::region_reset_to_slab).
+    #[cfg(feature = "region-spike")]
+    pub(crate) fn region_reset_to_dict(&self, map: IndexMap<String, Value>) {
+        *self.storage.borrow_mut() = ObjectStorage::Dict(map);
+        self.shape.set(0);
+        self.frozen.set(false);
+    }
+
+    /// REGION §3.1 — empty this cell IN PLACE for pooling (kill-site path). Drops
+    /// all contained values (releasing their strong refs) but RETAINS the storage
+    /// allocation's capacity — the recycling win. Resets `shape`/`frozen` so no
+    /// state leaks into the cell's next life. The caller has already proven
+    /// `strong_count() == 1`, so no live alias observes this mutation.
+    #[cfg(feature = "region-spike")]
+    pub(crate) fn region_clear_for_pool(&self) {
+        match &mut *self.storage.borrow_mut() {
+            ObjectStorage::Slab { values, .. } => values.clear(),
+            ObjectStorage::Dict(m) => m.clear(),
+        }
+        self.shape.set(0);
+        self.frozen.set(false);
+    }
+
     /// Whether this object has been frozen by `object.freeze`.
     pub fn is_frozen(&self) -> bool {
         self.frozen.get()

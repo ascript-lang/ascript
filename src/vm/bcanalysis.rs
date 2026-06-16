@@ -747,8 +747,21 @@ pub(crate) fn region_candidates(proto: &FnProto) -> RegionPlan {
     }
 
     // Pass 2: for each candidate, walk the live range and check for disqualifiers.
+    //
+    // The object stored at `SetLocal s` is dead at its NEXT slot-`s` overwrite — in
+    // a loop body that is the loop's own back-edge re-running `NewObject; SetLocal s`
+    // (the SAME flagged offset; the OLD/prior-iteration object dies there). So two
+    // straight-line live-range terminators SELECT the candidate (the runtime
+    // `strong_count()==1` guard is the soundness backstop, spec §3.3):
+    //   1. a SECOND `SetLocal s` (an explicit re-store of the same slot) reached
+    //      before any disqualifier — the prior value dies at the overwrite;
+    //   2. an `Op::Loop` (backward jump) whose target is at or before this
+    //      candidate's `NewObject` — the loop re-enters the construction, so the
+    //      slot's value is overwritten next iteration. A FORWARD jump still rejects
+    //      (non-linear range we do not model).
     let mut kills = Vec::new();
     'cand: for (set_local_ip, slot) in candidates {
+        let new_object_ip = set_local_ip - 3; // the `NewObject` preceding the SetLocal
         let range_start = set_local_ip + 3; // first instruction AFTER SetLocal
         let mut ip2 = range_start;
         while ip2 < n {
@@ -757,6 +770,31 @@ pub(crate) fn region_candidates(proto: &FnProto) -> RegionPlan {
                 continue 'cand;
             };
             let w = op.operand_width();
+
+            // --- Straight-line live-range TERMINATORS (SELECT) ---
+            // A re-store of slot `s` (the death of the value currently in `s`).
+            if op == Op::SetLocal {
+                let s = chunk.read_u16(ip2 + 1);
+                if s == slot {
+                    // The value in slot `s` dies here (overwritten). The candidate's
+                    // own offset is the kill site for this slot's prior value — select.
+                    kills.push(set_local_ip);
+                    continue 'cand;
+                }
+            }
+            // A backward loop edge re-entering at/before the construction → the slot
+            // is overwritten next iteration (the loop-churn shape, the primary win).
+            if op == Op::Loop {
+                let disp = chunk.read_i16(ip2 + 1) as isize;
+                let target = (ip2 + 1 + w) as isize + disp;
+                if target >= 0 && (target as usize) <= new_object_ip {
+                    kills.push(set_local_ip);
+                    continue 'cand;
+                }
+                // A backward loop whose target is AFTER our construction, or a forward
+                // loop — non-linear range we do not model: reject.
+                continue 'cand;
+            }
 
             // Check whether this op disqualifies the candidate.
             match op {
