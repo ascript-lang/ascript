@@ -352,17 +352,15 @@ pub(crate) trait OptionalDebug {
     fn optional_debug(&self) -> String;
 }
 
+// REGION spike (vendored gcmodule): the original used `default fn` specialization to
+// pretty-print Debug types here. That triggers a rustc `specialization is experimental`
+// warning under the workspace's feature-unification. Since this is a debug+nightly-only
+// dev nicety that AScript never enables, collapse it to a single non-specialized impl
+// (debug dumps show "" instead of the Debug repr) — no specialization, no warning.
 #[cfg(all(feature = "debug", feature = "nightly"))]
 impl<T: ?Sized> OptionalDebug for T {
-    default fn optional_debug(&self) -> String {
-        "".to_string()
-    }
-}
-
-#[cfg(all(feature = "debug", feature = "nightly"))]
-impl<T: std::fmt::Debug + ?Sized> OptionalDebug for T {
     fn optional_debug(&self) -> String {
-        format!("{:?}", self)
+        "".to_string()
     }
 }
 

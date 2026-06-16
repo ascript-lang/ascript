@@ -2,7 +2,7 @@
 // REGION spike: local vendored copy of gcmodule-0.3.3 (+ one `strong_count` accessor).
 // Its pre-existing upstream clippy/rustc lints are not the AScript workspace's to fix —
 // silence them so `cargo clippy --all-targets` stays clean on the workspace crate.
-#![allow(warnings, clippy::all, clippy::pedantic)]
+#![allow(warnings, clippy::all, clippy::pedantic, incomplete_features)]
 #![cfg_attr(feature = "nightly", feature(coerce_unsized), feature(unsize))]
 #![cfg_attr(all(feature = "debug", feature = "nightly"), feature(specialization))]
 
