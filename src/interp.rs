@@ -8310,7 +8310,15 @@ pub(crate) fn error_message(err: &Value) -> String {
 pub(crate) fn worker_fn_dispatch_name(v: &Value) -> Option<String> {
     match v.kind() {
         ValueKind::Function(f) if f.is_worker => f.name.as_ref().map(|n| n.to_string()),
-        ValueKind::Closure(c) if c.proto.is_worker => {
+        // A `static worker fn` is a class METHOD, not a top-level `worker fn` — it is not
+        // shippable through the free-fn slice path (`class_name: None`), so it is NOT a
+        // valid `run_in_worker` / `task.pmap` / `task.preduce` callback. Reject it at the
+        // value gate (returns `None` → the caller's "expects a named `worker fn`" §2.2
+        // panic) rather than letting it fail deep in `build_code_slice` with the internal
+        // "not a top-level function" message. The VM carries the owning class on
+        // `proto.owning_class`; the tree-walker already drops the worker flag on a static
+        // `Class.method` access, so both engines reject identically (byte-identical panic).
+        ValueKind::Closure(c) if c.proto.is_worker && c.proto.owning_class.is_none() => {
             c.proto.chunk.name.as_ref().map(|n| n.to_string())
         }
         _ => None,

@@ -925,6 +925,7 @@ pub(crate) fn par_callback_name(
     })
 }
 
+
 /// PAR spec §3.3.1: parse `{chunks?, minChunk?}` opts. Returns `(cap, min_chunk)`.
 /// Unknown keys are ignored (mirroring other stdlib opts). A present key that is not
 /// a positive integer is a Tier-2 panic mirroring `task.retry`'s validation style.
@@ -1512,6 +1513,46 @@ print(await task.pmap([], id))
                 "empty pmap must not touch the pool"
             );
         }
+    }
+
+    /// PAR §2.2 (Phase-2 review fix): a `static worker fn` is a class method, not a
+    /// shippable top-level `worker fn`, so a static-method callback must raise the §2.2
+    /// callback contract panic — NOT leak the internal slice-build "not a top-level
+    /// function" message. Both `pmap` and `preduce`; the message is byte-identical across
+    /// engines (the slice builder recompiles the shared source).
+    #[tokio::test]
+    async fn par_static_worker_fn_callback_is_a_clean_contract_panic() {
+        let pmap = run(r#"
+import * as task from "std/task"
+class Img { static worker fn sq(x) { return x * x } }
+let [v, err] = recover(() => task.pmap([1, 2, 3], Img.sq))
+print(err.message)
+"#)
+        .await;
+        assert!(
+            pmap.contains("expects a named `worker fn`"),
+            "pmap static-callback must raise the §2.2 contract message, got: {pmap}"
+        );
+        assert!(
+            !pmap.contains("worker entry"),
+            "pmap must NOT leak the internal slice-build message, got: {pmap}"
+        );
+
+        let preduce = run(r#"
+import * as task from "std/task"
+class Acc { static worker fn add(a, b) { return a + b } }
+let [v, err] = recover(() => task.preduce([1, 2, 3], Acc.add, 0))
+print(err.message)
+"#)
+        .await;
+        assert!(
+            preduce.contains("expects a named `worker fn`"),
+            "preduce static-callback must raise the §2.2 contract message, got: {preduce}"
+        );
+        assert!(
+            !preduce.contains("worker entry"),
+            "preduce must NOT leak the internal slice-build message, got: {preduce}"
+        );
     }
 
     /// Order preservation under an INVERSE workload: element i sleeps (n-i) ms, so
