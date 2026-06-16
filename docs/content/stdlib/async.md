@@ -243,7 +243,11 @@ cap-reduced parallel job, use `run_in_worker(f, input, {caps})` per item — see
 worker pool bench) plus the input copy/freeze cost, regardless of array length. For small or
 trivial per-element work this overhead dominates and a sequential `for` loop wins. The measured
 break-even (per-element duration below which sequential is faster) is published in
-`bench/DATA_PARALLEL_RESULTS.md`. <!-- TODO(bench): fill in the measured break-even threshold here when Phase 4 Task 4.1 completes -->
+`bench/DATA_PARALLEL_RESULTS.md`. On an Apple M4 with W=4 and 32 chunks, pmap wins
+starting somewhere between 0 and ~1 000 tight-loop iterations per element (≈20 µs per
+element total sequential time); at 10 000 iterations it is already 3.4× faster than
+sequential. Rule of thumb: if each element takes at least ~1 ms of CPU work, pmap pays
+off at W≥2.
 
 ```ascript
 import * as task from "std/task"
