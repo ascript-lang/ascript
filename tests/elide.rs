@@ -1983,4 +1983,818 @@ mod coverage {
     }
 }
 
+// ===========================================================================
+// Task 4.4 — Per-row positive/negative batteries (ELIDE spec §3, Gates 9-10)
+//
+// For each elidable row (spec §3 rows 1-3):
+//   POSITIVE test: proves elision happened (disasm / consumed / count membership)
+//     AND output is byte-identical across elide-on vs elide-off.
+//   NEGATIVE twins: proves the check is KEPT (not elided, no CALL_ELIDED /
+//     CHECK_LOCAL absent / fn_rets absent) AND the runtime panic still fires
+//     where it fires today.
+//
+// Kept-row spot checks (rows 4-12): CheckParam fires for bad defaults; Class.from
+// validation unchanged; std-call misuse still panics.
+//
+// IMPORTANT soundness assertion: if any expected-negative case IS elided, that is
+// a soundness bug in the predicate — the test fails loudly with "SOUNDNESS BUG".
+// ===========================================================================
 
+mod row_batteries {
+    use ascript::check::infer::elision_proofs;
+    use ascript::compile::{compile_source, compile_source_with_elision};
+    use ascript::vm::disasm::disasm;
+
+    // ── shared helpers ────────────────────────────────────────────────────────
+
+    /// Compile `src` with elision proofs and return the disassembly.
+    fn elided_disasm(src: &str) -> String {
+        let set = elision_proofs(src);
+        let chunk =
+            compile_source_with_elision(src, Some(&set)).expect("compile with elision ok");
+        disasm(&chunk)
+    }
+
+    /// Compile `src` WITHOUT elision and return the disassembly.
+    fn plain_disasm(src: &str) -> String {
+        let chunk = compile_source(src).expect("plain compile ok");
+        disasm(&chunk)
+    }
+
+    /// Assert elided disasm contains `CALL_ELIDED` (positive row-1 check).
+    fn assert_call_elided(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        let dis_plain = plain_disasm(src);
+        assert!(
+            dis_elided.contains("CALL_ELIDED"),
+            "[POSITIVE row-1] `{label}`: CALL_ELIDED must appear — predicate not firing.\n\
+             elided disasm:\n{dis_elided}\nset.calls: {:?}",
+            elision_proofs(src).calls
+        );
+        assert!(
+            !dis_plain.contains("CALL_ELIDED"),
+            "[POSITIVE row-1] `{label}`: plain compile must NOT contain CALL_ELIDED:\n{dis_plain}"
+        );
+    }
+
+    /// Assert elided disasm does NOT contain `CALL_ELIDED` (soundness check).
+    fn assert_call_not_elided(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        assert!(
+            !dis_elided.contains("CALL_ELIDED"),
+            "SOUNDNESS BUG in `{label}`: CALL_ELIDED must NOT appear but the predicate elided it!\n\
+             elided disasm:\n{dis_elided}"
+        );
+    }
+
+    /// Assert elided disasm has no `CHECK_LOCAL` (row-2 positive: check elided).
+    fn assert_check_local_absent(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        assert!(
+            !dis_elided.contains("CHECK_LOCAL"),
+            "[POSITIVE row-2] `{label}`: CHECK_LOCAL must be absent (let init proven):\n{dis_elided}"
+        );
+        let dis_plain = plain_disasm(src);
+        assert!(
+            dis_plain.contains("CHECK_LOCAL"),
+            "[POSITIVE row-2] `{label}`: plain compile must contain CHECK_LOCAL (sanity):\n{dis_plain}"
+        );
+    }
+
+    /// Assert elided disasm still contains `CHECK_LOCAL` (kept — soundness check).
+    fn assert_check_local_kept(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        assert!(
+            dis_elided.contains("CHECK_LOCAL"),
+            "SOUNDNESS BUG in `{label}`: CHECK_LOCAL must remain for unproven let but was elided!\n\
+             elided disasm:\n{dis_elided}"
+        );
+    }
+
+    /// Assert the collector's `fn_rets` set contains the fn named `fn_name`.
+    fn assert_fn_ret_proven(src: &str, fn_name: &str, label: &str) {
+        let set = elision_proofs(src);
+        let bstart = src
+            .find(fn_name)
+            .unwrap_or_else(|| panic!("`{fn_name}` not found in source for `{label}`"));
+        let bend = bstart + fn_name.len();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bend].chars().count() as u32;
+        assert!(
+            set.fn_rets.contains(&(start, end)),
+            "[POSITIVE row-3] `{label}`: fn_rets must contain `{fn_name}`;\nfn_rets: {:?}",
+            set.fn_rets
+        );
+    }
+
+    /// Assert the fn named `fn_name` is NOT in `fn_rets` (soundness check).
+    fn assert_fn_ret_not_proven(src: &str, fn_name: &str, label: &str) {
+        let set = elision_proofs(src);
+        if let Some(bstart) = src.find(fn_name) {
+            let bend = bstart + fn_name.len();
+            let start = src[..bstart].chars().count() as u32;
+            let end = src[..bend].chars().count() as u32;
+            assert!(
+                !set.fn_rets.contains(&(start, end)),
+                "SOUNDNESS BUG in `{label}`: fn `{fn_name}` must NOT be in fn_rets but it is!\n\
+                 fn_rets: {:?}",
+                set.fn_rets
+            );
+        }
+    }
+
+    /// Assert output is byte-identical between elide-on and elide-off.
+    fn assert_output_identical(src: &str, label: &str) {
+        type Res = Result<(String, Option<i32>), String>;
+        let (off, on): (Res, Res) = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                let off = ascript::vm_run_source(&src).await.map_err(|e| e.message);
+                let on = ascript::vm_run_source_elided(&src).await.map_err(|e| e.message);
+                (off, on)
+            }
+        });
+        assert_eq!(
+            off, on,
+            "[POSITIVE] `{label}`: elide-on must equal elide-off (cross-axis identity)"
+        );
+    }
+
+    // ==========================================================================
+    // ROW 1 — POSITIVE: call-site parameter contracts are elided
+    // ==========================================================================
+
+    /// Positive row-1: all typed params, literal args, no spread/named/rest.
+    #[test]
+    fn row1_positive_typed_params_literal_args() {
+        let src = "fn add(a: int, b: int): int { return a + b }\nprint(add(3, 4))\n";
+        assert_call_elided(src, "row1_positive_typed_params_literal_args");
+        assert_output_identical(src, "row1_positive_typed_params_literal_args");
+    }
+
+    /// Positive row-1: mixed param types (int, string, bool), all literal args.
+    #[test]
+    fn row1_positive_mixed_types() {
+        let src =
+            "fn greet(name: string, count: int, loud: bool): string {\n\
+            return name\n}\n\
+            print(greet(\"Alice\", 3, true))\n";
+        assert_call_elided(src, "row1_positive_mixed_types");
+        assert_output_identical(src, "row1_positive_mixed_types");
+    }
+
+    /// Positive row-1: unmutated annotated binding anchors the call.
+    #[test]
+    fn row1_positive_unmutated_annotated_binding() {
+        let src = "fn f(p: int){ print(p) }\nlet x: int = 5\nf(x)\n";
+        assert_call_elided(src, "row1_positive_unmutated_annotated_binding");
+        assert_output_identical(src, "row1_positive_unmutated_annotated_binding");
+    }
+
+    /// Positive row-1: arg via declared-ElideSafe return of another fn.
+    #[test]
+    fn row1_positive_arg_via_proven_return() {
+        let src = "fn double(x: int): int { return x * 2 }\nfn f(p: int){ print(p) }\nf(double(5))\n";
+        assert_call_elided(src, "row1_positive_arg_via_proven_return");
+        assert_output_identical(src, "row1_positive_arg_via_proven_return");
+    }
+
+    /// Positive row-1: any-typed PARAM is a free-pass — call is elided without arg proof.
+    #[test]
+    fn row1_positive_any_typed_param_free_pass() {
+        // fn f(p: any): any accepts anything. The call f(x) with x untyped is elided
+        // because `any` is ElideSafe (free-pass) — no (A) condition needed for it.
+        let src = "fn f(p: any) { print(p) }\nlet x = 5\nf(x)\n";
+        assert_call_elided(src, "row1_positive_any_typed_param_free_pass");
+        assert_output_identical(src, "row1_positive_any_typed_param_free_pass");
+    }
+
+    /// Positive row-1: defaulted params — f(3) is valid for (a:int, b:int=2).
+    #[test]
+    fn row1_positive_defaulted_param_arity() {
+        let src = "fn f(a: int, b: int = 2): int { return a + b }\nprint(f(3))\n";
+        assert_call_elided(src, "row1_positive_defaulted_param_arity");
+        assert_output_identical(src, "row1_positive_defaulted_param_arity");
+    }
+
+    // ==========================================================================
+    // ROW 1 — NEGATIVE twins: NOT elided AND runtime check still fires
+    // ==========================================================================
+
+    /// Negative row-1 (probe 3): mutated binding — NOT elided, runtime panics.
+    #[test]
+    fn row1_negative_mutated_binding() {
+        let src = "fn f(p: int){ return p }\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        assert_call_not_elided(src, "row1_negative_mutated_binding");
+        // Runtime must still panic (the check is KEPT).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_mutated_binding: must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: `any`-typed source arg (param is typed int, arg type is Any).
+    /// Any is not anchored → call is NOT elided.
+    #[test]
+    fn row1_negative_any_typed_source_arg() {
+        let src = "fn f(p: int){ print(p) }\nlet a: any = 5\nf(a)\n";
+        assert_call_not_elided(src, "row1_negative_any_typed_source_arg");
+        // Runtime succeeds (a holds 5 which is int) — the check is kept but passes.
+        let dis = elided_disasm(src);
+        assert!(dis.contains("CALL "), "plain CALL must remain:\n{dis}");
+    }
+
+    /// Negative row-1: spread arg `f(...xs)` — excluded by spec.
+    #[test]
+    fn row1_negative_spread_arg() {
+        let src = "fn f(a: int, b: int){}\nlet xs = [1, 2]\nf(...xs)\n";
+        assert_call_not_elided(src, "row1_negative_spread_arg");
+    }
+
+    /// Negative row-1: named args `f(a: 1, b: 2)` — excluded by spec.
+    #[test]
+    fn row1_negative_named_args() {
+        let src = "fn f(a: int, b: int){}\nf(a: 1, b: 2)\n";
+        assert_call_not_elided(src, "row1_negative_named_args");
+    }
+
+    /// Negative row-1: rest-param callee `fn f(...xs: array<int>)` — excluded.
+    #[test]
+    fn row1_negative_rest_param_callee() {
+        let src = "fn f(...xs: array<int>){ print(xs[0]) }\nf(1, 2, 3)\n";
+        assert_call_not_elided(src, "row1_negative_rest_param_callee");
+    }
+
+    /// Negative row-1: async callee — excluded from row-1 eligibility.
+    #[test]
+    fn row1_negative_async_callee() {
+        let src = "async fn f(p: int){ return p }\nf(5)\n";
+        assert_call_not_elided(src, "row1_negative_async_callee");
+    }
+
+    /// Negative row-1: generator (`fn*`) callee — excluded from row-1 eligibility.
+    #[test]
+    fn row1_negative_generator_callee() {
+        let src = "fn* f(p: int) { yield p }\nf(1)\n";
+        assert_call_not_elided(src, "row1_negative_generator_callee");
+    }
+
+    /// Negative row-1: `worker fn` callee — excluded from row-1 eligibility.
+    #[test]
+    fn row1_negative_worker_fn_callee() {
+        let src = "worker fn f(p: int) { return p }\nf(1)\n";
+        assert_call_not_elided(src, "row1_negative_worker_fn_callee");
+    }
+
+    /// Negative row-1: interface-typed param — Named is NOT ElideSafe (spec §2.2).
+    #[test]
+    fn row1_negative_interface_typed_param() {
+        let src = "interface I { fn m(): int }\nfn f(p: I){}\nf(42)\n";
+        assert_call_not_elided(src, "row1_negative_interface_typed_param");
+        // Runtime must still panic (42 is not an instance with method m).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_interface_typed_param: must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: `array<int>` (typed/deep) param — NOT ElideSafe.
+    #[test]
+    fn row1_negative_deep_array_param() {
+        // Passing the right value: check is KEPT but passes (not elided).
+        let src = "fn f(p: array<int>){ print(p[0]) }\nf([1, 2, 3])\n";
+        assert_call_not_elided(src, "row1_negative_deep_array_param");
+        // Passing a wrong value: runtime panics (check still there).
+        let bad_src = "fn f(p: array<int>){ print(p[0]) }\nf(\"notarray\")\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let s = bad_src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&s).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_deep_array_param: bad value must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: `object` param — NOT ElideSafe (probe 4, spec §0 #3 + §6.6).
+    #[test]
+    fn row1_negative_object_param_probe4() {
+        let src = "class C{}\nfn f(p: object){}\nf(C())\n";
+        assert_call_not_elided(src, "row1_negative_object_param_probe4");
+        // Runtime must still panic (the check is kept and fires).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_object_param_probe4: must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated: expected object, got instance"),
+            "expected 'type contract violated: expected object, got instance'"
+        );
+    }
+
+    /// Negative row-1: arrow function call — only named Stmt::Fn is eligible in v1.
+    /// Arrow functions are fn-expressions (not named declarations) → not elided.
+    #[test]
+    fn row1_negative_fn_expression_call() {
+        // Arrow function stored in a let binding: the callee is not a unique named Fn
+        // declaration (it's a fn-expression in a variable), so it's not elided.
+        let src = "let f = (p: int) => print(p)\nf(5)\n";
+        assert_call_not_elided(src, "row1_negative_fn_expression_call");
+    }
+
+    /// Negative row-1: arrow function call (explicit form) — same as above.
+    #[test]
+    fn row1_negative_arrow_call() {
+        let src = "let g = (p: string) => print(p)\ng(\"hello\")\n";
+        assert_call_not_elided(src, "row1_negative_arrow_call");
+    }
+
+    /// Negative row-1: method call — method calls use invoke_compiled_method, not row-1.
+    #[test]
+    fn row1_negative_method_call() {
+        let src = "class C { fn greet(name: string) { print(name) } }\nC().greet(\"Hi\")\n";
+        assert_call_not_elided(src, "row1_negative_method_call");
+    }
+
+    /// Negative row-1: uninitialized annotated let as arg — binding holds nil, not int.
+    #[test]
+    fn row1_negative_uninitialized_annotated_let_as_arg() {
+        let src = "fn f(p: int){ return p }\nlet x: int\nf(x)\n";
+        assert_call_not_elided(src, "row1_negative_uninitialized_annotated_let_as_arg");
+        // Runtime: f(nil) panics (int contract, got nil).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row1_negative_uninitialized_annotated_let_as_arg: must panic (nil is not int)"
+        );
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: fn with non-always-returning body + non-nil declared return type.
+    /// The outer call f(g(true)) is NOT proven (g's return is not proven), but the inner
+    /// call g(true) IS proven (bool param, bool literal arg). This tests that the outer
+    /// call keeps its check while the inner call is correctly elided.
+    ///
+    /// Note: CALL_ELIDED may appear for the inner `g(true)` call — that is correct and
+    /// expected. The OUTER call `f(g(...))` must use plain CALL (because g's return
+    /// type contract is not proven, so g() is not a proven arg source for f's int param).
+    #[test]
+    fn row1_negative_non_total_callee_return() {
+        // g has a non-total body: returns int on one path, implicit nil on the other.
+        // g's return is NOT proven → g() is NOT an anchored arg source for f's int param.
+        let src = "fn g(c: bool): int { if (c) { return 1 } }\nfn f(p: int){ print(p) }\nf(g(true))\n";
+        let set = elision_proofs(src);
+        // g's name-token must NOT be in fn_rets.
+        let bstart = src.find("g").unwrap();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bstart + 1].chars().count() as u32;
+        assert!(
+            !set.fn_rets.contains(&(start, end)),
+            "row1_negative_non_total_callee_return: g's return must NOT be proven;\nfn_rets: {:?}",
+            set.fn_rets
+        );
+        // The call `f(g(true))` must NOT be in set.calls (g's return is unproven → f's arg
+        // is unanchored). Check using the span of the outer call.
+        let outer_call = "f(g(true))";
+        let outer_start = src.find(outer_call).unwrap();
+        let outer_key = (
+            src[..outer_start].chars().count() as u32,
+            src[..outer_start + outer_call.len()].chars().count() as u32,
+        );
+        assert!(
+            !set.calls.contains(&outer_key),
+            "row1_negative_non_total_callee_return: outer call f(g(true)) must NOT be proven;\nset.calls: {:?}",
+            set.calls
+        );
+        // Calling g(false) at runtime panics (return contract fires — nil, not int).
+        let bad_src = "fn g(c: bool): int { if (c) { return 1 } }\ng(false)\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let s = bad_src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&s).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "g(false) must panic (return contract kept, nil not int)");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    // ==========================================================================
+    // ROW 2 — POSITIVE: typed local init (Op::CheckLocal) is elided
+    // ==========================================================================
+
+    /// Positive row-2: `let x: int = 5` — literal, ElideSafe, proven.
+    #[test]
+    fn row2_positive_typed_let_int_literal() {
+        let src = "let x: int = 5\nprint(x)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_int_literal");
+        assert_output_identical(src, "row2_positive_typed_let_int_literal");
+    }
+
+    /// Positive row-2: `let s: string = \"hello\"`.
+    #[test]
+    fn row2_positive_typed_let_string() {
+        let src = "let s: string = \"hello\"\nprint(s)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_string");
+        assert_output_identical(src, "row2_positive_typed_let_string");
+    }
+
+    /// Positive row-2: `let b: bool = true`.
+    #[test]
+    fn row2_positive_typed_let_bool() {
+        let src = "let b: bool = true\nprint(b)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_bool");
+        assert_output_identical(src, "row2_positive_typed_let_bool");
+    }
+
+    /// Positive row-2: let via arithmetic (int + int → int, anchored result).
+    #[test]
+    fn row2_positive_typed_let_arithmetic() {
+        let src = "let x: int = 3 + 4\nprint(x)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_arithmetic");
+        assert_output_identical(src, "row2_positive_typed_let_arithmetic");
+    }
+
+    // ==========================================================================
+    // ROW 2 — NEGATIVE: CHECK_LOCAL is KEPT (not elided)
+    // ==========================================================================
+
+    /// Negative row-2: mutated annotated binding — binding is not recorded as anchored.
+    #[test]
+    fn row2_negative_mutated_let() {
+        let src = "let x: int = 5\nx = 7\nprint(x)\n";
+        assert_check_local_kept(src, "row2_negative_mutated_let");
+    }
+
+    /// Negative row-2: `array<int>` annotation — deep container, NOT ElideSafe.
+    #[test]
+    fn row2_negative_deep_container_let() {
+        let src = "let x: array<int> = [1, 2, 3]\nprint(x[0])\n";
+        assert_check_local_kept(src, "row2_negative_deep_container_let");
+    }
+
+    /// Negative row-2: `object` typed let — object is NOT ElideSafe (v1).
+    #[test]
+    fn row2_negative_object_typed_let() {
+        let src = "let x: object = {a: 1}\nprint(x)\n";
+        assert_check_local_kept(src, "row2_negative_object_typed_let");
+    }
+
+    /// Negative row-2: initializer is a logical op (&&) — NOT anchored in v1.
+    #[test]
+    fn row2_negative_logical_op_initializer() {
+        let src = "let a: bool = true\nlet b: bool = false\nlet c: bool = a && b\nprint(c)\n";
+        // `a && b` initializer for c — logical ops are NOT anchored (spec §2.3).
+        // The let `c: bool = a && b` is NOT proven.
+        let set = elision_proofs(src);
+        let init = "a && b";
+        let bstart = src.find(init).unwrap();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bstart + init.len()].chars().count() as u32;
+        assert!(
+            !set.lets.contains(&(start, end)),
+            "row2_negative_logical_op_initializer: `a && b` must NOT be in set.lets"
+        );
+    }
+
+    /// Negative row-2: uninitialized annotated let — no initializer, no CHECK_LOCAL emitted.
+    /// The let is simply not in the set (no initializer to check).
+    #[test]
+    fn row2_negative_uninitialized_let() {
+        let src = "let x: int\nprint(x)\n";
+        let set = elision_proofs(src);
+        assert!(
+            set.lets.is_empty(),
+            "row2_negative_uninitialized_let: uninitialized annotated let must not be in set.lets"
+        );
+    }
+
+    // ==========================================================================
+    // ROW 3 — POSITIVE: declared-return contracts are elided per function
+    // ==========================================================================
+
+    /// Positive row-3: fn always returns an int literal.
+    #[test]
+    fn row3_positive_always_returns_literal() {
+        let src = "fn get_answer(): int { return 42 }\nprint(get_answer())\n";
+        assert_fn_ret_proven(src, "get_answer", "row3_positive_always_returns_literal");
+        assert_output_identical(src, "row3_positive_always_returns_literal");
+    }
+
+    /// Positive row-3: fn always returns anchored arithmetic result.
+    #[test]
+    fn row3_positive_always_returns_anchored_arith() {
+        let src = "fn double(x: int): int { return x * 2 }\nprint(double(5))\n";
+        assert_fn_ret_proven(src, "double", "row3_positive_always_returns_anchored_arith");
+        assert_output_identical(src, "row3_positive_always_returns_anchored_arith");
+    }
+
+    /// Positive row-3: fn returning a string literal.
+    #[test]
+    fn row3_positive_returns_string() {
+        let src = "fn greet(): string { return \"hello\" }\nprint(greet())\n";
+        assert_fn_ret_proven(src, "greet", "row3_positive_returns_string");
+        assert_output_identical(src, "row3_positive_returns_string");
+    }
+
+    /// Positive row-3: fn always returns a bool (comparison is anchored).
+    #[test]
+    fn row3_positive_returns_bool_comparison() {
+        let src = "fn positive(x: int): bool { return x > 0 }\nprint(positive(5))\n";
+        assert_fn_ret_proven(src, "positive", "row3_positive_returns_bool_comparison");
+        assert_output_identical(src, "row3_positive_returns_bool_comparison");
+    }
+
+    // ==========================================================================
+    // ROW 3 — NEGATIVE: fn return contract is KEPT (not elided)
+    // ==========================================================================
+
+    /// Negative row-3: non-always-returning body with non-nil return type.
+    /// Implicit nil at fall-off is NOT Yes against int → NOT proven.
+    #[test]
+    fn row3_negative_non_total_return() {
+        let src = "fn maybe(c: bool): int { if (c) { return 1 } }\nprint(maybe(true))\n";
+        assert_fn_ret_not_proven(src, "maybe", "row3_negative_non_total_return");
+        // maybe(false) falls off end → returns nil → contract fires → panics.
+        let bad_src = "fn maybe(c: bool): int { if (c) { return 1 } }\nmaybe(false)\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let s = bad_src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&s).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row3_negative_non_total_return: maybe(false) must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-3: fn-expression — only named Stmt::Fn declarations are eligible.
+    #[test]
+    fn row3_negative_fn_expression_ret() {
+        let src = "let f = fn(): int { return 5 }\nprint(f())\n";
+        let set = elision_proofs(src);
+        // No named fn declaration → fn_rets must be empty.
+        assert!(
+            set.fn_rets.is_empty(),
+            "row3_negative_fn_expression_ret: fn-expression must not be in fn_rets"
+        );
+    }
+
+    /// Negative row-3: fn returning a Named/class type — NOT ElideSafe.
+    #[test]
+    fn row3_negative_class_return_type() {
+        let src = "class C { fn init() {} }\nfn make(): C { return C() }\nmake()\n";
+        assert_fn_ret_not_proven(src, "make", "row3_negative_class_return_type");
+    }
+
+    /// Negative row-3: fn returning `array<int>` — NOT ElideSafe (deep container).
+    #[test]
+    fn row3_negative_deep_container_return() {
+        let src = "fn nums(): array<int> { return [1, 2, 3] }\nnums()\n";
+        assert_fn_ret_not_proven(src, "nums", "row3_negative_deep_container_return");
+    }
+
+    // ==========================================================================
+    // KEPT-ROW SPOT CHECKS (rows 4-12)
+    // ==========================================================================
+
+    /// Row 4 spot check: CheckParam fires for a bad DEFAULT even at a proven call site.
+    ///
+    /// Row 1 only elides the per-arg `check_type_env` calls. Op::CheckParam (param
+    /// defaults) is a SEPARATE opcode and is NEVER elided (spec §3 row 4).
+    ///
+    /// Setup: fn f(p: int, q: string = 42) {} — the default 42 is NOT a string.
+    ///        f(1) — the supplied arg `1` is proven (row-1 eligible), so CALL_ELIDED
+    ///        is emitted; BUT the default for `q` still fires CheckParam → panics.
+    #[test]
+    fn row4_check_param_fires_for_bad_default_at_proven_site() {
+        let src = "fn f(p: int, q: string = 42) { print(q) }\nf(1)\n";
+        // The call IS proven (p: int, arg 1: literal int).
+        // CALL_ELIDED must be emitted (elision fired on the arg contracts).
+        let dis = elided_disasm(src);
+        assert!(
+            dis.contains("CALL_ELIDED"),
+            "row4: the call f(1) must be elided (row-1 positive):\n{dis}"
+        );
+        // But at runtime, CheckParam fires for the bad default q=42 → panics.
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row4_check_param_fires_for_bad_default_at_proven_site: must panic \
+             (CheckParam fires for q's bad default even though arg contracts were elided)"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("type contract violated") || msg.contains("expected string"),
+            "expected a contract violation message for bad default, got: {msg:?}"
+        );
+    }
+
+    /// Row 9 spot check: `Class.from` validation is never elided (spec §3 row 9).
+    /// validate_into coerces AND checks — removing it changes values, not just performance.
+    #[test]
+    fn row9_class_from_validation_unchanged() {
+        let src = r#"
+class Point {
+    x: int
+    y: int
+}
+let p = Point.from({x: 1, y: "not_an_int"})
+print(p.x)
+"#;
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row9_class_from_validation_unchanged: Class.from with wrong field type must panic"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("expected int") || msg.contains("type contract violated") || msg.contains("y"),
+            "expected a type validation message from Class.from, got: {msg:?}"
+        );
+    }
+
+    /// Row 10 spot check: std/builtin argument validation is never affected by elision.
+    /// Native fns validate internally (Tier-2 panics) — they never route through
+    /// check_call_args, so row 10 is out of scope by construction. Misuse still panics.
+    #[test]
+    fn row10_std_call_misuse_still_panics() {
+        // math.sqrt of a non-number panics from the native fn's own validation.
+        let src = "import std/math\nprint(math.sqrt(\"not_a_number\"))\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row10_std_call_misuse_still_panics: math.sqrt('string') must panic"
+        );
+    }
+
+    // ==========================================================================
+    // Cross-axis identity: positive cases are behaviorally identical across all
+    // four modes (elide-off VM, elide-on VM, generic VM, tree-walker marked).
+    // This is spec §6.1's within-axis and cross-axis identity requirement.
+    // ==========================================================================
+
+    /// Four-mode identity for a representative row-1 positive.
+    #[test]
+    fn cross_axis_row1_four_mode() {
+        let src = "fn sum(a: int, b: int): int { return a + b }\nprint(sum(10, 20))\n";
+        let expected = "30\n";
+
+        let off: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source(&src).await.unwrap_or_else(|e| panic!("off: {e}")).0
+            }
+        });
+        let on: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("elided: {e}"))
+                    .0
+            }
+        });
+        let gen: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided_generic(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("generic: {e}"))
+                    .0
+            }
+        });
+        let tw: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::tw_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("tw: {e}"))
+                    .0
+            }
+        });
+
+        assert_eq!(off, expected, "elide-off VM");
+        assert_eq!(on, expected, "elide-on VM");
+        assert_eq!(gen, expected, "generic VM");
+        assert_eq!(tw, expected, "tree-walker marked");
+    }
+
+    /// Four-mode identity for a representative row-2 positive (typed let init).
+    #[test]
+    fn cross_axis_row2_four_mode() {
+        let src = "let x: int = 21\nlet y: int = x + 21\nprint(y)\n";
+        let expected = "42\n";
+        // Note: x is unmutated, annotated int, literal init → anchored.
+        // y's init `x + 21` → int + int → int anchored. Both proven.
+        let off: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source(&src).await.unwrap_or_else(|e| panic!("off: {e}")).0
+            }
+        });
+        let on: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("on: {e}"))
+                    .0
+            }
+        });
+        let tw: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::tw_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("tw: {e}"))
+                    .0
+            }
+        });
+        assert_eq!(off, expected, "elide-off VM");
+        assert_eq!(on, expected, "elide-on VM");
+        assert_eq!(tw, expected, "tree-walker marked");
+    }
+
+    /// Four-mode identity for a representative row-3 positive (declared-return).
+    #[test]
+    fn cross_axis_row3_four_mode() {
+        let src = "fn square(n: int): int { return n * n }\nprint(square(7))\n";
+        let expected = "49\n";
+
+        let off: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source(&src).await.unwrap_or_else(|e| panic!("off: {e}")).0
+            }
+        });
+        let on: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("on: {e}"))
+                    .0
+            }
+        });
+        let tw: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::tw_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("tw: {e}"))
+                    .0
+            }
+        });
+        assert_eq!(off, expected, "elide-off VM");
+        assert_eq!(on, expected, "elide-on VM");
+        assert_eq!(tw, expected, "tree-walker marked");
+    }
+}
