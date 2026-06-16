@@ -15,10 +15,11 @@
 # drift, so median over RUNS cancels outliers while staying fast).
 #
 # Usage:
-#   ./bench/run_elide_bench.sh                          # 5 runs per workload
+#   ./bench/run_elide_bench.sh                          # 5 runs per workload (default/no-elide)
 #   RUNS=7 ./bench/run_elide_bench.sh                   # override run count
 #   BINARY=path/to/ascript ./bench/run_elide_bench.sh   # custom binary
-#   BENCH_LABEL="post-ELIDE elide-on" ./bench/run_elide_bench.sh
+#   BENCH_LABEL="post-ELIDE elide-on" ELIDE_FLAG=--elide ./bench/run_elide_bench.sh
+#   ELIDE_FLAG=--no-elide ./bench/run_elide_bench.sh    # explicit no-elide
 #
 # Output:
 #   bench/ELIDE_RESULTS.md  (section APPENDED; run after each phase)
@@ -33,6 +34,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RESULTS_FILE="${SCRIPT_DIR}/ELIDE_RESULTS.md"
 BINARY="${BINARY:-${REPO_ROOT}/target/release/ascript}"
 RUNS="${RUNS:-5}"
+# ELIDE_FLAG: optional --elide or --no-elide to be inserted before the workload path.
+# When empty (the default), the binary's default applies (currently DEFAULT-OFF).
+ELIDE_FLAG="${ELIDE_FLAG:-}"
 
 # Workloads: the ELIDE headline pair first, then supporting corpus.
 BENCHES="call_heavy call_heavy_typed object_churn json_roundtrip func_pipeline"
@@ -64,13 +68,16 @@ median() {
 }
 
 run_ms() {
-    "${BINARY}" run "${SCRIPT_DIR}/profiling/$1.as" 2>/dev/null \
+    # shellcheck disable=SC2086
+    "${BINARY}" run ${ELIDE_FLAG} "${SCRIPT_DIR}/profiling/$1.as" 2>/dev/null \
         | grep -oE 'elapsed_ms=[0-9.]+' | cut -d= -f2
 }
 
 peak_rss_mb() {
     local bytes
-    bytes=$(/usr/bin/time -l "${BINARY}" run "${SCRIPT_DIR}/profiling/$1.as" 2>&1 >/dev/null \
+    # shellcheck disable=SC2086
+    bytes=$(/usr/bin/time -l "${BINARY}" run ${ELIDE_FLAG} "${SCRIPT_DIR}/profiling/$1.as" \
+        2>&1 >/dev/null \
         | grep -i "maximum resident" | grep -oE '[0-9]+' | head -1)
     awk -v b="${bytes:-0}" 'BEGIN { printf "%d", b / 1048576 }'
 }
