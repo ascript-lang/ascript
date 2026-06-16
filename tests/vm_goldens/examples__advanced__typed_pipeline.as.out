@@ -1,0 +1,15 @@
+# exit: none
+=== pipeline results ===
+  alpha(1): score=9000 tier=high
+  beta(2): score=3600 tier=low
+  gamma(3): score=10000 tier=high
+
+=== mixed run ===
+  ok: delta(10): score=6000 tier=mid
+  ok: zeta(13): score=1200 tier=low
+  boundary caught: type contract violated at record.id: expected int, got nil
+  boundary caught: type contract violated at record.value: expected int, got string
+
+boundary guard fires: Record.from expects an object, got string
+
+typed_pipeline ok

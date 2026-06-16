@@ -324,3 +324,89 @@ let r = id<string>(5)     // type-mismatch (Error): argument 1 expects `string`,
 > function** (`fn handle<T>(b: Box<T>)`) rather than relying on subtyping between instantiations.
 > (Built-in containers like `array<T>` keep their existing covariant rule; only user `class`/`enum`/
 > parameterized-interface applications are invariant.)
+
+## Annotations and performance
+
+When you annotate a function's parameters, a `let` binding, or a function's return type, the
+runtime enforces the contract on every execution — and for typed, fully-annotated code the static
+checker can *prove* that many of those checks will always pass. The **ELIDE** feature lets the
+compiler remove those proven-redundant checks from the executed bytecode, making annotated code
+faster without changing its behavior.
+
+### What gets elided
+
+Three kinds of boundary can be proven and removed:
+
+- **Call-site parameter contracts** — when every argument to a call is a literal, the result of
+  another proven call, or an unmutated binding that was itself checked at initialization, and
+  the parameter types are primitive (scalar) kinds like `int`, `float`, `string`, `bool`,
+  `nil`, `fn`, or `any`, the per-argument runtime check is dropped.
+
+- **Annotated `let` / `const` initializers** — when the right-hand side of an annotated binding
+  can be proven to match the annotation (same anchoring rules as above), the `Op::CheckLocal`
+  instruction is omitted from the bytecode entirely.
+
+- **Declared return contracts** — when every `return` in a function body is proven to satisfy
+  the declared return type, the per-return check is removed at definition time (`proto.ret =
+  None`), so no check runs at any call site.
+
+The proof applies only to **primitive kind checks** — `int`, `float`, `number`, `string`,
+`bool`, `nil`, `fn`, `array<any>`, optional/union combos of those, and type-erased generic
+parameters. Deep container contracts (`array<int>`, `map<string, number>`), class and interface
+types, and `object` are never elided in v1 — their checks run as today.
+
+### The gradual boundary always keeps its check
+
+Elision is invisible precisely because it only removes checks the runtime would have passed
+anyway. The boundary between typed and untyped code is **never** elided. If a value arrives as
+`any` — from a parse result, a network response, an untyped parameter, or any expression the
+checker cannot pin down — the call into typed code retains its full runtime contract:
+
+```ascript
+fn typed(n: int): int { return n * n }
+
+fn processRaw(raw: any) {
+  // `raw` is any-typed — this call site cannot be proven.
+  // The `n: int` contract fires at runtime and guards the typed interior.
+  return typed(raw)
+}
+
+processRaw(9)       // ok — 81
+processRaw("oops")  // panic: type contract violated: expected int, got string
+```
+
+This is the fundamental invariant: the more you annotate, the faster the proven interior runs —
+and the boundary check that protects that interior is kept exactly where it is needed.
+
+### Enabling elision
+
+Elision is **opt-in** on `run` (adding the static proof pass to every invocation would exceed
+the startup budget for short scripts). It is most useful via `ascript build`, where the
+one-time collector cost is amortised over every subsequent execution of the compiled artifact:
+
+```sh
+# Build once with elision; every run of the .aso gets the faster bytecode.
+ascript build --elide myapp.as -o myapp.aso
+ascript run myapp.aso
+
+# Or opt in per invocation:
+ascript run --elide myapp.as
+
+# Force elision off (the permanent kill switch; useful for debugging):
+ascript run --no-elide myapp.as
+# Equivalent environment variable:
+ASCRIPT_NO_ELIDE=1 ascript run myapp.as
+```
+
+### For engine developers — paranoid mode
+
+`ASCRIPT_ELIDE_PARANOID=1` compiles and marks as if elision is off (every contract is kept)
+but retains the per-module proof set. If a contract check *fails* at a site the collector
+claimed was proven, the panic message is escalated to:
+
+```
+ELIDE proof violated (checker soundness bug): …
+```
+
+This turns the full corpus and fuzzer into a continuous soundness test for the type checker. On
+a correct program, paranoid-mode output is byte-identical to elide-off output.
