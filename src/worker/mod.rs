@@ -287,6 +287,11 @@ pub fn dispatch_worker_inline(
 ///
 /// Returns a `Value::future` that resolves with the worker's result (scheduled on the
 /// caller's `LocalSet`, like any async call).
+// The inline executor mirrors the wire fields of a `WorkerRequest` (slice/archive bytes,
+// entry, encoded args + shared side-vec, caps floor, the PAR chunk job, span) — a cohesive
+// payload, not an accidental pile; folding them behind a struct would only rename the same
+// fields. PAR added the 8th (`chunk`).
+#[allow(clippy::too_many_arguments)]
 fn run_slice_inline(
     slice_bytes: Option<&[u8]>,
     archive_bytes: Option<&[u8]>,
