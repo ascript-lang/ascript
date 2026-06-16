@@ -880,6 +880,9 @@ pub async fn tw_run_source_elided(src: &str) -> Result<(String, crate::elide_mar
     let counts = crate::elide_mark::mark_program(&mut program, &set);
     let interp = Rc::new(Interp::new());
     interp.install_self();
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice
+    // (mirrors `run_source_exit` — required for any corpus file using workers).
+    interp.set_worker_source(src);
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local

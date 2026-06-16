@@ -212,9 +212,21 @@ fn mark_stmt(stmt: &mut Stmt, set: &ElisionSet, counts: &mut MarkCounts) {
             mark_expr(call, set, counts);
         }
 
+        // ── Destructuring lets — the RHS initializer can hold a proven call ──
+        //    e.g. `let [ok, e1] = loadUser(...)` where `loadUser(...)` is a
+        //    proven row-1 site. The destructuring TARGET is never an elision key
+        //    (the let itself is row-2 only for a *simple* annotated binding), but
+        //    its `value` expression must still be walked or the marker undercounts
+        //    relative to the collector/compiler (a cross-front-end key-agreement
+        //    divergence the count-parity gate catches). Both variants carry a
+        //    single `value: Expr`.
+        Stmt::LetDestructure { value, .. } | Stmt::LetDestructureObject { value, .. } => {
+            mark_expr(value, set, counts);
+        }
+
         // ── Everything else (Break, Continue, Return(None), Enum, Interface,
-        //    Import, LetDestructure, LetDestructureObject) — no sub-exprs to
-        //    recurse into that can hold proven call sites in v1. ──
+        //    Import) — no sub-exprs to recurse into that can hold proven call
+        //    sites in v1. ──
         _ => {}
     }
 }
@@ -542,6 +554,52 @@ mod tests {
         // Must not panic — even with an empty set.
         let counts = mark_program(&mut stmts, &set);
         assert_eq!(counts.total(), 0, "no eligible marks in method-only program");
+    }
+
+    #[test]
+    fn destructure_let_rhs_call_is_marked() {
+        // Regression (Task 4.3 count-parity, Gate 14): a proven call on the RHS
+        // of a DESTRUCTURING let (`let [a, b] = f(...)`) must be walked by the
+        // marker. Before the fix, `LetDestructure`/`LetDestructureObject` fell
+        // into the `_ => {}` arm and the call went unmarked — the collector +
+        // compiler counted it, the tree-walker did NOT, so count parity diverged
+        // (caught by the whole-corpus parity gate on `examples/typed_parse.as`).
+        let src = "fn f(p: int): [int, nil] { return [p, nil] }\nlet [a, b] = f(7)\n";
+        let set = elision_proofs(src);
+        assert!(
+            !set.calls.is_empty(),
+            "the typed `f(7)` call must be proven; set.calls={:?}",
+            set.calls
+        );
+        let mut stmts = parse(src);
+        let counts = mark_program(&mut stmts, &set);
+        assert_eq!(
+            counts.total(),
+            set.len(),
+            "marker must mark the destructure-let RHS call (marks={} != |set|={})",
+            counts.total(),
+            set.len()
+        );
+        assert!(counts.calls >= 1, "the destructure-let RHS call must be marked");
+        // Object-destructure twin: a proven call whose result is destructured by
+        // key. `makeObj` takes a typed param (proven row-1 call) and returns an
+        // object the `{ a }` pattern binds from.
+        let src2 = "fn makeObj(p: int): object { return { a: p } }\nlet { a } = makeObj(3)\n";
+        let set2 = elision_proofs(src2);
+        assert!(
+            !set2.calls.is_empty(),
+            "the typed `makeObj(3)` call must be proven; set2.calls={:?}",
+            set2.calls
+        );
+        let mut stmts2 = parse(src2);
+        let counts2 = mark_program(&mut stmts2, &set2);
+        assert_eq!(
+            counts2.total(),
+            set2.len(),
+            "marker must mark the object-destructure RHS call (marks={} != |set|={})",
+            counts2.total(),
+            set2.len()
+        );
     }
 
     #[test]
