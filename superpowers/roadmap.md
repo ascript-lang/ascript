@@ -696,6 +696,32 @@ Spec `superpowers/specs/2026-06-12-contract-elision-design.md`, plan
   rate. Two real bugs fixed in-branch failing-test-first: rule-6 `Class→Object` checker unsoundness;
   `mark_program` skipping `LetDestructure` RHS calls.
 
+## PAR — data-parallel primitives over the worker pool ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-data-parallel-design.md`, plan
+`…/plans/2026-06-12-data-parallel.md`. Stdlib-only; no syntax/opcode/grammar change;
+**`ASO_FORMAT_VERSION` 29 unchanged**; no new worker-wire tag; tree-walker untouched.
+
+- **Shipped:** `task.pmap(data, f, opts?) -> future<array>` and `task.preduce(data, f, init, opts?) ->
+  future<T>`. Both chunk an array across the existing worker pool and run a named top-level `worker fn`
+  callback per chunk in isolated interpreters. Results are merged in **input order** regardless of
+  completion order; first-by-input-order error wins; cancel-on-drop; venue-invariant nesting.
+- **Transport:** `ChunkJob` rides `WorkerRequest` as plain `Send` fields; a native `run_chunk_job` driver
+  runs inside each isolate — no new worker-wire tag. Frozen input → `Arc`-bump (TAG_SHARED, O(1)); plain
+  input → per-chunk structured-clone copy. **No auto-freeze** (explicit freeze-or-copy; the pre-spec
+  "auto-freeze" framing was corrected during implementation). Non-array → Tier-2 panic.
+- **Callback gate:** named top-level `worker fn` only; `static worker fn` rejected at the gate with the
+  §2.2 message. Worker `?`-propagation yields the `[nil,err]` pair (not nil — spec correction recorded).
+  Plain instances cross the airlock field-only (methods not shipped — Spec A limitation).
+- **Chunk plan (contractual):** `chunk_size = max(minChunk, ceil(len/cap))`; opts `{chunks?, minChunk?}`.
+  `preduce`: each chunk folds seeded by its own first element; `init` participates exactly once (final
+  combine only). `f` must be associative to match sequential reduce.
+- **Differential:** four-mode byte-identical (tree-walker == specialized == generic == `.aso`); no new
+  differential axis (PAR path is never reached by the single-threaded corpus).
+- **Performance (`bench/DATA_PARALLEL_RESULTS.md`):** scaling **4.28× @ 8 workers** (1.94×/3.16×/4.28×
+  at 2/4/8); break-even ~1000 LCG-iters/element; frozen input **2.01×** faster than plain at 1M elements;
+  Gate-12 spec/tw **3.85×** (PAR touched no engine path).
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

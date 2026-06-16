@@ -165,13 +165,13 @@ stated, results are measured.
 
 ### Multi-core — the ×cores lever (from shipped pieces)
 
-- 🔒 **PAR — Data-parallel primitives over the frozen shared heap.** `task.pmap(arr, f)` /
-  `task.preduce(arr, f, init)` (std-lib, no syntax): chunk a `shared.freeze`-frozen array across
-  the worker pool (zero-copy reads via the `TAG_SHARED` airlock path), run the callback in
-  isolates, merge results. Unfrozen inputs take a freeze-or-copy documented path; non-sendable
-  callbacks are the existing field-path panic. Builds entirely on `src/worker/` + `std/shared` +
-  the pool-side archive cache. Rayon-class throughput for batch work — a ×cores lever no
-  baseline JIT can match.
+- 🔒 **PAR — Data-parallel primitives over the worker pool.** `task.pmap(arr, f)` /
+  `task.preduce(arr, f, init)` (std-lib, no syntax): chunk an array across the worker pool, run
+  the callback in isolates, merge results. **Input: frozen array → `Arc`-bump zero-copy (TAG_SHARED
+  airlock); plain array → per-chunk structured-clone copy. No auto-freeze** — freeze-or-copy is
+  explicit and the shipped decision. Non-sendable callbacks are the existing field-path panic. Builds
+  entirely on `src/worker/` + `std/shared` + the pool-side archive cache. Rayon-class throughput for
+  batch work — a ×cores lever no baseline JIT can match.
   - Spec: `superpowers/specs/2026-06-12-data-parallel-design.md`
   - Plan: `superpowers/plans/2026-06-12-data-parallel.md`
 
