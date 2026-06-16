@@ -19,6 +19,32 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use tokio::sync::{mpsc, oneshot};
 
+// ── PAR §3.3.2 ──────────────────────────────────────────────────────────────
+
+/// PAR (spec §3.3.2): which kind of per-chunk data-parallel job to run.
+/// Plain `Copy`/`Send` scalars — no heap allocation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChunkKind {
+    /// Map: apply the entry fn to each element in `start..end`; collect results in order.
+    Map,
+    /// Reduce: fold the entry fn (binary) over `start..end`, seeded by the FIRST element
+    /// (`element[start]`). `init` never enters a chunk — that is the final-combine stage
+    /// (spec §3.3.3).
+    Reduce,
+}
+
+/// PAR (spec §3.3.2): a per-chunk data-parallel job. Plain `Copy`/`Send` scalars
+/// riding beside `caps` on [`WorkerRequest`] — NOT part of the structured-clone byte
+/// stream (no new wire tag; pinned by `tests/par_negative_space.rs`).
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkJob {
+    pub kind: ChunkKind,
+    /// Inclusive start index into the data array (chunk's first element).
+    pub start: u32,
+    /// Exclusive end index into the data array (one past the chunk's last element).
+    pub end: u32,
+}
+
 thread_local! {
     /// Set TRUE for the lifetime of an isolate's run loop. `dispatch_worker` reads it
     /// (via [`crate::worker::pool::in_isolate`]) to run a NESTED `worker fn` inline in
@@ -121,6 +147,10 @@ pub struct WorkerRequest {
     /// Cancel signal: the caller drops the paired sender on `Value::future` drop;
     /// the isolate `select!`s on this to abort the in-flight run (cancel-on-drop).
     pub abort: oneshot::Receiver<()>,
+    /// PAR (spec §3.3.2): when `Some`, the isolate runs the native chunk DRIVER over
+    /// the decoded data arg instead of a single entry call. Plain `Copy`/`Send` scalars —
+    /// no new wire tag, no serializer change (pinned by `tests/par_negative_space.rs`).
+    pub chunk: Option<ChunkJob>,
 }
 
 /// The isolate's response. `Send` bytes / a message string only — plus the SRV
@@ -328,6 +358,7 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
             caps,
             reply,
             abort,
+            chunk,
         } = req;
 
         // FFI §4.5a (the pooled-isolate soundness keystone). This `Interp` is REUSED
@@ -390,7 +421,19 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
             }
         };
 
-        let run = vm.call_value(entry, arg_values, crate::span::Span::new(0, 0));
+        // PAR §3.3.2: branch on whether this request carries a chunk job.
+        // The None arm is today's exact path (byte-for-byte).
+        let span = crate::span::Span::new(0, 0);
+        let run = async {
+            match &chunk {
+                Some(job) => {
+                    // chunk driver: data is the first (and only) decoded arg
+                    let data = arg_values.into_iter().next().unwrap_or(Value::nil());
+                    run_chunk_job(&vm, entry, data, job, span).await
+                }
+                None => vm.call_value(entry, arg_values, span).await,
+            }
+        };
         tokio::pin!(run);
         let reply_msg = tokio::select! {
             biased;
@@ -414,6 +457,170 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
             },
         };
         let _ = reply.send(reply_msg);
+    }
+}
+
+// ── PAR chunk driver helpers ─────────────────────────────────────────────────
+
+/// PAR §3.3.2: get the logical length of the data value for a chunk job.
+/// Accepts `Value::Array` (borrow the vec length) and `Value::Shared` whose node is
+/// `SharedNode::Array` (read the frozen array length). Any other kind is an internal
+/// invariant violation — the stdlib layer is responsible for validating before dispatch.
+fn chunk_data_len(
+    data: &Value,
+    span: crate::span::Span,
+) -> Result<usize, crate::interp::Control> {
+    use crate::value::SharedNode;
+    match data.kind() {
+        ValueKind::Array(a) => Ok(a.borrow().len()),
+        ValueKind::Shared(node) => match &**node {
+            SharedNode::Array(a) => Ok(a.len()),
+            other => Err(crate::interp::Control::Panic(crate::error::AsError::at(
+                format!(
+                    "chunk driver: data is a frozen {} but must be a frozen array (internal invariant)",
+                    other.kind_name()
+                ),
+                span,
+            ))),
+        },
+        _ => Err(crate::interp::Control::Panic(crate::error::AsError::at(
+            format!(
+                "chunk driver: data must be an array or frozen array, got {} (internal invariant)",
+                crate::interp::type_name(data)
+            ),
+            span,
+        ))),
+    }
+}
+
+/// PAR §3.3.2: read element `i` from the data value for a chunk job.
+///
+/// - `Value::Array`: clones the element OUT of the array before returning (never holds
+///   the `RefCell` borrow across an `.await` — the caller awaits the entry call after).
+/// - `Value::Shared` / `SharedNode::Array`: materializes the element via the shipped
+///   SRV `shared_child_to_value` reader — byte-identical to `frozen[i]` in script.
+fn chunk_data_element(
+    data: &Value,
+    i: usize,
+    span: crate::span::Span,
+) -> Result<Value, crate::interp::Control> {
+    use crate::value::SharedNode;
+    match data.kind() {
+        ValueKind::Array(a) => {
+            // Clone out of the borrow immediately so we never hold the borrow across
+            // an await (clippy `await_holding_refcell_ref` deny).
+            let elem = a.borrow().get(i).cloned().unwrap_or(Value::nil());
+            Ok(elem)
+        }
+        ValueKind::Shared(node) => match &**node {
+            SharedNode::Array(a) => {
+                Ok(a.get(i)
+                    .map(crate::interp::shared_child_to_value)
+                    .unwrap_or(Value::nil()))
+            }
+            other => Err(crate::interp::Control::Panic(crate::error::AsError::at(
+                format!(
+                    "chunk driver: data is a frozen {} but must be a frozen array (internal invariant)",
+                    other.kind_name()
+                ),
+                span,
+            ))),
+        },
+        _ => Err(crate::interp::Control::Panic(crate::error::AsError::at(
+            format!(
+                "chunk driver: data must be an array or frozen array, got {} (internal invariant)",
+                crate::interp::type_name(data)
+            ),
+            span,
+        ))),
+    }
+}
+
+/// PAR (spec §3.3.2): the native per-chunk element loop. `data` is either the WHOLE
+/// frozen input array (`Value::Shared`, frozen path — `start..end` index into it) or
+/// this chunk's own plain element slice (copy path — start=0). Per-element control
+/// flow mirrors the worker top-level rules in `isolate_loop` EXACTLY:
+/// - `Ok(v)` → element result (a returned future is driven to completion first)
+/// - `Err(Propagate(_))` → `nil` element [DEAD: `run_body` converts body-level `?` to
+///   `Ok([nil, err])` before `call_value` returns — kept to mirror `isolate_loop`]
+/// - `Err(Exit(_))` → the shipped "exit() is not allowed inside a worker" panic
+/// - `Err(Panic(e))` / other → the chunk fails with that error
+///
+/// Map replies an ordered results array; Reduce replies the partial fold seeded with
+/// the chunk's FIRST element (`init` never enters a chunk — spec §3.3.3).
+pub(crate) async fn run_chunk_job(
+    vm: &Rc<Vm>,
+    entry: Value,
+    data: Value,
+    job: &ChunkJob,
+    span: crate::span::Span,
+) -> Result<Value, crate::interp::Control> {
+    use crate::interp::Control;
+
+    let len = chunk_data_len(&data, span)?;
+    let start = job.start as usize;
+    let end = (job.end as usize).min(len);
+
+    /// Apply the worker top-level control-flow rules to one element call.
+    /// Mirrors the `isolate_loop` result match EXACTLY.
+    async fn call_element(
+        vm: &Rc<Vm>,
+        entry: &Value,
+        args: Vec<Value>,
+        span: crate::span::Span,
+    ) -> Result<Value, Control> {
+        match vm.call_value(entry.clone(), args, span).await {
+            Ok(v) => {
+                // A future return value must be driven to completion first (the task.spawn rule).
+                if let ValueKind::Future(f) = v.kind() {
+                    f.get().await
+                } else {
+                    Ok(v)
+                }
+            }
+            // DEAD arm: `run_body` converts a body-level `?` to `Ok([nil, err])` before
+            // `call_value` returns, so this arm is never reached for a `worker fn`. Kept
+            // to mirror `isolate_loop` byte-for-byte (spec §3.3.2 Phase-0 correction).
+            Err(Control::Propagate(_)) => Ok(Value::nil()),
+            // Exit refusal — the shipped diagnostic.
+            Err(Control::Exit(_)) => Err(Control::Panic(crate::error::AsError::at(
+                "exit() is not allowed inside a worker".to_string(),
+                span,
+            ))),
+            // Any other error (Panic, etc.) propagates unchanged → chunk fails.
+            Err(other) => Err(other),
+        }
+    }
+
+    match job.kind {
+        ChunkKind::Map => {
+            let mut out = Vec::with_capacity(end.saturating_sub(start));
+            for i in start..end {
+                // Clone the element OUT before the await (never hold the borrow).
+                let elem = chunk_data_element(&data, i, span)?;
+                out.push(call_element(vm, &entry, vec![elem], span).await?);
+            }
+            Ok(Value::array_cell(crate::value::ArrayCell::new(out)))
+        }
+        ChunkKind::Reduce => {
+            if start >= end {
+                // Empty range for Reduce is an internal invariant violation: the planner
+                // (Phase 2) must never emit an empty Reduce chunk. Return a recoverable
+                // panic rather than unwrapping.
+                return Err(Control::Panic(crate::error::AsError::at(
+                    "chunk driver: Reduce job has empty range (start >= end) — internal invariant"
+                        .to_string(),
+                    span,
+                )));
+            }
+            // Seed with the chunk's first element; init never enters a chunk (spec §3.3.3).
+            let mut acc = chunk_data_element(&data, start, span)?;
+            for i in start + 1..end {
+                let elem = chunk_data_element(&data, i, span)?;
+                acc = call_element(vm, &entry, vec![acc, elem], span).await?;
+            }
+            Ok(acc)
+        }
     }
 }
 
@@ -494,6 +701,283 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::sync::Arc;
+
+    // ── PAR Unit A: chunk driver tests (Step 5) ───────────────────────────────
+
+    /// Load a code slice into a fresh Vm (the dispatch.rs run_slice_in_fresh_isolate
+    /// pattern — lifted here so the chunk driver tests don't duplicate it). Returns
+    /// the Vm with the slice's globals defined, ready for `run_chunk_job`.
+    async fn fresh_vm_with_slice(src: &str, entry_name: &str) -> (Rc<Vm>, Value) {
+        let top = crate::compile::compile_source(src).expect("compiles");
+        let slice =
+            crate::worker::build_code_slice(&top, entry_name, None).expect("slice builds");
+
+        let chunk = Chunk::from_bytes(&slice.entry_aso).expect("slice .aso decodes");
+        let proto = Rc::new(FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+            name_span: None,
+        });
+        let closure = Closure::new(proto);
+
+        let interp = Rc::new(crate::interp::Interp::new());
+        interp.install_self();
+        let vm = Vm::new(interp);
+
+        let mut fiber = crate::vm::fiber::Fiber::new(closure);
+        match vm.run(&mut fiber).await.expect("slice runs") {
+            RunOutcome::Done(_) => {}
+            RunOutcome::Yielded(_) => unreachable!("fragment top-level cannot yield"),
+        }
+        let entry = vm
+            .user_global(entry_name)
+            .expect("entry global defined by the fragment");
+        (vm, entry)
+    }
+
+    /// PAR Unit A: Map over a plain array in order — the primary happy-path test.
+    /// `worker fn double(x) { return x * 2 }` applied to [10, 20, 30] must yield [20, 40, 60].
+    #[tokio::test]
+    async fn chunk_driver_map_plain_array_in_order() {
+        let (vm, entry) = fresh_vm_with_slice(
+            "worker fn double(x) { return x * 2 }",
+            "double",
+        )
+        .await;
+
+        let data = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::int(10),
+            Value::int(20),
+            Value::int(30),
+        ]));
+        let job = ChunkJob {
+            kind: ChunkKind::Map,
+            start: 0,
+            end: 3,
+        };
+        let out = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .expect("map chunk succeeds");
+        assert_eq!(format!("{out}"), "[20, 40, 60]");
+    }
+
+    /// PAR Unit A: Reduce seeds with the first element; `init` never enters a chunk
+    /// (spec §3.3.3). `add(a, b) = a + b` over [1, 2, 3, 4] → 1+2+3+4 = 10.
+    #[tokio::test]
+    async fn chunk_driver_reduce_seeded_with_first_element() {
+        let (vm, entry) = fresh_vm_with_slice(
+            "worker fn add(a, b) { return a + b }",
+            "add",
+        )
+        .await;
+
+        let data = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+        ]));
+        let job = ChunkJob {
+            kind: ChunkKind::Reduce,
+            start: 0,
+            end: 4,
+        };
+        let out = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .expect("reduce chunk succeeds");
+        // seed=1, then f(1,2)=3, f(3,3)=6, f(6,4)=10
+        assert_eq!(out, Value::int(10));
+    }
+
+    /// PAR Unit A: Phase-0 correction — a `?`-propagating callback yields the [nil, err]
+    /// PAIR (not nil), because `run_body` converts a body-level `?` to `Ok([nil, err])`
+    /// before `call_value` returns. The Propagate arm in `call_element` is dead code.
+    #[tokio::test]
+    async fn chunk_driver_map_propagating_element_yields_pair() {
+        // This worker fn uses `?` at top level; run_body converts it to Ok([nil, err])
+        // before call_value returns — so the element result is the pair, not nil.
+        let (vm, entry) = fresh_vm_with_slice(
+            r#"worker fn maybe(x) {
+    let [v, e] = [nil, {message: "oops"}]
+    let r = [v, e]?
+    return 1
+}"#,
+            "maybe",
+        )
+        .await;
+
+        let data = Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(0)]));
+        let job = ChunkJob {
+            kind: ChunkKind::Map,
+            start: 0,
+            end: 1,
+        };
+        let out = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .expect("map chunk returns ok (pair is a value)");
+        // The result is a 1-element array whose element is [nil, err_obj]
+        match out.kind() {
+            ValueKind::Array(a) => {
+                let elems = a.borrow().clone();
+                assert_eq!(elems.len(), 1, "one element in the map result");
+                // The element itself must be an array (the [nil, err] pair)
+                match elems[0].kind() {
+                    ValueKind::Array(pair) => {
+                        let pair = pair.borrow().clone();
+                        assert_eq!(pair.len(), 2, "pair has two elements");
+                        assert_eq!(pair[0], Value::nil(), "first element of pair is nil");
+                    }
+                    _ => panic!("element must be a [nil, err] array pair, got {}", elems[0]),
+                }
+            }
+            _ => panic!("expected Array output, got {}", out),
+        }
+    }
+
+    /// PAR Unit A: a panicking element aborts the rest of the chunk.
+    /// Uses division by zero to trigger a deterministic Tier-2 panic inside the worker fn.
+    #[tokio::test]
+    async fn chunk_driver_map_panic_aborts_chunk() {
+        // Dividing by zero triggers a recoverable Tier-2 panic inside the worker.
+        let (vm, entry) = fresh_vm_with_slice(
+            r#"worker fn boom(x) { return 1 / x }"#,
+            "boom",
+        )
+        .await;
+
+        let data = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::int(0), // triggers divide-by-zero panic
+            Value::int(2),
+        ]));
+        let job = ChunkJob {
+            kind: ChunkKind::Map,
+            start: 0,
+            end: 2,
+        };
+        let err = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .unwrap_err();
+        match err {
+            crate::interp::Control::Panic(e) => {
+                assert!(
+                    e.message.contains("zero") || e.message.contains("division"),
+                    "chunk error must propagate the element's panic message, got: {e:?}"
+                );
+            }
+            other => panic!("expected Panic control, got {other:?}"),
+        }
+    }
+
+    /// PAR Unit A: frozen `Shared` array data path — element materialization must be
+    /// byte-identical to `frozen[i]` in script (via `shared_child_to_value`).
+    #[tokio::test]
+    async fn chunk_driver_map_frozen_shared_array() {
+        let (vm, entry) = fresh_vm_with_slice(
+            "worker fn triple(x) { return x * 3 }",
+            "triple",
+        )
+        .await;
+
+        // Build a frozen SharedNode::Array directly
+        let shared_arr = std::sync::Arc::new(crate::value::SharedNode::Array(
+            std::sync::Arc::from(vec![
+                std::sync::Arc::new(crate::value::SharedNode::Int(5)),
+                std::sync::Arc::new(crate::value::SharedNode::Int(10)),
+                std::sync::Arc::new(crate::value::SharedNode::Int(15)),
+            ]),
+        ));
+        let data = Value::shared(shared_arr);
+
+        let job = ChunkJob {
+            kind: ChunkKind::Map,
+            start: 0,
+            end: 3,
+        };
+        let out = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .expect("frozen shared map chunk succeeds");
+        assert_eq!(format!("{out}"), "[15, 30, 45]");
+    }
+
+    /// PAR Unit A: `end > len` clamps to the actual array length — no out-of-bounds.
+    #[tokio::test]
+    async fn chunk_driver_map_end_clamps_to_len() {
+        let (vm, entry) = fresh_vm_with_slice(
+            "worker fn id(x) { return x }",
+            "id",
+        )
+        .await;
+
+        let data = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::int(1),
+            Value::int(2),
+        ]));
+        // end=99 but len=2 — must clamp to 2 without panicking.
+        let job = ChunkJob {
+            kind: ChunkKind::Map,
+            start: 0,
+            end: 99,
+        };
+        let out = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .expect("clamped end succeeds");
+        assert_eq!(format!("{out}"), "[1, 2]");
+    }
+
+    /// PAR Unit A: empty range (start == end) → Map returns `[]`.
+    #[tokio::test]
+    async fn chunk_driver_map_empty_range_returns_empty_array() {
+        let (vm, entry) = fresh_vm_with_slice(
+            "worker fn id(x) { return x }",
+            "id",
+        )
+        .await;
+
+        let data = Value::array_cell(crate::value::ArrayCell::new(vec![
+            Value::int(1),
+            Value::int(2),
+        ]));
+        let job = ChunkJob {
+            kind: ChunkKind::Map,
+            start: 1,
+            end: 1,
+        };
+        let out = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .expect("empty range map succeeds");
+        assert_eq!(format!("{out}"), "[]");
+    }
+
+    /// PAR Unit A: Reduce with a single element (start+1 == end) — returns just that element
+    /// without calling the combiner (spec §3.3.3 — seed is the first element, loop body empty).
+    #[tokio::test]
+    async fn chunk_driver_reduce_single_element_returns_seed() {
+        let (vm, entry) = fresh_vm_with_slice(
+            "worker fn add(a, b) { return a + b }",
+            "add",
+        )
+        .await;
+
+        let data = Value::array_cell(crate::value::ArrayCell::new(vec![Value::int(42)]));
+        let job = ChunkJob {
+            kind: ChunkKind::Reduce,
+            start: 0,
+            end: 1,
+        };
+        let out = run_chunk_job(&vm, entry, data, &job, crate::span::Span::new(0, 0))
+            .await
+            .expect("single-element reduce succeeds");
+        assert_eq!(out, Value::int(42));
+    }
 
     /// The dedicated (non-pooled) isolate substrate: `spawn_isolate` births a thread
     /// with its own runtime + fresh `Interp`/`Vm`, runs a caller-supplied run-loop that

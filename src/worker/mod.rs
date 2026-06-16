@@ -139,6 +139,8 @@ pub fn dispatch_worker(
         caps: Box::new(interp.caps()),
         reply: reply_tx,
         abort: abort_rx,
+        // PAR §3.3.2: plain dispatch has no chunk job (None = today's exact path).
+        chunk: None,
     };
     let inflight = match pool::dispatch(req) {
         Ok(inflight) => inflight,

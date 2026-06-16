@@ -220,6 +220,8 @@ mod tests {
             caps: Box::new(crate::stdlib::caps::CapSet::all_granted()),
             reply,
             abort,
+            // PAR §3.3.2: pool test fixture carries no chunk job (None = today's exact path).
+            chunk: None,
         }
     }
 
