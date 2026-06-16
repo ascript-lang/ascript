@@ -112,18 +112,26 @@ what is left after them.
 **Question:** is object identity observable in AScript, such that promotion (deep-copying an
 arena value into the general heap at an escape sink) would change observable behavior?
 
-**Answer: yes — categorically.** The audit (verified at `src/value.rs`, 2026-06-12):
+**Answer: yes — categorically.** The audit (verified at `src/value.rs`, 2026-06-16 — re-audit
+after NANB/CALL/ELIDE/PAR merge; semantics unchanged, file:line anchors updated):
 
 | # | Operation | Mechanism | Identity-observable? |
 |---|---|---|---|
-| 1 | `==` / `!=` on `Array`/`Object`/`Map`/`Set`/`Instance`/`Closure` | `gc::cc_ptr_eq` — POINTER identity (`src/value.rs:1414-1419, :1463`; `impl PartialEq for Value` at `:1393`) | **YES** — `a == b` is "same cell", full stop. `[1] == [1]` is `false` by design. |
-| 2 | `==` on `Function`/`Bytes`/`Regex`/`Native`/`Enum`/`Class`/`Interface`/`BoundMethod`/`Super`/`Future`/`Generator` | `Rc::ptr_eq` / `SharedFuture::ptr_eq` (`src/value.rs:1414-1469`, `src/task.rs:137`) | **YES** |
+| 1 | `==` / `!=` on `Array`/`Object`/`Map`/`Set`/`Instance`/`Closure` | `gc::cc_ptr_eq` — POINTER identity (`src/value.rs:2523-2527, :2571`; `impl PartialEq for Value` at `:2501`) | **YES** — `a == b` is "same cell", full stop. `[1] == [1]` is `false` by design. |
+| 2 | `==` on `Function`/`Bytes`/`Regex`/`Native`/`Enum`/`Class`/`Interface`/`BoundMethod`/`Super`/`Future`/`Generator` | `Rc::ptr_eq` / `SharedFuture::ptr_eq` (`src/value.rs:2522-2589`, `src/task.rs:137`) | **YES** |
 | 3 | **Aliasing + mutation** (`let b = a; b.x = 1` observed via `a.x`) | reference semantics on every mutable container — `SetProp`/index-set mutate the shared cell | **YES — this is the language's core data model**, stronger than identity: it is observable even without `==`. |
 | 4 | Array search ops built on `==` (`indexOf`/`includes`/…) | inherit row 1 for container elements | **YES** (derived) |
-| 5 | `Map` keys / `Set` elements | `MapKey::from_value` returns `None` for every container kind (`src/value.rs:241`) — containers are **not hashable** | **NO** — identity can never be a persistent map key. (One mercy.) |
-| 6 | Display/json/msgpack cycle guards, deep-equal `seen` sets | keyed by `cc_addr` (`src/value.rs:1587+`, `src/stdlib/{json,msgpack,object,assert_mod}.rs`) | **NO** — transient within one native call; addresses are never exposed to script. |
-| 7 | `shared.freeze` diamond/cycle tables | keyed by `cc_addr` (`src/stdlib/shared.rs`, `in_progress`/`completed`) | Structure-observable (shared subtrees stay shared in the frozen graph), but a sharing-preserving deep copy (cycle-table clone, like the airlock's `TAG_REF`) preserves it. Survivable. |
-| 8 | The worker airlock | structured clone with a container-id cycle table (`src/worker/serialize.rs:25-30`) | Already a copy — promotion-by-construction; sharing/cycles preserved on the far side. Survivable. |
+| 5 | `Map` keys / `Set` elements | `MapKey::from_value` returns `None` for every container kind (`src/value.rs:768` — the `_ => None` catch-all) — containers are **not hashable** | **NO** — identity can never be a persistent map key. (One mercy.) |
+| 6 | Display/json/msgpack cycle guards, deep-equal `seen` sets | keyed by `cc_addr` (`src/value.rs:2787+`, `src/stdlib/{json,msgpack,object,assert_mod}.rs`) — local `Vec`/`HashSet` per call | **NO** — transient within one native call; addresses are never exposed to script. |
+| 7 | `shared.freeze` diamond/cycle tables | keyed by `cc_addr` (`src/stdlib/shared.rs`, `in_progress`/`completed`) — local `HashSet`/`HashMap` in one `freeze()` call | Structure-observable (shared subtrees stay shared in the frozen graph), but a sharing-preserving deep copy (cycle-table clone, like the airlock's `TAG_REF`) preserves it. Survivable. |
+| 8 | The worker airlock | structured clone with a container-id cycle table (`src/worker/serialize.rs:25-30`) — local `HashMap` per serialization call | Already a copy — promotion-by-construction; sharing/cycles preserved on the far side. Survivable. |
+
+*2026-06-16 re-audit finding:* `Vm.class_methods`/`class_static_methods`/`class_defaults`
+(`src/vm/run.rs:575-591`) are persistent `FxHashMap<usize, …>` tables keyed by
+`Rc::as_ptr(class)` (a Class descriptor pointer), NOT by container `cc_addr`. Similarly,
+`Interp.iface_verdict_cache` (`src/interp.rs:636`) is keyed by `(class_ptr, iface_ptr)` with a
+generation guard against Rc reuse — also NOT container `cc_addr`. **No persistent table is keyed
+by container cc_addr.** Rows 6–7 verdict confirmed. Pinned by `tests/region_identity.rs`.
 
 **Consequence for promote-on-escape (option (i)).** Promotion deep-copies a subgraph at the
 moment one reference escapes. Every *other* live reference to that subgraph (an alias in a
@@ -571,12 +579,12 @@ per-class evaluation of `Map`/`Set`/`Instance`); the `bcanalysis` selection pass
   universal check would be the regression Gate 12 forbids. (A DECODE-side fold of the bitmap
   into the pre-decoded stream is a recorded post-DECODE refinement.)
 
-## 9. Grounding (verified file:line, 2026-06-12)
+## 9. Grounding (verified file:line, 2026-06-16 — re-anchored after NANB/CALL/ELIDE/PAR merge)
 
-- `src/value.rs:1101` `pub enum Value` (Cc container variants); `:1393` `impl PartialEq`;
-  `:1414-1419/:1463` the `cc_ptr_eq` identity arms (Array/Object/Map/Set/Closure/Instance) —
-  the §2.1 verdict's ground; `:189-243` `MapKey` (containers → `None` at `:241`); `:24`
-  `ObjectCell` (`map` + `shape: Cell<u32>` + `frozen: Cell<bool>`); `:73` `ArrayCell`.
+- `src/value.rs:1788` `pub enum Value` (doc-test line, the sealed-repr variant list is
+  immediately before); `:2501` `impl PartialEq for Value`;
+  `:2523-2527/:2571` the `cc_ptr_eq` identity arms (Closure/Array/Object/Map/Set/Instance) —
+  the §2.1 verdict's ground; `:729-770` `MapKey::from_value` (containers → `None` at `:768`).
 - `src/gc.rs:152/:159` `cc_addr`/`cc_ptr_eq`; `:88` `COLLECT_GROWTH_THRESHOLD = 10_000`;
   `:113/:137` `collect`/`maybe_collect`; `:126` `tracked_count` (the leak-test seam); `:193`
   `impl Trace for Value`; `:23-47` the traced-vs-deterministic-Drop invariant.
