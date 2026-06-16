@@ -166,3 +166,27 @@ recycler is ~15% end-to-end speedup on the server workload. That is above the �
 allocation-time gate (G1) — worth attempting.
 
 **Proceed to Phase 1** (Task 1.1 — gcmodule `ref_count()` getter fork).
+
+---
+
+## Checkpoint-review caveat (independent reviewer, 2026-06-16) — record for Phase 1
+
+The GO was independently verified: the histograms reproduce byte-for-byte deterministically (the
+exact roundness is real — `death()` fires only on `Drop`, and program-lifetime objects like
+`routes`/handler closures never drop before `dump()`, so they contribute zero residue), the
+arithmetic is correct against §5.3, and `server_request.as` is a legitimate pre-existing
+cross-campaign bench (created 2026-06-13 in the LANE/CALL Phase-0 corpus, a measured A/B row in
+`LANE_RESULTS.md`/CALL/DECODE/NANB). The main-task (`task == 0`) → `in_task` rule is the spec's
+**intended** semantics, not an artifact: eligibility is "refcount-1 at a kill site" (§3.3), the
+per-task guard exists for memory-bounding only (§3.4/§2.4), and the plan documents `b.task == 0`
+explicitly — main-loop steady-state churn is exactly what the per-`Vm` pool recycles.
+
+**The honest caveat (do NOT lose this in Phase 1):** the 40% is an **upper bound** on
+recycler-eligibility — the §5.3 probe does NOT model the §4 escape-sink census. The deciding
+`resp` cohort is passed to `json.stringify(resp)`, and §3.1 lists "any `Call*` argument position"
+as a *statically disqualifying* sink. The static pass may therefore reject this exact site, so the
+runtime refcount-1 proof would only apply *after* `stringify` returns. Phase 1's actual
+`recycled > 0` yield on `server_request` could land below 40% — possibly below the Phase-2 G1
+≥20%-allocation-time gate. §5.3 is a coarse early-NO-GO filter ("even a perfect recycler cannot
+reach the gate below 25%"); the REAL GO/NO-GO is Phase 2's measured A/B. Phase 1 must measure with
+eyes open on this sink.
