@@ -148,7 +148,8 @@ stated, results are measured.
 
 ### Types that pay you back
 
-- 🔒 **ELIDE — Contract elision via static proof.** When the TYPE checker statically PROVES a
+- ✅ **ELIDE — Contract elision via static proof. MERGED to `main` (`--no-ff`). See EXECUTION LOG.**
+  When the TYPE checker statically PROVES a
   call site's arguments satisfy the callee's annotations (or a field assignment its schema), the
   compiler emits an unchecked call/store; checks remain at every unproven (gradual) boundary —
   sound gradual typing where annotations BUY performance (the loop TypeScript/Sorbet structurally
@@ -624,6 +625,41 @@ stated, results are measured.
     GATE-VERDICT appended. **Gates (PATH-B `main`-applicable subset):** `vm_differential` 444/0 both
     configs; full suite + clippy clean both configs; `ASO_FORMAT_VERSION` 28 unchanged; no
     grammar/`.aso`/LSP/fmt change.
+
+- **ELIDE** — ✅ **MERGED to `main` (`--no-ff`).** Contract elision via static proof: when the TYPE
+  checker PROVES (the strict **(E)∧(Y)∧(A)** predicate — elide-safe destination ∧ `assignable==Yes` ∧
+  argument *anchored*, deliberately stronger than raw `Yes`) that a call's args / an annotated let's
+  initializer / a fn's returns satisfy their contracts, the runtime check is elided **identically on
+  both engines** — VM: `Op::CallElided` + skipped `Op::CheckLocal` + `proto.ret=None`; tree-walker: a
+  per-module AST marking pass (`Call.elide_args` / stripped `Stmt::Let.ty`/`Stmt::Fn.ret`) computed
+  from the same source-derived `ElisionSet`. 6 phases, subagent-driven (fresh implementer + independent
+  opus reviewer per task; per-phase holistic; whole-effort holistic). **DECISION (measured, §5.1.1):
+  DEFAULT-OFF, opt-in `--elide` / `ASCRIPT_ELIDE=1`** — `ascript run` doesn't type-check, so enabling
+  the collector on every run exceeded the §5.1 budget (corpus geomean **+6.99%** > 2%; collector 1.42 ms
+  at 266 lines > 1 ms); honest recorded outcome (spec option b). Kill switch `--no-elide` /
+  `ASCRIPT_NO_ELIDE=1` (force-off wins); paranoid audit mode `ASCRIPT_ELIDE_PARANOID=1` (runs elide-OFF,
+  escalates a violated proof to `ELIDE proof violated (checker soundness bug):` on both engines, zero
+  hot-path cost). **Headline opt-in win:** typed call-heavy **−6.0%** (`--elide` vs `--no-elide`), 66.7%
+  elision rate; default path unchanged (Gate-12/17 spec/tw **3.92×** ≥ 2×, DBG zero-cost 1.004×, startup
+  unchanged). `ASO_FORMAT_VERSION` **28→29** (`Op::CallElided` + verify/disasm/decode/bcanalysis arms).
+  **Four real bugs caught + fixed in-branch (each failing-test-first, Gate 14):** (1) a rule-6
+  `Class/ClassApp → Object` checker **unsoundness** (checker said `Yes`, runtime rejects instances —
+  would have elided an enforced check) → `Yes`→`Unknown`; (2) a resolver `mutated`-flag gap (reassigned
+  module **globals** read `mutated==false`, unsound anchoring) → `mutated_globals` set, behavior-neutral;
+  (3) `mark_program` skipped `LetDestructure` RHS calls (compiler-consumed but tree-walker-unmarked —
+  a cross-front-end divergence) — **found by the count-parity gate**; (4) `Op::CallElided` missing from
+  LANE's `sync_lane_op()` + DECODE's block-terminator set (+19% untyped regression) — **found by the A/B**.
+  **Gates:** the elide axis + **cross-axis (elide-on == elide-off)** joins the whole-corpus
+  `vm_differential` (444/0 both configs) + the fuzz differential (8th config, 3843 programs / 301 s / 0
+  divergences) + non-vacuous coverage/count-parity (56 typed files, 245 proven sites, collector ==
+  compiler == marker); diagnostic-neutral collector (§6.5, byte-identical diagnostics over `examples/**`);
+  paranoid corpus **zero escalations** both engines; a ~35-program adversarial predicate attack produced
+  **no** elide-on/off divergence. Full suite + clippy clean both configs; Gate-5 0 `type-*` on
+  `examples/**` both configs (incl. 2 new typed examples); fmt/LSP/REPL parity; **no grammar / tree-sitter
+  change** (internal AST field only). Docs: `type-contracts.md` "Annotations and performance",
+  `bench/ELIDE_RESULTS.md` (baseline/envelope/decision/headline), CLAUDE.md + roadmap + spec §5.1.1.
+  REPL / worker isolates / DAP / `--parallel` keep FULL checks (never elide). "Raw `Yes` is not a proof"
+  recorded as a warning for future checker work.
 
 ## Execution order
 
