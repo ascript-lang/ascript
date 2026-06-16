@@ -238,6 +238,7 @@ async fn eval_line_vm(vm: &Rc<Vm>, line: &str, session_src: &mut String) -> bool
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);

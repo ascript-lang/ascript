@@ -2,9 +2,15 @@
 // functions in a hot loop — per-call cost (arg vec, cells vector, frame push/pop, contract check).
 import * as time from "std/time"
 
-fn add(a, b) { return a + b }
-fn scale(x) { return add(x, x) }
-fn step(x) { return add(scale(x), 1) }
+fn add(a, b) {
+  return a + b
+}
+fn scale(x) {
+  return add(x, x)
+}
+fn step(x) {
+  return add(scale(x), 1)
+}
 
 let t0 = time.monotonic()
 let sum = 0

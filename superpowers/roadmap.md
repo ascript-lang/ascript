@@ -673,6 +673,29 @@ stays byte-identical (DECODE is a side representation, never a byte rewrite).
   workloads lead); interpretation-level pre-decode did not move the dispatch share. The JIT decision
   remains evidence-gated; what DECODE delivers is the *invalidation contract*, not a dispatch speedup.
 
+## ELIDE — contract elision via static proof ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-contract-elision-design.md`, plan
+`…/plans/2026-06-12-contract-elision.md`. Both engines; no grammar/LSP/fmt change;
+**`ASO_FORMAT_VERSION` 28 → 29** (`Op::CallElided`).
+
+- **Predicate (E)(Y)(A):** a call arg / annotated `let` / fn return is elided only when the
+  destination is an elide-safe type ∧ `Compat3::assignable==Yes` ∧ the argument is anchored
+  (immutable binding with a proved-at-creation value — kills stale-narrowing + loop-carried
+  hazards). **"Raw `Yes` is not a proof"** — anchoring is what makes a `Yes` a runtime guarantee.
+- **Both engines elide identically** (the campaign prime invariant held): VM emits `Op::CallElided`
+  + suppresses `Op::CheckLocal` + sets `proto.ret=None`; tree-walker runs a per-module AST marking
+  pass setting `Call.elide_args` / `Stmt::Fn.ret=None` before execution. The elide-on ==
+  elide-off cross-axis (in `vm_differential.rs`, both feature configs) + paranoid mode
+  (`ASCRIPT_ELIDE_PARANOID=1`, escalates a violated proof) are the verification layer.
+- **Default-OFF, opt-in** via `--elide` / `ASCRIPT_ELIDE=1` (collector cost: +1.42 ms / +6.99%
+  cold start at corpus scale > §5.1 budget of 1 ms / 2%; recorded in `bench/ELIDE_RESULTS.md`
+  + spec §5.1.1). `ascript build --elide` is the natural surface — the artifact carries the win.
+  Kill switch `--no-elide` / `ASCRIPT_NO_ELIDE=1` (force-off wins). Default path zero-cost-when-off
+  (Gate 12/17: spec/tw **3.92×** ≥ 2×). Headline opt-in: typed call-heavy **−6.0%**, 66.7% elision
+  rate. Two real bugs fixed in-branch failing-test-first: rule-6 `Class→Object` checker unsoundness;
+  `mark_program` skipping `LetDestructure` RHS calls.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

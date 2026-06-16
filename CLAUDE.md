@@ -437,6 +437,26 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   + flags remain as INERT no-ops (documented inert in `docs/content/cli.md`). spec/tw geomean ≥ 2×;
   `dbg_zero_cost_gate` ≈ 1.0×; no `.aso`/grammar/LSP/fmt change.
 
+- **ELIDE — contract elision via static proof** (both engines; spec
+  `superpowers/specs/2026-06-12-contract-elision-design.md`). When the TYPE checker PROVES a call
+  site's arguments / an annotated `let` / a fn's returns satisfy their contracts under the strict
+  **(E)(Y)(A)** predicate — elide-safe destination type ∧ `assignable==Yes` ∧ argument anchored —
+  the runtime check is dropped. **Both engines elide identically:** the VM via `Op::CallElided` +
+  skipped `Op::CheckLocal` + `proto.ret=None`; the tree-walker via a per-module AST marking pass
+  that sets `Call.elide_args` / `Stmt::Fn.ret=None` before execution. **"Raw `Yes` is not a
+  proof"** — anchoring (A) is what makes a `Compat3::Yes` a runtime guarantee; a speculative
+  narrowing or loop-carried update without anchoring is never elided, and ELIDE fixed a rule-6
+  `Class→Object` checker unsoundness discovered by the adversarial suite. **Default-OFF, opt-in
+  via `--elide` / `ASCRIPT_ELIDE=1`** (the collector pass adds ≥1ms / ≥7% cold-start at corpus
+  scale, exceeding the §5.1 budget; `ascript build --elide` is the natural surface — the artifact
+  carries the win). Kill switch `--no-elide` / `ASCRIPT_NO_ELIDE=1` force-off wins over the
+  opt-in. Paranoid mode `ASCRIPT_ELIDE_PARANOID=1` runs elide-OFF and escalates a violated proof
+  to `ELIDE proof violated (checker soundness bug):`. **Headline:** typed call-heavy **−6.0%**
+  (`--elide` vs `--no-elide`), 66.7% elision rate; default path unchanged (Gate-12/17 spec/tw
+  3.92× ≥ 2×). **Cross-axis gate:** elide-on == elide-off over the full corpus + fuzz +
+  paranoid-corpus zero-escalations (`vm_differential.rs` elide axis, both feature configs). **ASO
+  28→29** (`Op::CallElided`). No grammar/LSP/fmt/tree-walker-behavior change.
+
 ## Commands
 
 ```bash

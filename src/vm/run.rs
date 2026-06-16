@@ -467,6 +467,7 @@ fn op_is_block_terminator(op: Op) -> bool {
             | Op::MatchNoArm
             // calls + suspension points (frame/reactor/debugger transfer)
             | Op::Call
+            | Op::CallElided
             | Op::CallSpread
             | Op::CallMethod
             | Op::CallMethodSpread
@@ -817,6 +818,18 @@ pub struct Vm {
     /// (the entry body + every nested fn, recursively) so a `(file, line)` can target
     /// any proto, not just the current frame.
     debug_protos: RefCell<Vec<Rc<crate::vm::chunk::FnProto>>>,
+    /// **ELIDE §4.2/§5.2 — contract-elision compile mode for IMPORTED modules.**
+    /// When `true`, `compile_module_file` runs the `ElisionSet` collector on each
+    /// imported module's source and compiles it via `compile_source_with_elision`
+    /// (proven contract checks dropped from the bytecode). When `false` (the
+    /// default, and the `--no-elide` / `ASCRIPT_NO_ELIDE=1` kill switch), imports
+    /// compile byte-identically to pre-ELIDE. The ENTRY module's elision is applied
+    /// by the runner before the VM exists; this flag governs only the import loader.
+    /// A `Cell` set after construction (like `module_dir`), never read on the hot
+    /// path — only at module-compile time. **NOT inherited by worker isolates** (a
+    /// worker `Interp`/`Vm` is built fresh with `elide=false`; worker slices keep
+    /// full checks, §4.6).
+    elide: std::cell::Cell<bool>,
 }
 
 /// DBG: the final path component of a `/`- or `\`-separated path (the file name),
@@ -954,6 +967,7 @@ impl Vm {
             last_fault_source: RefCell::new(None),
             instrument: RefCell::new(None),
             debug_protos: RefCell::new(Vec::new()),
+            elide: std::cell::Cell::new(false),
             sync_lane,
             lane_sync_ops: std::cell::Cell::new(0),
             lane_bursts: std::cell::Cell::new(0),
@@ -1470,6 +1484,22 @@ impl Vm {
         *self.module_dir.borrow_mut() = dir;
     }
 
+    /// **ELIDE §4.2/§5.2** — enable contract elision for IMPORTED modules. When on,
+    /// `compile_module_file` runs the `ElisionSet` collector + compiles each import
+    /// via `compile_source_with_elision`. The default is `false` (the kill-switch
+    /// state). The runner sets this to the §5.1 decision value AFTER constructing the
+    /// VM (the entry module's elision is applied separately by the runner before the
+    /// VM exists). Worker isolates are built fresh and never call this, so worker
+    /// slices keep full checks (§4.6).
+    pub fn set_elide(&self, on: bool) {
+        self.elide.set(on);
+    }
+
+    /// Whether the import-loader compiles with contract elision (ELIDE §4.2).
+    pub fn elide(&self) -> bool {
+        self.elide.get()
+    }
+
     /// **SELF-CONTAINED-BUNDLES Phase 1.** Install an in-memory [`ModuleArchive`] as the
     /// source for relative file imports, and seed the entry's logical dir to the archive
     /// root (`""`). After this, `load_file_module` consults the archive by logical key
@@ -1674,6 +1704,9 @@ impl Vm {
         argc: usize,
         callee_idx: usize,
         call_span: Span,
+        // ELIDE §4.4: when true, skip per-param type-contract checks. Only the
+        // Op::CallElided dispatch paths pass true; all other callers pass false.
+        elide_contracts: bool,
     ) -> Result<(), Control> {
         // `what` mirrors the tree-walker's `func.name.as_deref().unwrap_or("function")`
         // so the wording of arity/contract panics matches byte-for-byte.
@@ -1695,6 +1728,7 @@ impl Vm {
             what,
             Some(&self.interp),
             Some(&self.class_env()),
+            elide_contracts,
         )?;
         // The args/rest array are gone from the stack; the new frame's window starts
         // where the callee value was.
@@ -2032,6 +2066,7 @@ impl Vm {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut module_fiber = Fiber::new(closure);
@@ -2074,7 +2109,18 @@ impl Vm {
                 format!("cannot read module {}: {}", as_path.display(), e),
             )
         })?;
-        let chunk = crate::compile::compile_source(&src).map_err(|e| {
+        // ELIDE §4.2: when import-elision is on, run the per-module ElisionSet
+        // collector and compile this module with the proven contract checks dropped.
+        // Per-module scoping is by construction — the set is computed from THIS
+        // module's own source, so cross-module span collisions are impossible (§4.3).
+        // Off (the default / kill-switch) → byte-identical to pre-ELIDE.
+        let compiled = if self.elide.get() {
+            let set = crate::check::infer::elision_proofs(&src);
+            crate::compile::compile_source_with_elision(&src, Some(&set))
+        } else {
+            crate::compile::compile_source(&src)
+        };
+        let chunk = compiled.map_err(|e| {
             self.panic_at(
                 fiber,
                 fault_ip,
@@ -3889,6 +3935,10 @@ impl Vm {
                     if let Some(ty) = ty {
                         let v = fiber.peek(0).clone();
                         if !crate::interp::check_type(&v, &ty) {
+                            // §6.3 paranoid: the call-site span is in `calls` set.
+                            if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                                return Err(e);
+                            }
                             return Err(crate::interp::contract_panic(&ty, &v, span));
                         }
                     }
@@ -3909,6 +3959,10 @@ impl Vm {
                     };
                     let v = fiber.peek(0).clone();
                     if !crate::interp::check_type(&v, &ty) {
+                        // §6.3 paranoid: the let initializer span is in `lets` set.
+                        if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                            return Err(e);
+                        }
                         return Err(crate::interp::contract_panic(&ty, &v, span));
                     }
                 }
@@ -3961,17 +4015,24 @@ impl Vm {
                     fiber.push(Value::closure(closure));
                 }
 
-                // ── Call / CallSpread (plain sync closure only) ───────────────
-                Op::Call | Op::CallSpread => {
+                // ── Call / CallElided / CallSpread (plain sync closure only) ─────
+                Op::Call | Op::CallElided | Op::CallSpread => {
                     // For CallSpread: peek at the callee before popping the args array.
-                    // For Call: peek at the callee using the static argc operand.
+                    // For Call / CallElided: peek at the callee using the static argc operand.
                     // If the callee is a plain (non-async, non-worker, non-generator)
                     // closure: push a new CallFrame (sync, no await) and continue.
                     // Any other callee kind: restore ip to fault_ip and escalate to async.
                     //
+                    // ELIDE §4.4: CallElided is semantically identical to Call here; the
+                    // elide flag threads into the binder to skip per-param type-contract
+                    // checks at statically-proven sites (Task 2.2).
+                    //
                     // INVARIANT: we must NOT pop anything from the stack before
                     // confirming the callee is sync-eligible, so that escalation
                     // leaves the stack completely untouched.
+                    // ELIDE §4.4: CallElided dispatch sets elide=true so the shared binder
+                    // skips per-param type-contract checks at this site.
+                    let elide = matches!(op, Op::CallElided);
                     if matches!(op, Op::CallSpread) {
                         // Stack is `[..., callee, argsArray]`. Peek callee at index -2.
                         let callee_ref = &fiber.stack[fiber.stack.len() - 2];
@@ -4014,7 +4075,7 @@ impl Vm {
                         // CallSpread is rare enough and rest-eligible that we keep the
                         // simpler path for clarity; the A2 fast path targets the common
                         // Op::Call shape where args are already individually on the stack).
-                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                        self.push_closure_frame(fiber, callee, argc, callee_idx, call_span, false)?;
                     } else {
                         // Op::Call: argc is the static operand.
                         let argc =
@@ -4047,6 +4108,7 @@ impl Vm {
                                 callee.proto.chunk.name.as_deref().unwrap_or("function"),
                                 Some(&self.interp),
                                 Some(&self.class_env()),
+                                elide,
                             )?;
                             fiber.stack.remove(callee_idx);
                             let slot_base = callee_idx;
@@ -4082,7 +4144,7 @@ impl Vm {
                             });
                             self.publish_profile_frames(fiber);
                         } else {
-                            self.push_closure_frame(fiber, callee, argc, callee_idx, call_span)?;
+                            self.push_closure_frame(fiber, callee, argc, callee_idx, call_span, elide)?;
                         }
                     }
                     // Continue the loop in the new (or returned-to) frame.
@@ -4667,16 +4729,20 @@ impl Vm {
                     ));
                 }
 
-                Op::Call | Op::CallSpread => {
-                    // `Op::Call` carries a STATIC `u8` argc; `Op::CallSpread` carries
-                    // none — its arguments arrived as a single runtime `Value::array_cell`
-                    // (built by the array/spread builder ops) sitting on top of the
-                    // callee `[..., callee, argsArray]`. For `CallSpread` we POP the
-                    // args array and re-push its elements as individual stack slots,
+                Op::Call | Op::CallElided | Op::CallSpread => {
+                    // `Op::Call`/`Op::CallElided` carry a STATIC `u8` argc; `Op::CallSpread`
+                    // carries none — its arguments arrived as a single runtime
+                    // `Value::array_cell` (built by the array/spread builder ops) sitting
+                    // on top of the callee `[..., callee, argsArray]`. For `CallSpread` we
+                    // POP the args array and re-push its elements as individual stack slots,
                     // so the stack becomes `[..., callee, arg0, .., arg{n-1}]` — the
                     // EXACT shape `Op::Call` expects — and dispatch is shared below
                     // (arity/contracts then apply to the flattened list, byte-
                     // identical to the tree-walker's `eval_call_args` → call).
+                    //
+                    // ELIDE §4.4: CallElided sets elide=true so the shared binder skips
+                    // per-param type-contract checks at statically-proven sites.
+                    let elide = matches!(op, Op::CallElided);
                     let argc = if matches!(op, Op::CallSpread) {
                         let args_arr = fiber.pop();
                         let args_ty = crate::interp::type_name(&args_arr);
@@ -4773,6 +4839,7 @@ impl Vm {
                                 what,
                                 Some(&self.interp),
                                 Some(&self.class_env()),
+                                false,
                             )?;
                             // Build a NOT-STARTED one-frame Fiber for the closure and
                             // place the bound params into its slots (cell slot → cell,
@@ -4884,6 +4951,7 @@ impl Vm {
                                     callee.proto.chunk.name.as_deref().unwrap_or("function"),
                                     Some(&self.interp),
                                     Some(&self.class_env()),
+                                    elide,
                                 )?;
                                 // Drop the callee value; the `argc` args shift down one
                                 // slot to start AT slot_base (an argc-element memmove,
@@ -4938,7 +5006,7 @@ impl Vm {
                                 // contracts, allocates cells, pushes the CallFrame (one
                                 // enter_frame_depth — SP3 §B), publishes profiler frames.
                                 self.push_closure_frame(
-                                    fiber, callee, argc, callee_idx, call_span,
+                                    fiber, callee, argc, callee_idx, call_span, elide,
                                 )?;
                             }
                             // Continue the loop in the new frame.
@@ -5371,6 +5439,10 @@ impl Vm {
                     if let Some(ty) = ty {
                         let v = fiber.peek(0).clone();
                         if !crate::interp::check_type(&v, &ty) {
+                            // §6.3 paranoid: call-site span in `calls` set.
+                            if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                                return Err(e);
+                            }
                             return Err(crate::interp::contract_panic(&ty, &v, span));
                         }
                     }
@@ -5398,6 +5470,10 @@ impl Vm {
                     };
                     let v = fiber.peek(0).clone();
                     if !crate::interp::check_type(&v, &ty) {
+                        // §6.3 paranoid: let initializer span in `lets` set.
+                        if let Some(e) = self.interp.maybe_paranoid_escalate(&ty, &v, span) {
+                            return Err(e);
+                        }
                         return Err(crate::interp::contract_panic(&ty, &v, span));
                     }
                 }
@@ -7894,7 +7970,7 @@ impl Vm {
                 if closure.proto.is_generator {
                     let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
                     let bound =
-                        crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+                        crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
                     let mut gfiber = Fiber::new(closure);
                     gfiber.frame_mut().ret_span = span;
                     gfiber.frame_mut().argc = bound.supplied;
@@ -7918,7 +7994,7 @@ impl Vm {
                 // Arity + per-param contracts + rest collection, shared verbatim
                 // with the tree-walker and the `Op::Call` arm.
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
                 // CALL §4 A3: take a pooled fiber (or allocate a fresh one when
                 // the pool is empty or call_fast=false). `take_pooled_fiber` pops
                 // the fiber from the pool so nested re-entrant calls grab a DIFFERENT
@@ -8350,7 +8426,7 @@ impl Vm {
             if !closure.proto.is_async && !closure.proto.is_generator {
                 let what = closure.proto.chunk.name.as_deref().unwrap_or("method");
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
                 let slot_base = fiber.stack.len();
                 let slot_count = closure.proto.chunk.slot_count as usize;
                 let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
@@ -9214,7 +9290,7 @@ impl Vm {
         // Bind the user args (arity + per-param contracts + rest) against the
         // method's declared params (which EXCLUDE self) — shared with every call
         // path. The bound values land in slots 1.. (self is slot 0).
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
         // A generator method (`fn*` / `async fn*`) is NOT run inline: it binds `self`
         // and args into a NOT-STARTED fiber and wraps it in a VM-backed
         // `GeneratorHandle`, returning a `Value::generator` immediately — exactly like
@@ -9328,7 +9404,7 @@ impl Vm {
             return Ok(Value::future(fut));
         }
         let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()))?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, Some(&self.interp), Some(&self.class_env()), false)?;
         // `static fn*` / `static async fn*`: build a NOT-STARTED fiber, bind args
         // into slots 0.., wrap in a VM `GeneratorHandle`. No receiver/self slot.
         if closure.proto.is_generator {
@@ -9622,6 +9698,12 @@ impl Vm {
             .expect("return/propagate with no active frame (VM bug)");
         if let Some(ret_ty) = &frame.closure.proto.ret {
             if !crate::interp::check_type(&value, ret_ty) {
+                // §6.3 paranoid: the fn name span is in `fn_rets` set.
+                if let Some(ns) = frame.closure.proto.name_span {
+                    if let Some(e) = self.interp.maybe_paranoid_escalate(ret_ty, &value, ns) {
+                        return Err(e);
+                    }
+                }
                 return Err(crate::interp::contract_panic(
                     ret_ty,
                     &value,
@@ -9876,6 +9958,13 @@ pub(crate) fn sync_lane_op(op: Op) -> bool {
             | Op::Closure
             // call (plain sync closure only; escalates for async/worker/generator/native)
             | Op::Call
+            // ELIDE §4.2: CallElided is dispatched IDENTICALLY to Call in the sync
+            // burst (only the contract-skip flag differs), so it MUST share Call's
+            // sync-lane admission — otherwise every proven call site escalates to the
+            // async driver and loses LANE's fast path (a measured ~19% regression on
+            // call-heavy code, untyped INCLUDED since an all-untyped-param call is a
+            // free-pass elide site). The §4.4 binder fast path handles it inline.
+            | Op::CallElided
             | Op::CallSpread
             // await (conditional — escalates only if the operand is a pending future;
             // a non-future operand or a resolved future completes inline per LANE §4)
@@ -9906,6 +9995,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10267,6 +10357,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10320,6 +10411,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -10480,6 +10572,7 @@ mod tests {
                 ret: None,
                 local_names: Vec::new(),
                 debug_name: None,
+            name_span: None,
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
 
@@ -10679,6 +10772,7 @@ mod tests {
                 ret: None,
                 local_names: Vec::new(),
                 debug_name: None,
+            name_span: None,
             });
             let proto_id = Rc::as_ptr(&proto) as *const () as usize;
             let (mut hook, cmd_tx, evt_rx) = DebuggerHook::new();
@@ -10792,6 +10886,7 @@ mod tests {
                 ret: None,
                 local_names: Vec::new(),
                 debug_name: None,
+            name_span: None,
             });
             let closure = Closure::new(top_proto);
             let mut fiber = Fiber::new(closure);
@@ -10868,6 +10963,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         vm.register_debug_protos(&entry);
         (entry, src_info)
@@ -10898,6 +10994,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let local = LocalSet::new();
@@ -10941,6 +11038,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let local = LocalSet::new();
@@ -11759,6 +11857,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto.clone());
         let mut fiber = Fiber::new(closure);
@@ -12191,6 +12290,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -12517,6 +12617,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -12544,6 +12645,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let fiber = Fiber::new(closure);
@@ -12882,6 +12984,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -12937,6 +13040,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);

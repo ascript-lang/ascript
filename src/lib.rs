@@ -18,6 +18,7 @@ pub mod diagnostics;
 // (`doc`, default-on) so `--no-default-features` builds none of it.
 #[cfg(feature = "doc")]
 pub mod doc;
+pub mod elide_mark;
 pub mod env;
 pub mod error;
 pub mod fmt;
@@ -108,6 +109,64 @@ where
         .expect("worker thread panicked")
 }
 
+/// **ELIDE §5 — the measured default for contract elision on the `run`/`build`/
+/// `test` SOURCE paths.**
+///
+/// The §5.1 DECISION (recorded with numbers in `bench/ELIDE_RESULTS.md` and the
+/// spec): the per-module collector cost is small in absolute terms (median 0.13 ms,
+/// and a real compute-bound A/B is a WIN — typed `call_heavy` −6%, untyped ≈0), BUT
+/// running it on EVERY source invocation fails BOTH §5.1 budget criteria as
+/// measured on the example corpus:
+/// - **≤ 2% corpus geomean:** measured **+6.99%** (68-file runnable example corpus,
+///   on/off, release) — the demo corpus is dominated by ms-runtime programs where a
+///   one-shot parse+resolve+infer collector pass is a large startup fraction.
+/// - **≤ 1 ms collector for a ≤500-line module:** the 266-line `all_features.as`
+///   already costs **1.42 ms** — over the absolute budget below 300 lines.
+///
+/// Per the spec's honesty mandate (plan Task 4.1 Step 2: "outside → default OFF …
+/// not a failure"), elision therefore ships **default-OFF**, opt-in via `--elide` /
+/// `ASCRIPT_ELIDE=1`. `ascript build` is the natural elide-on surface (a one-shot
+/// compile whose cost is amortised over every later run of the durable `.aso`).
+///
+/// Flip this one constant to make elision default-on (e.g. once the collector shares
+/// the compiler's parse+resolve, closing the startup gap). The kill-switch / opt-out
+/// path stays byte-identical to pre-ELIDE regardless.
+pub const ELIDE_DEFAULT_ON: bool = false;
+
+/// **ELIDE §5.2 — resolve whether contract elision is active for a source run.**
+///
+/// Precedence (most-specific wins, force-OFF beats opt-ON — the `--no-specialize`
+/// discipline):
+/// 1. `--no-elide` flag OR `ASCRIPT_NO_ELIDE=1` → **OFF** (explicit force-off).
+/// 2. `--elide` flag OR `ASCRIPT_ELIDE=1` → **ON** (the opt-in, since default-off).
+/// 3. otherwise → the measured [`ELIDE_DEFAULT_ON`] decision.
+///
+/// When this returns `false`, the collector never runs, the compiler is fed `None`,
+/// and the marker never marks — output bytecode and AST are byte-identical to
+/// pre-ELIDE (the zero-cost-when-off contract). When `true`, output is still
+/// byte-IDENTICAL behaviorally (elision is invisible); only proven checks are dropped.
+pub fn elide_enabled(elide_flag: bool, no_elide_flag: bool) -> bool {
+    // Force-off wins (defensive: an explicit kill switch always overrides opt-in).
+    if no_elide_flag || std::env::var("ASCRIPT_NO_ELIDE").as_deref() == Ok("1") {
+        return false;
+    }
+    if elide_flag || std::env::var("ASCRIPT_ELIDE").as_deref() == Ok("1") {
+        return true;
+    }
+    ELIDE_DEFAULT_ON
+}
+
+/// **ELIDE §6.3 — resolve whether paranoid proof-violation mode is active.**
+///
+/// When `true`, the runtime retains the per-module [`ElisionSet`] and escalates
+/// any contract failure at a proven site to a `ELIDE proof violated …` panic
+/// (a checker soundness bug). OFF by default; opt-in via `ASCRIPT_ELIDE_PARANOID=1`.
+/// Note: paranoid mode compiles/marks as elide-OFF (full checks retained) —
+/// the ElisionSet is used only on the failure path, zero hot-path cost.
+pub fn paranoid_enabled() -> bool {
+    std::env::var("ASCRIPT_ELIDE_PARANOID").as_deref() == Ok("1")
+}
+
 /// Run a `.as` file as the entry module (with import resolution relative to it).
 ///
 /// Returns the process exit code: `Ok(0)` for clean termination, `Ok(n)` when
@@ -121,7 +180,7 @@ where
 /// (only the script's own args — NOT the binary name or the file path).
 /// Pass `&[]` if the caller provides no trailing args.
 pub async fn run_file(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_with_packages(path, script_args, None, None).await
+    run_file_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
 }
 
 /// Like [`run_file`] (tree-walker) but installs a CLI-resolved package map (SP6)
@@ -133,6 +192,7 @@ pub async fn run_file_with_packages(
     script_args: &[String],
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<i32, AsError> {
     // CLI `run` streams `print` output live to stdout (so it appears immediately
     // and survives a later panic). Under `Live` there is no captured string, so
@@ -145,6 +205,23 @@ pub async fn run_file_with_packages(
     }
     if let Some(map) = packages {
         interp.set_package_resolver(map);
+    }
+    // ELIDE §4.3/§5: enable the per-module AST marking pass on the tree-walker.
+    // `load_module` runs `elision_proofs` + `mark_program` per module (entry AND
+    // imports flow through it), so per-module scoping is automatic. Off → the
+    // markers never run, byte-identical to pre-ELIDE.
+    interp.set_elide_mode(elide);
+    // ELIDE §6.3 paranoid mode: when active, build the ElisionSet from the source
+    // and install it for contract-failure-path lookup. Runs elide-OFF (no marking),
+    // so all contract checks are retained — the set is used ONLY when a check fails.
+    // NOTE: for multi-module programs, the CLI paranoid mode only covers the entry
+    // module (imported modules get separate passes via load_module). This is sufficient
+    // for correctness-gate purposes — the corpus test confirms zero escalations.
+    if paranoid_enabled() {
+        if let Ok(src) = std::fs::read_to_string(path) {
+            let paranoid_set = crate::check::infer::elision_proofs(&src);
+            interp.set_paranoid_set(paranoid_set);
+        }
     }
     interp.install_self();
     let local = tokio::task::LocalSet::new();
@@ -176,7 +253,7 @@ pub async fn run_tests_with_packages(
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
 ) -> Result<TestSummary, AsError> {
-    run_tests_with_options(files, packages, caps, None, false, None).await
+    run_tests_with_options(files, packages, caps, None, false, None, ELIDE_DEFAULT_ON).await
 }
 
 /// DX D2 Task 5 — the test runner with the `--parallel[=N]` option.
@@ -197,6 +274,7 @@ pub async fn run_tests_with_options(
     parallel: Option<usize>,
     update_snapshots: bool,
     filter: Option<&str>,
+    elide: bool,
 ) -> Result<TestSummary, AsError> {
     // Parallelize only when asked for >1 isolate AND there is more than one file. A
     // single file in one isolate is the serial path with extra cost — degrade to serial
@@ -213,9 +291,13 @@ pub async fn run_tests_with_options(
             // DX D2 Task 10: the `--filter` is applied INSIDE each isolate (same parsed
             // filter raw, re-parsed per isolate across the airlock), so the filtered/
             // passed/failed aggregate is identical regardless of parallelism (§7).
+            // ELIDE §4.6: the parallel path dispatches each FILE to its own worker
+            // ISOLATE; worker slices NEVER elide (full checks in the isolate), so the
+            // `elide` decision is intentionally NOT propagated across the airlock here.
+            let _ = elide;
             run_tests_parallel(files, packages, caps, n, update_snapshots, filter).await
         }
-        _ => run_tests_serial(files, packages, caps, update_snapshots, filter).await,
+        _ => run_tests_serial(files, packages, caps, update_snapshots, filter, elide).await,
     }
 }
 
@@ -341,6 +423,7 @@ async fn run_one_file_with_coverage(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     // Arm coverage over the entry proto tree BEFORE running (patches each line's first
     // offset to Op::Break; the cold trap arm recovers + records each line on first hit).
@@ -421,6 +504,7 @@ async fn run_tests_serial(
     caps: Option<crate::stdlib::caps::CapSet>,
     update_snapshots: bool,
     filter: Option<&str>,
+    elide: bool,
 ) -> Result<TestSummary, AsError> {
     // Parse the (CLI-validated) raw filter once for this serial run. A re-parse of an
     // already-validated filter cannot realistically fail, but a defensive `?` keeps the
@@ -431,6 +515,10 @@ async fn run_tests_serial(
     };
     let filter = filter.as_ref();
     let interp = Rc::new(Interp::new());
+    // ELIDE §4.3/§5: enable the per-module marking pass for the serial test run
+    // (each test FILE flows through `load_module`, which marks per-module). Off →
+    // byte-identical to pre-ELIDE.
+    interp.set_elide_mode(elide);
     if let Some(caps) = caps {
         interp.set_caps(caps);
     }
@@ -740,6 +828,77 @@ pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), A
     }
 }
 
+/// ELIDE §4.3 test seam: run a pre-parsed (and possibly AST-mutated) `Vec<Stmt>`
+/// on the tree-walker. Returns `Ok(output)` on success or `Err(panic_message)`
+/// on a Tier-2 panic. Used by `tests/elide.rs` Task 3.1 to inject `elide_args =
+/// true` on `ExprKind::Call` nodes before execution — the marking pass sets the
+/// flag in production; this seam lets tests do it surgically without needing access
+/// to `pub(crate)` internals.
+///
+/// `#[doc(hidden)]` test seam — not a public API.
+#[doc(hidden)]
+pub async fn tw_run_stmts(
+    stmts: Vec<crate::ast::Stmt>,
+) -> Result<String, String> {
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&stmts, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Ok(_) | Err(crate::interp::Control::Propagate(_)) | Err(crate::interp::Control::Exit(_)) => {
+            Ok(interp.output())
+        }
+        Err(crate::interp::Control::Panic(e)) => Err(e.message),
+    }
+}
+
+/// ELIDE §4.3 Task 3.2 test seam: parse `src`, run `elision_proofs` to build the
+/// `ElisionSet`, call `mark_program` on the AST, then execute on the tree-walker.
+/// Returns `(output, MarkCounts)` on success or `Err(panic_message)` on Tier-2
+/// panic. The counts let callers assert count parity against `vm_run_source_elided`
+/// and the raw `ElisionSet::len()`.
+///
+/// `#[doc(hidden)]` test seam — not a public API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn tw_run_source_elided(src: &str) -> Result<(String, crate::elide_mark::MarkCounts), String> {
+    let tokens = match lexer::lex(src) {
+        Ok(t) => t,
+        Err(e) => return Err(e.message),
+    };
+    let mut program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => return Err(e.message),
+    };
+    let set = crate::check::infer::elision_proofs(src);
+    let counts = crate::elide_mark::mark_program(&mut program, &set);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice
+    // (mirrors `run_source_exit` — required for any corpus file using workers).
+    interp.set_worker_source(src);
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Ok(_) | Err(crate::interp::Control::Propagate(_)) | Err(crate::interp::Control::Exit(_)) => {
+            Ok((interp.output(), counts))
+        }
+        Err(crate::interp::Control::Panic(e)) => Err(e.message),
+    }
+}
+
 /// Compile `src` to bytecode and run it on the VM, returning the value of the
 /// program's trailing expression (VM plan V1).
 ///
@@ -771,6 +930,7 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
 
@@ -874,6 +1034,7 @@ pub async fn vm_run_source_call_fast_stats(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -929,6 +1090,7 @@ pub async fn vm_run_source_obj_mode_stats(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1046,6 +1208,329 @@ pub async fn vm_run_source_decoded_forced(src: &str) -> Result<(String, Option<i
     vm_run_source_decode_cfg(src, true, true, true, 0).await
 }
 
+/// ELIDE §4.2 / §5.1: compile `src` with contract-elision (proven sites identified
+/// by the static checker are compiled without the corresponding runtime checks),
+/// then run on the VM with full specialization. Observable output is byte-identical
+/// to [`vm_run_source`] for programs the elision predicate is sound for — a
+/// behavioral regression means the proof predicate is wrong, not the run path.
+///
+/// Used by the ELIDE end-to-end tests in `tests/elide.rs` and the differential
+/// correctness gate (Phase 4). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn vm_run_source_elided(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::check::infer::elision_proofs;
+    use crate::compile::compile_source_with_elision;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let elide_set = elision_proofs(src);
+    let chunk = compile_source_with_elision(src, Some(&elide_set))
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// ELIDE §4.3 Task 3.2: like [`vm_run_source_elided`] but with VM specialization
+/// DISABLED (generic path). Used by the four-mode smoke test to confirm the
+/// generic-VM elided path produces byte-identical output.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_elided_generic(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::check::infer::elision_proofs;
+    use crate::compile::compile_source_with_elision;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let elide_set = elision_proofs(src);
+    let chunk = compile_source_with_elision(src, Some(&elide_set))
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    // specialize=false → generic (non-specializing) path
+    let vm = Vm::with_flags(interp.clone(), false, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// ELIDE §6.3: compile `src` WITHOUT elision (paranoid mode runs elide-OFF) but
+/// build the [`ElisionSet`] from the proof phase and install it on the `Interp`
+/// for contract-failure-path paranoid lookup. Returns `(output, exit_code)`.
+/// Any proven site that fails at runtime escalates to "ELIDE proof violated …".
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_paranoid(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::check::infer::elision_proofs;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    // Paranoid = elide-OFF compile (full checks retained) + ElisionSet retained.
+    let paranoid_set = elision_proofs(src);
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    interp.set_paranoid_set(paranoid_set);
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// ELIDE §6.3 test-only helper: parse `src` with the legacy parser and return the
+/// span of the first top-level `ExprKind::Call` statement. Panics if none found.
+/// Used so the injection seam injects the EXACT same span the runtime uses for the
+/// call — matching by the same char-offset key that [`Interp::maybe_paranoid_escalate`]
+/// looks up in the `calls` set.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+fn first_call_span_in_source(src: &str) -> crate::span::Span {
+    use crate::ast::{ExprKind, Stmt};
+    let tokens = lexer::lex(src).expect("lex in first_call_span_in_source");
+    let stmts = parser::parse(&tokens).expect("parse in first_call_span_in_source");
+    for stmt in &stmts {
+        if let Stmt::Expr(expr) = stmt {
+            if matches!(&expr.kind, ExprKind::Call { .. }) {
+                return expr.span;
+            }
+        }
+    }
+    panic!("no top-level Call expression found in source");
+}
+
+/// ELIDE §6.3 test-only: like [`vm_run_source_paranoid`] but additionally injects
+/// a FAKE call-site proof span so the FIRST contract failure at the call expression
+/// is treated as a proven site and escalates. The fake span is calculated from the
+/// source by finding the FIRST top-level `Call` expression using the legacy parser,
+/// ensuring it matches the span the runtime anchors contract panics to.
+///
+/// This simulates a checker soundness bug (the checker claimed a call was safe when
+/// it is not). Expected to return the panic message containing the escalation prefix.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn vm_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
+    use crate::check::infer::elision_proofs;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::Closure;
+    use crate::vm::Vm;
+
+    let paranoid_set = elision_proofs(src);
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| e.message)
+        .unwrap_or_else(|e| panic!("compile failed: {e}"));
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto.clone());
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    interp.set_paranoid_set(paranoid_set);
+    // Inject a FAKE proof: find the first top-level call expression span using the
+    // legacy parser (the same char-offset convention the runtime uses) and inject it
+    // into the `calls` set. This ensures `maybe_paranoid_escalate` sees an exact match
+    // when the contract fails, triggering the "ELIDE proof violated" escalation.
+    let call_span = first_call_span_in_source(src);
+    interp.inject_paranoid_call_span(call_span.start as u32, call_span.end as u32);
+    let vm = Vm::with_flags(interp.clone(), true, true, true);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Err(crate::interp::Control::Panic(e)) => e.message,
+        Ok(_) => String::from("(no panic — escalation did not fire)"),
+        Err(crate::interp::Control::Propagate(_)) => String::from("(propagated — no panic)"),
+        Err(crate::interp::Control::Exit(_)) => String::from("(exit — no panic)"),
+    }
+}
+
+/// ELIDE §6.3 tree-walker paranoid run: like [`vm_run_source_paranoid`] but on
+/// the tree-walker engine. Returns the captured output, or `Err(message)` on panic.
+/// `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn tw_run_source_paranoid(src: &str) -> Result<String, String> {
+    use crate::check::infer::elision_proofs;
+
+    let tokens = match lexer::lex(src) {
+        Ok(t) => t,
+        Err(e) => return Err(e.message),
+    };
+    let program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => return Err(e.message),
+    };
+    // Paranoid = elide-OFF (no mark_program call) + ElisionSet retained.
+    let paranoid_set = elision_proofs(src);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_paranoid_set(paranoid_set);
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Ok(_) | Err(crate::interp::Control::Propagate(_)) | Err(crate::interp::Control::Exit(_)) => {
+            Ok(interp.output())
+        }
+        Err(crate::interp::Control::Panic(e)) => Err(e.message),
+    }
+}
+
+/// ELIDE §6.3 test-only (TW): like [`tw_run_source_paranoid`] but additionally
+/// injects a FAKE call-site proof span to trigger escalation on contract failure.
+/// Returns the panic message string. `#[doc(hidden)]` — not a stable API.
+#[cfg(any(test, feature = "fuzzgen", fuzzing))]
+#[doc(hidden)]
+pub async fn tw_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
+    use crate::check::infer::elision_proofs;
+
+    let tokens = match lexer::lex(src) {
+        Ok(t) => t,
+        Err(e) => return format!("lex error: {e}"),
+    };
+    let program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => return format!("parse error: {e}"),
+    };
+    let paranoid_set = elision_proofs(src);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_paranoid_set(paranoid_set);
+    // Inject a FAKE proof: find the first top-level call expression span (the same
+    // char-offset convention the tree-walker uses for `expr.span`) and inject it into
+    // the `calls` set so `maybe_paranoid_escalate` sees an exact match.
+    let call_span = first_call_span_in_source(src);
+    interp.inject_paranoid_call_span(call_span.start as u32, call_span.end as u32);
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(
+            interp.exec_program(&program, &env),
+        ))
+        .await;
+    local.await;
+    match result {
+        Err(crate::interp::Control::Panic(e)) => e.message,
+        Ok(_) => String::from("(no panic — escalation did not fire)"),
+        Err(crate::interp::Control::Propagate(_)) => String::from("(propagated — no panic)"),
+        Err(crate::interp::Control::Exit(_)) => String::from("(exit — no panic)"),
+    }
+}
+
 /// DECODE §8.3: run `src` on the VM with DECODE FORCED (threshold=0) and return
 /// a [`DecodeStats`] bundle containing the program output + all stat counters.
 /// All counters are 0 until the corresponding task wires them up (INERT until
@@ -1107,6 +1592,7 @@ pub async fn vm_run_source_census(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1164,6 +1650,7 @@ async fn vm_run_source_decode_cfg(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1219,6 +1706,7 @@ async fn vm_run_source_decode_stats_cfg(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::value_ext::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1294,6 +1782,7 @@ pub async fn aso_roundtrip_run_source(src: &str) -> Result<(String, Option<i32>)
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1354,6 +1843,7 @@ pub async fn aso_runnable_accept(bytes: &[u8]) {
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = crate::vm::Closure::new(proto);
     let interp = Rc::new(Interp::new());
@@ -1381,13 +1871,15 @@ pub fn build_file(
     out: Option<&Path>,
     with_debug: bool,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<std::path::PathBuf, AsError> {
     // SELF-CONTAINED-BUNDLES (Task 1.5): a multi-module program is emitted as an
     // `ASCRIPTA` archive embedding the whole reachable import graph (so `run out.aso`
     // works from a directory WITHOUT the sources). A single-module program recompiles
     // the lone entry to a bare `ASO\0` chunk — byte-identical to the pre-archive
     // artifact, so existing `.aso` goldens/tests stay valid.
-    let (mut archive, report) = compile_archive(file, with_debug)?;
+    // ELIDE §4.2/§5: `build` elides under the same default / kill switch as `run`.
+    let (mut archive, report) = compile_archive(file, with_debug, elide)?;
     // SELF-CONTAINED-BUNDLES (Task 3.2, ARTIFACT-FORMAT RULE): emit an `ASCRIPTA` archive
     // when the graph has >1 module OR the caps are restricted (`caps.is_some()`); emit the
     // bare `ASO\0` chunk ONLY when single-module AND `caps` is `None`. This gives the
@@ -1414,7 +1906,7 @@ pub fn build_file(
         // single-module artifact stays byte-identical to the pre-archive output (and stays
         // decoupled from archive internals as Phase 2 evolves `compile_archive`). `build` is
         // a one-shot CLI compile, so re-compiling this one file is negligible.
-        compile_verified_aso_bytes(file, with_debug)? // bare ASO\0 — byte-identical to today
+        compile_verified_aso_bytes(file, with_debug, elide)? // bare ASO\0 — byte-identical to today
     };
     let out_path = match out {
         Some(p) => p.to_path_buf(),
@@ -1431,15 +1923,24 @@ pub fn build_file(
 /// loadable), then `to_bytes_with_debug`. Returns the verified `.aso` byte vector. The native
 /// bundle embeds these EXACT bytes, so the embedded payload is byte-identical to a `build`
 /// artifact (four-mode parity stays free; no `.aso` format change).
-fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, AsError> {
+fn compile_verified_aso_bytes(file: &Path, with_debug: bool, elide: bool) -> Result<Vec<u8>, AsError> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
     let src_info = Rc::new(SourceInfo {
         path: file.display().to_string(),
         text: src.clone(),
     });
-    let chunk = crate::compile::compile_source(&src)
-        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // ELIDE §4.2/§5: `ascript build` runs the collector under the same default /
+    // kill switch as `run`, so the produced `.aso`/native bundle KEEPS the win
+    // (the `CallElided` opcode is durable). Off → byte-identical to pre-ELIDE.
+    let chunk = if elide {
+        let set = crate::check::infer::elision_proofs(&src);
+        crate::compile::compile_source_with_elision(&src, Some(&set))
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    } else {
+        crate::compile::compile_source(&src)
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    };
     // DBG (v26): bind the module source onto the whole proto tree so a debug build
     // serializes line/variable info. Harmless for a `--strip` build (the source is
     // simply not written). `compile_source` does not bind a source itself.
@@ -1522,8 +2023,9 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool) -> Result<Vec<u8>, 
 pub fn compile_archive(
     entry: &Path,
     with_debug: bool,
+    elide: bool,
 ) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
-    compile_archive_with_shake(entry, with_debug, true)
+    compile_archive_with_shake(entry, with_debug, true, elide)
 }
 
 /// Like [`compile_archive`], but with the pass-2 TREE-SHAKE toggleable. This is the
@@ -1544,6 +2046,7 @@ pub fn compile_archive_with_shake(
     entry: &Path,
     with_debug: bool,
     shake: bool,
+    elide: bool,
 ) -> Result<(crate::vm::archive::ModuleArchive, crate::compile::shake::ShakeReport), AsError> {
     use crate::vm::archive::ModuleArchive;
     use std::collections::HashMap;
@@ -1607,7 +2110,7 @@ pub fn compile_archive_with_shake(
         // uses, so the stored chunk always re-verifies). The stored bytes are what RUN
         // (the archive replaces the source tree), so debug info is preserved per the
         // caller's `with_debug` choice — NOT dropped — matching a single-module build.
-        let bytes = compile_verified_aso_bytes(&item.path, with_debug)?;
+        let bytes = compile_verified_aso_bytes(&item.path, with_debug, elide)?;
 
         // Decode the just-produced chunk to read its import table. These are OUR OWN
         // freshly-verified bytes, so this never sees hostile input.
@@ -1764,7 +2267,7 @@ pub fn compile_archive_with_shake(
                 continue;
             };
             let path = &module_paths[idx];
-            let pruned = compile_pruned_aso_bytes(path, keep, with_debug)?;
+            let pruned = compile_pruned_aso_bytes(path, keep, with_debug, elide)?;
             *bytes = pruned;
         }
     }
@@ -1880,6 +2383,7 @@ fn compile_pruned_aso_bytes(
     file: &Path,
     keep: &std::collections::HashSet<Rc<str>>,
     with_debug: bool,
+    elide: bool,
 ) -> Result<Vec<u8>, AsError> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
@@ -1887,7 +2391,15 @@ fn compile_pruned_aso_bytes(
         path: file.display().to_string(),
         text: src.clone(),
     });
-    let chunk = crate::compile::compile_source_with_keep(&src, keep)
+    // ELIDE §4.2: a LIBRARY module is pruned to its keep-set AND elided in one
+    // compile (the two transforms are orthogonal). Off → byte-identical to the
+    // pre-ELIDE pruned path.
+    let elide_set = if elide {
+        Some(crate::check::infer::elision_proofs(&src))
+    } else {
+        None
+    };
+    let chunk = crate::compile::compile_source_with_keep_and_elision(&src, Some(keep), elide_set.as_ref())
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
     if with_debug {
         chunk.set_module_source(&src_info);
@@ -1954,6 +2466,7 @@ pub fn build_native(
     out: Option<&Path>,
     target: Option<&str>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<std::path::PathBuf, AsError> {
     // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
     // naming the requested triple, never a silent ignore or a generic clap failure.
@@ -1969,7 +2482,7 @@ pub fn build_native(
     // `ASCRIPTA` archive embedding the whole import graph for a multi-module program
     // (so the bundled binary runs from an empty directory). The `stub || payload ||
     // footer` framing below is unchanged: the payload is opaque to the bundler.
-    let (mut archive, report) = compile_archive(file, true)?;
+    let (mut archive, report) = compile_archive(file, true, elide)?;
     // SELF-CONTAINED-BUNDLES (Task 3.2, ARTIFACT-FORMAT RULE — same rule as `build_file`):
     // bundle an `ASCRIPTA` archive when the graph has >1 module OR the caps are restricted
     // (`caps.is_some()`); bundle the bare `ASO\0` chunk ONLY when single-module AND `caps`
@@ -1998,7 +2511,7 @@ pub fn build_native(
         // from the as-passed `file` keeps the relative source path, so the single-module
         // bundle stays byte-identical to the pre-archive output. `build` is one-shot, so
         // re-compiling this one file is negligible.
-        compile_verified_aso_bytes(file, true)? // bare ASO\0 — byte-identical to today
+        compile_verified_aso_bytes(file, true, elide)? // bare ASO\0 — byte-identical to today
     };
 
     // Step 2: the stub is a byte-for-byte copy of the running runtime — but if THIS binary is
@@ -2346,6 +2859,7 @@ async fn run_entry_proto_to_exit(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -2383,7 +2897,7 @@ async fn run_entry_proto_to_exit(
 /// build source), the source is attached to a Tier-2 panic here so its diagnostic
 /// renders against the file the user just ran.
 pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
-    run_file_on_vm_with_packages(path, script_args, None, None).await
+    run_file_on_vm_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
 }
 
 /// DX D4 §5.1: collect ALL recoverable parse diagnostics for a `.as` source file
@@ -2474,6 +2988,7 @@ pub async fn run_file_on_vm_with_packages(
     script_args: &[String],
     packages: Option<crate::interp::PackageMap>,
     caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
 ) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -2485,8 +3000,18 @@ pub async fn run_file_on_vm_with_packages(
         path: path.display().to_string(),
         text: src.clone(),
     });
-    let chunk = crate::compile::compile_source(&src)
-        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // ELIDE §4.2/§5: compile the ENTRY module with contract elision when enabled.
+    // The collector runs on this module's own source; the compiler drops proven
+    // CheckLocal/return checks and emits CallElided at proven call sites. Off (the
+    // default kill-switch state) → byte-identical to pre-ELIDE compilation.
+    let chunk = if elide {
+        let set = crate::check::infer::elision_proofs(&src);
+        crate::compile::compile_source_with_elision(&src, Some(&set))
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    } else {
+        crate::compile::compile_source(&src)
+            .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?
+    };
     // Bind the entry module's source onto its whole proto tree (SP4 §3) so a
     // panic raised in any of its functions renders its caret in this file even
     // when the error propagates up from a different module's call site.
@@ -2505,6 +3030,17 @@ pub async fn run_file_on_vm_with_packages(
         interp.set_package_resolver(map);
     }
     interp.install_self();
+    // ELIDE §6.3 paranoid mode (default VM CLI path): when active, build the entry
+    // module's ElisionSet and install it for contract-failure-path lookup. Paranoid
+    // runs elide-OFF (the entry/import compiles above keep all checks because the
+    // user opts in via ASCRIPT_ELIDE_PARANOID without --elide), so the set is
+    // consulted ONLY when a retained check fails — zero hot-path cost. Mirrors the
+    // tree-walker path in `run_file_with_packages`. Multi-module: covers the entry
+    // module (imports get their own passes); sufficient for the §6 correctness gate.
+    if paranoid_enabled() {
+        let paranoid_set = crate::check::infer::elision_proofs(&src);
+        interp.set_paranoid_set(paranoid_set);
+    }
     // VAL Task 4 (Gate 12 bench seam): `ASCRIPT_NO_SPECIALIZE=1` runs the CLI on
     // the GENERIC VM (every IC / adaptive-arith / global fast path skipped),
     // exactly as `vm_run_source_generic` does in tests. The two modes are asserted
@@ -2516,6 +3052,10 @@ pub async fn run_file_on_vm_with_packages(
     // → with_lanes reading the same env). Speed-only, never observable behavior.
     let specialize = std::env::var("ASCRIPT_NO_SPECIALIZE").as_deref() != Ok("1");
     let vm = Vm::with_specialize(interp.clone(), specialize);
+    // ELIDE §4.2: propagate the elision decision to the import loader so imported
+    // modules are compiled with elision too (the entry module was already compiled
+    // with it above). Off → imports compile byte-identically to pre-ELIDE.
+    vm.set_elide(elide);
     // Resolve relative imports against the source file's directory.
     if let Some(dir) = path.parent() {
         vm.set_module_dir(dir.to_path_buf());
@@ -2533,6 +3073,7 @@ pub async fn run_file_on_vm_with_packages(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -2603,6 +3144,7 @@ pub async fn run_file_decode_cfg(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -2725,6 +3267,7 @@ pub async fn run_file_on_vm_profiled(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
@@ -2869,6 +3412,7 @@ async fn vm_run_source_cfg_stats(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto.clone());
 
@@ -2958,6 +3502,7 @@ pub async fn vm_run_file_captured(entry: &Path) -> Result<(String, Option<i32>),
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
 
@@ -3047,6 +3592,7 @@ pub async fn run_archive(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);

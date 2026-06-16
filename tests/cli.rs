@@ -4802,3 +4802,201 @@ fn repl_defer_inside_fn_runs_on_fn_return() {
         "defer inside fn must fire after fn body; got: {out:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ELIDE §5 — CLI elision flag/kill-switch tests (Task 4.1 Step 3).
+//
+// A typed program runs identically with elision on (`--elide` / `ASCRIPT_ELIDE=1`)
+// and off (`--no-elide` / default). The simplest OBSERVABLE proof that elision
+// actually fired is at BUILD time: `build --elide` emits `Op::CallElided` at proven
+// call sites and drops proven `CheckLocal`/return checks, so the produced `.aso`
+// bytes DIFFER from a `build --no-elide` / default artifact — while BOTH `.aso`s run
+// byte-identically (elision is invisible).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A small fully-annotated program with proven call/let/return sites so elision has
+/// something to drop. Output is deterministic.
+const ELIDE_TYPED_SRC: &str = "\
+fn add(a: int, b: int): int {
+  return a + b
+}
+fn square(x: int): int {
+  return add(x, x) * 1
+}
+let base: int = 5
+let result: int = add(square(base), 10)
+print(result)
+";
+
+#[test]
+fn elide_build_changes_aso_bytes_but_not_output() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("elide_typed_{pid}.as"));
+    std::fs::write(&src, ELIDE_TYPED_SRC).unwrap();
+    let on = std::env::temp_dir().join(format!("elide_on_{pid}.aso"));
+    let off = std::env::temp_dir().join(format!("elide_off_{pid}.aso"));
+
+    // build --elide vs build --no-elide
+    let b_on = Command::new(bin)
+        .args(["build", "--elide"]).arg(&src).arg("-o").arg(&on)
+        .output().unwrap();
+    assert!(b_on.status.success(), "build --elide failed: {b_on:?}");
+    let b_off = Command::new(bin)
+        .args(["build", "--no-elide"]).arg(&src).arg("-o").arg(&off)
+        .output().unwrap();
+    assert!(b_off.status.success(), "build --no-elide failed: {b_off:?}");
+
+    let on_bytes = std::fs::read(&on).unwrap();
+    let off_bytes = std::fs::read(&off).unwrap();
+    assert_ne!(
+        on_bytes, off_bytes,
+        "build --elide must produce different bytecode than --no-elide \
+         (CallElided / dropped checks) for a typed program with proven sites"
+    );
+
+    // Both .aso run identically (elision is byte-invisible).
+    let r_on = Command::new(bin).arg("run").arg(&on).output().unwrap();
+    let r_off = Command::new(bin).arg("run").arg(&off).output().unwrap();
+    assert!(r_on.status.success(), "elided .aso run failed: {r_on:?}");
+    assert!(r_off.status.success(), "no-elide .aso run failed: {r_off:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&r_on.stdout),
+        String::from_utf8_lossy(&r_off.stdout),
+        "elided and non-elided .aso must produce identical output"
+    );
+    // The program computes add(square(5),10) = add(10,10) = 20.
+    assert_eq!(String::from_utf8_lossy(&r_on.stdout).trim(), "20");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&on);
+    let _ = std::fs::remove_file(&off);
+}
+
+#[test]
+fn elide_env_var_equivalent_to_flag() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("elide_env_{pid}.as"));
+    std::fs::write(&src, ELIDE_TYPED_SRC).unwrap();
+    let flag = std::env::temp_dir().join(format!("elide_envflag_{pid}.aso"));
+    let env = std::env::temp_dir().join(format!("elide_envenv_{pid}.aso"));
+
+    // build --elide
+    let b_flag = Command::new(bin)
+        .args(["build", "--elide"]).arg(&src).arg("-o").arg(&flag)
+        .output().unwrap();
+    assert!(b_flag.status.success(), "build --elide failed: {b_flag:?}");
+    // build with ASCRIPT_ELIDE=1 (no flag)
+    let b_env = Command::new(bin)
+        .env("ASCRIPT_ELIDE", "1")
+        .args(["build"]).arg(&src).arg("-o").arg(&env)
+        .output().unwrap();
+    assert!(b_env.status.success(), "build ASCRIPT_ELIDE=1 failed: {b_env:?}");
+
+    assert_eq!(
+        std::fs::read(&flag).unwrap(),
+        std::fs::read(&env).unwrap(),
+        "ASCRIPT_ELIDE=1 must produce byte-identical bytecode to --elide"
+    );
+
+    // ASCRIPT_NO_ELIDE=1 force-off wins over --elide.
+    let forced_off = std::env::temp_dir().join(format!("elide_forced_off_{pid}.aso"));
+    let plain_off = std::env::temp_dir().join(format!("elide_plain_off_{pid}.aso"));
+    let b_forced = Command::new(bin)
+        .env("ASCRIPT_NO_ELIDE", "1")
+        .args(["build", "--elide"]).arg(&src).arg("-o").arg(&forced_off)
+        .output().unwrap();
+    assert!(b_forced.status.success(), "build forced-off failed: {b_forced:?}");
+    let b_plain = Command::new(bin)
+        .args(["build", "--no-elide"]).arg(&src).arg("-o").arg(&plain_off)
+        .output().unwrap();
+    assert!(b_plain.status.success(), "build --no-elide failed: {b_plain:?}");
+    assert_eq!(
+        std::fs::read(&forced_off).unwrap(),
+        std::fs::read(&plain_off).unwrap(),
+        "ASCRIPT_NO_ELIDE=1 must win over --elide (force-off precedence)"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    for p in [&flag, &env, &forced_off, &plain_off] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn elide_run_source_paths_identical_output() {
+    // `ascript run` of a typed file: default (off), --elide, and --no-elide must all
+    // produce byte-identical output (elision is behaviorally invisible).
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("elide_run_{pid}.as"));
+    std::fs::write(&src, ELIDE_TYPED_SRC).unwrap();
+
+    let default_out = Command::new(bin).arg("run").arg(&src).output().unwrap();
+    let elide_out = Command::new(bin).args(["run", "--elide"]).arg(&src).output().unwrap();
+    let noelide_out = Command::new(bin).args(["run", "--no-elide"]).arg(&src).output().unwrap();
+    let tw_elide = Command::new(bin)
+        .args(["run", "--tree-walker", "--elide"]).arg(&src).output().unwrap();
+
+    for o in [&default_out, &elide_out, &noelide_out, &tw_elide] {
+        assert!(o.status.success(), "run failed: {o:?}");
+    }
+    let d = String::from_utf8_lossy(&default_out.stdout);
+    assert_eq!(d, String::from_utf8_lossy(&elide_out.stdout), "run --elide diverged");
+    assert_eq!(d, String::from_utf8_lossy(&noelide_out.stdout), "run --no-elide diverged");
+    assert_eq!(d.trim(), "20");
+    assert_eq!(
+        d, String::from_utf8_lossy(&tw_elide.stdout),
+        "tree-walker --elide must match the VM (four-mode invisibility)"
+    );
+
+    let _ = std::fs::remove_file(&src);
+}
+
+/// A `worker fn` whose body makes a WRONG-TYPED internal call STILL panics in the
+/// isolate even under `--elide` — worker slice compiles never run the collector
+/// (ELIDE §4.6), so the contract check is kept and fires. Proves worker isolates
+/// are NOT elided.
+#[test]
+fn elide_worker_isolate_keeps_full_checks() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let pid = std::process::id();
+    let src = std::env::temp_dir().join(format!("elide_worker_{pid}.as"));
+    // The worker fn calls a typed helper with a wrong-typed argument. If the worker
+    // slice were elided, the contract check would be dropped and no panic raised.
+    // (A pooled `worker fn` runs once per call and returns a future<T>.)
+    std::fs::write(
+        &src,
+        "\
+import * as task from \"std/task\"
+fn need_int(n: int): int { return n + 1 }
+worker fn job(): int {
+  // Wrong-typed internal call: pass a string where int is required.
+  let bad = \"not an int\"
+  return need_int(bad)
+}
+let r = await job()
+print(r)
+",
+    )
+    .unwrap();
+
+    // Run WITH elision forced on — the worker isolate must still panic.
+    let out = Command::new(bin)
+        .args(["run", "--elide"]).arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "worker fn with a wrong-typed internal call must STILL panic under --elide \
+         (worker slices keep full checks, §4.6); got success: {out:?}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("type contract") || err.contains("expected") || err.contains("int"),
+        "expected a contract-violation panic from the worker isolate, got:\n{err}"
+    );
+
+    let _ = std::fs::remove_file(&src);
+}

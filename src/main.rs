@@ -322,6 +322,8 @@ async fn real_main() -> ExitCode {
     match cli.command {
         Command::Run {
             tree_walker,
+            elide: elide_flag,
+            no_elide,
             locked,
             caps: CapFlags { deny, sandbox, deny_net, deny_fs },
             inspect,
@@ -475,12 +477,17 @@ async fn real_main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            // ELIDE §5.2: resolve the elision decision (`--elide`/`ASCRIPT_ELIDE`
+            // opt-in vs `--no-elide`/`ASCRIPT_NO_ELIDE` force-off over the measured
+            // default-OFF). `.aso` runs skip this — a compiled module already baked in
+            // whatever the `build` step elided (the opcode is durable).
+            let elide = ascript::elide_enabled(elide_flag, no_elide);
             let result = if is_aso {
                 ascript::run_aso_file(path, &args, caps).await
             } else if use_tree_walker {
-                ascript::run_file_with_packages(path, &args, packages, caps).await
+                ascript::run_file_with_packages(path, &args, packages, caps, elide).await
             } else {
-                ascript::run_file_on_vm_with_packages(path, &args, packages, caps).await
+                ascript::run_file_on_vm_with_packages(path, &args, packages, caps, elide).await
             };
             match result {
                 // Output already streamed live (OutputSink::Live).
@@ -495,6 +502,8 @@ async fn real_main() -> ExitCode {
         Command::Build {
             file,
             out,
+            elide: elide_flag,
+            no_elide,
             strip,
             native,
             target,
@@ -502,6 +511,11 @@ async fn real_main() -> ExitCode {
         } => {
             let out_path = out.as_deref().map(std::path::Path::new);
             let src = std::path::Path::new(&file);
+            // ELIDE §4.2/§5: `build --elide` (or `ASCRIPT_ELIDE=1`) bakes the proven
+            // elisions into the artifact — the `CallElided` opcode is durable, so the
+            // win rides every later `run` of the `.aso`/native bundle. Default-OFF
+            // (same as `run`); `--no-elide` is the explicit force-off.
+            let elide = ascript::elide_enabled(elide_flag, no_elide);
             // SELF-CONTAINED-BUNDLES (Task 3.1): compose the initial CapSet from the
             // CLI flags + the nearest `ascript.toml` `[capabilities]` table (the SAME
             // `compose_caps` the `run`/`test` commands use — single source of truth).
@@ -518,7 +532,7 @@ async fn real_main() -> ExitCode {
             if native {
                 // BIN: bundle a self-contained native executable. `--target` is
                 // host-only in v1 (build_native returns the specific Tier-1 error).
-                match ascript::build_native(src, out_path, target.as_deref(), caps) {
+                match ascript::build_native(src, out_path, target.as_deref(), caps, elide) {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
                     Err(e) => {
                         ascript::diagnostics::report(&e);
@@ -526,7 +540,7 @@ async fn real_main() -> ExitCode {
                     }
                 }
             } else {
-                match ascript::build_file(src, out_path, !strip, caps) {
+                match ascript::build_file(src, out_path, !strip, caps, elide) {
                     Ok(written) => {
                         println!("compiled {} -> {}", file, written.display());
                         ExitCode::SUCCESS
@@ -737,6 +751,8 @@ async fn real_main() -> ExitCode {
         } => run_doc(paths, out, format, private, open, check),
         Command::Test {
             files,
+            elide: elide_flag,
+            no_elide,
             locked,
             deny,
             sandbox,
@@ -746,6 +762,9 @@ async fn real_main() -> ExitCode {
             watch,
             coverage,
         } => {
+            // ELIDE §4.6/§5: resolve the elision decision for the (serial) test path.
+            // The PARALLEL path runs each file in a worker isolate, which never elides.
+            let elide = ascript::elide_enabled(elide_flag, no_elide);
             // DX D2 Task 10: validate the `--filter` ONCE up front so a malformed regex is a
             // clean error before any test runs (the raw string is re-parsed downstream — in
             // each isolate / the serial path — but it is already known-good here).
@@ -880,6 +899,7 @@ async fn real_main() -> ExitCode {
                 parallel,
                 update_snapshots,
                 filter_raw,
+                elide,
             )
             .await;
             match test_result {

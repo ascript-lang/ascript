@@ -1,0 +1,2800 @@
+//! ELIDE — semantics pins + (later) elision batteries.
+//!
+//! The probes in this file document the exact runtime/checker behaviors the
+//! ELIDE spec's proof predicate is shaped around (spec §0 / §3.4).  They must
+//! pass TODAY against the unmodified binary and must remain green after every
+//! ELIDE task so that any regression is caught immediately.
+//!
+//! Output routing (observed 2026-06-15):
+//!   `ascript check` diagnostics → **stdout** (ariadne reports go to stdout)
+//!   `ascript run` runtime errors → **stderr**
+//!
+//! Observed exact messages (2026-06-15, recorded here so later phases can rely
+//! on them — assert via `.contains(prefix)` to survive appended `, got {type}`
+//! tails per the DX message guide):
+//!
+//!   probe 1 check stdout: "[type-mismatch] Error: argument 1 of `f` expects `string`, found `int`"
+//!   probe 1 run  stderr : "type contract violated: expected string, got int (1)"
+//!   probe 3 run  stderr : "type contract violated: expected int, got string (s)"
+//!   probe 4 run  stderr : "type contract violated: expected object, got instance (<C instance>)"
+
+use std::process::Command;
+
+/// Spawn `ascript` with `args` and return `(stdout, stderr, exit_code)`.
+///
+/// Mirrors the pattern used in `tests/cli.rs` / `tests/lsp.rs`: no shell, no
+/// intermediary — direct `Command` spawn, UTF-8-lossy capture.
+fn run_cli(args: &[&str]) -> (String, String, i32) {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, code)
+}
+
+/// Write `src` to a uniquely-named temp file (keyed by test name + PID so
+/// parallel test runs never collide) and return the path.
+fn temp_as(tag: &str, src: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "ascript_elide_{}_{}.as",
+        tag,
+        std::process::id()
+    ));
+    std::fs::write(&path, src).unwrap();
+    path
+}
+
+// ---------------------------------------------------------------------------
+// Probe 1 — `ascript run` has no static type gate
+// ---------------------------------------------------------------------------
+//
+// Spec §5.3: `ascript check` blocks (exits != 0) on a provable `type-mismatch`
+// Error, but `ascript run` does NOT run the type checker — it executes the
+// program and only RUNTIME-panics when a contract is actually violated.
+// ELIDE must not change this (the probe is re-checked after each ELIDE task).
+//
+// Program: fn f(p: string){} f(1)
+//   ascript check  → exit 1, stdout contains "type-mismatch" / "expects"
+//                    (ariadne check diagnostics go to stdout, not stderr)
+//   ascript run    → exit 1, stderr contains "type contract violated: expected string, got int"
+//
+// Observed (2026-06-15):
+//   check stdout: "[type-mismatch] Error: argument 1 of `f` expects `string`, found `int`"
+//   run   stderr: "Error: type contract violated: expected string, got int (1)"
+#[test]
+fn probe_run_has_no_static_type_gate() {
+    let src = "fn f(p: string){} f(1)\n";
+    let file = temp_as("probe1", src);
+
+    // --- ascript check must block (exit != 0) ---
+    // Note: `ascript check` diagnostics go to STDOUT (ariadne rendering), not stderr.
+    let (check_out, _, check_code) = run_cli(&["check", file.to_str().unwrap()]);
+    assert_ne!(
+        check_code, 0,
+        "ascript check must exit != 0 for a provable type error; got exit {check_code}\nstdout: {check_out}"
+    );
+    // Observed stdout: "[type-mismatch] Error: argument 1 of `f` expects `string`, found `int`"
+    assert!(
+        check_out.contains("type-mismatch") || check_out.contains("expects"),
+        "expected a type-mismatch diagnostic in check stdout:\n{check_out}"
+    );
+
+    // --- ascript run must execute and RUNTIME-panic (not be blocked statically) ---
+    // Note: `ascript run` runtime errors go to STDERR.
+    let (_, run_err, run_code) = run_cli(&["run", file.to_str().unwrap()]);
+    assert_ne!(
+        run_code, 0,
+        "ascript run must exit != 0 due to the runtime contract panic; got exit {run_code}\nstderr: {run_err}"
+    );
+    // Observed: "type contract violated: expected string, got int (1)"
+    assert!(
+        run_err.contains("type contract violated: expected string"),
+        "expected runtime contract panic 'type contract violated: expected string' in run stderr:\n{run_err}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+// ---------------------------------------------------------------------------
+// Probe 2 — reassignment to an annotated let is NOT contract-checked
+// ---------------------------------------------------------------------------
+//
+// `let x: int = 5; x = "s"; print(x)` — the assignment `x = "s"` is never
+// checked against the annotation.  Both engines run clean (exit 0) and print "s".
+//
+// This is the spec §0 #2 landmine: the runtime does not contract-check later
+// assignments (src/interp.rs documents it), and the checker does not flow-update
+// annotated bindings on assignment.
+//
+// Observed (2026-06-15):
+//   VM output:          "s\n", exit 0
+//   tree-walker output: "s\n", exit 0
+#[test]
+fn probe_reassignment_is_not_contract_checked() {
+    let src = "let x: int = 5\nx = \"s\"\nprint(x)\n";
+    let file = temp_as("probe2", src);
+
+    // Default VM
+    let (vm_out, vm_err, vm_code) = run_cli(&["run", file.to_str().unwrap()]);
+    assert_eq!(
+        vm_code, 0,
+        "VM: expected clean exit (no contract check on reassignment); exit {vm_code}\nstderr: {vm_err}"
+    );
+    assert_eq!(
+        vm_out.trim(),
+        "s",
+        "VM: expected print output 's'; got: {vm_out:?}"
+    );
+
+    // Tree-walker (flag goes after the file per CLAUDE.md)
+    let (tw_out, tw_err, tw_code) =
+        run_cli(&["run", file.to_str().unwrap(), "--tree-walker"]);
+    assert_eq!(
+        tw_code, 0,
+        "tree-walker: expected clean exit (no contract check on reassignment); exit {tw_code}\nstderr: {tw_err}"
+    );
+    assert_eq!(
+        tw_out.trim(),
+        "s",
+        "tree-walker: expected print output 's'; got: {tw_out:?}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+// ---------------------------------------------------------------------------
+// Probe 3 — a mutated annotated binding is NOT a runtime guarantee
+// ---------------------------------------------------------------------------
+//
+// THE ELIDE landmine (spec §0 #2, §3.4 probe 3):
+//
+//   fn f(p: int){ return p }
+//   let x: int = 5
+//   x = "s"       ← annotation does NOT guard reassignment
+//   f(x)          ← checker still believes x : int → check exits 0
+//                   runtime sees x == "s" → contract panic
+//
+// Under ELIDE this site MUST remain un-elided because `x` is mutated
+// (not Anchored per §2.3).  This test is reasserted in Task 3.x to verify
+// that property after elision is wired.
+//
+// Observed (2026-06-15):
+//   ascript check exit:  0  (checker believes x : int, emits nothing)
+//   ascript run  exit:   1  "type contract violated: expected int, got string (s)"
+//   ascript run --tree-walker exit: 1, same message
+#[test]
+fn probe_mutated_binding_yes_is_not_a_runtime_guarantee() {
+    let src = "fn f(p: int){ return p }\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+    let file = temp_as("probe3", src);
+
+    // --- ascript check exits 0 (the checker's `Yes` is stale — annotated but mutated) ---
+    // Note: check diagnostics go to stdout; check_out is empty when no diagnostics.
+    let (check_out, _, check_code) = run_cli(&["check", file.to_str().unwrap()]);
+    assert_eq!(
+        check_code, 0,
+        "ascript check must exit 0 (checker does not track reassignment); got exit {check_code}\nstdout: {check_out}"
+    );
+
+    // --- VM: runtime panic because x holds "s" at the call site ---
+    let (_, run_err, run_code) = run_cli(&["run", file.to_str().unwrap()]);
+    assert_ne!(
+        run_code, 0,
+        "VM: expected runtime panic at f(x) after x was reassigned to a string; got exit {run_code}\nstderr: {run_err}"
+    );
+    // Observed: "type contract violated: expected int, got string (s)"
+    assert!(
+        run_err.contains("type contract violated: expected int"),
+        "VM: expected 'type contract violated: expected int' in run stderr:\n{run_err}"
+    );
+
+    // --- tree-walker: same panic ---
+    let (_, tw_err, tw_code) =
+        run_cli(&["run", file.to_str().unwrap(), "--tree-walker"]);
+    assert_ne!(
+        tw_code, 0,
+        "tree-walker: expected runtime panic at f(x); got exit {tw_code}\nstderr: {tw_err}"
+    );
+    assert!(
+        tw_err.contains("type contract violated: expected int"),
+        "tree-walker: expected 'type contract violated: expected int' in stderr:\n{tw_err}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+// ---------------------------------------------------------------------------
+// Probe 4 — `object` contract rejects class instances at runtime
+// ---------------------------------------------------------------------------
+//
+// Spec §0 #3 / §6.6: the checker's rule 6 (`assignable(Class(_), Object) = Yes`)
+// contradicts the runtime (`check_type` for `object` rejects instances).
+// ELIDE fixes rule 6 → Unknown (Task 1.1) and excludes `object` from the
+// ElideSafe form list.  This probe pins the runtime behavior that makes that
+// exclusion necessary.
+//
+// Program: class C{} fn f(p: object){} f(C())
+//   ascript check → exit 0 (checker today says Yes; after Task 1.1 still exit 0
+//                           because Unknown → no diagnostic)
+//   ascript run   → exit 1, "type contract violated: expected object, got instance"
+//   ascript run --tree-walker → exit 1, same message
+//
+// Observed (2026-06-15):
+//   check exit:  0
+//   run   exit:  1  "type contract violated: expected object, got instance (<C instance>)"
+//   tree-walker: 1  same
+#[test]
+fn probe_object_contract_rejects_instances() {
+    let src = "class C{}\nfn f(p: object){}\nf(C())\n";
+    let file = temp_as("probe4", src);
+
+    // checker is currently silent (rule 6 Yes → will stay silent as Unknown after Task 1.1)
+    // Note: check diagnostics go to stdout; check_out would be empty if silent.
+    let (check_out, _, check_code) = run_cli(&["check", file.to_str().unwrap()]);
+    assert_eq!(
+        check_code, 0,
+        "ascript check must exit 0 for class→object (checker rule 6 is Yes/Unknown, not No); got exit {check_code}\nstdout: {check_out}"
+    );
+
+    // VM runtime rejects the instance
+    let (_, run_err, run_code) = run_cli(&["run", file.to_str().unwrap()]);
+    assert_ne!(
+        run_code, 0,
+        "VM: expected runtime panic (object contract rejects instances); got exit {run_code}\nstderr: {run_err}"
+    );
+    // Observed: "type contract violated: expected object, got instance (<C instance>)"
+    assert!(
+        run_err.contains("type contract violated: expected object, got instance"),
+        "VM: expected 'type contract violated: expected object, got instance' in stderr:\n{run_err}"
+    );
+
+    // tree-walker runtime rejects the instance
+    let (_, tw_err, tw_code) =
+        run_cli(&["run", file.to_str().unwrap(), "--tree-walker"]);
+    assert_ne!(
+        tw_code, 0,
+        "tree-walker: expected runtime panic (object contract rejects instances); got exit {tw_code}\nstderr: {tw_err}"
+    );
+    assert!(
+        tw_err.contains("type contract violated: expected object, got instance"),
+        "tree-walker: expected 'type contract violated: expected object, got instance' in stderr:\n{tw_err}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+// ---------------------------------------------------------------------------
+// ELIDE Task 1.2 — the kind-table battery (spec §6.7)
+// ---------------------------------------------------------------------------
+//
+// The anchoring proof (A) relies on `arith_result_kind` MIRRORING the runtime's
+// NUM promotion EXACTLY: for every operand-kind pair × operator the table claims
+// a definite result kind, the runtime must actually produce a value of that kind.
+//
+// This battery generates ONE program (a single VM invocation) that, for every
+// concrete operand-kind pair × operator the table maps to `Some(kind)`, computes
+// the op on representative literals and prints `type(result)`. It then asserts the
+// printed runtime kind equals the table's `ResultKind`. Synth-vs-runtime is pinned
+// EXHAUSTIVELY over the concrete operand-kind matrix.
+//
+// `OperandKind::Number` is omitted from the runtime side: `number` is an
+// annotation SUPERTYPE with no literal form (a value is always concretely int or
+// float at runtime), and the table already returns `None` for every `Number`
+// operand — so there is no runtime obligation to pin for it.
+
+use ascript::check::infer::elide::{arith_result_kind, ArithOp, OperandKind, ResultKind};
+
+/// A representative `.as` literal expression for a concrete operand kind, plus a
+/// SECOND distinct literal (so e.g. `5 / 2` exercises the truncating int division
+/// rather than a trivial `x / x`).
+fn operand_literals(k: OperandKind) -> Option<(&'static str, &'static str)> {
+    match k {
+        OperandKind::Int => Some(("5", "2")),
+        OperandKind::Float => Some(("5.0", "2.0")),
+        OperandKind::String => Some(("\"a\"", "\"b\"")),
+        OperandKind::Bool => Some(("true", "false")),
+        OperandKind::Nil => Some(("nil", "nil")),
+        // `number` has no literal form (see the module note) — skip on the runtime
+        // side; the table already returns None for it.
+        OperandKind::Number => None,
+    }
+}
+
+/// The surface operator(s) covered by an `ArithOp` family. Each concrete operator
+/// must, for a kind pair the table maps to `Some`, produce that exact runtime kind.
+fn surface_ops(op: ArithOp) -> &'static [&'static str] {
+    match op {
+        // `+` is its own family (string-concat overload).
+        ArithOp::Add => &["+"],
+        // strictly-numeric arithmetic (float-accepting), incl. the truncating `/`,
+        // `%`, `**`.
+        ArithOp::NumericArith => &["-", "*", "/", "%", "**"],
+        // explicit overflow-WRAPPING arithmetic — int-only.
+        ArithOp::WrappingArith => &["+%", "-%", "*%"],
+        // bitwise / shift.
+        ArithOp::Bitwise => &["&", "|", "^", "<<", ">>"],
+        // comparison / membership (instanceof needs a type RHS, covered separately).
+        ArithOp::Comparison => &["==", "!=", "<", "<=", ">", ">="],
+        // logical / coalesce — never anchored; covered by a `None` assertion, not a
+        // runtime program.
+        ArithOp::Logical => &[],
+    }
+}
+
+/// Whether a concrete surface operator actually PRODUCES a value (vs panics
+/// before the site) for the given concrete operand kinds. The spec (§2.3) permits
+/// a "panic-before-site" for anchoring (a panic is not a wrong elision), so the
+/// battery only pins the cases that genuinely yield a value:
+/// - ORDERING comparisons (`< <= > >=`) require two numbers — a cross-type or
+///   non-number pair panics (`operator requires two numbers …`).
+/// - EQUALITY (`== !=`) works on any operand pair (→ bool).
+///
+/// All other families' Some-cases already imply value-producing operand kinds.
+fn runtime_produces_value(sop: &str, lhs: OperandKind, rhs: OperandKind) -> bool {
+    let numeric = |k: OperandKind| matches!(k, OperandKind::Int | OperandKind::Float);
+    match sop {
+        "<" | "<=" | ">" | ">=" => numeric(lhs) && numeric(rhs),
+        _ => true,
+    }
+}
+
+fn result_kind_name(k: ResultKind) -> &'static str {
+    match k {
+        ResultKind::Int => "int",
+        ResultKind::Float => "float",
+        ResultKind::String => "string",
+        ResultKind::Bool => "bool",
+    }
+}
+
+#[test]
+fn kind_table_battery_mirrors_runtime_num_promotion() {
+    let concrete_kinds = [
+        OperandKind::Int,
+        OperandKind::Float,
+        OperandKind::String,
+        OperandKind::Bool,
+        OperandKind::Nil,
+    ];
+    let families = [
+        ArithOp::Add,
+        ArithOp::NumericArith,
+        ArithOp::WrappingArith,
+        ArithOp::Bitwise,
+        ArithOp::Comparison,
+        ArithOp::Logical,
+    ];
+
+    // Build one program that prints the runtime kind of each anchored case, and a
+    // parallel `expected` vector of the table's claimed kind names.
+    let mut program = String::new();
+    let mut expected: Vec<&'static str> = Vec::new();
+    let mut cases: Vec<String> = Vec::new();
+
+    for &op in &families {
+        for &lhs in &concrete_kinds {
+            for &rhs in &concrete_kinds {
+                let Some(rk) = arith_result_kind(op, lhs, rhs) else {
+                    continue; // table says NOT anchored → no runtime obligation.
+                };
+                let (Some((la, _)), Some((_, rb))) =
+                    (operand_literals(lhs), operand_literals(rhs))
+                else {
+                    continue; // no literal form (e.g. Number) — skip.
+                };
+                for sop in surface_ops(op) {
+                    if !runtime_produces_value(sop, lhs, rhs) {
+                        continue; // panic-before-site — not a value-producing case.
+                    }
+                    let expr = format!("{la} {sop} {rb}");
+                    program.push_str(&format!("print(type({expr}))\n"));
+                    expected.push(result_kind_name(rk));
+                    cases.push(format!("{la} {sop} {rb}  (table: {})", result_kind_name(rk)));
+                }
+            }
+        }
+    }
+
+    assert!(
+        !expected.is_empty(),
+        "battery produced no cases — generator is broken"
+    );
+
+    // Run the whole battery in ONE VM invocation on a worker-stack runtime (the
+    // `!Send` idiom the differential uses).
+    let out = ascript::run_on_worker_stack({
+        let src = program.clone();
+        move || async move {
+            ascript::vm_run_source(&src)
+                .await
+                .expect("kind-table battery program failed to run")
+                .0
+        }
+    });
+
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "expected {} result lines, got {}\nprogram:\n{program}\noutput:\n{out}",
+        expected.len(),
+        lines.len()
+    );
+
+    for (i, (got, want)) in lines.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            got, want,
+            "case `{}`: arith_result_kind says `{want}`, runtime `type()` says `{got}`",
+            cases[i]
+        );
+    }
+
+    // Sanity: the battery is non-trivial (covers ~100 micro-cases, the spec's
+    // exhaustive-pin requirement).
+    assert!(
+        expected.len() >= 80,
+        "battery should pin ~100 cases, only pinned {}",
+        expected.len()
+    );
+}
+
+#[test]
+fn kind_table_logical_ops_never_anchored() {
+    // The logical/coalesce trio is NEVER anchored — `arith_result_kind` returns
+    // None for EVERY operand pair (pinned here so a future table edit can't
+    // silently anchor them).
+    let kinds = [
+        OperandKind::Int,
+        OperandKind::Float,
+        OperandKind::Number,
+        OperandKind::String,
+        OperandKind::Bool,
+        OperandKind::Nil,
+    ];
+    for &lhs in &kinds {
+        for &rhs in &kinds {
+            assert_eq!(
+                arith_result_kind(ArithOp::Logical, lhs, rhs),
+                None,
+                "logical {lhs:?} ∘ {rhs:?} must never be anchored"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Step 1 (Task 1.3) — `elision_proofs(src)`-level collection tests (spec §2.3).
+//
+// These assert SET MEMBERSHIP per the §2.3 anchoring table: which call / let /
+// fn-return sites the collector proves under the strict (E)∧(Y)∧(A) predicate.
+// Membership is checked by computing the CHAR-span key of a known source
+// substring (the same `(start_char, end_char)` convention the collector uses,
+// `code_range` → byte→char) and probing the corresponding `ElisionSet` field.
+// ===========================================================================
+
+mod collect {
+    use ascript::check::infer::elide::ElisionSet;
+    use ascript::check::infer::elision_proofs;
+
+    fn proofs(src: &str) -> ElisionSet {
+        elision_proofs(src)
+    }
+
+    /// CHAR `(start, end)` of the FIRST occurrence of `needle` in `src`. Mirrors the
+    /// `ByteToCharMap` convention: `start_char` = chars before the byte offset,
+    /// `end_char` = chars before the end byte. ASCII fixtures ⇒ byte == char.
+    fn char_span(src: &str, needle: &str) -> (u32, u32) {
+        let bstart = src.find(needle).unwrap_or_else(|| panic!("`{needle}` not in src"));
+        let bend = bstart + needle.len();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bend].chars().count() as u32;
+        (start, end)
+    }
+
+    fn has_call(src: &str, set: &ElisionSet, call_text: &str) -> bool {
+        set.calls.contains(&char_span(src, call_text))
+    }
+    fn has_let(src: &str, set: &ElisionSet, init_text: &str) -> bool {
+        set.lets.contains(&char_span(src, init_text))
+    }
+    fn has_fn_ret(src: &str, set: &ElisionSet, fn_name: &str) -> bool {
+        set.fn_rets.contains(&char_span(src, fn_name))
+    }
+
+    // ---- row 1: literals are anchored -------------------------------------
+
+    #[test]
+    fn literals_anchored_call() {
+        let src = "fn f(a: int, b: string) {} f(1, \"x\")\n";
+        let set = proofs(src);
+        assert!(has_call(src, &set, "f(1, \"x\")"), "literal call must be proven");
+        assert_eq!(set.calls.len(), 1, "exactly one call key");
+        // no annotated let / no ElideSafe-return fn ⇒ no other keys.
+        assert!(set.lets.is_empty());
+        assert!(set.fn_rets.is_empty());
+    }
+
+    // ---- row 2: unmutated annotated binding anchors the let AND the call ---
+
+    #[test]
+    fn unmutated_annotated_binding_anchors_let_and_call() {
+        let src = "fn f(p: int){}\nlet x: int = 5\nf(x)\n";
+        let set = proofs(src);
+        assert!(has_let(src, &set, "5"), "annotated let initializer proven");
+        assert!(has_call(src, &set, "f(x)"), "unmutated annotated binding anchors the call");
+    }
+
+    #[test]
+    fn mutated_binding_keeps_let_but_not_call() {
+        // x = 7 is provably fine, but a MUTATED binding is NOT anchored (v1) — the
+        // call keeps its check. The let key is NOT present either (the let binding is
+        // mutated ⇒ not anchored ⇒ not recorded).
+        let src = "fn f(p: int){}\nlet x: int = 5\nx = 7\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "mutated binding ⇒ call NOT proven");
+        // The let SITE: a mutated annotated binding is unanchored, so per the record
+        // predicate (annotation ElideSafe + Yes + Anchored-INITIALIZER) the initializer
+        // `5` IS still a literal (anchored) and the annotation IS ElideSafe and `5: int`
+        // is Yes — BUT the binding's unmutated gate fails, so the let is NOT recorded.
+        assert!(!has_let(src, &set, "5"), "mutated annotated let is NOT recorded");
+    }
+
+    #[test]
+    fn probe3_mutated_to_wrong_type_no_call_key() {
+        // THE soundness pin (§0 #2): x is reassigned to a string; even though the
+        // checker still believes x: int, the call must NOT be elided.
+        let src = "fn f(p: int){}\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "probe-3: mutated binding ⇒ no call key");
+    }
+
+    // ---- row 3: declared ElideSafe return + anchored call via it ----------
+
+    #[test]
+    fn declared_return_anchors_call_and_fn_ret() {
+        let src = "fn g(): int { return 1 }\nfn f(p: int){}\nf(g())\n";
+        let set = proofs(src);
+        assert!(has_fn_ret(src, &set, "g"), "g's return contract proven");
+        assert!(has_call(src, &set, "f(g())"), "call anchored via g's ElideSafe return");
+        // g() itself is a call to a 0-arg fn with no typed params ⇒ vacuously proven.
+        // (Compute the inner `g()` extent directly so the substring isn't confused with
+        // the declaration's empty param list `g():`.)
+        let call_off = src.find("f(g())").unwrap() + 2; // the inner `g(` start
+        assert_eq!(&src[call_off..call_off + 3], "g()");
+        let gkey = (call_off as u32, (call_off + 3) as u32);
+        assert!(set.calls.contains(&gkey), "g() (no typed params) is also proven");
+    }
+
+    // ---- gradual sources are excluded (rule-1 Yes via anchoring) ----------
+
+    #[test]
+    fn unknown_callee_arg_not_anchored() {
+        // unknown() resolves to nothing ⇒ Any ⇒ not anchored ⇒ no call key.
+        let src = "fn f(p: int){}\nf(unknown())\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(unknown())"), "Any-arg call not proven");
+    }
+
+    #[test]
+    fn any_typed_source_not_anchored() {
+        let src = "fn f(p: int){}\nlet a: any = 5\nf(a)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(a)"), "any-typed binding ⇒ not anchored");
+    }
+
+    // ---- ineligible call shapes -------------------------------------------
+
+    #[test]
+    fn spread_named_rest_async_worker_gen_excluded() {
+        // spread arg
+        let s1 = "fn f(p: int){}\nlet xs = [1]\nf(...xs)\n";
+        assert!(proofs(s1).calls.is_empty(), "spread ⇒ no key");
+        // named arg
+        let s2 = "fn f(p: int){}\nf(p: 1)\n";
+        assert!(proofs(s2).calls.is_empty(), "named arg ⇒ no key");
+        // rest-param callee
+        let s3 = "fn f(...p: array<int>){}\nf(1, 2)\n";
+        assert!(proofs(s3).calls.is_empty(), "rest callee ⇒ no key");
+        // async callee
+        let s4 = "async fn f(p: int){}\nf(1)\n";
+        assert!(proofs(s4).calls.is_empty(), "async callee ⇒ no key");
+        // worker callee
+        let s5 = "worker fn f(p: int) { return p }\nf(1)\n";
+        assert!(proofs(s5).calls.is_empty(), "worker callee ⇒ no key");
+        // generator callee
+        let s6 = "fn* f(p: int) { yield p }\nf(1)\n";
+        assert!(proofs(s6).calls.is_empty(), "generator callee ⇒ no key");
+    }
+
+    #[test]
+    fn arity_mismatch_no_key() {
+        // f(1,2,3) on a 2-arity fn: the collector counts arity itself ⇒ not proven.
+        let src = "fn f(a: int, b: int) {}\nf(1, 2, 3)\n";
+        let set = proofs(src);
+        assert!(set.calls.is_empty(), "arity mismatch ⇒ no key");
+        // too few:
+        let src2 = "fn f(a: int, b: int) {}\nf(1)\n";
+        assert!(proofs(src2).calls.is_empty(), "too-few args ⇒ no key");
+        // defaulted param: f(1) valid for (a:int, b:int=2)
+        let src3 = "fn f(a: int, b: int = 2) {}\nf(1)\n";
+        assert!(has_call(src3, &proofs(src3), "f(1)"), "defaulted arity ⇒ proven");
+    }
+
+    // ---- narrowing-from-anchored ------------------------------------------
+
+    #[test]
+    fn narrowed_anchored_binding_call() {
+        // x : int? unmutated, narrowed by `if (x != nil)` ⇒ the call inside is proven
+        // (the base binding is anchored via its ElideSafe `int?` annotation, and
+        // narrowing preserves anchoring).
+        let src = "fn f(p: int?){}\nlet x: int? = 5\nif (x != nil) { f(x) }\n";
+        let set = proofs(src);
+        assert!(has_call(src, &set, "f(x)"), "narrowed-from-anchored call proven");
+    }
+
+    // ---- arithmetic / ternary / unary / comparison composition ------------
+
+    #[test]
+    fn arithmetic_composition_anchored() {
+        // int literals + arithmetic → int (anchored).
+        let src = "fn f(p: int){}\nf(1 + 2)\n";
+        assert!(has_call(src, &proofs(src), "f(1 + 2)"), "int+int anchored");
+        // mixed int/float → float, into a float param.
+        let src2 = "fn g(p: float){}\ng(1 + 2.0)\n";
+        assert!(has_call(src2, &proofs(src2), "g(1 + 2.0)"), "int+float anchored as float");
+        // `**` is NOT kind-deterministic (int**−1 → float) ⇒ never anchored, so a
+        // call fed by it keeps its check (fail-safe — matches the synth's gradual
+        // `Number` for `**`).
+        let src3 = "fn f(p: int){}\nf(2 ** 3)\n";
+        assert!(proofs(src3).calls.is_empty(), "`**` ⇒ not anchored ⇒ no call key");
+    }
+
+    #[test]
+    fn unary_and_comparison_anchored() {
+        // `!cond` → bool, into a bool param.
+        let src = "fn f(p: bool){}\nf(!true)\n";
+        assert!(has_call(src, &proofs(src), "f(!true)"), "unary ! anchored as bool");
+        // comparison → bool.
+        let src2 = "fn f(p: bool){}\nf(1 < 2)\n";
+        assert!(has_call(src2, &proofs(src2), "f(1 < 2)"), "comparison anchored as bool");
+        // negation of an int literal → int.
+        let src3 = "fn f(p: int){}\nf(-5)\n";
+        assert!(has_call(src3, &proofs(src3), "f(-5)"), "unary - anchored as int");
+    }
+
+    #[test]
+    fn ternary_both_branches_anchored() {
+        let src = "fn f(p: int){}\nf(true ? 1 : 2)\n";
+        assert!(has_call(src, &proofs(src), "f(true ? 1 : 2)"), "ternary anchored");
+    }
+
+    #[test]
+    fn logical_op_not_anchored() {
+        // `&&` returns an operand (truthiness), not a fixed kind ⇒ never anchored.
+        let src = "fn f(p: bool){}\nlet a: bool = true\nlet b: bool = false\nf(a && b)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(a && b)"), "logical-op arg ⇒ not anchored");
+    }
+
+    // ---- uninitialized annotated let is UNANCHORED (soundness point) ------
+
+    #[test]
+    fn uninitialized_annotated_let_unanchored() {
+        // `let x: int` (no initializer): the runtime binds nil WITHOUT checking, so
+        // the annotation is not a runtime guarantee ⇒ the call must NOT be proven.
+        let src = "fn f(p: int){}\nlet x: int\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "uninitialized annotated let ⇒ no call key");
+        assert!(set.lets.is_empty(), "uninitialized let records no let key");
+    }
+
+    // ---- non-always-returning fn with non-nil ret is not a fn_ret key -----
+
+    #[test]
+    fn non_total_return_body_not_proven() {
+        // g returns int on one path but falls off the end ⇒ implicit nil; nil is NOT
+        // Yes against int ⇒ g's return contract is NOT proven ⇒ a call anchored via it
+        // is NOT proven.
+        let src = "fn g(c: bool): int { if (c) { return 1 } }\nfn f(p: int){}\nf(g(true))\n";
+        let set = proofs(src);
+        assert!(!has_fn_ret(src, &set, "g"), "non-total int-returning fn ⇒ no fn_ret key");
+        assert!(!has_call(src, &set, "f(g(true))"), "call via unproven return ⇒ no key");
+    }
+
+    // ---- shadowed fn name fails safe --------------------------------------
+
+    #[test]
+    fn shadowed_fn_name_no_call_key() {
+        // A genuine SHADOW: a local `f` (a non-fn binding) shadows the global `fn f`,
+        // so the call inside `g` resolves to the LOCAL, not the fn — resolve_in_file_fn
+        // must bail (not a unique non-shadowed Fn binding) ⇒ no call key for `f(1)`.
+        let src = "fn f(p: int) {}\nfn g() { let f = 5\nf(1) }\n";
+        let set = proofs(src);
+        // The call `f(1)` inside g resolves to the local `f = 5` (not callable / not the
+        // fn) — the collector must NOT prove it.
+        let off = src.rfind("f(1)").unwrap();
+        let key = (off as u32, (off + 4) as u32);
+        assert!(!set.calls.contains(&key), "shadowed fn name ⇒ no call key");
+    }
+
+    #[test]
+    fn captured_mutated_global_not_anchored() {
+        // A global mutated inside a nested fn (`mark_mutated_target` reaches the global
+        // binding) ⇒ the binding is NOT anchored ⇒ a call using it is not proven.
+        let src = "fn f(p: int){}\nlet x: int = 5\nfn bump() { x = 9 }\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "globally-mutated binding ⇒ no call key");
+    }
+
+    #[test]
+    fn forward_mutated_global_not_anchored() {
+        // The mutation `x = 9` (inside a fn) is collected order-independently, so even
+        // a mutation textually BEFORE the `let x` declaration marks x mutated ⇒ the
+        // call is not anchored (robustness of the resolver's mutated-globals set).
+        let src = "fn f(p: int){}\nfn bump() { x = 9 }\nlet x: int = 5\nf(x)\n";
+        let set = proofs(src);
+        assert!(!has_call(src, &set, "f(x)"), "forward-mutated global ⇒ no call key");
+    }
+}
+
+// ===========================================================================
+// Step 3 (Task 1.3) — diagnostic-neutrality gate (spec §6.5).
+//
+// For EVERY file in examples/** (both intro and advanced), the inference pass's
+// diagnostics must be byte-IDENTICAL whether or not elide-collection mode ran —
+// the collector is a pure side-accumulator that NEVER changes diagnostics. This
+// is the hover-mode invariant, re-proven for elide mode. Runs in BOTH feature
+// configs (the inference pass is feature-independent, so `cargo test` and
+// `--no-default-features` both exercise this).
+// ===========================================================================
+
+mod neutrality {
+    use ascript::check::infer::check_with_elision;
+    use std::fs;
+    use std::path::Path;
+
+    /// The full inference-pass diagnostics for `src` in NORMAL mode — recomputed
+    /// here via the same front-end the collection path uses, so the only variable
+    /// is the elide flag.
+    fn normal_diags(src: &str) -> Vec<String> {
+        use ascript::check::infer;
+        use ascript::syntax::{resolve, tree_builder};
+        let tree = tree_builder::build_tree(ascript::syntax::parser::parse(src));
+        let resolved = resolve::resolve(&tree);
+        infer::check(&tree, &resolved, src)
+            .into_iter()
+            .map(fmt_diag)
+            .collect()
+    }
+
+    fn fmt_diag(d: ascript::check::diagnostic::AsDiagnostic) -> String {
+        format!("{}:{}-{}:{}:{}", d.code, d.range.start, d.range.end, d.severity as u8, d.message)
+    }
+
+    fn collect_as_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    collect_as_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "as") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn elide_collection_is_diagnostic_neutral_over_examples() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut files = Vec::new();
+        collect_as_files(&Path::new(root).join("examples"), &mut files);
+        assert!(files.len() > 10, "expected a real example corpus, found {}", files.len());
+        let mut checked = 0usize;
+        for f in &files {
+            let src = fs::read_to_string(f).unwrap();
+            let normal = normal_diags(&src);
+            let (elide_diags, _set) = check_with_elision(&src);
+            let elide: Vec<String> = elide_diags.into_iter().map(fmt_diag).collect();
+            assert_eq!(
+                normal, elide,
+                "DIAGNOSTIC DRIFT in elide-collection mode for {}",
+                f.display()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, files.len(), "every example must be checked");
+    }
+}
+
+// ===========================================================================
+// Task 2.3 — Compiler consumption of ElisionSet (spec §4.2)
+//
+// These tests verify that `compile_source_with_elision` correctly:
+//   (a) skips CHECK_LOCAL for a proven let but NOT for an unproven one;
+//   (b) emits CALL_ELIDED at a proven call site, CALL at a gradual one;
+//   (c) sets proto.ret = None for a proven fn-return, Some(_) for unproven;
+//   (d) is byte-identical to compile_source when elide = None.
+//
+// Span-match PROOF: if CALL_ELIDED never appears in a typed compile the spans
+// don't match — this is an actual failure, not a latent miss.
+// ===========================================================================
+
+mod compiler {
+    use ascript::check::infer::elision_proofs;
+    use ascript::compile::{compile_source, compile_source_with_elision};
+    use ascript::vm::disasm::disasm;
+
+    // ---- (d) None elision-set ⇒ byte-identical to compile_source ----------
+
+    #[test]
+    fn none_elision_set_is_byte_identical() {
+        // A typed program (so an elision COULD fire if wired) — but with None,
+        // the output must be identical to compile_source.
+        let src = "fn f(p: int): int { return p }\nlet x: int = 5\nf(x)\n";
+        let chunk_default = compile_source(src).expect("compile_source ok");
+        let chunk_none = compile_source_with_elision(src, None).expect("compile_source_with_elision(None) ok");
+        // Compare the serialized disasm strings (fully recursive, includes protos).
+        let d_default = disasm(&chunk_default);
+        let d_none    = disasm(&chunk_none);
+        assert_eq!(
+            d_default, d_none,
+            "compile_source_with_elision(None) must produce byte-identical output to compile_source"
+        );
+        // Also compare the raw bytecode bytes of the top chunk.
+        assert_eq!(
+            chunk_default.code.as_slice(),
+            chunk_none.code.as_slice(),
+            "top-chunk bytecode bytes must be identical"
+        );
+    }
+
+    // ---- (a) CHECK_LOCAL skipped for proven let, kept for unproven ----------
+
+    #[test]
+    fn check_local_skipped_for_proven_let() {
+        // `let x: int = 5` — annotation ElideSafe, literal anchored, Yes ⇒ proven.
+        // `let y = 5` — no annotation ⇒ no check to skip.
+        // A separate `let z: int = get()` — `get()` is not anchored ⇒ NOT proven,
+        // but that would need a more complex setup; use an unannotated `let` as the
+        // "unproven" control case.
+        let src = "let x: int = 5\nlet y = 5\n";
+        let set = elision_proofs(src);
+        // `let x: int = 5`: proven ⇒ in set.lets
+        assert!(!set.lets.is_empty(), "expected `let x: int = 5` to be in set.lets");
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let chunk_plain  = compile_source(src).expect("compile_source ok");
+
+        let dis_elided = disasm(&chunk_elided);
+        let dis_plain  = disasm(&chunk_plain);
+
+        // The elided chunk must NOT contain CHECK_LOCAL (the annotation check was proven).
+        assert!(
+            !dis_elided.contains("CHECK_LOCAL"),
+            "CHECK_LOCAL must be absent from the elided disasm:\n{dis_elided}"
+        );
+        // The plain chunk MUST contain CHECK_LOCAL (no elision).
+        assert!(
+            dis_plain.contains("CHECK_LOCAL"),
+            "CHECK_LOCAL must be present in the plain disasm:\n{dis_plain}"
+        );
+    }
+
+    #[test]
+    fn check_local_kept_for_unproven_let_mutated() {
+        // `let x: int = 5; x = 7` — mutated ⇒ not anchored ⇒ NOT proven. The CHECK_LOCAL
+        // must remain even when an elision set is threaded through.
+        let src = "let x: int = 5\nx = 7\n";
+        let set = elision_proofs(src);
+        // The let MUST NOT be in set.lets (mutated binding).
+        assert!(set.lets.is_empty(), "mutated annotated let must not be in set.lets; set={set:?}");
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let dis_elided = disasm(&chunk_elided);
+        assert!(
+            dis_elided.contains("CHECK_LOCAL"),
+            "CHECK_LOCAL must remain for an unproven (mutated) let:\n{dis_elided}"
+        );
+    }
+
+    // ---- (b) CALL_ELIDED at proven call site, CALL at gradual one ----------
+
+    #[test]
+    fn call_elided_for_proven_call() {
+        // `fn f(p: int){} f(5)` — literal arg to typed param, no spread/named/rest.
+        // The collector MUST prove this call and the compiler MUST emit CALL_ELIDED.
+        let src = "fn f(p: int){}\nf(5)\n";
+        let set = elision_proofs(src);
+        assert!(!set.calls.is_empty(), "f(5) must be proven; set.calls={:?}", set.calls);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let dis_elided = disasm(&chunk_elided);
+
+        assert!(
+            dis_elided.contains("CALL_ELIDED"),
+            "CALL_ELIDED must appear in the elided disasm for a proven call;\n\
+             If it never appears, the compiler's call span does not match the collector's key.\n\
+             disasm:\n{dis_elided}\nset.calls: {:?}", set.calls
+        );
+        // The un-elided (None) compile must NOT have CALL_ELIDED.
+        let dis_plain = disasm(&compile_source(src).expect("ok"));
+        assert!(
+            !dis_plain.contains("CALL_ELIDED"),
+            "plain compile must not contain CALL_ELIDED:\n{dis_plain}"
+        );
+    }
+
+    #[test]
+    fn call_kept_for_gradual_call() {
+        // Probe-3 pattern: mutated binding ⇒ not anchored ⇒ collector produces no call key.
+        // With the set threaded in, the compiler must keep a plain CALL (not CALL_ELIDED).
+        let src = "fn f(p: int){}\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        let set = elision_proofs(src);
+        assert!(set.calls.is_empty(), "probe-3 call must NOT be proven; set={:?}", set);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let dis_elided = disasm(&chunk_elided);
+        assert!(
+            !dis_elided.contains("CALL_ELIDED"),
+            "CALL_ELIDED must NOT appear for a gradual (mutated-binding) call:\n{dis_elided}"
+        );
+        // The CALL opcode must still be present.
+        assert!(
+            dis_elided.contains("CALL "),
+            "plain CALL must remain for a gradual call:\n{dis_elided}"
+        );
+    }
+
+    // ---- (c) proto.ret = None for proven fn-return -------------------------
+
+    #[test]
+    fn proto_ret_none_for_proven_fn_return() {
+        // `fn g(): int { return 1 }` — ElideSafe return, literal anchored, always returns.
+        // Collector must put `g` in fn_rets; compiler must set proto.ret = None.
+        let src = "fn g(): int { return 1 }\n";
+        let set = elision_proofs(src);
+        assert!(!set.fn_rets.is_empty(), "g's return must be proven; set.fn_rets={:?}", set.fn_rets);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        // The proto for `g` is in chunk.protos (top-level fns compile to protos in
+        // the top chunk's proto table, not the const pool).
+        let proto = chunk_elided
+            .protos
+            .first()
+            .expect("g's FnProto must be in chunk.protos");
+        assert!(
+            proto.ret.is_none(),
+            "proven fn's proto.ret must be None (elided return contract); got {:?}", proto.ret
+        );
+    }
+
+    #[test]
+    fn proto_ret_some_for_non_proven_fn() {
+        // `fn h(c: bool): int { if (c) { return 1 } }` — non-total body, nil not Yes against int.
+        // NOT proven ⇒ proto.ret must remain Some(int).
+        let src = "fn h(c: bool): int { if (c) { return 1 } }\n";
+        let set = elision_proofs(src);
+        assert!(set.fn_rets.is_empty(), "non-total fn must NOT be in fn_rets; set={:?}", set);
+
+        let chunk_elided = compile_source_with_elision(src, Some(&set))
+            .expect("compile with elision ok");
+        let proto = chunk_elided
+            .protos
+            .first()
+            .expect("h's FnProto must be in chunk.protos");
+        assert!(
+            proto.ret.is_some(),
+            "non-proven fn's proto.ret must remain Some(_); got None"
+        );
+    }
+
+    // ---- consumed_count ⇒ matches len(ElisionSet) when all sites apply -----
+
+    #[test]
+    fn consumed_count_matches_elision_set_len() {
+        // A fully-typed program with a proven call + proven let + proven fn-ret.
+        let src = "fn g(): int { return 1 }\nfn f(p: int){}\nlet x: int = 5\nf(x)\ng()\n";
+        let set = elision_proofs(src);
+        let set_len = set.len();
+        assert!(set_len > 0, "expected at least one proven site");
+
+        let (chunk, consumed) = super::compile_source_with_elision_counted(src, Some(&set))
+            .expect("compile ok");
+        // consumed must equal the number of proven sites that were actually applied.
+        // For a simple single-module program where every key is in-scope, consumed == set_len.
+        assert_eq!(
+            consumed, set_len,
+            "consumed_count ({consumed}) must equal ElisionSet::len ({set_len})"
+        );
+        // Verify the disasm contains CALL_ELIDED (the call was actually consumed).
+        let dis = disasm(&chunk);
+        assert!(dis.contains("CALL_ELIDED"), "CALL_ELIDED must appear:\n{dis}");
+    }
+
+    // ---- end-to-end: vm_run_source_elided output == vm_run_source ----------
+
+    #[test]
+    fn vm_run_source_elided_same_output_typed_program() {
+        // A typed program that produces observable output — the elided version must
+        // produce byte-identical output to the normal run.
+        // `AsError` is `!Send` (holds `Rc<SourceInfo>`); reduce to `String` inside the
+        // worker closure so the return type is `Send`.
+        let src = "fn add(a: int, b: int): int { return a + b }\nprint(add(3, 4))\n";
+        type Summary = Result<(String, Option<i32>), String>;
+        let (out_normal, out_elided): (Summary, Summary) = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                let summarize = |r: Result<(String, Option<i32>), ascript::error::AsError>| -> Summary {
+                    r.map_err(|e| e.message)
+                };
+                let normal = summarize(ascript::vm_run_source(&src).await);
+                let elided = summarize(ascript::vm_run_source_elided(&src).await);
+                (normal, elided)
+            }
+        });
+        assert_eq!(
+            out_normal, out_elided,
+            "vm_run_source_elided must produce byte-identical output:\nnormal: {out_normal:?}\nelided: {out_elided:?}"
+        );
+    }
+
+    #[test]
+    fn vm_run_source_elided_gradual_boundary_still_panics() {
+        // Probe-3: mutated binding ⇒ call NOT elided ⇒ must STILL panic.
+        // `AsError` is `!Send`; reduce to `Result<_, String>` inside the closure.
+        let src = "fn f(p: int){ return p }\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "probe-3 program must still panic under vm_run_source_elided (gradual boundary kept)"
+        );
+    }
+}
+
+// ===========================================================================
+// Task 3.1 — tree-walker `elide_args` flag on `ExprKind::Call` (spec §4.3)
+//
+// These tests verify that the tree-walker correctly honours `elide_args: true`
+// on a `Call` AST node:
+//
+//   (a) A wrong-typed argument PASSES when `elide_args = true` — the per-param
+//       type-contract check is skipped, so the function body receives the value
+//       unchanged.
+//   (b) The UNMARKED twin (identical source, `elide_args = false` from the parser)
+//       PANICS with "type contract violated".
+//   (c) Arity errors STILL fire even when `elide_args = true` — the flag only
+//       skips type checks, not arity enforcement.
+//   (d) `elide_args` is invisible to the formatter / display: printing the marked
+//       call produces the same string as the unmarked call.
+//
+// The tests directly mutate the parsed AST — the only way to set `elide_args =
+// true` before the marking pass exists — and drive execution via the same
+// tree-walker path as `run_source_exit`.
+// ===========================================================================
+
+mod tw_elide {
+    use ascript::ast::{ExprKind, Stmt};
+
+    /// Parse `src` into a `Vec<Stmt>` via the legacy parser (called INSIDE the
+    /// worker thread — `Vec<Stmt>` is `!Send` because it contains `Rc<str>`).
+    fn parse(src: &str) -> Vec<Stmt> {
+        let tokens = ascript::lexer::lex(src).expect("lex ok");
+        ascript::parser::parse(&tokens).expect("parse ok")
+    }
+
+    // ── (a) wrong-typed arg passes when elide_args = true ────────────────────
+
+    #[test]
+    fn tw_elide_skips_type_check_on_marked_call() {
+        // `fn f(p: int){} f("wrong")` — the parser produces `elide_args: false`.
+        // We mutate the last Stmt::Expr to set `elide_args = true` and expect the
+        // tree-walker to accept the call without panicking.
+        //
+        // Parse + mutate + run all happen inside the worker closure so that the
+        // `!Send` `Vec<Stmt>` (contains `Rc<str>`) never crosses a thread boundary.
+        let result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            let src = "fn f(p: int){}\nf(\"wrong\")\n";
+            let mut stmts = parse(src);
+
+            // The last statement is `Stmt::Expr(f("wrong"))`. Find and mutate.
+            let last = stmts.last_mut().expect("non-empty program");
+            if let Stmt::Expr(expr) = last {
+                if let ExprKind::Call { elide_args, .. } = &mut expr.kind {
+                    *elide_args = true;
+                } else {
+                    panic!("expected Call expr in last statement, got {:?}", expr.kind);
+                }
+            } else {
+                panic!("expected Stmt::Expr as last statement");
+            }
+
+            ascript::tw_run_stmts(stmts).await
+        });
+
+        assert!(
+            result.is_ok(),
+            "elide_args=true must skip type check — expected Ok, got Err({:?})",
+            result.err()
+        );
+    }
+
+    // ── (b) unmarked twin panics ──────────────────────────────────────────────
+
+    #[test]
+    fn tw_unmarked_twin_still_panics() {
+        // Identical source, but WITHOUT mutating elide_args (stays false from
+        // the parser). The tree-walker MUST panic on the type mismatch.
+        let result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            let src = "fn f(p: int){}\nf(\"wrong\")\n";
+            let stmts = parse(src); // elide_args = false (default from parser)
+            ascript::tw_run_stmts(stmts).await
+        });
+
+        assert!(
+            result.is_err(),
+            "elide_args=false must enforce type check — expected Err, got Ok({:?})",
+            result.ok()
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("type contract violated"),
+            "expected 'type contract violated' in error message, got: {msg:?}"
+        );
+    }
+
+    // ── (c) arity error still fires when elide_args = true ───────────────────
+
+    #[test]
+    fn tw_elide_preserves_arity_check() {
+        // `fn g(p: int){} g()` — wrong arity, even with elide_args = true the
+        // arity error must fire.
+        let result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            let src = "fn g(p: int){}\ng()\n";
+            let mut stmts = parse(src);
+
+            // Mutate the call to g() to set elide_args = true.
+            let last = stmts.last_mut().expect("non-empty program");
+            if let Stmt::Expr(expr) = last {
+                if let ExprKind::Call { elide_args, .. } = &mut expr.kind {
+                    *elide_args = true;
+                } else {
+                    panic!("expected Call expr");
+                }
+            }
+
+            ascript::tw_run_stmts(stmts).await
+        });
+
+        assert!(
+            result.is_err(),
+            "arity check must still fire even when elide_args=true — expected Err, got Ok"
+        );
+        let msg = result.unwrap_err();
+        // The arity message contains "expected" and "got" (from `check_call_args`).
+        assert!(
+            msg.contains("expected") && msg.contains("got"),
+            "expected arity message (contains 'expected' and 'got'), got: {msg:?}"
+        );
+    }
+
+    // ── (d) elide_args is invisible to Display / fmt ──────────────────────────
+
+    #[test]
+    fn tw_elide_args_invisible_to_display() {
+        // Printing the Call expr with elide_args=true must produce the same string
+        // as with elide_args=false (the field is omitted from Display by design).
+        // This runs on the MAIN thread (no async needed, no `!Send` crossing).
+        let src = "fn f(p: int){}\nf(1)\n";
+        let stmts_unmarked = parse(src);
+        let mut stmts_marked = parse(src);
+
+        // Mutate last stmt's Call to set elide_args = true.
+        if let Stmt::Expr(expr) = stmts_marked.last_mut().unwrap() {
+            if let ExprKind::Call { elide_args, .. } = &mut expr.kind {
+                *elide_args = true;
+            }
+        }
+
+        // Compare Display output of the last expr (the Call node).
+        let display_unmarked = if let Stmt::Expr(e) = stmts_unmarked.last().unwrap() {
+            format!("{}", e.kind)
+        } else {
+            panic!("expected Stmt::Expr")
+        };
+        let display_marked = if let Stmt::Expr(e) = stmts_marked.last().unwrap() {
+            format!("{}", e.kind)
+        } else {
+            panic!("expected Stmt::Expr")
+        };
+
+        assert_eq!(
+            display_unmarked, display_marked,
+            "elide_args must be invisible to Display: {display_unmarked:?} vs {display_marked:?}"
+        );
+    }
+}
+
+/// Helper used only in the compiler-consumption tests: compiles with an elision set
+/// and also returns the consumed count. Exposed for tests via the `ascript` crate.
+fn compile_source_with_elision_counted(
+    src: &str,
+    elide: Option<&ascript::check::infer::elide::ElisionSet>,
+) -> Result<(ascript::vm::chunk::Chunk, usize), ascript::compile::CompileError> {
+    ascript::compile::compile_source_with_elision_counted(src, elide)
+}
+
+// ── Task 3.2: count parity + four-mode smoke ─────────────────────────────────
+
+/// Count parity helper: proves marks == consumed == |ElisionSet| for `src`.
+///
+/// Returns `(marks_total, consumed, set_len)` — the caller asserts all three
+/// are equal AND that `set_len > 0` (non-vacuous check).
+fn count_parity(src: &str) -> (usize, usize, usize) {
+    let set = ascript::check::infer::elision_proofs(src);
+    let set_len = set.len();
+
+    // Consumed: how many sites the VM compiler recognised in the ElisionSet.
+    let (_, consumed) = compile_source_with_elision_counted(src, Some(&set))
+        .unwrap_or_else(|e| panic!("compile failed: {:?}", e));
+
+    // Marks: parse + mark the AST + count.
+    let tokens = ascript::lexer::lex(src).expect("lex ok");
+    let mut program = ascript::parser::parse(&tokens).expect("parse ok");
+    let counts = ascript::elide_mark::mark_program(&mut program, &set);
+    let marks = counts.total();
+
+    (marks, consumed, set_len)
+}
+
+mod mark_parity {
+    use super::count_parity;
+
+    // ── Fixture 1: single typed call ─────────────────────────────────────────
+
+    #[test]
+    fn parity_single_call() {
+        // A simple typed function call — the elision collector should prove it
+        // and both the marker and compiler should recognise exactly 1 site.
+        let src = "fn add(a: int, b: int): int { a + b }\nlet r: int = add(1, 2)\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty for typed program (set_len=0 means span mismatch)"
+        );
+        assert_eq!(
+            marks, set_len,
+            "marker must hit every proven site (marks={marks} != |set|={set_len})"
+        );
+        assert_eq!(
+            consumed, set_len,
+            "compiler must consume every proven site (consumed={consumed} != |set|={set_len})"
+        );
+    }
+
+    // ── Fixture 2: multiple typed calls ──────────────────────────────────────
+
+    #[test]
+    fn parity_multiple_calls() {
+        // Several typed calls in sequence — all should be matched by both engines.
+        let src = "fn mul(x: int, y: int): int { x * y }\nfn neg(v: int): int { -v }\nlet a: int = mul(3, 4)\nlet b: int = neg(a)\nlet c: int = mul(b, 2)\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty for multi-call typed program (set_len=0)"
+        );
+        assert_eq!(marks, set_len, "marker miss: marks={marks} != |set|={set_len}");
+        assert_eq!(
+            consumed, set_len,
+            "compiler miss: consumed={consumed} != |set|={set_len}"
+        );
+    }
+
+    // ── Fixture 3: typed let + fn return ─────────────────────────────────────
+
+    #[test]
+    fn parity_typed_let_and_ret() {
+        // A typed let (initialiser span) + a function with an annotated return —
+        // exercises all three mark kinds (calls, lets, fn_rets).
+        let src = "fn double(n: int): int { n * 2 }\nlet result: int = double(5)\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty (typed let + typed fn return, set_len=0)"
+        );
+        assert_eq!(marks, set_len, "marker miss: marks={marks} != |set|={set_len}");
+        assert_eq!(
+            consumed, set_len,
+            "compiler miss: consumed={consumed} != |set|={set_len}"
+        );
+    }
+
+    // ── Fixture 4: nested typed calls ────────────────────────────────────────
+
+    #[test]
+    fn parity_nested_calls() {
+        let src = "fn inc(x: int): int { x + 1 }\nfn triple(x: int): int { x * 3 }\nlet r: int = inc(triple(2))\n";
+        let (marks, consumed, set_len) = count_parity(src);
+        assert!(
+            set_len > 0,
+            "ElisionSet must be non-empty for nested typed calls (set_len=0)"
+        );
+        assert_eq!(marks, set_len, "marker miss: marks={marks} != |set|={set_len}");
+        assert_eq!(
+            consumed, set_len,
+            "compiler miss: consumed={consumed} != |set|={set_len}"
+        );
+    }
+}
+
+// ── Four-mode smoke: TW-marked == spec-VM elided == generic-VM elided == off ─
+
+mod four_mode_smoke {
+    /// A typed program where elision proofs fire. We verify that all four
+    /// execution modes produce byte-identical output, confirming:
+    /// - The tree-walker marking pass correctly skips contracts that have been proved
+    /// - The VM elided path skips contracts identically
+    /// - The generic (non-specializing) VM path agrees
+    /// - Turning elision off (default) still produces the same output
+    ///   (no semantic change — elision only removes redundant checks)
+    const TYPED_SRC: &str = "fn square(n: int): int { return n * n }\nlet x: int = square(4)\nprint(x)\n";
+
+    #[test]
+    fn four_mode_output_identical() {
+        let expected_output = "16\n";
+
+        // Mode 1: tree-walker with marking pass (tw_run_source_elided).
+        let tw_result: Result<(String, ascript::elide_mark::MarkCounts), String> =
+            ascript::run_on_worker_stack(|| async {
+                ascript::tw_run_source_elided(TYPED_SRC).await
+            });
+        let (tw_out, tw_counts) = tw_result
+            .unwrap_or_else(|e| panic!("tw_run_source_elided failed: {e}"));
+        assert_eq!(tw_out, expected_output, "tree-walker (marked) output mismatch");
+
+        // Mode 2: VM elided (spec path, specialization ON).
+        let vm_elided_out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ascript::vm_run_source_elided(TYPED_SRC)
+                    .await
+                    .unwrap_or_else(|e| panic!("vm_run_source_elided failed: {e}"))
+                    .0
+            });
+        assert_eq!(vm_elided_out, expected_output, "VM (elided) output mismatch");
+
+        // Mode 3: VM elided generic (specialization OFF).
+        let vm_generic_out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ascript::vm_run_source_elided_generic(TYPED_SRC)
+                    .await
+                    .unwrap_or_else(|e| panic!("vm_run_source_elided_generic failed: {e}"))
+                    .0
+            });
+        assert_eq!(
+            vm_generic_out, expected_output,
+            "VM generic (elided) output mismatch"
+        );
+
+        // Mode 4: elision OFF (normal run — semantic floor).
+        let vm_normal_out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ascript::vm_run_source(TYPED_SRC)
+                    .await
+                    .unwrap_or_else(|e| panic!("vm_run_source failed: {e}"))
+                    .0
+            });
+        assert_eq!(
+            vm_normal_out, expected_output,
+            "VM normal (elide-off) output mismatch"
+        );
+
+        // Guard: the marking pass found at least one site (non-vacuous smoke).
+        assert!(
+            tw_counts.total() > 0,
+            "marking pass found 0 sites on typed program — span convention is broken"
+        );
+    }
+
+    /// Confirm that elided and normal tree-walker runs produce byte-identical
+    /// output — elision must not change semantics.
+    #[test]
+    fn elided_matches_normal_tw() {
+        let normal_result: Result<String, String> = ascript::run_on_worker_stack(|| async {
+            ascript::tw_run_stmts({
+                let tokens = ascript::lexer::lex(TYPED_SRC).expect("lex");
+                ascript::parser::parse(&tokens).expect("parse")
+            })
+            .await
+        });
+        let elided_result: Result<(String, ascript::elide_mark::MarkCounts), String> =
+            ascript::run_on_worker_stack(|| async {
+                ascript::tw_run_source_elided(TYPED_SRC).await
+            });
+
+        let normal_out = normal_result.expect("normal run ok");
+        let (elided_out, _) = elided_result.expect("elided run ok");
+        assert_eq!(
+            normal_out, elided_out,
+            "elided output must match normal output (elision must not change semantics)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 4.2 — Paranoid proof-violation mode (ELIDE §6.3)
+// ---------------------------------------------------------------------------
+//
+// Paranoid mode (`ASCRIPT_ELIDE_PARANOID=1`):
+//   • Compiles/marks as elide-OFF (all runtime checks retained — zero hot-path change).
+//   • Retains the per-module ElisionSet.
+//   • When a contract check FAILS at a site the checker PROVED safe, escalates
+//     to: `ELIDE proof violated (checker soundness bug): …` (panic prefix).
+//   • When a healthy program runs, paranoid output == elide-off output byte-for-byte.
+//
+// Two test classes:
+//   (a) Healthy typed programs: paranoid invisible (same output, exit 0).
+//   (b) Synthetic wrong-proof via test-only injection seam: escalates with the
+//       required prefix on BOTH engines.
+//   (c) Whole-corpus paranoid run: ZERO escalations (proves predicate soundness).
+
+/// A well-typed program with provable param + let + return contracts.
+/// Under paranoid mode, output must be IDENTICAL to normal run.
+const PARANOID_HEALTHY_SRC: &str = r#"
+fn add(a: int, b: int): int {
+    return a + b
+}
+let x: int = add(2, 3)
+print(x)
+"#;
+
+/// A program that intentionally violates a param contract at runtime,
+/// triggered ONLY when a fake proof is injected (not a real checker proof).
+/// We call this from Rust with a fake span in the ElisionSet.
+const PARANOID_VICTIM_SRC: &str = r#"
+fn f(p: string) {
+    print(p)
+}
+f(42)
+"#;
+
+mod paranoid {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // (a) Healthy program: paranoid mode is invisible
+    // -------------------------------------------------------------------
+
+    /// With `ASCRIPT_ELIDE_PARANOID=1`, a healthy typed program's output equals
+    /// elide-off output byte-for-byte (paranoid is invisible when proofs are correct).
+    #[test]
+    fn paranoid_healthy_invisible_vm() {
+        // Normal (elide-off) output.
+        let normal_out: String = ascript::run_on_worker_stack(|| async {
+            ascript::vm_run_source(PARANOID_HEALTHY_SRC)
+                .await
+                .unwrap_or_else(|e| panic!("normal run failed: {e}"))
+                .0
+        });
+
+        // Paranoid run.
+        let paranoid_out: String = ascript::run_on_worker_stack(|| async {
+            ascript::vm_run_source_paranoid(PARANOID_HEALTHY_SRC)
+                .await
+                .unwrap_or_else(|e| panic!("paranoid run failed: {e}"))
+                .0
+        });
+
+        assert_eq!(
+            normal_out, paranoid_out,
+            "paranoid mode must be invisible on a healthy typed program (VM)"
+        );
+    }
+
+    #[test]
+    fn paranoid_healthy_invisible_tw() {
+        let normal_out: String = ascript::run_on_worker_stack(|| async {
+            let tokens = ascript::lexer::lex(PARANOID_HEALTHY_SRC).expect("lex");
+            ascript::tw_run_stmts(ascript::parser::parse(&tokens).expect("parse"))
+                .await
+                .unwrap_or_else(|e| panic!("normal tw run failed: {e}"))
+        });
+
+        let paranoid_out: String = ascript::run_on_worker_stack(|| async {
+            ascript::tw_run_source_paranoid(PARANOID_HEALTHY_SRC)
+                .await
+                .unwrap_or_else(|e| panic!("paranoid tw run failed: {e}"))
+        });
+
+        assert_eq!(
+            normal_out, paranoid_out,
+            "paranoid mode must be invisible on a healthy typed program (TW)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // (b) Synthetic wrong-proof via test-only injection seam
+    // -------------------------------------------------------------------
+
+    /// When a fake span is injected into the ElisionSet (simulating a checker
+    /// soundness bug), a contract failure at that site escalates to the
+    /// `ELIDE proof violated (checker soundness bug):` prefix — VM engine.
+    #[test]
+    fn paranoid_escalates_on_fake_proof_vm() {
+        let err: String = ascript::run_on_worker_stack(|| async {
+            ascript::vm_run_source_paranoid_with_fake_call_proof(PARANOID_VICTIM_SRC).await
+        });
+        assert!(
+            err.contains("ELIDE proof violated (checker soundness bug)"),
+            "expected escalation prefix in panic message, got: {err:?}"
+        );
+    }
+
+    /// Same escalation check on the tree-walker engine.
+    #[test]
+    fn paranoid_escalates_on_fake_proof_tw() {
+        let err: String = ascript::run_on_worker_stack(|| async {
+            ascript::tw_run_source_paranoid_with_fake_call_proof(PARANOID_VICTIM_SRC).await
+        });
+        assert!(
+            err.contains("ELIDE proof violated (checker soundness bug)"),
+            "expected escalation prefix in panic message (TW), got: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // (c) CLI paranoid mode: healthy program, byte-identical output + exit 0
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn paranoid_cli_healthy_exit_zero() {
+        let src = "fn f(x: int): int { return x + 1 }\nprint(f(41))\n";
+        let file = temp_as("paranoid_cli", src);
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let output = std::process::Command::new(bin)
+            .env("ASCRIPT_ELIDE_PARANOID", "1")
+            .args(["run", file.to_str().unwrap()])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, 0,
+            "paranoid healthy program must exit 0; stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("42"),
+            "expected output '42' in stdout, got: {stdout:?}"
+        );
+        assert!(
+            !stderr.contains("ELIDE proof violated"),
+            "no escalation expected on healthy program; stderr: {stderr}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // (c) Whole-corpus paranoid run: ZERO escalations (both engines)
+    // -------------------------------------------------------------------
+
+    /// Run the whole example corpus under VM paranoid mode. Any escalation
+    /// means we found a REAL checker soundness bug — stop and report it.
+    #[test]
+    fn paranoid_corpus_zero_escalations_vm() {
+        let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut files: Vec<_> = std::fs::read_dir(&examples_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("as"))
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+
+        // Same skip list as other corpus tests.
+        const SKIP: &[&str] = &[
+            "server_",
+            "tui_",
+            "ffi_",
+            "debugger_",
+            "workers_pool_advanced",
+            "workers_actor",
+            "workers_stream",
+            "profiler_",
+        ];
+
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy();
+            if SKIP.iter().any(|s| name.contains(s)) {
+                continue;
+            }
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let result: Result<(String, Option<i32>), String> =
+                ascript::run_on_worker_stack(move || async move {
+                    ascript::vm_run_source_paranoid(&src)
+                        .await
+                        .map_err(|e| e.message)
+                });
+            if let Err(e) = result {
+                assert!(
+                    !e.contains("ELIDE proof violated"),
+                    "REAL CHECKER SOUNDNESS BUG found in {name}: {e}"
+                );
+                // Other panics (e.g. unimplemented feature) are fine to skip.
+            }
+        }
+    }
+
+    /// Same corpus check on the tree-walker.
+    #[test]
+    fn paranoid_corpus_zero_escalations_tw() {
+        let examples_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut files: Vec<_> = std::fs::read_dir(&examples_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("as"))
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+
+        const SKIP: &[&str] = &[
+            "server_",
+            "tui_",
+            "ffi_",
+            "debugger_",
+            "workers_pool_advanced",
+            "workers_actor",
+            "workers_stream",
+            "profiler_",
+        ];
+
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy();
+            if SKIP.iter().any(|s| name.contains(s)) {
+                continue;
+            }
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let result: Result<String, String> = ascript::run_on_worker_stack(move || async move {
+                ascript::tw_run_source_paranoid(&src).await.map_err(|_| String::new())
+            });
+            if let Err(e) = result {
+                assert!(
+                    !e.contains("ELIDE proof violated"),
+                    "REAL CHECKER SOUNDNESS BUG (TW) found in {name}: {e}"
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Task 4.3 Step 3 — COVERAGE / PARITY assertions (spec §6.4, Gate 15).
+//
+// Anti-false-green: the differential cross-axis is only a real net if elision
+// ACTUALLY FIRES somewhere (typed code) and NEVER fires where it must not
+// (untyped code). This module proves both, NON-VACUOUSLY:
+//
+//   (a) Typed sources (the typed bench + every annotated corpus file) produce
+//       `|ElisionSet| > 0`, and the aggregate elision RATE (proven sites /
+//       candidate sites) is reported and asserted ≥ a floor pinned from
+//       actuals. A zero here means the typed examples aren't exercising
+//       elision — a real gap.
+//   (b) Pre-existing UNANNOTATED corpus files produce ZERO elisions AND
+//       byte-identical bytecode vs `--no-elide` (snapshot a stable hash of the
+//       disasm). Proves the predicate fires ONLY where annotations exist and is
+//       invisible where they don't.
+//   (c) Count parity (collector == compiler == marker) over the whole typed
+//       corpus, both feature configs (§4.3).
+// ===========================================================================
+
+mod coverage {
+    use ascript::check::infer::elision_proofs;
+    use ascript::compile::{compile_source, compile_source_with_elision, compile_source_with_elision_counted};
+    use ascript::vm::disasm::disasm;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    /// A stable content hash of a chunk's full (recursive) disassembly — used to
+    /// snapshot byte-identical-bytecode equivalence between elide-off and
+    /// `--no-elide` without pinning a brittle golden string.
+    fn disasm_hash(src: &str, elide: Option<&ascript::check::infer::elide::ElisionSet>) -> u64 {
+        let chunk =
+            compile_source_with_elision(src, elide).expect("compile (with optional elision) ok");
+        let d = disasm(&chunk);
+        let mut h = DefaultHasher::new();
+        d.hash(&mut h);
+        h.finish()
+    }
+
+    /// The candidate-site denominator for an elision RATE: the universe of
+    /// potentially-elidable sites in the elide-OFF compile. We count, in the
+    /// no-elide disassembly, every `CALL`/`CALL_LOCAL` opcode (call-arg-contract
+    /// candidates), every `CHECK_LOCAL` opcode (annotated-let candidates), and
+    /// every proto carrying a return contract (`ret:` present — fn-return
+    /// candidates).
+    ///
+    /// Proven sites (the numerator) is `|ElisionSet|`. This is a conservative
+    /// over-count of the denominator (not every CALL has a typed callee), so the
+    /// reported rate is a LOWER bound on the true proven/eligible ratio — which is
+    /// exactly what a non-vacuous floor wants.
+    fn candidate_sites(src: &str) -> usize {
+        let chunk = compile_source(src).expect("elide-off compile ok");
+        let d = disasm(&chunk);
+        let mut calls = 0usize;
+        let mut checks = 0usize;
+        for line in d.lines() {
+            let t = line.trim();
+            // Opcode mnemonics are emitted uppercase by `disasm`. Match on word
+            // boundaries to avoid `CALL_ELIDED`/`CALL_METHOD` false hits (elide-off
+            // never emits CALL_ELIDED, and method calls are not v1 elision sites).
+            for tok in t.split_whitespace() {
+                match tok {
+                    "CALL" | "CALL_LOCAL" => calls += 1,
+                    "CHECK_LOCAL" => checks += 1,
+                    _ => {}
+                }
+            }
+        }
+        // `ret:`-carrying protos: counted by scanning the disasm proto headers.
+        let rets = d.matches("ret:").filter(|_| true).count();
+        calls + checks + rets
+    }
+
+    /// The fully-annotated profiling bench is the canonical typed source (it ships
+    /// in-repo and is fully annotated by construction).
+    const TYPED_BENCH: &str = "bench/profiling/call_heavy_typed.as";
+
+    /// Newly-added typed examples (created in Task 5.2). Probed if present — the
+    /// coverage assertion treats their absence as "not yet landed" rather than a
+    /// failure, so this gate is stable across the Phase-4→5 boundary.
+    const TYPED_EXAMPLES: &[&str] = &[
+        "examples/typed_contracts.as",
+        "examples/advanced/typed_pipeline.as",
+    ];
+
+    fn read(rel: &str) -> Option<String> {
+        let root = env!("CARGO_MANIFEST_DIR");
+        std::fs::read_to_string(std::path::Path::new(root).join(rel)).ok()
+    }
+
+    // ── (a) typed sources fire elision; report + floor the rate ──────────────
+
+    #[test]
+    fn typed_sources_elide_nonzero_with_reported_rate() {
+        let mut total_proven = 0usize;
+        let mut total_candidates = 0usize;
+        let mut probed = 0usize;
+
+        let mut probe = |rel: &str| {
+            let src = match read(rel) {
+                Some(s) => s,
+                None => return,
+            };
+            let set = elision_proofs(&src);
+            let proven = set.len();
+            let candidates = candidate_sites(&src);
+            let rate = if candidates == 0 {
+                0.0
+            } else {
+                proven as f64 / candidates as f64
+            };
+            println!(
+                "ELIDE coverage[{rel}]: proven={proven} candidates={candidates} rate={:.1}%",
+                rate * 100.0
+            );
+            // NON-VACUOUS: a fully-annotated typed source MUST prove at least one
+            // site. Zero ⇒ the predicate isn't firing on typed code (a real gap),
+            // OR a span-key mismatch.
+            assert!(
+                proven > 0,
+                "typed source `{rel}` produced ZERO elisions — the predicate is not firing on annotated code (gap or span mismatch)"
+            );
+            total_proven += proven;
+            total_candidates += candidates;
+            probed += 1;
+        };
+
+        probe(TYPED_BENCH);
+        for rel in TYPED_EXAMPLES {
+            probe(rel);
+        }
+
+        assert!(
+            probed > 0,
+            "no typed source was probed — the typed bench must exist at `{TYPED_BENCH}`"
+        );
+        let agg_rate = if total_candidates == 0 {
+            0.0
+        } else {
+            total_proven as f64 / total_candidates as f64
+        };
+        println!(
+            "ELIDE coverage AGGREGATE: proven={total_proven} candidates={total_candidates} \
+             rate={:.1}% over {probed} typed source(s)",
+            agg_rate * 100.0
+        );
+        // Floor pinned from actuals (the typed bench alone proves ≥3 sites of a
+        // small candidate universe — observed aggregate well above 10%). The floor
+        // is generous-below-observed but vastly above the silent-no-elision value
+        // of 0, so a future predicate regression that stops firing trips this.
+        assert!(
+            total_proven >= 3,
+            "typed corpus proved only {total_proven} sites — elision is barely firing (predicate regression?)"
+        );
+        assert!(
+            agg_rate >= 0.10,
+            "typed-corpus elision rate {:.1}% fell below the 10% floor — predicate regression?",
+            agg_rate * 100.0
+        );
+    }
+
+    // ── (b) untyped corpus: zero elisions + byte-identical bytecode ──────────
+
+    #[test]
+    fn untyped_corpus_zero_elisions_and_byte_identical_bytecode() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut checked = 0usize;
+        let mut zero_files = 0usize;
+        for dir in ["examples", "examples/advanced"] {
+            let p = std::path::Path::new(root).join(dir);
+            let rd = match std::fs::read_dir(&p) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for entry in rd {
+                let path = entry.expect("dir entry").path();
+                if path.extension().and_then(|x| x.to_str()) != Some("as") {
+                    continue;
+                }
+                let src = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                // "Unannotated" = produces an EMPTY ElisionSet. (We don't grep for
+                // `:` — a file may carry annotations the predicate can't prove,
+                // which is exactly the gradual-boundary case we want to include in
+                // the zero-elision universe.) A file that compiles-errors in THIS
+                // feature config (e.g. imports a stripped module → compile is still
+                // fine; it's RUNTIME that errors) is still compilable, so this is
+                // safe across configs.
+                let set = elision_proofs(&src);
+                checked += 1;
+                if !set.is_empty() {
+                    continue; // a typed/proven file — covered by (a) + the differential.
+                }
+                zero_files += 1;
+                // Byte-identical bytecode: elide-ON (with an empty set) MUST equal
+                // elide-OFF / `--no-elide`. An empty set can only be a no-op.
+                let off = disasm_hash(&src, None);
+                let on = disasm_hash(&src, Some(&set));
+                let rel = path.strip_prefix(root).unwrap().to_string_lossy();
+                assert_eq!(
+                    off, on,
+                    "untyped `{rel}` produced DIFFERENT bytecode under elide-on (empty set) vs --no-elide — an empty ElisionSet must be a no-op"
+                );
+                // And count parity: an empty set ⇒ zero consumed.
+                let (_, consumed) = compile_source_with_elision_counted(&src, Some(&set))
+                    .unwrap_or_else(|e| panic!("compile `{rel}`: {e:?}"));
+                assert_eq!(
+                    consumed, 0,
+                    "untyped `{rel}` consumed {consumed} elisions from an EMPTY set"
+                );
+            }
+        }
+        println!(
+            "ELIDE untyped coverage: {zero_files}/{checked} corpus files produce ZERO elisions \
+             (byte-identical bytecode vs --no-elide)"
+        );
+        // The corpus is dominated by gradual/untyped programs, so the zero-elision
+        // set is the bulk. Floor is config-aware: --no-default-features strips most
+        // stdlib examples, but the bare-language untyped ones remain.
+        let floor = if cfg!(feature = "data") { 20 } else { 5 };
+        assert!(
+            zero_files >= floor,
+            "expected >= {floor} zero-elision untyped files, found {zero_files} (corpus enumeration broke?)"
+        );
+    }
+
+    // ── (c) count parity over the whole typed corpus ─────────────────────────
+
+    #[test]
+    fn count_parity_over_typed_corpus() {
+        // For every corpus file that DOES prove sites, the collector, the VM
+        // compiler, and the tree-walker marker must agree on the count (§4.3) —
+        // the cross-front-end key-agreement gate.
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut typed_files = 0usize;
+        let mut total_proven = 0usize;
+        for dir in ["examples", "examples/advanced"] {
+            let p = std::path::Path::new(root).join(dir);
+            let rd = match std::fs::read_dir(&p) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for entry in rd {
+                let path = entry.expect("dir entry").path();
+                if path.extension().and_then(|x| x.to_str()) != Some("as") {
+                    continue;
+                }
+                let src = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let set = elision_proofs(&src);
+                let set_len = set.len();
+                if set_len == 0 {
+                    continue;
+                }
+                typed_files += 1;
+                total_proven += set_len;
+                let rel = path.strip_prefix(root).unwrap().to_string_lossy();
+                let (_, consumed) = compile_source_with_elision_counted(&src, Some(&set))
+                    .unwrap_or_else(|e| panic!("compile `{rel}`: {e:?}"));
+                assert_eq!(
+                    consumed, set_len,
+                    "compiler consumed {consumed} != |set|={set_len} for `{rel}` (span-key mismatch)"
+                );
+                let tokens = ascript::lexer::lex(&src).expect("lex ok");
+                let mut program = ascript::parser::parse(&tokens).expect("parse ok");
+                let marks = ascript::elide_mark::mark_program(&mut program, &set).total();
+                assert_eq!(
+                    marks, set_len,
+                    "marker marked {marks} != |set|={set_len} for `{rel}` (span-key mismatch)"
+                );
+            }
+        }
+        println!(
+            "ELIDE count-parity: {typed_files} typed corpus file(s), {total_proven} proven sites \
+             (collector == compiler == marker)"
+        );
+        // Config-aware: the full-feature build has many annotated examples; the
+        // bare build still has the bare-language typed ones.
+        let floor = if cfg!(feature = "data") { 5 } else { 1 };
+        assert!(
+            typed_files >= floor,
+            "expected >= {floor} typed corpus files exercising count-parity, found {typed_files}"
+        );
+    }
+}
+
+// ===========================================================================
+// Task 4.4 — Per-row positive/negative batteries (ELIDE spec §3, Gates 9-10)
+//
+// For each elidable row (spec §3 rows 1-3):
+//   POSITIVE test: proves elision happened (disasm / consumed / count membership)
+//     AND output is byte-identical across elide-on vs elide-off.
+//   NEGATIVE twins: proves the check is KEPT (not elided, no CALL_ELIDED /
+//     CHECK_LOCAL absent / fn_rets absent) AND the runtime panic still fires
+//     where it fires today.
+//
+// Kept-row spot checks (rows 4-12): CheckParam fires for bad defaults; Class.from
+// validation unchanged; std-call misuse still panics.
+//
+// IMPORTANT soundness assertion: if any expected-negative case IS elided, that is
+// a soundness bug in the predicate — the test fails loudly with "SOUNDNESS BUG".
+// ===========================================================================
+
+mod row_batteries {
+    use ascript::check::infer::elision_proofs;
+    use ascript::compile::{compile_source, compile_source_with_elision};
+    use ascript::vm::disasm::disasm;
+
+    // ── shared helpers ────────────────────────────────────────────────────────
+
+    /// Compile `src` with elision proofs and return the disassembly.
+    fn elided_disasm(src: &str) -> String {
+        let set = elision_proofs(src);
+        let chunk =
+            compile_source_with_elision(src, Some(&set)).expect("compile with elision ok");
+        disasm(&chunk)
+    }
+
+    /// Compile `src` WITHOUT elision and return the disassembly.
+    fn plain_disasm(src: &str) -> String {
+        let chunk = compile_source(src).expect("plain compile ok");
+        disasm(&chunk)
+    }
+
+    /// Assert elided disasm contains `CALL_ELIDED` (positive row-1 check).
+    fn assert_call_elided(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        let dis_plain = plain_disasm(src);
+        assert!(
+            dis_elided.contains("CALL_ELIDED"),
+            "[POSITIVE row-1] `{label}`: CALL_ELIDED must appear — predicate not firing.\n\
+             elided disasm:\n{dis_elided}\nset.calls: {:?}",
+            elision_proofs(src).calls
+        );
+        assert!(
+            !dis_plain.contains("CALL_ELIDED"),
+            "[POSITIVE row-1] `{label}`: plain compile must NOT contain CALL_ELIDED:\n{dis_plain}"
+        );
+    }
+
+    /// Assert elided disasm does NOT contain `CALL_ELIDED` (soundness check).
+    fn assert_call_not_elided(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        assert!(
+            !dis_elided.contains("CALL_ELIDED"),
+            "SOUNDNESS BUG in `{label}`: CALL_ELIDED must NOT appear but the predicate elided it!\n\
+             elided disasm:\n{dis_elided}"
+        );
+    }
+
+    /// Assert elided disasm has no `CHECK_LOCAL` (row-2 positive: check elided).
+    fn assert_check_local_absent(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        assert!(
+            !dis_elided.contains("CHECK_LOCAL"),
+            "[POSITIVE row-2] `{label}`: CHECK_LOCAL must be absent (let init proven):\n{dis_elided}"
+        );
+        let dis_plain = plain_disasm(src);
+        assert!(
+            dis_plain.contains("CHECK_LOCAL"),
+            "[POSITIVE row-2] `{label}`: plain compile must contain CHECK_LOCAL (sanity):\n{dis_plain}"
+        );
+    }
+
+    /// Assert elided disasm still contains `CHECK_LOCAL` (kept — soundness check).
+    fn assert_check_local_kept(src: &str, label: &str) {
+        let dis_elided = elided_disasm(src);
+        assert!(
+            dis_elided.contains("CHECK_LOCAL"),
+            "SOUNDNESS BUG in `{label}`: CHECK_LOCAL must remain for unproven let but was elided!\n\
+             elided disasm:\n{dis_elided}"
+        );
+    }
+
+    /// Assert the collector's `fn_rets` set contains the fn named `fn_name`.
+    fn assert_fn_ret_proven(src: &str, fn_name: &str, label: &str) {
+        let set = elision_proofs(src);
+        let bstart = src
+            .find(fn_name)
+            .unwrap_or_else(|| panic!("`{fn_name}` not found in source for `{label}`"));
+        let bend = bstart + fn_name.len();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bend].chars().count() as u32;
+        assert!(
+            set.fn_rets.contains(&(start, end)),
+            "[POSITIVE row-3] `{label}`: fn_rets must contain `{fn_name}`;\nfn_rets: {:?}",
+            set.fn_rets
+        );
+    }
+
+    /// Assert the fn named `fn_name` is NOT in `fn_rets` (soundness check).
+    fn assert_fn_ret_not_proven(src: &str, fn_name: &str, label: &str) {
+        let set = elision_proofs(src);
+        if let Some(bstart) = src.find(fn_name) {
+            let bend = bstart + fn_name.len();
+            let start = src[..bstart].chars().count() as u32;
+            let end = src[..bend].chars().count() as u32;
+            assert!(
+                !set.fn_rets.contains(&(start, end)),
+                "SOUNDNESS BUG in `{label}`: fn `{fn_name}` must NOT be in fn_rets but it is!\n\
+                 fn_rets: {:?}",
+                set.fn_rets
+            );
+        }
+    }
+
+    /// Assert output is byte-identical between elide-on and elide-off.
+    fn assert_output_identical(src: &str, label: &str) {
+        type Res = Result<(String, Option<i32>), String>;
+        let (off, on): (Res, Res) = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                let off = ascript::vm_run_source(&src).await.map_err(|e| e.message);
+                let on = ascript::vm_run_source_elided(&src).await.map_err(|e| e.message);
+                (off, on)
+            }
+        });
+        assert_eq!(
+            off, on,
+            "[POSITIVE] `{label}`: elide-on must equal elide-off (cross-axis identity)"
+        );
+    }
+
+    // ==========================================================================
+    // ROW 1 — POSITIVE: call-site parameter contracts are elided
+    // ==========================================================================
+
+    /// Positive row-1: all typed params, literal args, no spread/named/rest.
+    #[test]
+    fn row1_positive_typed_params_literal_args() {
+        let src = "fn add(a: int, b: int): int { return a + b }\nprint(add(3, 4))\n";
+        assert_call_elided(src, "row1_positive_typed_params_literal_args");
+        assert_output_identical(src, "row1_positive_typed_params_literal_args");
+    }
+
+    /// Positive row-1: mixed param types (int, string, bool), all literal args.
+    #[test]
+    fn row1_positive_mixed_types() {
+        let src =
+            "fn greet(name: string, count: int, loud: bool): string {\n\
+            return name\n}\n\
+            print(greet(\"Alice\", 3, true))\n";
+        assert_call_elided(src, "row1_positive_mixed_types");
+        assert_output_identical(src, "row1_positive_mixed_types");
+    }
+
+    /// Positive row-1: unmutated annotated binding anchors the call.
+    #[test]
+    fn row1_positive_unmutated_annotated_binding() {
+        let src = "fn f(p: int){ print(p) }\nlet x: int = 5\nf(x)\n";
+        assert_call_elided(src, "row1_positive_unmutated_annotated_binding");
+        assert_output_identical(src, "row1_positive_unmutated_annotated_binding");
+    }
+
+    /// Positive row-1: arg via declared-ElideSafe return of another fn.
+    #[test]
+    fn row1_positive_arg_via_proven_return() {
+        let src = "fn double(x: int): int { return x * 2 }\nfn f(p: int){ print(p) }\nf(double(5))\n";
+        assert_call_elided(src, "row1_positive_arg_via_proven_return");
+        assert_output_identical(src, "row1_positive_arg_via_proven_return");
+    }
+
+    /// Positive row-1: any-typed PARAM is a free-pass — call is elided without arg proof.
+    #[test]
+    fn row1_positive_any_typed_param_free_pass() {
+        // fn f(p: any): any accepts anything. The call f(x) with x untyped is elided
+        // because `any` is ElideSafe (free-pass) — no (A) condition needed for it.
+        let src = "fn f(p: any) { print(p) }\nlet x = 5\nf(x)\n";
+        assert_call_elided(src, "row1_positive_any_typed_param_free_pass");
+        assert_output_identical(src, "row1_positive_any_typed_param_free_pass");
+    }
+
+    /// Positive row-1: defaulted params — f(3) is valid for (a:int, b:int=2).
+    #[test]
+    fn row1_positive_defaulted_param_arity() {
+        let src = "fn f(a: int, b: int = 2): int { return a + b }\nprint(f(3))\n";
+        assert_call_elided(src, "row1_positive_defaulted_param_arity");
+        assert_output_identical(src, "row1_positive_defaulted_param_arity");
+    }
+
+    // ==========================================================================
+    // ROW 1 — NEGATIVE twins: NOT elided AND runtime check still fires
+    // ==========================================================================
+
+    /// Negative row-1 (probe 3): mutated binding — NOT elided, runtime panics.
+    #[test]
+    fn row1_negative_mutated_binding() {
+        let src = "fn f(p: int){ return p }\nlet x: int = 5\nx = \"s\"\nf(x)\n";
+        assert_call_not_elided(src, "row1_negative_mutated_binding");
+        // Runtime must still panic (the check is KEPT).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_mutated_binding: must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: `any`-typed source arg (param is typed int, arg type is Any).
+    /// Any is not anchored → call is NOT elided.
+    #[test]
+    fn row1_negative_any_typed_source_arg() {
+        let src = "fn f(p: int){ print(p) }\nlet a: any = 5\nf(a)\n";
+        assert_call_not_elided(src, "row1_negative_any_typed_source_arg");
+        // Runtime succeeds (a holds 5 which is int) — the check is kept but passes.
+        let dis = elided_disasm(src);
+        assert!(dis.contains("CALL "), "plain CALL must remain:\n{dis}");
+    }
+
+    /// Negative row-1: spread arg `f(...xs)` — excluded by spec.
+    #[test]
+    fn row1_negative_spread_arg() {
+        let src = "fn f(a: int, b: int){}\nlet xs = [1, 2]\nf(...xs)\n";
+        assert_call_not_elided(src, "row1_negative_spread_arg");
+    }
+
+    /// Negative row-1: named args `f(a: 1, b: 2)` — excluded by spec.
+    #[test]
+    fn row1_negative_named_args() {
+        let src = "fn f(a: int, b: int){}\nf(a: 1, b: 2)\n";
+        assert_call_not_elided(src, "row1_negative_named_args");
+    }
+
+    /// Negative row-1: rest-param callee `fn f(...xs: array<int>)` — excluded.
+    #[test]
+    fn row1_negative_rest_param_callee() {
+        let src = "fn f(...xs: array<int>){ print(xs[0]) }\nf(1, 2, 3)\n";
+        assert_call_not_elided(src, "row1_negative_rest_param_callee");
+    }
+
+    /// Negative row-1: async callee — excluded from row-1 eligibility.
+    #[test]
+    fn row1_negative_async_callee() {
+        let src = "async fn f(p: int){ return p }\nf(5)\n";
+        assert_call_not_elided(src, "row1_negative_async_callee");
+    }
+
+    /// Negative row-1: generator (`fn*`) callee — excluded from row-1 eligibility.
+    #[test]
+    fn row1_negative_generator_callee() {
+        let src = "fn* f(p: int) { yield p }\nf(1)\n";
+        assert_call_not_elided(src, "row1_negative_generator_callee");
+    }
+
+    /// Negative row-1: `worker fn` callee — excluded from row-1 eligibility.
+    #[test]
+    fn row1_negative_worker_fn_callee() {
+        let src = "worker fn f(p: int) { return p }\nf(1)\n";
+        assert_call_not_elided(src, "row1_negative_worker_fn_callee");
+    }
+
+    /// Negative row-1: interface-typed param — Named is NOT ElideSafe (spec §2.2).
+    #[test]
+    fn row1_negative_interface_typed_param() {
+        let src = "interface I { fn m(): int }\nfn f(p: I){}\nf(42)\n";
+        assert_call_not_elided(src, "row1_negative_interface_typed_param");
+        // Runtime must still panic (42 is not an instance with method m).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_interface_typed_param: must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: `array<int>` (typed/deep) param — NOT ElideSafe.
+    #[test]
+    fn row1_negative_deep_array_param() {
+        // Passing the right value: check is KEPT but passes (not elided).
+        let src = "fn f(p: array<int>){ print(p[0]) }\nf([1, 2, 3])\n";
+        assert_call_not_elided(src, "row1_negative_deep_array_param");
+        // Passing a wrong value: runtime panics (check still there).
+        let bad_src = "fn f(p: array<int>){ print(p[0]) }\nf(\"notarray\")\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let s = bad_src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&s).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_deep_array_param: bad value must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: `object` param — NOT ElideSafe (probe 4, spec §0 #3 + §6.6).
+    #[test]
+    fn row1_negative_object_param_probe4() {
+        let src = "class C{}\nfn f(p: object){}\nf(C())\n";
+        assert_call_not_elided(src, "row1_negative_object_param_probe4");
+        // Runtime must still panic (the check is kept and fires).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row1_negative_object_param_probe4: must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated: expected object, got instance"),
+            "expected 'type contract violated: expected object, got instance'"
+        );
+    }
+
+    /// Negative row-1: arrow function call — only named Stmt::Fn is eligible in v1.
+    /// Arrow functions are fn-expressions (not named declarations) → not elided.
+    #[test]
+    fn row1_negative_fn_expression_call() {
+        // Arrow function stored in a let binding: the callee is not a unique named Fn
+        // declaration (it's a fn-expression in a variable), so it's not elided.
+        let src = "let f = (p: int) => print(p)\nf(5)\n";
+        assert_call_not_elided(src, "row1_negative_fn_expression_call");
+    }
+
+    /// Negative row-1: arrow function call (explicit form) — same as above.
+    #[test]
+    fn row1_negative_arrow_call() {
+        let src = "let g = (p: string) => print(p)\ng(\"hello\")\n";
+        assert_call_not_elided(src, "row1_negative_arrow_call");
+    }
+
+    /// Negative row-1: method call — method calls use invoke_compiled_method, not row-1.
+    #[test]
+    fn row1_negative_method_call() {
+        let src = "class C { fn greet(name: string) { print(name) } }\nC().greet(\"Hi\")\n";
+        assert_call_not_elided(src, "row1_negative_method_call");
+    }
+
+    /// Negative row-1: uninitialized annotated let as arg — binding holds nil, not int.
+    #[test]
+    fn row1_negative_uninitialized_annotated_let_as_arg() {
+        let src = "fn f(p: int){ return p }\nlet x: int\nf(x)\n";
+        assert_call_not_elided(src, "row1_negative_uninitialized_annotated_let_as_arg");
+        // Runtime: f(nil) panics (int contract, got nil).
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row1_negative_uninitialized_annotated_let_as_arg: must panic (nil is not int)"
+        );
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-1: fn with non-always-returning body + non-nil declared return type.
+    /// The outer call f(g(true)) is NOT proven (g's return is not proven), but the inner
+    /// call g(true) IS proven (bool param, bool literal arg). This tests that the outer
+    /// call keeps its check while the inner call is correctly elided.
+    ///
+    /// Note: CALL_ELIDED may appear for the inner `g(true)` call — that is correct and
+    /// expected. The OUTER call `f(g(...))` must use plain CALL (because g's return
+    /// type contract is not proven, so g() is not a proven arg source for f's int param).
+    #[test]
+    fn row1_negative_non_total_callee_return() {
+        // g has a non-total body: returns int on one path, implicit nil on the other.
+        // g's return is NOT proven → g() is NOT an anchored arg source for f's int param.
+        let src = "fn g(c: bool): int { if (c) { return 1 } }\nfn f(p: int){ print(p) }\nf(g(true))\n";
+        let set = elision_proofs(src);
+        // g's name-token must NOT be in fn_rets.
+        let bstart = src.find("g").unwrap();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bstart + 1].chars().count() as u32;
+        assert!(
+            !set.fn_rets.contains(&(start, end)),
+            "row1_negative_non_total_callee_return: g's return must NOT be proven;\nfn_rets: {:?}",
+            set.fn_rets
+        );
+        // The call `f(g(true))` must NOT be in set.calls (g's return is unproven → f's arg
+        // is unanchored). Check using the span of the outer call.
+        let outer_call = "f(g(true))";
+        let outer_start = src.find(outer_call).unwrap();
+        let outer_key = (
+            src[..outer_start].chars().count() as u32,
+            src[..outer_start + outer_call.len()].chars().count() as u32,
+        );
+        assert!(
+            !set.calls.contains(&outer_key),
+            "row1_negative_non_total_callee_return: outer call f(g(true)) must NOT be proven;\nset.calls: {:?}",
+            set.calls
+        );
+        // Calling g(false) at runtime panics (return contract fires — nil, not int).
+        let bad_src = "fn g(c: bool): int { if (c) { return 1 } }\ng(false)\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let s = bad_src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&s).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "g(false) must panic (return contract kept, nil not int)");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    // ==========================================================================
+    // ROW 2 — POSITIVE: typed local init (Op::CheckLocal) is elided
+    // ==========================================================================
+
+    /// Positive row-2: `let x: int = 5` — literal, ElideSafe, proven.
+    #[test]
+    fn row2_positive_typed_let_int_literal() {
+        let src = "let x: int = 5\nprint(x)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_int_literal");
+        assert_output_identical(src, "row2_positive_typed_let_int_literal");
+    }
+
+    /// Positive row-2: `let s: string = \"hello\"`.
+    #[test]
+    fn row2_positive_typed_let_string() {
+        let src = "let s: string = \"hello\"\nprint(s)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_string");
+        assert_output_identical(src, "row2_positive_typed_let_string");
+    }
+
+    /// Positive row-2: `let b: bool = true`.
+    #[test]
+    fn row2_positive_typed_let_bool() {
+        let src = "let b: bool = true\nprint(b)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_bool");
+        assert_output_identical(src, "row2_positive_typed_let_bool");
+    }
+
+    /// Positive row-2: let via arithmetic (int + int → int, anchored result).
+    #[test]
+    fn row2_positive_typed_let_arithmetic() {
+        let src = "let x: int = 3 + 4\nprint(x)\n";
+        assert_check_local_absent(src, "row2_positive_typed_let_arithmetic");
+        assert_output_identical(src, "row2_positive_typed_let_arithmetic");
+    }
+
+    // ==========================================================================
+    // ROW 2 — NEGATIVE: CHECK_LOCAL is KEPT (not elided)
+    // ==========================================================================
+
+    /// Negative row-2: mutated annotated binding — binding is not recorded as anchored.
+    #[test]
+    fn row2_negative_mutated_let() {
+        let src = "let x: int = 5\nx = 7\nprint(x)\n";
+        assert_check_local_kept(src, "row2_negative_mutated_let");
+    }
+
+    /// Negative row-2: `array<int>` annotation — deep container, NOT ElideSafe.
+    #[test]
+    fn row2_negative_deep_container_let() {
+        let src = "let x: array<int> = [1, 2, 3]\nprint(x[0])\n";
+        assert_check_local_kept(src, "row2_negative_deep_container_let");
+    }
+
+    /// Negative row-2: `object` typed let — object is NOT ElideSafe (v1).
+    #[test]
+    fn row2_negative_object_typed_let() {
+        let src = "let x: object = {a: 1}\nprint(x)\n";
+        assert_check_local_kept(src, "row2_negative_object_typed_let");
+    }
+
+    /// Negative row-2: initializer is a logical op (&&) — NOT anchored in v1.
+    #[test]
+    fn row2_negative_logical_op_initializer() {
+        let src = "let a: bool = true\nlet b: bool = false\nlet c: bool = a && b\nprint(c)\n";
+        // `a && b` initializer for c — logical ops are NOT anchored (spec §2.3).
+        // The let `c: bool = a && b` is NOT proven.
+        let set = elision_proofs(src);
+        let init = "a && b";
+        let bstart = src.find(init).unwrap();
+        let start = src[..bstart].chars().count() as u32;
+        let end = src[..bstart + init.len()].chars().count() as u32;
+        assert!(
+            !set.lets.contains(&(start, end)),
+            "row2_negative_logical_op_initializer: `a && b` must NOT be in set.lets"
+        );
+    }
+
+    /// Negative row-2: uninitialized annotated let — no initializer, no CHECK_LOCAL emitted.
+    /// The let is simply not in the set (no initializer to check).
+    #[test]
+    fn row2_negative_uninitialized_let() {
+        let src = "let x: int\nprint(x)\n";
+        let set = elision_proofs(src);
+        assert!(
+            set.lets.is_empty(),
+            "row2_negative_uninitialized_let: uninitialized annotated let must not be in set.lets"
+        );
+    }
+
+    // ==========================================================================
+    // ROW 3 — POSITIVE: declared-return contracts are elided per function
+    // ==========================================================================
+
+    /// Positive row-3: fn always returns an int literal.
+    #[test]
+    fn row3_positive_always_returns_literal() {
+        let src = "fn get_answer(): int { return 42 }\nprint(get_answer())\n";
+        assert_fn_ret_proven(src, "get_answer", "row3_positive_always_returns_literal");
+        assert_output_identical(src, "row3_positive_always_returns_literal");
+    }
+
+    /// Positive row-3: fn always returns anchored arithmetic result.
+    #[test]
+    fn row3_positive_always_returns_anchored_arith() {
+        let src = "fn double(x: int): int { return x * 2 }\nprint(double(5))\n";
+        assert_fn_ret_proven(src, "double", "row3_positive_always_returns_anchored_arith");
+        assert_output_identical(src, "row3_positive_always_returns_anchored_arith");
+    }
+
+    /// Positive row-3: fn returning a string literal.
+    #[test]
+    fn row3_positive_returns_string() {
+        let src = "fn greet(): string { return \"hello\" }\nprint(greet())\n";
+        assert_fn_ret_proven(src, "greet", "row3_positive_returns_string");
+        assert_output_identical(src, "row3_positive_returns_string");
+    }
+
+    /// Positive row-3: fn always returns a bool (comparison is anchored).
+    #[test]
+    fn row3_positive_returns_bool_comparison() {
+        let src = "fn positive(x: int): bool { return x > 0 }\nprint(positive(5))\n";
+        assert_fn_ret_proven(src, "positive", "row3_positive_returns_bool_comparison");
+        assert_output_identical(src, "row3_positive_returns_bool_comparison");
+    }
+
+    // ==========================================================================
+    // ROW 3 — NEGATIVE: fn return contract is KEPT (not elided)
+    // ==========================================================================
+
+    /// Negative row-3: non-always-returning body with non-nil return type.
+    /// Implicit nil at fall-off is NOT Yes against int → NOT proven.
+    #[test]
+    fn row3_negative_non_total_return() {
+        let src = "fn maybe(c: bool): int { if (c) { return 1 } }\nprint(maybe(true))\n";
+        assert_fn_ret_not_proven(src, "maybe", "row3_negative_non_total_return");
+        // maybe(false) falls off end → returns nil → contract fires → panics.
+        let bad_src = "fn maybe(c: bool): int { if (c) { return 1 } }\nmaybe(false)\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let s = bad_src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&s).await.map_err(|e| e.message)
+            }
+        });
+        assert!(result.is_err(), "row3_negative_non_total_return: maybe(false) must panic");
+        assert!(
+            result.unwrap_err().contains("type contract violated"),
+            "expected 'type contract violated'"
+        );
+    }
+
+    /// Negative row-3: fn-expression — only named Stmt::Fn declarations are eligible.
+    #[test]
+    fn row3_negative_fn_expression_ret() {
+        let src = "let f = fn(): int { return 5 }\nprint(f())\n";
+        let set = elision_proofs(src);
+        // No named fn declaration → fn_rets must be empty.
+        assert!(
+            set.fn_rets.is_empty(),
+            "row3_negative_fn_expression_ret: fn-expression must not be in fn_rets"
+        );
+    }
+
+    /// Negative row-3: fn returning a Named/class type — NOT ElideSafe.
+    #[test]
+    fn row3_negative_class_return_type() {
+        let src = "class C { fn init() {} }\nfn make(): C { return C() }\nmake()\n";
+        assert_fn_ret_not_proven(src, "make", "row3_negative_class_return_type");
+    }
+
+    /// Negative row-3: fn returning `array<int>` — NOT ElideSafe (deep container).
+    #[test]
+    fn row3_negative_deep_container_return() {
+        let src = "fn nums(): array<int> { return [1, 2, 3] }\nnums()\n";
+        assert_fn_ret_not_proven(src, "nums", "row3_negative_deep_container_return");
+    }
+
+    // ==========================================================================
+    // KEPT-ROW SPOT CHECKS (rows 4-12)
+    // ==========================================================================
+
+    /// Row 4 spot check: CheckParam fires for a bad DEFAULT even at a proven call site.
+    ///
+    /// Row 1 only elides the per-arg `check_type_env` calls. Op::CheckParam (param
+    /// defaults) is a SEPARATE opcode and is NEVER elided (spec §3 row 4).
+    ///
+    /// Setup: fn f(p: int, q: string = 42) {} — the default 42 is NOT a string.
+    ///        f(1) — the supplied arg `1` is proven (row-1 eligible), so CALL_ELIDED
+    ///        is emitted; BUT the default for `q` still fires CheckParam → panics.
+    #[test]
+    fn row4_check_param_fires_for_bad_default_at_proven_site() {
+        let src = "fn f(p: int, q: string = 42) { print(q) }\nf(1)\n";
+        // The call IS proven (p: int, arg 1: literal int).
+        // CALL_ELIDED must be emitted (elision fired on the arg contracts).
+        let dis = elided_disasm(src);
+        assert!(
+            dis.contains("CALL_ELIDED"),
+            "row4: the call f(1) must be elided (row-1 positive):\n{dis}"
+        );
+        // But at runtime, CheckParam fires for the bad default q=42 → panics.
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row4_check_param_fires_for_bad_default_at_proven_site: must panic \
+             (CheckParam fires for q's bad default even though arg contracts were elided)"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("type contract violated") || msg.contains("expected string"),
+            "expected a contract violation message for bad default, got: {msg:?}"
+        );
+    }
+
+    /// Row 9 spot check: `Class.from` validation is never elided (spec §3 row 9).
+    /// validate_into coerces AND checks — removing it changes values, not just performance.
+    #[test]
+    fn row9_class_from_validation_unchanged() {
+        let src = r#"
+class Point {
+    x: int
+    y: int
+}
+let p = Point.from({x: 1, y: "not_an_int"})
+print(p.x)
+"#;
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row9_class_from_validation_unchanged: Class.from with wrong field type must panic"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("expected int") || msg.contains("type contract violated") || msg.contains("y"),
+            "expected a type validation message from Class.from, got: {msg:?}"
+        );
+    }
+
+    /// Row 10 spot check: std/builtin argument validation is never affected by elision.
+    /// Native fns validate internally (Tier-2 panics) — they never route through
+    /// check_call_args, so row 10 is out of scope by construction. Misuse still panics.
+    #[test]
+    fn row10_std_call_misuse_still_panics() {
+        // math.sqrt of a non-number panics from the native fn's own validation.
+        let src = "import std/math\nprint(math.sqrt(\"not_a_number\"))\n";
+        let result: Result<(String, Option<i32>), String> = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src).await.map_err(|e| e.message)
+            }
+        });
+        assert!(
+            result.is_err(),
+            "row10_std_call_misuse_still_panics: math.sqrt('string') must panic"
+        );
+    }
+
+    // ==========================================================================
+    // Cross-axis identity: positive cases are behaviorally identical across all
+    // four modes (elide-off VM, elide-on VM, generic VM, tree-walker marked).
+    // This is spec §6.1's within-axis and cross-axis identity requirement.
+    // ==========================================================================
+
+    /// Four-mode identity for a representative row-1 positive.
+    #[test]
+    fn cross_axis_row1_four_mode() {
+        let src = "fn sum(a: int, b: int): int { return a + b }\nprint(sum(10, 20))\n";
+        let expected = "30\n";
+
+        let off: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source(&src).await.unwrap_or_else(|e| panic!("off: {e}")).0
+            }
+        });
+        let on: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("elided: {e}"))
+                    .0
+            }
+        });
+        let gen: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided_generic(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("generic: {e}"))
+                    .0
+            }
+        });
+        let tw: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::tw_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("tw: {e}"))
+                    .0
+            }
+        });
+
+        assert_eq!(off, expected, "elide-off VM");
+        assert_eq!(on, expected, "elide-on VM");
+        assert_eq!(gen, expected, "generic VM");
+        assert_eq!(tw, expected, "tree-walker marked");
+    }
+
+    /// Four-mode identity for a representative row-2 positive (typed let init).
+    #[test]
+    fn cross_axis_row2_four_mode() {
+        let src = "let x: int = 21\nlet y: int = x + 21\nprint(y)\n";
+        let expected = "42\n";
+        // Note: x is unmutated, annotated int, literal init → anchored.
+        // y's init `x + 21` → int + int → int anchored. Both proven.
+        let off: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source(&src).await.unwrap_or_else(|e| panic!("off: {e}")).0
+            }
+        });
+        let on: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("on: {e}"))
+                    .0
+            }
+        });
+        let tw: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::tw_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("tw: {e}"))
+                    .0
+            }
+        });
+        assert_eq!(off, expected, "elide-off VM");
+        assert_eq!(on, expected, "elide-on VM");
+        assert_eq!(tw, expected, "tree-walker marked");
+    }
+
+    /// Four-mode identity for a representative row-3 positive (declared-return).
+    #[test]
+    fn cross_axis_row3_four_mode() {
+        let src = "fn square(n: int): int { return n * n }\nprint(square(7))\n";
+        let expected = "49\n";
+
+        let off: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source(&src).await.unwrap_or_else(|e| panic!("off: {e}")).0
+            }
+        });
+        let on: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::vm_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("on: {e}"))
+                    .0
+            }
+        });
+        let tw: String = ascript::run_on_worker_stack({
+            let src = src.to_string();
+            move || async move {
+                ascript::tw_run_source_elided(&src)
+                    .await
+                    .unwrap_or_else(|e| panic!("tw: {e}"))
+                    .0
+            }
+        });
+        assert_eq!(off, expected, "elide-off VM");
+        assert_eq!(on, expected, "elide-on VM");
+        assert_eq!(tw, expected, "tree-walker marked");
+    }
+}

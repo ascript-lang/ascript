@@ -131,6 +131,7 @@ impl CallbackTrampoline {
             what,
             Some(self.vm.interp()),
             Some(&self.vm.class_env()),
+            false,
         )?;
 
         // THE RESET INVARIANT (CALL §5.4): one fresh frame @ip0, slot_count Nil
@@ -273,6 +274,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -312,6 +314,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -557,6 +560,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());

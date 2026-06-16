@@ -517,8 +517,13 @@ impl CheckTy {
                     invariant_args(sargs, dargs, table, depth)
                 };
             }
-            // A parameterized class instance IS an object at runtime (mirrors rule 6).
-            (ClassApp(_, _), Object) => return Compat3::Yes,
+            // ELIDE §6.6: `ClassApp → Object` is `Unknown`, not `Yes`.
+            // The runtime `check_type` for `object` only accepts `ValueKind::Object(_)`
+            // and REJECTS `ValueKind::Instance(_)` (see `src/interp.rs` `check_type`
+            // `Type::Object` arm). Returning `Yes` here would tell ELIDE it is safe to
+            // skip the runtime contract check, which is unsound. `Unknown` keeps the
+            // checker silent (zero new corpus diagnostics) without being elidable.
+            (ClassApp(_, _), Object) => return Compat3::Unknown,
             // A raw class ref vs a parameterized one of the SAME (or related) head is
             // not provably wrong → gradual; of an unrelated head → provably wrong.
             (ClassApp(c, _), Class(d)) | (Class(c), ClassApp(d, _)) => {
@@ -582,7 +587,14 @@ impl CheckTy {
                         Compat3::No
                     }
                 }
-                Object => Compat3::Yes, // an instance IS an object at runtime
+                // ELIDE §6.6: `Class → Object` is `Unknown`, not `Yes`.
+                // The runtime `check_type` for `object` only accepts
+                // `ValueKind::Object(_)` and REJECTS `ValueKind::Instance(_)`
+                // (see `src/interp.rs` `check_type` `Type::Object` arm, ~line 8545).
+                // A `Yes` here would let ELIDE skip the runtime contract check,
+                // which is unsound. `Unknown` is gradual-silent (zero new diagnostics)
+                // and is never elidable.
+                Object => Compat3::Unknown,
                 // a class vs a concrete non-object primitive → provably no
                 _ if prim(dst) => Compat3::No,
                 _ => Compat3::Unknown,
@@ -1378,5 +1390,38 @@ mod tests {
         assert_eq!(opt(num()).only_nil(), CheckTy::Nil);
         assert!(opt(num()).includes_nil());
         assert!(!num().includes_nil());
+    }
+
+    // ---- ELIDE Task 1.1: rule-6 instance→object assignability bug fix --------
+    //
+    // The checker's rule 6 previously returned `Yes` for `Class(_) → Object` and
+    // `ClassApp(_, _) → Object`, but the runtime `check_type` for `object` only
+    // accepts `ValueKind::Object(_)` — it REJECTS `ValueKind::Instance(_)`.
+    // See `src/interp.rs` `check_type` `Type::Object` arm (line ~8545).
+    //
+    // ELIDE §6.6: the correct verdict is `Unknown` (gradual-silent, never No),
+    // so the checker stays silent (zero new corpus diagnostics) while ELIDE cannot
+    // treat these as elision-safe.
+    #[test]
+    fn class_to_object_is_unknown_not_yes() {
+        let table = build_table("class C {}");
+        let c_id = table.class_id("C").unwrap();
+
+        // Class(_) → Object must be Unknown (not Yes) — runtime rejects instances.
+        assert_eq!(
+            CheckTy::Class(c_id).assignable(&CheckTy::Object, &table),
+            Compat3::Unknown,
+            "Class→Object must be Unknown (runtime rejects instances against `object` contract)"
+        );
+
+        // ClassApp(_, _) → Object must also be Unknown — same runtime divergence.
+        let box_table = build_table("class Box<T> { value: T }");
+        let box_id = box_table.class_id("Box").unwrap();
+        let box_int = CheckTy::ClassApp(box_id, vec![CheckTy::Int]);
+        assert_eq!(
+            box_int.assignable(&CheckTy::Object, &box_table),
+            Compat3::Unknown,
+            "ClassApp→Object must be Unknown (runtime rejects instances against `object` contract)"
+        );
     }
 }

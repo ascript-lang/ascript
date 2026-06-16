@@ -2294,6 +2294,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Call {
                             callee: Box::new(expr),
                             args,
+                            elide_args: false,
                         },
                         span,
                     };
@@ -3522,7 +3523,7 @@ mod tests {
         // `Box<int>(5)` → a Call (type args erased: same shape as `Box(5)`).
         let e = parse_expr("Box<int>(5)");
         match &e.kind {
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, .. } => {
                 assert!(matches!(callee.kind, ExprKind::Ident(ref n) if n == "Box"));
                 assert_eq!(args.len(), 1);
             }
@@ -3531,7 +3532,7 @@ mod tests {
         // `map<string, number>(xs, f)` → a Call with two args (type args erased).
         let e = parse_expr("map<string, number>(xs, f)");
         match &e.kind {
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, .. } => {
                 assert!(matches!(callee.kind, ExprKind::Ident(ref n) if n == "map"));
                 assert_eq!(args.len(), 2);
             }

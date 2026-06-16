@@ -53,6 +53,13 @@ applied (the CLI can only tighten further, never re-grant what the manifest deni
 `--locked` — resolve dependencies exactly from `ascript.lock` (no network). Fails on any drift,
 missing lock, or integrity mismatch. For CI and air-gapped environments. See [Packages](packages).
 
+### Performance flags
+
+| Flag | Effect |
+|---|---|
+| `--elide` | Enable **contract elision** — drop statically-*proven* runtime type-contract checks (call arguments, annotated `let` initializers, declared returns) from the executed bytecode/AST. Behavior is byte-identical; only proven checks are removed. **Off by default on `run`** (the per-run proof collector adds a small startup cost that is over the measured budget for short programs). Equivalent to `ASCRIPT_ELIDE=1`. `ascript build --elide` is the cost-free surface (the elision is baked into the durable `.aso`). See [Type contracts → Annotations and performance](language/type-contracts). |
+| `--no-elide` | Force contract elision **off** (the permanent kill switch; wins over `--elide`). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
+
 ## `ascript build`
 
 Compile a `.as` program to a `.aso` bytecode file, then run the artifact with no compile step.
@@ -74,6 +81,8 @@ is, when to use it, and why it is not a stable cross-version format.
 | `--strip` | Omit the optional debug section (module source + per-function line/variable tables). The default includes debug info for use with `--inspect`. |
 | `--native` | Produce a self-contained native executable instead of a `.aso` — the full runtime plus the compiled program appended to a copy of the running binary. Bundling, not AOT: the embedded VM still interprets. Host architecture only in v1. See [Bundles](language/bundles). |
 | `--target <TRIPLE>` | Target triple for `--native` (requires `--native`). Host-only in v1 — accepted but rejected with a clear error. |
+| `--elide` | Bake **contract elision** into the artifact — drop statically-proven runtime type-contract checks from the compiled `.aso`/native bytecode. The win is durable (every later `run` of the artifact keeps it) and the one-shot collector cost is amortised, so this is the recommended elide surface. Behavior is byte-identical. Equivalent to `ASCRIPT_ELIDE=1`. Default-off; `--no-elide` forces it off. See [Type contracts → Annotations and performance](language/type-contracts). |
+| `--no-elide` | Force contract elision off in the artifact (kill switch; wins over `--elide`). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
 
 The four capability flags (`--deny`, `--sandbox`, `--deny-net`, `--deny-fs`) are also accepted on
 `build` and on `build --native`. The composed capability set is **embedded** in the produced
@@ -278,6 +287,8 @@ and they can coexist (import under a different alias if needed: `import * as A f
 | `--locked` | Resolve dependencies exactly from `ascript.lock` (no network). See [Packages](packages). |
 | `--deny <CAP>` | Deny capabilities for the test run (same names as `run --deny`). |
 | `--sandbox` | Deny all five dangerous capabilities for the test run. |
+| `--elide` | Enable contract elision for the (serial) test run (default-off; behavior byte-identical). Equivalent to `ASCRIPT_ELIDE=1`. The `--parallel` path runs each file in a worker isolate, which never elides. |
+| `--no-elide` | Force contract elision off (kill switch). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
 
 ## `ascript lsp`
 
@@ -383,6 +394,8 @@ configuration, and CI knobs — most programs never need them.
 |---|---|
 | `ASCRIPT_CACHE` | Override the cache root for the package store (default: a platform-specific user cache directory). See [Packages](packages). |
 | `ASCRIPT_DENY` | Comma-separated capability deny list applied to every embedded-binary run (equivalent to embedding `--deny` in a native bundle). For runtime sandbox enforcement. See [Capabilities](stdlib/caps). |
+| `ASCRIPT_ELIDE` | Set to `1` to enable contract elision (drop statically-proven runtime type-contract checks), equivalent to the `--elide` flag on `run`/`build`/`test`. Off by default — elision is invisible to behavior; only proven checks are removed. See [Type contracts → Annotations and performance](language/type-contracts). |
+| `ASCRIPT_ELIDE_PARANOID` | Set to `1` to enable **paranoid proof-violation mode** (ELIDE §6.3): all runtime type-contract checks are *retained* (elision is fully off), but any failure at a statically-proven site escalates to a `ELIDE proof violated (checker soundness bug): …` panic instead of the normal one. A diagnostic tool for detecting checker unsoundness bugs — healthy programs produce byte-identical output. Off by default. |
 | `ASCRIPT_ENGINE` | Set to `tree-walker` to select the legacy tree-walker engine for `run` and `repl` instead of the bytecode VM. The `--tree-walker` flag takes precedence. Primarily a debugging and differential-oracle knob. |
 | `ASCRIPT_LOG` | Log level for `std/log` output (`debug`, `info`, `warn`, `error`). Sets the filter threshold; messages below the level are dropped before any formatting. See [log](stdlib/log). |
 | `ASCRIPT_DECODE_THRESHOLD` | Override the DECODE warmth threshold (default: 8). A proto must be entered at least this many times before its bytecode is decoded into the fixed-width record stream. Set to `0` to force immediate decoding. A benchmarking knob for threshold A/B runs — see the DECODE performance docs. |
@@ -390,6 +403,7 @@ configuration, and CI knobs — most programs never need them.
 | `ASCRIPT_NO_DECODE` | Set to `1` to disable the DECODE optimisation (lazy decoded-dispatch record streams). The VM always executes directly from the bytecode stream. Behavior is byte-identical; a debugging and benchmarking knob. |
 | `ASCRIPT_NO_DECODE_INLINE` | Inert. DECODE Unit C (speculative global-fn inlining) was evidence-dropped and never shipped; this switch is still parsed but has no effect. Retained only for tooling parity. |
 | `ASCRIPT_NO_DECODE_TOS` | Inert. DECODE Unit D (top-of-stack register caching) was evidence-dropped and never shipped; this switch is still parsed but has no effect. Retained only for tooling parity. |
+| `ASCRIPT_NO_ELIDE` | Set to `1` to force contract elision off (the permanent kill switch; wins over `ASCRIPT_ELIDE` / `--elide`). Redundant while elision is already off by default, but stable for when the default flips. |
 | `ASCRIPT_NO_SPECIALIZE` | Set to `1` to disable every VM specialization (field/method inline caches, adaptive arithmetic, the global cache). Behavior is byte-identical to the default; only speed differs. Useful for isolating a performance regression or verifying that the generic and specialized paths agree. |
 | `ASCRIPT_NO_SYNC_LANE` | Set to `1` to disable the two-lane fiber engine's synchronous fast lane. The VM falls back to the async driver for every burst. Behavior is byte-identical; a debugging knob for isolating lane-related issues. |
 | `ASCRIPT_UPDATE_SNAPSHOTS` | Set to `1` to re-baseline all `assert.snapshot` calls, equivalent to `ascript test --update-snapshots`. Useful in CI scripts that want to update snapshots unconditionally. See [assert](stdlib/assert). |

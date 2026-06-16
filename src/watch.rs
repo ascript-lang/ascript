@@ -218,7 +218,9 @@ pub async fn run_watch(
     let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     let graph = ImportGraph::build(&paths);
 
-    // Initial full run.
+    // Initial full run. ELIDE §5: honor `ASCRIPT_ELIDE`/`ASCRIPT_NO_ELIDE` over the
+    // measured default (the `--watch` surface has no elide flags of its own).
+    let elide = crate::elide_enabled(false, false);
     print_run_summary(
         crate::run_tests_with_options(
             files,
@@ -227,6 +229,7 @@ pub async fn run_watch(
             parallel,
             false,
             filter,
+            elide,
         )
         .await,
     );
@@ -291,6 +294,7 @@ pub async fn run_watch(
                 parallel,
                 false,
                 filter,
+                elide,
             )
             .await,
         );

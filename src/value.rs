@@ -1516,6 +1516,10 @@ pub struct Function {
     /// `worker fn` — Spec A: dispatched to a pooled isolate, returns `future<T>`.
     /// The tree-walker reads this in `call_function` to route to the worker pool.
     pub is_worker: bool,
+    /// ELIDE §6.3 paranoid mode: the char-offset span of this fn's NAME token,
+    /// for `fn_rets` paranoid lookup at the return-type check site in `run_body`.
+    /// `None` for anonymous arrow/fn-expressions. Runtime-only, not serialized.
+    pub name_span: Option<crate::span::Span>,
 }
 
 /// SRV §3.3 — an immutable, `Send + Sync`, `Arc`-shared node. A frozen DAG of
@@ -3628,6 +3632,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let a = Closure::new(proto);
         let cv = Value::closure(a.clone());
@@ -3657,6 +3662,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         }));
         assert_ne!(Value::closure(a), Value::closure(b));
 
@@ -3677,6 +3683,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            name_span: None,
         })
     }
 

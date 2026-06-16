@@ -19,6 +19,10 @@ struct BodySpec<'a> {
     params: &'a [crate::ast::Param],
     ret: &'a Option<crate::ast::Type>,
     body: &'a [Stmt],
+    /// ELIDE §6.3 paranoid mode: the char-offset span of the fn's NAME token,
+    /// for `fn_rets` paranoid lookup at the return-type check site. `None` for
+    /// anonymous arrows / fn-expressions / methods (not in `fn_rets`).
+    name_span: Option<crate::span::Span>,
 }
 
 /// Non-local control-flow signal produced while executing statements.
@@ -683,6 +687,22 @@ pub struct Interp {
     /// always call `set_snapshot_update`.
     #[allow(dead_code)]
     snapshots_touched: RefCell<std::collections::BTreeSet<PathBuf>>,
+    /// ELIDE §4.3 Task 3.2: when `true`, the tree-walker module loader runs
+    /// `elision_proofs` on each module's source and calls `mark_program` before
+    /// execution. Defaults to `false` — zero behavior change in normal runs.
+    /// Task 4.1 gates the default-on decision (measured §5.1 budget); for THIS
+    /// task the flag is exposed via `set_elide_mode` so tests can turn it on
+    /// without changing any existing run path. A `Cell` (never held across `.await`).
+    pub(crate) elide_mode: Cell<bool>,
+    /// ELIDE §6.3 paranoid mode: when `Some(set)`, any contract failure at a site
+    /// whose span appears in `set` escalates to an "ELIDE proof violated" panic
+    /// (indicating a checker soundness bug). The set is built by merging the
+    /// per-module [`ElisionSet`]s collected during the proof phase. Consulted ONLY
+    /// on the contract-failure paths — ZERO hot-path cost (the lookup happens only
+    /// when a check is ALREADY failing, i.e. about to panic anyway). A `RefCell`
+    /// (never held across `.await` since all lookup sites are sync). `None` when
+    /// paranoid mode is off (the default) — the check short-circuits immediately.
+    pub(crate) paranoid_set: RefCell<Option<crate::check::infer::elide::ElisionSet>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1065,6 +1085,13 @@ impl Interp {
             // never overwrites a changed snapshot and never deletes an orphan.
             snapshot_update: Cell::new(false),
             snapshots_touched: RefCell::new(std::collections::BTreeSet::new()),
+            // ELIDE §4.3 Task 3.2: marking pass is OFF by default so every existing
+            // run is byte-identical (Task 4.1 decides the default-on path).
+            elide_mode: Cell::new(false),
+            // ELIDE §6.3 paranoid mode: OFF by default. Enabled by
+            // `set_paranoid_set` / `ASCRIPT_ELIDE_PARANOID=1`. When off, all
+            // contract-failure paths are entirely unaffected (zero cost).
+            paranoid_set: RefCell::new(None),
         }
     }
 
@@ -1101,6 +1128,75 @@ impl Interp {
     /// Consumed by `std/caps` `drop`/`dropAll` routing.
     pub(crate) fn caps_drop_allowed(&self) -> bool {
         self.caps_drop_allowed.get()
+    }
+
+    /// ELIDE §4.3 Task 3.2: enable/disable the AST marking pass on the tree-walker
+    /// module loader. When `true`, each module's source is run through
+    /// `elision_proofs` and `mark_program` before execution. Defaults to `false`
+    /// so every existing run is byte-identical (Task 4.1 decides the default-on
+    /// path). Exposed here so integration tests can turn it on without changing
+    /// any run path.
+    pub fn set_elide_mode(&self, on: bool) {
+        self.elide_mode.set(on);
+    }
+
+    /// ELIDE §6.3: install a merged [`ElisionSet`] for paranoid-mode proof
+    /// verification. Called once before execution when `ASCRIPT_ELIDE_PARANOID=1`
+    /// is set. The set is built from all per-module proof results; any contract
+    /// failure at a proven site is escalated to the soundness-bug message instead
+    /// of the normal panic.
+    pub fn set_paranoid_set(&self, set: crate::check::infer::elide::ElisionSet) {
+        *self.paranoid_set.borrow_mut() = Some(set);
+    }
+
+    /// ELIDE §6.3 test-only seam: inject a FAKE call-site span into the paranoid
+    /// set (simulating a checker soundness bug — a span the predicate would NOT
+    /// have proven). Used by `tests/elide.rs` to verify the escalation path fires.
+    /// Only reachable from `#[cfg(any(test, feature = "fuzzgen", fuzzing))]` callers.
+    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    pub fn inject_paranoid_call_span(&self, start: u32, end: u32) {
+        let mut guard = self.paranoid_set.borrow_mut();
+        let set = guard.get_or_insert_with(crate::check::infer::elide::ElisionSet::default);
+        set.calls.insert((start, end));
+    }
+
+    /// ELIDE §6.3: check whether a contract failure at `span` should be escalated
+    /// to a paranoid proof-violation panic. Returns `Some(Control::Panic(…))` when
+    /// paranoid mode is active AND the span is in the proven set (checker soundness
+    /// bug); returns `None` otherwise (caller falls through to the normal panic).
+    ///
+    /// Consulted ONLY when a contract check is ALREADY failing — zero hot-path cost.
+    pub(crate) fn maybe_paranoid_escalate(
+        &self,
+        ty: &crate::ast::Type,
+        value: &Value,
+        span: crate::span::Span,
+    ) -> Option<Control> {
+        let guard = self.paranoid_set.borrow();
+        let set = guard.as_ref()?;
+        let key = (span.start as u32, span.end as u32);
+        if set.calls.contains(&key)
+            || set.lets.contains(&key)
+            || set.fn_rets.contains(&key)
+        {
+            Some(
+                AsError::at(
+                    format!(
+                        "ELIDE proof violated (checker soundness bug): \
+                         proven site at {}:{} failed — expected {}, got {} ({})",
+                        span.start,
+                        span.end,
+                        ty,
+                        type_name(value),
+                        value,
+                    ),
+                    span,
+                )
+                .into(),
+            )
+        } else {
+            None
+        }
     }
 
     /// DX D2 Task 8: enable/disable snapshot "update mode" (the `--update-snapshots`
@@ -2837,8 +2933,18 @@ impl Interp {
 
         let tokens =
             lexer::lex(&src).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
-        let program =
+        let mut program =
             parser::parse(&tokens).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
+        // ELIDE §4.3 Task 3.2: when the marking pass is enabled, run elision proofs
+        // on this module's source and mark the AST in place. The flag defaults to
+        // `false`; Task 4.1 decides the default-on path. The mark runs ONCE per
+        // module load (the cache above ensures we never re-enter this path).
+        if self.elide_mode.get() {
+            let set = crate::check::infer::elision_proofs(&src);
+            if !set.is_empty() {
+                crate::elide_mark::mark_program(&mut program, &set);
+            }
+        }
         // DEFER §2.3: run the module body via `exec_program` so a top-level `defer`
         // (in the entry module OR any imported module) installs + drains its defer
         // scope. The module body runs to completion during import and its defers run
@@ -3003,6 +3109,10 @@ impl Interp {
                             // IFACE: env-aware so a `let x: Reader = …` interface
                             // annotation resolves the name to its descriptor.
                             if !self.check_type_env(&v, ty, env)? {
+                                // §6.3 paranoid: escalate if this let-site was proven.
+                                if let Some(e) = self.maybe_paranoid_escalate(ty, &v, value.span) {
+                                    return Err(e);
+                                }
                                 return Err(contract_panic(ty, &v, value.span));
                             }
                         }
@@ -3264,6 +3374,7 @@ impl Interp {
                 is_generator,
                 is_worker,
                 span,
+                name_span: fn_name_span,
                 ..
             } => {
                 // `worker async fn` is not a valid combination (a worker already returns
@@ -3285,6 +3396,8 @@ impl Interp {
                     is_async: *is_async,
                     is_generator: *is_generator,
                     is_worker: *is_worker,
+                    // §6.3 paranoid: carry the fn name-token span for fn_rets lookup.
+                    name_span: Some(*fn_name_span),
                 }));
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -3519,7 +3632,7 @@ impl Interp {
                 //
                 // `call` is guaranteed `ExprKind::Call { callee, args }` by the parser.
                 // Never hold a `RefCell` borrow across `.await`.
-                let ExprKind::Call { callee, args } = &call.kind else {
+                let ExprKind::Call { callee, args, .. } = &call.kind else {
                     // Parser guarantee — structurally unreachable.
                     return Err(AsError::at("defer: internal error: not a call", *span).into());
                 };
@@ -3720,6 +3833,7 @@ impl Interp {
                     is_generator: *is_generator,
                     // Arrows are never `worker` (no `worker` arrow syntax).
                     is_worker: false,
+                    name_span: None, // anonymous arrow: no name token
                 })))
             }
             ExprKind::Array(items) => {
@@ -4240,7 +4354,7 @@ impl Interp {
                 let v = index_get(&obj, &idx, object.span, expr.span)?;
                 Ok((v, false))
             }
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, elide_args } => {
                 // Fluent schema method-chaining hook: a Call whose callee is a
                 // plain `Member { object, name }` (NOT `OptMember`) where the
                 // evaluated `object` is a schema value and `name` is a schema
@@ -4277,9 +4391,12 @@ impl Interp {
                     // enum-variant prop, …), and only THEN evaluate the args, so
                     // a member-read error preempts arg evaluation / side effects.
                     // (This is the only path that supports NAMED args.)
+                    // ELIDE §4.3: member calls are ineligible for elision (elide_args
+                    // is always false here by construction — the marking pass only
+                    // marks plain non-member Call nodes); pass false defensively.
                     let callee_v = self.read_member(&recv, name, object.span)?;
                     let (values, names) = self.eval_call_args_named(args, env).await?;
-                    let v = self.call_value_named(callee_v, values, names, expr.span).await;
+                    let v = self.call_value_named(callee_v, values, names, expr.span, false).await;
                     return Ok((v?, false));
                 }
 
@@ -4288,7 +4405,11 @@ impl Interp {
                     return Ok((Value::nil(), true));
                 }
                 let (values, names) = self.eval_call_args_named(args, env).await?;
-                let v = self.call_value_named(callee_v, values, names, expr.span).await;
+                // ELIDE §4.3: thread the elide_args flag from the AST node.
+                // When true (set by the marking pass for a statically-proven call),
+                // per-param type-contract checks are skipped inside call_value_elided
+                // → call_function → run_body → check_call_args.
+                let v = self.call_value_named(callee_v, values, names, expr.span, *elide_args).await;
                 Ok((v?, false))
             }
             _ => Ok((self.eval_expr(expr, env).await?, false)),
@@ -4397,6 +4518,11 @@ impl Interp {
         values: Vec<Value>,
         names: Vec<Option<std::rc::Rc<str>>>,
         span: Span,
+        // ELIDE §4.3: threaded from the `ExprKind::Call` evaluator. Named-arg calls
+        // are ineligible for elision (the eligibility predicate excludes them), so
+        // when any name is Some this is effectively always false. Positional calls
+        // thread it through to `call_value_elided`.
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         if names.iter().any(|n| n.is_some()) {
             if let ValueKind::EnumVariant(ev) = callee.kind() {
@@ -4413,7 +4539,7 @@ impl Interp {
                 .into())
             }
         } else {
-            self.call_value(callee, values, span).await
+            self.call_value_elided(callee, values, span, elide_contracts).await
         }
     }
 
@@ -4607,6 +4733,26 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        self.call_value_elided(callee, args, span, false).await
+    }
+
+    /// ELIDE §4.3: the real body of `call_value`. When `elide_contracts` is true,
+    /// per-param type-contract checks are skipped inside the plain-`Function` branch
+    /// (the only branch a proven call site can reach — worker/generator/async paths are
+    /// excluded by the ELIDE eligibility predicate). Every other branch ignores the flag
+    /// (passes `false` onward) as a defensive measure: a stray `true` from a future
+    /// marking-pass bug can never skip a check that matters outside the plain-fn path.
+    ///
+    /// Arity errors, rest collection, and default evaluation are NEVER skipped —
+    /// only per-param type-contract checks.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn call_value_elided(
+        &self,
+        callee: Value,
+        args: Vec<Value>,
+        span: Span,
+        elide_contracts: bool,
+    ) -> Result<Value, Control> {
         match callee.into_kind() {
             // A VM closure (`native → VM` bridge): a native higher-order stdlib
             // function (e.g. `array.map`, a sort comparator, `recover`) is calling
@@ -4616,14 +4762,23 @@ impl Interp {
             // `Value::closure` can only exist if the VM created it, so the VM is
             // always registered here; a missing VM is a wiring bug (clear panic,
             // not UB).
+            // Defensive: Closure → VM path, elide_contracts ignored (VM handles it
+            // via Op::CallElided; the tree-walker never produces a Closure callee).
             OwnedKind::Closure(c) => {
                 let vm = self
                     .vm()
                     .expect("VM not registered for closure call (Interp::set_vm not called)");
                 vm.call_value(Value::closure(c), args, span).await
             }
+            // Defensive: builtins, constructors, bound methods, native methods,
+            // generator methods, enum constructors, class static methods — none of
+            // these are plain `Function` callees, so elide_contracts is always false
+            // for them regardless of the flag (the ELIDE eligibility predicate only
+            // proves plain non-async/non-generator/non-worker fn calls).
             OwnedKind::Builtin(name) => self.call_builtin(&name, &args, span).await,
-            OwnedKind::Function(func) => self.call_function(func, args, span).await,
+            OwnedKind::Function(func) => {
+                self.call_function(func, args, span, elide_contracts).await
+            }
             OwnedKind::Class(class) => self.construct(class, args, span).await,
             OwnedKind::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
             OwnedKind::NativeMethod(m) => self.call_native_method(m, args, span).await,
@@ -5212,6 +5367,11 @@ impl Interp {
         call_env: &Environment,
         span: Span,
         what: &str,
+        // ELIDE §4.3: when true, per-param type-contract checks are skipped. Arity,
+        // defaults, and rest collection are NEVER skipped. Method-invoke callers
+        // always pass false (methods are not elidable in v1 — the marking pass only
+        // marks plain non-member Call nodes).
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         // SP3 §B: `run_body` is the single funnel EVERY script call (function,
         // method, generator-step body, async body) passes through — and it is the
@@ -5226,12 +5386,13 @@ impl Interp {
         // live `eval_expr` frames do NOT count against the callee's body nesting.
         // This keeps deep recursion bounded SOLELY by `call_depth` on both engines.
         let _expr_reset = ExprDepthReset::enter(&self.expr_depth);
-        let BodySpec { params, ret, body } = spec;
+        let BodySpec { params, ret, body, name_span: fn_name_span } = spec;
         // Arity + parameter contracts + rest collection. Shared verbatim with the
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
         // IFACE: thread the callee frame env so a `Type::Named` param contract resolves
         // env-aware (interface → structural conforms; class → nominal).
-        let bound = check_call_args(params, args, span, what, Some(self), Some(call_env))?;
+        // ELIDE §4.3: elide_contracts is threaded through from call_value_elided.
+        let bound = check_call_args(params, args, span, what, Some(self), Some(call_env), elide_contracts)?;
         let defaults = bound.defaults.clone();
         // Bind the SUPPLIED params (and the rest array) — but NOT the omitted
         // defaulted positions, whose `bound.values` entries are placeholders. They
@@ -5310,6 +5471,13 @@ impl Interp {
             // IFACE: env-aware return-type contract (interface/class names resolve via
             // the callee frame's env chain → def env → module globals).
             if !self.check_type_env(&result, ty, call_env)? {
+                // §6.3 paranoid: if the fn's name span is in the proven fn_rets set,
+                // the checker certified this return would always pass — escalate.
+                if let Some(ns) = fn_name_span {
+                    if let Some(e) = self.maybe_paranoid_escalate(ty, &result, ns) {
+                        return Err(e);
+                    }
+                }
                 return Err(contract_panic(ty, &result, span));
             }
         }
@@ -5569,6 +5737,13 @@ impl Interp {
         func: Rc<crate::value::Function>,
         args: Vec<Value>,
         span: Span,
+        // ELIDE §4.3: when true, per-param type-contract checks are skipped inside
+        // `run_body` (arity, defaults, and rest collection are still enforced).
+        // Worker, generator, and async branches ignore this flag (they either dispatch
+        // to a separate isolate or spawn an independent future — the eligibility
+        // predicate excludes them from elision). The plain sync-fn branch threads it
+        // through to `run_function_body` → `run_body` → `check_call_args`.
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         let call_env = func.closure.child();
         let what = func.name.as_deref().unwrap_or("function").to_string();
@@ -5605,7 +5780,8 @@ impl Interp {
             let func = func.clone();
             let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
                 Box::pin(
-                    async move { vm.run_function_body(func, args, call_env, span, what).await },
+                    // Generators are excluded from ELIDE eligibility → always false.
+                    async move { vm.run_function_body(func, args, call_env, span, what, false).await },
                 );
             return Ok(Value::generator(Rc::new(
                 crate::coro::GeneratorHandle::new(body),
@@ -5658,14 +5834,15 @@ impl Interp {
                 let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
+                // Async fns are excluded from ELIDE eligibility → always false.
                 #[cfg(feature = "telemetry")]
                 let r = crate::interp::telemetry_scope(
                     telem_parent,
-                    vm.run_function_body(func, args, call_env, span, what),
+                    vm.run_function_body(func, args, call_env, span, what, false),
                 )
                 .await;
                 #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_function_body(func, args, call_env, span, what).await;
+                let r = vm.run_function_body(func, args, call_env, span, what, false).await;
                 cell.resolve(r);
             });
             // Cancel-on-drop: dropping the last handle aborts this task.
@@ -5675,13 +5852,18 @@ impl Interp {
             self.maybe_yield_for_inflight().await;
             return Ok(Value::future(fut));
         }
-        self.run_function_body(func, args, call_env, span, what)
+        self.run_function_body(func, args, call_env, span, what, elide_contracts)
             .await
     }
 
     /// Run a (already-prepared) function body, owning the `Rc<Function>` for the
     /// whole frame so the `BodySpec` borrow stays local. Used both inline (sync
     /// functions) and from a spawned `'static` task (async functions).
+    ///
+    /// `elide_contracts` is threaded from ELIDE §4.3: when true, per-param
+    /// type-contract checks are skipped inside `run_body`. Async and generator
+    /// spawned tasks always call this with `false` (those paths are excluded from
+    /// the ELIDE eligibility predicate).
     #[async_recursion(?Send)]
     async fn run_function_body(
         &self,
@@ -5690,13 +5872,16 @@ impl Interp {
         call_env: Environment,
         span: Span,
         what: String,
+        elide_contracts: bool,
     ) -> Result<Value, Control> {
         let spec = BodySpec {
             params: &func.params,
             ret: &func.ret,
             body: &func.body,
+            name_span: func.name_span,
         };
-        self.run_body(spec, args, &call_env, span, &what).await
+        self.run_body(spec, args, &call_env, span, &what, elide_contracts)
+            .await
     }
 
     #[async_recursion(?Send)]
@@ -6257,8 +6442,9 @@ impl Interp {
             params: &bm.method.params,
             ret: &bm.method.ret,
             body: &bm.method.body,
+            name_span: None, // methods are not in fn_rets
         };
-        self.run_body(spec, args, &call_env, span, &bm.name).await
+        self.run_body(spec, args, &call_env, span, &bm.name, false).await
     }
 
     /// Dispatch a STATIC method `C.name(args)` (SP1 §3). Unlike `invoke_method`
@@ -6329,8 +6515,9 @@ impl Interp {
             params: &method.params,
             ret: &method.ret,
             body: &method.body,
+            name_span: None, // methods are not in fn_rets
         };
-        self.run_body(spec, args, &call_env, span, name).await
+        self.run_body(spec, args, &call_env, span, name, false).await
     }
 
     /// Run a method body owning the `Rc<Method>` for the whole frame (so the
@@ -6348,8 +6535,9 @@ impl Interp {
             params: &method.params,
             ret: &method.ret,
             body: &method.body,
+            name_span: None, // methods are not in fn_rets
         };
-        self.run_body(spec, args, &call_env, span, &what).await
+        self.run_body(spec, args, &call_env, span, &what, false).await
     }
 
     /// FFI §4.5a — `run_in_worker(fn, input, opts?)`: dispatch a `worker fn` and, when
@@ -8338,6 +8526,12 @@ fn check_param_contract(
             _ => check_type(a, ty),
         };
         if !ok {
+            // §6.3 paranoid: escalate if this call-site was proven.
+            if let Some(itp) = interp {
+                if let Some(e) = itp.maybe_paranoid_escalate(ty, a, span) {
+                    return Err(e);
+                }
+            }
             return Err(contract_panic(ty, a, span));
         }
     }
@@ -8359,6 +8553,7 @@ pub(crate) fn check_call_args_in_place(
     what: &str,
     interp: Option<&Interp>,
     env: Option<&Environment>,
+    elide_contracts: bool,
 ) -> Result<usize, Control> {
     // Caller guarantees this; catch bugs early in debug builds.
     debug_assert!(!params.last().is_some_and(|p| p.rest));
@@ -8369,11 +8564,14 @@ pub(crate) fn check_call_args_in_place(
         .count();
     check_call_arity(params, n_positional, false, min, args.len(), span, what)?;
     // Contract-check the supplied args (left-to-right, same order as check_call_args).
-    let supplied = args.len().min(n_positional);
-    for (p, a) in params[..supplied].iter().zip(args[..supplied].iter()) {
-        check_param_contract(p, a, span, interp, env)?;
+    // ELIDE §4.4: per-param type checks are skipped when elide_contracts is true.
+    if !elide_contracts {
+        let supplied = args.len().min(n_positional);
+        for (p, a) in params[..supplied].iter().zip(args[..supplied].iter()) {
+            check_param_contract(p, a, span, interp, env)?;
+        }
     }
-    Ok(supplied)
+    Ok(args.len().min(n_positional))
 }
 
 pub(crate) fn check_call_args(
@@ -8390,6 +8588,10 @@ pub(crate) fn check_call_args(
     // pre-IFACE behavior, byte-identical for non-interface code).
     interp: Option<&Interp>,
     env: Option<&Environment>,
+    // ELIDE §4.4: when true, skip per-param and rest-element type-contract checks.
+    // Arity, defaults, and rest collection are NEVER skipped. Only CallElided dispatch
+    // passes true; every other call site passes false.
+    elide_contracts: bool,
 ) -> Result<BoundArgs, Control> {
     let has_rest = params.last().is_some_and(|p| p.rest);
     // Count of POSITIONAL params (excludes a trailing `...rest`).
@@ -8407,6 +8609,7 @@ pub(crate) fn check_call_args(
         .count();
 
     // Arity check — delegates to the shared core so both callers use identical wording.
+    // ELIDE §4.4: arity is NEVER skipped (only type-contract checks are).
     check_call_arity(params, n_positional, has_rest, min, args.len(), span, what)?;
 
     let mut values: Vec<Value> = Vec::with_capacity(params.len());
@@ -8416,8 +8619,10 @@ pub(crate) fn check_call_args(
     let supplied = it.len().min(n_positional);
     for p in &params[..supplied] {
         let a = it.next().unwrap();
-        // Per-param contract check — delegates to the shared core.
-        check_param_contract(p, &a, span, interp, env)?;
+        // Per-param contract check — ELIDE §4.4: skipped when elide_contracts is true.
+        if !elide_contracts {
+            check_param_contract(p, &a, span, interp, env)?;
+        }
         values.push(a);
     }
     // Placeholders for the omitted trailing defaulted positions (filled by the
@@ -8445,13 +8650,18 @@ pub(crate) fn check_call_args(
         };
         let mut rest_vals = Vec::new();
         for a in it {
-            if let Some(t) = elem_ty {
-                let ok = match (interp, env) {
-                    (Some(itp), Some(e)) => itp.check_type_env(&a, t, e)?,
-                    _ => check_type(&a, t),
-                };
-                if !ok {
-                    return Err(contract_panic(t, &a, span));
+            // Rest-element type check — ELIDE §4.4: skipped when elide_contracts is true.
+            // Note: eligibility excludes rest-param callees, so elide_contracts is never
+            // true here in practice; the guard is kept for defence-in-depth.
+            if !elide_contracts {
+                if let Some(t) = elem_ty {
+                    let ok = match (interp, env) {
+                        (Some(itp), Some(e)) => itp.check_type_env(&a, t, e)?,
+                        _ => check_type(&a, t),
+                    };
+                    if !ok {
+                        return Err(contract_panic(t, &a, span));
+                    }
                 }
             }
             rest_vals.push(a);
@@ -8516,7 +8726,7 @@ pub(crate) fn auto_init_bindings(
     // and spans are byte-identical to a hand-written `init(x, y)`. This free fn has no
     // engine/env (constructor field contracts resolve names via validate_into / the
     // env-aware field-set path), so pass `None` — env-free `check_type` for any Named.
-    let bound = check_call_args(&params, args, span, class_name, None, None)?;
+    let bound = check_call_args(&params, args, span, class_name, None, None, false)?;
     // Take only the supplied positional args (contract-checked by
     // `check_call_args`); pair each with its field name. Omitted defaulted fields
     // keep the default the caller already applied.
@@ -9891,6 +10101,7 @@ print(y)
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Value::closure(crate::vm::value_ext::Closure::new(proto));
         assert!(
@@ -14841,5 +15052,152 @@ print("after-drop")
             "§4.3: async fn* last-handle drop must NOT run defers; got: {out2:?}"
         );
         assert!(out2.contains("after-drop"), "program continued: {out2:?}");
+    }
+
+    // ── ELIDE §4.4: check_call_args / check_call_args_in_place elide_contracts mode ──
+
+    /// Helper: build a typed positional Param with no default and no rest.
+    fn typed_param(name: &str, ty: crate::ast::Type) -> crate::ast::Param {
+        crate::ast::Param {
+            name: name.to_string(),
+            ty: Some(ty),
+            name_span: Span::new(0, 0),
+            rest: false,
+            default: None,
+        }
+    }
+
+    /// ELIDE §4.4 (a): a wrong-typed arg passes through UNCHECKED when
+    /// elide_contracts=true; the result contains the original value unchanged.
+    #[test]
+    fn elide_contracts_skips_type_check() {
+        use crate::ast::Type;
+        // param `x: int` but we pass a string — normally a Tier-2 panic.
+        let params = vec![typed_param("x", Type::Int)];
+        let args = vec![Value::str("wrong")];
+        // With elide=false this should fail.
+        let err = check_call_args(&params, args.clone(), Span::new(0, 0), "f", None, None, false);
+        assert!(err.is_err(), "elide=false must reject a wrong-typed arg");
+        // With elide=true the same call must succeed and return the value unchanged.
+        let ok = check_call_args(&params, args, Span::new(0, 0), "f", None, None, true)
+            .expect("elide=true must pass a wrong-typed arg through unchecked");
+        assert_eq!(ok.supplied, 1);
+        assert!(
+            matches!(ok.values[0].kind(), crate::value::ValueKind::Str(_)),
+            "value must be the original string, not coerced"
+        );
+    }
+
+    /// ELIDE §4.4 (b): arity errors STILL fire even when elide_contracts=true.
+    #[test]
+    fn elide_contracts_preserves_arity_check() {
+        use crate::ast::Type;
+        // fn f(x: int) — called with zero args.
+        let params = vec![typed_param("x", Type::Int)];
+        let err_false = check_call_args(&params, vec![], Span::new(0, 0), "f", None, None, false);
+        let err_true  = check_call_args(&params, vec![], Span::new(0, 0), "f", None, None, true);
+        assert!(err_false.is_err(), "elide=false: arity must be enforced");
+        assert!(err_true.is_err(),  "elide=true: arity must STILL be enforced");
+        // Both messages must be byte-identical.
+        let msg_false = format!("{:?}", err_false.err().unwrap());
+        let msg_true  = format!("{:?}", err_true.err().unwrap());
+        assert_eq!(msg_false, msg_true, "arity panic message must be identical regardless of elide_contracts");
+    }
+
+    /// ELIDE §4.4 (c): default placeholders are still produced correctly when
+    /// elide_contracts=true — the engine-side default evaluation depends on them.
+    #[test]
+    fn elide_contracts_keeps_defaults() {
+        use crate::ast::Type;
+        // fn f(a: int, b: int = <default>) — call with 1 arg.
+        // Build b with a sentinel default so check_call_args treats it as optional.
+        let sentinel_default = crate::ast::Expr {
+            kind: crate::ast::ExprKind::Nil,
+            span: Span::new(0, 0),
+        };
+        let params = vec![
+            typed_param("a", Type::Int),
+            crate::ast::Param {
+                name: "b".to_string(),
+                ty: Some(Type::Int),
+                name_span: Span::new(0, 0),
+                rest: false,
+                default: Some(sentinel_default),
+            },
+        ];
+        let args = vec![Value::int(42)];
+        let bound = check_call_args(&params, args, Span::new(0, 0), "f", None, None, true)
+            .expect("elide=true with one arg for a two-param (one defaulted) fn must succeed");
+        assert_eq!(bound.supplied, 1, "supplied must be 1");
+        assert_eq!(bound.values.len(), 2, "values must have placeholders for all params");
+        assert!(
+            matches!(bound.values[0].kind(), crate::value::ValueKind::Int(42)),
+            "supplied arg must be preserved"
+        );
+        assert!(
+            matches!(bound.values[1].kind(), crate::value::ValueKind::Nil),
+            "defaulted placeholder must be Nil"
+        );
+        assert!(bound.defaults.contains(&1), "defaults range must cover the omitted slot");
+    }
+
+    /// ELIDE §4.4 (d): rest collection still works (value collected, no type check).
+    #[test]
+    fn elide_contracts_keeps_rest_collection() {
+        use crate::ast::Type;
+        // fn f(a: int, ...rest: array<int>) — call with wrong rest elements.
+        let params = vec![
+            typed_param("a", Type::Int),
+            crate::ast::Param {
+                name: "rest".to_string(),
+                ty: Some(Type::Array(Box::new(Type::Int))),
+                name_span: Span::new(0, 0),
+                rest: true,
+                default: None,
+            },
+        ];
+        // With elide=false: passing a string as a rest element must fail.
+        let args_bad = vec![Value::int(1), Value::str("oops")];
+        let err = check_call_args(&params, args_bad.clone(), Span::new(0, 0), "f", None, None, false);
+        assert!(err.is_err(), "elide=false must reject a wrong-typed rest element");
+        // With elide=true: same call must succeed and collect the rest array.
+        let ok = check_call_args(&params, args_bad, Span::new(0, 0), "f", None, None, true)
+            .expect("elide=true must collect rest elements unchecked");
+        assert_eq!(ok.supplied, 1, "supplied positional = 1");
+        // The rest array is the last value.
+        let rest_v = &ok.values[ok.values.len() - 1];
+        let arr = match rest_v.kind() {
+            crate::value::ValueKind::Array(a) => a.borrow().clone(),
+            other => panic!("expected Array, got {other:?}"),
+        };
+        assert_eq!(arr.len(), 1, "rest array must contain 1 element");
+        assert!(
+            matches!(arr[0].kind(), crate::value::ValueKind::Str(_)),
+            "rest element is the original string value"
+        );
+    }
+
+    /// ELIDE §4.4: check_call_args_in_place with elide_contracts=true skips type
+    /// checks but preserves arity enforcement.
+    #[test]
+    fn elide_contracts_in_place_skips_type_check_preserves_arity() {
+        use crate::ast::Type;
+        let params = vec![typed_param("x", Type::Int)];
+        // Wrong type — must be rejected with elide=false.
+        let stack = vec![Value::str("bad")];
+        let err = check_call_args_in_place(&params, &stack, Span::new(0, 0), "f", None, None, false);
+        assert!(err.is_err(), "in_place elide=false must reject wrong type");
+        // Same args, elide=true — must pass.
+        let supplied = check_call_args_in_place(&params, &stack, Span::new(0, 0), "f", None, None, true)
+            .expect("in_place elide=true must pass wrong-typed arg");
+        assert_eq!(supplied, 1);
+        // Arity: 0 args for 1 required param must still fail with elide=true.
+        let empty: &[Value] = &[];
+        let arity_err = check_call_args_in_place(&params, empty, Span::new(0, 0), "f", None, None, true);
+        assert!(arity_err.is_err(), "in_place elide=true must still enforce arity");
+        // Arity messages match between elide=true and elide=false.
+        let msg_false = format!("{:?}", check_call_args_in_place(&params, empty, Span::new(0, 0), "f", None, None, false).err().unwrap());
+        let msg_true  = format!("{:?}", arity_err.err().unwrap());
+        assert_eq!(msg_false, msg_true, "arity message must be identical regardless of elide_contracts");
     }
 }

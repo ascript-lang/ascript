@@ -164,7 +164,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   round-trip. Only the `EX_RANGE` byte stream grows (by one byte, plus the step
 ///   expr when present); every other layout is unchanged. Old readers must reject a
 ///   v27 chunk. (Bumped by reading the DBG-left v26 and adding one.)
-pub const ASO_FORMAT_VERSION: u32 = 28;
+pub const ASO_FORMAT_VERSION: u32 = 29; // ELIDE added Op::CallElided
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -1035,6 +1035,7 @@ fn read_proto(r: &mut Reader, with_debug: bool) -> Result<FnProto, AsoError> {
         ret,
         local_names,
         debug_name,
+        name_span: None,
     })
 }
 
@@ -1295,7 +1296,7 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             write_expr(w, object)?;
             write_expr(w, index)?;
         }
-        ExprKind::Call { callee, args } => {
+        ExprKind::Call { callee, args, .. } => {
             w.u8(EX_CALL);
             write_expr(w, callee)?;
             w.len(args.len());
@@ -1582,7 +1583,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
                 };
                 args.push(a);
             }
-            ExprKind::Call { callee, args }
+            ExprKind::Call { callee, args, elide_args: false }
         }
         EX_BINARY => {
             let op = binop_from_tag(r.u8()?)?;
@@ -2116,6 +2117,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let closure = Closure::new(proto);
         let interp = Rc::new(Interp::new());
@@ -2295,6 +2297,7 @@ run()
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto, false).unwrap();
@@ -2317,6 +2320,7 @@ run()
                 ret: None,
                 local_names: Vec::new(),
                 debug_name: None,
+                name_span: None,
             }
         };
         let mut w2 = Writer::new();
@@ -2342,6 +2346,7 @@ run()
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         };
         let mut w = Writer::new();
         write_proto(&mut w, &proto_with, false).unwrap();
@@ -2363,6 +2368,7 @@ run()
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         };
         let mut w2 = Writer::new();
         write_proto(&mut w2, &proto_none, false).unwrap();
@@ -2463,6 +2469,7 @@ run()
             ret: None,
             local_names: vec![(0, Rc::from("a")), (1, Rc::from("b"))],
             debug_name: Some(Rc::from("greet")),
+            name_span: None,
         };
         let mut root = Chunk::new();
         root.code = vec![crate::vm::opcode::Op::Nil as u8, crate::vm::opcode::Op::Return as u8].into();
@@ -2622,22 +2629,22 @@ run()
         assert_eq!(run_chunk(compile(src)), run_chunk(back));
     }
 
-    /// (#5) The format version is the live value (28, the DEFER opcodes bump)
+    /// (#5) The format version is the live value (29, ELIDE added Op::CallElided)
     /// and a mismatched-version (here: one-older) buffer is rejected with the version
     /// error, never run.
     #[test]
     fn aso_version_is_current_and_mismatch_rejected() {
         assert_eq!(
-            ASO_FORMAT_VERSION, 28,
-            "the DEFER DeferPush/DeferPushMethod opcodes bumped the format version to 28"
+            ASO_FORMAT_VERSION, 29,
+            "ELIDE added Op::CallElided, bumping the format version to 29"
         );
         let mut bytes = compile("print(1)").to_bytes().expect("serialize");
-        // Roll the version back one (simulating a v27 buffer).
+        // Roll the version back one (simulating a v28 buffer).
         bytes[4] = bytes[4].wrapping_sub(1);
         match Chunk::from_bytes(&bytes) {
             Err(AsoError::VersionMismatch { found, expected }) => {
-                assert_eq!(expected, 28);
-                assert_eq!(found, 27, "a one-older buffer reads as v27");
+                assert_eq!(expected, 29);
+                assert_eq!(found, 28, "a one-older buffer reads as v28");
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }

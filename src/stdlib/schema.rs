@@ -2776,6 +2776,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            name_span: None,
         };
         // Suppress unused import warning on CallArg
         let _ = CallArg::Pos(Expr {
@@ -2824,6 +2825,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            name_span: None,
         };
         let fn_val = Value::function(std::rc::Rc::new(func));
 
@@ -2863,6 +2865,7 @@ mod tests {
                     kind: ExprKind::Bool(false),
                     span: S::new(0, 0),
                 })],
+                elide_args: false,
             },
             span: S::new(0, 0),
         };
@@ -2882,6 +2885,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            name_span: None,
         };
         let fn_val = Value::function(std::rc::Rc::new(func));
 

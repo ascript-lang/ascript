@@ -1,0 +1,10 @@
+# exit: none
+30
+zero
+positive
+negative
+42
+nil
+result: 81
+boundary check caught: type contract violated: expected int, got string (hello)
+typed_contracts ok

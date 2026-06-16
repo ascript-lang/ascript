@@ -32,13 +32,14 @@ fn repo_root() -> &'static Path {
 #[test]
 fn aso_format_version_is_unchanged_by_srv() {
     // Literal pin (trips on ANY bump). SRV itself bumped nothing; the value has since
-    // been bumped to 28 by DEFER (the DeferPush / DeferPushMethod opcodes, ASO 27→28).
-    // The invariant this guards is that SRV is NOT the cause of any bump. When a later
-    // feature legitimately bumps the version, update this literal in the same commit
-    // after confirming the bump is NOT attributable to SRV.
+    // been bumped to 28 by DEFER (the DeferPush / DeferPushMethod opcodes, ASO 27→28)
+    // and to 29 by ELIDE (the Op::CallElided opcode, ASO 28→29). The invariant this
+    // guards is that SRV is NOT the cause of any bump. When a later feature legitimately
+    // bumps the version, update this literal in the same commit after confirming the
+    // bump is NOT attributable to SRV.
     assert_eq!(
         ascript::vm::aso::ASO_FORMAT_VERSION,
-        28,
+        29,
         "ASO_FORMAT_VERSION changed — confirm the bump is NOT attributable to SRV \
          (the shared heap is a runtime value, not a bytecode constant; TAG_SHARED is a \
          worker-wire tag, not an .aso constant), then update this literal pin."

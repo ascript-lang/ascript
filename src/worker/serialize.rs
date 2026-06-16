@@ -1255,6 +1255,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            name_span: None,
         }));
         let v = arr(vec![num(1.0), obj(&[("cb", func)])]);
         let err = check_sendable(&v).unwrap_err();
@@ -1326,6 +1327,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            name_span: None,
         }));
         assert!(encode(&func).is_err());
     }

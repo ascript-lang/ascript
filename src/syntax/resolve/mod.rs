@@ -127,6 +127,12 @@ struct Resolver {
     /// The module-global bindings (one per declared top-level name), recorded for
     /// the checker. They carry no real frame slot (`slot` is unused for globals).
     global_bindings: Vec<Binding>,
+    /// Names of module globals that are REASSIGNED somewhere (`x = …`). Collected
+    /// during the walk and applied to each global binding's `mutated` flag in
+    /// `finish` — robust to declaration order (an assignment may textually precede
+    /// the global's `let`). Consumed by the ELIDE anchoring gate (§2.3): a mutated
+    /// binding's annotation is not a runtime guarantee, so it is never anchored.
+    mutated_globals: HashSet<String>,
     /// SP8 #136 capture-by-value FIXUPS. Each `ParentLocal` upvalue is recorded with a
     /// pointer back to its SOURCE binding's `decl_range` and the child frame + upvalue
     /// index that captured it. The source binding's `mutated` flag is NOT final at
@@ -157,6 +163,7 @@ impl Resolver {
             module_global_mutable: HashMap::new(),
             global_uses: HashMap::new(),
             global_bindings: Vec::new(),
+            mutated_globals: HashSet::new(),
             capture_fixups: Vec::new(),
         }
     }
@@ -973,6 +980,15 @@ impl Resolver {
             if !mutable {
                 self.result.immutable_assign_targets.insert(range);
             }
+            // Record that this GLOBAL is reassigned so its binding's `mutated` flag is
+            // set in `finish` (robust to declaration order — the assignment may
+            // textually precede the `let`). Previously `mutated` was only set for
+            // locals/upvalues (the capture-by-value pass never needs it for a
+            // `Resolution::Global`), so a mutated module global read `false` — an
+            // unsound input for the ELIDE anchoring gate (§2.3: a reassigned binding's
+            // annotation is not a runtime guarantee). Globals are never captured by
+            // value, so the flag has no other effect on a global.
+            self.mutated_globals.insert(name.to_string());
         }
     }
 
@@ -1273,6 +1289,11 @@ impl Resolver {
         // (globals have no frame slot, so they could not use the slot-based counter).
         for mut b in std::mem::take(&mut self.global_bindings) {
             b.use_count = self.global_uses.get(&b.name).copied().unwrap_or(0);
+            // Apply reassignment-derived mutation (collected during the walk,
+            // order-independent) to the global binding's `mutated` flag.
+            if self.mutated_globals.contains(&b.name) {
+                b.mutated = true;
+            }
             self.result.bindings.push(b);
         }
         // SP8 #136: finalize each captured `ParentLocal` upvalue's `by_value` bit now

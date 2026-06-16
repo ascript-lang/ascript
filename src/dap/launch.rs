@@ -167,6 +167,7 @@ async fn run_program(
         ret: None,
         local_names: Vec::new(),
         debug_name: None,
+        name_span: None,
     });
 
     // Register the whole proto tree so the parked VM can resolve any (file,line).

@@ -582,6 +582,9 @@ fn is_block_terminator_op(op: Op) -> bool {
             | Op::Unwrap
             | Op::MatchNoArm
             | Op::Call
+            // ELIDE §4.2: CallElided is a call/suspension point exactly like Call —
+            // a basic-block terminator the peephole must never fuse across.
+            | Op::CallElided
             | Op::CallSpread
             | Op::CallMethod
             | Op::CallMethodSpread
@@ -850,6 +853,7 @@ mod tests {
             ret: None,
             local_names: Vec::new(),
             debug_name: None,
+            name_span: None,
         });
         let embed_epoch = foreign.chunk.patch_epoch.get();
 

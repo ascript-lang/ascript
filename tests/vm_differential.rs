@@ -1268,6 +1268,55 @@ async fn vm_run_whole_corpus_matches_treewalker() {
             tw, nodec,
             "no-decode VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-decode:   {nodec:?}"
         );
+
+        // ─── ELIDE §6.1 (Gate 15): the elide axis + cross-axis soundness proof ───
+        //
+        // The modes above are all the ELIDE-OFF axis (they compile without an
+        // ElisionSet — full contract checks retained). Now run the SAME program
+        // under elide-ON (proven checks removed: skipped CheckLocal, dropped
+        // proto.ret, Op::CallElided) on three engines: the tree-walker (AST
+        // marking pass), the specialized VM, and the generic VM.
+        //
+        //   (1) WITHIN-AXIS identity (elide-on): tw-marked == spec-elided ==
+        //       generic-elided — the elision mechanism is engine-agnostic.
+        //   (2) CROSS-AXIS identity: elide-on output == elide-off output. THIS is
+        //       the checker-soundness proof (§0/§6.1): a wrong proof manifests as
+        //       elide-off succeeding where elide-on diverges (or vice-versa). Most
+        //       corpus files are untyped (|ElisionSet| == 0 ⇒ trivially identical);
+        //       the 51 annotated files exercise REAL elision. A divergence is a
+        //       predicate bug — fix the checker/collector, NEVER this assertion.
+        let (tw_elided_out, _tw_marks) = ascript::tw_run_source_elided(&src)
+            .await
+            .unwrap_or_else(|e| panic!("tree-walker (marked) failed on non-skipped {rel}: {e}"));
+        let spec_elided = ascript::vm_run_source_elided(&src)
+            .await
+            .unwrap_or_else(|e| panic!("elided spec-VM failed on non-skipped {rel}: {e:?}"));
+        let gen_elided = ascript::vm_run_source_elided_generic(&src)
+            .await
+            .unwrap_or_else(|e| panic!("elided generic-VM failed on non-skipped {rel}: {e:?}"));
+        // The tree-walker seam returns stdout only (no exit code); compare its
+        // stdout against the VM modes' stdout, and the two VM modes in full.
+        assert_eq!(
+            spec_elided, gen_elided,
+            "elide-on: generic-VM diverged from specialized-VM for `{rel}`\n  spec-elided: {spec_elided:?}\n  gen-elided:  {gen_elided:?}"
+        );
+        assert_eq!(
+            tw_elided_out, spec_elided.0,
+            "elide-on: tree-walker (marked) diverged from specialized-VM for `{rel}`\n  tw-marked:   {tw_elided_out:?}\n  spec-elided: {:?}",
+            spec_elided.0
+        );
+        // CROSS-AXIS: elide-on == elide-off (the soundness proof). `tw` is the
+        // elide-off reference (stdout + exit); compare both projections.
+        assert_eq!(
+            tw.0, spec_elided.0,
+            "ELIDE cross-axis divergence (stdout) for `{rel}` — a checker/collector predicate bug\n  elide-off (tw): {:?}\n  elide-on (vm):  {:?}",
+            tw.0, spec_elided.0
+        );
+        assert_eq!(
+            tw.1, spec_elided.1,
+            "ELIDE cross-axis divergence (exit) for `{rel}` — a checker/collector predicate bug\n  elide-off (tw): {:?}\n  elide-on (vm):  {:?}",
+            tw.1, spec_elided.1
+        );
         ran += 1;
     }
     // Sanity: the gate must actually exercise the bulk of the corpus, and the
@@ -1288,7 +1337,8 @@ async fn vm_run_whole_corpus_matches_treewalker() {
     );
     eprintln!(
         "whole-corpus gate: {ran} examples byte-identical (all also verified lane-off + \
-         decoded-forced + no-decode), {skipped} skipped, {feature_skipped} feature-skipped \
+         decoded-forced + no-decode + ELIDE elide-on three-mode + elide-on==elide-off \
+         cross-axis), {skipped} skipped, {feature_skipped} feature-skipped \
          (modules unavailable in this build)"
     );
 }
