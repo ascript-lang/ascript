@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod bundle;
+pub mod cache;
 pub mod check;
 /// The clap derive types (`Cli`, `Command`, `CapFlags`) + `cli_command()` —
 /// the single source of truth for the CLI surface. Consumed by `src/main.rs`
@@ -2449,6 +2450,40 @@ fn resolve_module_file(target: &Path) -> Result<std::path::PathBuf, String> {
         candidates[0].display(),
         candidates[1].display()
     ))
+}
+
+/// WARM Task 1: expose `resolve_module_file` as a `pub(crate)` shim so
+/// `src/cache/mod.rs` can follow the same resolution logic without duplicating it.
+/// Identical behaviour to the private version above.
+pub(crate) fn resolve_module_file_pub(target: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    resolve_module_file(target)
+}
+
+/// WARM Task 1: compile `source` (already read from `path`) to verified `.aso` bytes,
+/// WITHOUT debug info or elision, purely to extract the import table for the cache
+/// module-graph walk. Uses the same verification path as `compile_verified_aso_bytes`
+/// but avoids a redundant disk read.
+///
+/// `pub(crate)` — consumed by `src/cache/mod.rs`; not a public API.
+pub(crate) fn compile_verified_aso_bytes_from_source_for_cache(
+    path: &std::path::Path,
+    source: &str,
+) -> Result<Vec<u8>, AsError> {
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: source.to_string(),
+    });
+    let chunk = crate::compile::compile_source(source)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    crate::vm::verify::verify(&chunk).map_err(|e| {
+        AsError::new(format!(
+            "internal: produced bytecode failed verification: {e}"
+        ))
+        .with_source(src_info)
+    })?;
+    chunk
+        .to_bytes_with_debug(false)
+        .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
 }
 
 /// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
