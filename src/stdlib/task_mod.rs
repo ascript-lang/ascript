@@ -69,9 +69,9 @@ impl Interp {
             "timeout" => self.task_timeout(args, span).await,
             "retry" => self.task_retry(args, span).await,
             "pipe" => self.task_pipe(args, span).await,
-            // PAR §2.1 — Task 2.2 ships pmap orchestration; preduce (Task 2.3) is pending.
+            // PAR §2.1 — Task 2.2: pmap; Task 2.3: preduce.
             "pmap" => self.task_pmap(args, span).await,
-            "preduce" => self.task_preduce_validate(args, span).await,
+            "preduce" => self.task_preduce(args, span).await,
             _ => Err(AsError::at(format!("unknown function 'task.{}'", func), span).into()),
         }
     }
@@ -482,26 +482,126 @@ impl Interp {
         Ok(Value::future(fut))
     }
 
-    /// `task.preduce(data, f, init, opts?) -> future<T>` — validation only (Task 2.1).
-    async fn task_preduce_validate(
-        &self,
-        args: &[Value],
-        span: Span,
-    ) -> Result<Value, Control> {
+    /// `task.preduce(data, f, init, opts?) -> future<T>` (PAR spec §2.1/§3.3.3).
+    ///
+    /// Parallel reduction. Each chunk is folded with `f` **seeded by the chunk's own
+    /// first element** (no `init` inside a chunk); the per-chunk partials are then
+    /// combined by ONE final fold `f(...f(f(init, p0), p1)...)`. `init` participates
+    /// **exactly once** — only in the final combine stage.
+    ///
+    /// `init` sendability is checked **up front** before any dispatch (§3.3.3 "fail fast").
+    /// Total dispatches = `chunks + 1` (the chunk jobs + the final-combine job).
+    ///
+    /// Non-pool fast paths: empty input resolves to `init` without touching the pool;
+    /// in-isolate calls run the same decomposition inline (`par_inline`, §5.1).
+    async fn task_preduce(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         // Step 1: classify input.
-        let _input = classify_par_input(&arg(args, 0), "task.preduce", span)?;
-        // Step 2: validate callback.
-        let _entry_name = par_callback_name(&arg(args, 1), "task.preduce", span)?;
-        // Step 3: init arg (position 2) — sendability checked up front in Task 2.3.
-        let _init = arg(args, 2);
+        let input = classify_par_input(&arg(args, 0), "task.preduce", span)?;
+        // Step 2: validate callback (named `worker fn` only — §2.2).
+        let entry_name = par_callback_name(&arg(args, 1), "task.preduce", span)?;
+        // Step 3: capture init; check sendability UP FRONT before any dispatch (§3.3.3).
+        let init = arg(args, 2);
+        crate::worker::serialize::check_sendable(&init).map_err(|e| {
+            Control::Panic(AsError::at(
+                format!("task.preduce: init is not sendable — {}", e.message()),
+                span,
+            ))
+        })?;
         // Step 4: parse opts.
-        let (_cap, _min_chunk) = par_opts(&arg(args, 3), "task.preduce", span)?;
-        // Orchestration (Task 2.3) not yet implemented.
-        Err(AsError::at(
-            "task.preduce: orchestration not yet implemented (Task 2.3 pending)",
-            span,
-        )
-        .into())
+        let (cap, min_chunk) = par_opts(&arg(args, 3), "task.preduce", span)?;
+
+        let len = input.len();
+
+        // Empty input → init instantly, pool untouched (§2.1).
+        if len == 0 {
+            return Ok(Value::future(SharedFuture::resolved(Ok(init))));
+        }
+
+        let plan = chunk_plan(len, cap, min_chunk);
+
+        // Nested (called inside an isolate): SAME decomposition, executed inline.
+        // The inline Reduce path: per-chunk partials + one local final fold — §5.1.
+        if crate::worker::pool::in_isolate() {
+            return self.par_inline(&input, &entry_name, &plan, ChunkKind::Reduce, Some(init), span);
+        }
+
+        // Build the code slice ONCE — all chunk dispatches + the final combine share it.
+        let slice = crate::worker::build_code_slice_for_interp(self, &entry_name)?;
+
+        // Dispatch all chunk Reduce jobs eagerly. Each returns a future<partial>.
+        // Chunks dispatch in INPUT ORDER so the first offending chunk by input order is
+        // the first to raise a non-sendable-element panic (§3.5).
+        let mut chunk_futs: Vec<Value> = Vec::with_capacity(plan.len());
+        for &(start, end) in &plan {
+            let (data, job) = input.chunk_payload(start, end, ChunkKind::Reduce);
+            let fut = crate::worker::dispatch_worker_job(
+                self,
+                slice.clone_for_dispatch(),
+                vec![data],
+                Some(job),
+                span,
+            )?;
+            chunk_futs.push(fut);
+        }
+
+        // The final-combine dispatch also needs `&Interp` (synchronous call). We capture
+        // `self.rc()` — the owning `Rc<Interp>` — so the orchestrator can call
+        // `dispatch_worker_job(&*interp_rc, …)` from inside the `spawn_local` async block
+        // without crossing a `Send` boundary (both live on the same `LocalSet` thread).
+        // No `RefCell` borrow is held across the `.await` calls inside the block.
+        let interp_rc = self.rc();
+        let final_slice = slice.clone_for_dispatch();
+
+        // Orchestrator: collect partials IN CHUNK ORDER, then dispatch ONE final combine.
+        let fut = SharedFuture::new();
+        let cell = fut.cell();
+        let handle = tokio::task::spawn_local(async move {
+            // Phase A: collect all per-chunk partials in input (chunk) order.
+            // Dropping the remaining futures cancels queued chunks on error (§3.5).
+            let mut partials: Vec<Value> = Vec::with_capacity(chunk_futs.len());
+            for f in chunk_futs {
+                match await_worker_future(f).await {
+                    Ok(v) => partials.push(v),
+                    Err(e) => {
+                        cell.resolve(Err(e));
+                        return;
+                    }
+                }
+            }
+
+            // Phase B: dispatch ONE final Reduce over [init, p0, .., pk] (plain data,
+            // copy path). The driver seeds with `init` and folds across `p0..pk`,
+            // producing `f(...f(f(init, p0), p1)...)` in one dispatch — §3.3.3.
+            let mut combine: Vec<Value> = Vec::with_capacity(partials.len() + 1);
+            combine.push(init);
+            combine.extend(partials);
+            let combine_len = combine.len();
+            let combine_data = Value::array(combine);
+            let final_job = ChunkJob {
+                kind: ChunkKind::Reduce,
+                start: 0,
+                end: combine_len as u32,
+            };
+            // dispatch_worker_job is synchronous — no borrow held across .await.
+            let final_fut_result = crate::worker::dispatch_worker_job(
+                &interp_rc,
+                final_slice,
+                vec![combine_data],
+                Some(final_job),
+                span,
+            );
+            match final_fut_result {
+                Err(e) => {
+                    cell.resolve(Err(e));
+                }
+                Ok(v) => match await_worker_future(v).await {
+                    Ok(result) => cell.resolve(Ok(result)),
+                    Err(e) => cell.resolve(Err(e)),
+                },
+            }
+        });
+        fut.set_abort(handle.abort_handle());
+        Ok(Value::future(fut))
     }
 
     /// `pipe(gen, bus)` — consume a (worker) generator and re-emit each yielded
@@ -1665,6 +1765,173 @@ print(await task.pmap([10, 20], outer, { chunks: 1 }))
         .await;
         // outer(10) -> [20, 22, 24]; outer(20) -> [40, 42, 44]
         assert_eq!(out, "[[20, 22, 24], [40, 42, 44]]\n");
+    }
+
+    // ── PAR Task 2.3: preduce tests ─────────────────────────────────────────
+
+    /// preduce with an associative combiner (add) must equal the sequential sum.
+    ///
+    /// Contractual values (spec §3.3.2/§3.3.3):
+    ///   preduce([1..10], add, 0):
+    ///     Chunks = pool_cap (≥1). Because add is associative, all chunk orderings
+    ///     give the same result: each chunk folds its elements seeded by the first,
+    ///     partials combine with init=0, total = 1+2+…+10 = 55.
+    ///   preduce([1..10], add, 100, {chunks:3}):
+    ///     Chunks: [0,4)=[1,2,3,4], [4,7)=[5,6,7], [7,10)=[8,9,10].
+    ///     Partials: p0=1+2+3+4=10, p1=5+6+7=18 (seeded 5, +6=11, +7=18), p2=8+9+10=27.
+    ///     Wait — seed-with-first: p0=1+2+3+4=((1+2)+3)+4=10; p1=5+6+7=((5+6)+7)=18;
+    ///     p2=8+9+10=((8+9)+10)=27. But wait: seed = first element, fold rest.
+    ///     p0: seed=1, fold 2,3,4 → (((1+2)+3)+4) = 10. ✓
+    ///     p1: seed=5, fold 6,7 → ((5+6)+7) = 18. ✓
+    ///     p2: seed=8, fold 9,10 → ((8+9)+10) = 27. ✓
+    ///     Final combine: [100, 10, 18, 27] → seed=100, fold: 100+10=110, 110+18=128, 128+27=155. ✓
+    ///     init=100 participates EXACTLY ONCE (in the final combine, as the seed).
+    #[tokio::test]
+    async fn preduce_equals_sequential_for_associative_f() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn add(a, b) { return a + b }
+print(await task.preduce([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], add, 0))
+print(await task.preduce([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], add, 100, { chunks: 3 }))
+"#)
+        .await;
+        assert_eq!(out, "55\n155\n");  // init participates EXACTLY once (spec §3.3.3)
+    }
+
+    /// Empty preduce resolves to init (poolless); single-element preduce = f(init, e).
+    ///
+    /// Contractual values:
+    ///   preduce([], add, 42): empty fast-path → 42.
+    ///   preduce([7], add, 1): one chunk [0,1), seed=7, partial=7;
+    ///     final combine: [1, 7] → seed=1, fold 7 → 1+7 = 8. ✓
+    #[tokio::test]
+    async fn preduce_empty_and_single() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn add(a, b) { return a + b }
+print(await task.preduce([], add, 42))
+print(await task.preduce([7], add, 1))
+"#)
+        .await;
+        assert_eq!(out, "42\n8\n");  // [] → init (poolless); [e] → f(init, e)
+    }
+
+    /// Non-associative f (subtraction) with pinned chunks is REPRODUCIBLE (byte-identical
+    /// across runs) but NOT equal to sequential reduce for chunks > 1.
+    ///
+    /// Contractual values for chunks:1 (spec §3.3.2/§3.3.3):
+    ///   sub(a,b) = a - b, data = [100,1,2,3,4,5], init = 0, chunks:1.
+    ///   ONE chunk [0,6): seed = data[0] = 100.
+    ///   Fold rest: ((((100-1)-2)-3)-4)-5 = 85. Partial p0 = 85.
+    ///   Final combine: [init=0, p0=85] → seed=0, fold 85 → 0-85 = -85.
+    ///   Result = -85.
+    ///   NB: preduce(chunks:1) = f(init, fold(chunk)) — equals sequential reduce ONLY
+    ///   for associative f. Sequential reduce(sub, 0, [100..5]) =
+    ///   (((((0-100)-1)-2)-3)-4)-5 = -115, which differs. By design (spec §2.1).
+    ///
+    /// For chunks:2 (the first run is for reproducibility only — we assert a==b):
+    ///   chunk_plan(6, 2, 1) = [(0,3), (3,6)].
+    ///   Chunk 0: [100,1,2] seed=100, fold: (100-1)-2=97. p0=97.
+    ///   Chunk 1: [3,4,5] seed=3, fold: (3-4)-5=-6. p1=-6.
+    ///   Final: [0, 97, -6] → seed=0, fold: 0-97=-97, -97-(-6)=-91. Result=-91.
+    #[tokio::test]
+    async fn preduce_nonassociative_is_reproducible_with_pinned_chunks() {
+        // chunks:1 → contractual value is -85 (NOT the sequential fold -115).
+        let seq1 = run(r#"
+import * as task from "std/task"
+worker fn sub(a, b) { return a - b }
+print(await task.preduce([100, 1, 2, 3, 4, 5], sub, 0, { chunks: 1 }))
+"#)
+        .await;
+        // Contractual: ONE chunk seeded with 100, partial=85; final fold = f(0, 85) = -85.
+        assert_eq!(seq1.trim(), "-85",
+            "contractual preduce(chunks:1) expected -85, got {seq1}");
+
+        // chunks:2 → run twice, assert equal (deterministic).
+        let src = r#"
+import * as task from "std/task"
+worker fn sub(a, b) { return a - b }
+print(await task.preduce([100, 1, 2, 3, 4, 5], sub, 0, { chunks: 2 }))
+"#;
+        let a = run(src).await;
+        let b = run(src).await;
+        assert_eq!(a, b, "preduce with pinned chunks must be deterministic");
+        // Contractual value for chunks:2: -91.
+        assert_eq!(a.trim(), "-91",
+            "contractual preduce(chunks:2) expected -91, got {a}");
+    }
+
+    /// Ragged final chunk: when len is not divisible by chunk_size, the last chunk
+    /// has fewer elements — result must still be correct.
+    #[tokio::test]
+    async fn preduce_ragged_final_chunk() {
+        // 7 elements, chunks:3 → plan(7,3,1): chunk_size=ceil(7/3)=3 → [(0,3),(3,6),(6,7)]
+        // Chunk 0: [10,20,30] seed=10, fold: 10+20=30, 30+30=60. p0=60.
+        // Chunk 1: [40,50,60] seed=40, fold: 40+50=90, 90+60=150. p1=150.
+        // Chunk 2: [70] seed=70, no fold. p2=70.
+        // Final: [0, 60, 150, 70] seed=0: 0+60=60, 60+150=210, 210+70=280.
+        let out = run(r#"
+import * as task from "std/task"
+worker fn add(a, b) { return a + b }
+print(await task.preduce([10, 20, 30, 40, 50, 60, 70], add, 0, { chunks: 3 }))
+"#)
+        .await;
+        assert_eq!(out.trim(), "280");
+    }
+
+    /// Non-sendable init panics UP FRONT (before any dispatch is made).
+    #[tokio::test]
+    async fn preduce_nonsendable_init_panics_upfront() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn add(a, b) { return a + b }
+let [v, err] = recover(() => task.preduce([1, 2, 3], add, () => 0))
+print(v)
+print(err != nil)
+"#)
+        .await;
+        // A closure (lambda) is not sendable → panic before any dispatch.
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    /// A panic inside the combiner during the FINAL stage surfaces as the preduce error.
+    #[tokio::test]
+    async fn preduce_panic_in_final_combine_surfaces() {
+        // The combiner panics when accumulator goes below -10. This happens in the
+        // final combine stage (when init=0 folds the partial which is > 10).
+        let out = run(r#"
+import * as task from "std/task"
+worker fn paranoid_add(a, b) {
+    if (a + b > 1000) {
+        assert(false, "overflow in combiner")
+    }
+    return a + b
+}
+let [v, err] = recover(() => {
+    return await task.preduce([500, 600], paranoid_add, 0, { chunks: 2 })
+})
+print(v)
+print(err != nil)
+"#)
+        .await;
+        // 2 chunks: p0=500, p1=600; final: [0, 500, 600] → 0+500=500, 500+600=1100 > 1000 → panic.
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    /// Frozen array input to preduce works correctly.
+    #[cfg(feature = "shared")]
+    #[tokio::test]
+    async fn preduce_frozen_input() {
+        let out = run(r#"
+import * as task from "std/task"
+import * as shared from "std/shared"
+worker fn add(a, b) { return a + b }
+let data = shared.freeze([1, 2, 3, 4, 5])
+print(await task.preduce(data, add, 0, { chunks: 2 }))
+"#)
+        .await;
+        // [1,2,3,4,5] sum = 15; init=0; result = 15.
+        assert_eq!(out.trim(), "15");
     }
 
     #[cfg(feature = "shared")]
