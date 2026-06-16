@@ -201,14 +201,20 @@ stated, results are measured.
   - Spec: `superpowers/specs/2026-06-12-vm-executor-design.md`
   - Plan: `superpowers/plans/2026-06-12-vm-executor.md`
 
-- 🔒 **REGION — Task-scoped region allocation.** Per-spawned-task / per-request bump arenas with
-  promote-on-escape (returns, captured-env writes, globals, channel/event sends, the airlock),
-  bulk-freed at task end — sound because isolation already draws the region boundary. **Gate: a
-  spike on `json_roundtrip` + the server workload proving ≥20% allocation-time win without
-  promotion-cost blowback.** v1 may narrow to compiler-PROVEN non-escaping allocations (Go-style
-  escape analysis on `bcanalysis` facts) if the dynamic promotion spike fails its gate. Depends
-  on NANB (value representation must be final first) — **now SATISFIED: NANB evidence-rejected the
-  16-byte repr, so `Value` is final at 24 B; REGION is unblocked at that representation.**
+- ⚖️ **REGION — Task-scoped region allocation — EVIDENCE-REJECTED (NO-GO). See EXECUTION LOG.**
+  The spike was executed honestly (probe → narrow prototype → A/B). The narrow refcount recycler
+  (proven-dead `ObjectCell` reuse, `strong_count()==1` proof, `region-spike` feature) is SOUND and
+  effective on its design shape (`region_escape` bench: 1,999,960 recycles, byte-identical,
+  `vm_differential` 444/0 region-on) — but the §5.5 **G1 gate FAILS decisively:** recycled=0 on
+  BOTH gate workloads. `json_roundtrip` builds all containers native-side in serde (0% VM-literal
+  eligibility, Phase-0 probe); `server_request`'s `resp` is module-scope + passed to
+  `json.stringify` (a Call-arg sink statically disqualified per §3.1/§4). 0% allocation-time
+  reduction, wall not improved. G2/G3/G4/G5 pass; G6 moot. The ~45% alloc/gc CPU headroom lives in
+  native-serde + Call-escaping allocations a bytecode-literal recycler provably cannot touch —
+  confirming the lock-record prediction (promote-on-escape killed on identity grounds). The spike
+  is frozen on `feat/task-regions` (unmerged); the vendored gcmodule `strong_count` fork (G6) was
+  spike-local and does not ship. Evidence: `bench/REGION_RESULTS.md` + `bench/REGION_PROBE.md`.
+  - Spec: `superpowers/specs/2026-06-12-task-regions-design.md` (Status → evidence-rejected)
   - Spec: `superpowers/specs/2026-06-12-task-regions-design.md`
   - Plan: `superpowers/plans/2026-06-12-task-regions.md`
 
@@ -692,6 +698,29 @@ stated, results are measured.
   future worker-hardening task):** two DIFFERENT `worker fn`s sharing a top-level helper hit a `DefineGlobal`
   redeclaration panic on a WARM pool isolate — reproduces with plain pooled `worker fn` calls (zero PAR
   involvement); the worker code-shipping slice re-defines an already-defined top-level helper.
+
+- **REGION** — ⚖️ **EVIDENCE-REJECTED (NO-GO); spike frozen on `feat/task-regions` (unmerged).** Task-scoped
+  region allocation, executed as the spec's PROBE → NARROW-PROTOTYPE → GO/NO-GO spike. **Phase 0:** identity
+  audit (semantics unchanged post-NANB, NO persistent container-address-keyed table — the spike's premise
+  holds) + a `region-probe` cfg-gated allocation-lifetime instrument; the §5.3 checkpoint **passed** (server
+  workload 40% literal-in-task ≥ 25%; json_roundtrip 0% — all serde-native), independently verified. **Phase
+  1:** the narrow recycler — vendored gcmodule `strong_count()` (path-patch, G6 production decision deferred),
+  `region_candidates` kill-site analysis + lazy `region_kills` bitmap (runtime-only, ASO 29 unchanged),
+  `RegionPool` reusing proven-dead `ObjectCell`s at `strong_count()==1` kill sites behind `region-spike` +
+  `ASCRIPT_NO_REGIONS`. Proven SOUND + byte-invisible: region-ON `vm_differential` **444/0** over the whole
+  corpus (region-on == tree-walker oracle == generic), an adversarial review found no shape-staleness /
+  refcount-guard / frozen-leak divergence, and `region_escape` recycles 1,999,960 cells byte-identically (the
+  mechanism WORKS). **Phase 2 A/B → NO-GO:** §5.5 **G1 FAILS decisively** — recycled=0 on BOTH gate workloads
+  (independently reproduced): `json_roundtrip` is 100% native-serde construction (no VM literal fires);
+  `server_request`'s `resp` is module-scope + a `json.stringify(resp)` Call-arg sink (statically disqualified
+  per §3.1/§4). 0% allocation-time reduction, wall not improved (json +0.00%, server +0.60%). G2 (escape <5%,
+  object_churn ok), G3 (regions-off ≈1.00× geomean), G4 (identity battery + differential green), G5 (RSS not
+  regressed, overflow=0) all PASS; G6 moot on a NO-GO. **The ~45% alloc/gc CPU headroom lives in native-serde
+  + Call-escaping allocations a bytecode-literal recycler provably cannot touch** — confirming the lock-record
+  prediction (promote-on-escape killed on identity grounds). Branch frozen+pushed (`origin/feat/task-regions`)
+  as the cheap re-run path; the vendored gcmodule fork was spike-local (does not ship). A first-class honored
+  evidence outcome (the VAL/NANB precedent). Evidence: `bench/REGION_RESULTS.md` + `bench/REGION_PROBE.md`;
+  spec Status → evidence-rejected.
 
 ## Execution order
 

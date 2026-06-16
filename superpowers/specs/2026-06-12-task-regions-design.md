@@ -1,8 +1,14 @@
 # Task-Scoped Region Allocation — Design (REGION)
 
-- **Status:** Draft for review — **SPIKE-GATED, not scheduled.** This document exists so the
-  go/no-go decision is made against a concrete plan rather than an assumption (the JIT-spec §0
-  posture, `superpowers/specs/2026-06-08-baseline-jit-design.md`). It is **not** a work order.
+- **Status:** **EVIDENCE-REJECTED (NO-GO), 2026-06-16.** The spike was executed (probe → narrow
+  prototype → A/B); §5.5 G1 fails decisively — recycled=0 on both gate workloads (json_roundtrip is
+  100% native-serde construction; server_request's `resp` is module-scope + a `json.stringify` Call-arg
+  sink, statically disqualified). The narrow refcount recycler is sound + byte-invisible (region-on
+  `vm_differential` 444/0; `region_escape` recycles 2M) but the gate workloads' allocations are provably
+  untouchable by a bytecode-literal recycler. See `bench/REGION_RESULTS.md`; spike frozen on
+  `feat/task-regions` (unmerged). _Originally: Draft for review — SPIKE-GATED, not scheduled; this
+  document existed so the go/no-go was made against a concrete plan (the JIT-spec §0 posture,
+  `superpowers/specs/2026-06-08-baseline-jit-design.md`), not an assumption._
 - **Date:** 2026-06-12
 - **Code:** REGION (PERF campaign, `goal-perf.md` — the evidence-gated wave)
 - **Depends on:** **NANB merged** (the value representation must be FINAL before an allocation
