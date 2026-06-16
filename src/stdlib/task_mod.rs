@@ -16,6 +16,7 @@ use crate::interp::{make_error, make_pair, Control, Interp};
 use crate::span::Span;
 use crate::task::SharedFuture;
 use crate::value::{OwnedKind, Value, ValueKind};
+use crate::worker::isolate::{ChunkJob, ChunkKind};
 
 /// Aborts a `spawn_local` task when dropped. Used by `race` to cancel the resolver
 /// tasks (and thereby the losing futures) once a winner is decided.
@@ -68,8 +69,8 @@ impl Interp {
             "timeout" => self.task_timeout(args, span).await,
             "retry" => self.task_retry(args, span).await,
             "pipe" => self.task_pipe(args, span).await,
-            // PAR §2.1 — Task 2.1 ships validation; orchestration (Task 2.2) is pending.
-            "pmap" => self.task_pmap_validate(args, span).await,
+            // PAR §2.1 — Task 2.2 ships pmap orchestration; preduce (Task 2.3) is pending.
+            "pmap" => self.task_pmap(args, span).await,
             "preduce" => self.task_preduce_validate(args, span).await,
             _ => Err(AsError::at(format!("unknown function 'task.{}'", func), span).into()),
         }
@@ -340,30 +341,145 @@ impl Interp {
         Err(Control::Panic(last_panic.expect("at least one attempt")))
     }
 
-    // ── PAR Task 2.1: validation stubs ───────────────────────────────────────
-    // Full orchestration (Task 2.2) is not yet implemented. These methods perform
-    // ALL synchronous validation (input classification, callback name check, opts
-    // parsing) — which is what Task 2.1 tests — then return an unimplemented error.
-    // Task 2.2 will replace the body after the validation block with real dispatch.
+    // ── PAR Task 2.2: pmap orchestrator ──────────────────────────────────────
 
-    /// `task.pmap(data, f, opts?) -> future<array>` — validation only (Task 2.1).
-    async fn task_pmap_validate(
+    /// `task.pmap(data, f, opts?) -> future<array>` (PAR spec §2/§3.4).
+    ///
+    /// Synchronously inside the call: validate args (§2.1/§2.2), SNAPSHOT the input
+    /// (so mutating `data` afterward can't affect the result), plan the chunks
+    /// (§3.3.1), build the code slice ONCE, and eagerly dispatch every chunk
+    /// (`dispatch_worker_job` with a `ChunkJob{Map, …}` — each returns an
+    /// already-running `Value::future`). Then an orchestrator `spawn_local` task awaits
+    /// the chunk futures **in input (chunk) order** and concatenates their result
+    /// arrays — input-order results, first-by-input-order errors, cancel-on-drop via
+    /// the `SharedFuture` abort handle (the `dispatch_worker` bridge shape, §3.5).
+    ///
+    /// Two non-pool fast paths: empty input resolves to `[]` WITHOUT touching the pool
+    /// (§2.1); a call made from INSIDE an isolate runs the same chunk decomposition
+    /// inline (`par_inline`, §5.1 venue-invariance) — an isolate never blocks on its
+    /// own pool.
+    async fn task_pmap(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        // Validate + snapshot synchronously (no borrow held past this point).
+        let input = classify_par_input(&arg(args, 0), "task.pmap", span)?;
+        let entry_name = par_callback_name(&arg(args, 1), "task.pmap", span)?;
+        let (cap, min_chunk) = par_opts(&arg(args, 2), "task.pmap", span)?;
+
+        let len = input.len();
+        // Empty input → [] instantly, pool untouched (§2.1).
+        if len == 0 {
+            return Ok(Value::future(SharedFuture::resolved(Ok(Value::array(
+                Vec::new(),
+            )))));
+        }
+
+        let plan = chunk_plan(len, cap, min_chunk);
+
+        // Nested (called inside an isolate): SAME decomposition, executed inline —
+        // venue never changes the value (§5.1) and an isolate never blocks on its pool.
+        if crate::worker::pool::in_isolate() {
+            return self.par_inline(&input, &entry_name, &plan, ChunkKind::Map, None, span);
+        }
+
+        // Build the slice once; clone_for_dispatch serves every chunk (§3.2).
+        let slice = crate::worker::build_code_slice_for_interp(self, &entry_name)?;
+        let mut chunk_futs: Vec<Value> = Vec::with_capacity(plan.len());
+        for &(start, end) in &plan {
+            // Frozen: (whole Shared, start..end). Plain: (slice copy, 0..end-start).
+            // A non-sendable plain element panics inside dispatch_worker_job's encode,
+            // synchronously, at THIS chunk — chunks dispatch in input order, so the
+            // first offending chunk by input order raises (§3.5).
+            let (data, job) = input.chunk_payload(start, end, ChunkKind::Map);
+            let fut = crate::worker::dispatch_worker_job(
+                self,
+                slice.clone_for_dispatch(),
+                vec![data],
+                Some(job),
+                span,
+            )?;
+            chunk_futs.push(fut);
+        }
+
+        // Orchestrator: await in INPUT order, concatenate. First error wins; dropping
+        // the remaining futures cancels queued chunks (§3.5).
+        let fut = SharedFuture::new();
+        let cell = fut.cell();
+        let handle = tokio::task::spawn_local(async move {
+            let mut merged: Vec<Value> = Vec::new();
+            let mut futs = chunk_futs.into_iter();
+            let result = loop {
+                let Some(f) = futs.next() else {
+                    break Ok(Value::array(merged));
+                };
+                match await_worker_future(f).await {
+                    Ok(v) => match v.kind() {
+                        ValueKind::Array(a) => {
+                            merged.extend(a.borrow().iter().cloned());
+                        }
+                        _ => {
+                            break Err(Control::Panic(AsError::at(
+                                format!(
+                                    "pmap chunk returned a non-array (internal invariant): {}",
+                                    crate::interp::type_name(&v)
+                                ),
+                                span,
+                            )));
+                        }
+                    },
+                    // Remaining futs DROP here → queued chunks cancel (§3.5).
+                    Err(e) => break Err(e),
+                }
+            };
+            cell.resolve(result);
+        });
+        fut.set_abort(handle.abort_handle());
+        Ok(Value::future(fut))
+    }
+
+    /// PAR spec §5.1: the in-isolate INLINE executor for `pmap`/`preduce`. Runs the
+    /// SAME chunk decomposition the pooled path runs, but on the CURRENT isolate's VM
+    /// (the entry global is already shipped transitively because the enclosing worker
+    /// body references `f` by name) — so a nested parallel call is deadlock-free and
+    /// produces a byte-identical value (venue-invariance).
+    ///
+    /// For `ChunkKind::Map` the chunk results are concatenated. For `ChunkKind::Reduce`
+    /// the per-chunk partials are collected and `final_init` (the `preduce` `init`)
+    /// drives one local final fold over `[init, p0, .., pk]` via the same `run_chunk_job`
+    /// — Task 2.3 passes `Some(init)`; Map passes `None`.
+    fn par_inline(
         &self,
-        args: &[Value],
+        input: &ParInput,
+        entry_name: &str,
+        plan: &[(usize, usize)],
+        kind: ChunkKind,
+        final_init: Option<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        // Step 1: classify input (panics for non-array/non-frozen-array input).
-        let _input = classify_par_input(&arg(args, 0), "task.pmap", span)?;
-        // Step 2: validate callback (panics for non-named-worker-fn).
-        let _entry_name = par_callback_name(&arg(args, 1), "task.pmap", span)?;
-        // Step 3: parse opts (panics for invalid opts).
-        let (_cap, _min_chunk) = par_opts(&arg(args, 2), "task.pmap", span)?;
-        // Orchestration (Task 2.2) not yet implemented.
-        Err(AsError::at(
-            "task.pmap: orchestration not yet implemented (Task 2.2 pending)",
-            span,
-        )
-        .into())
+        let vm = self.vm().ok_or_else(|| {
+            Control::Panic(AsError::at(
+                "inline parallel dispatch requires a VM (internal invariant)".to_string(),
+                span,
+            ))
+        })?;
+        let entry = vm.user_global(entry_name).ok_or_else(|| {
+            Control::Panic(AsError::at(
+                format!(
+                    "nested parallel callback '{entry_name}' is not available in the enclosing worker's code slice"
+                ),
+                span,
+            ))
+        })?;
+
+        let data = input.inline_data();
+        let plan: Vec<(usize, usize)> = plan.to_vec();
+
+        let fut = SharedFuture::new();
+        let cell = fut.cell();
+        let handle = tokio::task::spawn_local(async move {
+            let result = par_inline_run(&vm, &entry, &data, &plan, kind, final_init, span).await;
+            cell.resolve(result);
+        });
+        fut.set_abort(handle.abort_handle());
+        Ok(Value::future(fut))
     }
 
     /// `task.preduce(data, f, init, opts?) -> future<T>` — validation only (Task 2.1).
@@ -583,12 +699,54 @@ pub(crate) enum ParInput {
 }
 
 impl ParInput {
-    /// Number of elements in the input. Used by the orchestrator (Task 2.2).
-    #[allow(dead_code)]
+    /// Number of elements in the input.
     pub(crate) fn len(&self) -> usize {
         match self {
             ParInput::Frozen { len, .. } => *len,
             ParInput::Plain { elems } => elems.len(),
+        }
+    }
+
+    /// PAR spec §3.1/§3.3.2: build the `(data, ChunkJob)` payload for the chunk
+    /// `[start, end)` to dispatch.
+    ///
+    /// - **Frozen:** the data is the WHOLE shared `Value` (an `Arc` bump per chunk via
+    ///   the `TAG_SHARED` side-vector); the job indexes `start..end` directly into it.
+    /// - **Plain:** the data is THIS chunk's own element slice (a structured-clone copy
+    ///   of `elems[start..end]`); the job indexes `0..(end-start)` into that slice.
+    fn chunk_payload(&self, start: usize, end: usize, kind: ChunkKind) -> (Value, ChunkJob) {
+        match self {
+            ParInput::Frozen { shared, .. } => (
+                shared.clone(),
+                ChunkJob {
+                    kind,
+                    start: start as u32,
+                    end: end as u32,
+                },
+            ),
+            ParInput::Plain { elems } => {
+                let slice: Vec<Value> = elems[start..end].to_vec();
+                let len = slice.len();
+                (
+                    Value::array(slice),
+                    ChunkJob {
+                        kind,
+                        start: 0,
+                        end: len as u32,
+                    },
+                )
+            }
+        }
+    }
+
+    /// PAR spec §5.1 (inline nesting): build the WHOLE-input data value once for the
+    /// in-isolate executor, which indexes chunk ranges directly into it via
+    /// `run_chunk_job` (the same decomposition the pooled path runs per chunk). Frozen
+    /// returns the shared `Value` (zero-copy); Plain returns the snapshot array.
+    fn inline_data(&self) -> Value {
+        match self {
+            ParInput::Frozen { shared, .. } => shared.clone(),
+            ParInput::Plain { elems } => Value::array(elems.clone()),
         }
     }
 }
@@ -713,6 +871,93 @@ pub(crate) fn par_opts(opts: &Value, fn_name: &str, span: Span) -> Result<(usize
             span,
         )
         .into()),
+    }
+}
+
+/// PAR spec §3.4: await one chunk's `Value::future` and return its decoded result.
+/// `dispatch_worker_job` always returns a `Value::future`; this drives it. A non-future
+/// (defensive — never produced by the dispatch path) is returned as-is.
+async fn await_worker_future(v: Value) -> Result<Value, Control> {
+    if matches!(v.kind(), ValueKind::Future(_)) {
+        let OwnedKind::Future(f) = v.into_kind() else {
+            unreachable!()
+        };
+        f.get().await
+    } else {
+        Ok(v)
+    }
+}
+
+/// PAR spec §5.1: drive the inline (in-isolate) chunk decomposition for `par_inline`.
+/// Runs each chunk through the SAME `run_chunk_job` the pooled path uses, against the
+/// current isolate's `vm`/`entry`, and merges identically:
+/// - **Map:** concatenate the per-chunk result arrays in chunk order.
+/// - **Reduce:** collect per-chunk partials in chunk order, then drive one final fold
+///   `f(...f(f(init, p0), p1)...)` via a `Reduce` `run_chunk_job` over `[init, p0, .., pk]`
+///   (the §3.3.3 final-combine stage, executed locally).
+async fn par_inline_run(
+    vm: &std::rc::Rc<crate::vm::Vm>,
+    entry: &Value,
+    data: &Value,
+    plan: &[(usize, usize)],
+    kind: ChunkKind,
+    final_init: Option<Value>,
+    span: Span,
+) -> Result<Value, Control> {
+    match kind {
+        ChunkKind::Map => {
+            let mut merged: Vec<Value> = Vec::new();
+            for &(start, end) in plan {
+                let job = ChunkJob {
+                    kind: ChunkKind::Map,
+                    start: start as u32,
+                    end: end as u32,
+                };
+                let chunk =
+                    crate::worker::isolate::run_chunk_job(vm, entry.clone(), data.clone(), &job, span)
+                        .await?;
+                match chunk.kind() {
+                    ValueKind::Array(a) => merged.extend(a.borrow().iter().cloned()),
+                    _ => {
+                        return Err(Control::Panic(AsError::at(
+                            format!(
+                                "pmap chunk returned a non-array (internal invariant): {}",
+                                crate::interp::type_name(&chunk)
+                            ),
+                            span,
+                        )));
+                    }
+                }
+            }
+            Ok(Value::array(merged))
+        }
+        ChunkKind::Reduce => {
+            // Collect per-chunk partials (seeded by each chunk's first element) in order.
+            let mut partials: Vec<Value> = Vec::with_capacity(plan.len());
+            for &(start, end) in plan {
+                let job = ChunkJob {
+                    kind: ChunkKind::Reduce,
+                    start: start as u32,
+                    end: end as u32,
+                };
+                let partial =
+                    crate::worker::isolate::run_chunk_job(vm, entry.clone(), data.clone(), &job, span)
+                        .await?;
+                partials.push(partial);
+            }
+            // Final combine: fold `f` over [init, p0, .., pk] (init participates once).
+            let init = final_init.unwrap_or_else(Value::nil);
+            let mut combine: Vec<Value> = Vec::with_capacity(partials.len() + 1);
+            combine.push(init);
+            combine.extend(partials);
+            let combine_data = Value::array(combine.clone());
+            let job = ChunkJob {
+                kind: ChunkKind::Reduce,
+                start: 0,
+                end: combine.len() as u32,
+            };
+            crate::worker::isolate::run_chunk_job(vm, entry.clone(), combine_data, &job, span).await
+        }
     }
 }
 
@@ -1116,6 +1361,310 @@ print(err.message)
         let input = classify_par_input(&shared, "task.pmap", span)
             .expect("frozen array should classify as Frozen");
         assert!(matches!(input, super::ParInput::Frozen { len: 3, .. }));
+    }
+
+    // ── PAR Task 2.2: pmap orchestrator (run_source) ────────────────────────
+
+    /// pmap over a plain array returns results in INPUT order.
+    #[tokio::test]
+    async fn pmap_plain_array_input_order() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn double(x) { return x * 2 }
+print(await task.pmap([1, 2, 3, 4, 5, 6, 7, 8], double))
+"#)
+        .await;
+        assert_eq!(out, "[2, 4, 6, 8, 10, 12, 14, 16]\n");
+    }
+
+    /// pmap over a frozen array gives the same result (zero-copy path).
+    #[cfg(feature = "shared")]
+    #[tokio::test]
+    async fn pmap_frozen_input_same_result() {
+        let out = run(r#"
+import * as task from "std/task"
+import * as shared from "std/shared"
+worker fn double(x) { return x * 2 }
+print(await task.pmap(shared.freeze([1, 2, 3]), double, { chunks: 2 }))
+"#)
+        .await;
+        assert_eq!(out, "[2, 4, 6]\n");
+    }
+
+    /// Empty pmap resolves to [] instantly AND does NOT initialize the pool (§2.1).
+    /// Serial: asserts a process-global (pool init flag) so it must not race other
+    /// tests that spin up the pool.
+    #[tokio::test]
+    async fn pmap_empty_is_instant_and_poolless() {
+        // Only meaningful if no prior worker ran in this process — but the assertion
+        // is one-directional (empty pmap must not be the thing that inits the pool).
+        let already = crate::worker::pool_is_initialized();
+        let out = run(r#"
+import * as task from "std/task"
+worker fn id(x) { return x }
+print(await task.pmap([], id))
+"#)
+        .await;
+        assert_eq!(out, "[]\n");
+        if !already {
+            assert!(
+                !crate::worker::pool_is_initialized(),
+                "empty pmap must not touch the pool"
+            );
+        }
+    }
+
+    /// Order preservation under an INVERSE workload: element i sleeps (n-i) ms, so
+    /// later elements finish first — the merged result must still be input order.
+    /// Total sleep budget kept well under 1s.
+    #[tokio::test]
+    async fn pmap_order_under_inverse_workload() {
+        let out = run(r#"
+import * as task from "std/task"
+import * as time from "std/time"
+worker fn slow(x) {
+    // x in 0..8; sleep (8 - x) * 5 ms so element 0 is slowest, 7 fastest.
+    await time.sleep((8 - x) * 5)
+    return x * 10
+}
+print(await task.pmap([0, 1, 2, 3, 4, 5, 6, 7], slow))
+"#)
+        .await;
+        assert_eq!(out, "[0, 10, 20, 30, 40, 50, 60, 70]\n");
+    }
+
+    /// chunks: 1 (one isolate, sequential-in-isolate) still input order.
+    #[tokio::test]
+    async fn pmap_chunks_one() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn double(x) { return x * 2 }
+print(await task.pmap([1, 2, 3, 4, 5], double, { chunks: 1 }))
+"#)
+        .await;
+        assert_eq!(out, "[2, 4, 6, 8, 10]\n");
+    }
+
+    /// chunks > len clamps; minChunk > len → one chunk. Both still correct.
+    #[tokio::test]
+    async fn pmap_chunks_gt_len_and_min_chunk_gt_len() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn double(x) { return x * 2 }
+print(await task.pmap([1, 2, 3], double, { chunks: 16 }))
+print(await task.pmap([1, 2, 3], double, { minChunk: 16 }))
+"#)
+        .await;
+        assert_eq!(out, "[2, 4, 6]\n[2, 4, 6]\n");
+    }
+
+    /// A callback that is not a `worker fn` panics (recoverable).
+    #[tokio::test]
+    async fn pmap_callback_not_worker_fn_panics() {
+        let out = run(r#"
+import * as task from "std/task"
+fn plain(x) { return x }
+let [v, err] = recover(() => task.pmap([1, 2], plain))
+print(v)
+print(err.message)
+"#)
+        .await;
+        assert!(
+            out.contains("nil")
+                && out.contains("task.pmap expects a named `worker fn` as its callback"),
+            "unexpected output: {out}"
+        );
+    }
+
+    /// A non-sendable element (a closure inside the data) panics with a field path,
+    /// raised synchronously at the offending chunk's dispatch (first by input order).
+    /// The panic is raised by `dispatch_worker_job`'s encode, INSIDE the synchronous
+    /// `task.pmap` call, so `recover` around the bare call catches it directly.
+    #[tokio::test]
+    async fn pmap_non_sendable_element_field_path_panics() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn id(x) { return x }
+let [v, err] = recover(() => task.pmap([1, () => 2, 3], id, { chunks: 1 }))
+print(v)
+print(err != nil)
+"#)
+        .await;
+        // The closure cannot cross the airlock → recoverable Tier-2 panic at dispatch.
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    /// `?`-propagation inside the callback yields the `[nil, err]` PAIR element
+    /// (Phase-0 correction: `run_body` converts the propagation to Ok(pair)).
+    #[tokio::test]
+    async fn pmap_propagate_in_callback_yields_pair_element() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn maybe(x) {
+    let [v, e] = [nil, {message: "bad"}]
+    let r = [v, e]?
+    return x
+}
+print(await task.pmap([1, 2], maybe, { chunks: 1 }))
+"#)
+        .await;
+        // Both elements end in `?` → each element is the propagated pair, not nil.
+        assert_eq!(out, "[[nil, {message: \"bad\"}], [nil, {message: \"bad\"}]]\n");
+    }
+
+    /// A panicking callback surfaces as the pmap error (caught by recover). The panic
+    /// is raised inside the orchestrator future, so `recover` must `await` the pmap.
+    #[tokio::test]
+    async fn pmap_callback_panic_surfaces() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn boom(x) {
+    assert(x < 3, "too big")
+    return x
+}
+let [v, err] = recover(() => {
+    return await task.pmap([1, 2, 3, 4], boom, { chunks: 1 })
+})
+print(v)
+print(err != nil)
+"#)
+        .await;
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    // §3.1 parity battery — frozen-element mutation panic vs plain-copy mutation OK,
+    // and the two DIFFERENT frozen messages (mutate-frozen vs frozen-instance method).
+
+    /// Mutating a frozen OBJECT element view inside `f` is the shipped frozen panic.
+    /// The panic happens in the chunk (the orchestrator future), so `recover` awaits.
+    #[cfg(feature = "shared")]
+    #[tokio::test]
+    async fn pmap_frozen_element_mutation_panics() {
+        let out = run(r#"
+import * as task from "std/task"
+import * as shared from "std/shared"
+worker fn touch(o) {
+    o.x = 99
+    return o.x
+}
+let data = shared.freeze([{x: 1}, {x: 2}])
+let [v, err] = recover(() => {
+    return await task.pmap(data, touch, { chunks: 1 })
+})
+print(v)
+print(err.message)
+"#)
+        .await;
+        assert!(
+            out.starts_with("nil\n") && out.contains("cannot mutate a frozen"),
+            "unexpected output: {out}"
+        );
+    }
+
+    /// A user-method call on a frozen INSTANCE element gives the SRV distinct
+    /// "method '<name>' is not available on a frozen instance" diagnostic — DIFFERENT
+    /// from the mutate-frozen message above (the §3.1 two-message battery).
+    #[cfg(feature = "shared")]
+    #[tokio::test]
+    async fn pmap_frozen_instance_method_distinct_diagnostic() {
+        let out = run(r#"
+import * as task from "std/task"
+import * as shared from "std/shared"
+class Box {
+    value: number
+    fn doubled() { return self.value * 2 }
+}
+worker fn call_method(b) { return b.doubled() }
+let data = shared.freeze([Box(3), Box(4)])
+let [v, err] = recover(() => {
+    return await task.pmap(data, call_method, { chunks: 1 })
+})
+print(v)
+print(err.message)
+"#)
+        .await;
+        assert!(
+            out.starts_with("nil\n")
+                && out.contains("is not available on a frozen instance"),
+            "unexpected output: {out}"
+        );
+    }
+
+    /// A plain (unfrozen) INSTANCE element crosses the airlock as a FIELD-ONLY shell
+    /// (Spec A airlock limitation: classes ship without method tables — method dispatch
+    /// is NOT preserved across the isolate boundary, `resolve_class` in
+    /// `worker/serialize.rs`). So a method call on a plain-instance element fails with
+    /// the shipped "value is not callable" — the same as a direct `worker fn` call.
+    /// (The §3.1 spec text overstated "working methods"; field ACCESS works, method
+    /// dispatch does not — this pins the actual shipped behavior, identical on both
+    /// venues.) Field access on a plain-instance element DOES work (next test).
+    #[tokio::test]
+    async fn pmap_plain_instance_method_call_matches_worker_airlock() {
+        let out = run(r#"
+import * as task from "std/task"
+class Box {
+    value: number
+    fn doubled() { return self.value * 2 }
+}
+worker fn call_method(b) { return b.doubled() }
+let [v, err] = recover(() => {
+    return await task.pmap([Box(3), Box(4)], call_method, { chunks: 1 })
+})
+print(v)
+print(err != nil)
+"#)
+        .await;
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    /// FIELD access on a plain (unfrozen) instance element works (copy semantics) —
+    /// the §3.1 contrast that DOES hold across the airlock.
+    #[tokio::test]
+    async fn pmap_plain_instance_field_access_works() {
+        let out = run(r#"
+import * as task from "std/task"
+class Box {
+    value: number
+}
+worker fn read_value(b) { return b.value * 2 }
+print(await task.pmap([Box(3), Box(4)], read_value, { chunks: 1 }))
+"#)
+        .await;
+        assert_eq!(out, "[6, 8]\n");
+    }
+
+    /// A plain (unfrozen) OBJECT element can be mutated locally inside `f` (copy
+    /// semantics) — silent and isolated, the §3.1 contrast to the frozen mutation panic.
+    #[tokio::test]
+    async fn pmap_plain_element_mutation_is_local() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn touch(o) {
+    o.x = o.x + 100
+    return o.x
+}
+print(await task.pmap([{x: 1}, {x: 2}], touch, { chunks: 1 }))
+"#)
+        .await;
+        assert_eq!(out, "[101, 102]\n");
+    }
+
+    /// NESTED: a `worker fn` body that itself calls `task.pmap` runs the inline
+    /// decomposition (deadlock-free) and produces identical output to a top-level call.
+    #[tokio::test]
+    async fn pmap_nested_inline() {
+        let out = run(r#"
+import * as task from "std/task"
+worker fn double(x) { return x * 2 }
+worker fn outer(seed) {
+    let r = await task.pmap([seed, seed + 1, seed + 2], double)
+    return r
+}
+print(await task.pmap([10, 20], outer, { chunks: 1 }))
+"#)
+        .await;
+        // outer(10) -> [20, 22, 24]; outer(20) -> [40, 42, 44]
+        assert_eq!(out, "[[20, 22, 24], [40, 42, 44]]\n");
     }
 
     #[cfg(feature = "shared")]

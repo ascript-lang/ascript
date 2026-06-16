@@ -65,6 +65,21 @@ pub struct WorkerCodeSlice {
     pub entry_name: Rc<str>,
 }
 
+impl WorkerCodeSlice {
+    /// PAR (spec §3.2): a cheap clone of the slice so ONE build can serve every chunk
+    /// of a `task.pmap`/`task.preduce` call. All fields are `Copy`/`Rc`-backed
+    /// (`entry_aso: Rc<[u8]>`, `class_name: Option<Rc<str>>`, `entry_name: Rc<str>`),
+    /// so this is a handful of refcount bumps — never a byte copy of the slice.
+    pub(crate) fn clone_for_dispatch(&self) -> WorkerCodeSlice {
+        WorkerCodeSlice {
+            fn_id: self.fn_id,
+            entry_aso: self.entry_aso.clone(),
+            class_name: self.class_name.clone(),
+            entry_name: self.entry_name.clone(),
+        }
+    }
+}
+
 /// Dispatch a `worker fn` call: ship the entry's code slice + the structured-clone
 /// args to a pooled isolate (another OS thread) and return a `Value::future` that
 /// resolves with the worker's result. Only BYTES cross the thread boundary — the
