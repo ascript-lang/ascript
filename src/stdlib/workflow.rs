@@ -364,9 +364,26 @@ fn ffi_ret_from_json(rec: &serde_json::Value) -> crate::det::FfiRet {
     }
 }
 
-/// Read `{log: "path", durability?: "fsync"|"buffered"}` from a workflow options
-/// Object, returning `(log_path, fsync)`. `log` is required.
-fn read_options(opts: &Value, span: Span) -> Result<(String, bool), Control> {
+/// WARM C (§4.2): the parsed durability policy. Default is `Fsync` (today's behavior,
+/// unchanged). `Group` is parsed and validated here; its per-event-append behavior lands
+/// in Task 10 — for now it is treated as the `Fsync` path with a clear TODO.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Durability {
+    /// Whole-log snapshot at finish, F_FULLFSYNC + dir-fsync per commit (default).
+    Fsync,
+    /// Per-event append + coalesced fsync (Task 10 — group appender not yet wired).
+    Group { window_ms: f64, max_events: usize },
+    /// Whole-log snapshot at finish, no explicit fsync (OS-asynchronous writeback).
+    Buffered,
+}
+
+/// Read `{log: "path", durability?: "fsync"|"buffered"|"group", groupWindowMs?, groupMaxEvents?}`
+/// from a workflow options Object, returning `(log_path, durability)`. `log` is required.
+///
+/// WARM C §4.2 hardening: an UNKNOWN `durability` string is a Tier-2 error naming the
+/// three valid values. Previously, anything other than `"buffered"` silently meant fsync;
+/// a typo like `"groop"` now errors rather than silently choosing a different durability class.
+fn read_options(opts: &Value, span: Span) -> Result<(String, Durability), Control> {
     let ValueKind::Object(o) = opts.kind() else {
         return Err(AsError::at(
             "workflow: options must be an object with a `log` path",
@@ -384,9 +401,85 @@ fn read_options(opts: &Value, span: Span) -> Result<(String, bool), Control> {
             .into())
         }
     };
-    let fsync =
-        !matches!(o.get("durability").as_ref().map(Value::kind), Some(ValueKind::Str(s)) if s.as_ref() == "buffered");
-    Ok((log, fsync))
+    let durability = match o.get("durability").as_ref().map(Value::kind) {
+        None | Some(ValueKind::Nil) => Durability::Fsync,
+        Some(ValueKind::Str(s)) => match s.as_ref() {
+            "fsync" => Durability::Fsync,
+            "buffered" => Durability::Buffered,
+            "group" => {
+                // Parse optional override parameters with defaults (window=50ms, max=128).
+                let window_ms = match o.get("groupWindowMs").as_ref().map(Value::kind) {
+                    None | Some(ValueKind::Nil) => 50.0_f64,
+                    Some(ValueKind::Int(n)) => n as f64,
+                    Some(ValueKind::Float(f)) => f,
+                    _ => {
+                        return Err(AsError::at(
+                            "workflow: groupWindowMs must be a number",
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                if window_ms <= 0.0 || !window_ms.is_finite() {
+                    return Err(AsError::at(
+                        "workflow: groupWindowMs must be a positive finite number",
+                        span,
+                    )
+                    .into());
+                }
+                let max_events = match o.get("groupMaxEvents").as_ref().map(Value::kind) {
+                    None | Some(ValueKind::Nil) => 128_usize,
+                    Some(ValueKind::Int(n)) => {
+                        if n <= 0 {
+                            return Err(AsError::at(
+                                "workflow: groupMaxEvents must be a positive integer",
+                                span,
+                            )
+                            .into());
+                        }
+                        n as usize
+                    }
+                    Some(ValueKind::Float(f)) => {
+                        let n = f as i64;
+                        if n <= 0 || !f.is_finite() {
+                            return Err(AsError::at(
+                                "workflow: groupMaxEvents must be a positive integer",
+                                span,
+                            )
+                            .into());
+                        }
+                        n as usize
+                    }
+                    _ => {
+                        return Err(AsError::at(
+                            "workflow: groupMaxEvents must be a positive integer",
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                Durability::Group { window_ms, max_events }
+            }
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "workflow: unknown durability '{}' — valid values are 'fsync', 'group', 'buffered'",
+                        other
+                    ),
+                    span,
+                )
+                .into())
+            }
+        },
+        _ => {
+            return Err(AsError::at(
+                "workflow: durability must be a string ('fsync', 'group', or 'buffered')",
+                span,
+            )
+            .into())
+        }
+    };
+    Ok((log, durability))
 }
 
 impl Interp {
@@ -447,7 +540,7 @@ impl Interp {
         }
         let input = args.get(1).cloned().unwrap_or(Value::nil());
         let opts = args.get(2).cloned().unwrap_or(Value::nil());
-        let (log_path, fsync) = read_options(&opts, span)?;
+        let (log_path, durability) = read_options(&opts, span)?;
 
         // Seed the determinism context from the log path so a record/resume pair on
         // the same log uses the same RNG seed (deterministic across the boundary).
@@ -467,13 +560,13 @@ impl Interp {
             let ctx = DeterminismContext::replay(seed, start_ms, recorded);
             let prev = self.install_determinism(ctx);
             let outcome = self.drive_workflow(wf, input, span).await;
-            self.finish_workflow(outcome, &log_path, fsync, prev, span)
+            self.finish_workflow(outcome, &log_path, durability, prev, span)
                 .await
         } else {
             let ctx = DeterminismContext::record(seed, start_ms);
             let prev = self.install_determinism(ctx);
             let outcome = self.drive_workflow(wf, input, span).await;
-            self.finish_workflow(outcome, &log_path, fsync, prev, span)
+            self.finish_workflow(outcome, &log_path, durability, prev, span)
                 .await
         }
     }
@@ -505,7 +598,7 @@ impl Interp {
         &self,
         outcome: Result<Value, Control>,
         log_path: &str,
-        fsync: bool,
+        durability: Durability,
         prev: Option<DeterminismContext>,
         span: Span,
     ) -> Result<Value, Control> {
@@ -525,6 +618,14 @@ impl Interp {
             log.push_str(&rec.to_string());
             log.push('\n');
         }
+        // Map Durability to the fsync flag for write_log.
+        // Fsync and Group both use fsync=true for the snapshot path:
+        // - Fsync: snapshot-at-finish + F_FULLFSYNC (unchanged behavior).
+        // - Group: TODO(Task 10) — per-event appender not yet wired; for now treated as
+        //   the Fsync path so the parse/enum surface is correct but behavior is identical
+        //   to Fsync until the group appender lands.
+        // - Buffered: snapshot-at-finish, no explicit fsync (unchanged behavior).
+        let fsync = !matches!(durability, Durability::Buffered);
         write_log(log_path, &log, fsync, span)?;
         outcome
     }
