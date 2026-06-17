@@ -2,6 +2,9 @@
 name = "ascript"
 version = "0.6.0"
 edition = "2021"
+# RT §2.4: two bin targets now exist (`ascript` toolchain + `ascript-rt` runtime stub).
+# Keep `cargo run` unambiguous — it defaults to the toolchain bin.
+default-run = "ascript"
 description = "A gradually-typed, multi-paradigm, JavaScript-flavored scripting language with runtime-checked type contracts, structured concurrency, and a batteries-included standard library."
 repository = "https://github.com/ascript-lang/ascript"
 license = "MIT"
@@ -16,11 +19,19 @@ path = "src/lib.rs"
 # normal build. It is never set by `cargo build`/`cargo test` here — only the `test`
 # arm of the gate is active in-tree.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(ascript_rt)'] }
 
 [[bin]]
 name = "ascript"
 path = "src/main.rs"
+
+# RT §2.4 — the runtime-only bin (VM/GC/stdlib/workers/caps/loaders/diagnostics/
+# embedded shim; the front-end is compiled OUT under `cfg(ascript_rt)`). It always
+# COMPILES (so `cargo build --bins` keeps working), but is only size-optimal under
+# `ASCRIPT_RT=1` (which sets the cfg). Build it with `scripts/build-rt.sh <tier>`.
+[[bin]]
+name = "ascript-rt"
+path = "src/bin/ascript-rt.rs"
 
 [dependencies]
 rust_decimal = { version = "1", features = ["maths"] }
@@ -170,7 +181,12 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd"]
+# RT §3.1/§7 — the stub-side payload decompressor. Kept SEPARATE from `compress`
+# (which is `std/compress`) so rt-core can decompress its own `--compress`ed bundle
+# payload without shipping the whole compression stdlib. Pulls only `zstd` (already a
+# vendored optional dep). Default-on AND in every tier build (scripts/build-rt.sh).
+bundle-zstd = ["dep:zstd"]
 # FUZZ: the grammar-aware source generator (`src/fuzzgen/`). NON-default — enabled only by
 # the crate's self-dev-dependency for `tests/property.rs` (and by a `--cfg fuzzing` libFuzzer
 # build). Pulls `arbitrary`. Never in `default`, so production is byte-identical.

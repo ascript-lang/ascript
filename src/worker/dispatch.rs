@@ -235,8 +235,8 @@ pub fn build_class_slice(top: &Chunk, class_name: &str) -> Result<WorkerCodeSlic
     whole.emit(Op::Return, span);
 
     if let Some(limit) = whole.take_overflow() {
-        let ce = limit.into_compile_error();
-        return Err(Control::Panic(crate::error::AsError::at(ce.message, ce.span)));
+        let (msg, span) = limit.into_message_span();
+        return Err(Control::Panic(crate::error::AsError::at(msg, span)));
     }
 
     let bytes = whole.to_bytes().map_err(|e| {
@@ -772,8 +772,8 @@ fn materialize_slice(
     frag.emit(Op::Return, span);
 
     if let Some(limit) = frag.take_overflow() {
-        let ce = limit.into_compile_error();
-        return Err(Control::Panic(crate::error::AsError::at(ce.message, ce.span)));
+        let (msg, span) = limit.into_message_span();
+        return Err(Control::Panic(crate::error::AsError::at(msg, span)));
     }
 
     let bytes = frag.to_bytes().map_err(|e| {
@@ -837,10 +837,26 @@ pub fn build_code_slice_from_source(
              (worker fns require running via `ascript run`)"
         )))
     })?;
-    let top = crate::compile::compile_source(&src).map_err(|e| {
-        Control::Panic(crate::error::AsError::at(e.message, e.span))
-    })?;
-    build_code_slice(&top, entry_name, class_name)
+    // RT §2.3(b): the runtime-only build has no compiler — collapse the source-mode
+    // recompile to the SAME no-source recoverable panic. A bundle never sets
+    // `worker_source` (it sets `worker_aso_bytes`/`worker_archive_bytes`, the chunk
+    // path), so a stub never reaches a *needed* compile here; the refusal is the
+    // honest narrowing if an embedder somehow set source on a stub. Non-rt unchanged.
+    #[cfg(ascript_rt)]
+    {
+        let _ = (&src, &class_name);
+        Err(Control::Panic(crate::error::AsError::new(format!(
+            "cannot dispatch worker '{entry_name}': the program source is unavailable \
+             (worker fns require running via `ascript run`)"
+        ))))
+    }
+    #[cfg(not(ascript_rt))]
+    {
+        let top = crate::compile::compile_source(&src).map_err(|e| {
+            Control::Panic(crate::error::AsError::at(e.message, e.span))
+        })?;
+        build_code_slice(&top, entry_name, class_name)
+    }
 }
 
 /// Like [`build_code_slice_from_source`] but for a `static worker fn` (Spec A): builds
@@ -857,9 +873,21 @@ pub fn build_code_slice_for_static_method_from_source(
              unavailable (worker fns require running via `ascript run`)"
         )))
     })?;
-    let top = crate::compile::compile_source(&src)
-        .map_err(|e| Control::Panic(crate::error::AsError::at(e.message, e.span)))?;
-    build_code_slice_for_static_method(&top, class_name, method_name)
+    // RT §2.3(b): no compiler in the runtime build — collapse to the no-source panic.
+    #[cfg(ascript_rt)]
+    {
+        let _ = &src;
+        Err(Control::Panic(crate::error::AsError::new(format!(
+            "cannot dispatch worker '{class_name}.{method_name}': the program source is \
+             unavailable (worker fns require running via `ascript run`)"
+        ))))
+    }
+    #[cfg(not(ascript_rt))]
+    {
+        let top = crate::compile::compile_source(&src)
+            .map_err(|e| Control::Panic(crate::error::AsError::at(e.message, e.span)))?;
+        build_code_slice_for_static_method(&top, class_name, method_name)
+    }
 }
 
 /// Resolve the top-level program [`Chunk`] for a worker slice build, mirroring the
@@ -876,6 +904,11 @@ fn resolve_worker_top_chunk(
     what: &str,
     require_kind: &str,
 ) -> Result<Chunk, Control> {
+    // RT §2.3(b): the source-preferred arm needs the compiler — gated OUT of the
+    // runtime build. A bundle resolves its worker top chunk from `worker_aso_bytes`/
+    // `worker_archive_bytes` (the chunk path below), so a stub does not lose
+    // functionality; it simply never recompiles source. Non-rt unchanged.
+    #[cfg(not(ascript_rt))]
     if let Some(src) = interp.worker_source() {
         return crate::compile::compile_source(&src)
             .map_err(|e| Control::Panic(crate::error::AsError::at(e.message, e.span)));

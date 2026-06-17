@@ -313,8 +313,20 @@ impl ChunkLimit {
     }
 
     /// Lower this capacity overflow into a clean compile error.
+    ///
+    /// RT §2.2: `CompileError` lives in the gated-out `compile` module, so this is
+    /// non-rt only. Runtime callers (the worker chunk-assembly path) use
+    /// [`ChunkLimit::into_message_span`] instead — same wording, no `compile` dep.
+    #[cfg(not(ascript_rt))]
     pub fn into_compile_error(self) -> crate::compile::CompileError {
         crate::compile::CompileError::new(self.message(), self.span())
+    }
+
+    /// The overflow's diagnostic message + span, with NO dependency on the gated-out
+    /// `compile` module — usable from the runtime (worker chunk assembly). Byte-identical
+    /// wording to [`ChunkLimit::into_compile_error`] (both read `message()`/`span()`).
+    pub fn into_message_span(self) -> (String, Span) {
+        (self.message().to_string(), self.span())
     }
 }
 

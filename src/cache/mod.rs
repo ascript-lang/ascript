@@ -7,13 +7,20 @@
 
 pub mod compile_cache;
 
+// RT §2.2: the module-graph walk compiles each source (via the gated-out compiler) — so
+// it is non-rt only. The `compile_cache` submodule (content hashing / cache dir) has no
+// front-end dependency and stays in the runtime build (the archive run path uses
+// `sha256_bytes`). Normal builds compile the whole module.
+#[cfg(not(ascript_rt))]
 use crate::error::AsError;
+#[cfg(not(ascript_rt))]
 use std::path::{Path, PathBuf};
 
 /// One module in the reachable import graph, as the BFS walk discovers it.
 /// Produced by [`collect_module_graph`] and consumed by both the compile-cache
 /// keyer (to hash sources) and `compile_archive`/`compile_archive_with_shake`
 /// (to know the compiled set).
+#[cfg(not(ascript_rt))]
 pub struct GraphModule {
     /// The archive-style logical key (`join_logical` convention from `archive.rs`).
     pub logical_key: String,
@@ -35,6 +42,7 @@ pub struct GraphModule {
 /// The walk uses `Interp::classify_specifier` (the same resolver the archive
 /// builder uses) to resolve import specifiers so the keyed set and the compiled
 /// set are identical by construction.
+#[cfg(not(ascript_rt))]
 pub fn collect_module_graph(entry: &Path) -> Result<Vec<GraphModule>, AsError> {
     use crate::interp::{Interp, SpecifierKind};
     use crate::vm::archive::{join_logical, logical_parent};

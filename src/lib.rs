@@ -1,11 +1,25 @@
+// RT §2.2/§2.3(g): under the runtime-only build a number of items compile but are
+// statically unreachable (their only callers are the gated-out source/toolchain entry
+// points) — e.g. the tree-walker eval helpers, the source-running test entries, and the
+// `Interp` source-load seams. The linker dead-strips them; this crate-level allow keeps
+// the stub build clean WITHOUT carving them out textually (the spec's evidence-gated
+// follow-up). Scoped to `ascript_rt` ONLY — normal builds keep the full dead-code lint.
+#![cfg_attr(ascript_rt, allow(dead_code))]
+
 pub mod ast;
 pub mod bundle;
 pub mod cache;
+// RT §2.2 — the FRONT-END (parsers, compiler, checker, fmt, repl) is compiled OUT of
+// the runtime-only `ascript-rt` bin under `cfg(ascript_rt)`. Normal builds (the cfg
+// unset) are byte-identical.
+#[cfg(not(ascript_rt))]
 pub mod check;
 /// The clap derive types (`Cli`, `Command`, `CapFlags`) + `cli_command()` —
 /// the single source of truth for the CLI surface. Consumed by `src/main.rs`
 /// for parsing and by `tests/docs_drift.rs` for drift introspection (spec §4.1).
+#[cfg(not(ascript_rt))]
 pub mod cli_surface;
+#[cfg(not(ascript_rt))]
 pub mod compile;
 pub mod coro;
 // DBG Task 5b: the Debug Adapter Protocol (DAP) server over stdio. Feature-gated
@@ -19,9 +33,13 @@ pub mod diagnostics;
 // (`doc`, default-on) so `--no-default-features` builds none of it.
 #[cfg(feature = "doc")]
 pub mod doc;
+// RT §2.2: the tree-walker AST elision-marking pass (front-end product) — gated OUT of
+// the runtime-only build (it consumes `crate::ast` + the checker's `ElisionSet`).
+#[cfg(not(ascript_rt))]
 pub mod elide_mark;
 pub mod env;
 pub mod error;
+#[cfg(not(ascript_rt))]
 pub mod fmt;
 // FUZZ: the grammar-aware source generator (the differential-fuzzing core asset).
 // Feature-gated (`fuzzgen`, NON-default) + `cfg(test)` for the crate's own unit tests +
@@ -39,6 +57,7 @@ pub(crate) mod lex_literals;
 pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+#[cfg(not(ascript_rt))]
 pub mod parser;
 // DBG Task 7: the CPU sampling profiler's aggregation + output (speedscope JSON +
 // collapsed folded-stacks). Feature-gated (`profile`, default-on); the publish seam
@@ -47,22 +66,31 @@ pub mod parser;
 // reports a clean rebuild hint.
 #[cfg(feature = "profile")]
 pub mod profile;
+#[cfg(not(ascript_rt))]
 pub mod repl;
 pub mod span;
 pub mod stdlib;
+// RT §2.2: the CST front-end. Under the runtime-only build only the RUNTIME data types
+// the VM needs survive (`syntax::kind` + `syntax::resolve::types`, e.g.
+// `UpvalueDescriptor` which the VM/`.aso` carry); the parser/lexer/format/CST machinery
+// is gated out INSIDE the module. Normal builds compile the whole front-end.
 pub mod syntax;
 pub mod task;
 // DX D2 Task 10: `--filter PATTERN` test-name filtering (substring or `/regex/`) +
 // `--watch` import-graph scoping. Core (no feature gate); the regex branch is
 // `data`/`sys`-gated and degrades to a clean error otherwise.
 pub mod test_filter;
+#[cfg(not(ascript_rt))]
 pub mod watch;
 pub mod token;
 pub mod value;
 pub mod vm;
 pub mod worker;
 
-use crate::error::{AsError, SourceInfo};
+use crate::error::AsError;
+// RT §2.2: `SourceInfo` is only used by the gated-out source-running entry points.
+#[cfg(not(ascript_rt))]
+use crate::error::SourceInfo;
 use crate::interp::Interp;
 pub use crate::interp::TestSummary;
 #[cfg(feature = "telemetry")]
@@ -168,6 +196,7 @@ pub fn paranoid_enabled() -> bool {
     std::env::var("ASCRIPT_ELIDE_PARANOID").as_deref() == Ok("1")
 }
 
+#[cfg(not(ascript_rt))]
 /// Run a `.as` file as the entry module (with import resolution relative to it).
 ///
 /// Returns the process exit code: `Ok(0)` for clean termination, `Ok(n)` when
@@ -184,6 +213,7 @@ pub async fn run_file(path: &Path, script_args: &[String]) -> Result<i32, AsErro
     run_file_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`run_file`] (tree-walker) but installs a CLI-resolved package map (SP6)
 /// before running, so a bare `import "pkg"` resolves through it. `None` = no
 /// package resolver (every bare specifier is "unknown package"). `caps` (FFI §4.5)
@@ -302,6 +332,7 @@ pub async fn run_tests_with_options(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// DX D2 Task 6 — run `files` as a test suite on the bytecode VM with LINE COVERAGE
 /// armed, returning the aggregated [`TestSummary`] plus the rendered coverage report
 /// string (text/lcov) or a path hint (html, written to `target/coverage/`).
@@ -357,6 +388,7 @@ pub async fn run_tests_with_coverage(
     Ok((summary, report))
 }
 
+#[cfg(not(ascript_rt))]
 /// Run ONE test file on a coverage-armed VM: compile, arm coverage over the proto tree,
 /// run the module top-level (which registers `test(...)` closures), then run the
 /// registered tests (re-entering the same VM), and reclaim the coverage table. Returns
@@ -718,6 +750,7 @@ fn worker_isolate_cap() -> usize {
         .max(1)
 }
 
+#[cfg(not(ascript_rt))]
 /// Lex → parse → evaluate in a fresh global environment. Returns captured output.
 ///
 /// `exit(n)` is treated as a clean termination (the captured output is returned
@@ -726,6 +759,7 @@ pub async fn run_source(src: &str) -> Result<String, AsError> {
     run_source_exit(src).await.map(|(out, _)| out)
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`run_source`] but also returns the exit code requested by `exit(n)`, if any.
 pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError> {
     let src_info = Rc::new(SourceInfo {
@@ -765,6 +799,7 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// SP9 §3 test/embedder seam: run `src` on the tree-walker in DETERMINISTIC mode
 /// with the given `seed` (the eventual `--deterministic --seed N` CLI flag maps to
 /// this path). The clock/RNG seams route through a fresh
@@ -798,6 +833,7 @@ pub async fn run_source_deterministic(src: &str, seed: u64) -> Result<String, As
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// Run `src` on the tree-walker and return the captured output PLUS the owning
 /// `Rc<Interp>`, so a test can read interpreter-side state after the program
 /// finishes (used by the SP12 `std/telemetry` capture-mode tests, which assert on
@@ -829,6 +865,7 @@ pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), A
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §4.3 test seam: run a pre-parsed (and possibly AST-mutated) `Vec<Stmt>`
 /// on the tree-walker. Returns `Ok(output)` on success or `Err(panic_message)`
 /// on a Tier-2 panic. Used by `tests/elide.rs` Task 3.1 to inject `elide_args =
@@ -859,6 +896,7 @@ pub async fn tw_run_stmts(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §4.3 Task 3.2 test seam: parse `src`, run `elision_proofs` to build the
 /// `ElisionSet`, call `mark_program` on the AST, then execute on the tree-walker.
 /// Returns `(output, MarkCounts)` on success or `Err(panic_message)` on Tier-2
@@ -900,6 +938,7 @@ pub async fn tw_run_source_elided(src: &str) -> Result<(String, crate::elide_mar
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// Compile `src` to bytecode and run it on the VM, returning the value of the
 /// program's trailing expression (VM plan V1).
 ///
@@ -951,6 +990,7 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// Compile `src` to bytecode and run it on the VM for its *side effects*,
 /// returning captured stdout plus any `exit(n)` code (VM plan V2).
 ///
@@ -965,6 +1005,7 @@ pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> 
     vm_run_source_with(src, true).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but with the VM's specialization fast paths DISABLED —
 /// the `--no-specialize` kill switch (V11-T5). All inline caches and PEP-659
 /// adaptive sites are skipped; every dispatch takes the generic path.
@@ -978,6 +1019,7 @@ pub async fn vm_run_source_generic(src: &str) -> Result<(String, Option<i32>), A
     vm_run_source_with(src, false).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but with the LANE sync driver DISABLED — the
 /// `ASCRIPT_NO_SYNC_LANE=1` kill switch (LANE §6.1). Every instruction takes the
 /// async driver path regardless of whether it is in the sync subset. Observable
@@ -990,6 +1032,7 @@ pub async fn vm_run_source_no_sync_lane(src: &str) -> Result<(String, Option<i32
     vm_run_source_cfg(src, true, false, false, false).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but with the CALL fast paths DISABLED — the
 /// `ASCRIPT_NO_CALL_FAST=1` kill switch (CALL §8.1). All CALL fast paths
 /// (A2 in-place binding, A3 fiber pooling, B trampoline) are suppressed;
@@ -1005,6 +1048,7 @@ pub async fn vm_run_source_no_call_fast(src: &str) -> Result<(String, Option<i32
     vm_run_source_cfg_call_fast(src, true, false, false, true, false).await
 }
 
+#[cfg(not(ascript_rt))]
 /// CALL §8.3: like [`vm_run_source`] but also returns the `CallFastStats`
 /// counters after the run completes. Used by `tests/call_fast.rs` to assert
 /// that A2 (`inplace_binds > 0`) actually fires over the corpus (anti-false-green
@@ -1059,6 +1103,7 @@ pub async fn vm_run_source_call_fast_stats(
     Ok((pair.0, pair.1, stats))
 }
 
+#[cfg(not(ascript_rt))]
 /// SHAPE §3.5: like [`vm_run_source`] but also returns the storage-mode counters
 /// `(slab_constructed, dict_constructed, demotions)` after the run completes.
 /// Used by `tests/vm_differential.rs` to assert Gate 15 (both modes + demotion
@@ -1116,6 +1161,7 @@ pub async fn vm_run_source_obj_mode_stats(
     Ok((pair.0, pair.1, mode_stats))
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but also returns the LANE counters (LANE §6.4).
 ///
 /// Returns `(output, exit_code, lane_sync_ops, lane_bursts)`.
@@ -1134,6 +1180,7 @@ pub async fn vm_run_source_lane_stats(
     vm_run_source_cfg_stats(src, true, false, false, true, true).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source_lane_stats`] but with `sync_lane = false` (LANE §6.4).
 ///
 /// Allows the coverage assertion to check that `sync_lane == false` ⟹
@@ -1186,6 +1233,7 @@ pub struct DecodeStats {
     pub tos_ops: u64,
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but with DECODE DISABLED — the `ASCRIPT_NO_DECODE=1`
 /// kill switch (DECODE Task 2). Observable behavior is byte-identical to
 /// [`vm_run_source`]; only throughput may differ once Task 4 wires up the driver.
@@ -1199,6 +1247,7 @@ pub async fn vm_run_source_no_decode(src: &str) -> Result<(String, Option<i32>),
     vm_run_source_decode_cfg(src, false, true, true, Vm::DECODE_THRESHOLD).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source`] but with DECODE FORCED on with threshold=0 — every
 /// proto is decoded immediately, regardless of warmth, so even short programs
 /// exercise the record driver once Task 4 lands. Pre-driver (INERT), this is
@@ -1209,6 +1258,7 @@ pub async fn vm_run_source_decoded_forced(src: &str) -> Result<(String, Option<i
     vm_run_source_decode_cfg(src, true, true, true, 0).await
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §4.2 / §5.1: compile `src` with contract-elision (proven sites identified
 /// by the static checker are compiled without the corresponding runtime checks),
 /// then run on the VM with full specialization. Observable output is byte-identical
@@ -1265,6 +1315,7 @@ pub async fn vm_run_source_elided(src: &str) -> Result<(String, Option<i32>), As
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §4.3 Task 3.2: like [`vm_run_source_elided`] but with VM specialization
 /// DISABLED (generic path). Used by the four-mode smoke test to confirm the
 /// generic-VM elided path produces byte-identical output.
@@ -1319,6 +1370,7 @@ pub async fn vm_run_source_elided_generic(src: &str) -> Result<(String, Option<i
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §6.3: compile `src` WITHOUT elision (paranoid mode runs elide-OFF) but
 /// build the [`ElisionSet`] from the proof phase and install it on the `Interp`
 /// for contract-failure-path paranoid lookup. Returns `(output, exit_code)`.
@@ -1394,6 +1446,7 @@ fn first_call_span_in_source(src: &str) -> crate::span::Span {
     panic!("no top-level Call expression found in source");
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §6.3 test-only: like [`vm_run_source_paranoid`] but additionally injects
 /// a FAKE call-site proof span so the FIRST contract failure at the call expression
 /// is treated as a proven site and escalates. The fake span is calculated from the
@@ -1454,6 +1507,7 @@ pub async fn vm_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §6.3 tree-walker paranoid run: like [`vm_run_source_paranoid`] but on
 /// the tree-walker engine. Returns the captured output, or `Err(message)` on panic.
 /// `#[doc(hidden)]` — not a stable API.
@@ -1491,6 +1545,7 @@ pub async fn tw_run_source_paranoid(src: &str) -> Result<String, String> {
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// ELIDE §6.3 test-only (TW): like [`tw_run_source_paranoid`] but additionally
 /// injects a FAKE call-site proof span to trigger escalation on contract failure.
 /// Returns the panic message string. `#[doc(hidden)]` — not a stable API.
@@ -1532,6 +1587,7 @@ pub async fn tw_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// DECODE §8.3: run `src` on the VM with DECODE FORCED (threshold=0) and return
 /// a [`DecodeStats`] bundle containing the program output + all stat counters.
 /// All counters are 0 until the corresponding task wires them up (INERT until
@@ -1542,6 +1598,7 @@ pub async fn vm_run_source_decode_stats(src: &str) -> Result<DecodeStats, AsErro
     vm_run_source_decode_stats_cfg(src, true, true, true, 0).await
 }
 
+#[cfg(not(ascript_rt))]
 /// DECODE §8.3 variant: like [`vm_run_source_decode_stats`] but with DECODE OFF.
 /// Used to prove `decoded_ops == 0` when the kill switch is active.
 /// `#[doc(hidden)]` — not a stable API.
@@ -1567,6 +1624,7 @@ pub async fn vm_run_source_decode_stats_no_decode(src: &str) -> Result<DecodeSta
 #[doc(hidden)]
 pub const CENSUS_NO_PREV: u16 = crate::vm::decode::CENSUS_NO_PREV;
 
+#[cfg(not(ascript_rt))]
 #[cfg(feature = "decode-census")]
 #[doc(hidden)]
 pub async fn vm_run_source_census(
@@ -1620,6 +1678,7 @@ pub async fn vm_run_source_census(
     Ok(vm.take_census().unwrap_or_default())
 }
 
+#[cfg(not(ascript_rt))]
 /// Shared body for the DECODE test entries: runs `src` with explicit decode
 /// kill-switch values, no instrumentation (decode paths are orthogonal to DBG),
 /// and returns the plain `(output, exit_code)` pair.
@@ -1675,6 +1734,7 @@ async fn vm_run_source_decode_cfg(
     Ok(pair)
 }
 
+#[cfg(not(ascript_rt))]
 /// Shared body for the DECODE stats test entries: runs `src` with explicit decode
 /// flags and returns a [`DecodeStats`] bundle. Compiled only under
 /// `#[cfg(any(test, feature = "fuzzgen", fuzzing))]`.
@@ -1742,6 +1802,7 @@ async fn vm_run_source_decode_stats_cfg(
     })
 }
 
+#[cfg(not(ascript_rt))]
 /// FUZZ `.aso` round-trip seam (`#[doc(hidden)]` test API, not a stable surface):
 /// compile `src` to a [`Chunk`], serialize it to `.aso` bytes ([`vm::Chunk::to_bytes`]),
 /// deserialize + verify them back ([`vm::Chunk::from_bytes_verified`]), then run the
@@ -1860,6 +1921,7 @@ pub async fn aso_runnable_accept(bytes: &[u8]) {
     crate::gc::collect();
 }
 
+#[cfg(not(ascript_rt))]
 /// Compile a `.as` source file to a verified bytecode [`Chunk`] and write it to
 /// `out` as a `.aso` file (VM plan V12-T4 — `ascript build`).
 ///
@@ -1918,6 +1980,7 @@ pub fn build_file(
     Ok(out_path)
 }
 
+#[cfg(not(ascript_rt))]
 /// **WARM B §3.1 — compile, train, harvest, and emit a PGO-carrying archive.**
 ///
 /// Equivalent to [`build_file`] EXCEPT:
@@ -2058,6 +2121,7 @@ pub async fn build_file_with_pgo(
     Ok(out_path)
 }
 
+#[cfg(not(ascript_rt))]
 /// The shared compile → verify → serialize front half of [`build_file`] and
 /// [`build_native`] (BIN §2.2 step 1): read the source, [`compile::compile_source`], bind the
 /// module source for debug info, [`vm::verify::verify`] (so a produced `.aso` is always
@@ -2100,6 +2164,7 @@ fn compile_verified_aso_bytes(file: &Path, with_debug: bool, elide: bool) -> Res
         .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
 }
 
+#[cfg(not(ascript_rt))]
 /// BNDL §3 — walk a program's import graph from `entry` and compile every reachable
 /// user/package module into a [`ModuleArchive`] (Phase 1, Task 1.3). Later phases
 /// consult this archive at runtime (so a multi-file program needs no source tree on
@@ -2169,6 +2234,7 @@ pub fn compile_archive(
     compile_archive_with_shake(entry, with_debug, true, elide)
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`compile_archive`], but with the pass-2 TREE-SHAKE toggleable. This is the
 /// load-bearing TEST seam for the shaken-vs-unshaken differential (Phase 2, Task 2.5):
 /// `compile_archive(entry, dbg)` is exactly `compile_archive_with_shake(entry, dbg, true)`,
@@ -2426,6 +2492,7 @@ pub fn compile_archive_with_shake(
     Ok((archive, reach.report))
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM §2.5 — the COMPILE PATH's reachable-module enumeration, exposed as a
 /// `#[doc(hidden)]` test seam. Returns `(logical_key, canonical_path)` for every
 /// module `compile_archive_with_shake` would archive, in the SAME BFS order.
@@ -2548,6 +2615,7 @@ pub fn compile_path_module_set(
     Ok(result)
 }
 
+#[cfg(not(ascript_rt))]
 /// Convert a decoded [`crate::vm::chunk::ImportDesc`] into a tree-shaker
 /// [`crate::compile::shake::ImportEdge`] targeting the already-resolved dedup'd module
 /// index. A `Named` import contributes the imported export names as roots in the target;
@@ -2574,6 +2642,7 @@ fn import_desc_to_edge(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// Print a human-readable tree-shaking summary to STDERR (Task 2.4). Called by
 /// `build_file`/`build_native` for MULTI-MODULE archives only (a single-module build
 /// emits a bare chunk with no shaking, so there is nothing to report). STDERR keeps the
@@ -2635,6 +2704,7 @@ fn print_shake_report(report: &crate::compile::shake::ShakeReport) {
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// Compile a LIBRARY module's source to verified `.aso` bytes, PRUNED to its
 /// tree-shake `keep` set (Task 2.3). Mirrors [`compile_verified_aso_bytes`] exactly
 /// (read source → compile → bind debug source → VERIFY → serialize) but routes the
@@ -2682,6 +2752,9 @@ fn compile_pruned_aso_bytes(
 /// extension-less stem) to the actual file on disk, returning its CANONICAL path. Mirrors
 /// `load_file_module`'s `.as`/`.aso` precedence: an explicit extension is honored; a bare
 /// stem prefers `<stem>.as`, then `<stem>.aso`. A missing file is an `Err(message)`.
+/// Pure path resolution (no compiler), but reached ONLY from the gated-out compile/cache
+/// paths (archive build, module-set compile, the cache rebind) — so it is non-rt only.
+#[cfg(not(ascript_rt))]
 fn resolve_module_file(target: &Path) -> Result<std::path::PathBuf, String> {
     use std::path::PathBuf;
     // `classify_specifier` already defaulted a bare specifier to `.as`, but a `Package`
@@ -2714,6 +2787,7 @@ fn resolve_module_file(target: &Path) -> Result<std::path::PathBuf, String> {
     ))
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM Task 1: expose `resolve_module_file` as a `pub(crate)` shim so
 /// `src/cache/mod.rs` can follow the same resolution logic without duplicating it.
 /// Identical behaviour to the private version above.
@@ -2721,6 +2795,7 @@ pub(crate) fn resolve_module_file_pub(target: &std::path::Path) -> Result<std::p
     resolve_module_file(target)
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM Task 1: compile `source` (already read from `path`) to verified `.aso` bytes,
 /// WITHOUT debug info or elision, purely to extract the import table for the cache
 /// module-graph walk. Uses the same verification path as `compile_verified_aso_bytes`
@@ -2748,6 +2823,7 @@ pub(crate) fn compile_verified_aso_bytes_from_source_for_cache(
         .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
 }
 
+#[cfg(not(ascript_rt))]
 /// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
 /// executable that bundles the whole runtime + the compiled program. This is **bundling, not
 /// AOT**: the output is a copy of the running runtime (`current_exe()`) with the *verified*
@@ -2956,6 +3032,58 @@ pub async fn run_embedded_aso(payload: &[u8], args: &[String]) -> Result<i32, As
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     run_verified_aso(payload, args, None, module_dir, "the embedded program").await
+}
+
+/// BIN §2.3 / RT §2.4 — the pre-clap startup shim, factored out of `src/main.rs` so
+/// BOTH the toolchain `ascript` bin AND the runtime-only `ascript-rt` bin call ONE
+/// implementation. If THIS executable is a native bundle (a trailing `ASCRIPTB`
+/// footer over a valid payload region), read the payload, run it through the embedded
+/// path, and return `Some(exit_code)`. A plain launch (no footer) returns `None` and
+/// the caller falls through to its own argv handling, byte-identical to before.
+///
+/// Cost on the NON-bundle path (every normal launch): a `current_exe()` resolve +
+/// open + stat + a single `FOOTER_SIZE`-byte tail read — it never loads the whole
+/// image. Any I/O failure BEFORE footer confirmation (open / stat / footer read /
+/// `validate_footer`) is treated as "not a bundle" → `None` (it may be a plain
+/// launch). Once the `ASCRIPTB` magic is confirmed, a payload-read failure is a
+/// REPORTED error (`Some(1)`), NOT a silent fall-through — the binary IS a bundle, so
+/// a confusing "missing subcommand" usage error would be wrong. A run error reports
+/// the diagnostic and returns `Some(1)`.
+pub async fn run_embedded_if_bundled() -> Option<i32> {
+    use std::io::{Read, Seek, SeekFrom};
+    const FOOTER_SIZE: usize = crate::bundle::FOOTER_SIZE;
+
+    let exe = std::env::current_exe().ok()?;
+    let mut f = std::fs::File::open(&exe).ok()?;
+    let exe_len = f.metadata().ok()?.len();
+    if exe_len < FOOTER_SIZE as u64 {
+        return None;
+    }
+    // Read ONLY the trailing footer (cheap), validate against the file length.
+    f.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).ok()?;
+    let mut footer = [0u8; FOOTER_SIZE];
+    f.read_exact(&mut footer).ok()?;
+    let (offset, len) = crate::bundle::validate_footer(&footer, exe_len)?;
+
+    // It IS a bundle (`ASCRIPTB` confirmed) — from here a read failure is REPORTED,
+    // never a silent fall-through.
+    let mut payload = vec![0u8; len];
+    if let Err(e) = f
+        .seek(SeekFrom::Start(offset as u64))
+        .and_then(|_| f.read_exact(&mut payload))
+    {
+        eprintln!("error: failed to read embedded program: {e}");
+        return Some(1);
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = match run_embedded_aso(&payload, &args).await {
+        Ok(code) => code,
+        Err(e) => {
+            crate::diagnostics::report(&e);
+            1
+        }
+    };
+    Some(code)
 }
 
 /// SELF-CONTAINED-BUNDLES (Task 3.3): MONOTONE launch-time capability subtraction via the
@@ -3244,6 +3372,7 @@ async fn run_entry_proto_to_exit(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// Run a `.as` source file on the bytecode VM (the production `run` path).
 ///
 /// This mirrors [`run_aso_file`] exactly EXCEPT the [`vm::Chunk`] comes from
@@ -3259,6 +3388,7 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
     run_file_on_vm_with_packages(path, script_args, None, None, ELIDE_DEFAULT_ON).await
 }
 
+#[cfg(not(ascript_rt))]
 /// DX D4 §5.1: collect ALL recoverable parse diagnostics for a `.as` source file
 /// (grammar + lexical), each as an [`AsError`] with the file's source bound for
 /// caret rendering. The error-tolerant CST parser records every error and recovers
@@ -3289,6 +3419,7 @@ pub fn collect_parse_errors(path: &Path) -> Vec<AsError> {
         .collect()
 }
 
+#[cfg(not(ascript_rt))]
 /// Collect BLOCKING semantic diagnostics from the CST resolver that BOTH engines
 /// must reject identically BEFORE running (the shared `run` gate, alongside
 /// [`collect_parse_errors`]). A diagnostic is blocking iff its `blocking` flag is
@@ -3337,6 +3468,7 @@ fn byte_to_char_offset(src: &str, byte: usize) -> usize {
     src[..b].chars().count()
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`run_file_on_vm`] (VM) but installs a CLI-resolved package map (SP6)
 /// before running, so a bare `import "pkg"` resolves through it. `None` = no
 /// package resolver (every bare specifier is "unknown package"). `caps` (FFI §4.5)
@@ -3456,6 +3588,7 @@ pub async fn run_file_on_vm_with_packages(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM A §2.1 — the cached `ascript run` front door (the default plain-`.as`+VM path).
 ///
 /// Decides cacheability, looks up a content-addressed compiled artifact, and:
@@ -3528,6 +3661,7 @@ pub async fn run_file_on_vm_cached(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM A §2.1 — the synchronous cache-layer core behind [`run_file_on_vm_cached`].
 /// Returns `Some(artifact_bytes)` on a verified hit OR a successful miss-compile-publish,
 /// and `None` on ANY cache-layer failure (the caller then runs uncached). This is the
@@ -3658,6 +3792,7 @@ fn try_cached_artifact(
     Some(artifact_bytes)
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM A §2.4 — rebind every archive module's embedded debug source PATH to the string
 /// the from-source (uncached) loader would embed, so a cached run's panic carets are
 /// byte-identical to an uncached run's.
@@ -3857,6 +3992,7 @@ fn artifact_verifies(bytes: &[u8]) -> bool {
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// DECODE Task 4 (cross-module provenance test): run a `.as` FILE with an
 /// explicit decode kill-switch + warmth threshold, returning the same exit/error
 /// shape as [`run_file_on_vm_with_packages`]. Lets the §2.4 `last_fault_source`
@@ -3925,6 +4061,7 @@ pub async fn run_file_decode_cfg(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// DECODE Task 4: run a `.as` FILE with decode DISABLED (byte dispatch). See
 /// [`run_file_decode_cfg`]. `#[doc(hidden)]` — test API only.
 #[doc(hidden)]
@@ -3933,6 +4070,7 @@ pub async fn run_file_no_decode(path: &Path) -> Result<i32, AsError> {
     run_file_decode_cfg(path, false, Vm::DECODE_THRESHOLD).await
 }
 
+#[cfg(not(ascript_rt))]
 /// DECODE Task 4: run a `.as` FILE with decode FORCED on (threshold 0). See
 /// [`run_file_decode_cfg`]. `#[doc(hidden)]` — test API only.
 #[doc(hidden)]
@@ -4069,6 +4207,7 @@ pub async fn run_file_on_vm_profiled(
     }
 }
 
+#[cfg(not(ascript_rt))]
 /// Shared body for [`vm_run_source`] (specialize = true) and
 /// [`vm_run_source_generic`] (specialize = false). `specialize` is the kill-switch
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
@@ -4081,6 +4220,7 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
     vm_run_source_cfg(src, specialize, false, false, true).await
 }
 
+#[cfg(not(ascript_rt))]
 /// DBG Task 9 (zero-cost bench): run `src` on the SPECIALIZED VM with an EMPTY
 /// [`Instrumentation`](crate::vm::instrument::Instrumentation) armed (`breakpoints`/
 /// `profiler`/`coverage` all `None`) — the "attached debugger, idle" config. No byte is
@@ -4093,6 +4233,7 @@ pub async fn vm_run_source_armed_idle(src: &str) -> Result<(String, Option<i32>)
     vm_run_source_cfg(src, true, true, false, true).await
 }
 
+#[cfg(not(ascript_rt))]
 /// DX D2 Task 7 (coverage zero-cost bench): run `src` on the SPECIALIZED VM with LINE
 /// COVERAGE armed (`arm_coverage` patches each line's first offset to `Op::Break`). This
 /// is bench config (3) — `--coverage` ON. Its overhead is REPORTED (not gated): each line
@@ -4106,6 +4247,7 @@ pub async fn vm_run_source_coverage(src: &str) -> Result<(String, Option<i32>), 
     vm_run_source_cfg(src, true, false, true, true).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Shared VM-run body. Parameters:
 /// - `specialize`: V11-T5 kill switch — when `false`, all IC/adaptive fast paths skipped.
 /// - `armed`:      DBG zero-cost bench — attach an empty instrumentation payload.
@@ -4126,6 +4268,7 @@ async fn vm_run_source_cfg(
     vm_run_source_cfg_call_fast(src, specialize, armed, coverage, sync_lane, specialize).await
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source_cfg`] but with explicit `call_fast` control (CALL §8.1).
 async fn vm_run_source_cfg_call_fast(
     src: &str,
@@ -4140,6 +4283,7 @@ async fn vm_run_source_cfg_call_fast(
     Ok((output, exit))
 }
 
+#[cfg(not(ascript_rt))]
 /// Like [`vm_run_source_cfg`] but also returns the LANE counters (LANE §6.4):
 /// `(output, exit_code, lane_sync_ops, lane_bursts)`.
 async fn vm_run_source_cfg_stats(
@@ -4226,6 +4370,7 @@ async fn vm_run_source_cfg_stats(
     Ok((pair.0, pair.1, lane_sync_ops, lane_bursts))
 }
 
+#[cfg(not(ascript_rt))]
 /// **SELF-CONTAINED-BUNDLES Phase 2 (Task 2.5) test seam.** Run a multi-file program from
 /// DISK on the specialized VM with CAPTURED stdout, resolving relative `import`s against the
 /// entry file's directory (`set_module_dir`) — NO archive installed, so every import hits
@@ -4515,6 +4660,7 @@ pub fn pgo_seed_for_test(
     })
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM B §5-B(a) — compile `src` to a single-module `ASCRIPTA` archive, run it ONCE as a
 /// training workload (capture mode), harvest the warmed side tables, and return the
 /// PGO-carrying artifact bytes (archive + appended `ASPGO` trailing section). This is the
@@ -4591,6 +4737,7 @@ pub async fn pgo_build_artifact_from_source(src: &str) -> Result<Vec<u8>, AsErro
     Ok(artifact_bytes)
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM B §5-B(a) — the SEEDED differential mode (Gate 15), in-process and from SOURCE.
 ///
 /// Mirrors the production `build --pgo` → seed-at-load → run flow entirely in-process and
@@ -4619,6 +4766,7 @@ pub async fn pgo_seeded_run_from_source(src: &str) -> Result<(String, Option<i32
         .map_err(|e| e.with_source(src_info))
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM B §5-B(a) coverage seam (anti-false-green): build the PGO artifact for `src`, load it
 /// SEEDED, and return the INSTALLED-COUNT (how many side-table entries the seeder installed).
 /// The corpus coverage assertion sums this over the corpus to prove the seeded axis is NOT
@@ -4630,6 +4778,7 @@ pub async fn pgo_seeded_install_count_from_source(src: &str) -> Result<usize, As
     Ok(handle.installed())
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM B §6 bench seam — the UNSEEDED counterpart of [`pgo_seeded_run_from_source`]: build
 /// the SAME PGO-carrying artifact, but load it with seeding OFF (`seed=false`, the
 /// `ASCRIPT_NO_PGO` kill-switch path). The cold-start microbench (`vm_bench`) times this
@@ -4649,6 +4798,7 @@ pub async fn pgo_unseeded_run_from_source(src: &str) -> Result<(String, Option<i
         .map_err(|e| e.with_source(src_info))
 }
 
+#[cfg(not(ascript_rt))]
 /// WARM B §5-B(b) — the ADVERSARIAL-SEED axis (fuzzing the GUARDS, not the codec).
 ///
 /// Compiles `src` to an entry chunk, then injects PSEUDO-RANDOM JUNK directly into the

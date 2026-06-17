@@ -1892,11 +1892,23 @@ fn read_field_default(r: &mut Reader) -> Result<(Expr, Option<String>), AsoError
     if r.peek_u8()? == EX_REPARSE {
         let _ = r.u8()?; // consume the peeked tag
         let src = r.str()?;
-        let expr = crate::compile::reparse_default_from_source(&src).map_err(|_| AsoError::BadTag {
-            what: "reparse-default",
-            tag: EX_REPARSE,
-        })?;
-        return Ok((expr, Some(src)));
+        // RT §2.3: a reparse-default field needs the compiler to re-lower the captured
+        // source — gated OUT of the runtime-only build. Such an artifact is rejected
+        // cleanly by the `.aso` reader (BadTag), never silently misread. Non-rt
+        // re-lowers as before.
+        #[cfg(ascript_rt)]
+        {
+            let _ = (start, end, &src);
+            return Err(AsoError::BadTag { what: "reparse-default", tag: EX_REPARSE });
+        }
+        #[cfg(not(ascript_rt))]
+        {
+            let expr = crate::compile::reparse_default_from_source(&src).map_err(|_| AsoError::BadTag {
+                what: "reparse-default",
+                tag: EX_REPARSE,
+            })?;
+            return Ok((expr, Some(src)));
+        }
     }
     // Not a reparse default: rewind to the span and read normally. The span bytes
     // were already consumed, so feed them back by reading the rest via `read_expr`'s

@@ -367,6 +367,31 @@ fn native_target_is_rejected_and_requires_native() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// RT Task 1 — the NORMAL `ascript build --help` surface must be untouched by the
+/// `src/main.rs` cfg surgery. RT gates the whole legacy `main` under `cfg(ascript_rt)`
+/// (a tiny loud-error stub) and adds the `ascript-rt` bin; this test pins that a plain
+/// (non-rt) build still parses `build --help` cleanly and lists today's flags, so a
+/// regression in the clap CLI surface from the main-file gating is caught.
+#[test]
+fn normal_build_help_lists_todays_flags() {
+    let o = Command::new(bin())
+        .args(["build", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "build --help must succeed on the normal (non-rt) build: stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let help = String::from_utf8_lossy(&o.stdout);
+    for flag in ["--native", "--target", "--strip", "-o, --out"] {
+        assert!(
+            help.contains(flag),
+            "build --help is missing today's flag {flag:?}; full help:\n{help}"
+        );
+    }
+}
+
 /// N5 — once the `ASCRIPTB` magic is confirmed, an embedded-payload READ failure must be a
 /// REPORTED error (exit 1 with a clear message), NOT a silent fall-through to clap's confusing
 /// "missing subcommand" usage error. We can't easily inject an EINTR mid-read, so we exercise

@@ -1,11 +1,35 @@
 fn main() {
-    let dir = "tree-sitter-ascript/src";
-    println!("cargo:rerun-if-changed={}/parser.c", dir);
-    cc::Build::new()
-        .include(dir)
-        .file(format!("{}/parser.c", dir))
-        .warnings(false)
-        .compile("tree_sitter_ascript");
+    // RT §2.2 — the frontend gate is a BUILD-TIME cfg (the `fuzzing`-cfg precedent),
+    // not a Cargo feature. `ASCRIPT_RT=1` emits `cfg(ascript_rt)` (gates the parsers/
+    // compiler/checker/LSP/DAP/fmt/REPL out of the `ascript-rt` bin) and SKIPS the
+    // tree-sitter `cc` compile (the C parser is never linked into a stub). Without the
+    // env var the cfg is never set → normal builds are byte-identical.
+    println!("cargo:rerun-if-env-changed=ASCRIPT_RT");
+    let ascript_rt = std::env::var_os("ASCRIPT_RT").is_some_and(|v| v == "1");
+    if ascript_rt {
+        println!("cargo:rustc-cfg=ascript_rt");
+    }
+
+    // RT §2.4 — surface the tier name + the target triple to the bin via env! .
+    // `ASCRIPT_RT_TIER` is stamped at stub-build time (scripts/build-rt.sh); a plain
+    // build defaults to "custom". `TARGET` is the conventional way to give the binary
+    // its own triple (cargo does not expose it to the crate by default).
+    println!("cargo:rerun-if-env-changed=ASCRIPT_RT_TIER");
+    let tier = std::env::var("ASCRIPT_RT_TIER").unwrap_or_else(|_| "custom".to_string());
+    println!("cargo:rustc-env=ASCRIPT_RT_TIER={tier}");
+    if let Ok(target) = std::env::var("TARGET") {
+        println!("cargo:rustc-env=TARGET={target}");
+    }
+
+    if !ascript_rt {
+        let dir = "tree-sitter-ascript/src";
+        println!("cargo:rerun-if-changed={}/parser.c", dir);
+        cc::Build::new()
+            .include(dir)
+            .file(format!("{}/parser.c", dir))
+            .warnings(false)
+            .compile("tree_sitter_ascript");
+    }
 
     generate_ast_nodes();
 }
