@@ -13,3 +13,11 @@ pub mod report;
 pub mod select;
 pub mod std_features;
 pub mod tiers;
+
+// RT §5.1–§5.3 — distribution: signed manifest, fail-closed fetch, content-addressed
+// cache. The CACHE and the manifest PARSER build under `--no-default-features` (they
+// need only `std` + the core `sha2`); only the signature-verify (`verify_manifest`) and
+// the reqwest network arm inside `fetch` are gated on the default-on `rt-fetch` feature.
+pub mod cache;
+pub mod fetch;
+pub mod manifest;

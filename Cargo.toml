@@ -145,6 +145,13 @@ libloading = { version = "0.8", optional = true }
 # toolchains (`-print-multi-os-directory` / CFI assembler errors). The system libffi
 # is present on macOS (homebrew/system) and Linux (libffi-dev).
 libffi = { version = "3", optional = true, features = ["system"] }
+# RT §5.1 — detached ed25519 signature verification for the signed release manifest.
+# OPTIONAL, behind the default-on `rt-fetch` feature (CLI-side; never linked into a
+# stub). `default-features = false` keeps it lean — only the `verifying` half (no key
+# generation, no signing, no rand) is needed: the runtime VERIFIES against a compiled-in
+# public key; signing happens once at release time in CI. cfg's out cleanly under
+# `--no-default-features` (the cache + manifest-parse halves of `src/rtstub/` stay).
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"], optional = true }
 # VAL Task 0 / spec §6 — compile-time `!Send`/`!Sync` lock on `Value`
 # (`assert_not_impl_any!(Value: Send, Sync)`, module-level in `value.rs`). Promoted
 # from a dev-dependency to a normal dependency so the guard is active in the
@@ -168,6 +175,13 @@ ungrammar = "1"
 [dev-dependencies]
 tree-sitter = "0.25"
 tempfile = "3"
+# RT §10.1 — the supply-chain battery (`tests/rt_supply_chain.rs`) SIGNS test
+# manifests, so the dev build needs the ed25519 SIGNING half (the production dep is
+# verifying-only/`alloc`) plus `rand_core` for `SigningKey::from_bytes`. Dev-only —
+# never enters a release build. `sha2` is already a core dependency; declared here for
+# the battery's explicit `use sha2::{Digest, Sha256}`.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
+sha2 = "0.10"
 # FUZZ (differential fuzzing & property testing). Dev-only.
 proptest = "1"
 # Needed only by `tests/property.rs` to construct `ObjectCell`/`MapCell`/`SetCell`
@@ -181,7 +195,17 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch"]
+# RT §5.1/§5.2 — the signed-manifest verification + stub fetch half of the
+# runtime-stub distribution path. Pulls `net` (the pooled reqwest client used to fetch
+# the release manifest + stub blobs) and `ed25519-dalek` (verify the detached manifest
+# signature against a COMPILED-IN release public key — there is no insecure escape
+# hatch; the dev fallbacks `--stub`/sibling, not an env var, are the offline path). The
+# content-addressed stub CACHE and the manifest PARSER live in `src/rtstub/{cache,
+# manifest}.rs` and compile WITHOUT this feature (so `--no-default-features` still builds
+# the cache + manifest-parse halves; only the network + signature-verify arm is gated).
+# CLI-side only — never linked into an `ascript-rt` stub. Default-on (the builder fetches).
+rt-fetch = ["net", "dep:ed25519-dalek"]
 # RT §3.1/§7 — the stub-side payload decompressor. Kept SEPARATE from `compress`
 # (which is `std/compress`) so rt-core can decompress its own `--compress`ed bundle
 # payload without shipping the whole compression stdlib. Pulls only `zstd` (already a
