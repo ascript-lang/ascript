@@ -269,6 +269,54 @@ fn closure_drift() {
         }
     }
 
+    // 3. REVERSE direction (the dangerous drift): FEATURE_DEPS must be COMPLETE over
+    //    the features `required_features` actually traverses. Compute the set of
+    //    "relevant" features = the closure of the STD_MODULE_FEATURES value-set under
+    //    Cargo's REAL feature→feature edges (the ground truth of what the stub's feature
+    //    resolution must reach). For every relevant feature, every bare-feature edge it
+    //    has in Cargo.toml MUST appear in FEATURE_DEPS — else a NEW Cargo edge (e.g.
+    //    `binary` gaining a dep on a new runtime feature) would silently make
+    //    `required_features` under-report the closure while this gate stayed green.
+    let mut relevant: BTreeSet<&str> = STD_MODULE_FEATURES
+        .iter()
+        .filter_map(|(_m, f)| *f)
+        .collect();
+    loop {
+        let mut grew = false;
+        let snapshot: Vec<&str> = relevant.iter().copied().collect();
+        for feat in snapshot {
+            if let Some(deps) = manifest.get(feat) {
+                for dep in deps {
+                    // Only follow into features that themselves appear in the manifest
+                    // (bare feature→feature edges; `dep:`/`pkg/feat` already filtered out
+                    // by parse_cargo_feature_deps).
+                    if manifest.contains_key(dep) && relevant.insert(dep.as_str()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for feat in &relevant {
+        if let Some(deps) = manifest.get(*feat) {
+            for dep in deps {
+                if manifest.contains_key(dep)
+                    && !FEATURE_DEPS.iter().any(|(f, d)| f == feat && d == dep)
+                {
+                    errors.push(format!(
+                        "  Cargo.toml [features.{feat}] lists '{dep}' (a feature→feature \
+                         edge among closure-relevant features) but FEATURE_DEPS is MISSING \
+                         the ({feat} → {dep}) edge — required_features would under-report \
+                         the closure. Add it to FEATURE_DEPS."
+                    ));
+                }
+            }
+        }
+    }
+
     assert!(
         errors.is_empty(),
         "Closure drift detected between src/rtstub/std_features.rs and Cargo.toml:\n{}\n\
