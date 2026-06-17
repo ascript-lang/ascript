@@ -2286,6 +2286,128 @@ pub fn compile_archive_with_shake(
     Ok((archive, reach.report))
 }
 
+/// WARM §2.5 — the COMPILE PATH's reachable-module enumeration, exposed as a
+/// `#[doc(hidden)]` test seam. Returns `(logical_key, canonical_path)` for every
+/// module `compile_archive_with_shake` would archive, in the SAME BFS order.
+///
+/// This is the drift-tripwire counterpart to [`crate::cache::collect_module_graph`]:
+/// the cache keys/hashes the set `collect_module_graph` produces, while the archive
+/// COMPILES the set this function reports. The two walks are equivalent today;
+/// `tests/compile_cache.rs::collect_module_graph_matches_compile_path` asserts they
+/// produce the IDENTICAL set (paths + logical keys), so a future edit that lets them
+/// diverge (a false hit) fails CI loudly. Spec §2.5 wants ONE walk; this tripwire is
+/// the WARM Task 3 option-(b) resolution (option (a) — a true single-source refactor —
+/// was deferred as higher-risk: the cache walk compiles WITHOUT debug/elide purely to
+/// read imports, while the archive walk threads `with_debug`/`elide` into stored bytes,
+/// so collapsing them is a substantial refactor of `compile_archive_with_shake`).
+///
+/// It reuses `compile_archive_with_shake(entry, debug=true, shake=false, elide=false)`
+/// — the SAME call the cache's miss path uses — and re-derives each module's canonical
+/// path from its archived logical key by re-walking the graph. Rather than re-implement
+/// the walk, it returns the archive's logical-key order paired with the canonical paths
+/// the BFS visited (recorded into a side channel during the compile).
+#[doc(hidden)]
+pub fn compile_path_module_set(
+    entry: &Path,
+) -> Result<Vec<(String, std::path::PathBuf)>, AsError> {
+    // The archive's `modules` carry logical keys in BFS order; we need the matching
+    // canonical paths. `compile_archive_with_shake` does not return paths, so we run a
+    // parallel BFS here using the SAME resolution primitives (`classify_specifier` +
+    // `resolve_module_file`) it uses internally — this is the enumeration under test,
+    // and it MUST stay in lockstep with the inline walk in `compile_archive_with_shake`.
+    use crate::interp::SpecifierKind;
+    use crate::vm::archive::{join_logical, logical_parent};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    struct Pending {
+        path: PathBuf,
+        key: String,
+        logical_dir: String,
+    }
+
+    let interp = Interp::new();
+    let entry_canon = entry
+        .canonicalize()
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", entry.display(), e)))?;
+    let entry_dir = entry_canon
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let entry_key = entry_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "entry.as".to_string());
+
+    let mut result: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+    let mut queue: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    queue.push_back(Pending {
+        path: entry_canon.clone(),
+        key: entry_key,
+        logical_dir: String::new(),
+    });
+    seen.insert(entry_canon.clone(), 0);
+
+    while let Some(item) = queue.pop_front() {
+        let bytes = compile_verified_aso_bytes(&item.path, true, false)?;
+        let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes).map_err(|e| {
+            AsError::new(format!(
+                "internal: re-decoding compiled module {} failed: {e:?}",
+                item.path.display()
+            ))
+        })?;
+        let this_disk_dir = item
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| entry_dir.clone());
+        for imp in &chunk.imports {
+            let source = imp.source();
+            interp.set_module_dir(this_disk_dir.clone());
+            match interp.classify_specifier(source) {
+                SpecifierKind::Std => {}
+                kind @ (SpecifierKind::Relative(_) | SpecifierKind::Package { .. }) => {
+                    let target = match &kind {
+                        SpecifierKind::Relative(t) => t.clone(),
+                        SpecifierKind::Package { target, .. } => target.clone(),
+                        _ => unreachable!("matched only Relative|Package"),
+                    };
+                    let dep_path = resolve_module_file(&target).map_err(|msg| {
+                        AsError::new(format!(
+                            "cannot resolve import '{source}' from {}: {msg}",
+                            item.path.display()
+                        ))
+                    })?;
+                    if !seen.contains_key(&dep_path) {
+                        let dep_key = match &kind {
+                            SpecifierKind::Package { .. } => join_logical("pkg", source),
+                            _ => join_logical(&item.logical_dir, source),
+                        };
+                        let dep_logical_dir = logical_parent(&dep_key);
+                        let reserved = seen.len();
+                        seen.insert(dep_path.clone(), reserved);
+                        queue.push_back(Pending {
+                            path: dep_path,
+                            key: dep_key,
+                            logical_dir: dep_logical_dir,
+                        });
+                    }
+                }
+                SpecifierKind::UnknownPackage(key) => {
+                    return Err(AsError::new(format!(
+                        "unknown package '{key}' — add it with 'ascript add' \
+                         (imported from {})",
+                        item.path.display()
+                    )));
+                }
+            }
+        }
+        result.push((item.key, item.path));
+    }
+    Ok(result)
+}
+
 /// Convert a decoded [`crate::vm::chunk::ImportDesc`] into a tree-shaker
 /// [`crate::compile::shake::ImportEdge`] targeting the already-resolved dedup'd module
 /// index. A `Named` import contributes the imported export names as roots in the target;
@@ -3129,6 +3251,407 @@ pub async fn run_file_on_vm_with_packages(
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         Err(crate::interp::Control::Propagate(_)) => Ok(0),
         Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
+/// WARM A §2.1 — the cached `ascript run` front door (the default plain-`.as`+VM path).
+///
+/// Decides cacheability, looks up a content-addressed compiled artifact, and:
+/// - **Hit** → run the cached, *verified* artifact through the SAME magic-routing path
+///   ([`run_verified_aso`]) a `run file.aso`/bundle uses. Zero parse/resolve/compile.
+/// - **Miss** → compile via
+///   `compile_archive_with_shake(entry, /*debug*/true, /*shake*/false, /*elide*/false)`
+///   with `archive.caps = CapSet::all_granted()` (the NEUTRAL floor — run-time caps
+///   compose by monotone intersection in `run_verified_archive`, §2.6), publish the
+///   artifact + manifest atomically, then run the FRESHLY-compiled bytes through the
+///   SAME [`run_verified_aso`] path (hit and miss share ONE run path — no mode skew).
+///
+/// **FAIL-OPEN (load-bearing):** ANY cache-layer failure — a `Disabled` binary stamp, an
+/// unreadable/hostile store, a keying error, an exotic import graph the walk rejects, a
+/// publish IO error, or a verifier rejection of a poisoned slot — falls through to
+/// [`run_file_on_vm_with_packages`] (today's uncached compile-and-run). The cache is an
+/// optimization layered over an unchanged semantic path; it is NEVER the reason a run
+/// errors. A verifier rejection additionally DELETES the poisoned slot first (fail
+/// CLOSED to recompile), so the next run republishes a clean artifact (§2.7).
+///
+/// **Diagnostics parity (§2.4):** the entry path is part of the cache key, so a hit
+/// always loads the artifact built for THIS invoking path. At PUBLISH time each archived
+/// module's embedded debug source PATH is rebound to the string the from-source loader
+/// would embed (`rebind_archive_module_paths_to_runtime`), so a cached run's panic carets
+/// are byte-identical to the uncached run's — entry AND transitive modules. The
+/// `same_content_different_path` and `panic_output_parity` batteries prove it.
+///
+/// `no_cache` (from `--no-cache` || `ASCRIPT_NO_COMPILE_CACHE=1`) bypasses the cache
+/// entirely → no slot is created, byte-identical to the uncached path.
+///
+/// No `RefCell`/resource borrow is held across the `.await`s below: the cache-layer work
+/// is the fully-synchronous [`try_cached_artifact`], which returns OWNED artifact bytes
+/// before any await (Gate 4).
+pub async fn run_file_on_vm_cached(
+    path: &Path,
+    script_args: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    no_cache: bool,
+) -> Result<i32, AsError> {
+    // Kill switch: `--no-cache` / `ASCRIPT_NO_COMPILE_CACHE=1` → today's uncached path.
+    if no_cache {
+        return run_file_on_vm_with_packages(path, script_args, packages, caps, ELIDE_DEFAULT_ON)
+            .await;
+    }
+
+    // Attempt the cache layer. ANY failure returns `None` so we fall open below.
+    // `caps` is consumed by both the cached and the uncached path, so it is cloned for
+    // the lookup attempt and the original is threaded into whichever path runs.
+    match try_cached_artifact(path, packages.as_ref(), path) {
+        // CACHE HIT or freshly-published MISS — run the verified artifact bytes through
+        // the SAME magic-routing path a `.aso`/bundle uses. `module_dir` is the entry's
+        // parent so an archive-miss can still resolve a sibling on-disk source.
+        Some(artifact_bytes) => {
+            let module_dir = path.parent().map(std::path::Path::to_path_buf);
+            run_verified_aso(
+                &artifact_bytes,
+                script_args,
+                caps,
+                module_dir,
+                &path.display().to_string(),
+            )
+            .await
+        }
+        // FAIL-OPEN: the cache could not produce a runnable artifact (disabled, IO
+        // error, exotic graph, publish failure, verifier rejection) → run uncached.
+        None => {
+            run_file_on_vm_with_packages(path, script_args, packages, caps, ELIDE_DEFAULT_ON).await
+        }
+    }
+}
+
+/// WARM A §2.1 — the synchronous cache-layer core behind [`run_file_on_vm_cached`].
+/// Returns `Some(artifact_bytes)` on a verified hit OR a successful miss-compile-publish,
+/// and `None` on ANY cache-layer failure (the caller then runs uncached). This is the
+/// single fail-open chokepoint: every `?`-style early return here is a `return None`, so
+/// no cache error ever escapes as a run error. No `.await` happens inside — the bytes are
+/// handed back to the async caller for the actual run.
+fn try_cached_artifact(
+    path: &Path,
+    packages: Option<&crate::interp::PackageMap>,
+    entry_arg: &Path,
+) -> Option<Vec<u8>> {
+    use crate::cache::compile_cache as cc;
+
+    // The binary stamp invalidates on a rebuilt compiler. `Disabled` ⇒ cache off.
+    let binary_stamp = cc::BinaryStamp::current();
+    if binary_stamp.is_disabled() {
+        return None;
+    }
+
+    // The entry path is part of the key (§2.4): canonicalize it (a missing entry ⇒ the
+    // uncached path will surface the read error). A non-canonicalizable path ⇒ fail open.
+    let entry_canon = path.canonicalize().ok()?;
+    let entry_path = entry_canon.to_string_lossy().into_owned();
+
+    // The package-map digest is part of the key so a lockfile / re-resolution change ⇒
+    // a different key ⇒ miss (§2.9). NOTE: `compile_archive_with_shake` (the cache
+    // artifact compiler) does not currently install a package RESOLVER, so a program that
+    // imports a `{path=…}`/registry PACKAGE fails the archive walk and falls OPEN to the
+    // uncached run on every invocation (it is never cached, hence never stale-hits). The
+    // digest is keyed regardless so the day the archive builder gains package resolution
+    // the invalidation is already correct. Relative-only programs (the common case) cache
+    // fully. This is a documented fail-open limitation, not a stale-hit risk.
+    let package_map_digest = match packages {
+        Some(map) => cc::package_map_digest(map),
+        None => [0u8; 32],
+    };
+
+    let key = cc::CompileCacheKey {
+        key_schema: "ck1",
+        aso_format_version: crate::vm::aso::ASO_FORMAT_VERSION,
+        archive_version: crate::vm::archive::ARCHIVE_VERSION,
+        binary_stamp,
+        // v1 codegen-relevant flags: the cache artifact is ALWAYS the unshaken,
+        // debug-carrying, non-elided archive (§2.6), so these are constant — but they
+        // are enumerated so a future flag (e.g. ELIDE in the cache key) is mechanical,
+        // and so the `flag_change_misses` battery can perturb them via the test seam.
+        flags: cache_codegen_flags(),
+        entry_path,
+        package_map_digest,
+    };
+    let location_key = key.location_key();
+
+    // ── Lookup ────────────────────────────────────────────────────────────────────
+    // A HIT re-validates every source digest + the artifact digest, then runs the bytes
+    // through the verifier in `run_verified_aso`. If the verifier later rejects them the
+    // run errors — but `validate_manifest` already checked the artifact sha256, so a
+    // bit-flip is caught at lookup (→ Miss → recompile). We still guard the verify step
+    // on the miss path below.
+    if let cc::LookupResult::Hit { artifact_bytes } = cc::lookup(&location_key) {
+        // Defensive verify-on-hit: the FUZZ-hardened reader is the trust boundary. If a
+        // valid-digest-but-unverifiable artifact somehow exists (e.g. a format the
+        // current verifier rejects), treat the slot as poisoned: delete + fall to a
+        // recompile (fail closed). A clean verify ⇒ hand the bytes back.
+        if artifact_verifies(&artifact_bytes) {
+            return Some(artifact_bytes);
+        }
+        cc::delete_slot(&location_key);
+        // fall through to recompile
+    }
+
+    // ── Miss: compile the neutral-floor artifact + publish ─────────────────────────
+    // Compile the unshaken, debug-carrying archive (the cache artifact shape, §2.6).
+    // A compile error here is NOT a cache failure — it is a real program error, so we
+    // must NOT swallow it into a silent miss (that would hide the diagnostic). Instead
+    // fail open with `None`: the uncached path recompiles and surfaces the SAME error
+    // with full diagnostics. (The double-compile on a broken program is acceptable —
+    // a broken program is not the hot path.)
+    let (mut archive, _report) =
+        match compile_archive_with_shake(&entry_canon, /*debug*/ true, /*shake*/ false, /*elide*/ false)
+        {
+            Ok(v) => v,
+            Err(_) => return None, // fail open — the uncached path re-reports the error
+        };
+    // NEUTRAL caps floor (§2.6): all-granted ∩ runtime = runtime, so a cached run's
+    // effective caps are EXACTLY the CLI/manifest-composed set — byte-identical to the
+    // uncached run. Caps are deliberately NOT in the key (they compose at run time).
+    archive.caps = crate::stdlib::caps::CapSet::all_granted();
+
+    // DIAGNOSTICS PARITY (§2.4): `compile_archive` embeds each module's CANONICAL path
+    // in its debug section, but the from-source (uncached) run embeds the IMPORTER-JOINED
+    // path the loader builds (`module_dir.join(specifier)` — e.g. `/dir/./model.as`).
+    // To make a cached run's panic carets BYTE-IDENTICAL to the uncached run, rebind
+    // every embedded module source PATH to the runtime-equivalent string before encoding.
+    // Best-effort: a derivation failure leaves the canonical paths (still a runnable
+    // artifact — the parity test drives this, and a mismatch is caught there, not here).
+    rebind_archive_module_paths_to_runtime(&mut archive, entry_arg);
+    let artifact_bytes = archive.encode();
+
+    // Build the validation manifest from the SAME reachable set the cache keyer walks
+    // (`collect_module_graph` — the §2.5 single-walk source; the drift tripwire test
+    // proves it equals the compile path's set). A walk error ⇒ fail open (publish
+    // nothing, run uncached).
+    let graph = match crate::cache::collect_module_graph(&entry_canon) {
+        Ok(g) => g,
+        Err(_) => {
+            // We still have a runnable artifact — run it, just don't publish (no
+            // manifest means we can't validate later, so skip the publish entirely).
+            return Some(artifact_bytes);
+        }
+    };
+    let modules: Vec<cc::ManifestModule> = graph
+        .iter()
+        .map(|m| cc::ManifestModule {
+            logical_key: m.logical_key.clone(),
+            path: m.path.clone(),
+            sha256: cc::sha256_bytes(m.source.as_bytes()),
+        })
+        .collect();
+    let manifest = cc::CacheManifest {
+        modules,
+        artifact_sha256: cc::sha256_bytes(&artifact_bytes),
+        created_unix_ms: cc::now_unix_ms(),
+    };
+
+    // Atomic publish. An IO error ⇒ fail open (we still return the runnable bytes — the
+    // run succeeds, just unpublished; the next run will try to publish again).
+    let _ = cc::publish(&location_key, &manifest, &artifact_bytes);
+    Some(artifact_bytes)
+}
+
+/// WARM A §2.4 — rebind every archive module's embedded debug source PATH to the string
+/// the from-source (uncached) loader would embed, so a cached run's panic carets are
+/// byte-identical to an uncached run's.
+///
+/// The from-source loader embeds:
+/// - **entry:** the as-passed CLI path (`entry_arg.display()`); its `module_dir` is
+///   `entry_arg.parent()` (the as-passed parent, possibly relative).
+/// - **dependency:** `importer_module_dir.join(specifier).with_extension("as")`; its own
+///   `module_dir` is `canonical(dep).parent()` (the loader keys/recurses by canonical path
+///   but EMBEDS the importer-joined path).
+///
+/// This re-walks the graph mirroring `Vm::load_module_file` exactly (`module_dir.join` +
+/// `.with_extension("as")` + `canonicalize` for dedup), producing the runtime path per
+/// module. It then re-encodes each archive module with its path rebound. Best-effort: any
+/// IO/decode failure leaves that module's canonical path untouched (still runnable; the
+/// parity test catches a real mismatch).
+fn rebind_archive_module_paths_to_runtime(
+    archive: &mut crate::vm::archive::ModuleArchive,
+    entry_arg: &Path,
+) {
+    use crate::interp::SpecifierKind;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // Map canonical path → the runtime-embedded path string the loader would use.
+    // Built by a BFS mirroring the loader's resolution. The archive's modules are keyed
+    // by LOGICAL key (the `compile_archive` BFS order), but we rebind by matching each
+    // archive module's canonical path — so we also record logical_key → runtime path.
+    let mut runtime_path: HashMap<PathBuf, String> = HashMap::new();
+    // logical_key → canonical path, so we can rebind archive modules (keyed by logical).
+    let mut key_to_canon: HashMap<String, PathBuf> = HashMap::new();
+
+    let interp = Interp::new();
+
+    // The entry: embed the AS-PASSED path; its module_dir is the as-passed parent.
+    let entry_embed = entry_arg.display().to_string();
+    let entry_module_dir = entry_arg
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(""));
+    let Ok(entry_canon) = entry_arg.canonicalize() else {
+        return; // can't canonicalize → leave canonical paths (best-effort)
+    };
+    runtime_path.insert(entry_canon.clone(), entry_embed.clone());
+
+    // Recover the entry's LOGICAL key the same way `compile_archive` does.
+    let entry_logical = entry_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "entry.as".to_string());
+    key_to_canon.insert(entry_logical.clone(), entry_canon.clone());
+
+    struct Pending {
+        canon: PathBuf,
+        logical_key: String,
+        // The module_dir the loader uses to resolve THIS module's imports.
+        module_dir: PathBuf,
+    }
+    let mut queue: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    seen.insert(entry_canon.clone());
+    queue.push_back(Pending {
+        canon: entry_canon,
+        logical_key: entry_logical,
+        module_dir: entry_module_dir,
+    });
+
+    while let Some(item) = queue.pop_front() {
+        // Read + compile this module purely to read its import specifiers (same as the
+        // cache walk). Any failure → skip following its imports (best-effort rebind).
+        let Ok(source) = std::fs::read_to_string(&item.canon) else {
+            continue;
+        };
+        let Ok(bytes) = compile_verified_aso_bytes_from_source_for_cache(&item.canon, &source)
+        else {
+            continue;
+        };
+        let Ok(chunk) = crate::vm::chunk::Chunk::from_bytes_verified(&bytes) else {
+            continue;
+        };
+
+        for imp in &chunk.imports {
+            let spec = imp.source();
+            interp.set_module_dir(item.module_dir.clone());
+            match interp.classify_specifier(spec) {
+                SpecifierKind::Std => {}
+                kind @ (SpecifierKind::Relative(_) | SpecifierKind::Package { .. }) => {
+                    // The loader EMBEDS `module_dir.join(spec).with_extension("as")`.
+                    let requested = item.module_dir.join(spec);
+                    let as_path = if requested.extension().is_some() {
+                        requested.clone()
+                    } else {
+                        requested.with_extension("as")
+                    };
+                    let embed = as_path.display().to_string();
+                    // It KEYS / recurses by the canonical path.
+                    let target = match &kind {
+                        SpecifierKind::Relative(t) => t.clone(),
+                        SpecifierKind::Package { target, .. } => target.clone(),
+                        _ => unreachable!(),
+                    };
+                    let Ok(dep_canon) = resolve_module_file(&target) else {
+                        continue;
+                    };
+                    // First-importer-wins on the embedded path (matches the loader's
+                    // `file_modules`-keyed once-only binding).
+                    runtime_path.entry(dep_canon.clone()).or_insert(embed);
+                    if seen.insert(dep_canon.clone()) {
+                        let dep_key = match &kind {
+                            SpecifierKind::Package { .. } => {
+                                crate::vm::archive::join_logical("pkg", spec)
+                            }
+                            _ => crate::vm::archive::join_logical(
+                                &crate::vm::archive::logical_parent(&item.logical_key),
+                                spec,
+                            ),
+                        };
+                        key_to_canon.insert(dep_key.clone(), dep_canon.clone());
+                        let dep_module_dir = dep_canon
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        queue.push_back(Pending {
+                            canon: dep_canon,
+                            logical_key: dep_key,
+                            module_dir: dep_module_dir,
+                        });
+                    }
+                }
+                SpecifierKind::UnknownPackage(_) => {}
+            }
+        }
+    }
+
+    // Rebind each archive module: decode → rebind path → re-encode (debug-carrying).
+    for (logical_key, bytes) in archive.modules.iter_mut() {
+        let Some(canon) = key_to_canon.get(logical_key) else {
+            continue; // unknown key (e.g. package logical-dir drift) — leave as-is
+        };
+        let Some(new_path) = runtime_path.get(canon) else {
+            continue;
+        };
+        let Ok(chunk) = crate::vm::chunk::Chunk::from_bytes_verified(bytes) else {
+            continue;
+        };
+        chunk.rebind_source_path(new_path);
+        if let Ok(reencoded) = chunk.to_bytes_with_debug(true) {
+            *bytes = reencoded;
+        }
+    }
+}
+
+/// WARM A — the codegen-relevant flag list embedded in the [`cc::CompileCacheKey`].
+///
+/// v1 is constant (`debug=true, shake=false, elide=false`): the cache artifact is the
+/// unshaken, debug-carrying, non-elided archive (§2.6). Behind a `#[doc(hidden)]` test
+/// seam (`ASCRIPT_TEST_CACHE_FLAG_SALT`) the list can be PERTURBED so the `flag_change_misses`
+/// battery can prove a codegen-flag change ⇒ a different key ⇒ a miss, without needing a
+/// real second codegen flag to exist yet. The salt is read ONLY here and is absent on
+/// every production run (the env var is unset), so the production key is unaffected.
+fn cache_codegen_flags() -> Vec<(String, String)> {
+    let mut flags = vec![
+        ("debug".to_string(), "true".to_string()),
+        ("shake".to_string(), "false".to_string()),
+        ("elide".to_string(), "false".to_string()),
+    ];
+    // `#[doc(hidden)]` flag-change TEST SEAM (§5-A `flag_change_misses`): a non-empty
+    // `ASCRIPT_TEST_CACHE_FLAG_SALT` adds a synthetic codegen flag, changing the key exactly
+    // as a real flag flip would. Unset on every production run.
+    if let Ok(salt) = std::env::var("ASCRIPT_TEST_CACHE_FLAG_SALT") {
+        if !salt.is_empty() {
+            flags.push(("__test_salt".to_string(), salt));
+        }
+    }
+    flags
+}
+
+/// WARM A — verify a cached artifact through the SAME `from_bytes_verified` trust
+/// boundary the runtime uses, WITHOUT running it. Returns `true` iff every module
+/// (archive) or the single chunk (`ASO\0`) re-verifies. Hostile-input-safe: any decode
+/// or verify failure ⇒ `false` (the caller treats the slot as poisoned → recompile).
+fn artifact_verifies(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&crate::vm::archive::ARCHIVE_MAGIC) {
+        let archive = match crate::vm::archive::ModuleArchive::decode(bytes) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        // Every embedded module must re-verify through the FUZZ-hardened reader.
+        for (_key, mod_bytes) in &archive.modules {
+            if crate::vm::chunk::Chunk::from_bytes_verified(mod_bytes).is_err() {
+                return false;
+            }
+        }
+        true
+    } else {
+        crate::vm::chunk::Chunk::from_bytes_verified(bytes).is_ok()
     }
 }
 

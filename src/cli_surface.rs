@@ -81,6 +81,13 @@ pub enum Command {
         /// golden-stable) sample clock — used by goldens/tests, no wall-clock thread.
         #[arg(long = "profile-format", value_name = "FMT")]
         profile_format: Option<String>,
+        /// WARM A: bypass the content-addressed compile cache for this run (always
+        /// parse/resolve/compile from source). Equivalent to
+        /// `ASCRIPT_NO_COMPILE_CACHE=1`. The cache only ever applies to the plain
+        /// `.as`-on-the-VM path; `.aso`/`--tree-walker`/`--inspect`/`--profile` are
+        /// never cached regardless of this flag.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.

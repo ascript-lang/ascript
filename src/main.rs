@@ -331,6 +331,7 @@ async fn real_main() -> ExitCode {
             out,
             profile_hz,
             profile_format,
+            no_cache,
             file,
             args,
         } => {
@@ -482,12 +483,29 @@ async fn real_main() -> ExitCode {
             // default-OFF). `.aso` runs skip this — a compiled module already baked in
             // whatever the `build` step elided (the opcode is durable).
             let elide = ascript::elide_enabled(elide_flag, no_elide);
+            // WARM A: the plain `.as`-on-the-VM path routes through the cached front
+            // door (fail-open; a cache error falls back to the uncached compile-and-run).
+            // `--no-cache` OR `ASCRIPT_NO_COMPILE_CACHE=1` bypasses it. `.aso` (already
+            // compiled) and `--tree-walker` (the oracle path) are NEVER cached. The
+            // `--inspect`/`--profile` paths returned earlier above, so they never reach
+            // here — also uncached, as the spec requires (§2.8).
+            //
+            // The cache artifact is always the unshaken, debug-carrying, non-elided
+            // archive (§2.6). `--elide` therefore bypasses the cache too: an elided run
+            // would compile DIFFERENT bytes, but `elide` is a v1-constant cache flag, so
+            // routing an elided run through the cache would either stale-hit a non-elided
+            // artifact or never hit. Cleanest: an explicit-elide run is uncached.
+            let no_compile_cache = no_cache
+                || std::env::var("ASCRIPT_NO_COMPILE_CACHE").as_deref() == Ok("1")
+                || elide;
             let result = if is_aso {
                 ascript::run_aso_file(path, &args, caps).await
             } else if use_tree_walker {
                 ascript::run_file_with_packages(path, &args, packages, caps, elide).await
-            } else {
+            } else if no_compile_cache {
                 ascript::run_file_on_vm_with_packages(path, &args, packages, caps, elide).await
+            } else {
+                ascript::run_file_on_vm_cached(path, &args, packages, caps, false).await
             };
             match result {
                 // Output already streamed live (OutputSink::Live).
