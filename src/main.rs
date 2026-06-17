@@ -518,6 +518,7 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
+            compress,
             pgo,
             caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
@@ -544,7 +545,7 @@ async fn real_main() -> ExitCode {
             if native {
                 // BIN: bundle a self-contained native executable. `--target` is
                 // host-only in v1 (build_native returns the specific Tier-1 error).
-                match ascript::build_native(src, out_path, target.as_deref(), caps, elide) {
+                match ascript::build_native(src, out_path, target.as_deref(), caps, elide, compress) {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
                     Err(e) => {
                         ascript::diagnostics::report(&e);

@@ -2840,6 +2840,7 @@ pub fn build_native(
     target: Option<&str>,
     caps: Option<crate::stdlib::caps::CapSet>,
     elide: bool,
+    compress: bool,
 ) -> Result<std::path::PathBuf, AsError> {
     // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
     // naming the requested triple, never a silent ignore or a generic clap failure.
@@ -2885,6 +2886,24 @@ pub fn build_native(
         // bundle stays byte-identical to the pre-archive output. `build` is one-shot, so
         // re-compiling this one file is negligible.
         compile_verified_aso_bytes(file, true, elide)? // bare ASO\0 — byte-identical to today
+    };
+
+    // RT §7: optional zstd compression of the payload, AFTER the (verified) encode and
+    // BEFORE the append. `--compress` wraps the payload as `uncompressed_len:u64 || frame`
+    // and sets `FLAG_ZSTD` (→ footer version 2). Without `--compress` the payload and footer
+    // are BIT-IDENTICAL to a pre-RT bundle (flags=0, version=1) — the reproducibility floor.
+    let (payload, footer_flags) = if compress {
+        let raw_len = payload.len();
+        let compressed = crate::bundle::compress_payload(&payload).map_err(AsError::new)?;
+        eprintln!(
+            "compressed payload {} -> {} bytes ({:.1}%)",
+            raw_len,
+            compressed.len(),
+            if raw_len == 0 { 0.0 } else { 100.0 * compressed.len() as f64 / raw_len as f64 }
+        );
+        (compressed, crate::bundle::FLAG_ZSTD)
+    } else {
+        (payload, 0u16)
     };
 
     // Step 2: the stub is a byte-for-byte copy of the running runtime — but if THIS binary is
@@ -2970,6 +2989,7 @@ pub fn build_native(
         payload_offset,
         payload.len() as u64,
         crate::vm::aso::ASO_FORMAT_VERSION,
+        footer_flags,
     );
     {
         use std::io::Write;
@@ -3059,21 +3079,44 @@ pub async fn run_embedded_if_bundled() -> Option<i32> {
     if exe_len < FOOTER_SIZE as u64 {
         return None;
     }
-    // Read ONLY the trailing footer (cheap), validate against the file length.
+    // Read ONLY the trailing footer (cheap), validate against the file length. RT §7.2:
+    // the verdict is three-way — NotABundle (silent clap fall-through, pre-RT behavior),
+    // Bundle (run it), or Refused (the bytes ARE a bundle but a version/flags problem makes
+    // it unrunnable → a REPORTED error, never a confusing "missing subcommand").
     f.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).ok()?;
     let mut footer = [0u8; FOOTER_SIZE];
     f.read_exact(&mut footer).ok()?;
-    let (offset, len) = crate::bundle::validate_footer(&footer, exe_len)?;
+    let (offset, len, flags) = match crate::bundle::validate_footer(&footer, exe_len) {
+        crate::bundle::FooterCheck::NotABundle => return None,
+        crate::bundle::FooterCheck::Refused(msg) => {
+            eprintln!("error: {msg}");
+            return Some(1);
+        }
+        crate::bundle::FooterCheck::Bundle { offset, len, flags } => (offset, len, flags),
+    };
 
     // It IS a bundle (`ASCRIPTB` confirmed) — from here a read failure is REPORTED,
     // never a silent fall-through.
-    let mut payload = vec![0u8; len];
+    let mut payload = vec![0u8; len as usize];
     if let Err(e) = f
-        .seek(SeekFrom::Start(offset as u64))
+        .seek(SeekFrom::Start(offset))
         .and_then(|_| f.read_exact(&mut payload))
     {
         eprintln!("error: failed to read embedded program: {e}");
         return Some(1);
+    }
+    // RT §7: decompress the payload BEFORE the `ASO\0`/`ASCRIPTA` magic dispatch when the
+    // bundle is compressed. `validate_footer` has already guaranteed the codec is available
+    // (it refuses `FLAG_ZSTD` on a zstd-less stub), so a decompress failure here is genuine
+    // corruption → a reported error.
+    if flags & crate::bundle::FLAG_ZSTD != 0 {
+        match crate::bundle::decompress_payload(&payload) {
+            Ok(raw) => payload = raw,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return Some(1);
+            }
+        }
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match run_embedded_aso(&payload, &args).await {

@@ -126,6 +126,12 @@ pub enum Command {
         /// a clear error). Requires `--native`.
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
+        /// RT §7: zstd-compress the embedded payload of a `--native` bundle (smaller
+        /// artifact; the stub decompresses it at startup). Requires `--native`. The
+        /// footer is marked version 2 / `FLAG_ZSTD`; an uncompressed bundle stays
+        /// bit-identical to a pre-RT build.
+        #[arg(long = "compress", requires = "native")]
+        compress: bool,
         /// WARM B §3.1: run the program as a training workload, harvest the warmed
         /// inline caches and adaptive arithmetic state, and embed a PGO (profile-
         /// guided optimisation) section into the produced archive. The artifact is
