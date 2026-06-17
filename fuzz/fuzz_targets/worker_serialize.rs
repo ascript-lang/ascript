@@ -38,7 +38,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 
 use ascript::interp::Interp;
-use ascript::value::{ArrayCell, MapCell, MapKey, ObjectCell, SetCell, Value};
+use ascript::value::{MapKey, Value};
 use ascript::worker::serialize::{check_sendable, decode, encode};
 use indexmap::{IndexMap, IndexSet};
 
@@ -111,17 +111,17 @@ fn check_invariants(v: &Value) {
 fn build_value(u: &mut Unstructured, depth: &mut u32) -> Value {
     // Out of budget or bytes → a trivial sendable leaf.
     if *depth == 0 || u.is_empty() {
-        return Value::Nil;
+        return Value::nil();
     }
     *depth -= 1;
     let choice = u8::arbitrary(u).unwrap_or(0) % 10;
     match choice {
-        0 => Value::Nil,
-        1 => Value::Bool(bool::arbitrary(u).unwrap_or(false)),
+        0 => Value::nil(),
+        1 => Value::bool_(bool::arbitrary(u).unwrap_or(false)),
         // Numeric edges matter: bias toward the i64/float boundaries.
-        2 => Value::Int(int_edge(u)),
-        3 => Value::Float(f64_finite(u)),
-        4 => Value::Str(short_str(u).into()),
+        2 => Value::int(int_edge(u)),
+        3 => Value::float(f64_finite(u)),
+        4 => Value::str(short_str(u)),
         5 => {
             // array
             let n = (u8::arbitrary(u).unwrap_or(0) % 5) as usize;
@@ -129,7 +129,7 @@ fn build_value(u: &mut Unstructured, depth: &mut u32) -> Value {
             for _ in 0..n {
                 items.push(build_value(u, depth));
             }
-            Value::Array(ArrayCell::new(items))
+            Value::array(items)
         }
         6 => {
             // object (string keys)
@@ -140,7 +140,7 @@ fn build_value(u: &mut Unstructured, depth: &mut u32) -> Value {
                 let val = build_value(u, depth);
                 m.insert(k, val);
             }
-            Value::Object(ObjectCell::new(m))
+            Value::object(m)
         }
         7 => {
             // map (scalar keys via MapKey canonicalization)
@@ -153,7 +153,7 @@ fn build_value(u: &mut Unstructured, depth: &mut u32) -> Value {
                     m.insert(key, val);
                 }
             }
-            Value::Map(MapCell::new(m))
+            Value::map(m)
         }
         8 => {
             // set
@@ -165,14 +165,14 @@ fn build_value(u: &mut Unstructured, depth: &mut u32) -> Value {
                     s.insert(key);
                 }
             }
-            Value::Set(SetCell::new(s))
+            Value::set(s)
         }
         9 => {
             // Either a self-referential array CYCLE (sendable; the airlock must preserve
             // topology) or a NON-sendable leaf — both stress an invariant arm.
             if bool::arbitrary(u).unwrap_or(false) {
-                let a = Value::Array(ArrayCell::new(Vec::new()));
-                if let Value::Array(arr) = &a {
+                let a = Value::array(Vec::new());
+                if let Some(arr) = a.as_array() {
                     arr.borrow_mut().push(a.clone());
                     // Add one more sendable element so the cycle is non-trivial.
                     let extra = build_value(u, depth);
@@ -183,10 +183,10 @@ fn build_value(u: &mut Unstructured, depth: &mut u32) -> Value {
                 // A builtin (native fn) handle is the canonical NON-sendable leaf — its
                 // presence must flip both `check_sendable` and `encode` to a clean error.
                 let env = ascript::interp::global_env();
-                env.get("print").unwrap_or(Value::Nil)
+                env.get("print").unwrap_or(Value::nil())
             }
         }
-        _ => Value::Nil,
+        _ => Value::nil(),
     }
 }
 
@@ -236,8 +236,8 @@ fn short_str(u: &mut Unstructured) -> String {
 /// A scalar usable as a Map/Set key (bool / int-edge / short string — no nil/collection keys).
 fn scalar_key(u: &mut Unstructured) -> Value {
     match u8::arbitrary(u).unwrap_or(0) % 3 {
-        0 => Value::Bool(bool::arbitrary(u).unwrap_or(false)),
-        1 => Value::Int(int_edge(u)),
-        _ => Value::Str(short_str(u).into()),
+        0 => Value::bool_(bool::arbitrary(u).unwrap_or(false)),
+        1 => Value::int(int_edge(u)),
+        _ => Value::str(short_str(u)),
     }
 }
