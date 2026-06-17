@@ -304,6 +304,20 @@ pub enum Command {
     /// Re-hash the cache store against the lock integrity (fail-closed).
     #[cfg(feature = "pkg")]
     Verify,
+    /// Manage the compile cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+/// Subcommands for `ascript cache`.
+#[derive(Subcommand)]
+pub enum CacheAction {
+    /// Remove the compiled/ namespace (compile cache entries only — the pkg store/ is unaffected).
+    Clean,
+    /// Print the cache root directory.
+    Dir,
 }
 
 /// FFI §4.2/§4.4: the shared capability CLI flags, flattened into both the `run`

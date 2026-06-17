@@ -3,7 +3,7 @@ use std::process::ExitCode;
 #[cfg(feature = "pkg")]
 mod pkg;
 
-use ascript::cli_surface::{CapFlags, Cli, Command};
+use ascript::cli_surface::{CacheAction, CapFlags, Cli, Command};
 use clap::Parser;
 
 // SP3 §B: run the whole program on a worker thread with an enlarged
@@ -956,6 +956,26 @@ async fn real_main() -> ExitCode {
         Command::Tree => pkg_command_exit(pkg::commands::cmd_tree()),
         #[cfg(feature = "pkg")]
         Command::Verify => pkg_command_exit(pkg::commands::cmd_verify()),
+        Command::Cache { action } => match action {
+            CacheAction::Clean => {
+                let compiled = ascript::cache::compile_cache::compiled_dir();
+                if compiled.exists() {
+                    let count = std::fs::read_dir(&compiled)
+                        .map(|rd| rd.count())
+                        .unwrap_or(0);
+                    std::fs::remove_dir_all(&compiled)
+                        .unwrap_or_else(|e| eprintln!("warning: {e}"));
+                    println!("removed {count} cached compilation(s)");
+                } else {
+                    println!("compiled cache is already empty");
+                }
+                ExitCode::SUCCESS
+            }
+            CacheAction::Dir => {
+                println!("{}", ascript::cache::compile_cache::cache_root().display());
+                ExitCode::SUCCESS
+            }
+        },
     }
 }
 

@@ -347,6 +347,42 @@ See [editor setup](tooling/editor-setup) for VS Code, Zed, and Neovim configurat
 > source to produce diagnostics and navigation; it never runs the interpreter, so the whole layer
 > stays `Send + Sync` and free of runtime state.
 
+## `ascript cache`
+
+Manage the compile cache. The compile cache lives under the cache root (see `ascript cache dir`)
+in a `compiled/` subdirectory. Each slot is a content-addressed directory keyed by a hash of
+the compiler version, entry path, and codegen flags — not a hash of the source. Source integrity
+is validated per-slot via a manifest of file digests, so stale entries are detected and evicted
+automatically.
+
+The cache is fail-open: any IO error, digest mismatch, or missing slot falls through to a fresh
+compile without error. Corruption in a slot is self-healing on the next `ascript run`.
+
+### `ascript cache clean`
+
+Remove the `compiled/` namespace entirely (all compile cache entries). The pkg `store/` namespace
+(package tarballs) is **not** affected.
+
+```text
+ascript cache clean
+```
+
+Prints the number of slots removed, or a message if the cache was already empty. Use this to free
+disk space or force a full recompile of all programs.
+
+### `ascript cache dir`
+
+Print the cache root directory.
+
+```text
+ascript cache dir
+```
+
+The cache root is resolved from `$ASCRIPT_CACHE` (if set and non-empty), then the per-platform
+default (`~/Library/Caches/ascript` on macOS, `$XDG_CACHE_HOME/ascript` or `~/.cache/ascript`
+on Linux, `%LOCALAPPDATA%\ascript\Cache` on Windows). Set `$ASCRIPT_CACHE` to redirect the cache
+to a custom location (useful in CI or sandboxed environments).
+
 ## `ascript dap`
 
 Run a standalone Debug Adapter Protocol server over stdio. An editor's DAP client connects to the

@@ -707,6 +707,186 @@ pub fn now_unix_ms() -> u64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Compile cache store — lookup, publish, delete
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the cache root for the compile cache.
+///
+/// Reads `$ASCRIPT_CACHE` first; falls back to the per-platform default (same
+/// algorithm as `src/pkg/cache.rs::cache_root()`). Inlined here so `compile_cache`
+/// is accessible from `lib.rs` without needing to expose `src/pkg/` (which has
+/// binary-only module dependencies).
+pub fn cache_root() -> PathBuf {
+    if let Some(p) = std::env::var_os("ASCRIPT_CACHE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    cache_platform_default()
+}
+
+#[cfg(target_os = "macos")]
+fn cache_platform_default() -> PathBuf {
+    fn nonempty(key: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(key).filter(|v| !v.is_empty())
+    }
+    if let Some(xdg) = nonempty("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg).join("ascript");
+    }
+    if let Some(home) = nonempty("HOME") {
+        return PathBuf::from(home).join("Library/Caches/ascript");
+    }
+    std::env::temp_dir().join("ascript-cache")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn cache_platform_default() -> PathBuf {
+    fn nonempty(key: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(key).filter(|v| !v.is_empty())
+    }
+    if let Some(xdg) = nonempty("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg).join("ascript");
+    }
+    if let Some(home) = nonempty("HOME") {
+        return PathBuf::from(home).join(".cache/ascript");
+    }
+    std::env::temp_dir().join("ascript-cache")
+}
+
+#[cfg(windows)]
+fn cache_platform_default() -> PathBuf {
+    fn nonempty(key: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(key).filter(|v| !v.is_empty())
+    }
+    if let Some(local) = nonempty("LOCALAPPDATA") {
+        return PathBuf::from(local).join("ascript").join("Cache");
+    }
+    std::env::temp_dir().join("ascript-cache")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cache_platform_default() -> PathBuf {
+    std::env::temp_dir().join("ascript-cache")
+}
+
+/// The staging dir used for atomic publish (mirrors `src/pkg/cache.rs::tmp_dir()`).
+pub fn cache_tmp_dir() -> PathBuf {
+    cache_root().join("tmp")
+}
+
+/// The `compiled/` directory under the cache root.
+///
+/// Layout: `<cache_root>/compiled/<location_key>/`
+/// Each slot contains `manifest.json` + `program.aso`.
+pub fn compiled_dir() -> PathBuf {
+    cache_root().join("compiled")
+}
+
+/// The slot directory for a given `location_key`.
+pub fn slot_dir(location_key: &str) -> PathBuf {
+    compiled_dir().join(location_key)
+}
+
+/// The `manifest.json` path inside a slot.
+fn slot_manifest_path(location_key: &str) -> PathBuf {
+    slot_dir(location_key).join("manifest.json")
+}
+
+/// The `program.aso` path inside a slot.
+fn slot_artifact_path(location_key: &str) -> PathBuf {
+    slot_dir(location_key).join("program.aso")
+}
+
+/// Result of a cache lookup.
+pub enum LookupResult {
+    /// The slot exists, the manifest parsed, and all digests verified — the artifact
+    /// bytes are ready to hand to the VM.
+    Hit { artifact_bytes: Vec<u8> },
+    /// No slot, manifest missing/corrupt, source files changed, or artifact corrupt —
+    /// caller should compile from source.
+    Miss,
+}
+
+/// Look up a cache slot by `location_key`.
+///
+/// Reads `compiled/<location_key>/manifest.json` and `compiled/<location_key>/program.aso`,
+/// then calls [`validate_manifest`]. Any IO or parse anomaly → [`LookupResult::Miss`].
+/// Never panics.
+pub fn lookup(location_key: &str) -> LookupResult {
+    // Read manifest.
+    let manifest_path = slot_manifest_path(location_key);
+    let manifest_text = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(_) => return LookupResult::Miss,
+    };
+    let manifest = match CacheManifest::from_json(&manifest_text) {
+        Some(m) => m,
+        None => return LookupResult::Miss,
+    };
+
+    // Read artifact.
+    let artifact_path = slot_artifact_path(location_key);
+    let artifact_bytes = match std::fs::read(&artifact_path) {
+        Ok(b) => b,
+        Err(_) => return LookupResult::Miss,
+    };
+
+    // Validate everything — sources + artifact digest.
+    match validate_manifest(&manifest, &artifact_bytes) {
+        ValidateResult::Hit => LookupResult::Hit { artifact_bytes },
+        ValidateResult::Miss => LookupResult::Miss,
+    }
+}
+
+/// Publish a compiled artifact to the cache.
+///
+/// Stages in `<cache_root>/tmp/`, writes `program.aso` then `manifest.json` into the
+/// staging area, then atomically renames them into `compiled/<location_key>/` with the
+/// manifest LAST (so a half-published slot has no manifest and counts as a clean miss).
+///
+/// Any IO error → `Err`; the caller swallows this and treats it as fail-open (the compile-and-run
+/// path continues unchanged). Never panics.
+pub fn publish(
+    location_key: &str,
+    manifest: &CacheManifest,
+    artifact_bytes: &[u8],
+) -> Result<(), std::io::Error> {
+    let tmp = cache_tmp_dir();
+    std::fs::create_dir_all(&tmp)?;
+
+    // Unique staging names to avoid races between concurrent publishes.
+    let pid = std::process::id();
+    let ts = now_unix_ms();
+    let stage_aso = tmp.join(format!("publish-{pid}-{ts}.aso"));
+    let stage_manifest = tmp.join(format!("publish-{pid}-{ts}.manifest.json"));
+
+    // Write artifact first, then manifest.
+    std::fs::write(&stage_aso, artifact_bytes)?;
+    std::fs::write(&stage_manifest, manifest.to_json())?;
+
+    // Ensure the slot directory exists.
+    let slot = slot_dir(location_key);
+    std::fs::create_dir_all(&slot)?;
+
+    let dest_aso = slot_artifact_path(location_key);
+    let dest_manifest = slot_manifest_path(location_key);
+
+    // Rename artifact first, then manifest (manifest presence = slot is valid).
+    std::fs::rename(&stage_aso, &dest_aso)?;
+    std::fs::rename(&stage_manifest, &dest_manifest)?;
+
+    Ok(())
+}
+
+/// Delete a cache slot (used by the fail-closed path after verifier rejection, so the
+/// corrupted slot is repaired by recompile + re-publish on the next run).
+///
+/// Any IO error is silently swallowed — this is best-effort cleanup.
+pub fn delete_slot(location_key: &str) {
+    let _ = std::fs::remove_dir_all(slot_dir(location_key));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1088,5 +1268,185 @@ mod tests {
             ..make_key("/e.as", vec![], [0u8; 32])
         };
         assert_ne!(k1.location_key(), k2.location_key());
+    }
+
+    // ── Store: lookup / publish / delete_slot ─────────────────────────────────
+
+    /// A mutex that serialises the store tests that mutate ASCRIPT_CACHE.
+    /// cargo runs unit tests in the same binary in parallel by default.
+    static STORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper: acquire the env-lock, set ASCRIPT_CACHE to a fresh temp dir, and
+    /// return (lock_guard, dir).  The guard must be kept live for the test's scope.
+    fn with_temp_cache(tag: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+        let guard = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = scratch_dir(tag);
+        std::env::set_var("ASCRIPT_CACHE", &d);
+        (guard, d)
+    }
+
+    #[test]
+    fn store_miss_on_empty_cache() {
+        let (_g, _d) = with_temp_cache("miss_empty");
+        match lookup("ck1-deadbeef") {
+            LookupResult::Miss => {}
+            LookupResult::Hit { .. } => panic!("expected Miss on empty cache"),
+        }
+    }
+
+    #[test]
+    fn store_publish_then_lookup_hit() {
+        let (_g, dir) = with_temp_cache("pub_hit");
+        // Prepare real source files so validate_manifest can re-hash them.
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src_path = src_dir.join("main.as");
+        fs::write(&src_path, b"print('hello')").unwrap();
+
+        let src_digest = sha256_file(&src_path).unwrap();
+        let artifact_bytes: Vec<u8> = b"fake-aso-content".to_vec();
+        let art_digest = sha256_bytes(&artifact_bytes);
+
+        let manifest = CacheManifest {
+            modules: vec![ManifestModule {
+                logical_key: "main.as".to_string(),
+                path: src_path.clone(),
+                sha256: src_digest,
+            }],
+            artifact_sha256: art_digest,
+            created_unix_ms: now_unix_ms(),
+        };
+
+        let key = "ck1-0000000000000000000000000000000000000000000000000000000000000001";
+        publish(key, &manifest, &artifact_bytes).expect("publish must not fail");
+
+        // The slot directory and files must exist.
+        assert!(slot_dir(key).join("program.aso").exists(), "program.aso must exist");
+        assert!(slot_dir(key).join("manifest.json").exists(), "manifest.json must exist");
+
+        // Lookup must return Hit with the same bytes.
+        match lookup(key) {
+            LookupResult::Hit { artifact_bytes: got } => {
+                assert_eq!(got, artifact_bytes, "hit bytes must match published bytes");
+            }
+            LookupResult::Miss => panic!("expected Hit after publish"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_miss_after_source_edit() {
+        let (_g, dir) = with_temp_cache("miss_edit");
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src_path = src_dir.join("main.as");
+        fs::write(&src_path, b"print('hello')").unwrap();
+
+        let src_digest = sha256_file(&src_path).unwrap();
+        let artifact_bytes: Vec<u8> = b"fake-aso".to_vec();
+        let art_digest = sha256_bytes(&artifact_bytes);
+        let manifest = CacheManifest {
+            modules: vec![ManifestModule {
+                logical_key: "main.as".to_string(),
+                path: src_path.clone(),
+                sha256: src_digest,
+            }],
+            artifact_sha256: art_digest,
+            created_unix_ms: now_unix_ms(),
+        };
+
+        let key = "ck1-0000000000000000000000000000000000000000000000000000000000000002";
+        publish(key, &manifest, &artifact_bytes).unwrap();
+
+        // Edit the source AFTER publish.
+        fs::write(&src_path, b"print('world')").unwrap();
+
+        match lookup(key) {
+            LookupResult::Miss => {} // correct: source changed
+            LookupResult::Hit { .. } => panic!("expected Miss after source edit"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_miss_after_artifact_corruption() {
+        let (_g, dir) = with_temp_cache("miss_corrupt");
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src_path = src_dir.join("main.as");
+        fs::write(&src_path, b"print('hi')").unwrap();
+
+        let src_digest = sha256_file(&src_path).unwrap();
+        let artifact_bytes: Vec<u8> = b"valid-aso".to_vec();
+        let art_digest = sha256_bytes(&artifact_bytes);
+        let manifest = CacheManifest {
+            modules: vec![ManifestModule {
+                logical_key: "main.as".to_string(),
+                path: src_path,
+                sha256: src_digest,
+            }],
+            artifact_sha256: art_digest,
+            created_unix_ms: now_unix_ms(),
+        };
+
+        let key = "ck1-0000000000000000000000000000000000000000000000000000000000000003";
+        publish(key, &manifest, &artifact_bytes).unwrap();
+
+        // Bit-flip the artifact.
+        let aso_path = slot_dir(key).join("program.aso");
+        let mut aso = fs::read(&aso_path).unwrap();
+        aso[0] ^= 0xFF;
+        fs::write(&aso_path, &aso).unwrap();
+
+        match lookup(key) {
+            LookupResult::Miss => {} // correct: corrupt artifact
+            LookupResult::Hit { .. } => panic!("expected Miss after artifact corruption"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_delete_slot_clears_entry() {
+        let (_g, dir) = with_temp_cache("delete_slot");
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src_path = src_dir.join("main.as");
+        fs::write(&src_path, b"print(1)").unwrap();
+
+        let src_digest = sha256_file(&src_path).unwrap();
+        let artifact_bytes: Vec<u8> = b"aso".to_vec();
+        let art_digest = sha256_bytes(&artifact_bytes);
+        let manifest = CacheManifest {
+            modules: vec![ManifestModule {
+                logical_key: "main.as".to_string(),
+                path: src_path,
+                sha256: src_digest,
+            }],
+            artifact_sha256: art_digest,
+            created_unix_ms: now_unix_ms(),
+        };
+
+        let key = "ck1-0000000000000000000000000000000000000000000000000000000000000004";
+        publish(key, &manifest, &artifact_bytes).unwrap();
+
+        // Confirm it's a Hit.
+        assert!(matches!(lookup(key), LookupResult::Hit { .. }));
+
+        // Delete the slot.
+        delete_slot(key);
+        assert!(!slot_dir(key).exists(), "slot dir must be gone after delete_slot");
+
+        // Now it's a Miss.
+        assert!(matches!(lookup(key), LookupResult::Miss));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compiled_dir_is_under_cache_root() {
+        let (_g, dir) = with_temp_cache("compiled_dir");
+        let root = cache_root();
+        assert_eq!(compiled_dir(), root.join("compiled"));
+        let _ = fs::remove_dir_all(dir);
     }
 }
