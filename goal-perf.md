@@ -178,16 +178,21 @@ stated, results are measured.
 
 ### Deployment & I/O throughput
 
-- 🔒 **WARM — Warm starts & durable-log throughput.** (a) A content-addressed compile cache for
-  `ascript run` (key: source digest + `ASO_FORMAT_VERSION` + flags; store under `$ASCRIPT_CACHE`)
-  — large projects re-run instantly. (b) A PGO feedback section in the module-archive manifest
-  (BNDL): `build --pgo <training-run>` records warmed shapes/IC layouts/arith kinds; the loader
-  pre-seeds the side tables — `--native --pgo` ships a warm-starting, sandboxed, tree-shaken
-  single binary. (c) Workflow-log group commit: batched/coalesced fsync with an explicit
-  durability mode knob (`workflow` stays default-durable; the 96%-fsync workload becomes a
-  policy choice, never a silent relaxation).
+- ✅ **WARM — Warm starts & durable-log throughput.** MERGED `02cf14c` (2026-06-17). Three
+  behaviour-invisible units; no `ASO_FORMAT_VERSION`/`ARCHIVE_VERSION` bump; tree-walker untouched.
+  (a) Content-addressed compile cache for `ascript run` (key: source + transitive module graph +
+  flags + lockfile; `$ASCRIPT_CACHE/compiled/`) — **fail-open + verify-on-hit**; `--no-cache` /
+  `ascript cache clean|dir`. **8.0× warm @ N=500, +60ms cold tax.** (b) PGO trailing `ASPGO` section
+  riding OUTSIDE the archive codec; `build --pgo` harvests warmed IC/arith/shape state, `seed_chunk`
+  re-installs behind every specialization guard — byte-INVISIBLE (seeded-PGO is the **445/0**
+  `vm_differential` axis); `ASCRIPT_NO_PGO`. Steady-state seeded/unseeded **1.007×** (no load-path
+  tax). (c) Workflow `Durability::{Fsync (default), Group, Buffered}` via one `record_event`
+  chokepoint; crc-framed group appender + torn-tail prefix repair; at-least-once. **Group ≈98.85×
+  faster than fsync** on per-commit shapes; default `"fsync"` ≈ baseline.
   - Spec: `superpowers/specs/2026-06-12-warm-starts-design.md`
   - Plan: `superpowers/plans/2026-06-12-warm-starts.md`
+  - Follow-ups (recorded, none silent): cache auto-GC; PGO profile merging; method-IC seeding;
+    group-mode background flusher.
 
 ### Evidence-gated (designed now, executed only when their gate opens — the JIT discipline)
 
@@ -721,6 +726,41 @@ stated, results are measured.
   as the cheap re-run path; the vendored gcmodule fork was spike-local (does not ship). A first-class honored
   evidence outcome (the VAL/NANB precedent). Evidence: `bench/REGION_RESULTS.md` + `bench/REGION_PROBE.md`;
   spec Status → evidence-rejected.
+
+- **WARM** — ✅ **MERGED to `main` (`--no-ff`, `02cf14c`).** Warm starts & durable-log throughput — three
+  independent, behaviour-invisible units; **no `ASO_FORMAT_VERSION` bump (stays 29), no `ARCHIVE_VERSION`
+  bump (stays 1), tree-walker behaviorally untouched** (`git diff main -- src/interp.rs` empty). **Unit A —
+  compile cache** (CLI-side, `src/cache/`): content-addressed cache under `$ASCRIPT_CACHE/compiled/`, keyed
+  on source + the transitive module graph (`collect_module_graph`, a parallel re-derivation of
+  `compile_path_module_set` kept ≡ by the §2.5 walk-drift tripwire) + flags + lockfile; `CompileCacheKey`
+  (`ck1-`). **Fail-open + verify-on-hit** — a corrupt/hostile entry degrades to a normal compile; applies to
+  the plain `.as`-on-VM path only. `--no-cache` / `ASCRIPT_NO_COMPILE_CACHE`; `ascript cache clean|dir`.
+  CLI-only → `vm_differential` untouched. **8.0× warm @ N=500, +60ms cold tax.** **Unit B — PGO**
+  (`src/vm/{pgo,run,shape}.rs`): `build --pgo` runs the program as a real training workload, harvests warmed
+  IC/adaptive-arith state from live `FnProto`s, appends a self-described `ASPGO` section riding **OUTSIDE**
+  the `ModuleArchive` codec (count-bomb / hostile-byte safe); `seed_chunk` re-installs behind every
+  specialization guard (DERIVED field index, digest-checked) — **byte-INVISIBLE** (a build without `--pgo`
+  is byte-identical, a seeded run byte-identical to unseeded across all engines). Seeded-PGO joins
+  `vm_differential` as the **445/0** axis (both configs); `ASCRIPT_NO_PGO`. Steady-state seeded/unseeded
+  **1.007×** (no archive-load-path tax — Gate 17). **Unit C — workflow durability** (`workflow`-gated;
+  `src/stdlib/workflow.rs` + CORE `src/det.rs`): `Durability::{Fsync (default, unchanged), Group, Buffered}`
+  via ONE `record_event` chokepoint; crc-framed group appender with torn-tail **prefix repair**; at-least-once
+  activity contract; `det.rs` chokepoint compiles under `--no-default-features`. **Group ≈98.85× faster than
+  fsync** on per-commit shapes; default `"fsync"` ≈ baseline; kill-9 battery green (×5 stable). **Whole-effort
+  holistic review (independent opus, ran the suites + reproduced edges): PASS on all 6 focus areas with ONE
+  blocker found + fixed in-branch failing-test-first** — `parse_hex32` panicked on a hostile manifest with a
+  multibyte char at an even byte offset (byte-length check but byte-slice); fixed with a `!s.is_ascii()` guard
+  + 3 regression tests (§2.9 "corrupt manifest → MISS, never crash"). **Two incidental pre-existing fixes**
+  (campaign rule #1): the `worker_serialize` fuzz target's NANB-era Value-API drift (swapped to the public
+  lowercase constructors — the isolated fuzz workspace now builds) and a missing `corpus/pgo_section/*`
+  gitignore stanza. **Gates:** clippy clean both configs; full suite both configs (47 binaries, 0 fail);
+  `vm_differential` **445/0** both configs; compile_cache 20/0, pgo 8/0, workflow_durability 21/0;
+  `pgo_section` fuzz 858K runs / 60s, 0 findings; spec/tw geomean **4.13×** (≥2×), DBG zero-cost **1.002×**;
+  WARM_RESULTS.md complete (3 unit tables + RSS + same-session methodology). **Spec-prose deltas recorded** (no
+  recorded-semantics change): `collect_module_graph` is a parallel re-derivation (not a literal extraction);
+  the §3 "ASO v27 unchanged" references were stale at authoring time (the constant was already 29 via ELIDE) —
+  the binding invariant "WARM introduces no constant change vs `main`" holds. Follow-ups recorded in the
+  roadmap (none silent): cache auto-GC, PGO profile merging, method-IC seeding, group-mode background flusher.
 
 ## Execution order
 
