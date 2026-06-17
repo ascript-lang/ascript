@@ -73,8 +73,12 @@ fn tmp_dir(tag: &str) -> TmpDir {
 /// [`serial_native`] (so concurrent builds don't overrun a space-constrained volume); this
 /// function does not lock itself, because some tests build twice and a self-lock would deadlock.
 fn build_native(src: &Path, out: &Path) {
+    // `--no-fetch` keeps these hermetic: the default ladder would otherwise try the network
+    // fetch rung (rung 3) before falling through to current_exe (rung 5). Skipping it goes
+    // straight to current_exe — the same stub these tests have always used — with no network
+    // dependency or latency. Default behavior at rung 5 is unchanged.
     let o = Command::new(bin())
-        .args(["build", "--native"])
+        .args(["build", "--native", "--no-fetch"])
         .arg(src)
         .arg("-o")
         .arg(out)
@@ -333,31 +337,67 @@ fn native_worker_bundle_parity() {
     let _ = std::fs::remove_dir_all(&empty);
 }
 
-/// `--target` is parsed-but-rejected in v1 with a SPECIFIC message naming the triple (not a
-/// generic clap error, not a silent ignore — Gate 6/10), and `--target` without `--native`
-/// is a usage error.
+/// RT §6.3 — the `--target` contract (REWRITTEN from the v1 rejection pin; coverage never
+/// shrinks). Three cases:
+///   (a) an UNKNOWN triple → error listing the supported target set;
+///   (b) a KNOWN triple with `--no-fetch` and no other rung → the ladder-exhausted error
+///       naming each rung's reason (a cross target has no sibling/current_exe fallback);
+///   (c) `--target` WITHOUT `--native` is still a clap usage error.
+/// (Case `--target <host> --stub <rt bin>` builds-and-runs — covered in tests/rt_stub.rs
+/// where a real `ascript-rt` is available via `ASCRIPT_RT_BIN`.)
 #[test]
-fn native_target_is_rejected_and_requires_native() {
+fn native_target_contract() {
+    let _serial = serial_native();
     let dir = tmp_dir("target");
     let src = write(&dir, "p.as", "print(1)\n");
 
-    // --target with --native → specific cross-compile Tier-1 error, exit 1.
+    // (a) Unknown triple → error listing the supported set, exit 1.
     let o = Command::new(bin())
-        .args(["build", "--native", "--target", "x86_64-unknown-linux-gnu"])
+        .args(["build", "--native", "--target", "sparc-unknown-weird-os"])
         .arg(&src)
         .arg("-o")
-        .arg(dir.join("x"))
+        .arg(dir.join("xa"))
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(1), "cross-compile must exit 1");
+    assert_eq!(o.status.code(), Some(1), "unknown target must exit 1");
     let msg = String::from_utf8_lossy(&o.stderr);
     assert!(
-        msg.contains("cross-compilation is not yet supported")
-            && msg.contains("x86_64-unknown-linux-gnu"),
-        "expected the specific cross-compile error naming the triple, got: {msg}"
+        msg.contains("unknown --target") && msg.contains("Supported targets"),
+        "expected the unknown-target error listing supported targets, got: {msg}"
+    );
+    // The error must actually name a real supported triple.
+    assert!(
+        msg.contains("x86_64-unknown-linux-musl"),
+        "supported-targets list must include the musl triple, got: {msg}"
     );
 
-    // --target WITHOUT --native → clap usage error (non-zero, not 1).
+    // (b) A KNOWN cross triple (not the host) with --no-fetch and no stub → the ladder is
+    // exhausted after the fetch rung (a cross target has no sibling/current_exe fallback);
+    // the error names the target and points at --stub/--exact, exit 1.
+    let cross = if cfg!(target_arch = "x86_64") {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    };
+    let o = Command::new(bin())
+        .args(["build", "--native", "--no-fetch", "--target", cross])
+        .arg(&src)
+        .arg("-o")
+        .arg(dir.join("xb"))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "unreachable cross target must exit 1");
+    let msg = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        msg.contains("no stub available for target") && msg.contains(cross),
+        "expected the ladder-exhausted error naming the target, got: {msg}"
+    );
+    assert!(
+        msg.contains("--stub") || msg.contains("--exact"),
+        "ladder-exhausted error must point at --stub/--exact, got: {msg}"
+    );
+
+    // (c) --target WITHOUT --native → clap usage error (non-zero, not 1).
     let o = Command::new(bin())
         .args(["build", "--target", "x86_64-unknown-linux-gnu"])
         .arg(&src)
@@ -365,6 +405,120 @@ fn native_target_is_rejected_and_requires_native() {
         .unwrap();
     assert!(!o.status.success(), "--target without --native must fail");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RT §5.4 rung 5 — the DEFAULT host build (no `--stub`/`--target`, and `--no-fetch` so the
+/// network rung never delays) ends at the `current_exe` rung: it still produces a runnable
+/// bundle (today's exact behavior) AND prints EXACTLY ONE stderr warning naming the fallback.
+/// Default behavior preservation is the load-bearing invariant of Task 7.
+#[test]
+fn native_current_exe_fallback_warns_once_and_runs() {
+    let _serial = serial_native();
+    let dir = tmp_dir("curexe_warn");
+    let src = write(&dir, "p.as", "print(\"from current_exe stub\")\n");
+    let app = dir.join("p_app");
+
+    // Copy the toolchain into an ISOLATED dir so `current_exe()` has NO `ascript-rt` sibling
+    // (a normal `cargo build` also produces `target/<profile>/ascript-rt`, which would
+    // otherwise win at rung 4). With no sibling and `--no-fetch`, the ladder must fall to
+    // rung 5 (current_exe) and emit the one-time warning — the path this test pins.
+    let iso = dir.join("ascript");
+    std::fs::copy(bin(), &iso).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&iso, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let o = Command::new(&iso)
+        .args(["build", "--native", "--no-fetch"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "default --native build must succeed: stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    let warn_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("bundling onto the full toolchain binary"))
+        .collect();
+    assert_eq!(
+        warn_lines.len(),
+        1,
+        "expected EXACTLY ONE current_exe fallback warning; got {}:\n{stderr}",
+        warn_lines.len()
+    );
+
+    // The bundle still runs (today's behavior preserved).
+    let cwd = tmp_dir("curexe_warn_cwd");
+    let r = run_bundle(&app, &cwd, &[]);
+    assert!(
+        r.status.success(),
+        "current_exe-stub bundle must run: stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout),
+        "from current_exe stub\n"
+    );
+}
+
+/// RT §5.4 rung 4 — when an `ascript-rt` sits BESIDE the toolchain binary, the ladder picks
+/// it (the dev-sibling rung) over `current_exe()`. Copies the toolchain AND an `ascript-rt`
+/// into an isolated dir, runs the toolchain copy to build a bundle, and asserts the build
+/// report names `stub: sibling` (and the bundle runs).
+#[test]
+fn native_sibling_rung_is_chosen() {
+    let _serial = serial_native();
+    let dir = tmp_dir("sibling_rung");
+    let src = write(&dir, "p.as", "print(\"via sibling stub\")\n");
+    let app = dir.join("p_app");
+
+    // Isolated dir with BOTH binaries side-by-side.
+    let iso_tc = dir.join("ascript");
+    let iso_rt = dir.join(if cfg!(windows) { "ascript-rt.exe" } else { "ascript-rt" });
+    std::fs::copy(bin(), &iso_tc).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_ascript-rt"), &iso_rt).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&iso_tc, &iso_rt] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let o = Command::new(&iso_tc)
+        .args(["build", "--native", "--no-fetch"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "sibling-rung build must succeed: stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("stub:    sibling"),
+        "the build report must name the sibling rung; stderr:\n{stderr}"
+    );
+    // And NO current_exe fallback warning (the sibling rung short-circuited it).
+    assert!(
+        !stderr.contains("bundling onto the full toolchain binary"),
+        "sibling rung must NOT emit the current_exe fallback warning; stderr:\n{stderr}"
+    );
+
+    let cwd = tmp_dir("sibling_rung_cwd");
+    let r = run_bundle(&app, &cwd, &[]);
+    assert!(r.status.success(), "sibling-stub bundle must run: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(String::from_utf8_lossy(&r.stdout), "via sibling stub\n");
 }
 
 /// RT Task 1 — the NORMAL `ascript build --help` surface must be untouched by the

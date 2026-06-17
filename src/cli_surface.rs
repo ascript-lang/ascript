@@ -122,10 +122,24 @@ pub enum Command {
         /// embedded VM still interprets. Host-only in v1.
         #[arg(long = "native")]
         native: bool,
-        /// Target triple for `--native` (host-only in v1 — parsed but rejected with
-        /// a clear error). Requires `--native`.
+        /// RT §6: target triple for a `--native` cross build (one of the 8 published
+        /// triples — an unknown triple is rejected with the supported set). A platform-
+        /// independent payload is appended onto a per-target stub resolved via the §5.4
+        /// ladder; a cross target needs `--stub` or a fetched stub (no local fallback).
+        /// `--target <host>` is equivalent to omitting it. Requires `--native`.
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
+        /// RT §5.4 rung 1: an explicit local `ascript-rt` stub to append the payload onto
+        /// (tests, air-gap, custom builds). Footer-checked (a pre-existing overlay is
+        /// stripped) and feature-verified via `--rt-info` when host-executable. Requires
+        /// `--native`.
+        #[arg(long = "stub", requires = "native")]
+        stub: Option<String>,
+        /// RT §5.4 rung 3: skip the network fetch rung entirely (availability fall-through
+        /// to the dev sibling / current_exe). Equivalent to `ASCRIPT_RT_NO_FETCH=1`.
+        /// Requires `--native`.
+        #[arg(long = "no-fetch", requires = "native")]
+        no_fetch: bool,
         /// RT §7: zstd-compress the embedded payload of a `--native` bundle (smaller
         /// artifact; the stub decompresses it at startup). Requires `--native`. The
         /// footer is marked version 2 / `FLAG_ZSTD`; an uncompressed bundle stays

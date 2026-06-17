@@ -2853,6 +2853,15 @@ pub struct NativeBuildOpts {
     /// (the stderr human report still prints for every `--native` build). `Some("-")`
     /// ⇒ stdout.
     pub report_json: Option<String>,
+    /// `--stub <path>` — an explicit local stub (RT §5.4 rung 1). `None` ⇒ walk the rest
+    /// of the ladder (cache/fetch/sibling/current_exe).
+    pub stub: Option<std::path::PathBuf>,
+    /// `--no-fetch` — skip the network rung (RT §5.4 rung 3). Availability fall-through.
+    pub no_fetch: bool,
+    /// `--strip` — omit the optional DBG debug section from the embedded payload (RT §2.3e:
+    /// a stripped bundle degrades to span-less panic messages). `false` ⇒ debug info is
+    /// included (today's default for `--native`).
+    pub strip: bool,
 }
 
 #[cfg(not(ascript_rt))]
@@ -2871,23 +2880,27 @@ pub struct NativeBuildOpts {
 /// RT §4.4/§4.6/§9.2: selects the logical stub tier from the program's std imports (the
 /// actual stub stays `current_exe()` until Task 7's ladder lands), prints the §4.6 stderr
 /// build report, and emits the §9.2 JSON report when `opts.report_json` is set.
-pub fn build_native(
+pub async fn build_native(
     file: &Path,
     out: Option<&Path>,
     caps: Option<crate::stdlib::caps::CapSet>,
     elide: bool,
     opts: &NativeBuildOpts,
 ) -> Result<std::path::PathBuf, AsError> {
-    let target = opts.target.as_deref();
     let compress = opts.compress;
-    // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
-    // naming the requested triple, never a silent ignore or a generic clap failure.
-    // (RT Task 7 replaces this rejection with the triple-validation + stub ladder.)
-    if let Some(t) = target {
-        return Err(AsError::new(format!(
-            "cross-compilation is not yet supported (BIN v1 bundles for the host platform \
-             only). Build on a `{t}` host, or omit `--target` to bundle for this host."
-        )));
+    let with_debug = !opts.strip;
+
+    // RT §6.3: validate the `--target` triple against the published set (§3.3). An unknown
+    // triple is rejected up front with an error LISTING the supported targets — never a
+    // silent ignore or a generic clap failure. A `--target` equal to the host is accepted
+    // and equivalent to omitting it.
+    if let Some(t) = &opts.target {
+        if !crate::rtstub::select::SUPPORTED_TARGETS.contains(&t.as_str()) {
+            return Err(AsError::new(format!(
+                "unknown --target '{t}': not a published target. Supported targets are: {}",
+                crate::rtstub::select::SUPPORTED_TARGETS.join(", ")
+            )));
+        }
     }
 
     // Step 1: the payload is the SAME verified bytes a `build` produces — a bare `ASO\0`
@@ -2895,7 +2908,7 @@ pub fn build_native(
     // `ASCRIPTA` archive embedding the whole import graph for a multi-module program
     // (so the bundled binary runs from an empty directory). The `stub || payload ||
     // footer` framing below is unchanged: the payload is opaque to the bundler.
-    let (mut archive, report) = compile_archive(file, true, elide)?;
+    let (mut archive, report) = compile_archive(file, with_debug, elide)?;
 
     // RT §4.1/§4.4: select the logical stub tier from the archive's OWN import facts
     // (chunk-level truth, never the source). This drives the build report's tier +
@@ -2944,7 +2957,7 @@ pub fn build_native(
         // from the as-passed `file` keeps the relative source path, so the single-module
         // bundle stays byte-identical to the pre-archive output. `build` is one-shot, so
         // re-compiling this one file is negligible.
-        compile_verified_aso_bytes(file, true, elide)? // bare ASO\0 — byte-identical to today
+        compile_verified_aso_bytes(file, with_debug, elide)? // bare ASO\0 — byte-identical to today
     };
 
     let payload_uncompressed_len = payload.len() as u64;
@@ -2967,26 +2980,60 @@ pub fn build_native(
         (payload, 0u16)
     };
 
-    // Step 2: the stub is a byte-for-byte copy of the running runtime — but if THIS binary is
-    // itself a bundle (a double-bundle: someone ran a bundled `ascript` as the builder, or a
-    // future self-rebundle), strip the existing overlay first so the new output carries exactly
-    // ONE payload+footer and is not double-sized. The clean stub is everything before the
-    // existing payload offset; the recovered prefix is a footer-free runtime by construction.
-    let exe = std::env::current_exe()
-        .map_err(|e| AsError::new(format!("cannot locate the running executable: {e}")))?;
-    let raw = std::fs::read(&exe)
-        .map_err(|e| AsError::new(format!("cannot read the runtime {}: {}", exe.display(), e)))?;
-    let stub = match crate::bundle::read_bundle_footer(&raw) {
-        Some((offset, _len)) => raw[..offset].to_vec(), // strip old overlay → clean runtime
-        None => raw,
+    // Step 2: resolve the stub the payload is appended to via the RT §5.4 five-rung ladder
+    // (--stub → cache → fetch → dev sibling → current_exe). The resolver returns a CLEAN
+    // runtime path (any pre-existing overlay already stripped exactly as the old current_exe
+    // path did): for the default host build with no --stub/--target this ends at rung 5 =
+    // today's exact current_exe behavior (+ a one-time warning). Integrity failures (a
+    // tampered fetched stub, a tier-insufficient --stub) ABORT here; availability failures
+    // fall through inside `resolve_stub`.
+    let resolve_opts = crate::rtstub::select::ResolveOpts {
+        target: opts.target.clone(),
+        tier: selection.tier,
+        stub: opts.stub.clone(),
+        no_fetch: opts.no_fetch,
+        required_features: selection.required.clone(),
+        demanding: std_imports
+            .iter()
+            .filter_map(|spec| {
+                crate::rtstub::std_features::STD_MODULE_FEATURES
+                    .iter()
+                    .find(|(m, _)| *m == spec.as_str())
+                    .and_then(|(_, f)| f.map(|feat| (spec.clone(), feat.to_string())))
+            })
+            .collect(),
     };
-    // RT §9.2: identity of the (clean) stub the payload is appended to. Today's origin is
-    // always `current_exe` (Task 7's ladder adds cache/fetch/--stub/--exact origins).
-    let stub_sha256 = hex_digest(&sha256_bytes(&stub));
+    let resolved = crate::rtstub::select::resolve_stub(&resolve_opts)
+        .await
+        .map_err(AsError::new)?;
+    // The resolved path is a clean runtime (footer-free) — load its bytes to append onto.
+    let stub = std::fs::read(&resolved.bytes_path).map_err(|e| {
+        AsError::new(format!(
+            "cannot read the resolved stub {}: {}",
+            resolved.bytes_path.display(),
+            e
+        ))
+    })?;
+    // RT §6.2 / BIN sign-before-append rule: we ONLY ad-hoc sign locally for the
+    // current_exe rung (a stub produced on this mac host whose signature the append would
+    // otherwise invalidate). A fetched / `--stub` / sibling stub is appended AS-IS — those
+    // arrive pre-signed (release-time CI, or the user's own build), and the sign-before-
+    // append rule means an append never invalidates a signature computed over the clean
+    // stub's [0, stub_len). Signing someone else's stub here would re-sign over our own
+    // host identity, which is both wrong for a cross target and unnecessary.
+    let sign_locally = resolved.origin == "current_exe";
+    let stub_sha256 = resolved.sha256.clone();
     let stub_size = stub.len() as u64;
+    let stub_origin = resolved.origin;
     let payload_sha256 = hex_digest(&sha256_bytes(&payload));
 
-    // Step 3: choose the output path (source stem; `.exe` on Windows; NEVER `.aso`).
+    // Step 3: choose the output path (source stem; `.exe` for a *-windows-* TARGET regardless
+    // of host; NEVER `.aso`).
+    let windows_target = opts
+        .target
+        .as_deref()
+        .map(|t| t.contains("windows"))
+        .unwrap_or(cfg!(windows));
     let out_path = match out {
         Some(p) => p.to_path_buf(),
         None => {
@@ -2995,7 +3042,7 @@ pub fn build_native(
                 .map(|s| s.to_owned())
                 .unwrap_or_else(|| std::ffi::OsString::from("app"));
             let mut p = std::path::PathBuf::from(stem);
-            if cfg!(windows) {
+            if windows_target {
                 p.set_extension("exe");
             }
             p
@@ -3043,7 +3090,16 @@ pub fn build_native(
             AsError::new(format!("cannot chmod +x {}: {}", tmp_path.display(), e))
         })?;
     }
-    crate::bundle::adhoc_sign_macos(&tmp_path).map_err(AsError::new)?;
+    // RT §6.2 — the BIN sign-before-append rule: ad-hoc sign ONLY the current_exe rung (a
+    // stub freshly copied from this running mac binary, whose signature the append would
+    // otherwise invalidate → SIGKILL on arm64). Fetched / `--stub` / sibling stubs are
+    // appended AS-IS: they arrive pre-signed, and because the signature's `codeLimit` covers
+    // only the clean stub's [0, stub_len), an append to the trailing overlay never
+    // invalidates it. Signing them here would re-stamp our host identity (wrong for a cross
+    // target) and is unnecessary. A no-op on non-macOS regardless.
+    if sign_locally {
+        crate::bundle::adhoc_sign_macos(&tmp_path).map_err(AsError::new)?;
+    }
 
     // Step 5: append `payload || footer` AFTER the (now-signed) stub. `payload_offset` is the
     // on-disk size of the signed stub — signing rewrites `__LINKEDIT`, so it may differ from
@@ -3111,7 +3167,7 @@ pub fn build_native(
             sha256: payload_sha256,
         },
         stub: crate::rtstub::report::StubInfo {
-            origin: "current_exe",
+            origin: stub_origin,
             sha256: stub_sha256,
             size: stub_size,
         },

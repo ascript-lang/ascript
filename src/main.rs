@@ -518,6 +518,8 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
+            stub,
+            no_fetch,
             compress,
             tier,
             report_json,
@@ -560,16 +562,18 @@ async fn real_main() -> ExitCode {
                         }
                     },
                 };
-                // BIN/RT: bundle a self-contained native executable. `--target` is
-                // host-only in v1 (build_native returns the specific Tier-1 error until
-                // RT Task 7 un-rejects it).
+                // BIN/RT: bundle a self-contained native executable, resolving the stub
+                // via the §5.4 ladder (--stub → cache → fetch → sibling → current_exe).
                 let opts = ascript::NativeBuildOpts {
                     target: target.clone(),
                     tier: parsed_tier,
                     compress,
                     report_json: report_json.clone(),
+                    stub: stub.as_deref().map(std::path::PathBuf::from),
+                    no_fetch,
+                    strip,
                 };
-                match ascript::build_native(src, out_path, caps, elide, &opts) {
+                match ascript::build_native(src, out_path, caps, elide, &opts).await {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
                     Err(e) => {
                         ascript::diagnostics::report(&e);
