@@ -4667,9 +4667,8 @@ pub async fn pgo_adversarial_run_from_source(
     src: &str,
     junk: &[u8],
 ) -> Result<(String, Option<i32>), AsError> {
-    use crate::vm::adapt::{ArithCache, ArithKind, GlobalCache};
     use crate::vm::chunk::FnProto;
-    use crate::vm::ic::InlineCache;
+    use crate::vm::pgo::{PgoModule, PgoProto, PgoSection};
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
 
@@ -4679,59 +4678,134 @@ pub async fn pgo_adversarial_run_from_source(
     });
     let chunk = crate::compile::compile_source(src)
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let entry_bytes = chunk
+        .to_bytes_with_debug(true)
+        .map_err(|e| AsError::new(format!("cannot serialize compiled chunk: {e}")))?;
+    let entry_key = "<input>".to_string();
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
 
-    // Inject junk seeds into the entry chunk's side tables. We derive offsets/kinds/shapes
-    // from `junk` (a cheap LCG over the bytes), addressing the FULL code range so the
-    // injections hit real instruction boundaries AND mid-instruction garbage offsets alike.
-    let code_len = chunk.code.len().max(1);
+    // Derive a pseudo-random stream from `junk` (a cheap LCG over the bytes).
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     for &b in junk {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(b as u64 + 1);
     }
-    let mut next = || {
+    let mut next = move || {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         state
     };
-    // A bounded number of injections so a giant `junk` buffer can't blow up runtime.
-    let injections = (junk.len() % 64) + 8;
-    for _ in 0..injections {
-        let off = (next() as usize) % code_len;
-        match next() % 3 {
-            0 => {
-                // Arith junk: an arbitrary (possibly nonsensical) committed kind at `off`.
-                let kind = match next() % 4 {
-                    0 => ArithKind::Int,
-                    1 => ArithKind::Number,
-                    2 => ArithKind::Decimal,
-                    _ => ArithKind::ConcatStr,
-                };
-                chunk.set_arith_cache(off, ArithCache::Specialized { kind });
-            }
-            1 => {
-                // Field-IC junk: an arbitrary shape id → arbitrary index Mono entry. The
-                // run loop's shape-id guard rejects it unless the receiver's actual shape
-                // happens to equal this junk id (astronomically unlikely; and even then the
-                // index is re-validated against the live slab on the generic deopt path).
-                let mut ic = InlineCache::Cold;
-                ic.record(next() as u32, next() as u32);
-                chunk.set_field_ic(off, ic);
-            }
-            _ => {
-                // Global-cache junk: a bogus cached value at an arbitrary version. The
-                // version guard (current `global_version`) rejects a stale seed; a matching
-                // version still routes through the builtin/user-global resolution that the
-                // generic path uses, so a wrong value can only manifest as a guard miss.
-                let v = match next() % 3 {
-                    0 => crate::value::Value::int(next() as i64),
-                    1 => crate::value::Value::bool_(next() % 2 == 0),
-                    _ => crate::value::Value::builtin(Rc::from("not_a_real_builtin_xyz")),
-                };
-                chunk.set_global_cache(off, GlobalCache::set(v, next()));
-            }
-        }
+
+    // ── Build a JUNK PgoSection and seed it through the REAL `seed_chunk` ─────────
+    //
+    // WHY through `seed_chunk` (not raw `set_field_ic`): the §3.3 wire format carries NO field
+    // index — the seeder DERIVES the index from a key list, and a field-IC shape id is minted
+    // by INTERNING that key list. So the only states a (corrupt) profile can ever express are
+    // (junk OFFSET, junk arith KIND tag, junk KEY-LIST, junk KEY-LIST-INDEX reference, junk
+    // GLOBAL offset) — exactly what §5 names ("offset, kind/key-list/builtin-marker"). Raw
+    // `set_field_ic` with a fabricated (shape_id, index) pair would test a state the wire
+    // format CANNOT produce (a shape id that collides with a live shape but whose layout is
+    // NOT that key list — the shape invariant the seeder relies on), which is not the threat
+    // model. We therefore fuzz the seeder + run-loop guards AS SHIPPED: a junk profile in, the
+    // real derivation + interning + guards, byte-identical output out.
+    //
+    // The junk KEY LISTS deliberately MIX (a) full real-looking multi-field layouts that
+    // intern-COLLIDE with common object shapes (so the derived index is genuinely exercised —
+    // INCLUDING reversed/permuted orders, which a broken derivation that trusts the key-list
+    // index instead of deriving the name's position would mis-map → the liveness-relevant
+    // case) and (b) garbage names (so most lists intern to fresh non-colliding shapes →
+    // shape-miss). Both are corrupt-profile-expressible (interned → a real shape id).
+    let mut key_lists: Vec<Vec<String>> = vec![
+        // Real layouts the dangerous-shape corpus uses, in RECEIVER (insertion) ORDER so they
+        // intern to the SAME shape id as the live object → the seeder actually installs at the
+        // GetProp site and the DERIVED index is genuinely exercised. They sit at LIST indices
+        // (0,1,2,…) deliberately DIFFERENT from the field positions, so a broken derivation
+        // that trusted the key-list index instead of deriving the name's position would
+        // mis-map (e.g. `.c` in `{a,b,c}` → list-idx 0 ≠ field pos 2) → the liveness case.
+        // Also reversed orders (intern to a DIFFERENT shape → shape-miss, the other path).
+        vec!["a".into(), "b".into(), "c".into()],
+        vec!["x".into(), "y".into()],
+        vec!["k".into(), "m".into()],
+        vec!["first".into(), "second".into(), "third".into()],
+        vec!["c".into(), "b".into(), "a".into()],
+        vec!["b".into(), "a".into()],
+    ];
+    let junk_names = ["a", "b", "c", "d", "x", "y", "z", "k", "m", "first", "second", "third", "qqzz", "__nope__"];
+    let n_extra = (next() % 5) as usize;
+    for _ in 0..n_extra {
+        let len = (next() % 4) as usize; // 0..3 keys
+        key_lists.push(
+            (0..len)
+                .map(|_| junk_names[(next() as usize) % junk_names.len()].to_string())
+                .collect(),
+        );
     }
+    let n_lists = key_lists.len();
+
+    // Build junk PgoProtos. For each proto we target BOTH (a) the REAL op sites (so the seeder
+    // installs where derivation + guards are exercised — every GetProp/SetProp gets a field
+    // record referencing ALL key-lists, so a matching layout DOES install a derived index;
+    // every arith op gets a junk kind tag; every GetGlobal gets a global record) and (b) random
+    // offsets/indices for breadth. `all_lists` references every key-list, including the
+    // receiver-order layouts that intern-collide with the live objects.
+    let all_lists: Vec<u32> = (0..n_lists as u32).collect();
+    let build_proto =
+        |target: &crate::vm::chunk::Chunk, path: Vec<u32>, n: &mut dyn FnMut() -> u64| -> PgoProto {
+            use crate::vm::opcode::Op;
+            let code: Vec<u8> = target.code.to_vec();
+            let tlen = code.len().max(1) as u32;
+            let mut arith: Vec<(u32, u8)> = Vec::new();
+            let mut fields: Vec<(u32, Vec<u32>)> = Vec::new();
+            let mut globals: Vec<u32> = Vec::new();
+            // (a) Real op sites.
+            let mut off = 0usize;
+            while off < code.len() {
+                let Some(op) = Op::from_u8(code[off]) else { break };
+                if matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow) {
+                    arith.push((off as u32, (n() % 6) as u8)); // junk kind tag 0..5 (some invalid)
+                }
+                if matches!(op, Op::GetProp | Op::SetProp) {
+                    fields.push((off as u32, all_lists.clone()));
+                }
+                if matches!(op, Op::GetGlobal) {
+                    globals.push(off as u32);
+                }
+                off += 1 + op.operand_width();
+            }
+            // (b) Random breadth (mid-instruction offsets, random list-index refs).
+            for _ in 0..(n() % 6) {
+                arith.push(((n() as u32) % tlen, (n() % 6) as u8));
+            }
+            for _ in 0..(n() % 6) {
+                let n_idx = (n() % 3) as usize;
+                let idxs = (0..n_idx).map(|_| (n() as u32) % (n_lists as u32 + 2)).collect();
+                fields.push(((n() as u32) % tlen, idxs));
+            }
+            for _ in 0..(n() % 6) {
+                globals.push((n() as u32) % tlen);
+            }
+            PgoProto {
+                path,
+                arith,
+                fields,
+                globals,
+            }
+        };
+    let mut protos = vec![build_proto(&chunk, Vec::new(), &mut next)];
+    for i in 0..chunk.protos.len() {
+        protos.push(build_proto(&chunk.protos[i].chunk, vec![i as u32], &mut next));
+    }
+    // Occasionally point a proto path out of range (the seeder must skip it).
+    protos.push(build_proto(&chunk, vec![9999], &mut next));
+
+    let section = PgoSection {
+        key_lists,
+        modules: vec![PgoModule {
+            module_key: entry_key.clone(),
+            chunk_sha256: entry_sha256,
+            protos,
+        }],
+    };
 
     let proto = Rc::new(FnProto {
         chunk,
@@ -4751,6 +4825,9 @@ pub async fn pgo_adversarial_run_from_source(
     interp.install_self();
     interp.set_worker_source(src);
     let vm = Vm::new(interp.clone());
+    // Seed the JUNK section through the REAL seeder (derivation + interning + digest gate) —
+    // gated on `vm.specialize` + `seed=true`. The run-loop guards must absorb every lie.
+    vm.seed_entry_from_section(&proto.chunk, &section, &entry_key, &entry_sha256, true);
     let closure = Closure::new(proto.clone());
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
     let local = tokio::task::LocalSet::new();

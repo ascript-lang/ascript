@@ -238,9 +238,11 @@ proptest! {
         let src = prog.source.clone();
         let junk2 = junk.clone();
         let (baseline, adversarial) = ascript::run_on_worker_stack(move || async move {
-            // The unseeded reference is the tree-walker (the oracle the whole differential
-            // is anchored on); the candidate is the junk-seeded specialized VM.
-            let base = project(ascript::run_source_exit(&src).await);
+            // The unseeded reference is the plain specialized VM (the SAME CST front-end the
+            // seam compiles through — so an invalid program's PARSE-error message matches; the
+            // tree-walker would diverge on the SP1 cross-front-end message, a false positive).
+            // The whole-corpus tree-walker oracle is the seeded-differential mode elsewhere.
+            let base = project(ascript::vm_run_source(&src).await);
             let adv = project(ascript::pgo_adversarial_run_from_source(&src, &junk2).await);
             (base, adv)
         });
@@ -276,12 +278,76 @@ fn adversarial_seed_fixed_battery() {
         .collect();
     ascript::run_on_worker_stack(move || async move {
         for (src, junks) in &cases {
-            let base = project(ascript::run_source_exit(src).await);
+            // Unseeded baseline = the plain specialized VM (same CST front-end as the seam).
+            let base = project(ascript::vm_run_source(src).await);
             for junk in junks {
                 let adv = project(ascript::pgo_adversarial_run_from_source(src, junk).await);
                 assert_eq!(
                     base, adv,
                     "adversarial junk seed changed output (a missing guard)\n--- program ---\n{src}\n--- junk len {} ---\n  unseeded (tw): {base:?}\n  junk-seeded:   {adv:?}",
+                    junk.len()
+                );
+            }
+        }
+    });
+}
+
+/// WARM B §5-B(b) — the DANGEROUS-SHAPE adversarial battery (the LOAD-BEARING guard test).
+///
+/// The generator-driven battery above gives breadth but rarely emits the precise shape that
+/// makes a wrong seed OBSERVABLE: a multi-field object/instance whose fields hold DISTINCT
+/// values, read in a hot loop, so a mis-derived field index (or a wrong arith kind, or a stale
+/// global) would produce a DIFFERENT number. The junk is fed through the REAL seeder
+/// (`pgo_adversarial_run_from_source` builds a junk `PgoSection` — junk offsets, junk arith
+/// kind tags, junk key-lists, junk key-list-index references — and seeds it via the production
+/// `seed_chunk`, the only states a corrupt `.aso` PGO section can express; §3.3 carries NO
+/// field index, so raw `set_field_ic` would test a state the wire format cannot produce). The
+/// junk key-lists INCLUDE the corpus's real receiver layouts in receiver order (so they
+/// intern-collide and the DERIVED index is genuinely exercised) at list-indices ≠ the field
+/// positions. With MANY junk buffers each, a broken derivation / missing guard (the §3.3
+/// keystone) flips the output.
+///
+/// **Sabotage-verified (the battery is NOT asleep):** replacing the derivation
+/// `ic.record(shape, pos)` with `ic.record(shape, li)` (trust the key-list index instead of
+/// deriving the name's position — the exact §3.3 bug) makes the `{a,b,c}` program flip
+/// 36000→30000 here and this test FAILS; reverting restores PASS.
+#[test]
+fn adversarial_seed_dangerous_shapes() {
+    // Programs whose output is SENSITIVE to a wrong field index / arith kind / global value.
+    let progs: &[&str] = &[
+        // Multi-field object, distinct values, hot read of every field.
+        "let o = { a: 100, b: 200, c: 300 }\nlet s = 0\nfor (i in 0..60) { s = s + o.a + o.b + o.c }\nprint(s)",
+        // Two objects of the SAME shape but different values (shape-id collision pressure).
+        "let p = { x: 1, y: 2 }\nlet q = { x: 10, y: 20 }\nlet s = 0\nfor (i in 0..60) { s = s + p.x + p.y + q.x + q.y }\nprint(s)",
+        // Instance fields (the Instance arm of ic_get_field).
+        "class Pt { a: number\n b: number\n fn init(a, b) { self.a = a\n self.b = b } }\nlet p = Pt(7, 9)\nlet s = 0\nfor (i in 0..60) { s = s + p.a + p.b }\nprint(s)",
+        // Hot int arith (arith cache — a wrong committed kind must deopt).
+        "let s = 0\nfor (i in 1..=200) { s = s + i * 3 - 2 }\nprint(s)",
+        // Hot float arith (a wrong Int seed on a float site must deopt).
+        "let s = 0.0\nfor (i in 1..=200) { s = s + 1.5 }\nprint(s)",
+        // Builtin globals in a loop (global cache — a stale/bogus value must miss).
+        "let s = 0\nfor (i in 0..60) { s = s + len(\"abcd\") + abs(-3) }\nprint(s)",
+        // Mixed: object field + arith + builtin global together.
+        "fn f(n) { return n * 2 + 1 }\nlet o = { k: 5, m: 11 }\nlet s = 0\nfor (i in 0..60) { s = s + f(i) + o.k + o.m + abs(-2) }\nprint(s)",
+        // Object whose field ORDER differs from another (index-position pressure).
+        "let o = { first: 1000, second: 2000, third: 3000 }\nlet t = { third: 9, first: 8, second: 7 }\nprint(o.first + o.second + o.third + t.first + t.second + t.third)",
+    ];
+    // 256 distinct junk buffers per program — enough to cover the colliding-shape /
+    // in-range-wrong-index combinations across the whole stream.
+    let junks: Vec<Vec<u8>> = (0u64..256)
+        .map(|k| seed_bytes(k.wrapping_mul(2654435761).wrapping_add(1), 56))
+        .collect();
+    let progs: Vec<String> = progs.iter().map(|s| s.to_string()).collect();
+    ascript::run_on_worker_stack(move || async move {
+        for src in &progs {
+            // Unseeded baseline = the plain specialized VM (same CST front-end as the seam);
+            // every dangerous-shape program is valid AScript so the VM output is concrete.
+            let base = project(ascript::vm_run_source(src).await);
+            for junk in &junks {
+                let adv = project(ascript::pgo_adversarial_run_from_source(src, junk).await);
+                assert_eq!(
+                    base, adv,
+                    "a junk seed CHANGED output on a dangerous shape — a run-loop guard is missing (UNSOUND)\n--- program ---\n{src}\n--- junk len {} ---\n  unseeded (tw): {base:?}\n  junk-seeded:   {adv:?}",
                     junk.len()
                 );
             }
