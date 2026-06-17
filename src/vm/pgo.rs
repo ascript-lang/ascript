@@ -333,9 +333,7 @@ impl<'a> PgoReader<'a> {
     fn u32_clamped(&mut self) -> Option<u32> {
         let v = self.u32_raw()?;
         if v as usize > MAX_PGO_ITEMS {
-            // Hostile count: clamp to MAX_PGO_ITEMS so the with_capacity call above
-            // can't blow up, then the loop's take() calls will fail cleanly.
-            // Actually we return None immediately — it's cleaner and faster.
+            // Hostile count-bomb: reject immediately rather than reserving capacity for it.
             return None;
         }
         Some(v)

@@ -335,8 +335,13 @@ fn hex_digest(d: &[u8; 32]) -> String {
 }
 
 /// Parse a hex-encoded 32-byte digest. Returns `None` on any format error.
+///
+/// The `is_ascii` guard is load-bearing: the manifest is an attacker-writable file, and a
+/// non-ASCII 64-*byte* string would put the `&s[i*2..i*2+2]` slices on a non-char boundary and
+/// panic. A genuine hex digest is always ASCII, so this rejects exactly the hostile inputs (WARM
+/// §2.9: a corrupt manifest must MISS, never crash).
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    if s.len() != 64 || !s.is_ascii() {
         return None;
     }
     let mut out = [0u8; 32];
@@ -1448,5 +1453,38 @@ mod tests {
         let root = cache_root();
         assert_eq!(compiled_dir(), root.join("compiled"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // ── hostile-manifest hardening (WARM §2.9: a corrupt manifest must MISS, never panic) ──
+
+    #[test]
+    fn parse_hex32_rejects_a_multibyte_string_without_panicking() {
+        // 64 BYTES (61 'a' + the 3-byte '€') passes a naive byte-length check, but a
+        // byte-slice at an even offset would land inside the multibyte char and panic.
+        // An attacker writes this into a manifest under $ASCRIPT_CACHE/compiled/.
+        let hostile = format!("{}€", "a".repeat(61));
+        assert_eq!(hostile.len(), 64, "precondition: 64 bytes, fewer chars");
+        assert!(!hostile.is_char_boundary(62), "precondition: slice would split the char");
+        // Must return None (→ Miss → recompile), never panic.
+        assert_eq!(parse_hex32(&hostile), None);
+    }
+
+    #[test]
+    fn parse_hex32_accepts_a_genuine_digest_and_rejects_short_or_nonhex() {
+        let good = hex_digest(&[0xab; 32]);
+        assert_eq!(parse_hex32(&good), Some([0xab; 32]));
+        assert_eq!(parse_hex32("abcd"), None); // too short
+        assert_eq!(parse_hex32(&"z".repeat(64)), None); // 64 ASCII bytes, non-hex
+    }
+
+    #[test]
+    fn from_json_with_a_multibyte_sha_field_misses_instead_of_crashing() {
+        // The full parse path: a hostile manifest must parse to None (→ cache Miss),
+        // not unwind. `artifact_sha256` carries the 64-byte multibyte string.
+        let hostile_sha = format!("{}€", "a".repeat(61));
+        let json = format!(
+            r#"{{"artifact_sha256":"{hostile_sha}","modules":[],"created_unix_ms":1700000000}}"#,
+        );
+        assert!(CacheManifest::from_json(&json).is_none());
     }
 }
