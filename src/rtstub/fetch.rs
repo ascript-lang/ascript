@@ -203,7 +203,19 @@ async fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("cannot read {local}: {e}"));
     }
 
-    let resp = reqwest::get(url)
+    // RT §5.4: this fetch runs on the DEFAULT `build --native` path (rung 3, before the
+    // current_exe fall-through), so a silently-unreachable host (firewall/captive portal
+    // dropping packets) must NOT hold the build hostage at the OS TCP-connect timeout
+    // (~75s). A short connect timeout fails fast to the availability fall-through; the
+    // overall timeout stays generous enough to download a multi-MB stub on a slow link.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("failed to fetch {url}: {e}"))?;
     if !resp.status().is_success() {
