@@ -264,4 +264,40 @@ mod tests {
         assert_eq!(FOOTER_SIZE, 32);
         assert_eq!(write_footer(MIN_STUB_SIZE, 0, AV).len(), FOOTER_SIZE);
     }
+
+    /// RT §7.2 baseline pin: the SHIPPED reader accepts any bundle_version and any
+    /// reserved value (only length + magic are checked by `from_bytes`).
+    #[test]
+    fn shipped_reader_ignores_version_and_reserved() {
+        let mut f = BundleFooter {
+            payload_offset: MIN_STUB_SIZE,
+            payload_len: 8,
+            aso_version: AV,
+            bundle_version: 99,
+            reserved: 0xFFFF,
+            magic: BUNDLE_MAGIC,
+        };
+        assert!(
+            BundleFooter::from_bytes(&f.to_bytes()).is_some(),
+            "reader should accept bundle_version=99 reserved=0xFFFF"
+        );
+        f.reserved = 0;
+        assert!(
+            BundleFooter::from_bytes(&f.to_bytes()).is_some(),
+            "reader should accept bundle_version=99 reserved=0"
+        );
+    }
+
+    /// RT §6.1: writers have only ever emitted bundle_version=1, reserved=0.
+    #[test]
+    fn write_footer_emits_version1_reserved0() {
+        let b = write_footer(MIN_STUB_SIZE, 4, AV);
+        let f = BundleFooter::from_bytes(&b).unwrap();
+        assert_eq!(
+            (f.bundle_version, f.reserved),
+            (BUNDLE_FOOTER_VERSION, 0),
+            "write_footer must emit version={BUNDLE_FOOTER_VERSION} reserved=0"
+        );
+        assert_eq!(BUNDLE_FOOTER_VERSION, 1, "BUNDLE_FOOTER_VERSION constant must be 1");
+    }
 }
