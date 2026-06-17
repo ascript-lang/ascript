@@ -4630,6 +4630,25 @@ pub async fn pgo_seeded_install_count_from_source(src: &str) -> Result<usize, As
     Ok(handle.installed())
 }
 
+/// WARM B §6 bench seam — the UNSEEDED counterpart of [`pgo_seeded_run_from_source`]: build
+/// the SAME PGO-carrying artifact, but load it with seeding OFF (`seed=false`, the
+/// `ASCRIPT_NO_PGO` kill-switch path). The cold-start microbench (`vm_bench`) times this
+/// against the seeded run on the SAME artifact to measure the warm-up window the seeds
+/// eliminate, in-process (unmasked by process startup). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_unseeded_run_from_source(src: &str) -> Result<(String, Option<i32>), AsError> {
+    let artifact = pgo_build_artifact_from_source(src).await?;
+    let handle = pgo_seed_for_test(&artifact, /*seed=*/ false, /*specialize=*/ true)?;
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    handle
+        .run_with_exit()
+        .await
+        .map_err(|e| e.with_source(src_info))
+}
+
 /// WARM B §5-B(b) — the ADVERSARIAL-SEED axis (fuzzing the GUARDS, not the codec).
 ///
 /// Compiles `src` to an entry chunk, then injects PSEUDO-RANDOM JUNK directly into the

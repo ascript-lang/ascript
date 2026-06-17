@@ -346,5 +346,209 @@ with open(out_path, "w") as f:
 print(f"==> Written: {out_path}")
 PYEOF
 
+# ===========================================================================
+# WARM B -- PGO seeded-vs-unseeded A/B (cold-start delta + steady-state ~1.0x
+# + section-absent ~1.0x). Honest framing per spec 3.7: PGO's win is warm-up
+# elimination (cold-start / first-N-requests), NOT steady-state.
+#
+# Mechanism: `build --pgo` writes a trailing PGO section into the .aso archive;
+# at run time, ASCRIPT_NO_PGO=1 SKIPS seeding at load (the kill switch), so the
+# SAME artifact run with/without that env var is the seeded-vs-unseeded A/B.
+# A plain `build` (no --pgo) is the SECTION-ABSENT (pre-WARM) baseline.
+# ===========================================================================
+
+echo ""
+echo "==> WARM B: PGO seeded-vs-unseeded A/B"
+
+# B-time_run: run one timed invocation of an already-built .aso with the given
+# env prefix; prints "real_ms stdout".  (No cache; .aso never consults it.)
+btime_run() {
+  local envprefix="$1"  # e.g. "" or "ASCRIPT_NO_PGO=1"
+  local aso="$2"
+  local tmpout tmperr
+  tmpout="$(mktemp /tmp/ascript_bbench_out.XXXXXX)"
+  tmperr="$(mktemp /tmp/ascript_bbench_err.XXXXXX)"
+  env ${envprefix} /usr/bin/time -l "${BINARY}" run "${aso}" \
+    >"${tmpout}" 2>"${tmperr}" || true
+  local ms
+  ms="$(python3 - "${tmperr}" <<'PYEOF'
+import re, sys
+txt = open(sys.argv[1]).read()
+m = re.search(r'([0-9]+\.[0-9]+)\s+real', txt)
+print(int(round(float(m.group(1)) * 1000)) if m else 0)
+PYEOF
+)"
+  local outline
+  outline="$(tr '\n' '|' < "${tmpout}" | sed 's/|$//')"
+  rm -f "${tmpout}" "${tmperr}"
+  printf "%s %s\n" "${ms}" "${outline}"
+}
+
+# A short-lived CLI workload (the cold-start regime where seeding the side tables
+# wins warm-up iterations). Sized so the run is resolvable above the binary's
+# fixed startup (process launch dominates a truly tiny script, masking the delta).
+WB_CLI="/tmp/warm_b_cli.as"
+cat > "${WB_CLI}" <<'ASEOF'
+import * as math from "std/math"
+let sum = 0
+for (i in 1..=4000) { sum = sum + i * 2 - 1 }
+let o = { x: 10, y: 20, z: 30 }
+let acc = 0
+for (j in 0..3000) { acc = acc + o.x + o.y + o.z + math.abs(o.x - j) }
+print(`${sum} ${acc}`)
+ASEOF
+
+# A first-N-requests server-shaped workload (adapted from
+# bench/profiling/server_request.as) — N small so it models the warm-up window,
+# not steady state.
+WB_SRV="/tmp/warm_b_server.as"
+cat > "${WB_SRV}" <<'ASEOF'
+import * as json from "std/json"
+fn handle_get(req) { return { status: 200, body: { id: req.id, ok: true } } }
+fn handle_put(req) { return { status: 200, body: { id: req.id, saved: req.payload } } }
+fn handle_missing(req) { return { status: 404, body: { error: "no route" } } }
+let routes = { "GET /item": handle_get, "PUT /item": handle_put }
+let bytes = 0
+for (i in 0..2000) {
+  let raw = `{"method":"${i % 2 == 0 ? "GET" : "PUT"}","path":"/item","id":${i},"payload":"p${i % 50}"}`
+  let [req, e1] = json.parse(raw)
+  let key = `${req.method} ${req.path}`
+  let handler = routes[key] ?? handle_missing
+  let resp = handler(req)
+  let [out, e2] = json.stringify(resp)
+  bytes = bytes + len(out)
+}
+print(`server_request: bytes=${bytes}`)
+ASEOF
+
+# A steady-state workload (the server_request bench corpus shape with a large
+# loop) — seeding saves at most WARMUP_THRESHOLD generic executions per site, so
+# steady state must converge to ~1.0x (a regression is a bug). A deterministic
+# local variant of bench/profiling/server_request.as (NO time.monotonic print, so
+# the seeded/unseeded/section-absent outputs are byte-identical for the parity check).
+WB_STEADY="/tmp/warm_b_steady.as"
+cat > "${WB_STEADY}" <<'ASEOF'
+import * as json from "std/json"
+fn handle_get(req) { return { status: 200, body: { id: req.id, ok: true } } }
+fn handle_put(req) { return { status: 200, body: { id: req.id, saved: req.payload } } }
+fn handle_missing(req) { return { status: 404, body: { error: "no route" } } }
+let routes = { "GET /item": handle_get, "PUT /item": handle_put }
+let bytes = 0
+for (i in 0..500000) {
+  let raw = `{"method":"${i % 2 == 0 ? "GET" : "PUT"}","path":"/item","id":${i},"payload":"p${i % 50}"}`
+  let [req, e1] = json.parse(raw)
+  let key = `${req.method} ${req.path}`
+  let handler = routes[key] ?? handle_missing
+  let resp = handler(req)
+  let [out, e2] = json.stringify(resp)
+  bytes = bytes + len(out)
+}
+print(`server_request: bytes=${bytes}`)
+ASEOF
+
+WB_ROUNDS=9
+
+# b_measure: build --pgo + plain build for one workload, then time:
+#   seeded (.aso w/ section, no env), unseeded (.aso w/ section, ASCRIPT_NO_PGO=1),
+#   section-absent (plain .aso, no section). Returns medians via globals.
+b_measure() {
+  local src="$1"; local label="$2"
+  local pgo_aso plain_aso
+  pgo_aso="$(mktemp /tmp/ascript_b_pgo.XXXXXX.aso)"
+  plain_aso="$(mktemp /tmp/ascript_b_plain.XXXXXX.aso)"
+  echo "  [${label}] building (--pgo + plain)..."
+  ASCRIPT_NO_COMPILE_CACHE=1 "${BINARY}" build "${src}" --pgo -o "${pgo_aso}" >/dev/null 2>&1
+  ASCRIPT_NO_COMPILE_CACHE=1 "${BINARY}" build "${src}" -o "${plain_aso}" >/dev/null 2>&1
+  B_SEEDED=(); B_UNSEEDED=(); B_ABSENT=()
+  B_SEEDED_OUT=""; B_UNSEEDED_OUT=""; B_ABSENT_OUT=""
+  local i r ms out
+  for i in $(seq 1 "${WB_ROUNDS}"); do
+    # interleave the three to fairly share scheduling noise
+    r="$(btime_run "" "${pgo_aso}")"; ms="${r%% *}"; out="${r#* }"
+    B_SEEDED+=("${ms}"); [ -z "${B_SEEDED_OUT}" ] && B_SEEDED_OUT="${out}"
+    r="$(btime_run "ASCRIPT_NO_PGO=1" "${pgo_aso}")"; ms="${r%% *}"; out="${r#* }"
+    B_UNSEEDED+=("${ms}"); [ -z "${B_UNSEEDED_OUT}" ] && B_UNSEEDED_OUT="${out}"
+    r="$(btime_run "" "${plain_aso}")"; ms="${r%% *}"; out="${r#* }"
+    B_ABSENT+=("${ms}"); [ -z "${B_ABSENT_OUT}" ] && B_ABSENT_OUT="${out}"
+  done
+  rm -f "${pgo_aso}" "${plain_aso}"
+}
+
+B_LABELS=(); B_SM=(); B_UM=(); B_AM=(); B_PAR=()
+for spec in "cli:${WB_CLI}" "server_first_n:${WB_SRV}" "steady_state:${WB_STEADY}"; do
+  lbl="${spec%%:*}"; f="${spec#*:}"
+  echo "--- WARM B: ${lbl} ---"
+  b_measure "${f}" "${lbl}"
+  sm="$(median_of "${B_SEEDED[@]}")"; um="$(median_of "${B_UNSEEDED[@]}")"; am="$(median_of "${B_ABSENT[@]}")"
+  par="FAIL"
+  if [ "${B_SEEDED_OUT}" = "${B_UNSEEDED_OUT}" ] && [ "${B_SEEDED_OUT}" = "${B_ABSENT_OUT}" ]; then par="PASS"; fi
+  B_LABELS+=("${lbl}"); B_SM+=("${sm}"); B_UM+=("${um}"); B_AM+=("${am}"); B_PAR+=("${par}")
+  echo "  seeded=${sm}ms unseeded=${um}ms section-absent=${am}ms parity=${par}"
+done
+
+echo "==> Appending WARM B table to ${RESULTS_FILE}..."
+python3 - "${RESULTS_FILE}" "${WB_ROUNDS}" "${#B_LABELS[@]}" \
+  "${B_LABELS[@]}" "${B_SM[@]}" "${B_UM[@]}" "${B_AM[@]}" "${B_PAR[@]}" <<'PYEOF'
+import sys
+it = iter(sys.argv[1:])
+out_path = next(it); rounds = int(next(it)); cnt = int(next(it))
+def take(n): return [next(it) for _ in range(n)]
+labels = take(cnt); sm = [int(x) for x in take(cnt)]
+um = [int(x) for x in take(cnt)]; am = [int(x) for x in take(cnt)]
+par = take(cnt)
+
+def ratio(seeded, ref):
+    # ref / seeded  -> >1.0 means seeded is FASTER (cold-start win); ~1.0 steady.
+    if seeded == 0: return "n/a"
+    return f"{ref / seeded:.3f}x"
+
+L = ["", "---", "",
+     "## Unit B -- PGO Seeded vs Unseeded A/B (Gates 16-18)",
+     "",
+     f"**Rounds per measurement:** {rounds} (medians; interleaved seeded / unseeded / section-absent).",
+     "",
+     "Mechanism: `build --pgo` appends a trailing `ASPGO` section to the `.aso`; at run",
+     "time `ASCRIPT_NO_PGO=1` skips seeding at load, so the SAME artifact run with vs",
+     "without that env var is the seeded-vs-unseeded A/B. A plain `build` (no `--pgo`)",
+     "is the SECTION-ABSENT (pre-WARM) baseline — it proves the loader's trailing-section",
+     "scan is zero-cost when no section is present.",
+     "",
+     "| Workload | Seeded (ms) | Unseeded (ms) | Unseeded/Seeded | Section-absent (ms) | Absent/Seeded | Output parity |",
+     "|----------|-------------|---------------|-----------------|---------------------|---------------|---------------|"]
+for i in range(cnt):
+    L.append(
+        f"| {labels[i]} | {sm[i]} | {um[i]} | {ratio(sm[i], um[i])} |"
+        f" {am[i]} | {ratio(sm[i], am[i])} | {par[i]} |")
+
+L += ["",
+      "### Honest framing (spec 3.7)",
+      "",
+      "PGO's win is **warmup-time / cold-start latency elimination**, not steady-state",
+      "throughput. Seeding installs at most `WARMUP_THRESHOLD` (8) generic executions",
+      "per arith site, one generic lookup per IC/global site, and the shape-tree up front;",
+      "the caches converge to the SAME fixed point either way, so:",
+      "",
+      "- **`cli` / `server_first_n`** (short-lived / first-N-requests): the seeded column",
+      "  is the cold-start regime — any `Unseeded/Seeded > 1.0` is the warm-up iterations",
+      "  saved. The absolute delta is bounded and small at the current cache model (spec 3.7);",
+      "  the section's compounding value is as the carrier the DECODE/JIT specs consume.",
+      "- **`steady_state`** (500k-request loop): `Unseeded/Seeded` must be **~1.0x** — the",
+      "  warm-up window is a vanishing fraction of the run. A steady-state regression here",
+      "  would be a bug (seeding tax), not a feature.",
+      "- **Section-absent** (`Absent/Seeded` ~1.0x): the trailing-section loader scan is",
+      "  **zero-cost when no section is present** — a plain `.aso` pays nothing for the",
+      "  feature's existence (the Gate 12/17 posture).",
+      "",
+      "**Output parity PASS** across all three columns is the byte-invisibility check at",
+      "the artifact level (the corpus-wide proof is the seeded differential mode in",
+      "`tests/vm_differential.rs`).",
+      "",
+      "*Generated by `bench/run_warm_bench.sh` (Unit B section).*"]
+
+with open(out_path, "a") as f:
+    f.write("\n".join(L) + "\n")
+print(f"==> Appended Unit B to: {out_path}")
+PYEOF
+
 echo ""
 echo "==> Done."

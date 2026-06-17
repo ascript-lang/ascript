@@ -269,6 +269,13 @@ enum Engine {
     /// Used in the `decode_on_off` section to isolate the Units A+B contribution.
     /// Decode-ON (SpecializedVm) must show no regression vs decode-OFF (`>= 0.97x`).
     NoDecodeVm,
+    /// WARM B: a fresh PGO-carrying archive built from `src`, loaded SEEDED, and run. Each
+    /// timed run pays the load + seed + run (the cold-start regime — the warm-up window the
+    /// seeds eliminate). Timed against `PgoUnseeded` (the SAME artifact, seed off).
+    PgoSeeded,
+    /// WARM B: the SAME fresh PGO-carrying archive, loaded UNSEEDED (`seed=false`, the
+    /// `ASCRIPT_NO_PGO` kill-switch path) and run. The cold-start microbench baseline.
+    PgoUnseeded,
 }
 
 /// Run `src` once on `engine`, asserting it succeeds. Returns the elapsed time.
@@ -309,6 +316,16 @@ async fn time_once(engine: Engine, src: &str, name: &str) -> Duration {
             ascript::vm_run_source_no_decode(src)
                 .await
                 .unwrap_or_else(|e| panic!("no-decode VM failed on `{name}`: {e}"));
+        }
+        Engine::PgoSeeded => {
+            ascript::pgo_seeded_run_from_source(src)
+                .await
+                .unwrap_or_else(|e| panic!("PGO-seeded run failed on `{name}`: {e}"));
+        }
+        Engine::PgoUnseeded => {
+            ascript::pgo_unseeded_run_from_source(src)
+                .await
+                .unwrap_or_else(|e| panic!("PGO-unseeded run failed on `{name}`: {e}"));
         }
     }
     start.elapsed()
@@ -588,6 +605,121 @@ async fn run_baseline() {
     // aborts the harness on a busy host.
     decode_on_off(&benches).await;
     lane_on_off_overhead(&benches).await;
+    // WARM B: the in-process PGO cold-start microbench (warm-up window, unmasked by
+    // process startup) + the steady-state ~1.0x gate.
+    pgo_cold_start_section(&benches).await;
+}
+
+/// WARM B §6 — the IN-PROCESS PGO seeded-vs-unseeded microbench.
+///
+/// The `bench/run_warm_bench.sh` end-to-end numbers are dominated by process startup on
+/// short programs (the cold-start delta sinks below `/usr/bin/time`'s centisecond floor —
+/// itself the honest §3.7 finding that the win is bounded/small). THIS section times the
+/// SAME artifact loaded SEEDED vs UNSEEDED *in-process* (each timed run is a fresh archive
+/// load + VM run, so the warm-up window is paid every iteration — the cold-start regime),
+/// so the warm-up the seeds eliminate is measurable without the startup mask.
+///
+/// Honest framing (spec §3.7): seeded should be at-or-faster on warm-up-dominated programs;
+/// on a long steady-state loop it converges to ~1.0x (the caches reach the same fixed point
+/// either way). A steady-state REGRESSION (seeded materially slower) would be a bug — REPORTED
+/// here, and the corpus byte-identity is the seeded differential mode in `tests/vm_differential.rs`.
+async fn pgo_cold_start_section(benches: &[Bench]) {
+    println!("WARM B — PGO seeded vs unseeded (in-process; each run = fresh load + run)");
+    println!(
+        "{:<28} {:>13} {:>13} {:>14}",
+        "benchmark", "unseeded (ms)", "seeded (ms)", "unseeded/seeded",
+    );
+    println!("{}", "-".repeat(28 + 13 * 2 + 14 + 3));
+
+    // WARM-UP-WINDOW shapes (SHORT — the cold-start regime where seeding actually wins).
+    // The main `benches()` corpus is intentionally LONG (1e6-iteration compute-bound), so
+    // its warm-up is a vanishing fraction → ~1.0x by construction (the steady-state gate).
+    // These short shapes exercise the SAME hot site kinds (arith, monomorphic field, builtin
+    // global) but loop only a few hundred times — warm-up is the dominant cost, so seeding's
+    // win is visible.
+    struct WarmShape {
+        name: &'static str,
+        src: &'static str,
+    }
+    let warm_shapes = [
+        WarmShape {
+            name: "warmup: arith (300)",
+            src: "let s = 0\nfor (i in 1..=300) { s = s + i * 2 - 1 }\nprint(s)",
+        },
+        WarmShape {
+            name: "warmup: field r/w (300)",
+            src: "let o = { x: 1, y: 2, z: 3 }\nlet a = 0\nfor (i in 0..300) { a = a + o.x + o.y + o.z }\nprint(a)",
+        },
+        WarmShape {
+            name: "warmup: mixed (300)",
+            src: "fn f(n) { return n * 3 + 1 }\nlet o = { k: 7 }\nlet a = 0\nfor (i in 0..300) { a = a + f(i) + o.k }\nprint(a)",
+        },
+    ];
+
+    let mut ratios: Vec<f64> = Vec::new();
+    // The long steady-state corpus (≈1.0x — the no-tax gate).
+    for b in benches {
+        // Skip any program that cannot build a single-module PGO artifact (none today —
+        // the bench corpus is import-free — but stay defensive).
+        if ascript::pgo_seeded_run_from_source(b.src).await.is_err() {
+            continue;
+        }
+        let (unseeded_med, _) = measure(Engine::PgoUnseeded, b.src, b.name).await;
+        let (seeded_med, _) = measure(Engine::PgoSeeded, b.src, b.name).await;
+        let r = unseeded_med.as_secs_f64() / seeded_med.as_secs_f64();
+        ratios.push(r);
+        println!(
+            "{:<28} {} {} {:>13.3}x",
+            b.name,
+            ms(unseeded_med),
+            ms(seeded_med),
+            r,
+        );
+    }
+    println!("  (above: long steady-state corpus → ~1.0x expected, the no-tax gate)");
+    println!();
+    // The short warm-up-window shapes (the cold-start win, REPORTED not gated).
+    let mut warm_ratios: Vec<f64> = Vec::new();
+    for w in &warm_shapes {
+        if ascript::pgo_seeded_run_from_source(w.src).await.is_err() {
+            continue;
+        }
+        let (unseeded_med, _) = measure(Engine::PgoUnseeded, w.src, w.name).await;
+        let (seeded_med, _) = measure(Engine::PgoSeeded, w.src, w.name).await;
+        let r = unseeded_med.as_secs_f64() / seeded_med.as_secs_f64();
+        warm_ratios.push(r);
+        println!(
+            "{:<28} {} {} {:>13.3}x",
+            w.name,
+            ms(unseeded_med),
+            ms(seeded_med),
+            r,
+        );
+    }
+    if !warm_ratios.is_empty() {
+        let wg =
+            (warm_ratios.iter().map(|r| r.ln()).sum::<f64>() / warm_ratios.len() as f64).exp();
+        println!("  (above: short warm-up-window shapes → cold-start win, REPORTED; geomean {wg:.3}x)");
+    }
+    println!();
+    if ratios.is_empty() {
+        println!("  [REPORT] no PGO-buildable benches (unexpected for the import-free corpus)");
+        println!();
+        return;
+    }
+    let geomean = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
+    println!(
+        "geomean unseeded/seeded = {geomean:.3}x  \
+         (>1.0 = seeding wins warm-up; ~1.0 = steady-state converged — spec §3.7)"
+    );
+    // SANITY (not a hard win-gate — PGO's win is bounded, §3.7): seeding must not REGRESS the
+    // whole corpus materially. A geomean far below 1.0 would mean seeding is a net tax (a bug).
+    assert!(
+        geomean >= 0.90,
+        "PGO seeding REGRESSED the corpus geomean to {geomean:.3}x (< 0.90x) — a seeding tax bug, \
+         not the bounded warm-up win §3.7 predicts"
+    );
+    println!();
 }
 
 /// DBG Task 9 — the PRIMARY ACCEPTANCE GATE (spec §3.4): the post-DBG VM with NO
