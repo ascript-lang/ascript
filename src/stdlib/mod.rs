@@ -776,9 +776,8 @@ impl Interp {
             if self
                 .with_determinism_mut(|ctx| {
                     ctx.clock.advance(ms);
-                    ctx.events.push(crate::det::DetEvent::TimerSet {
-                        wake: ctx.clock.now_ms(),
-                    });
+                    let wake = ctx.clock.now_ms();
+                    let _ = ctx.record_event(crate::det::DetEvent::TimerSet { wake });
                 })
                 .is_some()
             {

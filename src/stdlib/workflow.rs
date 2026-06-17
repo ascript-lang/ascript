@@ -140,6 +140,141 @@ fn events_to_log(events: &[DetEvent]) -> String {
     out
 }
 
+/// WARM C (§4.3/§4.4): serialize one `(seq, event)` into a crc-framed newline-JSON
+/// record line for the GROUP appender. The crc is the hand-rolled [`crate::det::crc32`]
+/// over the record's compact JSON bytes WITHOUT the crc field; the `"crc"` field is
+/// then added LAST and the object re-serialized + newline-terminated. On open, the
+/// repair recomputes the crc the same way (remove crc → re-serialize → compare), so a
+/// torn final append (a partial `write`) fails the crc and is truncated away.
+///
+/// This is the `fn(usize, &DetEvent) -> Vec<u8>` handed to [`crate::det::GroupAppender`]
+/// so `det.rs` itself stays serde-free (and builds under `--no-default-features`).
+fn group_record_line(seq: usize, ev: &DetEvent) -> Vec<u8> {
+    let mut obj = event_to_json(seq, ev);
+    let bytes_sans_crc = obj.to_string();
+    let crc = crate::det::crc32(bytes_sans_crc.as_bytes());
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("crc".to_string(), serde_json::json!(crc));
+    }
+    let mut line = obj.to_string();
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// WARM C (§4.4): the crc-framed terminal `WorkflowCompleted` line for the group path.
+/// Carries a crc but NO `seq` (matching `completed_result`'s last-line check — a
+/// completion record is identified by `kind`, never by sequence).
+fn group_completion_line(result: &Value) -> Vec<u8> {
+    let mut rec = serde_json::json!({
+        "kind": "WorkflowCompleted",
+        "result": serde_json::from_str::<serde_json::Value>(&to_json_string(result))
+            .unwrap_or(serde_json::Value::Null),
+    });
+    let bytes_sans_crc = rec.to_string();
+    let crc = crate::det::crc32(bytes_sans_crc.as_bytes());
+    if let Some(map) = rec.as_object_mut() {
+        map.insert("crc".to_string(), serde_json::json!(crc));
+    }
+    let mut line = rec.to_string();
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// WARM C (§4.4): find the byte length of the VALID CONTIGUOUS PREFIX of a group log.
+/// A line is part of the valid prefix iff it is (a) newline-terminated, (b) valid JSON,
+/// (c) crc-carrying with a VERIFYING crc (a legacy crc-less line — e.g. a rename-written
+/// log — is accepted), and (d) `seq`-contiguous with its predecessor (records carry a
+/// monotone seq starting at 0; the `WorkflowCompleted` terminal carries none and ends
+/// the scan as a valid terminator). The first line failing any check ends the prefix;
+/// everything from there on is the torn/divergent tail to truncate.
+fn valid_prefix_len(bytes: &[u8]) -> usize {
+    let mut prefix_end = 0usize;
+    let mut pos = 0usize;
+    let mut expect_seq: i64 = 0;
+    while pos < bytes.len() {
+        // A line must be newline-terminated to be part of the durable prefix (a final
+        // line with no '\n' is a torn partial append).
+        let Some(rel_nl) = bytes[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let line_end = pos + rel_nl; // index of '\n'
+        let line = &bytes[pos..line_end];
+        let line_str = std::str::from_utf8(line).ok();
+        let Some(line_str) = line_str else { break };
+        let trimmed = line_str.trim();
+        if trimmed.is_empty() {
+            // A blank line is benign whitespace — include it and continue.
+            pos = line_end + 1;
+            prefix_end = pos;
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            break;
+        };
+        let Some(map) = v.as_object() else { break };
+        // crc check (if present): recompute over the object sans crc.
+        if let Some(crc_val) = map.get("crc") {
+            let Some(carried) = crc_val.as_u64() else { break };
+            let mut without = map.clone();
+            without.remove("crc");
+            let recomputed = crate::det::crc32(
+                serde_json::Value::Object(without).to_string().as_bytes(),
+            );
+            if recomputed as u64 != carried {
+                break;
+            }
+        }
+        // seq-contiguity check (if present). A `WorkflowCompleted` carries no seq and is
+        // a valid terminator — accept it and stop scanning (nothing legitimately follows).
+        if let Some(seq) = map.get("seq").and_then(|s| s.as_i64()) {
+            if seq != expect_seq {
+                break;
+            }
+            expect_seq += 1;
+        } else if map.get("kind").and_then(|k| k.as_str()) == Some("WorkflowCompleted") {
+            // Terminal record: include it, then stop.
+            pos = line_end + 1;
+            prefix_end = pos;
+            break;
+        }
+        // This line is part of the valid prefix.
+        pos = line_end + 1;
+        prefix_end = pos;
+    }
+    prefix_end
+}
+
+/// WARM C (§4.4): open the group log for resume, REPAIRING a torn tail by
+/// prefix-truncation. Reads the file, computes the valid contiguous prefix
+/// ([`valid_prefix_len`]), physically `set_len`s the file to that boundary (the
+/// truncation only ever SHRINKS — never extends — and an `ftruncate` error surfaces),
+/// and returns `(append_file, repaired_prefix_text)`. The returned file is opened in
+/// append mode positioned at the prefix end. A non-existent log is treated as a fresh
+/// run (create empty). Used only on the group resume path.
+fn open_group_log(path: &str, span: Span) -> Result<(std::fs::File, String), Control> {
+    use std::io::{Seek, SeekFrom};
+    let existing = std::fs::read(path).unwrap_or_default();
+    let prefix_len = valid_prefix_len(&existing);
+    let prefix_text = String::from_utf8_lossy(&existing[..prefix_len]).into_owned();
+
+    // Open (create if absent) read-write, truncate to the valid prefix, seek to end.
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| {
+            AsError::at(format!("workflow: cannot open group log '{}': {}", path, e), span)
+        })?;
+    // set_len only shrinks here (prefix_len <= existing.len()); a failure surfaces.
+    f.set_len(prefix_len as u64)
+        .map_err(|e| AsError::at(format!("workflow: log repair (truncate) failed: {}", e), span))?;
+    f.seek(SeekFrom::End(0))
+        .map_err(|e| AsError::at(format!("workflow: log seek failed: {}", e), span))?;
+    Ok((f, prefix_text))
+}
+
 /// One `DetEvent` → a JSON log record.
 fn event_to_json(seq: usize, ev: &DetEvent) -> serde_json::Value {
     use serde_json::json;
@@ -548,22 +683,64 @@ impl Interp {
         let start_ms = crate::interp::real_now_ms();
 
         if replay {
-            // Read the existing log. If it does not exist yet, resume behaves like a
-            // fresh run (record from the top).
-            let existing = std::fs::read_to_string(&log_path).unwrap_or_default();
-            let recorded = log_to_events(&existing);
-            // Idempotent completion check: if the log already holds a recorded
-            // WorkflowCompleted result line, return it without re-running.
-            if let Some(result) = completed_result(&existing) {
+            // Idempotent completion check FIRST (both modes): if the log already holds a
+            // recorded WorkflowCompleted result line, return it without re-running. For
+            // the group path we read the REPAIRED prefix so a torn tail after a completion
+            // does not hide the completion (and a torn tail before one is truncated away).
+            let (recorded, completed, repaired_file) =
+                if matches!(durability, Durability::Group { .. }) {
+                    // Open + repair (prefix-truncate the torn tail) before reading.
+                    let (file, prefix_text) = open_group_log(&log_path, span)?;
+                    let completed = completed_result(&prefix_text);
+                    (log_to_events(&prefix_text), completed, Some(file))
+                } else {
+                    let existing = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    (log_to_events(&existing), completed_result(&existing), None)
+                };
+            if let Some(result) = completed {
                 return Ok(result);
             }
-            let ctx = DeterminismContext::replay(seed, start_ms, recorded);
+            let persisted = recorded.len();
+            let mut ctx = DeterminismContext::replay(seed, start_ms, recorded);
+            if let (Durability::Group { window_ms, max_events }, Some(file)) =
+                (durability, repaired_file)
+            {
+                // Seed `persisted` to the repaired-prefix count so only NEW events append.
+                ctx.set_group_appender(crate::det::GroupAppender::new(
+                    file,
+                    persisted,
+                    window_ms,
+                    max_events,
+                    group_record_line,
+                ));
+            }
             let prev = self.install_determinism(ctx);
             let outcome = self.drive_workflow(wf, input, span).await;
             self.finish_workflow(outcome, &log_path, durability, prev, span)
                 .await
         } else {
-            let ctx = DeterminismContext::record(seed, start_ms);
+            let mut ctx = DeterminismContext::record(seed, start_ms);
+            if let Durability::Group { window_ms, max_events } = durability {
+                // Fresh run: create/truncate the log, install the appender at persisted=0.
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&log_path)
+                    .map_err(|e| {
+                        AsError::at(
+                            format!("workflow: cannot create group log '{}': {}", log_path, e),
+                            span,
+                        )
+                    })?;
+                ctx.set_group_appender(crate::det::GroupAppender::new(
+                    file,
+                    0,
+                    window_ms,
+                    max_events,
+                    group_record_line,
+                ));
+            }
             let prev = self.install_determinism(ctx);
             let outcome = self.drive_workflow(wf, input, span).await;
             self.finish_workflow(outcome, &log_path, durability, prev, span)
@@ -602,11 +779,44 @@ impl Interp {
         prev: Option<DeterminismContext>,
         span: Span,
     ) -> Result<Value, Control> {
-        let ctx = self.take_determinism();
+        let mut ctx = self.take_determinism();
+
+        // WARM C (§4.3): the GROUP path persists events incrementally as they are
+        // recorded (the appender), so finish does NOT snapshot via `write_log`. It only
+        // appends the terminal `WorkflowCompleted` line (on success) through the appender
+        // and does a final DEADLINE-CHECKED `maybe_fsync` (NOT a forced fsync — that would
+        // reinstate the per-commit F_FULLFSYNC and forfeit the bench win). The appender is
+        // then dropped (file closed).
+        let is_group = ctx
+            .as_ref()
+            .map(|c| c.has_group_appender())
+            .unwrap_or(false);
+        if is_group {
+            let terminal = match &outcome {
+                Ok(result) => group_completion_line(result),
+                // On error, no completion record — the partial log is replayable.
+                Err(_) => Vec::new(),
+            };
+            if let Some(c) = ctx.as_mut() {
+                if let Err(e) = c.finish_group(&terminal) {
+                    self.restore_determinism(prev);
+                    return Err(AsError::at(
+                        format!("workflow: group log finish failed: {}", e),
+                        span,
+                    )
+                    .into());
+                }
+            }
+            self.restore_determinism(prev);
+            return outcome;
+        }
+
         self.restore_determinism(prev);
         let events = ctx.map(|c| c.events).unwrap_or_default();
-        // Always flush the recorded effect stream (even on error: a crash mid-run
-        // leaves a partial log that a later resume fast-forwards through).
+        // Fsync/Buffered (UNCHANGED, byte-identical to pre-WARM): always flush the
+        // recorded effect stream as a whole-log atomic snapshot at finish (even on
+        // error: a crash mid-run leaves a partial log a later resume fast-forwards
+        // through).
         let mut log = events_to_log(&events);
         if let Ok(ref result) = outcome {
             // Append the terminal completion record so `resume` is idempotent.
@@ -618,13 +828,9 @@ impl Interp {
             log.push_str(&rec.to_string());
             log.push('\n');
         }
-        // Map Durability to the fsync flag for write_log.
-        // Fsync and Group both use fsync=true for the snapshot path:
         // - Fsync: snapshot-at-finish + F_FULLFSYNC (unchanged behavior).
-        // - Group: TODO(Task 10) — per-event appender not yet wired; for now treated as
-        //   the Fsync path so the parse/enum surface is correct but behavior is identical
-        //   to Fsync until the group appender lands.
         // - Buffered: snapshot-at-finish, no explicit fsync (unchanged behavior).
+        // (Group never reaches here — handled above.)
         let fsync = !matches!(durability, Durability::Buffered);
         write_log(log_path, &log, fsync, span)?;
         outcome
@@ -677,7 +883,7 @@ impl Interp {
                     }
                     c.clock.advance(ms);
                     let wake = c.clock.now_ms();
-                    c.events.push(DetEvent::TimerSet { wake });
+                    let _ = c.record_event(DetEvent::TimerSet { wake });
                 });
                 Ok(Value::nil())
             }
@@ -763,13 +969,25 @@ impl Interp {
             .into());
         }
         let result_json = to_json_string(&result);
-        self.with_determinism_mut(|c| {
-            c.events.push(DetEvent::ActivityCompleted {
+        // WARM C (§4.3): route through the `record_event` chokepoint. Under group
+        // durability this pumps the new `ActivityCompleted` to disk synchronously
+        // (write-at-record-time — the kill-9 guarantee). An I/O error on the pump is the
+        // durability-critical failure (§4.5 `ENOSPC`/`EIO`): surface it as a Tier-2 error
+        // rather than continue believing the activity is durably recorded.
+        let pump_err = self.with_determinism_mut(|c| {
+            c.record_event(DetEvent::ActivityCompleted {
                 name: act_name.clone(),
                 args_hash: sig,
                 result_json: result_json.clone(),
-            });
+            })
         });
+        if let Some(Err(e)) = pump_err {
+            return Err(AsError::at(
+                format!("workflow: durable log append failed: {}", e),
+                span,
+            )
+            .into());
+        }
         Ok(result)
     }
 }
