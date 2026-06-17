@@ -3015,7 +3015,11 @@ async fn run_verified_aso(
     if payload.starts_with(&crate::vm::archive::ARCHIVE_MAGIC) {
         let archive = crate::vm::archive::ModuleArchive::decode(payload)
             .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
-        return run_verified_archive(archive, script_args, caps, module_dir, what).await;
+        // WARM B §3.3: the PGO section (if any) is a self-described trailing section AFTER
+        // the module table. Scan it from the archive end. A corrupt/absent section ⇒ `None`
+        // ⇒ the program warms normally (the seeder is a no-op on `None`).
+        let section = decode_trailing_pgo(payload, &archive);
+        return run_verified_archive(archive, script_args, caps, module_dir, what, section).await;
     }
 
     let chunk = crate::vm::chunk::Chunk::from_bytes_verified(payload)
@@ -3041,7 +3045,26 @@ async fn run_verified_aso(
         vm.set_module_dir(dir);
     }
 
-    run_entry_proto_to_exit(&interp, &vm, chunk).await
+    // A bare `ASO\0` chunk has no trailing-section mechanism (the only PGO carrier is the
+    // archive container — spec §3.4), so there is never a section to seed here.
+    run_entry_proto_to_exit(&interp, &vm, chunk, None).await
+}
+
+/// WARM B §3.3 — decode the optional PGO trailing section from an archive's raw bytes.
+///
+/// The section rides AFTER the module table (`ModuleArchive::decode` ignores trailing
+/// bytes — the Task-0 pin). We locate the archive end by re-encoding the decoded archive
+/// (canonical, deterministic — BNDL §4.5) and scan from there. Returns `None` if absent,
+/// version-mismatched, or malformed (⇒ warm normally; never a load failure).
+fn decode_trailing_pgo(
+    payload: &[u8],
+    archive: &crate::vm::archive::ModuleArchive,
+) -> Option<crate::vm::pgo::PgoSection> {
+    let archive_end = archive.encode().len();
+    if archive_end >= payload.len() {
+        return None; // no trailing bytes
+    }
+    crate::vm::pgo::find_and_decode_pgo(payload, archive_end)
 }
 
 /// SELF-CONTAINED-BUNDLES (Task 1.5) — the PRODUCTION runner for an `ASCRIPTA` module
@@ -3069,6 +3092,7 @@ async fn run_verified_archive(
     caps: Option<crate::stdlib::caps::CapSet>,
     module_dir: Option<std::path::PathBuf>,
     what: &str,
+    pgo_section: Option<crate::vm::pgo::PgoSection>,
 ) -> Result<i32, AsError> {
     use crate::vm::Vm;
 
@@ -3076,14 +3100,16 @@ async fn run_verified_archive(
     // `from_bytes_verified` trust boundary the disk `.aso` path uses. A bounds-check on the
     // entry index yields a clean error rather than a panic (decode already validates this,
     // but never index without a check on possibly-foreign data).
-    let entry_bytes = archive
+    let (entry_key, entry_bytes) = archive
         .modules
         .get(archive.entry as usize)
         // clone the entry chunk out before `archive` is moved into `Rc::new` below
-        .map(|(_, b)| b.clone())
+        .map(|(k, b)| (k.clone(), b.clone()))
         .ok_or_else(|| {
             AsError::new(format!("cannot load {what}: archive entry index is out of range"))
         })?;
+    // WARM B §3.3: the entry module's stored-chunk digest for the per-module seed gate.
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
     let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
         .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
 
@@ -3129,7 +3155,30 @@ async fn run_verified_archive(
     }
     vm.set_module_archive(Rc::new(archive));
 
-    run_entry_proto_to_exit(&interp, &vm, chunk).await
+    let pgo_seed = pgo_section.as_ref().map(|section| PgoSeed {
+        section,
+        entry_key: &entry_key,
+        entry_sha256: &entry_sha256,
+        enabled: pgo_seeding_enabled(),
+    });
+    run_entry_proto_to_exit(&interp, &vm, chunk, pgo_seed).await
+}
+
+/// WARM B §3.3 — the seeding inputs threaded into [`run_entry_proto_to_exit`]: the decoded
+/// PGO section, the entry module's logical key + stored-chunk digest (for the per-module
+/// digest gate), and the resolved `enabled` flag (`vm.specialize && !ASCRIPT_NO_PGO`, or the
+/// test seam's explicit value). Absent (`None`) when the artifact carries no PGO section.
+struct PgoSeed<'a> {
+    section: &'a crate::vm::pgo::PgoSection,
+    entry_key: &'a str,
+    entry_sha256: &'a [u8; 32],
+    enabled: bool,
+}
+
+/// WARM B §3.3 — the `ASCRIPT_NO_PGO` kill switch. `true` (seed) unless the env var is set
+/// to a non-empty value. Mirrors the `ASCRIPT_NO_SPECIALIZE`/`ASCRIPT_NO_DECODE` posture.
+fn pgo_seeding_enabled() -> bool {
+    !std::env::var("ASCRIPT_NO_PGO").is_ok_and(|v| !v.is_empty())
 }
 
 /// The shared run tail behind [`run_verified_aso`] and [`run_verified_archive`]: wrap the
@@ -3140,6 +3189,7 @@ async fn run_entry_proto_to_exit(
     interp: &Rc<Interp>,
     vm: &crate::vm::Vm,
     chunk: crate::vm::chunk::Chunk,
+    pgo_seed: Option<PgoSeed<'_>>,
 ) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -3158,6 +3208,18 @@ async fn run_entry_proto_to_exit(
         debug_name: None,
         name_span: None,
     });
+    // WARM B §3.3: seed the warmed side tables BEFORE first execution (all-sync; no borrow
+    // held across the run below). Gated inside `seed_entry_from_section` on `vm.specialize`
+    // and the caller's `seed` flag (the `ASCRIPT_NO_PGO` kill switch is folded into `seed`).
+    if let Some(seed) = pgo_seed {
+        vm.seed_entry_from_section(
+            &proto.chunk,
+            seed.section,
+            seed.entry_key,
+            seed.entry_sha256,
+            seed.enabled,
+        );
+    }
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
@@ -4306,6 +4368,130 @@ pub async fn run_archive(
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
     }
+}
+
+/// WARM B §3.3/§5-B — the `#[doc(hidden)]` SEEDING test seam.
+///
+/// A white-box handle over a freshly-loaded PGO-carrying archive: it decodes the trailing
+/// PGO section, builds a `Vm` + the entry `FnProto`, and (when `seed` is set AND the Vm is
+/// specializing) seeds the entry chunk's side tables BEFORE first execution — exactly the
+/// production archive-load path, but with the entry proto held live for inspection.
+///
+/// `seed`/`specialize` are threaded EXPLICITLY (not read from `ASCRIPT_NO_PGO`/the global
+/// kill switch) so parallel tests never race a process-global env var (the LANE Task-2
+/// convention). The handle exposes the install COUNT, pre/post-run side-table accessors, and
+/// an async `run()` that drives the entry to completion and returns captured output.
+#[doc(hidden)]
+pub struct PgoSeedHandle {
+    interp: Rc<Interp>,
+    vm: Rc<crate::vm::Vm>,
+    entry_proto: Rc<crate::vm::chunk::FnProto>,
+    installed: usize,
+}
+
+impl PgoSeedHandle {
+    /// Number of side-table entries the seeder installed (0 when `seed`/`specialize` is off,
+    /// the section is absent, the digest mismatches, or every entry was skipped by a guard).
+    pub fn installed(&self) -> usize {
+        self.installed
+    }
+
+    /// White-box: the entry chunk's adaptive-arith state at byte offset `off`.
+    pub fn entry_arith_cache(&self, off: usize) -> crate::vm::adapt::ArithCache {
+        self.entry_proto.chunk.arith_cache(off)
+    }
+
+    /// White-box: the entry chunk's field inline cache at byte offset `off`.
+    pub fn entry_field_ic(&self, off: usize) -> crate::vm::ic::InlineCache {
+        self.entry_proto.chunk.field_ic(off)
+    }
+
+    /// White-box: the entry chunk's global cache at byte offset `off`.
+    pub fn entry_global_cache(&self, off: usize) -> crate::vm::adapt::GlobalCache {
+        self.entry_proto.chunk.global_cache(off)
+    }
+
+    /// Drive the entry proto to completion on a `LocalSet`, returning captured output.
+    pub async fn run(&self) -> Result<String, AsError> {
+        use crate::vm::value_ext::{Closure, RunOutcome};
+        let closure = Closure::new(Rc::clone(&self.entry_proto));
+        let mut fiber = crate::vm::fiber::Fiber::new(closure);
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(self.vm.run(&mut fiber)).await;
+        local.await;
+        crate::gc::collect();
+        match result {
+            Ok(RunOutcome::Done(_)) | Ok(RunOutcome::Yielded(_)) => Ok(self.interp.output()),
+            Err(crate::interp::Control::Panic(e)) => Err(e),
+            Err(crate::interp::Control::Propagate(_)) => Ok(self.interp.output()),
+            Err(crate::interp::Control::Exit(_)) => Ok(self.interp.output()),
+        }
+    }
+}
+
+/// WARM B §3.3 — load `archive_bytes` (an `ASCRIPTA` archive, optionally with a trailing PGO
+/// section) and seed the entry chunk per `seed`/`specialize`, returning a [`PgoSeedHandle`].
+/// `#[doc(hidden)]` test/seam API — NOT a stable surface.
+#[doc(hidden)]
+pub fn pgo_seed_for_test(
+    archive_bytes: &[u8],
+    seed: bool,
+    specialize: bool,
+) -> Result<PgoSeedHandle, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::Vm;
+
+    let archive = crate::vm::archive::ModuleArchive::decode(archive_bytes)
+        .map_err(|e| AsError::new(format!("cannot decode archive: {e}")))?;
+    let section = decode_trailing_pgo(archive_bytes, &archive);
+
+    let (entry_key, entry_bytes) = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(k, b)| (k.clone(), b.clone()))
+        .ok_or_else(|| AsError::new("archive entry index is out of range"))?;
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+        .map_err(|e| AsError::new(format!("cannot load archive entry: {e}")))?;
+
+    let interp = Rc::new(Interp::new()); // captured output
+    interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    interp.install_self();
+    // Honor the explicit `specialize` flag (the generic-VM seed-skip path).
+    let vm = Vm::with_specialize(interp.clone(), specialize);
+    vm.set_module_archive(Rc::new(archive));
+
+    let entry_proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+
+    // Seed BEFORE first execution — exactly the production order. `seed_entry_from_section`
+    // is internally gated on `vm.specialize`, so `specialize=false` ⇒ 0 installs.
+    let installed = match section.as_ref() {
+        Some(sec) => {
+            vm.seed_entry_from_section(&entry_proto.chunk, sec, &entry_key, &entry_sha256, seed)
+        }
+        None => 0,
+    };
+
+    Ok(PgoSeedHandle {
+        interp,
+        vm,
+        entry_proto,
+        installed,
+    })
 }
 
 /// Map a VM [`crate::interp::Control`] outcome to an [`AsError`], mirroring how

@@ -31,6 +31,30 @@ impl Drop for TmpDir {
     }
 }
 
+/// Build a `--pgo` archive for `source` into `dir`, returning the artifact bytes.
+fn build_pgo_artifact(dir: &TmpDir, source: &str) -> Vec<u8> {
+    let src = dir.join("prog.as");
+    let out = dir.join("prog.aso");
+    std::fs::write(&src, source).unwrap();
+    let result = Command::new(bin())
+        .args(["build", src.to_str().unwrap(), "--pgo", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn ascript build --pgo");
+    assert!(
+        result.status.success(),
+        "build --pgo failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::read(&out).unwrap()
+}
+
+/// The byte offset of the archive end (= where trailing sections begin), for an
+/// artifact that decodes as a `ModuleArchive`.
+fn archive_end(bytes: &[u8]) -> usize {
+    let archive = ascript::vm::archive::ModuleArchive::decode(bytes).unwrap();
+    archive.encode().len()
+}
+
 /// A program with a hot int loop (arith specialization), a hot monomorphic `o.x` read
 /// (field IC), and a `math.abs` call (global cache).
 fn pgo_training_source() -> &'static str {
@@ -302,4 +326,211 @@ panic("deliberate training panic")
     // has no records — partial profile from a panicking run is acceptable).
     let _pgo = ascript::vm::pgo::find_and_decode_pgo(&bytes, archive_len)
         .expect("PGO section must be present even after a panicking training run");
+}
+
+// ── Task 7: white-box seeding tests ───────────────────────────────────────────────────────
+//
+// These drive the `#[doc(hidden)]` seeding seam (`ascript::pgo_seed_for_test`), which loads a
+// PGO-carrying archive into a fresh `Vm`, seeds the side tables BEFORE first execution, and
+// exposes the installed-count + the live entry proto for white-box inspection. The seam threads
+// `seed`/`specialize` explicitly (the LANE Task-2 convention — env never read in parallel tests).
+
+use ascript::vm::adapt::{ArithCache, ArithKind};
+use ascript::vm::ic::InlineCache;
+
+/// The first arith offset in the entry module's PGO section that has the given kind tag.
+fn first_arith_off(pgo: &ascript::vm::pgo::PgoSection, kind: u8) -> Option<u32> {
+    pgo.modules
+        .iter()
+        .flat_map(|m| m.protos.iter())
+        .flat_map(|p| p.arith.iter())
+        .find(|(_off, k)| *k == kind)
+        .map(|(off, _)| *off)
+}
+
+/// The first field-IC offset in the entry module's PGO section whose key list contains `name`.
+fn first_field_off_for(pgo: &ascript::vm::pgo::PgoSection, name: &str) -> Option<u32> {
+    pgo.modules
+        .iter()
+        .flat_map(|m| m.protos.iter())
+        .flat_map(|p| p.fields.iter())
+        .find(|(_off, idxs)| {
+            idxs.iter().any(|&i| {
+                pgo.key_lists
+                    .get(i as usize)
+                    .is_some_and(|kl| kl.iter().any(|k| k == name))
+            })
+        })
+        .map(|(off, _)| *off)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn seeding_installs_before_first_execution_and_guards_hold() {
+    let tmp = TmpDir::new("seed_install");
+    let bytes = build_pgo_artifact(&tmp, pgo_training_source());
+    let pgo = ascript::vm::pgo::find_and_decode_pgo(&bytes, archive_end(&bytes))
+        .expect("PGO section present");
+
+    let arith_off = first_arith_off(&pgo, ArithKind::Int as u8)
+        .expect("training profile must record a Specialized(Int) arith site");
+    let field_off = first_field_off_for(&pgo, "x")
+        .expect("training profile must record a field IC whose layout includes 'x'");
+
+    // Load with seeding ON. The seam seeds BEFORE running and returns the install count
+    // and the live entry proto so we can inspect the side tables pre-execution.
+    let handle = ascript::pgo_seed_for_test(&bytes, /*seed=*/ true, /*specialize=*/ true)
+        .expect("load+seed must succeed");
+
+    // COVERAGE assertion: at least one entry was installed.
+    assert!(
+        handle.installed() > 0,
+        "seeding must install > 0 entries (coverage tripwire); installed={}",
+        handle.installed()
+    );
+
+    // BEFORE running: the hot arith site is Specialized(Int) and the field site is Mono.
+    assert_eq!(
+        handle.entry_arith_cache(arith_off as usize),
+        ArithCache::Specialized { kind: ArithKind::Int },
+        "arith site must be Specialized(Int) BEFORE first execution"
+    );
+    assert!(
+        matches!(handle.entry_field_ic(field_off as usize), InlineCache::Mono { .. }),
+        "field site must be Mono BEFORE first execution; got {:?}",
+        handle.entry_field_ic(field_off as usize)
+    );
+
+    // Run → output byte-identical to an UNSEEDED load.
+    let seeded_out = handle.run().await.expect("seeded run ok");
+    let unseeded = ascript::pgo_seed_for_test(&bytes, /*seed=*/ false, /*specialize=*/ true)
+        .expect("load (no seed) must succeed");
+    assert_eq!(unseeded.installed(), 0, "no-seed load installs nothing");
+    let unseeded_out = unseeded.run().await.expect("unseeded run ok");
+    assert_eq!(
+        seeded_out, unseeded_out,
+        "seeded output must be byte-identical to unseeded"
+    );
+    assert!(seeded_out.contains("210"), "program output present");
+
+    // AFTER running: the arith site is STILL Specialized (the seed was live — guards held).
+    // (We must re-load+seed+run on the same handle to inspect post-run; reuse: build a
+    // fresh seeded handle, run it, then inspect.)
+    let after = ascript::pgo_seed_for_test(&bytes, true, true).expect("re-seed");
+    let _ = after.run().await.expect("post-run inspect run ok");
+    assert_eq!(
+        after.entry_arith_cache(arith_off as usize),
+        ArithCache::Specialized { kind: ArithKind::Int },
+        "arith site must REMAIN Specialized(Int) after a run over the training input"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn digest_mismatch_skips_module_seeds_and_warms_normally() {
+    let tmp = TmpDir::new("seed_digest");
+    let bytes = build_pgo_artifact(&tmp, pgo_training_source());
+
+    // Corrupt EVERY module's chunk_sha256 in the section so the seeder rejects all of them.
+    let corrupted = corrupt_all_chunk_digests(&bytes);
+
+    let handle = ascript::pgo_seed_for_test(&corrupted, true, true).expect("load+seed");
+    assert_eq!(
+        handle.installed(),
+        0,
+        "a digest mismatch must skip ALL of that module's seeds"
+    );
+
+    // Output unchanged vs the original (uncorrupted) seeded load.
+    let corrupt_out = handle.run().await.expect("corrupt-digest run ok");
+    let good = ascript::pgo_seed_for_test(&bytes, true, true).expect("load good");
+    let good_out = good.run().await.expect("good run ok");
+    assert_eq!(corrupt_out, good_out, "digest mismatch must not change output");
+
+    // Sabotage / tripwire proof: the GOOD artifact installs > 0 (so the > 0 assertion in
+    // the coverage test is non-vacuous — corrupting digests makes it drop to 0).
+    assert!(good.installed() > 0, "uncorrupted artifact installs > 0");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn derived_index_skips_absent_name() {
+    let tmp = TmpDir::new("seed_absent");
+    let bytes = build_pgo_artifact(&tmp, pgo_training_source());
+    let pgo = ascript::vm::pgo::find_and_decode_pgo(&bytes, archive_end(&bytes)).unwrap();
+    let field_off = first_field_off_for(&pgo, "x").expect("a field IC for 'x'");
+
+    // Hand-craft a section where the field site's key list does NOT contain "x"
+    // (we rewrite every key list entry to a bogus name). The derived-index lookup
+    // (name "x" → position) must then FAIL → the field entry is skipped.
+    let lying = rewrite_key_lists_to_bogus(&bytes);
+
+    let handle = ascript::pgo_seed_for_test(&lying, true, true).expect("load+seed lying");
+    // The field site must NOT be installed (the name is absent from the key list).
+    assert!(
+        matches!(handle.entry_field_ic(field_off as usize), InlineCache::Cold),
+        "an absent-name field entry must be SKIPPED (no install); got {:?}",
+        handle.entry_field_ic(field_off as usize)
+    );
+
+    // Output byte-identical to the unseeded load.
+    let lying_out = handle.run().await.expect("lying run ok");
+    let unseeded = ascript::pgo_seed_for_test(&bytes, false, true).unwrap();
+    let unseeded_out = unseeded.run().await.expect("unseeded run ok");
+    assert_eq!(lying_out, unseeded_out, "lying profile must be byte-identical");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn kill_switch_and_generic_mode() {
+    let tmp = TmpDir::new("seed_kill");
+    let bytes = build_pgo_artifact(&tmp, pgo_training_source());
+
+    // Kill switch: seed=false ⇒ installed-count 0.
+    let killed = ascript::pgo_seed_for_test(&bytes, false, true).expect("load no-seed");
+    assert_eq!(killed.installed(), 0, "kill switch ⇒ no seeds");
+
+    // Generic VM (no_specialize) ⇒ seeds skipped even when seed=true.
+    let generic = ascript::pgo_seed_for_test(&bytes, true, false).expect("load generic");
+    assert_eq!(
+        generic.installed(),
+        0,
+        "generic VM (no_specialize) ⇒ seeds skipped entirely"
+    );
+
+    // Output identical in all modes.
+    let seeded = ascript::pgo_seed_for_test(&bytes, true, true).unwrap();
+    let a = seeded.run().await.expect("seeded run");
+    let b = killed.run().await.expect("killed run");
+    let c = generic.run().await.expect("generic run");
+    assert_eq!(a, b, "seeded == kill-switched output");
+    assert_eq!(a, c, "seeded == generic output");
+}
+
+// ── Section-mutation helpers (operate on the trailing PGO frame bytes) ─────────────────────
+
+/// Replace every `chunk_sha256` in the PGO section with a corrupted value (XOR 0xFF the
+/// first byte of each 32-byte digest), re-encoding the section in place.
+fn corrupt_all_chunk_digests(bytes: &[u8]) -> Vec<u8> {
+    let start = archive_end(bytes);
+    let mut pgo = ascript::vm::pgo::find_and_decode_pgo(bytes, start).unwrap();
+    for m in &mut pgo.modules {
+        m.chunk_sha256[0] ^= 0xFF;
+    }
+    rebuild_with_section(bytes, start, &pgo)
+}
+
+/// Rewrite every key list to a single bogus key so no real property name resolves.
+fn rewrite_key_lists_to_bogus(bytes: &[u8]) -> Vec<u8> {
+    let start = archive_end(bytes);
+    let mut pgo = ascript::vm::pgo::find_and_decode_pgo(bytes, start).unwrap();
+    for kl in &mut pgo.key_lists {
+        for k in kl.iter_mut() {
+            *k = "__bogus_absent_name__".to_string();
+        }
+    }
+    rebuild_with_section(bytes, start, &pgo)
+}
+
+/// Truncate `bytes` to the archive end and re-append the (mutated) PGO section frame.
+fn rebuild_with_section(bytes: &[u8], start: usize, pgo: &ascript::vm::pgo::PgoSection) -> Vec<u8> {
+    let mut out = bytes[..start].to_vec();
+    ascript::vm::pgo::append_section(&mut out, &pgo.encode());
+    out
 }

@@ -1317,6 +1317,187 @@ impl Vm {
         }
     }
 
+    /// **WARM B §3.3/§3.5 — seed one module's warmed side tables from a PGO profile.**
+    ///
+    /// Pre-installs the arith/field-IC/global cache entries a runtime warm-up would have
+    /// produced, so a warm-started run skips the warm-up window. Returns the number of
+    /// entries actually installed (the COVERAGE metric — `> 0` proves the seed was live).
+    ///
+    /// **THE SOUNDNESS KEYSTONE (§3.5):** every install lands BEHIND AN EXISTING GUARD; no
+    /// path trusts a profile index. A corrupt/stale/LYING profile therefore degrades to a
+    /// cache MISS (→ the generic path), never wrong behavior:
+    ///
+    /// 1. **Digest gate** — `module.chunk_sha256` must equal the sha256 of `chunk_sha256`
+    ///    (the live module's stored bytes, supplied by the caller); a mismatch ⇒ return 0
+    ///    (the profile was recorded against different bytecode — its offsets/paths are
+    ///    meaningless). `chunk` is the entry chunk; `proto_at` resolves nested protos.
+    /// 2. **Shape remap** — each profile key-list is interned through THIS `Vm`'s
+    ///    `ShapeRegistry` → a fresh per-`Vm` id (ids are per-Vm and never serialized). A
+    ///    seeded `Mono{shape}` only hits if a runtime receiver has the IDENTICAL key
+    ///    layout, in which case the derived index is correct by the shape invariant.
+    /// 3. **Per-proto resolution** — an out-of-range proto path ⇒ skip that proto.
+    /// 4. **Arith** — install `ArithCache::Specialized{kind}` (kind byte range-checked;
+    ///    the run loop re-guards operand kinds and deopts on a miss).
+    /// 5. **Field** — the index is **DERIVED, never trusted**: read the property NAME from
+    ///    the chunk's own const operand at the site, find its position in the interned key
+    ///    list, and install `Mono`/`Poly` with THAT index. A name absent from the key list
+    ///    ⇒ skip the entry (the one hole a trusted index would open — closed here).
+    /// 6. **Global** — read the site's name operand; install `GlobalCache::Cached` ONLY if
+    ///    the name resolves in the LIVE builtin table (else skip). The version guard stays.
+    ///
+    /// ALL borrows are plain synchronous (`RefCell`); the shape-registry borrow is SCOPED
+    /// per key-list (never held across an install). Not `async` — no await anywhere.
+    pub fn seed_chunk(
+        &self,
+        chunk: &crate::vm::chunk::Chunk,
+        module: &crate::vm::pgo::PgoModule,
+        chunk_sha256: &[u8; 32],
+        key_lists: &[Vec<String>],
+    ) -> usize {
+        use crate::vm::adapt::{ArithCache, GlobalCache};
+        use crate::vm::ic::InlineCache;
+        use crate::vm::opcode::Op;
+
+        // ── Step 1: digest gate ─────────────────────────────────────────────────
+        // A stale profile (recorded against different bytecode) is rejected wholesale —
+        // its offsets and proto paths address a chunk that no longer exists.
+        if &module.chunk_sha256 != chunk_sha256 {
+            return 0;
+        }
+
+        // Pre-intern every referenced key-list to a fresh per-Vm shape id. An interning
+        // failure (a layout exceeding the shape caps — SLAB_MAX_KEYS / SHAPE_FANOUT_MAX)
+        // yields `None`, and any field entry referencing it is skipped (a miss, never a lie).
+        // The borrow is SCOPED to this block — released before any install.
+        let interned: Vec<Option<u32>> = {
+            let mut shapes = self.shapes.borrow_mut();
+            key_lists
+                .iter()
+                .map(|kl| shapes.shape_for(kl.iter().map(String::as_str)))
+                .collect()
+        };
+
+        let mut installed = 0usize;
+
+        for pproto in &module.protos {
+            // ── Step 3: resolve the proto at this index path (out-of-range ⇒ skip) ──
+            let Some(target) = proto_at(chunk, &pproto.path) else {
+                continue;
+            };
+            let code = &*target.code;
+            let code_len = code.len();
+
+            // ── Step 4: arith seeds ─────────────────────────────────────────────
+            for &(off, kind_tag) in &pproto.arith {
+                let off = off as usize;
+                // The arith cache is keyed by the op byte offset; an offset past the
+                // code is a corrupt profile → skip (never index out of range).
+                if off >= code_len {
+                    continue;
+                }
+                let Some(kind) = arith_kind_from_tag(kind_tag) else {
+                    continue; // unknown kind byte ⇒ skip (range-checked)
+                };
+                // Behind a guard: the run loop's fast path re-confirms operand kinds and
+                // deopts on a miss, so a wrong seed can only be a deopt, never a wrong result.
+                target.set_arith_cache(off, ArithCache::Specialized { kind });
+                installed += 1;
+            }
+
+            // ── Step 5: field-IC seeds — the DERIVED index ──────────────────────
+            for (off, list_idxs) in &pproto.fields {
+                let off = *off as usize;
+                // Need the opcode byte + a u16 operand: off, off+1, off+2 must be in range.
+                if off + 2 >= code_len {
+                    continue;
+                }
+                // Defensive: the site MUST be a field op (GET_PROP/SET_PROP). A profile
+                // that points `off` at some other op is corrupt → skip.
+                let opb = Op::from_u8(code[off]);
+                if !matches!(opb, Some(Op::GetProp) | Some(Op::SetProp)) {
+                    continue;
+                }
+                // Read the property NAME from the chunk's own (verified) const operand.
+                let Some(name) = const_str_operand(target, off + 1) else {
+                    continue;
+                };
+
+                // Build the IC by deriving the index for `name` in each referenced key list.
+                // NEVER trust the profile's claimed index — there is none in the wire format.
+                let mut ic = InlineCache::Cold;
+                for &li in list_idxs {
+                    let Some(shape) = interned.get(li as usize).copied().flatten() else {
+                        continue; // out-of-range list idx OR un-internable layout ⇒ skip
+                    };
+                    let Some(kl) = key_lists.get(li as usize) else {
+                        continue;
+                    };
+                    // DERIVE: the index is the name's position in the ACTUAL key list. A
+                    // lying layout (name absent / mis-ordered) ⇒ no position ⇒ skip → the
+                    // shape guard at runtime would miss anyway (shape-id only equals a
+                    // receiver whose layout IS this list, where the position is correct).
+                    let Some(pos) = kl.iter().position(|k| k == &name) else {
+                        continue; // name absent ⇒ skip this layout (the §3.3 keystone)
+                    };
+                    ic.record(shape, pos as u32);
+                }
+                // Only install if at least one layout survived derivation.
+                if !matches!(ic, InlineCache::Cold) {
+                    target.set_field_ic(off, ic);
+                    installed += 1;
+                }
+            }
+
+            // ── Step 6: global seeds — live builtin resolution only ─────────────
+            for &off in &pproto.globals {
+                let off = off as usize;
+                if off + 2 >= code_len {
+                    continue;
+                }
+                if !matches!(Op::from_u8(code[off]), Some(Op::GetGlobal)) {
+                    continue;
+                }
+                let Some(name) = const_str_operand(target, off + 1) else {
+                    continue;
+                };
+                // Install ONLY if the name resolves in the LIVE builtin table. A user-named
+                // or unresolvable site is skipped; a name that later becomes a shadowing
+                // user-global bumps `global_version`, invalidating this seed (the guard).
+                if crate::interp::BUILTIN_NAMES.contains(&name.as_str()) {
+                    let v = Value::builtin(Rc::from(name.as_str()));
+                    target.set_global_cache(off, GlobalCache::set(v, self.global_version()));
+                    installed += 1;
+                }
+            }
+        }
+
+        installed
+    }
+
+    /// **WARM B §3.3 — seed the entry chunk from a decoded PGO section** (the archive
+    /// load entry point). Gated on `vm.specialize` (the generic VM is the semantic floor —
+    /// it consults no caches, so a seed would be dead weight AND must be skipped to keep
+    /// generic == specialized) and on the caller's `seed` flag (the `ASCRIPT_NO_PGO` kill
+    /// switch / the test seam). Finds the entry module record by logical key, validates its
+    /// digest against `entry_sha256`, and seeds. Returns the installed count (0 when gated
+    /// off, the section is absent, the module is not recorded, or the digest mismatches).
+    pub fn seed_entry_from_section(
+        &self,
+        chunk: &crate::vm::chunk::Chunk,
+        section: &crate::vm::pgo::PgoSection,
+        entry_key: &str,
+        entry_sha256: &[u8; 32],
+        seed: bool,
+    ) -> usize {
+        if !seed || !self.specialize {
+            return 0;
+        }
+        let Some(module) = section.modules.iter().find(|m| m.module_key == entry_key) else {
+            return 0;
+        };
+        self.seed_chunk(chunk, module, entry_sha256, &section.key_lists)
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // DECODE §5.1 (Unit B part 1) — the pair/triple census (feature-gated)
     // ──────────────────────────────────────────────────────────────────────────
@@ -9959,6 +10140,52 @@ fn binop_of(op: Op) -> BinOp {
         Op::WrapSub => BinOp::WrapSub,
         Op::WrapMul => BinOp::WrapMul,
         _ => unreachable!("binop_of called with non-binary opcode {op:?}"),
+    }
+}
+
+// ── WARM B §3.3 — PGO seeder helpers (all pure, hostile-input-safe) ──────────────
+
+/// Map a profile arith-kind tag byte to an [`ArithKind`], range-checked. An unknown
+/// byte (from a stale/corrupt profile) yields `None` ⇒ the seeder skips the entry.
+/// The byte→variant mapping mirrors `ArithKind as u8` (the harvest writes `kind as u8`).
+fn arith_kind_from_tag(tag: u8) -> Option<crate::vm::adapt::ArithKind> {
+    use crate::vm::adapt::ArithKind;
+    match tag {
+        0 => Some(ArithKind::Int),
+        1 => Some(ArithKind::Number),
+        2 => Some(ArithKind::Decimal),
+        3 => Some(ArithKind::ConcatStr),
+        _ => None,
+    }
+}
+
+/// Resolve a nested proto by its index path through `chunk.protos` (empty = the chunk
+/// itself), returning its `Chunk`. An out-of-range step ⇒ `None` (skip that proto):
+/// a corrupt/stale profile path is never trusted to index the proto tree.
+fn proto_at<'a>(
+    chunk: &'a crate::vm::chunk::Chunk,
+    path: &[u32],
+) -> Option<&'a crate::vm::chunk::Chunk> {
+    let mut cur = chunk;
+    for &step in path {
+        let child = cur.protos.get(step as usize)?;
+        cur = &child.chunk;
+    }
+    Some(cur)
+}
+
+/// Read the property-name string constant the op at byte offset `operand_at` references
+/// (a u16 const-pool index). Returns `None` on any anomaly (operand out of range, const
+/// index out of range, or a non-string const) — the bytes are verified, but the PROFILE
+/// offset is not, so this is a bounds-checked read that fails to a skip, never a panic.
+fn const_str_operand(chunk: &crate::vm::chunk::Chunk, operand_at: usize) -> Option<String> {
+    let code = &*chunk.code;
+    let lo = *code.get(operand_at)?;
+    let hi = *code.get(operand_at + 1)?;
+    let idx = u16::from_le_bytes([lo, hi]) as usize;
+    match chunk.consts.get(idx)?.kind() {
+        crate::value::ValueKind::Str(s) => Some(s.to_string()),
+        _ => None,
     }
 }
 
