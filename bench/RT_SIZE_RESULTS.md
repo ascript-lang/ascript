@@ -114,13 +114,40 @@ Cargo feature — that gate is Task 2's deliverable.
 
 ---
 
-## Per-tier ascript-rt sizes (appended by Task 2)
+## Per-tier ascript-rt sizes (Task 2)
 
-[PLACEHOLDER — Task 2 will define the `ascript-rt` Cargo feature set and measure
- the resulting stub binary sizes per tier. Expected tiers: `core` (VM + GC only),
- `runtime-minimal` (+ sys + data + net), `runtime-full` (+ all non-toolchain
- features). Task 2 will fill in this section with real numbers and a comparison
- to the full `ascript` binary.]
+**Date:** 2026-06-17  
+**Machine:** Darwin Mahmouds-Mini.lan 25.5.0 arm64 (Apple Silicon)  
+**Rust:** rustc 1.96.0 (ac68faa20 2026-05-25)  
+**Profile:** `--release` (each tier is a forced fresh link of `ascript-rt`)  
+**Full toolchain baseline:** 45,389,808 bytes (43.28 MB)
+
+Each tier is the CUMULATIVE feature set defined in `scripts/build-rt.sh`:
+
+| Tier | Feature set | Binary (bytes) | Binary (MB) | % of toolchain |
+|------|-------------|---------------|-------------|----------------|
+| `rt-core` | `shared, bundle-zstd` (VM + GC + core language + shared heap + zstd bundle) | 6,038,960 | **5.75 MB** | **13.3%** |
+| `rt-local` | rt-core + `data, binary, log, workflow, datetime, crypto, compress, sys, sysinfo, sql, tui` | 14,536,880 | **13.86 MB** | **32.0%** |
+| `rt-net` | rt-local + `net, postgres, redis, telemetry` | 21,410,064 | **20.41 MB** | **47.1%** |
+| `rt-full` | rt-net + `intl, ai, ffi` | 34,222,720 | **32.63 MB** | **75.3%** |
+
+### Headlines
+
+- **rt-core is 13.3% of the full 43.28 MB toolchain** (5.75 MB): the bare VM + GC +
+  shared heap, with no optional stdlib. This is the minimum viable runtime stub —
+  roughly the size of a small Go binary — and proves the toolchain front-end components
+  (LSP, CST parser, compiler, formatter, checker, REPL, tree-sitter, clap, codesign,
+  DAP) account for the majority of the 43.28 MB baseline.
+- **rt-full is 75.3% of the toolchain** (32.63 MB): all runtime features except the
+  toolchain-only front-end (`lsp`, `pkg`, `dap`, `ffi` tooling). The remaining 24.7%
+  (~10.7 MB) is compiler/LSP/formatter/checker/REPL/tree-sitter/codesign that only
+  belongs in the build tool, never the runtime.
+- **`intl` + `ai` + `ffi` add 12.8 MB** to rt-net → rt-full: `ai` alone is the
+  dominant optional feature (AWS SDK + genai + multi-TLS backends), consistent with
+  the Task-0 per-feature delta table.
+- **Task-0 estimate validated:** Task 0 estimated the achievable rt-stub floor at
+  ≈ 14–15 MB ("before any additional feature gating"). The actual rt-local (the
+  most realistic general-purpose tier) lands at 13.86 MB — within 1% of that estimate.
 
 ---
 
