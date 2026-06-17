@@ -1099,6 +1099,16 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/workflow_signup.as",
         SkipReason::SharedExternalState,
     ),
+    // WARM C: the order-processing durability example writes its durable-workflow
+    // event log to a FIXED path (`/tmp/ascript_workflow_durability.log`) and
+    // removes it at the end. Concurrent corpus oracles race each other's cleanup
+    // (the same SharedExternalState class as workflow_signup.as). It runs
+    // deterministically in isolation and is covered by `tests/workflow_durability.rs`;
+    // the parallel multi-oracle harness is the only unsupported context.
+    (
+        "examples/advanced/workflow_durability.as",
+        SkipReason::SharedExternalState,
+    ),
     // ---- Network-peer / long-running servers (cannot run headless) ------------
     // Forever-serving HTTP API: blocks on `serve` awaiting a client in a separate
     // process; it does not terminate on its own and hangs even the tree-walker.
