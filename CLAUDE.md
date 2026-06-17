@@ -471,6 +471,36 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   3.92× ≥ 2×). **Cross-axis gate:** elide-on == elide-off over the full corpus + fuzz +
   paranoid-corpus zero-escalations (`vm_differential.rs` elide axis, both feature configs). **ASO
   28→29** (`Op::CallElided`). No grammar/LSP/fmt/tree-walker-behavior change.
+- **WARM — warm starts & durable-log throughput** (spec
+  `superpowers/specs/2026-06-12-warm-starts-design.md`; three independent units, all
+  behaviour-invisible). **Unit A — compile cache** (CLI-side, `src/cache/`): `ascript run <f>.as`
+  consults a content-addressed cache under `$ASCRIPT_CACHE/compiled/` BEFORE parsing. The
+  `CompileCacheKey` (`ck1-` prefix) hashes source + the **transitive module graph**
+  (`collect_module_graph` — a parallel re-derivation of `compile_path_module_set`, kept ≡ by the
+  §2.5 walk-drift tripwire) + effective flags + lockfile. **Fail-open + verify-on-hit**: a hit is
+  re-verified before use, any mismatch/corruption degrades to a normal compile — a hostile cache
+  entry can never produce a wrong run. Applies ONLY to the plain `.as`-on-VM path (`.aso` /
+  `--tree-walker` / `--inspect` / `--profile` / `--elide` never cached). `--no-cache` /
+  `ASCRIPT_NO_COMPILE_CACHE`; `ascript cache clean|dir`. CLI-only → `vm_differential` untouched.
+  Bench N=500 → **8.0× warm** (+60ms cold tax). **Unit B — PGO** (`src/vm/pgo.rs` + `src/vm/run.rs`
+  harvest/seed + `src/vm/shape.rs` `keys_of_pgo`): `ascript build --pgo` runs the program as a REAL
+  training workload, harvests warmed inline-cache/adaptive-arith state from LIVE `FnProto`s, and
+  appends an `ASPGO` section that rides **OUTSIDE** the `ModuleArchive` encode/decode (count-bomb /
+  hostile-byte safe). A later run's `seed_chunk` pre-installs the profile **behind every
+  specialization guard** (DERIVED field index, digest-checked) — byte-INVISIBLE: a build without
+  `--pgo` is byte-identical, a seeded run is byte-identical to unseeded across all engines, and a
+  stale/hostile section deopts on first use. `ASCRIPT_NO_PGO` kill switch. Seeded-PGO joins
+  `vm_differential` as the **445/0** axis (both configs). Steady-state ≈1.0× (moves *when* caches
+  warm, not warm-code speed). **No `.aso` bump** (rides outside the archive; `ASO_FORMAT_VERSION`
+  unchanged, `ARCHIVE_VERSION` 1 unchanged). **Unit C — workflow durability** (`workflow`-gated;
+  `src/stdlib/workflow.rs` + the CORE `src/det.rs` chokepoint): `Durability::{Fsync (default,
+  unchanged), Group{window_ms,max_events}, Buffered}` routed through ONE `record_event` chokepoint;
+  a crc-framed group appender with torn-tail **prefix repair** (a partial trailing record is
+  truncated, never replayed). At-least-once activity contract. The `det.rs` chokepoint is core and
+  compiles under `--no-default-features`; `log_to_events` reconstruction keeps its local vec (NOT
+  pumped). Group ≈98.85× faster than fsync on per-commit shapes; `"fsync"` ≈ baseline. Tree-walker
+  untouched. Recorded follow-ups (roadmap, none silent): cache auto-GC, PGO profile merging,
+  method-IC seeding, group-mode background flusher.
 
 ## Commands
 

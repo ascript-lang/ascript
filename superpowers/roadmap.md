@@ -722,6 +722,31 @@ Spec `superpowers/specs/2026-06-12-data-parallel-design.md`, plan
   at 2/4/8); break-even ~1000 LCG-iters/element; frozen input **2.01×** faster than plain at 1M elements;
   Gate-12 spec/tw **3.85×** (PAR touched no engine path).
 
+## WARM — warm starts & durable-log throughput ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-warm-starts-design.md`, plan
+`…/plans/2026-06-12-warm-starts.md`. Three independent, behaviour-invisible units; **no
+`.aso`/`ARCHIVE_VERSION` bump** (PGO rides outside the archive); tree-walker untouched.
+
+- **Unit A — compile cache** (CLI-side, `src/cache/`): content-addressed cache under
+  `$ASCRIPT_CACHE/compiled/`, keyed on source + transitive module graph + flags + lockfile
+  (`CompileCacheKey`, `ck1-`). **Fail-open + verify-on-hit** — a corrupt/hostile entry degrades to a
+  normal compile. Plain `.as`-on-VM path only. `--no-cache` / `ASCRIPT_NO_COMPILE_CACHE`;
+  `ascript cache clean|dir`. Bench N=500 → **8.0× warm**, +60ms cold tax. `vm_differential` untouched.
+- **Unit B — PGO** (`src/vm/pgo.rs`, `src/vm/run.rs`, `src/vm/shape.rs`): `build --pgo` harvests warmed
+  IC/adaptive-arith state from live `FnProto`s into a trailing `ASPGO` section riding OUTSIDE the
+  archive codec; `seed_chunk` re-installs it behind every specialization guard (digest-checked,
+  derived index). Byte-INVISIBLE; seeded-PGO joins `vm_differential` as the **445/0** axis (both
+  configs). `ASCRIPT_NO_PGO`. Steady-state ≈1.0×.
+- **Unit C — workflow durability** (`workflow`-gated; `src/stdlib/workflow.rs` + core `src/det.rs`):
+  `Durability::{Fsync (default), Group, Buffered}` via one `record_event` chokepoint; crc-framed group
+  appender with torn-tail prefix repair; at-least-once activity contract. Group ≈**98.85×** faster than
+  fsync on per-commit shapes; `"fsync"` ≈ baseline (default unchanged). kill-9 battery green.
+- **Recorded follow-ups (none silent):** cache auto-GC (size/age eviction) — owner: defer to a cache-ops
+  pass; PGO profile merging across multiple training runs — owner: future PGO v2; method-IC seeding
+  (v1 seeds field/arith sites only) — owner: future PGO v2; group-mode background flusher (v1 flushes
+  on the recording thread) — owner: workflow-perf follow-up.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred
