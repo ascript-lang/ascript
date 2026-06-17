@@ -946,6 +946,147 @@ fn extract_payload_and_footer(bundle: &Path) -> Vec<u8> {
     out
 }
 
+// ── RT §4.5 `--exact` end-to-end ─────────────────────────────────────────────
+
+/// CI-gated end-to-end: `build --native --exact` on a std/math-only program:
+///   1. Builds a stub (exactly `shared,bundle-zstd` — no tier slack).
+///   2. Content-addresses it into the cache.
+///   3. The bundle runs and produces the expected output.
+///   4. A SECOND build with the same feature set reuses the cache (no second cargo
+///      invocation — verified via a modification-time probe of the cache slot).
+///
+/// Gated on `ASCRIPT_SRC` (path to the source checkout). Skipped if unset.
+#[test]
+fn exact_build_caches_and_runs() {
+    let src_dir = match std::env::var("ASCRIPT_SRC") {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            eprintln!(
+                "[rt_stub] SKIP exact_build_caches_and_runs — ASCRIPT_SRC not set; \
+                 run with ASCRIPT_SRC=$PWD to exercise --exact"
+            );
+            return;
+        }
+    };
+
+    let dir = tmp_dir("rt_exact_e2e");
+    // A std/math-only program: uses no optional features → selected tier is rt-core
+    // → exact feature set is shared,bundle-zstd (exactly rt-core).
+    let prog = write(
+        &dir,
+        "math_prog.as",
+        "import { sqrt } from \"std/math\"\nprint(sqrt(9.0))\n",
+    );
+
+    // ── First build: must invoke cargo and produce the bundle. ────────────────
+    let out1 = dir.join("math_prog_exact1");
+    let b1 = Command::new(toolchain_bin())
+        .args(["build", "--native", "--exact"])
+        .arg(&prog)
+        .arg("-o")
+        .arg(&out1)
+        .env("ASCRIPT_SRC", &src_dir)
+        .output()
+        .expect("failed to run ascript build --native --exact");
+    assert!(
+        b1.status.success(),
+        "first --exact build failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&b1.stdout),
+        String::from_utf8_lossy(&b1.stderr),
+    );
+    assert!(out1.exists(), "bundle not produced at {}", out1.display());
+
+    // Run the bundle and verify output.
+    let run1 = Command::new(&out1)
+        .output()
+        .expect("failed to run first exact bundle");
+    assert!(
+        run1.status.success(),
+        "exact bundle run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&run1.stdout),
+        String::from_utf8_lossy(&run1.stderr),
+    );
+    let stdout1 = String::from_utf8(run1.stdout).unwrap();
+    assert!(
+        stdout1.trim().contains("3"),
+        "expected sqrt(9.0)=3 in output, got: {stdout1}"
+    );
+
+    // Capture the cache slot mtime BEFORE the second build.
+    // We probe the exact-index sidecar in the cache rt/ dir.
+    let cache_index = {
+        // Use ASCRIPT_CACHE if set, else default.
+        let cache_root = std::env::var_os("ASCRIPT_CACHE")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                // Mirror the platform default from cache.rs.
+                #[cfg(target_os = "macos")]
+                {
+                    std::env::var_os("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join("Library/Caches/ascript"))
+                        .unwrap_or_else(|| std::env::temp_dir().join("ascript-cache"))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    std::env::var_os("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join(".cache/ascript"))
+                        .unwrap_or_else(|| std::env::temp_dir().join("ascript-cache"))
+                }
+            });
+        cache_root.join("rt").join("exact-index.json")
+    };
+    let mtime_before = std::fs::metadata(&cache_index)
+        .and_then(|m| m.modified())
+        .ok();
+
+    // ── Second build: must reuse the cache (no second cargo invocation). ──────
+    let out2 = dir.join("math_prog_exact2");
+    let b2 = Command::new(toolchain_bin())
+        .args(["build", "--native", "--exact"])
+        .arg(&prog)
+        .arg("-o")
+        .arg(&out2)
+        .env("ASCRIPT_SRC", &src_dir)
+        .output()
+        .expect("failed to run second ascript build --native --exact");
+    assert!(
+        b2.status.success(),
+        "second --exact build failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&b2.stdout),
+        String::from_utf8_lossy(&b2.stderr),
+    );
+
+    // The exact-index mtime should NOT have changed (no new entry written
+    // on a cache hit — we only append on a miss).
+    if let Some(before) = mtime_before {
+        let mtime_after = std::fs::metadata(&cache_index)
+            .and_then(|m| m.modified())
+            .ok();
+        assert_eq!(
+            Some(before),
+            mtime_after,
+            "exact-index was modified on the second build — expected a cache hit (no cargo invocation)"
+        );
+    }
+
+    // The second bundle must also run correctly.
+    let run2 = Command::new(&out2)
+        .output()
+        .expect("failed to run second exact bundle");
+    assert!(
+        run2.status.success(),
+        "second exact bundle run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&run2.stdout),
+        String::from_utf8_lossy(&run2.stderr),
+    );
+    let stdout2 = String::from_utf8(run2.stdout).unwrap();
+    assert!(
+        stdout2.trim().contains("3"),
+        "expected sqrt(9.0)=3 in second output, got: {stdout2}"
+    );
+}
+
 /// RT §4.3 — a tier-insufficient `--stub` (an rt-core stub) for a program importing `std/json`
 /// (which needs the `data` feature) is REJECTED fail-closed via the `--rt-info` probe, naming
 /// the missing feature. Gated on `ASCRIPT_RT_CORE_BIN` (an rt-core stub built with

@@ -2862,6 +2862,11 @@ pub struct NativeBuildOpts {
     /// a stripped bundle degrades to span-less panic messages). `false` ⇒ debug info is
     /// included (today's default for `--native`).
     pub strip: bool,
+    /// `--exact` — build the stub with EXACTLY the required features via a local
+    /// `cargo build` of `ascript-rt` (§4.5). Requires `$ASCRIPT_SRC` to point at a
+    /// matching source checkout. Mutually exclusive with `--tier` and `--stub`.
+    /// `false` ⇒ the default ladder (rung 0 skipped).
+    pub exact: bool,
 }
 
 #[cfg(not(ascript_rt))]
@@ -2980,51 +2985,76 @@ pub async fn build_native(
         (payload, 0u16)
     };
 
-    // Step 2: resolve the stub the payload is appended to via the RT §5.4 five-rung ladder
-    // (--stub → cache → fetch → dev sibling → current_exe). The resolver returns a CLEAN
-    // runtime path (any pre-existing overlay already stripped exactly as the old current_exe
-    // path did): for the default host build with no --stub/--target this ends at rung 5 =
-    // today's exact current_exe behavior (+ a one-time warning). Integrity failures (a
-    // tampered fetched stub, a tier-insufficient --stub) ABORT here; availability failures
-    // fall through inside `resolve_stub`.
-    let resolve_opts = crate::rtstub::select::ResolveOpts {
-        target: opts.target.clone(),
-        tier: selection.tier,
-        stub: opts.stub.clone(),
-        no_fetch: opts.no_fetch,
-        required_features: selection.required.clone(),
-        demanding: std_imports
+    // Step 2: resolve the stub the payload is appended to.
+    //
+    // Rung 0 (--exact, §4.5): when the user passed --exact, invoke a local cargo build
+    // of `ascript-rt` with EXACTLY the required features and content-address the result.
+    // This bypasses all other rungs. Mutually exclusive with --stub/--tier (enforced by
+    // clap); the exact module handles detection errors, signing, and the exact-index cache.
+    //
+    // Rungs 1–5 (--stub → cache → fetch → dev sibling → current_exe): walked when --exact
+    // is not set. See `resolve_stub` for the integrity-vs-availability contract.
+    let (stub, sign_locally, stub_sha256, stub_origin) = if opts.exact {
+        let required_set: std::collections::BTreeSet<&str> = selection
+            .required
             .iter()
-            .filter_map(|spec| {
-                crate::rtstub::std_features::STD_MODULE_FEATURES
-                    .iter()
-                    .find(|(m, _)| *m == spec.as_str())
-                    .and_then(|(_, f)| f.map(|feat| (spec.clone(), feat.to_string())))
-            })
-            .collect(),
-    };
-    let resolved = crate::rtstub::select::resolve_stub(&resolve_opts)
-        .await
+            .map(|s| s.as_str())
+            .collect();
+        let exact_result = crate::rtstub::exact::build_exact(
+            &required_set,
+            opts.target.as_deref(),
+            &crate::rtstub::exact::DetectContext::real(),
+        )
         .map_err(AsError::new)?;
-    // The resolved path is a clean runtime (footer-free) — load its bytes to append onto.
-    let stub = std::fs::read(&resolved.bytes_path).map_err(|e| {
-        AsError::new(format!(
-            "cannot read the resolved stub {}: {}",
-            resolved.bytes_path.display(),
-            e
-        ))
-    })?;
-    // RT §6.2 / BIN sign-before-append rule: we ONLY ad-hoc sign locally for the
-    // current_exe rung (a stub produced on this mac host whose signature the append would
-    // otherwise invalidate). A fetched / `--stub` / sibling stub is appended AS-IS — those
-    // arrive pre-signed (release-time CI, or the user's own build), and the sign-before-
-    // append rule means an append never invalidates a signature computed over the clean
-    // stub's [0, stub_len). Signing someone else's stub here would re-sign over our own
-    // host identity, which is both wrong for a cross target and unnecessary.
-    let sign_locally = resolved.origin == "current_exe";
-    let stub_sha256 = resolved.sha256.clone();
+        let bytes = std::fs::read(&exact_result.bytes_path).map_err(|e| {
+            AsError::new(format!(
+                "cannot read exact stub {}: {}",
+                exact_result.bytes_path.display(),
+                e
+            ))
+        })?;
+        // The exact stub was already signed (macOS) and is in the cache — never re-sign here.
+        (bytes, false, exact_result.sha256, "--exact")
+    } else {
+        // Rungs 1–5: the standard five-rung ladder.
+        let resolve_opts = crate::rtstub::select::ResolveOpts {
+            target: opts.target.clone(),
+            tier: selection.tier,
+            stub: opts.stub.clone(),
+            no_fetch: opts.no_fetch,
+            required_features: selection.required.clone(),
+            demanding: std_imports
+                .iter()
+                .filter_map(|spec| {
+                    crate::rtstub::std_features::STD_MODULE_FEATURES
+                        .iter()
+                        .find(|(m, _)| *m == spec.as_str())
+                        .and_then(|(_, f)| f.map(|feat| (spec.clone(), feat.to_string())))
+                })
+                .collect(),
+        };
+        let resolved = crate::rtstub::select::resolve_stub(&resolve_opts)
+            .await
+            .map_err(AsError::new)?;
+        let stub_bytes = std::fs::read(&resolved.bytes_path).map_err(|e| {
+            AsError::new(format!(
+                "cannot read the resolved stub {}: {}",
+                resolved.bytes_path.display(),
+                e
+            ))
+        })?;
+        // RT §6.2 / BIN sign-before-append rule: we ONLY ad-hoc sign locally for the
+        // current_exe rung (a stub produced on this mac host whose signature the append
+        // would otherwise invalidate). A fetched / --stub / sibling / --exact stub is
+        // appended AS-IS — those arrive pre-signed (release-time CI, or our own exact
+        // build), and the sign-before-append rule means an append never invalidates a
+        // signature computed over the clean stub's [0, stub_len).
+        let sign = resolved.origin == "current_exe";
+        let sha = resolved.sha256.clone();
+        let origin = resolved.origin;
+        (stub_bytes, sign, sha, origin)
+    };
     let stub_size = stub.len() as u64;
-    let stub_origin = resolved.origin;
     let payload_sha256 = hex_digest(&sha256_bytes(&payload));
 
     // Step 3: choose the output path (source stem; `.exe` for a *-windows-* TARGET regardless

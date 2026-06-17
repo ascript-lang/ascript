@@ -146,6 +146,15 @@ pub enum Command {
         /// bit-identical to a pre-RT build.
         #[arg(long = "compress", requires = "native")]
         compress: bool,
+        /// RT §4.5: build the stub with EXACTLY the features the program requires via a
+        /// local `cargo build` of `ascript-rt` (no tier slack). Requires `$ASCRIPT_SRC`
+        /// to be set to a source checkout matching this toolchain's version; `cargo` must
+        /// be on PATH. The result is content-addressed and cached — a second build with
+        /// the same feature set skips the cargo invocation. `--exact --target
+        /// *-apple-darwin` requires a macOS host. Mutually exclusive with `--tier` and
+        /// `--stub`. Requires `--native`.
+        #[arg(long = "exact", requires = "native", conflicts_with_all = ["tier", "stub"])]
+        exact: bool,
         /// RT §4.4: force the stub tier (`rt-core`/`rt-local`/`rt-net`/`rt-full`) for a
         /// `--native` bundle instead of automatic nearest-superset selection. A tier
         /// below the program's requirements is rejected (the error lists the missing

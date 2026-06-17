@@ -520,6 +520,7 @@ async fn real_main() -> ExitCode {
             target,
             stub,
             no_fetch,
+            exact,
             compress,
             tier,
             report_json,
@@ -572,6 +573,7 @@ async fn real_main() -> ExitCode {
                     stub: stub.as_deref().map(std::path::PathBuf::from),
                     no_fetch,
                     strip,
+                    exact,
                 };
                 match ascript::build_native(src, out_path, caps, elide, &opts).await {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`

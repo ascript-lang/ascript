@@ -773,3 +773,172 @@ fn report_json_end_to_end_sha_stable() {
         "two builds of the same source must have a stable output_sha256"
     );
 }
+
+// ─── RT §4.5 exact_build_plan pure-unit tests ───────────────────────────────
+
+use ascript::rtstub::exact::{check_darwin_cross, exact_build_plan};
+use std::collections::BTreeSet as BS;
+
+/// `exact_build_plan` always includes `bundle-zstd` and `shared`.
+#[test]
+fn exact_build_plan_minimal_empty_required() {
+    let req: BS<&str> = BS::new();
+    let (argv, env) = exact_build_plan(&req, None);
+    // Verify the fixed argv prefix.
+    assert_eq!(&argv[..6], &["build", "--release", "--bin", "ascript-rt",
+                              "--no-default-features", "--features"]);
+    // The features arg must contain bundle-zstd and shared (sorted).
+    let feat_arg = &argv[6];
+    let mut parts: Vec<&str> = feat_arg.split(',').collect();
+    parts.sort_unstable();
+    assert!(parts.contains(&"bundle-zstd"), "bundle-zstd missing: {feat_arg}");
+    assert!(parts.contains(&"shared"), "shared missing: {feat_arg}");
+    // No --target when target is None.
+    assert!(!argv.contains(&"--target".to_string()), "--target present but not requested");
+    // Required env vars.
+    assert!(env.contains(&("ASCRIPT_RT".to_string(), "1".to_string())));
+    assert!(env.contains(&("ASCRIPT_RT_TIER".to_string(), "custom".to_string())));
+}
+
+/// With `{"data"}` required, the features arg must be `"bundle-zstd,data,shared"` (sorted).
+#[test]
+fn exact_build_plan_with_data_feature() {
+    let mut req: BS<&str> = BS::new();
+    req.insert("data");
+    let (argv, _env) = exact_build_plan(&req, None);
+    let feat_arg = &argv[6];
+    // Sorted order: bundle-zstd < data < shared
+    assert_eq!(feat_arg, "bundle-zstd,data,shared", "feature set: {feat_arg}");
+}
+
+/// With an empty required set the features should be exactly `"bundle-zstd,shared"` (sorted).
+#[test]
+fn exact_build_plan_empty_required_features_string() {
+    let req: BS<&str> = BS::new();
+    let (argv, _env) = exact_build_plan(&req, None);
+    let feat_arg = &argv[6];
+    assert_eq!(feat_arg, "bundle-zstd,shared");
+}
+
+/// With `{"ffi"}` required and a target, `--target` appears in the argv.
+#[test]
+fn exact_build_plan_with_target() {
+    let mut req: BS<&str> = BS::new();
+    req.insert("ffi");
+    let target = "x86_64-unknown-linux-gnu";
+    let (argv, _env) = exact_build_plan(&req, Some(target));
+    let target_idx = argv
+        .iter()
+        .position(|a| a == "--target")
+        .expect("--target not in argv");
+    assert_eq!(argv[target_idx + 1], target);
+}
+
+/// Detection: cargo missing → specific error mentioning "install cargo" / "rustup.rs".
+#[test]
+fn exact_detect_no_cargo() {
+    use ascript::rtstub::exact::DetectContext;
+    let ctx = DetectContext {
+        cargo_available: false,
+        ascript_src: Some(std::path::PathBuf::from("/some/path")),
+        version_override: Some(env!("CARGO_PKG_VERSION").to_string()),
+    };
+    let err = ascript::rtstub::exact::detect(&ctx).unwrap_err();
+    assert!(
+        err.contains("install") || err.contains("cargo"),
+        "expected 'install cargo' hint, got: {err}"
+    );
+    assert!(
+        err.contains("rustup.rs") || err.contains("PATH"),
+        "expected PATH/rustup hint, got: {err}"
+    );
+}
+
+/// Detection: `$ASCRIPT_SRC` unset → specific error mentioning ASCRIPT_SRC.
+#[test]
+fn exact_detect_no_ascript_src() {
+    use ascript::rtstub::exact::DetectContext;
+    let ctx = DetectContext {
+        cargo_available: true,
+        ascript_src: None,
+        version_override: Some(env!("CARGO_PKG_VERSION").to_string()),
+    };
+    let err = ascript::rtstub::exact::detect(&ctx).unwrap_err();
+    assert!(
+        err.contains("ASCRIPT_SRC"),
+        "expected ASCRIPT_SRC in error, got: {err}"
+    );
+}
+
+/// Detection: version mismatch → specific error naming both versions.
+#[test]
+fn exact_detect_version_mismatch() {
+    use ascript::rtstub::exact::DetectContext;
+    let ctx = DetectContext {
+        cargo_available: true,
+        ascript_src: Some(std::path::PathBuf::from("/some/path")),
+        version_override: Some("0.0.0-wrong".to_string()),
+    };
+    let err = ascript::rtstub::exact::detect(&ctx).unwrap_err();
+    assert!(
+        err.contains("0.0.0-wrong"),
+        "expected mismatch version in error, got: {err}"
+    );
+    assert!(
+        err.contains(env!("CARGO_PKG_VERSION")),
+        "expected current version in error, got: {err}"
+    );
+    assert!(
+        err.contains("mismatch") || err.contains("version"),
+        "expected version mismatch message, got: {err}"
+    );
+}
+
+/// Detection: matching version → Ok.
+#[test]
+fn exact_detect_version_match_ok() {
+    use ascript::rtstub::exact::DetectContext;
+    let ctx = DetectContext {
+        cargo_available: true,
+        ascript_src: Some(std::path::PathBuf::from("/tmp/fake-src")),
+        version_override: Some(env!("CARGO_PKG_VERSION").to_string()),
+    };
+    // Should succeed (the src_path is not validated for existence in detect itself —
+    // only the version is checked via the override).
+    let result = ascript::rtstub::exact::detect(&ctx);
+    assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+}
+
+/// `--exact --target *-apple-darwin` on a non-macOS host → rejection.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn exact_darwin_cross_rejected_on_non_macos() {
+    let err = check_darwin_cross(Some("aarch64-apple-darwin")).unwrap_err();
+    assert!(
+        err.contains("non-macOS") || err.contains("macOS"),
+        "expected macOS-host error, got: {err}"
+    );
+    assert!(
+        err.contains("apple-darwin"),
+        "expected target name in error, got: {err}"
+    );
+}
+
+/// `--exact --target x86_64-unknown-linux-gnu` is always fine (non-darwin target).
+#[test]
+fn exact_non_darwin_target_ok() {
+    assert!(
+        check_darwin_cross(Some("x86_64-unknown-linux-gnu")).is_ok(),
+        "non-darwin target must not be rejected"
+    );
+}
+
+/// `--exact` with no target (`None`) is fine (host, never darwin unless we're on macOS).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn exact_no_target_ok_on_non_macos() {
+    assert!(
+        check_darwin_cross(None).is_ok(),
+        "no target on non-macOS must not be rejected"
+    );
+}
