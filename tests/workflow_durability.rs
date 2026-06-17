@@ -714,6 +714,382 @@ fn count_recorded_prefix_activities(prefix: &str) -> usize {
     kept
 }
 
+// ─── Task 11 (WARM C §5): the `kill -9` crash-recovery battery ────────────────
+//
+// These spawn the REAL binary (the `tests/cli.rs` precedent), drive a workflow to a
+// known point, `kill -9` it mid-run, then `resume` in a fresh process and assert the
+// EXACT §4.5 loss-window contract:
+//
+//   * "fsync" (the shipped default): a crash mid-run persists NOTHING from the
+//     in-flight run (the whole log is a single temp+rename snapshot written only at
+//     finish), so `resume` re-executes EVERY activity — at-least-once, markers for the
+//     already-run activities DOUBLE.
+//   * "group" (WARM C, Task 10): each event is appended at record-time and lives in the
+//     OS page cache the moment the recording call returns, so a `kill -9` loses NOTHING
+//     committed. `resume` REPLAYS the persisted prefix (no re-execution, markers do NOT
+//     double), executes only the suffix, and a SECOND resume is idempotent.
+//   * "group" mid-activity edge: the in-flight activity's `ActivityCompleted` is never
+//     recorded (the kill lands inside it), so `resume` re-executes EXACTLY that one
+//     activity — the at-least-once boundary the model guarantees.
+//
+// Unix-gated: `Child::kill()` sends SIGKILL on Unix (uncatchable, kernel-delivered even
+// while the debuggee busy-loops). No `libc`/`nix` dependency is introduced.
+
+/// The 5-activity marker workflow, spawned as a real process. `verb` is "run"
+/// (the first, killed invocation) or "resume" (the recovery invocation). `kill_point`
+/// selects how the process is held after activity 3:
+///   * `"between"` — a `spin` activity is inserted BETWEEN activity a2 and a3 ONLY on the
+///     run phase; it writes `ready.txt` and busy-loops forever. Events 0..2 (a0,a1,a2) are
+///     fully recorded before the spin; the kill lands cleanly between activities.
+///   * `"mid"` — activity a3 itself writes `ready.txt` and busy-loops BEFORE appending its
+///     marker, so the kill lands MID-activity and a3's `ActivityCompleted` is never
+///     recorded.
+///
+/// Each non-spin activity appends "<name>\n" to `markers.txt` (the at-least-once side
+/// effect) and returns its index; the workflow sums the indices (0+1+2+3+4 = 10).
+#[cfg(unix)]
+fn kill9_program(kill_point: &str) -> String {
+    // The activity bodies differ by kill_point: in "mid" mode a3 carries the
+    // signal+spin; in "between" mode a separate `spin` activity carries it.
+    let (a3_body, spin_step) = match kill_point {
+        "mid" => (
+            // a3: on the run phase, signal + busy-loop BEFORE recording its marker.
+            r#"if (verb == "run") { write(ready, "ready\n"); let i = 0; while (true) { i = i + 1 } }
+        append(marker, "a3\n")
+        return 3"#,
+            // no separate spin step in "between" position
+            "",
+        ),
+        _ => (
+            // a3: an ordinary activity.
+            r#"append(marker, "a3\n")
+        return 3"#,
+            // a `spin` activity inserted between a2 and a3, run-phase only.
+            r#"if (verb == "run") { ctx.call(spin) }"#,
+        ),
+    };
+    format!(
+        r#"
+import {{ run, resume, activity }} from "std/workflow"
+import {{ append, write }} from "std/fs"
+import {{ args }} from "std/env"
+
+let dir = args()[0]
+let dur = args()[1]
+let verb = args()[2]
+let marker = dir + "/markers.txt"
+let ready = dir + "/ready.txt"
+let log = dir + "/wf.log"
+
+fn mk(name, idx) {{
+    return activity(name, () => {{
+        append(marker, name + "\n")
+        return idx
+    }})
+}}
+let a0 = mk("a0", 0)
+let a1 = mk("a1", 1)
+let a2 = mk("a2", 2)
+let a4 = mk("a4", 4)
+let a3 = activity("a3", () => {{
+        {a3_body}
+}})
+// The `spin` activity (used only in "between" kill_point, run phase) signals ready and
+// busy-loops forever so the parent can kill it; on resume it is never reached.
+let spin = activity("spin", () => {{
+    write(ready, "ready\n")
+    let i = 0
+    while (true) {{ i = i + 1 }}
+    return 0
+}})
+
+fn flow(ctx, _) {{
+    let s = 0
+    s = s + ctx.call(a0)
+    s = s + ctx.call(a1)
+    s = s + ctx.call(a2)
+    {spin_step}
+    s = s + ctx.call(a3)
+    s = s + ctx.call(a4)
+    return s
+}}
+
+if (verb == "run") {{
+    let r = await run(flow, nil, {{ log: log, durability: dur }})
+    print(r)
+}} else {{
+    let r = await resume(flow, nil, {{ log: log, durability: dur }})
+    print(r)
+}}
+"#
+    )
+}
+
+/// A unique temp DIRECTORY for one kill-9 case (program file + markers + ready + log all
+/// live inside it). Created fresh; the caller cleans it up.
+#[cfg(unix)]
+fn kill9_dir(name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "ascript_kill9_{name}_{}_{:?}_{n}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create kill9 temp dir");
+    dir
+}
+
+/// Spawn `ascript run <prog> -- <dir> <durability> run`, poll for `ready.txt` (bounded,
+/// 30s), then `kill -9` (SIGKILL via `Child::kill` on Unix) and reap. Panics if the
+/// child never signals readiness (a hang is a real bug, never silently swallowed).
+#[cfg(unix)]
+fn run_until_ready_then_kill9(dir: &std::path::Path, prog: &std::path::Path, durability: &str) {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let ready = dir.join("ready.txt");
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(prog)
+        .arg("--")
+        .arg(dir)
+        .arg(durability)
+        .arg("run")
+        // Discard child stdout/stderr — we observe via the filesystem (markers/log).
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ascript run");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if ready.exists() {
+            break;
+        }
+        // If the child already exited (e.g. a compile error) before signalling, surface
+        // it loudly instead of polling to the timeout.
+        if let Ok(Some(status)) = child.try_wait() {
+            // Reap is done; the missing ready.txt is the real failure.
+            panic!(
+                "child exited (status {status:?}) before writing ready.txt — \
+                 ready={} markers={:?}",
+                ready.display(),
+                std::fs::read_to_string(dir.join("markers.txt")).ok()
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "timed out (30s) waiting for ready.txt at {} — markers={:?}",
+                ready.display(),
+                std::fs::read_to_string(dir.join("markers.txt")).ok()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // SIGKILL (uncatchable, kernel-delivered even while the debuggee busy-loops).
+    child.kill().expect("kill -9 the running workflow");
+    let _ = child.wait();
+}
+
+/// Spawn `ascript run <prog> -- <dir> <durability> resume` to completion and return its
+/// trimmed stdout. The recovery invocation skips the spin (verb != "run").
+#[cfg(unix)]
+fn resume_to_completion(
+    dir: &std::path::Path,
+    prog: &std::path::Path,
+    durability: &str,
+) -> String {
+    use std::process::Command;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin)
+        .arg("run")
+        .arg(prog)
+        .arg("--")
+        .arg(dir)
+        .arg(durability)
+        .arg("resume")
+        .output()
+        .expect("spawn ascript run (resume)");
+    assert!(
+        out.status.success(),
+        "resume must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Read the per-activity marker counts from `markers.txt` as a sorted `(name, count)`
+/// vector (deterministic ordering for assertions).
+#[cfg(unix)]
+fn marker_counts(dir: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let mut m = std::collections::BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(dir.join("markers.txt")) {
+        for line in text.lines() {
+            let l = line.trim();
+            if !l.is_empty() {
+                *m.entry(l.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    m
+}
+
+/// §5 / §4.5 — `"fsync"` mode (the shipped default): a `kill -9` mid-run persists nothing
+/// from the in-flight run, so `resume` re-executes EVERY activity. The already-run
+/// activities (a0,a1,a2) appear TWICE in markers.txt (at-least-once — today's contract,
+/// now pinned end-to-end); a3,a4 once. The final result is correct.
+#[cfg(unix)]
+#[test]
+fn kill9_fsync_mode_loses_in_flight_run_and_reexecutes_all() {
+    let dir = kill9_dir("fsync");
+    let prog = dir.join("wf.as");
+    std::fs::write(&prog, kill9_program("between")).unwrap();
+
+    run_until_ready_then_kill9(&dir, &prog, "fsync");
+
+    // After the kill: the run wrote markers a0,a1,a2 (3), and — because fsync only
+    // snapshots at finish — the log is absent (no mid-run persistence).
+    let after_kill = marker_counts(&dir);
+    assert_eq!(
+        after_kill.get("a0").copied().unwrap_or(0),
+        1,
+        "fsync: a0 ran once before the kill"
+    );
+    assert_eq!(after_kill.get("a2").copied().unwrap_or(0), 1, "fsync: a2 ran once");
+    assert!(
+        !dir.join("wf.log").exists()
+            || std::fs::read_to_string(dir.join("wf.log")).unwrap().trim().is_empty(),
+        "fsync mid-run must NOT have persisted the log (whole-log snapshot only at finish)"
+    );
+
+    // Resume completes and re-executes everything.
+    let out = resume_to_completion(&dir, &prog, "fsync");
+    assert_eq!(out, "10", "fsync resume must complete with 0+1+2+3+4 = 10");
+
+    let counts = marker_counts(&dir);
+    assert_eq!(counts.get("a0").copied(), Some(2), "fsync: a0 re-executed (doubled): {counts:?}");
+    assert_eq!(counts.get("a1").copied(), Some(2), "fsync: a1 re-executed (doubled): {counts:?}");
+    assert_eq!(counts.get("a2").copied(), Some(2), "fsync: a2 re-executed (doubled): {counts:?}");
+    assert_eq!(counts.get("a3").copied(), Some(1), "fsync: a3 ran once: {counts:?}");
+    assert_eq!(counts.get("a4").copied(), Some(1), "fsync: a4 ran once: {counts:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §5 / §4.5 — `"group"` mode: a `kill -9` mid-run loses NOTHING committed (records are in
+/// the OS page cache the moment the recording call returns). After the kill the log holds
+/// events 0..2; `resume` REPLAYS that prefix (markers a0,a1,a2 do NOT double), executes
+/// a3,a4, completes with the correct result, and the log ends with `WorkflowCompleted`. A
+/// SECOND resume is idempotent: it returns the recorded result, markers unchanged.
+#[cfg(unix)]
+#[test]
+fn kill9_group_mode_loses_nothing_and_replays_the_prefix() {
+    let dir = kill9_dir("group");
+    let prog = dir.join("wf.as");
+    std::fs::write(&prog, kill9_program("between")).unwrap();
+
+    run_until_ready_then_kill9(&dir, &prog, "group");
+
+    // After the kill: markers a0,a1,a2 (3, each once), and the log holds the persisted
+    // prefix (events 0,1,2) — page cache survives process death.
+    let after_kill = marker_counts(&dir);
+    assert_eq!(after_kill.get("a0").copied(), Some(1), "group: a0 once pre-kill: {after_kill:?}");
+    assert_eq!(after_kill.get("a1").copied(), Some(1), "group: a1 once pre-kill: {after_kill:?}");
+    assert_eq!(after_kill.get("a2").copied(), Some(1), "group: a2 once pre-kill: {after_kill:?}");
+    let killed_log = std::fs::read_to_string(dir.join("wf.log"))
+        .expect("group: the log must hold the persisted prefix after kill");
+    assert_eq!(
+        count_activity_lines(&killed_log),
+        3,
+        "group: the persisted prefix must hold exactly 3 ActivityCompleted records: {killed_log}"
+    );
+    assert!(
+        !killed_log.contains("WorkflowCompleted"),
+        "group: a killed mid-run log must NOT carry WorkflowCompleted"
+    );
+
+    // First resume: replays the prefix, executes the suffix, completes.
+    let out = resume_to_completion(&dir, &prog, "group");
+    assert_eq!(out, "10", "group resume must complete with 10");
+
+    let counts = marker_counts(&dir);
+    assert_eq!(counts.get("a0").copied(), Some(1), "group: a0 REPLAYED, not re-run: {counts:?}");
+    assert_eq!(counts.get("a1").copied(), Some(1), "group: a1 REPLAYED, not re-run: {counts:?}");
+    assert_eq!(counts.get("a2").copied(), Some(1), "group: a2 REPLAYED, not re-run: {counts:?}");
+    assert_eq!(counts.get("a3").copied(), Some(1), "group: a3 executed once: {counts:?}");
+    assert_eq!(counts.get("a4").copied(), Some(1), "group: a4 executed once: {counts:?}");
+
+    let final_log = std::fs::read_to_string(dir.join("wf.log")).unwrap();
+    assert_eq!(count_activity_lines(&final_log), 5, "group: completed log holds all 5: {final_log}");
+    assert!(
+        final_log.lines().any(|l| l.contains("WorkflowCompleted")),
+        "group: completed log must end with WorkflowCompleted: {final_log}"
+    );
+
+    // SECOND resume is idempotent — returns the recorded result, markers unchanged.
+    let out2 = resume_to_completion(&dir, &prog, "group");
+    assert_eq!(out2, "10", "group: a second resume must return the recorded result");
+    let counts2 = marker_counts(&dir);
+    assert_eq!(counts2, counts, "group: a second resume must NOT re-execute any activity: {counts2:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §5 / §4.5 — `"group"` mid-activity edge: the kill lands INSIDE activity a3, before its
+/// `ActivityCompleted` is recorded, so the log holds only events 0..2. `resume` replays
+/// a0,a1,a2 (no marker), re-executes EXACTLY a3 (its event was never recorded), then a4 —
+/// the in-flight-activity at-least-once boundary. No activity's marker doubles.
+#[cfg(unix)]
+#[test]
+fn kill9_mid_activity_group_mode_reexecutes_only_that_activity() {
+    let dir = kill9_dir("midact");
+    let prog = dir.join("wf.as");
+    std::fs::write(&prog, kill9_program("mid")).unwrap();
+
+    run_until_ready_then_kill9(&dir, &prog, "group");
+
+    // After the kill: a0,a1,a2 ran (3 markers); a3 wrote ready + busy-looped BEFORE its
+    // marker, so it has NO marker and NO ActivityCompleted record.
+    let after_kill = marker_counts(&dir);
+    assert_eq!(after_kill.get("a0").copied(), Some(1), "midact: a0 once: {after_kill:?}");
+    assert_eq!(after_kill.get("a1").copied(), Some(1), "midact: a1 once: {after_kill:?}");
+    assert_eq!(after_kill.get("a2").copied(), Some(1), "midact: a2 once: {after_kill:?}");
+    assert_eq!(after_kill.get("a3").copied(), None, "midact: a3 left no marker (killed mid-activity): {after_kill:?}");
+    let killed_log = std::fs::read_to_string(dir.join("wf.log"))
+        .expect("midact: the log must hold the prefix after kill");
+    assert_eq!(
+        count_activity_lines(&killed_log),
+        3,
+        "midact: only a0..a2 were recorded (a3's event never landed): {killed_log}"
+    );
+
+    // Resume: replays a0..a2, re-executes a3 exactly once, then a4.
+    let out = resume_to_completion(&dir, &prog, "group");
+    assert_eq!(out, "10", "midact resume must complete with 10");
+
+    let counts = marker_counts(&dir);
+    assert_eq!(counts.get("a0").copied(), Some(1), "midact: a0 replayed: {counts:?}");
+    assert_eq!(counts.get("a1").copied(), Some(1), "midact: a1 replayed: {counts:?}");
+    assert_eq!(counts.get("a2").copied(), Some(1), "midact: a2 replayed: {counts:?}");
+    assert_eq!(counts.get("a3").copied(), Some(1), "midact: a3 RE-EXECUTED exactly once: {counts:?}");
+    assert_eq!(counts.get("a4").copied(), Some(1), "midact: a4 executed once: {counts:?}");
+
+    let final_log = std::fs::read_to_string(dir.join("wf.log")).unwrap();
+    assert!(
+        final_log.lines().any(|l| l.contains("WorkflowCompleted")),
+        "midact: completed log must end with WorkflowCompleted"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// §4.4 seq-discontinuity: hand-edit a mid-file line's seq so it is non-contiguous;
 /// the repair truncates from there (the contiguous-prefix rule) and the suffix
 /// re-executes on resume — the final result is still correct.
