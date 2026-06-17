@@ -4427,6 +4427,27 @@ impl PgoSeedHandle {
             Err(crate::interp::Control::Exit(_)) => Ok(self.interp.output()),
         }
     }
+
+    /// Like [`run`](Self::run) but returns the `(output, exit_code)` pair, mapping every
+    /// `Control` channel exactly as the corpus differential modes (`vm_run_source` &c.) do —
+    /// so the seeded-PGO differential mode is comparable to them byte-for-byte (an `exit(n)`
+    /// surfaces the code; a top-level `?` propagation ends the program with `None`).
+    pub async fn run_with_exit(&self) -> Result<(String, Option<i32>), AsError> {
+        use crate::vm::value_ext::{Closure, RunOutcome};
+        let closure = Closure::new(Rc::clone(&self.entry_proto));
+        let mut fiber = crate::vm::fiber::Fiber::new(closure);
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(self.vm.run(&mut fiber)).await;
+        local.await;
+        crate::gc::collect();
+        match result {
+            Ok(RunOutcome::Done(_)) => Ok((self.interp.output(), None)),
+            Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+            Err(crate::interp::Control::Panic(e)) => Err(e),
+            Err(crate::interp::Control::Propagate(_)) => Ok((self.interp.output(), None)),
+            Err(crate::interp::Control::Exit(code)) => Ok((self.interp.output(), Some(code))),
+        }
+    }
 }
 
 /// WARM B §3.3 — load `archive_bytes` (an `ASCRIPTA` archive, optionally with a trailing PGO
@@ -4492,6 +4513,238 @@ pub fn pgo_seed_for_test(
         entry_proto,
         installed,
     })
+}
+
+/// WARM B §5-B(a) — compile `src` to a single-module `ASCRIPTA` archive, run it ONCE as a
+/// training workload (capture mode), harvest the warmed side tables, and return the
+/// PGO-carrying artifact bytes (archive + appended `ASPGO` trailing section). This is the
+/// in-process, disk-less equivalent of `build_file_with_pgo` for a self-contained program;
+/// the seeded differential + coverage seams below load these bytes through `pgo_seed_for_test`
+/// (the exact production seed-at-load path). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_build_artifact_from_source(src: &str) -> Result<Vec<u8>, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::pgo::append_section;
+    use crate::vm::value_ext::Closure;
+    use crate::vm::Vm;
+
+    // ── compile a single-module archive from source ──────────────────────────
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span))?;
+    let entry_bytes = chunk
+        .to_bytes_with_debug(true)
+        .map_err(|e| AsError::new(format!("cannot serialize compiled chunk: {e}")))?;
+    let entry_key = "<input>".to_string();
+    let archive = crate::vm::archive::ModuleArchive::new(
+        0,
+        crate::stdlib::caps::CapSet::all_granted(),
+        [0u8; 32],
+        vec![(entry_key.clone(), entry_bytes.clone())],
+    );
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
+    let encoded_archive = archive.encode();
+
+    // ── training run (capture) + harvest ─────────────────────────────────────
+    let pgo = {
+        let interp = Rc::new(Interp::new());
+        interp.set_worker_archive_bytes(Rc::from(encoded_archive.as_slice()));
+        interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+        interp.set_worker_source(src);
+        interp.install_self();
+        let train_chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+            .map_err(|e| AsError::new(format!("cannot load training chunk: {e}")))?;
+        let train_proto = Rc::new(FnProto {
+            chunk: train_chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+            name_span: None,
+        });
+        let vm = Vm::new(interp.clone());
+        vm.set_module_archive(Rc::new(
+            crate::vm::archive::ModuleArchive::decode(&encoded_archive)
+                .map_err(|e| AsError::new(format!("cannot re-decode archive: {e}")))?,
+        ));
+        {
+            let closure = Closure::new(Rc::clone(&train_proto));
+            let mut fiber = crate::vm::fiber::Fiber::new(closure);
+            let local = tokio::task::LocalSet::new();
+            // Absorb ALL outcomes — a panicking training run still yields a (partial) section.
+            let _ = local.run_until(vm.run(&mut fiber)).await;
+            local.await;
+            crate::gc::collect();
+        }
+        let harvest_modules: &[(String, [u8; 32], &FnProto)] =
+            &[(entry_key.clone(), entry_sha256, &train_proto)];
+        vm.harvest_pgo(harvest_modules)
+    };
+
+    let mut artifact_bytes = encoded_archive;
+    append_section(&mut artifact_bytes, &pgo.encode());
+    Ok(artifact_bytes)
+}
+
+/// WARM B §5-B(a) — the SEEDED differential mode (Gate 15), in-process and from SOURCE.
+///
+/// Mirrors the production `build --pgo` → seed-at-load → run flow entirely in-process and
+/// with CAPTURED output (so the corpus differential can compare it against the standard
+/// modes' `(String, Option<i32>)`): build the PGO-carrying artifact
+/// ([`pgo_build_artifact_from_source`]), then load it SEEDED through the production
+/// [`pgo_seed_for_test`] path and run.
+///
+/// The byte-invisibility PROOF: the corpus differential asserts this equals tree-walker ==
+/// spec == generic. A divergence means a seed bypassed a guard (the seeder is unsound).
+/// `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_seeded_run_from_source(src: &str) -> Result<(String, Option<i32>), AsError> {
+    let artifact = pgo_build_artifact_from_source(src).await?;
+    let handle = pgo_seed_for_test(&artifact, /*seed=*/ true, /*specialize=*/ true)?;
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    // `PgoSeedHandle::run` captures output and maps every Control channel like the corpus
+    // modes, but returns only the output String; re-derive the exit code by matching its
+    // run path here would duplicate it, so reuse `run()` and report exit via the handle.
+    handle
+        .run_with_exit()
+        .await
+        .map_err(|e| e.with_source(src_info))
+}
+
+/// WARM B §5-B(a) coverage seam (anti-false-green): build the PGO artifact for `src`, load it
+/// SEEDED, and return the INSTALLED-COUNT (how many side-table entries the seeder installed).
+/// The corpus coverage assertion sums this over the corpus to prove the seeded axis is NOT
+/// dark (>0 seeds actually install). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_seeded_install_count_from_source(src: &str) -> Result<usize, AsError> {
+    let artifact = pgo_build_artifact_from_source(src).await?;
+    let handle = pgo_seed_for_test(&artifact, /*seed=*/ true, /*specialize=*/ true)?;
+    Ok(handle.installed())
+}
+
+/// WARM B §5-B(b) — the ADVERSARIAL-SEED axis (fuzzing the GUARDS, not the codec).
+///
+/// Compiles `src` to an entry chunk, then injects PSEUDO-RANDOM JUNK directly into the
+/// chunk's side tables — `set_arith_cache` / `set_field_ic` / `set_global_cache` — BYPASSING
+/// the seeder entirely (so wrong offsets, wrong kinds, wrong shape ids, wrong indices, and
+/// bogus global values all land). The junk is derived from `junk` bytes (the fuzz input).
+/// The run loop's guards (operand-kind re-check on arith, shape-id match on field IC, version
+/// match on global cache) MUST absorb every lie → a junk seed can only deopt, never change
+/// output. The caller asserts byte-identity against the unseeded modes.
+///
+/// This is strictly MORE adversarial than the seeder: the seeder derives field indices and
+/// range-checks offsets; here we inject arbitrary indices/shapes/offsets at arbitrary sites.
+/// `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_adversarial_run_from_source(
+    src: &str,
+    junk: &[u8],
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::adapt::{ArithCache, ArithKind, GlobalCache};
+    use crate::vm::chunk::FnProto;
+    use crate::vm::ic::InlineCache;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+
+    // Inject junk seeds into the entry chunk's side tables. We derive offsets/kinds/shapes
+    // from `junk` (a cheap LCG over the bytes), addressing the FULL code range so the
+    // injections hit real instruction boundaries AND mid-instruction garbage offsets alike.
+    let code_len = chunk.code.len().max(1);
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for &b in junk {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(b as u64 + 1);
+    }
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+    // A bounded number of injections so a giant `junk` buffer can't blow up runtime.
+    let injections = (junk.len() % 64) + 8;
+    for _ in 0..injections {
+        let off = (next() as usize) % code_len;
+        match next() % 3 {
+            0 => {
+                // Arith junk: an arbitrary (possibly nonsensical) committed kind at `off`.
+                let kind = match next() % 4 {
+                    0 => ArithKind::Int,
+                    1 => ArithKind::Number,
+                    2 => ArithKind::Decimal,
+                    _ => ArithKind::ConcatStr,
+                };
+                chunk.set_arith_cache(off, ArithCache::Specialized { kind });
+            }
+            1 => {
+                // Field-IC junk: an arbitrary shape id → arbitrary index Mono entry. The
+                // run loop's shape-id guard rejects it unless the receiver's actual shape
+                // happens to equal this junk id (astronomically unlikely; and even then the
+                // index is re-validated against the live slab on the generic deopt path).
+                let mut ic = InlineCache::Cold;
+                ic.record(next() as u32, next() as u32);
+                chunk.set_field_ic(off, ic);
+            }
+            _ => {
+                // Global-cache junk: a bogus cached value at an arbitrary version. The
+                // version guard (current `global_version`) rejects a stale seed; a matching
+                // version still routes through the builtin/user-global resolution that the
+                // generic path uses, so a wrong value can only manifest as a guard miss.
+                let v = match next() % 3 {
+                    0 => crate::value::Value::int(next() as i64),
+                    1 => crate::value::Value::bool_(next() % 2 == 0),
+                    _ => crate::value::Value::builtin(Rc::from("not_a_real_builtin_xyz")),
+                };
+                chunk.set_global_cache(off, GlobalCache::set(v, next()));
+            }
+        }
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::new(interp.clone());
+    let closure = Closure::new(proto.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
 }
 
 /// Map a VM [`crate::interp::Control`] outcome to an [`AsError`], mirroring how

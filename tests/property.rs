@@ -202,6 +202,93 @@ proptest! {
     }
 }
 
+// ===========================================================================
+// WARM B §5-B(b) — the ADVERSARIAL-SEED axis (fuzzing the GUARDS)
+// ===========================================================================
+//
+// Task 5 fuzzed the PGO CODEC (hostile section bytes → never panic, bounded alloc). This
+// fuzzes the SEEDER'S GUARDS: it injects PSEUDO-RANDOM JUNK (wrong offsets, wrong arith
+// kinds, wrong shape ids, wrong field indices, bogus global values) DIRECTLY into the
+// compiled chunk's side tables — bypassing the seeder entirely — then runs and asserts the
+// output is byte-identical to the unseeded modes. A junk seed must shape-miss / version-miss
+// / kind-miss → deopt to the generic path → identical output. If a junk seed changes output,
+// a RUN-LOOP guard is missing (the §3.5 soundness argument is the thing under test, not the
+// well-formed-profile codec). This is the in-suite half of the fuzz target's adversarial
+// axis (`fuzz/fuzz_targets/differential.rs`), riding the normal `cargo test`.
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 96,
+        max_shrink_iters: 2048,
+        .. ProptestConfig::default()
+    })]
+
+    /// Adversarial-seed differential: generate a valid program, derive the UNSEEDED baseline
+    /// (tree-walker), then run the SAME program with junk seeds injected directly into the
+    /// entry chunk's side tables (junk derived from a second slice of the proptest input).
+    /// The junk-seeded run MUST equal the baseline — the guards absorb every lie. On failure
+    /// proptest shrinks toward a minimal (program, junk) reproducer; fix the GUARD, never the
+    /// assertion.
+    #[test]
+    fn adversarial_seed_axis_guards_absorb_junk(
+        prog_bytes in prop::collection::vec(any::<u8>(), 64..768),
+        junk in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let prog = fuzzgen::gen_program_from_bytes(&prog_bytes);
+        let src = prog.source.clone();
+        let junk2 = junk.clone();
+        let (baseline, adversarial) = ascript::run_on_worker_stack(move || async move {
+            // The unseeded reference is the tree-walker (the oracle the whole differential
+            // is anchored on); the candidate is the junk-seeded specialized VM.
+            let base = project(ascript::run_source_exit(&src).await);
+            let adv = project(ascript::pgo_adversarial_run_from_source(&src, &junk2).await);
+            (base, adv)
+        });
+        prop_assert_eq!(
+            &baseline, &adversarial,
+            "a junk seed CHANGED program output — a run-loop guard is missing (UNSOUND)\n\
+             --- program ---\n{}\n--- junk: {:?}\n--- unseeded (tw): {:?}\n--- junk-seeded:   {:?}",
+            prog.source, junk, baseline, adversarial
+        );
+    }
+}
+
+/// WARM B §5-B(b) — a DETERMINISTIC fixed-seed adversarial battery (no proptest dependency
+/// for the breadth; mirrors `three_way_differential_fixed_seed_battery`). For a spread of
+/// seeds, generate a program, inject several distinct junk-seed buffers, and assert the
+/// junk-seeded run equals the unseeded tree-walker baseline every time.
+#[test]
+fn adversarial_seed_fixed_battery() {
+    let cases: Vec<(String, Vec<Vec<u8>>)> = (0u64..120)
+        .map(|seed| {
+            let bytes = seed_bytes(seed, 256);
+            let src = fuzzgen::gen_program_from_bytes(&bytes).source;
+            // Four distinct junk buffers per program — empty, tiny, medium, and a
+            // pattern-heavy one (all-0xFF stresses the LCG toward max offsets/indices).
+            let junks = vec![
+                Vec::new(),
+                seed_bytes(seed ^ 0xABCD, 7),
+                seed_bytes(seed.wrapping_mul(31), 64),
+                vec![0xFFu8; 1 + (seed as usize % 200)],
+            ];
+            (src, junks)
+        })
+        .collect();
+    ascript::run_on_worker_stack(move || async move {
+        for (src, junks) in &cases {
+            let base = project(ascript::run_source_exit(src).await);
+            for junk in junks {
+                let adv = project(ascript::pgo_adversarial_run_from_source(src, junk).await);
+                assert_eq!(
+                    base, adv,
+                    "adversarial junk seed changed output (a missing guard)\n--- program ---\n{src}\n--- junk len {} ---\n  unseeded (tw): {base:?}\n  junk-seeded:   {adv:?}",
+                    junk.len()
+                );
+            }
+        }
+    });
+}
+
 /// `arbitrary::Unstructured` is re-exported via the generator's dep; build one from bytes.
 fn arbitrary_unstructured(bytes: &[u8]) -> arbitrary::Unstructured<'_> {
     arbitrary::Unstructured::new(bytes)

@@ -1269,6 +1269,22 @@ async fn vm_run_whole_corpus_matches_treewalker() {
             "no-decode VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  no-decode:   {nodec:?}"
         );
 
+        // WARM B §5-B(a) (Gate 15): the SEEDED PGO mode. Build a single-module archive
+        // from this corpus program, record a profile by running it once (training), then
+        // re-load SEEDED (the side tables pre-warmed behind their existing guards) and run.
+        // The seeded run MUST be byte-identical to the tree-walker (and thereby to spec ==
+        // generic == lane-off == decoded == no-decode). A divergence here means a seed
+        // bypassed a guard → the seeder is UNSOUND (the byte-invisibility proof, BLOCKING).
+        // Every non-skipped corpus program is import-self-contained (RelativeImports are
+        // skipped), so a single-module archive captures it faithfully.
+        let seeded = ascript::pgo_seeded_run_from_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("seeded-PGO VM failed on non-skipped {rel}: {e:?}"));
+        assert_eq!(
+            tw, seeded,
+            "seeded-PGO VM diverged from tree-walker for example `{rel}` — a seed bypassed a guard (UNSOUND)\n  tree-walker: {tw:?}\n  seeded:      {seeded:?}"
+        );
+
         // ─── ELIDE §6.1 (Gate 15): the elide axis + cross-axis soundness proof ───
         //
         // The modes above are all the ELIDE-OFF axis (they compile without an
@@ -1337,9 +1353,66 @@ async fn vm_run_whole_corpus_matches_treewalker() {
     );
     eprintln!(
         "whole-corpus gate: {ran} examples byte-identical (all also verified lane-off + \
-         decoded-forced + no-decode + ELIDE elide-on three-mode + elide-on==elide-off \
-         cross-axis), {skipped} skipped, {feature_skipped} feature-skipped \
-         (modules unavailable in this build)"
+         decoded-forced + no-decode + seeded-PGO + ELIDE elide-on three-mode + \
+         elide-on==elide-off cross-axis), {skipped} skipped, {feature_skipped} \
+         feature-skipped (modules unavailable in this build)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WARM B §5-B(c) (Gate 15) — THE SEEDED-PGO COVERAGE ASSERTION (anti-false-green).
+//
+//  The seeded axis in `vm_run_whole_corpus_matches_treewalker` only proves something
+//  if seeds ACTUALLY INSTALL — a seeder that installs nothing trivially passes every
+//  byte-identity check (the unseeded path is correct; the seeds are just dead weight).
+//  This test sums the install count over the corpus and asserts it is non-trivial, so a
+//  regression that silently stops seeding (a broken digest match, a wrong key, the kill
+//  switch stuck on) trips here even though byte-identity still holds. Mirrors DECODE's
+//  `decoded_dispatch_actually_executes_on_the_corpus` and the WARM B §5-B(c) sabotage
+//  proof (a mis-keyed digest ⇒ 0 installs ⇒ this floor fails).
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn seeded_pgo_actually_installs_seeds_on_the_corpus() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut total_installed: usize = 0;
+    let mut programs_with_seeds: usize = 0;
+    let mut ran = 0usize;
+    for rel in all_corpus_examples() {
+        // The SAME enumeration + skip list as oracle #1.
+        if skip_reason(&rel).is_some() {
+            continue;
+        }
+        let path = std::path::Path::new(root).join(&rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+        if let Ok(n) = ascript::pgo_seeded_install_count_from_source(&src).await {
+            total_installed += n;
+            if n > 0 {
+                programs_with_seeds += 1;
+            }
+            ran += 1;
+        }
+    }
+    println!(
+        "WARM B seeded-PGO coverage: {total_installed} seeds installed across \
+         {programs_with_seeds}/{ran} corpus programs"
+    );
+    assert!(ran > 0, "corpus enumeration broke (0 programs ran)");
+    // Anti-false-green floor: the corpus is rich in hot arith / monomorphic field reads /
+    // builtin globals, so seeding installs MANY entries. A floor well above the
+    // silent-no-seed value of 0 but below the observed count: if seeding ever silently
+    // collapses (a guard rejects everything, the digest never matches), this trips while
+    // every byte-identity check still passes.
+    assert!(
+        total_installed > 0,
+        "seeded-PGO installed 0 entries across the whole corpus — the seeder is dark \
+         (digest mismatch? kill switch stuck? harvest empty?)"
+    );
+    assert!(
+        programs_with_seeds > 0,
+        "no corpus program installed ANY seeds — the harvest/seed path is unwired"
     );
 }
 
