@@ -320,3 +320,48 @@ print(r)
         "expected a serialization-constraint error, got: {out}"
     );
 }
+
+/// WARM §0.1 / §4.1 baseline pin: the workflow log is written ONCE per `run()` call (at
+/// finish), NOT per activity event. A mid-run activity therefore observes NO log file at
+/// the log path — a `kill -9` mid-workflow today loses every recorded event. This test
+/// documents the shipped contract that Unit C's `"group"` mode improves on; if someone
+/// later adds an incremental per-event write to the default `"fsync"` path, this trips
+/// and the spec table must be revisited.
+#[test]
+fn fsync_mode_writes_nothing_until_finish() {
+    let log = temp_log("writes_nothing_until_finish");
+    // The activity checks whether the log file exists MID-RUN and records "exists" or
+    // "not_exists" as its return value. After run() we assert: activity saw "not_exists"
+    // (log was not written yet) AND the log file now exists (written at finish).
+    let src = format!(
+        r#"
+import {{ run, activity }} from "std/workflow"
+import {{ exists }} from "std/fs"
+
+let check = activity("check_log_mid_run", (_) => {{
+  return exists("{log}") ? "exists" : "not_exists"
+}})
+
+fn flow(ctx, input) {{
+  return ctx.call(check, nil)
+}}
+
+let result = await run(flow, nil, {{ log: "{log}" }})
+print(result)
+"#,
+        log = log
+    );
+    let (out, code) = run_as(&src, "fsync_writes_nothing_until_finish");
+    assert_eq!(code, Some(0), "workflow program should exit 0; got: {out}");
+    assert_eq!(
+        out.trim(),
+        "not_exists",
+        "WARM §0.1 contract violated: log was written mid-run (before finish_workflow) \
+         with default fsync durability; got activity result: {out}"
+    );
+    // After run() returns, the log MUST exist (finish_workflow wrote it).
+    assert!(
+        std::path::Path::new(&log).exists(),
+        "WARM §0.1: log file must exist after run() returns, but was not found at {log}"
+    );
+}

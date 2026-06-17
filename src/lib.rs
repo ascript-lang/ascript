@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod bundle;
+pub mod cache;
 pub mod check;
 /// The clap derive types (`Cli`, `Command`, `CapFlags`) + `cli_command()` —
 /// the single source of truth for the CLI surface. Consumed by `src/main.rs`
@@ -1917,6 +1918,146 @@ pub fn build_file(
     Ok(out_path)
 }
 
+/// **WARM B §3.1 — compile, train, harvest, and emit a PGO-carrying archive.**
+///
+/// Equivalent to [`build_file`] EXCEPT:
+///
+/// 1. The artifact is ALWAYS an `ASCRIPTA` archive (even for a single-module program —
+///    spec §3.4; the PGO section lives outside the module table as a trailing section).
+/// 2. The program is run once as a **training workload** immediately after compilation,
+///    with output streaming live to stdout (`OutputSink::Live`), so the user sees the
+///    training run in real time.
+/// 3. After the training run completes (even if it panics — spec §3.4 bullet 3), the
+///    VM's warmed inline caches and adaptive arithmetic state are snapshotted via
+///    [`Vm::harvest_pgo`] and appended as a `ASPGO` trailing section.
+///
+/// The training panic is **absorbed**: the build succeeds with a partial section
+/// (possibly empty) rather than propagating the error.
+pub async fn build_file_with_pgo(
+    file: &Path,
+    out: Option<&Path>,
+    with_debug: bool,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
+) -> Result<std::path::PathBuf, AsError> {
+    use crate::cache::compile_cache as cc;
+    use crate::vm::archive::ModuleArchive;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::pgo::append_section;
+    use crate::vm::value_ext::Closure;
+    use crate::vm::Vm;
+
+    // ── Step 1: compile to an archive (ALWAYS archive, even single-module) ──
+    let (mut archive, report) = compile_archive(file, with_debug, elide)?;
+    archive.caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
+    print_shake_report(&report);
+
+    // Snapshot (key, sha256) pairs from the archive BEFORE encoding, so we can
+    // supply them to `harvest_pgo` alongside the live proto references after the run.
+    // sha256 is over the stored chunk bytes — the same value the seeder will validate.
+    let module_meta: Vec<(String, [u8; 32])> = archive
+        .modules
+        .iter()
+        .map(|(key, bytes)| (key.clone(), cc::sha256_bytes(bytes)))
+        .collect();
+
+    // ── Step 2: decode the entry chunk and set up the Vm ────────────────────
+    // Decode the entry chunk (same trust boundary as `run file.aso`).
+    let entry_bytes = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(_, b)| b.clone())
+        .ok_or_else(|| AsError::new("archive entry index is out of range"))?;
+    let entry_chunk =
+        crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+            .map_err(|e| AsError::new(format!("cannot load archive entry: {e}")))?;
+
+    // Build the Interp with LIVE output so training-run stdout streams to the
+    // user's terminal (spec §3.4).
+    let interp = Rc::new(Interp::new_live());
+    let encoded_archive = archive.encode();
+    // Stash archive + entry bytes for worker parity (mirrors `run_verified_archive`).
+    interp.set_worker_archive_bytes(Rc::from(encoded_archive.as_slice()));
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    interp.install_self();
+
+    let vm = Vm::new(interp.clone());
+    // Set module dir so archive-miss relative imports resolve on disk.
+    if let Some(dir) = file.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+    vm.set_module_archive(Rc::new(
+        ModuleArchive::decode(&encoded_archive)
+            .map_err(|e| AsError::new(format!("cannot re-decode compiled archive: {e}")))?,
+    ));
+
+    // ── Step 3: drive the training run ──────────────────────────────────────
+    // Keep an Rc<FnProto> alive so we can read its warmed side tables AFTER
+    // the run.  The closure/fiber borrow the proto through the Rc; we hold
+    // our own clone that outlives the fiber.
+    let entry_proto = Rc::new(FnProto {
+        chunk: entry_chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    {
+        let closure = Closure::new(Rc::clone(&entry_proto));
+        let mut fiber = crate::vm::fiber::Fiber::new(closure);
+        let local = tokio::task::LocalSet::new();
+        // Absorb ALL outcomes (panic / propagate / exit) — a panicking training run
+        // still produces a (possibly partial) PGO section (spec §3.4).
+        let _ = local.run_until(vm.run(&mut fiber)).await;
+        local.await;
+        crate::gc::collect();
+    }
+    // `entry_proto` is still alive here; `fiber`/`closure` were dropped above.
+
+    // ── Step 4: harvest the warmed IC state from the live proto tree ─────────
+    // Build the slice that harvest_pgo expects: (key, sha256, &live_proto).
+    // For now only the ENTRY module is harvested (the common case: single-module
+    // programs and the entry of multi-module programs). Imported-module chunks are
+    // loaded by the archive path and their protos are not currently surfaced here;
+    // a future extension can walk `file_modules` to reach them.
+    let entry_key = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(k, _)| k.as_str())
+        .unwrap_or("");
+    let entry_sha256 = module_meta
+        .iter()
+        .find(|(k, _)| k == entry_key)
+        .map(|(_, h)| *h)
+        .unwrap_or([0u8; 32]);
+
+    let harvest_modules: &[(String, [u8; 32], &FnProto)] =
+        &[(entry_key.to_owned(), entry_sha256, &entry_proto)];
+    let pgo = vm.harvest_pgo(harvest_modules);
+
+    // ── Step 5: assemble the artifact bytes ─────────────────────────────────
+    // `encoded_archive` is the canonical ASCRIPTA bytes; append PGO as trailing section.
+    let mut artifact_bytes = encoded_archive;
+    let pgo_frame = pgo.encode();
+    append_section(&mut artifact_bytes, &pgo_frame);
+
+    // ── Step 6: write to disk ────────────────────────────────────────────────
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => file.with_extension("aso"),
+    };
+    std::fs::write(&out_path, &artifact_bytes)
+        .map_err(|e| AsError::new(format!("cannot write {}: {}", out_path.display(), e)))?;
+    Ok(out_path)
+}
+
 /// The shared compile → verify → serialize front half of [`build_file`] and
 /// [`build_native`] (BIN §2.2 step 1): read the source, [`compile::compile_source`], bind the
 /// module source for debug info, [`vm::verify::verify`] (so a produced `.aso` is always
@@ -2285,6 +2426,128 @@ pub fn compile_archive_with_shake(
     Ok((archive, reach.report))
 }
 
+/// WARM §2.5 — the COMPILE PATH's reachable-module enumeration, exposed as a
+/// `#[doc(hidden)]` test seam. Returns `(logical_key, canonical_path)` for every
+/// module `compile_archive_with_shake` would archive, in the SAME BFS order.
+///
+/// This is the drift-tripwire counterpart to [`crate::cache::collect_module_graph`]:
+/// the cache keys/hashes the set `collect_module_graph` produces, while the archive
+/// COMPILES the set this function reports. The two walks are equivalent today;
+/// `tests/compile_cache.rs::collect_module_graph_matches_compile_path` asserts they
+/// produce the IDENTICAL set (paths + logical keys), so a future edit that lets them
+/// diverge (a false hit) fails CI loudly. Spec §2.5 wants ONE walk; this tripwire is
+/// the WARM Task 3 option-(b) resolution (option (a) — a true single-source refactor —
+/// was deferred as higher-risk: the cache walk compiles WITHOUT debug/elide purely to
+/// read imports, while the archive walk threads `with_debug`/`elide` into stored bytes,
+/// so collapsing them is a substantial refactor of `compile_archive_with_shake`).
+///
+/// It reuses `compile_archive_with_shake(entry, debug=true, shake=false, elide=false)`
+/// — the SAME call the cache's miss path uses — and re-derives each module's canonical
+/// path from its archived logical key by re-walking the graph. Rather than re-implement
+/// the walk, it returns the archive's logical-key order paired with the canonical paths
+/// the BFS visited (recorded into a side channel during the compile).
+#[doc(hidden)]
+pub fn compile_path_module_set(
+    entry: &Path,
+) -> Result<Vec<(String, std::path::PathBuf)>, AsError> {
+    // The archive's `modules` carry logical keys in BFS order; we need the matching
+    // canonical paths. `compile_archive_with_shake` does not return paths, so we run a
+    // parallel BFS here using the SAME resolution primitives (`classify_specifier` +
+    // `resolve_module_file`) it uses internally — this is the enumeration under test,
+    // and it MUST stay in lockstep with the inline walk in `compile_archive_with_shake`.
+    use crate::interp::SpecifierKind;
+    use crate::vm::archive::{join_logical, logical_parent};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    struct Pending {
+        path: PathBuf,
+        key: String,
+        logical_dir: String,
+    }
+
+    let interp = Interp::new();
+    let entry_canon = entry
+        .canonicalize()
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", entry.display(), e)))?;
+    let entry_dir = entry_canon
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let entry_key = entry_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "entry.as".to_string());
+
+    let mut result: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+    let mut queue: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    queue.push_back(Pending {
+        path: entry_canon.clone(),
+        key: entry_key,
+        logical_dir: String::new(),
+    });
+    seen.insert(entry_canon.clone(), 0);
+
+    while let Some(item) = queue.pop_front() {
+        let bytes = compile_verified_aso_bytes(&item.path, true, false)?;
+        let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes).map_err(|e| {
+            AsError::new(format!(
+                "internal: re-decoding compiled module {} failed: {e:?}",
+                item.path.display()
+            ))
+        })?;
+        let this_disk_dir = item
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| entry_dir.clone());
+        for imp in &chunk.imports {
+            let source = imp.source();
+            interp.set_module_dir(this_disk_dir.clone());
+            match interp.classify_specifier(source) {
+                SpecifierKind::Std => {}
+                kind @ (SpecifierKind::Relative(_) | SpecifierKind::Package { .. }) => {
+                    let target = match &kind {
+                        SpecifierKind::Relative(t) => t.clone(),
+                        SpecifierKind::Package { target, .. } => target.clone(),
+                        _ => unreachable!("matched only Relative|Package"),
+                    };
+                    let dep_path = resolve_module_file(&target).map_err(|msg| {
+                        AsError::new(format!(
+                            "cannot resolve import '{source}' from {}: {msg}",
+                            item.path.display()
+                        ))
+                    })?;
+                    if !seen.contains_key(&dep_path) {
+                        let dep_key = match &kind {
+                            SpecifierKind::Package { .. } => join_logical("pkg", source),
+                            _ => join_logical(&item.logical_dir, source),
+                        };
+                        let dep_logical_dir = logical_parent(&dep_key);
+                        let reserved = seen.len();
+                        seen.insert(dep_path.clone(), reserved);
+                        queue.push_back(Pending {
+                            path: dep_path,
+                            key: dep_key,
+                            logical_dir: dep_logical_dir,
+                        });
+                    }
+                }
+                SpecifierKind::UnknownPackage(key) => {
+                    return Err(AsError::new(format!(
+                        "unknown package '{key}' — add it with 'ascript add' \
+                         (imported from {})",
+                        item.path.display()
+                    )));
+                }
+            }
+        }
+        result.push((item.key, item.path));
+    }
+    Ok(result)
+}
+
 /// Convert a decoded [`crate::vm::chunk::ImportDesc`] into a tree-shaker
 /// [`crate::compile::shake::ImportEdge`] targeting the already-resolved dedup'd module
 /// index. A `Named` import contributes the imported export names as roots in the target;
@@ -2449,6 +2712,40 @@ fn resolve_module_file(target: &Path) -> Result<std::path::PathBuf, String> {
         candidates[0].display(),
         candidates[1].display()
     ))
+}
+
+/// WARM Task 1: expose `resolve_module_file` as a `pub(crate)` shim so
+/// `src/cache/mod.rs` can follow the same resolution logic without duplicating it.
+/// Identical behaviour to the private version above.
+pub(crate) fn resolve_module_file_pub(target: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    resolve_module_file(target)
+}
+
+/// WARM Task 1: compile `source` (already read from `path`) to verified `.aso` bytes,
+/// WITHOUT debug info or elision, purely to extract the import table for the cache
+/// module-graph walk. Uses the same verification path as `compile_verified_aso_bytes`
+/// but avoids a redundant disk read.
+///
+/// `pub(crate)` — consumed by `src/cache/mod.rs`; not a public API.
+pub(crate) fn compile_verified_aso_bytes_from_source_for_cache(
+    path: &std::path::Path,
+    source: &str,
+) -> Result<Vec<u8>, AsError> {
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: source.to_string(),
+    });
+    let chunk = crate::compile::compile_source(source)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    crate::vm::verify::verify(&chunk).map_err(|e| {
+        AsError::new(format!(
+            "internal: produced bytecode failed verification: {e}"
+        ))
+        .with_source(src_info)
+    })?;
+    chunk
+        .to_bytes_with_debug(false)
+        .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
 }
 
 /// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
@@ -2718,7 +3015,11 @@ async fn run_verified_aso(
     if payload.starts_with(&crate::vm::archive::ARCHIVE_MAGIC) {
         let archive = crate::vm::archive::ModuleArchive::decode(payload)
             .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
-        return run_verified_archive(archive, script_args, caps, module_dir, what).await;
+        // WARM B §3.3: the PGO section (if any) is a self-described trailing section AFTER
+        // the module table. Scan it from the archive end. A corrupt/absent section ⇒ `None`
+        // ⇒ the program warms normally (the seeder is a no-op on `None`).
+        let section = decode_trailing_pgo(payload, &archive);
+        return run_verified_archive(archive, script_args, caps, module_dir, what, section).await;
     }
 
     let chunk = crate::vm::chunk::Chunk::from_bytes_verified(payload)
@@ -2744,7 +3045,26 @@ async fn run_verified_aso(
         vm.set_module_dir(dir);
     }
 
-    run_entry_proto_to_exit(&interp, &vm, chunk).await
+    // A bare `ASO\0` chunk has no trailing-section mechanism (the only PGO carrier is the
+    // archive container — spec §3.4), so there is never a section to seed here.
+    run_entry_proto_to_exit(&interp, &vm, chunk, None).await
+}
+
+/// WARM B §3.3 — decode the optional PGO trailing section from an archive's raw bytes.
+///
+/// The section rides AFTER the module table (`ModuleArchive::decode` ignores trailing
+/// bytes — the Task-0 pin). We locate the archive end by re-encoding the decoded archive
+/// (canonical, deterministic — BNDL §4.5) and scan from there. Returns `None` if absent,
+/// version-mismatched, or malformed (⇒ warm normally; never a load failure).
+fn decode_trailing_pgo(
+    payload: &[u8],
+    archive: &crate::vm::archive::ModuleArchive,
+) -> Option<crate::vm::pgo::PgoSection> {
+    let archive_end = archive.encode().len();
+    if archive_end >= payload.len() {
+        return None; // no trailing bytes
+    }
+    crate::vm::pgo::find_and_decode_pgo(payload, archive_end)
 }
 
 /// SELF-CONTAINED-BUNDLES (Task 1.5) — the PRODUCTION runner for an `ASCRIPTA` module
@@ -2772,6 +3092,7 @@ async fn run_verified_archive(
     caps: Option<crate::stdlib::caps::CapSet>,
     module_dir: Option<std::path::PathBuf>,
     what: &str,
+    pgo_section: Option<crate::vm::pgo::PgoSection>,
 ) -> Result<i32, AsError> {
     use crate::vm::Vm;
 
@@ -2779,14 +3100,16 @@ async fn run_verified_archive(
     // `from_bytes_verified` trust boundary the disk `.aso` path uses. A bounds-check on the
     // entry index yields a clean error rather than a panic (decode already validates this,
     // but never index without a check on possibly-foreign data).
-    let entry_bytes = archive
+    let (entry_key, entry_bytes) = archive
         .modules
         .get(archive.entry as usize)
         // clone the entry chunk out before `archive` is moved into `Rc::new` below
-        .map(|(_, b)| b.clone())
+        .map(|(k, b)| (k.clone(), b.clone()))
         .ok_or_else(|| {
             AsError::new(format!("cannot load {what}: archive entry index is out of range"))
         })?;
+    // WARM B §3.3: the entry module's stored-chunk digest for the per-module seed gate.
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
     let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
         .map_err(|e| AsError::new(format!("cannot load {what}: {e}")))?;
 
@@ -2832,7 +3155,30 @@ async fn run_verified_archive(
     }
     vm.set_module_archive(Rc::new(archive));
 
-    run_entry_proto_to_exit(&interp, &vm, chunk).await
+    let pgo_seed = pgo_section.as_ref().map(|section| PgoSeed {
+        section,
+        entry_key: &entry_key,
+        entry_sha256: &entry_sha256,
+        enabled: pgo_seeding_enabled(),
+    });
+    run_entry_proto_to_exit(&interp, &vm, chunk, pgo_seed).await
+}
+
+/// WARM B §3.3 — the seeding inputs threaded into [`run_entry_proto_to_exit`]: the decoded
+/// PGO section, the entry module's logical key + stored-chunk digest (for the per-module
+/// digest gate), and the resolved `enabled` flag (`vm.specialize && !ASCRIPT_NO_PGO`, or the
+/// test seam's explicit value). Absent (`None`) when the artifact carries no PGO section.
+struct PgoSeed<'a> {
+    section: &'a crate::vm::pgo::PgoSection,
+    entry_key: &'a str,
+    entry_sha256: &'a [u8; 32],
+    enabled: bool,
+}
+
+/// WARM B §3.3 — the `ASCRIPT_NO_PGO` kill switch. `true` (seed) unless the env var is set
+/// to a non-empty value. Mirrors the `ASCRIPT_NO_SPECIALIZE`/`ASCRIPT_NO_DECODE` posture.
+fn pgo_seeding_enabled() -> bool {
+    !std::env::var("ASCRIPT_NO_PGO").is_ok_and(|v| !v.is_empty())
 }
 
 /// The shared run tail behind [`run_verified_aso`] and [`run_verified_archive`]: wrap the
@@ -2843,6 +3189,7 @@ async fn run_entry_proto_to_exit(
     interp: &Rc<Interp>,
     vm: &crate::vm::Vm,
     chunk: crate::vm::chunk::Chunk,
+    pgo_seed: Option<PgoSeed<'_>>,
 ) -> Result<i32, AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
@@ -2861,6 +3208,18 @@ async fn run_entry_proto_to_exit(
         debug_name: None,
         name_span: None,
     });
+    // WARM B §3.3: seed the warmed side tables BEFORE first execution (all-sync; no borrow
+    // held across the run below). Gated inside `seed_entry_from_section` on `vm.specialize`
+    // and the caller's `seed` flag (the `ASCRIPT_NO_PGO` kill switch is folded into `seed`).
+    if let Some(seed) = pgo_seed {
+        vm.seed_entry_from_section(
+            &proto.chunk,
+            seed.section,
+            seed.entry_key,
+            seed.entry_sha256,
+            seed.enabled,
+        );
+    }
     let closure = Closure::new(proto);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
@@ -3094,6 +3453,407 @@ pub async fn run_file_on_vm_with_packages(
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         Err(crate::interp::Control::Propagate(_)) => Ok(0),
         Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
+/// WARM A §2.1 — the cached `ascript run` front door (the default plain-`.as`+VM path).
+///
+/// Decides cacheability, looks up a content-addressed compiled artifact, and:
+/// - **Hit** → run the cached, *verified* artifact through the SAME magic-routing path
+///   ([`run_verified_aso`]) a `run file.aso`/bundle uses. Zero parse/resolve/compile.
+/// - **Miss** → compile via
+///   `compile_archive_with_shake(entry, /*debug*/true, /*shake*/false, /*elide*/false)`
+///   with `archive.caps = CapSet::all_granted()` (the NEUTRAL floor — run-time caps
+///   compose by monotone intersection in `run_verified_archive`, §2.6), publish the
+///   artifact + manifest atomically, then run the FRESHLY-compiled bytes through the
+///   SAME [`run_verified_aso`] path (hit and miss share ONE run path — no mode skew).
+///
+/// **FAIL-OPEN (load-bearing):** ANY cache-layer failure — a `Disabled` binary stamp, an
+/// unreadable/hostile store, a keying error, an exotic import graph the walk rejects, a
+/// publish IO error, or a verifier rejection of a poisoned slot — falls through to
+/// [`run_file_on_vm_with_packages`] (today's uncached compile-and-run). The cache is an
+/// optimization layered over an unchanged semantic path; it is NEVER the reason a run
+/// errors. A verifier rejection additionally DELETES the poisoned slot first (fail
+/// CLOSED to recompile), so the next run republishes a clean artifact (§2.7).
+///
+/// **Diagnostics parity (§2.4):** the entry path is part of the cache key, so a hit
+/// always loads the artifact built for THIS invoking path. At PUBLISH time each archived
+/// module's embedded debug source PATH is rebound to the string the from-source loader
+/// would embed (`rebind_archive_module_paths_to_runtime`), so a cached run's panic carets
+/// are byte-identical to the uncached run's — entry AND transitive modules. The
+/// `same_content_different_path` and `panic_output_parity` batteries prove it.
+///
+/// `no_cache` (from `--no-cache` || `ASCRIPT_NO_COMPILE_CACHE=1`) bypasses the cache
+/// entirely → no slot is created, byte-identical to the uncached path.
+///
+/// No `RefCell`/resource borrow is held across the `.await`s below: the cache-layer work
+/// is the fully-synchronous [`try_cached_artifact`], which returns OWNED artifact bytes
+/// before any await (Gate 4).
+pub async fn run_file_on_vm_cached(
+    path: &Path,
+    script_args: &[String],
+    packages: Option<crate::interp::PackageMap>,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    no_cache: bool,
+) -> Result<i32, AsError> {
+    // Kill switch: `--no-cache` / `ASCRIPT_NO_COMPILE_CACHE=1` → today's uncached path.
+    if no_cache {
+        return run_file_on_vm_with_packages(path, script_args, packages, caps, ELIDE_DEFAULT_ON)
+            .await;
+    }
+
+    // Attempt the cache layer. ANY failure returns `None` so we fall open below.
+    // `caps` is consumed by both the cached and the uncached path, so it is cloned for
+    // the lookup attempt and the original is threaded into whichever path runs.
+    match try_cached_artifact(path, packages.as_ref(), path) {
+        // CACHE HIT or freshly-published MISS — run the verified artifact bytes through
+        // the SAME magic-routing path a `.aso`/bundle uses. `module_dir` is the entry's
+        // parent so an archive-miss can still resolve a sibling on-disk source.
+        Some(artifact_bytes) => {
+            let module_dir = path.parent().map(std::path::Path::to_path_buf);
+            run_verified_aso(
+                &artifact_bytes,
+                script_args,
+                caps,
+                module_dir,
+                &path.display().to_string(),
+            )
+            .await
+        }
+        // FAIL-OPEN: the cache could not produce a runnable artifact (disabled, IO
+        // error, exotic graph, publish failure, verifier rejection) → run uncached.
+        None => {
+            run_file_on_vm_with_packages(path, script_args, packages, caps, ELIDE_DEFAULT_ON).await
+        }
+    }
+}
+
+/// WARM A §2.1 — the synchronous cache-layer core behind [`run_file_on_vm_cached`].
+/// Returns `Some(artifact_bytes)` on a verified hit OR a successful miss-compile-publish,
+/// and `None` on ANY cache-layer failure (the caller then runs uncached). This is the
+/// single fail-open chokepoint: every `?`-style early return here is a `return None`, so
+/// no cache error ever escapes as a run error. No `.await` happens inside — the bytes are
+/// handed back to the async caller for the actual run.
+fn try_cached_artifact(
+    path: &Path,
+    packages: Option<&crate::interp::PackageMap>,
+    entry_arg: &Path,
+) -> Option<Vec<u8>> {
+    use crate::cache::compile_cache as cc;
+
+    // The binary stamp invalidates on a rebuilt compiler. `Disabled` ⇒ cache off.
+    let binary_stamp = cc::BinaryStamp::current();
+    if binary_stamp.is_disabled() {
+        return None;
+    }
+
+    // The entry path is part of the key (§2.4): canonicalize it (a missing entry ⇒ the
+    // uncached path will surface the read error). A non-canonicalizable path ⇒ fail open.
+    let entry_canon = path.canonicalize().ok()?;
+    let entry_path = entry_canon.to_string_lossy().into_owned();
+
+    // The package-map digest is part of the key so a lockfile / re-resolution change ⇒
+    // a different key ⇒ miss (§2.9). NOTE: `compile_archive_with_shake` (the cache
+    // artifact compiler) does not currently install a package RESOLVER, so a program that
+    // imports a `{path=…}`/registry PACKAGE fails the archive walk and falls OPEN to the
+    // uncached run on every invocation (it is never cached, hence never stale-hits). The
+    // digest is keyed regardless so the day the archive builder gains package resolution
+    // the invalidation is already correct. Relative-only programs (the common case) cache
+    // fully. This is a documented fail-open limitation, not a stale-hit risk.
+    let package_map_digest = match packages {
+        Some(map) => cc::package_map_digest(map),
+        None => [0u8; 32],
+    };
+
+    let key = cc::CompileCacheKey {
+        key_schema: "ck1",
+        aso_format_version: crate::vm::aso::ASO_FORMAT_VERSION,
+        archive_version: crate::vm::archive::ARCHIVE_VERSION,
+        binary_stamp,
+        // v1 codegen-relevant flags: the cache artifact is ALWAYS the unshaken,
+        // debug-carrying, non-elided archive (§2.6), so these are constant — but they
+        // are enumerated so a future flag (e.g. ELIDE in the cache key) is mechanical,
+        // and so the `flag_change_misses` battery can perturb them via the test seam.
+        flags: cache_codegen_flags(),
+        entry_path,
+        package_map_digest,
+    };
+    let location_key = key.location_key();
+
+    // ── Lookup ────────────────────────────────────────────────────────────────────
+    // A HIT re-validates every source digest + the artifact digest, then runs the bytes
+    // through the verifier in `run_verified_aso`. If the verifier later rejects them the
+    // run errors — but `validate_manifest` already checked the artifact sha256, so a
+    // bit-flip is caught at lookup (→ Miss → recompile). We still guard the verify step
+    // on the miss path below.
+    if let cc::LookupResult::Hit { artifact_bytes } = cc::lookup(&location_key) {
+        // Defensive verify-on-hit: the FUZZ-hardened reader is the trust boundary. If a
+        // valid-digest-but-unverifiable artifact somehow exists (e.g. a format the
+        // current verifier rejects), treat the slot as poisoned: delete + fall to a
+        // recompile (fail closed). A clean verify ⇒ hand the bytes back.
+        if artifact_verifies(&artifact_bytes) {
+            return Some(artifact_bytes);
+        }
+        cc::delete_slot(&location_key);
+        // fall through to recompile
+    }
+
+    // ── Miss: compile the neutral-floor artifact + publish ─────────────────────────
+    // Compile the unshaken, debug-carrying archive (the cache artifact shape, §2.6).
+    // A compile error here is NOT a cache failure — it is a real program error, so we
+    // must NOT swallow it into a silent miss (that would hide the diagnostic). Instead
+    // fail open with `None`: the uncached path recompiles and surfaces the SAME error
+    // with full diagnostics. (The double-compile on a broken program is acceptable —
+    // a broken program is not the hot path.)
+    let (mut archive, _report) =
+        match compile_archive_with_shake(&entry_canon, /*debug*/ true, /*shake*/ false, /*elide*/ false)
+        {
+            Ok(v) => v,
+            Err(_) => return None, // fail open — the uncached path re-reports the error
+        };
+    // NEUTRAL caps floor (§2.6): all-granted ∩ runtime = runtime, so a cached run's
+    // effective caps are EXACTLY the CLI/manifest-composed set — byte-identical to the
+    // uncached run. Caps are deliberately NOT in the key (they compose at run time).
+    archive.caps = crate::stdlib::caps::CapSet::all_granted();
+
+    // DIAGNOSTICS PARITY (§2.4): `compile_archive` embeds each module's CANONICAL path
+    // in its debug section, but the from-source (uncached) run embeds the IMPORTER-JOINED
+    // path the loader builds (`module_dir.join(specifier)` — e.g. `/dir/./model.as`).
+    // To make a cached run's panic carets BYTE-IDENTICAL to the uncached run, rebind
+    // every embedded module source PATH to the runtime-equivalent string before encoding.
+    // Best-effort: a derivation failure leaves the canonical paths (still a runnable
+    // artifact — the parity test drives this, and a mismatch is caught there, not here).
+    rebind_archive_module_paths_to_runtime(&mut archive, entry_arg);
+    let artifact_bytes = archive.encode();
+
+    // Build the validation manifest from the SAME reachable set the cache keyer walks
+    // (`collect_module_graph` — the §2.5 single-walk source; the drift tripwire test
+    // proves it equals the compile path's set). A walk error ⇒ fail open (publish
+    // nothing, run uncached).
+    let graph = match crate::cache::collect_module_graph(&entry_canon) {
+        Ok(g) => g,
+        Err(_) => {
+            // We still have a runnable artifact — run it, just don't publish (no
+            // manifest means we can't validate later, so skip the publish entirely).
+            return Some(artifact_bytes);
+        }
+    };
+    let modules: Vec<cc::ManifestModule> = graph
+        .iter()
+        .map(|m| cc::ManifestModule {
+            logical_key: m.logical_key.clone(),
+            path: m.path.clone(),
+            sha256: cc::sha256_bytes(m.source.as_bytes()),
+        })
+        .collect();
+    let manifest = cc::CacheManifest {
+        modules,
+        artifact_sha256: cc::sha256_bytes(&artifact_bytes),
+        created_unix_ms: cc::now_unix_ms(),
+    };
+
+    // Atomic publish. An IO error ⇒ fail open (we still return the runnable bytes — the
+    // run succeeds, just unpublished; the next run will try to publish again).
+    let _ = cc::publish(&location_key, &manifest, &artifact_bytes);
+    Some(artifact_bytes)
+}
+
+/// WARM A §2.4 — rebind every archive module's embedded debug source PATH to the string
+/// the from-source (uncached) loader would embed, so a cached run's panic carets are
+/// byte-identical to an uncached run's.
+///
+/// The from-source loader embeds:
+/// - **entry:** the as-passed CLI path (`entry_arg.display()`); its `module_dir` is
+///   `entry_arg.parent()` (the as-passed parent, possibly relative).
+/// - **dependency:** `importer_module_dir.join(specifier).with_extension("as")`; its own
+///   `module_dir` is `canonical(dep).parent()` (the loader keys/recurses by canonical path
+///   but EMBEDS the importer-joined path).
+///
+/// This re-walks the graph mirroring `Vm::load_module_file` exactly (`module_dir.join` +
+/// `.with_extension("as")` + `canonicalize` for dedup), producing the runtime path per
+/// module. It then re-encodes each archive module with its path rebound. Best-effort: any
+/// IO/decode failure leaves that module's canonical path untouched (still runnable; the
+/// parity test catches a real mismatch).
+fn rebind_archive_module_paths_to_runtime(
+    archive: &mut crate::vm::archive::ModuleArchive,
+    entry_arg: &Path,
+) {
+    use crate::interp::SpecifierKind;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // Map canonical path → the runtime-embedded path string the loader would use.
+    // Built by a BFS mirroring the loader's resolution. The archive's modules are keyed
+    // by LOGICAL key (the `compile_archive` BFS order), but we rebind by matching each
+    // archive module's canonical path — so we also record logical_key → runtime path.
+    let mut runtime_path: HashMap<PathBuf, String> = HashMap::new();
+    // logical_key → canonical path, so we can rebind archive modules (keyed by logical).
+    let mut key_to_canon: HashMap<String, PathBuf> = HashMap::new();
+
+    let interp = Interp::new();
+
+    // The entry: embed the AS-PASSED path; its module_dir is the as-passed parent.
+    let entry_embed = entry_arg.display().to_string();
+    let entry_module_dir = entry_arg
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(""));
+    let Ok(entry_canon) = entry_arg.canonicalize() else {
+        return; // can't canonicalize → leave canonical paths (best-effort)
+    };
+    runtime_path.insert(entry_canon.clone(), entry_embed.clone());
+
+    // Recover the entry's LOGICAL key the same way `compile_archive` does.
+    let entry_logical = entry_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "entry.as".to_string());
+    key_to_canon.insert(entry_logical.clone(), entry_canon.clone());
+
+    struct Pending {
+        canon: PathBuf,
+        logical_key: String,
+        // The module_dir the loader uses to resolve THIS module's imports.
+        module_dir: PathBuf,
+    }
+    let mut queue: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    seen.insert(entry_canon.clone());
+    queue.push_back(Pending {
+        canon: entry_canon,
+        logical_key: entry_logical,
+        module_dir: entry_module_dir,
+    });
+
+    while let Some(item) = queue.pop_front() {
+        // Read + compile this module purely to read its import specifiers (same as the
+        // cache walk). Any failure → skip following its imports (best-effort rebind).
+        let Ok(source) = std::fs::read_to_string(&item.canon) else {
+            continue;
+        };
+        let Ok(bytes) = compile_verified_aso_bytes_from_source_for_cache(&item.canon, &source)
+        else {
+            continue;
+        };
+        let Ok(chunk) = crate::vm::chunk::Chunk::from_bytes_verified(&bytes) else {
+            continue;
+        };
+
+        for imp in &chunk.imports {
+            let spec = imp.source();
+            interp.set_module_dir(item.module_dir.clone());
+            match interp.classify_specifier(spec) {
+                SpecifierKind::Std => {}
+                kind @ (SpecifierKind::Relative(_) | SpecifierKind::Package { .. }) => {
+                    // The loader EMBEDS `module_dir.join(spec).with_extension("as")`.
+                    let requested = item.module_dir.join(spec);
+                    let as_path = if requested.extension().is_some() {
+                        requested.clone()
+                    } else {
+                        requested.with_extension("as")
+                    };
+                    let embed = as_path.display().to_string();
+                    // It KEYS / recurses by the canonical path.
+                    let target = match &kind {
+                        SpecifierKind::Relative(t) => t.clone(),
+                        SpecifierKind::Package { target, .. } => target.clone(),
+                        _ => unreachable!(),
+                    };
+                    let Ok(dep_canon) = resolve_module_file(&target) else {
+                        continue;
+                    };
+                    // First-importer-wins on the embedded path (matches the loader's
+                    // `file_modules`-keyed once-only binding).
+                    runtime_path.entry(dep_canon.clone()).or_insert(embed);
+                    if seen.insert(dep_canon.clone()) {
+                        let dep_key = match &kind {
+                            SpecifierKind::Package { .. } => {
+                                crate::vm::archive::join_logical("pkg", spec)
+                            }
+                            _ => crate::vm::archive::join_logical(
+                                &crate::vm::archive::logical_parent(&item.logical_key),
+                                spec,
+                            ),
+                        };
+                        key_to_canon.insert(dep_key.clone(), dep_canon.clone());
+                        let dep_module_dir = dep_canon
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        queue.push_back(Pending {
+                            canon: dep_canon,
+                            logical_key: dep_key,
+                            module_dir: dep_module_dir,
+                        });
+                    }
+                }
+                SpecifierKind::UnknownPackage(_) => {}
+            }
+        }
+    }
+
+    // Rebind each archive module: decode → rebind path → re-encode (debug-carrying).
+    for (logical_key, bytes) in archive.modules.iter_mut() {
+        let Some(canon) = key_to_canon.get(logical_key) else {
+            continue; // unknown key (e.g. package logical-dir drift) — leave as-is
+        };
+        let Some(new_path) = runtime_path.get(canon) else {
+            continue;
+        };
+        let Ok(chunk) = crate::vm::chunk::Chunk::from_bytes_verified(bytes) else {
+            continue;
+        };
+        chunk.rebind_source_path(new_path);
+        if let Ok(reencoded) = chunk.to_bytes_with_debug(true) {
+            *bytes = reencoded;
+        }
+    }
+}
+
+/// WARM A — the codegen-relevant flag list embedded in the [`cc::CompileCacheKey`].
+///
+/// v1 is constant (`debug=true, shake=false, elide=false`): the cache artifact is the
+/// unshaken, debug-carrying, non-elided archive (§2.6). Behind a `#[doc(hidden)]` test
+/// seam (`ASCRIPT_TEST_CACHE_FLAG_SALT`) the list can be PERTURBED so the `flag_change_misses`
+/// battery can prove a codegen-flag change ⇒ a different key ⇒ a miss, without needing a
+/// real second codegen flag to exist yet. The salt is read ONLY here and is absent on
+/// every production run (the env var is unset), so the production key is unaffected.
+fn cache_codegen_flags() -> Vec<(String, String)> {
+    let mut flags = vec![
+        ("debug".to_string(), "true".to_string()),
+        ("shake".to_string(), "false".to_string()),
+        ("elide".to_string(), "false".to_string()),
+    ];
+    // `#[doc(hidden)]` flag-change TEST SEAM (§5-A `flag_change_misses`): a non-empty
+    // `ASCRIPT_TEST_CACHE_FLAG_SALT` adds a synthetic codegen flag, changing the key exactly
+    // as a real flag flip would. Unset on every production run.
+    if let Ok(salt) = std::env::var("ASCRIPT_TEST_CACHE_FLAG_SALT") {
+        if !salt.is_empty() {
+            flags.push(("__test_salt".to_string(), salt));
+        }
+    }
+    flags
+}
+
+/// WARM A — verify a cached artifact through the SAME `from_bytes_verified` trust
+/// boundary the runtime uses, WITHOUT running it. Returns `true` iff every module
+/// (archive) or the single chunk (`ASO\0`) re-verifies. Hostile-input-safe: any decode
+/// or verify failure ⇒ `false` (the caller treats the slot as poisoned → recompile).
+fn artifact_verifies(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&crate::vm::archive::ARCHIVE_MAGIC) {
+        let archive = match crate::vm::archive::ModuleArchive::decode(bytes) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        // Every embedded module must re-verify through the FUZZ-hardened reader.
+        for (_key, mod_bytes) in &archive.modules {
+            if crate::vm::chunk::Chunk::from_bytes_verified(mod_bytes).is_err() {
+                return false;
+            }
+        }
+        true
+    } else {
+        crate::vm::chunk::Chunk::from_bytes_verified(bytes).is_ok()
     }
 }
 
@@ -3605,6 +4365,479 @@ pub async fn run_archive(
         Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
         Err(crate::interp::Control::Panic(e)) => Err(e),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// WARM B §3.3/§5-B — the `#[doc(hidden)]` SEEDING test seam.
+///
+/// A white-box handle over a freshly-loaded PGO-carrying archive: it decodes the trailing
+/// PGO section, builds a `Vm` + the entry `FnProto`, and (when `seed` is set AND the Vm is
+/// specializing) seeds the entry chunk's side tables BEFORE first execution — exactly the
+/// production archive-load path, but with the entry proto held live for inspection.
+///
+/// `seed`/`specialize` are threaded EXPLICITLY (not read from `ASCRIPT_NO_PGO`/the global
+/// kill switch) so parallel tests never race a process-global env var (the LANE Task-2
+/// convention). The handle exposes the install COUNT, pre/post-run side-table accessors, and
+/// an async `run()` that drives the entry to completion and returns captured output.
+#[doc(hidden)]
+pub struct PgoSeedHandle {
+    interp: Rc<Interp>,
+    vm: Rc<crate::vm::Vm>,
+    entry_proto: Rc<crate::vm::chunk::FnProto>,
+    installed: usize,
+}
+
+impl PgoSeedHandle {
+    /// Number of side-table entries the seeder installed (0 when `seed`/`specialize` is off,
+    /// the section is absent, the digest mismatches, or every entry was skipped by a guard).
+    pub fn installed(&self) -> usize {
+        self.installed
+    }
+
+    /// White-box: the entry chunk's adaptive-arith state at byte offset `off`.
+    pub fn entry_arith_cache(&self, off: usize) -> crate::vm::adapt::ArithCache {
+        self.entry_proto.chunk.arith_cache(off)
+    }
+
+    /// White-box: the entry chunk's field inline cache at byte offset `off`.
+    pub fn entry_field_ic(&self, off: usize) -> crate::vm::ic::InlineCache {
+        self.entry_proto.chunk.field_ic(off)
+    }
+
+    /// White-box: the entry chunk's global cache at byte offset `off`.
+    pub fn entry_global_cache(&self, off: usize) -> crate::vm::adapt::GlobalCache {
+        self.entry_proto.chunk.global_cache(off)
+    }
+
+    /// Drive the entry proto to completion on a `LocalSet`, returning captured output.
+    pub async fn run(&self) -> Result<String, AsError> {
+        use crate::vm::value_ext::{Closure, RunOutcome};
+        let closure = Closure::new(Rc::clone(&self.entry_proto));
+        let mut fiber = crate::vm::fiber::Fiber::new(closure);
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(self.vm.run(&mut fiber)).await;
+        local.await;
+        crate::gc::collect();
+        match result {
+            Ok(RunOutcome::Done(_)) | Ok(RunOutcome::Yielded(_)) => Ok(self.interp.output()),
+            Err(crate::interp::Control::Panic(e)) => Err(e),
+            Err(crate::interp::Control::Propagate(_)) => Ok(self.interp.output()),
+            Err(crate::interp::Control::Exit(_)) => Ok(self.interp.output()),
+        }
+    }
+
+    /// Like [`run`](Self::run) but returns the `(output, exit_code)` pair, mapping every
+    /// `Control` channel exactly as the corpus differential modes (`vm_run_source` &c.) do —
+    /// so the seeded-PGO differential mode is comparable to them byte-for-byte (an `exit(n)`
+    /// surfaces the code; a top-level `?` propagation ends the program with `None`).
+    pub async fn run_with_exit(&self) -> Result<(String, Option<i32>), AsError> {
+        use crate::vm::value_ext::{Closure, RunOutcome};
+        let closure = Closure::new(Rc::clone(&self.entry_proto));
+        let mut fiber = crate::vm::fiber::Fiber::new(closure);
+        let local = tokio::task::LocalSet::new();
+        let result = local.run_until(self.vm.run(&mut fiber)).await;
+        local.await;
+        crate::gc::collect();
+        match result {
+            Ok(RunOutcome::Done(_)) => Ok((self.interp.output(), None)),
+            Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+            Err(crate::interp::Control::Panic(e)) => Err(e),
+            Err(crate::interp::Control::Propagate(_)) => Ok((self.interp.output(), None)),
+            Err(crate::interp::Control::Exit(code)) => Ok((self.interp.output(), Some(code))),
+        }
+    }
+}
+
+/// WARM B §3.3 — load `archive_bytes` (an `ASCRIPTA` archive, optionally with a trailing PGO
+/// section) and seed the entry chunk per `seed`/`specialize`, returning a [`PgoSeedHandle`].
+/// `#[doc(hidden)]` test/seam API — NOT a stable surface.
+#[doc(hidden)]
+pub fn pgo_seed_for_test(
+    archive_bytes: &[u8],
+    seed: bool,
+    specialize: bool,
+) -> Result<PgoSeedHandle, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::Vm;
+
+    let archive = crate::vm::archive::ModuleArchive::decode(archive_bytes)
+        .map_err(|e| AsError::new(format!("cannot decode archive: {e}")))?;
+    let section = decode_trailing_pgo(archive_bytes, &archive);
+
+    let (entry_key, entry_bytes) = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(k, b)| (k.clone(), b.clone()))
+        .ok_or_else(|| AsError::new("archive entry index is out of range"))?;
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+        .map_err(|e| AsError::new(format!("cannot load archive entry: {e}")))?;
+
+    let interp = Rc::new(Interp::new()); // captured output
+    interp.set_worker_archive_bytes(Rc::from(archive.encode().as_slice()));
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    interp.install_self();
+    // Honor the explicit `specialize` flag (the generic-VM seed-skip path).
+    let vm = Vm::with_specialize(interp.clone(), specialize);
+    vm.set_module_archive(Rc::new(archive));
+
+    let entry_proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+
+    // Seed BEFORE first execution — exactly the production order. `seed_entry_from_section`
+    // is internally gated on `vm.specialize`, so `specialize=false` ⇒ 0 installs.
+    let installed = match section.as_ref() {
+        Some(sec) => {
+            vm.seed_entry_from_section(&entry_proto.chunk, sec, &entry_key, &entry_sha256, seed)
+        }
+        None => 0,
+    };
+
+    Ok(PgoSeedHandle {
+        interp,
+        vm,
+        entry_proto,
+        installed,
+    })
+}
+
+/// WARM B §5-B(a) — compile `src` to a single-module `ASCRIPTA` archive, run it ONCE as a
+/// training workload (capture mode), harvest the warmed side tables, and return the
+/// PGO-carrying artifact bytes (archive + appended `ASPGO` trailing section). This is the
+/// in-process, disk-less equivalent of `build_file_with_pgo` for a self-contained program;
+/// the seeded differential + coverage seams below load these bytes through `pgo_seed_for_test`
+/// (the exact production seed-at-load path). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_build_artifact_from_source(src: &str) -> Result<Vec<u8>, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::pgo::append_section;
+    use crate::vm::value_ext::Closure;
+    use crate::vm::Vm;
+
+    // ── compile a single-module archive from source ──────────────────────────
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span))?;
+    let entry_bytes = chunk
+        .to_bytes_with_debug(true)
+        .map_err(|e| AsError::new(format!("cannot serialize compiled chunk: {e}")))?;
+    let entry_key = "<input>".to_string();
+    let archive = crate::vm::archive::ModuleArchive::new(
+        0,
+        crate::stdlib::caps::CapSet::all_granted(),
+        [0u8; 32],
+        vec![(entry_key.clone(), entry_bytes.clone())],
+    );
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
+    let encoded_archive = archive.encode();
+
+    // ── training run (capture) + harvest ─────────────────────────────────────
+    let pgo = {
+        let interp = Rc::new(Interp::new());
+        interp.set_worker_archive_bytes(Rc::from(encoded_archive.as_slice()));
+        interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+        interp.set_worker_source(src);
+        interp.install_self();
+        let train_chunk = crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+            .map_err(|e| AsError::new(format!("cannot load training chunk: {e}")))?;
+        let train_proto = Rc::new(FnProto {
+            chunk: train_chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: false,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+            local_names: Vec::new(),
+            debug_name: None,
+            name_span: None,
+        });
+        let vm = Vm::new(interp.clone());
+        vm.set_module_archive(Rc::new(
+            crate::vm::archive::ModuleArchive::decode(&encoded_archive)
+                .map_err(|e| AsError::new(format!("cannot re-decode archive: {e}")))?,
+        ));
+        {
+            let closure = Closure::new(Rc::clone(&train_proto));
+            let mut fiber = crate::vm::fiber::Fiber::new(closure);
+            let local = tokio::task::LocalSet::new();
+            // Absorb ALL outcomes — a panicking training run still yields a (partial) section.
+            let _ = local.run_until(vm.run(&mut fiber)).await;
+            local.await;
+            crate::gc::collect();
+        }
+        let harvest_modules: &[(String, [u8; 32], &FnProto)] =
+            &[(entry_key.clone(), entry_sha256, &train_proto)];
+        vm.harvest_pgo(harvest_modules)
+    };
+
+    let mut artifact_bytes = encoded_archive;
+    append_section(&mut artifact_bytes, &pgo.encode());
+    Ok(artifact_bytes)
+}
+
+/// WARM B §5-B(a) — the SEEDED differential mode (Gate 15), in-process and from SOURCE.
+///
+/// Mirrors the production `build --pgo` → seed-at-load → run flow entirely in-process and
+/// with CAPTURED output (so the corpus differential can compare it against the standard
+/// modes' `(String, Option<i32>)`): build the PGO-carrying artifact
+/// ([`pgo_build_artifact_from_source`]), then load it SEEDED through the production
+/// [`pgo_seed_for_test`] path and run.
+///
+/// The byte-invisibility PROOF: the corpus differential asserts this equals tree-walker ==
+/// spec == generic. A divergence means a seed bypassed a guard (the seeder is unsound).
+/// `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_seeded_run_from_source(src: &str) -> Result<(String, Option<i32>), AsError> {
+    let artifact = pgo_build_artifact_from_source(src).await?;
+    let handle = pgo_seed_for_test(&artifact, /*seed=*/ true, /*specialize=*/ true)?;
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    // `PgoSeedHandle::run` captures output and maps every Control channel like the corpus
+    // modes, but returns only the output String; re-derive the exit code by matching its
+    // run path here would duplicate it, so reuse `run()` and report exit via the handle.
+    handle
+        .run_with_exit()
+        .await
+        .map_err(|e| e.with_source(src_info))
+}
+
+/// WARM B §5-B(a) coverage seam (anti-false-green): build the PGO artifact for `src`, load it
+/// SEEDED, and return the INSTALLED-COUNT (how many side-table entries the seeder installed).
+/// The corpus coverage assertion sums this over the corpus to prove the seeded axis is NOT
+/// dark (>0 seeds actually install). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_seeded_install_count_from_source(src: &str) -> Result<usize, AsError> {
+    let artifact = pgo_build_artifact_from_source(src).await?;
+    let handle = pgo_seed_for_test(&artifact, /*seed=*/ true, /*specialize=*/ true)?;
+    Ok(handle.installed())
+}
+
+/// WARM B §6 bench seam — the UNSEEDED counterpart of [`pgo_seeded_run_from_source`]: build
+/// the SAME PGO-carrying artifact, but load it with seeding OFF (`seed=false`, the
+/// `ASCRIPT_NO_PGO` kill-switch path). The cold-start microbench (`vm_bench`) times this
+/// against the seeded run on the SAME artifact to measure the warm-up window the seeds
+/// eliminate, in-process (unmasked by process startup). `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_unseeded_run_from_source(src: &str) -> Result<(String, Option<i32>), AsError> {
+    let artifact = pgo_build_artifact_from_source(src).await?;
+    let handle = pgo_seed_for_test(&artifact, /*seed=*/ false, /*specialize=*/ true)?;
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    handle
+        .run_with_exit()
+        .await
+        .map_err(|e| e.with_source(src_info))
+}
+
+/// WARM B §5-B(b) — the ADVERSARIAL-SEED axis (fuzzing the GUARDS, not the codec).
+///
+/// Compiles `src` to an entry chunk, then injects PSEUDO-RANDOM JUNK directly into the
+/// chunk's side tables — `set_arith_cache` / `set_field_ic` / `set_global_cache` — BYPASSING
+/// the seeder entirely (so wrong offsets, wrong kinds, wrong shape ids, wrong indices, and
+/// bogus global values all land). The junk is derived from `junk` bytes (the fuzz input).
+/// The run loop's guards (operand-kind re-check on arith, shape-id match on field IC, version
+/// match on global cache) MUST absorb every lie → a junk seed can only deopt, never change
+/// output. The caller asserts byte-identity against the unseeded modes.
+///
+/// This is strictly MORE adversarial than the seeder: the seeder derives field indices and
+/// range-checks offsets; here we inject arbitrary indices/shapes/offsets at arbitrary sites.
+/// `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+pub async fn pgo_adversarial_run_from_source(
+    src: &str,
+    junk: &[u8],
+) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::pgo::{PgoModule, PgoProto, PgoSection};
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let entry_bytes = chunk
+        .to_bytes_with_debug(true)
+        .map_err(|e| AsError::new(format!("cannot serialize compiled chunk: {e}")))?;
+    let entry_key = "<input>".to_string();
+    let entry_sha256 = crate::cache::compile_cache::sha256_bytes(&entry_bytes);
+
+    // Derive a pseudo-random stream from `junk` (a cheap LCG over the bytes).
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for &b in junk {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(b as u64 + 1);
+    }
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+
+    // ── Build a JUNK PgoSection and seed it through the REAL `seed_chunk` ─────────
+    //
+    // WHY through `seed_chunk` (not raw `set_field_ic`): the §3.3 wire format carries NO field
+    // index — the seeder DERIVES the index from a key list, and a field-IC shape id is minted
+    // by INTERNING that key list. So the only states a (corrupt) profile can ever express are
+    // (junk OFFSET, junk arith KIND tag, junk KEY-LIST, junk KEY-LIST-INDEX reference, junk
+    // GLOBAL offset) — exactly what §5 names ("offset, kind/key-list/builtin-marker"). Raw
+    // `set_field_ic` with a fabricated (shape_id, index) pair would test a state the wire
+    // format CANNOT produce (a shape id that collides with a live shape but whose layout is
+    // NOT that key list — the shape invariant the seeder relies on), which is not the threat
+    // model. We therefore fuzz the seeder + run-loop guards AS SHIPPED: a junk profile in, the
+    // real derivation + interning + guards, byte-identical output out.
+    //
+    // The junk KEY LISTS deliberately MIX (a) full real-looking multi-field layouts that
+    // intern-COLLIDE with common object shapes (so the derived index is genuinely exercised —
+    // INCLUDING reversed/permuted orders, which a broken derivation that trusts the key-list
+    // index instead of deriving the name's position would mis-map → the liveness-relevant
+    // case) and (b) garbage names (so most lists intern to fresh non-colliding shapes →
+    // shape-miss). Both are corrupt-profile-expressible (interned → a real shape id).
+    let mut key_lists: Vec<Vec<String>> = vec![
+        // Real layouts the dangerous-shape corpus uses, in RECEIVER (insertion) ORDER so they
+        // intern to the SAME shape id as the live object → the seeder actually installs at the
+        // GetProp site and the DERIVED index is genuinely exercised. They sit at LIST indices
+        // (0,1,2,…) deliberately DIFFERENT from the field positions, so a broken derivation
+        // that trusted the key-list index instead of deriving the name's position would
+        // mis-map (e.g. `.c` in `{a,b,c}` → list-idx 0 ≠ field pos 2) → the liveness case.
+        // Also reversed orders (intern to a DIFFERENT shape → shape-miss, the other path).
+        vec!["a".into(), "b".into(), "c".into()],
+        vec!["x".into(), "y".into()],
+        vec!["k".into(), "m".into()],
+        vec!["first".into(), "second".into(), "third".into()],
+        vec!["c".into(), "b".into(), "a".into()],
+        vec!["b".into(), "a".into()],
+    ];
+    let junk_names = ["a", "b", "c", "d", "x", "y", "z", "k", "m", "first", "second", "third", "qqzz", "__nope__"];
+    let n_extra = (next() % 5) as usize;
+    for _ in 0..n_extra {
+        let len = (next() % 4) as usize; // 0..3 keys
+        key_lists.push(
+            (0..len)
+                .map(|_| junk_names[(next() as usize) % junk_names.len()].to_string())
+                .collect(),
+        );
+    }
+    let n_lists = key_lists.len();
+
+    // Build junk PgoProtos. For each proto we target BOTH (a) the REAL op sites (so the seeder
+    // installs where derivation + guards are exercised — every GetProp/SetProp gets a field
+    // record referencing ALL key-lists, so a matching layout DOES install a derived index;
+    // every arith op gets a junk kind tag; every GetGlobal gets a global record) and (b) random
+    // offsets/indices for breadth. `all_lists` references every key-list, including the
+    // receiver-order layouts that intern-collide with the live objects.
+    let all_lists: Vec<u32> = (0..n_lists as u32).collect();
+    let build_proto =
+        |target: &crate::vm::chunk::Chunk, path: Vec<u32>, n: &mut dyn FnMut() -> u64| -> PgoProto {
+            use crate::vm::opcode::Op;
+            let code: Vec<u8> = target.code.to_vec();
+            let tlen = code.len().max(1) as u32;
+            let mut arith: Vec<(u32, u8)> = Vec::new();
+            let mut fields: Vec<(u32, Vec<u32>)> = Vec::new();
+            let mut globals: Vec<u32> = Vec::new();
+            // (a) Real op sites.
+            let mut off = 0usize;
+            while off < code.len() {
+                let Some(op) = Op::from_u8(code[off]) else { break };
+                if matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow) {
+                    arith.push((off as u32, (n() % 6) as u8)); // junk kind tag 0..5 (some invalid)
+                }
+                if matches!(op, Op::GetProp | Op::SetProp) {
+                    fields.push((off as u32, all_lists.clone()));
+                }
+                if matches!(op, Op::GetGlobal) {
+                    globals.push(off as u32);
+                }
+                off += 1 + op.operand_width();
+            }
+            // (b) Random breadth (mid-instruction offsets, random list-index refs).
+            for _ in 0..(n() % 6) {
+                arith.push(((n() as u32) % tlen, (n() % 6) as u8));
+            }
+            for _ in 0..(n() % 6) {
+                let n_idx = (n() % 3) as usize;
+                let idxs = (0..n_idx).map(|_| (n() as u32) % (n_lists as u32 + 2)).collect();
+                fields.push(((n() as u32) % tlen, idxs));
+            }
+            for _ in 0..(n() % 6) {
+                globals.push((n() as u32) % tlen);
+            }
+            PgoProto {
+                path,
+                arith,
+                fields,
+                globals,
+            }
+        };
+    let mut protos = vec![build_proto(&chunk, Vec::new(), &mut next)];
+    for i in 0..chunk.protos.len() {
+        protos.push(build_proto(&chunk.protos[i].chunk, vec![i as u32], &mut next));
+    }
+    // Occasionally point a proto path out of range (the seeder must skip it).
+    protos.push(build_proto(&chunk, vec![9999], &mut next));
+
+    let section = PgoSection {
+        key_lists,
+        modules: vec![PgoModule {
+            module_key: entry_key.clone(),
+            chunk_sha256: entry_sha256,
+            protos,
+        }],
+    };
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::new(interp.clone());
+    // Seed the JUNK section through the REAL seeder (derivation + interning + digest gate) —
+    // gated on `vm.specialize` + `seed=true`. The run-loop guards must absorb every lie.
+    vm.seed_entry_from_section(&proto.chunk, &section, &entry_key, &entry_sha256, true);
+    let closure = Closure::new(proto.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
     }

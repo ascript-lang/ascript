@@ -3,7 +3,7 @@ use std::process::ExitCode;
 #[cfg(feature = "pkg")]
 mod pkg;
 
-use ascript::cli_surface::{CapFlags, Cli, Command};
+use ascript::cli_surface::{CacheAction, CapFlags, Cli, Command};
 use clap::Parser;
 
 // SP3 §B: run the whole program on a worker thread with an enlarged
@@ -331,6 +331,7 @@ async fn real_main() -> ExitCode {
             out,
             profile_hz,
             profile_format,
+            no_cache,
             file,
             args,
         } => {
@@ -482,12 +483,29 @@ async fn real_main() -> ExitCode {
             // default-OFF). `.aso` runs skip this — a compiled module already baked in
             // whatever the `build` step elided (the opcode is durable).
             let elide = ascript::elide_enabled(elide_flag, no_elide);
+            // WARM A: the plain `.as`-on-the-VM path routes through the cached front
+            // door (fail-open; a cache error falls back to the uncached compile-and-run).
+            // `--no-cache` OR `ASCRIPT_NO_COMPILE_CACHE=1` bypasses it. `.aso` (already
+            // compiled) and `--tree-walker` (the oracle path) are NEVER cached. The
+            // `--inspect`/`--profile` paths returned earlier above, so they never reach
+            // here — also uncached, as the spec requires (§2.8).
+            //
+            // The cache artifact is always the unshaken, debug-carrying, non-elided
+            // archive (§2.6). `--elide` therefore bypasses the cache too: an elided run
+            // would compile DIFFERENT bytes, but `elide` is a v1-constant cache flag, so
+            // routing an elided run through the cache would either stale-hit a non-elided
+            // artifact or never hit. Cleanest: an explicit-elide run is uncached.
+            let no_compile_cache = no_cache
+                || std::env::var("ASCRIPT_NO_COMPILE_CACHE").as_deref() == Ok("1")
+                || elide;
             let result = if is_aso {
                 ascript::run_aso_file(path, &args, caps).await
             } else if use_tree_walker {
                 ascript::run_file_with_packages(path, &args, packages, caps, elide).await
-            } else {
+            } else if no_compile_cache {
                 ascript::run_file_on_vm_with_packages(path, &args, packages, caps, elide).await
+            } else {
+                ascript::run_file_on_vm_cached(path, &args, packages, caps, false).await
             };
             match result {
                 // Output already streamed live (OutputSink::Live).
@@ -507,6 +525,7 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
+            pgo,
             caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
             let out_path = out.as_deref().map(std::path::Path::new);
@@ -534,6 +553,19 @@ async fn real_main() -> ExitCode {
                 // host-only in v1 (build_native returns the specific Tier-1 error).
                 match ascript::build_native(src, out_path, target.as_deref(), caps, elide) {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
+                    Err(e) => {
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
+                }
+            } else if pgo {
+                // WARM B §3.1: PGO harvest — run the program as a training workload,
+                // harvest warmed ICs + adaptive caches, embed a PGO section.
+                match ascript::build_file_with_pgo(src, out_path, !strip, caps, elide).await {
+                    Ok(written) => {
+                        println!("compiled {} -> {} (with PGO section)", file, written.display());
+                        ExitCode::SUCCESS
+                    }
                     Err(e) => {
                         ascript::diagnostics::report(&e);
                         ExitCode::from(1)
@@ -956,6 +988,26 @@ async fn real_main() -> ExitCode {
         Command::Tree => pkg_command_exit(pkg::commands::cmd_tree()),
         #[cfg(feature = "pkg")]
         Command::Verify => pkg_command_exit(pkg::commands::cmd_verify()),
+        Command::Cache { action } => match action {
+            CacheAction::Clean => {
+                let compiled = ascript::cache::compile_cache::compiled_dir();
+                if compiled.exists() {
+                    let count = std::fs::read_dir(&compiled)
+                        .map(|rd| rd.count())
+                        .unwrap_or(0);
+                    std::fs::remove_dir_all(&compiled)
+                        .unwrap_or_else(|e| eprintln!("warning: {e}"));
+                    println!("removed {count} cached compilation(s)");
+                } else {
+                    println!("compiled cache is already empty");
+                }
+                ExitCode::SUCCESS
+            }
+            CacheAction::Dir => {
+                println!("{}", ascript::cache::compile_cache::cache_root().display());
+                ExitCode::SUCCESS
+            }
+        },
     }
 }
 

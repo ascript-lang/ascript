@@ -81,6 +81,13 @@ pub enum Command {
         /// golden-stable) sample clock — used by goldens/tests, no wall-clock thread.
         #[arg(long = "profile-format", value_name = "FMT")]
         profile_format: Option<String>,
+        /// WARM A: bypass the content-addressed compile cache for this run (always
+        /// parse/resolve/compile from source). Equivalent to
+        /// `ASCRIPT_NO_COMPILE_CACHE=1`. The cache only ever applies to the plain
+        /// `.as`-on-the-VM path; `.aso`/`--tree-walker`/`--inspect`/`--profile` are
+        /// never cached regardless of this flag.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -119,6 +126,14 @@ pub enum Command {
         /// a clear error). Requires `--native`.
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
+        /// WARM B §3.1: run the program as a training workload, harvest the warmed
+        /// inline caches and adaptive arithmetic state, and embed a PGO (profile-
+        /// guided optimisation) section into the produced archive. The artifact is
+        /// always an `ASCRIPTA` archive (even for a single-module program). The
+        /// training run's stdout streams live. A panicking training run still
+        /// produces a (possibly partial) PGO section — the build does not abort.
+        #[arg(long = "pgo")]
+        pgo: bool,
         #[command(flatten)]
         caps: CapFlags,
     },
@@ -304,6 +319,20 @@ pub enum Command {
     /// Re-hash the cache store against the lock integrity (fail-closed).
     #[cfg(feature = "pkg")]
     Verify,
+    /// Manage the compile cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+/// Subcommands for `ascript cache`.
+#[derive(Subcommand)]
+pub enum CacheAction {
+    /// Remove the compiled/ namespace (compile cache entries only — the pkg store/ is unaffected).
+    Clean,
+    /// Print the cache root directory.
+    Dir,
 }
 
 /// FFI §4.2/§4.4: the shared capability CLI flags, flattened into both the `run`

@@ -87,3 +87,14 @@ path = "fuzz_targets/worker_serialize.rs"
 test = false
 doc = false
 bench = false
+
+# WARM Task 5 — the PGO section codec byte-fuzz target (WARM spec §3.2).
+# Feeds ARBITRARY bytes to PgoSection::decode — asserts no panic, no OOM, idempotent
+# re-encode if Some is returned. The in-suite truncation/bomb tests are the real guard;
+# this is the coverage-guided extension.
+[[bin]]
+name = "pgo_section"
+path = "fuzz_targets/pgo_section.rs"
+test = false
+doc = false
+bench = false

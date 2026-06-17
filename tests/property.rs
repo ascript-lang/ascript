@@ -202,6 +202,159 @@ proptest! {
     }
 }
 
+// ===========================================================================
+// WARM B §5-B(b) — the ADVERSARIAL-SEED axis (fuzzing the GUARDS)
+// ===========================================================================
+//
+// Task 5 fuzzed the PGO CODEC (hostile section bytes → never panic, bounded alloc). This
+// fuzzes the SEEDER'S GUARDS: it injects PSEUDO-RANDOM JUNK (wrong offsets, wrong arith
+// kinds, wrong shape ids, wrong field indices, bogus global values) DIRECTLY into the
+// compiled chunk's side tables — bypassing the seeder entirely — then runs and asserts the
+// output is byte-identical to the unseeded modes. A junk seed must shape-miss / version-miss
+// / kind-miss → deopt to the generic path → identical output. If a junk seed changes output,
+// a RUN-LOOP guard is missing (the §3.5 soundness argument is the thing under test, not the
+// well-formed-profile codec). This is the in-suite half of the fuzz target's adversarial
+// axis (`fuzz/fuzz_targets/differential.rs`), riding the normal `cargo test`.
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 96,
+        max_shrink_iters: 2048,
+        .. ProptestConfig::default()
+    })]
+
+    /// Adversarial-seed differential: generate a valid program, derive the UNSEEDED baseline
+    /// (tree-walker), then run the SAME program with junk seeds injected directly into the
+    /// entry chunk's side tables (junk derived from a second slice of the proptest input).
+    /// The junk-seeded run MUST equal the baseline — the guards absorb every lie. On failure
+    /// proptest shrinks toward a minimal (program, junk) reproducer; fix the GUARD, never the
+    /// assertion.
+    #[test]
+    fn adversarial_seed_axis_guards_absorb_junk(
+        prog_bytes in prop::collection::vec(any::<u8>(), 64..768),
+        junk in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let prog = fuzzgen::gen_program_from_bytes(&prog_bytes);
+        let src = prog.source.clone();
+        let junk2 = junk.clone();
+        let (baseline, adversarial) = ascript::run_on_worker_stack(move || async move {
+            // The unseeded reference is the plain specialized VM (the SAME CST front-end the
+            // seam compiles through — so an invalid program's PARSE-error message matches; the
+            // tree-walker would diverge on the SP1 cross-front-end message, a false positive).
+            // The whole-corpus tree-walker oracle is the seeded-differential mode elsewhere.
+            let base = project(ascript::vm_run_source(&src).await);
+            let adv = project(ascript::pgo_adversarial_run_from_source(&src, &junk2).await);
+            (base, adv)
+        });
+        prop_assert_eq!(
+            &baseline, &adversarial,
+            "a junk seed CHANGED program output — a run-loop guard is missing (UNSOUND)\n\
+             --- program ---\n{}\n--- junk: {:?}\n--- unseeded (tw): {:?}\n--- junk-seeded:   {:?}",
+            prog.source, junk, baseline, adversarial
+        );
+    }
+}
+
+/// WARM B §5-B(b) — a DETERMINISTIC fixed-seed adversarial battery (no proptest dependency
+/// for the breadth; mirrors `three_way_differential_fixed_seed_battery`). For a spread of
+/// seeds, generate a program, inject several distinct junk-seed buffers, and assert the
+/// junk-seeded run equals the unseeded tree-walker baseline every time.
+#[test]
+fn adversarial_seed_fixed_battery() {
+    let cases: Vec<(String, Vec<Vec<u8>>)> = (0u64..120)
+        .map(|seed| {
+            let bytes = seed_bytes(seed, 256);
+            let src = fuzzgen::gen_program_from_bytes(&bytes).source;
+            // Four distinct junk buffers per program — empty, tiny, medium, and a
+            // pattern-heavy one (all-0xFF stresses the LCG toward max offsets/indices).
+            let junks = vec![
+                Vec::new(),
+                seed_bytes(seed ^ 0xABCD, 7),
+                seed_bytes(seed.wrapping_mul(31), 64),
+                vec![0xFFu8; 1 + (seed as usize % 200)],
+            ];
+            (src, junks)
+        })
+        .collect();
+    ascript::run_on_worker_stack(move || async move {
+        for (src, junks) in &cases {
+            // Unseeded baseline = the plain specialized VM (same CST front-end as the seam).
+            let base = project(ascript::vm_run_source(src).await);
+            for junk in junks {
+                let adv = project(ascript::pgo_adversarial_run_from_source(src, junk).await);
+                assert_eq!(
+                    base, adv,
+                    "adversarial junk seed changed output (a missing guard)\n--- program ---\n{src}\n--- junk len {} ---\n  unseeded (tw): {base:?}\n  junk-seeded:   {adv:?}",
+                    junk.len()
+                );
+            }
+        }
+    });
+}
+
+/// WARM B §5-B(b) — the DANGEROUS-SHAPE adversarial battery (the LOAD-BEARING guard test).
+///
+/// The generator-driven battery above gives breadth but rarely emits the precise shape that
+/// makes a wrong seed OBSERVABLE: a multi-field object/instance whose fields hold DISTINCT
+/// values, read in a hot loop, so a mis-derived field index (or a wrong arith kind, or a stale
+/// global) would produce a DIFFERENT number. The junk is fed through the REAL seeder
+/// (`pgo_adversarial_run_from_source` builds a junk `PgoSection` — junk offsets, junk arith
+/// kind tags, junk key-lists, junk key-list-index references — and seeds it via the production
+/// `seed_chunk`, the only states a corrupt `.aso` PGO section can express; §3.3 carries NO
+/// field index, so raw `set_field_ic` would test a state the wire format cannot produce). The
+/// junk key-lists INCLUDE the corpus's real receiver layouts in receiver order (so they
+/// intern-collide and the DERIVED index is genuinely exercised) at list-indices ≠ the field
+/// positions. With MANY junk buffers each, a broken derivation / missing guard (the §3.3
+/// keystone) flips the output.
+///
+/// **Sabotage-verified (the battery is NOT asleep):** replacing the derivation
+/// `ic.record(shape, pos)` with `ic.record(shape, li)` (trust the key-list index instead of
+/// deriving the name's position — the exact §3.3 bug) makes the `{a,b,c}` program flip
+/// 36000→30000 here and this test FAILS; reverting restores PASS.
+#[test]
+fn adversarial_seed_dangerous_shapes() {
+    // Programs whose output is SENSITIVE to a wrong field index / arith kind / global value.
+    let progs: &[&str] = &[
+        // Multi-field object, distinct values, hot read of every field.
+        "let o = { a: 100, b: 200, c: 300 }\nlet s = 0\nfor (i in 0..60) { s = s + o.a + o.b + o.c }\nprint(s)",
+        // Two objects of the SAME shape but different values (shape-id collision pressure).
+        "let p = { x: 1, y: 2 }\nlet q = { x: 10, y: 20 }\nlet s = 0\nfor (i in 0..60) { s = s + p.x + p.y + q.x + q.y }\nprint(s)",
+        // Instance fields (the Instance arm of ic_get_field).
+        "class Pt { a: number\n b: number\n fn init(a, b) { self.a = a\n self.b = b } }\nlet p = Pt(7, 9)\nlet s = 0\nfor (i in 0..60) { s = s + p.a + p.b }\nprint(s)",
+        // Hot int arith (arith cache — a wrong committed kind must deopt).
+        "let s = 0\nfor (i in 1..=200) { s = s + i * 3 - 2 }\nprint(s)",
+        // Hot float arith (a wrong Int seed on a float site must deopt).
+        "let s = 0.0\nfor (i in 1..=200) { s = s + 1.5 }\nprint(s)",
+        // Builtin globals in a loop (global cache — a stale/bogus value must miss).
+        "let s = 0\nfor (i in 0..60) { s = s + len(\"abcd\") + abs(-3) }\nprint(s)",
+        // Mixed: object field + arith + builtin global together.
+        "fn f(n) { return n * 2 + 1 }\nlet o = { k: 5, m: 11 }\nlet s = 0\nfor (i in 0..60) { s = s + f(i) + o.k + o.m + abs(-2) }\nprint(s)",
+        // Object whose field ORDER differs from another (index-position pressure).
+        "let o = { first: 1000, second: 2000, third: 3000 }\nlet t = { third: 9, first: 8, second: 7 }\nprint(o.first + o.second + o.third + t.first + t.second + t.third)",
+    ];
+    // 256 distinct junk buffers per program — enough to cover the colliding-shape /
+    // in-range-wrong-index combinations across the whole stream.
+    let junks: Vec<Vec<u8>> = (0u64..256)
+        .map(|k| seed_bytes(k.wrapping_mul(2654435761).wrapping_add(1), 56))
+        .collect();
+    let progs: Vec<String> = progs.iter().map(|s| s.to_string()).collect();
+    ascript::run_on_worker_stack(move || async move {
+        for src in &progs {
+            // Unseeded baseline = the plain specialized VM (same CST front-end as the seam);
+            // every dangerous-shape program is valid AScript so the VM output is concrete.
+            let base = project(ascript::vm_run_source(src).await);
+            for junk in &junks {
+                let adv = project(ascript::pgo_adversarial_run_from_source(src, junk).await);
+                assert_eq!(
+                    base, adv,
+                    "a junk seed CHANGED output on a dangerous shape — a run-loop guard is missing (UNSOUND)\n--- program ---\n{src}\n--- junk len {} ---\n  unseeded (tw): {base:?}\n  junk-seeded:   {adv:?}",
+                    junk.len()
+                );
+            }
+        }
+    });
+}
+
 /// `arbitrary::Unstructured` is re-exported via the generator's dep; build one from bytes.
 fn arbitrary_unstructured(bytes: &[u8]) -> arbitrary::Unstructured<'_> {
     arbitrary::Unstructured::new(bytes)

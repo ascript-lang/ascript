@@ -46,3 +46,11 @@ corpus/worker_serialize/*
 corpus/archive_roundtrip/*
 !corpus/archive_roundtrip/ex_*
 !corpus/archive_roundtrip/bad_*
+
+# WARM Unit B — the `pgo_section` PGO-trailing-section decoder target: same discipline. Ignore
+# the (nightly-GROWN, hash-named) corpus, RE-INCLUDE only the curated `ex_pgo_section` example
+# and the `bad_*` rejection seeds (count-bomb / empty / invalid-kind). Not `.aso` files, so the
+# root `*.aso` rule does not touch them; these two negations are what tracks the curated seeds.
+corpus/pgo_section/*
+!corpus/pgo_section/ex_*
+!corpus/pgo_section/bad_*

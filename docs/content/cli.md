@@ -59,6 +59,7 @@ missing lock, or integrity mismatch. For CI and air-gapped environments. See [Pa
 |---|---|
 | `--elide` | Enable **contract elision** — drop statically-*proven* runtime type-contract checks (call arguments, annotated `let` initializers, declared returns) from the executed bytecode/AST. Behavior is byte-identical; only proven checks are removed. **Off by default on `run`** (the per-run proof collector adds a small startup cost that is over the measured budget for short programs). Equivalent to `ASCRIPT_ELIDE=1`. `ascript build --elide` is the cost-free surface (the elision is baked into the durable `.aso`). See [Type contracts → Annotations and performance](language/type-contracts). |
 | `--no-elide` | Force contract elision **off** (the permanent kill switch; wins over `--elide`). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
+| `--no-cache` | Bypass the **compile cache** for this run — always parse/resolve/compile from source. Equivalent to `ASCRIPT_NO_COMPILE_CACHE=1`. The cache only ever applies to the plain `.as`-on-the-VM path: `.aso`, `--tree-walker`, `--inspect`, `--profile`, and explicit `--elide` runs are never cached regardless of this flag. See [`ascript cache`](#ascript-cache). |
 
 ## `ascript build`
 
@@ -83,6 +84,7 @@ is, when to use it, and why it is not a stable cross-version format.
 | `--target <TRIPLE>` | Target triple for `--native` (requires `--native`). Host-only in v1 — accepted but rejected with a clear error. |
 | `--elide` | Bake **contract elision** into the artifact — drop statically-proven runtime type-contract checks from the compiled `.aso`/native bytecode. The win is durable (every later `run` of the artifact keeps it) and the one-shot collector cost is amortised, so this is the recommended elide surface. Behavior is byte-identical. Equivalent to `ASCRIPT_ELIDE=1`. Default-off; `--no-elide` forces it off. See [Type contracts → Annotations and performance](language/type-contracts). |
 | `--no-elide` | Force contract elision off in the artifact (kill switch; wins over `--elide`). Equivalent to `ASCRIPT_NO_ELIDE=1`. |
+| `--pgo` | **Profile-guided optimisation harvest** (WARM B §3.1). Run the program as a training workload, collect the VM's warmed inline caches and adaptive arithmetic state, and embed a compact PGO section into the produced `.aso`. The artifact is always an `ASCRIPTA` archive (even for a single-module program). Training-run stdout streams live. A panicking training run still produces a (possibly partial) section — the build never aborts on a training panic. |
 
 The four capability flags (`--deny`, `--sandbox`, `--deny-net`, `--deny-fs`) are also accepted on
 `build` and on `build --native`. The composed capability set is **embedded** in the produced
@@ -347,6 +349,52 @@ See [editor setup](tooling/editor-setup) for VS Code, Zed, and Neovim configurat
 > source to produce diagnostics and navigation; it never runs the interpreter, so the whole layer
 > stays `Send + Sync` and free of runtime state.
 
+## `ascript cache`
+
+Manage the compile cache. On `ascript run <file>.as` (the default VM path) the CLI consults this
+cache before compiling: an unchanged program is loaded from its cached, verified bytecode instead
+of being re-parsed, re-resolved, and re-compiled. The cached and uncached runs are **byte-identical**
+(stdout, stderr, exit code, and panic carets alike). Bypass the cache with `--no-cache` or
+`ASCRIPT_NO_COMPILE_CACHE=1`. It never applies to `.aso` (already compiled), `--tree-walker`,
+`--inspect`, `--profile`, `--elide`, or `ascript test`.
+
+The compile cache lives under the cache root (see `ascript cache dir`)
+in a `compiled/` subdirectory. Each slot is a content-addressed directory keyed by a hash of
+the compiler version, entry path, codegen flags, and resolved package map — not a hash of the
+source. Source integrity is validated per-slot via a manifest of per-file digests over the whole
+reachable import graph, so editing **any** module (entry, transitive, or a `{path=…}` dependency)
+misses and recompiles, while a content-preserving `touch` (mtime-only change) still hits.
+
+The cache is fail-open: any IO error, digest mismatch, hostile entry, or missing slot falls through
+to a fresh compile without error — a normal `run` never fails because of the cache. Corruption in a
+slot is self-healing: the verifier rejects it, the slot is deleted, and the next `ascript run`
+recompiles and republishes.
+
+### `ascript cache clean`
+
+Remove the `compiled/` namespace entirely (all compile cache entries). The pkg `store/` namespace
+(package tarballs) is **not** affected.
+
+```text
+ascript cache clean
+```
+
+Prints the number of slots removed, or a message if the cache was already empty. Use this to free
+disk space or force a full recompile of all programs.
+
+### `ascript cache dir`
+
+Print the cache root directory.
+
+```text
+ascript cache dir
+```
+
+The cache root is resolved from `$ASCRIPT_CACHE` (if set and non-empty), then the per-platform
+default (`~/Library/Caches/ascript` on macOS, `$XDG_CACHE_HOME/ascript` or `~/.cache/ascript`
+on Linux, `%LOCALAPPDATA%\ascript\Cache` on Windows). Set `$ASCRIPT_CACHE` to redirect the cache
+to a custom location (useful in CI or sandboxed environments).
+
 ## `ascript dap`
 
 Run a standalone Debug Adapter Protocol server over stdio. An editor's DAP client connects to the
@@ -400,10 +448,12 @@ configuration, and CI knobs — most programs never need them.
 | `ASCRIPT_LOG` | Log level for `std/log` output (`debug`, `info`, `warn`, `error`). Sets the filter threshold; messages below the level are dropped before any formatting. See [log](stdlib/log). |
 | `ASCRIPT_DECODE_THRESHOLD` | Override the DECODE warmth threshold (default: 8). A proto must be entered at least this many times before its bytecode is decoded into the fixed-width record stream. Set to `0` to force immediate decoding. A benchmarking knob for threshold A/B runs — see the DECODE performance docs. |
 | `ASCRIPT_NO_CALL_FAST` | Set to `1` to disable the CALL fast-path optimizations (in-place arg binding, fiber pooling, and the higher-order callback trampoline). Behavior is byte-identical to the default; only allocation counts and throughput differ. A debugging and benchmarking knob — equivalent to `--no-specialize` for the call path. |
+| `ASCRIPT_NO_COMPILE_CACHE` | Set to `1` to bypass the compile cache for every `ascript run` (always parse/resolve/compile from source), equivalent to the `--no-cache` flag. The cache is invisible to behavior — cached and uncached runs are byte-identical — so this is a debugging / measurement knob. See [`ascript cache`](#ascript-cache). |
 | `ASCRIPT_NO_DECODE` | Set to `1` to disable the DECODE optimisation (lazy decoded-dispatch record streams). The VM always executes directly from the bytecode stream. Behavior is byte-identical; a debugging and benchmarking knob. |
 | `ASCRIPT_NO_DECODE_INLINE` | Inert. DECODE Unit C (speculative global-fn inlining) was evidence-dropped and never shipped; this switch is still parsed but has no effect. Retained only for tooling parity. |
 | `ASCRIPT_NO_DECODE_TOS` | Inert. DECODE Unit D (top-of-stack register caching) was evidence-dropped and never shipped; this switch is still parsed but has no effect. Retained only for tooling parity. |
 | `ASCRIPT_NO_ELIDE` | Set to `1` to force contract elision off (the permanent kill switch; wins over `ASCRIPT_ELIDE` / `--elide`). Redundant while elision is already off by default, but stable for when the default flips. |
+| `ASCRIPT_NO_PGO` | Set to `1` to disable PGO warm-state seeding when loading a `build --pgo` archive. The program warms its inline caches / adaptive-arith sites from scratch instead of pre-installing the recorded profile. Behavior is byte-identical to the default (seeds only ever pre-warm caches that would warm anyway, behind the same runtime guards); a debugging and benchmarking knob. |
 | `ASCRIPT_NO_SPECIALIZE` | Set to `1` to disable every VM specialization (field/method inline caches, adaptive arithmetic, the global cache). Behavior is byte-identical to the default; only speed differs. Useful for isolating a performance regression or verifying that the generic and specialized paths agree. |
 | `ASCRIPT_NO_SYNC_LANE` | Set to `1` to disable the two-lane fiber engine's synchronous fast lane. The VM falls back to the async driver for every burst. Behavior is byte-identical; a debugging knob for isolating lane-related issues. |
 | `ASCRIPT_UPDATE_SNAPSHOTS` | Set to `1` to re-baseline all `assert.snapshot` calls, equivalent to `ascript test --update-snapshots`. Useful in CI scripts that want to update snapshots unconditionally. See [assert](stdlib/assert). |

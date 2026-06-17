@@ -366,6 +366,49 @@ fn runs_modules_example() {
     assert!(out.contains("3.14159")); // geo.PI
 }
 
+/// WARM A: the multi-module compile-cache demo (a subdir example, like
+/// `examples/modules/`, so it is not auto-enumerated by the conformance corpus — exercised
+/// explicitly here). Verifies the program runs (cold), and that a second run with the same
+/// cache produces byte-identical output (warm hit), and that `--tree-walker` matches.
+#[test]
+fn runs_compile_cache_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let cache = std::env::temp_dir().join(format!(
+        "ascript-excache-cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let run = |c: &std::path::Path| {
+        Command::new(bin)
+            .arg("run")
+            .arg("examples/compile_cache/main.as")
+            .env("ASCRIPT_CACHE", c)
+            .output()
+            .unwrap()
+    };
+    let cold = run(&cache);
+    assert!(cold.status.success(), "cold run failed: {:?}", cold);
+    let out = String::from_utf8_lossy(&cold.stdout);
+    assert!(out.contains("hello world"), "got: {out}");
+    assert!(out.contains("hello cache!"), "got: {out}");
+    // Warm run (cache hit) — byte-identical.
+    let warm = run(&cache);
+    assert_eq!(cold.stdout, warm.stdout, "warm-hit output must be byte-identical");
+    assert_eq!(cold.status.code(), warm.status.code());
+    // Tree-walker (uncached) parity.
+    let tw = Command::new(bin)
+        .arg("run")
+        .arg("--tree-walker")
+        .arg("examples/compile_cache/main.as")
+        .output()
+        .unwrap();
+    assert_eq!(cold.stdout, tw.stdout, "tree-walker output must match");
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
 #[test]
 fn runs_stdlib_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");

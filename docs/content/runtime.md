@@ -63,6 +63,41 @@ ship a compiled program or skip recompilation on every run.
 > Treat `.aso` as a cache keyed to your current `ascript` binary: rebuild it from source after
 > upgrading.
 
+## Compile cache and profile-guided optimisation
+
+Two mechanisms shave the cost off the two ends of a program's run — the front-end (parse → resolve
+→ compile) and the VM warm-up. Both are **behaviour-invisible**: a run with them on is
+byte-for-byte identical (stdout, stderr, exit code, panic carets) to a run with them off. They are
+optimisations of *time*, never of *result*.
+
+**Compile cache.** `ascript run app.as` (the default VM path) consults a content-addressed cache
+under the cache root before parsing. The key is derived from the program source, its **transitive
+module graph**, the effective flags, and the lockfile — change any input and the key changes, so a
+stale artifact is never reused. On a hit the cached compiled artifact is loaded and verified before
+use (**verify-on-hit**); on any mismatch the cache is ignored and the program is compiled from
+source (**fail-open** — a corrupt or attacker-written cache entry degrades to a normal compile, it
+can never produce a wrong run). The cache applies only to the plain `.as`-on-the-VM path; `.aso`
+inputs (already compiled), `--tree-walker`, `--inspect`, `--profile`, and explicit `--elide` runs
+are never cached. Bypass it with `--no-cache` or `ASCRIPT_NO_COMPILE_CACHE=1`; manage it with
+[`ascript cache clean` / `ascript cache dir`](cli#ascript-cache).
+
+**Profile-guided optimisation (PGO).** `ascript build --pgo app.as` runs the program as a *real
+training workload*, then harvests the VM's warmed state — the inline caches it resolved and the
+adaptive-arithmetic sites it specialised — into a compact section appended to the produced archive.
+A later run of that artifact **seeds** those profiles up front, so the VM starts warm instead of
+re-discovering them. The seeded profile only ever pre-installs a cache entry that the program would
+have warmed to anyway, and every seeded site sits **behind the same runtime guard** the VM checks
+on a cold cache: a profile that no longer matches the code simply deoptimises on first use. A stale
+or hostile section can therefore never change behaviour — at worst it is ignored. Disable seeding
+with `ASCRIPT_NO_PGO=1`. The PGO section rides outside the bytecode archive's own encoding, so
+`build --pgo` does **not** change the `.aso` format version, and a build *without* `--pgo` is
+byte-identical to before this feature existed.
+
+> [!NOTE] Honest expectations: the compile cache is a large win on cold starts of multi-module
+> programs (it skips the whole front-end); steady-state throughput of an already-warm long-running
+> program is unchanged by either mechanism (PGO only moves *when* the caches warm, not how fast the
+> warm code runs). Re-run the bench suite to measure your own workload.
+
 ## Garbage collection
 
 AScript manages memory with a **cycle-collecting garbage collector** (reference counting plus a

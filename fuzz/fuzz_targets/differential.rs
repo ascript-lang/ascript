@@ -88,10 +88,18 @@ fuzz_target!(|data: &[u8]| {
     // via the TYPE-era surface, so it genuinely exercises elision. `tw_elided`
     // projects stdout only (the marked-tree-walker seam returns no exit code), so
     // it is compared on the stdout projection; the VM elide modes project fully.
+    // WARM B §5-B(b) / Gate 15 — the ADVERSARIAL-SEED axis. Derive a junk-seed buffer from
+    // the SAME fuzz input (rotated, so a tiny program still produces varied junk) and inject
+    // it DIRECTLY into the entry chunk's side tables, bypassing the seeder. The guards must
+    // absorb every lie → junk-seeded == unseeded (tree-walker). This fuzzes the §3.5 soundness
+    // argument itself, not the well-formed-profile codec (`aso_roundtrip`/`pgo_section` do that).
+    let junk: Vec<u8> = data.iter().rev().copied().collect();
+
     #[allow(clippy::type_complexity)]
-    let (tw, vm, gen, nolane, nocf, decfwd, nodec, spec_elided, gen_elided, tw_elided) =
+    let (tw, vm, gen, nolane, nocf, decfwd, nodec, spec_elided, gen_elided, tw_elided, seeded) =
         ascript::run_on_worker_stack({
             let src = src.clone();
+            let junk = junk.clone();
             move || async move {
                 let tw = project(ascript::run_source_exit(&src).await);
                 let vm = project(ascript::vm_run_source(&src).await);
@@ -112,8 +120,12 @@ fuzz_target!(|data: &[u8]| {
                     Ok((stdout, _counts)) => Outcome::Ok { stdout, exit: None },
                     Err(message) => Outcome::Panic { message },
                 };
+                // WARM B §5-B(b): junk seeds injected directly into the chunk side tables.
+                let seeded =
+                    project(ascript::pgo_adversarial_run_from_source(&src, &junk).await);
                 (
                     tw, vm, gen, nolane, nocf, decfwd, nodec, spec_elided, gen_elided, tw_elided,
+                    seeded,
                 )
             }
         });
@@ -180,5 +192,15 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         vm, spec_elided,
         "ELIDE cross-axis divergence — a checker/collector predicate bug\n--- program ---\n{src}\n--- elide-off (vm): {vm:?}\n--- elide-on (vm):  {spec_elided:?}"
+    );
+    // WARM B §5-B(b) / Gate 15 — the ADVERSARIAL-SEED axis. The junk-seeded run MUST equal
+    // the unseeded tree-walker baseline: a wrong offset / kind / shape id / field index /
+    // global value can only DEOPT to the generic path (a guard miss), never change output.
+    // If this fires, a run-loop guard is MISSING — the seeder's soundness rests on the run
+    // loop re-confirming every seeded fast path, so reduce to a `tests/property.rs` case and
+    // fix the GUARD, never relax this assertion (Gate 0).
+    assert_eq!(
+        tw, seeded,
+        "a junk seed CHANGED program output — a run-loop guard is missing (UNSOUND)\n--- program ---\n{src}\n--- unseeded (tw): {tw:?}\n--- junk-seeded:   {seeded:?}"
     );
 });

@@ -234,10 +234,156 @@ impl SeededRng {
     }
 }
 
+/// WARM C (§4.3/§4.4) — hand-rolled CRC32 (IEEE 802.3, reflected polynomial
+/// `0xEDB88320`). A ~10-line pure-Rust bitwise implementation chosen DELIBERATELY over
+/// a new crate dependency (owner-confirmed): it keeps the build graph clean and adds no
+/// dependency-resolution decision. The group appender frames each newline-JSON record
+/// with the crc of the record's bytes (sans the crc field) so a torn append (partial
+/// write on power loss) is detected at open and truncated away. Determinism: a fixed
+/// polynomial + fixed init/xor, identical on every platform — the log is portable.
+pub fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            // Branchless: `mask` is all-ones iff the low bit is set.
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// WARM C (§4.3) — the group-durability appender. Installed on the
+/// [`DeterminismContext`] only when `durability: "group"`; absent (`None`) for the
+/// `Fsync`/`Buffered` modes, so [`DeterminismContext::pump`] is an inert no-op and
+/// those paths stay BIT-IDENTICAL to pre-WARM (the SP9 inert-when-off pattern).
+///
+/// Holds an open append-mode `File`, the count of already-persisted events
+/// (`persisted` — the cursor `pump` serializes from), and the coalesced-fsync window
+/// state (`unsynced` records since the last `sync_all`, and the wall-clock `Instant` of
+/// the oldest unsynced record). All writes are SYNCHRONOUS inside the recording call —
+/// no borrow is ever held across an `.await` (the write happens exactly where the
+/// `Vec::push` happens today). `!Send` is fine (the runtime is per-isolate `!Send`).
+pub struct GroupAppender {
+    /// The open log file, positioned at end (append).
+    file: std::fs::File,
+    /// How many `events` have already been serialized + written to `file`.
+    persisted: usize,
+    /// Records written since the last `sync_all` (the `max_events` coalescing bound).
+    unsynced: usize,
+    /// Wall-clock instant of the oldest unsynced record (the `window_ms` bound). `None`
+    /// when everything is synced. NOTE: this is REAL I/O timing for the fsync window,
+    /// NOT the VM determinism clock — `Instant::now` is correct here (the SP9 ban is on
+    /// the virtual clock, never on physical I/O latency timing).
+    oldest_unsynced: Option<std::time::Instant>,
+    /// Coalescing window: fsync if the oldest unsynced record is at least this old.
+    window_ms: f64,
+    /// Coalescing cap: fsync if at least this many unsynced records have accumulated.
+    max_events: usize,
+    /// Serialize one `(seq, event)` into a crc-framed newline-JSON record line.
+    /// Provided by the `workflow` layer (which owns `event_to_json` + `serde_json`) so
+    /// `det.rs` stays serde-free and builds under `--no-default-features`. Returns the
+    /// FULL line bytes including the trailing `\n`.
+    serialize: fn(usize, &DetEvent) -> Vec<u8>,
+}
+
+impl std::fmt::Debug for GroupAppender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupAppender")
+            .field("persisted", &self.persisted)
+            .field("unsynced", &self.unsynced)
+            .field("window_ms", &self.window_ms)
+            .field("max_events", &self.max_events)
+            .finish()
+    }
+}
+
+impl GroupAppender {
+    /// Build an appender over an already-opened append-mode `file`, having already
+    /// persisted `persisted` events (0 for a fresh run; the repaired-prefix count for a
+    /// resume). `serialize` frames one `(seq, event)` as a crc'd newline-JSON line.
+    pub fn new(
+        file: std::fs::File,
+        persisted: usize,
+        window_ms: f64,
+        max_events: usize,
+        serialize: fn(usize, &DetEvent) -> Vec<u8>,
+    ) -> Self {
+        GroupAppender {
+            file,
+            persisted,
+            unsynced: 0,
+            oldest_unsynced: None,
+            window_ms,
+            max_events,
+            serialize,
+        }
+    }
+
+    /// Serialize and write every event in `events[self.persisted..]` as ONE batched
+    /// `write_all`, advance `persisted`, then `maybe_fsync`. The `seq` of each record is
+    /// its absolute index in `events` (so seq is monotone + contiguous across pumps —
+    /// the repair's contiguity check depends on it).
+    fn pump_from(&mut self, events: &[DetEvent]) -> std::io::Result<()> {
+        use std::io::Write;
+        if self.persisted >= events.len() {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        let mut batch = Vec::new();
+        let mut new_records = 0usize;
+        for (seq, ev) in events.iter().enumerate().skip(self.persisted) {
+            batch.extend_from_slice(&(self.serialize)(seq, ev));
+            new_records += 1;
+        }
+        self.file.write_all(&batch)?;
+        self.persisted = events.len();
+        if self.oldest_unsynced.is_none() {
+            self.oldest_unsynced = Some(now);
+        }
+        self.unsynced += new_records;
+        self.maybe_fsync()
+    }
+
+    /// Coalesced fsync (§4.3): `sync_all` only when at least `max_events` unsynced
+    /// records have accumulated OR the oldest unsynced record is at least `window_ms`
+    /// old; then reset the window. NOT an unconditional fsync — the window/cap is the
+    /// durability contract and the bench win.
+    fn maybe_fsync(&mut self) -> std::io::Result<()> {
+        let due = self.unsynced >= self.max_events
+            || self
+                .oldest_unsynced
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0 >= self.window_ms)
+                .unwrap_or(false);
+        if due && self.unsynced > 0 {
+            self.file.sync_all()?;
+            self.unsynced = 0;
+            self.oldest_unsynced = None;
+        }
+        Ok(())
+    }
+
+    /// Finish (§4.3): write the already-crc-framed terminal `WorkflowCompleted` line,
+    /// then a final DEADLINE-CHECKED `maybe_fsync` (never forced). The file is closed
+    /// when the appender drops.
+    fn finish(&mut self, terminal_line: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        if !terminal_line.is_empty() {
+            self.file.write_all(terminal_line)?;
+            if self.oldest_unsynced.is_none() {
+                self.oldest_unsynced = Some(std::time::Instant::now());
+            }
+            self.unsynced += 1;
+        }
+        self.maybe_fsync()
+    }
+}
+
 /// The per-`Interp` deterministic-mode context (spec §3.2). When installed
 /// (`Interp.determinism = Some(..)`), the clock/RNG seams route through it; when
 /// `None` (default), they take their existing real paths.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DeterminismContext {
     pub mode: Mode,
     pub clock: VirtualClock,
@@ -248,6 +394,28 @@ pub struct DeterminismContext {
     /// The in-memory recorded effect stream (the persisted workflow log is a
     /// projection of this).
     pub events: Vec<DetEvent>,
+    /// WARM C (§4.3): the group-durability appender. `None` for `Fsync`/`Buffered`
+    /// (the inert-when-off path — `record_event`'s `pump` is then a no-op, byte-identical
+    /// to pre-WARM). `Some` only under `durability: "group"`, installed by `workflow_run`.
+    pub group: Option<GroupAppender>,
+}
+
+impl Clone for DeterminismContext {
+    /// Clone the determinism state WITHOUT the group appender (an open `File` is not
+    /// `Clone`). The appender is never cloned in practice — it is installed on the live
+    /// context, drained at finish, and dropped; `Clone` exists only for the pre-WARM
+    /// test helpers that snapshot record/replay state, none of which install an appender.
+    fn clone(&self) -> Self {
+        DeterminismContext {
+            mode: self.mode,
+            clock: self.clock.clone(),
+            rng: self.rng.clone(),
+            seed: self.seed,
+            cursor: self.cursor,
+            events: self.events.clone(),
+            group: None,
+        }
+    }
 }
 
 impl DeterminismContext {
@@ -261,6 +429,7 @@ impl DeterminismContext {
             seed,
             cursor: 0,
             events: Vec::new(),
+            group: None,
         }
     }
 
@@ -275,7 +444,60 @@ impl DeterminismContext {
             seed,
             cursor: 0,
             events,
+            group: None,
         }
+    }
+
+    /// WARM C (§4.3): install the group-durability appender (called by `workflow_run`
+    /// only under `durability: "group"`). After this, every [`Self::record_event`] pumps
+    /// new events to disk; absent it, `pump` is an inert no-op.
+    pub fn set_group_appender(&mut self, appender: GroupAppender) {
+        self.group = Some(appender);
+    }
+
+    /// WARM C (§4.3) — the SINGLE recording chokepoint. Every `DetEvent` is appended
+    /// through here (the 11 det-seam sites + the 3 workflow sites + `stdlib/mod.rs`),
+    /// so the group appender has exactly one place to observe a new record. For the
+    /// `Fsync`/`Buffered` modes (no appender installed) this is `push` + an inert `pump`
+    /// — byte-identical to the pre-WARM `events.push`.
+    pub fn record_event(&mut self, ev: DetEvent) -> std::io::Result<()> {
+        self.events.push(ev);
+        self.pump()
+    }
+
+    /// WARM C (§4.3): persist any not-yet-written events to the group log (one
+    /// `write_all` for the whole new batch), then maybe-fsync per the coalescing policy.
+    /// A no-op when no appender is installed (`Fsync`/`Buffered`). A write/fsync I/O
+    /// error is surfaced to the caller's recording site (it does NOT silently lie about
+    /// durability — §4.5). All synchronous: no borrow spans an `.await`.
+    pub fn pump(&mut self) -> std::io::Result<()> {
+        // Split the borrow: take the appender out so we can read `events` immutably
+        // while writing through the appender, then put it back.
+        let Some(mut appender) = self.group.take() else {
+            return Ok(());
+        };
+        let res = appender.pump_from(&self.events);
+        self.group = Some(appender);
+        res
+    }
+
+    /// WARM C (§4.3): the finish-time flush for the group path. Append the terminal
+    /// record bytes (already crc-framed by the caller — `WorkflowCompleted`, no seq),
+    /// then a final `maybe_fsync` (DEADLINE-CHECKED, never an unconditional fsync — that
+    /// would reinstate the per-commit `F_FULLFSYNC` and forfeit the bench win, §4.3).
+    /// Drops the appender (closes the file). A no-op when no appender is installed.
+    pub fn finish_group(&mut self, terminal_line: &[u8]) -> std::io::Result<()> {
+        let Some(mut appender) = self.group.take() else {
+            return Ok(());
+        };
+        let res = appender.finish(terminal_line);
+        // Drop the appender (the workflow is done) — do NOT put it back.
+        res
+    }
+
+    /// Whether a group appender is installed (the group durability path is active).
+    pub fn has_group_appender(&self) -> bool {
+        self.group.is_some()
     }
 
     /// Read the wall clock (ms-epoch). Record: draw the virtual clock value, append a
@@ -285,7 +507,7 @@ impl DeterminismContext {
         match self.mode {
             Mode::Record => {
                 let v = self.clock.now_ms();
-                self.events.push(DetEvent::ClockRead { value: v });
+                let _ = self.record_event(DetEvent::ClockRead { value: v });
                 v
             }
             Mode::Replay => match self.next_event() {
@@ -310,7 +532,7 @@ impl DeterminismContext {
         match self.mode {
             Mode::Record => {
                 let v = self.clock.monotonic_ms();
-                self.events.push(DetEvent::MonotonicRead { value: v });
+                let _ = self.record_event(DetEvent::MonotonicRead { value: v });
                 v
             }
             Mode::Replay => match self.next_event() {
@@ -329,7 +551,7 @@ impl DeterminismContext {
                 None => {
                     self.mode = Mode::Record;
                     let v = self.clock.monotonic_ms();
-                    self.events.push(DetEvent::MonotonicRead { value: v });
+                    let _ = self.record_event(DetEvent::MonotonicRead { value: v });
                     v
                 }
             },
@@ -343,7 +565,7 @@ impl DeterminismContext {
         match self.mode {
             Mode::Record => {
                 let v = self.rng.next_f64();
-                self.events.push(DetEvent::RandomRead { value: v });
+                let _ = self.record_event(DetEvent::RandomRead { value: v });
                 v
             }
             Mode::Replay => match self.next_event() {
@@ -356,7 +578,7 @@ impl DeterminismContext {
                 None => {
                     self.mode = Mode::Record;
                     let v = self.rng.next_f64();
-                    self.events.push(DetEvent::RandomRead { value: v });
+                    let _ = self.record_event(DetEvent::RandomRead { value: v });
                     v
                 }
             },
@@ -378,7 +600,7 @@ impl DeterminismContext {
         match self.mode {
             Mode::Record => {
                 self.rng.fill_bytes(buf);
-                self.events.push(DetEvent::BytesRead {
+                let _ = self.record_event(DetEvent::BytesRead {
                     bytes: buf.to_vec(),
                 });
             }
@@ -394,7 +616,7 @@ impl DeterminismContext {
                 None => {
                     self.mode = Mode::Record;
                     self.rng.fill_bytes(buf);
-                    self.events.push(DetEvent::BytesRead {
+                    let _ = self.record_event(DetEvent::BytesRead {
                         bytes: buf.to_vec(),
                     });
                 }
@@ -412,7 +634,7 @@ impl DeterminismContext {
             BoundaryOutcome::Done => (Vec::new(), None),
             BoundaryOutcome::Panic(msg) => (Vec::new(), Some(msg.clone())),
         };
-        self.events.push(DetEvent::ActorCall {
+        let _ = self.record_event(DetEvent::ActorCall {
             method: method.to_string(),
             result,
             panic,
@@ -455,7 +677,7 @@ impl DeterminismContext {
             BoundaryOutcome::Done => (None, None),
             BoundaryOutcome::Panic(msg) => (None, Some(msg.clone())),
         };
-        self.events.push(DetEvent::GeneratorYield { value, panic });
+        let _ = self.record_event(DetEvent::GeneratorYield { value, panic });
     }
 
     /// Workers Spec B (Task 12): replay one `worker fn*` resume boundary outcome.
@@ -481,7 +703,7 @@ impl DeterminismContext {
     /// Appends a [`DetEvent::FfiCall`] carrying the marshalled return + the post-call
     /// snapshot of every `Bytes` out-param.
     pub fn record_ffi_call(&mut self, ret: FfiRet, out_params: Vec<(usize, Vec<u8>)>) {
-        self.events.push(DetEvent::FfiCall { ret, out_params });
+        let _ = self.record_event(DetEvent::FfiCall { ret, out_params });
     }
 
     /// FFI Task 10 (§7A): replay one foreign-call boundary. Returns the recorded
@@ -541,7 +763,7 @@ impl DeterminismContext {
     fn switch_to_record_clock(&mut self) -> f64 {
         self.mode = Mode::Record;
         let v = self.clock.now_ms();
-        self.events.push(DetEvent::ClockRead { value: v });
+        let _ = self.record_event(DetEvent::ClockRead { value: v });
         v
     }
 }

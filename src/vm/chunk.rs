@@ -545,6 +545,31 @@ impl Chunk {
             proto.chunk.set_module_source(src);
         }
     }
+
+    /// WARM A §2.4 — FORCE-rebind this chunk's (and every nested proto's) module
+    /// source PATH to `new_path`, preserving the existing source TEXT. Unlike
+    /// [`Chunk::set_module_source`] (innermost-wins, never overwrites), this
+    /// unconditionally replaces the path so a cached archive's per-module debug
+    /// provenance can be made byte-identical to the from-source run's importer-joined
+    /// path. A chunk with NO bound source is left untouched (nothing to rebind — a
+    /// `--strip` artifact). Used ONLY by the compile cache's miss path; never on a
+    /// distribution `build`/`--native` archive.
+    pub fn rebind_source_path(&self, new_path: &str) {
+        {
+            let mut slot = self.source.borrow_mut();
+            if let Some(existing) = slot.as_ref() {
+                if existing.path != new_path {
+                    *slot = Some(std::rc::Rc::new(crate::error::SourceInfo {
+                        path: new_path.to_string(),
+                        text: existing.text.clone(),
+                    }));
+                }
+            }
+        }
+        for proto in &self.protos {
+            proto.chunk.rebind_source_path(new_path);
+        }
+    }
 }
 
 /// A compiled function prototype: a [`Chunk`] plus the calling-convention flags

@@ -1,6 +1,12 @@
 # AScript Warm Starts & Durable-Log Throughput — Design (WARM)
 
-- **Status:** Draft for review
+- **Status:** Implemented — merged to `main` (merge SHA in `goal-perf.md` EXECUTION LOG). All three
+  units shipped; `ASO_FORMAT_VERSION`/`ARCHIVE_VERSION` unchanged; tree-walker untouched.
+  **Deltas from spec recorded at merge:** (1) `collect_module_graph` is a *parallel re-derivation*
+  of `compile_path_module_set` (not a literal extraction), kept equivalent by the §2.5 walk-drift
+  tripwire — a prose correction, not a semantics change; (2) the §3 "ASO_FORMAT_VERSION still 27"
+  references were stale at authoring time (the constant was already 29 via ELIDE) — the binding
+  invariant is "WARM introduces no constant change vs `main`", which holds.
 - **Date:** 2026-06-12
 - **Code:** WARM (PERF campaign, `goal-perf.md` "Deployment & I/O throughput")
 - **Depends on:** BNDL merged (the `ASCRIPTA` module-archive container + `compile_archive`
