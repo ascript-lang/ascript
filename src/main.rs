@@ -525,6 +525,7 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
+            pgo,
             caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
             let out_path = out.as_deref().map(std::path::Path::new);
@@ -552,6 +553,19 @@ async fn real_main() -> ExitCode {
                 // host-only in v1 (build_native returns the specific Tier-1 error).
                 match ascript::build_native(src, out_path, target.as_deref(), caps, elide) {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
+                    Err(e) => {
+                        ascript::diagnostics::report(&e);
+                        ExitCode::from(1)
+                    }
+                }
+            } else if pgo {
+                // WARM B §3.1: PGO harvest — run the program as a training workload,
+                // harvest warmed ICs + adaptive caches, embed a PGO section.
+                match ascript::build_file_with_pgo(src, out_path, !strip, caps, elide).await {
+                    Ok(written) => {
+                        println!("compiled {} -> {} (with PGO section)", file, written.display());
+                        ExitCode::SUCCESS
+                    }
                     Err(e) => {
                         ascript::diagnostics::report(&e);
                         ExitCode::from(1)

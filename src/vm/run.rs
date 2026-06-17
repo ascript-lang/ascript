@@ -1132,6 +1132,192 @@ impl Vm {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // WARM B §3.1 — PGO warm-state harvest
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// **WARM B §3.1 — harvest the VM's warmed inline caches into a [`PgoSection`].**
+    ///
+    /// Called after the training run completes (success or caught panic) to snapshot
+    /// the adaptive state that the VM accumulated during execution.
+    ///
+    /// The caller supplies `modules`: each entry is
+    /// - the module's logical archive key,
+    /// - the sha256 of the module's raw `.aso` chunk bytes (pre-computed by the caller
+    ///   from the archive bytes — the same value the seeder will hash-validate), and
+    /// - a reference to the **live `FnProto`** that the training run executed.  The ICs
+    ///   are stored on `FnProto.chunk.{field_ics,arith_caches,global_caches}` — they are
+    ///   populated by the VM during the run and MUST be read from those same instances,
+    ///   NOT from a freshly-decoded copy (fresh copies have empty side tables).
+    ///
+    /// For each proto (recursively) the function keeps:
+    /// - `ArithCache::Specialized { kind }` → `(offset, kind as u8)`
+    /// - `InlineCache::Mono/Poly` → shape → `keys_of_pgo` → deduped key-list index
+    /// - `GlobalCache::Cached` → offset only (the seeder re-resolves the builtin)
+    ///
+    /// `GlobalCache::IndexBound` is deliberately excluded (define-order dependent).
+    /// `InlineCache::Mega` is excluded (too many shapes; no useful seed).
+    ///
+    /// Key lists are deduplicated across the whole section: two Mono sites with the same
+    /// field layout share one key-list entry.
+    ///
+    /// An unresolvable shape id (the shape was promoted/evicted since the run) is silently
+    /// skipped — the seeder is written to handle missing seeds gracefully.
+    ///
+    /// All borrows are plain synchronous (`RefCell::borrow`) — this method is NOT `async`
+    /// and MUST NOT be called while any other borrow is held on the VM's side tables.
+    pub fn harvest_pgo(
+        &self,
+        modules: &[(String, [u8; 32], &crate::vm::chunk::FnProto)],
+    ) -> crate::vm::pgo::PgoSection {
+        use crate::vm::adapt::{ArithCache, GlobalCache};
+        use crate::vm::ic::InlineCache;
+        use crate::vm::pgo::{PgoModule, PgoProto, PgoSection};
+        use std::collections::HashMap;
+
+        // Deduped key-list table: a key-list (ordered Vec<String>) → its index in
+        // `key_lists`.  We build this incrementally as we encounter IC shapes.
+        let mut key_lists: Vec<Vec<String>> = Vec::new();
+        let mut key_list_index: HashMap<Vec<String>, u32> = HashMap::new();
+
+        /// Intern `keys` into the dedup table, returning its index.
+        fn intern_keys(
+            keys: Vec<String>,
+            key_lists: &mut Vec<Vec<String>>,
+            key_list_index: &mut HashMap<Vec<String>, u32>,
+        ) -> u32 {
+            if let Some(&idx) = key_list_index.get(&keys) {
+                return idx;
+            }
+            let idx = key_lists.len() as u32;
+            key_lists.push(keys.clone());
+            key_list_index.insert(keys, idx);
+            idx
+        }
+
+        // Walk a FnProto recursively with a path tracking the index sequence from the
+        // chunk root.  Populates `protos_out` with one `PgoProto` per reachable proto
+        // that has at least one IC entry (empty protos are elided from the section).
+        fn walk_proto(
+            proto: &crate::vm::chunk::FnProto,
+            path: &mut Vec<u32>,
+            shapes: &crate::vm::shape::ShapeRegistry,
+            key_lists: &mut Vec<Vec<String>>,
+            key_list_index: &mut HashMap<Vec<String>, u32>,
+            protos_out: &mut Vec<PgoProto>,
+        ) {
+            // ── arith seeds ─────────────────────────────────────────────────────
+            let arith_entries: Vec<(u32, u8)> = {
+                let ics = proto.chunk.arith_caches.borrow();
+                ics.iter()
+                    .filter_map(|(&off, cache)| {
+                        if let ArithCache::Specialized { kind } = cache {
+                            Some((off as u32, *kind as u8))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            // ── field IC seeds ───────────────────────────────────────────────────
+            // For each warm IC site collect the set of shape key-lists seen there.
+            let field_entries: Vec<(u32, Vec<u32>)> = {
+                let ics = proto.chunk.field_ics.borrow();
+                ics.iter()
+                    .filter_map(|(&off, ic)| {
+                        // Collect all shape_ids from this IC site.
+                        let shape_ids: Vec<u32> = match ic {
+                            InlineCache::Mono { shape, .. } => vec![*shape],
+                            InlineCache::Poly { entries, len } => {
+                                entries[..*len as usize]
+                                    .iter()
+                                    .map(|&(s, _)| s)
+                                    .collect()
+                            }
+                            InlineCache::Cold | InlineCache::Mega => return None,
+                        };
+
+                        // Resolve shapes → key lists → dedup indices.
+                        let mut list_indices: Vec<u32> = Vec::with_capacity(shape_ids.len());
+                        for shape_id in shape_ids {
+                            if let Some(keys) = shapes.keys_of_pgo(shape_id) {
+                                let idx = intern_keys(keys, key_lists, key_list_index);
+                                if !list_indices.contains(&idx) {
+                                    list_indices.push(idx);
+                                }
+                            }
+                            // unknown shape id → skip silently
+                        }
+                        if list_indices.is_empty() {
+                            return None;
+                        }
+                        Some((off as u32, list_indices))
+                    })
+                    .collect()
+            };
+
+            // ── global cache seeds ────────────────────────────────────────────────
+            let global_entries: Vec<u32> = {
+                let ics = proto.chunk.global_caches.borrow();
+                ics.iter()
+                    .filter_map(|(&off, cache)| {
+                        if matches!(cache, GlobalCache::Cached { .. }) {
+                            Some(off as u32)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            // Only emit a proto record when at least one IC was warmed.
+            if !arith_entries.is_empty() || !field_entries.is_empty() || !global_entries.is_empty() {
+                protos_out.push(PgoProto {
+                    path: path.clone(),
+                    arith: arith_entries,
+                    fields: field_entries,
+                    globals: global_entries,
+                });
+            }
+
+            // Recurse into nested protos (child proto index = position in
+            // `chunk.protos`).
+            for (i, child) in proto.chunk.protos.iter().enumerate() {
+                path.push(i as u32);
+                walk_proto(child, path, shapes, key_lists, key_list_index, protos_out);
+                path.pop();
+            }
+        }
+
+        let shapes_ref = self.shapes.borrow();
+        let mut pgo_modules: Vec<PgoModule> = Vec::with_capacity(modules.len());
+
+        for (module_key, chunk_sha256, root_proto) in modules {
+            let mut protos: Vec<PgoProto> = Vec::new();
+            let mut path: Vec<u32> = Vec::new();
+            walk_proto(
+                root_proto,
+                &mut path,
+                &shapes_ref,
+                &mut key_lists,
+                &mut key_list_index,
+                &mut protos,
+            );
+
+            pgo_modules.push(PgoModule {
+                module_key: module_key.clone(),
+                chunk_sha256: *chunk_sha256,
+                protos,
+            });
+        }
+
+        PgoSection {
+            key_lists,
+            modules: pgo_modules,
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // DECODE §5.1 (Unit B part 1) — the pair/triple census (feature-gated)
     // ──────────────────────────────────────────────────────────────────────────
 

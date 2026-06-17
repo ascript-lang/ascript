@@ -126,6 +126,14 @@ pub enum Command {
         /// a clear error). Requires `--native`.
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
+        /// WARM B §3.1: run the program as a training workload, harvest the warmed
+        /// inline caches and adaptive arithmetic state, and embed a PGO (profile-
+        /// guided optimisation) section into the produced archive. The artifact is
+        /// always an `ASCRIPTA` archive (even for a single-module program). The
+        /// training run's stdout streams live. A panicking training run still
+        /// produces a (possibly partial) PGO section — the build does not abort.
+        #[arg(long = "pgo")]
+        pgo: bool,
         #[command(flatten)]
         caps: CapFlags,
     },

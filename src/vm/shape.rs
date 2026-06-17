@@ -150,11 +150,51 @@ impl ShapeRegistry {
     pub fn keys_of(&self, shape: u32) -> Rc<[Rc<str>]> {
         self.keys[shape as usize].clone()
     }
+
+    /// WARM B §3.1 — PGO harvest: return the ordered key list for `shape` as a
+    /// `Vec<String>`, or `None` if `shape` is not a registered id.
+    ///
+    /// This is the safe, `Option`-returning variant used by the PGO recorder. The
+    /// production `keys_of` above panics on an out-of-range id (it is always called
+    /// with a registry-minted id) — for untrusted/stale shape ids from a running Vm
+    /// that may have demoted a slab, we return `None` instead.
+    ///
+    /// `EMPTY_SHAPE` (0) ⇒ `Some([])` — the empty key list is always registered.
+    pub fn keys_of_pgo(&self, shape: u32) -> Option<Vec<String>> {
+        let entry = self.keys.get(shape as usize)?;
+        Some(entry.iter().map(|k| k.as_ref().to_owned()).collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── v2 tests (Task 2.1) ──────────────────────────────────────────────────
+
+    // ── WARM B §3.1 — keys_of_pgo tests ────────────────────────────────────
+
+    #[test]
+    fn keys_of_pgo_reverses_interned_list() {
+        let mut reg = ShapeRegistry::new();
+        let abc = reg.shape_for(["a", "b", "c"]).unwrap();
+        let keys = reg.keys_of_pgo(abc).unwrap();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn keys_of_pgo_empty_shape_returns_some_empty() {
+        let reg = ShapeRegistry::new();
+        let keys = reg.keys_of_pgo(EMPTY_SHAPE).unwrap();
+        assert!(keys.is_empty(), "EMPTY_SHAPE must yield an empty list");
+    }
+
+    #[test]
+    fn keys_of_pgo_unknown_id_returns_none() {
+        let reg = ShapeRegistry::new();
+        // Shape id 9999 was never registered.
+        assert_eq!(reg.keys_of_pgo(9999), None);
+    }
 
     // ── v2 tests (Task 2.1) ──────────────────────────────────────────────────
 

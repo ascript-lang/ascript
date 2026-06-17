@@ -1918,6 +1918,146 @@ pub fn build_file(
     Ok(out_path)
 }
 
+/// **WARM B §3.1 — compile, train, harvest, and emit a PGO-carrying archive.**
+///
+/// Equivalent to [`build_file`] EXCEPT:
+///
+/// 1. The artifact is ALWAYS an `ASCRIPTA` archive (even for a single-module program —
+///    spec §3.4; the PGO section lives outside the module table as a trailing section).
+/// 2. The program is run once as a **training workload** immediately after compilation,
+///    with output streaming live to stdout (`OutputSink::Live`), so the user sees the
+///    training run in real time.
+/// 3. After the training run completes (even if it panics — spec §3.4 bullet 3), the
+///    VM's warmed inline caches and adaptive arithmetic state are snapshotted via
+///    [`Vm::harvest_pgo`] and appended as a `ASPGO` trailing section.
+///
+/// The training panic is **absorbed**: the build succeeds with a partial section
+/// (possibly empty) rather than propagating the error.
+pub async fn build_file_with_pgo(
+    file: &Path,
+    out: Option<&Path>,
+    with_debug: bool,
+    caps: Option<crate::stdlib::caps::CapSet>,
+    elide: bool,
+) -> Result<std::path::PathBuf, AsError> {
+    use crate::cache::compile_cache as cc;
+    use crate::vm::archive::ModuleArchive;
+    use crate::vm::chunk::FnProto;
+    use crate::vm::pgo::append_section;
+    use crate::vm::value_ext::Closure;
+    use crate::vm::Vm;
+
+    // ── Step 1: compile to an archive (ALWAYS archive, even single-module) ──
+    let (mut archive, report) = compile_archive(file, with_debug, elide)?;
+    archive.caps = caps.unwrap_or_else(crate::stdlib::caps::CapSet::all_granted);
+    print_shake_report(&report);
+
+    // Snapshot (key, sha256) pairs from the archive BEFORE encoding, so we can
+    // supply them to `harvest_pgo` alongside the live proto references after the run.
+    // sha256 is over the stored chunk bytes — the same value the seeder will validate.
+    let module_meta: Vec<(String, [u8; 32])> = archive
+        .modules
+        .iter()
+        .map(|(key, bytes)| (key.clone(), cc::sha256_bytes(bytes)))
+        .collect();
+
+    // ── Step 2: decode the entry chunk and set up the Vm ────────────────────
+    // Decode the entry chunk (same trust boundary as `run file.aso`).
+    let entry_bytes = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(_, b)| b.clone())
+        .ok_or_else(|| AsError::new("archive entry index is out of range"))?;
+    let entry_chunk =
+        crate::vm::chunk::Chunk::from_bytes_verified(&entry_bytes)
+            .map_err(|e| AsError::new(format!("cannot load archive entry: {e}")))?;
+
+    // Build the Interp with LIVE output so training-run stdout streams to the
+    // user's terminal (spec §3.4).
+    let interp = Rc::new(Interp::new_live());
+    let encoded_archive = archive.encode();
+    // Stash archive + entry bytes for worker parity (mirrors `run_verified_archive`).
+    interp.set_worker_archive_bytes(Rc::from(encoded_archive.as_slice()));
+    interp.set_worker_aso_bytes(Rc::from(entry_bytes.as_slice()));
+    interp.install_self();
+
+    let vm = Vm::new(interp.clone());
+    // Set module dir so archive-miss relative imports resolve on disk.
+    if let Some(dir) = file.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+    vm.set_module_archive(Rc::new(
+        ModuleArchive::decode(&encoded_archive)
+            .map_err(|e| AsError::new(format!("cannot re-decode compiled archive: {e}")))?,
+    ));
+
+    // ── Step 3: drive the training run ──────────────────────────────────────
+    // Keep an Rc<FnProto> alive so we can read its warmed side tables AFTER
+    // the run.  The closure/fiber borrow the proto through the Rc; we hold
+    // our own clone that outlives the fiber.
+    let entry_proto = Rc::new(FnProto {
+        chunk: entry_chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    {
+        let closure = Closure::new(Rc::clone(&entry_proto));
+        let mut fiber = crate::vm::fiber::Fiber::new(closure);
+        let local = tokio::task::LocalSet::new();
+        // Absorb ALL outcomes (panic / propagate / exit) — a panicking training run
+        // still produces a (possibly partial) PGO section (spec §3.4).
+        let _ = local.run_until(vm.run(&mut fiber)).await;
+        local.await;
+        crate::gc::collect();
+    }
+    // `entry_proto` is still alive here; `fiber`/`closure` were dropped above.
+
+    // ── Step 4: harvest the warmed IC state from the live proto tree ─────────
+    // Build the slice that harvest_pgo expects: (key, sha256, &live_proto).
+    // For now only the ENTRY module is harvested (the common case: single-module
+    // programs and the entry of multi-module programs). Imported-module chunks are
+    // loaded by the archive path and their protos are not currently surfaced here;
+    // a future extension can walk `file_modules` to reach them.
+    let entry_key = archive
+        .modules
+        .get(archive.entry as usize)
+        .map(|(k, _)| k.as_str())
+        .unwrap_or("");
+    let entry_sha256 = module_meta
+        .iter()
+        .find(|(k, _)| k == entry_key)
+        .map(|(_, h)| *h)
+        .unwrap_or([0u8; 32]);
+
+    let harvest_modules: &[(String, [u8; 32], &FnProto)] =
+        &[(entry_key.to_owned(), entry_sha256, &entry_proto)];
+    let pgo = vm.harvest_pgo(harvest_modules);
+
+    // ── Step 5: assemble the artifact bytes ─────────────────────────────────
+    // `encoded_archive` is the canonical ASCRIPTA bytes; append PGO as trailing section.
+    let mut artifact_bytes = encoded_archive;
+    let pgo_frame = pgo.encode();
+    append_section(&mut artifact_bytes, &pgo_frame);
+
+    // ── Step 6: write to disk ────────────────────────────────────────────────
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => file.with_extension("aso"),
+    };
+    std::fs::write(&out_path, &artifact_bytes)
+        .map_err(|e| AsError::new(format!("cannot write {}: {}", out_path.display(), e)))?;
+    Ok(out_path)
+}
+
 /// The shared compile → verify → serialize front half of [`build_file`] and
 /// [`build_native`] (BIN §2.2 step 1): read the source, [`compile::compile_source`], bind the
 /// module source for debug info, [`vm::verify::verify`] (so a produced `.aso` is always
