@@ -9,4 +9,7 @@
 //! Must also build under `--no-default-features` (the test matrix contract).
 //! Nothing here may depend on an optional Cargo feature.
 
+pub mod report;
+pub mod select;
 pub mod std_features;
+pub mod tiers;

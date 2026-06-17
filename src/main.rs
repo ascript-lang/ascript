@@ -519,6 +519,8 @@ async fn real_main() -> ExitCode {
             native,
             target,
             compress,
+            tier,
+            report_json,
             pgo,
             caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
@@ -543,9 +545,31 @@ async fn real_main() -> ExitCode {
                 }
             };
             if native {
-                // BIN: bundle a self-contained native executable. `--target` is
-                // host-only in v1 (build_native returns the specific Tier-1 error).
-                match ascript::build_native(src, out_path, target.as_deref(), caps, elide, compress) {
+                // RT §4.4: parse the optional `--tier` override into a `Tier` (a clear
+                // error for an unknown name, never a silent ignore).
+                let parsed_tier = match tier.as_deref() {
+                    None => None,
+                    Some(name) => match ascript::rtstub::tiers::Tier::parse(name) {
+                        Some(t) => Some(t),
+                        None => {
+                            eprintln!(
+                                "error: unknown --tier '{name}' (expected one of: \
+                                 rt-core, rt-local, rt-net, rt-full)"
+                            );
+                            return ExitCode::from(1);
+                        }
+                    },
+                };
+                // BIN/RT: bundle a self-contained native executable. `--target` is
+                // host-only in v1 (build_native returns the specific Tier-1 error until
+                // RT Task 7 un-rejects it).
+                let opts = ascript::NativeBuildOpts {
+                    target: target.clone(),
+                    tier: parsed_tier,
+                    compress,
+                    report_json: report_json.clone(),
+                };
+                match ascript::build_native(src, out_path, caps, elide, &opts) {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
                     Err(e) => {
                         ascript::diagnostics::report(&e);

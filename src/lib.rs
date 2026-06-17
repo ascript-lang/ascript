@@ -2830,6 +2830,31 @@ pub(crate) fn compile_verified_aso_bytes_from_source_for_cache(
         .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))
 }
 
+/// RT §4.4/§9.2 — the option bundle for [`build_native`]. Refactored from a positional
+/// signature into a struct ONCE (RT Task 5) so later tasks add fields without re-touching
+/// every call site. [`Default`] reproduces TODAY's exact behavior (no target, automatic
+/// host-tier selection with the `current_exe()` stub, no report) — every existing
+/// `--native` build is byte-identical under the default opts.
+///
+/// Fields beyond `compress`/`tier`/`report_json` are placeholders for later tasks
+/// (`stub`/`exact`/`oci`/`no_fetch` — Tasks 6–9); they are reserved here so the
+/// signature is stable.
+#[cfg(not(ascript_rt))]
+#[derive(Debug, Clone, Default)]
+pub struct NativeBuildOpts {
+    /// `--target` triple (RT Task 7 un-rejects this; still rejected for now). `None` ⇒
+    /// the host platform.
+    pub target: Option<String>,
+    /// `--tier` override (RT §4.4). `None` ⇒ automatic nearest-superset selection.
+    pub tier: Option<crate::rtstub::tiers::Tier>,
+    /// `--compress` — zstd-compress the embedded payload (RT §7).
+    pub compress: bool,
+    /// `--report-json <PATH|->` — emit the §9.2 JSON build report. `None` ⇒ no JSON
+    /// (the stderr human report still prints for every `--native` build). `Some("-")`
+    /// ⇒ stdout.
+    pub report_json: Option<String>,
+}
+
 #[cfg(not(ascript_rt))]
 /// BIN §2.2 — `ascript build --native app.as -o app`: produce a self-contained native
 /// executable that bundles the whole runtime + the compiled program. This is **bundling, not
@@ -2838,19 +2863,26 @@ pub(crate) fn compile_verified_aso_bytes_from_source_for_cache(
 /// own footer and runs the payload through the SAME `from_bytes_verified` path as
 /// `run file.aso`.
 ///
-/// `--target` is parsed-but-rejected in v1 (host-only). The default output is the source stem
-/// with NO extension (`.exe` on Windows). On Unix the output is `chmod +x`; on macOS it is
-/// ad-hoc signed (mandatory on arm64 — appending invalidated the stub's signature).
+/// `--target` is parsed-but-rejected in v1 (host-only — RT Task 7 un-rejects it). The
+/// default output is the source stem with NO extension (`.exe` on Windows). On Unix the
+/// output is `chmod +x`; on macOS it is ad-hoc signed (mandatory on arm64 — appending
+/// invalidated the stub's signature).
+///
+/// RT §4.4/§4.6/§9.2: selects the logical stub tier from the program's std imports (the
+/// actual stub stays `current_exe()` until Task 7's ladder lands), prints the §4.6 stderr
+/// build report, and emits the §9.2 JSON report when `opts.report_json` is set.
 pub fn build_native(
     file: &Path,
     out: Option<&Path>,
-    target: Option<&str>,
     caps: Option<crate::stdlib::caps::CapSet>,
     elide: bool,
-    compress: bool,
+    opts: &NativeBuildOpts,
 ) -> Result<std::path::PathBuf, AsError> {
+    let target = opts.target.as_deref();
+    let compress = opts.compress;
     // v1: cross-compilation is parsed-but-cleanly-rejected (§3.2) — a SPECIFIC Tier-1 error
     // naming the requested triple, never a silent ignore or a generic clap failure.
+    // (RT Task 7 replaces this rejection with the triple-validation + stub ladder.)
     if let Some(t) = target {
         return Err(AsError::new(format!(
             "cross-compilation is not yet supported (BIN v1 bundles for the host platform \
@@ -2864,6 +2896,26 @@ pub fn build_native(
     // (so the bundled binary runs from an empty directory). The `stub || payload ||
     // footer` framing below is unchanged: the payload is opaque to the bundler.
     let (mut archive, report) = compile_archive(file, true, elide)?;
+
+    // RT §4.1/§4.4: select the logical stub tier from the archive's OWN import facts
+    // (chunk-level truth, never the source). This drives the build report's tier +
+    // unused-feature delta. The actual stub is still `current_exe()` here (Task 7 wires
+    // the resolution ladder); selecting the tier now lets the report show the SELECTED
+    // tier and the would-be savings even while the stub is the full toolchain binary.
+    let std_imports = crate::rtstub::std_features::collect_std_imports(&archive);
+    let selection = crate::rtstub::select::select(&std_imports, opts.tier)
+        .map_err(|e| AsError::new(format!("tier selection failed: {e}")))?;
+
+    let caps_all_granted = caps.is_none();
+    let multi_or_capped = archive.modules.len() > 1 || caps.is_some();
+    let payload_format = if multi_or_capped { "archive" } else { "aso" };
+    let module_count = archive.modules.len();
+    let shake_digest_hex = if multi_or_capped {
+        Some(hex_digest(&archive.shake_digest))
+    } else {
+        None
+    };
+
     // SELF-CONTAINED-BUNDLES (Task 3.2, ARTIFACT-FORMAT RULE — same rule as `build_file`):
     // bundle an `ASCRIPTA` archive when the graph has >1 module OR the caps are restricted
     // (`caps.is_some()`); bundle the bare `ASO\0` chunk ONLY when single-module AND `caps`
@@ -2894,6 +2946,8 @@ pub fn build_native(
         // re-compiling this one file is negligible.
         compile_verified_aso_bytes(file, true, elide)? // bare ASO\0 — byte-identical to today
     };
+
+    let payload_uncompressed_len = payload.len() as u64;
 
     // RT §7: optional zstd compression of the payload, AFTER the (verified) encode and
     // BEFORE the append. `--compress` wraps the payload as `uncompressed_len:u64 || frame`
@@ -2926,6 +2980,11 @@ pub fn build_native(
         Some((offset, _len)) => raw[..offset].to_vec(), // strip old overlay → clean runtime
         None => raw,
     };
+    // RT §9.2: identity of the (clean) stub the payload is appended to. Today's origin is
+    // always `current_exe` (Task 7's ladder adds cache/fetch/--stub/--exact origins).
+    let stub_sha256 = hex_digest(&sha256_bytes(&stub));
+    let stub_size = stub.len() as u64;
+    let payload_sha256 = hex_digest(&sha256_bytes(&payload));
 
     // Step 3: choose the output path (source stem; `.exe` on Windows; NEVER `.aso`).
     let out_path = match out {
@@ -3029,7 +3088,72 @@ pub fn build_native(
         out_path.display(),
         total
     );
+
+    // RT §4.6/§9.2: assemble the build report. The artifact sha256 is computed over the
+    // FINAL bytes on disk (deterministic given the inputs — §9.1). The report contains
+    // NO timestamps, so a double-build yields byte-identical JSON.
+    let final_bytes = std::fs::read(&out_path).map_err(|e| {
+        AsError::new(format!("cannot read {} for the build report: {}", out_path.display(), e))
+    })?;
+    let report = crate::rtstub::report::BuildReport {
+        source: file.display().to_string(),
+        output: out_path.display().to_string(),
+        output_sha256: hex_digest(&sha256_bytes(&final_bytes)),
+        target: opts.target.clone(),
+        tier: selection.tier,
+        tier_source: selection.source,
+        selection: selection.clone(),
+        payload: crate::rtstub::report::PayloadInfo {
+            format: payload_format,
+            compressed: compress,
+            size: payload.len() as u64,
+            uncompressed_size: payload_uncompressed_len,
+            sha256: payload_sha256,
+        },
+        stub: crate::rtstub::report::StubInfo {
+            origin: "current_exe",
+            sha256: stub_sha256,
+            size: stub_size,
+        },
+        module_count,
+        shake_digest: shake_digest_hex,
+        caps_all_granted,
+    };
+    // Human report → stderr (the `bundled … -> …` line above stays on stdout).
+    eprint!("{}", report.render_stderr());
+    // JSON report → the requested sink (`-` = stdout) when `--report-json` was passed.
+    if let Some(dest) = &opts.report_json {
+        let json = report.to_json();
+        if dest == "-" {
+            println!("{json}");
+        } else {
+            std::fs::write(dest, json.as_bytes()).map_err(|e| {
+                AsError::new(format!("cannot write --report-json {dest}: {e}"))
+            })?;
+        }
+    }
+
     Ok(out_path)
+}
+
+/// Compute the sha256 of `bytes` (RT §9.2 — artifact/stub/payload identity).
+#[cfg(not(ascript_rt))]
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
+}
+
+/// Lowercase-hex encode a 32-byte digest (RT §9.2).
+#[cfg(not(ascript_rt))]
+fn hex_digest(d: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in d {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Run a compiled `.aso` file on the VM (VM plan V12-T4). Reads the bytes, verifies

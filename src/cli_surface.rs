@@ -132,6 +132,17 @@ pub enum Command {
         /// bit-identical to a pre-RT build.
         #[arg(long = "compress", requires = "native")]
         compress: bool,
+        /// RT §4.4: force the stub tier (`rt-core`/`rt-local`/`rt-net`/`rt-full`) for a
+        /// `--native` bundle instead of automatic nearest-superset selection. A tier
+        /// below the program's requirements is rejected (the error lists the missing
+        /// features and the modules that demand them). Requires `--native`.
+        #[arg(long = "tier", requires = "native")]
+        tier: Option<String>,
+        /// RT §9.2: emit the canonical JSON build report for a `--native` bundle to
+        /// `<PATH>` (or `-` for stdout) — the CI/reproducibility hook. The human report
+        /// always prints to stderr regardless. Requires `--native`.
+        #[arg(long = "report-json", requires = "native")]
+        report_json: Option<String>,
         /// WARM B §3.1: run the program as a training workload, harvest the warmed
         /// inline caches and adaptive arithmetic state, and embed a PGO (profile-
         /// guided optimisation) section into the produced archive. The artifact is

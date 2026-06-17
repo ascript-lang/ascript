@@ -435,3 +435,341 @@ fn required_features_cases() {
         result.unwrap()
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// RT Task 5 — tiers, nearest-superset selection, build report.
+// ════════════════════════════════════════════════════════════════════════════════
+
+use ascript::rtstub::report::{BuildReport, PayloadInfo, StubInfo};
+use ascript::rtstub::select::{select, Selection, TierSource};
+use ascript::rtstub::tiers::{select_tier, validate_forced_tier, Tier};
+
+// ─── Test 6: the tier chain is a STRICT superset chain ───────────────────────
+
+/// rt-core ⊊ rt-local ⊊ rt-net ⊊ rt-full — each is a PROPER superset of the
+/// previous (set containment over the FEATURES consts, both `⊇` and `≠`).
+#[test]
+fn tier_chain_is_strict_superset() {
+    let pairs = [
+        (Tier::RtCore, Tier::RtLocal),
+        (Tier::RtLocal, Tier::RtNet),
+        (Tier::RtNet, Tier::RtFull),
+    ];
+    for (lower, higher) in pairs {
+        let lo = lower.feature_set();
+        let hi = higher.feature_set();
+        // superset: every feature of the lower tier is in the higher tier
+        assert!(
+            lo.iter().all(|f| hi.contains(f)),
+            "{} is not a superset of {}: missing {:?}",
+            higher.name(),
+            lower.name(),
+            lo.difference(&hi).collect::<Vec<_>>(),
+        );
+        // proper: the higher tier has strictly more
+        assert!(
+            hi.len() > lo.len(),
+            "{} must be a PROPER superset of {} (strictly larger), got {} vs {}",
+            higher.name(),
+            lower.name(),
+            hi.len(),
+            lo.len(),
+        );
+    }
+    // bundle-zstd present in every tier (the stub-side decompressor, §3.1)
+    for t in Tier::CHAIN {
+        assert!(
+            t.feature_set().contains("bundle-zstd"),
+            "{} must include bundle-zstd",
+            t.name()
+        );
+    }
+}
+
+// ─── Test 7: nearest-superset selection ──────────────────────────────────────
+
+fn set(items: &[&str]) -> BTreeSet<&'static str> {
+    // SAFETY of 'static: the literals live for the program lifetime.
+    items
+        .iter()
+        .map(|s| -> &'static str {
+            match *s {
+                "data" => "data",
+                "net" => "net",
+                "ffi" => "ffi",
+                "binary" => "binary",
+                "shared" => "shared",
+                other => Box::leak(other.to_string().into_boxed_str()),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn select_tier_nearest_superset() {
+    assert_eq!(select_tier(&set(&[])), Tier::RtCore, "empty → rt-core");
+    assert_eq!(select_tier(&set(&["data"])), Tier::RtLocal, "data → rt-local");
+    assert_eq!(select_tier(&set(&["net"])), Tier::RtNet, "net → rt-net");
+    assert_eq!(select_tier(&set(&["ffi"])), Tier::RtFull, "ffi → rt-full");
+    // binary alone (a local-tier feature) → rt-local
+    assert_eq!(select_tier(&set(&["binary"])), Tier::RtLocal);
+}
+
+// ─── Test 8: --tier downgrade error names missing features + modules ──────────
+
+#[test]
+fn tier_downgrade_below_requirement_errors() {
+    // A program needing `data` forced to rt-core (which lacks `data`).
+    let required = set(&["data"]);
+    let demanding = vec![("std/json".to_string(), "data")];
+    let err = validate_forced_tier(Tier::RtCore, &required, &demanding)
+        .expect_err("rt-core cannot satisfy a `data` requirement");
+    assert!(err.contains("data"), "error must name the missing feature: {err}");
+    assert!(
+        err.contains("std/json"),
+        "error must name the demanding module: {err}"
+    );
+    assert!(err.contains("rt-core"), "error must name the forced tier: {err}");
+
+    // A satisfying downgrade passes (rt-full forced for a `data`-only program).
+    assert!(validate_forced_tier(Tier::RtFull, &required, &demanding).is_ok());
+    // Forcing the exact tier passes.
+    assert!(validate_forced_tier(Tier::RtLocal, &required, &demanding).is_ok());
+}
+
+/// The high-level `select()` entry surfaces the same downgrade error through `--tier`.
+#[test]
+fn select_with_forced_insufficient_tier_errors() {
+    let imports: BTreeSet<String> = ["std/json"].iter().map(|s| s.to_string()).collect();
+    let err = select(&imports, Some(Tier::RtCore))
+        .expect_err("forcing rt-core for a std/json program must fail");
+    assert!(err.contains("data") && err.contains("std/json"), "{err}");
+
+    // Automatic selection picks rt-local for std/json.
+    let sel = select(&imports, None).expect("auto-select must succeed");
+    assert_eq!(sel.tier, Tier::RtLocal);
+    assert_eq!(sel.source, TierSource::Selected);
+    assert!(sel.required.contains(&"data".to_string()));
+    // rt-local carries many features std/json does not need.
+    assert!(sel.unused.contains(&"sql".to_string()));
+    assert!(!sel.unused.contains(&"data".to_string()), "required ∉ unused");
+}
+
+// ─── Test 9: tier drift — tiers.rs vs scripts/build-rt.sh ─────────────────────
+
+/// Parse `scripts/build-rt.sh`'s `case` arms (`rt-X) FEATURES="a,b,c" ;;`) and assert
+/// each tier's feature list equals `tiers.rs`'s FEATURES const — BOTH directions (the
+/// script and the code are one source of truth tested against the other).
+#[test]
+fn tier_drift_against_build_script() {
+    let script = read("scripts/build-rt.sh");
+
+    // Extract `FEATURES="..."` for each `rt-X)` case arm.
+    let mut from_script: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in script.lines() {
+        let t = line.trim();
+        // e.g.  rt-core)  FEATURES="shared,bundle-zstd" ;;
+        for tier_name in ["rt-core", "rt-local", "rt-net", "rt-full"] {
+            let prefix = format!("{tier_name})");
+            if t.starts_with(&prefix) {
+                let feats = t
+                    .split_once("FEATURES=\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(f, _)| f)
+                    .unwrap_or_else(|| panic!("no FEATURES=\"...\" on line: {t}"));
+                let list: Vec<String> = feats.split(',').map(|s| s.trim().to_string()).collect();
+                from_script.insert(tier_name.to_string(), list);
+            }
+        }
+    }
+
+    assert_eq!(
+        from_script.len(),
+        4,
+        "expected 4 tier case arms in build-rt.sh, found {}: {:?}",
+        from_script.len(),
+        from_script.keys().collect::<Vec<_>>()
+    );
+
+    for tier in Tier::CHAIN {
+        let script_feats: BTreeSet<&str> = from_script
+            .get(tier.name())
+            .unwrap_or_else(|| panic!("build-rt.sh missing tier {}", tier.name()))
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let code_feats: BTreeSet<&str> = tier.feature_set();
+        assert_eq!(
+            script_feats, code_feats,
+            "tier '{}' DRIFT between scripts/build-rt.sh and src/rtstub/tiers.rs:\n\
+             script: {:?}\n  code: {:?}",
+            tier.name(),
+            script_feats,
+            code_feats,
+        );
+    }
+}
+
+// ─── Test 10: build report JSON schema + determinism + sha pinning ────────────
+
+fn sample_report() -> BuildReport {
+    let imports: BTreeSet<String> = ["std/math"].iter().map(|s| s.to_string()).collect();
+    let selection: Selection = select(&imports, None).expect("select std/math");
+    BuildReport {
+        source: "hello.as".to_string(),
+        output: "hello".to_string(),
+        output_sha256: "a".repeat(64),
+        target: None,
+        tier: selection.tier,
+        tier_source: selection.source,
+        selection,
+        payload: PayloadInfo {
+            format: "aso",
+            compressed: false,
+            size: 1234,
+            uncompressed_size: 1234,
+            sha256: "b".repeat(64),
+        },
+        stub: StubInfo {
+            origin: "current_exe",
+            sha256: "c".repeat(64),
+            size: 42_000_000,
+        },
+        module_count: 1,
+        shake_digest: None,
+        caps_all_granted: true,
+    }
+}
+
+#[test]
+fn report_json_schema_and_fields() {
+    let r = sample_report();
+    let json = r.to_json();
+
+    // Schema 1 + the §9.2 field set present.
+    assert!(json.contains("\"schema\":1"), "schema 1 marker: {json}");
+    for key in [
+        "\"source\":",
+        "\"output\":",
+        "\"output_sha256\":",
+        "\"target\":",
+        "\"tier\":",
+        "\"tier_source\":",
+        "\"required\":",
+        "\"stub_features\":",
+        "\"unused\":",
+        "\"payload\":",
+        "\"module_count\":",
+        "\"caps_all_granted\":",
+    ] {
+        assert!(json.contains(key), "missing JSON key {key} in {json}");
+    }
+
+    // §9.1 determinism: NO timestamp field of any kind.
+    for forbidden in ["created", "timestamp", "time", "date", "built_at", "now"] {
+        assert!(
+            !json.contains(&format!("\"{forbidden}\"")),
+            "report JSON must contain NO time field, found '{forbidden}': {json}"
+        );
+    }
+
+    // rt-core for a std/math-only program, tier_source = selected.
+    assert!(json.contains("\"tier\":\"rt-core\""), "{json}");
+    assert!(json.contains("\"tier_source\":\"selected\""), "{json}");
+    // null target (host).
+    assert!(json.contains("\"target\":null"), "{json}");
+}
+
+#[test]
+fn report_json_is_deterministic() {
+    let a = sample_report().to_json();
+    let b = sample_report().to_json();
+    assert_eq!(a, b, "the build report JSON must be byte-identical across builds");
+}
+
+/// The §4.6 stderr report carries the tier, the stub origin, and the sizes.
+#[test]
+fn report_stderr_carries_tier_origin_sizes() {
+    let r = sample_report();
+    let s = r.render_stderr();
+    assert!(s.contains("rt-core"), "stderr report must name the tier: {s}");
+    assert!(s.contains("current_exe"), "stderr report must name the stub origin: {s}");
+    assert!(s.contains("42000000"), "stderr report must carry the stub size: {s}");
+    assert!(s.contains("1234"), "stderr report must carry the payload size: {s}");
+}
+
+/// END-TO-END: `--report-json -` on a real hello build emits schema-1 JSON whose
+/// `output_sha256` matches an INDEPENDENTLY computed sha256 of the artifact bytes, and a
+/// double-build yields an identical digest (§9.1 determinism).
+#[test]
+fn report_json_end_to_end_sha_stable() {
+    use std::process::Command;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_ascript")
+    }
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let d = h.finalize();
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn extract<'a>(json: &'a str, key: &str) -> &'a str {
+        let needle = format!("\"{key}\":\"");
+        let start = json.find(&needle).unwrap_or_else(|| panic!("no {key} in {json}")) + needle.len();
+        let rest = &json[start..];
+        let end = rest.find('"').unwrap();
+        &rest[..end]
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("prog.as");
+    std::fs::write(&src, "import { sqrt } from \"std/math\"\nprint(sqrt(16.0))\n").unwrap();
+
+    let build = |out_name: &str| -> String {
+        let out = dir.path().join(out_name);
+        let o = Command::new(bin())
+            .args(["build", "--native", "--report-json", "-"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "build failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        // The JSON line is on stdout (the only stdout line besides `bundled … -> …`).
+        let stdout = String::from_utf8(o.stdout).unwrap();
+        let json_line = stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with('{'))
+            .unwrap_or_else(|| panic!("no JSON line on stdout: {stdout}"))
+            .to_string();
+
+        // The report's output_sha256 must equal the real artifact's sha256.
+        let artifact = std::fs::read(&out).unwrap();
+        assert_eq!(
+            extract(&json_line, "output_sha256"),
+            sha256_hex(&artifact),
+            "report output_sha256 must equal the real artifact digest"
+        );
+        // std/math is core → rt-core selected.
+        assert!(json_line.contains("\"tier\":\"rt-core\""), "{json_line}");
+        // unused-feature delta is present (rt-core has bundle-zstd/shared unused here).
+        assert!(json_line.contains("\"unused\":["), "{json_line}");
+        json_line
+    };
+
+    let j1 = build("prog1");
+    let j2 = build("prog2");
+    // The two builds differ only by output PATH; their output_sha256 (a function of the
+    // payload+stub bytes, not the name) must be identical, and the rest of the report too.
+    assert_eq!(
+        extract(&j1, "output_sha256"),
+        extract(&j2, "output_sha256"),
+        "two builds of the same source must have a stable output_sha256"
+    );
+}
