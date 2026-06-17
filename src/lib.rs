@@ -86,6 +86,13 @@ pub mod token;
 pub mod value;
 pub mod vm;
 pub mod worker;
+// RT §4.1–§4.2: module→feature table + archive std-import scanner.
+// Toolchain-side only (data used by `ascript build --native`); excluded from
+// stub builds via the `ascript_rt` cfg (set by `ASCRIPT_RT=1`, never by
+// `cargo build`/`cargo test`, so normal builds are byte-identical).
+// Also builds under `--no-default-features` (no optional-feature deps inside).
+#[cfg(not(ascript_rt))]
+pub mod rtstub;
 
 use crate::error::AsError;
 // RT §2.2: `SourceInfo` is only used by the gated-out source-running entry points.
