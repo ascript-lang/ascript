@@ -814,6 +814,49 @@ impl CapBits {
     }
 }
 
+/// A capability **requirement** at the dispatch gate (CNTR §5.2): a `Copy` `u8`
+/// bitset over the SAME bit layout as [`CapBits`]/`CapSet`, so it can name a
+/// **conjunction** of capabilities a single call requires. Almost every
+/// [`crate::stdlib::required_cap`] entry is a single cap (`CapReq::one(..)`);
+/// `docker` is the first conjunction — it requires **both** `net` AND `process`
+/// (CNTR §5), which `Option<Cap>` cannot express.
+///
+/// The gate iterates the required caps in stable [`Cap::ALL`] order, so the
+/// **first denied** cap names the error deterministically — for a single-cap
+/// requirement the loop runs exactly once, byte-identical to the pre-CNTR
+/// single-`Cap` gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapReq(u8);
+
+impl CapReq {
+    /// The empty requirement (an ungated module/func) — the gate runs no check.
+    pub const NONE: CapReq = CapReq(0);
+
+    /// A requirement of exactly one capability (the common case).
+    pub const fn one(cap: Cap) -> CapReq {
+        CapReq(cap.bit())
+    }
+
+    /// Add a capability to the requirement — a CONJUNCTION (`net ∧ process`).
+    /// Returns a new `CapReq` (it is `Copy`); idempotent on an already-present cap.
+    pub const fn and(self, cap: Cap) -> CapReq {
+        CapReq(self.0 | cap.bit())
+    }
+
+    /// Is this an empty requirement? The new "ungated" probe (the `CapReq`
+    /// replacement for the old `Option::is_none`).
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Iterate the required capabilities in stable [`Cap::ALL`] order. Determinism
+    /// is load-bearing: the gate's "first denied names the error" verdict depends
+    /// on this order being fixed.
+    pub fn iter(self) -> impl Iterator<Item = Cap> {
+        Cap::ALL.into_iter().filter(move |c| self.0 & c.bit() != 0)
+    }
+}
+
 // ─────────────────────────── `std/caps` module routing ───────────────────────
 // CORE (no feature gate): the capability query/drop surface exists in every build.
 // `import * as caps from "std/caps"` then `caps.has(...)` / `caps.drop(...)`.
@@ -1002,6 +1045,33 @@ mod tests {
         fn assert_copy<T: Copy>() {}
         assert_copy::<CapBits>();
         assert_copy::<Cap>();
+    }
+
+    #[test]
+    fn capreq_conjunction_iterates_in_cap_all_order() {
+        // CNTR §5.2: a conjunction (docker = net ∧ process) yields its caps in
+        // stable Cap::ALL order (fs, net, process, ffi, env) — the gate's
+        // first-denied-names-the-error verdict depends on this order.
+        let req = CapReq::one(Cap::Net).and(Cap::Process);
+        assert_eq!(req.iter().collect::<Vec<_>>(), vec![Cap::Net, Cap::Process]);
+        // Built in the other order → same Cap::ALL-ordered iteration.
+        let req2 = CapReq::one(Cap::Process).and(Cap::Net);
+        assert_eq!(req2.iter().collect::<Vec<_>>(), vec![Cap::Net, Cap::Process]);
+        // A single cap yields exactly that cap.
+        assert_eq!(CapReq::one(Cap::Fs).iter().collect::<Vec<_>>(), vec![Cap::Fs]);
+        // NONE is empty.
+        assert!(CapReq::NONE.is_empty());
+        assert_eq!(CapReq::NONE.iter().collect::<Vec<_>>(), Vec::<Cap>::new());
+        // A non-empty requirement is not empty.
+        assert!(!req.is_empty());
+        // `and` is idempotent on an already-present cap.
+        assert_eq!(req.and(Cap::Net), req);
+    }
+
+    #[test]
+    fn capreq_is_copy_and_send() {
+        fn _assert<T: Copy + Send>() {}
+        _assert::<CapReq>();
     }
 
     #[test]

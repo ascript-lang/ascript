@@ -121,10 +121,14 @@ fn op_variant_count_unchanged_by_cntr() {
 #[test]
 fn required_cap_net_tcp_is_net() {
     use ascript::stdlib::caps::Cap;
+    // CNTR §5.2: `required_cap` now returns a `CapReq` conjunction bitset; iterate it
+    // in Cap::ALL order. `net_tcp` is a single-cap `net` requirement.
     assert_eq!(
-        ascript::stdlib::required_cap("net_tcp", "connect"),
-        Some(Cap::Net),
-        "required_cap(\"net_tcp\", \"connect\") must be Some(Net); \
+        ascript::stdlib::required_cap("net_tcp", "connect")
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Cap::Net],
+        "required_cap(\"net_tcp\", \"connect\") must be [Net]; \
          CNTR's std/docker joins this cap class in Phase 1"
     );
 }
@@ -141,10 +145,14 @@ fn required_cap_net_tcp_is_net() {
 #[test]
 fn required_cap_process_spawn_is_process() {
     use ascript::stdlib::caps::Cap;
+    // CNTR §5.2: `CapReq` conjunction bitset, iterated in Cap::ALL order. `process`
+    // is a single-cap requirement.
     assert_eq!(
-        ascript::stdlib::required_cap("process", "spawn"),
-        Some(Cap::Process),
-        "required_cap(\"process\", \"spawn\") must be Some(Process); \
+        ascript::stdlib::required_cap("process", "spawn")
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Cap::Process],
+        "required_cap(\"process\", \"spawn\") must be [Process]; \
          CNTR's docker.exec uses the process cap for the fallback spawn path"
     );
 }

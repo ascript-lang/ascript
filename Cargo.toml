@@ -200,7 +200,7 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker"]
 # RT §5.1/§5.2 — the signed-manifest verification + stub fetch half of the
 # runtime-stub distribution path. Pulls `net` (the pooled reqwest client used to fetch
 # the release manifest + stub blobs) and `ed25519-dalek` (verify the detached manifest
@@ -369,6 +369,15 @@ ffi = ["dep:libloading", "dep:libffi"]
 # substrates lru/sync/task are core). Default-on (batteries). cfg's out cleanly
 # under --no-default-features (where `import "std/resilience"` is unknown-module).
 resilience = []
+# CNTR §4/§5: std/docker — typed Docker Engine-API wrapper (containers/images/exec;
+# logs/events/pull streams). The MODULE is added in a later CNTR task; this feature is
+# registered NOW (Task 1.1) so the `required_cap("docker", _)` conjunction arm + its
+# gate test compile in the default build. Pulls `net` (the Engine API is HTTP over a
+# Unix socket / TCP). Default-ON (batteries — per FFI §3.6, the cap gate, NOT feature
+# subtraction, is the safety story: `docker.*` requires BOTH `net` AND `process`).
+# cfg's out cleanly under --no-default-features (the conjunction arm is gated out; the
+# CapReq machinery itself is CORE and still builds bare).
+docker = ["net"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"

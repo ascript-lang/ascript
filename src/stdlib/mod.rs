@@ -327,54 +327,65 @@ fn fs_path_arg<'a>(func: &str, args: &'a [Value]) -> Option<(&'a str, bool)> {
 /// are gated by `Net`; the rest of `os` is ambient self-introspection (`pid`,
 /// `platform`, `arch`, `cpuCount`, `tempDir`, `uptime`, `disks`, `memory`, …) and
 /// is ungated.
-pub fn required_cap(module: &str, func: &str) -> Option<caps::Cap> {
-    use caps::Cap;
+pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
+    use caps::{Cap, CapReq};
     match module {
         // Filesystem — every fs func reads/writes/lists the host filesystem.
-        "fs" => Some(Cap::Fs),
+        "fs" => CapReq::one(Cap::Fs),
         // `io` reads process STDIN (a real input channel) → gated as a host-fd read.
-        "io" => Some(Cap::Fs),
+        "io" => CapReq::one(Cap::Fs),
         // Environment variables.
-        "env" => Some(Cap::Env),
+        "env" => CapReq::one(Cap::Env),
         // Subprocess spawning.
-        "process" => Some(Cap::Process),
+        "process" => CapReq::one(Cap::Process),
         // FFI: a denied `ffi` blocks `ffi.open`, transitively blocking all native calls.
-        "ffi" => Some(Cap::Ffi),
-        // All network modules — sockets, HTTP, DNS, UDP, WebSocket, servers.
-        // `"net"` covers `net.lookup`/`lookupOne` (DNS) by construction.
-        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server" => Some(Cap::Net),
+        "ffi" => CapReq::one(Cap::Ffi),
+        // All network modules — sockets, HTTP, DNS, UDP, WebSocket, servers, Unix-domain.
+        // `"net"` covers `net.lookup`/`lookupOne` (DNS) by construction. `net_unix` is a
+        // UDS byte pipe — single-cap `net` (it conveys no process authority; CNTR §5.1).
+        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server" => {
+            CapReq::one(Cap::Net)
+        }
+        #[cfg(feature = "net")]
+        "net_unix" => CapReq::one(Cap::Net),
+        // CNTR §5.2 — the FIRST conjunction: `docker.*` drives the Engine API over the
+        // network AND can spawn arbitrary host processes, so it requires BOTH `net` AND
+        // `process`. `--deny net` or `--deny process` (or `--sandbox`) blocks it. Gated
+        // like the other feature arms (the `docker` feature pulls `net`).
+        #[cfg(feature = "docker")]
+        "docker" => CapReq::one(Cap::Net).and(Cap::Process),
         // Database modules open OS resources (BLOCKER 2). `sqlite` opens/creates a DB
         // file → `Fs`; `postgres`/`redis` open TCP sockets → `Net`. Feature-gated the
         // SAME way the dispatch match arms are so `--no-default-features` still builds.
         #[cfg(feature = "sql")]
-        "sqlite" => Some(Cap::Fs),
+        "sqlite" => CapReq::one(Cap::Fs),
         #[cfg(feature = "postgres")]
-        "postgres" => Some(Cap::Net),
+        "postgres" => CapReq::one(Cap::Net),
         #[cfg(feature = "redis")]
-        "redis" => Some(Cap::Net),
+        "redis" => CapReq::one(Cap::Net),
         // `ai` + `telemetry` each carry their OWN reqwest network stack (LLM API calls /
         // OTLP-HTTP/Sentry/PostHog exporters) — NOT routed through `net_http`, so they
         // need their own gate or a `--deny net`/`--sandbox`/`run_in_worker({deny net})`
         // isolate could still exfiltrate over the network. Whole-module `Net` gate, the
         // same posture as `net.lookup`. Feature-gated like the dispatch arms.
         #[cfg(feature = "ai")]
-        "ai" => Some(Cap::Net),
+        "ai" => CapReq::one(Cap::Net),
         #[cfg(feature = "telemetry")]
-        "telemetry" => Some(Cap::Net),
+        "telemetry" => CapReq::one(Cap::Net),
         // `workflow.run`/`resume` PERSIST an append-only event log to a user-specified
         // `{log}` FILE PATH (`write_log` → `std::fs::File::create`), so a durable workflow
         // writes the host filesystem → `Fs`. (Found by the completeness sweep below; same
         // ungated-OS-module class as ai/telemetry.)
         #[cfg(feature = "workflow")]
-        "workflow" => Some(Cap::Fs),
+        "workflow" => CapReq::one(Cap::Fs),
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
-            "networkInterfaces" | "localIp" | "hostname" => Some(Cap::Net),
-            _ => None,
+            "networkInterfaces" | "localIp" | "hostname" => CapReq::one(Cap::Net),
+            _ => CapReq::NONE,
         },
         // Everything else is pure / non-resource-acquiring (math, json, string, …).
-        _ => None,
+        _ => CapReq::NONE,
     }
 }
 
@@ -479,7 +490,11 @@ impl Interp {
         // zero-cost on the hot path and the default run is byte-identical.
         let cap_bits = self.caps_bits(); // Copy snapshot — no borrow held across the await below.
         if !cap_bits.all_granted() {
-            if let Some(cap) = required_cap(module, func) {
+            // CNTR §5.2: a requirement may be a CONJUNCTION (docker = net ∧ process).
+            // The caps are checked in Cap::ALL order, so the FIRST denied cap names the
+            // error (the pinned, shipped string). For a single-cap module the loop runs
+            // exactly once — byte-identical to the pre-CNTR single-`Cap` gate.
+            for cap in required_cap(module, func).iter() {
                 self.require_cap(cap, module, func, args, span)?;
             }
             // FFI §4.4 stage-2 (fs carve-out): a configured `fs` carve-out makes the
@@ -991,52 +1006,80 @@ mod cap_gate_tests {
     use crate::stdlib::caps::Cap;
 
     #[test]
+    fn required_cap_docker_requires_both_net_and_process() {
+        // CNTR §5.2: `docker` is the first CONJUNCTION requirement (net ∧ process),
+        // yielded in stable Cap::ALL order. Single-cap modules yield one cap; an
+        // ungated module yields the empty requirement.
+        #[cfg(feature = "docker")]
+        {
+            let caps: Vec<Cap> = required_cap("docker", "anything").iter().collect();
+            assert_eq!(caps, vec![Cap::Net, Cap::Process], "docker = net AND process, Cap::ALL order");
+        }
+        assert_eq!(required_cap("fs", "readFile").iter().collect::<Vec<_>>(), vec![Cap::Fs]);
+        #[cfg(feature = "net")]
+        assert_eq!(required_cap("net_unix", "connect").iter().collect::<Vec<_>>(), vec![Cap::Net]);
+        assert!(required_cap("math", "abs").is_empty());
+    }
+
+    /// Collect a `required_cap` verdict as a `Vec<Cap>` for assertion (CNTR §5.2:
+    /// the verdict is now a `CapReq` conjunction, iterated in Cap::ALL order).
+    fn req(module: &str, func: &str) -> Vec<Cap> {
+        required_cap(module, func).iter().collect()
+    }
+
+    #[test]
     fn required_cap_complete_enumeration() {
         // fs / io → Fs
-        assert_eq!(required_cap("fs", "readFile"), Some(Cap::Fs));
-        assert_eq!(required_cap("fs", "writeFile"), Some(Cap::Fs));
-        assert_eq!(required_cap("io", "readAll"), Some(Cap::Fs));
-        assert_eq!(required_cap("io", "readLine"), Some(Cap::Fs));
+        assert_eq!(req("fs", "readFile"), vec![Cap::Fs]);
+        assert_eq!(req("fs", "writeFile"), vec![Cap::Fs]);
+        assert_eq!(req("io", "readAll"), vec![Cap::Fs]);
+        assert_eq!(req("io", "readLine"), vec![Cap::Fs]);
         // env → Env
-        assert_eq!(required_cap("env", "get"), Some(Cap::Env));
+        assert_eq!(req("env", "get"), vec![Cap::Env]);
         // process → Process
-        assert_eq!(required_cap("process", "spawn"), Some(Cap::Process));
+        assert_eq!(req("process", "spawn"), vec![Cap::Process]);
         // ffi → Ffi
-        assert_eq!(required_cap("ffi", "open"), Some(Cap::Ffi));
+        assert_eq!(req("ffi", "open"), vec![Cap::Ffi]);
         // all net modules → Net (incl. DNS via the "net" module string)
         for m in ["net", "net_tcp", "net_http", "net_udp", "net_ws", "http_server"] {
-            assert_eq!(required_cap(m, "anything"), Some(Cap::Net), "module {m}");
+            assert_eq!(req(m, "anything"), vec![Cap::Net], "module {m}");
         }
         // DNS specifically: net.lookup / lookupOne route through "net" → Net.
-        assert_eq!(required_cap("net", "lookup"), Some(Cap::Net));
-        assert_eq!(required_cap("net", "lookupOne"), Some(Cap::Net));
+        assert_eq!(req("net", "lookup"), vec![Cap::Net]);
+        assert_eq!(req("net", "lookupOne"), vec![Cap::Net]);
+        // CNTR §5.1: net_unix is a single-cap `net` (a UDS pipe conveys no process authority).
+        #[cfg(feature = "net")]
+        assert_eq!(req("net_unix", "connect"), vec![Cap::Net]);
+        // CNTR §5.2: docker is the first conjunction — net ∧ process, in Cap::ALL order.
+        #[cfg(feature = "docker")]
+        assert_eq!(req("docker", "run"), vec![Cap::Net, Cap::Process]);
         // BLOCKER 2: database modules open OS resources and MUST be gated.
         // sqlite opens/creates a DB file → Fs; postgres/redis open TCP sockets → Net.
         #[cfg(feature = "sql")]
-        assert_eq!(required_cap("sqlite", "open"), Some(Cap::Fs));
+        assert_eq!(req("sqlite", "open"), vec![Cap::Fs]);
         #[cfg(feature = "postgres")]
-        assert_eq!(required_cap("postgres", "connect"), Some(Cap::Net));
+        assert_eq!(req("postgres", "connect"), vec![Cap::Net]);
         #[cfg(feature = "redis")]
-        assert_eq!(required_cap("redis", "connect"), Some(Cap::Net));
-        // os per-func split (§4.3a): topology/identity → Net; ambient → None.
-        assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
-        assert_eq!(required_cap("os", "localIp"), Some(Cap::Net));
-        assert_eq!(required_cap("os", "hostname"), Some(Cap::Net));
-        assert_eq!(required_cap("os", "pid"), None);
-        assert_eq!(required_cap("os", "platform"), None);
-        assert_eq!(required_cap("os", "cpuCount"), None);
-        assert_eq!(required_cap("os", "tempDir"), None);
-        assert_eq!(required_cap("os", "uptime"), None);
-        assert_eq!(required_cap("os", "disks"), None);
-        // pure / non-resource modules → None.
-        assert_eq!(required_cap("math", "abs"), None);
-        assert_eq!(required_cap("json", "parse"), None);
-        assert_eq!(required_cap("string", "upper"), None);
-        assert_eq!(required_cap("array", "map"), None);
+        assert_eq!(req("redis", "connect"), vec![Cap::Net]);
+        // os per-func split (§4.3a): topology/identity → Net; ambient → empty.
+        assert_eq!(req("os", "networkInterfaces"), vec![Cap::Net]);
+        assert_eq!(req("os", "localIp"), vec![Cap::Net]);
+        assert_eq!(req("os", "hostname"), vec![Cap::Net]);
+        assert!(required_cap("os", "pid").is_empty());
+        assert!(required_cap("os", "platform").is_empty());
+        assert!(required_cap("os", "cpuCount").is_empty());
+        assert!(required_cap("os", "tempDir").is_empty());
+        assert!(required_cap("os", "uptime").is_empty());
+        assert!(required_cap("os", "disks").is_empty());
+        // pure / non-resource modules → empty.
+        assert!(required_cap("math", "abs").is_empty());
+        assert!(required_cap("json", "parse").is_empty());
+        assert!(required_cap("string", "upper").is_empty());
+        assert!(required_cap("array", "map").is_empty());
         // caps itself is NOT gated (querying/dropping is always allowed).
-        assert_eq!(required_cap("caps", "drop"), None);
+        assert!(required_cap("caps", "drop").is_empty());
         // resilience is pure / in-memory.
-        assert_eq!(required_cap("resilience", "breaker"), None);
+        assert!(required_cap("resilience", "breaker").is_empty());
     }
 
     /// Drift guard: every resource-acquiring module string the dispatch match
@@ -1079,13 +1122,16 @@ mod cap_gate_tests {
         ];
         for (m, want) in gated {
             assert_eq!(
-                required_cap(m, "x"),
-                Some(*want),
+                req(m, "x"),
+                vec![*want],
                 "resource module {m} must map to {want:?}"
             );
         }
+        // CNTR §5.2: docker is the first conjunction requirement (net ∧ process).
+        #[cfg(feature = "docker")]
+        assert_eq!(req("docker", "x"), vec![Cap::Net, Cap::Process]);
         // os is per-func: at least its topology funcs must be Net.
-        assert_eq!(required_cap("os", "networkInterfaces"), Some(Cap::Net));
+        assert_eq!(req("os", "networkInterfaces"), vec![Cap::Net]);
     }
 
     /// COMPLETENESS guard (holistic-review BLOCKER 2): the prior test only checks modules
@@ -1126,7 +1172,7 @@ mod cap_gate_tests {
             if key == "os" {
                 continue; // per-func (topology→Net, ambient→None); covered above.
             }
-            let gated = required_cap(&key, "__probe__").is_some();
+            let gated = !required_cap(&key, "__probe__").is_empty();
             let ungated = KNOWN_UNGATED.contains(&key.as_str());
             assert!(
                 gated || ungated,
@@ -1141,40 +1187,40 @@ mod cap_gate_tests {
         }
     }
 
-    /// CNTR Phase-0 pin — `required_cap` verdicts for the resource-class keys that
-    /// `std/docker` will JOIN in Phase 1.
+    /// CNTR Phase-1 pin (migrated from the Phase-0 `Option` form to `CapReq`, §5.2) —
+    /// `required_cap` verdicts for the resource-class keys `std/docker` JOINS.
     ///
-    /// Phase 1 adds `"docker" => Some(Cap::Net)` as a NEW entry.  This pin proves
-    /// the existing entries it sits beside (`net_tcp → Net`, `process → Process`)
-    /// are intact at branch creation, so the Phase-1 migration is purely additive.
+    /// Phase 1 (this commit) adds `"docker" => CapReq::one(Net).and(Process)` — the
+    /// first CONJUNCTION. This pin proves the existing entries it sits beside
+    /// (`net_tcp → Net`, `process → Process`) are intact through the migration, and
+    /// that docker is now the net ∧ process conjunction (was the Phase-0 "not yet"
+    /// sanity check).
     ///
     /// Real module keys confirmed by reading the `required_cap` match arms:
-    ///   `"net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server"
-    ///     => Some(Cap::Net)`
-    ///   `"process" => Some(Cap::Process)`
+    ///   `"net" | "net_tcp" | ... => CapReq::one(Cap::Net)`
+    ///   `"process" => CapReq::one(Cap::Process)`
+    ///   `"docker" => CapReq::one(Cap::Net).and(Cap::Process)`
     #[test]
     fn cntr_required_cap_preflight_pins() {
-        // net_tcp → Net.  Docker daemon communicates over a Unix socket or TCP;
-        // Phase 1 gates `"docker"` the same way.
+        // net_tcp → Net.  Docker daemon communicates over a Unix socket or TCP.
         assert_eq!(
-            required_cap("net_tcp", "connect"),
-            Some(Cap::Net),
-            "required_cap(\"net_tcp\", \"connect\") pre-CNTR baseline must be Some(Net); \
-             CNTR Phase 1 adds \"docker\" to the same Net class"
+            req("net_tcp", "connect"),
+            vec![Cap::Net],
+            "required_cap(\"net_tcp\", \"connect\") baseline must be [Net]"
         );
         // process → Process.  docker.exec / docker.run may use a child-process
         // fallback; the existing process gate must be intact.
         assert_eq!(
-            required_cap("process", "spawn"),
-            Some(Cap::Process),
-            "required_cap(\"process\", \"spawn\") pre-CNTR baseline must be Some(Process)"
+            req("process", "spawn"),
+            vec![Cap::Process],
+            "required_cap(\"process\", \"spawn\") baseline must be [Process]"
         );
-        // Sanity: "docker" is NOT yet registered (Phase 1 adds it).
+        // CNTR §5.2: "docker" is now registered as the net ∧ process conjunction.
+        #[cfg(feature = "docker")]
         assert_eq!(
-            required_cap("docker", "run"),
-            None,
-            "\"docker\" must not be in required_cap yet — Phase 1 will add it; \
-             if this fails, Phase 1 already landed or the name collides with something else"
+            req("docker", "run"),
+            vec![Cap::Net, Cap::Process],
+            "\"docker\" must require BOTH net AND process (the first CapReq conjunction)"
         );
     }
 }
