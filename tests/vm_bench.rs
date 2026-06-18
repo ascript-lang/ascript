@@ -485,6 +485,36 @@ print(total)
     ]
 }
 
+/// RESIL §5.1 — the async-spawn-heavy workload, kept SEPARATE from the compute
+/// corpus on purpose. Each `await work(i)` is an M17 eager `spawn_local`, so this
+/// exercises the spawn-site `task_locals_capture()` (a `try_with` + `Option<Rc>`
+/// clone, `None` when no deadline/trace is set) RESIL added to the FIVE spawn sites.
+///
+/// It is NOT in `benches()` because it is spawn/await-bound: it escalates to the
+/// async driver at every `await` (the sync lane can never help an await-bound
+/// program), so it does not belong in the LANE/DECODE/DBG per-bench gates (those
+/// assume compute-bound workloads where the sync lane bursts a suspension-free run —
+/// a pure-await bench trips LANE's 1.03x no-regression bound on escalation noise with
+/// no payoff). The RESIL section measures it on its own; the pre-RESIL `main` vs
+/// branch delta on THIS workload is the Gate-12/16 zero-cost evidence recorded in
+/// `bench/RESILIENCE_RESULTS.md`.
+fn resil_spawn_benches() -> Vec<Bench> {
+    vec![Bench {
+        name: "async spawn (100k)",
+        compute_bound: false,
+        src: r#"
+async fn work(n) { return n + 1 }
+let total = 0
+let i = 0
+while (i < 100000) {
+  total = total + await work(i)
+  i = i + 1
+}
+print(total)
+"#,
+    }]
+}
+
 /// A generous worker-thread stack so the recursion benchmarks (and the
 /// `!Send`, current-thread tokio runtime they drive) have room — the default
 /// test-thread stack (2 MiB) is too small for fib-style recursion under the
@@ -599,6 +629,7 @@ async fn run_baseline() {
     println!("         EXEMPT from the >= 2x compute-bound target, but checked for no-regression.");
     println!();
 
+    resil_zero_cost_gate(&benches).await;
     dbg_zero_cost_gate(&benches).await;
     // DECODE Task 11: run the decode-on/off section BEFORE the lane section so the
     // Units-A+B table is emitted even if the (machine-noise-sensitive) lane gate
@@ -736,6 +767,83 @@ async fn pgo_cold_start_section(benches: &[Bench]) {
 /// So a non-noise gap here would mean a stray instrumentation check leaked into a hot
 /// path — a BUG to fix, never an accepted tradeoff. The compute corpus (esp. the
 /// recursion benches, which push/pop frames hardest) is the stress.
+/// RESIL Task 4.5 — the task-local zero-cost section (spec §5.1, Gates 12/16/17).
+///
+/// RESIL's `TASK_LOCALS` seam has NO in-binary off-state (unlike DBG's `instrument ==
+/// None` toggle): the task-local cell is always compiled in, and the "off" state is
+/// simply "no deadline/trace set", which routes every consult through the `None` branch
+/// (`task_locals_capture()` / `deadline_remaining_ms()` → one TLS `try_with`, no clone).
+/// So the genuine zero-cost A/B is CROSS-BINARY (pre-RESIL `main` vs this branch),
+/// recorded same-session in `bench/RESILIENCE_RESULTS.md` (Gate 16). This in-harness
+/// section does the two things it CAN in one binary:
+///   (1) reports the async-spawn-heavy bench timing across the three engines (the
+///       workload that stresses the spawn-site `task_locals_capture()` — its branch-vs-
+///       main delta is the headline zero-cost number in the results file), and
+///   (2) re-asserts the COMPUTE-bound spec/tw >= 2x floor (Gate 17) — RESIL touched the
+///       async spawn sites and the method-dispatch ladder, so this is the proof the floor
+///       survived. (The assertion mirrors `run_baseline`'s compute gate; duplicated here
+///       so the RESIL section is self-contained in the report output.)
+async fn resil_zero_cost_gate(benches: &[Bench]) {
+    println!("RESIL TASK-LOCAL ZERO-COST (Task 4.5 §5.1): no in-binary off-state — the");
+    println!("zero-cost A/B is cross-binary (main vs branch) in bench/RESILIENCE_RESULTS.md.");
+    println!("This section reports the async-spawn workload + re-asserts the >= 2x compute floor.");
+    println!(
+        "{:<28} {:>9} {:>11} {:>11} {:>11} {:>11}",
+        "benchmark", "kind", "tw (ms)", "gen (ms)", "spec (ms)", "spec/tw",
+    );
+    println!("{}", "-".repeat(28 + 9 + 11 * 3 + 12));
+
+    // The async-spawn workload (RESIL-specific) is measured here ONLY; the compute
+    // corpus is re-measured to re-assert the Gate-17 floor after RESIL's changes.
+    let spawn_benches = resil_spawn_benches();
+    let mut compute_ratios: Vec<f64> = Vec::new();
+    let mut compute_misses: Vec<(&str, f64)> = Vec::new();
+    for b in spawn_benches.iter().chain(benches.iter()) {
+        let (tw_med, _) = measure(Engine::TreeWalker, b.src, b.name).await;
+        let (gen_med, _) = measure(Engine::GenericVm, b.src, b.name).await;
+        let (spec_med, _) = measure(Engine::SpecializedVm, b.src, b.name).await;
+        let spec_vs_tw = tw_med.as_secs_f64() / spec_med.as_secs_f64();
+        if b.compute_bound {
+            compute_ratios.push(spec_vs_tw);
+            if spec_vs_tw < 2.0 {
+                compute_misses.push((b.name, spec_vs_tw));
+            }
+        }
+        println!(
+            "{:<28} {:>9} {} {} {} {:>10.2}x",
+            b.name,
+            if b.compute_bound { "compute" } else { "spawn/alloc" },
+            ms(tw_med),
+            ms(gen_med),
+            ms(spec_med),
+            spec_vs_tw,
+        );
+    }
+
+    let geomean = if compute_ratios.is_empty() {
+        1.0
+    } else {
+        (compute_ratios.iter().map(|r| r.ln()).sum::<f64>() / compute_ratios.len() as f64).exp()
+    };
+    println!();
+    println!("compute-bound spec/tw geomean = {geomean:.2}x (Gate 17 floor >= 2.0x)");
+    if compute_misses.is_empty() {
+        println!("  [PASS] every COMPUTE-bound bench still >= 2.0x — RESIL's spawn-site capture");
+        println!("         and consult sites did not erode the floor.");
+    } else {
+        println!("  [FAIL] COMPUTE-bound bench(es) below 2.0x after RESIL:");
+        for (name, r) in &compute_misses {
+            println!("           - {name}: {r:.2}x");
+        }
+    }
+    assert!(
+        compute_misses.is_empty(),
+        "RESIL Gate-17 FAILED: a compute-bound bench dropped below 2.0x spec/tw \
+         (the task-local seam leaked cost into a hot path)"
+    );
+    println!();
+}
+
 async fn dbg_zero_cost_gate(benches: &[Bench]) {
     println!("DBG ZERO-COST GATE (Task 9 §3.4): instrument==None vs armed-idle (Some, all None)");
     println!(
