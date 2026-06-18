@@ -280,16 +280,21 @@ stated, results are measured.
 
 ### Deployment & reach track (independent of the engine waves; RT is the track's foundation)
 
-- 🔒 **RT — runtime-only native stubs, v2 upfront (tier matrix + import-driven pruning).**
-  `build --native` today appends the archive to a copy of the FULL 42 MB toolchain binary
-  (LSP, DAP, fmt, REPL, pkg, checker, three parsers). RT ships a runtime-only `ascript-rt`
-  bin target and, from day one, a prebuilt per-target **stub tier matrix** (curated feature
-  supersets, fetched fail-closed with pinned checksums into the `$ASCRIPT_CACHE` store) with
-  **nearest-superset selection** driven by the tree-shaker's import graph via a drift-tested
-  module→Cargo-feature table, plus `--exact` local-cargo builds. Includes: `--target` cross
-  builds (platform-independent payload onto platform stubs), **`--oci`** (emit a loadable OCI
-  image tarball without Docker), `--compress` (zstd payload), reproducible outputs, and the
-  tier-selection build report. Foundation for CNTR's images and WASM-adjacent distribution.
+- ✅ **RT — runtime-only native stubs.** MERGED `349f4ce` (2026-06-18). CLI/link-level — **no engine
+  change** (`ASO_FORMAT_VERSION` 29 + `ARCHIVE_VERSION` 1 unchanged; `vm_differential` 445/0 both configs
+  with the cfg additions present). A runtime-only **`ascript-rt`** bin compiles the front-end (parsers,
+  compiler, checker, LSP/DAP/fmt/REPL/pkg, tree-sitter) OUT via a **build-time cfg `ascript_rt`** (NOT a
+  Cargo feature); §2.3 audit + an `nm` tripwire (0 `compile_source`/tree-sitter symbols) prove the stub
+  ships no compiler. **4-tier matrix** (rt-core **5.75 MB = 13%** of the 43 MB toolchain .. rt-full
+  32.6 MB) selected by the archive's import facts through a drift-tested module→feature table. **Fail-closed
+  distribution:** ed25519-signed version-locked manifest (compiled-in pubkey, no insecure env knob; signing
+  on a default-OFF `rt-release` feature, never in a stub), a content-addressed cache that re-hashes on load,
+  a 5-rung ladder where **integrity aborts and only availability falls through**. Footer flags + `--compress`
+  (zstd, bounded; `flags=0` byte-identical), `--target` cross (platform-independent payload, macOS
+  sign-before-append), `--exact` (local-cargo precise stub), `--oci` (deterministic Docker-less OCI tarball,
+  two-digest rule, musl-only), reproducible outputs, `--report-json` (schema-locked). Foundation for CNTR's
+  images. Whole-effort holistic review APPROVE; FINAL gates all green; musl spike validated-at-first-CI
+  (narrow-fallback recorded).
   - Spec: `superpowers/specs/2026-06-12-native-runtime-stubs-design.md` · Plan: `superpowers/plans/2026-06-12-native-runtime-stubs.md`
 
 - 🔒 **CNTR — container-native runtime + `std/docker`.** Unix-domain sockets in `std/net` +
@@ -761,6 +766,50 @@ stated, results are measured.
   the §3 "ASO v27 unchanged" references were stale at authoring time (the constant was already 29 via ELIDE) —
   the binding invariant "WARM introduces no constant change vs `main`" holds. Follow-ups recorded in the
   roadmap (none silent): cache auto-GC, PGO profile merging, method-IC seeding, group-mode background flusher.
+
+- **RT** — ✅ **MERGED to `main` (`--no-ff`, `349f4ce`).** Runtime-only native stubs — CLI/link-level, **no
+  engine change** (`ASO_FORMAT_VERSION` 29 + `ARCHIVE_VERSION` 1 unchanged; `vm_differential` 445/0 BOTH feature
+  configs with the cfg additions present — the `ascript_rt` cfg is never set under `cargo test`). **The
+  architectural keystone:** the front-end (parsers, compiler, checker, LSP/DAP/fmt/REPL/pkg, tree-sitter) is
+  compiled OUT of the `ascript-rt` bin via a **build-time cfg `ascript_rt`** (NOT a Cargo feature — features are
+  additive and `--no-default-features` must keep building the parsers; emitted by `build.rs` from `ASCRIPT_RT=1`,
+  the `fuzzing`-cfg precedent). The §2.3 audit enumerated every compiler-reaching runtime path and cfg-gated each
+  to a loud refusal; the **holistic review found a third path (`Interp::load_module`) the spec folded into row
+  (g) — also correctly gated (the impl gates MORE than the two promised)**; an `nm` tripwire proves a stub has 0
+  `compile_source`/tree-sitter symbols (full toolchain = 4). **12 tasks, subagent-driven** (fresh implementer +
+  independent opus reviewer per task; per-task SABOTAGE of every fail-closed path; whole-effort holistic).
+  **4-tier matrix** (rt-core **5.75 MB = 13.3%** of 43.3 MB .. rt-local 32% .. rt-net 47% .. rt-full 75.3%)
+  selected by the archive's own import facts through a **drift-tested module→feature table** (3 gates,
+  sabotage-proven; `closure_drift` made bidirectional in review). **Fail-closed supply chain:** an
+  ed25519-signed, version-locked release manifest (compiled-in pubkey, **no insecure env knob**; the signing
+  half rides a default-OFF `rt-release` feature — `nm`-proven absent from a stub), a content-addressed cache
+  that **re-hashes on load** (never trusts by path), a **5-rung resolution ladder** (`--stub` → cache → fetch →
+  dev-sibling → `current_exe`) where **integrity failures ABORT and only availability failures fall through** (a
+  tampered stub never recovers to a weaker rung). Reviewers SABOTAGE-proved every integrity gate (disable
+  signature/version-lock/re-hash → the matching refusal test fails). **Footer flags** (`reserved`→`flags`,
+  `FLAG_ZSTD`; `BUNDLE_FOOTER_VERSION` 1→2 only for compressed; `flags=0` byte-identical to pre-RT) power
+  **`--compress`** (zstd, bounded 512 MB decompress, exact-length). Plus un-rejected **`--target`** cross builds
+  (platform-independent payload — same bytes onto any stub; macOS sign-before-append means prebuilt darwin
+  stubs append cleanly with no host signing), **`--exact`** (local-cargo precise-feature stub, sign-before-cache
+  + content-addressed reuse), **`--oci`** (a deterministic, Docker-less OCI image tarball — hand-rolled USTAR +
+  the two-digest rule; musl-only/scratch; the reviewer validated a produced tarball with **skopeo + docker
+  load**), reproducible outputs (cross-flag double-build battery — every form bit-identical, sabotage-proven
+  non-vacuous), and **`--report-json`** (a schema-locked build report). **Recovered TWO crashed/cut-off
+  implementer agents** (T6 1st-attempt API crash → 2nd completed; T7 ended mid-verify → I verified+committed).
+  **Worktree hygiene:** the subagent-driven skill self-creates git worktrees; reclaimed 23 GB of stale ones,
+  then instructed implementers to commit directly. **Cross-task interactions verified compose** (`--compress
+  --oci --stub` byte-identical rebuild; `--stub`-onto-a-bundle overlay-stripped; the WARM compile cache
+  verified to never cache an RT `--native`/`--oci` artifact). **Spec-prose deltas (no recorded-semantics
+  change):** the §2.3(a) disk-recompile scenario is architecturally unreachable via `build --native` (the
+  archive embeds every static import; `load_file_module` resolves archive-first) — the gate is a defensive
+  backstop, string-proven in the stub, unchanged; the §13 grounding's "ASO v27" is stale (real 29, code +
+  `--rt-info` report 29). **FINAL gates all green:** clippy clean default/`--no-default-features`/`--features
+  rt-release`; full suite both configs; `native` 37/0 (rewritten `--target` pin); the five `rt_*` suites green
+  against a real stub; `vm_bench` spec/tw geomean ≥2× (RT touches no engine); `RT_SIZE_RESULTS.md` complete;
+  `docs_drift` green (bundles.md + cli.md, no new NAV — Gate 13). **Musl-feasibility spike** failed locally as
+  RT §12 predicted (no musl cross-linker on a macOS host) → validated at the first CI release run; narrow-
+  fallback recorded in the spec header + roadmap (never a silent absent artifact). **Recorded futures:** SBOM
+  for `--oci`, registry-push (`--push`), tree-walker-eval carve-out if Phase-0-material, musl-matrix narrowing.
 
 ## Execution order
 
