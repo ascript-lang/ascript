@@ -1,6 +1,7 @@
-//! SP12 `std/telemetry` capture-mode tests. Run with `--features telemetry`
-//! (the feature is not in `default`, so the whole file is `#[cfg]`-gated and is
-//! empty/compiles-clean in the default config). No socket, no secret: telemetry
+//! SP12 `std/telemetry` capture-mode tests. The `telemetry` feature is in
+//! `default`, so these run in the default config; the whole file is
+//! `#[cfg(feature = "telemetry")]`-gated and is empty/compiles-clean only under
+//! `--no-default-features` (or any build dropping the feature). No socket, no secret: telemetry
 //! runs in capture mode and the recorded exporter HTTP payloads are read back via
 //! `interp.telemetry_capture()`.
 
@@ -22,6 +23,15 @@ async fn run(src: &str) -> (String, Vec<ascript::CapturedRequest>) {
 /// `telemetry_spans_debug()` (buffered spans) or `telemetry_capture()`.
 async fn run_i(src: &str) -> (String, Rc<ascript::interp::Interp>) {
     run_source_with_interp(src)
+        .await
+        .expect("program should run")
+}
+
+/// RESIL Gate-14 fix #1: run `.as` source on the SPECIALIZED VM, returning (stdout,
+/// owning interp). Used to prove a VM-mode async-fn body's spans parent correctly —
+/// the spawn-site `telemetry_scope` wrap the VM previously lacked.
+async fn run_vm_i(src: &str) -> (String, Rc<ascript::interp::Interp>) {
+    ascript::vm_run_source_with_interp(src)
         .await
         .expect("program should run")
 }
@@ -169,6 +179,38 @@ await telemetry.span("outer", async () => {{
     let inner = spans.iter().find(|s| s.name == "inner").expect("inner");
     assert_eq!(inner.trace_id, outer.trace_id, "same trace");
     assert_eq!(inner.parent_id.as_deref(), Some(outer.span_id.as_str()), "inner parents to outer");
+}
+
+/// RESIL Gate-14 fix #1 (VM-mode span lineage). The VM async-closure / static-async
+/// spawn sites previously LACKED the `telemetry_scope` wrap the tree-walker's async
+/// arms have — so a span opened INSIDE a VM-mode spawned async-fn body did NOT
+/// parent to the spawning task's current span. This runs ON THE VM: the body of
+/// `telemetry.span("outer", …)` calls a top-level `async fn inner_work()` (a real
+/// VM spawn_local), and that spawned body opens "inner". With the wrap, "inner"
+/// parents to "outer" — exactly as the tree-walker does (asserted above).
+#[tokio::test]
+async fn vm_async_fn_body_span_parents_to_scoped_span() {
+    let (_out, interp) = run_vm_i(&format!(
+        r#"{INIT}
+async fn inner_work() {{
+  let inner = telemetry.startSpan("inner")
+  inner.end()
+}}
+await telemetry.span("outer", async () => {{
+  await inner_work()   // a VM spawn_local; its body must inherit "outer" as current
+}})
+"#
+    ))
+    .await;
+    let spans = interp.telemetry_spans_debug();
+    let outer = spans.iter().find(|s| s.name == "outer").expect("outer");
+    let inner = spans.iter().find(|s| s.name == "inner").expect("inner");
+    assert_eq!(inner.trace_id, outer.trace_id, "same trace (VM mode)");
+    assert_eq!(
+        inner.parent_id.as_deref(),
+        Some(outer.span_id.as_str()),
+        "VM-mode inner parents to outer (Gate-14 fix #1)"
+    );
 }
 
 #[tokio::test]

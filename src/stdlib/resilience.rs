@@ -76,6 +76,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("fallback", super::bi("resilience.fallback")),
         ("singleflight", super::bi("resilience.singleflight")),
         ("memoize", super::bi("resilience.memoize")),
+        ("deadline", super::bi("resilience.deadline")),
+        ("deadlineRemaining", super::bi("resilience.deadlineRemaining")),
     ]
 }
 
@@ -2239,6 +2241,119 @@ fn memoize_bump(recv: &Value, field: &str) {
     }
 }
 
+// ── Interp::call_deadline (§5.2) ─────────────────────────────────────────────
+
+impl Interp {
+    /// `resilience.deadline(ms, fn)` — establish a deadline budget on the current
+    /// task's ambient locals ([`crate::interp::TASK_LOCALS`]) for the duration of
+    /// `fn`, then restore the previous locals.
+    ///
+    /// **Nesting only SHRINKS** (§5.2): the effective deadline is
+    /// `min(existing, now + ms)` — a callee never extends its caller's budget. The
+    /// new locals are a COW [`crate::interp::TaskLocals`] `Rc` (the existing
+    /// `trace_id` is carried forward).
+    ///
+    /// **save → set → run → restore**, restore on ALL exits (incl. a panic): the
+    /// callback runs via `call_value`, which returns a `Result` (a Tier-2 panic is
+    /// `Err(Control::Panic)`, never a host unwind), so the restore line always
+    /// executes before the outcome is inspected.
+    ///
+    /// **Task 4.1 scope (set/restore only):** this task establishes the budget and
+    /// inheritance; it does NOT race a timer against the body (the enforcement race —
+    /// cancelling the body when the deadline elapses — and the immediate
+    /// expired-on-entry refusal are **Task 4.2**, deliberately deferred here). `ms`
+    /// must be a finite number (Tier-2 panic otherwise).
+    async fn call_deadline(
+        &self,
+        ms: Value,
+        user_fn: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::interp::{make_pair, result_pair_err, TaskLocals, TASK_LOCALS};
+        use crate::stdlib::time::real_monotonic_ms;
+        use std::rc::Rc;
+
+        // ── Validate `ms` (Tier-2 on non-number / non-finite) ─────────────────
+        let ms = match ms.as_f64() {
+            Some(n) if n.is_finite() => n,
+            Some(_) => {
+                return Err(AsError::at(
+                    "resilience.deadline: 'ms' must be a finite number",
+                    span,
+                )
+                .into())
+            }
+            None => {
+                return Err(AsError::at(
+                    format!(
+                        "resilience.deadline: 'ms' must be a number, got {}",
+                        crate::interp::type_name(&ms)
+                    ),
+                    span,
+                )
+                .into())
+            }
+        };
+
+        // ── Compute the effective (shrunk) deadline + build the COW locals ────
+        let now = self.clock_monotonic_ms(real_monotonic_ms());
+        let new_at = now + ms;
+        // Snapshot the current locals to compute the shrink + carry the trace id.
+        let prev = crate::interp::task_locals_current();
+        let effective_at = match prev.as_ref().and_then(|l| l.deadline_at_ms) {
+            // Nested: a callee's deadline can only SHRINK the caller's budget.
+            Some(existing) => existing.min(new_at),
+            None => new_at,
+        };
+        let carried_trace = prev.as_ref().and_then(|l| l.trace_id.clone());
+        let new_locals = Rc::new(TaskLocals {
+            deadline_at_ms: Some(effective_at),
+            trace_id: carried_trace,
+        });
+
+        // ── save → set (no borrow held across .await) ────────────────────────
+        // `replace` returns the previous cell value so we restore it after. If the
+        // task-local is somehow not in scope (`try_with` errs), fall back to running
+        // the body without a deadline — never panic the host.
+        let restore: Option<Option<Rc<TaskLocals>>> = TASK_LOCALS
+            .try_with(|c| c.replace(Some(new_locals)))
+            .ok();
+
+        // ── run the callback (drives a returned future) ──────────────────────
+        let raw = self.call_value(user_fn, vec![], span).await;
+        let outcome: Result<Value, Control> = match raw {
+            Ok(v) => match v.kind() {
+                crate::value::ValueKind::Future(_) => {
+                    let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                        unreachable!()
+                    };
+                    f.get().await
+                }
+                _ => Ok(v),
+            },
+            other => other,
+        };
+
+        // ── restore on ALL exits (incl. panic, captured as Err above) ─────────
+        if let Some(old) = restore {
+            let _ = TASK_LOCALS.try_with(|c| c.set(old));
+        }
+
+        // ── normalize to a `[value, err]` pair (matches `fallback`/the breaker) ─
+        match outcome {
+            Err(e) => Err(e),
+            Ok(v) => {
+                if result_pair_err(&v).is_some() {
+                    // Already an err-pair (or a normalized result pair) — pass through.
+                    Ok(v)
+                } else {
+                    Ok(make_pair(v, Value::nil()))
+                }
+            }
+        }
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -2286,6 +2401,15 @@ impl Interp {
                 let opts = arg(args, 0);
                 self.make_memoize(opts, span)
             }
+            "deadline" => {
+                let ms = arg(args, 0);
+                let user_fn = arg(args, 1);
+                self.call_deadline(ms, user_fn, span).await
+            }
+            "deadlineRemaining" => Ok(match self.deadline_remaining_ms() {
+                Some(ms) => Value::float(ms),
+                None => Value::nil(),
+            }),
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
                 span,
@@ -3661,5 +3785,98 @@ let cache = resilience.memoize({ max: 0 })
                 );
             }
         }
+    }
+
+    // ── Task 4.1: resilience.deadline / deadlineRemaining (§5.1–§5.3) ──────────
+
+    /// The deadline local is captured at the spawn site so a child async fn spawned
+    /// WHILE the deadline is set inherits it; restored to nil at top level after.
+    /// Exercises the spawn-site capture wrap (the critical seam).
+    #[tokio::test]
+    async fn deadline_local_inherited_by_spawned_async_fn() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+async fn child() { return resilience.deadlineRemaining() != nil }
+let [v, err] = resilience.deadline(60000, async () => {
+    let f = child()              // spawned WHILE the deadline local is set
+    return await f
+})
+print(v)
+print(resilience.deadlineRemaining())   // restored: nil at top level
+"#)
+        .await;
+        assert_eq!(out, "true\nnil\n");
+    }
+
+    /// deadlineRemaining() is nil when no deadline is set.
+    #[tokio::test]
+    async fn deadline_remaining_nil_outside_deadline() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+print(resilience.deadlineRemaining())
+"#)
+        .await;
+        assert_eq!(out, "nil\n");
+    }
+
+    /// A panicking deadline body still restores the previous locals: after a
+    /// recover()-caught panic, deadlineRemaining() is nil at top level.
+    #[tokio::test]
+    async fn deadline_restores_on_panic() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let [v, err] = recover(() => resilience.deadline(60000, () => { assert(false, "boom") }))
+print(resilience.deadlineRemaining())   // restored even though the body panicked
+"#)
+        .await;
+        assert_eq!(out, "nil\n");
+    }
+
+    /// Nested deadlines only SHRINK: an inner deadline(120000) inside an outer
+    /// deadline(60000) sees the SHRUNK budget (≤ outer), never the larger 120000.
+    #[tokio::test]
+    async fn deadline_nesting_only_shrinks() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let observed = [0.0]
+resilience.deadline(60000, () => {
+    resilience.deadline(120000, () => {
+        // inner budget must be the SHRUNK one (<= 60000), not 120000
+        observed[0] = resilience.deadlineRemaining()
+        return nil
+    })
+    return nil
+})
+print(observed[0] <= 60000)
+"#)
+        .await;
+        assert_eq!(out, "true\n");
+    }
+
+    /// deadline returns a `[value, nil]` ok-pair on a plain-value body.
+    #[tokio::test]
+    async fn deadline_wraps_plain_value_as_ok_pair() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let [v, err] = resilience.deadline(1000, () => 42)
+print(v)
+print(err)
+"#)
+        .await;
+        assert_eq!(out, "42\nnil\n");
+    }
+
+    /// A non-number `ms` is a Tier-2 panic.
+    #[tokio::test]
+    async fn deadline_non_number_ms_panics() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+resilience.deadline("nope", () => 1)
+"#)
+        .await;
+        assert!(
+            res.is_err() || res.unwrap().contains("ms"),
+            "expected a panic about ms"
+        );
     }
 }

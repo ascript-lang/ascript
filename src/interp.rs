@@ -110,6 +110,78 @@ pub(crate) fn merge_defer_panic(pending: &mut Result<Value, Control>, new: AsErr
     }
 }
 
+/// RESIL §5: the current task's ambient locals (deadline, trace id). An immutable,
+/// `Rc`-shared record: setting a value builds a NEW `Rc` (copy-on-write), so a child
+/// task captured at spawn time is forever isolated from the parent's later scopes.
+pub(crate) struct TaskLocals {
+    /// Absolute monotonic deadline (ms, the `clock_monotonic_ms` domain), if any.
+    pub deadline_at_ms: Option<f64>,
+    /// Ambient trace/request id, if any.
+    pub trace_id: Option<Rc<str>>,
+}
+
+tokio::task_local! {
+    /// RESIL §5.1: the CURRENT task's ambient locals (deadline budget, trace id). A
+    /// tokio task-local (NOT a shared cell) so concurrent `spawn_local` tasks each
+    /// have their OWN locals — a deadline set in one task can never leak into an
+    /// unrelated concurrent task. It survives `.await` within a task and is isolated
+    /// across tasks.
+    ///
+    /// **CORE, NOT feature-gated** (engine infrastructure, like [`SpanStatus`]): the
+    /// seam compiles under `--no-default-features`. The cell holds an
+    /// `Option<Rc<TaskLocals>>` (COPY-ON-WRITE — each `deadline`/`withTrace` builds a
+    /// fresh `Rc`), seeded at every entry point (`ambient_root_scope`) and re-seeded
+    /// at every user-code async-fn/method/static spawn site (capturing the spawning
+    /// task's current `Rc`), so a child task spawned WHILE a deadline is set inherits
+    /// it — but is isolated from the parent's LATER scope mutations.
+    ///
+    /// **Zero-cost when unset:** consulting it is `try_with(|c| c.get())` → `None`
+    /// fast (a TLS lookup + `Cell` read; the `Rc` is cloned only on `Some`). No probe
+    /// runs work on the `None` path.
+    ///
+    /// **NOT wrapped** at these spawn sites (per spec §5.1): `task_mod.rs`
+    /// race-resolver tasks (only await existing futures, no user code); worker
+    /// isolates (locals do NOT cross the airlock — a worker body starts with EMPTY
+    /// locals, honest + documented); generators (`coro.rs` bodies are lazily polled
+    /// INSIDE the resuming caller's task → `gen.next()` sees the resumer's current
+    /// locals ambiently — resume-time semantics, correct for deadlines); http_server
+    /// connection tasks (each request starts fresh by design); internal bridges
+    /// (actor reply, postgres driver, etc. — no user code).
+    pub(crate) static TASK_LOCALS: std::cell::Cell<Option<Rc<TaskLocals>>>;
+}
+
+/// RESIL §5.1: capture the current task's ambient locals (for propagation into a
+/// spawned task). `None` if unset (e.g. no deadline) — one refcount bump on `Some`,
+/// zero cost on `None`. Consulted at every user-code async spawn site.
+pub(crate) fn task_locals_capture() -> Option<Rc<TaskLocals>> {
+    TASK_LOCALS.try_with(|c| {
+        // Clone the `Rc` out, then put it back (the `Cell` requires take-or-replace).
+        let cur = c.take();
+        let out = cur.clone();
+        c.set(cur);
+        out
+    })
+    .ok()
+    .flatten()
+}
+
+/// RESIL §5.1: the current task's ambient locals, if any (a clone of the `Rc`).
+/// Alias of [`task_locals_capture`] — named for the 4.3 reader call sites.
+pub(crate) fn task_locals_current() -> Option<Rc<TaskLocals>> {
+    task_locals_capture()
+}
+
+/// RESIL §5.1: run `fut` within a fresh [`TASK_LOCALS`] scope seeded with `parent`
+/// (the spawning task's current locals, captured at spawn time). Used at the
+/// user-code async-fn/method/static spawn sites so the captured locals flow into the
+/// spawned body.
+pub(crate) async fn task_locals_scope<F, T>(parent: Option<Rc<TaskLocals>>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TASK_LOCALS.scope(std::cell::Cell::new(parent), fut).await
+}
+
 #[cfg(feature = "telemetry")]
 tokio::task_local! {
     /// SP12: the CURRENT telemetry span context for THIS async task. A tokio
@@ -143,22 +215,29 @@ where
         .await
 }
 
-/// Root-scope variant for the entry points (`run_file*`, `run_source*`, repl,
-/// `run_tests`) that aren't feature-gated. With the `telemetry` feature ON it
-/// establishes the root [`TELEMETRY_CURRENT`] scope (no parent); with it OFF it
-/// is the identity, so non-telemetry builds pay nothing.
-pub async fn telemetry_root_scope<F, T>(fut: F) -> T
+/// Root ambient-scope for the entry points (`run_file*`, `run_source*`, repl,
+/// `run_tests`). Establishes BOTH the root [`TASK_LOCALS`] scope (ALWAYS — core, so
+/// `try_with` never errs on the main task) AND, when the `telemetry` feature is on,
+/// the root [`TELEMETRY_CURRENT`] scope (no parent). With telemetry OFF the telemetry
+/// half is the identity, so non-telemetry builds pay only the (cheap) TASK_LOCALS
+/// scope. RESIL §5.1 renamed this from `telemetry_root_scope`.
+pub async fn ambient_root_scope<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    #[cfg(feature = "telemetry")]
-    {
-        telemetry_scope(None, fut).await
-    }
-    #[cfg(not(feature = "telemetry"))]
-    {
-        fut.await
-    }
+    // RESIL §5.1: always establish the root TASK_LOCALS scope (core), so every entry
+    // point has the cell in scope — `task_locals_capture()`'s `try_with` never errs.
+    task_locals_scope(None, async move {
+        #[cfg(feature = "telemetry")]
+        {
+            telemetry_scope(None, fut).await
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            fut.await
+        }
+    })
+    .await
 }
 
 /// Capture the current task's telemetry span context (for propagation into a
@@ -1596,6 +1675,16 @@ impl Interp {
             Some(ctx) => ctx.clock_monotonic_ms(),
             None => real_value,
         }
+    }
+
+    /// RESIL §5.2: the remaining deadline budget in ms (≥ 0), or `None` when no
+    /// deadline is set on the current task's [`TASK_LOCALS`]. `now` is the det-routed
+    /// monotonic clock so it agrees with how the deadline was computed. Zero-cost when
+    /// unset (a `try_with` → `None` short-circuits before any clock read).
+    pub(crate) fn deadline_remaining_ms(&self) -> Option<f64> {
+        let at = task_locals_current().and_then(|l| l.deadline_at_ms)?;
+        let now = self.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+        Some((at - now).max(0.0))
     }
 
     /// The next seeded `[0,1)` random value when deterministic, or `None` when not
@@ -5931,19 +6020,18 @@ impl Interp {
             // inherits the correct parent lineage (per-task isolation, spec §9.3).
             #[cfg(feature = "telemetry")]
             let telem_parent = crate::interp::telemetry_capture_current();
+            // RESIL §5.1: capture THIS task's ambient locals (deadline/trace) so the
+            // spawned body inherits them — COW-isolated from the parent's later scopes.
+            let locals_parent = crate::interp::task_locals_capture();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
                 // Async fns are excluded from ELIDE eligibility → always false.
+                let body = vm.run_function_body(func, args, call_env, span, what, false);
                 #[cfg(feature = "telemetry")]
-                let r = crate::interp::telemetry_scope(
-                    telem_parent,
-                    vm.run_function_body(func, args, call_env, span, what, false),
-                )
-                .await;
-                #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_function_body(func, args, call_env, span, what, false).await;
+                let body = crate::interp::telemetry_scope(telem_parent, body);
+                let r = crate::interp::task_locals_scope(locals_parent, body).await;
                 cell.resolve(r);
             });
             // Cancel-on-drop: dropping the last handle aborts this task.
@@ -6521,18 +6609,16 @@ impl Interp {
             let guard = self.inflight_guard();
             #[cfg(feature = "telemetry")]
             let telem_parent = crate::interp::telemetry_capture_current();
+            // RESIL §5.1: inherit the spawning task's ambient locals (deadline/trace).
+            let locals_parent = crate::interp::task_locals_capture();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
                 // `run_method_body`'s frame, so nothing escapes the `'static` task.
+                let body = vm.run_method_body(method, args, call_env, span, name);
                 #[cfg(feature = "telemetry")]
-                let r = crate::interp::telemetry_scope(
-                    telem_parent,
-                    vm.run_method_body(method, args, call_env, span, name),
-                )
-                .await;
-                #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_method_body(method, args, call_env, span, name).await;
+                let body = crate::interp::telemetry_scope(telem_parent, body);
+                let r = crate::interp::task_locals_scope(locals_parent, body).await;
                 cell.resolve(r);
             });
             fut.set_abort(handle.abort_handle());
@@ -6596,16 +6682,14 @@ impl Interp {
             let guard = self.inflight_guard();
             #[cfg(feature = "telemetry")]
             let telem_parent = crate::interp::telemetry_capture_current();
+            // RESIL §5.1: inherit the spawning task's ambient locals (deadline/trace).
+            let locals_parent = crate::interp::task_locals_capture();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                let body = vm.run_method_body(m, args, call_env, span, what);
                 #[cfg(feature = "telemetry")]
-                let r = crate::interp::telemetry_scope(
-                    telem_parent,
-                    vm.run_method_body(m, args, call_env, span, what),
-                )
-                .await;
-                #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_method_body(m, args, call_env, span, what).await;
+                let body = crate::interp::telemetry_scope(telem_parent, body);
+                let r = crate::interp::task_locals_scope(locals_parent, body).await;
                 cell.resolve(r);
             });
             fut.set_abort(handle.abort_handle());

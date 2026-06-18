@@ -4,8 +4,9 @@
 //! envelopes, PostHog capture) over the pooled `reqwest::Client` in `net_http.rs`.
 //!
 //! Telemetry is **opt-in at runtime** — a no-op until `telemetry.init(...)` runs —
-//! and **opt-in at build** (the `telemetry` Cargo feature, not in `default`). State
-//! is an `Interp`-stateful singleton (mirroring `std/log`): the configured pipeline
+//! and gated behind the `telemetry` Cargo feature (which IS in the `default` set, so
+//! a plain `cargo build` includes it; `--no-default-features` drops it cleanly).
+//! State is an `Interp`-stateful singleton (mirroring `std/log`): the configured pipeline
 //! lives behind interior-mutability cells and emits to the network (live) or to a
 //! capture buffer (tests, `Interp::telemetry_capture()`).
 //!
@@ -764,7 +765,7 @@ telemetry.init({ service: "hook-test", exporters: [ telemetry.otlp({ endpoint: "
         let interp = active_interp().await;
         // The task-local current is per-task: set/restore round-trips inside a
         // telemetry scope (mirrors `telemetry.span`'s save → set → restore).
-        crate::interp::telemetry_root_scope(async {
+        crate::interp::ambient_root_scope(async {
             assert!(interp.telemetry_current().is_none());
             let prev = interp.telemetry_set_current(Some(SpanCtx {
                 resource_id: 7,
