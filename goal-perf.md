@@ -308,7 +308,7 @@ stated, results are measured.
   resilience wired). Depends on RT (images) and RESIL (template policies).
   - Spec: `superpowers/specs/2026-06-12-containers-docker-design.md` · Plan: `superpowers/plans/2026-06-12-containers-docker.md`
 
-- 🔒 **RESIL — `std/resilience` for backend hosting.** Composable per-isolate policies:
+- ✅ **RESIL — `std/resilience` for backend hosting. MERGED to `main` (`--no-ff`). See EXECUTION LOG.** Composable per-isolate policies:
   circuit breaker, keyed token-bucket rate limiter, bulkhead + load shedding, retry v2
   (backoff + jitter + budgets), fallback, policy composition; **singleflight** +
   stampede-protected memoization (composing `std/lru`); **deadline propagation** via the
@@ -810,6 +810,42 @@ stated, results are measured.
   RT §12 predicted (no musl cross-linker on a macOS host) → validated at the first CI release run; narrow-
   fallback recorded in the spec header + roadmap (never a silent absent artifact). **Recorded futures:** SBOM
   for `--oci`, registry-push (`--push`), tree-walker-eval carve-out if Phase-0-material, musl-matrix narrowing.
+- **RESIL** — ✅ **MERGED to `main` (`--no-ff`, `b3fec2d`)** from `feat/resilience-stdlib`. `std/resilience` —
+  composable per-isolate backend policies (`resilience` feature, default-on). **NO `.aso`/opcode/grammar change**
+  (`ASO_FORMAT_VERSION` 29 unchanged); `vm_differential` **445/0 BOTH feature configs** every step. Six policy kinds
+  (breaker/limiter/keyedLimiter/bulkhead/retry/memoize) as **tagged Objects** routed through a **call-position-only
+  hook** mirroring `std/schema` (hook ladder: schema FIRST then resilience — disjoint tags+method sets, pinned);
+  module fns fallback/singleflight/deadline/withTrace/metricsHandler/health/handler. Substrates reused not rebuilt
+  (breaker ring + `sync.semaphore` + `std/lru` + `SharedFuture`). **THE engine seam = `TASK_LOCALS`** (CORE
+  `tokio::task_local!`, NOT feature-gated): copy-on-spawn at the **5 user-code async spawn sites** + `ambient_root_
+  scope` (renamed from `telemetry_root_scope`) at EVERY entry point. Zero-cost when unused — every consult is one
+  TLS `try_with` → `None` fast; the §5.4 deadline-aware I/O sites + limiter/bulkhead parks all take the `None`
+  branch unchanged. Time via det-routed `clock_monotonic_ms` → Record/Replay verdicts replay byte-identically (§8
+  probe `tests/resil_determinism_probe.rs`); the enforcement sleep is timing-only. Per-isolate honesty (§7): N
+  workers = N copies, `__local` marker = loud field-path panic on a worker boundary, actor pattern for global state.
+  Always-on per-isolate metrics registry + `#[cfg(telemetry)]` mirror + `#[cfg(log)]` breaker breadcrumb;
+  `metricsHandler`/`health`/`handler` are `NativeKind::Resilience` `NativeMethod`s (Prometheus 0.0.4; 429/503/504
+  map; `required_cap`=`None` → serve under `--sandbox`). **6 phases, subagent-driven** (fresh implementer +
+  independent opus reviewer per phase + a final holistic). **Reviews caught & fixed 2 real four-mode/integration
+  gaps:** the CLI tree-walker module load (`lib.rs`) lacked `ambient_root_scope` → `deadline` silently no-op'd vs the
+  VM (CRITICAL, fixed + `tests/cli.rs` regression); each http connection task lacked the scope → `handler({deadlineMs})`
+  no-op'd in-server (fixed + `/slow`+`/slowasync` 504 e2e proofs). **Two Gate-14 carry-forward fixes landed:** the VM
+  async-spawn sites previously lacked the `telemetry_scope` wrap the tree-walker had (span lineage now matches;
+  regression in `tests/telemetry.rs`), and a stale telemetry doc-comment. **Corrected a misdiagnosis:** the alleged
+  "module-call-in-native-async-closure" gap was just `task.sleep` not existing (the sleep fn is `time.sleep`) — the
+  async deadline RACE works fully on both engines, proven in-server (`/slowasync` deadlineMs:50 over an 800 ms body
+  → 504). `task.retry` gained v2 keys (additive, v1 bit-identical, Phase-0 pins green). **Zero-cost gate**
+  (`bench/RESILIENCE_RESULTS.md`, same-session cross-binary vs the `11a5d7d` merge-base): worst-case 1M-empty-spawn
+  microbench **1.024× wall** (within the 1.05× DBG bound; ~80 ns/spawn user CPU, unmeasurable on real work), RSS
+  flat 1.011×; in-process compute-floor spec/tw geomean **5.32× ≥ 2×**; DBG/LANE/DECODE gates unperturbed.
+  **FINAL gates all green:** clippy clean default/`--no-default-features`/`--features resilience`; full suite both
+  configs (4527/0); `vm_differential` 445/0 both; examples `examples/resilience.as` + `examples/advanced/resilient_
+  gateway.as` four-mode byte-identical, fmt-idempotent, check 0-diag (in-corpus, goldens); `resil_negative_space`
+  (ASO-29 + no-opcode + hook-order + OptMember + retry-v1 pins); `docs_drift` green (resilience.md + NAV). Examples
+  honesty: the bulkhead-SHED demo is concurrency-driven (`spawn(async () => bh.run())` hangs under the live CLI —
+  M17 spawn-driving; shed is server-tested in `resil_handler_server`). **Recorded follow-up:** redis deadline-mid-op
+  abandon may reuse a connection that ideally should be discarded (honestly documented at `src/stdlib/redis.rs`;
+  low-risk, narrow window). Parked per spec: hedged requests, AIMD adaptive concurrency, `std/k8s`.
 
 ## Execution order
 
