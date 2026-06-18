@@ -86,6 +86,29 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         // PAR (spec §2.1): pmap(data, f, opts?) min 2; preduce(data, f, init, opts?) min 3.
         ("std/task", "pmap") => 2,
         ("std/task", "preduce") => 3,
+        // RESIL (spec §2.1): constructors that REQUIRE an options object (their opts
+        // arg is positional; calling with 0 args passes nil, which panics inside the
+        // constructor because a required field is missing).
+        //
+        // - `limiter`/`keyedLimiter`: require `capacity` and `refillPerSec` in opts →
+        //   nil/absent opts → panic.  min = 1 (one opts object required).
+        // - `bulkhead`: requires `limit` in opts → nil opts → panic.  min = 1.
+        //
+        // Constructors that TOLERATE nil/absent opts (all fields have defaults) are
+        // deliberately OMITTED (min = 0 would flag nothing → no value in the table):
+        //   `breaker`, `retry`, `memoize` — nil opts → all-defaults, no panic.
+        //
+        // Non-constructor free functions that require ≥ 2 positional args:
+        //   `fallback(fn, fallback_fn)`, `singleflight(key, fn)`,
+        //   `deadline(ms, fn)`, `withTrace(id, fn)`, `handler(policies, fn)` — min 2.
+        ("std/resilience", "limiter") => 1,
+        ("std/resilience", "keyedLimiter") => 1,
+        ("std/resilience", "bulkhead") => 1,
+        ("std/resilience", "fallback") => 2,
+        ("std/resilience", "singleflight") => 2,
+        ("std/resilience", "deadline") => 2,
+        ("std/resilience", "withTrace") => 2,
+        ("std/resilience", "handler") => 2,
         // std/string — NUM code-point helpers (fixed required arity).
         ("std/string", "codepoints") => 1,
         ("std/string", "from_codepoints") => 1,
@@ -174,6 +197,25 @@ mod tests {
             #[cfg(feature = "data")]
             ("std/assert", "matches"),
             ("std/assert", "throwsWith"),
+            // RESIL: resilience-gated exports. Keyed unconditionally in the curated
+            // table (the checker builds under any feature config), but only
+            // export-cross-checkable when the `resilience` feature is built.
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "limiter"),
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "keyedLimiter"),
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "bulkhead"),
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "fallback"),
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "singleflight"),
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "deadline"),
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "withTrace"),
+            #[cfg(feature = "resilience")]
+            ("std/resilience", "handler"),
         ];
         // FFI handle METHODS (resolved on a `ForeignLib`/`ForeignSymbol` handle, not
         // module-level exports). Keyed in `required_args` so `call-arity` can reach

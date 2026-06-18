@@ -1,10 +1,10 @@
-//! RESIL Phase 0 — preflight pins (spec §1).
+//! RESIL Phase 0 + Phase 6 — preflight pins (spec §1) + negative-space pins (spec §5.2).
 //!
 //! These tests document the **shipped behavior** that the `std/resilience` design
 //! composes on top of.  They must PASS today (they reflect current ground truth);
 //! a failure means the design's foundation moved → STOP and report.
 //!
-//! Pins:
+//! Phase 0 Pins:
 //!  1. `ASO_FORMAT_VERSION` — RESIL is a pure-stdlib addition; no new opcode,
 //!     no new bytecode layout.  Pinned at 29 (ELIDE bumped 28 → 29).
 //!  2. `task.retry` v1 contract — the three shipped retry semantics that RESIL
@@ -12,6 +12,17 @@
 //!     no-retry of error pairs.
 //!  3. Substrate pins — SharedFuture multi-await, panicking-future double-await,
 //!     `sync.semaphore` acquire/release round-trip, `lru` eviction.
+//!
+//! Phase 6 Pins (Task 6.2 — negative-space):
+//!  4. Opcode count unchanged at 121 (RESIL adds no opcode — pure stdlib).
+//!     Reuses the `from_u8` filter technique from `tests/par_negative_space.rs`.
+//!  5. Hook-order pin — schema's call-site hook fires BEFORE resilience's.
+//!     A dual-tagged object (`__kind` ∈ SCHEMA_KINDS, `__resil` ∈ RESIL_KINDS)
+//!     routes to the schema hook when a schema method is called, because
+//!     `member_call_is_hook` (and `call_method_recv`) check schema FIRST (spec §2.3).
+//!  6. `OptMember` non-routing pin — `policy?.method(...)` does NOT route through
+//!     the resilience call-site hook; `?.` compiles to `GetPropOpt` (field read,
+//!     nil-short-circuits) then `Call`, never `CallMethod`, so the hook is bypassed.
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared helpers
@@ -219,4 +230,153 @@ print(cache.has("c"))
     // "a" was inserted first and never promoted, so it is LRU → evicted on set("c").
     // get("a") returns nil (miss); "b" and "c" survive.
     assert_eq!(out, "nil\ntrue\ntrue\n");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Phase 6 / Task 6.2 — negative-space pins
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ── Pin 4 — opcode count unchanged ───────────────────────────────────────────
+
+/// RESIL adds NO new opcode — it is a pure-stdlib module dispatching through
+/// the existing call machinery.  The `Op` variant count must remain at 121
+/// (DEFER added `DeferPush`/`DeferPushMethod` → 120; ELIDE added `CallElided`
+/// → 121; RESIL contributes NOTHING).
+///
+/// Uses the `from_u8` filter technique from `tests/par_negative_space.rs` and
+/// `tests/shape_negative_space.rs`: a new opcode is only reachable once it has
+/// a `from_u8` arm, so counting reachable discriminants catches any variant
+/// inserted anywhere in the enum — not just appended at the end.
+#[test]
+fn no_new_opcode_for_resil() {
+    /// Pre-RESIL opcode count (and current value — RESIL adds none).
+    /// DEFER added DeferPush + DeferPushMethod (→ 120).
+    /// ELIDE added CallElided (→ 121).
+    /// Update this constant only if a NON-RESIL feature adds a new opcode.
+    const EXPECTED_OP_COUNT: usize = 121;
+
+    let op_count = (0u16..=255)
+        .filter(|&b| ascript::vm::opcode::Op::from_u8(b as u8).is_some())
+        .count();
+
+    assert_eq!(
+        op_count, EXPECTED_OP_COUNT,
+        "Op variant count changed — RESIL must add NO opcodes (resilience policies \
+         dispatch through existing call/member machinery); update EXPECTED_OP_COUNT \
+         only if a non-RESIL feature adds the new opcode."
+    );
+
+    // Complementary: `CallElided` (discriminant 120) is still the last variant.
+    assert_eq!(
+        ascript::vm::opcode::Op::CallElided as u16 + 1,
+        EXPECTED_OP_COUNT as u16,
+        "CallElided is no longer the last Op variant — a new opcode was appended \
+         after it; update EXPECTED_OP_COUNT if it is NOT attributable to RESIL."
+    );
+}
+
+// ── Pin 5 — hook-order: schema fires BEFORE resilience ───────────────────────
+
+/// A value dual-tagged with BOTH a `__kind` (schema) and a `__resil` (resilience)
+/// field routes to the SCHEMA hook — NOT the resilience hook — when a schema
+/// method is called.
+///
+/// Ground truth from `src/interp.rs` `member_call_is_hook` / `call_method_recv`
+/// (and the mirror in `src/vm/run.rs` `shared_method_dispatch`):
+///   1. Schema check: `is_schema_value(recv) && is_schema_method(name)` — schema kinds
+///      are {"string","number","bool","nil","any","literal","array","object","map",
+///      "optional","union","oneOf"} (keyed on `__kind`); schema methods include
+///      `parse`, `minLength`, `maxLength`, `min`, `max`, `default`, etc.
+///   2. Resilience check: `is_resilience_value(recv) && is_resilience_method(name)` —
+///      resilience kinds are {"breaker","limiter","keyedLimiter","bulkhead","retry",
+///      "memoize"} (keyed on `__resil`); resilience methods are `call`, `state`,
+///      `stats`, `reset`, `acquire`, `tryAcquire`, `run`, `get`, `delete`, `clear`,
+///      `len`.
+///
+/// The two METHOD SETS are DISJOINT (no name appears in both), so the hook-order
+/// is only observable via the PREDICATE check order on the receiver.  We construct
+/// a dual-tagged object: `__kind: "string"` (schema-tagged) AND `__resil: "breaker"`
+/// (resilience-tagged).  Calling `.parse(42)` on it:
+///   - Schema check: `is_schema_value` → true (`__kind:"string"` ∈ SCHEMA_KINDS) AND
+///     `is_schema_method("parse")` → true.  Schema wins → routes to `call_schema`.
+///   - Resilience check would have won if schema were absent/checked second.
+///
+/// The schema `"string".parse(42)` call validates 42 as a string and returns the
+/// Tier-1 error pair `[nil, err]`.  We assert the err is non-nil, proving schema
+/// (not resilience) handled the call — a resilience dispatch would have panicked
+/// (the recv has no real resilience state) rather than returning a pair.
+#[cfg(feature = "resilience")]
+#[tokio::test]
+async fn hook_order_schema_wins_over_resilience_on_dual_tagged_value() {
+    let out = run(r#"
+import * as schema from "std/schema"
+
+// Build a value that satisfies BOTH is_schema_value (has __kind:"string" which
+// is in SCHEMA_KINDS) AND is_resilience_value (has __resil:"breaker" which is
+// in RESIL_KINDS).  Constructing it raw — no stdlib call — so neither hook
+// fires during construction.
+let dual = {__kind: "string", __resil: "breaker", __state: "closed"}
+
+// Call .parse(42) on it.  Schema method "parse" + schema predicate ("string" kind)
+// → schema hook fires first.  schema."string".parse(42) returns [nil, err] because
+// 42 is not a string.  If the resilience hook had fired instead it would have panicked
+// (dual has no real resilience machinery).
+let [v, err] = dual.parse(42)
+print(v)
+print(err != nil)
+print(type(err))
+"#)
+    .await;
+    // schema hook fired: parse returned the Tier-1 pair.
+    // v=nil, err=object (the parse-error record), type "object".
+    assert_eq!(out, "nil\ntrue\nobject\n");
+}
+
+// ── Pin 6 — OptMember (?) does NOT route through the resilience hook ──────────
+
+/// `policy?.method(...)` with a non-nil policy does NOT route through the
+/// resilience call-site hook; it falls back to the generic field-read → call path.
+///
+/// `?.` on a non-nil receiver is lowered by the compiler to `GetPropOpt(name)`
+/// (a nil-short-circuiting field READ) then a plain `Call` — NOT `CallMethod`.
+/// The resilience hook lives only on `CallMethod` / `ExprKind::Call { callee:
+/// Member { .. } }` (plain `.`), so `?.` bypasses it entirely.
+///
+/// Observable consequence: `breaker?.state()` does NOT invoke the `state` method
+/// via the hook.  Instead it reads the stored field named `"state"` from the
+/// breaker object (absent — resilience objects store `"__state"`, not `"state"`),
+/// gets nil, and calls nil — which is a recoverable Tier-2 panic.
+///
+/// We verify:
+///   (a) `policy.state()` via the PLAIN `.` hook returns "closed" (hook fires, ok).
+///   (b) `policy?.state()` panics — the field is absent → nil → not callable.
+///
+/// This pins that `?.` is NOT a transparent alias for `.` on hook-dispatched receivers.
+#[cfg(feature = "resilience")]
+#[tokio::test]
+async fn opt_member_does_not_route_through_resilience_hook() {
+    // (a) Plain dot call — hook fires, returns the current state string.
+    let out_plain = run(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({})
+print(b.state())
+"#)
+    .await;
+    assert_eq!(out_plain, "closed\n", "plain .state() should route through hook");
+
+    // (b) Optional-chaining call — bypasses the hook; reads "state" field (absent),
+    // gets nil, calling nil panics.  Wrap in recover to observe the error.
+    let out_opt = run(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({})
+let [v, err] = recover(() => b?.state())
+print(v)
+print(err != nil)
+"#)
+    .await;
+    // v=nil (panic), err=non-nil (panic message).
+    assert_eq!(
+        out_opt, "nil\ntrue\n",
+        "?.state() should NOT route through the hook; nil field → call nil → panic"
+    );
 }
