@@ -752,6 +752,66 @@ stream.close()
         assert!(plain.check_unix_path("/anything", Span::new(0, 0)).is_ok());
     }
 
+    // ─── REVIEW PROBES (Task 2.2 adversarial) ──────────────────────────────────
+    // Canonicalization + no-substring-bug for the UDS net carve-out. These probe the
+    // two highest-risk spots: a non-canonical path that resolves to an allowed one
+    // must be ADMITTED, and a path that is merely a prefix/superstring of an allowed
+    // one must be DENIED.
+    fn probe_interp_with_allow(allow: Vec<String>) -> Interp {
+        use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+        let interp = Interp::new();
+        let mut cs = CapSet::all_granted();
+        cs.set_net_scope(NetScope { deny: NetDeny::All, allow });
+        interp.set_caps(cs);
+        interp
+    }
+
+    #[tokio::test]
+    async fn probe_noncanonical_path_canonicalizing_to_allowed_is_admitted() {
+        use crate::span::Span;
+        let dir = std::env::temp_dir().join(format!("ascript-probe-canon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("s.sock");
+        let real_str = real.to_str().unwrap().to_string();
+        let interp = Interp::new();
+        let canon_key = interp.unix_scope_key(&real_str);
+        let interp = probe_interp_with_allow(vec![canon_key.clone()]);
+        // <dir>/./s.sock — a noisy spelling of the same canonical path.
+        let noisy = format!("{}/./s.sock", dir.to_str().unwrap());
+        let r = interp.check_unix_path(&noisy, Span::new(0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            r.is_ok(),
+            "noisy path {noisy} canonicalizing to allowed {canon_key} must be admitted; got {r:?}"
+        );
+    }
+
+    #[test]
+    fn probe_prefix_of_allowed_path_is_denied() {
+        use crate::span::Span;
+        let interp = Interp::new();
+        let allowed_key = interp.unix_scope_key("/tmp/ascript-probe-px/app.sock");
+        let interp = probe_interp_with_allow(vec![allowed_key]);
+        let r = interp.check_unix_path("/tmp/ascript-probe-px/app.soc", Span::new(0, 0));
+        assert!(
+            matches!(r, Err(crate::interp::Control::Panic(_))),
+            "a prefix of an allowed path must be denied (no substring/prefix match); got {r:?}"
+        );
+    }
+
+    #[test]
+    fn probe_superstring_of_allowed_path_is_denied() {
+        use crate::span::Span;
+        let interp = Interp::new();
+        let allowed_key = interp.unix_scope_key("/tmp/ascript-probe-sx/app.sock");
+        let interp = probe_interp_with_allow(vec![allowed_key]);
+        let r = interp.check_unix_path("/tmp/ascript-probe-sx/evil/app.sock", Span::new(0, 0));
+        assert!(
+            matches!(r, Err(crate::interp::Control::Panic(_))),
+            "a path containing the allowed one as a suffix must be denied; got {r:?}"
+        );
+    }
+
     #[tokio::test]
     async fn allow_unix_carveout_admits_uds_end_to_end() {
         use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
