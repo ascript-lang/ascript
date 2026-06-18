@@ -1140,6 +1140,43 @@ mod cap_gate_tests {
             );
         }
     }
+
+    /// CNTR Phase-0 pin — `required_cap` verdicts for the resource-class keys that
+    /// `std/docker` will JOIN in Phase 1.
+    ///
+    /// Phase 1 adds `"docker" => Some(Cap::Net)` as a NEW entry.  This pin proves
+    /// the existing entries it sits beside (`net_tcp → Net`, `process → Process`)
+    /// are intact at branch creation, so the Phase-1 migration is purely additive.
+    ///
+    /// Real module keys confirmed by reading the `required_cap` match arms:
+    ///   `"net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server"
+    ///     => Some(Cap::Net)`
+    ///   `"process" => Some(Cap::Process)`
+    #[test]
+    fn cntr_required_cap_preflight_pins() {
+        // net_tcp → Net.  Docker daemon communicates over a Unix socket or TCP;
+        // Phase 1 gates `"docker"` the same way.
+        assert_eq!(
+            required_cap("net_tcp", "connect"),
+            Some(Cap::Net),
+            "required_cap(\"net_tcp\", \"connect\") pre-CNTR baseline must be Some(Net); \
+             CNTR Phase 1 adds \"docker\" to the same Net class"
+        );
+        // process → Process.  docker.exec / docker.run may use a child-process
+        // fallback; the existing process gate must be intact.
+        assert_eq!(
+            required_cap("process", "spawn"),
+            Some(Cap::Process),
+            "required_cap(\"process\", \"spawn\") pre-CNTR baseline must be Some(Process)"
+        );
+        // Sanity: "docker" is NOT yet registered (Phase 1 adds it).
+        assert_eq!(
+            required_cap("docker", "run"),
+            None,
+            "\"docker\" must not be in required_cap yet — Phase 1 will add it; \
+             if this fails, Phase 1 already landed or the name collides with something else"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "shared"))]

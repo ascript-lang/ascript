@@ -15555,4 +15555,48 @@ print("after-drop")
         let msg_true  = format!("{:?}", arity_err.err().unwrap());
         assert_eq!(msg_false, msg_true, "arity message must be identical regardless of elide_contracts");
     }
+
+    /// CNTR Phase-0 pin — `native_stream_method` registry baseline.
+    ///
+    /// `std/docker` will add log and event stream handles (`DockerLogStream`,
+    /// `DockerEventStream`) to the `native_stream_method` registry in Phase 1.
+    /// Pinning the CURRENT registry state before that addition proves the Phase-1
+    /// commit is PURELY ADDITIVE (it must not alter the verdicts for existing
+    /// `NativeKind` variants).
+    ///
+    /// Current state (feature = "net"):
+    ///   - `SseStream`     → `Some("next")`  (SSE server-sent events)
+    ///   - `WsConnection`  → `Some("recv")`  (WebSocket)
+    ///
+    /// Gated on `feature = "net"` — the same gate that guards the match arms in
+    /// `native_stream_method` (`#[cfg(feature = "net")]`).  Under
+    /// `--no-default-features` the function returns `None` for all kinds and
+    /// there is nothing to pin beyond the None-fallthrough behaviour.
+    #[cfg(feature = "net")]
+    #[test]
+    fn cntr_native_stream_method_registry_baseline() {
+        use crate::value::NativeKind;
+        // SseStream → "next" (SSE pull-stream protocol).
+        assert_eq!(
+            native_stream_method(NativeKind::SseStream),
+            Some("next"),
+            "native_stream_method(SseStream) must be Some(\"next\") before CNTR \
+             extends the registry; a change here means the pre-CNTR baseline moved"
+        );
+        // WsConnection → "recv" (WebSocket receive loop).
+        assert_eq!(
+            native_stream_method(NativeKind::WsConnection),
+            Some("recv"),
+            "native_stream_method(WsConnection) must be Some(\"recv\") before CNTR \
+             extends the registry; a change here means the pre-CNTR baseline moved"
+        );
+        // A NativeKind that is deliberately NOT a stream must return None
+        // (proves the registry is a positive allowlist, not a catch-all).
+        assert_eq!(
+            native_stream_method(NativeKind::TcpStream),
+            None,
+            "native_stream_method(TcpStream) must be None — TcpStream is a transport \
+             handle, not a stream-protocol handle with a named pull method"
+        );
+    }
 }
