@@ -36,6 +36,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
         ("breaker", super::bi("resilience.breaker")),
         ("limiter", super::bi("resilience.limiter")),
+        ("keyedLimiter", super::bi("resilience.keyedLimiter")),
     ]
 }
 
@@ -273,6 +274,7 @@ impl Interp {
         match kind.as_str() {
             "breaker" => self.call_breaker_method(&recv, name, args, span).await,
             "limiter" => self.call_limiter_method(&recv, name, args, span).await,
+            "keyedLimiter" => self.call_keyed_limiter_method(&recv, name, args, span).await,
             other => Err(AsError::at(
                 format!("{} policy has no method '{}'", other, name),
                 span,
@@ -943,6 +945,319 @@ fn limiter_refill(obj: &Value, now: f64) -> f64 {
     new_tokens
 }
 
+// ── keyed limiter constructor + method dispatch ───────────────────────────────
+
+impl Interp {
+    /// Build a per-key token-bucket limiter policy object (§3.2.2).
+    ///
+    /// The bucket store is a real `std/lru` handle created via `new_lru_handle`,
+    /// so recency and eviction are the shipped lru machinery.
+    ///
+    /// Fields:
+    /// - `capacity`: positive integer (≥ 1), per-key bucket capacity
+    /// - `refillPerSec`: non-negative finite number
+    /// - `maxKeys`: optional positive int, default 10_000
+    /// - `name`: optional string label, default "default"
+    ///
+    /// `__store` is the lru Native handle.
+    fn make_keyed_limiter(&self, opts: Value, span: Span) -> Result<Value, Control> {
+        let name = limiter_opt_name(&opts, span)?;
+        let capacity = limiter_opt_capacity(&opts, span)?;
+        let refill_per_sec = limiter_opt_refill_per_sec(&opts, span)?;
+        let max_keys = keyed_opt_max_keys(&opts, span)?;
+
+        // Create the real lru handle for the bucket store.
+        let store = self.new_lru_handle(max_keys);
+
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        // kind tag (§2.2 — RESIL_KINDS already includes "keyedLimiter")
+        m.insert("__resil".to_string(), Value::str("keyedLimiter"));
+        // config fields
+        m.insert("name".to_string(), Value::str(name));
+        m.insert("capacity".to_string(), Value::float(capacity));
+        m.insert("refillPerSec".to_string(), Value::float(refill_per_sec));
+        m.insert("maxKeys".to_string(), Value::int(max_keys as i64));
+        // the lru handle for per-key bucket storage
+        m.insert("__store".to_string(), store);
+        // non-sendable marker
+        m.insert("__local".to_string(), local_marker());
+
+        Ok(Value::object(m))
+    }
+
+    /// Dispatch a method on a `keyedLimiter` policy object.
+    ///
+    /// Supported methods: `tryAcquire(key, n=1)`, `acquire(key, n=1)`, `stats()`.
+    ///
+    /// The bucket store is the `__store` lru handle. Each bucket is an Object
+    /// `{tokens: float, lastMs: float}`. Bucket refill/consume uses the SAME
+    /// per-bucket formula as the plain limiter (`limiter_refill_bucket`).
+    ///
+    /// NO borrow is held across `.await` in `acquire`.
+    async fn call_keyed_limiter_method(
+        &self,
+        recv: &Value,
+        name: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::stdlib::time::real_monotonic_ms;
+
+        match name {
+            "tryAcquire" => {
+                // args[0]=recv, args[1]=key, args[2]=n (optional)
+                let key = args.get(1).cloned().unwrap_or(Value::nil());
+                let key_str = keyed_validate_key(&key, span)?;
+                let n = args.get(2).and_then(|v| v.as_f64()).unwrap_or(1.0);
+
+                let now = self.clock_monotonic_ms(real_monotonic_ms());
+                let (capacity, refill_per_sec, store_id) = keyed_read_config(recv);
+
+                // Get or create bucket from lru store
+                let bucket = keyed_get_bucket(self, store_id, &key_str, capacity, now, span)?;
+
+                // Refill + try consume
+                let new_tokens = limiter_refill_bucket(&bucket, capacity, refill_per_sec, now);
+                if new_tokens >= n {
+                    bucket_set_tokens(&bucket, new_tokens - n);
+                    // Touch: set the updated bucket back into the lru (updates recency + tokens)
+                    keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
+                    Ok(Value::bool_(true))
+                } else {
+                    // Set back to persist the refill update even on rejection
+                    keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
+                    Ok(Value::bool_(false))
+                }
+            }
+
+            "acquire" => {
+                // args[0]=recv, args[1]=key, args[2]=n (optional)
+                let key = args.get(1).cloned().unwrap_or(Value::nil());
+                let key_str = keyed_validate_key(&key, span)?;
+                let n = args.get(2).and_then(|v| v.as_f64()).unwrap_or(1.0);
+
+                loop {
+                    let now = self.clock_monotonic_ms(real_monotonic_ms());
+                    let (capacity, refill_per_sec, store_id) = keyed_read_config(recv);
+
+                    // Short synchronous section: refill + check
+                    let bucket = keyed_get_bucket(self, store_id, &key_str, capacity, now, span)?;
+                    let new_tokens = limiter_refill_bucket(&bucket, capacity, refill_per_sec, now);
+
+                    if new_tokens >= n {
+                        bucket_set_tokens(&bucket, new_tokens - n);
+                        keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
+                        return Ok(Value::nil());
+                    }
+
+                    // Compute deficit sleep, persist refill update, drop all borrows before await
+                    bucket_set_tokens(&bucket, new_tokens);
+                    keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
+
+                    let deficit = n - new_tokens;
+                    let sleep_ms = if refill_per_sec > 0.0 {
+                        (deficit / refill_per_sec * 1000.0).max(1.0)
+                    } else {
+                        return Err(AsError::at(
+                            "keyedLimiter.acquire: cannot acquire tokens from a zero-refill limiter",
+                            span,
+                        ).into());
+                    };
+
+                    // ── ALL borrows dropped here before .await ─────────────────
+                    let duration = std::time::Duration::from_millis(sleep_ms as u64);
+                    tokio::time::sleep(duration).await;
+                    // Re-loop to re-check after sleep
+                }
+            }
+
+            "stats" => {
+                let (_, _, store_id) = keyed_read_config(recv);
+                let keys = self.lru_len(store_id) as i64;
+                let evictions = self.lru_eviction_count(store_id) as i64;
+
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("keys".to_string(), Value::int(keys));
+                m.insert("evictions".to_string(), Value::int(evictions));
+                Ok(Value::object(m))
+            }
+
+            other => Err(AsError::at(
+                format!("keyedLimiter policy has no method '{}'", other),
+                span,
+            ).into()),
+        }
+    }
+}
+
+// ── keyed-limiter helpers ─────────────────────────────────────────────────────
+
+/// Extract `maxKeys` field (default 10_000; must be ≥ 1).
+fn keyed_opt_max_keys(opts: &Value, span: Span) -> Result<usize, Control> {
+    let v = match opts.kind() {
+        ValueKind::Object(o) => o.get("maxKeys"),
+        _ => return Ok(10_000),
+    };
+    match v {
+        None => Ok(10_000),
+        Some(v) => match v.as_f64() {
+            Some(n) if n >= 1.0 => Ok(n as usize),
+            Some(_) => Err(AsError::at(
+                "keyedLimiter: 'maxKeys' must be a positive integer (>= 1)",
+                span,
+            ).into()),
+            None => match v.kind() {
+                ValueKind::Nil => Ok(10_000),
+                _ => Err(AsError::at(
+                    format!(
+                        "keyedLimiter: 'maxKeys' must be a number, got {}",
+                        crate::interp::type_name(&v)
+                    ),
+                    span,
+                ).into()),
+            },
+        },
+    }
+}
+
+/// Validate that a key is a `Value::Str`; return the string or Tier-2 panic.
+fn keyed_validate_key(key: &Value, span: Span) -> Result<String, Control> {
+    match key.kind() {
+        ValueKind::Str(s) => Ok(s.to_string()),
+        _ => Err(AsError::at(
+            format!(
+                "keyedLimiter: key must be a string, got {}",
+                crate::interp::type_name(key)
+            ),
+            span,
+        ).into()),
+    }
+}
+
+/// Extract `(capacity, refillPerSec, store_id)` from the keyed limiter policy object.
+/// Returns defaults on parse failures (should not happen with a valid policy object).
+fn keyed_read_config(recv: &Value) -> (f64, f64, u64) {
+    match recv.kind() {
+        ValueKind::Object(o) => {
+            let capacity = o.get("capacity").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let refill_per_sec = o.get("refillPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let store_id = o.get("__store")
+                .and_then(|v| match v.kind() {
+                    ValueKind::Native(n) => Some(n.id),
+                    _ => None,
+                })
+                .unwrap_or(u64::MAX);
+            (capacity, refill_per_sec, store_id)
+        }
+        _ => (1.0, 0.0, u64::MAX),
+    }
+}
+
+/// Get or create a bucket `{tokens, lastMs}` for `key` from the lru store.
+///
+/// On a miss: returns a fresh full bucket (capacity tokens, `now` as lastMs).
+/// On a hit: returns the stored bucket (after touching it for recency via the lru set path).
+/// The bucket is returned as an owned `Value::Object`; callers must write it back via
+/// `keyed_set_bucket` to persist any mutations.
+fn keyed_get_bucket(
+    interp: &Interp,
+    store_id: u64,
+    key: &str,
+    capacity: f64,
+    now: f64,
+    _span: Span,
+) -> Result<Value, Control> {
+    use crate::interp::ResourceState;
+    use crate::value::MapKey;
+
+    let map_key = MapKey::Str(key.into());
+    // Read from lru without touching recency (we'll touch on set after the refill)
+    let existing = interp.with_resource(store_id, |r| match r {
+        Some(ResourceState::Lru(s)) => {
+            s.map.get(&map_key).cloned()
+        }
+        _ => None,
+    });
+
+    match existing {
+        Some(bucket) => Ok(bucket),
+        None => {
+            // Fresh full bucket
+            let mut b: IndexMap<String, Value> = IndexMap::new();
+            b.insert("tokens".to_string(), Value::float(capacity));
+            b.insert("lastMs".to_string(), Value::float(now));
+            Ok(Value::object(b))
+        }
+    }
+    .map_err(|e: Control| e) // infallible, but satisfies the signature
+}
+
+/// Write a bucket back to the lru store, updating recency via the lru set path.
+///
+/// This calls `call_lru_method` via the standard dispatch so the eviction machinery
+/// and recency updates (touch-on-set) are handled by the shipped lru code.
+fn keyed_set_bucket(
+    interp: &Interp,
+    store_id: u64,
+    key: &str,
+    bucket: &Value,
+    _span: Span,
+) -> Result<(), Control> {
+    use crate::interp::ResourceState;
+    use crate::value::MapKey;
+
+    // Use the shipped lru `set` path directly (same as call_lru_method "set"):
+    // This is inlined here to avoid constructing a NativeMethod just for one call.
+    let map_key = MapKey::Str(key.into());
+    interp.with_resource_mut(store_id, |r| {
+        if let Some(ResourceState::Lru(s)) = r {
+            if s.map.contains_key(&map_key) {
+                // Update value + mark MRU (no eviction; size unchanged).
+                s.map.insert(map_key.clone(), bucket.clone());
+                s.touch(&map_key);
+            } else {
+                // Evict the LRU (front) entry if at capacity.
+                while s.map.len() >= s.capacity && !s.map.is_empty() {
+                    s.map.shift_remove_index(0);
+                    s.eviction_count += 1;
+                }
+                s.map.insert(map_key, bucket.clone());
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Refill a bucket object `{tokens, lastMs}` using the limiter formula.
+///
+/// Same formula as `limiter_refill` but operating on a standalone bucket Object
+/// rather than the limiter policy Object directly.
+/// Returns the post-refill token count AND mutates the bucket's `tokens`/`lastMs`.
+fn limiter_refill_bucket(bucket: &Value, capacity: f64, refill_per_sec: f64, now: f64) -> f64 {
+    let o = match bucket.kind() {
+        ValueKind::Object(o) => o,
+        _ => return 0.0,
+    };
+    let last_ms = o.get("lastMs").and_then(|v| v.as_f64()).unwrap_or(now);
+    let tokens = o.get("tokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let elapsed_ms = (now - last_ms).max(0.0);
+    let replenish = elapsed_ms / 1000.0 * refill_per_sec;
+    let new_tokens = (tokens + replenish).min(capacity);
+
+    o.insert("tokens", Value::float(new_tokens));
+    o.insert("lastMs", Value::float(now));
+
+    new_tokens
+}
+
+/// Update the `tokens` field of a bucket Object.
+fn bucket_set_tokens(bucket: &Value, tokens: f64) {
+    if let ValueKind::Object(o) = bucket.kind() {
+        o.insert("tokens", Value::float(tokens));
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -963,6 +1278,10 @@ impl Interp {
             "limiter" => {
                 let opts = arg(args, 0);
                 make_limiter(opts, span)
+            }
+            "keyedLimiter" => {
+                let opts = arg(args, 0);
+                self.make_keyed_limiter(opts, span)
             }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
@@ -1452,5 +1771,84 @@ let r2 = b.call(fail)
 print(r2[1].code)
 "#, 42).await.expect("deterministic run should succeed");
         assert_eq!(out_b, "open\nopen\nbreaker-open\n");
+    }
+
+    // ── Task 2.2: keyedLimiter tests ──────────────────────────────────────────
+
+    /// Per-key isolation: exhausting key "A" does not affect key "B".
+    #[tokio::test]
+    async fn keyed_limiter_per_key_isolation() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let kl = resilience.keyedLimiter({capacity: 2, refillPerSec: 0.001, maxKeys: 100})
+// Exhaust key "A"
+print(kl.tryAcquire("A"))   // true
+print(kl.tryAcquire("A"))   // true
+print(kl.tryAcquire("A"))   // false (exhausted)
+// Key "B" should have its own FULL bucket
+print(kl.tryAcquire("B"))   // true
+print(kl.tryAcquire("B"))   // true
+print(kl.tryAcquire("B"))   // false
+"#).await;
+        assert_eq!(out, "true\ntrue\nfalse\ntrue\ntrue\nfalse\n");
+    }
+
+    /// Documented eviction: maxKeys=2; exhaust A, touch B, touch C (→ A evicted).
+    /// A's next tryAcquire returns true on a FULL bucket (re-created fresh).
+    /// stats().evictions incremented.
+    #[tokio::test]
+    async fn keyed_limiter_eviction_resets_bucket_and_counts() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let kl = resilience.keyedLimiter({capacity: 3, refillPerSec: 0.0, maxKeys: 2})
+// Exhaust key "A"
+kl.tryAcquire("A")
+kl.tryAcquire("A")
+kl.tryAcquire("A")
+// A is exhausted; now touch B and C to evict A (maxKeys=2)
+kl.tryAcquire("B")
+kl.tryAcquire("C")   // C admission evicts LRU ("A")
+let s1 = kl.stats()
+print(s1.evictions >= 1)   // at least 1 eviction
+// A should now have a fresh full bucket (capacity=3)
+print(kl.tryAcquire("A"))  // true (fresh bucket)
+print(kl.tryAcquire("A"))  // true
+print(kl.tryAcquire("A"))  // true
+print(kl.tryAcquire("A"))  // false (exhausted again)
+"#).await;
+        assert_eq!(out, "true\ntrue\ntrue\ntrue\nfalse\n");
+    }
+
+    /// stats() returns {keys, evictions} reflecting current lru state.
+    #[tokio::test]
+    async fn keyed_limiter_stats() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let kl = resilience.keyedLimiter({capacity: 5, refillPerSec: 0.0, maxKeys: 10})
+kl.tryAcquire("X")
+kl.tryAcquire("Y")
+let s = kl.stats()
+print(s.keys)      // 2 (two distinct buckets stored)
+print(s.evictions) // 0 (no evictions yet)
+"#).await;
+        assert_eq!(out, "2\n0\n");
+    }
+
+    /// Non-string key → Tier-2 panic.
+    #[tokio::test]
+    async fn keyed_limiter_non_string_key_panics() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+let kl = resilience.keyedLimiter({capacity: 5, refillPerSec: 0.0, maxKeys: 10})
+kl.tryAcquire(42)
+"#).await;
+        let msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(s) => s,
+        };
+        assert!(
+            msg.contains("key must be a string"),
+            "expected string-key panic, got: {msg:?}"
+        );
     }
 }
