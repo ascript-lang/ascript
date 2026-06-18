@@ -35,9 +35,6 @@ use std::rc::Rc;
 /// "resilience")]`). Tasks 3.2/3.3/5.x consume it; this task (3.1) only
 /// declares the struct so there is ONE Interp touch total.
 #[derive(Default)]
-// `flights` is read in Task 3.2 (singleflight), `registry` in Phase 5 (§6.1) — pre-declared
-// here as the single Interp touch.
-#[allow(dead_code)]
 pub(crate) struct ResilState {
     /// Active singleflight flights keyed by the user-supplied string key.
     /// Each value is the `SharedFuture` for the ONE in-progress execution;
@@ -45,8 +42,15 @@ pub(crate) struct ResilState {
     /// launching a second invocation. Entries are removed when the flight
     /// resolves (Task 3.2).
     pub(crate) flights: IndexMap<String, crate::task::SharedFuture>,
+    /// Monotonic counter minting a UNIQUE `__sfPrefix` per `memoize()` cache
+    /// (Task 3.3 §3.7), so two distinct caches never collide on the global
+    /// singleflight `flights` table when memoizing the same user key.
+    pub(crate) sf_prefix_next: u64,
     /// Minimal per-isolate metrics registry (§6.1). Phase 5 fills this;
     /// currently empty (the `Default` impl gives zero cost).
+    // `registry` is consumed in Phase 5 (§6.1) — pre-declared here as part of
+    // the single Interp touch; not yet read.
+    #[allow(dead_code)]
     pub(crate) registry: ResilRegistry,
 }
 
@@ -71,6 +75,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("retry", super::bi("resilience.retry")),
         ("fallback", super::bi("resilience.fallback")),
         ("singleflight", super::bi("resilience.singleflight")),
+        ("memoize", super::bi("resilience.memoize")),
     ]
 }
 
@@ -92,7 +97,7 @@ pub(crate) fn is_resilience_method(name: &str) -> bool {
     matches!(
         name,
         "call" | "state" | "stats" | "reset" | "acquire" | "tryAcquire" | "run" | "get"
-            | "delete" | "clear"
+            | "delete" | "clear" | "len"
     )
 }
 
@@ -305,6 +310,7 @@ impl Interp {
             "keyedLimiter" => self.call_keyed_limiter_method(&recv, name, args, span).await,
             "bulkhead" => self.call_bulkhead_method(&recv, name, args, span).await,
             "retry" => self.call_retry_method(&recv, name, args, span).await,
+            "memoize" => self.call_memoize_method(&recv, name, args, span).await,
             other => Err(AsError::at(
                 format!("{} policy has no method '{}'", other, name),
                 span,
@@ -1870,6 +1876,369 @@ impl Interp {
     }
 }
 
+// ── memoize constructor + method dispatch (§3.7) ──────────────────────────────
+
+impl Interp {
+    /// Build a stampede-protected `memoize` cache policy object (§3.7).
+    ///
+    /// Fields:
+    /// - `max`: positive int (≥ 1), the lru entry cap; default 1024.
+    /// - `ttlMs`: optional positive number; absent/nil means entries never expire.
+    ///
+    /// State:
+    /// - `__store`: a `std/lru` Native handle (recency + eviction shipped). Entries
+    ///   are `{value, atMs}` Objects.
+    /// - `__sfPrefix`: a per-isolate-unique string minted from `ResilState.sf_prefix_next`,
+    ///   so two caches never collide on the GLOBAL singleflight `flights` table.
+    /// - `__hits` / `__misses`: stats counters (mutated on the recv Object, like breaker).
+    fn make_memoize(&self, opts: Value, span: Span) -> Result<Value, Control> {
+        // ── max (positive int, default 1024) ──────────────────────────────────
+        let max = memoize_opt_pos_int(&opts, "max", 1024, span)?;
+
+        // ── ttlMs (optional positive number; nil/absent = no TTL) ──────────────
+        let ttl_ms = memoize_opt_ttl_ms(&opts, span)?;
+
+        // Real lru handle for the entry store.
+        let store = self.new_lru_handle(max as usize);
+
+        // Mint a unique singleflight prefix for this cache.
+        let sf_prefix = {
+            let mut st = self.resilience.borrow_mut();
+            let n = st.sf_prefix_next;
+            st.sf_prefix_next = st.sf_prefix_next.wrapping_add(1);
+            format!("__memo{}:", n)
+        };
+
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("__resil".to_string(), Value::str("memoize"));
+        m.insert("max".to_string(), Value::int(max as i64));
+        m.insert(
+            "ttlMs".to_string(),
+            match ttl_ms {
+                Some(t) => Value::float(t),
+                None => Value::nil(),
+            },
+        );
+        m.insert("__store".to_string(), store);
+        m.insert("__sfPrefix".to_string(), Value::str(sf_prefix));
+        m.insert("__hits".to_string(), Value::int(0));
+        m.insert("__misses".to_string(), Value::int(0));
+        // non-sendable marker
+        m.insert("__local".to_string(), local_marker());
+
+        Ok(Value::object(m))
+    }
+
+    /// Dispatch a method on a `memoize` cache policy object (§3.7).
+    ///
+    /// Supported methods: `get(key, fn)`, `delete(key)`, `clear()`, `len()`, `stats()`.
+    /// NO `RefCell`/resources borrow is held across `.await`.
+    async fn call_memoize_method(
+        &self,
+        recv: &Value,
+        name: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::interp::{make_pair, result_pair_err, ResourceState};
+        use crate::stdlib::time::real_monotonic_ms;
+        use crate::value::MapKey;
+
+        // Read config off the recv Object (sync, no borrow held across await).
+        let (store_id, sf_prefix, ttl_ms) = memoize_read_config(recv);
+
+        match name {
+            "get" => {
+                // args[0]=recv, args[1]=key, args[2]=fn
+                let key = args.get(1).cloned().unwrap_or(Value::nil());
+                let key_str = match key.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => {
+                        return Err(AsError::at(
+                            format!(
+                                "memoize: key must be a string, got {}",
+                                crate::interp::type_name(&key)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                let user_fn = args.get(2).cloned().unwrap_or(Value::nil());
+
+                let now = self.clock_monotonic_ms(real_monotonic_ms());
+
+                // ── Look up the lru entry (touch recency on hit via lru `get`) ──
+                let map_key = MapKey::Str(key_str.as_str().into());
+                let entry = self.with_resource_mut(store_id, |r| match r {
+                    Some(ResourceState::Lru(s)) => {
+                        if s.map.contains_key(&map_key) {
+                            s.touch(&map_key);
+                            s.map.get(&map_key).cloned()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                });
+
+                // ── HIT test: entry present AND (no TTL OR within TTL) ──────────
+                if let Some(ref e) = entry {
+                    let (value, at_ms) = match e.kind() {
+                        ValueKind::Object(o) => (
+                            o.get("value").unwrap_or(Value::nil()),
+                            o.get("atMs").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        ),
+                        _ => (Value::nil(), 0.0),
+                    };
+                    let fresh = match ttl_ms {
+                        None => true,
+                        Some(ttl) => (now - at_ms) < ttl,
+                    };
+                    if fresh {
+                        // Hit: bump __hits, return the ok-pair [value, nil].
+                        memoize_bump(recv, "__hits");
+                        return Ok(make_pair(value, Value::nil()));
+                    }
+                    // Expired → fall through to a miss (lazy TTL).
+                }
+
+                // ── MISS: singleflight on a cache-scoped key, await it ─────────
+                memoize_bump(recv, "__misses");
+                let flight_key = Value::str(format!("{}{}", sf_prefix, key_str));
+                let fut = self.call_singleflight(flight_key, user_fn, span)?;
+                // Await the flight (all concurrent awaiters observe the same result).
+                let result = match fut.kind() {
+                    ValueKind::Future(_) => {
+                        let crate::value::OwnedKind::Future(f) = fut.into_kind() else {
+                            unreachable!()
+                        };
+                        f.get().await?
+                    }
+                    _ => fut,
+                };
+
+                // Classify the flight result. SUCCESS = a plain value OR an
+                // ok-pair `[v, nil]`; FAILURE = an err-pair `[nil, e]`. A panic
+                // propagated via `?` above (never reaches here, never stored).
+                if result_pair_err(&result).is_some() {
+                    // err-pair: NOT cached (negative caching parked, §3.7).
+                    // Pass the err-pair through unchanged.
+                    return Ok(result);
+                }
+
+                // Success. Normalize the cached/returned value to the underlying
+                // value: an ok-pair `[v, nil]` stores `v`; a plain value stores
+                // itself. `get` always returns the `[value, nil]` ok-pair shape.
+                let value = match result_pair_value(&result) {
+                    Some(v) => v,
+                    None => result.clone(),
+                };
+                let mut e: IndexMap<String, Value> = IndexMap::new();
+                e.insert("value".to_string(), value.clone());
+                e.insert("atMs".to_string(), Value::float(now));
+                let entry_obj = Value::object(e);
+                // lru set path: eviction + recency via the shipped machinery.
+                let map_key = MapKey::Str(key_str.as_str().into());
+                self.with_resource_mut(store_id, |r| {
+                    if let Some(ResourceState::Lru(s)) = r {
+                        if s.map.contains_key(&map_key) {
+                            s.map.insert(map_key.clone(), entry_obj);
+                            s.touch(&map_key);
+                        } else {
+                            while s.map.len() >= s.capacity && !s.map.is_empty() {
+                                s.map.shift_remove_index(0);
+                                s.eviction_count += 1;
+                            }
+                            s.map.insert(map_key, entry_obj);
+                        }
+                    }
+                });
+
+                Ok(make_pair(value, Value::nil()))
+            }
+
+            "delete" => {
+                let key = args.get(1).cloned().unwrap_or(Value::nil());
+                let key_str = match key.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => {
+                        return Err(AsError::at(
+                            format!(
+                                "memoize: key must be a string, got {}",
+                                crate::interp::type_name(&key)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                let map_key = MapKey::Str(key_str.as_str().into());
+                self.with_resource_mut(store_id, |r| {
+                    if let Some(ResourceState::Lru(s)) = r {
+                        s.map.shift_remove(&map_key);
+                    }
+                });
+                Ok(Value::nil())
+            }
+
+            "clear" => {
+                self.with_resource_mut(store_id, |r| {
+                    if let Some(ResourceState::Lru(s)) = r {
+                        s.map.clear();
+                    }
+                });
+                Ok(Value::nil())
+            }
+
+            "len" => Ok(Value::int(self.lru_len(store_id) as i64)),
+
+            "stats" => {
+                let (hits, misses) = match recv.kind() {
+                    ValueKind::Object(o) => (
+                        o.get("__hits").unwrap_or(Value::int(0)),
+                        o.get("__misses").unwrap_or(Value::int(0)),
+                    ),
+                    _ => (Value::int(0), Value::int(0)),
+                };
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("hits".to_string(), hits);
+                m.insert("misses".to_string(), misses);
+                Ok(Value::object(m))
+            }
+
+            other => Err(AsError::at(
+                format!("memoize policy has no method '{}'", other),
+                span,
+            )
+            .into()),
+        }
+    }
+}
+
+// ── memoize helpers ───────────────────────────────────────────────────────────
+
+/// Read a positive-integer option field; Tier-2 panic on a non-number or a
+/// non-positive value. Mirrors the breaker `opt_pos_int`+`check_pos_int` pair
+/// but with `memoize:`-prefixed messages.
+fn memoize_opt_pos_int(opts: &Value, key: &str, default: u64, span: Span) -> Result<u64, Control> {
+    let v = match opts.kind() {
+        ValueKind::Object(o) => o.get(key),
+        ValueKind::Nil => return Ok(default),
+        _ => {
+            return Err(AsError::at(
+                "memoize: expected an options object, got non-object",
+                span,
+            )
+            .into())
+        }
+    };
+    match v {
+        None => Ok(default),
+        Some(v) => match v.kind() {
+            ValueKind::Nil => Ok(default),
+            _ => match v.as_f64() {
+                Some(n) if n >= 1.0 && n.is_finite() => Ok(n as u64),
+                Some(_) => Err(AsError::at(
+                    format!("memoize: '{}' must be a positive integer (>= 1)", key),
+                    span,
+                )
+                .into()),
+                None => Err(AsError::at(
+                    format!(
+                        "memoize: '{}' must be a number, got {}",
+                        key,
+                        crate::interp::type_name(&v)
+                    ),
+                    span,
+                )
+                .into()),
+            },
+        },
+    }
+}
+
+/// Read the optional `ttlMs` field: absent/nil → `None` (no TTL); a positive
+/// finite number → `Some(n)`; anything else → Tier-2 panic.
+fn memoize_opt_ttl_ms(opts: &Value, span: Span) -> Result<Option<f64>, Control> {
+    let v = match opts.kind() {
+        ValueKind::Object(o) => o.get("ttlMs"),
+        _ => return Ok(None),
+    };
+    match v {
+        None => Ok(None),
+        Some(v) => match v.kind() {
+            ValueKind::Nil => Ok(None),
+            _ => match v.as_f64() {
+                Some(n) if n > 0.0 && n.is_finite() => Ok(Some(n)),
+                Some(_) => Err(AsError::at(
+                    "memoize: 'ttlMs' must be a positive number",
+                    span,
+                )
+                .into()),
+                None => Err(AsError::at(
+                    format!(
+                        "memoize: 'ttlMs' must be a number, got {}",
+                        crate::interp::type_name(&v)
+                    ),
+                    span,
+                )
+                .into()),
+            },
+        },
+    }
+}
+
+/// Extract `(store_id, sfPrefix, ttlMs)` from a memoize policy Object.
+fn memoize_read_config(recv: &Value) -> (u64, String, Option<f64>) {
+    match recv.kind() {
+        ValueKind::Object(o) => {
+            let store_id = o
+                .get("__store")
+                .and_then(|v| match v.kind() {
+                    ValueKind::Native(n) => Some(n.id),
+                    _ => None,
+                })
+                .unwrap_or(u64::MAX);
+            let sf_prefix = o
+                .get("__sfPrefix")
+                .and_then(|v| match v.kind() {
+                    ValueKind::Str(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let ttl_ms = o.get("ttlMs").and_then(|v| v.as_f64());
+            (store_id, sf_prefix, ttl_ms)
+        }
+        _ => (u64::MAX, String::new(), None),
+    }
+}
+
+/// If `v` is an ok-pair `[value, nil]` (2-element array, nil at `[1]`), return
+/// `Some(value)`; otherwise `None`. Used to normalize a flight's success result
+/// (the user fn may return a plain value OR an ok-pair) into the stored value.
+fn result_pair_value(v: &Value) -> Option<Value> {
+    match v.kind() {
+        ValueKind::Array(a) => {
+            let b = a.borrow();
+            if b.len() == 2 && b[1] == Value::nil() {
+                Some(b[0].clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Increment an integer counter field (`__hits` / `__misses`) on a policy Object.
+fn memoize_bump(recv: &Value, field: &str) {
+    if let ValueKind::Object(o) = recv.kind() {
+        let cur = o.get(field).and_then(|v| v.as_int()).unwrap_or(0);
+        o.insert(field, Value::int(cur + 1));
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -1912,6 +2281,10 @@ impl Interp {
                 let key = arg(args, 0);
                 let user_fn = arg(args, 1);
                 self.call_singleflight(key, user_fn, span)
+            }
+            "memoize" => {
+                let opts = arg(args, 0);
+                self.make_memoize(opts, span)
             }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
@@ -2962,6 +3335,225 @@ print("done")
         assert!(
             interp.resilience.borrow().flights.is_empty(),
             "flights table must be empty — a dropped-awaiter flight must not leak"
+        );
+    }
+
+    // ── Task 3.3: resilience.memoize (§3.7) ─────────────────────────────────
+
+    /// Stampede protection: N concurrent `cache.get("k", fn)` collapse to ONE
+    /// `fn` execution (singleflight), and every caller observes the same value.
+    #[tokio::test]
+    async fn memoize_stampede_collapses_concurrent_misses() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn fetchIt() { calls[0] = calls[0] + 1; return 42 }
+let cache = resilience.memoize({ max: 100 })
+let f1 = cache.get("k", fetchIt)
+let f2 = cache.get("k", fetchIt)
+let f3 = cache.get("k", fetchIt)
+let [v1, e1] = await f1
+let [v2, e2] = await f2
+let [v3, e3] = await f3
+print(v1); print(v2); print(v3); print(calls[0])
+"#)
+        .await;
+        assert_eq!(out, "42\n42\n42\n1\n");
+    }
+
+    /// A second `get` on a cached key is a HIT: `fn` does NOT re-run.
+    #[tokio::test]
+    async fn memoize_hit_does_not_rerun() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn fetchIt() { calls[0] = calls[0] + 1; return 7 }
+let cache = resilience.memoize({ max: 100 })
+let [a, ea] = await cache.get("k", fetchIt)
+let [b, eb] = await cache.get("k", fetchIt)
+print(a); print(b); print(calls[0])
+"#)
+        .await;
+        assert_eq!(out, "7\n7\n1\n");
+    }
+
+    /// `stats()` reports hits/misses: one miss (first get) + one hit (second).
+    #[tokio::test]
+    async fn memoize_stats_hits_and_misses() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+async fn fetchIt() { return 1 }
+let cache = resilience.memoize({ max: 100 })
+await cache.get("k", fetchIt)
+await cache.get("k", fetchIt)
+await cache.get("k", fetchIt)
+let s = cache.stats()
+print(s.hits); print(s.misses)
+"#)
+        .await;
+        assert_eq!(out, "2\n1\n");
+    }
+
+    /// TTL boundary under the virtual clock: ttlMs=100, hit at +99, miss at +101.
+    #[tokio::test]
+    async fn memoize_ttl_boundary_virtual_clock() {
+        let out = crate::run_source_deterministic(r#"
+import * as resilience from "std/resilience"
+import * as time from "std/time"
+let calls = [0]
+async fn fetchIt() { calls[0] = calls[0] + 1; return calls[0] }
+let cache = resilience.memoize({ max: 100, ttlMs: 100 })
+let [a, ea] = await cache.get("k", fetchIt)   // miss → fn ran (calls=1)
+print(a)
+await time.sleep(99)
+let [b, eb] = await cache.get("k", fetchIt)   // +99 < 100 → HIT (fn not run)
+print(b)
+await time.sleep(2)                            // total +101 >= 100 → expired
+let [c, ec] = await cache.get("k", fetchIt)   // miss → fn ran (calls=2)
+print(c)
+print(calls[0])
+"#, 42).await.expect("deterministic run should succeed");
+        assert_eq!(out, "1\n1\n2\n2\n");
+    }
+
+    /// Eviction via `max` (lru semantics): max=2 → inserting a third key evicts
+    /// the least-recently-used; a re-get on the evicted key re-runs `fn`.
+    #[tokio::test]
+    async fn memoize_eviction_via_max() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn f() { calls[0] = calls[0] + 1; return calls[0] }
+let cache = resilience.memoize({ max: 2 })
+await cache.get("a", f)   // calls=1, store {a}
+await cache.get("b", f)   // calls=2, store {a,b}
+await cache.get("c", f)   // calls=3, evicts "a", store {b,c}
+print(cache.len())        // 2
+let [v, e] = await cache.get("a", f)   // "a" evicted → miss → calls=4
+print(v)
+print(calls[0])           // 4
+"#)
+        .await;
+        assert_eq!(out, "2\n4\n4\n");
+    }
+
+    /// Errors are NOT cached: an err-pair-returning fn that later succeeds is
+    /// re-run on the next get.
+    #[tokio::test]
+    async fn memoize_err_pair_not_cached() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn f() {
+  calls[0] = calls[0] + 1
+  if (calls[0] == 1) { return [nil, {message: "boom"}] }
+  return 99
+}
+let cache = resilience.memoize({ max: 100 })
+let [v1, e1] = await cache.get("k", f)   // err-pair → NOT cached
+print(e1.message)
+let [v2, e2] = await cache.get("k", f)   // re-runs → success
+print(v2)
+print(calls[0])                          // 2
+"#)
+        .await;
+        assert_eq!(out, "boom\n99\n2\n");
+    }
+
+    /// Panics are NOT cached: a panicking fn that later succeeds is re-run.
+    #[tokio::test]
+    async fn memoize_panic_not_cached() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn f() {
+  calls[0] = calls[0] + 1
+  if (calls[0] == 1) { assert(false, "kaboom") }
+  return 5
+}
+let cache = resilience.memoize({ max: 100 })
+let [v1, e1] = recover(() => await cache.get("k", f))
+print(e1.message)
+let [v2, e2] = await cache.get("k", f)   // re-runs → success
+print(v2)
+print(calls[0])                          // 2
+"#)
+        .await;
+        assert_eq!(out, "kaboom\n5\n2\n");
+    }
+
+    /// `delete`/`clear`/`len` behave as expected.
+    #[tokio::test]
+    async fn memoize_delete_clear_len() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+async fn f() { return 1 }
+let cache = resilience.memoize({ max: 100 })
+await cache.get("a", f)
+await cache.get("b", f)
+print(cache.len())     // 2
+cache.delete("a")
+print(cache.len())     // 1
+cache.clear()
+print(cache.len())     // 0
+"#)
+        .await;
+        assert_eq!(out, "2\n1\n0\n");
+    }
+
+    /// Two caches never collide on the global singleflight table: a key "k" in
+    /// cache1 and "k" in cache2 are independent flights (distinct __sfPrefix).
+    #[tokio::test]
+    async fn memoize_distinct_caches_dont_collide() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn f() { calls[0] = calls[0] + 1; return calls[0] }
+let c1 = resilience.memoize({ max: 100 })
+let c2 = resilience.memoize({ max: 100 })
+let [a, ea] = await c1.get("k", f)   // calls=1
+let [b, eb] = await c2.get("k", f)   // distinct cache → calls=2 (no collision)
+print(a); print(b); print(calls[0])
+"#)
+        .await;
+        assert_eq!(out, "1\n2\n2\n");
+    }
+
+    /// A non-string key is a Tier-2 panic.
+    #[tokio::test]
+    async fn memoize_non_string_key_is_tier2() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+async fn f() { return 1 }
+let cache = resilience.memoize({ max: 100 })
+let _ = await cache.get(42, f)
+"#)
+        .await;
+        let msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(s) => s,
+        };
+        assert!(
+            msg.contains("key must be a string"),
+            "expected non-string key Tier-2 panic, got: {msg:?}"
+        );
+    }
+
+    /// Invalid `max` (non-positive) is a Tier-2 panic at construction.
+    #[tokio::test]
+    async fn memoize_invalid_max_is_tier2() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+let cache = resilience.memoize({ max: 0 })
+"#)
+        .await;
+        let msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(s) => s,
+        };
+        assert!(
+            msg.contains("memoize") && msg.contains("max"),
+            "expected memoize 'max' validation Tier-2 panic, got: {msg:?}"
         );
     }
 }
