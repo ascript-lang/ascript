@@ -1,0 +1,15 @@
+# exit: none
+true
+true
+false
+payload
+nil
+2
+200
+200
+200
+fixed-trace
+429
+200
+true
+resilient_gateway ok
