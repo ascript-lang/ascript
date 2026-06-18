@@ -1333,7 +1333,16 @@ impl Interp {
             BodyMode::Str
         };
 
-        let drive = self.uds_drive_request(socket_path, &req, stream_resp, mode, span);
+        // errorOnStatus: a non-2xx response becomes a Tier-1 err — IDENTICAL to the TCP
+        // path (`call_http_send`). Decided here (where `opts` is in scope) and applied
+        // inside `uds_drive_request` after the status is parsed.
+        let error_on_status = matches!(
+            opt_field(opts, "errorOnStatus").map(|x| x.into_kind()),
+            Some(OwnedKind::Bool(true))
+        );
+
+        let drive =
+            self.uds_drive_request(socket_path, &req, stream_resp, mode, error_on_status, span);
         match timeout_ms {
             Some(ms) => match tokio::time::timeout(
                 std::time::Duration::from_millis(ms),
@@ -1360,6 +1369,7 @@ impl Interp {
         req: &crate::stdlib::http1::Http1Request<'_>,
         stream_resp: bool,
         mode: BodyMode,
+        error_on_status: bool,
         _span: Span,
     ) -> Result<Value, Control> {
         use crate::stdlib::http1;
@@ -1376,6 +1386,18 @@ impl Interp {
             Ok(r) => r,
             Err(e) => return Ok(err_pair(format!("net/http: {}", e))),
         };
+
+        // errorOnStatus: a non-2xx response becomes a Tier-1 err — byte-identical in
+        // SHAPE to the TCP path (`call_http_send`); `url` is the synthesized
+        // `unix://<socketPath>` that `resp.url` also reports.
+        if error_on_status && !(200..300).contains(&resp.status) {
+            return Ok(err_pair(format!(
+                "net/http {} {} returned status {}",
+                req.method,
+                format_args!("unix://{}", socket_path),
+                resp.status
+            )));
+        }
 
         // Build the metadata fields (status/ok/version/url/headers/cookies/trailers)
         // in the SAME shape as the TCP path — see `http_response_fields`.
@@ -3973,6 +3995,12 @@ print(err.code)
                             "/textct" => b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
                             "/json" => b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}".to_vec(),
                             "/chunked" => b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nchunk1\n\r\n7\r\nchunk2\n\r\n7\r\nchunk3\n\r\n0\r\n\r\n".to_vec(),
+                            // /slow accepts the request then never responds (sleeps well
+                            // past any test timeout) so the whole-request timeout fires.
+                            "/slow" => {
+                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
+                            }
                             _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope".to_vec(),
                         };
                         let _ = stream.write_all(&resp).await;
@@ -4116,6 +4144,81 @@ print(err != nil)
 "#
             );
             assert_eq!(run(&src).await, "nil\ntrue\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_error_on_status_turns_404_into_err() {
+            // REVIEW PROBE (CNTR Phase 3): `errorOnStatus:true` must behave IDENTICALLY
+            // on the UDS path as on the TCP path — a non-2xx response becomes a Tier-1
+            // err. The fixture's unknown route returns 404, so `/nope` + errorOnStatus
+            // must yield [nil, err], NOT a successful [resp, nil].
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/nope", errorOnStatus: true }})
+print(resp)
+print(err != nil)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\ntrue\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_error_on_status_passes_2xx_through() {
+            // Symmetry: errorOnStatus:true on a 200 must NOT error — the resp passes through.
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/text", errorOnStatus: true }})
+print(err)
+print(resp.status)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\n200\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_total_timeout_fires_on_slow_server() {
+            // REVIEW PROBE (CNTR Phase 3, item 6): a UDS server that accepts then never
+            // responds (the /slow route sleeps 30s) must surface a Tier-1 timeout err
+            // under a small `timeout.total`, NOT hang the request. The whole test is
+            // wrapped in a 5s tokio timeout so a real hang is a loud test failure.
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/slow", timeout: {{ total: 50 }} }})
+print(resp)
+print(err != nil)
+"#
+            );
+            let out = tokio::time::timeout(std::time::Duration::from_secs(5), run(&src))
+                .await
+                .expect("UDS total-timeout must not hang the request");
+            assert_eq!(out, "nil\ntrue\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_non_200_surfaces_status_ok_and_body() {
+            // REVIEW PROBE (CNTR Phase 3, item 3): a non-200 response (no errorOnStatus)
+            // must still produce a normal [resp, nil] pair with `status`/`ok`/body all
+            // script-visible — NOT an error, and `ok` must be false.
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/nope" }})
+print(err)
+print(resp.status)
+print(resp.ok)
+let [body, berr] = await resp.text()
+print(berr)
+print(body)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\n404\nfalse\nnil\nnope\n");
         }
 
         #[tokio::test]

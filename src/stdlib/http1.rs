@@ -781,4 +781,98 @@ A;ext=1\r\n0123456789\r\n\
         let e = expect_err(b"HTTP/1.1 600 Weird\r\n\r\n").await;
         assert!(e.contains("range") || e.contains("status"), "got: {e}");
     }
+
+    // ---- REVIEW PROBES (CNTR Phase 3 independent review) ----
+
+    /// A header line with no colon must be a clean Err, not a panic on `split_once`.
+    #[tokio::test]
+    async fn probe_header_no_colon_is_clean_err() {
+        let e = expect_err(b"HTTP/1.1 200 OK\r\nThisHeaderHasNoColon\r\n\r\n").await;
+        assert!(e.contains("no colon") || e.contains("malformed"), "got: {e}");
+    }
+
+    /// A chunk-size line that is ALL extension and no hex digit (`;ext\r\n`) → the
+    /// `size_part` is empty → `from_str_radix("", 16)` is `Err(Empty)` → clean Err, no hang.
+    #[tokio::test]
+    async fn probe_chunk_size_all_extension_no_hex() {
+        let e = expect_err(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n;onlyext\r\nXX",
+        )
+        .await;
+        assert!(e.contains("chunk size"), "got: {e}");
+    }
+
+    /// CL + TE BOTH present (the classic request-smuggling vector). For a CLIENT reading
+    /// ONE framed response this is not exploitable, but the codec must make a deterministic
+    /// choice and frame correctly. `decide_framing` checks TE first → chunked WINS; the
+    /// bogus Content-Length is ignored. Confirm the body decodes via chunked framing.
+    #[tokio::test]
+    async fn probe_content_length_and_transfer_encoding_chunked_wins() {
+        let canned = b"HTTP/1.1 200 OK\r\nContent-Length: 9999\r\nTransfer-Encoding: chunked\r\n\r\n\
+5\r\nhello\r\n\
+0\r\n\r\n";
+        let resp = run(canned).await.unwrap();
+        let body = match resp.body {
+            Http1Body::Stream(r) => r.read_to_end(1 << 20).await.unwrap(),
+            _ => panic!("expected stream body"),
+        };
+        // chunked framing wins → exactly "hello", not 9999 bytes read-to-EOF.
+        assert_eq!(body, b"hello");
+    }
+
+    /// Many zero-length-DATA chunks would be a progress-guard concern, but `0` is the
+    /// TERMINAL chunk in HTTP/1.1 — there is no such thing as a non-terminal zero-length
+    /// data chunk. So the relevant adversarial shape is a long run of MINIMAL (1-byte)
+    /// chunks: each loop iteration consumes input and returns, so EOF (not an infinite
+    /// loop) terminates. Confirm a 1000-chunk body decodes fully without hang.
+    #[tokio::test]
+    async fn probe_many_tiny_chunks_make_progress() {
+        let mut canned = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..1000 {
+            canned.extend_from_slice(b"1\r\nx\r\n");
+        }
+        canned.extend_from_slice(b"0\r\n\r\n");
+        let resp = match timeout(Duration::from_secs(3), run(&canned)).await {
+            Ok(r) => r.unwrap(),
+            Err(_) => panic!("TIMEOUT: many-tiny-chunks hung the parser"),
+        };
+        let body = match resp.body {
+            Http1Body::Stream(r) => timeout(Duration::from_secs(3), r.read_to_end(1 << 20))
+                .await
+                .expect("read must not hang")
+                .unwrap(),
+            _ => panic!("expected stream body"),
+        };
+        assert_eq!(body.len(), 1000);
+        assert!(body.iter().all(|&b| b == b'x'));
+    }
+
+    /// A `read_to_end` `cap` smaller than the body must be a clean Err, never an OOM or a
+    /// silent truncation. (The buffered UDS path passes MAX_ALLOC_COUNT here.)
+    #[tokio::test]
+    async fn probe_read_to_end_cap_enforced() {
+        let resp = run(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n\
+0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789")
+            .await
+            .unwrap();
+        let r = match resp.body {
+            Http1Body::Stream(r) => r,
+            _ => panic!("expected stream body"),
+        };
+        // cap below the 100-byte body → clean Err.
+        let e = r.read_to_end(10).await.unwrap_err();
+        assert!(e.contains("limit"), "got: {e}");
+    }
+
+    /// A chunked body that never sends its terminal `0` chunk and then EOFs mid-stream
+    /// must Err (connection closed mid-chunk), not hang waiting for more.
+    #[tokio::test]
+    async fn probe_chunked_eof_before_terminal_is_err() {
+        // One full chunk then EOF (no terminal 0 chunk).
+        let e = expect_err(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+        )
+        .await;
+        assert!(!e.is_empty(), "got: {e}");
+    }
 }
