@@ -613,7 +613,10 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
                 Some(pull_progress_http())
             }
         }
-        ("POST", p) if p.starts_with("/exec/") && p.ends_with("/json") => Some(exec_create_http()),
+        // CNTR §4.5 exec — create on the container, start (101 hijack), inspect.
+        ("POST", p) if p.starts_with("/containers/") && p.ends_with("/exec") => {
+            Some(exec_create_http())
+        }
         ("POST", p) if p.starts_with("/exec/") && p.ends_with("/start") => {
             Some(exec_upgrade_bin())
         }
@@ -1464,4 +1467,210 @@ async fn docker_stream_is_non_sendable() {
     let err = ascript::worker::serialize::check_sendable(&handle)
         .expect_err("a DockerStream handle must be non-sendable");
     assert_eq!(err.kind, "native");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Task 4.5 — exec create / start (101 hijack) / inspect + the d.exec convenience.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `d.execCreate(containerId, {cmd})` → the exec id from the 201 body.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_create_returns_exec_id() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [id, err] = await d.execCreate("web", {{ cmd: ["echo", "hi"] }})
+print(err)
+print(id)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\nexec123\n");
+}
+
+/// `d.execStart(execId, {})` → a `dockerStream` over the 101-upgrade body; a
+/// `for await` demuxes the multiplexed exec frames.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_start_hijack_demuxes_frames() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [stream, err] = await d.execStart("exec123", {{}})
+print(err)
+for await (frame in stream) {{ print(`${{frame.stream}}:${{frame.text}}`) }}
+"#
+    );
+    assert_eq!(
+        run(&src).await,
+        "nil\nstdout:exec stdout\n\nstderr:exec stderr\n\n"
+    );
+}
+
+/// The exec-start `for await` also works on the bytecode VM (not just the tree-walker).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_start_hijack_works_on_the_vm() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [stream, err] = await d.execStart("exec123", {{}})
+print(err)
+for await (frame in stream) {{ print(`${{frame.stream}}:${{frame.text}}`) }}
+"#
+    );
+    let (out, _code) = ascript::vm_run_source(&src)
+        .await
+        .unwrap_or_else(|e| panic!("VM run failed: {}", e.message));
+    assert_eq!(out, "nil\nstdout:exec stdout\n\nstderr:exec stderr\n\n");
+}
+
+/// `d.execInspect(execId)` → the exec status object (`ExitCode`/`Running`).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_inspect_returns_status() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [info, err] = await d.execInspect("exec123")
+print(err)
+print(info.ExitCode)
+print(info.Running)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\n0\nfalse\n");
+}
+
+/// `d.exec(containerId, {cmd})` — the convenience composition: create → start →
+/// drain → inspect, returning `{exitCode, stdout, stderr}`.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_convenience_returns_exit_code_and_output() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [res, err] = await d.exec("web", {{ cmd: ["echo", "hi"] }})
+print(err)
+print(res.exitCode)
+print(res.stdout)
+print(res.stderr)
+"#
+    );
+    // stdout = "exec stdout\n", stderr = "exec stderr\n" from the upgrade fixture.
+    assert_eq!(
+        run(&src).await,
+        "nil\n0\nexec stdout\n\nexec stderr\n\n"
+    );
+}
+
+/// `d.exec` result mirrors `process.run`'s shape (a `code` alias alongside `exitCode`).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_convenience_result_mirrors_process_run() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [res, err] = await d.exec("web", {{ cmd: ["echo", "hi"] }})
+print(err)
+print(res.code)
+print(res.exitCode == res.code)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\n0\ntrue\n");
+}
+
+/// The convenience runs on the bytecode VM too.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_convenience_works_on_the_vm() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [res, err] = await d.exec("web", {{ cmd: ["echo", "hi"] }})
+print(err)
+print(res.exitCode)
+"#
+    );
+    let (out, _code) = ascript::vm_run_source(&src)
+        .await
+        .unwrap_or_else(|e| panic!("VM run failed: {}", e.message));
+    assert_eq!(out, "nil\n0\n");
+}
+
+/// `attachStdin: true` on exec/execStart is a deferred-feature Tier-2 panic with the
+/// pinned message (interactive stdin attach is out of v1 scope).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_attach_stdin_is_deferred_tier2() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [v, err] = recover(() => d.execStart("exec123", {{ attachStdin: true }}))
+print(v)
+print(err != nil)
+print(err.message)
+"#
+    );
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\ntrue\n"), "expected a recovered Tier-2 panic, got:\n{out}");
+    assert!(
+        out.contains("attachStdin is not supported"),
+        "expected the pinned deferral message, got:\n{out}"
+    );
+}
+
+/// `attachStdin: true` on the convenience `d.exec` is the same pinned Tier-2 deferral.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_convenience_attach_stdin_is_deferred_tier2() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [v, err] = recover(() => d.exec("web", {{ cmd: ["sh"], attachStdin: true }}))
+print(v)
+print(err != nil)
+print(err.message)
+"#
+    );
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\ntrue\n"), "expected a recovered Tier-2 panic, got:\n{out}");
+    assert!(out.contains("attachStdin is not supported"), "got:\n{out}");
+}
+
+/// A non-string exec id on `execStart`/`execInspect` is a Tier-2 panic.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn exec_non_string_id_is_tier2_panic() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [a, ea] = recover(() => d.execStart(42, {{}}))
+print(a)
+print(ea != nil)
+let [b, eb] = recover(() => d.execInspect(99))
+print(b)
+print(eb != nil)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\ntrue\nnil\ntrue\n");
 }

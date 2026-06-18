@@ -136,6 +136,12 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/docker", "wait") => 1,
         ("std/docker", "remove") => 1,
         ("std/docker", "removeImage") => 1,
+        // CNTR §4.5 exec — each takes the container/exec id as the first required arg
+        // (the opts arg is optional → min 1). Handle methods (cross-check-skipped).
+        ("std/docker", "execCreate") => 1,
+        ("std/docker", "execStart") => 1,
+        ("std/docker", "execInspect") => 1,
+        ("std/docker", "exec") => 1,
         _ => return None,
     };
     Some(n)
@@ -249,6 +255,10 @@ mod tests {
             ("std/docker", "wait"),
             ("std/docker", "remove"),
             ("std/docker", "removeImage"),
+            ("std/docker", "execCreate"),
+            ("std/docker", "execStart"),
+            ("std/docker", "execInspect"),
+            ("std/docker", "exec"),
         ];
         // FFI handle METHODS (resolved on a `ForeignLib`/`ForeignSymbol` handle, not
         // module-level exports). Keyed in `required_args` so `call-arity` can reach
@@ -265,6 +275,10 @@ mod tests {
             ("std/docker", "wait"),
             ("std/docker", "remove"),
             ("std/docker", "removeImage"),
+            ("std/docker", "execCreate"),
+            ("std/docker", "execStart"),
+            ("std/docker", "execInspect"),
+            ("std/docker", "exec"),
         ];
         for (module, name) in keys {
             // The entry must actually be in the table.

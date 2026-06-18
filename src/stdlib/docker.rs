@@ -341,6 +341,23 @@ impl Interp {
             "logs" => return self.docker_logs(&socket_path, &api_version, &args, span).await,
             "events" => return self.docker_events(&socket_path, &api_version, &args, span).await,
             "pull" => return self.docker_pull(&socket_path, &api_version, &args, span).await,
+            // §4.5 exec verbs.
+            "execCreate" => {
+                return self
+                    .docker_exec_create(&socket_path, &api_version, &args, span)
+                    .await
+            }
+            "execStart" => {
+                return self
+                    .docker_exec_start(&socket_path, &api_version, &args, span)
+                    .await
+            }
+            "execInspect" => {
+                return self
+                    .docker_exec_inspect(&socket_path, &api_version, &args, span)
+                    .await
+            }
+            "exec" => return self.docker_exec(&socket_path, &api_version, &args, span).await,
             _ => {}
         }
 
@@ -994,6 +1011,333 @@ impl Interp {
     }
 }
 
+/// The pinned Tier-2 deferral message for `attachStdin: true` (interactive stdin
+/// attach is out of v1 scope — §4.5). A bare prefix `.contains(...)` survives any
+/// future tail; do NOT reword without updating the asserting tests.
+#[cfg(unix)]
+const ATTACH_STDIN_DEFERRED: &str =
+    "docker exec: attachStdin is not supported (interactive stdin attach is deferred) — \
+     use exec without stdin or process.spawn";
+
+impl Interp {
+    /// `d.execCreate(containerId, opts)` — POST `/containers/{id}/exec` with the exec
+    /// config; a 201 body's `Id` is returned as `[execId, nil]`. A non-string container
+    /// id is a Tier-2 panic; a non-2xx is a `[nil, {message, statusCode}]` pair.
+    #[cfg(unix)]
+    async fn docker_exec_create(
+        &self,
+        socket_path: &str,
+        api_version: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        let cid = self.docker_want_id(args, span, "docker.execCreate")?;
+        let opts = args.get(1).cloned().unwrap_or_else(Value::nil);
+        // §4.5 attachStdin deferral guard (also rejected at create time, before any IO).
+        if matches!(opt_bool(&opts, "attachStdin"), Some(true)) {
+            return Err(AsError::at(ATTACH_STDIN_DEFERRED.to_string(), span).into());
+        }
+        let body = self.docker_exec_config_body(&opts, span)?;
+        let base = format!("/v{}", api_version);
+        let path = format!("{base}/containers/{cid}/exec");
+        let resp = match self
+            .docker_unary_raw(socket_path, "POST", &path, Some(&body), span)
+            .await
+        {
+            Ok(r) => r,
+            Err(msg) => return Ok(docker_err_pair(msg, None)),
+        };
+        if !(200..300).contains(&resp.0) {
+            let (msg, status) = docker_decode_error(&resp);
+            return Ok(docker_err_pair(msg, Some(status)));
+        }
+        // 201 body `{"Id":"…"}` → the exec id string.
+        let text = String::from_utf8_lossy(&resp.1).into_owned();
+        let parsed = crate::stdlib::json::call("parse", &[Value::str(text)], span)?;
+        let exec_id = match docker_pair_value(&parsed) {
+            Some(v) => match self.read_member(&v, "Id", span) {
+                Ok(idv) => match idv.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => String::new(),
+                },
+                Err(_) => String::new(),
+            },
+            None => String::new(),
+        };
+        if exec_id.is_empty() {
+            return Ok(docker_err_pair(
+                "docker: exec create response had no Id".to_string(),
+                None,
+            ));
+        }
+        Ok(make_pair(Value::str(exec_id), Value::nil()))
+    }
+
+    /// `d.execStart(execId, opts)` — POST `/exec/{id}/start` with `Connection: Upgrade`/
+    /// `Upgrade: tcp` to trigger the hijack; the `101` upgrade body becomes a
+    /// `dockerStream` demuxing `leftover` then the raw transport (Multiplexed unless
+    /// `tty:true`). A non-string id is a Tier-2 panic; `attachStdin:true` is the pinned
+    /// deferral.
+    #[cfg(unix)]
+    async fn docker_exec_start(
+        &self,
+        socket_path: &str,
+        api_version: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        let exec_id = self.docker_want_id(args, span, "docker.execStart")?;
+        let opts = args.get(1).cloned().unwrap_or_else(Value::nil);
+        self.docker_exec_start_inner(socket_path, api_version, &exec_id, &opts, span)
+            .await
+    }
+
+    /// The shared exec-start body: drive the hijack and register the `dockerStream`. Used
+    /// by both `execStart` and the `exec` convenience (which already validated its id).
+    #[cfg(unix)]
+    async fn docker_exec_start_inner(
+        &self,
+        socket_path: &str,
+        api_version: &str,
+        exec_id: &str,
+        opts: &Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        if matches!(opt_bool(opts, "attachStdin"), Some(true)) {
+            return Err(AsError::at(ATTACH_STDIN_DEFERRED.to_string(), span).into());
+        }
+        let tty = matches!(opt_bool(opts, "tty"), Some(true));
+        let detach = matches!(opt_bool(opts, "detach"), Some(true));
+        // Body: {"Detach":<detach>,"Tty":<tty>}.
+        let body = format!(
+            "{{\"Detach\":{},\"Tty\":{}}}",
+            bool_param(detach),
+            bool_param(tty)
+        )
+        .into_bytes();
+        let base = format!("/v{}", api_version);
+        let path = format!("{base}/exec/{exec_id}/start");
+        use crate::stdlib::http1;
+        let stream = match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(docker_err_pair(
+                    format!("docker: connect to '{}' failed: {}", socket_path, e),
+                    None,
+                ))
+            }
+        };
+        let req = http1::Http1Request {
+            method: "POST",
+            path: &path,
+            // The hijack: setting Connection/Upgrade makes the codec skip its default
+            // `Connection: close` and triggers the `101 Switching Protocols` arm.
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Connection".to_string(), "Upgrade".to_string()),
+                ("Upgrade".to_string(), "tcp".to_string()),
+            ],
+            body: Some(&body),
+        };
+        let resp = match http1::send_request(stream, &req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(docker_err_pair(format!("docker: {}", e), None)),
+        };
+        // A non-101 (e.g. a 4xx error head) is a Tier-1 error pair.
+        if resp.status != 101 {
+            let buf = match resp.body {
+                http1::Http1Body::Stream(r) => r
+                    .read_to_end(super::MAX_ALLOC_COUNT as usize)
+                    .await
+                    .unwrap_or_default(),
+                http1::Http1Body::Upgraded { .. } => Vec::new(),
+            };
+            let (msg, status) = docker_decode_error(&(resp.status, buf));
+            return Ok(docker_err_pair(msg, Some(status)));
+        }
+        let (transport, leftover) = match resp.body {
+            http1::Http1Body::Upgraded {
+                transport,
+                leftover,
+            } => (transport, leftover),
+            http1::Http1Body::Stream(_) => {
+                return Ok(docker_err_pair(
+                    "docker: exec start did not upgrade (no 101 hijack)".to_string(),
+                    None,
+                ))
+            }
+        };
+        // Chain `leftover` ++ the raw transport into the demux byte source, then register
+        // a dockerStream over it (TTY framing if requested, else multiplexed demux).
+        let source = upgraded_byte_source(transport, leftover);
+        let framing = if tty {
+            StreamFraming::Tty
+        } else {
+            StreamFraming::Multiplexed
+        };
+        let handle = self.register_resource(
+            NativeKind::DockerStream,
+            indexmap::IndexMap::new(),
+            ResourceState::DockerStream(Box::new(DockerStreamState { source, framing })),
+        );
+        Ok(make_pair(handle, Value::nil()))
+    }
+
+    /// `d.execInspect(execId)` — GET `/exec/{id}/json` → the exec status object.
+    #[cfg(unix)]
+    async fn docker_exec_inspect(
+        &self,
+        socket_path: &str,
+        api_version: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        let exec_id = self.docker_want_id(args, span, "docker.execInspect")?;
+        let base = format!("/v{}", api_version);
+        let path = format!("{base}/exec/{exec_id}/json");
+        let resp = match self
+            .docker_unary_raw(socket_path, "GET", &path, None, span)
+            .await
+        {
+            Ok(r) => r,
+            Err(msg) => return Ok(docker_err_pair(msg, None)),
+        };
+        self.docker_map_response(resp, span)
+    }
+
+    /// `d.exec(containerId, opts)` — the convenience composition (§4.5): execCreate →
+    /// execStart → DRAIN the stream collecting stdout/stderr → execInspect for the exit
+    /// code → `{exitCode, code, stdout, stderr}` (mirrors `process.run`'s shape, with a
+    /// `code` alias). A failure at any stage short-circuits to that stage's `[nil, err]`.
+    #[cfg(unix)]
+    async fn docker_exec(
+        &self,
+        socket_path: &str,
+        api_version: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        let cid = self.docker_want_id(args, span, "docker.exec")?;
+        let opts = args.get(1).cloned().unwrap_or_else(Value::nil);
+        // attachStdin is rejected up-front (the deferral guard, before any IO).
+        if matches!(opt_bool(&opts, "attachStdin"), Some(true)) {
+            return Err(AsError::at(ATTACH_STDIN_DEFERRED.to_string(), span).into());
+        }
+        let tty = matches!(opt_bool(&opts, "tty"), Some(true));
+
+        // 1. Create the exec.
+        let created = self
+            .docker_exec_create(socket_path, api_version, &[Value::str(cid), opts.clone()], span)
+            .await?;
+        let exec_id = match docker_pair_ok_str(&created) {
+            Ok(s) => s,
+            Err(pair) => return Ok(pair), // surface the create [nil, err]
+        };
+
+        // 2. Start the exec (hijack) → a dockerStream id.
+        let started = self
+            .docker_exec_start_inner(socket_path, api_version, &exec_id, &opts, span)
+            .await?;
+        let stream_id = match docker_pair_native_id(&started) {
+            Some(id) => id,
+            None => return Ok(started), // a start [nil, err]
+        };
+
+        // 3. Drain the stream, accumulating per-stream text.
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        loop {
+            // Take the state OUT across the read await (never hold the table borrow).
+            let mut state = match self.take_resource(stream_id) {
+                Some(ResourceState::DockerStream(s)) => s,
+                other => {
+                    if let Some(o) = other {
+                        self.return_resource(stream_id, o);
+                    }
+                    break;
+                }
+            };
+            let outcome = demux_next(&mut state.source, &mut state.framing).await;
+            match outcome {
+                Ok(DockerItem::Item(v)) => {
+                    self.return_resource(stream_id, ResourceState::DockerStream(state));
+                    let (s, t) = item_stream_text(&v, tty);
+                    if s == "stderr" {
+                        stderr.push_str(&t);
+                    } else {
+                        stdout.push_str(&t);
+                    }
+                }
+                Ok(DockerItem::Err(e)) => {
+                    // Terminal stream error — drop the connection, surface the pair.
+                    return Ok(make_pair(Value::nil(), e));
+                }
+                Ok(DockerItem::End) => break, // drop the connection (state not returned)
+                Err(io) => {
+                    return Ok(make_pair(
+                        Value::nil(),
+                        stream_err(&format!("docker: stream read failed: {}", io)),
+                    ))
+                }
+            }
+        }
+
+        // 4. Inspect for the exit code.
+        let inspected = self
+            .docker_exec_inspect(socket_path, api_version, &[Value::str(exec_id)], span)
+            .await?;
+        let exit_code = match docker_pair_value_ok(&inspected) {
+            Ok(v) => match self.read_member(&v, "ExitCode", span) {
+                Ok(c) => match c.into_kind() {
+                    crate::value::OwnedKind::Int(i) => i,
+                    crate::value::OwnedKind::Float(f) => f as i64,
+                    _ => 0,
+                },
+                Err(_) => 0,
+            },
+            Err(pair) => return Ok(pair), // an inspect [nil, err]
+        };
+
+        let mut result = indexmap::IndexMap::new();
+        result.insert("exitCode".to_string(), Value::int(exit_code));
+        result.insert("code".to_string(), Value::int(exit_code));
+        result.insert("stdout".to_string(), Value::str(stdout));
+        result.insert("stderr".to_string(), Value::str(stderr));
+        Ok(make_pair(Value::object(result), Value::nil()))
+    }
+
+    /// Build the exec-create JSON body from the opts object. Maps the §4.5 fields
+    /// (`cmd`→`Cmd`, `env`→`Env`, `workingDir`→`WorkingDir`, `user`→`User`,
+    /// `attachStdout`/`attachStderr`/`tty`) onto the Engine-API config; an absent
+    /// `attachStdout`/`attachStderr` defaults to ON (an exec with neither attached
+    /// yields no output). REUSES `std/json`'s encoder.
+    #[cfg(unix)]
+    fn docker_exec_config_body(&self, opts: &Value, span: Span) -> Result<Vec<u8>, Control> {
+        let mut cfg = indexmap::IndexMap::new();
+        if let ValueKind::Object(o) = opts.kind() {
+            if let Some(cmd) = o.get("cmd") {
+                cfg.insert("Cmd".to_string(), cmd.clone());
+            }
+            if let Some(env) = o.get("env") {
+                cfg.insert("Env".to_string(), env.clone());
+            }
+            if let Some(wd) = o.get("workingDir") {
+                cfg.insert("WorkingDir".to_string(), wd.clone());
+            }
+            if let Some(user) = o.get("user") {
+                cfg.insert("User".to_string(), user.clone());
+            }
+        }
+        let attach_stdout = !matches!(opt_bool(opts, "attachStdout"), Some(false));
+        let attach_stderr = !matches!(opt_bool(opts, "attachStderr"), Some(false));
+        let tty = matches!(opt_bool(opts, "tty"), Some(true));
+        cfg.insert("AttachStdout".to_string(), Value::bool_(attach_stdout));
+        cfg.insert("AttachStderr".to_string(), Value::bool_(attach_stderr));
+        cfg.insert("Tty".to_string(), Value::bool_(tty));
+        self.docker_json_body(&Value::object(cfg), span, "docker.execCreate")
+    }
+}
+
 /// Read `opts.<key>` as a bool, or `None` if absent / not a bool.
 #[cfg(unix)]
 fn opt_bool(opts: &Value, key: &str) -> Option<bool> {
@@ -1026,6 +1370,93 @@ fn opt_scalar(opts: &Value, key: &str) -> Option<String> {
 #[cfg(unix)]
 fn bool_param(b: bool) -> String {
     if b { "true" } else { "false" }.to_string()
+}
+
+/// Build a `DockerByteSource` over a `101`-upgraded transport: the `leftover` bytes
+/// (already read past the head) are emitted FIRST, then the raw `UnixStream` is read to
+/// EOF. The result is the EXACT `DockerByteSource` type the §4.3 demux drives, so the
+/// upgrade hijack reuses the multiplex/TTY framing verbatim.
+#[cfg(unix)]
+fn upgraded_byte_source(
+    transport: tokio::net::UnixStream,
+    leftover: Vec<u8>,
+) -> DockerByteSource {
+    use tokio_util::bytes::Bytes;
+    // State: (optional leftover to emit once, then the live transport).
+    let init = (Some(leftover), transport);
+    let stream = futures_util::stream::unfold(init, |(pending, mut transport)| async move {
+        // Emit the leftover bytes as the first chunk (only once, and only if non-empty).
+        if let Some(lo) = pending {
+            if !lo.is_empty() {
+                return Some((Ok(Bytes::from(lo)), (None, transport)));
+            }
+        }
+        // Then read frames off the raw transport until EOF.
+        let mut buf = [0u8; 16 * 1024];
+        match transport.read(&mut buf).await {
+            Ok(0) => None, // EOF — end of stream
+            Ok(n) => Some((Ok(Bytes::copy_from_slice(&buf[..n])), (None, transport))),
+            Err(e) => Some((Err(e), (None, transport))),
+        }
+    });
+    let byte_stream: crate::stdlib::net_http::ByteStream = Box::pin(stream);
+    tokio::io::BufReader::new(tokio_util::io::StreamReader::new(byte_stream))
+}
+
+/// Read the `{stream, text}` fields of a demuxed logs item; a TTY raw item is all
+/// stdout. Returns `(stream_name, text)`.
+#[cfg(unix)]
+fn item_stream_text(v: &Value, tty: bool) -> (String, String) {
+    if let ValueKind::Object(o) = v.kind() {
+        let s = if tty {
+            "stdout".to_string()
+        } else {
+            o.get("stream")
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "stdout".to_string())
+        };
+        let t = o.get("text").map(|x| x.to_string()).unwrap_or_default();
+        return (s, t);
+    }
+    ("stdout".to_string(), v.to_string())
+}
+
+/// For a `[value, err]` pair: `Ok(string)` if err is nil and value is a string; else
+/// `Err(the original pair)` so the caller can surface the error pair unchanged.
+#[cfg(unix)]
+fn docker_pair_ok_str(pair: &Value) -> Result<String, Value> {
+    if docker_pair_err(pair) == Some(false) {
+        if let Some(v) = docker_pair_value(pair) {
+            if let ValueKind::Str(s) = v.kind() {
+                return Ok(s.to_string());
+            }
+        }
+    }
+    Err(pair.clone())
+}
+
+/// For a `[value, err]` pair: `Ok(value)` if err is nil; else `Err(the original pair)`.
+#[cfg(unix)]
+fn docker_pair_value_ok(pair: &Value) -> Result<Value, Value> {
+    if docker_pair_err(pair) == Some(false) {
+        if let Some(v) = docker_pair_value(pair) {
+            return Ok(v);
+        }
+    }
+    Err(pair.clone())
+}
+
+/// For a `[value, err]` pair whose value is a `Value::native` handle: its resource id.
+#[cfg(unix)]
+fn docker_pair_native_id(pair: &Value) -> Option<u64> {
+    if docker_pair_err(pair) == Some(false) {
+        if let Some(v) = docker_pair_value(pair) {
+            if let ValueKind::Native(n) = v.kind() {
+                return Some(n.id);
+            }
+        }
+    }
+    None
 }
 
 /// Extract the `value` (index 0) from a `[value, err]` pair Value.

@@ -64,3 +64,28 @@ d.close()
 | `close()` | Release the client handle. |
 
 `filters` is JSON-encoded onto the query string. A non-string id is a Tier-2 panic.
+
+## Running a command (`exec`)
+
+`d.exec(containerId, opts)` is the convenience composition: it creates an exec, starts
+it (hijacking the connection), drains the output, and inspects for the exit code —
+returning `{ exitCode, code, stdout, stderr }` (the `code` field mirrors
+`process.run`'s shape).
+
+```js
+let [res, err] = await d.exec("web", { cmd: ["echo", "hi"] })
+if (err != nil) { print(err.message); exit(1) }
+print(res.exitCode)  // 0
+print(res.stdout)    // "hi\n"
+```
+
+The three steps are also available individually:
+
+| Method | Description |
+| --- | --- |
+| `execCreate(id, opts)` | Create an exec on a container (`{ cmd, env?, workingDir?, user?, attachStdout?, attachStderr?, tty? }`) → `[execId, err]`. |
+| `execStart(execId, opts?)` | Start an exec via a `101` connection hijack → `[stream, err]`; the stream demuxes stdout/stderr like `logs` (raw stdout under `{ tty: true }`). |
+| `execInspect(execId)` | Inspect an exec's status → `[{ ExitCode, Running, … }, err]`. |
+
+`opts.cmd` is the argv array. Interactive stdin attach is out of scope in v1:
+`attachStdin: true` is a Tier-2 panic — run without stdin, or use `std/process`.
