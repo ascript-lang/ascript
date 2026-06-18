@@ -19,8 +19,9 @@ use crate::value::{OwnedKind, Value, ValueKind};
 use crate::worker::isolate::{ChunkJob, ChunkKind};
 
 /// Aborts a `spawn_local` task when dropped. Used by `race` to cancel the resolver
-/// tasks (and thereby the losing futures) once a winner is decided.
-struct AbortOnDrop(tokio::task::AbortHandle);
+/// tasks (and thereby the losing futures) once a winner is decided, and by CNTR §6's
+/// signal-handler registry to abort each listener task on `Interp` teardown.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

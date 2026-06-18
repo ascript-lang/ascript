@@ -17,6 +17,14 @@
 //! tokio is NOT replaced. These seams pin *time/RNG values and recorded ordering*,
 //! not *task scheduling*. Bit-for-bit reproducible interleaving of arbitrary
 //! concurrent tasks remains the one named 2b residual (spec §3.6).
+//!
+//! Explicitly EXCLUDED seams (real-OS, intentionally NOT routed through a
+//! `DeterminismContext`): CNTR §6's inbound `process.on`/`process.off` signal handlers.
+//! An OS signal arrives at a wall-clock-driven, externally-triggered moment that has no
+//! meaningful record/replay (re-delivering a real SIGTERM on resume is impossible, and
+//! the §6.3 emulated default exits the process). The `workflow-determinism` lint flags a
+//! `process.*` call (incl. `process.on`) inside a workflow body so the author drives any
+//! needed signal-driven effect through an `activity`/`ctx.call` boundary instead.
 
 /// A FIXED, seed-derived virtual-clock start (ms-epoch) for a pure deterministic
 /// run. Using a seed-derived base (NOT the real wall clock) is what makes two

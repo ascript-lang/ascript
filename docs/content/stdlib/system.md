@@ -494,6 +494,8 @@ Subprocess execution built on the async event loop. There are two entry points, 
 - `process.run` — one-shot: spawn, await completion, and capture output.
 - `process.spawn` — streaming: returns a `ChildProcess` handle whose stdio you read and write incrementally.
 
+It also handles **inbound** signals (the signals your own process receives): `process.on` / `process.off` register and remove handlers for `SIGTERM`/`SIGINT`/etc.
+
 > [!TIER1]
 > For `process.run`, a **non-zero exit is not an error** — it comes back as a normal result with `success == false`. Only a *spawn failure* (binary not found, permission denied, timeout) is the `err`. Setting `check: true` flips a non-zero exit into a Tier-1 error.
 
@@ -598,6 +600,36 @@ if (err != nil) {
   let status = await child.wait()
   print(status.success)
 }
+```
+
+### process.on
+
+Registers a handler for an **inbound** OS signal — the signal your *own* process receives (e.g. a `SIGTERM` from `kill` or an orchestrator shutting the container down). This is the inverse of `child.kill`, which *sends* a signal to a child.
+
+- **signalName** `string` — one of `"SIGTERM"`, `"SIGINT"`, `"SIGHUP"`, `"SIGQUIT"`, `"SIGUSR1"`, `"SIGUSR2"`. An unknown name, or the uncatchable `"SIGKILL"`/`"SIGSTOP"`, is a Tier-2 panic. On Windows only `"SIGINT"` (ctrl-c) is supported; any other name panics.
+- **handler** `fn(signalName)` — called with the signal name each time the signal arrives. A second `on` for the same signal **replaces** the handler (last call wins). A panic in the handler is reported and the listener keeps running.
+- **Returns** `nil`.
+
+`process.on` is **main-isolate only** — calling it inside a `worker fn` / `worker class` / `worker fn*` is a Tier-2 refusal. Until you register a handler, the signal keeps its OS default (a `SIGTERM` kills the process with exit code 143).
+
+```ascript
+import { on } from "std/process"
+on("SIGTERM", (sig) => {
+  print("shutting down on " + sig)
+  exit(0)
+})
+```
+
+### process.off
+
+Removes a previously-registered handler. The **next** receipt of that signal restores the emulated OS default: the process flushes output and exits with `128 + signo` (e.g. `143` for `SIGTERM`). Removing a signal that was never registered is a no-op. Main-isolate only.
+
+- **signalName** `string` — the signal to stop handling.
+- **Returns** `nil`.
+
+```ascript
+import { on, off } from "std/process"
+on("SIGINT", (sig) => { print("once") ; off("SIGINT") })
 ```
 
 ## std/crypto

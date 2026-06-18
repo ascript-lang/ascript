@@ -398,6 +398,29 @@ fn audit_process_spawn_run_denied() {
     assert_denied("audit_proc_spawn.as", imp, "process.spawn(\"true\", [])", "process", &["--sandbox"]);
 }
 
+// CNTR §6 (Task 4.6 forward-link): `process.on` is the inbound signal seam — gated by
+// Process like the rest of `std/process`. `--deny process` AND `--sandbox` both deny it
+// BEFORE the listener task is ever spawned (the gate fires at `call_stdlib`).
+#[cfg(all(unix, feature = "sys"))]
+#[test]
+fn audit_process_on_denied() {
+    let imp = "import * as process from \"std/process\"";
+    assert_denied(
+        "audit_proc_on_deny.as",
+        imp,
+        "process.on(\"SIGTERM\", (s) => { print(s) })",
+        "process",
+        &["--deny", "process"],
+    );
+    assert_denied(
+        "audit_proc_on_sbx.as",
+        imp,
+        "process.on(\"SIGTERM\", (s) => { print(s) })",
+        "process",
+        &["--sandbox"],
+    );
+}
+
 // ───────────────────────────── os topology / identity — gated by Net ──────────
 // `os.networkInterfaces()` / `os.localIp()` / `os.hostname()` leak network topology
 // / host identity without a socket — gated by Net. Ambient introspection

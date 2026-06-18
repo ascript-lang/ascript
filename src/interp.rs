@@ -894,6 +894,42 @@ pub struct Interp {
     /// (never held across `.await` since all lookup sites are sync). `None` when
     /// paranoid mode is off (the default) — the check short-circuits immediately.
     pub(crate) paranoid_set: RefCell<Option<ParanoidElisionSet>>,
+    /// CNTR §6: inbound OS-signal handlers registered via `process.on` / removed via
+    /// `process.off`. Keyed by the canonical signal name (`"SIGTERM"`, …). The FIRST
+    /// `on` for a signal spawns ONE `spawn_local` listener task; a later `on` for the
+    /// same signal SWAPS the handler in-place (last-wins, no new task); `off` flips the
+    /// entry to [`SignalState::Restored`] so the listener's next receipt emulates the
+    /// OS-default kill (`exit(128+signo)`). Main-isolate only — a worker isolate calling
+    /// `process.on` is a Tier-2 refusal, so this map is never touched off the main
+    /// isolate. A `RefCell` (the handler `Value` is cloned out and the borrow dropped
+    /// before the handler runs — never held across `.await`). Only WRITTEN by
+    /// `std/process` (`sys`-gated); the field is unconditional so `Interp::new` always
+    /// builds — `#[allow(dead_code)]` off `sys` (mirrors `snapshots_touched`).
+    #[cfg_attr(not(feature = "sys"), allow(dead_code))]
+    pub(crate) signal_handlers: RefCell<std::collections::HashMap<&'static str, SignalReg>>,
+}
+
+/// CNTR §6: one registered inbound-signal handler + its listener-task state.
+#[cfg_attr(not(feature = "sys"), allow(dead_code))]
+pub(crate) struct SignalReg {
+    /// The current handler `Value` (callable). Swapped in place on a repeat `on`.
+    pub(crate) handler: Value,
+    /// Whether the handler is live (`Active`) or has been removed via `off` (`Restored`).
+    pub(crate) state: SignalState,
+    /// Held so dropping the `Interp` aborts the listener task (no zombie thread on a
+    /// fresh interp teardown). The listener loop normally lives for the program's life.
+    pub(crate) _task: crate::stdlib::task_mod::AbortOnDrop,
+}
+
+/// CNTR §6: a registered signal is either live or restored-to-default.
+#[cfg_attr(not(feature = "sys"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SignalState {
+    /// `on` is live: the listener invokes the current handler on each receipt.
+    Active,
+    /// `off` was called: the listener's NEXT receipt emulates the OS default
+    /// (`exit(128+signo)`) instead of calling a handler.
+    Restored,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1285,6 +1321,8 @@ impl Interp {
             // `set_paranoid_set` / `ASCRIPT_ELIDE_PARANOID=1`. When off, all
             // contract-failure paths are entirely unaffected (zero cost).
             paranoid_set: RefCell::new(None),
+            // CNTR §6: no inbound-signal handlers until the first `process.on`.
+            signal_handlers: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1910,6 +1948,16 @@ impl Interp {
                 let _ = so.flush();
             }
         }
+    }
+
+    /// CNTR §6: flush buffered stdout before a process-exiting signal default
+    /// (`exit(128+signo)`) or a handler `exit(code)`. `push_output` already flushes
+    /// per line under `Live`, so this is a belt-and-suspenders final flush before the
+    /// hard `std::process::exit` in the signal listener.
+    #[cfg_attr(not(feature = "sys"), allow(dead_code))]
+    pub(crate) fn flush_output(&self) {
+        use std::io::Write;
+        let _ = std::io::stdout().lock().flush();
     }
 
     /// Emit one std/log record line. Buffers into `log_capture` under `Capture`

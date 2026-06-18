@@ -319,6 +319,26 @@ let [d, _] = docker.connect({ socketPath: "/var/run/docker.sock" })
         );
     }
 
+    /// CNTR §6: a `process.on(...)` (inbound-signal handler registration) inside an
+    /// inline workflow body is flagged — `process` is in `SEAM_MODULES`, so the signal
+    /// seam is non-deterministic-across-replay like every other `process.*` call.
+    #[test]
+    fn flags_process_on_in_inline_workflow() {
+        let src = r#"
+import { run } from "std/workflow"
+import * as process from "std/process"
+await run((ctx, input) => {
+  process.on("SIGTERM", (s) => { print(s) })
+  return input
+}, 0, { log: "x" })
+"#;
+        assert!(
+            has(src, "workflow-determinism"),
+            "process.on inside a workflow body must be flagged: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
     /// AScript has no `fn` *expression* form: `fn`/`fn name` is statement-only on
     /// both engines, so an inline `fn(ctx, input){…}` argument never parses as a
     /// workflow body — it is a SYNTAX error. This pins that reality (the rule's
