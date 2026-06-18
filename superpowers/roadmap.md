@@ -747,7 +747,7 @@ Spec `superpowers/specs/2026-06-12-warm-starts-design.md`, plan
   (v1 seeds field/arith sites only) — owner: future PGO v2; group-mode background flusher (v1 flushes
   on the recording thread) — owner: workflow-perf follow-up.
 
-## RT — runtime-only native stubs 🚧 IN PROGRESS (`feat/native-runtime-stubs`)
+## RT — runtime-only native stubs ✅ MERGED
 Ships `ascript-rt` (a runtime-only bin target gated by `cfg(ascript_rt)`), a per-target×tier
 stub matrix (8 triples × 4 tiers, RT §3.3), import-driven tier selection, `--target` cross
 builds, `--exact`/`--stub`, `--oci` (dockerless OCI image tarball), `--compress` (zstd

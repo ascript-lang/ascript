@@ -208,6 +208,23 @@ unused-feature delta. **Integrity failures are fatal; availability failures fall
 tampered fetched stub is never "recovered" by falling back to a weaker rung, because rungs 4/5
 are local binaries that never touch the network.
 
+### Stub tiers
+
+The published stubs come in four cumulative tiers, selected automatically from the program's
+imports (the nearest tier whose feature set is a superset of what the program needs). A
+pure-compute CLI tool ships on `rt-core` — a fraction of the full toolchain:
+
+| Tier | Includes | Size | vs. toolchain |
+| --- | --- | --- | --- |
+| **rt-core** | VM, GC, core language, workers, caps, shared heap, zstd-bundle | **5.75 MB** | 13.3% |
+| **rt-local** | + json/msgpack, files/process/env, sqlite, dates, crypto, compress, terminal, logging | **13.9 MB** | 32.0% |
+| **rt-net** | + HTTP(S)/WS/TCP/UDP + servers, Postgres, Redis, telemetry | **20.4 MB** | 47.1% |
+| **rt-full** | + intl, AI, FFI (everything runtime-shaped) | **32.6 MB** | 75.3% |
+| _full toolchain_ | _(today's `--native` stub: VM + the whole compiler/LSP/DAP/formatter/REPL)_ | _43.3 MB_ | 100% |
+
+(Measured on an arm64 release build; re-run `bench/rt_size_matrix.sh` for your platform.) Force
+a tier with `--tier`; build a stub with the program's *exact* feature set via `--exact`.
+
 ## Cross builds (`--target`)
 
 The embedded payload is **platform-independent** — it carries bytecode, constants, and
@@ -234,7 +251,9 @@ the `current_exe` rung, where the running mac binary's own signature would other
 | `--stub <path>` | Append onto an explicit local `ascript-rt` stub (rung 1). |
 | `--no-fetch` | Skip the network fetch rung (availability fall-through, never an integrity bypass). |
 | `--tier <rt-core\|rt-local\|rt-net\|rt-full>` | Force the stub tier instead of automatic nearest-superset selection. |
+| `--exact` | Build a stub with the program's *exact* feature set via local cargo (needs `cargo` + an AScript source checkout at `$ASCRIPT_SRC` matching this toolchain's version). The result is content-addressed and reused. |
 | `--compress` | zstd-compress the embedded payload (the stub decompresses at startup). |
+| `--oci` / `--oci-tag <tag>` | Write a loadable OCI image tarball instead of a bare executable (see below). |
 | `--report-json <path\|->` | Emit the canonical JSON build report. |
 | `--deny <caps>` | Embed a denial of one or more caps (comma-separated/repeatable). |
 | `--sandbox` | Embed a denial of all five caps (`fs,net,process,ffi,env`). |
@@ -242,6 +261,31 @@ the `current_exe` rung, where the running mac binary's own signature would other
 | `--deny-fs <mode>` | Fs carve-out: `write` (reads allowed) or `all`. |
 
 `ASCRIPT_DENY` (an environment variable, not a flag) subtracts further at launch — see above.
+
+## Container images (`--oci`)
+
+`ascript build --oci app.as -o app.tar` writes a **loadable OCI image tarball** — no Docker (or
+any container runtime) needed at build time. The image is `scratch`-based (no base layers), so the
+bundle must be statically linked: `--oci` builds for a `*-unknown-linux-musl` target (defaulting to
+`<host-arch>-unknown-linux-musl`; a gnu/darwin/windows triple is rejected with the musl equivalent
+named). The single layer holds `/app` = the bundle, with `Entrypoint: ["/app"]`. The tag defaults to
+`<stem>:latest` (override with `--oci-tag`). `--oci` composes with `--compress`, `--target`, and
+`--tier`.
+
+The output is **reproducible**: same source + same stub + same flags ⇒ byte-identical tarball
+(fixed timestamps — `1970-01-01T00:00:00Z`, or `SOURCE_DATE_EPOCH` when set; sorted entries; pinned
+gzip).
+
+```text
+ascript build --oci app.as -o app.tar
+podman load -i app.tar && podman run --rm app:latest
+```
+
+> [!NOTE] The tarball is a standard **OCI image layout**, which `podman load`, `skopeo`, `buildah`,
+> `nerdctl`, and Docker's containerd-snapshotter store all accept directly. Docker's **classic
+> (overlay2) image store** rejects OCI-layout archives ("does not contain a manifest.json"); use
+> `podman load`, or `skopeo copy oci-archive:app.tar docker-daemon:app:latest`, or enable the
+> containerd image store, to load into such a daemon.
 
 ---
 
