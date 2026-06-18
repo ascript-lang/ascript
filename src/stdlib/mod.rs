@@ -20,6 +20,8 @@ pub mod compress;
 pub mod convert;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+#[cfg(feature = "docker")]
+pub mod docker;
 pub mod events;
 #[cfg(feature = "ffi")]
 pub mod ffi;
@@ -215,6 +217,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/tui" => tui::exports(),
         #[cfg(feature = "ffi")]
         "std/ffi" => ffi::exports(),
+        #[cfg(feature = "docker")]
+        "std/docker" => docker::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -288,6 +292,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/tui",
     "std/ffi",
     "std/resilience",
+    "std/docker",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -629,6 +634,8 @@ impl Interp {
             "tui" => self.call_tui(func, args, span),
             #[cfg(feature = "ffi")]
             "ffi" => self.call_ffi(func, args, span).await,
+            #[cfg(feature = "docker")]
+            "docker" => self.call_docker(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

@@ -124,6 +124,18 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         // feature-independent); export-cross-checked only when `net` is built (below).
         ("std/net/unix", "connect") => 1,
         ("std/net/unix", "listen") => 1,
+        // CNTR §4.2 std/docker — the id-taking `dockerClient` HANDLE methods each take
+        // exactly one required arg (the container/image id). `connect` is omitted (its
+        // opts arg is optional → min 0). These are handle methods, NOT module exports,
+        // so they are listed in `handle_methods` below and skipped by the export
+        // cross-check (the `ffi` symbol/call precedent).
+        ("std/docker", "inspect") => 1,
+        ("std/docker", "start") => 1,
+        ("std/docker", "stop") => 1,
+        ("std/docker", "restart") => 1,
+        ("std/docker", "wait") => 1,
+        ("std/docker", "remove") => 1,
+        ("std/docker", "removeImage") => 1,
         _ => return None,
     };
     Some(n)
@@ -227,12 +239,33 @@ mod tests {
             ("std/net/unix", "connect"),
             #[cfg(feature = "net")]
             ("std/net/unix", "listen"),
+            // CNTR §4.2: std/docker handle methods — keyed unconditionally above, but
+            // they are HANDLE methods (not module exports), so they are skipped by the
+            // export cross-check via `handle_methods` below.
+            ("std/docker", "inspect"),
+            ("std/docker", "start"),
+            ("std/docker", "stop"),
+            ("std/docker", "restart"),
+            ("std/docker", "wait"),
+            ("std/docker", "remove"),
+            ("std/docker", "removeImage"),
         ];
         // FFI handle METHODS (resolved on a `ForeignLib`/`ForeignSymbol` handle, not
         // module-level exports). Keyed in `required_args` so `call-arity` can reach
         // `lib.symbol(...)` / `sym.call(...)` (Gate-5), but NOT in `std_module_exports`,
         // so the export cross-check skips them.
-        let handle_methods: &[(&str, &str)] = &[("std/ffi", "symbol"), ("std/ffi", "call")];
+        let handle_methods: &[(&str, &str)] = &[
+            ("std/ffi", "symbol"),
+            ("std/ffi", "call"),
+            // CNTR §4.2: dockerClient handle methods — no module export to cross-check.
+            ("std/docker", "inspect"),
+            ("std/docker", "start"),
+            ("std/docker", "stop"),
+            ("std/docker", "restart"),
+            ("std/docker", "wait"),
+            ("std/docker", "remove"),
+            ("std/docker", "removeImage"),
+        ];
         for (module, name) in keys {
             // The entry must actually be in the table.
             assert!(

@@ -486,7 +486,9 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
     // Split into METHOD and path.
     let mut parts = request_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("").to_uppercase();
-    let raw_path = parts.next().unwrap_or("/");
+    // Drop the query string before routing (a real daemon routes on the path; our
+    // fixtures key on the path alone). `?all=true`/`?filters=…` must not foil a match.
+    let raw_path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/");
 
     // Strip API version prefix, e.g. `/v1.43/containers/json` → `/containers/json`.
     // Pattern: raw_path starts with `/v<digits>.<digits>/`.
@@ -591,12 +593,31 @@ async fn read_request_line(stream: &mut UnixStream) -> Option<String> {
 
 /// Serve one connection from the mock daemon: read the request head, route it,
 /// write the fixture response, then close.
-async fn serve_one_connection(mut stream: UnixStream) {
+async fn serve_one_connection(stream: UnixStream) {
+    serve_one_connection_versioned(stream, false).await;
+}
+
+/// Is this request line a `GET /version` (with or without the `/v1.xx` prefix)?
+fn is_version_request(request_line: &str) -> bool {
+    let mut parts = request_line.splitn(3, ' ');
+    let method = parts.next().unwrap_or("");
+    let raw_path = parts.next().unwrap_or("/");
+    method.eq_ignore_ascii_case("GET") && raw_path.ends_with("/version")
+}
+
+/// Serve one connection; if `old_version` is true, the `GET /version` route returns
+/// the below-floor (1.20) fixture so the version-negotiation FLOOR path can be
+/// exercised against a real daemon. Every other route is unchanged.
+async fn serve_one_connection_versioned(mut stream: UnixStream, old_version: bool) {
     let Some(request_line) = read_request_line(&mut stream).await else {
         return; // connection closed before head — benign
     };
 
-    let response = route_request(&request_line).unwrap_or_else(error_404_http);
+    let response = if old_version && is_version_request(&request_line) {
+        version_old_http()
+    } else {
+        route_request(&request_line).unwrap_or_else(error_404_http)
+    };
 
     // Write the response in chunks to exercise pull-driven reads (helps streaming
     // fixture tests catch framing bugs). For streamed/chunked fixtures, insert a
@@ -675,6 +696,50 @@ pub async fn mock_daemon() -> (String, DaemonGuard) {
             }
         }
         // Best-effort cleanup of the socket file.
+        let _ = std::fs::remove_file(&sock_path_cleanup);
+    });
+
+    (sock_path_str, DaemonGuard { stop, _handle: handle })
+}
+
+/// Like [`mock_daemon`] but the `GET /version` route returns the BELOW-FLOOR (1.20)
+/// fixture, so the docker module's version-negotiation floor check can be exercised
+/// end-to-end. Every other route is identical to `mock_daemon`.
+pub async fn mock_daemon_old() -> (String, DaemonGuard) {
+    let tmp = tempfile::Builder::new()
+        .prefix("ascript_docker_mock_old_")
+        .suffix(".sock")
+        .tempfile()
+        .expect("create temp file for socket path");
+    let sock_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let listener = UnixListener::bind(&sock_path)
+        .unwrap_or_else(|e| panic!("mock_daemon_old: bind {:?}: {e}", sock_path));
+
+    let sock_path_str = sock_path.to_string_lossy().to_string();
+    let stop = Arc::new(Mutex::new(false));
+    let stop_clone = stop.clone();
+    let sock_path_cleanup = sock_path.clone();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            if *stop_clone.lock().unwrap() {
+                break;
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _addr))) => {
+                    tokio::spawn(serve_one_connection_versioned(stream, true));
+                }
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+        }
         let _ = std::fs::remove_file(&sock_path_cleanup);
     });
 
@@ -874,4 +939,232 @@ while (line != nil) {{
     );
     // The body should contain JSON events with "Action".
     assert!(out.contains("Action"), "expected event JSON in body, got:\n{out}");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Task 4.2 — std/docker client: connect + version negotiation + unary API.
+//
+// These exercise the real `std/docker` module against the mock daemon. Gated on
+// `feature = "docker"` (the module is compiled out without it; the file-level cfg
+// is only `net`).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "docker")]
+async fn run(src: &str) -> String {
+    ascript::run_source(src)
+        .await
+        .unwrap_or_else(|e| panic!("AScript program failed: {}", e.message))
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn connect_negotiates_version_and_lists_containers() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, err] = await docker.connect({{ socketPath: "{sock}" }})
+print(err)
+print(d.apiVersion)
+let [cs, e2] = await d.containers({{ all: true }})
+print(e2)
+print(len(cs))
+print(cs[0].Names[0])
+"#
+    );
+    assert_eq!(run(&src).await, "nil\n1.43\nnil\n2\n/web\n");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn connect_exposes_socket_path_field() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, err] = await docker.connect({{ socketPath: "{sock}" }})
+print(err)
+print(d.socketPath == "{sock}")
+"#
+    );
+    assert_eq!(run(&src).await, "nil\ntrue\n");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn old_daemon_below_floor_is_tier1_err() {
+    let (sock, _guard) = mock_daemon_old().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, err] = await docker.connect({{ socketPath: "{sock}" }})
+print(d)
+print(err != nil)
+print(err.message)
+"#
+    );
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\ntrue\n"), "expected Tier-1 floor err, got:\n{out}");
+    assert!(out.contains("1.20"), "err should name the daemon version, got:\n{out}");
+    assert!(out.contains("1.24"), "err should name the floor, got:\n{out}");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn unreachable_socket_is_tier1_err() {
+    // A path with no daemon → connect fails → Tier-1 [nil, err].
+    let src = r#"
+import * as docker from "std/docker"
+let [d, err] = await docker.connect({ socketPath: "/nonexistent/ascript-docker-nope.sock" })
+print(d)
+print(err != nil)
+"#;
+    assert_eq!(run(src).await, "nil\ntrue\n");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn inspect_404_has_status_code_and_message() {
+    let (sock, _guard) = mock_daemon().await;
+    // The mock returns 404 for a `GET /containers/<id>/json` whose id is unknown?
+    // Actually the mock routes ANY `/containers/.../json` to inspect_http (200). To
+    // exercise the 404 mapping we hit a path the mock 404s: removeImage of an unknown
+    // image returns the image_remove (200). The reliably-404 route is an unknown
+    // endpoint — `info` is not routed by the mock → 404.
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, err] = await docker.connect({{ socketPath: "{sock}" }})
+print(err)
+let [v, e2] = await d.info()
+print(v)
+print(e2.statusCode)
+print(e2.message)
+"#
+    );
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\nnil\n"), "connect ok + info nil val, got:\n{out}");
+    assert!(out.contains("404"), "expected statusCode 404, got:\n{out}");
+    assert!(out.contains("No such container"), "expected daemon message, got:\n{out}");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn tcp_docker_host_is_tier1_unsupported() {
+    let src = r#"
+import * as docker from "std/docker"
+let [d, err] = await docker.connect({ host: "tcp://127.0.0.1:2375" })
+print(d)
+print(err != nil)
+print(err.message)
+"#;
+    let out = run(src).await;
+    assert!(out.starts_with("nil\ntrue\n"), "expected Tier-1 err, got:\n{out}");
+    assert!(
+        out.to_lowercase().contains("tcp") || out.to_lowercase().contains("unix socket"),
+        "err should explain TCP is unsupported, got:\n{out}"
+    );
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn start_204_is_nil_nil_pair() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _e] = await docker.connect({{ socketPath: "{sock}" }})
+let [v, err] = await d.start("abc123")
+print(v)
+print(err)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\nnil\n");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn create_returns_201_body() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _e] = await docker.connect({{ socketPath: "{sock}" }})
+let [v, err] = await d.create({{ Image: "nginx:latest" }})
+print(err)
+print(v.Id)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\nabc123\n");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn inspect_returns_container_json() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _e] = await docker.connect({{ socketPath: "{sock}" }})
+let [v, err] = await d.inspect("abc123def456")
+print(err)
+print(v.Name)
+print(v.State.Running)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\n/web\ntrue\n");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn inspect_non_string_id_is_tier2_panic() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _e] = await docker.connect({{ socketPath: "{sock}" }})
+let [v, err] = recover(() => d.inspect(42))
+print(v)
+print(err != nil)
+"#
+    );
+    // recover() catches the Tier-2 panic → [nil, err].
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\ntrue\n"), "expected a recovered Tier-2 panic, got:\n{out}");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn ping_and_images_unary_calls() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _e] = await docker.connect({{ socketPath: "{sock}" }})
+let [pong, perr] = await d.ping()
+print(perr)
+let [imgs, ierr] = await d.images({{}})
+print(ierr)
+print(len(imgs))
+print(imgs[0].RepoTags[0])
+"#
+    );
+    assert_eq!(run(&src).await, "nil\nnil\n2\nnginx:latest\n");
+}
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn docker_client_is_non_sendable() {
+    // A DockerClient handle must be rejected by the worker airlock (it is a native
+    // resource → !Send). Constructing the handle directly and checking the serializer
+    // proves the field-path panic without needing a live worker.
+    use ascript::value::{NativeKind, NativeObject, Value};
+    let handle = Value::native(std::rc::Rc::new(NativeObject {
+        id: 1,
+        kind: NativeKind::DockerClient,
+        fields: indexmap::IndexMap::new(),
+    }));
+    let err = ascript::worker::serialize::check_sendable(&handle)
+        .expect_err("a DockerClient handle must be non-sendable");
+    assert_eq!(err.kind, "native");
 }

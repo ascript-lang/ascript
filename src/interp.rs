@@ -572,6 +572,12 @@ pub(crate) enum ResourceState {
     /// lifetime). GC-UNTRACED.
     #[cfg(feature = "ffi")]
     ForeignPtr(usize),
+    /// CNTR §4.1: a `std/docker` Engine-API client. Holds only the resolved socket
+    /// path + the negotiated API version — NO live socket (each API call opens a
+    /// fresh `UnixStream`), so there is nothing OS-backed to reclaim on drop beyond
+    /// removing the table entry. Unix-only.
+    #[cfg(all(feature = "docker", unix))]
+    DockerClient(crate::stdlib::docker::DockerClientState),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5576,6 +5582,12 @@ impl Interp {
         {
             if matches!(m.receiver.kind, crate::value::NativeKind::Resilience) {
                 return self.call_resilience_native_method(&m, args, span).await;
+            }
+        }
+        #[cfg(all(feature = "docker", unix))]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::DockerClient) {
+                return self.call_docker_method(&m, args, span).await;
             }
         }
         #[cfg(feature = "telemetry")]

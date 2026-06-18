@@ -1306,6 +1306,16 @@ pub enum NativeKind {
     // variant is compiled out when the feature is absent (matches the telemetry pattern).
     #[cfg(feature = "resilience")]
     Resilience,
+    // CNTR §4.1: a `std/docker` Engine-API client handle (`docker.connect`). Carries
+    // no live socket (each API call opens a fresh `UnixStream`); the backing
+    // `ResourceState::DockerClient` holds the resolved socket path + negotiated API
+    // version. Readable fields: `apiVersion`, `socketPath`. Methods: containers/
+    // inspect/create/start/stop/restart/wait/remove/images/removeImage/ping/version/
+    // info/close. `governing_caps` = net ∧ process (the §5.2 conjunction). Non-sendable
+    // (a native handle → the worker airlock rejects it). Feature-gated — compiled out
+    // without `docker` (mirrors the `resilience` pattern).
+    #[cfg(feature = "docker")]
+    DockerClient,
 }
 
 impl NativeKind {
@@ -1363,6 +1373,8 @@ impl NativeKind {
             NativeKind::ForeignPtr => "foreignPtr",
             #[cfg(feature = "resilience")]
             NativeKind::Resilience => "resilienceMarker",
+            #[cfg(feature = "docker")]
+            NativeKind::DockerClient => "dockerClient",
         }
     }
 
@@ -1438,6 +1450,11 @@ impl NativeKind {
             // RESIL §2.2: no OS resource — a pure in-memory marker.
             #[cfg(feature = "resilience")]
             NativeKind::Resilience => CapReq::NONE,
+            // CNTR §5.3: operating a docker client drives the Engine API over the
+            // network AND can spawn host processes — net ∧ process, the same
+            // conjunction the dispatch gate enforces, so a `caps.drop` HOLDS.
+            #[cfg(feature = "docker")]
+            NativeKind::DockerClient => CapReq::one(Cap::Net).and(Cap::Process),
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a

@@ -216,6 +216,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/tui", "tui.md"),
     ("std/ffi", "ffi.md"),
     ("std/resilience", "resilience.md"),
+    ("std/docker", "docker.md"),
 ];
 
 /// Pure checker (mutation-self-testable): validates a mapping against a module

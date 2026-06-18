@@ -377,7 +377,9 @@ resilience = []
 # subtraction, is the safety story: `docker.*` requires BOTH `net` AND `process`).
 # cfg's out cleanly under --no-default-features (the conjunction arm is gated out; the
 # CapReq machinery itself is CORE and still builds bare).
-docker = ["net"]
+# Pulls `data` as well as `net` (Task 4.2: the Engine-API client encodes/decodes JSON
+# request and response bodies via `std/json` + `serde_json`).
+docker = ["net", "data"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"
