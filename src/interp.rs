@@ -619,6 +619,17 @@ pub struct Interp {
     /// opening a socket. Tests read it via [`Interp::telemetry_capture`].
     #[cfg(feature = "telemetry")]
     telemetry_capture: RefCell<Vec<crate::stdlib::telemetry::model::CapturedRequest>>,
+    /// RESIL §3.6/§6.1: per-isolate singleflight table and metrics registry.
+    /// `None` fields are absent in a non-resilience build; `Default` gives zero
+    /// cost (empty IndexMap + empty registry). Tasks 3.2/3.3/5.x consume this;
+    /// Task 3.1 (this field) is the single Interp touch so later tasks are
+    /// pure-stdlib changes. Never held across `.await`; accessed through
+    /// short-lived borrows only.
+    // Read starting in Task 3.2 (singleflight uses `.flights`) and Phase 5 (`.registry`);
+    // pre-declared here as the single Interp touch (spec §3.6/§6.1).
+    #[cfg(feature = "resilience")]
+    #[allow(dead_code)]
+    pub(crate) resilience: RefCell<crate::stdlib::resilience::ResilState>,
     /// The script's own CLI arguments (`ascript run file.as <args...>`).
     /// Excludes the binary name and the script path — only the trailing args.
     /// Empty unless set by [`Interp::set_cli_args`] (i.e. the REPL and test
@@ -1107,6 +1118,8 @@ impl Interp {
             telemetry: RefCell::new(None),
             #[cfg(feature = "telemetry")]
             telemetry_capture: RefCell::new(Vec::new()),
+            #[cfg(feature = "resilience")]
+            resilience: RefCell::new(crate::stdlib::resilience::ResilState::default()),
             #[cfg(feature = "ai")]
             ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),

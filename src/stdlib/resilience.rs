@@ -27,6 +27,36 @@ use crate::value::{NativeKind, NativeObject, Value, ValueKind};
 use indexmap::IndexMap;
 use std::rc::Rc;
 
+// ── per-isolate state ─────────────────────────────────────────────────────────
+
+/// Per-isolate singleflight table (§3.6) + metrics registry (§6.1).
+///
+/// Lives on `Interp.resilience` (a `RefCell<ResilState>`, `#[cfg(feature =
+/// "resilience")]`). Tasks 3.2/3.3/5.x consume it; this task (3.1) only
+/// declares the struct so there is ONE Interp touch total.
+#[derive(Default)]
+// `flights` is read in Task 3.2 (singleflight), `registry` in Phase 5 (§6.1) — pre-declared
+// here as the single Interp touch.
+#[allow(dead_code)]
+pub(crate) struct ResilState {
+    /// Active singleflight flights keyed by the user-supplied string key.
+    /// Each value is the `SharedFuture` for the ONE in-progress execution;
+    /// concurrent callers with the same key clone-and-await it instead of
+    /// launching a second invocation. Entries are removed when the flight
+    /// resolves (Task 3.2).
+    pub(crate) flights: IndexMap<String, crate::task::SharedFuture>,
+    /// Minimal per-isolate metrics registry (§6.1). Phase 5 fills this;
+    /// currently empty (the `Default` impl gives zero cost).
+    pub(crate) registry: ResilRegistry,
+}
+
+/// Per-isolate minimal metrics registry — Phase 5 will add counter/gauge
+/// fields here. `#[derive(Default)]` so `ResilState::default()` is free.
+#[derive(Default)]
+pub(crate) struct ResilRegistry {
+    // Phase 5 fills this (§6.1).
+}
+
 // ── public exports ────────────────────────────────────────────────────────────
 
 /// The export list (binding name → value) for `import * from "std/resilience"`.
