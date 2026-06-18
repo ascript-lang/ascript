@@ -220,8 +220,15 @@ pub(crate) fn make_error(msg: Value) -> Value {
 ///
 /// Returns `Some(err)` if `v` is a 2-element array whose second element is
 /// non-nil; `None` otherwise (plain value, ok-pair `[v, nil]`, or not an array).
-/// This is the SAME shape test `ExprKind::Try` (`?` operator) uses (see `eval_expr`),
-/// extracted here so all four engine paths share a single predicate by construction.
+/// Recognizes a `[value, err]` ERROR pair: a 2-element array whose second element is
+/// non-nil, returning that error. This is the SAME error-pair *shape* the `?` operator
+/// (`ExprKind::Try`) recognizes (2-element array, non-nil `[1]`), but it is a deliberately
+/// LENIENT predicate distinct from `Try`'s inline logic: `Try` ERRORS on a non-pair (the `?`
+/// operator requires a Result pair), whereas this returns `None` on a non-pair or a `[v, nil]`
+/// — because for outcome classification (the circuit breaker, §3.1.3) a non-pair or success
+/// pair is a SUCCESS, not a failure. The two stay behaviorally consistent on the error-pair
+/// case by the four-mode differential; they are not literally the same function (Try's
+/// non-pair-is-error rule must not leak into outcome classification).
 pub(crate) fn result_pair_err(v: &Value) -> Option<Value> {
     match v.kind() {
         crate::value::ValueKind::Array(a) => {
