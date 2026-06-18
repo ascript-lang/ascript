@@ -2,13 +2,19 @@
 
 pub mod types;
 
+#[cfg(not(ascript_rt))]
 use crate::syntax::cst::ResolvedNode;
+#[cfg(not(ascript_rt))]
 use crate::syntax::kind::SyntaxKind;
+#[cfg(not(ascript_rt))]
 use cstree::text::TextRange;
+#[cfg(not(ascript_rt))]
 use std::collections::{HashMap, HashSet};
+#[cfg(not(ascript_rt))]
 use types::*;
 
 /// Resolve a parsed source file.
+#[cfg(not(ascript_rt))]
 pub fn resolve(root: &ResolvedNode) -> ResolveResult {
     let mut r = Resolver::new();
     r.resolve_file(root);
@@ -16,6 +22,7 @@ pub fn resolve(root: &ResolvedNode) -> ResolveResult {
 }
 
 /// First IDENT token's text within `node` (via the resolver-backed tree).
+#[cfg(not(ascript_rt))]
 pub fn ident_text(node: &ResolvedNode) -> Option<String> {
     node.children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -24,6 +31,7 @@ pub fn ident_text(node: &ResolvedNode) -> Option<String> {
 }
 
 /// Stable map key for a use site: its text range.
+#[cfg(not(ascript_rt))]
 pub fn use_key(node: &ResolvedNode) -> TextRange {
     node.text_range()
 }
@@ -31,6 +39,7 @@ pub fn use_key(node: &ResolvedNode) -> TextRange {
 /// True if `node` is a `MethodDecl` carrying the `static` modifier (SP1 §3),
 /// detected by a direct `StaticKw` child token. Shared by the resolver, compiler,
 /// formatter, and checker so the three engines agree on what is a static method.
+#[cfg(not(ascript_rt))]
 pub fn is_static_method(node: &ResolvedNode) -> bool {
     node.children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -39,6 +48,7 @@ pub fn is_static_method(node: &ResolvedNode) -> bool {
 
 /// Spec A: true if `node` is a `FnDecl` or `MethodDecl` declared with the
 /// contextual `worker` modifier (carries a direct `WorkerKw` child token).
+#[cfg(not(ascript_rt))]
 pub fn is_worker_fn(node: &ResolvedNode) -> bool {
     node.children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -49,6 +59,7 @@ pub fn is_worker_fn(node: &ResolvedNode) -> bool {
 /// `worker` modifier (carries a direct `WorkerKw` child token).
 /// Used by the compiler (`compile_class`) and the checker to set the
 /// `is_worker` flag on the class proto.
+#[cfg(not(ascript_rt))]
 pub fn is_worker_class(node: &ResolvedNode) -> bool {
     node.kind() == SyntaxKind::ClassDecl
         && node
@@ -57,6 +68,7 @@ pub fn is_worker_class(node: &ResolvedNode) -> bool {
             .any(|t| t.kind() == SyntaxKind::WorkerKw)
 }
 
+#[cfg(not(ascript_rt))]
 fn is_expr(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
@@ -87,6 +99,7 @@ fn is_expr(kind: SyntaxKind) -> bool {
     )
 }
 
+#[cfg(not(ascript_rt))]
 struct Frame {
     bindings: Vec<Binding>,
     next_slot: u32,
@@ -96,10 +109,12 @@ struct Frame {
     scope_base: usize,
 }
 
+#[cfg(not(ascript_rt))]
 struct Scope {
     names: HashMap<String, u32>,
 }
 
+#[cfg(not(ascript_rt))]
 struct Resolver {
     result: ResolveResult,
     frames: Vec<Frame>,
@@ -147,12 +162,14 @@ struct Resolver {
 /// the FINAL `mutated` flag of the source binding declared at `source_decl_range`. A
 /// TextRange uniquely identifies one node, so the `(_, frame_range)` entry in
 /// `result.frames` is unambiguous.
+#[cfg(not(ascript_rt))]
 struct CaptureFixup {
     frame_range: TextRange,
     upval_idx: usize,
     source_decl_range: TextRange,
 }
 
+#[cfg(not(ascript_rt))]
 impl Resolver {
     fn new() -> Self {
         Resolver {
@@ -1355,6 +1372,7 @@ impl Resolver {
 /// SP8 #136: split a frame's captured bindings into the by-REFERENCE cell set
 /// (`captured && mutated`) and the by-VALUE set (`captured && !mutated`). The
 /// `mutated` flag must be final (call only at frame-pop / post-resolution).
+#[cfg(not(ascript_rt))]
 fn split_capture_slots(bindings: &[Binding]) -> (Vec<u32>, Vec<u32>) {
     let mut cells = Vec::new();
     let mut values = Vec::new();
@@ -1368,6 +1386,7 @@ fn split_capture_slots(bindings: &[Binding]) -> (Vec<u32>, Vec<u32>) {
     (cells, values)
 }
 
+#[cfg(not(ascript_rt))]
 fn is_pattern(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
@@ -1377,6 +1396,7 @@ fn is_pattern(kind: SyntaxKind) -> bool {
 }
 
 /// If a LiteralPat is exactly a single bare `NameRef`, return its name.
+#[cfg(not(ascript_rt))]
 fn bare_ident_pattern(pat: &ResolvedNode) -> Option<String> {
     let mut exprs = pat.children().filter(|c| is_expr(c.kind()));
     let first = exprs.next()?;
@@ -1391,6 +1411,7 @@ fn bare_ident_pattern(pat: &ResolvedNode) -> Option<String> {
 }
 
 /// Determine whether a `LetStmt` node is a `const` or `let` binding.
+#[cfg(not(ascript_rt))]
 fn let_kind(node: &ResolvedNode) -> BindingKind {
     let is_const = node
         .children_with_tokens()
@@ -1404,6 +1425,7 @@ fn let_kind(node: &ResolvedNode) -> BindingKind {
 }
 
 /// The declared name of a function (first IDENT token after `fn`/`async`/`*`).
+#[cfg(not(ascript_rt))]
 fn fn_name(node: &ResolvedNode) -> Option<String> {
     node.children_with_tokens()
         .filter_map(|el| el.into_token())

@@ -122,10 +122,66 @@ pub enum Command {
         /// embedded VM still interprets. Host-only in v1.
         #[arg(long = "native")]
         native: bool,
-        /// Target triple for `--native` (host-only in v1 — parsed but rejected with
-        /// a clear error). Requires `--native`.
+        /// RT §6: target triple for a `--native` cross build (one of the 8 published
+        /// triples — an unknown triple is rejected with the supported set). A platform-
+        /// independent payload is appended onto a per-target stub resolved via the §5.4
+        /// ladder; a cross target needs `--stub` or a fetched stub (no local fallback).
+        /// `--target <host>` is equivalent to omitting it. Requires `--native` (or `--oci`,
+        /// which implies `--native`).
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
+        /// RT §5.4 rung 1: an explicit local `ascript-rt` stub to append the payload onto
+        /// (tests, air-gap, custom builds). Footer-checked (a pre-existing overlay is
+        /// stripped) and feature-verified via `--rt-info` when host-executable. Requires
+        /// `--native`.
+        #[arg(long = "stub", requires = "native")]
+        stub: Option<String>,
+        /// RT §5.4 rung 3: skip the network fetch rung entirely (availability fall-through
+        /// to the dev sibling / current_exe). Equivalent to `ASCRIPT_RT_NO_FETCH=1`.
+        /// Requires `--native`.
+        #[arg(long = "no-fetch", requires = "native")]
+        no_fetch: bool,
+        /// RT §7: zstd-compress the embedded payload of a `--native` bundle (smaller
+        /// artifact; the stub decompresses it at startup). Requires `--native`. The
+        /// footer is marked version 2 / `FLAG_ZSTD`; an uncompressed bundle stays
+        /// bit-identical to a pre-RT build.
+        #[arg(long = "compress", requires = "native")]
+        compress: bool,
+        /// RT §4.5: build the stub with EXACTLY the features the program requires via a
+        /// local `cargo build` of `ascript-rt` (no tier slack). Requires `$ASCRIPT_SRC`
+        /// to be set to a source checkout matching this toolchain's version; `cargo` must
+        /// be on PATH. The result is content-addressed and cached — a second build with
+        /// the same feature set skips the cargo invocation. `--exact --target
+        /// *-apple-darwin` requires a macOS host. Mutually exclusive with `--tier` and
+        /// `--stub`. Requires `--native`.
+        #[arg(long = "exact", requires = "native", conflicts_with_all = ["tier", "stub"])]
+        exact: bool,
+        /// RT §4.4: force the stub tier (`rt-core`/`rt-local`/`rt-net`/`rt-full`) for a
+        /// `--native` bundle instead of automatic nearest-superset selection. A tier
+        /// below the program's requirements is rejected (the error lists the missing
+        /// features and the modules that demand them). Requires `--native`.
+        #[arg(long = "tier", requires = "native")]
+        tier: Option<String>,
+        /// RT §9.2: emit the canonical JSON build report for a `--native` bundle to
+        /// `<PATH>` (or `-` for stdout) — the CI/reproducibility hook. The human report
+        /// always prints to stderr regardless. Requires `--native`.
+        #[arg(long = "report-json", requires = "native")]
+        report_json: Option<String>,
+        /// RT §8: produce an OCI Image Layout tarball loadable by `docker load`/`podman
+        /// load` WITHOUT Docker at build time. Implies `--native`. The image has no base
+        /// layers (scratch semantics), so the binary must be statically linked: requires
+        /// a `*-unknown-linux-musl` target. With no `--target`, defaults to
+        /// `<host-arch>-unknown-linux-musl`. A gnu/darwin/windows triple is rejected with
+        /// an error naming the musl equivalent. Composes with `--compress`, `--stub`,
+        /// `--target`, and `--tier`. Requires the `compress` Cargo feature (default-on).
+        #[arg(long = "oci")]
+        oci: bool,
+        /// RT §8: the image reference tag written as the
+        /// `org.opencontainers.image.ref.name` annotation in the OCI `index.json` (used
+        /// by `docker load`/`podman load` to name the image). Defaults to
+        /// `<file-stem>:latest`. Requires `--oci`.
+        #[arg(long = "oci-tag", requires = "oci")]
+        oci_tag: Option<String>,
         /// WARM B §3.1: run the program as a training workload, harvest the warmed
         /// inline caches and adaptive arithmetic state, and embed a PGO (profile-
         /// guided optimisation) section into the produced archive. The artifact is
@@ -323,6 +379,41 @@ pub enum Command {
     Cache {
         #[command(subcommand)]
         action: CacheAction,
+    },
+    /// RT §5.1 / Task 11 — generate + sign the release stub manifest (internal release
+    /// tooling; driven by `scripts/release-rt-stubs.sh`). HIDDEN: not part of the public
+    /// CLI surface. Gated on the default-OFF `rt-release` feature (the ed25519 SIGNING
+    /// half), so it is absent from a normal toolchain build.
+    #[cfg(feature = "rt-release")]
+    #[command(name = "rt-manifest-gen", hide = true)]
+    RtManifestGen {
+        /// Mint a fresh ed25519 keypair, print `(private seed hex, public key hex)`, and
+        /// exit. The maintainer compiles the public key into `PRODUCTION_PUBKEY` and
+        /// stores the private seed in the CI secret `ASCRIPT_RT_SIGNING_KEY`. No manifest
+        /// is written in this mode.
+        #[arg(long = "genkey")]
+        genkey: bool,
+        /// The toolchain version the manifest is cut for (the §5.1 version lock). Defaults
+        /// to this binary's own `CARGO_PKG_VERSION`.
+        #[arg(long = "version", value_name = "VER")]
+        version: Option<String>,
+        /// The deterministic `created` timestamp embedded in the manifest (a fixed input,
+        /// never `now()` — so a rebuild is byte-identical). Defaults to the epoch.
+        #[arg(long = "created", value_name = "TS")]
+        created: Option<String>,
+        /// Path to a JSON file holding the stub entries array (each
+        /// `{target,tier,features,sha256,size,filename}`). The release script assembles
+        /// this after building + hashing every stub.
+        #[arg(long = "entries-file", value_name = "PATH")]
+        entries_file: Option<String>,
+        /// Path to a file holding the 64-hex-char private signing seed (the CI secret
+        /// `ASCRIPT_RT_SIGNING_KEY`). Required unless `--genkey`.
+        #[arg(long = "key", value_name = "PATH")]
+        key: Option<String>,
+        /// Directory to write `rt-manifest.json` + `rt-manifest.json.sig` into. Defaults
+        /// to the current directory.
+        #[arg(long = "out-dir", value_name = "DIR")]
+        out_dir: Option<String>,
     },
 }
 

@@ -501,6 +501,35 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   pumped). Group ≈98.85× faster than fsync on per-commit shapes; `"fsync"` ≈ baseline. Tree-walker
   untouched. Recorded follow-ups (roadmap, none silent): cache auto-GC, PGO profile merging,
   method-IC seeding, group-mode background flusher.
+- **RT — runtime-only native stubs** (spec `superpowers/specs/2026-06-12-native-runtime-stubs-design.md`;
+  CLI/link-level — **no engine change**, `ASO_FORMAT_VERSION` 29 + `ARCHIVE_VERSION` 1 unchanged). `build
+  --native` no longer ships the full ~43 MB toolchain as the runtime. A second bin target **`ascript-rt`**
+  (`src/bin/ascript-rt.rs`, no clap) is the runtime-only stub — VM/GC/`Interp`-kernel/stdlib/workers/caps/
+  `.aso`+archive loaders/panic-diagnostics/embedded-shim, with the entire front-end (parsers, compiler,
+  checker, LSP/DAP/fmt/REPL/pkg, tree-sitter) compiled OUT via a **build-time cfg `ascript_rt`** (NOT a
+  Cargo feature — features are additive and `--no-default-features` must keep building the parsers; the cfg
+  is emitted by `build.rs` from `ASCRIPT_RT=1`, the `fuzzing`-cfg precedent). Normal builds are byte-identical
+  (the cfg is never set under `cargo test`). The §2.3 audit proves EXACTLY two runtime paths can reach the
+  compiler — `Vm::compile_module_file`'s `.as`-disk fallback and `src/worker/dispatch.rs`'s `compile_source`
+  arms — both cfg-gated to a loud refusal; a stub has **0 `compile_source`/tree-sitter symbols** (`nm`
+  tripwire). **4-tier prebuilt matrix** (rt-core ⊂ rt-local ⊂ rt-net ⊂ rt-full; rt-core **5.75 MB = 13% of
+  43 MB**) selected by the archive's own import facts through a drift-tested module→feature table
+  (`src/rtstub/std_features.rs`). **Distribution is fail-closed:** an ed25519-signed, version-locked release
+  manifest (compiled-in pubkey, no insecure env knob), a content-addressed stub cache that **re-hashes on
+  load** (never trusts by path), and a 5-rung resolution ladder (`--stub` → cache → fetch → dev-sibling →
+  `current_exe`) where **integrity failures ABORT and only availability failures fall through** (a tampered
+  stub never "recovers" to a weaker rung). The signing half rides a default-OFF `rt-release` feature — never
+  in a stub. **Footer flags** (`reserved`→`flags`, `FLAG_ZSTD`; `BUNDLE_FOOTER_VERSION` 1→2 only for
+  compressed; `flags=0` byte-identical to pre-RT) power **`--compress`** (zstd, bounded decompress). Plus
+  un-rejected **`--target`** cross builds (platform-independent payload; macOS sign-before-append means
+  prebuilt darwin stubs append cleanly with no host signing), **`--exact`** (local-cargo precise-feature
+  stub), **`--oci`** (a deterministic, Docker-less OCI image tarball — hand-rolled USTAR + the two-digest
+  rule; musl-only/scratch), reproducible outputs, and **`--report-json`** (a schema-locked build report).
+  Engines untouched; tests in `tests/{native,rt_stub,rt_supply_chain,rt_oci,rt_select,rt_repro}.rs`; docs in
+  `docs/content/language/bundles.md`. **Stubs are version-locked to the toolchain** (a stub verifies payloads
+  with the same `ASO_FORMAT_VERSION` the builder emits). Recorded follow-ups: SBOM for `--oci`,
+  registry-push (`--push`), the tree-walker-eval carve-out if Phase-0-material, musl-matrix narrowing if a CI
+  leg fails.
 
 ## Commands
 

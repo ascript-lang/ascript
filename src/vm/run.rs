@@ -2469,6 +2469,24 @@ impl Vm {
         fault_ip: usize,
         fiber: &Fiber,
     ) -> Result<crate::vm::chunk::Chunk, Control> {
+        // RT §2.3(a): the runtime-only build has NO compiler. A bundle whose import
+        // misses the embedded archive and finds a sibling `.as` on disk would reach
+        // here — refuse loudly (a recoverable Tier-2 panic) BEFORE touching disk. The
+        // `.aso` disk fallback in `load_file_module` stays (the verifier IS in the
+        // runtime). The non-rt path below is byte-identical to pre-RT.
+        #[cfg(ascript_rt)]
+        {
+            Err(self.panic_at(
+                fiber,
+                fault_ip,
+                format!(
+                    "cannot compile module '{}': this runtime has no compiler — the module is not embedded in the bundle (rebuild with the ascript toolchain)",
+                    as_path.display()
+                ),
+            ))
+        }
+        #[cfg(not(ascript_rt))]
+        {
         let src = std::fs::read_to_string(as_path).map_err(|e| {
             self.panic_at(
                 fiber,
@@ -2507,6 +2525,7 @@ impl Vm {
         });
         chunk.set_module_source(&src_info);
         Ok(chunk)
+        }
     }
 
     /// Drive `fiber` until it returns (or panics). V1 runs the synchronous
@@ -7911,6 +7930,17 @@ impl Vm {
         frame_id: usize,
         expr_text: &str,
     ) -> (bool, String) {
+        // RT §2.3(c/d): paused-frame expression evaluation re-parses on the legacy
+        // front-end (lexer/parser/ast), which the runtime-only build compiles OUT. The
+        // DAP feature is never in a tier, so this is unreachable on a stub; the refusal
+        // keeps the core VM debug seam compiling. Non-rt below is byte-identical.
+        #[cfg(ascript_rt)]
+        {
+            let _ = (fiber, frame_id, expr_text);
+            (false, "<evaluation unavailable: this runtime has no parser>".to_string())
+        }
+        #[cfg(not(ascript_rt))]
+        {
         // (1) Map the DAP frame id (innermost-first, as `build_frame_snapshots` /
         // `stackTrace` order it) back to the bottom-first `fiber.frames` index.
         let n = fiber.frames.len();
@@ -7965,6 +7995,7 @@ impl Vm {
             Ok(v) => (true, format!("{v}")),
             Err(Control::Panic(e)) => (false, e.message),
             Err(_) => (false, "<propagated>".to_string()),
+        }
         }
     }
 

@@ -23,65 +23,16 @@ use std::path::PathBuf;
 /// Resolve the cache root, honoring `$ASCRIPT_CACHE` first, then the per-OS
 /// default, then a tempdir last resort. Never fails (the tempdir fallback always
 /// yields a path).
+///
+/// **RT T6 nit — single canonical impl.** The per-OS resolution logic used to be
+/// REPLICATED here and in the library's `rtstub::cache` (`pkg` is a binary-only
+/// module, so it could not import the library's copy). The hoist makes the
+/// LIBRARY's `ascript::rtstub::cache::cache_root` the one canonical implementation
+/// and this `pkg`-side function a thin delegate — so an `--exact`/fetch stub publish
+/// and a package-store fetch resolve to the SAME root by construction, with no drift
+/// risk. The on-disk layout is unchanged.
 pub fn cache_root() -> PathBuf {
-    if let Some(p) = std::env::var_os("ASCRIPT_CACHE") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    platform_default()
-}
-
-/// Read an env var, treating empty as absent.
-fn nonempty_env(key: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(key).filter(|v| !v.is_empty())
-}
-
-#[cfg(target_os = "macos")]
-fn platform_default() -> PathBuf {
-    // macOS: ~/Library/Caches/ascript, but honor an explicit XDG_CACHE_HOME if
-    // the user set one (matching most Rust tooling).
-    if let Some(xdg) = nonempty_env("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("ascript");
-    }
-    if let Some(home) = nonempty_env("HOME") {
-        return PathBuf::from(home).join("Library/Caches/ascript");
-    }
-    temp_fallback()
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn platform_default() -> PathBuf {
-    // Linux / other unix: $XDG_CACHE_HOME/ascript else ~/.cache/ascript.
-    if let Some(xdg) = nonempty_env("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("ascript");
-    }
-    if let Some(home) = nonempty_env("HOME") {
-        return PathBuf::from(home).join(".cache/ascript");
-    }
-    temp_fallback()
-}
-
-#[cfg(windows)]
-fn platform_default() -> PathBuf {
-    // Windows: %LOCALAPPDATA%\ascript\Cache.
-    if let Some(local) = nonempty_env("LOCALAPPDATA") {
-        return PathBuf::from(local).join("ascript").join("Cache");
-    }
-    temp_fallback()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_default() -> PathBuf {
-    // Fall back to the tempdir on exotic targets. `nonempty_env` is unused here,
-    // but reachable on every real target, so reference it once to keep the
-    // function honest without an `#[allow]`.
-    let _ = nonempty_env;
-    temp_fallback()
-}
-
-fn temp_fallback() -> PathBuf {
-    std::env::temp_dir().join("ascript-cache")
+    ascript::rtstub::cache::cache_root()
 }
 
 /// The immutable content-addressed store dir for a package whose normalized-tree
@@ -177,6 +128,29 @@ mod tests {
         std::env::set_var("ASCRIPT_CACHE", "");
         let root = cache_root();
         assert!(!root.as_os_str().is_empty());
+        restore(prev);
+    }
+
+    /// RT T6 nit: `pkg::cache::cache_root` is now a thin delegate to the single
+    /// canonical library impl (`ascript::rtstub::cache::cache_root`). This pins the
+    /// hoist — the two MUST resolve identically (with and without an explicit
+    /// `$ASCRIPT_CACHE` override) so the package store and the rt stub cache share
+    /// one root by construction.
+    #[test]
+    fn cache_root_delegates_to_the_single_canonical_lib_impl() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("ASCRIPT_CACHE");
+
+        // With an explicit override they must agree.
+        let tmp = std::env::temp_dir().join(format!("ascache-hoist-{}", std::process::id()));
+        std::env::set_var("ASCRIPT_CACHE", &tmp);
+        assert_eq!(cache_root(), ascript::rtstub::cache::cache_root());
+        assert_eq!(cache_root(), tmp);
+
+        // And with the override absent (per-OS default) they must still agree.
+        std::env::remove_var("ASCRIPT_CACHE");
+        assert_eq!(cache_root(), ascript::rtstub::cache::cache_root());
+
         restore(prev);
     }
 

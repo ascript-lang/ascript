@@ -6,9 +6,24 @@ use crate::env::{AssignError, Environment};
 use crate::error::AsError;
 use crate::span::Span;
 use crate::value::{OwnedKind, Value, ValueKind};
+// RT §2.2: the legacy lexer/parser are the tree-walker front-end — gated OUT of the
+// runtime-only build (the tree-walker is never an entry point in a stub). The `Interp`
+// KERNEL stays; its source-loading methods refuse under `cfg(ascript_rt)`.
+#[cfg(not(ascript_rt))]
 use crate::{lexer, parser};
 use async_recursion::async_recursion;
 use std::cell::{Cell, RefCell};
+
+// RT §2.2 — ELIDE paranoid-mode proof verification leans on the checker's `ElisionSet`
+// (a front-end product). Non-rt uses the real type; the runtime-only build (no checker)
+// uses a trivially-empty stand-in so the `Interp` kernel still compiles. Paranoid mode
+// is set only from the gated source entry points, so on a stub the set is always empty
+// and `maybe_paranoid_escalate` short-circuits — byte-identical behavior (never armed).
+#[cfg(not(ascript_rt))]
+type ParanoidElisionSet = crate::check::infer::elide::ElisionSet;
+#[cfg(ascript_rt)]
+#[derive(Default)]
+pub(crate) struct ParanoidElisionSet;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -702,7 +717,7 @@ pub struct Interp {
     /// when a check is ALREADY failing, i.e. about to panic anyway). A `RefCell`
     /// (never held across `.await` since all lookup sites are sync). `None` when
     /// paranoid mode is off (the default) — the check short-circuits immediately.
-    pub(crate) paranoid_set: RefCell<Option<crate::check::infer::elide::ElisionSet>>,
+    pub(crate) paranoid_set: RefCell<Option<ParanoidElisionSet>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1145,6 +1160,7 @@ impl Interp {
     /// is set. The set is built from all per-module proof results; any contract
     /// failure at a proven site is escalated to the soundness-bug message instead
     /// of the normal panic.
+    #[cfg(not(ascript_rt))]
     pub fn set_paranoid_set(&self, set: crate::check::infer::elide::ElisionSet) {
         *self.paranoid_set.borrow_mut() = Some(set);
     }
@@ -1153,7 +1169,7 @@ impl Interp {
     /// set (simulating a checker soundness bug — a span the predicate would NOT
     /// have proven). Used by `tests/elide.rs` to verify the escalation path fires.
     /// Only reachable from `#[cfg(any(test, feature = "fuzzgen", fuzzing))]` callers.
-    #[cfg(any(test, feature = "fuzzgen", fuzzing))]
+    #[cfg(all(not(ascript_rt), any(test, feature = "fuzzgen", fuzzing)))]
     pub fn inject_paranoid_call_span(&self, start: u32, end: u32) {
         let mut guard = self.paranoid_set.borrow_mut();
         let set = guard.get_or_insert_with(crate::check::infer::elide::ElisionSet::default);
@@ -1172,6 +1188,16 @@ impl Interp {
         value: &Value,
         span: crate::span::Span,
     ) -> Option<Control> {
+        // RT §2.2: paranoid mode is never armed on a stub (the source entry points that
+        // set the proof set are gated out) → the set is always empty. Short-circuit so
+        // the body's `crate::check`-typed field accessors aren't needed at compile time.
+        #[cfg(ascript_rt)]
+        {
+            let _ = (ty, value, span);
+            None
+        }
+        #[cfg(not(ascript_rt))]
+        {
         let guard = self.paranoid_set.borrow();
         let set = guard.as_ref()?;
         let key = (span.start as u32, span.end as u32);
@@ -1196,6 +1222,7 @@ impl Interp {
             )
         } else {
             None
+        }
         }
     }
 
@@ -2898,6 +2925,21 @@ impl Interp {
                 e
             )))
         })?;
+        // RT §2.3(g): the tree-walker's source module loader needs the lexer/parser/
+        // checker — gated OUT of the runtime-only build (the tree-walker is never an
+        // entry point in a stub; this method stays only so the `Interp` kernel compiles
+        // and the linker dead-strips it). Refuse loudly before any setup work. Non-rt
+        // below is byte-identical.
+        #[cfg(ascript_rt)]
+        {
+            let _ = &src;
+            return Err(Control::Panic(AsError::new(format!(
+                "cannot compile module '{}': this runtime has no compiler — the module is not embedded in the bundle (rebuild with the ascript toolchain)",
+                canon.display()
+            ))));
+        }
+        #[cfg(not(ascript_rt))]
+        {
         // Child of the global (builtins) env so module-level definitions and
         // imports can shadow builtins (resolution walks up to find builtins).
         let env = global_env().child();
@@ -2956,14 +2998,17 @@ impl Interp {
         // same "'break'/'continue' outside of a loop" the entry path produces).
         let result = self.exec_program(&program, &env).await;
 
-        *self.module_dir.borrow_mut() = prev_dir;
-        *self.current_exports.borrow_mut() = prev_exports;
+        {
+            *self.module_dir.borrow_mut() = prev_dir;
+            *self.current_exports.borrow_mut() = prev_exports;
 
-        if let Err(Control::Panic(e)) = result {
-            return Err(Control::Panic(e.with_source(src_info)));
+            if let Err(Control::Panic(e)) = result {
+                return Err(Control::Panic(e.with_source(src_info)));
+            }
+            result?; // propagate any other control flow from the module body (Exit)
+            Ok(entry)
         }
-        result?; // propagate any other control flow from the module body (Exit)
-        Ok(entry)
+        }
     }
 
     /// Resolve a `std/*` built-in module to a cached `ModuleEntry`, building it

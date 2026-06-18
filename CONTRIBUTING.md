@@ -114,6 +114,68 @@ AScript is fuzzed two ways:
   `read_*` / `src/vm/verify.rs` edit) **and** the corpus reaches ≥ 90 % line coverage of the
   `read_*` family. See `.github/workflows/fuzz-nightly.yml` and the native-binary plan's Task 0.
 
+## Releasing the runtime-stub matrix (RT)
+
+`ascript build --native` appends a program's payload onto a small prebuilt `ascript-rt`
+stub matched to what the program imports (RT spec
+`superpowers/specs/2026-06-12-native-runtime-stubs-design.md`). The stubs are published as
+GitHub-release artifacts, indexed by a **signed manifest** (`rt-manifest.json` +
+`rt-manifest.json.sig`) that the builder verifies against a **compiled-in ed25519 public
+key** (`PRODUCTION_PUBKEY` in `src/rtstub/manifest.rs`). There is NO insecure escape hatch —
+the dev fallbacks (`--stub` / a sibling `ascript-rt` / `current_exe`) are the offline path.
+
+### The signing key (custody + rotation)
+
+- The **public** key is compiled into the toolchain (`PRODUCTION_PUBKEY`). The **private**
+  seed lives ONLY in the repository CI secret **`ASCRIPT_RT_SIGNING_KEY`** (64 hex chars,
+  the ed25519 seed). It is NEVER committed and never echoed in CI logs.
+- **Rotation requires a toolchain release** (the pubkey is compiled in). Because stubs are
+  version-locked to the toolchain anyway (the manifest's `ascript` version must equal
+  `CARGO_PKG_VERSION`), this is acceptable. To rotate:
+  1. `cargo run --features rt-release -- rt-manifest-gen --genkey` — prints
+     `private_seed_hex`, `public_key_hex`, and a ready-to-paste `public_key_rust=[…]` array.
+  2. Paste the array into `PRODUCTION_PUBKEY` (`src/rtstub/manifest.rs`) and commit (this is
+     the toolchain release that ships the new key).
+  3. Set the repo CI secret `ASCRIPT_RT_SIGNING_KEY` to the new `private_seed_hex`.
+  > The keypair currently in `PRODUCTION_PUBKEY` was minted during the RT campaign for the
+  > hermetic round-trip tests. **A maintainer MUST regenerate it and set the secret before a
+  > real public release** — the campaign key's private seed is in the branch history.
+
+### Cutting a release
+
+Pushing a `v*` tag triggers `.github/workflows/release-rt.yml`: a matrix
+(ubuntu/macos/windows) builds the §3.3 stub set, writes the CI secret to a temp file, and
+runs `scripts/release-rt-stubs.sh`, which builds each tier (`scripts/build-rt.sh <tier>
+--target <triple>`), ad-hoc-signs darwin stubs on the macOS runner (sign-BEFORE-append, RT
+§6.2), hashes + sizes each, and invokes `ascript rt-manifest-gen` to emit the signed
+manifest. The `assemble-and-release` job collects every leg's stubs, builds the one manifest
+over all of them, and uploads stubs + `rt-manifest.json` + `.sig` to the release.
+
+**Local dry-run (host target's 4 tiers only):**
+
+```bash
+printf '<64-hex-seed>' > /tmp/rt.key
+scripts/release-rt-stubs.sh --host-only --key /tmp/rt.key --out-dir ./rt-release
+```
+
+### The musl feasibility caveat (owner-noted)
+
+The musl legs (`*-unknown-linux-musl`) need a musl C cross-toolchain (`musl-tools` on the
+ubuntu runner) because the bundled-C deps (`rusqlite` et al.) and the rustls stack must
+cross-build under musl. This is **validated at the first CI release run** — it cannot be
+verified on a macOS host (no musl linker). If a musl leg fails, NARROW the published matrix
+(drop the failing target) with an owner note in the spec status header + `roadmap.md` — a
+recorded decision, never a silent absent artifact (RT §12).
+
+### The `rt-release` feature
+
+The signed-manifest GENERATOR (`generate_manifest`/`sign_manifest`/the `rt-manifest-gen`
+subcommand) is behind the **default-OFF `rt-release` feature** because it pulls the ed25519
+SIGNING half (key generation + `SigningKey::sign`). A runtime `ascript-rt` stub must NEVER
+link signing — it only VERIFIES against the compiled-in pubkey — so the generator is opt-in
+(`--features rt-release`, which the release CI enables) and absent from every normal build
+and every stub tier.
+
 ## Conventions
 
 - Commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` for AI-assisted work.
