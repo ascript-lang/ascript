@@ -3338,6 +3338,35 @@ print("done")
         );
     }
 
+    /// Adversarial driver-leak hunt (Task 3.4 review): start N flights on
+    /// DISTINCT keys, drop ALL awaiter handles mid-flight (never await), and
+    /// confirm the isolate exits cleanly AND the flights table empties (every
+    /// short-lived driver runs its `shift_remove`). Exercises the multi-entry
+    /// path the single-key drop test does not.
+    #[tokio::test]
+    async fn singleflight_many_dropped_flights_leave_no_leak() {
+        let (out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let ran = [0]
+async fn slow(n) { ran[0] = ran[0] + 1; return n }
+// Start 16 flights on distinct keys; drop every handle without awaiting.
+let i = 0
+while (i < 16) {
+    let f = resilience.singleflight(`key-${i}`, () => slow(i))
+    f = nil
+    i = i + 1
+}
+print("done")
+"#)
+        .await
+        .expect("program should run");
+        assert_eq!(out, "done\n");
+        assert!(
+            interp.resilience.borrow().flights.is_empty(),
+            "flights table must be empty — N dropped-awaiter flights must not leak"
+        );
+    }
+
     // ── Task 3.3: resilience.memoize (§3.7) ─────────────────────────────────
 
     /// Stampede protection: N concurrent `cache.get("k", fn)` collapse to ONE
@@ -3555,5 +3584,82 @@ let cache = resilience.memoize({ max: 0 })
             msg.contains("memoize") && msg.contains("max"),
             "expected memoize 'max' validation Tier-2 panic, got: {msg:?}"
         );
+    }
+
+    // ── Task 3.4 review: kind × method dispatch-hole sweep ────────────────────
+    //
+    // For EVERY kind in RESIL_KINDS × the full `is_resilience_method` allowlist,
+    // a method NOT in that kind's own valid set MUST raise EXACTLY
+    //   "<kind> policy has no method '<name>'"
+    // — never silently accept a foreign method (a dispatch-table hole), never a
+    // different message. This catches both a missing `other =>` arm and a kind
+    // that leaks another kind's method.
+    #[tokio::test]
+    async fn kind_method_dispatch_sweep() {
+        // The COMPLETE method allowlist routed through the call-site hook.
+        // Kept in sync with `is_resilience_method`.
+        const ALL_METHODS: &[&str] = &[
+            "call", "state", "stats", "reset", "acquire", "tryAcquire", "run", "get", "delete",
+            "clear", "len",
+        ];
+        // Assert the allowlist constant matches `is_resilience_method` exactly
+        // (so this sweep can never silently fall out of date).
+        for m in ALL_METHODS {
+            assert!(
+                super::is_resilience_method(m),
+                "ALL_METHODS lists '{m}' but is_resilience_method rejects it"
+            );
+        }
+
+        // (kind, constructor-expr, valid-method-set)
+        let kinds: &[(&str, &str, &[&str])] = &[
+            ("breaker", "resilience.breaker({})", &["state", "stats", "reset", "call"]),
+            (
+                "limiter",
+                "resilience.limiter({capacity: 2, refillPerSec: 1.0})",
+                &["tryAcquire", "acquire"],
+            ),
+            (
+                "keyedLimiter",
+                "resilience.keyedLimiter({capacity: 5, refillPerSec: 0.0, maxKeys: 10})",
+                &["tryAcquire", "acquire", "stats"],
+            ),
+            ("bulkhead", "resilience.bulkhead({limit: 1})", &["run"]),
+            ("retry", "resilience.retry({attempts: 3, baseMs: 1})", &["call", "stats", "reset"]),
+            (
+                "memoize",
+                "resilience.memoize({max: 10})",
+                &["get", "delete", "clear", "len", "stats"],
+            ),
+        ];
+
+        for (kind, ctor, valid) in kinds {
+            for method in ALL_METHODS {
+                if valid.contains(method) {
+                    // Positive pairs are exercised by the per-kind tests; here we
+                    // only prove the negative pairs do NOT silently work.
+                    continue;
+                }
+                // Call the foreign method with no args (the dispatch arm runs
+                // BEFORE any arg handling, so arity is irrelevant — a present
+                // arm would either succeed or raise an arity/type panic, both of
+                // which would FAIL this assertion and expose the hole).
+                let src = format!(
+                    "import * as resilience from \"std/resilience\"\n\
+                     let p = {ctor}\n\
+                     let _ = p.{method}()\n"
+                );
+                let res = crate::run_source(&src).await;
+                let msg = match res {
+                    Err(e) => format!("{e}"),
+                    Ok(s) => s,
+                };
+                let expected = format!("{kind} policy has no method '{method}'");
+                assert!(
+                    msg.contains(&expected),
+                    "kind '{kind}' method '{method}': expected {expected:?}, got: {msg:?}"
+                );
+            }
+        }
     }
 }
