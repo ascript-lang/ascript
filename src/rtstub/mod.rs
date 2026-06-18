@@ -22,3 +22,11 @@ pub mod tiers;
 pub mod cache;
 pub mod fetch;
 pub mod manifest;
+
+// RT §8 — `--oci` OCI image tarball writer. Gated on `compress` (flate2 for gzip).
+// Decision recorded: `compress` is the gate because it provides flate2; sha2 is core;
+// serde_json is also in the default set — the gate is the minimum required dep addition.
+// Under `--no-default-features` the module still exists but all items are `#[cfg(...)]`-
+// gated INSIDE the file — the `pub mod` declaration here is always present.
+#[cfg(feature = "compress")]
+pub mod oci;

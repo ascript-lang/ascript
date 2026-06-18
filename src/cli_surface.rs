@@ -126,7 +126,8 @@ pub enum Command {
         /// triples — an unknown triple is rejected with the supported set). A platform-
         /// independent payload is appended onto a per-target stub resolved via the §5.4
         /// ladder; a cross target needs `--stub` or a fetched stub (no local fallback).
-        /// `--target <host>` is equivalent to omitting it. Requires `--native`.
+        /// `--target <host>` is equivalent to omitting it. Requires `--native` (or `--oci`,
+        /// which implies `--native`).
         #[arg(long = "target", requires = "native")]
         target: Option<String>,
         /// RT §5.4 rung 1: an explicit local `ascript-rt` stub to append the payload onto
@@ -166,6 +167,21 @@ pub enum Command {
         /// always prints to stderr regardless. Requires `--native`.
         #[arg(long = "report-json", requires = "native")]
         report_json: Option<String>,
+        /// RT §8: produce an OCI Image Layout tarball loadable by `docker load`/`podman
+        /// load` WITHOUT Docker at build time. Implies `--native`. The image has no base
+        /// layers (scratch semantics), so the binary must be statically linked: requires
+        /// a `*-unknown-linux-musl` target. With no `--target`, defaults to
+        /// `<host-arch>-unknown-linux-musl`. A gnu/darwin/windows triple is rejected with
+        /// an error naming the musl equivalent. Composes with `--compress`, `--stub`,
+        /// `--target`, and `--tier`. Requires the `compress` Cargo feature (default-on).
+        #[arg(long = "oci")]
+        oci: bool,
+        /// RT §8: the image reference tag written as the
+        /// `org.opencontainers.image.ref.name` annotation in the OCI `index.json` (used
+        /// by `docker load`/`podman load` to name the image). Defaults to
+        /// `<file-stem>:latest`. Requires `--oci`.
+        #[arg(long = "oci-tag", requires = "oci")]
+        oci_tag: Option<String>,
         /// WARM B §3.1: run the program as a training workload, harvest the warmed
         /// inline caches and adaptive arithmetic state, and embed a PGO (profile-
         /// guided optimisation) section into the produced archive. The artifact is

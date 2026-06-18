@@ -524,6 +524,8 @@ async fn real_main() -> ExitCode {
             compress,
             tier,
             report_json,
+            oci,
+            oci_tag,
             pgo,
             caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
@@ -547,7 +549,8 @@ async fn real_main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            if native {
+            // RT §8: `--oci` implies `--native` (an OCI image contains a native bundle).
+            if native || oci {
                 // RT §4.4: parse the optional `--tier` override into a `Tier` (a clear
                 // error for an unknown name, never a silent ignore).
                 let parsed_tier = match tier.as_deref() {
@@ -574,6 +577,8 @@ async fn real_main() -> ExitCode {
                     no_fetch,
                     strip,
                     exact,
+                    oci,
+                    oci_tag,
                 };
                 match ascript::build_native(src, out_path, caps, elide, &opts).await {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
