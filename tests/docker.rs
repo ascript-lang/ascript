@@ -1674,3 +1674,94 @@ print(eb != nil)
     );
     assert_eq!(run(&src).await, "nil\ntrue\nnil\ntrue\n");
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Task 4.6 — per-handle re-check (BLOCKER-3 mirror) for DockerClient / DockerStream
+//
+// These are the mock-backed rows called out in cap_audit.rs §10.2. They prove that
+// a handle opened while both caps are granted is DENIED on the NEXT operation after
+// `caps.drop`. The connect-time denial rows (deny before socket I/O) are hermetic
+// and live in tests/cap_audit.rs; these rows cover the already-open-handle path.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A `DockerClient` handle opened while caps are granted is DENIED on `.ping()`
+/// once `caps.drop("process")` is called (BLOCKER-3 mirror, §10.2).
+///
+/// This proves `NativeKind::DockerClient.governing_caps()` = net ∧ process is
+/// re-checked on every method call, not just at connect time.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn docker_client_per_handle_recheck_after_cap_drop() {
+    let (sock, _g) = mock_daemon().await;
+    // Connect succeeds (both caps granted); then drop 'process'; then ping → denied.
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+import * as caps from "std/caps"
+let [d, e] = await docker.connect({{ socketPath: "{sock}" }})
+if (e != nil) {{ print("connect failed") }}
+caps.drop("process")
+let r = recover(() => d.ping())
+print(r[1].message)
+"#
+    );
+    let out = run(&src).await;
+    // The per-handle re-check iterates in Cap::ALL order (Net before Process).
+    // After dropping only 'process', Net is still granted, so 'process' is named.
+    assert_eq!(
+        out, "capability 'process' denied\n",
+        "d.ping() after caps.drop(\"process\") must be denied (BLOCKER-3 for DockerClient)"
+    );
+}
+
+/// A `DockerClient` handle is also denied on `.ping()` after `caps.drop("net")`
+/// (net is checked first in Cap::ALL order — it is denied when only net is dropped).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn docker_client_per_handle_recheck_net_drop() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+import * as caps from "std/caps"
+let [d, e] = await docker.connect({{ socketPath: "{sock}" }})
+if (e != nil) {{ print("connect failed") }}
+caps.drop("net")
+let r = recover(() => d.ping())
+print(r[1].message)
+"#
+    );
+    let out = run(&src).await;
+    assert_eq!(
+        out, "capability 'net' denied\n",
+        "d.ping() after caps.drop(\"net\") must be denied with 'net' (BLOCKER-3 for DockerClient)"
+    );
+}
+
+/// A `DockerStream` handle (from `d.logs`) is DENIED on `.next()` after
+/// `caps.drop("net")` (BLOCKER-3 mirror for DockerStream, §10.2).
+///
+/// Proves `NativeKind::DockerStream.governing_caps()` = net ∧ process is re-checked.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn docker_stream_per_handle_recheck_after_cap_drop() {
+    let (sock, _g) = mock_daemon().await;
+    // Open a log stream on "web" (the mock has the fixture), then drop net → denied.
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+import * as caps from "std/caps"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [stream, e] = await d.logs("web", {{ follow: false }})
+if (e != nil) {{ print("logs failed") }}
+caps.drop("net")
+let r = recover(() => stream.next())
+print(r[1].message)
+"#
+    );
+    let out = run(&src).await;
+    assert_eq!(
+        out, "capability 'net' denied\n",
+        "stream.next() after caps.drop(\"net\") must be denied (BLOCKER-3 for DockerStream)"
+    );
+}

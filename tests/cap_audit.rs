@@ -272,12 +272,121 @@ fn audit_net_per_handle_recheck_after_drop_blocker3() {
 // `required_cap` gate uses. For every CURRENT handle the requirement is a single
 // cap (so the loop runs exactly once → byte-identical to the pre-CNTR
 // `Option<Cap>` path, proven by `governing_caps_preserves_verdicts` in
-// `src/value.rs` + the BLOCKER 3 end-to-end row above). When CNTR Phase 4 adds a
-// docker exec/attach STREAM handle requiring `net ∧ process`, its end-to-end
-// denial-order rows (net denied first when both dropped) belong in this file under
-// **CNTR Task 4.6**. The order mechanism itself is pinned today by
-// `caps::tests::capreq_conjunction_iterates_in_cap_all_order` (net-first), so a
-// regression in `CapReq::iter` ordering fails before any docker module exists.
+// `src/value.rs` + the BLOCKER 3 end-to-end row above).
+
+// ───────────────────── docker (net ∧ process conjunction — CNTR §10.2) ─────────
+//
+// `std/docker` is the FIRST dual-cap conjunction in the stdlib: `docker.connect`
+// requires BOTH `net` (to open the Unix/TCP socket to the Engine) AND `process`
+// (the Engine can spawn host processes on behalf of the call). The gate fires at
+// the `call_stdlib` dispatch chokepoint BEFORE any socket I/O (hermetic — no real
+// daemon needed). CNTR Task 4.6 end-to-end proof:
+//   1. `--deny net`     → denied with `capability 'net' denied`
+//   2. `--deny process` → denied with `capability 'process' denied`
+//   3. `--sandbox`      → denied (sandbox = deny-all)
+//   4. in-code `caps.drop("process")` → denied (irreversible drop is honoured)
+//   5. `--deny net --deny process` together → `'net' denied` (Cap::ALL order:
+//      Net is checked before Process — net-first is the conjunction iteration order)
+//   6. Per-handle re-check (BLOCKER-3 mirror): a `DockerClient` handle opened while
+//      both caps are granted is DENIED on `.ping()` AFTER `caps.drop("process")`.
+//   7. Per-handle re-check for a `DockerStream`: a log stream handle is DENIED on
+//      `.next()` after `caps.drop("net")`.
+//
+// POSITIVE half: `docker.connect` SUCCEEDS with no denials. That proof is in
+// `tests/docker.rs` (Task 4.2 `connect_negotiates_version_and_lists_containers` and
+// the full Task 4.5 live-round-trip). The rows below cover the DENIAL side only.
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_under_deny_net() {
+    // Denial fires at the dispatch gate BEFORE any socket I/O — a bogus path is fine.
+    assert_denied(
+        "audit_docker_deny_net.as",
+        "import * as docker from \"std/docker\"",
+        "docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" })",
+        "net",
+        &["--deny", "net"],
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_under_deny_process() {
+    assert_denied(
+        "audit_docker_deny_process.as",
+        "import * as docker from \"std/docker\"",
+        "docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" })",
+        "process",
+        &["--deny", "process"],
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_under_sandbox() {
+    assert_denied(
+        "audit_docker_sandbox.as",
+        "import * as docker from \"std/docker\"",
+        "docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" })",
+        "net",
+        &["--sandbox"],
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_via_caps_drop_process() {
+    // `caps.drop("process")` is irreversible; the gate at `call_stdlib` fires after.
+    let src = "import * as docker from \"std/docker\"\n\
+               import * as caps from \"std/caps\"\n\
+               caps.drop(\"process\")\n\
+               let r = recover(() => docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" }))\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "audit_docker_caps_drop_process.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(
+        out, "capability 'process' denied\n",
+        "caps.drop(\"process\") must deny docker.connect"
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_conjunction_net_denied_first_when_both_dropped() {
+    // Cap::ALL order: Fs, Net, Process, Ffi, Env — Net is checked before Process.
+    // When BOTH are denied, the error names 'net' (the first denied cap in ALL-order).
+    let src = "import * as docker from \"std/docker\"\n\
+               import * as caps from \"std/caps\"\n\
+               caps.drop(\"net\")\n\
+               caps.drop(\"process\")\n\
+               let r = recover(() => docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" }))\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "audit_docker_conjunction_order.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(
+        out, "capability 'net' denied\n",
+        "when both net and process are denied, 'net' must be named first (Cap::ALL order)"
+    );
+}
+
+// CNTR §10.2 per-handle re-check (BLOCKER-3 mirror for DockerClient).
+//
+// Strategy: the mock daemon from tests/docker.rs is NOT available here (cap_audit
+// tests are sync + hermetic). We cover the per-handle re-check in a self-contained
+// way: use a `unix.connect` raw socket to speak HTTP to the mock... that would need
+// async. Instead, we use the `--deny` flag PATH for connect-time denial (rows above)
+// AND wire the per-handle re-check via the in-code `caps.drop` path:
+//   - Open a DockerClient against the mock (requires the mock → tested in docker.rs).
+//   - OR: prove the per-handle re-check mechanism is wired for DockerClient /
+//     DockerStream via the unit test `governing_caps_preserves_verdicts` in
+//     `src/value.rs` (which asserts `NativeKind::DockerClient.governing_caps() ==
+//     CapReq::one(Net).and(Process)`) and the end-to-end denial that fires via the
+//     dispatch gate before connect.
+//
+// The actual mock-backed per-handle re-check (connect → drop cap → ping → denied)
+// is covered in `tests/docker.rs` as `docker_client_per_handle_recheck_after_cap_drop`
+// (Task 4.6 — added there because it needs `mock_daemon()` which is async/tokio).
+// That test proves BLOCKER-3 end-to-end; the rows here prove the CONNECT-TIME side.
 
 // ───────────────────────────── process (spawn) — gated by Process ─────────────
 
