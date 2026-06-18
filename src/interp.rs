@@ -110,6 +110,87 @@ pub(crate) fn merge_defer_panic(pending: &mut Result<Value, Control>, new: AsErr
     }
 }
 
+/// RESIL §5: the current task's ambient locals (deadline, trace id). An immutable,
+/// `Rc`-shared record: setting a value builds a NEW `Rc` (copy-on-write), so a child
+/// task captured at spawn time is forever isolated from the parent's later scopes.
+///
+/// The fields are read by the `resilience`/`net`/`postgres`/`redis`/`sql` features
+/// (deadline + trace readers); under a bare `--no-default-features` build none of
+/// those are present, so allow dead_code there (mirrors the bare `#[allow(dead_code)]`
+/// precedent elsewhere in this file for core-but-feature-consumed items).
+#[allow(dead_code)]
+pub(crate) struct TaskLocals {
+    /// Absolute monotonic deadline (ms, the `clock_monotonic_ms` domain), if any.
+    pub deadline_at_ms: Option<f64>,
+    /// Ambient trace/request id, if any.
+    pub trace_id: Option<Rc<str>>,
+}
+
+tokio::task_local! {
+    /// RESIL §5.1: the CURRENT task's ambient locals (deadline budget, trace id). A
+    /// tokio task-local (NOT a shared cell) so concurrent `spawn_local` tasks each
+    /// have their OWN locals — a deadline set in one task can never leak into an
+    /// unrelated concurrent task. It survives `.await` within a task and is isolated
+    /// across tasks.
+    ///
+    /// **CORE, NOT feature-gated** (engine infrastructure, like [`SpanStatus`]): the
+    /// seam compiles under `--no-default-features`. The cell holds an
+    /// `Option<Rc<TaskLocals>>` (COPY-ON-WRITE — each `deadline`/`withTrace` builds a
+    /// fresh `Rc`), seeded at every entry point (`ambient_root_scope`) and re-seeded
+    /// at every user-code async-fn/method/static spawn site (capturing the spawning
+    /// task's current `Rc`), so a child task spawned WHILE a deadline is set inherits
+    /// it — but is isolated from the parent's LATER scope mutations.
+    ///
+    /// **Zero-cost when unset:** consulting it is `try_with(|c| c.get())` → `None`
+    /// fast (a TLS lookup + `Cell` read; the `Rc` is cloned only on `Some`). No probe
+    /// runs work on the `None` path.
+    ///
+    /// **NOT wrapped** at these spawn sites (per spec §5.1): `task_mod.rs`
+    /// race-resolver tasks (only await existing futures, no user code); worker
+    /// isolates (locals do NOT cross the airlock — a worker body starts with EMPTY
+    /// locals, honest + documented); generators (`coro.rs` bodies are lazily polled
+    /// INSIDE the resuming caller's task → `gen.next()` sees the resumer's current
+    /// locals ambiently — resume-time semantics, correct for deadlines); http_server
+    /// connection tasks (each request starts fresh by design); internal bridges
+    /// (actor reply, postgres driver, etc. — no user code).
+    pub(crate) static TASK_LOCALS: std::cell::Cell<Option<Rc<TaskLocals>>>;
+}
+
+/// RESIL §5.1: capture the current task's ambient locals (for propagation into a
+/// spawned task). `None` if unset (e.g. no deadline) — one refcount bump on `Some`,
+/// zero cost on `None`. Consulted at every user-code async spawn site.
+pub(crate) fn task_locals_capture() -> Option<Rc<TaskLocals>> {
+    TASK_LOCALS.try_with(|c| {
+        // Clone the `Rc` out, then put it back (the `Cell` requires take-or-replace).
+        let cur = c.take();
+        let out = cur.clone();
+        c.set(cur);
+        out
+    })
+    .ok()
+    .flatten()
+}
+
+/// RESIL §5.1: the current task's ambient locals, if any (a clone of the `Rc`).
+/// Alias of [`task_locals_capture`] — named for the 4.3 reader call sites.
+/// Only the deadline/trace readers (behind `resilience`/`net`/`postgres`/`redis`/
+/// `sql`) call it; dead under a bare `--no-default-features` build.
+#[allow(dead_code)]
+pub(crate) fn task_locals_current() -> Option<Rc<TaskLocals>> {
+    task_locals_capture()
+}
+
+/// RESIL §5.1: run `fut` within a fresh [`TASK_LOCALS`] scope seeded with `parent`
+/// (the spawning task's current locals, captured at spawn time). Used at the
+/// user-code async-fn/method/static spawn sites so the captured locals flow into the
+/// spawned body.
+pub(crate) async fn task_locals_scope<F, T>(parent: Option<Rc<TaskLocals>>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TASK_LOCALS.scope(std::cell::Cell::new(parent), fut).await
+}
+
 #[cfg(feature = "telemetry")]
 tokio::task_local! {
     /// SP12: the CURRENT telemetry span context for THIS async task. A tokio
@@ -143,22 +224,25 @@ where
         .await
 }
 
-/// Root-scope variant for the entry points (`run_file*`, `run_source*`, repl,
-/// `run_tests`) that aren't feature-gated. With the `telemetry` feature ON it
-/// establishes the root [`TELEMETRY_CURRENT`] scope (no parent); with it OFF it
-/// is the identity, so non-telemetry builds pay nothing.
-pub async fn telemetry_root_scope<F, T>(fut: F) -> T
+/// Root ambient-scope for the entry points (`run_file*`, `run_source*`, repl,
+/// `run_tests`). Establishes BOTH the root [`TASK_LOCALS`] scope (ALWAYS — core, so
+/// `try_with` never errs on the main task) AND, when the `telemetry` feature is on,
+/// the root [`TELEMETRY_CURRENT`] scope (no parent). With telemetry OFF the telemetry
+/// half is the identity, so non-telemetry builds pay only the (cheap) TASK_LOCALS
+/// scope. RESIL §5.1 renamed this from `telemetry_root_scope`.
+pub async fn ambient_root_scope<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
+    // RESIL §5.1: always establish the root TASK_LOCALS scope (core), so every entry
+    // point has the cell in scope — `task_locals_capture()`'s `try_with` never errs.
+    // The telemetry root scope nests inside it when that feature is on; with it off the
+    // inner future is `fut` itself (no redundant async wrapper).
     #[cfg(feature = "telemetry")]
-    {
-        telemetry_scope(None, fut).await
-    }
+    let inner = telemetry_scope(None, fut);
     #[cfg(not(feature = "telemetry"))]
-    {
-        fut.await
-    }
+    let inner = fut;
+    task_locals_scope(None, inner).await
 }
 
 /// Capture the current task's telemetry span context (for propagation into a
@@ -214,6 +298,58 @@ pub(crate) fn make_error(msg: Value) -> Value {
     let mut map = indexmap::IndexMap::new();
     map.insert("message".to_string(), msg);
     Value::object(map)
+}
+
+/// RESIL §5.4: the canonical `[nil, {message, code:"deadline-exceeded"}]` Tier-1
+/// err pair returned when a deadline budget is exhausted. ONE construction site so
+/// the shape is byte-identical across the deadline race ([`crate::stdlib::resilience`]),
+/// the limiter/bulkhead budget-aware parks, and the deadline-aware I/O consult sites
+/// (`std/http` / `std/postgres` / `std/redis` / `std/sqlite`). Field order is
+/// `message` then `code` (matching `make_error` + an explicit `code`). This lives in
+/// core (not behind the `resilience` feature) so the I/O consult sites can build it
+/// even when `resilience` is compiled out but the I/O module is enabled.
+#[cfg_attr(
+    not(any(
+        feature = "resilience",
+        feature = "net",
+        feature = "postgres",
+        feature = "redis",
+        feature = "sql"
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn deadline_exceeded_pair() -> Value {
+    let mut err = indexmap::IndexMap::new();
+    err.insert("message".to_string(), Value::str("deadline exceeded"));
+    err.insert("code".to_string(), Value::str("deadline-exceeded"));
+    make_pair(Value::nil(), Value::object(err))
+}
+
+/// RESIL §3.1.3: test whether `v` is a Result pair `[_, err]` with `err != nil`.
+///
+/// Returns `Some(err)` if `v` is a 2-element array whose second element is
+/// non-nil; `None` otherwise (plain value, ok-pair `[v, nil]`, or not an array).
+/// Recognizes a `[value, err]` ERROR pair: a 2-element array whose second element is
+/// non-nil, returning that error. This is the SAME error-pair *shape* the `?` operator
+/// (`ExprKind::Try`) recognizes (2-element array, non-nil `[1]`), but it is a deliberately
+/// LENIENT predicate distinct from `Try`'s inline logic: `Try` ERRORS on a non-pair (the `?`
+/// operator requires a Result pair), whereas this returns `None` on a non-pair or a `[v, nil]`
+/// — because for outcome classification (the circuit breaker, §3.1.3) a non-pair or success
+/// pair is a SUCCESS, not a failure. The two stay behaviorally consistent on the error-pair
+/// case by the four-mode differential; they are not literally the same function (Try's
+/// non-pair-is-error rule must not leak into outcome classification).
+pub(crate) fn result_pair_err(v: &Value) -> Option<Value> {
+    match v.kind() {
+        crate::value::ValueKind::Array(a) => {
+            let b = a.borrow();
+            if b.len() == 2 && b[1] != Value::nil() {
+                Some(b[1].clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -592,6 +728,17 @@ pub struct Interp {
     /// opening a socket. Tests read it via [`Interp::telemetry_capture`].
     #[cfg(feature = "telemetry")]
     telemetry_capture: RefCell<Vec<crate::stdlib::telemetry::model::CapturedRequest>>,
+    /// RESIL §3.6/§6.1: per-isolate singleflight table and metrics registry.
+    /// `None` fields are absent in a non-resilience build; `Default` gives zero
+    /// cost (empty IndexMap + empty registry). Tasks 3.2/3.3/5.x consume this;
+    /// Task 3.1 (this field) is the single Interp touch so later tasks are
+    /// pure-stdlib changes. Never held across `.await`; accessed through
+    /// short-lived borrows only.
+    // Read starting in Task 3.2 (singleflight uses `.flights`) and Phase 5 (`.registry`);
+    // pre-declared here as the single Interp touch (spec §3.6/§6.1).
+    #[cfg(feature = "resilience")]
+    #[allow(dead_code)]
+    pub(crate) resilience: RefCell<crate::stdlib::resilience::ResilState>,
     /// The script's own CLI arguments (`ascript run file.as <args...>`).
     /// Excludes the binary name and the script path — only the trailing args.
     /// Empty unless set by [`Interp::set_cli_args`] (i.e. the REPL and test
@@ -1080,6 +1227,8 @@ impl Interp {
             telemetry: RefCell::new(None),
             #[cfg(feature = "telemetry")]
             telemetry_capture: RefCell::new(Vec::new()),
+            #[cfg(feature = "resilience")]
+            resilience: RefCell::new(crate::stdlib::resilience::ResilState::default()),
             #[cfg(feature = "ai")]
             ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),
@@ -1558,6 +1707,19 @@ impl Interp {
         }
     }
 
+    /// RESIL §5.2: the remaining deadline budget in ms (≥ 0), or `None` when no
+    /// deadline is set on the current task's [`TASK_LOCALS`]. `now` is the det-routed
+    /// monotonic clock so it agrees with how the deadline was computed. Zero-cost when
+    /// unset (a `try_with` → `None` short-circuits before any clock read).
+    /// Consulted by the §5.4 deadline-aware sites (`resilience`/`net`/`postgres`/
+    /// `redis`/`sql`); dead under a bare `--no-default-features` build.
+    #[allow(dead_code)]
+    pub(crate) fn deadline_remaining_ms(&self) -> Option<f64> {
+        let at = task_locals_current().and_then(|l| l.deadline_at_ms)?;
+        let now = self.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+        Some((at - now).max(0.0))
+    }
+
     /// The next seeded `[0,1)` random value when deterministic, or `None` when not
     /// (so the caller falls back to today's thread-local PRNG — byte-identical).
     pub(crate) fn next_seeded_f64(&self) -> Option<f64> {
@@ -1812,16 +1974,29 @@ impl Interp {
                     }
                 }
                 let msg = parts.join(" ");
+                // RESIL §5.5: attach the ambient trace id (if a `withTrace` scope is
+                // active) as a RESERVED `traceId` field. Zero-cost `None` path: when no
+                // trace is set the read is a TLS lookup + `Cell` read and NO field is
+                // added (so logs outside a trace scope stay byte-identical).
+                let trace_id: Option<std::rc::Rc<str>> =
+                    crate::interp::task_locals_current().and_then(|l| l.trace_id.clone());
                 let line = match self.log_format.get() {
                     LogFormat::Json => {
                         let mut rec = serde_json::Map::new();
                         // User fields FIRST, then reserved keys, so a user field
-                        // named `level`/`msg` can never clobber the authoritative ones.
+                        // named `level`/`msg`/`traceId` can never clobber the
+                        // authoritative ones.
                         for (k, v) in fields {
                             rec.insert(k, v);
                         }
                         rec.insert("level".into(), serde_json::Value::String(func.into()));
                         rec.insert("msg".into(), serde_json::Value::String(msg));
+                        if let Some(tid) = &trace_id {
+                            rec.insert(
+                                "traceId".into(),
+                                serde_json::Value::String(tid.to_string()),
+                            );
+                        }
                         serde_json::Value::Object(rec).to_string()
                     }
                     LogFormat::Human => {
@@ -1837,6 +2012,9 @@ impl Interp {
                             };
                             s.push_str(&format!(" {}={}", k, vs));
                         }
+                        if let Some(tid) = &trace_id {
+                            s.push_str(&format!(" traceId={}", tid));
+                        }
                         s
                     }
                 };
@@ -1845,6 +2023,50 @@ impl Interp {
             }
             other => Err(AsError::at(format!("std/log has no function '{}'", other), span).into()),
         }
+    }
+
+    /// Emit a `debug`-level structured log line SYNCHRONOUSLY (RESIL §6.1
+    /// breadcrumb path): respects the level filter + format, then routes to
+    /// [`Self::emit_log`]. Unlike [`Self::call_log`] this takes a static message +
+    /// pre-resolved string fields (no thunk, no `Value` args) so it can be called
+    /// from a non-async context. Used for resilience transition breadcrumbs (its
+    /// only caller — so gated on both features).
+    #[cfg(all(feature = "log", feature = "resilience"))]
+    pub(crate) fn log_debug_breadcrumb(&self, msg: &str, fields: &[(&str, &str)]) {
+        if LogLevel::Debug < self.log_level.get() {
+            return;
+        }
+        let trace_id: Option<std::rc::Rc<str>> =
+            crate::interp::task_locals_current().and_then(|l| l.trace_id.clone());
+        let line = match self.log_format.get() {
+            LogFormat::Json => {
+                let mut rec = serde_json::Map::new();
+                for (k, v) in fields {
+                    rec.insert((*k).to_string(), serde_json::Value::String((*v).to_string()));
+                }
+                rec.insert("level".into(), serde_json::Value::String("debug".into()));
+                rec.insert("msg".into(), serde_json::Value::String(msg.to_string()));
+                if let Some(tid) = &trace_id {
+                    rec.insert("traceId".into(), serde_json::Value::String(tid.to_string()));
+                }
+                serde_json::Value::Object(rec).to_string()
+            }
+            LogFormat::Human => {
+                let mut s = if msg.is_empty() {
+                    "[DEBUG]".to_string()
+                } else {
+                    format!("[DEBUG] {}", msg)
+                };
+                for (k, v) in fields {
+                    s.push_str(&format!(" {}={}", k, v));
+                }
+                if let Some(tid) = &trace_id {
+                    s.push_str(&format!(" traceId={}", tid));
+                }
+                s
+            }
+        };
+        self.emit_log(&line);
     }
 
     // ---- SP12 std/telemetry: state access + the SP11-facing soft hook ----
@@ -2043,6 +2265,13 @@ impl Interp {
             Some(ctx) => (ctx.trace_id, Some(ctx.span_id)),
             None => (new_trace_id(), None),
         };
+        // RESIL §5.5: attach the ambient trace/request id (from a `withTrace` scope) as
+        // a `trace_id` span attribute when one is set. Zero-cost `None` path (a TLS +
+        // `Cell` read; no attr pushed when no trace is active).
+        let mut attrs = attrs;
+        if let Some(tid) = crate::interp::task_locals_current().and_then(|l| l.trace_id.clone()) {
+            attrs.push(("trace_id".to_string(), Value::str(&*tid)));
+        }
         let open = OpenSpan {
             trace_id,
             span_id: new_span_id(),
@@ -5253,6 +5482,12 @@ impl Interp {
                 return self.call_events_method(&m, args, span).await;
             }
         }
+        #[cfg(feature = "resilience")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::Resilience) {
+                return self.call_resilience_native_method(&m, args, span).await;
+            }
+        }
         #[cfg(feature = "telemetry")]
         {
             use crate::value::NativeKind::*;
@@ -5597,6 +5832,12 @@ impl Interp {
         {
             return true;
         }
+        #[cfg(feature = "resilience")]
+        if crate::stdlib::resilience::is_resilience_value(recv)
+            && crate::stdlib::resilience::is_resilience_method(name)
+        {
+            return true;
+        }
         #[cfg(feature = "workflow")]
         if crate::stdlib::workflow::is_ctx_value(recv)
             && crate::stdlib::workflow::is_ctx_method(name)
@@ -5643,6 +5884,16 @@ impl Interp {
             sargs.push(recv);
             sargs.extend(args);
             return self.call_schema(name, &sargs, span).await;
+        }
+        // Resilience policy call-site hook (RESIL §2.3).
+        #[cfg(feature = "resilience")]
+        if crate::stdlib::resilience::is_resilience_value(&recv)
+            && crate::stdlib::resilience::is_resilience_method(name)
+        {
+            let mut rargs = Vec::with_capacity(args.len() + 1);
+            rargs.push(recv);
+            rargs.extend(args);
+            return self.call_resilience_method(name, &rargs, span).await;
         }
         // Workflow ctx hook.
         #[cfg(feature = "workflow")]
@@ -5875,19 +6126,18 @@ impl Interp {
             // inherits the correct parent lineage (per-task isolation, spec §9.3).
             #[cfg(feature = "telemetry")]
             let telem_parent = crate::interp::telemetry_capture_current();
+            // RESIL §5.1: capture THIS task's ambient locals (deadline/trace) so the
+            // spawned body inherits them — COW-isolated from the parent's later scopes.
+            let locals_parent = crate::interp::task_locals_capture();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
                 // Async fns are excluded from ELIDE eligibility → always false.
+                let body = vm.run_function_body(func, args, call_env, span, what, false);
                 #[cfg(feature = "telemetry")]
-                let r = crate::interp::telemetry_scope(
-                    telem_parent,
-                    vm.run_function_body(func, args, call_env, span, what, false),
-                )
-                .await;
-                #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_function_body(func, args, call_env, span, what, false).await;
+                let body = crate::interp::telemetry_scope(telem_parent, body);
+                let r = crate::interp::task_locals_scope(locals_parent, body).await;
                 cell.resolve(r);
             });
             // Cancel-on-drop: dropping the last handle aborts this task.
@@ -6465,18 +6715,16 @@ impl Interp {
             let guard = self.inflight_guard();
             #[cfg(feature = "telemetry")]
             let telem_parent = crate::interp::telemetry_capture_current();
+            // RESIL §5.1: inherit the spawning task's ambient locals (deadline/trace).
+            let locals_parent = crate::interp::task_locals_capture();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
                 // `run_method_body`'s frame, so nothing escapes the `'static` task.
+                let body = vm.run_method_body(method, args, call_env, span, name);
                 #[cfg(feature = "telemetry")]
-                let r = crate::interp::telemetry_scope(
-                    telem_parent,
-                    vm.run_method_body(method, args, call_env, span, name),
-                )
-                .await;
-                #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_method_body(method, args, call_env, span, name).await;
+                let body = crate::interp::telemetry_scope(telem_parent, body);
+                let r = crate::interp::task_locals_scope(locals_parent, body).await;
                 cell.resolve(r);
             });
             fut.set_abort(handle.abort_handle());
@@ -6540,16 +6788,14 @@ impl Interp {
             let guard = self.inflight_guard();
             #[cfg(feature = "telemetry")]
             let telem_parent = crate::interp::telemetry_capture_current();
+            // RESIL §5.1: inherit the spawning task's ambient locals (deadline/trace).
+            let locals_parent = crate::interp::task_locals_capture();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                let body = vm.run_method_body(m, args, call_env, span, what);
                 #[cfg(feature = "telemetry")]
-                let r = crate::interp::telemetry_scope(
-                    telem_parent,
-                    vm.run_method_body(m, args, call_env, span, what),
-                )
-                .await;
-                #[cfg(not(feature = "telemetry"))]
-                let r = vm.run_method_body(m, args, call_env, span, what).await;
+                let body = crate::interp::telemetry_scope(telem_parent, body);
+                let r = crate::interp::task_locals_scope(locals_parent, body).await;
                 cell.resolve(r);
             });
             fut.set_abort(handle.abort_handle());
@@ -9547,7 +9793,9 @@ mod tests {
         let env = global_env().child();
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") })
+            .run_until(crate::interp::ambient_root_scope(async {
+                interp.exec(&stmts, &env).await.expect("program panicked")
+            }))
             .await;
         local.await;
         interp.log_output()
@@ -9589,6 +9837,59 @@ log.debug(() => "expensive")
                 && logs.contains("\"userId\":5")
         );
         assert!(!logs.contains("expensive"));
+    }
+
+    /// RESIL §5.5: a `log` record emitted inside a `withTrace` scope carries a
+    /// `traceId` reserved field; outside any trace scope NO `traceId` is added.
+    #[cfg(all(feature = "log", feature = "resilience"))]
+    #[tokio::test]
+    async fn log_carries_trace_id_inside_trace_scope() {
+        let logs = run_logs(
+            r#"
+import * as log from "std/log"
+import * as resilience from "std/resilience"
+log.setFormat("json")
+resilience.withTrace("t-1", () => {
+    log.info("inside")
+    return nil
+})
+log.info("outside")
+"#,
+        )
+        .await;
+        // The first record (inside the trace scope) carries the traceId.
+        let inside = logs.lines().find(|l| l.contains("\"msg\":\"inside\"")).expect("inside record");
+        assert!(inside.contains("\"traceId\":\"t-1\""), "inside should carry traceId: {inside}");
+        // The second record (outside) has NO traceId field.
+        let outside = logs.lines().find(|l| l.contains("\"msg\":\"outside\"")).expect("outside record");
+        assert!(!outside.contains("traceId"), "outside must NOT carry traceId: {outside}");
+    }
+
+    /// RESIL Task 5.1 (§6.1): a breaker state transition emits a `log.debug`
+    /// breadcrumb (behind the `log` feature) with the policy name + from/to.
+    #[cfg(all(feature = "log", feature = "resilience"))]
+    #[tokio::test]
+    async fn breaker_transition_emits_log_breadcrumb() {
+        let logs = run_logs(
+            r#"
+import * as log from "std/log"
+import * as resilience from "std/resilience"
+log.setLevel("debug")
+log.setFormat("json")
+let b = resilience.breaker({name: "svc", failureRate: 0.5, window: 2, minCalls: 2, cooldownMs: 999999, halfOpenMax: 1})
+fn fail() { return [nil, {message: "x"}] }
+b.call(fail)
+b.call(fail)   // → opens (closed→open)
+"#,
+        )
+        .await;
+        let line = logs
+            .lines()
+            .find(|l| l.contains("breaker state transition"))
+            .expect("a transition breadcrumb");
+        assert!(line.contains("\"breaker\":\"svc\""), "policy name: {line}");
+        assert!(line.contains("\"to\":\"open\""), "to=open: {line}");
+        assert!(line.contains("\"from\":\"closed\""), "from=closed: {line}");
     }
 
     #[cfg(feature = "log")]

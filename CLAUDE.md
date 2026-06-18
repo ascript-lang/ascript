@@ -530,6 +530,39 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   with the same `ASO_FORMAT_VERSION` the builder emits). Recorded follow-ups: SBOM for `--oci`,
   registry-push (`--push`), the tree-walker-eval carve-out if Phase-0-material, musl-matrix narrowing if a CI
   leg fails.
+- **RESIL — `std/resilience` stdlib** (spec `superpowers/specs/2026-06-12-resilience-stdlib-design.md`; `resilience`
+  feature, default-on; **no `.aso`/opcode/grammar change**, `ASO_FORMAT_VERSION` 29 unchanged). Six policy kinds
+  (`breaker`/`limiter`/`keyedLimiter`/`bulkhead`/`retry`/`memoize`) + module fns (`fallback`/`singleflight`/
+  `deadline`/`withTrace`/`metricsHandler`/`health`/`handler`). Policies are **tagged Objects** (`{__resil:"<kind>",
+  …, __local: Native(NativeKind::Resilience)}` — NO new `Value` variant); method calls route through a
+  **call-position-only hook** mirroring `std/schema` (one `call_resilience_method`, both engines, `OptMember`
+  excluded). **Hook ladder order: schema FIRST, then resilience** (disjoint `__kind`/`__resil` tags + disjoint
+  method sets; pinned in `tests/resil_negative_space.rs`). Rejections are Tier-1 `[nil, {message, code}]` (§2.4
+  codes: `rate-limited`/`bulkhead-full`/`breaker-open`/`deadline-exceeded`/…); misuse is Tier-2. Substrates reused,
+  not rebuilt: breaker ring + `sync.semaphore` (bulkhead) + `std/lru` (keyed-limiter buckets, memoize entries) +
+  `SharedFuture` (singleflight). Time via the det-routed `clock_monotonic_ms` seam → SP9 Record/Replay verdicts
+  replay byte-identically; the enforcement **sleep** is timing-only (the documented exemption). **THE engine seam
+  — `TASK_LOCALS`** (`src/interp.rs`, CORE `tokio::task_local!`, NOT feature-gated): `Cell<Option<Rc<TaskLocals
+  {deadline_at_ms, trace_id}>>>`, **copy-on-spawn** (capture an `Rc` clone before the spawn, `task_locals_scope`
+  the body) at the **five user-code async spawn sites** (tree-walker ×3 + VM ×2), the `ambient_root_scope` root
+  (renamed from `telemetry_root_scope`, wraps every entry point INCL. the CLI tree-walker load AND each http-server
+  connection task so `deadline`/`withTrace` work there). Zero-cost when unused: every consult is one TLS `try_with`
+  → `None` fast (`deadline_remaining_ms`/`task_locals_capture`); the §5.4 deadline-aware I/O sites (http clamp,
+  pg/redis budget-wrap, sqlite pre-check) and the limiter/bulkhead parks all take the `None` branch unchanged when
+  no deadline is set — so `vm_differential` stays **445/0** (deadline-bearing code is unreachable in the corpus).
+  Per-isolate honesty (§7): every policy's state is per-isolate; under `serve({workers:N})` there are N independent
+  copies (the per-replica model); the `__local` marker makes shipping a policy to a worker a LOUD field-path panic;
+  global state = the `worker class` actor pattern. Minimal always-on per-isolate metrics **registry** (`ResilState`
+  on `Interp`, counters+gauges, `ascript_resilience_*`) with a `#[cfg(telemetry)]` mirror (no-op until init) + a
+  `#[cfg(log)]` breaker-transition breadcrumb; `metricsHandler()`/`health()`/`handler()` are `NativeKind::Resilience`
+  `NativeMethod`s the server mounts directly (Prometheus 0.0.4 text; 429/503/504 status mapping; `required_cap` =
+  `None` so they serve under `--sandbox`). **Two Gate-14 carry-forward fixes landed here:** the VM async-spawn sites
+  previously LACKED the `telemetry_scope` wrap the tree-walker had (span lineage now matches; regression test in
+  `tests/telemetry.rs`), and a stale telemetry doc-comment. `task.retry` gained v2 keys (additive, v1 bit-identical).
+  Zero-cost gate (`bench/RESILIENCE_RESULTS.md`): cross-binary async-spawn 1.024× wall (within the 1.05× DBG bound),
+  RSS flat; compute floor geomean 5.32× ≥ 2×. Examples: `examples/resilience.as`, `examples/advanced/
+  resilient_gateway.as`; docs `docs/content/stdlib/resilience.md`. (Note: the sleep fn is `time.sleep`, NOT a
+  non-existent `task.sleep`.)
 
 ## Commands
 

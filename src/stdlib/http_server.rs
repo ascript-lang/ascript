@@ -1389,8 +1389,17 @@ impl Interp {
             // for the task's whole lifetime, then dropped (released) on completion.
             let handle = tokio::task::spawn_local(async move {
                 let _permit = permit;
-                vm.handle_connection(id, stream, max_body, timeout_ms, span)
-                    .await;
+                // RESIL §5.1/§6.4: each connection task gets a FRESH `ambient_root_scope`
+                // (None-seeded TASK_LOCALS — it does NOT inherit any serve-level deadline,
+                // so requests "start fresh" per §5.1) so a per-request
+                // `resilience.handler({deadlineMs})` / `resilience.deadline` can set+read
+                // its OWN deadline local in-server; without the scope `call_deadline`'s
+                // `try_with` errs and the deadline silently no-ops. Also gives top-level
+                // telemetry spans in a handler a root scope.
+                crate::interp::ambient_root_scope(vm.handle_connection(
+                    id, stream, max_body, timeout_ms, span,
+                ))
+                .await;
             });
             if bounded {
                 inflight.push(handle);

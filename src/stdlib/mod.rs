@@ -73,6 +73,8 @@ pub mod redis;
 #[cfg(feature = "data")]
 pub mod regex;
 pub mod schema;
+#[cfg(feature = "resilience")]
+pub mod resilience;
 #[cfg(feature = "shared")]
 pub mod shared;
 pub mod set;
@@ -126,6 +128,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/object" => object::exports(),
         "std/map" => map::exports(),
         "std/schema" => schema::exports(),
+        #[cfg(feature = "resilience")]
+        "std/resilience" => resilience::exports(),
         #[cfg(feature = "shared")]
         "std/shared" => shared::exports(),
         "std/set" => set::exports(),
@@ -276,6 +280,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/cbor",
     "std/tui",
     "std/ffi",
+    "std/resilience",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -503,6 +508,8 @@ impl Interp {
             "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
             "schema" => self.call_schema(func, args, span).await,
+            #[cfg(feature = "resilience")]
+            "resilience" => self.call_resilience(func, args, span).await,
             #[cfg(feature = "shared")]
             "shared" => shared::call(func, args, span),
             "set" => set::call(func, args, span),
@@ -1028,6 +1035,8 @@ mod cap_gate_tests {
         assert_eq!(required_cap("array", "map"), None);
         // caps itself is NOT gated (querying/dropping is always allowed).
         assert_eq!(required_cap("caps", "drop"), None);
+        // resilience is pure / in-memory.
+        assert_eq!(required_cap("resilience", "breaker"), None);
     }
 
     /// Drift guard: every resource-acquiring module string the dispatch match
@@ -1109,6 +1118,8 @@ mod cap_gate_tests {
             "convert", "task", "time", "sync", "stream", "date", "intl", "json", "log",
             "encoding", "crypto", "compress", "regex", "url", "uuid", "csv", "toml", "yaml",
             "msgpack", "cbor", "tui",
+            // RESIL §0: pure / in-memory policy kit — no OS resource, no cap.
+            "resilience",
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");

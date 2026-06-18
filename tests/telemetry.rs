@@ -1,6 +1,7 @@
-//! SP12 `std/telemetry` capture-mode tests. Run with `--features telemetry`
-//! (the feature is not in `default`, so the whole file is `#[cfg]`-gated and is
-//! empty/compiles-clean in the default config). No socket, no secret: telemetry
+//! SP12 `std/telemetry` capture-mode tests. The `telemetry` feature is in
+//! `default`, so these run in the default config; the whole file is
+//! `#[cfg(feature = "telemetry")]`-gated and is empty/compiles-clean only under
+//! `--no-default-features` (or any build dropping the feature). No socket, no secret: telemetry
 //! runs in capture mode and the recorded exporter HTTP payloads are read back via
 //! `interp.telemetry_capture()`.
 
@@ -22,6 +23,15 @@ async fn run(src: &str) -> (String, Vec<ascript::CapturedRequest>) {
 /// `telemetry_spans_debug()` (buffered spans) or `telemetry_capture()`.
 async fn run_i(src: &str) -> (String, Rc<ascript::interp::Interp>) {
     run_source_with_interp(src)
+        .await
+        .expect("program should run")
+}
+
+/// RESIL Gate-14 fix #1: run `.as` source on the SPECIALIZED VM, returning (stdout,
+/// owning interp). Used to prove a VM-mode async-fn body's spans parent correctly —
+/// the spawn-site `telemetry_scope` wrap the VM previously lacked.
+async fn run_vm_i(src: &str) -> (String, Rc<ascript::interp::Interp>) {
+    ascript::vm_run_source_with_interp(src)
         .await
         .expect("program should run")
 }
@@ -171,6 +181,38 @@ await telemetry.span("outer", async () => {{
     assert_eq!(inner.parent_id.as_deref(), Some(outer.span_id.as_str()), "inner parents to outer");
 }
 
+/// RESIL Gate-14 fix #1 (VM-mode span lineage). The VM async-closure / static-async
+/// spawn sites previously LACKED the `telemetry_scope` wrap the tree-walker's async
+/// arms have — so a span opened INSIDE a VM-mode spawned async-fn body did NOT
+/// parent to the spawning task's current span. This runs ON THE VM: the body of
+/// `telemetry.span("outer", …)` calls a top-level `async fn inner_work()` (a real
+/// VM spawn_local), and that spawned body opens "inner". With the wrap, "inner"
+/// parents to "outer" — exactly as the tree-walker does (asserted above).
+#[tokio::test]
+async fn vm_async_fn_body_span_parents_to_scoped_span() {
+    let (_out, interp) = run_vm_i(&format!(
+        r#"{INIT}
+async fn inner_work() {{
+  let inner = telemetry.startSpan("inner")
+  inner.end()
+}}
+await telemetry.span("outer", async () => {{
+  await inner_work()   // a VM spawn_local; its body must inherit "outer" as current
+}})
+"#
+    ))
+    .await;
+    let spans = interp.telemetry_spans_debug();
+    let outer = spans.iter().find(|s| s.name == "outer").expect("outer");
+    let inner = spans.iter().find(|s| s.name == "inner").expect("inner");
+    assert_eq!(inner.trace_id, outer.trace_id, "same trace (VM mode)");
+    assert_eq!(
+        inner.parent_id.as_deref(),
+        Some(outer.span_id.as_str()),
+        "VM-mode inner parents to outer (Gate-14 fix #1)"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_scoped_spans_do_not_cross_parent() {
     // Two telemetry.span calls driven on concurrent spawn_local tasks must each
@@ -207,6 +249,38 @@ await gather([a, b])
     assert_eq!(a_child.trace_id, a.trace_id);
     assert_eq!(b_child.trace_id, b.trace_id);
     assert_ne!(a.trace_id, b.trace_id, "A and B are distinct traces");
+}
+
+// ---- RESIL §5.5: trace-id local attaches as a span attribute ----
+
+/// A span opened inside a `resilience.withTrace` scope carries the trace id as a
+/// `trace_id` span attribute; a span opened outside any trace scope does not.
+#[tokio::test]
+async fn span_carries_trace_id_attribute_from_local() {
+    let (_out, interp) = run_i(&format!(
+        r#"{INIT}
+import * as resilience from "std/resilience"
+resilience.withTrace("req-42", () => {{
+  telemetry.startSpan("traced").end()
+  return nil
+}})
+telemetry.startSpan("untraced").end()
+"#
+    ))
+    .await;
+    let spans = interp.telemetry_spans_debug();
+    let traced = spans.iter().find(|s| s.name == "traced").expect("traced span");
+    let untraced = spans.iter().find(|s| s.name == "untraced").expect("untraced span");
+    assert!(
+        traced.attributes.iter().any(|(k, v)| k == "trace_id" && v == "req-42"),
+        "traced span should carry trace_id=req-42 attribute: {:?}",
+        traced.attributes
+    );
+    assert!(
+        !untraced.attributes.iter().any(|(k, _)| k == "trace_id"),
+        "untraced span must NOT carry a trace_id attribute: {:?}",
+        untraced.attributes
+    );
 }
 
 // ---- F2: OTLP exporter — span / metric / log HTTP payloads (capture seam) ----
@@ -300,6 +374,56 @@ await telemetry.flush()
     let body = &caps.iter().find(|r| r.signal == "metrics").unwrap().body;
     assert_eq!(body.matches("\"name\":\"hits\"").count(), 1, "one instrument: {body}");
     assert!(body.contains("\"asDouble\":2.0") || body.contains("\"asDouble\":2"), "sum=2: {body}");
+}
+
+// ---- RESIL Task 5.1: std/resilience §6.1 metric mirror through the soft hook ----
+
+/// With telemetry initialized, a breaker call mirrors its §6.1 registry counter
+/// through the SP12 soft hook → the OTLP metrics payload carries the
+/// `ascript_resilience_breaker_calls_total` instrument.
+#[cfg(feature = "resilience")]
+#[tokio::test]
+async fn resilience_breaker_mirrors_metric_through_soft_hook() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+import * as resilience from "std/resilience"
+let b = resilience.breaker({{ name: "svc" }})
+fn ok() {{ return 1 }}
+b.call(ok)
+b.call(ok)
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let req = caps
+        .iter()
+        .find(|r| r.signal == "metrics")
+        .expect("a metrics request after a breaker call");
+    let body = &req.body;
+    assert!(
+        body.contains("ascript_resilience_breaker_calls_total"),
+        "breaker calls counter mirrored: {body}"
+    );
+    // The `result=success` label rides as an attribute on the data point.
+    assert!(body.contains("success"), "result label present: {body}");
+}
+
+/// WITHOUT `telemetry.init`, a breaker call records NOTHING through the hook (the
+/// soft hook no-ops) but the program runs cleanly — the registry still captured
+/// the sample (asserted in the lib-side registry tests).
+#[cfg(feature = "resilience")]
+#[tokio::test]
+async fn resilience_metric_mirror_noop_when_telemetry_uninitialized() {
+    let (out, caps) = run(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({ name: "svc" })
+fn ok() { return 1 }
+b.call(ok)
+print("done")
+"#)
+    .await;
+    assert_eq!(out, "done\n");
+    assert!(caps.is_empty(), "no captured requests without init: {:?}", caps);
 }
 
 /// The first `"key":"<value>"` after the needle.

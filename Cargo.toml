@@ -200,7 +200,7 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience"]
 # RT §5.1/§5.2 — the signed-manifest verification + stub fetch half of the
 # runtime-stub distribution path. Pulls `net` (the pooled reqwest client used to fetch
 # the release manifest + stub blobs) and `ed25519-dalek` (verify the detached manifest
@@ -363,6 +363,12 @@ ai = ["data", "net", "dep:genai"]
 # --no-default-features (where `import "std/ffi"` is an unknown-module error; the
 # `std/caps` capability surface stays CORE — capabilities exist in a bare build).
 ffi = ["dep:libloading", "dep:libffi"]
+# RESIL §0: std/resilience — backend-hosting policy kit (circuit breaker, rate
+# limiter, bulkhead, retry v2, singleflight, memoize, deadline propagation,
+# metrics/health handlers). Pure in-memory (no OS resource, no extra deps —
+# substrates lru/sync/task are core). Default-on (batteries). cfg's out cleanly
+# under --no-default-features (where `import "std/resilience"` is unknown-module).
+resilience = []
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"

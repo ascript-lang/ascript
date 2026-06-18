@@ -1,0 +1,32 @@
+# exit: none
+open
+breaker-open
+1
+closed
+true
+true
+false
+true
+true
+false
+true
+true
+42
+nil
+recovered
+3
+fallback(err)
+nil
+true
+1
+1
+value
+1
+nil
+deadline-exceeded
+false
+true
+deadline-exceeded
+0
+true
+resilience ok

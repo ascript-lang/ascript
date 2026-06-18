@@ -53,7 +53,401 @@ fn err_pair(msg: String) -> Value {
     make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Retry v2 (RESIL spec §3.4) — the shared retry engine.
+//
+// `task.retry` (CORE, stateless) and `resilience.retry(opts)` (the feature-gated
+// stateful policy) both route through ONE engine: `Interp::retry_engine`. The
+// engine is configured by a plain `RetryConfig` (parsed from opts), and the delay
+// schedule is a PURE function (`compute_retry_delay`) so it is exhaustively
+// unit-testable. When the v2 keys are absent the behavior is BIT-IDENTICAL to
+// retry v1 (the three shipped `task.retry` tests are the compat contract).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Backoff schedule for the delay between attempts (§3.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Backoff {
+    /// `base_ms * 2^attempt`, capped at `max_ms` — the v1 default.
+    Exponential,
+    /// Every delay is `base_ms` (capped at `max_ms`).
+    Fixed,
+}
+
+/// Jitter mode applied to the computed delay (§3.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Jitter {
+    /// No jitter — the deterministic computed delay. `jitter: false`/`"none"`.
+    None,
+    /// The v1 `jitter: true` behavior: add up to +50% of the computed delay.
+    PlusHalf,
+    /// AWS full jitter: the delay is drawn uniformly from `[0, computedDelay]`.
+    /// `jitter: "full"`.
+    Full,
+}
+
+/// Which outcome classes are retried (§3.4 `retryOn`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RetryOn {
+    /// Only `Control::Panic` (the v1 default). Returned pairs are NOT retried.
+    Panic,
+    /// Only a returned `[_, err≠nil]` pair is retried (panics pass through).
+    Error,
+    /// Either a panic or an error pair.
+    Both,
+}
+
+/// A parsed retry configuration shared by `task.retry` and `resilience.retry`.
+pub(crate) struct RetryConfig {
+    pub attempts: usize,
+    pub base_ms: u64,
+    pub max_ms: Option<u64>,
+    pub backoff: Backoff,
+    pub jitter: Jitter,
+    pub retry_on: RetryOn,
+    /// Optional `retryIf(err) -> bool` predicate value (a callable).
+    pub retry_if: Option<Value>,
+}
+
+/// PURE delay schedule (§3.4). Given the zero-based `attempt` index, the `base_ms`,
+/// the optional `max_ms` cap, the `backoff` mode, the `jitter` mode, and a
+/// random-source closure `rand_f64` (called ONLY in jitter modes — `[0,1)`),
+/// return the sleep duration in milliseconds.
+///
+/// BIT-IDENTICAL to retry v1 for `Backoff::Exponential` + `Jitter::{None,PlusHalf}`:
+/// the exponential schedule is `base_ms * 2^attempt` with the shift capped at 62 so
+/// `1u64 << shift` never overflows (attempt ≥ 63 is clamped to shift 62), `max_ms`
+/// caps the pre-jitter delay, and `Jitter::PlusHalf` reuses the v1 `+0..50%` formula
+/// verbatim.
+pub(crate) fn compute_retry_delay(
+    attempt: usize,
+    base_ms: u64,
+    max_ms: Option<u64>,
+    backoff: Backoff,
+    jitter: Jitter,
+    rand_f64: impl FnOnce() -> f64,
+) -> u64 {
+    // Base (pre-jitter) delay.
+    let base = match backoff {
+        Backoff::Exponential => {
+            // Cap shift at 62 so `1u64 << shift` never overflows (v1 invariant).
+            let shift = attempt.min(62) as u32;
+            let multiplier = 1u64 << shift;
+            base_ms.saturating_mul(multiplier)
+        }
+        Backoff::Fixed => base_ms,
+    };
+    let delay = match max_ms {
+        Some(max) => delay_min(base, max),
+        None => base,
+    };
+
+    match jitter {
+        Jitter::None => delay,
+        Jitter::PlusHalf => {
+            // v1 formula, verbatim — add up to +50% of the computed delay.
+            let frac = rand_f64();
+            delay.saturating_add((delay / 2).saturating_mul((frac * 1000.0) as u64) / 1000)
+        }
+        Jitter::Full => {
+            // AWS full jitter: draw uniformly from [0, delay].
+            let frac = rand_f64();
+            ((delay as f64) * frac) as u64
+        }
+    }
+}
+
+/// `a.min(b)` for `u64` — extracted so `compute_retry_delay` reads cleanly.
+#[inline]
+fn delay_min(a: u64, b: u64) -> u64 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Parse a `RetryConfig` from a `task.retry`/`resilience.retry` opts value (§3.4).
+///
+/// The legacy keys (`attempts`, `baseMs`, `maxMs`, `jitter: bool`) parse EXACTLY as
+/// v1 — when the v2 keys are absent the resulting config drives byte-identical
+/// behavior. `budget` is NOT parsed here (it is the policy's stateful key, handled
+/// by the caller); an unknown key is ignored (stdlib-wide convention).
+pub(crate) fn parse_retry_config(opts: &Value, span: Span) -> Result<RetryConfig, Control> {
+    let o = match opts.kind() {
+        ValueKind::Nil => {
+            return Ok(RetryConfig {
+                attempts: 3,
+                base_ms: 100,
+                max_ms: None,
+                backoff: Backoff::Exponential,
+                jitter: Jitter::None,
+                retry_on: RetryOn::Panic,
+                retry_if: None,
+            });
+        }
+        ValueKind::Object(o) => o,
+        _ => {
+            return Err(AsError::at(
+                format!(
+                    "task.retry opts must be an object or nil, got {}",
+                    crate::interp::type_name(opts)
+                ),
+                span,
+            )
+            .into());
+        }
+    };
+
+    let attempts = match o.get("attempts") {
+        Some(v) => {
+            let n = super::want_number(&v, span, "task.retry attempts")?;
+            if n < 1.0 || n.fract() != 0.0 {
+                return Err(
+                    AsError::at("task.retry: attempts must be a positive integer", span).into(),
+                );
+            }
+            n as usize
+        }
+        None => 3,
+    };
+    let base_ms = match o.get("baseMs") {
+        Some(v) => {
+            let n = super::want_number(&v, span, "task.retry baseMs")?;
+            if n < 0.0 {
+                return Err(AsError::at("task.retry: baseMs must be non-negative", span).into());
+            }
+            n as u64
+        }
+        None => 100,
+    };
+    let max_ms = match o.get("maxMs") {
+        Some(v) => {
+            let n = super::want_number(&v, span, "task.retry maxMs")?;
+            if n < 0.0 {
+                return Err(AsError::at("task.retry: maxMs must be non-negative", span).into());
+            }
+            Some(n as u64)
+        }
+        None => None,
+    };
+
+    // backoff: "exponential" (default) | "fixed"
+    let backoff = match o.get("backoff") {
+        None => Backoff::Exponential,
+        Some(v) => match v.kind() {
+            ValueKind::Nil => Backoff::Exponential,
+            ValueKind::Str(s) => match s.as_ref() {
+                "exponential" => Backoff::Exponential,
+                "fixed" => Backoff::Fixed,
+                other => {
+                    return Err(AsError::at(
+                        format!(
+                            "task.retry: backoff must be \"exponential\" or \"fixed\", got \"{other}\""
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+            },
+            _ => {
+                return Err(AsError::at(
+                    "task.retry: backoff must be a string",
+                    span,
+                )
+                .into());
+            }
+        },
+    };
+
+    // jitter: false/"none" | true (+0..50%) | "full"
+    let jitter = match o.get("jitter") {
+        None => Jitter::None,
+        Some(v) => match v.kind() {
+            ValueKind::Nil | ValueKind::Bool(false) => Jitter::None,
+            ValueKind::Bool(true) => Jitter::PlusHalf,
+            ValueKind::Str(s) => match s.as_ref() {
+                "none" => Jitter::None,
+                "full" => Jitter::Full,
+                other => {
+                    return Err(AsError::at(
+                        format!(
+                            "task.retry: jitter must be a bool, \"none\", or \"full\", got \"{other}\""
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+            },
+            _ => {
+                return Err(AsError::at(
+                    "task.retry: jitter must be a bool or a string",
+                    span,
+                )
+                .into());
+            }
+        },
+    };
+
+    // retryOn: "panic" (default) | "error" | "both"
+    let retry_on = match o.get("retryOn") {
+        None => RetryOn::Panic,
+        Some(v) => match v.kind() {
+            ValueKind::Nil => RetryOn::Panic,
+            ValueKind::Str(s) => match s.as_ref() {
+                "panic" => RetryOn::Panic,
+                "error" => RetryOn::Error,
+                "both" => RetryOn::Both,
+                other => {
+                    return Err(AsError::at(
+                        format!(
+                            "task.retry: retryOn must be \"panic\", \"error\", or \"both\", got \"{other}\""
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+            },
+            _ => {
+                return Err(AsError::at(
+                    "task.retry: retryOn must be a string",
+                    span,
+                )
+                .into());
+            }
+        },
+    };
+
+    // retryIf: fn(err) -> bool (a callable)
+    let retry_if = match o.get("retryIf") {
+        None => None,
+        Some(v) => match v.kind() {
+            ValueKind::Nil => None,
+            ValueKind::Function(_)
+            | ValueKind::Closure(_)
+            | ValueKind::Builtin(_)
+            | ValueKind::BoundMethod(_)
+            | ValueKind::NativeMethod(_) => Some(v),
+            _ => {
+                return Err(AsError::at(
+                    format!(
+                        "task.retry: retryIf must be a function, got {}",
+                        crate::interp::type_name(&v)
+                    ),
+                    span,
+                )
+                .into());
+            }
+        },
+    };
+
+    Ok(RetryConfig {
+        attempts,
+        base_ms,
+        max_ms,
+        backoff,
+        jitter,
+        retry_on,
+        retry_if,
+    })
+}
+
+/// Fold `code: "retries-exhausted"` into the err of a returned pair when it is
+/// absent (§3.4 — the `retryOn: error`/`both` exhaustion path). The pair's value
+/// slot is preserved; only the err object gains the code iff it lacks one.
+fn fold_retries_exhausted(pair: Value) -> Value {
+    let (val, err) = match pair.kind() {
+        ValueKind::Array(a) => {
+            let b = a.borrow();
+            if b.len() == 2 {
+                (b[0].clone(), b[1].clone())
+            } else {
+                return pair.clone();
+            }
+        }
+        _ => return pair,
+    };
+    // Only fold when err is an Object lacking a `code` field.
+    if let ValueKind::Object(o) = err.kind() {
+        if o.get("code").is_none() {
+            o.insert("code", Value::str("retries-exhausted"));
+        }
+    }
+    make_pair(val, err)
+}
+
+// ── budget (the resilience.retry policy's count-based retry budget, §3.4) ──────
+
+/// The policy field names for the count-based retry budget.
+const BUDGET_ATTEMPTS: &str = "__attemptsSeen";
+const BUDGET_SPENT: &str = "__retriesSpent";
+
+/// Record one attempt against the budget's first-attempt-rate denominator.
+fn budget_record_attempt(state: &Value) {
+    if let ValueKind::Object(o) = state.kind() {
+        let n = o.get(BUDGET_ATTEMPTS).and_then(|v| v.as_int()).unwrap_or(0);
+        o.insert(BUDGET_ATTEMPTS, Value::int(n + 1));
+    }
+}
+
+/// Record one spent retry credit.
+fn budget_record_retry(state: &Value) {
+    if let ValueKind::Object(o) = state.kind() {
+        let n = o.get(BUDGET_SPENT).and_then(|v| v.as_int()).unwrap_or(0);
+        o.insert(BUDGET_SPENT, Value::int(n + 1));
+    }
+}
+
+/// Read the retry policy's `name` field (default `"default"`) — the `{name}`
+/// label for the §6.1 retry metrics. Only the stateful `resilience.retry` policy
+/// carries a `name`; plain `task.retry` passes `budget_state: None` and never
+/// bumps these metrics.
+#[cfg(feature = "resilience")]
+fn retry_policy_name(state: &Value) -> String {
+    match state.kind() {
+        ValueKind::Object(o) => o
+            .get("name")
+            .and_then(|v| match v.kind() {
+                ValueKind::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "default".to_string()),
+        _ => "default".to_string(),
+    }
+}
+
+/// True iff the budget permits another retry: `__retriesSpent < budget * __attemptsSeen`.
+/// Count-based, no clock interaction (§3.4).
+fn budget_permits_retry(state: &Value) -> bool {
+    let ValueKind::Object(o) = state.kind() else {
+        return true;
+    };
+    let budget = o.get("budget").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let attempts = o.get(BUDGET_ATTEMPTS).and_then(|v| v.as_int()).unwrap_or(0) as f64;
+    let spent = o.get(BUDGET_SPENT).and_then(|v| v.as_int()).unwrap_or(0) as f64;
+    spent < budget * attempts
+}
+
 impl Interp {
+    /// §6.1: bump `retry_attempts_total{name,outcome}` (resilience.retry only).
+    #[cfg(feature = "resilience")]
+    fn resil_retry_attempt(&self, name: &str, outcome: &str) {
+        self.resil_metric_incr(
+            "ascript_resilience_retry_attempts_total",
+            &[("name", name), ("outcome", outcome)],
+            1.0,
+        );
+    }
+
+    /// §6.1: bump `retry_budget_exhausted_total{name}` (resilience.retry only).
+    #[cfg(feature = "resilience")]
+    fn resil_retry_budget_exhausted(&self, name: &str) {
+        self.resil_metric_incr(
+            "ascript_resilience_retry_budget_exhausted_total",
+            &[("name", name)],
+            1.0,
+        );
+    }
+
     /// `std/task` dispatch. All entries are async (they drive futures / spawn
     /// tasks), so this is awaited on the event loop.
     pub(crate) async fn call_task(
@@ -212,82 +606,75 @@ impl Interp {
     /// `retry(fn, opts?) -> value`
     ///
     /// Calls `fn()` up to `opts.attempts` times (default 3). On each
-    /// `Control::Panic` (and only on panic — returned `[nil, err]` pairs are
-    /// NOT retried; retry is on Tier-2 panics only), waits
-    /// `baseMs * 2^attemptIndex` ms (capped at `opts.maxMs` if given) then
-    /// retries. If `opts.jitter` is `true`, adds a uniform random fraction of
-    /// the delay (up to +50%). After all attempts fail, re-raises the LAST panic.
+    /// `Control::Panic` (and only on panic by default — returned `[nil, err]`
+    /// pairs are NOT retried unless `retryOn` opts in; retry is on Tier-2 panics
+    /// only by default), waits `baseMs * 2^attemptIndex` ms (capped at `opts.maxMs`
+    /// if given) then retries. If `opts.jitter` is `true`, adds a uniform random
+    /// fraction of the delay (up to +50%). After all attempts fail, re-raises the
+    /// LAST panic.
     ///
     /// Non-panic errors (`Control::Propagate`, `Control::Exit`) are passed
     /// through immediately without retry.
+    ///
+    /// RESIL §3.4: additive opts (`backoff`, `jitter` string modes, `retryOn`,
+    /// `retryIf`) are parsed by the shared `parse_retry_config`; `budget` is the
+    /// stateful policy's key and is a Tier-2 error on `task.retry`. When the new
+    /// keys are absent the behavior is BIT-IDENTICAL to retry v1.
     async fn task_retry(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let func = arg(args, 0);
         let opts = arg(args, 1);
 
-        // Parse options.
-        let (attempts, base_ms, max_ms, jitter) = match opts.kind() {
-            ValueKind::Nil => (3usize, 100u64, None::<u64>, false),
-            ValueKind::Object(o) => {
-                let attempts = match o.get("attempts") {
-                    Some(v) => {
-                        let n = super::want_number(&v, span, "task.retry attempts")?;
-                        if n < 1.0 || n.fract() != 0.0 {
-                            return Err(AsError::at(
-                                "task.retry: attempts must be a positive integer",
-                                span,
-                            )
-                            .into());
-                        }
-                        n as usize
-                    }
-                    None => 3,
-                };
-                let base_ms = match o.get("baseMs") {
-                    Some(v) => {
-                        let n = super::want_number(&v, span, "task.retry baseMs")?;
-                        if n < 0.0 {
-                            return Err(AsError::at(
-                                "task.retry: baseMs must be non-negative",
-                                span,
-                            )
-                            .into());
-                        }
-                        n as u64
-                    }
-                    None => 100,
-                };
-                let max_ms = match o.get("maxMs") {
-                    Some(v) => {
-                        let n = super::want_number(&v, span, "task.retry maxMs")?;
-                        if n < 0.0 {
-                            return Err(AsError::at(
-                                "task.retry: maxMs must be non-negative",
-                                span,
-                            )
-                            .into());
-                        }
-                        Some(n as u64)
-                    }
-                    None => None,
-                };
-                let jitter = matches!(o.get("jitter").as_ref().map(Value::kind), Some(ValueKind::Bool(true)));
-                (attempts, base_ms, max_ms, jitter)
-            }
-            _ => {
+        // `budget` belongs to the stateful resilience.retry policy, never to the
+        // stateless task.retry (Gate 6 — never a silent ignore).
+        if let ValueKind::Object(o) = opts.kind() {
+            if o.get("budget").is_some() {
                 return Err(AsError::at(
-                    format!(
-                        "task.retry opts must be an object or nil, got {}",
-                        crate::interp::type_name(&opts)
-                    ),
+                    "task.retry: budget requires a resilience.retry policy",
                     span,
                 )
                 .into());
             }
-        };
+        }
 
+        let cfg = parse_retry_config(&opts, span)?;
+        self.retry_engine(func, &cfg, None, span).await
+    }
+
+    /// The shared retry engine (RESIL §3.4). Drives `func()` up to `cfg.attempts`
+    /// times under the configured backoff/jitter/retryOn/retryIf policy. Both
+    /// `task.retry` (with `budget_state: None`) and `resilience.retry`'s `call`
+    /// method (with the policy's count-based `budget_state`) route through here, so
+    /// the retry behavior is identical by construction.
+    ///
+    /// `budget_state`, when `Some`, is the resilience.retry policy object carrying
+    /// `__retriesSpent` / `__attemptsSeen` and the `budget` ratio. A retry is
+    /// permitted only while `__retriesSpent < budget * __attemptsSeen`; once the
+    /// ratio is exhausted the engine behaves as exhausted immediately. The budget
+    /// verdict is COUNT-BASED (no clock interaction).
+    pub(crate) async fn retry_engine(
+        &self,
+        func: Value,
+        cfg: &RetryConfig,
+        budget_state: Option<&Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
         let mut last_panic: Option<crate::error::AsError> = None;
+        // The last retried error pair (for the `retryOn: error`/`both` exhaustion path).
+        let mut last_pair: Option<Value> = None;
 
-        for attempt in 0..attempts {
+        // §6.1 retry metrics are emitted ONLY for the stateful resilience.retry
+        // policy (which carries a `name` + budget state); plain task.retry passes
+        // `budget_state: None` and never touches the registry. The metric path
+        // compiles out entirely without the `resilience` feature (no policy exists).
+        #[cfg(feature = "resilience")]
+        let retry_name: Option<String> = budget_state.map(retry_policy_name);
+
+        for attempt in 0..cfg.attempts {
+            // Count this attempt for the budget ratio (the first-attempt rate).
+            if let Some(state) = budget_state {
+                budget_record_attempt(state);
+            }
+
             // Call the function. If it is an async fn, call_value returns
             // Ok(Value::future(..)) immediately — we must drive the future to
             // completion by awaiting it before inspecting the result.
@@ -301,44 +688,166 @@ impl Interp {
                 }
                 other => other,
             };
-            match result {
-                // Success: return immediately (no retry of ok values or [nil,err] pairs).
-                Ok(v) => return Ok(v),
-                // Panic: retry if attempts remain.
-                Err(Control::Panic(e)) => {
-                    last_panic = Some(e);
-                    // If this was the last attempt, break to re-raise below.
-                    if attempt + 1 >= attempts {
-                        break;
-                    }
-                    // Compute exponential backoff delay.
-                    // Cap shift at 62 so 1u64 << shift never overflows.
-                    let shift = attempt.min(62) as u32;
-                    let multiplier = 1u64 << shift;
-                    let delay = base_ms.saturating_mul(multiplier);
-                    let mut delay = if let Some(max) = max_ms {
-                        delay.min(max)
-                    } else {
-                        delay
-                    };
-                    if jitter {
-                        // Add up to +50% jitter.
-                        let frac = retry_rand_f64();
-                        delay = delay.saturating_add(
-                            (delay / 2).saturating_mul((frac * 1000.0) as u64) / 1000,
-                        );
-                    }
-                    if delay > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
+            // Classify the outcome against `retryOn`, deciding the retry candidate.
+            // `retryable_err` is the error VALUE handed to `retryIf` (the panic's
+            // error value, or the pair's err).
+            enum Class {
+                /// Terminal success (or an un-retried pair) — return as-is.
+                Success(Value),
+                /// A panic candidate — retry if budget/retryIf/attempts allow.
+                Panic(crate::error::AsError, Value),
+                /// An error-pair candidate — retry if budget/retryIf/attempts allow.
+                ErrPair(Value, Value),
+                /// Non-retryable control flow — pass through.
+                Passthrough(Control),
+            }
+            let class = match result {
+                Ok(v) => {
+                    // An error pair is a retry candidate only under retryOn error/both.
+                    match crate::interp::result_pair_err(&v) {
+                        Some(err)
+                            if matches!(cfg.retry_on, RetryOn::Error | RetryOn::Both) =>
+                        {
+                            Class::ErrPair(v, err)
+                        }
+                        _ => Class::Success(v),
                     }
                 }
-                // Propagate / Exit: not retryable — pass through unchanged.
-                Err(other) => return Err(other),
+                Err(Control::Panic(e))
+                    if matches!(cfg.retry_on, RetryOn::Panic | RetryOn::Both) =>
+                {
+                    // The error VALUE handed to `retryIf` mirrors `recover`'s shape:
+                    // `{message: <panic message>}` (src/interp.rs recover arm).
+                    let errv = make_error(Value::str(e.message.clone()));
+                    Class::Panic(e, errv)
+                }
+                Err(other) => Class::Passthrough(other),
+            };
+
+            match class {
+                Class::Success(v) => {
+                    // §6.1: a successful attempt outcome.
+                    #[cfg(feature = "resilience")]
+                    if let Some(rn) = &retry_name {
+                        self.resil_retry_attempt(rn, "success");
+                    }
+                    return Ok(v);
+                }
+                Class::Passthrough(c) => return Err(c),
+                Class::Panic(e, errv) => {
+                    // §6.1: a failed attempt outcome.
+                    #[cfg(feature = "resilience")]
+                    if let Some(rn) = &retry_name {
+                        self.resil_retry_attempt(rn, "failure");
+                    }
+                    // `retryIf(err) == false` → re-raise immediately (no further attempts).
+                    if !self.retry_if_allows(cfg, &errv, span).await? {
+                        return Err(Control::Panic(e));
+                    }
+                    last_panic = Some(e);
+                    last_pair = None;
+                    // Last attempt OR budget exhausted → re-raise below.
+                    let budget_ok = budget_state
+                        .map(budget_permits_retry)
+                        .unwrap_or(true);
+                    if attempt + 1 >= cfg.attempts || !budget_ok {
+                        // §6.1: budget-driven (not attempt-cap-driven) exhaustion.
+                        #[cfg(feature = "resilience")]
+                        if !budget_ok {
+                            if let Some(rn) = &retry_name {
+                                self.resil_retry_budget_exhausted(rn);
+                            }
+                        }
+                        break;
+                    }
+                    if let Some(state) = budget_state {
+                        budget_record_retry(state);
+                    }
+                    self.retry_backoff_sleep(cfg, attempt).await;
+                }
+                Class::ErrPair(pair, errv) => {
+                    // §6.1: a failed attempt outcome.
+                    #[cfg(feature = "resilience")]
+                    if let Some(rn) = &retry_name {
+                        self.resil_retry_attempt(rn, "failure");
+                    }
+                    if !self.retry_if_allows(cfg, &errv, span).await? {
+                        return Ok(pair);
+                    }
+                    last_pair = Some(pair);
+                    last_panic = None;
+                    let budget_ok = budget_state
+                        .map(budget_permits_retry)
+                        .unwrap_or(true);
+                    if attempt + 1 >= cfg.attempts || !budget_ok {
+                        #[cfg(feature = "resilience")]
+                        if !budget_ok {
+                            if let Some(rn) = &retry_name {
+                                self.resil_retry_budget_exhausted(rn);
+                            }
+                        }
+                        break;
+                    }
+                    if let Some(state) = budget_state {
+                        budget_record_retry(state);
+                    }
+                    self.retry_backoff_sleep(cfg, attempt).await;
+                }
             }
         }
 
-        // All attempts exhausted — re-raise the last panic.
-        Err(Control::Panic(last_panic.expect("at least one attempt")))
+        // Exhausted. Panic exhaustion re-raises the last panic (v1 behavior); pair
+        // exhaustion returns the LAST pair with `code: "retries-exhausted"` folded
+        // into its err if absent (§3.4).
+        if let Some(pair) = last_pair {
+            Ok(fold_retries_exhausted(pair))
+        } else {
+            Err(Control::Panic(last_panic.expect("at least one attempt")))
+        }
+    }
+
+    /// Sleep the computed backoff delay between attempts (timing-only — the §3.4
+    /// SP9 exemption). `attempt` is the zero-based index that just failed.
+    async fn retry_backoff_sleep(&self, cfg: &RetryConfig, attempt: usize) {
+        let delay = compute_retry_delay(
+            attempt,
+            cfg.base_ms,
+            cfg.max_ms,
+            cfg.backoff,
+            cfg.jitter,
+            retry_rand_f64,
+        );
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
+
+    /// Evaluate `cfg.retry_if(err)` if present; returns `true` (retry allowed) when
+    /// no predicate is set. A panic INSIDE the predicate re-raises (programmer
+    /// error — §3.4). A non-bool return is coerced via truthiness.
+    async fn retry_if_allows(
+        &self,
+        cfg: &RetryConfig,
+        errv: &Value,
+        span: Span,
+    ) -> Result<bool, Control> {
+        let Some(pred) = cfg.retry_if.as_ref() else {
+            return Ok(true);
+        };
+        let r = self
+            .call_value(pred.clone(), vec![errv.clone()], span)
+            .await?;
+        // Drive a returned future (async predicate) to completion.
+        let r = if matches!(r.kind(), ValueKind::Future(_)) {
+            let OwnedKind::Future(f) = r.into_kind() else {
+                unreachable!()
+            };
+            f.get().await?
+        } else {
+            r
+        };
+        Ok(r.is_truthy())
     }
 
     // ── PAR Task 2.2: pmap orchestrator ──────────────────────────────────────
@@ -1169,6 +1678,215 @@ print(counter[0])
         .await;
         // result is the array [nil, {message:...}], type is "array"; counter == 1 (no retry)
         assert_eq!(out, "array\n1\n");
+    }
+
+    // ── RESIL §3.4: compute_retry_delay PURE unit tests ──────────────────────
+    // The delay schedule is a pure fn so its bounds are exhaustively testable.
+
+    use super::{compute_retry_delay, Backoff, Jitter};
+
+    /// Fixed backoff: every delay is `base_ms` regardless of attempt (no jitter).
+    #[test]
+    fn compute_delay_fixed_is_constant() {
+        for attempt in 0..10 {
+            let d = compute_retry_delay(attempt, 50, None, Backoff::Fixed, Jitter::None, || 0.0);
+            assert_eq!(d, 50, "fixed backoff attempt {attempt} should be base_ms");
+        }
+    }
+
+    /// Fixed backoff capped at max_ms.
+    #[test]
+    fn compute_delay_fixed_capped() {
+        let d = compute_retry_delay(3, 200, Some(100), Backoff::Fixed, Jitter::None, || 0.0);
+        assert_eq!(d, 100);
+    }
+
+    /// Exponential backoff doubles per attempt (base 100): 100, 200, 400, 800, ...
+    #[test]
+    fn compute_delay_exponential_doubles() {
+        let base = 100u64;
+        for attempt in 0..6 {
+            let d =
+                compute_retry_delay(attempt, base, None, Backoff::Exponential, Jitter::None, || 0.0);
+            assert_eq!(d, base << attempt, "attempt {attempt}");
+        }
+    }
+
+    /// Exponential backoff capped at max_ms.
+    #[test]
+    fn compute_delay_exponential_capped() {
+        // 100 * 2^5 = 3200, capped at 1000.
+        let d = compute_retry_delay(5, 100, Some(1000), Backoff::Exponential, Jitter::None, || 0.0);
+        assert_eq!(d, 1000);
+    }
+
+    /// The v1 `1u64 << shift` cap: attempt ≥ 63 must NOT overflow (shift clamped at 62).
+    #[test]
+    fn compute_delay_shift_cap_no_overflow() {
+        // base_ms = 1 so the multiplier is the full 1u64 << shift (no saturation hides it).
+        for &attempt in &[62usize, 63, 64, 100, usize::MAX] {
+            let d =
+                compute_retry_delay(attempt, 1, None, Backoff::Exponential, Jitter::None, || 0.0);
+            // shift clamps at 62 → multiplier == 1<<62; with base 1, delay == 1<<62.
+            assert_eq!(d, 1u64 << 62, "attempt {attempt} should clamp the shift at 62");
+        }
+        // With base 100 (the default) the saturating_mul saturates — but never panics.
+        let d = compute_retry_delay(100, 100, None, Backoff::Exponential, Jitter::None, || 0.0);
+        assert_eq!(d, 100u64.saturating_mul(1u64 << 62));
+    }
+
+    /// Jitter "none" is deterministic — never calls the rand source.
+    #[test]
+    fn compute_delay_jitter_none_deterministic() {
+        let d = compute_retry_delay(2, 100, None, Backoff::Exponential, Jitter::None, || {
+            panic!("rand must not be consulted in Jitter::None")
+        });
+        assert_eq!(d, 400);
+    }
+
+    /// Full jitter: result ∈ [0, computedDelay]. rand=0.0 → 0; rand=~1.0 → ~delay.
+    #[test]
+    fn compute_delay_jitter_full_bounds() {
+        // computed delay = 100 * 2^2 = 400.
+        let lo = compute_retry_delay(2, 100, None, Backoff::Exponential, Jitter::Full, || 0.0);
+        assert_eq!(lo, 0, "full jitter at rand=0.0 is 0");
+
+        let hi =
+            compute_retry_delay(2, 100, None, Backoff::Exponential, Jitter::Full, || 0.9999999);
+        assert!(hi <= 400, "full jitter must not exceed the computed delay, got {hi}");
+        assert!(hi >= 399, "full jitter at rand≈1.0 should be near the full delay, got {hi}");
+
+        // A mid value stays in bounds.
+        let mid = compute_retry_delay(2, 100, None, Backoff::Exponential, Jitter::Full, || 0.5);
+        assert!(mid <= 400, "mid full jitter in bounds");
+        assert_eq!(mid, 200);
+    }
+
+    /// PlusHalf jitter (the v1 `jitter: true`): result ∈ [delay, delay + delay/2].
+    #[test]
+    fn compute_delay_jitter_plushalf_bounds() {
+        // computed delay = 100.
+        let lo = compute_retry_delay(0, 100, None, Backoff::Exponential, Jitter::PlusHalf, || 0.0);
+        assert_eq!(lo, 100, "plushalf at rand=0.0 adds nothing");
+        let hi =
+            compute_retry_delay(0, 100, None, Backoff::Exponential, Jitter::PlusHalf, || 0.999);
+        assert!((100..=150).contains(&hi), "plushalf within [delay, delay+50%], got {hi}");
+    }
+
+    // ── RESIL §3.4: task.retry additive keys (counter-observable) ─────────────
+
+    /// `backoff: "fixed"` still drives the attempts (baseMs:1 keeps it fast).
+    #[tokio::test]
+    async fn task_retry_fixed_backoff_attempts_happen() {
+        let out = run(r#"
+import { retry } from "std/task"
+let counter = [0]
+async fn flaky() {
+    counter[0] = counter[0] + 1
+    if (counter[0] < 3) { assert(false, "not yet") }
+    return "ok"
+}
+let r = await retry(flaky, {attempts: 5, baseMs: 1, backoff: "fixed"})
+print(r)
+print(counter[0])
+"#)
+        .await;
+        assert_eq!(out, "ok\n3\n");
+    }
+
+    /// `jitter: "none"` and `jitter: "full"` are accepted (drive attempts).
+    #[tokio::test]
+    async fn task_retry_jitter_string_modes_accepted() {
+        let out = run(r#"
+import { retry } from "std/task"
+let c = [0]
+async fn flaky() { c[0] = c[0] + 1; if (c[0] < 2) { assert(false, "x") }; return "ok" }
+let r1 = await retry(flaky, {attempts: 3, baseMs: 1, jitter: "none"})
+let c2 = [0]
+async fn flaky2() { c2[0] = c2[0] + 1; if (c2[0] < 2) { assert(false, "x") }; return "ok" }
+let r2 = await retry(flaky2, {attempts: 3, baseMs: 1, jitter: "full"})
+print(r1)
+print(r2)
+"#)
+        .await;
+        assert_eq!(out, "ok\nok\n");
+    }
+
+    /// `retryOn: "error"`: an err-pair-returning fn IS retried; exhaustion returns
+    /// the LAST pair with `code: "retries-exhausted"` folded in (absent before).
+    #[tokio::test]
+    async fn task_retry_retry_on_error_exhausts_with_code() {
+        let out = run(r#"
+import { retry } from "std/task"
+let c = [0]
+async fn errs() { c[0] = c[0] + 1; return [nil, {message: "bad"}] }
+let [v, err] = await retry(errs, {attempts: 3, baseMs: 1, retryOn: "error"})
+print(c[0])          // 3 — retried until exhaustion
+print(err.code)      // retries-exhausted (folded in)
+print(err.message)   // bad (preserved)
+"#)
+        .await;
+        assert_eq!(out, "3\nretries-exhausted\nbad\n");
+    }
+
+    /// `retryOn: "error"`: a present `code` is NOT overwritten on exhaustion.
+    #[tokio::test]
+    async fn task_retry_retry_on_error_preserves_existing_code() {
+        let out = run(r#"
+import { retry } from "std/task"
+async fn errs() { return [nil, {message: "bad", code: "mine"}] }
+let [v, err] = await retry(errs, {attempts: 2, baseMs: 1, retryOn: "error"})
+print(err.code)
+"#)
+        .await;
+        assert_eq!(out, "mine\n");
+    }
+
+    /// `retryIf` returning false → only ONE attempt; the pair returns immediately.
+    #[tokio::test]
+    async fn task_retry_retry_if_false_short_circuits() {
+        let out = run(r#"
+import { retry } from "std/task"
+let c = [0]
+async fn errs() { c[0] = c[0] + 1; return [nil, {message: "bad"}] }
+let [v, err] = await retry(errs, {attempts: 5, baseMs: 1, retryOn: "error", retryIf: (e) => false})
+print(c[0])   // 1 — no retry
+"#)
+        .await;
+        assert_eq!(out, "1\n");
+    }
+
+    /// A panic INSIDE `retryIf` re-raises (programmer error — §3.4).
+    #[tokio::test]
+    async fn task_retry_retry_if_panic_reraises() {
+        let out = run(r#"
+import { retry } from "std/task"
+async fn boom() { assert(false, "boom") }
+let [v, err] = recover(() => await retry(boom, {attempts: 3, baseMs: 1, retryIf: (e) => { assert(false, "predicate boom") }}))
+print(err != nil)
+print(err.message)
+"#)
+        .await;
+        assert_eq!(out, "true\npredicate boom\n");
+    }
+
+    /// `budget` on the STATELESS task.retry → Tier-2 with the §3.4 EXACT message.
+    #[tokio::test]
+    async fn task_retry_budget_is_tier2() {
+        let res = crate::run_source(r#"
+import { retry } from "std/task"
+async fn f() { return 1 }
+await retry(f, {attempts: 3, budget: 0.5})
+"#)
+        .await;
+        let msg = match res {
+            Err(e) => e.message,
+            Ok(s) => s,
+        };
+        assert!(
+            msg.contains("task.retry: budget requires a resilience.retry policy"),
+            "expected the exact §3.4 budget message, got: {msg:?}"
+        );
     }
 
     // ── PAR Phase 0 pins — shipped semantics the pmap/preduce design composes (spec §3) ──

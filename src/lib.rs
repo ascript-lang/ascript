@@ -263,7 +263,14 @@ pub async fn run_file_with_packages(
     }
     interp.install_self();
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(interp.load_module(path)).await;
+    // RESIL §5.1: establish the root TASK_LOCALS scope (+ telemetry root scope when that
+    // feature is on) so `resilience.deadline`/`withTrace`'s `TASK_LOCALS.try_with` finds
+    // the cell in scope on the CLI tree-walker path — matching every other entry point
+    // (run_source, the VM run paths). Without it the deadline/trace locals silently
+    // no-op here, diverging from the VM on `ascript run file.as --tree-walker`.
+    let result = local
+        .run_until(crate::interp::ambient_root_scope(interp.load_module(path)))
+        .await;
     local.await; // drain spawned tasks (structured join) — no-op until Phase 2
                  // End-of-program cycle collection (V13-T3): the tree-walker shares
                  // the same `Cc` value model, so a final sweep here reclaims any
@@ -475,7 +482,7 @@ async fn run_one_file_with_coverage(
     let local = tokio::task::LocalSet::new();
     let mut file_summary = TestSummary::default();
     let run_result: Result<(), AsError> = local
-        .run_until(crate::interp::telemetry_root_scope(async {
+        .run_until(crate::interp::ambient_root_scope(async {
             // Run the module body (registers tests; coverage records its lines).
             match vm.run(&mut fiber).await {
                 Ok(RunOutcome::Done(_)) | Err(crate::interp::Control::Propagate(_)) => {}
@@ -570,7 +577,7 @@ async fn run_tests_serial(
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local
-        .run_until(crate::interp::telemetry_root_scope(async {
+        .run_until(crate::interp::ambient_root_scope(async {
             for file in files {
                 match interp.load_module(Path::new(file)).await {
                     Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
@@ -671,7 +678,7 @@ async fn run_tests_parallel(
 
     let local = tokio::task::LocalSet::new();
     let per_file: Vec<crate::worker::testrun::FileRunResult> = local
-        .run_until(crate::interp::telemetry_root_scope(async {
+        .run_until(crate::interp::ambient_root_scope(async {
             // Spawn one local task per file; each acquires a permit (bounded concurrency)
             // then runs its file in an isolate. The task index pins the result slot, so
             // completion order is irrelevant to aggregation.
@@ -786,7 +793,7 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     // DEFER §2.3: use `exec_program` (installs + drains the top-level defer frame)
     // so top-level `defer` statements run at program end.
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(
+        .run_until(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
         ))
         .await;
@@ -828,7 +835,7 @@ pub async fn run_source_deterministic(src: &str, seed: u64) -> Result<String, As
     let local = tokio::task::LocalSet::new();
     // DEFER §2.3: exec_program installs the top-level defer frame.
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(
+        .run_until(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
         ))
         .await;
@@ -861,11 +868,68 @@ pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), A
     // Establish the root telemetry-span scope so top-level `telemetry.span` /
     // `startSpan` parenting works (per-task isolation; spec §9.3).
     // DEFER §2.3: exec_program installs the top-level defer frame.
-    let root = crate::interp::telemetry_root_scope(interp.exec_program(&program, &env));
+    let root = crate::interp::ambient_root_scope(interp.exec_program(&program, &env));
     let result = local.run_until(root).await;
     local.await;
     match result {
         Ok(_) => Ok((interp.output(), interp)),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), interp)),
+        Err(crate::interp::Control::Exit(_)) => Ok((interp.output(), interp)),
+    }
+}
+
+#[cfg(not(ascript_rt))]
+/// RESIL Gate-14 fix #1: run `src` on the SPECIALIZED VM and return the captured
+/// output PLUS the owning `Rc<Interp>` (the shared interp the VM drives), so a test
+/// can read interpreter-side state — used by the VM-mode telemetry span-lineage
+/// regression test that proves a VM-mode async-fn body's span parents to the
+/// spawning task's current span (the spawn-site `telemetry_scope` wrap added in
+/// `src/vm/run.rs`). Mirrors [`run_source_with_interp`] but on the VM, and wraps the
+/// run in [`crate::interp::ambient_root_scope`] so top-level `telemetry.span`
+/// parenting works. `#[doc(hidden)]` test seam — not a public API.
+#[doc(hidden)]
+#[cfg(feature = "telemetry")]
+pub async fn vm_run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        is_worker: false,
+        owning_class: None,
+        params: Vec::new(),
+        ret: None,
+        local_names: Vec::new(),
+        debug_name: None,
+        name_span: None,
+    });
+    let closure = Closure::new(proto);
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.set_worker_source(src);
+    let vm = Vm::new(interp.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
+        .await;
+    local.await;
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), interp)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
         Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), interp)),
         Err(crate::interp::Control::Exit(_)) => Ok((interp.output(), interp)),
@@ -890,7 +954,7 @@ pub async fn tw_run_stmts(
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(
+        .run_until(crate::interp::ambient_root_scope(
             interp.exec_program(&stmts, &env),
         ))
         .await;
@@ -932,7 +996,7 @@ pub async fn tw_run_source_elided(src: &str) -> Result<(String, crate::elide_mar
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(
+        .run_until(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
         ))
         .await;
@@ -1539,7 +1603,7 @@ pub async fn tw_run_source_paranoid(src: &str) -> Result<String, String> {
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(
+        .run_until(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
         ))
         .await;
@@ -1581,7 +1645,7 @@ pub async fn tw_run_source_paranoid_with_fake_call_proof(src: &str) -> String {
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(
+        .run_until(crate::interp::ambient_root_scope(
             interp.exec_program(&program, &env),
         ))
         .await;
@@ -3783,7 +3847,7 @@ async fn run_entry_proto_to_exit(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
     // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
     local.run_until(interp.telemetry_flush_on_exit()).await;
@@ -4001,7 +4065,7 @@ pub async fn run_file_on_vm_with_packages(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
     // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
     local.run_until(interp.telemetry_flush_on_exit()).await;
@@ -4477,7 +4541,7 @@ pub async fn run_file_decode_cfg(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await;
@@ -4602,7 +4666,7 @@ pub async fn run_file_on_vm_profiled(
 
     let local = tokio::task::LocalSet::new();
     let result = local
-        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await;

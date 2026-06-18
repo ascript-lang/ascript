@@ -47,6 +47,24 @@ fn err_pair(msg: String) -> Value {
     make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
+/// The outcome of a Postgres op-run helper: a successful payload, a Tier-1 DB error
+/// message, or a RESIL §5.4 deadline-budget exhaustion (carried distinctly so it
+/// surfaces the canonical `deadline-exceeded` pair, not a plain `{message}` err).
+enum PgOutcome<T> {
+    Ok(T),
+    Err(String),
+    Deadline,
+}
+
+impl<T> PgOutcome<T> {
+    fn from_result(r: Result<T, String>) -> Self {
+        match r {
+            Ok(v) => PgOutcome::Ok(v),
+            Err(msg) => PgOutcome::Err(msg),
+        }
+    }
+}
+
 impl Interp {
     /// `std/postgres` module dispatch (only `connect`; methods go through
     /// `call_postgres_method`).
@@ -107,10 +125,10 @@ impl Interp {
                 let sql = want_string(&arg(&args, 0), span, "connection.query")?;
                 let params = bind_params(args.get(1), span, "connection.query")?;
                 let type_arg = args.get(2).cloned();
-                let rows = match self.pg_run_query(id, &sql, &params, span).await {
-                    Ok(Ok(rows)) => rows,
-                    Ok(Err(msg)) => return Ok(err_pair(msg)),
-                    Err(c) => return Err(c),
+                let rows = match self.pg_run_query(id, &sql, &params, span).await? {
+                    PgOutcome::Ok(rows) => rows,
+                    PgOutcome::Err(msg) => return Ok(err_pair(msg)),
+                    PgOutcome::Deadline => return Ok(crate::interp::deadline_exceeded_pair()),
                 };
                 let row_vals = rows.iter().map(rows_to_value).collect::<Vec<_>>();
                 // Optional typed decode per row (Class or schema).
@@ -133,10 +151,10 @@ impl Interp {
             "queryOne" => {
                 let sql = want_string(&arg(&args, 0), span, "connection.queryOne")?;
                 let params = bind_params(args.get(1), span, "connection.queryOne")?;
-                let rows = match self.pg_run_query(id, &sql, &params, span).await {
-                    Ok(Ok(rows)) => rows,
-                    Ok(Err(msg)) => return Ok(err_pair(msg)),
-                    Err(c) => return Err(c),
+                let rows = match self.pg_run_query(id, &sql, &params, span).await? {
+                    PgOutcome::Ok(rows) => rows,
+                    PgOutcome::Err(msg) => return Ok(err_pair(msg)),
+                    PgOutcome::Deadline => return Ok(crate::interp::deadline_exceeded_pair()),
                 };
                 match rows.first() {
                     Some(r) => Ok(make_pair(rows_to_value(r), Value::nil())),
@@ -146,10 +164,10 @@ impl Interp {
             "exec" => {
                 let sql = want_string(&arg(&args, 0), span, "connection.exec")?;
                 let params = bind_params(args.get(1), span, "connection.exec")?;
-                match self.pg_run_execute(id, &sql, &params, span).await {
-                    Ok(Ok(n)) => Ok(make_pair(Value::int(n as i64), Value::nil())),
-                    Ok(Err(msg)) => Ok(err_pair(msg)),
-                    Err(c) => Err(c),
+                match self.pg_run_execute(id, &sql, &params, span).await? {
+                    PgOutcome::Ok(n) => Ok(make_pair(Value::int(n as i64), Value::nil())),
+                    PgOutcome::Err(msg) => Ok(err_pair(msg)),
+                    PgOutcome::Deadline => Ok(crate::interp::deadline_exceeded_pair()),
                 }
             }
             "begin" => self.pg_simple(id, "BEGIN", "connection.begin", span).await,
@@ -162,34 +180,59 @@ impl Interp {
     }
 
     /// Run a query via the take-out-across-await pattern. Returns
-    /// `Ok(Ok(rows))` on success, `Ok(Err(msg))` on a Tier-1 DB error, or
-    /// `Err(Control)` only for a closed-handle programmer error (never here:
-    /// closed → Tier-1 err for ergonomics).
+    /// `Ok(PgOutcome::Ok(rows))` on success, `Ok(PgOutcome::Err(msg))` on a Tier-1
+    /// DB error, `Ok(PgOutcome::Deadline)` when a `resilience.deadline` budget was
+    /// exhausted (§5.4), or `Err(Control)` only for a closed-handle programmer error
+    /// (never here: closed → Tier-1 err for ergonomics).
     async fn pg_run_query(
         &self,
         id: u64,
         sql: &str,
         params: &[BoundParam],
         _span: Span,
-    ) -> Result<Result<Vec<tokio_postgres::Row>, String>, Control> {
+    ) -> Result<PgOutcome<Vec<tokio_postgres::Row>>, Control> {
+        // RESIL §5.4 pre-check: an exhausted deadline budget → refuse before issuing
+        // the query (no resource taken, no wire bytes). NO deadline → `None` fast path.
+        if matches!(self.deadline_remaining_ms(), Some(r) if r <= 0.0) {
+            return Ok(PgOutcome::Deadline);
+        }
         let state = match self.take_resource(id) {
             Some(ResourceState::PostgresConnection { client, conn_task }) => (client, conn_task),
             other => {
                 if let Some(o) = other {
                     self.return_resource(id, o);
                 }
-                return Ok(Err("connection is closed".to_string()));
+                return Ok(PgOutcome::Err("connection is closed".to_string()));
             }
         };
         let (client, conn_task) = state;
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p.as_to_sql()).collect();
-        let result = client.query(sql, &param_refs).await;
+        // RESIL §5.4 budget-wrap: race the query against the remaining budget. On the
+        // deadline branch the query future is DROPPED. tokio-postgres does NOT cancel
+        // the server-side query on a dropped future (no CancelToken is sent): the
+        // command continues to run on the server and its protocol replies remain
+        // un-consumed on the shared connection, so the pooled connection is left in an
+        // indeterminate state — callers should DISCARD a deadline-abandoned connection
+        // rather than reuse it. NO deadline → the `None` branch awaits unchanged
+        // (byte-identical). The resource is ALWAYS returned (so `close()` still works).
+        let result = match self.deadline_remaining_ms() {
+            Some(r) => {
+                tokio::select! {
+                    res = client.query(sql, &param_refs) => Some(res),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(r as u64)) => None,
+                }
+            }
+            None => Some(client.query(sql, &param_refs).await),
+        };
         self.return_resource(
             id,
             ResourceState::PostgresConnection { client, conn_task },
         );
-        Ok(result.map_err(|e| format!("connection.query failed: {}", e)))
+        Ok(match result {
+            Some(r) => PgOutcome::from_result(r.map_err(|e| format!("connection.query failed: {}", e))),
+            None => PgOutcome::Deadline,
+        })
     }
 
     async fn pg_run_execute(
@@ -198,25 +241,41 @@ impl Interp {
         sql: &str,
         params: &[BoundParam],
         _span: Span,
-    ) -> Result<Result<u64, String>, Control> {
+    ) -> Result<PgOutcome<u64>, Control> {
+        // RESIL §5.4 pre-check (see `pg_run_query`).
+        if matches!(self.deadline_remaining_ms(), Some(r) if r <= 0.0) {
+            return Ok(PgOutcome::Deadline);
+        }
         let state = match self.take_resource(id) {
             Some(ResourceState::PostgresConnection { client, conn_task }) => (client, conn_task),
             other => {
                 if let Some(o) = other {
                     self.return_resource(id, o);
                 }
-                return Ok(Err("connection is closed".to_string()));
+                return Ok(PgOutcome::Err("connection is closed".to_string()));
             }
         };
         let (client, conn_task) = state;
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p.as_to_sql()).collect();
-        let result = client.execute(sql, &param_refs).await;
+        // RESIL §5.4 budget-wrap (see `pg_run_query` for the connection-fate note).
+        let result = match self.deadline_remaining_ms() {
+            Some(r) => {
+                tokio::select! {
+                    res = client.execute(sql, &param_refs) => Some(res),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(r as u64)) => None,
+                }
+            }
+            None => Some(client.execute(sql, &param_refs).await),
+        };
         self.return_resource(
             id,
             ResourceState::PostgresConnection { client, conn_task },
         );
-        Ok(result.map_err(|e| format!("connection.exec failed: {}", e)))
+        Ok(match result {
+            Some(r) => PgOutcome::from_result(r.map_err(|e| format!("connection.exec failed: {}", e))),
+            None => PgOutcome::Deadline,
+        })
     }
 
     async fn pg_simple(
@@ -226,10 +285,10 @@ impl Interp {
         ctx: &str,
         span: Span,
     ) -> Result<Value, Control> {
-        match self.pg_run_execute(id, sql, &[], span).await {
-            Ok(Ok(_)) => Ok(make_pair(Value::nil(), Value::nil())),
-            Ok(Err(msg)) => Ok(err_pair(format!("{}: {}", ctx, msg))),
-            Err(c) => Err(c),
+        match self.pg_run_execute(id, sql, &[], span).await? {
+            PgOutcome::Ok(_) => Ok(make_pair(Value::nil(), Value::nil())),
+            PgOutcome::Err(msg) => Ok(err_pair(format!("{}: {}", ctx, msg))),
+            PgOutcome::Deadline => Ok(crate::interp::deadline_exceeded_pair()),
         }
     }
 }
@@ -521,6 +580,120 @@ mod tests {
                 // Cleanup: TEMP tables vanish with the session; close to be tidy.
                 let c = m("close");
                 interp.call_postgres_method(&c, vec![], sp()).await.unwrap();
+            })
+            .await;
+    }
+
+    // ── RESIL §5.4: deadline-aware Postgres consult site ─────────────────────
+
+    use crate::interp::{task_locals_scope, TaskLocals};
+    use crate::value::{NativeMethod, NativeObject};
+
+    fn assert_deadline_pair(pair: &Value) {
+        match pair.kind() {
+            ValueKind::Array(a) => {
+                let b = a.borrow();
+                assert_eq!(b.len(), 2, "expected a [value, err] pair");
+                assert_eq!(b[0], Value::nil());
+                match b[1].kind() {
+                    ValueKind::Object(o) => assert_eq!(
+                        o.get("code"),
+                        Some(Value::str("deadline-exceeded")),
+                        "err code should be deadline-exceeded"
+                    ),
+                    other => panic!("err slot should be an object, got {:?}", other),
+                }
+            }
+            other => panic!("expected a pair, got {:?}", other),
+        }
+    }
+
+    // §5.4 pre-check (NO live server): with an ALREADY-EXPIRED deadline, the query
+    // op-runner returns the deadline-exceeded pair BEFORE taking the connection
+    // resource — so even a non-existent handle id never reaches the wire. This
+    // isolates the pre-check from any connection. The receiver id is bogus on
+    // purpose: if the pre-check did NOT fire first, the path would instead hit the
+    // "connection is closed" Tier-1 err (a {message}-only pair, no `code`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn pg_expired_deadline_pre_check_no_op() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let interp = std::rc::Rc::new(Interp::new());
+                interp.install_self();
+                let now = interp.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+                let locals = std::rc::Rc::new(TaskLocals {
+                    deadline_at_ms: Some(now - 1000.0),
+                    trace_id: None,
+                });
+                let recv = std::rc::Rc::new(NativeObject {
+                    id: u64::MAX, // a handle that is NOT registered
+                    kind: NativeKind::PostgresConnection,
+                    fields: indexmap::IndexMap::new(),
+                });
+                let m = std::rc::Rc::new(NativeMethod {
+                    receiver: recv,
+                    method: "query".to_string(),
+                });
+                let pair = task_locals_scope(Some(locals), async {
+                    interp
+                        .call_postgres_method(&m, vec![Value::str("SELECT 1")], sp())
+                        .await
+                        .expect("must not panic")
+                })
+                .await;
+                assert_deadline_pair(&pair);
+            })
+            .await;
+    }
+
+    // Live budget-wrap — gated on ASCRIPT_TEST_POSTGRES_URL (skips/pass when unset,
+    // matching the other live tests). A `pg_sleep(5)` query under a 100ms deadline
+    // returns `deadline-exceeded` well before the 5s server-side sleep completes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pg_budget_wrap_live() {
+        let Ok(url) = std::env::var("ASCRIPT_TEST_POSTGRES_URL") else {
+            return; // no live server → no-op pass
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let interp = std::rc::Rc::new(Interp::new());
+                interp.install_self();
+                let pair = interp
+                    .call_postgres("connect", &[Value::str(url.clone())], sp())
+                    .await
+                    .unwrap();
+                let conn = match pair.kind() {
+                    ValueKind::Array(a) => a.borrow()[0].clone(),
+                    _ => panic!("connect pair"),
+                };
+                let recv = match conn.kind() {
+                    ValueKind::Native(n) => n.clone(),
+                    _ => panic!("handle"),
+                };
+                let m = std::rc::Rc::new(NativeMethod {
+                    receiver: recv,
+                    method: "query".to_string(),
+                });
+                let now = interp.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+                let locals = std::rc::Rc::new(TaskLocals {
+                    deadline_at_ms: Some(now + 100.0),
+                    trace_id: None,
+                });
+                let started = std::time::Instant::now();
+                let res = task_locals_scope(Some(locals), async {
+                    interp
+                        .call_postgres_method(&m, vec![Value::str("SELECT pg_sleep(5)")], sp())
+                        .await
+                        .unwrap()
+                })
+                .await;
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(3),
+                    "budget-wrap must return well before the 5s pg_sleep"
+                );
+                assert_deadline_pair(&res);
             })
             .await;
     }

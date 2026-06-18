@@ -5297,10 +5297,23 @@ impl Vm {
                             let fut = crate::task::SharedFuture::new();
                             let cell = fut.cell();
                             let guard = self.interp.inflight_guard();
+                            // Gate-14 fix #1: the VM async-closure spawn site lacked
+                            // the telemetry-scope wrap the tree-walker's async-fn arm
+                            // has — so a VM-mode async-fn body's spans did NOT parent
+                            // to the spawning task's current span. Capture + scope it
+                            // here so VM-mode span lineage matches the tree-walker.
+                            #[cfg(feature = "telemetry")]
+                            let telem_parent = crate::interp::telemetry_capture_current();
+                            // RESIL §5.1: inherit ambient locals (deadline/trace).
+                            let locals_parent = crate::interp::task_locals_capture();
                             let handle = tokio::task::spawn_local(async move {
                                 let _g = guard;
+                                let body =
+                                    vm.call_value(Value::closure(callee), args, call_span);
+                                #[cfg(feature = "telemetry")]
+                                let body = crate::interp::telemetry_scope(telem_parent, body);
                                 let r =
-                                    vm.call_value(Value::closure(callee), args, call_span).await;
+                                    crate::interp::task_locals_scope(locals_parent, body).await;
                                 cell.resolve(r);
                             });
                             fut.set_abort(handle.abort_handle());
@@ -8749,6 +8762,22 @@ impl Vm {
             fiber.push(v);
             return Ok(());
         }
+        // (1a) RESIL §2.3: resilience policy call-site hook (same predicate + shape as
+        // the schema hook, same routing to the shared `Interp::call_resilience_method`).
+        #[cfg(feature = "resilience")]
+        if crate::stdlib::resilience::is_resilience_value(&recv)
+            && crate::stdlib::resilience::is_resilience_method(name)
+        {
+            let mut rargs = Vec::with_capacity(args.len() + 1);
+            rargs.push(recv);
+            rargs.extend(args);
+            let v = self
+                .interp
+                .call_resilience_method(name, &rargs, span)
+                .await?;
+            fiber.push(v);
+            return Ok(());
+        }
         // (1a) SP9 §2: workflow `ctx.<method>()` hook (same predicate + shape as the
         // schema hook, same routing to the shared `Interp`).
         #[cfg(feature = "workflow")]
@@ -9792,9 +9821,19 @@ impl Vm {
             let fut = crate::task::SharedFuture::new();
             let cell = fut.cell();
             let guard = self.interp.inflight_guard();
+            // Gate-14 fix #1: wrap the VM static-async-closure body in the telemetry
+            // scope (mirroring the tree-walker's `call_static_method` async arm) so
+            // VM-mode span lineage parents correctly.
+            #[cfg(feature = "telemetry")]
+            let telem_parent = crate::interp::telemetry_capture_current();
+            // RESIL §5.1: inherit ambient locals (deadline/trace).
+            let locals_parent = crate::interp::task_locals_capture();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
-                let r = vm.call_value(Value::closure(closure), args, span).await;
+                let body = vm.call_value(Value::closure(closure), args, span);
+                #[cfg(feature = "telemetry")]
+                let body = crate::interp::telemetry_scope(telem_parent, body);
+                let r = crate::interp::task_locals_scope(locals_parent, body).await;
                 cell.resolve(r);
             });
             fut.set_abort(handle.abort_handle());

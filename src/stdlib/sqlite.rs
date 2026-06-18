@@ -51,6 +51,19 @@ fn err_pair(msg: String) -> Value {
     make_pair(Value::nil(), make_error(Value::str(msg)))
 }
 
+/// RESIL §5.4: deadline PRE-CHECK for the synchronous sqlite ops. rusqlite is fully
+/// synchronous — an in-progress query cannot be preempted mid-flight (there is no
+/// `.await` to lose a future at), so the consult is pre-check ONLY: if a
+/// `resilience.deadline(...)` budget is already exhausted, refuse before issuing the
+/// query and return the canonical `deadline-exceeded` pair. NO deadline → `None`, the
+/// byte-identical fast path. Returns `Some(pair)` to short-circuit, `None` to proceed.
+fn deadline_pre_check(interp: &Interp) -> Option<Value> {
+    match interp.deadline_remaining_ms() {
+        Some(r) if r <= 0.0 => Some(crate::interp::deadline_exceeded_pair()),
+        _ => None,
+    }
+}
+
 fn obj(map: indexmap::IndexMap<String, Value>) -> Value {
     Value::object_cell(crate::value::ObjectCell::new(map))
 }
@@ -125,6 +138,9 @@ impl Interp {
 
         match method {
             "exec" => {
+                if let Some(p) = deadline_pre_check(self) {
+                    return Ok(p);
+                }
                 let sql = want_string(&arg(args, 0), span, "connection.exec")?;
                 let params = parse_params(args.get(1), span, "connection.exec")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
@@ -134,6 +150,9 @@ impl Interp {
                 }
             }
             "query" => {
+                if let Some(p) = deadline_pre_check(self) {
+                    return Ok(p);
+                }
                 let sql = want_string(&arg(args, 0), span, "connection.query")?;
                 let params = parse_params(args.get(1), span, "connection.query")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
@@ -174,6 +193,9 @@ impl Interp {
     }
 
     fn conn_exec_simple(&self, id: u64, sql: &str, ctx: &str) -> Result<Value, Control> {
+        if let Some(p) = deadline_pre_check(self) {
+            return Ok(p);
+        }
         let conn = self.sqlite_conn(id).expect("checked present");
         match conn.execute(sql, []) {
             Ok(_) => Ok(make_pair(Value::nil(), Value::nil())),
@@ -203,6 +225,9 @@ impl Interp {
 
         match method {
             "run" => {
+                if let Some(p) = deadline_pre_check(self) {
+                    return Ok(p);
+                }
                 let params = parse_params(args.first(), span, "statement.run")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match exec_cached(&conn, &sql, &params) {
@@ -211,6 +236,9 @@ impl Interp {
                 }
             }
             "all" => {
+                if let Some(p) = deadline_pre_check(self) {
+                    return Ok(p);
+                }
                 let params = parse_params(args.first(), span, "statement.all")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match query_cached(&conn, &sql, &params) {
@@ -633,5 +661,73 @@ print(conn)
             r,
             Some(ResourceState::SqliteConnection(_))
         )));
+    }
+
+    // ── RESIL §5.4: deadline pre-check (sqlite is synchronous → pre-check ONLY) ──
+
+    // An ALREADY-EXPIRED deadline → connection.query returns the deadline-exceeded
+    // pair BEFORE issuing the SQL (the table does not exist, so without the pre-check
+    // it would instead surface a "no such table" Tier-1 err). No server is needed;
+    // sqlite is in-memory. Note (documented in `deadline_pre_check`): a sync query
+    // already in flight cannot be preempted — only the pre-issue check is possible.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_expired_deadline_pre_check() {
+        use crate::interp::{task_locals_scope, Interp, TaskLocals};
+        use crate::value::NativeMethod;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let interp = std::rc::Rc::new(Interp::new());
+                interp.install_self();
+                let pair = interp
+                    .call_sqlite_open("open", &[Value::str(":memory:")], crate::span::Span::new(0, 0))
+                    .unwrap();
+                let conn = match pair.kind() {
+                    ValueKind::Array(a) => a.borrow()[0].clone(),
+                    _ => panic!("open pair"),
+                };
+                let recv = match conn.kind() {
+                    ValueKind::Native(n) => n.clone(),
+                    _ => panic!("handle"),
+                };
+                let m = std::rc::Rc::new(NativeMethod {
+                    receiver: recv,
+                    method: "query".to_string(),
+                });
+                let now = interp.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+                let locals = std::rc::Rc::new(TaskLocals {
+                    deadline_at_ms: Some(now - 1000.0),
+                    trace_id: None,
+                });
+                // The SQL references a missing table, so a non-pre-checked path would
+                // surface "no such table" instead of the deadline pair.
+                let res = task_locals_scope(Some(locals), async {
+                    interp
+                        .call_sqlite_method(
+                            &m,
+                            vec![Value::str("SELECT * FROM missing_table")],
+                            crate::span::Span::new(0, 0),
+                        )
+                        .await
+                        .expect("must not panic")
+                })
+                .await;
+                match res.kind() {
+                    ValueKind::Array(a) => {
+                        let b = a.borrow();
+                        assert_eq!(b[0], Value::nil());
+                        match b[1].kind() {
+                            ValueKind::Object(o) => assert_eq!(
+                                o.get("code"),
+                                Some(Value::str("deadline-exceeded")),
+                                "err code should be deadline-exceeded (pre-check fired before issuing SQL)"
+                            ),
+                            other => panic!("err slot should be an object, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected a pair, got {:?}", other),
+                }
+            })
+            .await;
     }
 }
