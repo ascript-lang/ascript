@@ -227,17 +227,13 @@ where
 {
     // RESIL §5.1: always establish the root TASK_LOCALS scope (core), so every entry
     // point has the cell in scope — `task_locals_capture()`'s `try_with` never errs.
-    task_locals_scope(None, async move {
-        #[cfg(feature = "telemetry")]
-        {
-            telemetry_scope(None, fut).await
-        }
-        #[cfg(not(feature = "telemetry"))]
-        {
-            fut.await
-        }
-    })
-    .await
+    // The telemetry root scope nests inside it when that feature is on; with it off the
+    // inner future is `fut` itself (no redundant async wrapper).
+    #[cfg(feature = "telemetry")]
+    let inner = telemetry_scope(None, fut);
+    #[cfg(not(feature = "telemetry"))]
+    let inner = fut;
+    task_locals_scope(None, inner).await
 }
 
 /// Capture the current task's telemetry span context (for propagation into a
