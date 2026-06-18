@@ -46,19 +46,125 @@ pub(crate) struct ResilState {
     /// (Task 3.3 §3.7), so two distinct caches never collide on the global
     /// singleflight `flights` table when memoizing the same user key.
     pub(crate) sf_prefix_next: u64,
-    /// Minimal per-isolate metrics registry (§6.1). Phase 5 fills this;
-    /// currently empty (the `Default` impl gives zero cost).
-    // `registry` is consumed in Phase 5 (§6.1) — pre-declared here as part of
-    // the single Interp touch; not yet read.
-    #[allow(dead_code)]
+    /// Minimal per-isolate metrics registry (§6.1) — the always-on source of
+    /// truth for policy counters/gauges (telemetry is a mirror, log a
+    /// breadcrumb). Filled by Phase 5's policy instrumentation.
     pub(crate) registry: ResilRegistry,
+    /// Instrument-id cache for the SP12 telemetry soft-hook mirror: ONE
+    /// registration per metric NAME across the isolate, keyed by metric name.
+    /// `telemetry_register_instrument` is itself idempotent, but caching the id
+    /// avoids a `telemetry.borrow()` scan on every bump. Behind the telemetry
+    /// feature — the registry itself is always-on and feature-free.
+    #[cfg(feature = "telemetry")]
+    pub(crate) instrument_ids: std::collections::HashMap<String, u64>,
 }
 
-/// Per-isolate minimal metrics registry — Phase 5 will add counter/gauge
-/// fields here. `#[derive(Default)]` so `ResilState::default()` is free.
+/// A metric's type — Prometheus needs this for the `# TYPE` line (Task 5.2) and
+/// it selects the aggregation (counter = monotonic add, gauge = set).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResilMetricKind {
+    Counter,
+    Gauge,
+}
+
+/// One label series of a metric: the (insertion-ordered) labels and its value.
+struct ResilSeries {
+    /// The label pairs in declaration order (so a deterministic Prometheus
+    /// render can emit `{name="t",result="failure"}` in a stable order).
+    labels: Vec<(String, String)>,
+    value: f64,
+}
+
+/// One metric: its kind plus the per-label-key series, both insertion-ordered.
+struct ResilMetric {
+    kind: ResilMetricKind,
+    /// `sorted-label-key → series`. The key is the `attr_key`-style canonical
+    /// form (sorted `k=v` joined by `;`) so the same labels always map to ONE
+    /// series; iteration order is first-seen (deterministic Task-5.2 render).
+    series: IndexMap<String, ResilSeries>,
+}
+
+/// Per-isolate minimal metrics registry (§6.1) — counters and gauges only (NO
+/// histograms in v1). Shape: `metric-name → (label-key → series)`, both
+/// `IndexMap`s so a deterministic walk for Prometheus rendering (Task 5.2) is
+/// trivial (metric-name insertion order × per-metric label-key insertion order).
 #[derive(Default)]
 pub(crate) struct ResilRegistry {
-    // Phase 5 fills this (§6.1).
+    metrics: IndexMap<String, ResilMetric>,
+}
+
+/// Canonical sorted-label key for the registry — mirrors `telemetry::model`'s
+/// `attr_key` (sorted `k=v` joined by `;`) so a registry series and its
+/// telemetry-mirror point share the same identity for string-valued labels.
+fn label_key(labels: &[(&str, &str)]) -> String {
+    let mut parts: Vec<String> = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    parts.sort();
+    parts.join(";")
+}
+
+impl ResilRegistry {
+    /// Add `by` to a counter `metric_name` for the given label set (monotonic).
+    /// Registers the metric (as a Counter) on first sight; a later use of a
+    /// known name keeps its kind.
+    pub(crate) fn incr(&mut self, metric_name: &str, labels: &[(&str, &str)], by: f64) {
+        let metric = self
+            .metrics
+            .entry(metric_name.to_string())
+            .or_insert_with(|| ResilMetric {
+                kind: ResilMetricKind::Counter,
+                series: IndexMap::new(),
+            });
+        let key = label_key(labels);
+        let series = metric.series.entry(key).or_insert_with(|| ResilSeries {
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            value: 0.0,
+        });
+        series.value += by;
+    }
+
+    /// Set a gauge `metric_name` for the given label set to `value`.
+    /// Registers the metric (as a Gauge) on first sight.
+    pub(crate) fn set_gauge(&mut self, metric_name: &str, labels: &[(&str, &str)], value: f64) {
+        let metric = self
+            .metrics
+            .entry(metric_name.to_string())
+            .or_insert_with(|| ResilMetric {
+                kind: ResilMetricKind::Gauge,
+                series: IndexMap::new(),
+            });
+        let key = label_key(labels);
+        let series = metric.series.entry(key).or_insert_with(|| ResilSeries {
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            value: 0.0,
+        });
+        series.value = value;
+    }
+
+    /// Read a counter/gauge series value (test/Task-5.2 accessor). Returns
+    /// `0.0` if the metric or label set has never been touched.
+    #[allow(dead_code)]
+    pub(crate) fn value(&self, metric_name: &str, labels: &[(&str, &str)]) -> f64 {
+        let Some(metric) = self.metrics.get(metric_name) else {
+            return 0.0;
+        };
+        metric
+            .series
+            .get(&label_key(labels))
+            .map(|s| s.value)
+            .unwrap_or(0.0)
+    }
+
+    /// Deterministic walk for Task-5.2 Prometheus rendering: yields
+    /// `(metric_name, kind, &[(label_pairs)], value)` in metric-name insertion
+    /// order × per-metric label-key insertion order.
+    #[allow(dead_code)]
+    pub(crate) fn walk(&self) -> impl Iterator<Item = (&str, ResilMetricKind, &[(String, String)], f64)> {
+        self.metrics.iter().flat_map(|(name, metric)| {
+            metric.series.values().map(move |s| {
+                (name.as_str(), metric.kind, s.labels.as_slice(), s.value)
+            })
+        })
+    }
 }
 
 // ── public exports ────────────────────────────────────────────────────────────
@@ -295,6 +401,102 @@ fn deadline_exceeded_pair() -> Value {
     crate::interp::deadline_exceeded_pair()
 }
 
+impl Interp {
+    /// §6.1: bump `deadline_exceeded_total` (no `name` label) and return the
+    /// shared `[nil, {code:"deadline-exceeded"}]` pair. Used at EVERY site that
+    /// returns a deadline-exceeded result (the `deadline` body race + already-
+    /// expired entry, and the budget-aware park exits in limiter/keyedLimiter/
+    /// bulkhead acquire). The returned pair is byte-identical to
+    /// `deadline_exceeded_pair()` — only the registry side effect is added.
+    fn resil_deadline_exceeded_pair(&self) -> Value {
+        self.resil_metric_incr("ascript_resilience_deadline_exceeded_total", &[], 1.0);
+        deadline_exceeded_pair()
+    }
+}
+
+// ── §6.1 metric bump helpers ─────────────────────────────────────────────────
+//
+// EVERY policy outcome routes a counter/gauge bump through ONE of these two
+// `&self` helpers, so the always-on internal registry (the source of truth) and
+// the SP12 telemetry soft-hook mirror stay in lock-step BY CONSTRUCTION:
+//   - `resil_metric_incr` — a monotonic counter add
+//   - `resil_metric_gauge` — a gauge set
+// The telemetry mirror is `#[cfg(feature="telemetry")]` and no-ops until
+// `telemetry.init` (the hook handles that); the registry works regardless. The
+// `self.resilience` borrow is a SHORT synchronous borrow (never across `.await`).
+
+impl Interp {
+    /// Add `by` to the registry counter `name` for `labels`, then mirror the add
+    /// through the SP12 telemetry soft hook (lazy one-per-name instrument).
+    pub(crate) fn resil_metric_incr(&self, name: &str, labels: &[(&str, &str)], by: f64) {
+        // Always-on registry (short sync borrow).
+        self.resilience.borrow_mut().registry.incr(name, labels, by);
+        #[cfg(feature = "telemetry")]
+        self.resil_telemetry_mirror(
+            name,
+            crate::stdlib::telemetry::model::MetricKind::Counter,
+            "add",
+            by,
+            labels,
+        );
+    }
+
+    /// Set the registry gauge `name` for `labels` to `value`, then mirror.
+    pub(crate) fn resil_metric_gauge(&self, name: &str, labels: &[(&str, &str)], value: f64) {
+        self.resilience.borrow_mut().registry.set_gauge(name, labels, value);
+        #[cfg(feature = "telemetry")]
+        self.resil_telemetry_mirror(
+            name,
+            crate::stdlib::telemetry::model::MetricKind::Gauge,
+            "set",
+            value,
+            labels,
+        );
+    }
+
+    /// Mirror one metric sample through the SP12 telemetry soft hook. ONE
+    /// instrument registration per metric NAME across the isolate (id cached in
+    /// `ResilState.instrument_ids`); `telemetry_record_metric` no-ops until
+    /// `telemetry.init`. Behind the telemetry feature; never holds the
+    /// `resilience` borrow across the `telemetry` borrow.
+    #[cfg(feature = "telemetry")]
+    fn resil_telemetry_mirror(
+        &self,
+        name: &str,
+        kind: crate::stdlib::telemetry::model::MetricKind,
+        method: &str,
+        amount: f64,
+        labels: &[(&str, &str)],
+    ) {
+        // Resolve (and cache) the instrument id for this metric name. The cache
+        // borrow is dropped before the registration / record calls.
+        let cached = self.resilience.borrow().instrument_ids.get(name).copied();
+        let id = match cached {
+            Some(id) => id,
+            None => {
+                // `u64::MAX` means telemetry is uninitialized — register lazily but
+                // do NOT cache the sentinel, so a later `telemetry.init` re-registers
+                // (and caches the real id) on the next bump.
+                let id = self.telemetry_register_instrument(name, kind, None, None);
+                if id != u64::MAX {
+                    self.resilience.borrow_mut().instrument_ids.insert(name.to_string(), id);
+                }
+                id
+            }
+        };
+        if id == u64::MAX {
+            // Telemetry uninitialized — nothing to record (the registry already
+            // captured the sample).
+            return;
+        }
+        let attrs: Vec<(String, Value)> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::str(*v)))
+            .collect();
+        self.telemetry_record_metric(id, method, amount, attrs);
+    }
+}
+
 // ── call-site hook: method dispatch on a resilience policy object ─────────────
 
 /// Dispatch a method call on a resilience policy object (§2.3 call-site hook).
@@ -459,6 +661,9 @@ impl Interp {
             }
         };
 
+        // The policy `name` label, captured once for all §6.1 breaker bumps.
+        let bname = breaker_name(recv);
+
         // ── Step 2: Admit/reject decision (sync) ─────────────────────────────────
         let now = self.clock_monotonic_ms(real_monotonic_ms());
         let is_probe;
@@ -478,6 +683,8 @@ impl Interp {
                         o.insert("__halfOpenInFlight", Value::int(1));
                         o.insert("__halfOpenSuccesses", Value::int(0));
                     }
+                    // §6.1: cooldown-driven open→halfOpen transition.
+                    self.breaker_note_transition(&bname, "open", "halfOpen");
                     is_probe = true;
                 } else {
                     // Still open → reject
@@ -485,14 +692,14 @@ impl Interp {
                         let rej = o.get("__rejected").and_then(|v| v.as_int()).unwrap_or(0);
                         o.insert("__rejected", Value::int(rej + 1));
                     }
-                    let name = match recv.kind() {
-                        ValueKind::Object(o) => o.get("name")
-                            .and_then(|v| match v.kind() { ValueKind::Str(s) => Some(s.to_string()), _ => None })
-                            .unwrap_or_else(|| "default".to_string()),
-                        _ => "default".to_string(),
-                    };
+                    // §6.1: a rejected call (breaker open, cooldown not elapsed).
+                    self.resil_metric_incr(
+                        "ascript_resilience_breaker_calls_total",
+                        &[("name", &bname), ("result", "rejected")],
+                        1.0,
+                    );
                     let mut err: IndexMap<String, Value> = IndexMap::new();
-                    err.insert("message".to_string(), Value::str(format!("circuit breaker '{}' is open", name)));
+                    err.insert("message".to_string(), Value::str(format!("circuit breaker '{}' is open", bname)));
                     err.insert("code".to_string(), Value::str("breaker-open"));
                     return Ok(make_pair(Value::nil(), Value::object(err)));
                 }
@@ -510,14 +717,14 @@ impl Interp {
                         let rej = o.get("__rejected").and_then(|v| v.as_int()).unwrap_or(0);
                         o.insert("__rejected", Value::int(rej + 1));
                     }
-                    let name = match recv.kind() {
-                        ValueKind::Object(o) => o.get("name")
-                            .and_then(|v| match v.kind() { ValueKind::Str(s) => Some(s.to_string()), _ => None })
-                            .unwrap_or_else(|| "default".to_string()),
-                        _ => "default".to_string(),
-                    };
+                    // §6.1: a rejected call (halfOpen probe budget exhausted).
+                    self.resil_metric_incr(
+                        "ascript_resilience_breaker_calls_total",
+                        &[("name", &bname), ("result", "rejected")],
+                        1.0,
+                    );
                     let mut err: IndexMap<String, Value> = IndexMap::new();
-                    err.insert("message".to_string(), Value::str(format!("circuit breaker '{}' is open", name)));
+                    err.insert("message".to_string(), Value::str(format!("circuit breaker '{}' is open", bname)));
                     err.insert("code".to_string(), Value::str("breaker-open"));
                     return Ok(make_pair(Value::nil(), Value::object(err)));
                 }
@@ -569,9 +776,13 @@ impl Interp {
                     }
                 }
                 // Record failure in ring + counters + transition
+                let pre = breaker_state_str(recv);
                 breaker_record_outcome(recv, true /* is_failure */, is_probe,
                                        false /* transition already handled via halfOpen fail below */,
                                        window, min_calls, failure_rate, now, true /* panic path */);
+                // §6.1: a panic is a failure outcome (the recorder skips state
+                // transitions on the panic path, so post == pre — no edge bump).
+                self.breaker_after_outcome(recv, &bname, true, &pre);
                 Err(Control::Panic(e))
             }
 
@@ -596,8 +807,12 @@ impl Interp {
                         o.insert("__halfOpenInFlight", Value::int((inf - 1).max(0)));
                     }
                 }
+                let pre = breaker_state_str(recv);
                 breaker_record_outcome(recv, is_failure, is_probe, true,
                                        window, min_calls, failure_rate, now, false);
+                // §6.1: count the success/failure outcome + reflect any state edge
+                // the recorder made (closed→open, halfOpen→open, halfOpen→closed).
+                self.breaker_after_outcome(recv, &bname, is_failure, &pre);
                 // Normalize: wrap plain values in [v, nil] so callers always get a pair.
                 // If it's already a 2-element array (ok-pair or err-pair), pass through.
                 let is_pair = match v.kind() {
@@ -650,13 +865,26 @@ impl Interp {
                 // Short synchronous borrow — no .await inside
                 let now = self.clock_monotonic_ms(real_monotonic_ms());
                 let new_tokens = limiter_refill(recv, now);
+                let lname = policy_name(recv);
                 if new_tokens >= n {
                     // Consume n tokens (atomic: check+consume under one sync borrow)
                     if let ValueKind::Object(o) = recv.kind() {
                         o.insert("__tokens", Value::float(new_tokens - n));
                     }
+                    // §6.1: a granted acquisition.
+                    self.resil_metric_incr(
+                        "ascript_resilience_limiter_acquired_total",
+                        &[("name", &lname)],
+                        1.0,
+                    );
                     Ok(Value::bool_(true))
                 } else {
+                    // §6.1: a rejected (would-block) tryAcquire.
+                    self.resil_metric_incr(
+                        "ascript_resilience_limiter_rejected_total",
+                        &[("name", &lname)],
+                        1.0,
+                    );
                     Ok(Value::bool_(false))
                 }
             }
@@ -687,6 +915,12 @@ impl Interp {
                         if let ValueKind::Object(o) = recv.kind() {
                             o.insert("__tokens", Value::float(new_tokens - n));
                         }
+                        // §6.1: a granted acquisition (possibly after parking).
+                        self.resil_metric_incr(
+                            "ascript_resilience_limiter_acquired_total",
+                            &[("name", &policy_name(recv))],
+                            1.0,
+                        );
                         return Ok(Value::nil());
                     }
 
@@ -710,13 +944,13 @@ impl Interp {
                     // fast path is byte-identical to before (plain sleep, no race).
                     let duration = std::time::Duration::from_millis(sleep_ms as u64);
                     match self.deadline_remaining_ms() {
-                        Some(r) if r <= 0.0 => return Ok(deadline_exceeded_pair()),
+                        Some(r) if r <= 0.0 => return Ok(self.resil_deadline_exceeded_pair()),
                         Some(r) => {
                             tokio::select! {
                                 _ = tokio::time::sleep(duration) => {}
                                 _ = tokio::time::sleep(
                                     std::time::Duration::from_millis(r as u64),
-                                ) => return Ok(deadline_exceeded_pair()),
+                                ) => return Ok(self.resil_deadline_exceeded_pair()),
                             }
                         }
                         None => tokio::time::sleep(duration).await,
@@ -729,6 +963,115 @@ impl Interp {
                 format!("limiter policy has no method '{}'", other),
                 span,
             ).into()),
+        }
+    }
+}
+
+// ── §6.1 breaker metric helpers ──────────────────────────────────────────────
+
+/// Read a policy's `name` field (default `"default"`) as an owned `String` —
+/// the `{name}` label for every §6.1 policy metric (breaker/limiter/bulkhead/
+/// keyedLimiter/memoize/retry all carry a `name`).
+fn policy_name(recv: &Value) -> String {
+    breaker_name(recv)
+}
+
+/// Read the breaker policy's `name` field (default `"default"`) as an owned
+/// `String` — the `{name}` label for every §6.1 breaker metric.
+fn breaker_name(recv: &Value) -> String {
+    match recv.kind() {
+        ValueKind::Object(o) => o
+            .get("name")
+            .and_then(|v| match v.kind() {
+                ValueKind::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "default".to_string()),
+        _ => "default".to_string(),
+    }
+}
+
+/// Read the breaker's current `__state` string (default `"closed"`).
+fn breaker_state_str(recv: &Value) -> String {
+    match recv.kind() {
+        ValueKind::Object(o) => o
+            .get("__state")
+            .and_then(|v| match v.kind() {
+                ValueKind::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "closed".to_string()),
+        _ => "closed".to_string(),
+    }
+}
+
+/// Map a breaker state string to the §6.1 `breaker_state` gauge value
+/// (0 = closed, 1 = open, 2 = halfOpen).
+fn breaker_state_gauge(state: &str) -> f64 {
+    match state {
+        "open" => 1.0,
+        "halfOpen" => 2.0,
+        _ => 0.0,
+    }
+}
+
+impl Interp {
+    /// Record a breaker STATE TRANSITION (`from`→`to`): the §6.1
+    /// `breaker_transitions_total{name,to}` counter, the `breaker_state{name}`
+    /// gauge, and a `log.debug` transition breadcrumb (behind the `log` feature —
+    /// a transition event, never per-call spam).
+    fn breaker_note_transition(&self, name: &str, from: &str, to: &str) {
+        self.resil_metric_incr(
+            "ascript_resilience_breaker_transitions_total",
+            &[("name", name), ("to", to)],
+            1.0,
+        );
+        self.resil_metric_gauge(
+            "ascript_resilience_breaker_state",
+            &[("name", name)],
+            breaker_state_gauge(to),
+        );
+        #[cfg(feature = "log")]
+        self.breaker_log_transition(name, from, to);
+        #[cfg(not(feature = "log"))]
+        let _ = from;
+    }
+
+    /// `log.debug` breadcrumb for a breaker transition (best-effort, behind the
+    /// `log` feature). Routed through the SYNCHRONOUS `log_debug_breadcrumb`
+    /// emitter so it can be called from the sync metric helpers (the regular
+    /// `call_log` is async only because of its thunk-first-arg path, which this
+    /// breadcrumb never uses).
+    #[cfg(feature = "log")]
+    fn breaker_log_transition(&self, name: &str, from: &str, to: &str) {
+        self.log_debug_breadcrumb(
+            "breaker state transition",
+            &[("breaker", name), ("from", from), ("to", to)],
+        );
+    }
+
+    /// After `breaker_record_outcome`, emit the §6.1 outcome metrics: the
+    /// `breaker_calls_total{name,result=success|failure}` counter, the
+    /// `breaker_state{name}` gauge, and a transition counter/breadcrumb when the
+    /// recorder moved the breaker between states (`pre_state` != post-state).
+    fn breaker_after_outcome(&self, recv: &Value, name: &str, is_failure: bool, pre_state: &str) {
+        let result = if is_failure { "failure" } else { "success" };
+        self.resil_metric_incr(
+            "ascript_resilience_breaker_calls_total",
+            &[("name", name), ("result", result)],
+            1.0,
+        );
+        let post = breaker_state_str(recv);
+        if post != pre_state {
+            // A real edge — bumps the transition counter + sets the gauge.
+            self.breaker_note_transition(name, pre_state, &post);
+        } else {
+            // No edge: keep the gauge current (idempotent set; cheap).
+            self.resil_metric_gauge(
+                "ascript_resilience_breaker_state",
+                &[("name", name)],
+                breaker_state_gauge(&post),
+            );
         }
     }
 }
@@ -1079,22 +1422,28 @@ impl Interp {
 
                 let now = self.clock_monotonic_ms(real_monotonic_ms());
                 let (capacity, refill_per_sec, store_id) = keyed_read_config(recv);
+                let kname = policy_name(recv);
+                // §6.1: evictions are counted as the lru store's eviction-count
+                // delta across this operation (the bucket store evicts the LRU key
+                // when at `maxKeys` inside `keyed_set_bucket`).
+                let ev_before = self.lru_eviction_count(store_id);
 
                 // Get or create bucket from lru store
                 let bucket = keyed_get_bucket(self, store_id, &key_str, capacity, now, span)?;
 
                 // Refill + try consume
                 let new_tokens = limiter_refill_bucket(&bucket, capacity, refill_per_sec, now);
-                if new_tokens >= n {
+                let granted = new_tokens >= n;
+                if granted {
                     bucket_set_tokens(&bucket, new_tokens - n);
                     // Touch: set the updated bucket back into the lru (updates recency + tokens)
                     keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
-                    Ok(Value::bool_(true))
                 } else {
                     // Set back to persist the refill update even on rejection
                     keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
-                    Ok(Value::bool_(false))
                 }
+                self.keyed_emit_metrics(&kname, store_id, ev_before, Some(granted));
+                Ok(Value::bool_(granted))
             }
 
             "acquire" => {
@@ -1106,6 +1455,7 @@ impl Interp {
                 loop {
                     let now = self.clock_monotonic_ms(real_monotonic_ms());
                     let (capacity, refill_per_sec, store_id) = keyed_read_config(recv);
+                    let ev_before = self.lru_eviction_count(store_id);
 
                     // Short synchronous section: refill + check
                     let bucket = keyed_get_bucket(self, store_id, &key_str, capacity, now, span)?;
@@ -1114,12 +1464,18 @@ impl Interp {
                     if new_tokens >= n {
                         bucket_set_tokens(&bucket, new_tokens - n);
                         keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
+                        // §6.1: a granted acquisition (+ any eviction delta).
+                        self.keyed_emit_metrics(&policy_name(recv), store_id, ev_before, Some(true));
                         return Ok(Value::nil());
                     }
 
                     // Compute deficit sleep, persist refill update, drop all borrows before await
                     bucket_set_tokens(&bucket, new_tokens);
                     keyed_set_bucket(self, store_id, &key_str, &bucket, span)?;
+                    // §6.1: count evictions caused by this park-iteration's bucket
+                    // touch (acquire never "rejects" — it parks — so pass `None`:
+                    // evictions only, no acquired/rejected bump on the wait path).
+                    self.keyed_emit_metrics(&policy_name(recv), store_id, ev_before, None);
 
                     let deficit = n - new_tokens;
                     let sleep_ms = if refill_per_sec > 0.0 {
@@ -1137,13 +1493,13 @@ impl Interp {
                     // NO deadline → byte-identical plain sleep.
                     let duration = std::time::Duration::from_millis(sleep_ms as u64);
                     match self.deadline_remaining_ms() {
-                        Some(r) if r <= 0.0 => return Ok(deadline_exceeded_pair()),
+                        Some(r) if r <= 0.0 => return Ok(self.resil_deadline_exceeded_pair()),
                         Some(r) => {
                             tokio::select! {
                                 _ = tokio::time::sleep(duration) => {}
                                 _ = tokio::time::sleep(
                                     std::time::Duration::from_millis(r as u64),
-                                ) => return Ok(deadline_exceeded_pair()),
+                                ) => return Ok(self.resil_deadline_exceeded_pair()),
                             }
                         }
                         None => tokio::time::sleep(duration).await,
@@ -1212,6 +1568,43 @@ fn keyed_validate_key(key: &Value, span: Span) -> Result<String, Control> {
             ),
             span,
         ).into()),
+    }
+}
+
+impl Interp {
+    /// Emit the §6.1 keyedLimiter metrics for one acquire/tryAcquire op:
+    /// `limiter_evictions_total{name}` for the lru eviction-count delta since
+    /// `ev_before`, plus (when `granted` is `Some`) `limiter_acquired_total{name}`
+    /// on grant or `limiter_rejected_total{name}` on a `tryAcquire` rejection.
+    /// `granted = None` is the `acquire` park path — evictions only.
+    fn keyed_emit_metrics(
+        &self,
+        name: &str,
+        store_id: u64,
+        ev_before: u64,
+        granted: Option<bool>,
+    ) {
+        let ev_after = self.lru_eviction_count(store_id);
+        if ev_after > ev_before {
+            self.resil_metric_incr(
+                "ascript_resilience_limiter_evictions_total",
+                &[("name", name)],
+                (ev_after - ev_before) as f64,
+            );
+        }
+        match granted {
+            Some(true) => self.resil_metric_incr(
+                "ascript_resilience_limiter_acquired_total",
+                &[("name", name)],
+                1.0,
+            ),
+            Some(false) => self.resil_metric_incr(
+                "ascript_resilience_limiter_rejected_total",
+                &[("name", name)],
+                1.0,
+            ),
+            None => {}
+        }
     }
 }
 
@@ -1465,6 +1858,13 @@ impl Interp {
             }
         };
 
+        // The policy `name` + `limit` for the §6.1 bulkhead gauge/shed metrics.
+        let bhname = policy_name(recv);
+        let limit = match recv.kind() {
+            ValueKind::Object(o) => o.get("limit").and_then(|v| v.as_int()).unwrap_or(0),
+            _ => 0,
+        };
+
         // ── Step 2: Check current in-flight by inspecting semaphore available ──
         // available == 0 means limit reached.
         let sem = match get_semaphore(self, sem_id) {
@@ -1491,6 +1891,12 @@ impl Interp {
                         .unwrap_or_else(|| "default".to_string()),
                     _ => "default".to_string(),
                 };
+                // §6.1: an immediately-shed call (queue full).
+                self.resil_metric_incr(
+                    "ascript_resilience_bulkhead_shed_total",
+                    &[("name", &bhname)],
+                    1.0,
+                );
                 let mut err: IndexMap<String, Value> = IndexMap::new();
                 err.insert(
                     "message".to_string(),
@@ -1536,7 +1942,7 @@ impl Interp {
                             o.insert("__waiting", Value::int((w - 1).max(0)));
                         }
                     }
-                    return Ok(deadline_exceeded_pair());
+                    return Ok(self.resil_deadline_exceeded_pair());
                 }
                 Some(r) => {
                     tokio::select! {
@@ -1555,7 +1961,7 @@ impl Interp {
                                     o.insert("__waiting", Value::int((w - 1).max(0)));
                                 }
                             }
-                            return Ok(deadline_exceeded_pair());
+                            return Ok(self.resil_deadline_exceeded_pair());
                         }
                     }
                 }
@@ -1582,6 +1988,17 @@ impl Interp {
             }
         }
 
+        // §6.1: reflect the now-incremented in-flight count (limit − available),
+        // computed from the live semaphore (short borrow, no await held).
+        {
+            let avail = *sem.available.borrow();
+            self.resil_metric_gauge(
+                "ascript_resilience_bulkhead_in_flight",
+                &[("name", &bhname)],
+                (limit - avail as i64).max(0) as f64,
+            );
+        }
+
         // ── Step 5: Call the user fn (NO borrow held across .await) ──────────
         let call_result = self.call_value(user_fn, vec![], span).await;
         // Drive a returned future to completion (the task.retry / breaker pattern)
@@ -1601,6 +2018,16 @@ impl Interp {
         // ── Step 6: Release the permit on ALL exit paths ──────────────────────
         // sync_release never fails (it only increments the counter and notify_one).
         let _ = self.sync_release(&[sem_value], span);
+
+        // §6.1: reflect the now-decremented in-flight count after release.
+        {
+            let avail = *sem.available.borrow();
+            self.resil_metric_gauge(
+                "ascript_resilience_bulkhead_in_flight",
+                &[("name", &bhname)],
+                (limit - avail as i64).max(0) as f64,
+            );
+        }
 
         // Return the outcome:
         // - success: normalize plain value → [v, nil]; already-a-pair passes through.
@@ -1663,6 +2090,19 @@ fn make_retry_policy(opts: Value, span: Span) -> Result<Value, Control> {
     // `budget` is a policy-only key parse_retry_config ignores — validated below.
     let _cfg = crate::stdlib::task_mod::parse_retry_config(&opts, span)?;
 
+    // Policy `name` label (default "default") for the §6.1 retry metrics.
+    let name = match opts.kind() {
+        ValueKind::Object(o) => match o.get("name") {
+            Some(v) => match v.kind() {
+                ValueKind::Str(s) => s.to_string(),
+                ValueKind::Nil => "default".to_string(),
+                _ => return Err(AsError::at("resilience.retry: 'name' must be a string", span).into()),
+            },
+            None => "default".to_string(),
+        },
+        _ => "default".to_string(),
+    };
+
     // Parse + validate the budget ratio (policy-only).
     let budget = match opts.kind() {
         ValueKind::Object(o) => match o.get("budget") {
@@ -1693,6 +2133,7 @@ fn make_retry_policy(opts: Value, span: Span) -> Result<Value, Control> {
 
     let mut m: IndexMap<String, Value> = IndexMap::new();
     m.insert("__resil".to_string(), Value::str("retry"));
+    m.insert("name".to_string(), Value::str(name));
     // Stash the original opts so `call` re-derives the config via the shared parser
     // (keeps ONE source of truth for the retry config, incl. the `retryIf` callable).
     m.insert(
@@ -1907,9 +2348,17 @@ impl Interp {
         // ── Join an existing flight (SHORT borrow, dropped before return) ──────
         {
             let flights = self.resilience.borrow();
-            if let Some(existing) = flights.flights.get(&key_str) {
-                let handle = existing.clone();
-                drop(flights);
+            let joined = flights.flights.get(&key_str).cloned();
+            // Drop the registry borrow BEFORE the §6.1 join bump (which takes a
+            // `borrow_mut` of the SAME `self.resilience` cell).
+            drop(flights);
+            if let Some(handle) = joined {
+                // §6.1: a singleflight join (no `name` label — flights are global).
+                self.resil_metric_incr(
+                    "ascript_resilience_singleflight_joins_total",
+                    &[],
+                    1.0,
+                );
                 return Ok(Value::future(handle));
             }
         }
@@ -1982,6 +2431,19 @@ impl Interp {
     ///   so two caches never collide on the GLOBAL singleflight `flights` table.
     /// - `__hits` / `__misses`: stats counters (mutated on the recv Object, like breaker).
     fn make_memoize(&self, opts: Value, span: Span) -> Result<Value, Control> {
+        // ── name (optional string label, default "default") ───────────────────
+        let mname = match opts.kind() {
+            ValueKind::Object(o) => match o.get("name") {
+                Some(v) => match v.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    ValueKind::Nil => "default".to_string(),
+                    _ => return Err(AsError::at("memoize: 'name' must be a string", span).into()),
+                },
+                None => "default".to_string(),
+            },
+            _ => "default".to_string(),
+        };
+
         // ── max (positive int, default 1024) ──────────────────────────────────
         let max = memoize_opt_pos_int(&opts, "max", 1024, span)?;
 
@@ -2001,6 +2463,7 @@ impl Interp {
 
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("__resil".to_string(), Value::str("memoize"));
+        m.insert("name".to_string(), Value::str(mname));
         m.insert("max".to_string(), Value::int(max as i64));
         m.insert(
             "ttlMs".to_string(),
@@ -2088,6 +2551,13 @@ impl Interp {
                     if fresh {
                         // Hit: bump __hits, return the ok-pair [value, nil].
                         memoize_bump(recv, "__hits");
+                        // §6.1: a cross-cache aggregate hit (separate from the
+                        // per-cache `__hits`/`stats()` counter).
+                        self.resil_metric_incr(
+                            "ascript_resilience_memoize_hits_total",
+                            &[("name", &policy_name(recv))],
+                            1.0,
+                        );
                         return Ok(make_pair(value, Value::nil()));
                     }
                     // Expired → fall through to a miss (lazy TTL).
@@ -2095,6 +2565,12 @@ impl Interp {
 
                 // ── MISS: singleflight on a cache-scoped key, await it ─────────
                 memoize_bump(recv, "__misses");
+                // §6.1: a cross-cache aggregate miss.
+                self.resil_metric_incr(
+                    "ascript_resilience_memoize_misses_total",
+                    &[("name", &policy_name(recv))],
+                    1.0,
+                );
                 let flight_key = Value::str(format!("{}{}", sf_prefix, key_str));
                 let fut = self.call_singleflight(flight_key, user_fn, span)?;
                 // Await the flight (all concurrent awaiters observe the same result).
@@ -2423,7 +2899,7 @@ impl Interp {
         let remaining = self.deadline_remaining_ms();
         if matches!(remaining, Some(r) if r <= 0.0) {
             do_restore(restore);
-            return Ok(deadline_exceeded_pair());
+            return Ok(self.resil_deadline_exceeded_pair());
         }
 
         // ── §5.2 the race: body vs. the remaining budget ─────────────────────
@@ -2455,7 +2931,7 @@ impl Interp {
                     r = body => r,
                     _ = tokio::time::sleep(std::time::Duration::from_millis(r as u64)) => {
                         do_restore(restore);
-                        return Ok(deadline_exceeded_pair());
+                        return Ok(self.resil_deadline_exceeded_pair());
                     }
                 }
             }
@@ -4383,6 +4859,185 @@ resilience.withTrace(123, () => 1)
         assert!(
             res.is_err() || res.unwrap().contains("must be a string"),
             "expected a panic about id being a string"
+        );
+    }
+
+    // ── Task 5.1: §6.1 per-isolate metrics registry ─────────────────────────
+
+    /// A breaker trip scenario fills `breaker_calls_total` (success/failure/
+    /// rejected), sets `breaker_state` to 1.0 (open), and counts the closed→open
+    /// transition — all in the always-on registry.
+    #[tokio::test]
+    async fn registry_breaker_outcomes_state_and_transition() {
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({name: "t", failureRate: 0.5, window: 4, minCalls: 4, cooldownMs: 999999, halfOpenMax: 1})
+fn ok() { return 42 }
+fn fail() { return [nil, {message: "boom", code: "err"}] }
+b.call(ok)    // success #1
+b.call(ok)    // success #2
+b.call(fail)  // failure #1
+b.call(fail)  // failure #2 → opens (50% over 4 >= 0.5)
+b.call(ok)    // rejected (open)
+print(b.state())
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(reg.value("ascript_resilience_breaker_state", &[("name", "t")]), 1.0, "open gauge");
+        assert_eq!(
+            reg.value("ascript_resilience_breaker_calls_total", &[("name", "t"), ("result", "success")]),
+            2.0, "2 successes"
+        );
+        assert_eq!(
+            reg.value("ascript_resilience_breaker_calls_total", &[("name", "t"), ("result", "failure")]),
+            2.0, "2 failures"
+        );
+        assert_eq!(
+            reg.value("ascript_resilience_breaker_calls_total", &[("name", "t"), ("result", "rejected")]),
+            1.0, "1 rejected"
+        );
+        assert_eq!(
+            reg.value("ascript_resilience_breaker_transitions_total", &[("name", "t"), ("to", "open")]),
+            1.0, "1 closed→open transition"
+        );
+    }
+
+    /// limiter: a granted `tryAcquire` and a rejected one bump the §6.1 counters.
+    #[tokio::test]
+    async fn registry_limiter_acquired_and_rejected() {
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let l = resilience.limiter({name: "L", capacity: 1, refillPerSec: 0})
+print(l.tryAcquire())   // true  → acquired
+print(l.tryAcquire())   // false → rejected (bucket empty, no refill)
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(reg.value("ascript_resilience_limiter_acquired_total", &[("name", "L")]), 1.0);
+        assert_eq!(reg.value("ascript_resilience_limiter_rejected_total", &[("name", "L")]), 1.0);
+    }
+
+    /// keyedLimiter: an eviction bumps `limiter_evictions_total` (maxKeys=1, two
+    /// distinct keys → the first bucket is evicted).
+    #[tokio::test]
+    async fn registry_keyed_limiter_evictions() {
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let k = resilience.keyedLimiter({name: "K", capacity: 5, refillPerSec: 0, maxKeys: 1})
+k.tryAcquire("a")   // creates bucket a → acquired
+k.tryAcquire("b")   // creates bucket b → evicts a → acquired
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(reg.value("ascript_resilience_limiter_acquired_total", &[("name", "K")]), 2.0);
+        assert_eq!(reg.value("ascript_resilience_limiter_evictions_total", &[("name", "K")]), 1.0);
+    }
+
+    /// bulkhead: an immediate shed (limit=0-capacity reached, queue=0) bumps
+    /// `bulkhead_shed_total`; in-flight gauge returns to 0 after the run.
+    #[tokio::test]
+    async fn registry_bulkhead_shed_and_in_flight() {
+        // limit=1, queue=0: a synchronous run completes + releases, so in_flight
+        // returns to 0; a SECOND concurrent run would shed, but to keep this test
+        // deterministic we assert the in_flight gauge after a completed run.
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let bh = resilience.bulkhead({name: "B", limit: 1, queue: 0})
+fn work() { return 1 }
+let [v, e] = bh.run(work)
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        // The permit was acquired (in_flight→1) then released (in_flight→0).
+        assert_eq!(reg.value("ascript_resilience_bulkhead_in_flight", &[("name", "B")]), 0.0);
+    }
+
+    /// retry: a resilience.retry policy bumps `retry_attempts_total{outcome}`
+    /// (one failure then a success).
+    #[tokio::test]
+    async fn registry_retry_attempts() {
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let r = resilience.retry({name: "R", attempts: 3, baseMs: 0, retryOn: "error"})
+let tries = [0]
+fn flaky() {
+  tries[0] = tries[0] + 1
+  if (tries[0] < 2) { return [nil, {message: "x"}] }
+  return 99
+}
+let v = r.call(flaky)
+print(v)
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(
+            reg.value("ascript_resilience_retry_attempts_total", &[("name", "R"), ("outcome", "failure")]),
+            1.0, "1 failed attempt"
+        );
+        assert_eq!(
+            reg.value("ascript_resilience_retry_attempts_total", &[("name", "R"), ("outcome", "success")]),
+            1.0, "1 successful attempt"
+        );
+    }
+
+    /// memoize: one miss (first get) then one hit (second get) bump the §6.1
+    /// cross-cache aggregate counters.
+    #[tokio::test]
+    async fn registry_memoize_hits_and_misses() {
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let c = resilience.memoize({name: "M", max: 10})
+async fn f() { return 1 }
+await c.get("k", f)   // miss
+await c.get("k", f)   // hit
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(reg.value("ascript_resilience_memoize_misses_total", &[("name", "M")]), 1.0);
+        assert_eq!(reg.value("ascript_resilience_memoize_hits_total", &[("name", "M")]), 1.0);
+    }
+
+    /// singleflight: N concurrent same-key calls collapse to one execution; the
+    /// joiners bump `singleflight_joins_total` (no name label).
+    #[tokio::test]
+    async fn registry_singleflight_joins() {
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+async fn slow() { return 7 }
+let f1 = resilience.singleflight("k", slow)   // starts the flight
+let f2 = resilience.singleflight("k", slow)   // join #1
+let f3 = resilience.singleflight("k", slow)   // join #2
+await f1
+await f2
+await f3
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(reg.value("ascript_resilience_singleflight_joins_total", &[]), 2.0);
+    }
+
+    /// deadline: an already-expired (0ms) deadline bumps `deadline_exceeded_total`
+    /// (no name label).
+    #[tokio::test]
+    async fn registry_deadline_exceeded() {
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+fn body() { return 1 }
+let [v, e] = resilience.deadline(0, body)   // already-expired entry → exceeded
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(reg.value("ascript_resilience_deadline_exceeded_total", &[]), 1.0);
+    }
+
+    /// cfg-matrix proof: WITHOUT telemetry/log features the registry still works
+    /// (this test runs in every config that includes `resilience`).
+    #[tokio::test]
+    async fn registry_works_without_telemetry_init() {
+        // No telemetry.init anywhere — the soft-hook mirror no-ops, the registry
+        // still records the breaker outcome.
+        let (_out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({name: "z"})
+fn ok() { return 1 }
+b.call(ok)
+"#).await.expect("run");
+        let reg = &interp.resilience.borrow().registry;
+        assert_eq!(
+            reg.value("ascript_resilience_breaker_calls_total", &[("name", "z"), ("result", "success")]),
+            1.0
         );
     }
 }

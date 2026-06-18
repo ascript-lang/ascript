@@ -397,6 +397,24 @@ fn budget_record_retry(state: &Value) {
     }
 }
 
+/// Read the retry policy's `name` field (default `"default"`) — the `{name}`
+/// label for the §6.1 retry metrics. Only the stateful `resilience.retry` policy
+/// carries a `name`; plain `task.retry` passes `budget_state: None` and never
+/// bumps these metrics.
+#[cfg(feature = "resilience")]
+fn retry_policy_name(state: &Value) -> String {
+    match state.kind() {
+        ValueKind::Object(o) => o
+            .get("name")
+            .and_then(|v| match v.kind() {
+                ValueKind::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "default".to_string()),
+        _ => "default".to_string(),
+    }
+}
+
 /// True iff the budget permits another retry: `__retriesSpent < budget * __attemptsSeen`.
 /// Count-based, no clock interaction (§3.4).
 fn budget_permits_retry(state: &Value) -> bool {
@@ -410,6 +428,26 @@ fn budget_permits_retry(state: &Value) -> bool {
 }
 
 impl Interp {
+    /// §6.1: bump `retry_attempts_total{name,outcome}` (resilience.retry only).
+    #[cfg(feature = "resilience")]
+    fn resil_retry_attempt(&self, name: &str, outcome: &str) {
+        self.resil_metric_incr(
+            "ascript_resilience_retry_attempts_total",
+            &[("name", name), ("outcome", outcome)],
+            1.0,
+        );
+    }
+
+    /// §6.1: bump `retry_budget_exhausted_total{name}` (resilience.retry only).
+    #[cfg(feature = "resilience")]
+    fn resil_retry_budget_exhausted(&self, name: &str) {
+        self.resil_metric_incr(
+            "ascript_resilience_retry_budget_exhausted_total",
+            &[("name", name)],
+            1.0,
+        );
+    }
+
     /// `std/task` dispatch. All entries are async (they drive futures / spawn
     /// tasks), so this is awaited on the event loop.
     pub(crate) async fn call_task(
@@ -624,6 +662,13 @@ impl Interp {
         // The last retried error pair (for the `retryOn: error`/`both` exhaustion path).
         let mut last_pair: Option<Value> = None;
 
+        // §6.1 retry metrics are emitted ONLY for the stateful resilience.retry
+        // policy (which carries a `name` + budget state); plain task.retry passes
+        // `budget_state: None` and never touches the registry. The metric path
+        // compiles out entirely without the `resilience` feature (no policy exists).
+        #[cfg(feature = "resilience")]
+        let retry_name: Option<String> = budget_state.map(retry_policy_name);
+
         for attempt in 0..cfg.attempts {
             // Count this attempt for the budget ratio (the first-attempt rate).
             if let Some(state) = budget_state {
@@ -681,9 +726,21 @@ impl Interp {
             };
 
             match class {
-                Class::Success(v) => return Ok(v),
+                Class::Success(v) => {
+                    // §6.1: a successful attempt outcome.
+                    #[cfg(feature = "resilience")]
+                    if let Some(rn) = &retry_name {
+                        self.resil_retry_attempt(rn, "success");
+                    }
+                    return Ok(v);
+                }
                 Class::Passthrough(c) => return Err(c),
                 Class::Panic(e, errv) => {
+                    // §6.1: a failed attempt outcome.
+                    #[cfg(feature = "resilience")]
+                    if let Some(rn) = &retry_name {
+                        self.resil_retry_attempt(rn, "failure");
+                    }
                     // `retryIf(err) == false` → re-raise immediately (no further attempts).
                     if !self.retry_if_allows(cfg, &errv, span).await? {
                         return Err(Control::Panic(e));
@@ -695,6 +752,13 @@ impl Interp {
                         .map(budget_permits_retry)
                         .unwrap_or(true);
                     if attempt + 1 >= cfg.attempts || !budget_ok {
+                        // §6.1: budget-driven (not attempt-cap-driven) exhaustion.
+                        #[cfg(feature = "resilience")]
+                        if !budget_ok {
+                            if let Some(rn) = &retry_name {
+                                self.resil_retry_budget_exhausted(rn);
+                            }
+                        }
                         break;
                     }
                     if let Some(state) = budget_state {
@@ -703,6 +767,11 @@ impl Interp {
                     self.retry_backoff_sleep(cfg, attempt).await;
                 }
                 Class::ErrPair(pair, errv) => {
+                    // §6.1: a failed attempt outcome.
+                    #[cfg(feature = "resilience")]
+                    if let Some(rn) = &retry_name {
+                        self.resil_retry_attempt(rn, "failure");
+                    }
                     if !self.retry_if_allows(cfg, &errv, span).await? {
                         return Ok(pair);
                     }
@@ -712,6 +781,12 @@ impl Interp {
                         .map(budget_permits_retry)
                         .unwrap_or(true);
                     if attempt + 1 >= cfg.attempts || !budget_ok {
+                        #[cfg(feature = "resilience")]
+                        if !budget_ok {
+                            if let Some(rn) = &retry_name {
+                                self.resil_retry_budget_exhausted(rn);
+                            }
+                        }
                         break;
                     }
                     if let Some(state) = budget_state {

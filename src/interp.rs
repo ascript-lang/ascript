@@ -2017,6 +2017,50 @@ impl Interp {
         }
     }
 
+    /// Emit a `debug`-level structured log line SYNCHRONOUSLY (RESIL §6.1
+    /// breadcrumb path): respects the level filter + format, then routes to
+    /// [`Self::emit_log`]. Unlike [`Self::call_log`] this takes a static message +
+    /// pre-resolved string fields (no thunk, no `Value` args) so it can be called
+    /// from a non-async context. Used for resilience transition breadcrumbs (its
+    /// only caller — so gated on both features).
+    #[cfg(all(feature = "log", feature = "resilience"))]
+    pub(crate) fn log_debug_breadcrumb(&self, msg: &str, fields: &[(&str, &str)]) {
+        if LogLevel::Debug < self.log_level.get() {
+            return;
+        }
+        let trace_id: Option<std::rc::Rc<str>> =
+            crate::interp::task_locals_current().and_then(|l| l.trace_id.clone());
+        let line = match self.log_format.get() {
+            LogFormat::Json => {
+                let mut rec = serde_json::Map::new();
+                for (k, v) in fields {
+                    rec.insert((*k).to_string(), serde_json::Value::String((*v).to_string()));
+                }
+                rec.insert("level".into(), serde_json::Value::String("debug".into()));
+                rec.insert("msg".into(), serde_json::Value::String(msg.to_string()));
+                if let Some(tid) = &trace_id {
+                    rec.insert("traceId".into(), serde_json::Value::String(tid.to_string()));
+                }
+                serde_json::Value::Object(rec).to_string()
+            }
+            LogFormat::Human => {
+                let mut s = if msg.is_empty() {
+                    "[DEBUG]".to_string()
+                } else {
+                    format!("[DEBUG] {}", msg)
+                };
+                for (k, v) in fields {
+                    s.push_str(&format!(" {}={}", k, v));
+                }
+                if let Some(tid) = &trace_id {
+                    s.push_str(&format!(" traceId={}", tid));
+                }
+                s
+            }
+        };
+        self.emit_log(&line);
+    }
+
     // ---- SP12 std/telemetry: state access + the SP11-facing soft hook ----
     //
     // The hook methods (`telemetry_active`/`telemetry_span_start`/…) have
@@ -9805,6 +9849,33 @@ log.info("outside")
         // The second record (outside) has NO traceId field.
         let outside = logs.lines().find(|l| l.contains("\"msg\":\"outside\"")).expect("outside record");
         assert!(!outside.contains("traceId"), "outside must NOT carry traceId: {outside}");
+    }
+
+    /// RESIL Task 5.1 (§6.1): a breaker state transition emits a `log.debug`
+    /// breadcrumb (behind the `log` feature) with the policy name + from/to.
+    #[cfg(all(feature = "log", feature = "resilience"))]
+    #[tokio::test]
+    async fn breaker_transition_emits_log_breadcrumb() {
+        let logs = run_logs(
+            r#"
+import * as log from "std/log"
+import * as resilience from "std/resilience"
+log.setLevel("debug")
+log.setFormat("json")
+let b = resilience.breaker({name: "svc", failureRate: 0.5, window: 2, minCalls: 2, cooldownMs: 999999, halfOpenMax: 1})
+fn fail() { return [nil, {message: "x"}] }
+b.call(fail)
+b.call(fail)   // → opens (closed→open)
+"#,
+        )
+        .await;
+        let line = logs
+            .lines()
+            .find(|l| l.contains("breaker state transition"))
+            .expect("a transition breadcrumb");
+        assert!(line.contains("\"breaker\":\"svc\""), "policy name: {line}");
+        assert!(line.contains("\"to\":\"open\""), "to=open: {line}");
+        assert!(line.contains("\"from\":\"closed\""), "from=closed: {line}");
     }
 
     #[cfg(feature = "log")]

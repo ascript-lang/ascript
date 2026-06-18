@@ -376,6 +376,56 @@ await telemetry.flush()
     assert!(body.contains("\"asDouble\":2.0") || body.contains("\"asDouble\":2"), "sum=2: {body}");
 }
 
+// ---- RESIL Task 5.1: std/resilience §6.1 metric mirror through the soft hook ----
+
+/// With telemetry initialized, a breaker call mirrors its §6.1 registry counter
+/// through the SP12 soft hook → the OTLP metrics payload carries the
+/// `ascript_resilience_breaker_calls_total` instrument.
+#[cfg(feature = "resilience")]
+#[tokio::test]
+async fn resilience_breaker_mirrors_metric_through_soft_hook() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+import * as resilience from "std/resilience"
+let b = resilience.breaker({{ name: "svc" }})
+fn ok() {{ return 1 }}
+b.call(ok)
+b.call(ok)
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let req = caps
+        .iter()
+        .find(|r| r.signal == "metrics")
+        .expect("a metrics request after a breaker call");
+    let body = &req.body;
+    assert!(
+        body.contains("ascript_resilience_breaker_calls_total"),
+        "breaker calls counter mirrored: {body}"
+    );
+    // The `result=success` label rides as an attribute on the data point.
+    assert!(body.contains("success"), "result label present: {body}");
+}
+
+/// WITHOUT `telemetry.init`, a breaker call records NOTHING through the hook (the
+/// soft hook no-ops) but the program runs cleanly — the registry still captured
+/// the sample (asserted in the lib-side registry tests).
+#[cfg(feature = "resilience")]
+#[tokio::test]
+async fn resilience_metric_mirror_noop_when_telemetry_uninitialized() {
+    let (out, caps) = run(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({ name: "svc" })
+fn ok() { return 1 }
+b.call(ok)
+print("done")
+"#)
+    .await;
+    assert_eq!(out, "done\n");
+    assert!(caps.is_empty(), "no captured requests without init: {:?}", caps);
+}
+
 /// The first `"key":"<value>"` after the needle.
 fn field_after(body: &str, key: &str) -> String {
     let needle = format!("\"{}\":\"", key);
