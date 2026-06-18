@@ -174,6 +174,17 @@ impl HttpBodyState {
         HttpBodyState { reader, mode }
     }
 
+    /// CNTR §3.2: build a streaming body over an ALREADY-BOXED `ByteStream` (the http1
+    /// UDS client's `into_byte_stream()` returns this EXACT type). The resulting
+    /// `HttpBodyState` is INDISTINGUISHABLE downstream from a reqwest-backed one — the
+    /// same `StreamReader`+`BufReader` adaptation, so `resp.body.read()`/`readLine()`/
+    /// `readToEnd()` behave byte-identically over a UDS response.
+    #[cfg(unix)]
+    pub(crate) fn from_byte_stream(stream: ByteStream, mode: BodyMode) -> Self {
+        let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(stream));
+        HttpBodyState { reader, mode }
+    }
+
     async fn read_upto(&mut self, n: usize, buf: &mut Vec<u8>) -> std::io::Result<usize> {
         // `read_buf` over a `take(n)` adapter appends only the bytes actually
         // available, capped at `n` — bounding the read at `n` with NO 64KB zero-fill
@@ -893,6 +904,132 @@ fn scalar_to_string(v: &Value, span: Span, ctx: &str) -> Result<String, Control>
     }
 }
 
+/// CNTR §3.2: extract the request-target PATH (incl. `?query`) from a URL for a
+/// `{socketPath}` verb-helper call. The host is ignored (a UDS has no host). A URL
+/// with no parseable path falls back to `/` (and a bare path that is already a
+/// request-target — e.g. `"/json"` — is returned verbatim).
+#[cfg(unix)]
+fn path_from_url(url: &str) -> String {
+    // Find the authority terminator: after "scheme://host", the first '/'/'?'/'#'.
+    let after_scheme = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => {
+            // No scheme: if it already looks like a request-target, use it verbatim.
+            if url.starts_with('/') {
+                return url.to_string();
+            }
+            url
+        }
+    };
+    match after_scheme.find(['/', '?', '#']) {
+        Some(i) => {
+            let rest = &after_scheme[i..];
+            // Strip a trailing '#fragment' (not sent on the wire).
+            match rest.find('#') {
+                Some(h) => rest[..h].to_string(),
+                None => rest.to_string(),
+            }
+        }
+        None => "/".to_string(),
+    }
+}
+
+/// CNTR §3.2: URL-encode query pairs (`a=1&b=2`) for a UDS request-target. The TCP
+/// path uses reqwest's `.query()`; here we encode the same `Vec<(String,String)>`.
+#[cfg(unix)]
+fn encode_query_pairs(pairs: &[(String, String)]) -> String {
+    fn enc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{:02X}", b)),
+            }
+        }
+        out
+    }
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// CNTR §3.2: the whole-request timeout (ms) for the UDS path. Mirrors the TCP
+/// `timeout {connect, read, total}` precedence: `total` wins, else `read`, else
+/// `connect` (the UDS path has no connect/read split, so all collapse to ONE
+/// whole-request bound). `None` ⇒ no timeout.
+#[cfg(unix)]
+fn parse_total_timeout_ms(opts: &Value, span: Span) -> Result<Option<u64>, Control> {
+    let t = match opt_field(opts, "timeout") {
+        None => return Ok(None),
+        Some(t) => t,
+    };
+    let o = match t.kind() {
+        ValueKind::Object(o) => o,
+        _ => {
+            return Err(AsError::at(
+                format!(
+                    "net/http timeout expects an object, got {}",
+                    crate::interp::type_name(&t)
+                ),
+                span,
+            )
+            .into())
+        }
+    };
+    let ms = num_field(o, "total")
+        .or_else(|| num_field(o, "read"))
+        .or_else(|| num_field(o, "connect"));
+    Ok(ms.map(|m| m.max(0.0) as u64))
+}
+
+/// CNTR §3.2: build the response metadata `fields` from an http1 UDS response in the
+/// SAME shape as `http_response_fields` (status/ok/version/url/headers/cookies/
+/// trailers). `url` is synthesized as `unix://<socketPath>` (the TCP path's
+/// `resp.url` is the request URL; a UDS request has no URL, so we surface the socket).
+#[cfg(unix)]
+fn uds_response_fields(
+    resp: &crate::stdlib::http1::Http1Response<tokio::net::UnixStream>,
+    socket_path: &str,
+) -> IndexMap<String, Value> {
+    let mut fields = IndexMap::new();
+    // NUM §4: an HTTP status code is an `Int`.
+    fields.insert("status".to_string(), Value::int(i64::from(resp.status)));
+    fields.insert(
+        "ok".to_string(),
+        Value::bool_((200..300).contains(&resp.status)),
+    );
+    // The http1 codec speaks HTTP/1.1. Match the TCP path's `http_version_str` form
+    // ("1.1", NOT "HTTP/1.1") so `resp.version` is byte-identical across transports.
+    fields.insert("version".to_string(), Value::str("1.1"));
+    fields.insert(
+        "url".to_string(),
+        Value::str(format!("unix://{}", socket_path)),
+    );
+
+    // headers: object of lowercased name → value (last value wins), Set-Cookie folded
+    // into `cookies` — byte-identical to the TCP path's `http_response_fields`.
+    let mut headers = IndexMap::new();
+    let mut cookies = IndexMap::new();
+    for (name, value) in resp.headers.iter() {
+        let key = name.to_ascii_lowercase();
+        if key == "set-cookie" {
+            if let Some((k, v)) = parse_set_cookie(value) {
+                cookies.insert(k, Value::str(v));
+            }
+        }
+        headers.insert(key, Value::str(value.clone()));
+    }
+    fields.insert("headers".to_string(), obj(headers));
+    fields.insert("cookies".to_string(), obj(cookies));
+    fields.insert("trailers".to_string(), obj(IndexMap::new()));
+    fields
+}
+
 impl Interp {
     /// Module-level dispatch for `std/net/http` (the verbs + `request`).
     pub(crate) async fn call_http(
@@ -906,6 +1043,17 @@ impl Interp {
                 let method = func.to_ascii_uppercase();
                 let url = want_string(&arg(args, 0), span, &format!("net/http.{}", func))?;
                 let opts = arg(args, 1);
+                // CNTR §3.2: a verb helper with `socketPath` routes to the http1 UDS
+                // client. The URL's PATH is the request-target; the host is ignored (a
+                // UDS endpoint has no host).
+                #[cfg(unix)]
+                if let Some(sp) = opt_field(&opts, "socketPath") {
+                    let socket_path = want_string(&sp, span, "net/http socketPath")?.to_string();
+                    let path = path_from_url(&url);
+                    return self
+                        .call_http_send_uds(&method, &socket_path, &path, &opts, span)
+                        .await;
+                }
                 self.call_http_send(&method, url.to_string(), &opts, span)
                     .await
             }
@@ -917,6 +1065,20 @@ impl Interp {
                     }
                     None => "GET".to_string(),
                 };
+                // CNTR §3.2: `request({socketPath, path, …})` routes to the http1 UDS
+                // client. `socketPath` is checked BEFORE `opts.url` is required — a UDS
+                // request has no URL, only a `path` request-target.
+                #[cfg(unix)]
+                if let Some(sp) = opt_field(&opts, "socketPath") {
+                    let socket_path = want_string(&sp, span, "net/http socketPath")?.to_string();
+                    let path = match opt_field(&opts, "path") {
+                        Some(p) => want_string(&p, span, "net/http.request path")?.to_string(),
+                        None => "/".to_string(),
+                    };
+                    return self
+                        .call_http_send_uds(&method, &socket_path, &path, &opts, span)
+                        .await;
+                }
                 let url = match opt_field(&opts, "url") {
                     Some(u) => want_string(&u, span, "net/http.request url")?.to_string(),
                     None => {
@@ -1079,6 +1241,265 @@ impl Interp {
             ))
         } else {
             Ok(make_pair(self.http_response_value(resp), Value::nil()))
+        }
+    }
+
+    /// CNTR §3.2: build + send one request over a `{socketPath}` Unix-domain socket
+    /// using the hardened http1 client codec (reqwest cannot speak HTTP/1.1 over a
+    /// `UnixStream`). The returned Tier-1 `[resp, err]` pair's `resp` is
+    /// SCRIPT-VISIBLY IDENTICAL to the TCP path: the same `status`/`ok`/`version`/
+    /// `headers`/`cookies` fields and the same `text()/bytes()/json()/json(Class)`
+    /// buffered accessors (or streaming `body.read()` when `opts.stream:true`).
+    ///
+    /// Differences from the reqwest path (documented, not silent):
+    ///   - `path` is the request-target; the host is ignored (a UDS has no host), so
+    ///     `opts.query` pairs are merged onto `path`.
+    ///   - The timeout is a WHOLE-REQUEST `tokio::time::timeout` around the entire
+    ///     connect+send+buffer (the UDS path has no reqwest connect/read split).
+    ///   - A STREAMING request body (`body:{stream:…}`) is unsupported (buffered
+    ///     bodies only) — a clear Tier-2 panic.
+    #[cfg(unix)]
+    async fn call_http_send_uds(
+        &self,
+        method: &str,
+        socket_path: &str,
+        path: &str,
+        opts: &Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::stdlib::http1;
+        // §3.1 carve-out (stage-2): enforce a `net` carve-out against the resolved
+        // socket path BEFORE connecting. Gate-12: no carve-out → immediate Ok.
+        self.check_unix_path(socket_path, span)?;
+
+        // Build the request-target: merge `opts.query` onto `path` (the TCP path uses
+        // reqwest's `.query()`; here we append the encoded pairs to the target).
+        let mut target = path.to_string();
+        if let Some(q) = opt_field(opts, "query") {
+            let pairs = value_to_query_pairs(&q, span, "net/http query")?;
+            if !pairs.is_empty() {
+                let qs = encode_query_pairs(&pairs);
+                let sep = if target.contains('?') { '&' } else { '?' };
+                target.push(sep);
+                target.push_str(&qs);
+            }
+        }
+
+        // Headers: object of string→string (the same shape the TCP path accepts).
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(h) = opt_field(opts, "headers") {
+            let map = match h.kind() {
+                ValueKind::Object(o) => o,
+                _ => {
+                    return Err(AsError::at(
+                        format!(
+                            "net/http headers expects an object, got {}",
+                            crate::interp::type_name(&h)
+                        ),
+                        span,
+                    )
+                    .into())
+                }
+            };
+            for (k, v) in map.entries() {
+                let vs = scalar_to_string(&v, span, "net/http header")?;
+                headers.push((k.as_ref().to_string(), vs));
+            }
+        }
+
+        // Body: a buffered string / bytes / {json} / {form}. A STREAMING request body
+        // ({stream:…}) is NOT supported over the UDS client (it buffers request
+        // bodies) — a clear Tier-2 panic, never a silent drop or partial send.
+        let body_bytes: Option<Vec<u8>> = self.uds_request_body(opts, &mut headers, span)?;
+
+        // Connect (Tier-1 on failure), send + parse, all under one whole-request
+        // timeout if `opts.timeout` requests one.
+        let timeout_ms = parse_total_timeout_ms(opts, span)?;
+        let body_ref = body_bytes.as_deref();
+        let req = http1::Http1Request {
+            method,
+            path: &target,
+            headers,
+            body: body_ref,
+        };
+
+        let stream_resp = matches!(
+            opt_field(opts, "stream").map(|x| x.into_kind()),
+            Some(OwnedKind::Bool(true))
+        );
+        let mode = if stream_resp {
+            BodyMode::parse(opts, span)?
+        } else {
+            BodyMode::Str
+        };
+
+        let drive = self.uds_drive_request(socket_path, &req, stream_resp, mode, span);
+        match timeout_ms {
+            Some(ms) => match tokio::time::timeout(
+                std::time::Duration::from_millis(ms),
+                drive,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Ok(err_pair(format!(
+                    "net/http {} {} timed out after {}ms",
+                    method, socket_path, ms
+                ))),
+            },
+            None => drive.await,
+        }
+    }
+
+    /// CNTR §3.2: connect to `socket_path`, send `req`, and adapt the http1 response
+    /// to the script-visible response value (buffered or streaming).
+    #[cfg(unix)]
+    async fn uds_drive_request(
+        &self,
+        socket_path: &str,
+        req: &crate::stdlib::http1::Http1Request<'_>,
+        stream_resp: bool,
+        mode: BodyMode,
+        _span: Span,
+    ) -> Result<Value, Control> {
+        use crate::stdlib::http1;
+        let stream = match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(err_pair(format!(
+                    "net/http: connect to unix socket '{}' failed: {}",
+                    socket_path, e
+                )))
+            }
+        };
+        let resp = match http1::send_request(stream, req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(err_pair(format!("net/http: {}", e))),
+        };
+
+        // Build the metadata fields (status/ok/version/url/headers/cookies/trailers)
+        // in the SAME shape as the TCP path — see `http_response_fields`.
+        let mut fields = uds_response_fields(&resp, socket_path);
+
+        let body = match resp.body {
+            http1::Http1Body::Stream(reader) => reader,
+            // 101 Switching Protocols has no place in a plain http.request (that is the
+            // Phase-4 exec/attach hijack path); treat the upgrade as a Tier-1 error here.
+            http1::Http1Body::Upgraded { .. } => {
+                return Ok(err_pair(
+                    "net/http: server returned 101 Switching Protocols (upgrade not supported by http.request)".to_string(),
+                ))
+            }
+        };
+
+        if stream_resp {
+            // Streaming: wrap the http1 body's EXACT `ByteStream` in the SAME
+            // `HttpBodyState`/`HttpBody` reader the TCP stream path uses, so
+            // `resp.body.read()/readLine()/readToEnd()` is byte-identical.
+            let body_handle = self.register_resource(
+                NativeKind::HttpBody,
+                IndexMap::new(),
+                ResourceState::HttpBody(HttpBodyState::from_byte_stream(
+                    body.into_byte_stream(),
+                    mode,
+                )),
+            );
+            fields.insert("body".to_string(), body_handle);
+            // Mint the response handle WITHOUT a live backing resource (the body owns
+            // the stream) — mirrors `http_streaming_response_value`.
+            let handle =
+                self.register_resource(NativeKind::HttpResponse, fields, ResourceState::Closed);
+            if let ValueKind::Native(n) = handle.kind() {
+                self.take_resource(n.id);
+            }
+            Ok(make_pair(handle, Value::nil()))
+        } else {
+            // Buffered: read the whole body up-front (bounded by MAX_ALLOC_COUNT) and
+            // store it so `text()/bytes()/json()` produce the SAME surface as a
+            // reqwest `Response`.
+            let buf = match body.read_to_end(super::MAX_ALLOC_COUNT as usize).await {
+                Ok(b) => b,
+                Err(e) => return Ok(err_pair(format!("net/http: {}", e))),
+            };
+            let handle = self.register_resource(
+                NativeKind::HttpResponse,
+                fields,
+                ResourceState::HttpBufferedResponse(buf),
+            );
+            Ok(make_pair(handle, Value::nil()))
+        }
+    }
+
+    /// CNTR §3.2: extract a buffered request body for the UDS path. Supports the same
+    /// buffered shapes as the TCP path (string / bytes / `{json}` / `{form}`) and sets
+    /// `Content-Type` accordingly. A STREAMING request body (`{stream:…}`) is a clear
+    /// Tier-2 panic — the UDS client buffers request bodies.
+    #[cfg(unix)]
+    fn uds_request_body(
+        &self,
+        opts: &Value,
+        headers: &mut Vec<(String, String)>,
+        span: Span,
+    ) -> Result<Option<Vec<u8>>, Control> {
+        let b = match opt_field(opts, "body") {
+            None => return Ok(None),
+            Some(b) => b,
+        };
+        match b.kind() {
+            ValueKind::Str(s) => Ok(Some(s.as_bytes().to_vec())),
+            ValueKind::Bytes(by) => Ok(Some(by.borrow().clone())),
+            ValueKind::Object(o) => {
+                if o.get("stream").is_some() {
+                    return Err(AsError::at(
+                        "net/http: a streaming request body (body:{stream}) is not supported over a socketPath (UDS) request — the UDS client buffers request bodies; use a string/bytes/{json}/{form} body",
+                        span,
+                    )
+                    .into());
+                }
+                if let Some(jv) = o.get("json") {
+                    let json = crate::stdlib::json::from_ascript(&jv, &mut Vec::new())
+                        .map_err(|m| {
+                            Control::from(AsError::at(format!("net/http body.json: {}", m), span))
+                        })?;
+                    let bytes = serde_json::to_vec(&json).map_err(|e| {
+                        Control::from(AsError::at(format!("net/http body.json: {}", e), span))
+                    })?;
+                    if !headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    {
+                        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+                    }
+                    Ok(Some(bytes))
+                } else if let Some(form) = o.get("form") {
+                    let pairs = value_to_query_pairs(&form, span, "net/http body.form")?;
+                    let encoded = encode_query_pairs(&pairs);
+                    if !headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    {
+                        headers.push((
+                            "Content-Type".to_string(),
+                            "application/x-www-form-urlencoded".to_string(),
+                        ));
+                    }
+                    Ok(Some(encoded.into_bytes()))
+                } else {
+                    Err(AsError::at(
+                        "net/http body object must be {json}, {form}, or {stream}; over a socketPath request {multipart} and {stream} are unsupported",
+                        span,
+                    )
+                    .into())
+                }
+            }
+            _ => Err(AsError::at(
+                format!(
+                    "net/http body must be a string, bytes, or an object, got {}",
+                    crate::interp::type_name(&b)
+                ),
+                span,
+            )
+            .into()),
         }
     }
 
@@ -1491,6 +1912,13 @@ impl Interp {
         let method = m.method.as_str();
         match method {
             "text" | "bytes" | "json" => {
+                // CNTR §3.2: a buffered UDS response stores its body bytes directly
+                // (no live `reqwest::Response`). Produce the SAME `[value, err]`
+                // surface from those bytes — text (UTF-8-lossy), bytes, json/json(Class).
+                #[cfg(unix)]
+                if let Some(buf) = self.take_http_buffered(id) {
+                    return self.uds_body_accessor(method, buf, args, span).await;
+                }
                 let resp = match self.take_http_response(id) {
                     Some(r) => r,
                     None => {
@@ -1577,6 +2005,63 @@ impl Interp {
             other => {
                 Err(AsError::at(format!("httpResponse has no method '{}'", other), span).into())
             }
+        }
+    }
+
+    /// CNTR §3.2: produce the `text()/bytes()/json()/json(Class)` `[value, err]` pair
+    /// from a buffered UDS response's body bytes. The `json` arm REUSES the exact same
+    /// typed-parse dispatch as the reqwest path (Class → `validate_into`; tagged-schema
+    /// Object → `parse_value`; else raw) so the script-visible surface is identical.
+    #[cfg(unix)]
+    #[async_recursion::async_recursion(?Send)]
+    async fn uds_body_accessor(
+        &self,
+        method: &str,
+        buf: Vec<u8>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match method {
+            "text" => Ok(make_pair(
+                Value::str(String::from_utf8_lossy(&buf).into_owned()),
+                Value::nil(),
+            )),
+            "bytes" => Ok(make_pair(bytes_value(buf), Value::nil())),
+            "json" => match serde_json::from_slice::<serde_json::Value>(&buf) {
+                Ok(jv) => {
+                    let val = crate::stdlib::json::to_ascript(&jv);
+                    if let Some(ValueKind::Class(c)) = args.first().map(|x| x.kind()) {
+                        let strict = matches!(
+                            args.get(1).map(|x| x.kind()),
+                            Some(ValueKind::Bool(true))
+                        );
+                        match self.validate_into(c, &val, strict, "", span).await {
+                            Ok(inst) => Ok(make_pair(inst, Value::nil())),
+                            Err(e) => Ok(err_pair(e.message)),
+                        }
+                    } else if let Some(schema_val) = args.first() {
+                        if crate::stdlib::schema::schema_kind(schema_val).is_some() {
+                            let schema_val = schema_val.clone();
+                            match self.parse_value(&schema_val, &val, "", false, span).await {
+                                Ok(v) => Ok(make_pair(v, Value::nil())),
+                                Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
+                                    Ok(make_pair(Value::nil(), e))
+                                }
+                                Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
+                                    Err(crate::error::AsError::at(msg, span).into())
+                                }
+                                Err(crate::stdlib::schema::ParseFail::Control(c)) => Err(c),
+                            }
+                        } else {
+                            Ok(make_pair(val, Value::nil()))
+                        }
+                    } else {
+                        Ok(make_pair(val, Value::nil()))
+                    }
+                }
+                Err(e) => Ok(err_pair(format!("response.json failed: {}", e))),
+            },
+            _ => unreachable!("uds_body_accessor only handles text/bytes/json"),
         }
     }
 
@@ -3397,5 +3882,372 @@ print(err.code)
                 drop(listener);
             })
             .await;
+    }
+
+    // ---- CNTR §3.2: {socketPath} routing over the http1 UDS client ----------
+    //
+    // A `socketPath` request speaks HTTP/1.1 over a `UnixStream` (Docker's socket
+    // shape). The script-visible surface (status/headers/text()/json()/json(Class)/
+    // streaming body.read()) MUST be byte-identical to a TCP request. These tests
+    // spawn an in-test UDS HTTP/1.1 server and assert that parity, plus the §3.1
+    // carve-out, the streaming-request-body refusal, and the non-unix platform error.
+    #[cfg(unix)]
+    mod uds {
+        use super::run_on;
+        use crate::interp::Interp;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        /// A throwaway UDS path under the temp dir that unlinks on drop.
+        struct UdsTemp {
+            path: std::path::PathBuf,
+        }
+        impl Drop for UdsTemp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        fn uds_temp_path(tag: &str) -> UdsTemp {
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!(
+                "ascript-http-uds-{}-{}-{}.sock",
+                tag,
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_file(&path);
+            UdsTemp { path }
+        }
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        /// Spawn an in-test UDS HTTP/1.1 server. Reads one request head (best-effort),
+        /// routes on the request-target path, writes a canned HTTP/1.1 response, and
+        /// closes the connection. Routes:
+        ///   /text     → 200 text/plain "hello" (Content-Length)
+        ///   /json     → 200 application/json {"ok":true} (Content-Length)
+        ///   /chunked  → 200 Transfer-Encoding: chunked, three data chunks then terminal 0
+        /// Returns the socket path string (kept alive by the returned guard).
+        fn spawn_uds_http_fixture() -> (String, UdsTemp) {
+            let tmp = uds_temp_path("fixture");
+            let path = tmp.path.to_str().unwrap().to_string();
+            let listener = UnixListener::bind(&tmp.path).expect("bind uds");
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = match listener.accept().await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        // Read the request head (up to the blank line) so the client's
+                        // write completes; we only need the request-target path.
+                        let mut buf = Vec::new();
+                        let mut byte = [0u8; 1];
+                        loop {
+                            match stream.read(&mut byte).await {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    buf.push(byte[0]);
+                                    if buf.ends_with(b"\r\n\r\n") {
+                                        break;
+                                    }
+                                    if buf.len() > 64 * 1024 {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buf);
+                        let target = head
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let resp: Vec<u8> = match target.as_str() {
+                            // NOTE: no Content-Type here — the TCP hyper fixture's
+                            // /text route also omits it, so the surface-parity test
+                            // (which prints resp.headers["content-type"]) sees nil on
+                            // BOTH paths. /textct below is the with-content-type route.
+                            "/text" => b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+                            "/textct" => b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+                            "/json" => b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}".to_vec(),
+                            "/chunked" => b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nchunk1\n\r\n7\r\nchunk2\n\r\n7\r\nchunk3\n\r\n0\r\n\r\n".to_vec(),
+                            _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope".to_vec(),
+                        };
+                        let _ = stream.write_all(&resp).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+            (path, tmp)
+        }
+
+        async fn run(src: &str) -> String {
+            crate::run_source(src).await.expect("program should run")
+        }
+
+        #[tokio::test]
+        async fn http_request_over_socket_path_matches_tcp_surface() {
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/json", method: "GET" }})
+print(err)
+print(resp.status)
+let [v, jerr] = await resp.json()
+print(jerr)
+print(v.ok)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\n200\nnil\ntrue\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_text_status_headers_surface() {
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/textct" }})
+print(err)
+print(resp.status)
+print(resp.ok)
+print(resp.headers["content-type"])
+let [body, berr] = await resp.text()
+print(berr)
+print(body)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\n200\ntrue\ntext/plain\nnil\nhello\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_streaming_body_read_yields_chunks_then_nil() {
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/chunked", stream: true }})
+print(err)
+print(resp.status)
+let body = await resp.body.readToEnd()
+print(body)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\n200\nchunk1\nchunk2\nchunk3\n\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_typed_json_class_parse() {
+            let (sock, _g) = spawn_uds_http_fixture();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+class Ok {{ ok: bool }}
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/json" }})
+print(err)
+let [v, jerr] = await resp.json(Ok)
+print(jerr)
+print(v.ok)
+print(v instanceof Ok)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\nnil\ntrue\ntrue\n");
+        }
+
+        #[tokio::test]
+        async fn verb_helper_get_with_socket_path_extracts_url_path() {
+            let (sock, _g) = spawn_uds_http_fixture();
+            // The verb helper takes a URL; with socketPath the host is ignored and the
+            // URL's PATH is used as the request-target.
+            let src = format!(
+                r#"
+import {{ get }} from "std/net/http"
+let [resp, err] = await get("http://docker/json", {{ socketPath: "{sock}" }})
+print(err)
+print(resp.status)
+let [v, _je] = await resp.json()
+print(v.ok)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\n200\ntrue\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_streaming_request_body_is_clear_tier2() {
+            let (sock, _g) = spawn_uds_http_fixture();
+            // The UDS client buffers request bodies; a STREAMING request body
+            // (`body:{stream:…}`) is unsupported → a clear Tier-2 panic.
+            let interp = Interp::new();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/text", method: "POST", body: {{ stream: "abc" }} }})
+print(resp)
+"#
+            );
+            let res = run_on(&interp, &src).await;
+            match res {
+                Err(crate::interp::Control::Panic(e)) => {
+                    assert!(
+                        e.message.contains("streaming request body")
+                            && e.message.contains("socketPath"),
+                        "got: {}",
+                        e.message
+                    );
+                }
+                other => panic!("expected a streaming-request-body Tier-2 panic, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn socket_path_connect_failure_is_tier1_pair() {
+            // A socketPath that does not exist → a Tier-1 [nil, err] pair, never a panic.
+            let missing = uds_temp_path("missing");
+            let path = missing.path.to_str().unwrap().to_string();
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{path}", path: "/text" }})
+print(resp)
+print(err != nil)
+"#
+            );
+            assert_eq!(run(&src).await, "nil\ntrue\n");
+        }
+
+        #[tokio::test]
+        async fn socket_path_deny_net_scope_is_denied() {
+            use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+            let (sock, _g) = spawn_uds_http_fixture();
+            // A net carve-out with NO unix allow entry → the UDS request is denied at
+            // the §3.1 stage-2 carve-out (`check_unix_path`).
+            let interp = Interp::new();
+            let mut cs = CapSet::all_granted();
+            cs.set_net_scope(NetScope {
+                deny: NetDeny::All,
+                allow: vec![],
+            });
+            interp.set_caps(cs);
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/text" }})
+print(resp)
+"#
+            );
+            match run_on(&interp, &src).await {
+                Err(crate::interp::Control::Panic(e)) => {
+                    assert!(
+                        e.message.contains("net") && e.message.contains(&sock),
+                        "got: {}",
+                        e.message
+                    );
+                }
+                other => panic!("expected a net-carve-out denial, got {other:?}"),
+            }
+        }
+
+        // ---- explicit surface-parity battery: UDS == TCP shape -------------
+        //
+        // Run the SAME script body against the TCP hyper fixture and the UDS fixture
+        // and diff the printed output. The fixtures serve the SAME /text content
+        // ("hello", text/plain), so every script-visible field EXCEPT `resp.url`
+        // (intentionally `unix://…` vs `http://…` — documented) must match
+        // byte-for-byte.
+        #[tokio::test]
+        async fn surface_parity_text_uds_equals_tcp() {
+            let tcp_base = super::fixture::start().await;
+            let (sock, _g) = spawn_uds_http_fixture();
+            // A script that prints every comparable surface field (NOT url).
+            let probe = |req: &str| {
+                format!(
+                    r#"
+import * as http from "std/net/http"
+let [resp, err] = await {req}
+print(err)
+print(resp.status)
+print(resp.ok)
+print(resp.version)
+print(resp.headers["content-type"])
+print(type(resp.headers))
+let [body, berr] = await resp.text()
+print(berr)
+print(body)
+print(len(body))
+"#
+                )
+            };
+            let tcp_src = probe(&format!(r#"http.request({{ url: "{tcp_base}/text" }})"#));
+            let uds_src = probe(&format!(
+                r#"http.request({{ socketPath: "{sock}", path: "/text" }})"#
+            ));
+            let tcp_out = run(&tcp_src).await;
+            let uds_out = run(&uds_src).await;
+            assert_eq!(
+                tcp_out, uds_out,
+                "UDS surface must match TCP surface (except url); TCP=\n{tcp_out}\nUDS=\n{uds_out}"
+            );
+            // And the concrete value (status 200, ok true, version HTTP/1.1, no
+            // content-type → nil, body hello, len 5).
+            assert_eq!(
+                uds_out,
+                "nil\n200\ntrue\n1.1\nnil\nobject\nnil\nhello\n5\n"
+            );
+        }
+
+        // Streaming-body surface parity: the same `body.readToEnd()` reader idiom
+        // over a chunked response yields the SAME string both over TCP (/stream) and
+        // UDS (/chunked) — both emit "chunk1\nchunk2\nchunk3\n".
+        #[tokio::test]
+        async fn surface_parity_stream_uds_equals_tcp() {
+            let tcp_base = super::fixture::start().await;
+            let (sock, _g) = spawn_uds_http_fixture();
+            let probe = |req: &str| {
+                format!(
+                    r#"
+import * as http from "std/net/http"
+let [resp, _e] = await {req}
+print(resp.status)
+let body = await resp.body.readToEnd()
+print(type(body))
+print(body)
+"#
+                )
+            };
+            let tcp_src = probe(&format!(
+                r#"http.request({{ url: "{tcp_base}/stream", stream: true }})"#
+            ));
+            let uds_src = probe(&format!(
+                r#"http.request({{ socketPath: "{sock}", path: "/chunked", stream: true }})"#
+            ));
+            assert_eq!(run(&tcp_src).await, run(&uds_src).await);
+        }
+
+        #[tokio::test]
+        async fn socket_path_allow_carveout_admits_request() {
+            use crate::stdlib::caps::{CapSet, NetDeny, NetScope};
+            let (sock, _g) = spawn_uds_http_fixture();
+            let interp = Interp::new();
+            let canon = interp.unix_scope_key(&sock);
+            let mut cs = CapSet::all_granted();
+            cs.set_net_scope(NetScope {
+                deny: NetDeny::All,
+                allow: vec![canon],
+            });
+            interp.set_caps(cs);
+            let src = format!(
+                r#"
+import * as http from "std/net/http"
+let [resp, err] = await http.request({{ socketPath: "{sock}", path: "/json" }})
+print(err)
+print(resp.status)
+"#
+            );
+            run_on(&interp, &src).await.expect("exec");
+            assert_eq!(interp.output(), "nil\n200\n");
+        }
     }
 }

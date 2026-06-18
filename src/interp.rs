@@ -408,6 +408,14 @@ pub(crate) enum ResourceState {
     // second body accessor on the same handle is a use-after-consume Tier-2 panic.
     #[cfg(feature = "net")]
     HttpResponse(reqwest::Response),
+    // CNTR §3.2 std/net/http: a buffered response from the `{socketPath}` UDS http1
+    // client. reqwest cannot speak HTTP/1.1 over a `UnixStream`, so that path reads the
+    // body up-front (bounded) and stores the raw bytes here; `resp.text()/bytes()/json()/
+    // json(Class)` operate on these bytes to produce the SAME script-visible surface as
+    // a TCP `reqwest::Response`. Consumed by the first body accessor (use-after-consume
+    // is the same Tier-2 panic as `HttpResponse`).
+    #[cfg(all(feature = "net", unix))]
+    HttpBufferedResponse(Vec<u8>),
     // M14 std/net/http: a streaming response body (`opts.stream:true`). Wraps the
     // response's chunked byte stream in a `BufReader` so the §11.4 reader idiom
     // (`read(n?)`/`readLine()`/`readToEnd()`) applies verbatim. Finalized on EOF.
@@ -3092,6 +3100,28 @@ impl Interp {
             // Not an HttpResponse (or already gone): nothing to return. If it was a
             // different live resource, put it back is unnecessary — ids are unique
             // per kind by construction, so this branch means "already consumed".
+            _ => None,
+        }
+    }
+
+    /// CNTR §3.2: take the buffered UDS response body bytes behind a handle id,
+    /// removing it from the table. `None` if it was already consumed (a body accessor
+    /// took it) — the caller maps `None` to the same "already consumed" Tier-2 panic.
+    #[cfg(all(feature = "net", unix))]
+    pub(crate) fn take_http_buffered(&self, id: u64) -> Option<Vec<u8>> {
+        // Peek the kind WITHOUT removing: a non-buffered entry (e.g. a live reqwest
+        // `HttpResponse`) must be left intact for `take_http_response`. Removing it
+        // unconditionally would drop the reqwest response and make its body accessor
+        // fail with "already consumed".
+        let is_buffered = matches!(
+            self.resources.borrow().get(&id),
+            Some(ResourceState::HttpBufferedResponse(_))
+        );
+        if !is_buffered {
+            return None;
+        }
+        match self.resources.borrow_mut().remove(&id) {
+            Some(ResourceState::HttpBufferedResponse(b)) => Some(b),
             _ => None,
         }
     }
