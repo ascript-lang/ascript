@@ -216,6 +216,26 @@ pub(crate) fn make_error(msg: Value) -> Value {
     Value::object(map)
 }
 
+/// RESIL §3.1.3: test whether `v` is a Result pair `[_, err]` with `err != nil`.
+///
+/// Returns `Some(err)` if `v` is a 2-element array whose second element is
+/// non-nil; `None` otherwise (plain value, ok-pair `[v, nil]`, or not an array).
+/// This is the SAME shape test `ExprKind::Try` (`?` operator) uses (see `eval_expr`),
+/// extracted here so all four engine paths share a single predicate by construction.
+pub(crate) fn result_pair_err(v: &Value) -> Option<Value> {
+    match v.kind() {
+        crate::value::ValueKind::Array(a) => {
+            let b = a.borrow();
+            if b.len() == 2 && b[1] != Value::nil() {
+                Some(b[1].clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct ModuleEntry {
     pub env: Environment,
