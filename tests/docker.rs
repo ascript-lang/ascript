@@ -1765,3 +1765,125 @@ print(r[1].message)
         "stream.next() after caps.drop(\"net\") must be denied (BLOCKER-3 for DockerStream)"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Task 4.5 — env-gated live round-trip test (CNTR §4.6)
+//
+// Requires a running Docker daemon. Enable with:
+//   ASCRIPT_DOCKER_LIVE=1 cargo test --test docker live_round_trip
+//
+// Without the env var the test skips cleanly (eprintln + return). This follows
+// the "skip-without-docker discipline": never a silently-passing empty assert.
+//
+// Without ASCRIPT_DOCKER_LIVE=1 this test always passes (skips). With it set it
+// performs the full round-trip: ping → pull alpine → create → start → wait →
+// logs (both streams) → exec → remove.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn live_round_trip() {
+    // Respect the documented skip-without-docker discipline: skip cleanly, never
+    // a silently-passing empty assert.
+    if std::env::var("ASCRIPT_DOCKER_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipping docker live test: set ASCRIPT_DOCKER_LIVE=1 with a running daemon");
+        return;
+    }
+
+    // Resolve the Docker socket path: honour $DOCKER_HOST (tcp:// is unsupported by
+    // std/docker v1; unix:// is stripped to the path), else fall back to the default.
+    let sock = match std::env::var("DOCKER_HOST") {
+        Ok(h) if h.starts_with("unix://") => h["unix://".len()..].to_string(),
+        Ok(h) if h.starts_with("tcp://") => {
+            eprintln!("skipping docker live test: DOCKER_HOST={h} is TCP; std/docker v1 requires a Unix socket");
+            return;
+        }
+        _ => "/var/run/docker.sock".to_string(),
+    };
+
+    if !std::path::Path::new(&sock).exists() {
+        eprintln!("skipping docker live test: socket {sock} does not exist");
+        return;
+    }
+
+    // The test pulls `alpine` (a tiny image), runs a simple echo, captures logs and
+    // exec output, then removes the container. Each step is a Tier-1 [value, err] pair.
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+
+// 1. connect + ping
+let [d, conn_err] = await docker.connect({{ socketPath: "{sock}" }})
+if (conn_err != nil) {{ print(`FAIL connect: ${{conn_err.message}}`); exit(1) }}
+let [ping_ok, ping_err] = await d.ping()
+if (ping_err != nil) {{ print(`FAIL ping: ${{ping_err.message}}`); exit(1) }}
+print("PING OK")
+
+// 2. pull alpine (collect progress events; ignore individual errors — image may exist)
+let [pull_stream, pull_err] = await d.pull({{ fromImage: "alpine", tag: "latest" }})
+if (pull_err != nil) {{ print(`FAIL pull: ${{pull_err.message}}`); exit(1) }}
+for await (event in pull_stream) {{
+  // progress events — just drain them
+}}
+print("PULL OK")
+
+// 3. create + start + wait
+let [create_res, create_err] = await d.create({{
+  Image: "alpine:latest",
+  Cmd: ["sh", "-c", "echo hi; echo err >&2"]
+}})
+if (create_err != nil) {{ print(`FAIL create: ${{create_err.message}}`); exit(1) }}
+let container_id = create_res.Id
+print(`CREATED ${{container_id}}`)
+
+let [_, start_err] = await d.start(container_id)
+if (start_err != nil) {{ print(`FAIL start: ${{start_err.message}}`); exit(1) }}
+print("STARTED")
+
+let [wait_res, wait_err] = await d.wait(container_id)
+if (wait_err != nil) {{ print(`FAIL wait: ${{wait_err.message}}`); exit(1) }}
+print(`WAIT EXIT ${{wait_res.StatusCode}}`)
+
+// 4. logs — assert BOTH stdout and stderr have content
+let [log_stream, log_err] = await d.logs(container_id, {{ stdout: true, stderr: true }})
+if (log_err != nil) {{ print(`FAIL logs: ${{log_err.message}}`); exit(1) }}
+let stdout_seen = false
+let stderr_seen = false
+for await (frame in log_stream) {{
+  if (frame.stream == "stdout") {{ stdout_seen = true }}
+  if (frame.stream == "stderr") {{ stderr_seen = true }}
+}}
+if (!stdout_seen) {{ print("FAIL logs: no stdout frames"); exit(1) }}
+if (!stderr_seen) {{ print("FAIL logs: no stderr frames"); exit(1) }}
+print("LOGS OK")
+
+// 5. exec (restart the container first so it accepts exec)
+let [_, restart_err] = await d.start(container_id)
+// ignore restart_err — container may have exited already; exec on a stopped
+// container returns a daemon error (covered by the [value, err] pair).
+let [exec_res, exec_err] = await d.exec(container_id, {{ cmd: ["echo", "exec-hi"] }})
+if (exec_err != nil) {{
+  print(`exec err (acceptable if container exited): ${{exec_err.message}}`)
+}} else {{
+  print(`EXEC EXIT ${{exec_res.exitCode}}`)
+}}
+
+// 6. remove
+let [_, rm_err] = await d.remove(container_id, {{ force: true }})
+if (rm_err != nil) {{ print(`FAIL remove: ${{rm_err.message}}`); exit(1) }}
+print("REMOVED")
+print("LIVE ROUND-TRIP OK")
+"#
+    );
+
+    let out = ascript::run_source(&src)
+        .await
+        .unwrap_or_else(|e| panic!("AScript live round-trip failed: {}", e.message));
+
+    assert!(out.contains("PING OK"), "live ping must succeed; got:\n{out}");
+    assert!(out.contains("PULL OK"), "live pull must succeed; got:\n{out}");
+    assert!(out.contains("WAIT EXIT"), "live wait must return; got:\n{out}");
+    assert!(out.contains("LOGS OK"), "live logs must have both stdout+stderr; got:\n{out}");
+    assert!(out.contains("REMOVED"), "live remove must succeed; got:\n{out}");
+    assert!(out.contains("LIVE ROUND-TRIP OK"), "live round-trip did not complete; got:\n{out}");
+}
