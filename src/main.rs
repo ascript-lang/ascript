@@ -1,9 +1,27 @@
+// RT §2.2 — under the runtime-only build cfg, the toolchain `ascript` bin (clap CLI,
+// the checker/fmt/doc/pkg/repl/lsp/dap subcommands) is compiled OUT. This file's whole
+// body is gated `cfg(not(ascript_rt))`; the cfg build gets a tiny loud-error stub `main`
+// so `cargo build --bins` under the cfg still fails LOUDLY rather than confusingly. The
+// runtime entry point is the separate `ascript-rt` bin (`src/bin/ascript-rt.rs`).
+#[cfg(ascript_rt)]
+fn main() -> std::process::ExitCode {
+    eprintln!(
+        "error: this is a toolchain build misconfiguration — the `ascript` bin cannot be \
+         built with ASCRIPT_RT=1 (the front-end is compiled out under that cfg). \
+         ascript-rt is the runtime bin; build it with `scripts/build-rt.sh <tier>`."
+    );
+    std::process::ExitCode::from(2)
+}
+
+#[cfg(not(ascript_rt))]
 use std::process::ExitCode;
 
-#[cfg(feature = "pkg")]
+#[cfg(all(not(ascript_rt), feature = "pkg"))]
 mod pkg;
 
+#[cfg(not(ascript_rt))]
 use ascript::cli_surface::{CacheAction, CapFlags, Cli, Command};
+#[cfg(not(ascript_rt))]
 use clap::Parser;
 
 // SP3 §B: run the whole program on a worker thread with an enlarged
@@ -26,6 +44,7 @@ use clap::Parser;
 ///
 /// Returns `Ok(None)` when nothing is denied (all granted → the byte-identical
 /// default). A bad cap name / deny-mode (CLI or manifest) is a clean `Err`.
+#[cfg(not(ascript_rt))]
 fn compose_caps(
     _path: &std::path::Path,
     deny: &[String],
@@ -122,7 +141,7 @@ fn compose_caps(
 /// `speedscope`/`collapsed` use the wall-clock sampler thread, while the
 /// `deterministic-*` variants use the inline (call-structure-driven, golden-stable)
 /// clock with no thread.
-#[cfg(feature = "profile")]
+#[cfg(all(not(ascript_rt), feature = "profile"))]
 #[allow(clippy::too_many_arguments)]
 async fn run_profiled(
     path: &std::path::Path,
@@ -190,6 +209,7 @@ async fn run_profiled(
     ascript::run_file_on_vm_profiled(path, args, packages, caps, cfg).await
 }
 
+#[cfg(not(ascript_rt))]
 fn main() -> ExitCode {
     let worker = std::thread::Builder::new()
         .name("ascript-main".to_string())
@@ -208,6 +228,7 @@ fn main() -> ExitCode {
 /// Fold an analysis's diagnostics into the run's exit-status accumulators: an
 /// `Error`-severity diagnostic fails the run; a surviving `Warning` trips the run
 /// only when the file's effective config asks (`--deny-warnings` / toml).
+#[cfg(not(ascript_rt))]
 fn tally(
     analysis: &ascript::check::Analysis,
     config: &ascript::check::LintConfig,
@@ -228,6 +249,7 @@ fn tally(
 /// A machine-readable JSON array of the planned `--fix-dry-run` edits for `path`:
 /// `[{"path","start","end","replacement"}, ...]`. Hand-rolled (serde-free) to
 /// match the existing JSON renderer's posture.
+#[cfg(not(ascript_rt))]
 fn fix_edits_json(path: &str, edits: &[ascript::check::TextEdit]) -> String {
     fn esc(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 2);
@@ -273,45 +295,16 @@ fn fix_edits_json(path: &str, edits: &[ascript::check::TextEdit]) -> String {
 /// `Cli::parse()`. Once the `ASCRIPTB` magic is confirmed, a payload-read failure is a
 /// REPORTED error (exit 1), NOT a silent fall-through — the binary IS a bundle, so a confusing
 /// clap "missing subcommand" error would be wrong.
+#[cfg(not(ascript_rt))]
 async fn try_run_embedded() -> Option<ExitCode> {
-    use std::io::{Read, Seek, SeekFrom};
-    const FOOTER_SIZE: usize = ascript::bundle::FOOTER_SIZE;
-
-    let exe = std::env::current_exe().ok()?;
-    let mut f = std::fs::File::open(&exe).ok()?;
-    let exe_len = f.metadata().ok()?.len();
-    if exe_len < FOOTER_SIZE as u64 {
-        return None;
-    }
-    // Read ONLY the trailing footer (cheap), validate against the file length.
-    f.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).ok()?;
-    let mut footer = [0u8; FOOTER_SIZE];
-    f.read_exact(&mut footer).ok()?;
-    let (offset, len) = ascript::bundle::validate_footer(&footer, exe_len)?;
-
-    // It IS a bundle (the `ASCRIPTB` magic is confirmed) — from here a read failure is a
-    // REPORTED error, NOT a silent fall-through to clap. A transient I/O error (e.g. EINTR
-    // under load) on the payload read used to `.ok()?` → `None` → `Cli::parse()` → clap's
-    // confusing "missing subcommand" usage error; the binary IS a bundle, so surface it.
-    let mut payload = vec![0u8; len];
-    if let Err(e) = f
-        .seek(SeekFrom::Start(offset as u64))
-        .and_then(|_| f.read_exact(&mut payload))
-    {
-        eprintln!("error: failed to read embedded program: {e}");
-        return Some(ExitCode::from(1));
-    }
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = match ascript::run_embedded_aso(&payload, &args).await {
-        Ok(code) => code,
-        Err(e) => {
-            ascript::diagnostics::report(&e);
-            1
-        }
-    };
-    Some(ExitCode::from(code as u8))
+    // RT §2.4: the shim body is shared with the `ascript-rt` bin — ONE implementation
+    // in `ascript::run_embedded_if_bundled`. Map its `Option<i32>` to an `ExitCode`.
+    ascript::run_embedded_if_bundled()
+        .await
+        .map(|code| ExitCode::from(code as u8))
 }
 
+#[cfg(not(ascript_rt))]
 async fn real_main() -> ExitCode {
     // BIN §2.3: a bundled binary runs its embedded program BEFORE clap ever sees argv — so
     // `./app a b --c` forwards `[a, b, --c]` to the program, never as ascript subcommands.
@@ -525,6 +518,12 @@ async fn real_main() -> ExitCode {
             strip,
             native,
             target,
+            stub,
+            no_fetch,
+            exact,
+            compress,
+            tier,
+            report_json,
             pgo,
             caps: CapFlags { deny, sandbox, deny_net, deny_fs },
         } => {
@@ -549,9 +548,34 @@ async fn real_main() -> ExitCode {
                 }
             };
             if native {
-                // BIN: bundle a self-contained native executable. `--target` is
-                // host-only in v1 (build_native returns the specific Tier-1 error).
-                match ascript::build_native(src, out_path, target.as_deref(), caps, elide) {
+                // RT §4.4: parse the optional `--tier` override into a `Tier` (a clear
+                // error for an unknown name, never a silent ignore).
+                let parsed_tier = match tier.as_deref() {
+                    None => None,
+                    Some(name) => match ascript::rtstub::tiers::Tier::parse(name) {
+                        Some(t) => Some(t),
+                        None => {
+                            eprintln!(
+                                "error: unknown --tier '{name}' (expected one of: \
+                                 rt-core, rt-local, rt-net, rt-full)"
+                            );
+                            return ExitCode::from(1);
+                        }
+                    },
+                };
+                // BIN/RT: bundle a self-contained native executable, resolving the stub
+                // via the §5.4 ladder (--stub → cache → fetch → sibling → current_exe).
+                let opts = ascript::NativeBuildOpts {
+                    target: target.clone(),
+                    tier: parsed_tier,
+                    compress,
+                    report_json: report_json.clone(),
+                    stub: stub.as_deref().map(std::path::PathBuf::from),
+                    no_fetch,
+                    strip,
+                    exact,
+                };
+                match ascript::build_native(src, out_path, caps, elide, &opts).await {
                     Ok(_) => ExitCode::SUCCESS, // build_native prints `bundled … -> …`
                     Err(e) => {
                         ascript::diagnostics::report(&e);
@@ -1014,7 +1038,7 @@ async fn real_main() -> ExitCode {
 /// DX D1: `ascript doc` — discover `.as` files, build the doc model (static CST
 /// walk, never the interpreter), and emit Markdown / HTML, or `--check` for
 /// undocumented public symbols.
-#[cfg(feature = "doc")]
+#[cfg(all(not(ascript_rt), feature = "doc"))]
 fn run_doc(
     paths: Vec<String>,
     out: Option<String>,
@@ -1194,7 +1218,7 @@ fn run_doc(
 /// Lexically canonicalize a path (resolve `.`/`..`) WITHOUT touching the
 /// filesystem, mirroring the workspace index's keying so `Doc` can look a source
 /// file up by its indexed key.
-#[cfg(feature = "doc")]
+#[cfg(all(not(ascript_rt), feature = "doc"))]
 fn lexical_canon(path: &std::path::Path) -> std::path::PathBuf {
     let mut out = std::path::PathBuf::new();
     for comp in path.components() {
@@ -1214,7 +1238,7 @@ fn lexical_canon(path: &std::path::Path) -> std::path::PathBuf {
 /// module's root-relative display name (finding 1). With a single file, the root
 /// is its parent directory (so the name is the bare stem). Empty input → the
 /// current dir.
-#[cfg(feature = "doc")]
+#[cfg(all(not(ascript_rt), feature = "doc"))]
 fn common_root(files: &[std::path::PathBuf]) -> std::path::PathBuf {
     use std::path::{Path, PathBuf};
     // Each file's parent directory; the common root is the shared prefix of those.
@@ -1237,7 +1261,7 @@ fn common_root(files: &[std::path::PathBuf]) -> std::path::PathBuf {
 
 /// Best-effort open of the generated index in the default browser (`sys`-gated;
 /// a no-op with a hint otherwise).
-#[cfg(all(feature = "doc", feature = "sys"))]
+#[cfg(all(not(ascript_rt), feature = "doc", feature = "sys"))]
 fn open_in_browser(path: &std::path::Path) {
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -1250,7 +1274,7 @@ fn open_in_browser(path: &std::path::Path) {
 }
 
 /// `--open` fallback when `sys` is not compiled in.
-#[cfg(all(feature = "doc", not(feature = "sys")))]
+#[cfg(all(not(ascript_rt), feature = "doc", not(feature = "sys")))]
 fn open_in_browser(path: &std::path::Path) {
     eprintln!(
         "note: --open requires the 'sys' feature; the docs are at {}",
@@ -1260,7 +1284,7 @@ fn open_in_browser(path: &std::path::Path) {
 
 /// Map a package-command `Result<(), String>` to an exit code (clear error to
 /// stderr on failure).
-#[cfg(feature = "pkg")]
+#[cfg(all(not(ascript_rt), feature = "pkg"))]
 fn pkg_command_exit(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,

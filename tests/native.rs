@@ -73,8 +73,12 @@ fn tmp_dir(tag: &str) -> TmpDir {
 /// [`serial_native`] (so concurrent builds don't overrun a space-constrained volume); this
 /// function does not lock itself, because some tests build twice and a self-lock would deadlock.
 fn build_native(src: &Path, out: &Path) {
+    // `--no-fetch` keeps these hermetic: the default ladder would otherwise try the network
+    // fetch rung (rung 3) before falling through to current_exe (rung 5). Skipping it goes
+    // straight to current_exe — the same stub these tests have always used — with no network
+    // dependency or latency. Default behavior at rung 5 is unchanged.
     let o = Command::new(bin())
-        .args(["build", "--native"])
+        .args(["build", "--native", "--no-fetch"])
         .arg(src)
         .arg("-o")
         .arg(out)
@@ -333,31 +337,67 @@ fn native_worker_bundle_parity() {
     let _ = std::fs::remove_dir_all(&empty);
 }
 
-/// `--target` is parsed-but-rejected in v1 with a SPECIFIC message naming the triple (not a
-/// generic clap error, not a silent ignore — Gate 6/10), and `--target` without `--native`
-/// is a usage error.
+/// RT §6.3 — the `--target` contract (REWRITTEN from the v1 rejection pin; coverage never
+/// shrinks). Three cases:
+///   (a) an UNKNOWN triple → error listing the supported target set;
+///   (b) a KNOWN triple with `--no-fetch` and no other rung → the ladder-exhausted error
+///       naming each rung's reason (a cross target has no sibling/current_exe fallback);
+///   (c) `--target` WITHOUT `--native` is still a clap usage error.
+/// (Case `--target <host> --stub <rt bin>` builds-and-runs — covered in tests/rt_stub.rs
+/// where a real `ascript-rt` is available via `ASCRIPT_RT_BIN`.)
 #[test]
-fn native_target_is_rejected_and_requires_native() {
+fn native_target_contract() {
+    let _serial = serial_native();
     let dir = tmp_dir("target");
     let src = write(&dir, "p.as", "print(1)\n");
 
-    // --target with --native → specific cross-compile Tier-1 error, exit 1.
+    // (a) Unknown triple → error listing the supported set, exit 1.
     let o = Command::new(bin())
-        .args(["build", "--native", "--target", "x86_64-unknown-linux-gnu"])
+        .args(["build", "--native", "--target", "sparc-unknown-weird-os"])
         .arg(&src)
         .arg("-o")
-        .arg(dir.join("x"))
+        .arg(dir.join("xa"))
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(1), "cross-compile must exit 1");
+    assert_eq!(o.status.code(), Some(1), "unknown target must exit 1");
     let msg = String::from_utf8_lossy(&o.stderr);
     assert!(
-        msg.contains("cross-compilation is not yet supported")
-            && msg.contains("x86_64-unknown-linux-gnu"),
-        "expected the specific cross-compile error naming the triple, got: {msg}"
+        msg.contains("unknown --target") && msg.contains("Supported targets"),
+        "expected the unknown-target error listing supported targets, got: {msg}"
+    );
+    // The error must actually name a real supported triple.
+    assert!(
+        msg.contains("x86_64-unknown-linux-musl"),
+        "supported-targets list must include the musl triple, got: {msg}"
     );
 
-    // --target WITHOUT --native → clap usage error (non-zero, not 1).
+    // (b) A KNOWN cross triple (not the host) with --no-fetch and no stub → the ladder is
+    // exhausted after the fetch rung (a cross target has no sibling/current_exe fallback);
+    // the error names the target and points at --stub/--exact, exit 1.
+    let cross = if cfg!(target_arch = "x86_64") {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    };
+    let o = Command::new(bin())
+        .args(["build", "--native", "--no-fetch", "--target", cross])
+        .arg(&src)
+        .arg("-o")
+        .arg(dir.join("xb"))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "unreachable cross target must exit 1");
+    let msg = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        msg.contains("no stub available for target") && msg.contains(cross),
+        "expected the ladder-exhausted error naming the target, got: {msg}"
+    );
+    assert!(
+        msg.contains("--stub") || msg.contains("--exact"),
+        "ladder-exhausted error must point at --stub/--exact, got: {msg}"
+    );
+
+    // (c) --target WITHOUT --native → clap usage error (non-zero, not 1).
     let o = Command::new(bin())
         .args(["build", "--target", "x86_64-unknown-linux-gnu"])
         .arg(&src)
@@ -365,6 +405,145 @@ fn native_target_is_rejected_and_requires_native() {
         .unwrap();
     assert!(!o.status.success(), "--target without --native must fail");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RT §5.4 rung 5 — the DEFAULT host build (no `--stub`/`--target`, and `--no-fetch` so the
+/// network rung never delays) ends at the `current_exe` rung: it still produces a runnable
+/// bundle (today's exact behavior) AND prints EXACTLY ONE stderr warning naming the fallback.
+/// Default behavior preservation is the load-bearing invariant of Task 7.
+#[test]
+fn native_current_exe_fallback_warns_once_and_runs() {
+    let _serial = serial_native();
+    let dir = tmp_dir("curexe_warn");
+    let src = write(&dir, "p.as", "print(\"from current_exe stub\")\n");
+    let app = dir.join("p_app");
+
+    // Copy the toolchain into an ISOLATED dir so `current_exe()` has NO `ascript-rt` sibling
+    // (a normal `cargo build` also produces `target/<profile>/ascript-rt`, which would
+    // otherwise win at rung 4). With no sibling and `--no-fetch`, the ladder must fall to
+    // rung 5 (current_exe) and emit the one-time warning — the path this test pins.
+    let iso = dir.join("ascript");
+    std::fs::copy(bin(), &iso).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&iso, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let o = Command::new(&iso)
+        .args(["build", "--native", "--no-fetch"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "default --native build must succeed: stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    let warn_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("bundling onto the full toolchain binary"))
+        .collect();
+    assert_eq!(
+        warn_lines.len(),
+        1,
+        "expected EXACTLY ONE current_exe fallback warning; got {}:\n{stderr}",
+        warn_lines.len()
+    );
+
+    // The bundle still runs (today's behavior preserved).
+    let cwd = tmp_dir("curexe_warn_cwd");
+    let r = run_bundle(&app, &cwd, &[]);
+    assert!(
+        r.status.success(),
+        "current_exe-stub bundle must run: stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout),
+        "from current_exe stub\n"
+    );
+}
+
+/// RT §5.4 rung 4 — when an `ascript-rt` sits BESIDE the toolchain binary, the ladder picks
+/// it (the dev-sibling rung) over `current_exe()`. Copies the toolchain AND an `ascript-rt`
+/// into an isolated dir, runs the toolchain copy to build a bundle, and asserts the build
+/// report names `stub: sibling` (and the bundle runs).
+#[test]
+fn native_sibling_rung_is_chosen() {
+    let _serial = serial_native();
+    let dir = tmp_dir("sibling_rung");
+    let src = write(&dir, "p.as", "print(\"via sibling stub\")\n");
+    let app = dir.join("p_app");
+
+    // Isolated dir with BOTH binaries side-by-side.
+    let iso_tc = dir.join("ascript");
+    let iso_rt = dir.join(if cfg!(windows) { "ascript-rt.exe" } else { "ascript-rt" });
+    std::fs::copy(bin(), &iso_tc).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_ascript-rt"), &iso_rt).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&iso_tc, &iso_rt] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let o = Command::new(&iso_tc)
+        .args(["build", "--native", "--no-fetch"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "sibling-rung build must succeed: stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("stub:    sibling"),
+        "the build report must name the sibling rung; stderr:\n{stderr}"
+    );
+    // And NO current_exe fallback warning (the sibling rung short-circuited it).
+    assert!(
+        !stderr.contains("bundling onto the full toolchain binary"),
+        "sibling rung must NOT emit the current_exe fallback warning; stderr:\n{stderr}"
+    );
+
+    let cwd = tmp_dir("sibling_rung_cwd");
+    let r = run_bundle(&app, &cwd, &[]);
+    assert!(r.status.success(), "sibling-stub bundle must run: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(String::from_utf8_lossy(&r.stdout), "via sibling stub\n");
+}
+
+/// RT Task 1 — the NORMAL `ascript build --help` surface must be untouched by the
+/// `src/main.rs` cfg surgery. RT gates the whole legacy `main` under `cfg(ascript_rt)`
+/// (a tiny loud-error stub) and adds the `ascript-rt` bin; this test pins that a plain
+/// (non-rt) build still parses `build --help` cleanly and lists today's flags, so a
+/// regression in the clap CLI surface from the main-file gating is caught.
+#[test]
+fn normal_build_help_lists_todays_flags() {
+    let o = Command::new(bin())
+        .args(["build", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "build --help must succeed on the normal (non-rt) build: stderr={}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let help = String::from_utf8_lossy(&o.stdout);
+    for flag in ["--native", "--target", "--strip", "-o, --out"] {
+        assert!(
+            help.contains(flag),
+            "build --help is missing today's flag {flag:?}; full help:\n{help}"
+        );
+    }
 }
 
 /// N5 — once the `ASCRIPTB` magic is confirmed, an embedded-payload READ failure must be a
@@ -441,6 +620,7 @@ fn native_double_bundle_strip_recovers_clean_stub() {
         clean_stub.len() as u64,
         payload.len() as u64,
         26,
+        0, // flags=0 → a plain v1 footer
     ));
 
     // The strip logic: read the footer, take everything before payload_offset.
@@ -1580,5 +1760,172 @@ fn ascript_deny_honored_on_aso_run_path() {
         "an all-granted .aso without ASCRIPT_DENY must not deny fs: {gerr}"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// RT §7 — compressed-bundle end-to-end (`build --native --compress`).
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Read the trailing footer's `(payload_offset, payload_len, flags)`. The footer is the last
+/// 32 bytes: offset(8) | len(8) | aso_version(4) | bundle_version(2) | flags(2) | magic(8).
+fn footer_fields(bundle: &Path) -> (u64, u64, u16, u16) {
+    let bytes = std::fs::read(bundle).unwrap();
+    assert!(bytes.len() >= 32);
+    let f = &bytes[bytes.len() - 32..];
+    assert_eq!(&f[24..32], b"ASCRIPTB", "footer magic not at the tail");
+    (
+        u64::from_le_bytes(f[0..8].try_into().unwrap()),    // payload_offset
+        u64::from_le_bytes(f[8..16].try_into().unwrap()),   // payload_len
+        u16::from_le_bytes(f[20..22].try_into().unwrap()),  // bundle_version
+        u16::from_le_bytes(f[22..24].try_into().unwrap()),  // flags
+    )
+}
+
+/// A repetitive, compressible program: many distinct top-level statements over a long shared
+/// string so the embedded `.aso` actually shrinks under zstd.
+fn write_compressible(dir: &Path) -> PathBuf {
+    let mut body = String::new();
+    // A long, repetitive literal (built Rust-side) compresses well; many distinct top-level
+    // statements give the payload real bulk so the size win is unambiguous.
+    let chunk = "the quick brown fox jumps over the lazy dog ".repeat(40);
+    body.push_str(&format!("let base = \"{chunk}\"\n"));
+    for i in 0..200 {
+        body.push_str(&format!("let v{i} = base + \" line {i} the quick brown fox\"\n"));
+    }
+    body.push_str("print(len(base))\nprint(\"compressed-ok\")\n");
+    write(dir, "big.as", &body)
+}
+
+/// `--native --compress` produces a runnable bundle whose output is byte-identical to the
+/// uncompressed bundle's run, AND the compressed artifact is SMALLER, AND its payload region
+/// is a `uncompressed_len:u64 LE || zstd frame` container marked version 2 / FLAG_ZSTD.
+#[test]
+fn native_compressed_bundle_runs_and_is_smaller() {
+    let _serial = serial_native();
+    let dir = tmp_dir("compress");
+    let src = write_compressible(&dir);
+
+    // Uncompressed reference bundle.
+    let plain = dir.join("plain_app");
+    build_native(&src, &plain);
+    let (_, _, plain_ver, plain_flags) = footer_fields(&plain);
+    assert_eq!((plain_ver, plain_flags), (1, 0), "plain bundle must stay v1/flags=0");
+
+    // Compressed bundle.
+    let comp = dir.join("comp_app");
+    build_with(&["--native", "--compress"], &src, &comp);
+    let (coff, clen, cver, cflags) = footer_fields(&comp);
+    assert_eq!(cver, 2, "compressed footer must be version 2");
+    assert_eq!(cflags & 0x0001, 0x0001, "compressed footer must set FLAG_ZSTD");
+
+    // Payload region begins with the u64 uncompressed-len prefix, then a zstd frame
+    // (magic 0x28 0xB5 0x2F 0xFD).
+    let cbytes = std::fs::read(&comp).unwrap();
+    let region = &cbytes[coff as usize..(coff + clen) as usize];
+    assert!(region.len() > 12, "compressed payload too small");
+    let declared = u64::from_le_bytes(region[0..8].try_into().unwrap());
+    assert!(declared > 0, "uncompressed_len prefix must be nonzero");
+    assert_eq!(
+        &region[8..12],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "the bytes after the u64 prefix must be a zstd frame magic"
+    );
+
+    // Size: the compressed artifact is smaller than the uncompressed one.
+    let plain_sz = std::fs::metadata(&plain).unwrap().len();
+    let comp_sz = std::fs::metadata(&comp).unwrap().len();
+    assert!(
+        comp_sz < plain_sz,
+        "compressed bundle ({comp_sz}) must be smaller than uncompressed ({plain_sz})"
+    );
+
+    // Run equivalence: same stdout + exit as the uncompressed bundle (and the source ref).
+    let empty = tmp_dir("compress_cwd");
+    let bc = run_bundle(&comp, &empty, &[]);
+    let bp = run_bundle(&plain, &empty, &[]);
+    let r = run_ref(&src, &[]);
+    assert!(bc.status.success(), "compressed bundle failed: {}", String::from_utf8_lossy(&bc.stderr));
+    assert_eq!(bc.stdout, bp.stdout, "compressed vs uncompressed stdout differs");
+    assert_eq!(bc.stdout, r.stdout, "compressed bundle stdout differs from `run`");
+    assert_eq!(bc.status.code(), bp.status.code(), "exit differs");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// SECURITY (§7.3): tampering the compressed payload's `uncompressed_len` prefix — too HIGH
+/// and too LOW — makes the bundle exit cleanly (non-zero, a reported error, NO over-allocation
+/// / OOM / crash), and the program does NOT run.
+#[test]
+fn native_compressed_tampered_len_refused_cleanly() {
+    let _serial = serial_native();
+    let dir = tmp_dir("comptamper");
+    let src = write_compressible(&dir);
+    let app = dir.join("ct_app");
+    build_with(&["--native", "--compress"], &src, &app);
+    let (off, _len, _ver, _flags) = footer_fields(&app);
+    let empty = tmp_dir("comptamper_cwd");
+
+    // The u64 len prefix sits at the very start of the payload region.
+    let make_tampered = |new_len: u64| -> PathBuf {
+        let mut bytes = std::fs::read(&app).unwrap();
+        bytes[off as usize..off as usize + 8].copy_from_slice(&new_len.to_le_bytes());
+        let p = dir.join(format!("ct_{new_len}"));
+        std::fs::write(&p, &bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        p
+    };
+
+    // Too HIGH (but a value an attacker could pick to force a huge allocation): u64::MAX.
+    let huge = make_tampered(u64::MAX);
+    let oh = run_bundle(&huge, &empty, &[]);
+    assert!(!oh.status.success(), "absurd uncompressed_len must not succeed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(oh.status.signal().is_none(), "must be a clean exit, not a signal/OOM-kill");
+    }
+    let eh = String::from_utf8_lossy(&oh.stderr);
+    assert!(
+        eh.contains("implausible") || eh.contains("length mismatch"),
+        "expected a clean refusal, got: {eh}"
+    );
+    assert!(!String::from_utf8_lossy(&oh.stdout).contains("compressed-ok"), "program must not run");
+
+    // Too LOW: declare 1 byte.
+    let low = make_tampered(1);
+    let ol = run_bundle(&low, &empty, &[]);
+    assert!(!ol.status.success(), "under-declared uncompressed_len must not succeed");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(ol.status.signal().is_none(), "must be a clean exit, not a signal");
+    }
+    let el = String::from_utf8_lossy(&ol.stderr);
+    assert!(el.contains("length mismatch"), "expected a length-mismatch refusal, got: {el}");
+    assert!(!String::from_utf8_lossy(&ol.stdout).contains("compressed-ok"), "program must not run");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// `--compress` without `--native` is a clap usage error (the flag `requires = "native"`).
+#[test]
+fn compress_requires_native() {
+    let dir = tmp_dir("compress_req");
+    let src = write(&dir, "p.as", "print(1)\n");
+    let o = Command::new(bin())
+        .args(["build", "--compress"])
+        .arg(&src)
+        .arg("-o")
+        .arg(dir.join("x.aso"))
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "--compress without --native must be a usage error");
     let _ = std::fs::remove_dir_all(&dir);
 }

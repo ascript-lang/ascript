@@ -184,13 +184,58 @@ Hello, world!
 The report goes to stderr (`util.farewell` was dropped), `bundled … -> app` goes to stdout, and
 the binary runs anywhere with `net` denied and `fs` deniable at launch — sources and all.
 
+## Runtime stubs and the resolution ladder
+
+A `--native` bundle is a **runtime stub** with the compiled program appended. The stub the
+payload is appended onto is resolved through a five-rung ladder, in order:
+
+1. **`--stub <path>`** — an explicit local `ascript-rt` stub (tests, air-gaps, custom builds,
+   cross targets). If the stub is itself a bundle, its overlay is stripped first; when the
+   stub runs on this host its feature set is verified via `--rt-info` and a **tier-insufficient
+   stub is rejected** (it names the missing feature and the importing module).
+2. **Cache** — a previously fetched/verified stub in the content-addressed store.
+3. **Fetch** — download the per-target stub against the signed, version-locked release
+   manifest (skipped by `--no-fetch` / `ASCRIPT_RT_NO_FETCH=1`). An **integrity** failure
+   (bad signature, checksum, or version) ABORTS the build; a pure **availability** failure
+   (offline, 404) falls through.
+4. **Dev sibling** — an `ascript-rt` next to the running toolchain binary (host target only).
+5. **`current_exe()`** — the full toolchain binary itself, with a one-time warning that the
+   bundle carries the whole toolchain.
+
+The default host build with none of these flags ends at rung 5 (today's behavior). A smaller
+stub trims the bundle to just the runtime; the build report shows the chosen tier and the
+unused-feature delta. **Integrity failures are fatal; availability failures fall through** — a
+tampered fetched stub is never "recovered" by falling back to a weaker rung, because rungs 4/5
+are local binaries that never touch the network.
+
+## Cross builds (`--target`)
+
+The embedded payload is **platform-independent** — it carries bytecode, constants, and
+logical module keys, with no machine word-size, endianness, or path dependence. A cross build
+is therefore a plain append of the same payload onto a per-target stub: `--target <triple>`
+(one of the 8 published triples) resolves a stub for that triple through the ladder (a cross
+target has no sibling/`current_exe` fallback, so it needs `--stub` or a fetched stub) and
+appends. The output gets a `.exe` extension for a `*-windows-*` target regardless of host.
+
+On macOS the **sign-before-append** rule does the work for cross builds: prebuilt darwin
+stubs are ad-hoc signed once at release time, and because the signature's `codeLimit` covers
+only the clean stub's bytes, appending the payload never invalidates it — so cross-building to
+macOS needs no signing machinery on the build host. (The builder only ad-hoc signs locally for
+the `current_exe` rung, where the running mac binary's own signature would otherwise break.)
+
 ## CLI flags
 
 | Flag | Effect |
 | --- | --- |
 | `--native` | Produce a self-contained native executable instead of a `.aso`. |
 | `-o, --out <path>` | Output path (defaults to `<stem>.aso`, or `<stem>` with `--native`). |
-| `--strip` | Omit the optional debug section (source + line/variable tables). |
+| `--strip` | Omit the optional debug section (source + line/variable tables). A stripped bundle degrades to span-only panic messages (no source frame). |
+| `--target <triple>` | Cross-build for one of the 8 published triples (an unknown triple is rejected with the supported set). `--target <host>` ≡ omitting it. |
+| `--stub <path>` | Append onto an explicit local `ascript-rt` stub (rung 1). |
+| `--no-fetch` | Skip the network fetch rung (availability fall-through, never an integrity bypass). |
+| `--tier <rt-core\|rt-local\|rt-net\|rt-full>` | Force the stub tier instead of automatic nearest-superset selection. |
+| `--compress` | zstd-compress the embedded payload (the stub decompresses at startup). |
+| `--report-json <path\|->` | Emit the canonical JSON build report. |
 | `--deny <caps>` | Embed a denial of one or more caps (comma-separated/repeatable). |
 | `--sandbox` | Embed a denial of all five caps (`fs,net,process,ffi,env`). |
 | `--deny-net <mode>` | Net carve-out: `external` (block public, allow loopback/private) or `all`. |

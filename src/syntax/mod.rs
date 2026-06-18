@@ -4,22 +4,36 @@
 //! default VM engine. The legacy `lexer`/`token`/`parser`/`ast` front-end now
 //! backs only the `--tree-walker` reference oracle.
 
+// RT §2.2 — the CST front-end (parser/lexer/format/CST machinery) is gated OUT of the
+// runtime-only build; only `kind` + `resolve::types` survive (the VM/`.aso` runtime data
+// types such as `UpvalueDescriptor` live there). Normal builds compile the whole module.
+#[cfg(not(ascript_rt))]
 pub mod ast;
+#[cfg(not(ascript_rt))]
 pub mod cst;
+#[cfg(not(ascript_rt))]
 pub mod doc_comment;
+#[cfg(not(ascript_rt))]
 pub mod event;
+#[cfg(not(ascript_rt))]
 pub mod format;
 pub mod kind;
+#[cfg(not(ascript_rt))]
 pub mod lexer;
+#[cfg(not(ascript_rt))]
 pub mod parser;
 pub mod resolve;
+#[cfg(not(ascript_rt))]
 pub mod tree_builder;
 
+#[cfg(not(ascript_rt))]
 pub use cst::{build_flat_tree, ResolvedNode, SyntaxNode, SyntaxToken};
 pub use kind::SyntaxKind;
+#[cfg(not(ascript_rt))]
 pub use lexer::{lex, render, LexToken};
 
 /// Parse source into a structured, lossless cstree tree.
+#[cfg(not(ascript_rt))]
 pub fn parse_to_tree(src: &str) -> crate::syntax::cst::ResolvedNode {
     tree_builder::build_tree(parser::parse(src))
 }
@@ -32,6 +46,7 @@ pub fn parse_to_tree(src: &str) -> crate::syntax::cst::ResolvedNode {
 /// aligned (e.g. an anonymous `fn(){...}` EXPRESSION, which is not a language
 /// construct — only the arrow `() => ...` is — is rejected on BOTH engines
 /// rather than crashing the VM compiler on a recovered, name-less `FnDecl`).
+#[cfg(not(ascript_rt))]
 pub struct SyntaxError {
     pub message: String,
     pub start: usize,
@@ -49,6 +64,7 @@ pub struct SyntaxError {
 /// tree (e.g. the VM compile path) should parse ONCE and call
 /// [`first_syntax_error_in`] on the resulting [`parser::Parse`], then hand that
 /// same `Parse` to [`tree_builder::build_tree`] — parsing twice is wasted work.
+#[cfg(not(ascript_rt))]
 pub fn first_syntax_error(src: &str) -> Option<SyntaxError> {
     first_syntax_error_in(&parser::parse(src))
 }
@@ -58,6 +74,7 @@ pub fn first_syntax_error(src: &str) -> Option<SyntaxError> {
 /// is the single source of truth; [`first_syntax_error`] is the parse-from-`&str`
 /// wrapper. Reading the errors off the `Parse` is borrow-only, so the caller can
 /// still move the `Parse` into `build_tree` afterwards.
+#[cfg(not(ascript_rt))]
 pub fn first_syntax_error_in(parsed: &parser::Parse) -> Option<SyntaxError> {
     // Map a non-trivia token index to a byte range (mirrors `check::analyze`).
     let grammar = parsed.errors.first().map(|e| {
@@ -112,6 +129,7 @@ pub fn first_syntax_error_in(parsed: &parser::Parse) -> Option<SyntaxError> {
 /// this batches them for multi-error reporting (DX D4 §5.1): a file with several
 /// parse errors renders them all at once instead of "fix one, recompile, find the
 /// next". Borrow-only — the caller can still move the `Parse` into `build_tree`.
+#[cfg(not(ascript_rt))]
 pub fn all_syntax_errors_in(parsed: &parser::Parse) -> Vec<SyntaxError> {
     let mut out: Vec<SyntaxError> = Vec::new();
     // Grammar errors are indexed by NON-TRIVIA token position; map each to a byte
@@ -166,11 +184,13 @@ pub fn all_syntax_errors_in(parsed: &parser::Parse) -> Vec<SyntaxError> {
 }
 
 /// Parse + resolve in one step (convenience for tests/tools).
+#[cfg(not(ascript_rt))]
 pub fn resolve_source(src: &str) -> resolve::types::ResolveResult {
     resolve::resolve(&parse_to_tree(src))
 }
 
 /// Parse + format in one step (convenience for tests/tools).
+#[cfg(not(ascript_rt))]
 pub fn format_tree(src: &str) -> String {
     format::format(&parse_to_tree(src))
 }

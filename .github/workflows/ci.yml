@@ -47,6 +47,33 @@ jobs:
       - name: Clippy (--no-default-features)
         run: cargo clippy --no-default-features --all-targets -- -D warnings
 
+  rt-stub:
+    name: rt-stub · build + battery
+    runs-on: ubuntu-latest
+    # RT §10.2 — build the ascript-rt runtime stub (rt-full tier) and run the
+    # end-to-end battery from tests/rt_stub.rs (RUN-NOW cases only; Task-7-gated
+    # cases are #[ignore]d and do not block CI until --stub is wired).
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build both the toolchain binary (needed by rt_stub tests for `ascript build`)
+      # and the runtime stub (rt-full tier).
+      - name: Build toolchain binary
+        run: cargo build --release --bin ascript
+
+      - name: Build ascript-rt (rt-full)
+        run: bash scripts/build-rt.sh rt-full
+
+      - name: Test rt_stub battery
+        run: ASCRIPT_RT_BIN=$PWD/target/release/ascript-rt cargo test --test rt_stub
+        env:
+          CARGO_TERM_COLOR: always
+
   fuzz-smoke:
     name: fuzz · build + corpus smoke
     runs-on: ubuntu-latest
