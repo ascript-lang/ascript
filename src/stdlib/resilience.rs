@@ -47,22 +47,16 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 
 /// Known `__resil` kind tags — kept narrow so an unrelated user object that
 /// happens to carry a `__resil` field is never hijacked by the call-site hook.
-// Task 1.2 (call-site hook) uses these; pre-declared here.
-#[allow(dead_code)]
 pub(crate) const RESIL_KINDS: &[&str] =
     &["breaker", "limiter", "keyedLimiter", "bulkhead", "retry", "memoize"];
 
 /// True iff `v` is a resilience policy object: a `Value::Object` whose `__resil`
 /// field is a string in `RESIL_KINDS`.
-// Task 1.2 uses this in the call-site hook wiring; dead until then.
-#[allow(dead_code)]
 pub(crate) fn is_resilience_value(v: &Value) -> bool {
     resil_kind(v).map(|k| RESIL_KINDS.contains(&&*k)).unwrap_or(false)
 }
 
 /// The method names that route through the call-site hook (Task 1.2).
-// Task 1.2 uses this in the call-site hook wiring; dead until then.
-#[allow(dead_code)]
 pub(crate) fn is_resilience_method(name: &str) -> bool {
     matches!(
         name,
@@ -1689,10 +1683,9 @@ impl Interp {
             Err(Control::Exit(code)) => return Err(Control::Exit(code)),
 
             // Panic: consume the panic, build {message: <msg>} error object for fb.
-            Err(Control::Panic(e)) => {
-                let msg = format!("{e}");
-                make_error(Value::str(msg))
-            }
+            // Use the CLEAN message (not Display, which appends "(at start..end)" byte
+            // offsets) so fb receives the same shape recover()/retryIf get — §3.5.
+            Err(Control::Panic(e)) => make_error(Value::str(e.message.clone())),
 
             // Ok value: check whether it is an err-pair.
             Ok(v) => {
