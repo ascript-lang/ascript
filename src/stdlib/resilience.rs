@@ -167,6 +167,71 @@ impl ResilRegistry {
     }
 }
 
+/// Escape a Prometheus label VALUE per the text exposition format 0.0.4 rules:
+/// `\` → `\\`, `"` → `\"`, newline → `\n`. (Label NAMES are never escaped — they
+/// come from our closed vocabulary of `[a-z_]` keys.)
+fn escape_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the registry as Prometheus text exposition format 0.0.4. Deterministic:
+/// metric-name insertion order × per-metric label-key (already-sorted) order; one
+/// `# TYPE <metric> <counter|gauge>` line per metric NAME (emitted before its first
+/// series, never duplicated). Metric names already carry the `ascript_resilience_`
+/// prefix (stored at bump time), so no prefix is added here.
+pub(crate) fn render_prometheus(reg: &ResilRegistry) -> String {
+    let mut out = String::new();
+    let mut last_name: Option<&str> = None;
+    for (name, kind, labels, value) in reg.walk() {
+        // `# TYPE` once per metric name, before its first series.
+        if last_name != Some(name) {
+            let kind_str = match kind {
+                ResilMetricKind::Counter => "counter",
+                ResilMetricKind::Gauge => "gauge",
+            };
+            out.push_str("# TYPE ");
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(kind_str);
+            out.push('\n');
+            last_name = Some(name);
+        }
+        out.push_str(name);
+        if !labels.is_empty() {
+            out.push('{');
+            for (i, (k, v)) in labels.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(k);
+                out.push_str("=\"");
+                out.push_str(&escape_label_value(v));
+                out.push('"');
+            }
+            out.push('}');
+        }
+        out.push(' ');
+        // Prometheus values are plain decimals; an integral f64 prints without a
+        // trailing `.0` to match the conventional counter rendering (`5`, not `5.0`).
+        if value.fract() == 0.0 && value.is_finite() {
+            out.push_str(&format!("{}", value as i64));
+        } else {
+            out.push_str(&format!("{}", value));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // ── public exports ────────────────────────────────────────────────────────────
 
 /// The export list (binding name → value) for `import * from "std/resilience"`.
@@ -186,6 +251,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("deadlineRemaining", super::bi("resilience.deadlineRemaining")),
         ("withTrace", super::bi("resilience.withTrace")),
         ("traceId", super::bi("resilience.traceId")),
+        ("metricsHandler", super::bi("resilience.metricsHandler")),
     ]
 }
 
@@ -3124,8 +3190,63 @@ impl Interp {
                     None => Value::nil(),
                 },
             ),
+            // §6.2: a callable handler the server mounts directly
+            // (`server.get("/metrics", resilience.metricsHandler())`). It carries NO
+            // per-instance state — the registry lives on `self.resilience`, read at
+            // call time in `call_resilience_native_method`. Receiver is a fields-only
+            // `NativeKind::Resilience` marker (id = u64::MAX, like `__local`).
+            "metricsHandler" => Ok(Value::native_method(Rc::new(crate::value::NativeMethod {
+                receiver: Rc::new(NativeObject {
+                    id: u64::MAX,
+                    kind: NativeKind::Resilience,
+                    fields: IndexMap::new(),
+                }),
+                method: "__metrics".to_string(),
+            }))),
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// Dispatch a `NativeKind::Resilience` `NativeMethod` (§6.2). Today the only
+    /// method is `__metrics` (the handler minted by `resilience.metricsHandler()`):
+    /// render the per-isolate registry as Prometheus text and return an HTTP
+    /// response object `{status, headers, body}` the server understands — the
+    /// `text/plain; version=0.0.4` content-type set explicitly so `value_to_response`
+    /// does not override it with `text/plain; charset=utf-8`. The request arg is
+    /// ignored (a Prometheus scrape carries no meaningful body).
+    pub(crate) async fn call_resilience_native_method(
+        &self,
+        m: &Rc<crate::value::NativeMethod>,
+        _args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match m.method.as_str() {
+            "__metrics" => {
+                let body = render_prometheus(&self.resilience.borrow().registry);
+                let headers = Value::object(
+                    [(
+                        "content-type".to_string(),
+                        Value::str("text/plain; version=0.0.4"),
+                    )]
+                    .into_iter()
+                    .collect(),
+                );
+                Ok(Value::object(
+                    [
+                        ("status".to_string(), Value::int(200)),
+                        ("headers".to_string(), headers),
+                        ("body".to_string(), Value::str(body.as_str())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ))
+            }
+            other => Err(AsError::at(
+                format!("resilience handler has no method '{}'", other),
                 span,
             )
             .into()),
@@ -5039,5 +5160,106 @@ b.call(ok)
             reg.value("ascript_resilience_breaker_calls_total", &[("name", "z"), ("result", "success")]),
             1.0
         );
+    }
+
+    // ── Task 5.2: §6.2 Prometheus text render ────────────────────────────────
+
+    /// `render_prometheus` over a hand-built registry: `# TYPE` once per metric
+    /// (gauge + counter), a labeled series, an unlabeled series (no `{}`), and a
+    /// label VALUE that exercises all three escape rules (`\`, `"`, newline).
+    #[test]
+    fn render_prometheus_format_and_escaping() {
+        let mut reg = super::ResilRegistry::default();
+        // gauge with a single label
+        reg.set_gauge("ascript_resilience_breaker_state", &[("name", "t")], 1.0);
+        // counter, two series under ONE metric name (must share one # TYPE line)
+        reg.incr(
+            "ascript_resilience_breaker_calls_total",
+            &[("name", "t"), ("result", "success")],
+            2.0,
+        );
+        reg.incr(
+            "ascript_resilience_breaker_calls_total",
+            &[("name", "t"), ("result", "failure")],
+            1.0,
+        );
+        // counter with NO labels → no `{}`
+        reg.incr("ascript_resilience_singleflight_joins_total", &[], 3.0);
+        // counter whose label value needs escaping: \ , " , newline
+        reg.incr(
+            "ascript_resilience_breaker_calls_total",
+            &[("name", "a\"b\\c\nd"), ("result", "success")],
+            1.0,
+        );
+
+        let text = super::render_prometheus(&reg);
+
+        // # TYPE lines, one per metric name, correct kind.
+        assert!(
+            text.contains("# TYPE ascript_resilience_breaker_state gauge\n"),
+            "gauge TYPE line:\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE ascript_resilience_breaker_calls_total counter\n"),
+            "counter TYPE line:\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE ascript_resilience_singleflight_joins_total counter\n"),
+            "joins TYPE line:\n{text}"
+        );
+
+        // The gauge series line (integral value prints with no trailing .0).
+        assert!(
+            text.contains("ascript_resilience_breaker_state{name=\"t\"} 1\n"),
+            "gauge series:\n{text}"
+        );
+        // Labeled counter series.
+        assert!(
+            text.contains(
+                "ascript_resilience_breaker_calls_total{name=\"t\",result=\"success\"} 2\n"
+            ),
+            "labeled counter series:\n{text}"
+        );
+        // Unlabeled series → no `{}`.
+        assert!(
+            text.contains("ascript_resilience_singleflight_joins_total 3\n"),
+            "unlabeled series:\n{text}"
+        );
+        // Escaping: \ → \\, " → \", newline → \n.
+        assert!(
+            text.contains(
+                "ascript_resilience_breaker_calls_total{name=\"a\\\"b\\\\c\\nd\",result=\"success\"} 1\n"
+            ),
+            "escaped label value:\n{text}"
+        );
+
+        // # TYPE for the multi-series counter appears EXACTLY once.
+        let type_count = text
+            .matches("# TYPE ascript_resilience_breaker_calls_total ")
+            .count();
+        assert_eq!(type_count, 1, "no duplicate # TYPE for multi-series metric:\n{text}");
+    }
+
+    /// `resilience.metricsHandler()` returns a callable `NativeMethod` whose call
+    /// (with a request arg) yields the `{status:200, headers:{content-type}, body}`
+    /// HTTP-response shape the server understands.
+    #[tokio::test]
+    async fn metrics_handler_returns_http_response_shape() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+import * as string from "std/string"
+let b = resilience.breaker({name: "t", failureRate: 0.5, window: 4, minCalls: 4, cooldownMs: 999999, halfOpenMax: 1})
+fn ok() { return 1 }
+b.call(ok)
+let h = resilience.metricsHandler()
+let resp = h({method: "GET", path: "/metrics"})
+let body = resp.body
+print(resp.status)
+print(resp.headers["content-type"])
+print(string.contains(body, "# TYPE ascript_resilience_breaker_calls_total counter"))
+print(string.contains(body, "ascript_resilience_breaker_calls_total{name=\"t\",result=\"success\"} 1"))
+"##)
+        .await;
+        assert_eq!(out, "200\ntext/plain; version=0.0.4\ntrue\ntrue\n");
     }
 }

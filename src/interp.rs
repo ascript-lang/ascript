@@ -5474,6 +5474,12 @@ impl Interp {
                 return self.call_events_method(&m, args, span).await;
             }
         }
+        #[cfg(feature = "resilience")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::Resilience) {
+                return self.call_resilience_native_method(&m, args, span).await;
+            }
+        }
         #[cfg(feature = "telemetry")]
         {
             use crate::value::NativeKind::*;
