@@ -7,16 +7,17 @@
 //! test process issues raw HTTP/1 GETs on an ephemeral port and asserts the mapped
 //! statuses + JSON body + `retry-after` header.
 //!
-//! All exercised paths are SYNCHRONOUS at the policy boundary (limiter `tryAcquire`,
-//! sync health checks, the expired-on-entry `deadlineMs:0` → 504 path) — they
-//! SIDESTEP one pre-existing, out-of-scope gap: a module-qualified call inside an
-//! async closure invoked by `deadline`/`bulkhead`/`breaker` from native code raises
-//! "value is not callable" on BOTH engines (so the async deadline RACE for
-//! `deadlineMs>0` cannot be exercised end-to-end yet — the expired-on-entry path
-//! covers the 504 mapping in-server). The per-connection task DOES establish a
-//! fresh `TASK_LOCALS` scope (`ambient_root_scope`, http_server.rs) so a per-request
-//! `resilience.handler({deadlineMs})` can set+read its own deadline (§6.4) — the
-//! `/slow` assertion below is the in-server proof.
+//! Covers the full §6.3/§6.4 surface in-server: sync policy boundaries (limiter
+//! `tryAcquire` → 429, sync health checks → 503), the expired-on-entry
+//! `deadlineMs:0` → 504 path, AND the async deadline RACE (`/slowasync`: a 50ms
+//! deadline over an 800ms `await time.sleep` body → 504, body cancelled). The
+//! per-connection task establishes a fresh `TASK_LOCALS` scope (`ambient_root_scope`,
+//! http_server.rs) so a per-request `resilience.handler({deadlineMs})` can set+read
+//! its own deadline (§6.4); without it `call_deadline`'s `try_with` errs and the
+//! handler runs the body returning 200 — the `/slow` + `/slowasync` 504s are the
+//! in-server proof. (NB: the slow body uses `time.sleep`, the real sleep fn — an
+//! earlier draft mis-used the non-existent `task.sleep`, which reads as nil → "value
+//! is not callable"; there is NO native-invocation gap.)
 //!
 //! `net` + `resilience` gated.
 
@@ -88,10 +89,14 @@ fn handler_server_program() -> String {
     r#"
 import * as server from "std/http/server"
 import * as resilience from "std/resilience"
+import * as time from "std/time"
 import * as env from "std/env"
 
 let lim = resilience.limiter({capacity: 1, refillPerSec: 0.001})
 fn quote(req) { return { status: 200, body: "quote-ok" } }
+// A genuinely-slow async handler: sleeps far past the deadline so the §5.2 RACE
+// (not just expired-on-entry) fires and cancels the body.
+async fn slowQuote(req) { await time.sleep(800); return { status: 200, body: "slow-ok" } }
 
 fn pingOk() { return true }
 fn pingBad() { return false }
@@ -100,14 +105,16 @@ let app = server.create()
 app.route("GET", "/healthz", resilience.health({}))
 app.route("GET", "/readyz", resilience.health({ checks: { up: pingOk, down: pingBad } }))
 app.route("GET", "/quote", resilience.handler({ limiter: lim }, quote))
-// deadlineMs:0 is expired-on-entry (sync) → 504 WITHOUT running `quote`. This
-// only works if the per-connection task has a TASK_LOCALS scope (ambient_root_scope)
-// so `call_deadline`'s `try_with` can set/read the deadline local in-server.
+// deadlineMs:0 is expired-on-entry (sync) → 504 WITHOUT running `quote`.
 app.route("GET", "/slow", resilience.handler({ deadlineMs: 0 }, quote))
+// deadlineMs:50 with an 800ms async body → the deadline RACE fires → 504, body
+// cancelled. Both this and /slow only work because the per-connection task has a
+// TASK_LOCALS scope (ambient_root_scope) so `call_deadline` can set+read the local.
+app.route("GET", "/slowasync", resilience.handler({ deadlineMs: 50 }, slowQuote))
 
 async fn main() {
   let [port, perr] = int(env.get("ASC_SERVE_PORT"))
-  await app.listen("127.0.0.1", port, { maxRequests: 5 })
+  await app.listen("127.0.0.1", port, { maxRequests: 6 })
 }
 await main()
 "#
@@ -165,12 +172,9 @@ fn health_and_handler_routes_map_statuses() {
     );
 
     // 5. /slow has deadlineMs:0 → expired-on-entry → 504, `quote` never runs.
-    // This is the in-server proof that the per-connection task establishes a
-    // TASK_LOCALS scope (ambient_root_scope) — without it `call_deadline`'s
-    // `try_with` errs, the deadline is never set, and the handler silently runs
-    // `quote` returning 200. (The async race for deadlineMs>0 is gated on the
-    // pre-existing "module call inside a native-invoked async closure" bug,
-    // documented in the module header; the expired-on-entry path is synchronous.)
+    // In-server proof that the per-connection task establishes a TASK_LOCALS scope
+    // (ambient_root_scope) — without it `call_deadline`'s `try_with` errs, the deadline
+    // is never set, and the handler silently runs `quote` returning 200.
     let r = fetch(&mut child, port, "/slow");
     assert!(
         r.starts_with("HTTP/1.1 504"),
@@ -181,10 +185,23 @@ fn health_and_handler_routes_map_statuses() {
         "deadlineMs:0 must refuse before running the handler:\n{r}"
     );
 
-    // The server stopped after maxRequests:5 → process exits 0.
+    // 6. /slowasync has deadlineMs:50 + an 800ms async body → the deadline RACE fires
+    // → 504, the body is cancelled (no "slow-ok"). This exercises the full async
+    // enforcement path in-server (the body awaits `time.sleep`, so the race preempts it).
+    let r = fetch(&mut child, port, "/slowasync");
+    assert!(
+        r.starts_with("HTTP/1.1 504"),
+        "slowasync (deadlineMs:50, 800ms body) expected 504 via the deadline race:\n{r}"
+    );
+    assert!(
+        !r.contains("slow-ok"),
+        "the deadline race must cancel the slow body:\n{r}"
+    );
+
+    // The server stopped after maxRequests:6 → process exits 0.
     let status = child.wait().expect("wait for server exit");
     assert!(
         status.success(),
-        "server should exit 0 after maxRequests:5, got {status:?}"
+        "server should exit 0 after maxRequests:6, got {status:?}"
     );
 }
