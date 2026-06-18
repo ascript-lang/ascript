@@ -169,6 +169,18 @@ fn canonical_lossy(p: &std::path::Path) -> std::path::PathBuf {
     p.to_path_buf()
 }
 
+/// CNTR §3.1: the best-effort canonical form of a Unix-domain-socket path, as a
+/// `String`, using the SAME `canonical_lossy` discipline the `fs` scope applies to
+/// path prefixes (canonicalize the longest existing ancestor, re-append the tail). The
+/// net_unix carve-out allow-list names `unix:<this>`. Public so the net stage-2 UDS
+/// check (`Interp::check_unix_path`) and its tests build identical keys.
+#[cfg_attr(not(feature = "net"), allow(dead_code))]
+pub fn canonical_unix_path(path: &str) -> String {
+    canonical_lossy(std::path::Path::new(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Granular `net` carve-out: deny the class, allow back specific hosts (§4.4).
 /// See [`FsScope`] for the Gate-12 short-circuit rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -60,6 +60,8 @@ pub mod net_tcp;
 #[cfg(feature = "net")]
 pub mod net_udp;
 #[cfg(feature = "net")]
+pub mod net_unix;
+#[cfg(feature = "net")]
 pub mod net_ws;
 pub mod object;
 #[cfg(feature = "sys")]
@@ -182,6 +184,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         #[cfg(feature = "net")]
         "std/net/udp" => net_udp::exports(),
         #[cfg(feature = "net")]
+        "std/net/unix" => net_unix::exports(),
+        #[cfg(feature = "net")]
         "std/net/ws" => net_ws::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
@@ -266,6 +270,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/net/http",
     "std/http/server",
     "std/net/udp",
+    "std/net/unix",
     "std/net/ws",
     "std/regex",
     "std/sqlite",
@@ -592,6 +597,8 @@ impl Interp {
             "http_server" => self.call_http_server(func, args, span).await,
             #[cfg(feature = "net")]
             "net_udp" => self.call_net_udp(func, args, span).await,
+            #[cfg(feature = "net")]
+            "net_unix" => self.call_net_unix(func, args, span).await,
             #[cfg(feature = "net")]
             "net_ws" => self.call_net_ws(func, args, span).await,
             #[cfg(feature = "data")]

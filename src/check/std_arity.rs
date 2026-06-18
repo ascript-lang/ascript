@@ -119,6 +119,11 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/assert", "deepEq") => 2,
         ("std/assert", "matches") => 2,
         ("std/assert", "throwsWith") => 2,
+        // CNTR §3.1 std/net/unix — `connect(path)` / `listen(path)` each take exactly
+        // one required arg (the socket path). Keyed unconditionally (the checker core is
+        // feature-independent); export-cross-checked only when `net` is built (below).
+        ("std/net/unix", "connect") => 1,
+        ("std/net/unix", "listen") => 1,
         _ => return None,
     };
     Some(n)
@@ -216,6 +221,12 @@ mod tests {
             ("std/resilience", "withTrace"),
             #[cfg(feature = "resilience")]
             ("std/resilience", "handler"),
+            // CNTR §3.1: std/net/unix — keyed unconditionally above, but only an
+            // export of the `net`-built module, so cross-check it under `net`.
+            #[cfg(feature = "net")]
+            ("std/net/unix", "connect"),
+            #[cfg(feature = "net")]
+            ("std/net/unix", "listen"),
         ];
         // FFI handle METHODS (resolved on a `ForeignLib`/`ForeignSymbol` handle, not
         // module-level exports). Keyed in `required_args` so `call-arity` can reach

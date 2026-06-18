@@ -202,6 +202,49 @@ conn.close()
 server.close()
 ```
 
+## std/net/unix
+
+Unix-domain-socket (UDS) client and server handles, built on tokio's `UnixStream`/`UnixListener`. The API is the byte-for-byte structural mirror of `std/net/tcp` over a filesystem socket path instead of a host/port — a stream supports `read`/`readLine`/`readToEnd`/`write`/`close`; a listener supports `accept`/`close`. UDS are a POSIX concept; on a non-Unix platform `connect`/`listen` raise a Tier-2 panic.
+
+```ascript
+import * as unix from "std/net/unix"
+```
+
+### unix.connect
+
+`unix.connect(path) -> future<[stream, err]>` — opens a client stream to the socket at `path`. Tier-1: a missing socket / refused connection comes back as `[nil, err]`.
+
+### unix.listen
+
+`unix.listen(path) -> future<[listener, err]>` — binds a listener at the filesystem `path`. The handle exposes the bound `path` (`listener.path`) and **unlinks the socket file it created** on `close()` / last-drop (a UDS leaves a stale inode otherwise). Binding a path that is already in use is a Tier-1 `[nil, err]`, and a path the listener did not create is never removed.
+
+### UDS stream / listener methods
+
+Identical to the TCP handle methods (see [TCP stream methods](#tcp-stream-methods) and [TCP listener](#tcp-listener)): `read(n?)` / `readLine()` / `readToEnd()` / `write(data)` / `close()` on a stream; `accept()` / `close()` on a listener.
+
+### Capabilities
+
+`std/net/unix` is gated by the `net` capability exactly like the other networking modules: `--deny net` / `--sandbox` (or `caps.drop("net")`) block `connect`/`listen` before any bind/connect. A granular `net` carve-out can allow a specific socket path back with an `allow: ["unix:<path>"]` entry.
+
+```ascript
+import * as unix from "std/net/unix"
+
+let [server, err] = await unix.listen("/tmp/echo.sock")
+print(err) // nil
+print(server.path) // /tmp/echo.sock
+
+let [client, _e] = await unix.connect("/tmp/echo.sock")
+let [conn, _ae] = await server.accept()
+
+await client.write("ping\n")
+let msg = await conn.readLine()
+print(msg) // ping
+
+client.close()
+conn.close()
+server.close() // unlinks /tmp/echo.sock
+```
+
 ## std/net/http
 
 A modern HTTP client built on reqwest. It offers the seven HTTP verbs plus a generic `request`, a cancellation primitive, and a first-class Server-Sent-Events client.

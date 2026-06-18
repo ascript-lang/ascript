@@ -1169,6 +1169,11 @@ pub enum NativeKind {
     // M14 networking handles (registered only under feature `net`).
     TcpListener,
     TcpStream,
+    // CNTR §3.1 std/net/unix: a bound Unix-domain listener and a buffered
+    // client/accepted stream (registered only under feature `net`, unix only). The
+    // listener unlinks its socket file on drop; the stream mirrors `TcpStream`.
+    UnixListener,
+    UnixStream,
     HttpResponse,
     // A streaming HTTP response body reader (`resp.body` when `opts.stream:true`).
     // Follows the §11.4 reader idiom over a chunked byte stream.
@@ -1313,6 +1318,8 @@ impl NativeKind {
             NativeKind::Writer => "writer",
             NativeKind::TcpListener => "tcpListener",
             NativeKind::TcpStream => "tcpStream",
+            NativeKind::UnixListener => "unixListener",
+            NativeKind::UnixStream => "unixStream",
             NativeKind::HttpResponse => "httpResponse",
             NativeKind::HttpBody => "httpBody",
             NativeKind::CancelHandle => "cancelHandle",
@@ -1385,6 +1392,8 @@ impl NativeKind {
             // Networking handles — operating them is live network I/O.
             NativeKind::TcpListener
             | NativeKind::TcpStream
+            | NativeKind::UnixListener
+            | NativeKind::UnixStream
             | NativeKind::HttpResponse
             | NativeKind::HttpBody
             | NativeKind::SseStream
@@ -4050,6 +4059,8 @@ mod tests {
         // ── old Some(Cap::Net) arms ──────────────────────────────────────────
         one(NativeKind::TcpListener, Cap::Net);
         one(NativeKind::TcpStream, Cap::Net);
+        one(NativeKind::UnixListener, Cap::Net);
+        one(NativeKind::UnixStream, Cap::Net);
         one(NativeKind::HttpResponse, Cap::Net);
         one(NativeKind::HttpBody, Cap::Net);
         one(NativeKind::SseStream, Cap::Net);

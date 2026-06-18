@@ -395,6 +395,13 @@ pub(crate) enum ResourceState {
     TcpListener(tokio::net::TcpListener),
     #[cfg(feature = "net")]
     TcpStream(crate::stdlib::net_tcp::TcpStreamState),
+    // CNTR §3.1 std/net/unix: a bound Unix-domain listener (unlinks its socket file on
+    // drop) and a buffered client/accepted stream (BufReader for `readLine`). Mirrors
+    // the TCP variants; unix-only (a `UnixListener`/`UnixStream` is POSIX).
+    #[cfg(all(feature = "net", unix))]
+    UnixListener(crate::stdlib::net_unix::UnixListenerState),
+    #[cfg(all(feature = "net", unix))]
+    UnixStream(crate::stdlib::net_unix::UnixStreamState),
     // M14 std/net/http: a received HTTP response whose body has not yet been read.
     // `reqwest::Response::text()/bytes()/json()` consume `self` by value, so the
     // response is stored here and `take_resource`'d by the first body accessor; a
@@ -1481,6 +1488,51 @@ impl Interp {
         } else {
             Err(Control::Panic(AsError::at(
                 format!("capability 'net' denied for host '{host}'"),
+                span,
+            )))
+        }
+    }
+
+    /// CNTR §3.1: the carve-out allow-list KEY for a Unix-domain socket path —
+    /// `unix:<canonical>`, where `<canonical>` is the same best-effort
+    /// `canonical_lossy` form the `fs` scope uses (so `./sock/../s` and `./s` agree).
+    /// Public so the net_unix tests can build a matching allow entry.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) fn unix_scope_key(&self, path: &str) -> String {
+        let canon = crate::stdlib::caps::canonical_unix_path(path);
+        format!("unix:{}", canon)
+    }
+
+    /// CNTR §3.1 STAGE 2 (net carve-out, UDS form): enforce a `net` carve-out against a
+    /// resolved Unix-socket `path` at connect/bind time. **Gate-12 fast path:** when no
+    /// `net` carve-out is configured (`net_scope` is `None`) this returns `Ok(())`
+    /// immediately with NO canonicalization — the dispatch-site bitset test was already
+    /// conclusive. When a carve-out exists, the path is admitted iff `unix:<canonical>`
+    /// is on the carve-out's `allow` list (a UDS is a filesystem-named endpoint, so the
+    /// allow entry names the literal socket path, not a host); else a Tier-2 panic.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) fn check_unix_path(&self, path: &str, span: Span) -> Result<(), Control> {
+        // Borrow is await-free and dropped before return.
+        let configured = {
+            let caps = self.caps.borrow();
+            caps.net_scope.is_some()
+        };
+        if !configured {
+            return Ok(()); // Gate-12: no carve-out → no canonicalization.
+        }
+        let key = self.unix_scope_key(path);
+        let allowed = {
+            let caps = self.caps.borrow();
+            match &caps.net_scope {
+                None => return Ok(()),
+                Some(scope) => scope.allow.iter().any(|e| e == &key),
+            }
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Control::Panic(AsError::at(
+                format!("capability 'net' denied for unix socket '{path}'"),
                 span,
             )))
         }
@@ -5426,6 +5478,10 @@ impl Interp {
             use crate::value::NativeKind::*;
             if matches!(m.receiver.kind, TcpListener | TcpStream) {
                 return self.call_tcp_method(&m, args, span).await;
+            }
+            #[cfg(unix)]
+            if matches!(m.receiver.kind, UnixListener | UnixStream) {
+                return self.call_unix_method(&m, args, span).await;
             }
             if matches!(m.receiver.kind, HttpResponse) {
                 return self.call_http_response_method(&m, args, span).await;

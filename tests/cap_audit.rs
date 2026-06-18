@@ -173,6 +173,42 @@ fn audit_net_tcp_connect_listen_denied() {
     assert_denied("audit_tcp_connect_sbx.as", imp, "tcp.connect(\"127.0.0.1\", 9)", "net", &["--sandbox"]);
 }
 
+// CNTR §3.1 std/net/unix — a UDS connect/listen is gated by `Net` exactly like TCP.
+// `--deny net` AND `--sandbox` deny BEFORE any bind/connect (no real socket touched).
+#[cfg(all(unix, feature = "net"))]
+#[test]
+fn audit_net_unix_connect_listen_denied() {
+    let imp = "import * as unix from \"std/net/unix\"";
+    assert_denied(
+        "audit_unix_connect.as",
+        imp,
+        "unix.connect(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--deny", "net"],
+    );
+    assert_denied(
+        "audit_unix_listen.as",
+        imp,
+        "unix.listen(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--deny", "net"],
+    );
+    assert_denied(
+        "audit_unix_connect_sbx.as",
+        imp,
+        "unix.connect(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--sandbox"],
+    );
+    assert_denied(
+        "audit_unix_listen_sbx.as",
+        imp,
+        "unix.listen(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--sandbox"],
+    );
+}
+
 // [BLOCKER 1] the net carve-out covers http/udp/ws/server — NOT just tcp. A
 // regression that gated only tcp connect/listen would leave these open.
 #[cfg(feature = "net")]
