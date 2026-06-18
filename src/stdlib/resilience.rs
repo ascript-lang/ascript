@@ -39,6 +39,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("keyedLimiter", super::bi("resilience.keyedLimiter")),
         ("bulkhead", super::bi("resilience.bulkhead")),
         ("retry", super::bi("resilience.retry")),
+        ("fallback", super::bi("resilience.fallback")),
     ]
 }
 
@@ -1645,6 +1646,101 @@ impl Interp {
     }
 }
 
+// ── Interp::call_fallback (§3.5) ─────────────────────────────────────────────
+
+impl Interp {
+    /// `resilience.fallback(fn, fb)` — runs `fn`; on success passes through as
+    /// `[v, nil]`; on an err pair calls `fb(err)`; on a panic calls `fb({message})`
+    /// (consuming the panic — this is the ONE documented place RESIL swallows a
+    /// `Control::Panic`). `fb`'s result is normalized to a pair; if `fb` itself
+    /// panics that re-raises. Async `fn`/`fb` are driven.
+    async fn call_fallback(
+        &self,
+        user_fn: Value,
+        fb: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::interp::{make_error, make_pair, result_pair_err};
+
+        // ── Step 1: drive fn (await if it returns a future) ───────────────────
+        let raw = self.call_value(user_fn, vec![], span).await;
+
+        // Drive any returned future to completion (mirror of the breaker/retry pattern).
+        let outcome: Result<Value, Control> = match raw {
+            Ok(v) => {
+                match v.kind() {
+                    crate::value::ValueKind::Future(_) => {
+                        let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                            unreachable!()
+                        };
+                        f.get().await
+                    }
+                    _ => Ok(v),
+                }
+            }
+            other => other,
+        };
+
+        // ── Step 2: classify outcome ──────────────────────────────────────────
+        let fb_arg: Value = match outcome {
+            // Propagate: pass through unchanged (not a fn-level panic/error).
+            Err(Control::Propagate(pair)) => return Err(Control::Propagate(pair)),
+            // Exit: pass through unchanged.
+            Err(Control::Exit(code)) => return Err(Control::Exit(code)),
+
+            // Panic: consume the panic, build {message: <msg>} error object for fb.
+            Err(Control::Panic(e)) => {
+                let msg = format!("{e}");
+                make_error(Value::str(msg))
+            }
+
+            // Ok value: check whether it is an err-pair.
+            Ok(v) => {
+                match result_pair_err(&v) {
+                    // err-pair [nil, err]: call fb with the err object.
+                    Some(err) => err,
+                    // success (ok-pair or plain value): pass through as [v, nil].
+                    None => return Ok(make_pair(v, Value::nil())),
+                }
+            }
+        };
+
+        // ── Step 3: call fb(err_arg) — fb panics propagate unchanged ──────────
+        let fb_raw = self.call_value(fb, vec![fb_arg], span).await;
+
+        // Drive any future returned by fb.
+        let fb_outcome: Result<Value, Control> = match fb_raw {
+            Ok(v) => {
+                match v.kind() {
+                    crate::value::ValueKind::Future(_) => {
+                        let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                            unreachable!()
+                        };
+                        f.get().await
+                    }
+                    _ => Ok(v),
+                }
+            }
+            other => other,
+        };
+
+        // ── Step 4: normalize fb result to a pair ─────────────────────────────
+        match fb_outcome {
+            // fb panics re-raise.
+            Err(e) => Err(e),
+            Ok(v) => {
+                // If fb returned an err-pair already, return as-is.
+                // If fb returned a plain value (or ok-pair), wrap as [v, nil].
+                if result_pair_err(&v).is_some() {
+                    Ok(v)
+                } else {
+                    Ok(make_pair(v, Value::nil()))
+                }
+            }
+        }
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -1677,6 +1773,11 @@ impl Interp {
             "retry" => {
                 let opts = arg(args, 0);
                 make_retry_policy(opts, span)
+            }
+            "fallback" => {
+                let user_fn = arg(args, 0);
+                let fb = arg(args, 1);
+                self.call_fallback(user_fn, fb, span).await
             }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
@@ -2494,5 +2595,104 @@ print(after.retriesSpent)
 "#)
         .await;
         assert_eq!(out, "true\n0\n0\n");
+    }
+
+    // ── Task 2.5: resilience.fallback (§3.5) ────────────────────────────────
+
+    /// ok value passes through as [v, nil]; fb is NOT called.
+    #[tokio::test]
+    async fn fallback_ok_value_passes_through() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let called = [false]
+fn fb(e) { called[0] = true; return "fallback" }
+let [v, err] = resilience.fallback(() => 42, fb)
+print(v)
+print(err)
+print(called[0])
+"#)
+        .await;
+        assert_eq!(out, "42\nnil\nfalse\n");
+    }
+
+    /// err pair → fb(err) called with the err object; fb result returned as pair.
+    #[tokio::test]
+    async fn fallback_err_pair_calls_fb() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+fn primary() { return [nil, {message: "x"}] }
+fn fb(e) { return e.message }
+let [v, err] = resilience.fallback(primary, fb)
+print(v)
+print(err)
+"#)
+        .await;
+        assert_eq!(out, "x\nnil\n");
+    }
+
+    /// panic → fb called with {message: <panic msg>}; panic is consumed (NOT re-raised).
+    #[tokio::test]
+    async fn fallback_panic_calls_fb_and_is_consumed() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+import { contains } from "std/string"
+fn primary() { assert(false, "boom") }
+let got_msg = [""]
+fn fb(e) { got_msg[0] = e.message; return "recovered" }
+let [v, err] = resilience.fallback(primary, fb)
+print(v)
+print(err)
+print(contains(got_msg[0], "boom"))
+"#)
+        .await;
+        assert_eq!(out, "recovered\nnil\ntrue\n");
+    }
+
+    /// fb panic re-raises (NOT consumed).
+    #[tokio::test]
+    async fn fallback_fb_panic_reraises() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+fn primary() { return [nil, {message: "x"}] }
+fn fb(e) { assert(false, "fb-boom") }
+let [v, err] = resilience.fallback(primary, fb)
+print(v)
+"#)
+        .await;
+        let msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(s) => s,
+        };
+        assert!(msg.contains("fb-boom"), "expected fb panic to re-raise, got: {msg:?}");
+    }
+
+    /// fb result normalized: a plain value returned by fb → [value, nil].
+    #[tokio::test]
+    async fn fallback_fb_result_normalized_to_pair() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+fn primary() { return [nil, {message: "x"}] }
+fn fb(e) { return 99 }
+let [v, err] = resilience.fallback(primary, fb)
+print(v)
+print(err)
+"#)
+        .await;
+        assert_eq!(out, "99\nnil\n");
+    }
+
+    /// async fn and async fb are driven correctly.
+    #[tokio::test]
+    async fn fallback_async_fn_and_fb_driven() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+async fn primary() { return [nil, {message: "async-err"}] }
+async fn fb(e) { return e.message }
+let [v, err] = await resilience.fallback(primary, fb)
+print(v)
+print(err)
+"#)
+        .await;
+        assert_eq!(out, "async-err\nnil\n");
     }
 }
