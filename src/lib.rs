@@ -263,7 +263,14 @@ pub async fn run_file_with_packages(
     }
     interp.install_self();
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(interp.load_module(path)).await;
+    // RESIL §5.1: establish the root TASK_LOCALS scope (+ telemetry root scope when that
+    // feature is on) so `resilience.deadline`/`withTrace`'s `TASK_LOCALS.try_with` finds
+    // the cell in scope on the CLI tree-walker path — matching every other entry point
+    // (run_source, the VM run paths). Without it the deadline/trace locals silently
+    // no-op here, diverging from the VM on `ascript run file.as --tree-walker`.
+    let result = local
+        .run_until(crate::interp::ambient_root_scope(interp.load_module(path)))
+        .await;
     local.await; // drain spawned tasks (structured join) — no-op until Phase 2
                  // End-of-program cycle collection (V13-T3): the tree-walker shares
                  // the same `Cc` value model, so a final sweep here reclaims any

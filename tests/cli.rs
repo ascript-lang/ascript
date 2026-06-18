@@ -221,6 +221,54 @@ fn run_tree_walker_flag_works() {
 }
 
 #[test]
+fn run_tree_walker_deadline_local_matches_vm() {
+    // RESIL Phase 4 regression (review CHANGES_REQUIRED): the tree-walker CLI path
+    // (`run_file_with_packages` → `load_module`) must establish the `ambient_root_scope`
+    // root TASK_LOCALS scope like every other entry point — else `resilience.deadline`
+    // silently no-ops on `ascript run file.as --tree-walker` (the cell isn't in scope,
+    // `deadlineRemaining()` returns nil inside the body) while the VM works → a four-mode
+    // divergence the unit tests miss (they use `run_source`, which IS wrapped).
+    let file = std::env::temp_dir().join(format!("ascript_deadline_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        r#"import * as resilience from "std/resilience"
+let [v, e] = resilience.deadline(60000, () => {
+    return resilience.deadlineRemaining() != nil
+})
+print(v)
+print(resilience.deadlineRemaining())
+"#,
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let vm = Command::new(bin).args(["run"]).arg(&file).output().unwrap();
+    let tw = Command::new(bin)
+        .args(["run", "--tree-walker"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        vm.status.success() && tw.status.success(),
+        "both engines must run cleanly; vm={:?} tw={:?}",
+        String::from_utf8_lossy(&vm.stderr),
+        String::from_utf8_lossy(&tw.stderr),
+    );
+    // Inside the deadline body deadlineRemaining() must be a number (true), and nil
+    // again at top level — identical on both engines.
+    assert_eq!(
+        String::from_utf8_lossy(&vm.stdout),
+        "true\nnil\n",
+        "VM: deadline must be visible inside the body"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&tw.stdout),
+        String::from_utf8_lossy(&vm.stdout),
+        "--tree-walker must see the deadline local exactly like the VM (ambient_root_scope)"
+    );
+}
+
+#[test]
 fn run_error_shows_source_caret() {
     let file = std::env::temp_dir().join(format!("ascript_diag_{}.as", std::process::id()));
     std::fs::write(&file, "let x = 1\nprint(missing)\n").unwrap();
