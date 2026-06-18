@@ -543,5 +543,7 @@ error/cancel semantics, and break-even guidance.
 ---
 
 See also: [Modules & async](modules-async) for the single-isolate `async`/`await`/generator
-model, [`std/task`](../stdlib/async) for `gather`/`race`/`pipe`, and [Shared read-only
-heap](../stdlib/shared) for `shared.freeze`.
+model, [`std/task`](../stdlib/async) for `gather`/`race`/`pipe`, [Shared read-only
+heap](../stdlib/shared) for `shared.freeze`, and [Resilience policies](../stdlib/resilience) for
+per-isolate circuit breakers, rate limiters, and the `worker class` actor pattern for
+process-global policy state (§7.2 `GlobalLimiter`).

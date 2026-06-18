@@ -112,6 +112,11 @@ let result = await task.retry(flaky, {attempts: 5, baseMs: 1})
 print(result)   // "ok"  — succeeded on attempt 3
 ```
 
+See also: [`std/resilience`](resilience) ships `resilience.retry` — a richer policy object
+(`retryOn`, `retryIf`, `budget`, stats/reset) that composes with breakers and deadlines. Use
+`task.retry` for simple panic-only retry; use `resilience.retry` when you need Tier-1 error retry,
+`retryIf` guards, or explicit policy composition.
+
 ### `task.pipe`
 
 ```ascript
