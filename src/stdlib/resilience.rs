@@ -282,6 +282,22 @@ fn check_pos_int(r: Result<u64, String>, field: &str, span: Span) -> Result<u64,
     }
 }
 
+// ── deadline-exceeded err pair (RESIL §5.2/§5.4) ─────────────────────────────
+
+/// The `[nil, {code:"deadline-exceeded", message}]` err pair returned when a
+/// deadline is hit — by `deadline` (the body race / already-expired entry) and by
+/// the budget-aware park points (`limiter.acquire`, `keyedLimiter.acquire`,
+/// `bulkhead.run`). One construction site so the shape is identical everywhere.
+fn deadline_exceeded_pair() -> Value {
+    let mut err: IndexMap<String, Value> = IndexMap::new();
+    err.insert(
+        "message".to_string(),
+        Value::str("deadline exceeded"),
+    );
+    err.insert("code".to_string(), Value::str("deadline-exceeded"));
+    crate::interp::make_pair(Value::nil(), Value::object(err))
+}
+
 // ── call-site hook: method dispatch on a resilience policy object ─────────────
 
 /// Dispatch a method call on a resilience policy object (§2.3 call-site hook).
@@ -690,8 +706,24 @@ impl Interp {
                     };
 
                     // ── Borrow is DROPPED here before .await ──────────────────
+                    // §5.4 budget-aware park: if a deadline is set and the refill
+                    // sleep would carry us past the budget (or it is already
+                    // exhausted), return `deadline-exceeded` at ~the budget rather
+                    // than waiting for the full refill. NO deadline → the `None`
+                    // fast path is byte-identical to before (plain sleep, no race).
                     let duration = std::time::Duration::from_millis(sleep_ms as u64);
-                    tokio::time::sleep(duration).await;
+                    match self.deadline_remaining_ms() {
+                        Some(r) if r <= 0.0 => return Ok(deadline_exceeded_pair()),
+                        Some(r) => {
+                            tokio::select! {
+                                _ = tokio::time::sleep(duration) => {}
+                                _ = tokio::time::sleep(
+                                    std::time::Duration::from_millis(r as u64),
+                                ) => return Ok(deadline_exceeded_pair()),
+                            }
+                        }
+                        None => tokio::time::sleep(duration).await,
+                    }
                     // Re-loop to re-check after sleep
                 }
             }
@@ -1103,8 +1135,22 @@ impl Interp {
                     };
 
                     // ── ALL borrows dropped here before .await ─────────────────
+                    // §5.4 budget-aware park (same shape as `limiter.acquire`): a
+                    // set deadline caps the refill wait at the remaining budget.
+                    // NO deadline → byte-identical plain sleep.
                     let duration = std::time::Duration::from_millis(sleep_ms as u64);
-                    tokio::time::sleep(duration).await;
+                    match self.deadline_remaining_ms() {
+                        Some(r) if r <= 0.0 => return Ok(deadline_exceeded_pair()),
+                        Some(r) => {
+                            tokio::select! {
+                                _ = tokio::time::sleep(duration) => {}
+                                _ = tokio::time::sleep(
+                                    std::time::Duration::from_millis(r as u64),
+                                ) => return Ok(deadline_exceeded_pair()),
+                            }
+                        }
+                        None => tokio::time::sleep(duration).await,
+                    }
                     // Re-loop to re-check after sleep
                 }
             }
@@ -1471,9 +1517,54 @@ impl Interp {
             _ => Value::nil(),
         };
 
-        let acquire_result = self
-            .sync_acquire(std::slice::from_ref(&sem_value), span)
-            .await;
+        // §5.4 budget-aware park: race the permit acquire against the remaining
+        // deadline budget. The acquire future is `&mut`-driven through the select
+        // so the WINNER on the deadline branch only ABANDONS the wait (the future
+        // is dropped → no permit leaked, `sync_acquire` had not yet incremented an
+        // in-flight count). NO deadline set → the `None` fast path is byte-identical
+        // to the previous plain `.await` (no select, no behavior change).
+        //
+        // We reach Step 6's unconditional release ONLY when we hold a permit (this
+        // block returns early on a deadline-expiry park exit, before any permit).
+        let acquire_result: Result<Value, Control> = {
+            let acquire = self.sync_acquire(std::slice::from_ref(&sem_value), span);
+            match self.deadline_remaining_ms() {
+                Some(r) if r <= 0.0 => {
+                    drop(acquire);
+                    // Already past the budget — never park. Cleanup `__waiting`.
+                    if needs_wait {
+                        if let ValueKind::Object(o) = recv.kind() {
+                            let w =
+                                o.get("__waiting").and_then(|v| v.as_int()).unwrap_or(1);
+                            o.insert("__waiting", Value::int((w - 1).max(0)));
+                        }
+                    }
+                    return Ok(deadline_exceeded_pair());
+                }
+                Some(r) => {
+                    tokio::select! {
+                        res = acquire => res,
+                        _ = tokio::time::sleep(
+                            std::time::Duration::from_millis(r as u64),
+                        ) => {
+                            // Deadline expired while parked: decrement `__waiting`
+                            // (exactly once — we are on a `needs_wait` park exit).
+                            if needs_wait {
+                                if let ValueKind::Object(o) = recv.kind() {
+                                    let w = o
+                                        .get("__waiting")
+                                        .and_then(|v| v.as_int())
+                                        .unwrap_or(1);
+                                    o.insert("__waiting", Value::int((w - 1).max(0)));
+                                }
+                            }
+                            return Ok(deadline_exceeded_pair());
+                        }
+                    }
+                }
+                None => acquire.await,
+            }
+        };
 
         // If acquisition failed (shouldn't in normal operation), clean up waiting and propagate.
         if let Err(e) = acquire_result {
@@ -2319,25 +2410,77 @@ impl Interp {
             .try_with(|c| c.replace(Some(new_locals)))
             .ok();
 
-        // ── run the callback (drives a returned future) ──────────────────────
-        let raw = self.call_value(user_fn, vec![], span).await;
-        let outcome: Result<Value, Control> = match raw {
-            Ok(v) => match v.kind() {
-                crate::value::ValueKind::Future(_) => {
-                    let crate::value::OwnedKind::Future(f) = v.into_kind() else {
-                        unreachable!()
-                    };
-                    f.get().await
+        // A local closure so EVERY exit (already-expired, normal, expiry, panic,
+        // try_with-failure) restores the previous locals exactly once — the cell
+        // op is sync (no borrow held across `.await`).
+        let do_restore = |restore: Option<Option<Rc<TaskLocals>>>| {
+            if let Some(old) = restore {
+                let _ = TASK_LOCALS.try_with(|c| c.set(old));
+            }
+        };
+
+        // ── §5.2 already-expired on ENTRY: refuse, NEVER run the body ─────────
+        // `remaining` reflects the EFFECTIVE (shrunk) deadline we just set. A
+        // freshly-zero `deadline(0, fn)` or entering under an already-past outer
+        // deadline returns the err pair immediately — `user_fn` is never called.
+        let remaining = self.deadline_remaining_ms();
+        if matches!(remaining, Some(r) if r <= 0.0) {
+            do_restore(restore);
+            return Ok(deadline_exceeded_pair());
+        }
+
+        // ── §5.2 the race: body vs. the remaining budget ─────────────────────
+        // Defensively: if no deadline is set (`remaining == None` — impossible
+        // inside `deadline`, which always sets one), just await the body with no
+        // race. Otherwise race the body future against a sleep of `remaining` ms;
+        // on the sleep branch `tokio::select!` DROPS the body future →
+        // cancel-on-drop cancels eagerly-spawned async work. A synchronous body
+        // cannot be preempted (same truth as `task.timeout`): the deadline fires
+        // after the body's last `.await` yields control.
+        let outcome: Result<Value, Control> = match remaining {
+            Some(r) => {
+                let body = async {
+                    let raw = self.call_value(user_fn, vec![], span).await;
+                    match raw {
+                        Ok(v) => match v.kind() {
+                            crate::value::ValueKind::Future(_) => {
+                                let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                                    unreachable!()
+                                };
+                                f.get().await
+                            }
+                            _ => Ok(v),
+                        },
+                        other => other,
+                    }
+                };
+                tokio::select! {
+                    r = body => r,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(r as u64)) => {
+                        do_restore(restore);
+                        return Ok(deadline_exceeded_pair());
+                    }
                 }
-                _ => Ok(v),
-            },
-            other => other,
+            }
+            None => {
+                let raw = self.call_value(user_fn, vec![], span).await;
+                match raw {
+                    Ok(v) => match v.kind() {
+                        crate::value::ValueKind::Future(_) => {
+                            let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                                unreachable!()
+                            };
+                            f.get().await
+                        }
+                        _ => Ok(v),
+                    },
+                    other => other,
+                }
+            }
         };
 
         // ── restore on ALL exits (incl. panic, captured as Err above) ─────────
-        if let Some(old) = restore {
-            let _ = TASK_LOCALS.try_with(|c| c.set(old));
-        }
+        do_restore(restore);
 
         // ── normalize to a `[value, err]` pair (matches `fallback`/the breaker) ─
         match outcome {
@@ -3864,6 +4007,130 @@ print(err)
 "#)
         .await;
         assert_eq!(out, "42\nnil\n");
+    }
+
+    /// §5.2 the race: a body that sleeps far past the deadline is cancelled and the
+    /// caller gets `[nil, {code:"deadline-exceeded"}]` — and the body's side effect
+    /// (a flag set AFTER the long sleep) never happens (the body future is dropped).
+    #[tokio::test]
+    async fn deadline_body_exceeds_returns_err_and_cancels() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+import * as time from "std/time"
+let ran = [false]
+let [v, err] = resilience.deadline(50, async () => {
+    await time.sleep(500)
+    ran[0] = true          // must NEVER run — body cancelled at ~50ms
+    return "done"
+})
+print(v)
+print(err.code)
+print(ran[0])
+"#)
+        .await;
+        assert_eq!(out, "nil\ndeadline-exceeded\nfalse\n");
+    }
+
+    /// §5.2 already-expired on entry: `deadline(0, fn)` returns the err pair
+    /// immediately and NEVER calls `fn` (a counter the body bumps stays 0).
+    #[tokio::test]
+    async fn deadline_zero_never_runs_body() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let ran = [0]
+let [v, err] = resilience.deadline(0, () => { ran[0] = ran[0] + 1; return 7 })
+print(v)
+print(err.code)
+print(ran[0])
+"#)
+        .await;
+        assert_eq!(out, "nil\ndeadline-exceeded\n0\n");
+    }
+
+    /// §5.2 nested shrink enforcement: an inner `deadline(120000)` inside an outer
+    /// `deadline(60000)` has an effective remaining ≤ the outer's remaining (relative
+    /// comparison — not absolute values, to avoid clock flakiness).
+    #[tokio::test]
+    async fn deadline_nested_inner_remaining_le_outer() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let outer = [0.0]
+let inner = [0.0]
+resilience.deadline(60000, () => {
+    outer[0] = resilience.deadlineRemaining()
+    resilience.deadline(120000, () => {
+        inner[0] = resilience.deadlineRemaining()
+        return nil
+    })
+    return nil
+})
+print(inner[0] <= outer[0])
+"#)
+        .await;
+        assert_eq!(out, "true\n");
+    }
+
+    /// §5.2 restore-after-expiry: after a `deadline` that EXPIRED (body raced out),
+    /// `deadlineRemaining()` at top level is nil — the locals are restored on the
+    /// expiry branch just like on normal return / panic.
+    #[tokio::test]
+    async fn deadline_restores_after_expiry() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+import * as time from "std/time"
+let [v, err] = resilience.deadline(40, async () => {
+    await time.sleep(400)
+    return "done"
+})
+print(err.code)
+print(resilience.deadlineRemaining())   // restored to nil after the expired deadline
+"#)
+        .await;
+        assert_eq!(out, "deadline-exceeded\nnil\n");
+    }
+
+    /// §5.4 bulkhead park-with-budget: limit=1, queue=1. Hold the one permit with a
+    /// long task, then a second `run` under a 50ms deadline → the caller gets
+    /// `deadline-exceeded` (NOT bulkhead-full — it was admitted to the queue) and
+    /// `__waiting` returns to 0 after the parked caller bails on the budget.
+    #[tokio::test]
+    async fn bulkhead_park_respects_deadline_budget() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+import * as time from "std/time"
+let b = resilience.bulkhead({limit: 1, queue: 4})
+// Holder occupies the single permit for 1s.
+let holder = b.run(async () => { await time.sleep(1000); return "held" })
+await time.sleep(20)   // let the holder acquire the permit first
+// Second caller parks (queue has room), then bails at its 50ms deadline.
+let [v, err] = resilience.deadline(50, async () => {
+    return await b.run(async () => { await time.sleep(1000); return "second" })
+})
+print(err.code)
+print(b.__waiting)
+"#)
+        .await;
+        assert_eq!(out, "deadline-exceeded\n0\n");
+    }
+
+    /// §5.4 limiter park-with-budget: a 1-token/sec limiter, drained, then an
+    /// `acquire(1)` under a tight 30ms deadline → `deadline-exceeded` rather than the
+    /// ~1000ms refill wait. (Acquire returns the err PAIR under a deadline; the
+    /// no-deadline success path still returns nil — see other limiter tests.)
+    #[tokio::test]
+    async fn limiter_acquire_respects_deadline_budget() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let l = resilience.limiter({capacity: 1, refillPerSec: 1})
+l.acquire()    // drain the single token (no deadline → returns nil, instant)
+let [v, err] = resilience.deadline(30, async () => {
+    let r = l.acquire()    // would need ~1000ms to refill — budget caps it
+    return r
+})
+print(err.code)
+"#)
+        .await;
+        assert_eq!(out, "deadline-exceeded\n");
     }
 
     /// A non-number `ms` is a Tier-2 panic.
