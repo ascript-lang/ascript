@@ -5387,7 +5387,11 @@ impl Interp {
         // kind maps to NO cap (a pure in-memory native) stays ungated.
         let cap_bits = self.caps_bits(); // Copy snapshot — no borrow across the awaits below.
         if !cap_bits.all_granted() {
-            if let Some(cap) = m.receiver.kind.governing_cap() {
+            // CNTR §5.3: iterate the handle's CapReq in stable `Cap::ALL` order.
+            // For a single-cap handle (every current arm) the loop runs EXACTLY once
+            // with the same cap/args/error-string as the pre-CNTR `Option<Cap>` path
+            // → byte-identical. A `CapReq::NONE` handle iterates zero times (ungated).
+            for cap in m.receiver.kind.governing_caps().iter() {
                 self.require_cap(cap, m.receiver.kind.type_name(), &m.method, &args, span)?;
             }
         }
@@ -5509,7 +5513,7 @@ impl Interp {
         {
             use crate::value::NativeKind::*;
             // FFI handle methods. The `ffi` capability already re-checked above via
-            // `governing_cap` (all three FFI kinds → Cap::Ffi), so operating an open
+            // `governing_caps` (all three FFI kinds → Cap::Ffi), so operating an open
             // handle is denied after `caps.drop("ffi")`.
             match m.receiver.kind {
                 ForeignLib if m.method == "symbol" => {

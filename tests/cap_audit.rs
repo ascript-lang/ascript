@@ -230,6 +230,19 @@ fn audit_net_per_handle_recheck_after_drop_blocker3() {
     );
 }
 
+// CNTR §5.3 (Task 1.2): the per-handle re-check (BLOCKER 3, above) now consults
+// `NativeKind::governing_caps() -> CapReq` and iterates it in stable `Cap::ALL`
+// order — the same "first-denied names the error" mechanism the central
+// `required_cap` gate uses. For every CURRENT handle the requirement is a single
+// cap (so the loop runs exactly once → byte-identical to the pre-CNTR
+// `Option<Cap>` path, proven by `governing_caps_preserves_verdicts` in
+// `src/value.rs` + the BLOCKER 3 end-to-end row above). When CNTR Phase 4 adds a
+// docker exec/attach STREAM handle requiring `net ∧ process`, its end-to-end
+// denial-order rows (net denied first when both dropped) belong in this file under
+// **CNTR Task 4.6**. The order mechanism itself is pinned today by
+// `caps::tests::capreq_conjunction_iterates_in_cap_all_order` (net-first), so a
+// regression in `CapReq::iter` ordering fails before any docker module exists.
+
 // ───────────────────────────── process (spawn) — gated by Process ─────────────
 
 #[cfg(feature = "sys")]

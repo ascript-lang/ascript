@@ -1296,7 +1296,7 @@ pub enum NativeKind {
     // resource-table entry — the `noop_handle` precedent from telemetry/mod.rs:113).
     // Purpose: the worker airlock's field-path scan sees a `Value::Native` whose kind
     // is non-sendable, so a policy crossing an isolate boundary fails loudly instead of
-    // silently deep-copying its counters into a divergent twin.  `governing_cap` → None
+    // silently deep-copying its counters into a divergent twin.  `governing_caps` → NONE
     // (no OS resource). Feature-gated — `#[cfg(feature = "resilience")]` — so the
     // variant is compiled out when the feature is absent (matches the telemetry pattern).
     #[cfg(feature = "resilience")]
@@ -1359,21 +1359,28 @@ impl NativeKind {
         }
     }
 
-    /// FFI §4 (BLOCKER 3): the capability that governs OPERATING an already-open
-    /// handle of this kind, or `None` for a pure in-memory native that touches no OS
-    /// resource. Consulted at the top of `Interp::call_native_method` so that
-    /// dropping a capability HOLDS for handles opened before the drop (e.g.
-    /// `socket.read()` / `listener.accept()` are denied after `caps.drop("net")`).
+    /// FFI §4 (BLOCKER 3) / CNTR §5.3: the capability requirement that governs
+    /// OPERATING an already-open handle of this kind, or `CapReq::NONE` for a pure
+    /// in-memory native that touches no OS resource. Consulted at the top of
+    /// `Interp::call_native_method` so that dropping a capability HOLDS for handles
+    /// opened before the drop (e.g. `socket.read()` / `listener.accept()` are denied
+    /// after `caps.drop("net")`). The re-check iterates `CapReq` in stable
+    /// `Cap::ALL` order — for a single-cap handle the loop runs exactly once,
+    /// byte-identical to the pre-CNTR `Option<Cap>` gate (CNTR §5.3 sibling of the
+    /// Task 1.1 `required_cap -> CapReq` migration). A handle requiring a CONJUNCTION
+    /// (e.g. a future docker exec/attach stream needing `net ∧ process`) is expressed
+    /// `CapReq::one(Net).and(Process)`; no such handle exists yet → all current arms
+    /// are 1:1 single-cap or `NONE`.
     ///
     /// - `Net`: every networking handle (TCP, UDP, HTTP body/server/response/SSE,
     ///   WebSocket, HTTP cancel/next) plus the network DB connections (postgres/redis).
     /// - `Process`: a child process and its stdio reader/writer.
     /// - `Fs`: a sqlite connection/statement (an open DB FILE handle).
-    /// - `None`: pure in-memory natives (channel, semaphore, timers, rate limiter,
+    /// - `NONE`: pure in-memory natives (channel, semaphore, timers, rate limiter,
     ///   stream, lru, events, telemetry, ai-config, worker actor, terminal) — they
     ///   acquire no OS effect at method time, so gating them would over-deny.
-    pub fn governing_cap(self) -> Option<crate::stdlib::caps::Cap> {
-        use crate::stdlib::caps::Cap;
+    pub fn governing_caps(self) -> crate::stdlib::caps::CapReq {
+        use crate::stdlib::caps::{Cap, CapReq};
         match self {
             // Networking handles — operating them is live network I/O.
             NativeKind::TcpListener
@@ -1384,28 +1391,28 @@ impl NativeKind {
             | NativeKind::HttpServer
             | NativeKind::WsConnection
             | NativeKind::WsListener
-            | NativeKind::UdpSocket => Some(Cap::Net),
-            NativeKind::PostgresConnection | NativeKind::RedisConnection => Some(Cap::Net),
+            | NativeKind::UdpSocket => CapReq::one(Cap::Net),
+            NativeKind::PostgresConnection | NativeKind::RedisConnection => CapReq::one(Cap::Net),
             // A cancel token (`http.cancelToken()`) is a pure in-memory `Notify` —
             // cancelling acquires no network, so gating it would over-deny a cleanup
             // (you typically cancel an in-flight request even after dropping `net`).
             // The HTTP-next middleware advancer drives already-accepted server work;
             // the accept itself (HttpServer) is gated. Both stay ungated to avoid
             // over-deny on the default path's request-lifecycle handles.
-            NativeKind::CancelHandle | NativeKind::HttpNext => None,
+            NativeKind::CancelHandle | NativeKind::HttpNext => CapReq::NONE,
             // A child process + its stdio: operating them is subprocess control.
             NativeKind::ChildProcess | NativeKind::Reader | NativeKind::Writer => {
-                Some(Cap::Process)
+                CapReq::one(Cap::Process)
             }
             // An open DB file handle (sqlite): operating it is filesystem I/O.
-            NativeKind::SqliteConnection | NativeKind::SqliteStatement => Some(Cap::Fs),
+            NativeKind::SqliteConnection | NativeKind::SqliteStatement => CapReq::one(Cap::Fs),
             // FFI §4 (BLOCKER 3): operating an OPEN foreign handle — `lib.symbol`,
             // `sym.call`, reading a `ForeignPtr` — is a native-call effect governed by
             // `ffi`. So `caps.drop("ffi")` HOLDS for libs/symbols opened before the
             // drop: a `lib.symbol`/`sym.call` after the drop is denied here, not just
             // the initial `ffi.open` at the dispatch gate.
             NativeKind::ForeignLib | NativeKind::ForeignSymbol | NativeKind::ForeignPtr => {
-                Some(Cap::Ffi)
+                CapReq::one(Cap::Ffi)
             }
             // Pure in-memory natives — no OS effect at method time → ungated.
             NativeKind::Terminal
@@ -1418,10 +1425,10 @@ impl NativeKind {
             | NativeKind::Stream
             | NativeKind::Lru
             | NativeKind::Events
-            | NativeKind::WorkerActor => None,
+            | NativeKind::WorkerActor => CapReq::NONE,
             // RESIL §2.2: no OS resource — a pure in-memory marker.
             #[cfg(feature = "resilience")]
-            NativeKind::Resilience => None,
+            NativeKind::Resilience => CapReq::NONE,
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a
@@ -1430,7 +1437,7 @@ impl NativeKind {
             #[cfg(feature = "telemetry")]
             NativeKind::TelemetrySpan
             | NativeKind::TelemetryInstrument
-            | NativeKind::TelemetryNoop => None,
+            | NativeKind::TelemetryNoop => CapReq::NONE,
             // An OPEN AI stream reads completions FROM THE NETWORK on each `.next()`
             // (`exec_chat_stream`), so operating one after `caps.drop("net")` must be
             // denied — the per-handle re-check that makes the drop HOLD (mirrors
@@ -1438,9 +1445,9 @@ impl NativeKind {
             // definitions with no network-doing handle methods (the network is the
             // module-level `ai.generate`/`ai.stream`, gated at the dispatch root).
             #[cfg(feature = "ai")]
-            NativeKind::AiStream | NativeKind::AiTextStream => Some(Cap::Net),
+            NativeKind::AiStream | NativeKind::AiTextStream => CapReq::one(Cap::Net),
             #[cfg(feature = "ai")]
-            NativeKind::AiProvider | NativeKind::AiModel | NativeKind::AiTool => None,
+            NativeKind::AiProvider | NativeKind::AiModel | NativeKind::AiTool => CapReq::NONE,
         }
     }
 }
@@ -4005,5 +4012,99 @@ mod tests {
         o.demote_to_dict(); // no-op
         assert_eq!(o.len(), 2);
         assert_eq!(o.shape.get(), 0);
+    }
+
+    // CNTR §5.3 (Task 1.2): the per-handle re-check now consults
+    // `NativeKind::governing_caps() -> CapReq` (sibling of Task 1.1's
+    // `required_cap -> CapReq`). This proves the migration preserved EVERY old
+    // `governing_cap() -> Option<Cap>` verdict 1:1 — a Some(cap) arm becomes a
+    // single-cap `CapReq::one(cap)` (nonempty, same cap), a None arm becomes
+    // `CapReq::NONE` (empty). The re-check loop runs exactly once per single-cap
+    // handle → byte-identical to the pre-CNTR `if let Some(cap)` path.
+    #[test]
+    fn governing_caps_preserves_verdicts() {
+        use crate::stdlib::caps::Cap;
+        use crate::value::NativeKind;
+
+        // Helper: a handle that maps to exactly one cap.
+        let one = |k: NativeKind, cap: Cap| {
+            assert!(!k.governing_caps().is_empty(), "{:?} must be gated", k);
+            assert_eq!(
+                k.governing_caps().iter().collect::<Vec<_>>(),
+                vec![cap],
+                "{:?} governing cap mismatch",
+                k
+            );
+        };
+        // Helper: a pure in-memory handle (old None arm → CapReq::NONE).
+        let none = |k: NativeKind| {
+            assert!(k.governing_caps().is_empty(), "{:?} must be ungated", k);
+            assert_eq!(
+                k.governing_caps().iter().collect::<Vec<_>>(),
+                Vec::<Cap>::new(),
+                "{:?} should yield no cap",
+                k
+            );
+        };
+
+        // ── old Some(Cap::Net) arms ──────────────────────────────────────────
+        one(NativeKind::TcpListener, Cap::Net);
+        one(NativeKind::TcpStream, Cap::Net);
+        one(NativeKind::HttpResponse, Cap::Net);
+        one(NativeKind::HttpBody, Cap::Net);
+        one(NativeKind::SseStream, Cap::Net);
+        one(NativeKind::HttpServer, Cap::Net);
+        one(NativeKind::WsConnection, Cap::Net);
+        one(NativeKind::WsListener, Cap::Net);
+        one(NativeKind::UdpSocket, Cap::Net);
+        one(NativeKind::PostgresConnection, Cap::Net);
+        one(NativeKind::RedisConnection, Cap::Net);
+
+        // ── old Some(Cap::Process) arms ─────────────────────────────────────
+        one(NativeKind::ChildProcess, Cap::Process);
+        one(NativeKind::Reader, Cap::Process);
+        one(NativeKind::Writer, Cap::Process);
+
+        // ── old Some(Cap::Fs) arms ──────────────────────────────────────────
+        one(NativeKind::SqliteConnection, Cap::Fs);
+        one(NativeKind::SqliteStatement, Cap::Fs);
+
+        // ── old Some(Cap::Ffi) arms ─────────────────────────────────────────
+        one(NativeKind::ForeignLib, Cap::Ffi);
+        one(NativeKind::ForeignSymbol, Cap::Ffi);
+        one(NativeKind::ForeignPtr, Cap::Ffi);
+
+        // ── old None arms (pure in-memory) ──────────────────────────────────
+        none(NativeKind::CancelHandle);
+        none(NativeKind::HttpNext);
+        none(NativeKind::Terminal);
+        none(NativeKind::Channel);
+        none(NativeKind::Semaphore);
+        none(NativeKind::Interval);
+        none(NativeKind::DebounceWrapper);
+        none(NativeKind::ThrottleWrapper);
+        none(NativeKind::RateLimiter);
+        none(NativeKind::Stream);
+        none(NativeKind::Lru);
+        none(NativeKind::Events);
+        none(NativeKind::WorkerActor);
+
+        // ── feature-gated variants ──────────────────────────────────────────
+        #[cfg(feature = "resilience")]
+        none(NativeKind::Resilience);
+        #[cfg(feature = "telemetry")]
+        {
+            none(NativeKind::TelemetrySpan);
+            none(NativeKind::TelemetryInstrument);
+            none(NativeKind::TelemetryNoop);
+        }
+        #[cfg(feature = "ai")]
+        {
+            one(NativeKind::AiStream, Cap::Net);
+            one(NativeKind::AiTextStream, Cap::Net);
+            none(NativeKind::AiProvider);
+            none(NativeKind::AiModel);
+            none(NativeKind::AiTool);
+        }
     }
 }

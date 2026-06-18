@@ -13,7 +13,7 @@
 //! `required_cap("ffi", _) -> Some(Cap::Ffi)` gate, so `ffi.open` is denied after a
 //! `caps.drop("ffi")` / `--deny ffi` / `--sandbox`. Operating an ALREADY-OPEN handle
 //! (`lib.symbol`, `sym.call`) is re-gated at `call_native_method` via
-//! `NativeKind::governing_cap` (also `Cap::Ffi`), so a drop HOLDS for handles opened
+//! `NativeKind::governing_caps` (also `Cap::Ffi`), so a drop HOLDS for handles opened
 //! before it.
 //!
 //! **Sized C ints marshal OVER `int`** (NUM §10): `i8`…`u64`/`size` exist only at the
