@@ -33,7 +33,10 @@ use std::rc::Rc;
 ///
 /// Task 1.1 ships only `breaker`; subsequent tasks will extend this list.
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("breaker", super::bi("resilience.breaker"))]
+    vec![
+        ("breaker", super::bi("resilience.breaker")),
+        ("limiter", super::bi("resilience.limiter")),
+    ]
 }
 
 // ── tagged-object helpers ─────────────────────────────────────────────────────
@@ -269,6 +272,7 @@ impl Interp {
 
         match kind.as_str() {
             "breaker" => self.call_breaker_method(&recv, name, args, span).await,
+            "limiter" => self.call_limiter_method(&recv, name, args, span).await,
             other => Err(AsError::at(
                 format!("{} policy has no method '{}'", other, name),
                 span,
@@ -557,6 +561,109 @@ impl Interp {
     }
 }
 
+// ── limiter method dispatch ───────────────────────────────────────────────────
+
+impl Interp {
+    /// Dispatch a method call on a `limiter` policy object.
+    ///
+    /// ## `tryAcquire([n])` — sync, atomic
+    /// Refills tokens, then if `__tokens >= n`: consume n, return true.
+    /// Else: no-op, return false.  All-or-nothing under one synchronous borrow.
+    ///
+    /// ## `acquire([n])` — async deficit-sleep loop
+    /// Short borrow: refill + check.  If enough tokens: consume + return.
+    /// Else: compute deficit sleep duration, DROP borrow, sleep, re-loop.
+    /// CRITICAL: no borrow held across the sleep `.await`.
+    async fn call_limiter_method(
+        &self,
+        recv: &Value,
+        name: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::stdlib::time::real_monotonic_ms;
+
+        match name {
+            "tryAcquire" => {
+                // args[0] = recv, args[1] (optional) = n
+                let n = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                if n < 0.0 {
+                    return Err(AsError::at(
+                        "limiter.tryAcquire: n must be non-negative",
+                        span,
+                    ).into());
+                }
+
+                // Short synchronous borrow — no .await inside
+                let now = self.clock_monotonic_ms(real_monotonic_ms());
+                let new_tokens = limiter_refill(recv, now);
+                if new_tokens >= n {
+                    // Consume n tokens (atomic: check+consume under one sync borrow)
+                    if let ValueKind::Object(o) = recv.kind() {
+                        o.insert("__tokens", Value::float(new_tokens - n));
+                    }
+                    Ok(Value::bool_(true))
+                } else {
+                    Ok(Value::bool_(false))
+                }
+            }
+
+            "acquire" => {
+                // args[0] = recv, args[1] (optional) = n
+                let n = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                if n < 0.0 {
+                    return Err(AsError::at(
+                        "limiter.acquire: n must be non-negative",
+                        span,
+                    ).into());
+                }
+
+                loop {
+                    // ── Short borrow: refill + check ──────────────────────────
+                    let now = self.clock_monotonic_ms(real_monotonic_ms());
+                    let new_tokens = limiter_refill(recv, now);
+                    let refill_per_sec = match recv.kind() {
+                        ValueKind::Object(o) => {
+                            o.get("refillPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                        }
+                        _ => 0.0,
+                    };
+
+                    if new_tokens >= n {
+                        // Enough tokens — consume and return
+                        if let ValueKind::Object(o) = recv.kind() {
+                            o.insert("__tokens", Value::float(new_tokens - n));
+                        }
+                        return Ok(Value::nil());
+                    }
+
+                    // Not enough — compute sleep duration
+                    let deficit = n - new_tokens;
+                    let sleep_ms = if refill_per_sec > 0.0 {
+                        (deficit / refill_per_sec * 1000.0).max(1.0)
+                    } else {
+                        // Zero refill rate: never refills — avoid infinite loop
+                        return Err(AsError::at(
+                            "limiter.acquire: cannot acquire tokens from a zero-refill limiter",
+                            span,
+                        ).into());
+                    };
+
+                    // ── Borrow is DROPPED here before .await ──────────────────
+                    let duration = std::time::Duration::from_millis(sleep_ms as u64);
+                    tokio::time::sleep(duration).await;
+                    // Re-loop to re-check after sleep
+                }
+            }
+
+            other => Err(AsError::at(
+                format!("limiter policy has no method '{}'", other),
+                span,
+            ).into()),
+        }
+    }
+}
+
 // ── breaker_record_outcome: ring update + state transition ───────────────────
 
 /// Record a call outcome into the ring window and perform state transitions.
@@ -703,6 +810,139 @@ fn breaker_record_outcome(
     }
 }
 
+// ── limiter constructor ───────────────────────────────────────────────────────
+
+/// Build a token-bucket limiter policy object from an options `Value::Object`.
+///
+/// Required (Tier-2 panic if wrong):
+/// - `capacity`: positive integer (≥ 1)
+/// - `refillPerSec`: non-negative finite number (≥ 0)
+///
+/// Optional:
+/// - `name`: string label (default `"default"`)
+///
+/// State fields set on construction (§3.2.1):
+/// - `__tokens: float` — initialized to `capacity` (full bucket)
+/// - `__lastMs: float` — current monotonic time (via `real_monotonic_ms`)
+fn make_limiter(opts: Value, span: Span) -> Result<Value, Control> {
+    use crate::stdlib::time::real_monotonic_ms;
+
+    let name = limiter_opt_name(&opts, span)?;
+    let capacity = limiter_opt_capacity(&opts, span)?;
+    let refill_per_sec = limiter_opt_refill_per_sec(&opts, span)?;
+
+    // Initial state: full bucket, clock set to now
+    let now = real_monotonic_ms();
+
+    let mut m: IndexMap<String, Value> = IndexMap::new();
+    // kind tag
+    m.insert("__resil".to_string(), Value::str("limiter"));
+    // config fields
+    m.insert("name".to_string(), Value::str(name));
+    m.insert("capacity".to_string(), Value::float(capacity));
+    m.insert("refillPerSec".to_string(), Value::float(refill_per_sec));
+    // mutable state — floats for precision
+    m.insert("__tokens".to_string(), Value::float(capacity));
+    m.insert("__lastMs".to_string(), Value::float(now));
+    // non-sendable marker
+    m.insert("__local".to_string(), local_marker());
+
+    Ok(Value::object(m))
+}
+
+/// Extract `name` field (default `"default"`).
+fn limiter_opt_name(opts: &Value, span: Span) -> Result<String, Control> {
+    match opts.kind() {
+        ValueKind::Object(o) => match o.get("name") {
+            Some(v) => match v.kind() {
+                ValueKind::Str(s) => Ok(s.to_string()),
+                ValueKind::Nil => Ok("default".to_string()),
+                _ => Err(AsError::at("limiter: 'name' must be a string", span).into()),
+            },
+            None => Ok("default".to_string()),
+        },
+        ValueKind::Nil => Ok("default".to_string()),
+        _ => Err(AsError::at("limiter: expected an options object, got non-object", span).into()),
+    }
+}
+
+/// Extract `capacity` as `f64` (must be ≥ 1).
+fn limiter_opt_capacity(opts: &Value, span: Span) -> Result<f64, Control> {
+    let v = match opts.kind() {
+        ValueKind::Object(o) => o.get("capacity"),
+        ValueKind::Nil => None,
+        _ => return Err(AsError::at("limiter: expected an options object, got non-object", span).into()),
+    };
+    match v {
+        None => Err(AsError::at("limiter: 'capacity' is required", span).into()),
+        Some(v) => match v.as_f64() {
+            Some(n) if n >= 1.0 => Ok(n),
+            Some(_) => Err(AsError::at(
+                "limiter: 'capacity' must be a positive integer (>= 1)",
+                span,
+            ).into()),
+            None => Err(AsError::at(
+                format!(
+                    "limiter: 'capacity' must be a number, got {}",
+                    crate::interp::type_name(&v)
+                ),
+                span,
+            ).into()),
+        },
+    }
+}
+
+/// Extract `refillPerSec` as `f64` (must be ≥ 0 and finite).
+fn limiter_opt_refill_per_sec(opts: &Value, span: Span) -> Result<f64, Control> {
+    let v = match opts.kind() {
+        ValueKind::Object(o) => o.get("refillPerSec"),
+        ValueKind::Nil => None,
+        _ => return Err(AsError::at("limiter: expected an options object, got non-object", span).into()),
+    };
+    match v {
+        None => Err(AsError::at("limiter: 'refillPerSec' is required", span).into()),
+        Some(v) => match v.as_f64() {
+            Some(n) if n.is_finite() && n >= 0.0 => Ok(n),
+            Some(_) => Err(AsError::at(
+                "limiter: 'refillPerSec' must be a non-negative finite number",
+                span,
+            ).into()),
+            None => Err(AsError::at(
+                format!(
+                    "limiter: 'refillPerSec' must be a number, got {}",
+                    crate::interp::type_name(&v)
+                ),
+                span,
+            ).into()),
+        },
+    }
+}
+
+/// Refill `__tokens` based on elapsed time since `__lastMs` (§3.2.1 formula).
+///
+/// `now` must be from `clock_monotonic_ms` (det-routed).
+/// Returns the post-refill token count.
+/// MUST be called under a short, synchronous borrow — no `.await` inside.
+fn limiter_refill(obj: &Value, now: f64) -> f64 {
+    let o = match obj.kind() {
+        ValueKind::Object(o) => o,
+        _ => return 0.0,
+    };
+    let capacity = o.get("capacity").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let refill_per_sec = o.get("refillPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let last_ms = o.get("__lastMs").and_then(|v| v.as_f64()).unwrap_or(now);
+    let tokens = o.get("__tokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let elapsed_ms = (now - last_ms).max(0.0);
+    let replenish = elapsed_ms / 1000.0 * refill_per_sec;
+    let new_tokens = (tokens + replenish).min(capacity);
+
+    o.insert("__tokens", Value::float(new_tokens));
+    o.insert("__lastMs", Value::float(now));
+
+    new_tokens
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -719,6 +959,10 @@ impl Interp {
             "breaker" => {
                 let opts = arg(args, 0);
                 make_breaker(opts, span)
+            }
+            "limiter" => {
+                let opts = arg(args, 0);
+                make_limiter(opts, span)
             }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
@@ -886,14 +1130,14 @@ print(fake.state)
         assert_eq!(out, "whatever\n");
     }
 
-    /// An unimplemented kind (not "breaker") raises a Tier-2 panic with the kind name.
+    /// An unimplemented kind raises a Tier-2 panic with the kind name.
     #[tokio::test]
     async fn hook_unimplemented_kind_error() {
-        // We can't construct a non-breaker policy yet, but we can craft a tagged object
-        // with a known kind and call a method on it to check the error message.
+        // Craft a tagged object with a known-but-unimplemented kind ("bulkhead")
+        // and call a method on it to check the error message.
         let res = crate::run_source(r#"
-let fake = {__resil: "limiter"}
-fake.acquire()
+let fake = {__resil: "bulkhead"}
+fake.run()
 "#)
         .await;
         // run_source returns Err(AsError) for a Tier-2 panic.
@@ -902,8 +1146,8 @@ fake.acquire()
             Ok(s) => s,
         };
         assert!(
-            msg.contains("limiter policy has no method 'acquire'"),
-            "expected limiter kind error, got: {msg:?}"
+            msg.contains("bulkhead policy has no method 'run'"),
+            "expected bulkhead kind error, got: {msg:?}"
         );
     }
 
@@ -1072,6 +1316,100 @@ b.call(ok)
 print(b.state())
 "#, 42).await.expect("deterministic run should succeed");
         assert_eq!(out, "open\nhalfOpen\nclosed\n");
+    }
+
+    // ── Task 2.1: limiter tests (TDD — add BEFORE implementation) ──────────────
+
+    /// Capacity exhaustion determinism: capacity=2 → first two tryAcquire() true, third false.
+    #[tokio::test]
+    async fn limiter_capacity_exhaustion_deterministic() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let lim = resilience.limiter({capacity: 2, refillPerSec: 0.001})
+print(lim.tryAcquire())
+print(lim.tryAcquire())
+print(lim.tryAcquire())
+"#).await;
+        assert_eq!(out, "true\ntrue\nfalse\n");
+    }
+
+    /// tryAcquire(n) atomicity: 5 tokens → tryAcquire(5) true (all 5 consumed);
+    /// then 4 remaining tokens → tryAcquire(5) false AND none consumed.
+    #[tokio::test]
+    async fn limiter_try_acquire_n_atomicity() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let lim = resilience.limiter({capacity: 5, refillPerSec: 0.0})
+let r1 = lim.tryAcquire(5)
+print(r1)
+// Re-fill 4 tokens manually by creating a fresh limiter with 4 capacity
+let lim2 = resilience.limiter({capacity: 4, refillPerSec: 0.0})
+let r2 = lim2.tryAcquire(5)
+print(r2)
+// Verify 4 tokens still present (can still take 4)
+let r3 = lim2.tryAcquire(4)
+print(r3)
+"#).await;
+        assert_eq!(out, "true\nfalse\ntrue\n");
+    }
+
+    /// Refill under virtual clock: capacity=1, consume it, advance clock 2s → tryAcquire() true.
+    #[tokio::test]
+    async fn limiter_refill_virtual_clock() {
+        let out = crate::run_source_deterministic(r#"
+import * as resilience from "std/resilience"
+import * as time from "std/time"
+let lim = resilience.limiter({capacity: 1, refillPerSec: 1000})
+print(lim.tryAcquire())
+print(lim.tryAcquire())
+await time.sleep(2)
+print(lim.tryAcquire())
+"#, 42).await.expect("deterministic run should succeed");
+        assert_eq!(out, "true\nfalse\ntrue\n");
+    }
+
+    /// acquire integration: capacity=1, high refillPerSec → two sequential await lim.acquire()
+    /// both complete in real time (the sleep is timing-only per §3.2.1).
+    /// Uses a high refillPerSec (10000/sec = 0.1ms/token) so the test completes quickly.
+    #[tokio::test]
+    async fn limiter_acquire_integration() {
+        let out = crate::run_source(r#"
+import * as resilience from "std/resilience"
+let lim = resilience.limiter({capacity: 1, refillPerSec: 10000})
+await lim.acquire()
+print("first")
+await lim.acquire()
+print("second")
+"#).await.expect("acquire integration should succeed");
+        assert_eq!(out, "first\nsecond\n");
+    }
+
+    /// Validation panics (Tier-2): capacity=0, negative refillPerSec, non-number args.
+    #[tokio::test]
+    async fn limiter_validation_panics() {
+        // capacity: 0
+        let r1 = crate::run_source(r#"
+import * as resilience from "std/resilience"
+resilience.limiter({capacity: 0, refillPerSec: 10})
+"#).await;
+        let msg1 = match r1 { Err(e) => format!("{e}"), Ok(s) => s };
+        assert!(msg1.contains("capacity"), "expected capacity panic, got: {msg1:?}");
+
+        // negative refillPerSec
+        let r2 = crate::run_source(r#"
+import * as resilience from "std/resilience"
+resilience.limiter({capacity: 10, refillPerSec: -1})
+"#).await;
+        let msg2 = match r2 { Err(e) => format!("{e}"), Ok(s) => s };
+        assert!(msg2.contains("refillPerSec"), "expected refillPerSec panic, got: {msg2:?}");
+
+        // non-number capacity
+        let r3 = crate::run_source(r#"
+import * as resilience from "std/resilience"
+resilience.limiter({capacity: "ten", refillPerSec: 10})
+"#).await;
+        let msg3 = match r3 { Err(e) => format!("{e}"), Ok(s) => s };
+        assert!(msg3.contains("capacity"), "expected capacity type panic, got: {msg3:?}");
     }
 
     /// halfOpenMax=2: two sequential probes both succeed → breaker re-closes.
