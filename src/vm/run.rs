@@ -8749,6 +8749,22 @@ impl Vm {
             fiber.push(v);
             return Ok(());
         }
+        // (1a) RESIL §2.3: resilience policy call-site hook (same predicate + shape as
+        // the schema hook, same routing to the shared `Interp::call_resilience_method`).
+        #[cfg(feature = "resilience")]
+        if crate::stdlib::resilience::is_resilience_value(&recv)
+            && crate::stdlib::resilience::is_resilience_method(name)
+        {
+            let mut rargs = Vec::with_capacity(args.len() + 1);
+            rargs.push(recv);
+            rargs.extend(args);
+            let v = self
+                .interp
+                .call_resilience_method(name, &rargs, span)
+                .await?;
+            fiber.push(v);
+            return Ok(());
+        }
         // (1a) SP9 §2: workflow `ctx.<method>()` hook (same predicate + shape as the
         // schema hook, same routing to the shared `Interp`).
         #[cfg(feature = "workflow")]

@@ -42,6 +42,7 @@ const NAV = [
     ['stdlib/stream', 'Lazy streams'],
     ['stdlib/utilities', 'Utilities (LRU, events, templates)'],
     ['stdlib/workflow', 'Workflows (durable execution)'],
+    ['stdlib/resilience', 'Resilience policies'],
     ['stdlib/telemetry', 'Telemetry & observability'],
     ['stdlib/ai', 'AI (LLM client)'],
     ['stdlib/log', 'Logging'],

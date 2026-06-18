@@ -5597,6 +5597,12 @@ impl Interp {
         {
             return true;
         }
+        #[cfg(feature = "resilience")]
+        if crate::stdlib::resilience::is_resilience_value(recv)
+            && crate::stdlib::resilience::is_resilience_method(name)
+        {
+            return true;
+        }
         #[cfg(feature = "workflow")]
         if crate::stdlib::workflow::is_ctx_value(recv)
             && crate::stdlib::workflow::is_ctx_method(name)
@@ -5643,6 +5649,16 @@ impl Interp {
             sargs.push(recv);
             sargs.extend(args);
             return self.call_schema(name, &sargs, span).await;
+        }
+        // Resilience policy call-site hook (RESIL §2.3).
+        #[cfg(feature = "resilience")]
+        if crate::stdlib::resilience::is_resilience_value(&recv)
+            && crate::stdlib::resilience::is_resilience_method(name)
+        {
+            let mut rargs = Vec::with_capacity(args.len() + 1);
+            rargs.push(recv);
+            rargs.extend(args);
+            return self.call_resilience_method(name, &rargs, span).await;
         }
         // Workflow ctx hook.
         #[cfg(feature = "workflow")]

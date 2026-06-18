@@ -79,6 +79,7 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     ("std/cbor",        Some("binary")),
     ("std/tui",         Some("tui")),
     ("std/ffi",         Some("ffi")),
+    ("std/resilience",  Some("resilience")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.

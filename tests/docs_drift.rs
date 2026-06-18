@@ -214,6 +214,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/cbor", "data.md"),
     ("std/tui", "tui.md"),
     ("std/ffi", "ffi.md"),
+    ("std/resilience", "resilience.md"),
 ];
 
 /// Pure checker (mutation-self-testable): validates a mapping against a module

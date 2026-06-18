@@ -243,6 +243,98 @@ fn check_pos_int(r: Result<u64, String>, field: &str, span: Span) -> Result<u64,
     }
 }
 
+// ── call-site hook: method dispatch on a resilience policy object ─────────────
+
+/// Dispatch a method call on a resilience policy object (§2.3 call-site hook).
+///
+/// Called from BOTH the tree-walker (`member_call_is_hook` / `call_method_recv`,
+/// `src/interp.rs`) and the VM (`dispatch_method`, `src/vm/run.rs`), always with
+/// the receiver at `args[0]` followed by the user-supplied arguments — the same
+/// `[recv, ...args]` convention `call_schema` uses.
+///
+/// For kinds not yet implemented (all except `breaker` in Task 1.2), every
+/// method raises a Tier-2 panic with `"<kind> policy has no method '<name>'"`.
+impl Interp {
+    pub(crate) async fn call_resilience_method(
+        &self,
+        name: &str,
+        args: &[Value],   // args[0] = the policy receiver
+        span: Span,
+    ) -> Result<Value, Control> {
+        // args[0] is always the receiver (the `[recv, ...user_args]` convention).
+        let recv = args.first().cloned().unwrap_or(Value::nil());
+        let kind = resil_kind(&recv)
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        match kind.as_str() {
+            "breaker" => Self::call_breaker_method(&recv, name, args, span),
+            other => Err(AsError::at(
+                format!("{} policy has no method '{}'", other, name),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// Dispatch a method call on a `breaker` policy object.
+    fn call_breaker_method(
+        recv: &Value,
+        name: &str,
+        _args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        match name {
+            // state() → returns the __state field value ("closed" | "open" | "halfOpen")
+            "state" => {
+                let s = match recv.kind() {
+                    ValueKind::Object(o) => o
+                        .get("__state")
+                        .unwrap_or(Value::str("closed")),
+                    _ => Value::str("closed"),
+                };
+                Ok(s)
+            }
+            // stats() → {calls, failures, rejected}
+            "stats" => {
+                let (calls, failures, rejected) = match recv.kind() {
+                    ValueKind::Object(o) => (
+                        o.get("__calls").unwrap_or(Value::int(0)),
+                        o.get("__failures").unwrap_or(Value::int(0)),
+                        o.get("__rejected").unwrap_or(Value::int(0)),
+                    ),
+                    _ => (Value::int(0), Value::int(0), Value::int(0)),
+                };
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("calls".to_string(), calls);
+                m.insert("failures".to_string(), failures);
+                m.insert("rejected".to_string(), rejected);
+                Ok(Value::object(m))
+            }
+            // reset() → clears state back to closed, window cleared
+            "reset" => {
+                if let ValueKind::Object(o) = recv.kind() {
+                    o.insert("__state", Value::str("closed"));
+                    o.insert("__ring", Value::array(vec![]));
+                    o.insert("__ringIdx", Value::int(0));
+                    o.insert("__calls", Value::int(0));
+                    o.insert("__failures", Value::int(0));
+                    o.insert("__rejected", Value::int(0));
+                    o.insert("__openedAtMs", Value::nil());
+                    o.insert("__halfOpenInFlight", Value::int(0));
+                    o.insert("__halfOpenSuccesses", Value::int(0));
+                }
+                Ok(Value::nil())
+            }
+            other => Err(AsError::at(
+                format!("breaker policy has no method '{}'", other),
+                span,
+            )
+            .into()),
+        }
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -341,6 +433,109 @@ resilience.breaker({window: 0})
         assert!(
             res.is_err() || res.unwrap().contains("window"),
             "expected a panic about window"
+        );
+    }
+
+    // ── hook tests (Task 1.2) ─────────────────────────────────────────────────
+
+    /// Hook routes `.state()`, `.stats()`, `.reset()` calls on a breaker.
+    #[tokio::test]
+    async fn hook_routes_method_calls() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({window: 4, minCalls: 2})
+print(b.state())
+let s = b.stats()
+print(s.calls)
+print(s.failures)
+print(s.rejected)
+b.reset()
+print(b.state())
+"#)
+        .await;
+        assert_eq!(out, "closed\n0\n0\n0\nclosed\n");
+    }
+
+    /// A bare member read (not a call) still reads the stored field, not the hook.
+    /// `b.state` (no parens) should return `nil` (the __state field is named `__state`,
+    /// and `state` is not a config field — so it reads nil).
+    #[tokio::test]
+    async fn hook_call_position_only_bare_read_not_routed() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({window: 4, minCalls: 2})
+let bare = b.state
+print(type(bare))
+"#)
+        .await;
+        // bare member read of a non-existent field returns nil
+        assert_eq!(out, "nil\n");
+    }
+
+    /// A method in the union set but not valid for a breaker raises a Tier-2 panic.
+    /// `acquire` is a limiter method — calling it on a breaker should panic.
+    #[tokio::test]
+    async fn hook_wrong_method_for_kind_is_tier2() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({window: 4, minCalls: 2})
+b.acquire()
+"#)
+        .await;
+        // run_source returns Err(AsError) for a Tier-2 panic.
+        let msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(s) => s,
+        };
+        assert!(
+            msg.contains("breaker policy has no method 'acquire'"),
+            "expected breaker method-mismatch message, got: {msg:?}"
+        );
+    }
+
+    /// OptMember (`b?.state(...)`) does NOT route through the hook.
+    /// It reads the stored `state` field (nil) and the call is never made.
+    #[tokio::test]
+    async fn hook_opt_member_does_not_route() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({window: 4, minCalls: 2})
+print(b?.state)
+"#)
+        .await;
+        // OptMember reads the object field `state` (absent → nil), not the method
+        assert_eq!(out, "nil\n");
+    }
+
+    /// An object that carries `__resil` with a BOGUS kind is NOT hijacked.
+    #[tokio::test]
+    async fn hook_bogus_resil_not_hijacked() {
+        let out = run(r#"
+let fake = {__resil: "notAKind", state: "whatever"}
+print(fake.state)
+"#)
+        .await;
+        assert_eq!(out, "whatever\n");
+    }
+
+    /// An unimplemented kind (not "breaker") raises a Tier-2 panic with the kind name.
+    #[tokio::test]
+    async fn hook_unimplemented_kind_error() {
+        // We can't construct a non-breaker policy yet, but we can craft a tagged object
+        // with a known kind and call a method on it to check the error message.
+        let res = crate::run_source(r#"
+let fake = {__resil: "limiter"}
+fake.acquire()
+"#)
+        .await;
+        // run_source returns Err(AsError) for a Tier-2 panic.
+        let msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(s) => s,
+        };
+        assert!(
+            msg.contains("limiter policy has no method 'acquire'"),
+            "expected limiter kind error, got: {msg:?}"
         );
     }
 }
