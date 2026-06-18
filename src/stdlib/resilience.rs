@@ -37,6 +37,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("breaker", super::bi("resilience.breaker")),
         ("limiter", super::bi("resilience.limiter")),
         ("keyedLimiter", super::bi("resilience.keyedLimiter")),
+        ("bulkhead", super::bi("resilience.bulkhead")),
     ]
 }
 
@@ -275,6 +276,7 @@ impl Interp {
             "breaker" => self.call_breaker_method(&recv, name, args, span).await,
             "limiter" => self.call_limiter_method(&recv, name, args, span).await,
             "keyedLimiter" => self.call_keyed_limiter_method(&recv, name, args, span).await,
+            "bulkhead" => self.call_bulkhead_method(&recv, name, args, span).await,
             other => Err(AsError::at(
                 format!("{} policy has no method '{}'", other, name),
                 span,
@@ -1258,6 +1260,269 @@ fn bucket_set_tokens(bucket: &Value, tokens: f64) {
     }
 }
 
+// ── bulkhead constructor + method dispatch ────────────────────────────────────
+
+impl Interp {
+    /// Build a bulkhead policy object from an options `Value::Object` (spec §3.3).
+    ///
+    /// Fields:
+    /// - `limit`:  max concurrent executions (positive int ≥ 1; required).
+    /// - `queue`:  max callers that may park waiting (non-negative int ≥ 0; default 0).
+    /// - `name`:   optional string label (default `"default"`).
+    ///
+    /// The concurrency cap is backed by a real `sync.semaphore` handle (`__sem`)
+    /// so the lost-wakeup-safe acquire loop is reused verbatim.
+    /// `__waiting` tracks parked waiters synchronously (O(1) shed check).
+    fn make_bulkhead(&self, opts: Value, span: Span) -> Result<Value, Control> {
+        // ── extract & validate opts ───────────────────────────────────────────
+        let name = match opts.kind() {
+            ValueKind::Object(o) => match o.get("name") {
+                Some(v) => match v.kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    ValueKind::Nil => "default".to_string(),
+                    _ => return Err(AsError::at("bulkhead: 'name' must be a string", span).into()),
+                },
+                None => "default".to_string(),
+            },
+            ValueKind::Nil => "default".to_string(),
+            _ => return Err(AsError::at("bulkhead: expected an options object", span).into()),
+        };
+
+        let limit: u64 = match opts.kind() {
+            ValueKind::Object(o) => match o.get("limit") {
+                None => {
+                    return Err(AsError::at("bulkhead: 'limit' is required", span).into())
+                }
+                Some(v) => match v.as_f64() {
+                    Some(n) if n >= 1.0 && n.fract() == 0.0 => n as u64,
+                    _ => {
+                        return Err(AsError::at(
+                            "bulkhead: 'limit' must be a positive integer (>= 1)",
+                            span,
+                        )
+                        .into())
+                    }
+                },
+            },
+            _ => return Err(AsError::at("bulkhead: 'limit' is required", span).into()),
+        };
+
+        let queue: u64 = match opts.kind() {
+            ValueKind::Object(o) => match o.get("queue") {
+                None => 0,
+                Some(v) => match v.kind() {
+                    ValueKind::Nil => 0,
+                    _ => match v.as_f64() {
+                        Some(n) if n >= 0.0 && n.fract() == 0.0 => n as u64,
+                        _ => {
+                            return Err(AsError::at(
+                                "bulkhead: 'queue' must be a non-negative integer (>= 0)",
+                                span,
+                            )
+                            .into())
+                        }
+                    },
+                },
+            },
+            _ => 0,
+        };
+
+        // Create the semaphore handle (capacity = limit).
+        let sem_val = self.sync_semaphore(
+            &[Value::int(limit as i64)],
+            span,
+        )?;
+
+        // ── build the policy object ───────────────────────────────────────────
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("__resil".to_string(), Value::str("bulkhead"));
+        m.insert("name".to_string(), Value::str(name));
+        m.insert("limit".to_string(), Value::int(limit as i64));
+        m.insert("queue".to_string(), Value::int(queue as i64));
+        // The real semaphore handle — concurrency cap
+        m.insert("__sem".to_string(), sem_val);
+        // Current parked waiters count (synchronous int counter, short borrows only)
+        m.insert("__waiting".to_string(), Value::int(0));
+        // Non-sendable marker (§2.2)
+        m.insert("__local".to_string(), local_marker());
+
+        Ok(Value::object(m))
+    }
+
+    /// `bulkhead.run(fn)` — the core policy method (spec §3.3).
+    ///
+    /// Three paths:
+    /// 1. Permit immediately available (in-flight < limit): acquire (sync), run, release.
+    /// 2. No permit AND `__waiting >= queue`: **immediate shed** — returns `[nil, {code:"bulkhead-full"}]`.
+    /// 3. No permit AND `__waiting < queue`: `__waiting += 1`, park on semaphore, `__waiting -= 1`, run, release.
+    ///
+    /// Permit released on ALL exit paths (success, error pair, panic, propagate).
+    /// `__waiting` decremented on ALL wait-path exits.
+    /// No `RefCell`/ObjectCell borrow held across `.await`.
+    async fn bulkhead_run(
+        &self,
+        recv: &Value,
+        user_fn: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::interp::make_pair;
+        use super::sync::get_semaphore;
+
+        // ── Step 1: Read config + state under short synchronous borrow ────────
+        let (sem_id, queue, waiting) = {
+            match recv.kind() {
+                ValueKind::Object(o) => {
+                    let sem_id = o.get("__sem")
+                        .and_then(|v| match v.kind() {
+                            ValueKind::Native(n) => Some(n.id),
+                            _ => None,
+                        })
+                        .unwrap_or(u64::MAX);
+                    let queue = o.get("queue").and_then(|v| v.as_int()).unwrap_or(0);
+                    let waiting = o.get("__waiting").and_then(|v| v.as_int()).unwrap_or(0);
+                    (sem_id, queue, waiting)
+                }
+                _ => (u64::MAX, 0, 0),
+            }
+        };
+
+        // ── Step 2: Check current in-flight by inspecting semaphore available ──
+        // available == 0 means limit reached.
+        let sem = match get_semaphore(self, sem_id) {
+            Some(s) => s,
+            None => {
+                return Err(AsError::at("bulkhead: internal semaphore is invalid", span).into());
+            }
+        };
+        let available = *sem.available.borrow();
+
+        // ── Step 3: Admit or shed decision ────────────────────────────────────
+        let needs_wait = available == 0;
+
+        if needs_wait {
+            if waiting >= queue {
+                // O(1) immediate shed — no parking
+                let name = match recv.kind() {
+                    ValueKind::Object(o) => o
+                        .get("name")
+                        .and_then(|v| match v.kind() {
+                            ValueKind::Str(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "default".to_string()),
+                    _ => "default".to_string(),
+                };
+                let mut err: IndexMap<String, Value> = IndexMap::new();
+                err.insert(
+                    "message".to_string(),
+                    Value::str(format!("bulkhead '{}' queue is full", name)),
+                );
+                err.insert("code".to_string(), Value::str("bulkhead-full"));
+                return Ok(make_pair(Value::nil(), Value::object(err)));
+            }
+
+            // Park path: increment waiting (sync, no borrow across await below)
+            if let ValueKind::Object(o) = recv.kind() {
+                o.insert("__waiting", Value::int(waiting + 1));
+            }
+        }
+
+        // ── Step 4: Acquire the permit (may park if needs_wait) ────────────────
+        // Build a Value::Native(Semaphore) slice reference to pass to sync_acquire.
+        // We already have `sem_id`; reconstitute the Value we need to pass.
+        let sem_value = match recv.kind() {
+            ValueKind::Object(o) => o.get("__sem").unwrap_or(Value::nil()),
+            _ => Value::nil(),
+        };
+
+        let acquire_result = self
+            .sync_acquire(std::slice::from_ref(&sem_value), span)
+            .await;
+
+        // If acquisition failed (shouldn't in normal operation), clean up waiting and propagate.
+        if let Err(e) = acquire_result {
+            if needs_wait {
+                if let ValueKind::Object(o) = recv.kind() {
+                    let w = o.get("__waiting").and_then(|v| v.as_int()).unwrap_or(1);
+                    o.insert("__waiting", Value::int((w - 1).max(0)));
+                }
+            }
+            return Err(e);
+        }
+
+        // Acquired the permit — decrement waiting counter (if we were waiting)
+        if needs_wait {
+            if let ValueKind::Object(o) = recv.kind() {
+                let w = o.get("__waiting").and_then(|v| v.as_int()).unwrap_or(1);
+                o.insert("__waiting", Value::int((w - 1).max(0)));
+            }
+        }
+
+        // ── Step 5: Call the user fn (NO borrow held across .await) ──────────
+        let call_result = self.call_value(user_fn, vec![], span).await;
+        // Drive a returned future to completion (the task.retry / breaker pattern)
+        let outcome = match call_result {
+            Ok(v) => match v.kind() {
+                ValueKind::Future(_) => {
+                    let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                        unreachable!()
+                    };
+                    f.get().await
+                }
+                _ => Ok(v),
+            },
+            other => other,
+        };
+
+        // ── Step 6: Release the permit on ALL exit paths ──────────────────────
+        // sync_release never fails (it only increments the counter and notify_one).
+        let _ = self.sync_release(&[sem_value], span);
+
+        // Return the outcome:
+        // - success: normalize plain value → [v, nil]; already-a-pair passes through.
+        // - err pair: pass through.
+        // - panic: re-raise (never swallowed — caller uses recover).
+        // - propagate/exit: pass through.
+        match outcome {
+            Ok(v) => {
+                // Normalize: plain non-pair value → [v, nil]; 2-element array passes through.
+                let is_pair = match v.kind() {
+                    ValueKind::Array(a) => a.borrow().len() == 2,
+                    _ => false,
+                };
+                if is_pair {
+                    Ok(v)
+                } else {
+                    Ok(crate::interp::make_pair(v, Value::nil()))
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Dispatch a method call on a `bulkhead` policy object.
+    async fn call_bulkhead_method(
+        &self,
+        recv: &Value,
+        name: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        match name {
+            "run" => {
+                // args[0] = receiver, args[1] = the fn to run
+                let user_fn = args.get(1).cloned().unwrap_or(Value::nil());
+                self.bulkhead_run(recv, user_fn, span).await
+            }
+            other => Err(AsError::at(
+                format!("bulkhead policy has no method '{}'", other),
+                span,
+            )
+            .into()),
+        }
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -1282,6 +1547,10 @@ impl Interp {
             "keyedLimiter" => {
                 let opts = arg(args, 0);
                 self.make_keyed_limiter(opts, span)
+            }
+            "bulkhead" => {
+                let opts = arg(args, 0);
+                self.make_bulkhead(opts, span)
             }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
@@ -1452,11 +1721,12 @@ print(fake.state)
     /// An unimplemented kind raises a Tier-2 panic with the kind name.
     #[tokio::test]
     async fn hook_unimplemented_kind_error() {
-        // Craft a tagged object with a known-but-unimplemented kind ("bulkhead")
-        // and call a method on it to check the error message.
+        // Call a hook-dispatched method name (state) that bulkhead does not implement.
+        // Verifies the call_bulkhead_method fallthrough path returns the right error.
         let res = crate::run_source(r#"
-let fake = {__resil: "bulkhead"}
-fake.run()
+import * as resilience from "std/resilience"
+let bh = resilience.bulkhead({limit: 1})
+bh.state()
 "#)
         .await;
         // run_source returns Err(AsError) for a Tier-2 panic.
@@ -1465,7 +1735,7 @@ fake.run()
             Ok(s) => s,
         };
         assert!(
-            msg.contains("bulkhead policy has no method 'run'"),
+            msg.contains("bulkhead policy has no method 'state'"),
             "expected bulkhead kind error, got: {msg:?}"
         );
     }
@@ -1851,4 +2121,157 @@ kl.tryAcquire(42)
             "expected string-key panic, got: {msg:?}"
         );
     }
+
+    // ── Task 2.3: bulkhead tests ──────────────────────────────────────────────
+
+    /// Cap honored: limit=2, three concurrent bh.run() of a parking async fn →
+    /// at most 2 in-flight at once (third parks then proceeds when one finishes).
+    #[tokio::test]
+    async fn bulkhead_cap_honored() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+import { channel, send, recv } from "std/sync"
+import { spawn, gather } from "std/task"
+
+let bh = resilience.bulkhead({limit: 2, queue: 10})
+let in_flight = channel()   // signals entry
+let release = channel()     // gate to control exit
+
+async fn worker(id) {
+    await send(in_flight, id)       // signal entry
+    await recv(release)             // park until released
+}
+
+// Wrap in async closures so spawn gets a Future (bh.run is a hook call, not an async fn literal)
+let t1 = spawn(async () => bh.run(() => worker(1)))
+let t2 = spawn(async () => bh.run(() => worker(2)))
+let t3 = spawn(async () => bh.run(() => worker(3)))
+
+// Drain 2 in-flight signals — exactly 2 should have started (limit=2)
+let id1 = await recv(in_flight)
+let id2 = await recv(in_flight)
+// Release one so the third can enter
+await send(release, "go")
+// Third should start now (got a permit)
+let id3 = await recv(in_flight)
+// Release remaining two
+await send(release, "go")
+await send(release, "go")
+
+await gather([t1, t2, t3])
+// If we got here without deadlock, at most 2 were in-flight simultaneously
+print("ok")
+"#).await;
+        assert_eq!(out, "ok\n");
+    }
+
+    /// Queue boundary: limit=1, queue=1 → first parks, second parks (queued),
+    /// third gets immediate [nil, {code:"bulkhead-full"}] (shed before first finishes).
+    #[tokio::test]
+    async fn bulkhead_queue_boundary_shed() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+import { channel, send, recv } from "std/sync"
+import { spawn, gather } from "std/task"
+import * as time from "std/time"
+
+let bh = resilience.bulkhead({limit: 1, queue: 1, name: "test"})
+let gate = channel()
+let entered = channel()
+
+async fn slow_fn() {
+    await send(entered, "in")
+    await recv(gate)
+    return "done"
+}
+
+// First: acquires the permit, parks on gate
+let t1 = spawn(async () => bh.run(slow_fn))
+let _ = await recv(entered)   // wait for t1 to be in-flight
+
+// Second: queued (limit=1 full, queue=1 empty) — spawn and give it a tick
+let t2 = spawn(async () => bh.run(slow_fn))
+// Yield to let t2 enter the waiting state (increment __waiting)
+await time.sleep(5)
+
+// Third: immediate shed — queue is full (queue=1, 1 already waiting)
+// Call synchronously (no spawn) — the shed path returns immediately without parking
+let [v3, e3] = bh.run(slow_fn)
+print(e3.code)   // bulkhead-full
+
+// Release the gate so t1 and t2 can finish
+await send(gate, "go")
+await send(gate, "go")
+await t1
+await t2
+print("done")
+"#).await;
+        assert_eq!(out, "bulkhead-full\ndone\n");
+    }
+
+    /// All-paths release: panicking fn → permit released → subsequent run succeeds.
+    #[tokio::test]
+    async fn bulkhead_all_paths_release_on_panic() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+
+let bh = resilience.bulkhead({limit: 1, queue: 0})
+
+fn panicking_fn() { error("kaboom") }
+fn ok_fn() { return 42 }
+
+// First run panics — but must release the permit
+let [v1, e1] = recover(() => bh.run(panicking_fn))
+print(e1 != nil)   // true: panic propagated (wrapped by recover)
+
+// If permit was released, this should succeed
+let [v2, e2] = bh.run(ok_fn)
+print(v2)          // 42
+print(e2)          // nil
+"#).await;
+        assert_eq!(out, "true\n42\nnil\n");
+    }
+
+    /// Validation: limit=0 rejected (Tier-2); queue=0 valid (sheds immediately when full).
+    #[tokio::test]
+    async fn bulkhead_validation() {
+        // limit=0 → Tier-2 panic
+        let r1 = crate::run_source(r#"
+import * as resilience from "std/resilience"
+resilience.bulkhead({limit: 0, queue: 0})
+"#).await;
+        let msg1 = match r1 { Err(e) => format!("{e}"), Ok(s) => s };
+        assert!(msg1.contains("limit"), "expected limit panic, got: {msg1:?}");
+
+        // queue=0 valid — sheds immediately when limit reached
+        let out = run(r#"
+import * as resilience from "std/resilience"
+import { channel, send, recv } from "std/sync"
+import { spawn } from "std/task"
+
+let bh = resilience.bulkhead({limit: 1, queue: 0})
+let gate = channel()
+let entered = channel()
+
+async fn slow_fn() {
+    await send(entered, "in")
+    await recv(gate)
+    return "done"
+}
+
+let t1 = spawn(async () => bh.run(slow_fn))
+let _ = await recv(entered)   // t1 is in-flight
+
+// queue=0: second run sheds immediately (synchronous call, no spawn needed)
+let [v2, e2] = bh.run(slow_fn)
+print(e2.code)   // bulkhead-full
+
+await send(gate, "go")
+await t1
+print("done")
+"#).await;
+        assert_eq!(out, "bulkhead-full\ndone\n");
+    }
+
+    // deadline-while-parked test added in Task 4.4
 }

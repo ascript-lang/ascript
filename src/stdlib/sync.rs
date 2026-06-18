@@ -50,7 +50,7 @@ use std::rc::Rc;
 /// and awaited without holding a borrow — identical discipline to `Channel`).
 pub struct Semaphore {
     /// Current free permits (>= 0, <= `max`).
-    available: Rc<RefCell<usize>>,
+    pub(crate) available: Rc<RefCell<usize>>,
     /// Fires when a permit is released — wakes parked `acquire` callers.
     permit_available: Rc<tokio::sync::Notify>,
     /// The initial permit count. `release` is capped at this so the pool can never
@@ -193,7 +193,7 @@ fn get_channel(interp: &Interp, id: u64) -> Option<Channel> {
 
 /// Extract the `Semaphore` from the resource table by cloning both `Rc`s.
 /// Returns `None` when the id is absent or maps to a non-Semaphore resource.
-fn get_semaphore(interp: &Interp, id: u64) -> Option<Semaphore> {
+pub(crate) fn get_semaphore(interp: &Interp, id: u64) -> Option<Semaphore> {
     interp.with_resource(id, |r| match r {
         Some(ResourceState::Semaphore(s)) => Some(Semaphore {
             available: s.available.clone(),
@@ -463,7 +463,7 @@ impl Interp {
 
     // ── sync.semaphore ───────────────────────────────────────────────────────
 
-    fn sync_semaphore(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+    pub(crate) fn sync_semaphore(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let n = want_number(&arg(args, 0), span, "sync.semaphore permits")?;
         if n < 1.0 || n.fract() != 0.0 {
             return Err(
@@ -481,7 +481,7 @@ impl Interp {
 
     // ── sync.acquire ─────────────────────────────────────────────────────────
 
-    async fn sync_acquire(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+    pub(crate) async fn sync_acquire(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_semaphore_id(&arg(args, 0), span, "sync.acquire")?;
 
         loop {
@@ -533,7 +533,7 @@ impl Interp {
 
     // ── sync.release ─────────────────────────────────────────────────────────
 
-    fn sync_release(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+    pub(crate) fn sync_release(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_semaphore_id(&arg(args, 0), span, "sync.release")?;
 
         match get_semaphore(self, id) {
