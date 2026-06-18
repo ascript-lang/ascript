@@ -1219,6 +1219,29 @@ print(imgs[0].RepoTags[0])
     assert_eq!(run(&src).await, "nil\nnil\n2\nnginx:latest\n");
 }
 
+/// Spec §4.2 return shapes (Phase-4 review nit): `ping` → `[true, nil]` (a boolean,
+/// not the daemon's raw `"OK"` text) and `wait` → `[StatusCode_int, nil]` (the bare
+/// exit code, not the `{StatusCode}` object).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn ping_returns_true_and_wait_returns_status_code_int_per_spec() {
+    let (sock, _guard) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _e] = await docker.connect({{ socketPath: "{sock}" }})
+let [pong, perr] = await d.ping()
+print(pong)
+print(perr)
+let [code, werr] = await d.wait("abc")
+print(code)
+print(werr)
+"#
+    );
+    // ping → true (boolean), wait → 0 (the StatusCode int from the fixture).
+    assert_eq!(run(&src).await, "true\nnil\n0\nnil\n");
+}
+
 #[cfg(feature = "docker")]
 #[tokio::test]
 async fn docker_client_is_non_sendable() {
@@ -1842,7 +1865,7 @@ print("STARTED")
 
 let [wait_res, wait_err] = await d.wait(container_id)
 if (wait_err != nil) {{ print(`FAIL wait: ${{wait_err.message}}`); exit(1) }}
-print(`WAIT EXIT ${{wait_res.StatusCode}}`)
+print(`WAIT EXIT ${{wait_res}}`)
 
 // 4. logs — assert BOTH stdout and stderr have content
 let [log_stream, log_err] = await d.logs(container_id, {{ stdout: true, stderr: true }})

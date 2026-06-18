@@ -477,7 +477,8 @@ impl Interp {
             Ok(r) => r,
             Err(msg) => return Ok(docker_err_pair(msg, None)),
         };
-        self.docker_map_response(resp, span)
+        let mapped = self.docker_map_response(resp, span)?;
+        Ok(docker_postprocess_unary(name, mapped))
     }
 
     /// Validate that arg 0 is a string id; a non-string is a Tier-2 panic.
@@ -1469,6 +1470,35 @@ fn docker_pair_value(pair: &Value) -> Option<Value> {
         }
     }
     None
+}
+
+/// Spec §4.2 return-shape conformance for the two endpoints whose Engine-API body
+/// shape differs from the documented AScript return. `ping` → `[true, nil]` (a 2xx
+/// `/_ping` means the daemon is alive — the script gets a boolean, not the raw `"OK"`
+/// text the daemon sends). `wait` → `[StatusCode_int, nil]` (unwrap the daemon's
+/// `{"StatusCode":N}` object to the bare exit code the spec table promises).
+///
+/// Every other method returns its decoded body unchanged. An ERROR pair (index-1
+/// non-nil) passes through untouched (so a non-2xx `ping`/`wait` keeps its err).
+#[cfg(unix)]
+fn docker_postprocess_unary(name: &str, mapped: Value) -> Value {
+    // Only transform a SUCCESS pair `[value, nil]`; an err pair passes through.
+    if docker_pair_err(&mapped) != Some(false) {
+        return mapped;
+    }
+    match name {
+        "ping" => make_pair(Value::bool_(true), Value::nil()),
+        "wait" => {
+            let code = docker_pair_value(&mapped)
+                .and_then(|v| match v.kind() {
+                    ValueKind::Object(o) => o.get("StatusCode").and_then(|s| s.as_int()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            make_pair(Value::int(code), Value::nil())
+        }
+        _ => mapped,
+    }
 }
 
 /// Is the `err` slot (index 1) of a `[value, err]` pair non-nil?
