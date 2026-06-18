@@ -1291,6 +1291,16 @@ pub enum NativeKind {
     // C "constructor" handle). Carries the raw `usize` address; passed back as a
     // `ffi.ptr`. NOT auto-freed (ownership is the C library's contract). GC-UNTRACED.
     ForeignPtr,
+    // RESIL §2.2: a non-sendable marker embedded in every `std/resilience` policy
+    // object as the `__local` field.  Carries no OS resource (id = u64::MAX, no
+    // resource-table entry — the `noop_handle` precedent from telemetry/mod.rs:113).
+    // Purpose: the worker airlock's field-path scan sees a `Value::Native` whose kind
+    // is non-sendable, so a policy crossing an isolate boundary fails loudly instead of
+    // silently deep-copying its counters into a divergent twin.  `governing_cap` → None
+    // (no OS resource). Feature-gated — `#[cfg(feature = "resilience")]` — so the
+    // variant is compiled out when the feature is absent (matches the telemetry pattern).
+    #[cfg(feature = "resilience")]
+    Resilience,
 }
 
 impl NativeKind {
@@ -1344,6 +1354,8 @@ impl NativeKind {
             NativeKind::ForeignLib => "foreignLib",
             NativeKind::ForeignSymbol => "foreignSymbol",
             NativeKind::ForeignPtr => "foreignPtr",
+            #[cfg(feature = "resilience")]
+            NativeKind::Resilience => "resilienceMarker",
         }
     }
 
@@ -1407,6 +1419,9 @@ impl NativeKind {
             | NativeKind::Lru
             | NativeKind::Events
             | NativeKind::WorkerActor => None,
+            // RESIL §2.2: no OS resource — a pure in-memory marker.
+            #[cfg(feature = "resilience")]
+            NativeKind::Resilience => None,
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a
