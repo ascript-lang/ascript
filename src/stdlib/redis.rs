@@ -140,6 +140,13 @@ impl Interp {
             }
         }
 
+        // RESIL §5.4 pre-check: an exhausted `resilience.deadline` budget → refuse
+        // before taking the connection / issuing the command. NO deadline → the
+        // `None` fast path (byte-identical).
+        if matches!(self.deadline_remaining_ms(), Some(r) if r <= 0.0) {
+            return Ok(crate::interp::deadline_exceeded_pair());
+        }
+
         // Take the connection out across the await (it needs &mut self).
         let mut conn = match self.take_resource(id) {
             Some(ResourceState::RedisConnection(c)) => c,
@@ -150,12 +157,29 @@ impl Interp {
                 return Ok(err_pair("connection is closed".to_string()));
             }
         };
-        let result: redis::RedisResult<redis::Value> =
-            command.query_async(conn.as_mut()).await;
+        // RESIL §5.4 budget-wrap: race the command against the remaining budget. On
+        // the deadline branch the `query_async` future is DROPPED. The redis crate's
+        // multiplexed connection pipelines commands over a shared socket and matches
+        // replies to requests in FIFO order; dropping an in-flight command does NOT
+        // cancel it server-side (no UNSUBSCRIBE/RESET is sent) and risks the next
+        // reply being mis-correlated to the abandoned request — so a connection that
+        // suffered a deadline-abandoned op should be DISCARDED rather than reused. The
+        // resource is ALWAYS returned (so `close()` still works). NO deadline → the
+        // `None` branch awaits unchanged (byte-identical).
+        let result: Option<redis::RedisResult<redis::Value>> = match self.deadline_remaining_ms() {
+            Some(r) => {
+                tokio::select! {
+                    res = command.query_async(conn.as_mut()) => Some(res),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(r as u64)) => None,
+                }
+            }
+            None => Some(command.query_async(conn.as_mut()).await),
+        };
         self.return_resource(id, ResourceState::RedisConnection(conn));
         match result {
-            Ok(v) => Ok(make_pair(redis_to_value(&v), Value::nil())),
-            Err(e) => Ok(err_pair(format!("connection.{} failed: {}", m.method, e))),
+            Some(Ok(v)) => Ok(make_pair(redis_to_value(&v), Value::nil())),
+            Some(Err(e)) => Ok(err_pair(format!("connection.{} failed: {}", m.method, e))),
+            None => Ok(crate::interp::deadline_exceeded_pair()),
         }
     }
 }
@@ -317,6 +341,123 @@ mod tests {
                     .await
                     .unwrap();
                 interp.call_redis_method(&m("close"), vec![], sp()).await.unwrap();
+            })
+            .await;
+    }
+
+    // ── RESIL §5.4: deadline-aware Redis consult site ────────────────────────
+
+    use crate::interp::{task_locals_scope, TaskLocals};
+    use crate::value::NativeObject;
+
+    fn assert_deadline_pair(pair: &Value) {
+        match pair.kind() {
+            ValueKind::Array(a) => {
+                let b = a.borrow();
+                assert_eq!(b.len(), 2);
+                assert_eq!(b[0], Value::nil());
+                match b[1].kind() {
+                    ValueKind::Object(o) => assert_eq!(
+                        o.get("code"),
+                        Some(Value::str("deadline-exceeded")),
+                        "err code should be deadline-exceeded"
+                    ),
+                    other => panic!("err slot should be an object, got {:?}", other),
+                }
+            }
+            other => panic!("expected a pair, got {:?}", other),
+        }
+    }
+
+    // §5.4 pre-check (NO live server): an ALREADY-EXPIRED deadline → the command
+    // dispatch returns the deadline-exceeded pair BEFORE taking the connection, so a
+    // non-existent handle id never reaches the wire. (Without the pre-check, the same
+    // bogus id would instead hit "connection is closed" — a {message}-only pair.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn redis_expired_deadline_pre_check_no_op() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let interp = std::rc::Rc::new(Interp::new());
+                interp.install_self();
+                let now = interp.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+                let locals = std::rc::Rc::new(TaskLocals {
+                    deadline_at_ms: Some(now - 1000.0),
+                    trace_id: None,
+                });
+                let recv = std::rc::Rc::new(NativeObject {
+                    id: u64::MAX, // not registered
+                    kind: NativeKind::RedisConnection,
+                    fields: indexmap::IndexMap::new(),
+                });
+                let m = std::rc::Rc::new(NativeMethod {
+                    receiver: recv,
+                    method: "get".to_string(),
+                });
+                let pair = task_locals_scope(Some(locals), async {
+                    interp
+                        .call_redis_method(&m, vec![Value::str("k")], sp())
+                        .await
+                        .expect("must not panic")
+                })
+                .await;
+                assert_deadline_pair(&pair);
+            })
+            .await;
+    }
+
+    // Live budget-wrap — gated on ASCRIPT_TEST_REDIS_URL. A BLPOP on a missing key
+    // blocks for `timeout` seconds; under a 100ms deadline the command returns
+    // `deadline-exceeded` well before the 5s BLPOP timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redis_budget_wrap_live() {
+        let Ok(url) = std::env::var("ASCRIPT_TEST_REDIS_URL") else {
+            return; // no live server → no-op pass
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let interp = std::rc::Rc::new(Interp::new());
+                interp.install_self();
+                let key = format!("sp5:resil:{}", uuid::Uuid::new_v4().simple());
+                let pair = interp
+                    .call_redis("connect", &[Value::str(url.clone())], sp())
+                    .await
+                    .unwrap();
+                let conn = match pair.kind() {
+                    ValueKind::Array(a) => a.borrow()[0].clone(),
+                    _ => panic!("connect pair"),
+                };
+                let recv = match conn.kind() {
+                    ValueKind::Native(n) => n.clone(),
+                    _ => panic!("handle"),
+                };
+                let m = std::rc::Rc::new(NativeMethod {
+                    receiver: recv,
+                    method: "command".to_string(),
+                });
+                let now = interp.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+                let locals = std::rc::Rc::new(TaskLocals {
+                    deadline_at_ms: Some(now + 100.0),
+                    trace_id: None,
+                });
+                let started = std::time::Instant::now();
+                let res = task_locals_scope(Some(locals), async {
+                    interp
+                        .call_redis_method(
+                            &m,
+                            vec![Value::str("BLPOP"), Value::str(key.clone()), Value::int(5)],
+                            sp(),
+                        )
+                        .await
+                        .unwrap()
+                })
+                .await;
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(3),
+                    "budget-wrap must return well before the 5s BLPOP timeout"
+                );
+                assert_deadline_pair(&res);
             })
             .await;
     }

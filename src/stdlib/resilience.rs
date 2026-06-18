@@ -289,15 +289,10 @@ fn check_pos_int(r: Result<u64, String>, field: &str, span: Span) -> Result<u64,
 /// The `[nil, {code:"deadline-exceeded", message}]` err pair returned when a
 /// deadline is hit — by `deadline` (the body race / already-expired entry) and by
 /// the budget-aware park points (`limiter.acquire`, `keyedLimiter.acquire`,
-/// `bulkhead.run`). One construction site so the shape is identical everywhere.
+/// `bulkhead.run`). Delegates to the CORE `interp::deadline_exceeded_pair` so the
+/// shape is byte-identical with the §5.4 I/O consult sites (http/pg/redis/sqlite).
 fn deadline_exceeded_pair() -> Value {
-    let mut err: IndexMap<String, Value> = IndexMap::new();
-    err.insert(
-        "message".to_string(),
-        Value::str("deadline exceeded"),
-    );
-    err.insert("code".to_string(), Value::str("deadline-exceeded"));
-    crate::interp::make_pair(Value::nil(), Value::object(err))
+    crate::interp::deadline_exceeded_pair()
 }
 
 // ── call-site hook: method dispatch on a resilience policy object ─────────────

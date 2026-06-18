@@ -951,6 +951,14 @@ impl Interp {
                 )
             }
         };
+        // RESIL §5.4: deadline pre-check. If a `resilience.deadline(...)` budget is
+        // active and already exhausted, refuse BEFORE any connect/DNS — return the
+        // deadline-exceeded pair (distinct from a plain timeout) immediately. NO
+        // deadline → `deadline_remaining_ms()` is `None`, the byte-identical fast path.
+        let deadline_remaining = self.deadline_remaining_ms();
+        if matches!(deadline_remaining, Some(r) if r <= 0.0) {
+            return Ok(crate::interp::deadline_exceeded_pair());
+        }
         // FFI §4.4 stage-2 (net carve-out, BLOCKER 1): re-check the resolved target
         // host against the allow-list BEFORE issuing the request. Gate-12: no carve-out
         // → `check_net_host` returns immediately with no comparison. A URL with no
@@ -1017,12 +1025,30 @@ impl Interp {
         // Parse the retry policy (default: OFF).
         let retry = parse_retry(opts, span)?;
 
-        let resp = match self
-            .send_with_retry(rb, &m, &url, method, retry, cancel)
-            .await
-        {
-            Ok(r) => r,
-            Err(pair) => return Ok(pair),
+        // RESIL §5.4: clamp the request's wall-clock to min(requested total,
+        // remaining deadline budget). The effective per-request `total` timeout is
+        // already wired into the reqwest client (`build_client_inner`); racing the
+        // whole send (incl. the retry loop) against a `sleep(remaining)` makes the
+        // EFFECTIVE bound the smaller of the two and yields `deadline-exceeded`
+        // (not a plain timeout) when the budget wins. NO deadline → the `None`
+        // branch awaits the send unchanged (byte-identical fast path).
+        let send = self.send_with_retry(rb, &m, &url, method, retry, cancel);
+        let resp = match deadline_remaining {
+            Some(r) => {
+                tokio::select! {
+                    res = send => match res {
+                        Ok(r) => r,
+                        Err(pair) => return Ok(pair),
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(r as u64)) => {
+                        return Ok(crate::interp::deadline_exceeded_pair());
+                    }
+                }
+            }
+            None => match send.await {
+                Ok(r) => r,
+                Err(pair) => return Ok(pair),
+            },
         };
 
         // errorOnStatus: a non-2xx response becomes a Tier-1 err instead of a resp.
@@ -3254,5 +3280,122 @@ print(data.body)
         );
         let out = run(&src).await;
         assert_eq!(out, "chunk1\nchunk2\nchunk3\n\n");
+    }
+
+    // ── RESIL §5.4: deadline-aware HTTP consult site ─────────────────────────
+
+    use crate::interp::{task_locals_scope, TaskLocals};
+    use crate::span::Span;
+    use crate::value::{Value, ValueKind};
+    use std::rc::Rc;
+
+    /// Assert `pair` is `[nil, {code:"deadline-exceeded"}]`.
+    fn assert_deadline_pair(pair: &Value) {
+        match pair.kind() {
+            ValueKind::Array(a) => {
+                let b = a.borrow();
+                assert_eq!(b.len(), 2, "expected a [value, err] pair");
+                assert_eq!(b[0], Value::nil(), "value slot should be nil");
+                match b[1].kind() {
+                    ValueKind::Object(o) => {
+                        assert_eq!(
+                            o.get("code"),
+                            Some(Value::str("deadline-exceeded")),
+                            "err code should be deadline-exceeded"
+                        );
+                    }
+                    other => panic!("err slot should be an object, got {:?}", other),
+                }
+            }
+            other => panic!("expected a pair, got {:?}", other),
+        }
+    }
+
+    // §5.4: an ALREADY-EXPIRED deadline → call_http_send returns the
+    // deadline-exceeded pair IMMEDIATELY, with NO connection attempt. The target is
+    // a non-routable address (TEST-NET-1, RFC 5737); if a connect were attempted it
+    // would block until the (default) connect timeout — far longer than the assert
+    // budget. Returning fast proves the pre-check fired before any connect.
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_expired_deadline_pre_check_no_connect() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let interp = std::rc::Rc::new(Interp::new());
+                interp.install_self();
+                // Build an already-expired deadline in the current task locals.
+                let now = interp.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());
+                let locals = Rc::new(TaskLocals {
+                    deadline_at_ms: Some(now - 1000.0),
+                    trace_id: None,
+                });
+                let opts = Value::nil();
+                let started = std::time::Instant::now();
+                let pair = task_locals_scope(Some(locals), async {
+                    interp
+                        .call_http_send("GET", "http://192.0.2.1/".to_string(), &opts, Span::new(0, 0))
+                        .await
+                        .expect("must not panic")
+                })
+                .await;
+                let elapsed = started.elapsed();
+                assert_deadline_pair(&pair);
+                assert!(
+                    elapsed < std::time::Duration::from_secs(1),
+                    "expired deadline must return immediately (no connect), took {:?}",
+                    elapsed
+                );
+            })
+            .await;
+    }
+
+    // §5.4: clamp — the effective total timeout is min(requested, remaining). A real
+    // listener that NEVER accepts means a connect would hang ~indefinitely (or for
+    // the requested 60s total). Under a 50ms deadline the call returns the
+    // deadline-exceeded pair in well under that — proving min(60000, 50) clamping.
+    #[cfg(feature = "resilience")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_clamp_to_remaining_budget() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Bind a listener and NEVER accept → connects to it hang in the
+                // backlog / time out only at the full requested total.
+                let listener =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                // Fill the accept backlog so a fresh connect actually stalls rather
+                // than completing the TCP handshake (kernel may auto-accept a few).
+                // Even if the handshake completes, no HTTP response ever arrives, so
+                // the 60s total would otherwise apply.
+                let url = format!("http://{}/", addr);
+                let src = format!(
+                    r#"
+import {{ get }} from "std/net/http"
+import * as resilience from "std/resilience"
+let [resp, err] = resilience.deadline(50, async () => {{
+    return await get("{url}", {{ timeout: {{ total: 60000 }} }})
+}})
+print(err.code)
+"#
+                );
+                let started = std::time::Instant::now();
+                let out = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::run_source(&src),
+                )
+                .await
+                .expect("must return well under the 60s requested total")
+                .expect("program should run");
+                let elapsed = started.elapsed();
+                assert_eq!(out, "deadline-exceeded\n");
+                assert!(
+                    elapsed < std::time::Duration::from_secs(2),
+                    "clamp to the 50ms budget should return fast, took {:?}",
+                    elapsed
+                );
+                drop(listener);
+            })
+            .await;
     }
 }

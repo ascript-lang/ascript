@@ -295,6 +295,31 @@ pub(crate) fn make_error(msg: Value) -> Value {
     Value::object(map)
 }
 
+/// RESIL §5.4: the canonical `[nil, {message, code:"deadline-exceeded"}]` Tier-1
+/// err pair returned when a deadline budget is exhausted. ONE construction site so
+/// the shape is byte-identical across the deadline race ([`crate::stdlib::resilience`]),
+/// the limiter/bulkhead budget-aware parks, and the deadline-aware I/O consult sites
+/// (`std/http` / `std/postgres` / `std/redis` / `std/sqlite`). Field order is
+/// `message` then `code` (matching `make_error` + an explicit `code`). This lives in
+/// core (not behind the `resilience` feature) so the I/O consult sites can build it
+/// even when `resilience` is compiled out but the I/O module is enabled.
+#[cfg_attr(
+    not(any(
+        feature = "resilience",
+        feature = "net",
+        feature = "postgres",
+        feature = "redis",
+        feature = "sql"
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn deadline_exceeded_pair() -> Value {
+    let mut err = indexmap::IndexMap::new();
+    err.insert("message".to_string(), Value::str("deadline exceeded"));
+    err.insert("code".to_string(), Value::str("deadline-exceeded"));
+    make_pair(Value::nil(), Value::object(err))
+}
+
 /// RESIL §3.1.3: test whether `v` is a Result pair `[_, err]` with `err != nil`.
 ///
 /// Returns `Some(err)` if `v` is a 2-element array whose second element is
