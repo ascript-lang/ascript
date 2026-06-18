@@ -17,16 +17,20 @@
 //!
 //! The cache ROOT is resolved exactly like the SP6 package store (`$ASCRIPT_CACHE`
 //! first, then the per-OS default, then a tempdir last resort — deliberately no `dirs`
-//! crate), so an `--exact` publish and a fetch publish land under the SAME root. The
-//! resolution is replicated here (not imported from `pkg`) because `pkg` is a
-//! binary-crate module not reachable from the library; the layout is identical.
+//! crate), so an `--exact` publish and a fetch publish land under the SAME root.
+//!
+//! **This [`cache_root`] is the ONE canonical implementation** (RT T6 nit). The binary
+//! `pkg::cache::cache_root` is now a thin delegate to it (the binary depends on the
+//! library, so it can call in — there is no longer a replicated copy to drift). Both the
+//! package store and the rt stub cache therefore resolve to the SAME root by
+//! construction.
 
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 /// Resolve the cache root, honoring `$ASCRIPT_CACHE` first, then the per-OS default,
-/// then a tempdir last resort. Identical to `pkg::cache::cache_root` (replicated — see
-/// the module note). Never fails.
+/// then a tempdir last resort. The ONE canonical implementation: `pkg::cache::cache_root`
+/// delegates here (see the module note). Never fails.
 pub fn cache_root() -> PathBuf {
     if let Some(p) = std::env::var_os("ASCRIPT_CACHE") {
         if !p.is_empty() {
