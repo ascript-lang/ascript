@@ -774,6 +774,288 @@ fn report_json_end_to_end_sha_stable() {
     );
 }
 
+// ─── RT §9.2 — report-json schema lock ──────────────────────────────────────
+//
+// This is the VERSIONED CI CONTRACT for `--report-json` consumers.
+// Bumping the schema (adding/removing/retyping a top-level field) REQUIRES:
+//   1. Setting `"schema": 2` in `BuildReport::to_json` (src/rtstub/report.rs).
+//   2. Updating BOTH the `EXPECTED_TOP_LEVEL_KEYS` set AND the type assertions
+//      in this test to match the new schema.
+//
+// The test MUST fail if any field is added, removed, or retyped without a schema bump.
+
+/// Parse the top-level keys of a hand-rolled JSON object (no serde dep).
+/// Returns a sorted list of `(key, type_tag)` where type_tag is one of:
+///   "number", "string", "bool", "null", "array", "object"
+fn parse_top_level_schema(json: &str) -> Vec<(String, &'static str)> {
+    // Strip outer braces.
+    let inner = json
+        .trim()
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .expect("JSON must be an object");
+
+    let mut result = Vec::new();
+    // Walk the inner string extracting `"key":<value>` pairs.
+    let mut pos = 0;
+    let bytes = inner.as_bytes();
+    while pos < bytes.len() {
+        // Skip whitespace/comma.
+        while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b',' || bytes[pos] == b'\n') {
+            pos += 1;
+        }
+        if pos >= bytes.len() { break; }
+        // Expect a `"key":` entry.
+        if bytes[pos] != b'"' { pos += 1; continue; }
+        pos += 1; // skip opening quote
+        let key_start = pos;
+        while pos < bytes.len() && bytes[pos] != b'"' {
+            if bytes[pos] == b'\\' { pos += 1; }
+            pos += 1;
+        }
+        let key = &inner[key_start..pos];
+        pos += 1; // skip closing quote
+        // Skip `:`.
+        while pos < bytes.len() && (bytes[pos] == b':' || bytes[pos] == b' ') { pos += 1; }
+        // Peek at value type.
+        if pos >= bytes.len() { break; }
+        let type_tag: &'static str = match bytes[pos] {
+            b'"' => "string",
+            b'{' => "object",
+            b'[' => "array",
+            b't' | b'f' => "bool",
+            b'n' => "null",
+            b'0'..=b'9' | b'-' => "number",
+            _ => "unknown",
+        };
+        result.push((key.to_string(), type_tag));
+        // Skip past the value (depth-counting to handle nested structures).
+        let open = bytes[pos];
+        if open == b'{' || open == b'[' {
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 0i32;
+            let mut in_str = false;
+            while pos < bytes.len() {
+                let b = bytes[pos];
+                if in_str {
+                    if b == b'\\' { pos += 1; }
+                    else if b == b'"' { in_str = false; }
+                } else {
+                    if b == b'"' { in_str = true; }
+                    else if b == open { depth += 1; }
+                    else if b == close {
+                        depth -= 1;
+                        if depth == 0 { pos += 1; break; }
+                    }
+                }
+                pos += 1;
+            }
+        } else if bytes[pos] == b'"' {
+            // string: skip past closing quote
+            pos += 1;
+            while pos < bytes.len() {
+                if bytes[pos] == b'\\' { pos += 1; }
+                else if bytes[pos] == b'"' { pos += 1; break; }
+                pos += 1;
+            }
+        } else {
+            // scalar: skip to next comma/} outside string
+            while pos < bytes.len() && bytes[pos] != b',' && bytes[pos] != b'}' { pos += 1; }
+        }
+    }
+    result
+}
+
+/// RT §9.2 — the STRICT schema lock for `BuildReport::to_json`.
+///
+/// **CI CONTRACT**: This test encodes the EXACT top-level key set + value types of the
+/// `schema: 1` JSON document. A consumer of `--report-json` can depend on these fields
+/// being stable. Any change to the key set (add/remove/retype) MUST bump `"schema"` to 2
+/// AND update this test. This test MUST fail on any un-versioned field change.
+///
+/// # Schema 1 field manifest (§9.2):
+/// ```
+///   "schema"          : number   — always 1 (the schema version)
+///   "source"          : string   — source file path
+///   "output"          : string   — artifact output path
+///   "output_sha256"   : string   — sha256(artifact bytes)
+///   "target"          : string|null — cross target or null (host)
+///   "tier"            : string   — "rt-core" | "rt-local" | "rt-net" | "rt-full"
+///   "tier_source"     : string   — "selected" | "--tier"
+///   "required"        : array    — features the program requires (closure-expanded)
+///   "stub_features"   : array    — full feature set shipped by the chosen tier
+///   "unused"          : array    — stub_features \ required (potential --exact savings)
+///   "stub"            : object   — {origin: string, sha256: string, size: number}
+///   "payload"         : object   — {format, compressed, size, uncompressed_size, sha256}
+///   "module_count"    : number   — number of embedded modules
+///   "shake_digest"    : string|null — archive shake digest or null
+///   "caps_all_granted": bool     — whether caps are all-granted
+/// ```
+#[test]
+fn report_json_schema_lock() {
+    // Build the sample report (same as used by the other report tests).
+    let r = sample_report();
+    let json = r.to_json();
+
+    // ── 1. Schema version marker ────────────────────────────────────────────
+    assert!(
+        json.contains("\"schema\":1"),
+        "schema must be 1 (the current schema version); update to schema 2 if you are \
+         adding/removing/retyping fields: {json}"
+    );
+
+    // ── 2. Parse the top-level key set ──────────────────────────────────────
+    let schema = parse_top_level_schema(&json);
+    let got_keys: Vec<&str> = schema.iter().map(|(k, _)| k.as_str()).collect();
+
+    // The EXACT set of top-level keys in schema 1, in §9.2 canonical order.
+    // If you need to add/remove/rename a key: bump to schema 2 and update this list.
+    const EXPECTED_KEYS_IN_ORDER: &[&str] = &[
+        "schema",
+        "source",
+        "output",
+        "output_sha256",
+        "target",
+        "tier",
+        "tier_source",
+        "required",
+        "stub_features",
+        "unused",
+        "stub",
+        "payload",
+        "module_count",
+        "shake_digest",
+        "caps_all_granted",
+    ];
+
+    assert_eq!(
+        got_keys,
+        EXPECTED_KEYS_IN_ORDER,
+        "§9.2 SCHEMA LOCK VIOLATED: the top-level key set or order has changed.\n\
+         To add/remove/retype a field: bump to '\"schema\":2' in BuildReport::to_json \
+         AND update EXPECTED_KEYS_IN_ORDER and the type assertions in this test.\n\
+         Got keys (in order): {got_keys:?}\n\
+         Expected:            {EXPECTED_KEYS_IN_ORDER:?}"
+    );
+
+    // ── 3. Assert exact types for every top-level field ──────────────────────
+    // Any type change is a schema change and requires schema 2.
+    let type_of = |key: &str| -> &'static str {
+        schema
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, t)| *t)
+            .unwrap_or("MISSING")
+    };
+
+    assert_eq!(type_of("schema"), "number", "schema must be a number");
+    assert_eq!(type_of("source"), "string", "source must be a string");
+    assert_eq!(type_of("output"), "string", "output must be a string");
+    assert_eq!(type_of("output_sha256"), "string", "output_sha256 must be a string");
+    // target is null when no cross-target (sample_report has target=None).
+    assert_eq!(type_of("target"), "null", "target must be null (string when cross-target)");
+    assert_eq!(type_of("tier"), "string", "tier must be a string");
+    assert_eq!(type_of("tier_source"), "string", "tier_source must be a string");
+    assert_eq!(type_of("required"), "array", "required must be an array");
+    assert_eq!(type_of("stub_features"), "array", "stub_features must be an array");
+    assert_eq!(type_of("unused"), "array", "unused must be an array");
+    assert_eq!(type_of("stub"), "object", "stub must be an object");
+    assert_eq!(type_of("payload"), "object", "payload must be an object");
+    assert_eq!(type_of("module_count"), "number", "module_count must be a number");
+    // shake_digest is null for a single-module build (sample_report has shake_digest=None).
+    assert_eq!(type_of("shake_digest"), "null", "shake_digest must be null (string for multi-module)");
+    assert_eq!(type_of("caps_all_granted"), "bool", "caps_all_granted must be a bool");
+
+    // ── 4. Verify the stub sub-object fields ────────────────────────────────
+    // Extract the stub sub-object and verify its structure.
+    let stub_start = json.find("\"stub\":{").expect("stub object missing") + "\"stub\":".len();
+    // Find the matching closing brace.
+    let stub_json = {
+        let tail = &json[stub_start..];
+        let mut depth = 0i32;
+        let mut end = 0;
+        let mut in_str = false;
+        for (i, b) in tail.bytes().enumerate() {
+            if in_str {
+                if b == b'\\' { continue; }
+                if b == b'"' { in_str = false; }
+            } else {
+                match b {
+                    b'"' => { in_str = true; }
+                    b'{' => { depth += 1; }
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 { end = i + 1; break; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        &tail[..end]
+    };
+    let stub_schema = parse_top_level_schema(stub_json);
+    let stub_keys: Vec<&str> = stub_schema.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        stub_keys,
+        &["origin", "sha256", "size"],
+        "stub sub-object must have exactly {{origin, sha256, size}}: {stub_json}"
+    );
+    assert_eq!(stub_schema[0].1, "string", "stub.origin must be string");
+    assert_eq!(stub_schema[1].1, "string", "stub.sha256 must be string");
+    assert_eq!(stub_schema[2].1, "number", "stub.size must be number");
+
+    // ── 5. Verify the payload sub-object fields ──────────────────────────────
+    let payload_start = json.find("\"payload\":{").expect("payload object missing") + "\"payload\":".len();
+    let payload_json = {
+        let tail = &json[payload_start..];
+        let mut depth = 0i32;
+        let mut end = 0;
+        let mut in_str = false;
+        for (i, b) in tail.bytes().enumerate() {
+            if in_str {
+                if b == b'\\' { continue; }
+                if b == b'"' { in_str = false; }
+            } else {
+                match b {
+                    b'"' => { in_str = true; }
+                    b'{' => { depth += 1; }
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 { end = i + 1; break; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        &tail[..end]
+    };
+    let payload_schema = parse_top_level_schema(payload_json);
+    let payload_keys: Vec<&str> = payload_schema.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        payload_keys,
+        &["format", "compressed", "size", "uncompressed_size", "sha256"],
+        "payload sub-object must have exactly \
+         {{format, compressed, size, uncompressed_size, sha256}}: {payload_json}"
+    );
+    assert_eq!(payload_schema[0].1, "string", "payload.format must be string");
+    assert_eq!(payload_schema[1].1, "bool", "payload.compressed must be bool");
+    assert_eq!(payload_schema[2].1, "number", "payload.size must be number");
+    assert_eq!(payload_schema[3].1, "number", "payload.uncompressed_size must be number");
+    assert_eq!(payload_schema[4].1, "string", "payload.sha256 must be string");
+
+    // ── 6. No time/date fields anywhere (§9.1 determinism contract) ──────────
+    for forbidden in [
+        "\"created\"", "\"timestamp\"", "\"time\"", "\"date\"",
+        "\"built_at\"", "\"now\"", "\"built\"",
+    ] {
+        assert!(
+            !json.contains(forbidden),
+            "§9.1 violation: report JSON must contain NO time field; \
+             found {forbidden} in:\n{json}"
+        );
+    }
+}
+
 // ─── RT §4.5 exact_build_plan pure-unit tests ───────────────────────────────
 
 use ascript::rtstub::exact::{check_darwin_cross, exact_build_plan};
