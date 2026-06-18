@@ -70,6 +70,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("bulkhead", super::bi("resilience.bulkhead")),
         ("retry", super::bi("resilience.retry")),
         ("fallback", super::bi("resilience.fallback")),
+        ("singleflight", super::bi("resilience.singleflight")),
     ]
 }
 
@@ -1764,6 +1765,111 @@ impl Interp {
     }
 }
 
+// ── Interp::call_singleflight (§3.6) ─────────────────────────────────────────
+
+impl Interp {
+    /// `resilience.singleflight(key, fn)` — collapse concurrent same-key calls
+    /// to ONE execution of `fn`; all awaiters observe the same value (or the
+    /// same panic, via `SharedFuture`'s panic fan-out). NO result caching — the
+    /// table entry is removed on resolve, so the key is re-flyable the moment
+    /// the result is delivered (caching is memoize's job, §3.7).
+    ///
+    /// - `key` must be a string (Tier-2 panic otherwise).
+    /// - key present → clone the live flight handle out (under a SHORT borrow,
+    ///   dropped before returning) and return it; the caller awaits the shared
+    ///   handle (N awaiters → one execution).
+    /// - key absent → create a taskless `SharedFuture`, insert it, then
+    ///   `spawn_local` a driver that invokes `fn` (driving a returned future),
+    ///   resolves the cell, and removes the table entry in ALL paths
+    ///   (success / panic / propagate).
+    ///
+    /// Lifecycle (the `task.rs` split): the driver holds only the `ResultCell`,
+    /// the table holds the handle — so callers dropping their futures mid-flight
+    /// do NOT cancel the flight (it completes for whoever joins next; herd-safe).
+    /// The `flights` borrow is NEVER held across an `.await`.
+    fn call_singleflight(
+        &self,
+        key: Value,
+        user_fn: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // ── Validate the key (Tier-2 on non-string) ───────────────────────────
+        let key_str = match key.kind() {
+            ValueKind::Str(s) => s.to_string(),
+            _ => {
+                return Err(AsError::at(
+                    format!(
+                        "singleflight: key must be a string, got {}",
+                        crate::interp::type_name(&key)
+                    ),
+                    span,
+                )
+                .into())
+            }
+        };
+
+        // ── Join an existing flight (SHORT borrow, dropped before return) ──────
+        {
+            let flights = self.resilience.borrow();
+            if let Some(existing) = flights.flights.get(&key_str) {
+                let handle = existing.clone();
+                drop(flights);
+                return Ok(Value::future(handle));
+            }
+        }
+
+        // ── Start a new flight ────────────────────────────────────────────────
+        // Taskless `SharedFuture`: the table owns this handle, so the flight is
+        // not cancelled when callers drop their futures (the driver holds only
+        // the cell — see the lifecycle note).
+        let fut = crate::task::SharedFuture::new();
+        let cell = fut.cell();
+
+        // Insert the handle into the table under a SHORT borrow (dropped before
+        // we spawn / return).
+        {
+            let mut flights = self.resilience.borrow_mut();
+            flights.flights.insert(key_str.clone(), fut.clone());
+        }
+
+        // Drive `fn` on its own task; resolve the cell + remove the table entry
+        // on ALL exit paths. Held alive: an owned `Rc<Interp>` so the driver can
+        // touch `self.resilience` after the await.
+        let interp = self.rc();
+        let driver = tokio::task::spawn_local(async move {
+            // Invoke `fn`, driving a returned future to completion.
+            let raw = interp.call_value(user_fn, vec![], span).await;
+            let outcome: Result<Value, Control> = match raw {
+                Ok(v) => match v.kind() {
+                    ValueKind::Future(_) => {
+                        let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                            unreachable!()
+                        };
+                        f.get().await
+                    }
+                    _ => Ok(v),
+                },
+                other => other,
+            };
+
+            // Remove the table entry FIRST (so the key is re-flyable immediately;
+            // no caching), then resolve so all awaiters wake with the result.
+            // Short borrow, no `.await` inside.
+            {
+                let mut flights = interp.resilience.borrow_mut();
+                flights.flights.shift_remove(&key_str);
+            }
+            cell.resolve(outcome);
+        });
+        // Park the driver's abort handle on the table handle so the short-lived
+        // driver is reaped at isolate teardown. The table holds a handle clone
+        // until resolve, so caller-drops never trip this abort mid-flight.
+        fut.set_abort(driver.abort_handle());
+
+        Ok(Value::future(fut))
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -1801,6 +1907,11 @@ impl Interp {
                 let user_fn = arg(args, 0);
                 let fb = arg(args, 1);
                 self.call_fallback(user_fn, fb, span).await
+            }
+            "singleflight" => {
+                let key = arg(args, 0);
+                let user_fn = arg(args, 1);
+                self.call_singleflight(key, user_fn, span)
             }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
@@ -2717,5 +2828,140 @@ print(err)
 "#)
         .await;
         assert_eq!(out, "async-err\nnil\n");
+    }
+
+    // ── Task 3.2: resilience.singleflight (§3.6) ────────────────────────────
+
+    /// Concurrent same-key calls COLLAPSE to one execution; both awaiters get
+    /// the same value, `fn` runs exactly once.
+    #[tokio::test]
+    async fn singleflight_collapses_concurrent_calls() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn fetchIt() { calls[0] = calls[0] + 1; return 42 }
+let f1 = resilience.singleflight("k", fetchIt)
+let f2 = resilience.singleflight("k", fetchIt)
+print(await f1); print(await f2); print(calls[0])
+"#)
+        .await;
+        assert_eq!(out, "42\n42\n1\n");
+    }
+
+    /// PANIC FAN-OUT: a panicking flight delivers the SAME panic to BOTH
+    /// awaiters (two `recover`s, both err messages equal — the §3.6 SharedFuture
+    /// argument).
+    #[tokio::test]
+    async fn singleflight_panic_fans_out_to_all_awaiters() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+async fn boom() { assert(false, "kaboom") }
+let f1 = resilience.singleflight("k", boom)
+let f2 = resilience.singleflight("k", boom)
+let [v1, e1] = recover(() => await f1)
+let [v2, e2] = recover(() => await f2)
+print(e1.message)
+print(e2.message)
+print(e1.message == e2.message)
+"#)
+        .await;
+        assert_eq!(out, "kaboom\nkaboom\ntrue\n");
+    }
+
+    /// NO result caching: after a flight settles, the key is reusable — a fresh
+    /// same-key call re-runs `fn` (sequential singleflight→await→singleflight).
+    #[tokio::test]
+    async fn singleflight_key_reusable_after_settle() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let calls = [0]
+async fn fetchIt() { calls[0] = calls[0] + 1; return calls[0] }
+let a = await resilience.singleflight("k", fetchIt)
+let b = await resilience.singleflight("k", fetchIt)
+print(a); print(b); print(calls[0])
+"#)
+        .await;
+        // Two SEQUENTIAL flights → fn ran TWICE.
+        assert_eq!(out, "1\n2\n2\n");
+    }
+
+    /// The flights table is emptied after success AND after failure
+    /// (Rust-level assertion over `interp.resilience.borrow().flights`).
+    #[tokio::test]
+    async fn singleflight_table_emptied_after_settle() {
+        // Success path.
+        let (out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+async fn ok() { return 1 }
+print(await resilience.singleflight("k", ok))
+"#)
+        .await
+        .expect("program should run");
+        assert_eq!(out, "1\n");
+        assert!(
+            interp.resilience.borrow().flights.is_empty(),
+            "flights table must be empty after a successful flight settles"
+        );
+
+        // Failure (panic) path.
+        let (out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+async fn boom() { assert(false, "x") }
+let [v, e] = recover(() => await resilience.singleflight("k", boom))
+print(e.message)
+"#)
+        .await
+        .expect("program should run");
+        assert_eq!(out, "x\n");
+        assert!(
+            interp.resilience.borrow().flights.is_empty(),
+            "flights table must be empty after a panicking flight settles"
+        );
+    }
+
+    /// A non-string key is a Tier-2 panic.
+    #[tokio::test]
+    async fn singleflight_non_string_key_is_tier2() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+async fn f() { return 1 }
+let _ = await resilience.singleflight(42, f)
+"#)
+        .await;
+        let msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(s) => s,
+        };
+        assert!(
+            msg.contains("key must be a string"),
+            "expected non-string key Tier-2 panic, got: {msg:?}"
+        );
+    }
+
+    /// Driver-leak check: a singleflight whose awaiters are all dropped
+    /// mid-flight must NOT leak — the table holds the handle (so the flight is
+    /// not cancelled), the short-lived driver completes + removes the table
+    /// entry, and the isolate exits cleanly. We start a flight, then DROP the
+    /// returned future without awaiting it (reassign to nil), and confirm the
+    /// program runs to completion + the table is empty afterwards.
+    #[tokio::test]
+    async fn singleflight_dropped_awaiters_exit_cleanly() {
+        let (out, interp) = crate::run_source_with_interp(r#"
+import * as resilience from "std/resilience"
+let ran = [0]
+async fn slow() { ran[0] = ran[0] + 1; return 7 }
+let f = resilience.singleflight("k", slow)
+f = nil   // drop the only handle the caller holds, mid-flight, without awaiting
+print("done")
+"#)
+        .await
+        .expect("program should run");
+        assert_eq!(out, "done\n");
+        // The flight completes for whoever joins next; the driver removes the
+        // entry on resolve, so the table is empty and nothing leaks.
+        assert!(
+            interp.resilience.borrow().flights.is_empty(),
+            "flights table must be empty — a dropped-awaiter flight must not leak"
+        );
     }
 }
