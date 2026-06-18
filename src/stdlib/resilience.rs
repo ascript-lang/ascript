@@ -78,6 +78,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("memoize", super::bi("resilience.memoize")),
         ("deadline", super::bi("resilience.deadline")),
         ("deadlineRemaining", super::bi("resilience.deadlineRemaining")),
+        ("withTrace", super::bi("resilience.withTrace")),
+        ("traceId", super::bi("resilience.traceId")),
     ]
 }
 
@@ -2495,6 +2497,93 @@ impl Interp {
             }
         }
     }
+
+    /// `resilience.withTrace(id, fn)` — establish an ambient trace/request id on the
+    /// current task's locals ([`crate::interp::TASK_LOCALS`]) for the duration of
+    /// `fn`, then restore the previous locals.
+    ///
+    /// Same **save → set → run → restore** cell discipline as [`Self::call_deadline`]:
+    /// the new locals are a COW [`crate::interp::TaskLocals`] `Rc` (the existing
+    /// `deadline_at_ms` is carried forward, so a `withTrace` nested inside a
+    /// `deadline` — or vice-versa — preserves BOTH fields). Restore runs on ALL exits
+    /// (normal return / `?`-propagate / panic captured as `Err`). NO deadline
+    /// enforcement race — `withTrace` only sets an id.
+    ///
+    /// Return convention MIRRORS `deadline`/`fallback`: a plain body value becomes a
+    /// `[value, nil]` ok-pair; an err-pair passes through unchanged. (The §5.5 gateway
+    /// idiom `withTrace(id, () => next(req))` returns the body's result; pair-normalizing
+    /// keeps it consistent with the rest of the module.)
+    async fn call_with_trace(
+        &self,
+        id: Value,
+        user_fn: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::interp::{make_pair, result_pair_err, TaskLocals, TASK_LOCALS};
+        use std::rc::Rc;
+
+        // ── Validate `id` (Tier-2 on non-string) ──────────────────────────────
+        let id: Rc<str> = match id.kind() {
+            ValueKind::Str(s) => s.clone(),
+            _ => {
+                return Err(AsError::at(
+                    format!(
+                        "resilience.withTrace: 'id' must be a string, got {}",
+                        crate::interp::type_name(&id)
+                    ),
+                    span,
+                )
+                .into())
+            }
+        };
+
+        // ── Build the COW locals (carry the existing deadline forward) ────────
+        let prev = crate::interp::task_locals_current();
+        let carried_deadline = prev.as_ref().and_then(|l| l.deadline_at_ms);
+        let new_locals = Rc::new(TaskLocals {
+            deadline_at_ms: carried_deadline,
+            trace_id: Some(id),
+        });
+
+        // ── save → set (no borrow held across .await) ────────────────────────
+        let restore: Option<Option<Rc<TaskLocals>>> =
+            TASK_LOCALS.try_with(|c| c.replace(Some(new_locals))).ok();
+        let do_restore = |restore: Option<Option<Rc<TaskLocals>>>| {
+            if let Some(old) = restore {
+                let _ = TASK_LOCALS.try_with(|c| c.set(old));
+            }
+        };
+
+        // ── run the body (drive a returned future, like `call_deadline`) ──────
+        let raw = self.call_value(user_fn, vec![], span).await;
+        let outcome: Result<Value, Control> = match raw {
+            Ok(v) => match v.kind() {
+                crate::value::ValueKind::Future(_) => {
+                    let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                        unreachable!()
+                    };
+                    f.get().await
+                }
+                _ => Ok(v),
+            },
+            other => other,
+        };
+
+        // ── restore on ALL exits (incl. panic, captured as Err above) ─────────
+        do_restore(restore);
+
+        // ── normalize to a `[value, err]` pair (matches `deadline`/`fallback`) ─
+        match outcome {
+            Err(e) => Err(e),
+            Ok(v) => {
+                if result_pair_err(&v).is_some() {
+                    Ok(v)
+                } else {
+                    Ok(make_pair(v, Value::nil()))
+                }
+            }
+        }
+    }
 }
 
 // ── Interp::call_resilience ───────────────────────────────────────────────────
@@ -2553,6 +2642,17 @@ impl Interp {
                 Some(ms) => Value::float(ms),
                 None => Value::nil(),
             }),
+            "withTrace" => {
+                let id = arg(args, 0);
+                let user_fn = arg(args, 1);
+                self.call_with_trace(id, user_fn, span).await
+            }
+            "traceId" => Ok(
+                match crate::interp::task_locals_current().and_then(|l| l.trace_id.clone()) {
+                    Some(id) => Value::str(&*id),
+                    None => Value::nil(),
+                },
+            ),
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
                 span,
@@ -4144,6 +4244,150 @@ resilience.deadline("nope", () => 1)
         assert!(
             res.is_err() || res.unwrap().contains("ms"),
             "expected a panic about ms"
+        );
+    }
+
+    // ── Task 4.3: resilience.withTrace / traceId (§5.5) ────────────────────────
+
+    /// `traceId()` inside `withTrace` returns the set id; after the scope it is nil
+    /// again (save → set → restore on the cell, like `deadline`).
+    #[tokio::test]
+    async fn with_trace_sets_and_restores() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+resilience.withTrace("t-1", () => {
+    print(resilience.traceId())
+    return nil
+})
+print(resilience.traceId())   // restored: nil at top level
+"#)
+        .await;
+        assert_eq!(out, "t-1\nnil\n");
+    }
+
+    /// The trace id is captured at the spawn site, so a child async fn spawned WHILE
+    /// the trace is set inherits it (mirrors the deadline inheritance probe).
+    #[tokio::test]
+    async fn with_trace_inherited_by_spawned_async_fn() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+async fn child() { return resilience.traceId() }
+let [v, err] = resilience.withTrace("t-1", async () => {
+    let f = child()              // spawned WHILE the trace local is set
+    return await f
+})
+print(v)
+print(resilience.traceId())   // restored: nil at top level
+"#)
+        .await;
+        assert_eq!(out, "t-1\nnil\n");
+    }
+
+    /// `withTrace` returns a `[value, nil]` ok-pair on a plain-value body (matches
+    /// `deadline`/`fallback`).
+    #[tokio::test]
+    async fn with_trace_wraps_plain_value_as_ok_pair() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let [v, err] = resilience.withTrace("t-1", () => 42)
+print(v)
+print(err)
+"#)
+        .await;
+        assert_eq!(out, "42\nnil\n");
+    }
+
+    /// Nested `withTrace`: the inner sets a new id, restored to the outer's on exit.
+    #[tokio::test]
+    async fn with_trace_nesting_restores_outer() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+resilience.withTrace("outer", () => {
+    print(resilience.traceId())
+    resilience.withTrace("inner", () => {
+        print(resilience.traceId())
+        return nil
+    })
+    print(resilience.traceId())   // restored to the outer id
+    return nil
+})
+"#)
+        .await;
+        assert_eq!(out, "outer\ninner\nouter\n");
+    }
+
+    /// A panicking `withTrace` body still restores the previous trace id.
+    #[tokio::test]
+    async fn with_trace_restores_on_panic() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let [v, err] = recover(() => resilience.withTrace("t-1", () => { assert(false, "boom") }))
+print(resilience.traceId())   // restored even though the body panicked
+"#)
+        .await;
+        assert_eq!(out, "nil\n");
+    }
+
+    /// `withTrace` inside `deadline` (and the reverse) preserves the OTHER field via
+    /// the COW copy: both the deadline budget AND the trace id are visible inside.
+    #[tokio::test]
+    async fn with_trace_inside_deadline_preserves_both() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+resilience.deadline(60000, () => {
+    resilience.withTrace("t", () => {
+        print(resilience.deadlineRemaining() != nil)
+        print(resilience.traceId())
+        return nil
+    })
+    return nil
+})
+"#)
+        .await;
+        assert_eq!(out, "true\nt\n");
+    }
+
+    /// `deadline` inside `withTrace`: the trace id survives the deadline scope (the
+    /// deadline COW carries the existing trace_id forward).
+    #[tokio::test]
+    async fn deadline_inside_with_trace_preserves_trace() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+resilience.withTrace("t", () => {
+    resilience.deadline(60000, () => {
+        print(resilience.traceId())
+        print(resilience.deadlineRemaining() != nil)
+        return nil
+    })
+    return nil
+})
+"#)
+        .await;
+        assert_eq!(out, "t\ntrue\n");
+    }
+
+    /// `traceId()` is nil when no trace is set.
+    #[tokio::test]
+    async fn trace_id_nil_outside_with_trace() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+print(resilience.traceId())
+"#)
+        .await;
+        assert_eq!(out, "nil\n");
+    }
+
+    /// A non-string `id` is a Tier-2 panic.
+    #[tokio::test]
+    async fn with_trace_non_string_id_panics() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+resilience.withTrace(123, () => 1)
+"#)
+        .await;
+        assert!(
+            res.is_err() || res.unwrap().contains("must be a string"),
+            "expected a panic about id being a string"
         );
     }
 }

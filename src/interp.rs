@@ -1941,16 +1941,29 @@ impl Interp {
                     }
                 }
                 let msg = parts.join(" ");
+                // RESIL §5.5: attach the ambient trace id (if a `withTrace` scope is
+                // active) as a RESERVED `traceId` field. Zero-cost `None` path: when no
+                // trace is set the read is a TLS lookup + `Cell` read and NO field is
+                // added (so logs outside a trace scope stay byte-identical).
+                let trace_id: Option<std::rc::Rc<str>> =
+                    crate::interp::task_locals_current().and_then(|l| l.trace_id.clone());
                 let line = match self.log_format.get() {
                     LogFormat::Json => {
                         let mut rec = serde_json::Map::new();
                         // User fields FIRST, then reserved keys, so a user field
-                        // named `level`/`msg` can never clobber the authoritative ones.
+                        // named `level`/`msg`/`traceId` can never clobber the
+                        // authoritative ones.
                         for (k, v) in fields {
                             rec.insert(k, v);
                         }
                         rec.insert("level".into(), serde_json::Value::String(func.into()));
                         rec.insert("msg".into(), serde_json::Value::String(msg));
+                        if let Some(tid) = &trace_id {
+                            rec.insert(
+                                "traceId".into(),
+                                serde_json::Value::String(tid.to_string()),
+                            );
+                        }
                         serde_json::Value::Object(rec).to_string()
                     }
                     LogFormat::Human => {
@@ -1965,6 +1978,9 @@ impl Interp {
                                 other => other.to_string(),
                             };
                             s.push_str(&format!(" {}={}", k, vs));
+                        }
+                        if let Some(tid) = &trace_id {
+                            s.push_str(&format!(" traceId={}", tid));
                         }
                         s
                     }
@@ -2172,6 +2188,13 @@ impl Interp {
             Some(ctx) => (ctx.trace_id, Some(ctx.span_id)),
             None => (new_trace_id(), None),
         };
+        // RESIL §5.5: attach the ambient trace/request id (from a `withTrace` scope) as
+        // a `trace_id` span attribute when one is set. Zero-cost `None` path (a TLS +
+        // `Cell` read; no attr pushed when no trace is active).
+        let mut attrs = attrs;
+        if let Some(tid) = crate::interp::task_locals_current().and_then(|l| l.trace_id.clone()) {
+            attrs.push(("trace_id".to_string(), Value::str(&*tid)));
+        }
         let open = OpenSpan {
             trace_id,
             span_id: new_span_id(),
@@ -9687,7 +9710,9 @@ mod tests {
         let env = global_env().child();
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") })
+            .run_until(crate::interp::ambient_root_scope(async {
+                interp.exec(&stmts, &env).await.expect("program panicked")
+            }))
             .await;
         local.await;
         interp.log_output()
@@ -9729,6 +9754,32 @@ log.debug(() => "expensive")
                 && logs.contains("\"userId\":5")
         );
         assert!(!logs.contains("expensive"));
+    }
+
+    /// RESIL §5.5: a `log` record emitted inside a `withTrace` scope carries a
+    /// `traceId` reserved field; outside any trace scope NO `traceId` is added.
+    #[cfg(all(feature = "log", feature = "resilience"))]
+    #[tokio::test]
+    async fn log_carries_trace_id_inside_trace_scope() {
+        let logs = run_logs(
+            r#"
+import * as log from "std/log"
+import * as resilience from "std/resilience"
+log.setFormat("json")
+resilience.withTrace("t-1", () => {
+    log.info("inside")
+    return nil
+})
+log.info("outside")
+"#,
+        )
+        .await;
+        // The first record (inside the trace scope) carries the traceId.
+        let inside = logs.lines().find(|l| l.contains("\"msg\":\"inside\"")).expect("inside record");
+        assert!(inside.contains("\"traceId\":\"t-1\""), "inside should carry traceId: {inside}");
+        // The second record (outside) has NO traceId field.
+        let outside = logs.lines().find(|l| l.contains("\"msg\":\"outside\"")).expect("outside record");
+        assert!(!outside.contains("traceId"), "outside must NOT carry traceId: {outside}");
     }
 
     #[cfg(feature = "log")]

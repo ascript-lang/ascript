@@ -251,6 +251,38 @@ await gather([a, b])
     assert_ne!(a.trace_id, b.trace_id, "A and B are distinct traces");
 }
 
+// ---- RESIL §5.5: trace-id local attaches as a span attribute ----
+
+/// A span opened inside a `resilience.withTrace` scope carries the trace id as a
+/// `trace_id` span attribute; a span opened outside any trace scope does not.
+#[tokio::test]
+async fn span_carries_trace_id_attribute_from_local() {
+    let (_out, interp) = run_i(&format!(
+        r#"{INIT}
+import * as resilience from "std/resilience"
+resilience.withTrace("req-42", () => {{
+  telemetry.startSpan("traced").end()
+  return nil
+}})
+telemetry.startSpan("untraced").end()
+"#
+    ))
+    .await;
+    let spans = interp.telemetry_spans_debug();
+    let traced = spans.iter().find(|s| s.name == "traced").expect("traced span");
+    let untraced = spans.iter().find(|s| s.name == "untraced").expect("untraced span");
+    assert!(
+        traced.attributes.iter().any(|(k, v)| k == "trace_id" && v == "req-42"),
+        "traced span should carry trace_id=req-42 attribute: {:?}",
+        traced.attributes
+    );
+    assert!(
+        !untraced.attributes.iter().any(|(k, _)| k == "trace_id"),
+        "untraced span must NOT carry a trace_id attribute: {:?}",
+        untraced.attributes
+    );
+}
+
 // ---- F2: OTLP exporter — span / metric / log HTTP payloads (capture seam) ----
 
 #[tokio::test]
