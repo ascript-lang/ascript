@@ -38,6 +38,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("limiter", super::bi("resilience.limiter")),
         ("keyedLimiter", super::bi("resilience.keyedLimiter")),
         ("bulkhead", super::bi("resilience.bulkhead")),
+        ("retry", super::bi("resilience.retry")),
     ]
 }
 
@@ -277,6 +278,7 @@ impl Interp {
             "limiter" => self.call_limiter_method(&recv, name, args, span).await,
             "keyedLimiter" => self.call_keyed_limiter_method(&recv, name, args, span).await,
             "bulkhead" => self.call_bulkhead_method(&recv, name, args, span).await,
+            "retry" => self.call_retry_method(&recv, name, args, span).await,
             other => Err(AsError::at(
                 format!("{} policy has no method '{}'", other, name),
                 span,
@@ -1523,6 +1525,126 @@ impl Interp {
     }
 }
 
+// ── retry policy constructor + method dispatch (§3.4) ─────────────────────────
+
+/// Build a reusable retry policy object (§3.4).
+///
+/// The policy carries the parsed retry config (validated up front via the shared
+/// `parse_retry_config`), a `budget` ratio in (0, 1], and the count-based budget
+/// state (`__attemptsSeen`/`__retriesSpent`). `p.call(fn)` routes to the SAME
+/// `Interp::retry_engine` `task.retry` uses, with this policy as the budget state.
+///
+/// `budget`, when present, must be a number in (0, 1] (Tier-2 otherwise). When
+/// absent, the budget never blocks a retry (treated as 1.0 — `attempts` bounds it).
+fn make_retry_policy(opts: Value, span: Span) -> Result<Value, Control> {
+    // Validate the retry config up front (shared with task.retry; same messages).
+    // `budget` is a policy-only key parse_retry_config ignores — validated below.
+    let _cfg = crate::stdlib::task_mod::parse_retry_config(&opts, span)?;
+
+    // Parse + validate the budget ratio (policy-only).
+    let budget = match opts.kind() {
+        ValueKind::Object(o) => match o.get("budget") {
+            None => 1.0,
+            Some(v) => match v.kind() {
+                ValueKind::Nil => 1.0,
+                _ => match v.as_f64() {
+                    Some(n) if n > 0.0 && n <= 1.0 => n,
+                    _ => {
+                        return Err(AsError::at(
+                            "resilience.retry: budget must be a number in (0, 1]",
+                            span,
+                        )
+                        .into())
+                    }
+                },
+            },
+        },
+        ValueKind::Nil => 1.0,
+        _ => {
+            return Err(AsError::at(
+                "resilience.retry: expected an options object or nil",
+                span,
+            )
+            .into())
+        }
+    };
+
+    let mut m: IndexMap<String, Value> = IndexMap::new();
+    m.insert("__resil".to_string(), Value::str("retry"));
+    // Stash the original opts so `call` re-derives the config via the shared parser
+    // (keeps ONE source of truth for the retry config, incl. the `retryIf` callable).
+    m.insert(
+        "__opts".to_string(),
+        match opts.kind() {
+            ValueKind::Nil => Value::nil(),
+            _ => opts.clone(),
+        },
+    );
+    // Budget ratio + count-based state.
+    m.insert("budget".to_string(), Value::float(budget));
+    m.insert("__attemptsSeen".to_string(), Value::int(0));
+    m.insert("__retriesSpent".to_string(), Value::int(0));
+    // non-sendable marker (§2.2)
+    m.insert("__local".to_string(), local_marker());
+
+    Ok(Value::object(m))
+}
+
+impl Interp {
+    /// Dispatch a method call on a `retry` policy object (§3.4).
+    ///
+    /// `p.call(fn)` re-derives the `RetryConfig` from the stashed `__opts` and drives
+    /// `retry_engine` with the policy as the count-based budget state. `p.stats()`
+    /// returns `{attemptsSeen, retriesSpent, budget}`. `p.reset()` zeroes the budget
+    /// counters.
+    async fn call_retry_method(
+        &self,
+        recv: &Value,
+        name: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        match name {
+            "call" => {
+                let user_fn = args.get(1).cloned().unwrap_or(Value::nil());
+                let opts = match recv.kind() {
+                    ValueKind::Object(o) => o.get("__opts").unwrap_or(Value::nil()),
+                    _ => Value::nil(),
+                };
+                let cfg = crate::stdlib::task_mod::parse_retry_config(&opts, span)?;
+                self.retry_engine(user_fn, &cfg, Some(recv), span).await
+            }
+            "stats" => {
+                let (seen, spent, budget) = match recv.kind() {
+                    ValueKind::Object(o) => (
+                        o.get("__attemptsSeen").unwrap_or(Value::int(0)),
+                        o.get("__retriesSpent").unwrap_or(Value::int(0)),
+                        o.get("budget").unwrap_or(Value::float(1.0)),
+                    ),
+                    _ => (Value::int(0), Value::int(0), Value::float(1.0)),
+                };
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("attemptsSeen".to_string(), seen);
+                m.insert("retriesSpent".to_string(), spent);
+                m.insert("budget".to_string(), budget);
+                Ok(Value::object(m))
+            }
+            "reset" => {
+                if let ValueKind::Object(o) = recv.kind() {
+                    o.insert("__attemptsSeen", Value::int(0));
+                    o.insert("__retriesSpent", Value::int(0));
+                }
+                Ok(Value::nil())
+            }
+            other => Err(AsError::at(
+                format!("retry policy has no method '{}'", other),
+                span,
+            )
+            .into()),
+        }
+    }
+}
+
 // ── Interp::call_resilience ───────────────────────────────────────────────────
 
 impl Interp {
@@ -1551,6 +1673,10 @@ impl Interp {
             "bulkhead" => {
                 let opts = arg(args, 0);
                 self.make_bulkhead(opts, span)
+            }
+            "retry" => {
+                let opts = arg(args, 0);
+                make_retry_policy(opts, span)
             }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
@@ -2274,4 +2400,99 @@ print("done")
     }
 
     // deadline-while-parked test added in Task 4.4
+
+    // ── Task 2.4: resilience.retry stateful budget policy (§3.4) ──────────────
+
+    /// A retry policy with no budget behaves like task.retry (retries panics, succeeds).
+    #[tokio::test]
+    async fn retry_policy_basic_succeeds() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let p = resilience.retry({attempts: 5, baseMs: 1})
+let c = [0]
+async fn flaky() { c[0] = c[0] + 1; if (c[0] < 3) { assert(false, "x") }; return "ok" }
+print(await p.call(flaky))
+print(c[0])
+"#)
+        .await;
+        assert_eq!(out, "ok\n3\n");
+    }
+
+    /// Budget exhaustion is COUNT-based: with budget=0.5 over an err-retry policy,
+    /// retries stop once `__retriesSpent >= budget * __attemptsSeen`. Driving many
+    /// always-failing calls, the budget caps retries → later calls exhaust immediately
+    /// (one attempt only). NO clocks involved.
+    #[tokio::test]
+    async fn retry_policy_budget_caps_retries() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+// budget 0.5: at most half as many retries as attempts seen.
+let p = resilience.retry({attempts: 10, baseMs: 1, retryOn: "error", budget: 0.5})
+let total = [0]
+async fn errs() { total[0] = total[0] + 1; return [nil, {message: "bad"}] }
+// Run several failing calls; each consumes from the shared budget.
+let i = [0]
+while (i[0] < 5) {
+    let [v, e] = await p.call(errs)
+    i[0] = i[0] + 1
+}
+let s = p.stats()
+// Budget invariant: retriesSpent <= budget * attemptsSeen (count-based, no clocks).
+print(s.retriesSpent <= 0.5 * s.attemptsSeen)
+// The budget genuinely throttled retries (fewer attempts than the unbounded 5*10=50).
+print(s.attemptsSeen < 50)
+print(s.retriesSpent > 0)
+"#)
+        .await;
+        assert_eq!(out, "true\ntrue\ntrue\n");
+    }
+
+    /// A tiny budget throttles HARD after the first retry. The budget invariant is
+    /// `spent < budget * seen`; with budget=0.1 the first call (seen=1, spent=0)
+    /// permits exactly one retry (0 < 0.1), then the second attempt (seen=2, spent=1)
+    /// is blocked (1 < 0.2 is false) → exactly 2 attempts. Count-based, NO clocks.
+    #[tokio::test]
+    async fn retry_policy_tiny_budget_throttles_after_first_retry() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let p = resilience.retry({attempts: 5, baseMs: 1, retryOn: "error", budget: 0.1})
+let c = [0]
+async fn errs() { c[0] = c[0] + 1; return [nil, {message: "bad"}] }
+let [v, e] = await p.call(errs)
+print(c[0])   // 2 — one retry permitted, then budget blocks further attempts
+"#)
+        .await;
+        assert_eq!(out, "2\n");
+    }
+
+    /// budget out of range (> 1) on resilience.retry → Tier-2.
+    #[tokio::test]
+    async fn retry_policy_budget_range_validated() {
+        let res = crate::run_source(r#"
+import * as resilience from "std/resilience"
+resilience.retry({attempts: 3, budget: 2.0})
+"#)
+        .await;
+        let msg = match res { Err(e) => format!("{e}"), Ok(s) => s };
+        assert!(msg.contains("budget"), "expected budget range panic, got: {msg:?}");
+    }
+
+    /// reset() zeroes the budget counters.
+    #[tokio::test]
+    async fn retry_policy_reset_clears_counters() {
+        let out = run(r#"
+import * as resilience from "std/resilience"
+let p = resilience.retry({attempts: 3, baseMs: 1, retryOn: "error", budget: 1.0})
+async fn errs() { return [nil, {message: "bad"}] }
+await p.call(errs)
+let before = p.stats()
+print(before.attemptsSeen > 0)
+p.reset()
+let after = p.stats()
+print(after.attemptsSeen)
+print(after.retriesSpent)
+"#)
+        .await;
+        assert_eq!(out, "true\n0\n0\n");
+    }
 }
