@@ -150,7 +150,7 @@ impl BodyMode {
 /// `BufReader` over that, which lets the §11.4 idiom (`read`/`read_until`/
 /// `read_to_end`) apply VERBATIM over the chunked stream — the leftover buffering
 /// for partial `read(n)` and `readLine()` line-splitting is the BufReader's own.
-type ByteStream =
+pub(crate) type ByteStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>>>;
 
 /// A streaming HTTP response body: a `BufReader` over the response's chunked byte

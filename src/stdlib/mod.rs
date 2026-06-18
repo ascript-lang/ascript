@@ -35,6 +35,8 @@ pub mod env;
 #[cfg(feature = "sys")]
 pub mod fs;
 #[cfg(feature = "net")]
+pub mod http1;
+#[cfg(feature = "net")]
 pub mod http_server;
 #[cfg(feature = "intl")]
 pub mod intl;
