@@ -252,6 +252,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("withTrace", super::bi("resilience.withTrace")),
         ("traceId", super::bi("resilience.traceId")),
         ("metricsHandler", super::bi("resilience.metricsHandler")),
+        ("health", super::bi("resilience.health")),
+        ("handler", super::bi("resilience.handler")),
     ]
 }
 
@@ -297,6 +299,110 @@ fn local_marker() -> Value {
         kind: NativeKind::Resilience,
         fields: IndexMap::new(),
     }))
+}
+
+// ── §6.3/§6.4 HTTP wrapper helpers (free fns) ────────────────────────────────
+
+/// Append a JSON-escaped string literal (with surrounding quotes) to `out`.
+/// A minimal, feature-INDEPENDENT escaper (the `resilience` feature does not pull
+/// in `data`/`serde_json`) covering the RFC 8259 mandatory escapes + control chars.
+fn json_push_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Serialize the §6.3 health body: `{"status":"ok|degraded","checks":{<name>:{ok:bool,
+/// error?:string}, ...}}`. Hand-built (no `serde_json` dependency) so it works under
+/// `--no-default-features --features resilience`.
+fn health_json(all_ok: bool, results: &[(String, bool, Option<String>)]) -> String {
+    let mut out = String::from("{\"status\":");
+    json_push_str(&mut out, if all_ok { "ok" } else { "degraded" });
+    out.push_str(",\"checks\":{");
+    for (i, (name, ok, err)) in results.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_push_str(&mut out, name);
+        out.push_str(":{\"ok\":");
+        out.push_str(if *ok { "true" } else { "false" });
+        if let Some(msg) = err {
+            out.push_str(",\"error\":");
+            json_push_str(&mut out, msg);
+        }
+        out.push('}');
+    }
+    out.push_str("}}");
+    out
+}
+
+/// Extract a human-readable message from a check's error value (`{message}` object
+/// or a bare string), for the health body `error` field.
+fn health_err_message(err: &Value) -> String {
+    match err.kind() {
+        ValueKind::Object(o) => match o.get("message").as_ref().map(|v| v.kind()) {
+            Some(ValueKind::Str(s)) => s.to_string(),
+            _ => err.to_string(),
+        },
+        ValueKind::Str(s) => s.to_string(),
+        _ => err.to_string(),
+    }
+}
+
+/// Build a §6.4 status-only HTTP response object `{status, headers?}`. When
+/// `retry_after` is `Some(secs)`, a `retry-after` header (whole seconds, rounded up,
+/// ≥ 1) is attached — the standard HTTP `Retry-After` delta-seconds form.
+fn handler_status_response(status: i64, retry_after: Option<f64>) -> Value {
+    let mut fields: IndexMap<String, Value> = IndexMap::new();
+    fields.insert("status".to_string(), Value::int(status));
+    if let Some(secs) = retry_after {
+        let whole = (secs.ceil() as i64).max(1);
+        let headers = Value::object(
+            [("retry-after".to_string(), Value::str(whole.to_string()))]
+                .into_iter()
+                .collect(),
+        );
+        fields.insert("headers".to_string(), headers);
+    }
+    Value::object(fields)
+}
+
+/// Read an optional `retryAfter` (seconds) off a policy-rejection error object.
+fn retry_after_of(err: &Value) -> Option<f64> {
+    match err.kind() {
+        ValueKind::Object(o) => o.get("retryAfter").and_then(|v| v.as_f64()),
+        _ => None,
+    }
+}
+
+/// Compute a limiter's retry-after (seconds until ≥ 1 token refills) from its live
+/// `__tokens`/`refillPerSec`. Returns `None` for a zero-refill bucket (never refills
+/// → omit the header) or a non-limiter receiver. Used to populate the 429 header.
+fn limiter_retry_after_secs(lim: &Value) -> Option<f64> {
+    match lim.kind() {
+        ValueKind::Object(o) => {
+            let refill = o.get("refillPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if refill <= 0.0 {
+                return None;
+            }
+            let tokens = o.get("__tokens").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let deficit = (1.0 - tokens).max(0.0);
+            Some(deficit / refill)
+        }
+        _ => None,
+    }
 }
 
 // ── breaker constructor ───────────────────────────────────────────────────────
@@ -3203,6 +3309,45 @@ impl Interp {
                 }),
                 method: "__metrics".to_string(),
             }))),
+            // §6.3: a callable readiness/liveness handler the server mounts directly
+            // (`server.get("/readyz", resilience.health({checks, timeoutMs}))`). The
+            // `{checks, timeoutMs}` config is stashed verbatim in the handle's
+            // `NativeObject.fields` under `__config` and read at call time in
+            // `call_resilience_native_method` (the request arg is ignored — readiness
+            // carries no meaningful body).
+            "health" => {
+                let cfg = arg(args, 0);
+                let mut fields: IndexMap<String, Value> = IndexMap::new();
+                fields.insert("__config".to_string(), cfg);
+                Ok(Value::native_method(Rc::new(crate::value::NativeMethod {
+                    receiver: Rc::new(NativeObject {
+                        id: u64::MAX,
+                        kind: NativeKind::Resilience,
+                        fields,
+                    }),
+                    method: "__health".to_string(),
+                })))
+            }
+            // §6.4: a callable policy-wrapped HTTP handler the server mounts directly
+            // (`server.get("/quote", resilience.handler(policies, fn))`). Both the
+            // `policies` object and the wrapped `fn` are stashed in the handle's
+            // `NativeObject.fields` (`__policies`, `__fn`); composition + code→status
+            // mapping happens at call time in `call_resilience_native_method`.
+            "handler" => {
+                let policies = arg(args, 0);
+                let user_fn = arg(args, 1);
+                let mut fields: IndexMap<String, Value> = IndexMap::new();
+                fields.insert("__policies".to_string(), policies);
+                fields.insert("__fn".to_string(), user_fn);
+                Ok(Value::native_method(Rc::new(crate::value::NativeMethod {
+                    receiver: Rc::new(NativeObject {
+                        id: u64::MAX,
+                        kind: NativeKind::Resilience,
+                        fields,
+                    }),
+                    method: "__handler".to_string(),
+                })))
+            }
             other => Err(AsError::at(
                 format!("resilience.{}: not implemented in this build", other),
                 span,
@@ -3221,11 +3366,14 @@ impl Interp {
     pub(crate) async fn call_resilience_native_method(
         &self,
         m: &Rc<crate::value::NativeMethod>,
-        _args: Vec<Value>,
+        args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
         match m.method.as_str() {
             "__metrics" => {
+                // Prometheus scrape carries no meaningful body; the request arg is
+                // ignored (preserved as a binding so all arms share the signature).
+                let _ = &args;
                 let body = render_prometheus(&self.resilience.borrow().registry);
                 let headers = Value::object(
                     [(
@@ -3245,12 +3393,369 @@ impl Interp {
                     .collect(),
                 ))
             }
+            // §6.3: readiness/liveness. Run every check (sequential, registration
+            // order), each contained (`recover`-style — a panicking check never 500s
+            // the endpoint) under a per-check `timeoutMs` deadline, and report.
+            "__health" => {
+                let cfg = m.receiver.fields.get("__config").cloned().unwrap_or(Value::nil());
+                self.run_health(&cfg, span).await
+            }
+            // §6.4: the policy-wrapped handler. Read `policies`+`fn`+the request arg,
+            // compose the fixed policy stack, and map a policy-rejection code to its
+            // HTTP status (429/503/504); a real handler error/success passes through.
+            "__handler" => {
+                let policies = m.receiver.fields.get("__policies").cloned().unwrap_or(Value::nil());
+                let user_fn = m.receiver.fields.get("__fn").cloned().unwrap_or(Value::nil());
+                let req = args.into_iter().next().unwrap_or(Value::nil());
+                self.run_handler(&policies, &user_fn, req, span).await
+            }
+            // §6.4: an internal composition-step callable — the `user_fn` a policy
+            // method (bulkhead/breaker/deadline) invokes with no args. It re-enters
+            // the policy stack at the stored `__layer`, threading the stored request.
+            "__handler_step" => {
+                let policies = m.receiver.fields.get("__policies").cloned().unwrap_or(Value::nil());
+                let user_fn = m.receiver.fields.get("__fn").cloned().unwrap_or(Value::nil());
+                let req = m.receiver.fields.get("__req").cloned().unwrap_or(Value::nil());
+                let layer = m
+                    .receiver
+                    .fields
+                    .get("__layer")
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as u8;
+                self.handler_layer(&policies, &user_fn, req, layer, span).await
+            }
             other => Err(AsError::at(
                 format!("resilience handler has no method '{}'", other),
                 span,
             )
             .into()),
         }
+    }
+
+    // ── §6.3 health composition ───────────────────────────────────────────────
+
+    /// Run all health checks (sequential, registration order) under per-check
+    /// containment + a per-check `timeoutMs` deadline, and assemble the HTTP
+    /// response object. All pass → 200 `{"status":"ok",...}`; any fail → 503
+    /// `{"status":"degraded",...}`. Body is a hand-built JSON string + an explicit
+    /// `application/json` content-type (the server stringifies an Object body via
+    /// display, not JSON — so we serialize here, like `__metrics`).
+    async fn run_health(&self, cfg: &Value, span: Span) -> Result<Value, Control> {
+        // Pull `checks` (key → fn) + optional `timeoutMs` out of the config object.
+        let (checks, timeout_ms): (Vec<(String, Value)>, Option<f64>) = match cfg.kind() {
+            ValueKind::Object(o) => {
+                let checks = match o.get("checks").as_ref().map(|v| v.kind()) {
+                    Some(ValueKind::Object(c)) => c
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let timeout = o.get("timeoutMs").and_then(|v| v.as_f64());
+                (checks, timeout)
+            }
+            _ => (Vec::new(), None),
+        };
+
+        // Run each check; collect (name, ok, optional error message). Containment is
+        // total: a panic / propagate / falsy / err-pair / timeout all read as a fail
+        // and NEVER escape (`recover`-style — one bad check cannot 500 the endpoint).
+        let mut results: Vec<(String, bool, Option<String>)> = Vec::with_capacity(checks.len());
+        let mut all_ok = true;
+        for (name, check_fn) in checks {
+            let (ok, err) = self.run_one_check(check_fn, timeout_ms, span).await;
+            if !ok {
+                all_ok = false;
+            }
+            results.push((name, ok, err));
+        }
+
+        let status = if all_ok { 200 } else { 503 };
+        let body = health_json(all_ok, &results);
+        let headers = Value::object(
+            [("content-type".to_string(), Value::str("application/json"))]
+                .into_iter()
+                .collect(),
+        );
+        Ok(Value::object(
+            [
+                ("status".to_string(), Value::int(status)),
+                ("headers".to_string(), headers),
+                ("body".to_string(), Value::str(body.as_str())),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+    }
+
+    /// Run ONE health check fn (driving a returned future), under an optional
+    /// per-check `timeoutMs` deadline, fully contained. Returns `(ok, Some(error))`.
+    /// Pass: truthy plain value OR ok-pair `[v, nil]`. Fail: falsy, err-pair,
+    /// panic/propagate (the message captured), or deadline-exceeded.
+    async fn run_one_check(
+        &self,
+        check_fn: Value,
+        timeout_ms: Option<f64>,
+        span: Span,
+    ) -> (bool, Option<String>) {
+        // A timeout wraps the check in `deadline(ms, () => check())`; the deadline
+        // helper already drives a returned future + contains the body in a pair.
+        let raw = match timeout_ms {
+            Some(ms) => self.call_deadline(Value::float(ms), check_fn, span).await,
+            None => {
+                let r = self.call_value(check_fn, vec![], span).await;
+                // Drive a returned future to completion (like deadline/breaker do).
+                match r {
+                    Ok(v) => match v.kind() {
+                        ValueKind::Future(_) => {
+                            let crate::value::OwnedKind::Future(f) = v.into_kind() else {
+                                unreachable!()
+                            };
+                            f.get().await
+                        }
+                        _ => Ok(v),
+                    },
+                    other => other,
+                }
+            }
+        };
+
+        match raw {
+            // A panic/propagate is contained → reported as a failed check.
+            Err(Control::Panic(e)) => (false, Some(e.message)),
+            Err(Control::Propagate(p)) => {
+                let msg = crate::interp::result_pair_err(&p)
+                    .map(|e| health_err_message(&e))
+                    .unwrap_or_else(|| "check propagated".to_string());
+                (false, Some(msg))
+            }
+            // Exit must not be contained — let it surface (process-level intent).
+            Err(other) => {
+                // Defensive: treat any other Control as a fail without escaping the
+                // endpoint, EXCEPT Exit which we re-raise via the caller path. Since
+                // run_one_check has no Result return, fold Exit into a fail too — an
+                // exit() inside a health check is pathological; containment wins.
+                let _ = other;
+                (false, Some("check did not complete".to_string()))
+            }
+            Ok(v) => {
+                // `deadline`/no-timeout both may hand back a pair; classify it.
+                if let Some(e) = crate::interp::result_pair_err(&v) {
+                    return (false, Some(health_err_message(&e)));
+                }
+                // An ok-pair `[v, nil]` — unwrap to the inner value for truthiness.
+                let inner = match v.kind() {
+                    ValueKind::Array(a) => {
+                        let b = a.borrow();
+                        if b.len() == 2 && b[1] == Value::nil() {
+                            b[0].clone()
+                        } else {
+                            v.clone()
+                        }
+                    }
+                    _ => v.clone(),
+                };
+                if inner.is_truthy() {
+                    (true, None)
+                } else {
+                    (false, Some("check returned a falsy value".to_string()))
+                }
+            }
+        }
+    }
+
+    // ── §6.4 handler composition ──────────────────────────────────────────────
+
+    /// Entry: run the policy-wrapped handler for one request and map the outcome
+    /// to an HTTP response. Composes the fixed stack (limiter → bulkhead → breaker
+    /// → deadline → fn), then inspects the resulting pair: a known policy-rejection
+    /// `code` → the mapped status object (429/503/504); an ok-pair → the handler's
+    /// own value (unwrapped — the server serializes it); any other error pair → the
+    /// pair UNCHANGED (the server's existing 500 path).
+    async fn run_handler(
+        &self,
+        policies: &Value,
+        user_fn: &Value,
+        req: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let outcome = self.handler_layer(policies, user_fn, req, 0, span).await?;
+        // The composed stack always returns a pair (every policy normalizes; the
+        // identity `{}` path normalizes too). Classify the error half.
+        if let Some(err) = crate::interp::result_pair_err(&outcome) {
+            let code = match err.kind() {
+                ValueKind::Object(o) => match o.get("code").as_ref().map(|v| v.kind()) {
+                    Some(ValueKind::Str(s)) => Some(s.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match code.as_deref() {
+                Some("rate-limited") => {
+                    return Ok(handler_status_response(429, retry_after_of(&err)));
+                }
+                Some("bulkhead-full") => return Ok(handler_status_response(503, None)),
+                Some("breaker-open") => {
+                    return Ok(handler_status_response(503, retry_after_of(&err)));
+                }
+                Some("deadline-exceeded") => return Ok(handler_status_response(504, None)),
+                // Any other error pair from the handler itself: pass through unchanged
+                // so the server's existing semantics (value_to_response → 500) apply.
+                _ => return Ok(outcome),
+            }
+        }
+        // Ok-pair: hand back the handler's value (unwrapped). `value_to_response`
+        // also unwraps an ok-pair, but returning the bare value keeps a unit-tested
+        // `resp.status` working without the server in the loop.
+        match outcome.kind() {
+            ValueKind::Array(a) => {
+                let b = a.borrow();
+                if b.len() == 2 && b[1] == Value::nil() {
+                    return Ok(b[0].clone());
+                }
+                drop(b);
+                Ok(outcome)
+            }
+            _ => Ok(outcome),
+        }
+    }
+
+    /// Apply ONE policy layer and recurse. Fixed order (outermost first):
+    /// 0 = limiter (sync `tryAcquire`; on reject → `rate-limited` pair),
+    /// 1 = bulkhead (`run`), 2 = breaker (`call`), 3 = deadline, 4 = the handler fn.
+    /// A layer with no configured policy falls through to the next. Each delegating
+    /// layer passes a `__handler_step` NativeMethod (carrying policies/fn/req/next
+    /// layer) as the policy method's `user_fn`, so the policy invokes our recursion.
+    #[async_recursion::async_recursion(?Send)]
+    async fn handler_layer(
+        &self,
+        policies: &Value,
+        user_fn: &Value,
+        req: Value,
+        layer: u8,
+        span: Span,
+    ) -> Result<Value, Control> {
+        use crate::interp::make_pair;
+
+        let policy = |name: &str| -> Option<Value> {
+            match policies.kind() {
+                ValueKind::Object(o) => o.get(name).filter(|v| !matches!(v.kind(), ValueKind::Nil)),
+                _ => None,
+            }
+        };
+
+        match layer {
+            // ── Layer 0: limiter / keyedLimiter (sync, non-blocking tryAcquire) ──
+            0 => {
+                if let Some(lim) = policy("limiter") {
+                    let kind = resil_kind(&lim).map(|k| k.to_string());
+                    let granted = match kind.as_deref() {
+                        Some("keyedLimiter") => {
+                            // Resolve the partition key via the optional `key` fn.
+                            let key = match policy("key") {
+                                Some(kf) => self.call_value(kf, vec![req.clone()], span).await?,
+                                None => Value::str("anon"),
+                            };
+                            let r = self
+                                .call_keyed_limiter_method(
+                                    &lim,
+                                    "tryAcquire",
+                                    &[lim.clone(), key],
+                                    span,
+                                )
+                                .await?;
+                            matches!(r.kind(), ValueKind::Bool(true))
+                        }
+                        Some("limiter") => {
+                            let r = self
+                                .call_limiter_method(
+                                    &lim,
+                                    "tryAcquire",
+                                    std::slice::from_ref(&lim),
+                                    span,
+                                )
+                                .await?;
+                            matches!(r.kind(), ValueKind::Bool(true))
+                        }
+                        // A non-limiter under the `limiter` key: ignore (no shed).
+                        _ => true,
+                    };
+                    if !granted {
+                        let mut err: IndexMap<String, Value> = IndexMap::new();
+                        err.insert("message".to_string(), Value::str("rate limit exceeded"));
+                        err.insert("code".to_string(), Value::str("rate-limited"));
+                        if let Some(ra) = limiter_retry_after_secs(&lim) {
+                            err.insert("retryAfter".to_string(), Value::float(ra));
+                        }
+                        return Ok(make_pair(Value::nil(), Value::object(err)));
+                    }
+                }
+                self.handler_layer(policies, user_fn, req, 1, span).await
+            }
+            // ── Layer 1: bulkhead.run(step@2) ───────────────────────────────────
+            1 => {
+                if let Some(bh) = policy("bulkhead") {
+                    let inner = self.handler_step(policies, user_fn, &req, 2);
+                    return self.bulkhead_run(&bh, inner, span).await;
+                }
+                self.handler_layer(policies, user_fn, req, 2, span).await
+            }
+            // ── Layer 2: breaker.call(step@3) ───────────────────────────────────
+            2 => {
+                if let Some(b) = policy("breaker") {
+                    let inner = self.handler_step(policies, user_fn, &req, 3);
+                    return self.breaker_call(&b, inner, span).await;
+                }
+                self.handler_layer(policies, user_fn, req, 3, span).await
+            }
+            // ── Layer 3: deadline(ms, step@4) ───────────────────────────────────
+            3 => {
+                if let Some(ms) = policy("deadlineMs") {
+                    let inner = self.handler_step(policies, user_fn, &req, 4);
+                    return self.call_deadline(ms, inner, span).await;
+                }
+                self.handler_layer(policies, user_fn, req, 4, span).await
+            }
+            // ── Layer 4: the handler fn itself; normalize to a pair ─────────────
+            _ => {
+                let r = self.call_value(user_fn.clone(), vec![req], span).await?;
+                // Drive a returned future to completion (async handler). Return the
+                // handler's value RAW (no `[v,nil]` wrap): each wrapping policy
+                // (bulkhead/breaker/deadline) normalizes a bare value to a pair
+                // exactly once, and `run_handler` normalizes the no-policy path. A
+                // premature wrap here would be double-wrapped by `deadline` (which
+                // re-wraps an OK-pair, unlike breaker/bulkhead's is-pair guard).
+                match r.kind() {
+                    ValueKind::Future(_) => {
+                        let crate::value::OwnedKind::Future(f) = r.into_kind() else {
+                            unreachable!()
+                        };
+                        f.get().await
+                    }
+                    _ => Ok(r),
+                }
+            }
+        }
+    }
+
+    /// Build a `__handler_step` callable for `next_layer`, carrying the full handler
+    /// state (policies/fn/req) in its `NativeObject.fields` so the policy method that
+    /// invokes it (with no args) re-enters `handler_layer` at the right point.
+    fn handler_step(&self, policies: &Value, user_fn: &Value, req: &Value, next_layer: u8) -> Value {
+        let mut fields: IndexMap<String, Value> = IndexMap::new();
+        fields.insert("__policies".to_string(), policies.clone());
+        fields.insert("__fn".to_string(), user_fn.clone());
+        fields.insert("__req".to_string(), req.clone());
+        fields.insert("__layer".to_string(), Value::int(next_layer as i64));
+        Value::native_method(Rc::new(crate::value::NativeMethod {
+            receiver: Rc::new(NativeObject {
+                id: u64::MAX,
+                kind: NativeKind::Resilience,
+                fields,
+            }),
+            method: "__handler_step".to_string(),
+        }))
     }
 }
 
@@ -5261,5 +5766,230 @@ print(string.contains(body, "ascript_resilience_breaker_calls_total{name=\"t\",r
 "##)
         .await;
         assert_eq!(out, "200\ntext/plain; version=0.0.4\ntrue\ntrue\n");
+    }
+
+    // ── §6.3 resilience.health ────────────────────────────────────────────────
+
+    /// Liveness: empty `{}` → 200, `{"status":"ok","checks":{}}`.
+    #[tokio::test]
+    async fn health_empty_is_liveness_200() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+import * as json from "std/json"
+import * as object from "std/object"
+let h = resilience.health({})
+let resp = h({method: "GET", path: "/healthz"})
+print(resp.status)
+print(resp.headers["content-type"])
+let [d, e] = json.parse(resp.body)
+print(d.status)
+print(len(object.keys(d.checks)))
+"##)
+        .await;
+        assert_eq!(out, "200\napplication/json\nok\n0\n");
+    }
+
+    /// All checks pass (truthy / ok-pair) → 200 degraded=false, per-check detail.
+    #[tokio::test]
+    async fn health_all_pass_200() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+import * as json from "std/json"
+fn pingDb() { return true }
+fn pingCache() { return [1, nil] }
+let h = resilience.health({ checks: { db: pingDb, cache: pingCache } })
+let resp = h({})
+print(resp.status)
+let [d, e] = json.parse(resp.body)
+print(d.status)
+print(d.checks.db.ok)
+print(d.checks.cache.ok)
+"##)
+        .await;
+        assert_eq!(out, "200\nok\ntrue\ntrue\n");
+    }
+
+    /// One failing check (falsy) → 503 degraded; others still reported (containment).
+    #[tokio::test]
+    async fn health_one_failing_503_others_reported() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+import * as json from "std/json"
+fn good() { return true }
+fn bad() { return false }
+let h = resilience.health({ checks: { a: good, b: bad, c: good } })
+let resp = h({})
+print(resp.status)
+let [d, e] = json.parse(resp.body)
+print(d.status)
+print(d.checks.a.ok)
+print(d.checks.b.ok)
+print(d.checks.c.ok)
+"##)
+        .await;
+        assert_eq!(out, "503\ndegraded\ntrue\nfalse\ntrue\n");
+    }
+
+    /// A check that PANICS is contained (recover-style): reported ok:false, never 500.
+    #[tokio::test]
+    async fn health_panicking_check_contained_503() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+import * as json from "std/json"
+fn good() { return true }
+fn boom() { let x = nil; return x.field }
+let h = resilience.health({ checks: { a: good, b: boom } })
+let resp = h({})
+print(resp.status)
+let [d, e] = json.parse(resp.body)
+print(d.status)
+print(d.checks.a.ok)
+print(d.checks.b.ok)
+"##)
+        .await;
+        assert_eq!(out, "503\ndegraded\ntrue\nfalse\n");
+    }
+
+    /// An err-pair return `[nil, e]` is a failing check.
+    #[tokio::test]
+    async fn health_err_pair_check_fails_503() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+import * as json from "std/json"
+fn bad() { return [nil, {message: "db down", code: "down"}] }
+let h = resilience.health({ checks: { db: bad } })
+let resp = h({})
+print(resp.status)
+let [d, e] = json.parse(resp.body)
+print(d.status)
+print(d.checks.db.ok)
+"##)
+        .await;
+        assert_eq!(out, "503\ndegraded\nfalse\n");
+    }
+
+    // ── §6.4 resilience.handler ───────────────────────────────────────────────
+
+    /// Empty `{}` wrapper is the identity: passes `fn`'s result straight through.
+    #[tokio::test]
+    async fn handler_empty_is_identity() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+fn handle(req) { return { status: 201, body: "hi" } }
+let h = resilience.handler({}, handle)
+let resp = h({method: "GET", path: "/x"})
+print(resp.status)
+print(resp.body)
+"##)
+        .await;
+        assert_eq!(out, "201\nhi\n");
+    }
+
+    /// A plain handler error-pair passes through unchanged (server maps it to 500).
+    #[tokio::test]
+    async fn handler_fn_error_pair_passes_through() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+fn handle(req) { return [nil, {message: "kaboom", code: "boom"}] }
+let h = resilience.handler({}, handle)
+let resp = h({})
+let [v, e] = resp
+print(v)
+print(e.code)
+"##)
+        .await;
+        assert_eq!(out, "nil\nboom\n");
+    }
+
+    /// A drained limiter → 429 with a `retry-after` header.
+    #[tokio::test]
+    async fn handler_rate_limited_429() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+let lim = resilience.limiter({capacity: 1, refillPerSec: 1})
+fn handle(req) { return { status: 200, body: "ok" } }
+let h = resilience.handler({ limiter: lim }, handle)
+let r1 = h({})
+print(r1.status)
+let r2 = h({})
+print(r2.status)
+print(r2.headers["retry-after"] != nil)
+"##)
+        .await;
+        assert_eq!(out, "200\n429\ntrue\n");
+    }
+
+    /// A keyed limiter with a `key` extractor that receives the request object.
+    #[tokio::test]
+    async fn handler_keyed_limiter_key_receives_request() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+let lim = resilience.keyedLimiter({capacity: 1, refillPerSec: 1, maxKeys: 16})
+fn handle(req) { return { status: 200, body: "ok" } }
+let h = resilience.handler({ limiter: lim, key: (req) => req.headers["x-api-key"] }, handle)
+let r1 = h({headers: {"x-api-key": "alice"}})
+print(r1.status)
+let r2 = h({headers: {"x-api-key": "bob"}})
+print(r2.status)
+let r3 = h({headers: {"x-api-key": "alice"}})
+print(r3.status)
+"##)
+        .await;
+        assert_eq!(out, "200\n200\n429\n");
+    }
+
+    /// Breaker open → 503.
+    #[tokio::test]
+    async fn handler_breaker_open_503() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+let b = resilience.breaker({name: "bq", failureRate: 0.5, window: 2, minCalls: 2, cooldownMs: 999999, halfOpenMax: 1})
+fn fail() { return [nil, {message: "x", code: "e"}] }
+b.call(fail)
+b.call(fail)
+fn handle(req) { return { status: 200, body: "ok" } }
+let h = resilience.handler({ breaker: b }, handle)
+let resp = h({})
+print(resp.status)
+"##)
+        .await;
+        assert_eq!(out, "503\n");
+    }
+
+    /// Deadline expiry → 504. A zero budget is already-expired on entry, so the
+    /// handler `fn` never runs — exercises the code→status map deterministically and
+    /// SIDESTEPS the pre-existing module-method-from-native async-driver bug (a
+    /// module-qualified call inside an async closure invoked by `deadline`/`bulkhead`
+    /// from native code is "value is not callable" on BOTH engines — out of scope).
+    /// The end-to-end async timeout path is covered by `tests/resil_handler_server.rs`.
+    #[tokio::test]
+    async fn handler_deadline_exceeded_504() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+fn handle(req) { return { status: 200, body: "ok" } }
+let h = resilience.handler({ deadlineMs: 0 }, handle)
+let resp = h({})
+print(resp.status)
+"##)
+        .await;
+        assert_eq!(out, "504\n");
+    }
+
+    /// A successful `fn` value through the full stack returns unchanged.
+    #[tokio::test]
+    async fn handler_success_through_full_stack() {
+        let out = run(r##"
+import * as resilience from "std/resilience"
+let lim = resilience.limiter({capacity: 5, refillPerSec: 1})
+let bh = resilience.bulkhead({name: "bh2", limit: 4, queue: 4})
+let b = resilience.breaker({name: "b2", failureRate: 0.5, window: 4, minCalls: 4})
+fn handle(req) { return { status: 200, body: req.path } }
+let h = resilience.handler({ limiter: lim, bulkhead: bh, breaker: b, deadlineMs: 1000 }, handle)
+let resp = await h({path: "/quote"})
+print(resp.status)
+print(resp.body)
+"##)
+        .await;
+        assert_eq!(out, "200\n/quote\n");
     }
 }
