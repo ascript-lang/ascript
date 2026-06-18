@@ -576,6 +576,13 @@ impl Interp {
 /// - `now`: the current monotonic clock value (pre-computed; no det borrow here)
 /// - `panic_path`: when true, the `__halfOpenInFlight` was already decremented
 ///   by the caller — skip the halfOpen success path for probe handling
+// The breaker outcome recorder threads the policy's count-window config + the timing
+// snapshot explicitly (the state mutation runs in a synchronous section with the ObjectCell
+// borrow taken locally — passing the config by value keeps the borrow scopes minimal). The
+// nested probe-failure/probe-success branch is kept explicit for the state-machine clarity
+// the §3.1.2 transitions demand; collapsing it into a match guard would change the
+// non-probe-in-halfOpen fall-through.
+#[allow(clippy::too_many_arguments, clippy::collapsible_match)]
 fn breaker_record_outcome(
     recv: &Value,
     is_failure: bool,
