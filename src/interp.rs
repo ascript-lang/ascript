@@ -578,6 +578,14 @@ pub(crate) enum ResourceState {
     /// removing the table entry. Unix-only.
     #[cfg(all(feature = "docker", unix))]
     DockerClient(crate::stdlib::docker::DockerClientState),
+    /// CNTR §4.3–4.4: a `std/docker` log/event/pull stream. Owns the dedicated
+    /// `UnixStream` byte source (buffered) + the framing state machine (8-byte
+    /// multiplex demux, raw TTY, or newline JSON-lines). `next()` pulls the next
+    /// item; dropping the variant (on `close()`/last-drop) closes the connection.
+    /// Boxed to keep the `ResourceState` enum compact (the BufReader + framing buffer
+    /// are sizeable). Unix-only.
+    #[cfg(all(feature = "docker", unix))]
+    DockerStream(Box<crate::stdlib::docker::DockerStreamState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5589,6 +5597,9 @@ impl Interp {
             if matches!(m.receiver.kind, crate::value::NativeKind::DockerClient) {
                 return self.call_docker_method(&m, args, span).await;
             }
+            if matches!(m.receiver.kind, crate::value::NativeKind::DockerStream) {
+                return self.call_docker_stream_method(&m, args, span).await;
+            }
         }
         #[cfg(feature = "telemetry")]
         {
@@ -8674,6 +8685,15 @@ pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'s
     {
         use crate::value::NativeKind::*;
         if matches!(kind, AiStream | AiTextStream) {
+            return Some("next");
+        }
+    }
+    // CNTR §4.3: a docker log/event/pull stream follows the `[item, err]` pull
+    // contract (nil item ends the stream), so `for await` drives it via `.next()`
+    // on BOTH engines.
+    #[cfg(all(feature = "docker", unix))]
+    {
+        if matches!(kind, crate::value::NativeKind::DockerStream) {
             return Some("next");
         }
     }

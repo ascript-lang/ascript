@@ -290,6 +290,44 @@ pub fn exec_upgrade_bin() -> Vec<u8> {
     out
 }
 
+/// `GET /containers/{id}/logs` (multiplexed, non-TTY) → 200 Content-Length body of
+/// 8-byte-framed multiplex frames (stdout "hello\n" + stderr "oops\n").
+pub fn logs_multiplexed_http() -> Vec<u8> {
+    let body = logs_multiplexed_bin();
+    // application/vnd.docker.raw-stream is what the real daemon sends; the http1 codec
+    // frames by Content-Length regardless, so the body is read byte-exact.
+    http_response_octet("HTTP/1.1 200 OK", &body)
+}
+
+/// `GET /containers/{id}/logs` for a TTY container → 200 raw text body (no frames).
+pub fn logs_tty_http() -> Vec<u8> {
+    http_response_octet("HTTP/1.1 200 OK", &logs_tty_bin())
+}
+
+/// `GET /containers/{id}/logs` truncated-frame variant (header claims 20, only 4 follow).
+pub fn logs_truncated_frame_http() -> Vec<u8> {
+    http_response_octet("HTTP/1.1 200 OK", &logs_truncated_frame_bin())
+}
+
+/// `GET /containers/{id}/logs` oversize-frame variant (SIZE > 16 MiB, no payload).
+pub fn logs_oversize_frame_http() -> Vec<u8> {
+    http_response_octet("HTTP/1.1 200 OK", &logs_oversize_frame_bin())
+}
+
+/// Build a raw-octet HTTP/1.1 response with Content-Length framing (no application/json
+/// Content-Type — these bodies are binary multiplex streams).
+fn http_response_octet(status_line: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(status_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"Content-Type: application/vnd.docker.raw-stream\r\n");
+    out.extend_from_slice(cl_header(body).as_bytes());
+    out.extend_from_slice(b"Connection: close\r\n");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+    out
+}
+
 // ── Hostile fixtures ─────────────────────────────────────────────────────────
 
 /// A multiplexed stream frame whose 8-byte header claims SIZE=N but the payload is
@@ -488,7 +526,10 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
     let method = parts.next().unwrap_or("").to_uppercase();
     // Drop the query string before routing (a real daemon routes on the path; our
     // fixtures key on the path alone). `?all=true`/`?filters=…` must not foil a match.
-    let raw_path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/");
+    let raw_path_full = parts.next().unwrap_or("/");
+    let raw_path = raw_path_full.split('?').next().unwrap_or("/");
+    // The query string is needed for pull, which routes the error variant by image name.
+    let query = raw_path_full.split('?').nth(1).unwrap_or("");
 
     // Strip API version prefix, e.g. `/v1.43/containers/json` → `/containers/json`.
     // Pattern: raw_path starts with `/v<digits>.<digits>/`.
@@ -531,6 +572,21 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
         ("GET", "/_ping") => Some(ping_http()),
         ("GET", "/version") => Some(version_http()),
         ("GET", "/containers/json") => Some(containers_list_http()),
+        // CNTR §4.3 logs streams — the container id selects the fixture variant so a
+        // single route covers happy/TTY/hostile paths (a real daemon keys on the id
+        // too). `…/tty/logs` → raw TTY; `…/truncated/logs` / `…/oversize/logs` →
+        // the hostile multiplex fixtures; anything else → the multiplexed fixture.
+        ("GET", p) if p.starts_with("/containers/") && p.ends_with("/logs") => {
+            if p.contains("/tty/") {
+                Some(logs_tty_http())
+            } else if p.contains("/truncated/") {
+                Some(logs_truncated_frame_http())
+            } else if p.contains("/oversize/") {
+                Some(logs_oversize_frame_http())
+            } else {
+                Some(logs_multiplexed_http())
+            }
+        }
         ("GET", p) if p.starts_with("/containers/") && p.ends_with("/json") => {
             Some(inspect_http())
         }
@@ -548,7 +604,15 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
         ("GET", "/images/json") => Some(images_list_http()),
         ("DELETE", p) if p.starts_with("/images/") => Some(image_remove_http()),
         ("GET", "/events") => Some(events_jsonl_http()),
-        ("POST", "/images/create") => Some(pull_progress_http()),
+        // CNTR §4.3 pull — the `fromImage` query selects the fixture: a `nonexistent`
+        // image returns the in-stream-error progress stream; anything else succeeds.
+        ("POST", "/images/create") => {
+            if query.contains("nonexistent") {
+                Some(pull_error_http())
+            } else {
+                Some(pull_progress_http())
+            }
+        }
         ("POST", p) if p.starts_with("/exec/") && p.ends_with("/json") => Some(exec_create_http()),
         ("POST", p) if p.starts_with("/exec/") && p.ends_with("/start") => {
             Some(exec_upgrade_bin())
@@ -1166,5 +1230,238 @@ async fn docker_client_is_non_sendable() {
     }));
     let err = ascript::worker::serialize::check_sendable(&handle)
         .expect_err("a DockerClient handle must be non-sendable");
+    assert_eq!(err.kind, "native");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Task 4.3–4.4 — logs / events / pull as for-await streams + the multiplex demux.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The headline: `d.logs(...)` over a multiplexed stream demuxes stdout/stderr and is
+/// `for await`-iterable, yielding `{stream, text}` items.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn logs_stream_for_await_demuxes_stdout_stderr() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [logs, err] = await d.logs("abc", {{ stdout: true, stderr: true }})
+print(err)
+for await (entry in logs) {{ print(`${{entry.stream}}:${{entry.text}}`) }}
+"#
+    );
+    assert_eq!(run(&src).await, "nil\nstdout:hello\n\nstderr:oops\n\n");
+}
+
+/// A TTY container's logs stream is raw text (auto-detected, no frames) — the items
+/// are all `stdout` and their concatenation is the raw body.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn logs_tty_stream_is_raw_stdout() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [logs, err] = await d.logs("tty", {{}})
+print(err)
+let acc = ""
+let allStdout = true
+for await (entry in logs) {{
+    if (entry.stream != "stdout") {{ allStdout = false }}
+    acc = acc + entry.text
+}}
+print(acc)
+print(allStdout)
+"#
+    );
+    // The TTY body may arrive as one or more stdout chunks; the concatenated text is
+    // the raw body and every chunk is stdout.
+    assert_eq!(run(&src).await, "nil\nplain tty output\n\ntrue\n");
+}
+
+/// `d.events()` yields decoded JSON objects.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn events_stream_yields_decoded_objects() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [events, err] = await d.events({{}})
+print(err)
+let n = 0
+for await (ev in events) {{
+    n = n + 1
+    print(ev.Action)
+}}
+print(n)
+"#
+    );
+    assert_eq!(run(&src).await, "nil\nstart\nstop\npull\n3\n");
+}
+
+/// `break` out of a `for await` over an events stream, then `close()` reclaims the
+/// stream's connection: a subsequent `.next()` on the closed stream returns the clean
+/// terminal `[nil, nil]` (proving the resource entry was taken on close — the fd is
+/// reclaimed deterministically).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn events_break_and_close_then_next_is_ended() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [events, _e] = await d.events({{}})
+let first = ""
+for await (ev in events) {{
+    first = ev.Action
+    break
+}}
+print(first)
+events.close()
+let [item, err] = await events.next()
+print(item)
+print(err)
+"#
+    );
+    // first event, then close → next() is the terminal [nil, nil].
+    assert_eq!(run(&src).await, "start\nnil\nnil\n");
+}
+
+/// `d.pull()` progress objects stream to completion (clean end).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn pull_progress_stream_then_end() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [prog, err] = await d.pull("nginx:latest")
+print(err)
+let n = 0
+for await (p in prog) {{ n = n + 1 }}
+print(n)
+"#
+    );
+    // 7 progress lines in the fixture.
+    assert_eq!(run(&src).await, "nil\n7\n");
+}
+
+/// A pull that hits a registry error: the in-stream `{"error":…}` line is a terminal
+/// `[nil, err]` on `.next()`. (Consumed via `.next()` directly — a `for await` would
+/// raise it as a loop-site Tier-2 panic; manual `next()` surfaces the pair.)
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn pull_error_is_terminal_pair_via_next() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [prog, err] = await d.pull("nonexistent:latest")
+print(err)
+let [a, ea] = await prog.next()
+print(ea)
+print(a.status)
+let [b, eb] = await prog.next()
+print(b)
+print(eb.message)
+let [c, ec] = await prog.next()
+print(c)
+print(ec)
+"#
+    );
+    // first item = progress object (status set), second = terminal error pair,
+    // third = clean end [nil, nil].
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\nnil\n"), "connect ok + first item ok, got:\n{out}");
+    assert!(out.contains("manifest unknown"), "expected the registry error, got:\n{out}");
+    assert!(out.ends_with("nil\nnil\n"), "stream ends [nil, nil], got:\n{out}");
+}
+
+/// A truncated multiplex frame (header claims more than follows) → a terminal
+/// `[nil, err]` on `.next()` (not a panic/hang).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn logs_truncated_frame_is_tier1_err() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [logs, _e] = await d.logs("truncated", {{}})
+let [item, err] = await logs.next()
+print(item)
+print(err != nil)
+print(err.message)
+"#
+    );
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\ntrue\n"), "truncation is a Tier-1 err, got:\n{out}");
+    assert!(out.contains("truncated"), "err names the truncation, got:\n{out}");
+}
+
+/// An oversize frame (SIZE > 16 MiB) → a Tier-1 err WITHOUT allocating the claimed
+/// size (a hang/OOM would fail the test by timeout/memory, not assertion).
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn logs_oversize_frame_is_tier1_err_no_alloc() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [logs, _e] = await d.logs("oversize", {{}})
+let [item, err] = await logs.next()
+print(item)
+print(err != nil)
+print(err.message)
+"#
+    );
+    let out = run(&src).await;
+    assert!(out.starts_with("nil\ntrue\n"), "oversize is a Tier-1 err, got:\n{out}");
+    assert!(out.contains("cap") || out.contains("exceeds"), "err names the cap, got:\n{out}");
+}
+
+/// VM-path proof: a `for await` over a docker stream works on the bytecode VM too
+/// (not just the tree-walker `run`) — `native_stream_method` makes it iterable on
+/// BOTH engines.
+#[cfg(feature = "docker")]
+#[tokio::test]
+async fn logs_for_await_works_on_the_vm() {
+    let (sock, _g) = mock_daemon().await;
+    let src = format!(
+        r#"
+import * as docker from "std/docker"
+let [d, _] = await docker.connect({{ socketPath: "{sock}" }})
+let [logs, err] = await d.logs("abc", {{ stdout: true, stderr: true }})
+print(err)
+for await (entry in logs) {{ print(`${{entry.stream}}:${{entry.text}}`) }}
+"#
+    );
+    let (out, _code) = ascript::vm_run_source(&src)
+        .await
+        .unwrap_or_else(|e| panic!("VM run failed: {}", e.message));
+    assert_eq!(out, "nil\nstdout:hello\n\nstderr:oops\n\n");
+}
+
+/// A `dockerStream` handle is non-sendable (the worker airlock rejects it).
+#[cfg(all(feature = "docker", unix))]
+#[tokio::test]
+async fn docker_stream_is_non_sendable() {
+    use ascript::value::{NativeKind, NativeObject, Value};
+    let handle = Value::native(std::rc::Rc::new(NativeObject {
+        id: 1,
+        kind: NativeKind::DockerStream,
+        fields: indexmap::IndexMap::new(),
+    }));
+    let err = ascript::worker::serialize::check_sendable(&handle)
+        .expect_err("a DockerStream handle must be non-sendable");
     assert_eq!(err.kind, "native");
 }

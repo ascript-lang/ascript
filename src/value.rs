@@ -1316,6 +1316,17 @@ pub enum NativeKind {
     // without `docker` (mirrors the `resilience` pattern).
     #[cfg(feature = "docker")]
     DockerClient,
+    // CNTR §4.3–4.4: a `std/docker` streaming handle (`d.logs`/`d.events`/`d.pull`).
+    // Owns a dedicated `UnixStream` byte source + the framing state (the 8-byte
+    // multiplex demux for logs, raw TTY auto-detection, or newline JSON-lines for
+    // events/pull). `next()` yields the next `[item, err]` (a `nil` item ends the
+    // stream); registered in `native_stream_method` (→ `"next"`) so `for await` works
+    // on BOTH engines. `close()` drops the connection (deterministic fd reclaim).
+    // `governing_caps` = net ∧ process (same as `DockerClient`). Non-sendable (a
+    // native handle → the worker airlock rejects it). Feature-gated — compiled out
+    // without `docker` (mirrors `DockerClient`).
+    #[cfg(all(feature = "docker", unix))]
+    DockerStream,
 }
 
 impl NativeKind {
@@ -1375,6 +1386,8 @@ impl NativeKind {
             NativeKind::Resilience => "resilienceMarker",
             #[cfg(feature = "docker")]
             NativeKind::DockerClient => "dockerClient",
+            #[cfg(all(feature = "docker", unix))]
+            NativeKind::DockerStream => "dockerStream",
         }
     }
 
@@ -1455,6 +1468,12 @@ impl NativeKind {
             // conjunction the dispatch gate enforces, so a `caps.drop` HOLDS.
             #[cfg(feature = "docker")]
             NativeKind::DockerClient => CapReq::one(Cap::Net).and(Cap::Process),
+            // CNTR §4.3: a docker log/event/pull stream reads from the daemon over the
+            // network on each `.next()` (and the daemon can spawn host processes) —
+            // net ∧ process, so a `caps.drop` after the stream opens HOLDS (mirrors
+            // DockerClient + the AiStream per-handle re-check precedent).
+            #[cfg(all(feature = "docker", unix))]
+            NativeKind::DockerStream => CapReq::one(Cap::Net).and(Cap::Process),
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a
