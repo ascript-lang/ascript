@@ -113,6 +113,12 @@ pub(crate) fn merge_defer_panic(pending: &mut Result<Value, Control>, new: AsErr
 /// RESIL §5: the current task's ambient locals (deadline, trace id). An immutable,
 /// `Rc`-shared record: setting a value builds a NEW `Rc` (copy-on-write), so a child
 /// task captured at spawn time is forever isolated from the parent's later scopes.
+///
+/// The fields are read by the `resilience`/`net`/`postgres`/`redis`/`sql` features
+/// (deadline + trace readers); under a bare `--no-default-features` build none of
+/// those are present, so allow dead_code there (mirrors the bare `#[allow(dead_code)]`
+/// precedent elsewhere in this file for core-but-feature-consumed items).
+#[allow(dead_code)]
 pub(crate) struct TaskLocals {
     /// Absolute monotonic deadline (ms, the `clock_monotonic_ms` domain), if any.
     pub deadline_at_ms: Option<f64>,
@@ -167,6 +173,9 @@ pub(crate) fn task_locals_capture() -> Option<Rc<TaskLocals>> {
 
 /// RESIL §5.1: the current task's ambient locals, if any (a clone of the `Rc`).
 /// Alias of [`task_locals_capture`] — named for the 4.3 reader call sites.
+/// Only the deadline/trace readers (behind `resilience`/`net`/`postgres`/`redis`/
+/// `sql`) call it; dead under a bare `--no-default-features` build.
+#[allow(dead_code)]
 pub(crate) fn task_locals_current() -> Option<Rc<TaskLocals>> {
     task_locals_capture()
 }
@@ -1702,6 +1711,9 @@ impl Interp {
     /// deadline is set on the current task's [`TASK_LOCALS`]. `now` is the det-routed
     /// monotonic clock so it agrees with how the deadline was computed. Zero-cost when
     /// unset (a `try_with` → `None` short-circuits before any clock read).
+    /// Consulted by the §5.4 deadline-aware sites (`resilience`/`net`/`postgres`/
+    /// `redis`/`sql`); dead under a bare `--no-default-features` build.
+    #[allow(dead_code)]
     pub(crate) fn deadline_remaining_ms(&self) -> Option<f64> {
         let at = task_locals_current().and_then(|l| l.deadline_at_ms)?;
         let now = self.clock_monotonic_ms(crate::stdlib::time::real_monotonic_ms());

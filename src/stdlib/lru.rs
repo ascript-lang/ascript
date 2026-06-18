@@ -108,7 +108,9 @@ impl Interp {
     ///
     /// Used by `resilience.keyedLimiter` and `resilience.memoize` so they can create
     /// a real `std/lru` Native handle with the shipped eviction machinery without going
-    /// through `call_lru_new`'s argument parsing.
+    /// through `call_lru_new`'s argument parsing. (Only the `resilience` feature calls
+    /// these three helpers — dead under a bare `--no-default-features` build.)
+    #[allow(dead_code)]
     pub(crate) fn new_lru_handle(&self, capacity: usize) -> Value {
         self.register_resource(
             NativeKind::Lru,
@@ -121,6 +123,7 @@ impl Interp {
     ///
     /// Returns 0 if the handle is not a valid Lru resource.
     /// Used by `resilience.keyedLimiter.stats()` to expose `evictions`.
+    #[allow(dead_code)]
     pub(crate) fn lru_eviction_count(&self, id: u64) -> u64 {
         self.with_resource(id, |r| match r {
             Some(ResourceState::Lru(s)) => s.eviction_count,
@@ -132,6 +135,7 @@ impl Interp {
     ///
     /// Returns 0 if the handle is not a valid Lru resource.
     /// Used by `resilience.keyedLimiter.stats()` to expose `keys`.
+    #[allow(dead_code)]
     pub(crate) fn lru_len(&self, id: u64) -> usize {
         self.with_resource(id, |r| match r {
             Some(ResourceState::Lru(s)) => s.map.len(),
