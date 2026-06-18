@@ -2867,6 +2867,14 @@ pub struct NativeBuildOpts {
     /// matching source checkout. Mutually exclusive with `--tier` and `--stub`.
     /// `false` ⇒ the default ladder (rung 0 skipped).
     pub exact: bool,
+    /// `--oci` — produce an OCI Image Layout tarball instead of a bare native binary
+    /// (RT §8). Implies `--native`. Output is `<stem>.tar` (or the `-o` path). Requires
+    /// `cfg(feature = "compress")` (flate2/gzip); without it a clean error is emitted.
+    /// `false` (default) ⇒ the standard `build_native` bundle output.
+    pub oci: bool,
+    /// `--oci-tag` — the image reference tag for the OCI `index.json` annotation
+    /// (`org.opencontainers.image.ref.name`). Defaults to `<stem>:latest`.
+    pub oci_tag: Option<String>,
 }
 
 #[cfg(not(ascript_rt))]
@@ -2907,6 +2915,43 @@ pub async fn build_native(
             )));
         }
     }
+
+    // RT §8 — `--oci` early validation: requires the `compress` feature (flate2 for gzip)
+    // and a `*-unknown-linux-musl` target (scratch-base = statically linked binary). When
+    // `--target` is omitted, default to `<host-arch>-unknown-linux-musl`. Reject every
+    // non-musl triple with a clear error naming the musl equivalent.
+    #[cfg(feature = "compress")]
+    let oci_effective_target: Option<String> = if opts.oci {
+        let triple = opts.target.clone().unwrap_or_else(|| {
+            // Default: host arch + linux-musl.
+            #[cfg(target_arch = "aarch64")]
+            { "aarch64-unknown-linux-musl".to_string() }
+            #[cfg(target_arch = "x86_64")]
+            { "x86_64-unknown-linux-musl".to_string() }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            { "x86_64-unknown-linux-musl".to_string() }
+        });
+        // musl check: reject if the triple does not contain "-musl"
+        if !triple.contains("-musl") {
+            return Err(AsError::new(
+                crate::rtstub::oci::oci_target_rejection_message(&triple)
+            ));
+        }
+        Some(triple)
+    } else {
+        None
+    };
+    // When `compress` feature is absent, `--oci` cannot be used (clean error).
+    #[cfg(not(feature = "compress"))]
+    if opts.oci {
+        return Err(AsError::new(
+            "ascript build --oci requires compress support — rebuild with the \
+             'compress' Cargo feature (enabled by default)"
+        ));
+    }
+    // Under no-compress, this variable is unused but must exist for the code below.
+    #[cfg(not(feature = "compress"))]
+    let _oci_effective_target: Option<String> = None;
 
     // Step 1: the payload is the SAME verified bytes a `build` produces — a bare `ASO\0`
     // chunk for a single-module program (byte-identical to today's bundle) or an
@@ -3064,6 +3109,56 @@ pub async fn build_native(
         .as_deref()
         .map(|t| t.contains("windows"))
         .unwrap_or(cfg!(windows));
+
+    // The file stem (used for both the native bundle name and the OCI tar name).
+    let stem_str: String = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "app".to_string());
+    #[cfg(not(feature = "compress"))]
+    let _ = &stem_str; // used only by the compress-gated OCI path
+
+    // RT §8: when `--oci` is active, the user's `-o` path (or the default) is the FINAL OCI
+    // tarball destination. The intermediate native bundle must go to a distinct temp path so
+    // that `write_oci_tar`'s atomic rename does not collide with (or overwrite) the native
+    // bundle before we can read it. We build the native bundle at `native_bundle_tmp`, then
+    // read its bytes, write the OCI tar to `oci_out`, and delete `native_bundle_tmp`.
+    #[cfg(feature = "compress")]
+    let (out_path, oci_out_opt): (std::path::PathBuf, Option<std::path::PathBuf>) = if opts.oci {
+        // OCI output: user's -o or <stem>.tar
+        let oci_out = match out {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let mut p = std::path::PathBuf::from(&stem_str);
+                p.set_extension("tar");
+                p
+            }
+        };
+        // Intermediate native bundle: a temp path alongside the OCI output.
+        let native_tmp = {
+            let mut p = oci_out.clone();
+            p.set_extension(format!("native.{}.tmp", std::process::id()));
+            p
+        };
+        (native_tmp, Some(oci_out))
+    } else {
+        let p = match out {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let stem = file
+                    .file_stem()
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| std::ffi::OsString::from("app"));
+                let mut p = std::path::PathBuf::from(stem);
+                if windows_target {
+                    p.set_extension("exe");
+                }
+                p
+            }
+        };
+        (p, None)
+    };
+    #[cfg(not(feature = "compress"))]
     let out_path = match out {
         Some(p) => p.to_path_buf(),
         None => {
@@ -3078,6 +3173,8 @@ pub async fn build_native(
             p
         }
     };
+    #[cfg(not(feature = "compress"))]
+    let _oci_out_opt: Option<std::path::PathBuf> = None;
 
     // Step 4: build the bundle on a TEMP sibling, then atomically rename onto `out_path` at the
     // very end. Every prior step (write stub → chmod → macOS sign → append payload+footer)
@@ -3168,6 +3265,79 @@ pub async fn build_native(
     guard.1 = false;
 
     let total = payload_offset + payload.len() as u64 + crate::bundle::FOOTER_SIZE as u64;
+
+    // RT §8 — `--oci` path: if the user asked for an OCI image tarball, READ the just-written
+    // native bundle back, feed it into the OCI writer, produce the OCI tar at `oci_out`, then
+    // remove the intermediate native bundle. The native bundle was built to `out_path` (a temp
+    // path distinct from `oci_out` — see Step 3 above — to avoid collisions). `write_oci_tar`
+    // writes atomically via its own temp-rename, so the OCI tar appears atomically at `oci_out`.
+    #[cfg(feature = "compress")]
+    if let (Some(ref effective_target), Some(ref oci_out)) =
+        (&oci_effective_target, &oci_out_opt)
+    {
+        let bundle_bytes = std::fs::read(&out_path).map_err(|e| {
+            AsError::new(format!("cannot read bundle for OCI wrapping {}: {}", out_path.display(), e))
+        })?;
+        // Remove the intermediate native bundle (it was the temp path, not the user's output).
+        let _ = std::fs::remove_file(&out_path);
+
+        let arch = crate::rtstub::oci::oci_arch_from_triple(effective_target)
+            .map_err(AsError::new)?;
+        let tag = opts.oci_tag.clone().unwrap_or_else(|| format!("{stem_str}:latest"));
+
+        crate::rtstub::oci::write_oci_tar(&bundle_bytes, arch, &tag, oci_out)
+            .map_err(AsError::new)?;
+
+        let oci_size = std::fs::metadata(oci_out).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "packaged {} -> {} ({} bytes)",
+            file.display(),
+            oci_out.display(),
+            oci_size
+        );
+
+        // RT §9.2: assemble the build report for the OCI tarball.
+        let oci_bytes = std::fs::read(oci_out).map_err(|e| {
+            AsError::new(format!("cannot read OCI tar for report: {}", e))
+        })?;
+        let report = crate::rtstub::report::BuildReport {
+            source: file.display().to_string(),
+            output: oci_out.display().to_string(),
+            output_sha256: hex_digest(&sha256_bytes(&oci_bytes)),
+            target: Some(effective_target.clone()),
+            tier: selection.tier,
+            tier_source: selection.source,
+            selection: selection.clone(),
+            payload: crate::rtstub::report::PayloadInfo {
+                format: payload_format,
+                compressed: compress,
+                size: payload.len() as u64,
+                uncompressed_size: payload_uncompressed_len,
+                sha256: payload_sha256,
+            },
+            stub: crate::rtstub::report::StubInfo {
+                origin: stub_origin,
+                sha256: stub_sha256,
+                size: stub_size,
+            },
+            module_count,
+            shake_digest: shake_digest_hex,
+            caps_all_granted,
+        };
+        eprint!("{}", report.render_stderr());
+        if let Some(dest) = &opts.report_json {
+            let json = report.to_json();
+            if dest == "-" {
+                println!("{json}");
+            } else {
+                std::fs::write(dest, json.as_bytes()).map_err(|e| {
+                    AsError::new(format!("cannot write --report-json {dest}: {e}"))
+                })?;
+            }
+        }
+        return Ok(oci_out.clone());
+    }
+
     println!(
         "bundled {} -> {} ({} bytes)",
         file.display(),
