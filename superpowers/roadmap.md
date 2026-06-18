@@ -747,6 +747,30 @@ Spec `superpowers/specs/2026-06-12-warm-starts-design.md`, plan
   (v1 seeds field/arith sites only) — owner: future PGO v2; group-mode background flusher (v1 flushes
   on the recording thread) — owner: workflow-perf follow-up.
 
+## RT — runtime-only native stubs 🚧 IN PROGRESS (`feat/native-runtime-stubs`)
+Ships `ascript-rt` (a runtime-only bin target gated by `cfg(ascript_rt)`), a per-target×tier
+stub matrix (8 triples × 4 tiers, RT §3.3), import-driven tier selection, `--target` cross
+builds, `--exact`/`--stub`, `--oci` (dockerless OCI image tarball), `--compress` (zstd
+payload), reproducible outputs, and the signed-manifest fetch + content-addressed stub
+cache. **Task 11 (release machinery):** the in-tree, hermetically-tested signed-manifest
+GENERATOR + hidden `ascript rt-manifest-gen` subcommand behind a default-OFF `rt-release`
+feature (the ed25519 SIGNING half NEVER links into a stub — a stub only verifies against the
+compiled-in `PRODUCTION_PUBKEY`); `scripts/release-rt-stubs.sh` (the per-target×tier worker,
+`--host-only` for local dry-runs); `.github/workflows/release-rt.yml` (tag-triggered matrix).
+The real production ed25519 pubkey is compiled in; the private seed lives ONLY in CI secret
+`ASCRIPT_RT_SIGNING_KEY` (rotation = a toolchain release; runbook in `CONTRIBUTING.md`).
+The `pkg::cache::cache_root` duplication was hoisted to the single canonical lib impl
+`ascript::rtstub::cache::cache_root` (RT T6 nit).
+- **Musl matrix feasibility — owner-noted (RT §12):** the local Task-11 spike on a macOS host
+  FAILED as predicted (`cc-rs: failed to find tool "x86_64-linux-musl-gcc"` — bundled-C deps
+  need a musl C cross-toolchain a bare macOS host lacks). Musl feasibility is validated at the
+  FIRST CI release run (the ubuntu legs install `musl-tools`). If a CI musl leg fails
+  (rusqlite bundled-C / rustls-under-musl), NARROW the published matrix (drop that target)
+  in the spec status header + here — a recorded decision, never a silent absent artifact.
+- **Campaign key note:** the production keypair was minted in-branch; a REAL public release
+  requires the maintainer to regenerate it (`rt-manifest-gen --genkey`), recompile the pubkey
+  into `PRODUCTION_PUBKEY`, and set the CI secret.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

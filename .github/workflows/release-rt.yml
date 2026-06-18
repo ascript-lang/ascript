@@ -1,0 +1,222 @@
+name: Release RT stubs
+
+# RT §3.3 / §5.1 / Task 11 — tag-triggered: build the per-target×tier `ascript-rt`
+# stub matrix, sign the release manifest with the CI-secret ed25519 key, and upload
+# every stub + rt-manifest.json + rt-manifest.json.sig to the GitHub release.
+#
+# The published target set (RT §3.3): {x86_64, aarch64} × {apple-darwin,
+# unknown-linux-gnu, unknown-linux-musl, pc-windows-msvc} = 8 triples × 4 tiers.
+#
+# THE MUSL FEASIBILITY SPIKE (RT §12 risk / Task 11): the musl matrix legs run on the
+# ubuntu runner with musl-cross installed. `rusqlite` (bundled C) + the rustls stack must
+# cross-build under musl. The first real release run is the spike: if a musl leg fails,
+# NARROW the published matrix (drop the failing target) with an owner note in the spec
+# status header + roadmap.md — a recorded decision, never a silent absent artifact. Until
+# a tag exists this workflow has never run; the local Task-11 spike (a macOS host) could
+# NOT cross-link musl (no musl linker), so musl feasibility is validated HERE on first run.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # upload artifacts to the release
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build-stubs:
+    name: build stubs · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-gnu
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-gnu
+          - name: linux-aarch64-gnu
+            os: ubuntu-latest
+            targets: aarch64-unknown-linux-gnu
+            cross_linker: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          # --- the musl feasibility spike legs (see header) ---
+          - name: linux-x86_64-musl
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-musl
+            apt: musl-tools
+          - name: linux-aarch64-musl
+            os: ubuntu-latest
+            targets: aarch64-unknown-linux-musl
+            cross_linker: aarch64-linux-musl-gcc
+            apt: musl-tools
+          - name: macos
+            os: macos-latest
+            targets: x86_64-apple-darwin aarch64-apple-darwin
+          - name: windows
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add rust targets
+        shell: bash
+        run: |
+          for t in ${{ matrix.targets }}; do rustup target add "$t"; done
+
+      - name: Install cross toolchain (Linux cross/musl legs)
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Write signing key from secret
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          # NEVER echoed: written straight to a file, used only by --key. The job logs
+          # never see the private key (no `echo`, masked secret).
+          ASCRIPT_RT_SIGNING_KEY: ${{ secrets.ASCRIPT_RT_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$ASCRIPT_RT_SIGNING_KEY" > "$RUNNER_TEMP/rt-signing.key"
+
+      # Build the stubs for this leg's targets. The cross legs set the linker explicitly.
+      - name: Build stub matrix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.cross_linker }}
+        run: |
+          set -euo pipefail
+          args=()
+          for t in ${{ matrix.targets }}; do args+=(--target "$t"); done
+          bash scripts/release-rt-stubs.sh \
+            --key "$RUNNER_TEMP/rt-signing.key" \
+            --out-dir "$RUNNER_TEMP/rt-out" \
+            "${args[@]}"
+
+      # Windows: build the stubs only (manifest is assembled on the linux job for the
+      # whole matrix; here we publish the per-leg stubs as artifacts). The manifest needs
+      # ALL stubs' hashes, so the FULL signed manifest is produced by the `assemble` job.
+      - name: Build stub matrix (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in ${{ matrix.targets }}; do
+            for tier in rt-core rt-local rt-net rt-full; do
+              bash scripts/build-rt.sh "$tier" --target "$t"
+            done
+          done
+          mkdir -p "$RUNNER_TEMP/rt-out"
+          VERSION="$(awk '/^\[package\]/{p=1} p&&/^version *=/{gsub(/[" ]/,"");split($0,a,"=");print a[2];exit}' Cargo.toml)"
+          for t in ${{ matrix.targets }}; do
+            for tier in rt-core rt-local rt-net rt-full; do
+              cp "target/$t/release/ascript-rt.exe" \
+                 "$RUNNER_TEMP/rt-out/ascript-rt-${VERSION}-${t}-${tier}.exe"
+            done
+          done
+
+      - name: Upload leg stubs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rt-stubs-${{ matrix.name }}
+          path: ${{ runner.temp }}/rt-out/ascript-rt-*
+          if-no-files-found: error
+
+  # Collect every leg's stubs, build the ONE signed manifest over all of them, and
+  # upload stubs + manifest + signature to the release.
+  assemble-and-release:
+    name: assemble signed manifest + release
+    needs: build-stubs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download all leg stubs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rt-stubs-*
+          path: rt-stubs
+          merge-multiple: true
+
+      - name: Write signing key from secret
+        shell: bash
+        env:
+          ASCRIPT_RT_SIGNING_KEY: ${{ secrets.ASCRIPT_RT_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$ASCRIPT_RT_SIGNING_KEY" > "$RUNNER_TEMP/rt-signing.key"
+
+      # Assemble the entries JSON over EVERY downloaded stub (each leg already built +
+      # signed darwin), compute sha256/size here, and invoke the generator once.
+      - name: Build signed manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(awk '/^\[package\]/{p=1} p&&/^version *=/{gsub(/[" ]/,"");split($0,a,"=");print a[2];exit}' Cargo.toml)"
+          out="$RUNNER_TEMP/release"
+          mkdir -p "$out"
+          cp rt-stubs/ascript-rt-* "$out"/
+
+          features_for() {
+            case "$1" in
+              rt-core)  echo '"shared","bundle-zstd"' ;;
+              rt-local) echo '"shared","bundle-zstd","data","binary","log","workflow","datetime","crypto","compress","sys","sysinfo","sql","tui"' ;;
+              rt-net)   echo '"shared","bundle-zstd","data","binary","log","workflow","datetime","crypto","compress","sys","sysinfo","sql","tui","net","postgres","redis","telemetry"' ;;
+              rt-full)  echo '"shared","bundle-zstd","data","binary","log","workflow","datetime","crypto","compress","sys","sysinfo","sql","tui","net","postgres","redis","telemetry","intl","ai","ffi"' ;;
+            esac
+          }
+
+          entries="$RUNNER_TEMP/entries.json"
+          echo "[" > "$entries"
+          first=1
+          for f in "$out"/ascript-rt-*; do
+            base="$(basename "$f")"
+            # ascript-rt-<version>-<target>-<tier>[.exe]
+            rest="${base#ascript-rt-${VERSION}-}"
+            rest="${rest%.exe}"
+            tier="${rest##*-rt-}"; tier="rt-${tier}"
+            target="${rest%-${tier}}"
+            sha="$(sha256sum "$f" | awk '{print $1}')"
+            size="$(stat -c%s "$f")"
+            feats="$(features_for "$tier")"
+            [[ $first -eq 0 ]] && echo "," >> "$entries"
+            first=0
+            printf '{"target":"%s","tier":"%s","features":[%s],"sha256":"%s","size":%s,"filename":"%s"}' \
+              "$target" "$tier" "$feats" "$sha" "$size" "$base" >> "$entries"
+          done
+          echo "]" >> "$entries"
+
+          cargo run --release --features rt-release --bin ascript -- \
+            rt-manifest-gen \
+            --version "$VERSION" \
+            --created "1970-01-01T00:00:00Z" \
+            --entries-file "$entries" \
+            --key "$RUNNER_TEMP/rt-signing.key" \
+            --out-dir "$out"
+
+          ls -1 "$out"
+
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ runner.temp }}/release/ascript-rt-*
+            ${{ runner.temp }}/release/rt-manifest.json
+            ${{ runner.temp }}/release/rt-manifest.json.sig

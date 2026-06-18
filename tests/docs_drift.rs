@@ -113,6 +113,11 @@ fn every_env_var_in_src_is_documented_in_cli_md() {
           postgres.rs); developer-facing, documented in stdlib/db.md, not user CLI surface"),
         ("ASCRIPT_DOTENV", "std/env dotenv unit-test fixture keys (src/stdlib/env.rs)"),
         ("ASCRIPT_E2E", "end-to-end test fixture keys (src/stdlib/env.rs)"),
+        ("ASCRIPT_RT_SIGNING_KEY", "RT §5.1 / Task 11 — the ed25519 release-signing \
+          private seed, a CI SECRET (release-rt.yml). It is NEVER read by the runtime via \
+          std::env (the release script writes it to a file and passes --key <path>); it \
+          appears only in doc-comments + the release runbook in CONTRIBUTING.md. Release \
+          infrastructure, not user CLI surface."),
     ];
 
     let cli_md = read("docs/content/cli.md");

@@ -152,6 +152,11 @@ libffi = { version = "3", optional = true, features = ["system"] }
 # public key; signing happens once at release time in CI. cfg's out cleanly under
 # `--no-default-features` (the cache + manifest-parse halves of `src/rtstub/` stay).
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"], optional = true }
+# RT §5.1 / Task 11 — OS randomness for the release-side keypair generator
+# (`ascript rt-manifest-gen --genkey`). OPTIONAL, pulled ONLY by the default-OFF
+# `rt-release` feature (the SIGNING/generator half). `getrandom` gives `OsRng`. A runtime
+# stub never enables `rt-release`, so this never links into a stub.
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 # VAL Task 0 / spec §6 — compile-time `!Send`/`!Sync` lock on `Value`
 # (`assert_not_impl_any!(Value: Send, Sync)`, module-level in `value.rs`). Promoted
 # from a dev-dependency to a normal dependency so the guard is active in the
@@ -206,6 +211,15 @@ default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net"
 # the cache + manifest-parse halves; only the network + signature-verify arm is gated).
 # CLI-side only — never linked into an `ascript-rt` stub. Default-on (the builder fetches).
 rt-fetch = ["net", "dep:ed25519-dalek"]
+# RT §5.1 / Task 11 — the release-side signed-manifest GENERATOR (in-tree, hermetically
+# tested) + the hidden `ascript rt-manifest-gen` subcommand the release script drives.
+# DEFAULT-OFF by design: it pulls the ed25519 SIGNING half (`rand_core` for keygen +
+# `SigningKey::sign`), which a runtime stub must NEVER link (a stub only VERIFIES against
+# the compiled-in pubkey). Building it requires opting in (`--features rt-release`); the
+# release CI does so. Enables `rt-fetch` (the verify half + the `RtManifest` types it
+# round-trips against) and turns on `ed25519-dalek/rand_core`. Never in `default`, so
+# neither a normal toolchain build nor any `ascript-rt` tier links signing.
+rt-release = ["rt-fetch", "ed25519-dalek/rand_core", "dep:rand_core"]
 # RT §3.1/§7 — the stub-side payload decompressor. Kept SEPARATE from `compress`
 # (which is `std/compress`) so rt-core can decompress its own `--compress`ed bundle
 # payload without shipping the whole compression stdlib. Pulls only `zstd` (already a

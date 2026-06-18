@@ -356,6 +356,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "rand 0.8.6",
+ "rand_core 0.6.4",
  "redis",
  "regex",
  "reqwest 0.12.28",

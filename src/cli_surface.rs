@@ -380,6 +380,41 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// RT §5.1 / Task 11 — generate + sign the release stub manifest (internal release
+    /// tooling; driven by `scripts/release-rt-stubs.sh`). HIDDEN: not part of the public
+    /// CLI surface. Gated on the default-OFF `rt-release` feature (the ed25519 SIGNING
+    /// half), so it is absent from a normal toolchain build.
+    #[cfg(feature = "rt-release")]
+    #[command(name = "rt-manifest-gen", hide = true)]
+    RtManifestGen {
+        /// Mint a fresh ed25519 keypair, print `(private seed hex, public key hex)`, and
+        /// exit. The maintainer compiles the public key into `PRODUCTION_PUBKEY` and
+        /// stores the private seed in the CI secret `ASCRIPT_RT_SIGNING_KEY`. No manifest
+        /// is written in this mode.
+        #[arg(long = "genkey")]
+        genkey: bool,
+        /// The toolchain version the manifest is cut for (the §5.1 version lock). Defaults
+        /// to this binary's own `CARGO_PKG_VERSION`.
+        #[arg(long = "version", value_name = "VER")]
+        version: Option<String>,
+        /// The deterministic `created` timestamp embedded in the manifest (a fixed input,
+        /// never `now()` — so a rebuild is byte-identical). Defaults to the epoch.
+        #[arg(long = "created", value_name = "TS")]
+        created: Option<String>,
+        /// Path to a JSON file holding the stub entries array (each
+        /// `{target,tier,features,sha256,size,filename}`). The release script assembles
+        /// this after building + hashing every stub.
+        #[arg(long = "entries-file", value_name = "PATH")]
+        entries_file: Option<String>,
+        /// Path to a file holding the 64-hex-char private signing seed (the CI secret
+        /// `ASCRIPT_RT_SIGNING_KEY`). Required unless `--genkey`.
+        #[arg(long = "key", value_name = "PATH")]
+        key: Option<String>,
+        /// Directory to write `rt-manifest.json` + `rt-manifest.json.sig` into. Defaults
+        /// to the current directory.
+        #[arg(long = "out-dir", value_name = "DIR")]
+        out_dir: Option<String>,
+    },
 }
 
 /// Subcommands for `ascript cache`.

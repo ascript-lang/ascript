@@ -409,3 +409,156 @@ fn manifest_parse_round_trip() {
     assert_eq!(e.size, stub.len() as u64);
     assert!(e.features.contains(&"shared".to_string()));
 }
+
+// ----------------------------------------------------------------------------
+// RT §5.1 / Task 11 — the in-tree manifest GENERATOR, hermetically tested.
+// Gated on `rt-release` (the ed25519 SIGNING half — a runtime stub never links it).
+// The whole point: what `generate_manifest` + `sign_manifest` produce is EXACTLY what
+// Task 6's `verify_manifest` accepts, proven by a round-trip against a TEST key.
+// ----------------------------------------------------------------------------
+
+#[cfg(feature = "rt-release")]
+mod generator {
+    use super::*;
+    use ascript::rtstub::manifest::{
+        entry_filename, generate_manifest, generate_keypair, load_signing_key_hex,
+        parse_entries, sign_manifest, verify_manifest, StubEntry,
+    };
+
+    fn sample_entries(version: &str) -> Vec<StubEntry> {
+        let triples = [
+            ("x86_64-apple-darwin", "rt-core"),
+            ("x86_64-unknown-linux-musl", "rt-net"),
+            ("aarch64-pc-windows-msvc", "rt-full"),
+        ];
+        triples
+            .iter()
+            .enumerate()
+            .map(|(i, (target, tier))| {
+                let bytes = format!("stub-{target}-{tier}").into_bytes();
+                StubEntry {
+                    target: target.to_string(),
+                    tier: tier.to_string(),
+                    features: vec!["shared".into(), "bundle-zstd".into()],
+                    sha256: sha256_hex(&bytes),
+                    size: (1000 + i) as u64,
+                    filename: entry_filename(version, target, tier),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generated_manifest_round_trips_through_the_task6_verifier() {
+        let version = env!("CARGO_PKG_VERSION");
+        let entries = sample_entries(version);
+        let bytes = generate_manifest(version, "1970-01-01T00:00:00Z", &entries);
+
+        // Sign with the TEST key and verify against its PUBLIC key — the exact path the
+        // production builder takes against PRODUCTION_PUBKEY.
+        let sk = test_signing_key();
+        let sig = sign_manifest(&bytes, &sk);
+        let pubkey = sk.verifying_key().to_bytes();
+
+        let m = verify_manifest(&bytes, &sig, &pubkey)
+            .expect("the generated+signed manifest must verify against the test pubkey");
+        assert_eq!(m.ascript, version);
+        assert_eq!(m.stubs.len(), entries.len());
+        // The parsed entries equal the inputs (order + every field preserved).
+        assert_eq!(m.stubs, entries);
+    }
+
+    #[test]
+    fn entry_filenames_follow_the_spec_convention() {
+        let v = "0.6.0";
+        assert_eq!(
+            entry_filename(v, "x86_64-unknown-linux-musl", "rt-net"),
+            "ascript-rt-0.6.0-x86_64-unknown-linux-musl-rt-net"
+        );
+        // Windows targets keep the .exe extension.
+        assert_eq!(
+            entry_filename(v, "aarch64-pc-windows-msvc", "rt-full"),
+            "ascript-rt-0.6.0-aarch64-pc-windows-msvc-rt-full.exe"
+        );
+    }
+
+    #[test]
+    fn double_generate_is_byte_identical() {
+        let version = env!("CARGO_PKG_VERSION");
+        let entries = sample_entries(version);
+        let a = generate_manifest(version, "1970-01-01T00:00:00Z", &entries);
+        let b = generate_manifest(version, "1970-01-01T00:00:00Z", &entries);
+        assert_eq!(a, b, "the generator must be deterministic (no now(), fixed key order)");
+    }
+
+    #[test]
+    fn tampered_manifest_fails_verify() {
+        let version = env!("CARGO_PKG_VERSION");
+        let entries = sample_entries(version);
+        let mut bytes = generate_manifest(version, "1970-01-01T00:00:00Z", &entries);
+        let sk = test_signing_key();
+        let sig = sign_manifest(&bytes, &sk);
+        let pubkey = sk.verifying_key().to_bytes();
+
+        // Flip a byte AFTER signing — the signature no longer covers these bytes.
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x20;
+        let err = verify_manifest(&bytes, &sig, &pubkey)
+            .expect_err("a tampered manifest must fail signature verification");
+        assert!(err.contains("signature"), "{err}");
+    }
+
+    #[test]
+    fn entries_file_round_trips_through_parse_entries() {
+        // The release script writes an entries array; parse_entries reads it back. A
+        // generated manifest's stubs must equal the entries parsed from the same JSON.
+        let version = env!("CARGO_PKG_VERSION");
+        let entries = sample_entries(version);
+        // Build an entries-array JSON the same way the release script would.
+        let mut arr = String::from("[");
+        for (i, e) in entries.iter().enumerate() {
+            if i > 0 {
+                arr.push(',');
+            }
+            let feats: Vec<String> =
+                e.features.iter().map(|f| format!("\"{f}\"")).collect();
+            arr.push_str(&format!(
+                r#"{{"target":"{}","tier":"{}","features":[{}],"sha256":"{}","size":{},"filename":"{}"}}"#,
+                e.target,
+                e.tier,
+                feats.join(","),
+                e.sha256,
+                e.size,
+                e.filename
+            ));
+        }
+        arr.push(']');
+        let parsed = parse_entries(arr.as_bytes()).expect("parse entries");
+        assert_eq!(parsed, entries);
+    }
+
+    #[test]
+    fn generated_keypair_signs_and_verifies() {
+        // generate_keypair → load the private seed → sign → verify against the public.
+        let (seed_hex, pub_hex) = generate_keypair();
+        let sk = load_signing_key_hex(&seed_hex).expect("load minted seed");
+        let version = env!("CARGO_PKG_VERSION");
+        let entries = sample_entries(version);
+        let bytes = generate_manifest(version, "1970-01-01T00:00:00Z", &entries);
+        let sig = sign_manifest(&bytes, &sk);
+
+        // Reconstruct the 32-byte pubkey from the printed hex.
+        let mut pk = [0u8; 32];
+        for (i, b) in pk.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&pub_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        assert!(verify_manifest(&bytes, &sig, &pk).is_ok());
+    }
+
+    #[test]
+    fn load_signing_key_rejects_malformed_seed() {
+        assert!(load_signing_key_hex("tooshort").is_err());
+        assert!(load_signing_key_hex(&"z".repeat(64)).is_err());
+        assert!(load_signing_key_hex(&"a".repeat(64)).is_ok());
+    }
+}

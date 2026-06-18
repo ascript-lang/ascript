@@ -1037,7 +1037,125 @@ async fn real_main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         },
+        #[cfg(feature = "rt-release")]
+        Command::RtManifestGen { genkey, version, created, entries_file, key, out_dir } => {
+            run_rt_manifest_gen(genkey, version, created, entries_file, key, out_dir)
+        }
     }
+}
+
+/// RT §5.1 / Task 11 — generate + sign the release stub manifest (hidden subcommand,
+/// `rt-release`-gated). Two modes:
+///
+/// - `--genkey`: mint a fresh keypair, print `(private seed hex, public key hex)`, exit.
+/// - default: read the entries file, build the CANONICAL manifest, sign it with the
+///   key-file seed, and write `rt-manifest.json` + `rt-manifest.json.sig` into `--out-dir`.
+///
+/// The PRIVATE key is read from a file path (the CI-secret path) — never echoed.
+#[cfg(feature = "rt-release")]
+fn run_rt_manifest_gen(
+    genkey: bool,
+    version: Option<String>,
+    created: Option<String>,
+    entries_file: Option<String>,
+    key: Option<String>,
+    out_dir: Option<String>,
+) -> ExitCode {
+    use ascript::rtstub::manifest;
+
+    if genkey {
+        // Mint a fresh keypair for the maintainer (out-of-band key rotation).
+        let (seed_hex, pub_hex) = manifest::generate_keypair();
+        // The Rust array literal for the PRODUCTION_PUBKEY const, for convenience.
+        let arr: Vec<String> = (0..32)
+            .map(|i| format!("0x{}", &pub_hex[i * 2..i * 2 + 2]))
+            .collect();
+        println!("private_seed_hex={seed_hex}");
+        println!("public_key_hex={pub_hex}");
+        println!("public_key_rust=[{}]", arr.join(", "));
+        eprintln!(
+            "note: store the private seed in the CI secret ASCRIPT_RT_SIGNING_KEY and \
+             compile the public key into PRODUCTION_PUBKEY (a toolchain release)."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let version = version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let created = created.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+
+    // Read + parse the entries file.
+    let entries_path = match entries_file {
+        Some(p) => p,
+        None => {
+            eprintln!("error: --entries-file is required (or use --genkey)");
+            return ExitCode::from(2);
+        }
+    };
+    let entries_bytes = match std::fs::read(&entries_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: cannot read entries file '{entries_path}': {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let entries = match manifest::parse_entries(&entries_bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Read the private signing seed from the key-file path (never echoed).
+    let key_path = match key {
+        Some(p) => p,
+        None => {
+            eprintln!("error: --key <path-to-seed-file> is required to sign the manifest");
+            return ExitCode::from(2);
+        }
+    };
+    let seed_hex = match std::fs::read_to_string(&key_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read signing key file '{key_path}': {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let signing_key = match manifest::load_signing_key_hex(&seed_hex) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Generate the canonical manifest + detached signature.
+    let manifest_bytes = manifest::generate_manifest(&version, &created, &entries);
+    let sig = manifest::sign_manifest(&manifest_bytes, &signing_key);
+
+    let dir = out_dir.unwrap_or_else(|| ".".to_string());
+    let dir = std::path::Path::new(&dir);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("error: cannot create out-dir '{}': {e}", dir.display());
+        return ExitCode::from(1);
+    }
+    let manifest_out = dir.join("rt-manifest.json");
+    let sig_out = dir.join("rt-manifest.json.sig");
+    if let Err(e) = std::fs::write(&manifest_out, &manifest_bytes) {
+        eprintln!("error: cannot write '{}': {e}", manifest_out.display());
+        return ExitCode::from(1);
+    }
+    if let Err(e) = std::fs::write(&sig_out, sig) {
+        eprintln!("error: cannot write '{}': {e}", sig_out.display());
+        return ExitCode::from(1);
+    }
+    eprintln!(
+        "wrote {} ({} stub entries) + {}",
+        manifest_out.display(),
+        entries.len(),
+        sig_out.display()
+    );
+    ExitCode::SUCCESS
 }
 
 /// DX D1: `ascript doc` — discover `.as` files, build the doc model (static CST

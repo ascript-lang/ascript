@@ -17,13 +17,22 @@
 //! refuses, naming the reason. The signature is checked over the EXACT manifest bytes
 //! against a compiled-in ed25519 public key — there is no insecure escape hatch.
 
-/// RT §5.1: production release pubkey — rotated only by a toolchain release (Task 11 sets the real key).
+/// RT §5.1: production release pubkey — rotated only by a toolchain release.
 ///
-/// A 32-byte ed25519 verifying key compiled into the toolchain. This placeholder is
-/// all-zero until the real release key is minted; a real signed manifest will not
-/// verify against it (fail-closed by construction), and the dev fallbacks (§5.4
-/// `--stub`/sibling) are the offline path — never an insecure env knob.
-pub const PRODUCTION_PUBKEY: [u8; 32] = [0u8; 32];
+/// A 32-byte ed25519 verifying key compiled into the toolchain. The matching PRIVATE
+/// key lives ONLY in the CI secret `ASCRIPT_RT_SIGNING_KEY` (never committed); rotation
+/// requires a toolchain release because the pubkey is compiled in — acceptable, since
+/// stubs are version-locked to the toolchain anyway (RT §12 key custody). The dev
+/// fallbacks (§5.4 `--stub`/sibling) are the offline path — never an insecure env knob.
+///
+/// **Campaign note:** this key was minted in-branch for Task 11. For a REAL public
+/// release the maintainer regenerates the keypair (`ascript rt-manifest-gen --genkey`),
+/// replaces this const, and stores the new private seed in CI secrets. See the release
+/// runbook in `CONTRIBUTING.md`.
+pub const PRODUCTION_PUBKEY: [u8; 32] = [
+    0xc4, 0x34, 0xcd, 0x2a, 0x49, 0x89, 0xe8, 0xc5, 0x39, 0xcf, 0xba, 0x65, 0xcd, 0x11, 0x52, 0xb5,
+    0x86, 0xba, 0xc3, 0xaa, 0x9e, 0x5d, 0x84, 0x8a, 0x57, 0x14, 0xac, 0xaa, 0xd3, 0x73, 0xac, 0xc9,
+];
 
 /// The current manifest schema version this toolchain understands.
 pub const SCHEMA_VERSION: u64 = 1;
@@ -479,6 +488,218 @@ pub fn verify_manifest(
     }
 
     Ok(manifest)
+}
+
+// ---------------------------------------------------------------------------
+// RT §5.1 / Task 11 — the release-side manifest GENERATOR (gated on `rt-release`).
+//
+// This is the half that PRODUCES + SIGNS what `verify_manifest` accepts. It pulls the
+// ed25519 SIGNING key material, so it is behind the default-OFF `rt-release` feature —
+// a runtime stub NEVER links signing (it only verifies against `PRODUCTION_PUBKEY`).
+// ---------------------------------------------------------------------------
+
+/// The canonical entry-filename convention (RT §5.1):
+/// `ascript-rt-{version}-{target}-{tier}` (with `.exe` for windows targets — the on-disk
+/// stub keeps the platform extension). The release script and the manifest agree by
+/// construction because they both call this.
+#[cfg(feature = "rt-release")]
+pub fn entry_filename(version: &str, target: &str, tier: &str) -> String {
+    let ext = if target.contains("windows") { ".exe" } else { "" };
+    format!("ascript-rt-{version}-{target}-{tier}{ext}")
+}
+
+/// Emit a CANONICAL release manifest (RT §5.1) for `version` over `entries`.
+///
+/// **Determinism (the load-bearing property):** the byte output is a pure function of
+/// `(version, created, entries)` — fixed key order, no timestamps drawn from `now()`
+/// (the `created` value is a DETERMINISTIC INPUT, never the wall clock), entries emitted
+/// in the order given. Calling it twice with the same arguments yields byte-identical
+/// output (the reproducibility battery + the hermetic round-trip test pin this).
+///
+/// The output is exactly the shape [`parse_manifest`] reads back and [`verify_manifest`]
+/// accepts — the round-trip is proven in `tests/rt_supply_chain.rs`.
+#[cfg(feature = "rt-release")]
+pub fn generate_manifest(version: &str, created: &str, entries: &[StubEntry]) -> Vec<u8> {
+    let mut s = String::with_capacity(256 + entries.len() * 256);
+    s.push('{');
+    // Fixed key order: schema, ascript, created, stubs.
+    s.push_str(&format!("\"schema\":{SCHEMA_VERSION},"));
+    s.push_str(&format!("\"ascript\":{},", json_string(version)));
+    s.push_str(&format!("\"created\":{},", json_string(created)));
+    s.push_str("\"stubs\":[");
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('{');
+        // Fixed per-entry key order: target, tier, features, sha256, size, filename.
+        s.push_str(&format!("\"target\":{},", json_string(&e.target)));
+        s.push_str(&format!("\"tier\":{},", json_string(&e.tier)));
+        s.push_str("\"features\":[");
+        for (j, f) in e.features.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push_str(&json_string(f));
+        }
+        s.push_str("],");
+        s.push_str(&format!("\"sha256\":{},", json_string(&e.sha256)));
+        s.push_str(&format!("\"size\":{},", e.size));
+        s.push_str(&format!("\"filename\":{}", json_string(&e.filename)));
+        s.push('}');
+    }
+    s.push_str("]}");
+    s.into_bytes()
+}
+
+/// Minimal JSON string escaper for the canonical generator. Handles the escapes the
+/// hand-rolled [`parse_manifest`] reader understands (`"`, `\`, control chars). Target
+/// triples / tiers / feature names / hex digests / filenames are all ASCII-safe in
+/// practice, but the escaper is total so a hostile field can never produce invalid JSON.
+#[cfg(feature = "rt-release")]
+fn json_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Sign the EXACT manifest bytes with an ed25519 signing key, returning the 64-byte
+/// detached signature (what `rt-manifest.json.sig` carries). The companion of
+/// [`verify_manifest`]'s check 1.
+#[cfg(feature = "rt-release")]
+pub fn sign_manifest(
+    manifest_bytes: &[u8],
+    signing_key: &ed25519_dalek::SigningKey,
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    signing_key.sign(manifest_bytes).to_bytes()
+}
+
+/// Generate a fresh ed25519 keypair from OS randomness, returning
+/// `(private_seed_hex, public_key_hex)`. Used by `ascript rt-manifest-gen --genkey` to
+/// mint a release key OUT of band: the maintainer compiles the public key into
+/// [`PRODUCTION_PUBKEY`] and stores the private seed in the CI secret
+/// `ASCRIPT_RT_SIGNING_KEY`. The private seed is NEVER persisted by this toolchain.
+#[cfg(feature = "rt-release")]
+pub fn generate_keypair() -> (String, String) {
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+    let sk = SigningKey::generate(&mut OsRng);
+    let vk = sk.verifying_key();
+    (hex32(&sk.to_bytes()), hex32(&vk.to_bytes()))
+}
+
+/// Lowercase-hex a 32-byte array.
+#[cfg(feature = "rt-release")]
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Load an ed25519 signing key from a file holding the 64-hex-char private seed (the
+/// release script passes the CI-secret key path). Whitespace is trimmed. A wrong length
+/// or non-hex content is a clean `Err` (fail-closed: the release aborts, never signs with
+/// a malformed key).
+#[cfg(feature = "rt-release")]
+pub fn load_signing_key_hex(seed_hex: &str) -> Result<ed25519_dalek::SigningKey, String> {
+    let seed_hex = seed_hex.trim();
+    if seed_hex.len() != 64 {
+        return Err(format!(
+            "signing key seed must be 64 hex chars (32 bytes), got {} chars",
+            seed_hex.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        let hi = hex_nibble(seed_hex.as_bytes()[i * 2])?;
+        let lo = hex_nibble(seed_hex.as_bytes()[i * 2 + 1])?;
+        *byte = (hi << 4) | lo;
+    }
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+/// Parse a release-script entries file: a JSON ARRAY of stub-entry objects (each
+/// `{target,tier,features,sha256,size,filename}`). Reuses the same bounds-checked
+/// internal reader as [`parse_manifest`] (no serde). Returns the entries in file order
+/// (the manifest preserves that order — deterministic). A structural error is a clean
+/// `Err`. This is a TRUSTED local input (the release script writes it), but it is parsed
+/// fail-closed all the same.
+#[cfg(feature = "rt-release")]
+pub fn parse_entries(bytes: &[u8]) -> Result<Vec<StubEntry>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "entries file is not valid UTF-8".to_string())?;
+    let mut p = Parser::new(text);
+    let value = p.parse_value()?;
+    p.skip_ws();
+    if !p.at_end() {
+        return Err("entries file has trailing content after the JSON array".to_string());
+    }
+    let arr = value.as_array().ok_or("entries file root is not a JSON array")?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let e = entry
+            .as_object()
+            .ok_or_else(|| format!("entries file entry #{i} is not an object"))?;
+        let field_str = |name: &str| -> Result<String, String> {
+            e.field(name)
+                .and_then(Json::as_str)
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("entries file entry #{i} is missing string '{name}'"))
+        };
+        let target = field_str("target")?;
+        let tier = field_str("tier")?;
+        let sha256 = field_str("sha256")?;
+        let filename = field_str("filename")?;
+        let size = e
+            .field("size")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| format!("entries file entry #{i} is missing an integer 'size'"))?;
+        let features = match e.field("features") {
+            Some(Json::Array(items)) => {
+                let mut feats = Vec::with_capacity(items.len());
+                for f in items {
+                    feats.push(
+                        f.as_str()
+                            .ok_or_else(|| {
+                                format!("entries file entry #{i} has a non-string feature")
+                            })?
+                            .to_string(),
+                    );
+                }
+                feats
+            }
+            Some(_) => return Err(format!("entries file entry #{i} 'features' is not an array")),
+            None => Vec::new(),
+        };
+        out.push(StubEntry { target, tier, features, sha256, size, filename });
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "rt-release")]
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("signing key seed contains a non-hex character".to_string()),
+    }
 }
 
 #[cfg(test)]

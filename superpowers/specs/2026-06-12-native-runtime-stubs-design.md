@@ -1,6 +1,15 @@
 # AScript Runtime-Only Native Stubs — Tier Matrix, Import-Driven Pruning, Cross Builds, OCI & Compression — Design (RT)
 
-- **Status:** Proposed (no branch yet — design only)
+- **Status:** Implemented on `feat/native-runtime-stubs` (Tasks 0–11). **Musl spike
+  (Task 11, RT §12):** the local feasibility attempt was run on a macOS host and FAILED
+  as the risk predicted — `scripts/build-rt.sh rt-core --target x86_64-unknown-linux-musl`
+  errored in `cc-rs` (`failed to find tool "x86_64-linux-musl-gcc"`), i.e. the bundled-C
+  deps (rusqlite et al.) need a musl C cross-toolchain a bare macOS host lacks. Musl
+  feasibility is therefore validated at the FIRST CI release run (the ubuntu legs install
+  `musl-tools`; `.github/workflows/release-rt.yml`). The published matrix ships as-designed
+  (8×4); the NARROW-FALLBACK plan stands: if a CI musl leg fails (rusqlite bundled-C /
+  rustls-under-musl), drop the failing target from the matrix here + in `roadmap.md` with
+  an owner note — a recorded decision, never a silent absent artifact.
 - **Date:** 2026-06-12
 - **Code:** RT (the foundation of goal-perf.md's "Deployment & reach track"; CNTR's images
   build on it)
