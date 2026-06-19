@@ -6,8 +6,8 @@
 //!
 //! ## Authoring conventions
 //!
-//! Use the four `StdParam` constructors (req / opt / variadic / with_default)
-//! together with `StdSig::new` to build rows.  The optional-ordering invariant
+//! Use the `StdParam` constructors (req / req_untyped / opt / variadic /
+//! with_default) together with `StdSig::new` to build rows.  The optional-ordering invariant
 //! ("no required param may follow an optional or variadic one") is enforced by
 //! `validate_param_order` called from the `table_ordering_invariant` test.
 //!
