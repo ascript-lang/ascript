@@ -3343,3 +3343,54 @@ fn dim(s: Shape): int {\n  return match s {\n    Shape.Circle(r) | Shape.Square(
         );
     }
 }
+
+/// SIG §3.3: hovering a stdlib member (`math.sqrt`) over the wire returns a
+/// hover response whose content includes the curated signature label.
+#[test]
+fn lsp_hover_stdlib_member_shows_signature() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://stdlib_hover.as";
+    // line 0: import * as math from "std/math"
+    // line 1: let y = math.sqrt(2)
+    let text = "import * as math from \"std/math\"\nlet y = math.sqrt(2)\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Hover on `sqrt` in `math.sqrt(2)` (line 1, char 13 — inside `sqrt`).
+    client.request(
+        2,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 13 }
+        }),
+    );
+    let hover_resp = client.read_response(2, overall);
+    let content = hover_resp["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        content.contains("math.sqrt("),
+        "hover on math.sqrt must show the signature; got: {content:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}

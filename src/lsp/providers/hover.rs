@@ -7,8 +7,35 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 /// Hover at byte `offset`. Returns the inferred/declared type (if any) plus a
 /// keyword/builtin/declaration doc line. `None` when neither is available (cursor
 /// on trivia / an unknown token with no inferred type).
+///
+/// When the cursor lands on a stdlib member (`math.sqrt`, `math.pi`), a stdlib
+/// signature / constant-type block is pushed FIRST (before the inferred type and
+/// doc parts) so the curated sig leads the hover.
 pub fn hover(model: &SemanticModel, offset: usize) -> Option<Hover> {
+    use crate::check::std_sigs::{module_members, std_sig, MemberKind};
+    use crate::lsp::providers::signature::render_sig_label;
+
     let mut parts: Vec<String> = Vec::new();
+
+    // § SIG §3.3: stdlib member sig + doc, pushed FIRST so the curated info leads.
+    if let Some((module, member, alias)) = stdlib_member_at(model, offset) {
+        if let Some(sig) = std_sig(&module, &member) {
+            let prefix = format!("{alias}.{member}");
+            let (label, _) = render_sig_label(&prefix, sig);
+            parts.push(format!("```ascript\n{label}\n```"));
+            if !sig.doc.is_empty() {
+                parts.push(sig.doc.to_string());
+            }
+        } else if let Some(members) = module_members(&module) {
+            // A CONSTANT: `alias.member: type`
+            if let Some((_, MemberKind::Const(ty))) =
+                members.iter().find(|(n, _)| *n == member.as_str())
+            {
+                parts.push(format!("```ascript\n{alias}.{member}: {ty}\n```"));
+            }
+        }
+    }
+
     if let Some(ty) = crate::check::infer::hover_type_at(&model.text, offset) {
         parts.push(format!("```ascript\n{ty}\n```"));
     }
@@ -25,6 +52,84 @@ pub fn hover(model: &SemanticModel, offset: usize) -> Option<Hover> {
         }),
         range: None,
     })
+}
+
+/// Scan the source at `offset` to find a stdlib member access of the form
+/// `<alias>.<member>` where the cursor sits on `<member>`. Returns
+/// `(module_path, member_name, alias)` on success, or `None` when:
+/// - the cursor is on the alias (before the dot), not the member;
+/// - there is no dot immediately before the identifier at `offset`;
+/// - the alias is not a `import * as <alias> from "std/…"` namespace import.
+///
+/// The scanner works in CHAR space (matching the idiom in `completion.rs` and
+/// `signature.rs`) and never holds a borrow across an `await`.
+fn stdlib_member_at(
+    model: &SemanticModel,
+    offset: usize,
+) -> Option<(String /*module*/, String /*member*/, String /*alias*/)> {
+    use crate::lsp::providers::completion::namespace_import_module_pub;
+
+    let chars: Vec<char> = model.text.chars().collect();
+    let offset = offset.min(chars.len());
+
+    // Identify the identifier token that contains (or starts at) `offset`.
+    // Scan backward to the start of the identifier, then forward to its end.
+    // `offset` may be inside the identifier (not just at its start).
+    let ident_end = {
+        let mut e = offset;
+        while e < chars.len() && is_ident_char(chars[e]) {
+            e += 1;
+        }
+        e
+    };
+    let ident_start = {
+        let mut s = offset;
+        while s > 0 && is_ident_char(chars[s - 1]) {
+            s -= 1;
+        }
+        s
+    };
+
+    // If `offset` is not inside an identifier, bail.
+    if ident_start >= ident_end {
+        return None;
+    }
+
+    // Require a dot IMMEDIATELY before the member identifier (no whitespace).
+    if ident_start == 0 || chars[ident_start - 1] != '.' {
+        return None;
+    }
+    let dot_pos = ident_start - 1;
+
+    // Read the alias: the identifier ending right before the dot.
+    // There must be no whitespace between alias and dot in `alias.member`.
+    let alias_end = dot_pos;
+    if alias_end == 0 || !is_ident_char(chars[alias_end - 1]) {
+        return None;
+    }
+    let mut alias_start = alias_end;
+    while alias_start > 0 && is_ident_char(chars[alias_start - 1]) {
+        alias_start -= 1;
+    }
+    // alias must start with a valid identifier start (not a digit)
+    if chars[alias_start].is_ascii_digit() {
+        return None;
+    }
+
+    let alias: String = chars[alias_start..alias_end].iter().collect();
+    let member: String = chars[ident_start..ident_end].iter().collect();
+    if member.is_empty() || alias.is_empty() {
+        return None;
+    }
+
+    // The alias must be a namespace import of a known stdlib module.
+    let module = namespace_import_module_pub(&model.text, &alias)?;
+
+    Some((module, member, alias))
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 #[cfg(test)]
@@ -146,5 +251,38 @@ mod tests {
             panic!()
         };
         assert!(mk.value.contains("array<int>"), "got {}", mk.value);
+    }
+
+    // ── SIG §3.3: stdlib-member hover ────────────────────────────────────────
+
+    #[test]
+    fn hover_on_stdlib_member_shows_signature_and_doc() {
+        let src = "import * as math from \"std/math\"\nlet y = math.sqrt(2)\n";
+        let m = model(src);
+        let off = src.rfind("sqrt").unwrap() + 1; // inside `sqrt`
+        let h = hover(&m, off).expect("hover on math.sqrt");
+        let HoverContents::Markup(mk) = h.contents else {
+            panic!()
+        };
+        assert!(mk.value.contains("math.sqrt("), "sig line: {}", mk.value);
+        assert!(
+            mk.value.contains("Returns")
+                || mk.value.contains("square root")
+                || mk.value.contains("->"),
+            "doc/ret: {}",
+            mk.value
+        );
+    }
+
+    #[test]
+    fn hover_on_stdlib_constant_shows_type() {
+        let src = "import * as math from \"std/math\"\nlet y = math.pi\n";
+        let m = model(src);
+        let off = src.rfind("pi").unwrap();
+        let h = hover(&m, off).expect("hover on math.pi");
+        let HoverContents::Markup(mk) = h.contents else {
+            panic!()
+        };
+        assert!(mk.value.contains("math.pi: float"), "{}", mk.value);
     }
 }
