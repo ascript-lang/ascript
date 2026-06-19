@@ -591,6 +591,539 @@ static ARRAY_MEMBERS: &[(&str, MemberKind)] = &[
     ("partition", MemberKind::Fn),
 ];
 
+// ── std/object ───────────────────────────────────────────────────────────────
+
+static OBJECT_KEYS_PARAMS: &[StdParam] = &[StdParam::req("o", "object")];
+static OBJECT_VALUES_PARAMS: &[StdParam] = &[StdParam::req("o", "object")];
+static OBJECT_ENTRIES_PARAMS: &[StdParam] = &[StdParam::req("o", "object")];
+static OBJECT_HAS_PARAMS: &[StdParam] = &[
+    StdParam::req("o", "object"),
+    StdParam::req("key", "string"),
+];
+static OBJECT_DELETE_PARAMS: &[StdParam] = &[
+    StdParam::req("o", "object"),
+    StdParam::req("key", "string"),
+];
+static OBJECT_MERGE_PARAMS: &[StdParam] = &[StdParam::variadic("objects", "object")];
+static OBJECT_FROM_ENTRIES_PARAMS: &[StdParam] = &[StdParam::req("pairs", "array")];
+static OBJECT_PICK_PARAMS: &[StdParam] = &[
+    StdParam::req("o", "object"),
+    StdParam::req("keys", "array"),
+];
+static OBJECT_OMIT_PARAMS: &[StdParam] = &[
+    StdParam::req("o", "object"),
+    StdParam::req("keys", "array"),
+];
+static OBJECT_DEEP_CLONE_PARAMS: &[StdParam] = &[StdParam::req("o", "object")];
+static OBJECT_DEEP_EQUAL_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static OBJECT_MAP_VALUES_PARAMS: &[StdParam] = &[
+    StdParam::req("o", "object"),
+    StdParam::req("f", "fn(value, key)"),
+];
+static OBJECT_FREEZE_PARAMS: &[StdParam] = &[StdParam::req_untyped("x")];
+static OBJECT_IS_FROZEN_PARAMS: &[StdParam] = &[StdParam::req_untyped("x")];
+
+static OBJECT_SIGS: &[(&str, StdSig)] = &[
+    ("keys", StdSig { params: OBJECT_KEYS_PARAMS, ret: Some("array"), doc: "Return an array of the object's keys, in insertion order." }),
+    ("values", StdSig { params: OBJECT_VALUES_PARAMS, ret: Some("array"), doc: "Return an array of the object's values, in insertion order." }),
+    ("entries", StdSig { params: OBJECT_ENTRIES_PARAMS, ret: Some("array"), doc: "Return an array of [key, value] pairs, in insertion order." }),
+    ("has", StdSig { params: OBJECT_HAS_PARAMS, ret: Some("bool"), doc: "Test whether the object contains a key." }),
+    ("delete", StdSig { params: OBJECT_DELETE_PARAMS, ret: Some("bool"), doc: "Remove a key, mutating the object in place." }),
+    ("merge", StdSig { params: OBJECT_MERGE_PARAMS, ret: Some("object"), doc: "Merge any number of objects left to right into a new object; later keys overwrite earlier ones." }),
+    ("fromEntries", StdSig { params: OBJECT_FROM_ENTRIES_PARAMS, ret: Some("object"), doc: "Construct an object from an array of [key, value] pairs." }),
+    ("pick", StdSig { params: OBJECT_PICK_PARAMS, ret: Some("object"), doc: "Return a new object containing only the specified keys." }),
+    ("omit", StdSig { params: OBJECT_OMIT_PARAMS, ret: Some("object"), doc: "Return a new object with the specified keys removed." }),
+    ("deepClone", StdSig { params: OBJECT_DEEP_CLONE_PARAMS, ret: Some("object"), doc: "Recursively clone an object (and any nested objects, arrays, or maps) into a fully independent copy." }),
+    ("deepEqual", StdSig { params: OBJECT_DEEP_EQUAL_PARAMS, ret: Some("bool"), doc: "Recursively compare two values for structural equality." }),
+    ("mapValues", StdSig { params: OBJECT_MAP_VALUES_PARAMS, ret: Some("object"), doc: "Return a new object with each value transformed by f." }),
+    ("freeze", StdSig { params: OBJECT_FREEZE_PARAMS, ret: None, doc: "Shallow-freeze a mutable container in place and return it." }),
+    ("isFrozen", StdSig { params: OBJECT_IS_FROZEN_PARAMS, ret: Some("bool"), doc: "Whether the value is a frozen container." }),
+];
+
+static OBJECT_MEMBERS: &[(&str, MemberKind)] = &[
+    ("keys", MemberKind::Fn),
+    ("values", MemberKind::Fn),
+    ("entries", MemberKind::Fn),
+    ("has", MemberKind::Fn),
+    ("delete", MemberKind::Fn),
+    ("merge", MemberKind::Fn),
+    ("fromEntries", MemberKind::Fn),
+    ("pick", MemberKind::Fn),
+    ("omit", MemberKind::Fn),
+    ("deepClone", MemberKind::Fn),
+    ("deepEqual", MemberKind::Fn),
+    ("mapValues", MemberKind::Fn),
+    ("freeze", MemberKind::Fn),
+    ("isFrozen", MemberKind::Fn),
+];
+
+// ── std/map ──────────────────────────────────────────────────────────────────
+
+static MAP_NEW_PARAMS: &[StdParam] = &[StdParam::opt("seed", "array")];
+static MAP_GET_PARAMS: &[StdParam] = &[
+    StdParam::req("m", "map"),
+    StdParam::req_untyped("key"),
+];
+static MAP_SET_PARAMS: &[StdParam] = &[
+    StdParam::req("m", "map"),
+    StdParam::req_untyped("key"),
+    StdParam::req_untyped("value"),
+];
+static MAP_HAS_PARAMS: &[StdParam] = &[
+    StdParam::req("m", "map"),
+    StdParam::req_untyped("key"),
+];
+static MAP_DELETE_PARAMS: &[StdParam] = &[
+    StdParam::req("m", "map"),
+    StdParam::req_untyped("key"),
+];
+static MAP_KEYS_PARAMS: &[StdParam] = &[StdParam::req("m", "map")];
+static MAP_VALUES_PARAMS: &[StdParam] = &[StdParam::req("m", "map")];
+static MAP_ENTRIES_PARAMS: &[StdParam] = &[StdParam::req("m", "map")];
+
+static MAP_SIGS: &[(&str, StdSig)] = &[
+    ("new", StdSig { params: MAP_NEW_PARAMS, ret: Some("map"), doc: "Create a new map, optionally seeded from an array of [key, value] pairs." }),
+    ("get", StdSig { params: MAP_GET_PARAMS, ret: None, doc: "Read the value for a key; returns nil if the key is absent." }),
+    ("set", StdSig { params: MAP_SET_PARAMS, ret: Some("map"), doc: "Insert or update a key/value pair, mutating the map in place." }),
+    ("has", StdSig { params: MAP_HAS_PARAMS, ret: Some("bool"), doc: "Test whether the map contains a key." }),
+    ("delete", StdSig { params: MAP_DELETE_PARAMS, ret: Some("bool"), doc: "Remove a key, mutating the map in place." }),
+    ("keys", StdSig { params: MAP_KEYS_PARAMS, ret: Some("array"), doc: "Return an array of the map's keys, in insertion order." }),
+    ("values", StdSig { params: MAP_VALUES_PARAMS, ret: Some("array"), doc: "Return an array of the map's values, in insertion order." }),
+    ("entries", StdSig { params: MAP_ENTRIES_PARAMS, ret: Some("array"), doc: "Return an array of [key, value] pairs, in insertion order." }),
+];
+
+static MAP_MEMBERS: &[(&str, MemberKind)] = &[
+    ("new", MemberKind::Fn),
+    ("get", MemberKind::Fn),
+    ("set", MemberKind::Fn),
+    ("has", MemberKind::Fn),
+    ("delete", MemberKind::Fn),
+    ("keys", MemberKind::Fn),
+    ("values", MemberKind::Fn),
+    ("entries", MemberKind::Fn),
+];
+
+// ── std/set ──────────────────────────────────────────────────────────────────
+
+static SET_NEW_PARAMS: &[StdParam] = &[];
+static SET_FROM_PARAMS: &[StdParam] = &[StdParam::req("arr", "array")];
+static SET_ADD_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "set"),
+    StdParam::req_untyped("value"),
+];
+static SET_HAS_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "set"),
+    StdParam::req_untyped("value"),
+];
+static SET_DELETE_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "set"),
+    StdParam::req_untyped("value"),
+];
+static SET_SIZE_PARAMS: &[StdParam] = &[StdParam::req("s", "set")];
+static SET_VALUES_PARAMS: &[StdParam] = &[StdParam::req("s", "set")];
+static SET_UNION_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "set"),
+    StdParam::req("b", "set"),
+];
+static SET_INTERSECTION_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "set"),
+    StdParam::req("b", "set"),
+];
+static SET_DIFFERENCE_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "set"),
+    StdParam::req("b", "set"),
+];
+
+static SET_SIGS: &[(&str, StdSig)] = &[
+    ("new", StdSig { params: SET_NEW_PARAMS, ret: Some("set"), doc: "Create an empty set." }),
+    ("from", StdSig { params: SET_FROM_PARAMS, ret: Some("set"), doc: "Build a set from an array, deduplicating elements." }),
+    ("add", StdSig { params: SET_ADD_PARAMS, ret: Some("set"), doc: "Insert a value into the set; returns the set itself for chaining." }),
+    ("has", StdSig { params: SET_HAS_PARAMS, ret: Some("bool"), doc: "Test whether a value is in the set." }),
+    ("delete", StdSig { params: SET_DELETE_PARAMS, ret: Some("bool"), doc: "Remove a value from the set, mutating it in place." }),
+    ("size", StdSig { params: SET_SIZE_PARAMS, ret: Some("number"), doc: "Return the number of elements in the set." }),
+    ("values", StdSig { params: SET_VALUES_PARAMS, ret: Some("array"), doc: "Return an array of the set's elements, in insertion order." }),
+    ("union", StdSig { params: SET_UNION_PARAMS, ret: Some("set"), doc: "Return a new set containing all elements from a and all elements from b not already in a." }),
+    ("intersection", StdSig { params: SET_INTERSECTION_PARAMS, ret: Some("set"), doc: "Return a new set of elements that appear in both a and b." }),
+    ("difference", StdSig { params: SET_DIFFERENCE_PARAMS, ret: Some("set"), doc: "Return a new set of elements that are in a but not in b." }),
+];
+
+static SET_MEMBERS: &[(&str, MemberKind)] = &[
+    ("new", MemberKind::Fn),
+    ("from", MemberKind::Fn),
+    ("add", MemberKind::Fn),
+    ("has", MemberKind::Fn),
+    ("delete", MemberKind::Fn),
+    ("size", MemberKind::Fn),
+    ("values", MemberKind::Fn),
+    ("union", MemberKind::Fn),
+    ("intersection", MemberKind::Fn),
+    ("difference", MemberKind::Fn),
+];
+
+// ── std/bytes ────────────────────────────────────────────────────────────────
+
+static BYTES_ALLOC_PARAMS: &[StdParam] = &[StdParam::req("n", "number")];
+static BYTES_FROM_ARRAY_PARAMS: &[StdParam] = &[StdParam::req("arr", "array")];
+static BYTES_TO_ARRAY_PARAMS: &[StdParam] = &[StdParam::req("b", "bytes")];
+static BYTES_GET_PARAMS: &[StdParam] = &[
+    StdParam::req("b", "bytes"),
+    StdParam::req("i", "number"),
+];
+static BYTES_SET_PARAMS: &[StdParam] = &[
+    StdParam::req("b", "bytes"),
+    StdParam::req("i", "number"),
+    StdParam::req("v", "number"),
+];
+static BYTES_SLICE_PARAMS: &[StdParam] = &[
+    StdParam::req("b", "bytes"),
+    StdParam::req("start", "number"),
+    StdParam::opt("end", "number"),
+];
+static BYTES_CONCAT_PARAMS: &[StdParam] = &[StdParam::variadic("buffers", "bytes")];
+static BYTES_READ_UINT_PARAMS: &[StdParam] = &[
+    StdParam::req("b", "bytes"),
+    StdParam::req("offset", "number"),
+    StdParam::req("n", "number"),
+    StdParam::req("endian", "string"),
+];
+static BYTES_WRITE_UINT_PARAMS: &[StdParam] = &[
+    StdParam::req("b", "bytes"),
+    StdParam::req("offset", "number"),
+    StdParam::req("value", "number"),
+    StdParam::req("n", "number"),
+    StdParam::req("endian", "string"),
+];
+static BYTES_READ_INT_PARAMS: &[StdParam] = &[
+    StdParam::req("b", "bytes"),
+    StdParam::req("offset", "number"),
+    StdParam::req("n", "number"),
+    StdParam::req("endian", "string"),
+];
+static BYTES_WRITE_INT_PARAMS: &[StdParam] = &[
+    StdParam::req("b", "bytes"),
+    StdParam::req("offset", "number"),
+    StdParam::req("value", "number"),
+    StdParam::req("n", "number"),
+    StdParam::req("endian", "string"),
+];
+
+static BYTES_SIGS: &[(&str, StdSig)] = &[
+    ("alloc", StdSig { params: BYTES_ALLOC_PARAMS, ret: Some("bytes"), doc: "Allocate a zero-filled byte buffer of a given length." }),
+    ("fromArray", StdSig { params: BYTES_FROM_ARRAY_PARAMS, ret: Some("bytes"), doc: "Build a byte buffer from an array of integers, each in 0..=255." }),
+    ("toArray", StdSig { params: BYTES_TO_ARRAY_PARAMS, ret: Some("array"), doc: "Convert a byte buffer to an array of numbers." }),
+    ("get", StdSig { params: BYTES_GET_PARAMS, ret: None, doc: "Read the byte at an index; returns nil for out-of-bounds indices." }),
+    ("set", StdSig { params: BYTES_SET_PARAMS, ret: None, doc: "Write a single byte at an index, mutating the buffer in place." }),
+    ("slice", StdSig { params: BYTES_SLICE_PARAMS, ret: Some("bytes"), doc: "Extract a subrange of bytes." }),
+    ("concat", StdSig { params: BYTES_CONCAT_PARAMS, ret: Some("bytes"), doc: "Concatenate any number of byte buffers into a new buffer." }),
+    ("readUint", StdSig { params: BYTES_READ_UINT_PARAMS, ret: Some("int"), doc: "Read an unsigned integer of n bytes from an offset, using the given endianness." }),
+    ("writeUint", StdSig { params: BYTES_WRITE_UINT_PARAMS, ret: None, doc: "Write a non-negative integer of n bytes at an offset, using the given endianness." }),
+    ("readInt", StdSig { params: BYTES_READ_INT_PARAMS, ret: Some("int"), doc: "Read a signed integer of n bytes from an offset, using the given endianness." }),
+    ("writeInt", StdSig { params: BYTES_WRITE_INT_PARAMS, ret: None, doc: "Write a signed integer of n bytes at an offset, using the given endianness." }),
+];
+
+static BYTES_MEMBERS: &[(&str, MemberKind)] = &[
+    ("alloc", MemberKind::Fn),
+    ("fromArray", MemberKind::Fn),
+    ("toArray", MemberKind::Fn),
+    ("get", MemberKind::Fn),
+    ("set", MemberKind::Fn),
+    ("slice", MemberKind::Fn),
+    ("concat", MemberKind::Fn),
+    ("readUint", MemberKind::Fn),
+    ("writeUint", MemberKind::Fn),
+    ("readInt", MemberKind::Fn),
+    ("writeInt", MemberKind::Fn),
+];
+
+// ── std/convert ──────────────────────────────────────────────────────────────
+
+static CONVERT_PARSE_NUMBER_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static CONVERT_PARSE_INT_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "string"),
+    StdParam::with_default("radix", "number", "10"),
+];
+static CONVERT_TO_STRING_PARAMS: &[StdParam] = &[StdParam::req_untyped("v")];
+static CONVERT_TO_NUMBER_PARAMS: &[StdParam] = &[StdParam::req_untyped("v")];
+static CONVERT_TO_BOOL_PARAMS: &[StdParam] = &[StdParam::req_untyped("v")];
+
+static CONVERT_SIGS: &[(&str, StdSig)] = &[
+    ("parseNumber", StdSig { params: CONVERT_PARSE_NUMBER_PARAMS, ret: Some("[float, err]"), doc: "Parse a string as a floating-point number; accepts scientific notation and IEEE-754 specials." }),
+    ("parseInt", StdSig { params: CONVERT_PARSE_INT_PARAMS, ret: Some("[int, err]"), doc: "Parse a string as an integer in a given radix (2–36, default 10)." }),
+    ("toString", StdSig { params: CONVERT_TO_STRING_PARAMS, ret: Some("string"), doc: "Convert any value to its display string form." }),
+    ("toNumber", StdSig { params: CONVERT_TO_NUMBER_PARAMS, ret: Some("float"), doc: "Coerce a value to a float; numbers pass through, booleans and nil are converted, strings are parsed." }),
+    ("toBool", StdSig { params: CONVERT_TO_BOOL_PARAMS, ret: Some("bool"), doc: "Coerce any value to a boolean using AScript's truthiness rules." }),
+];
+
+static CONVERT_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parseNumber", MemberKind::Fn),
+    ("parseInt", MemberKind::Fn),
+    ("toString", MemberKind::Fn),
+    ("toNumber", MemberKind::Fn),
+    ("toBool", MemberKind::Fn),
+];
+
+// ── std/decimal ──────────────────────────────────────────────────────────────
+
+static DECIMAL_FROM_PARAMS: &[StdParam] = &[StdParam::req_untyped("x")];
+static DECIMAL_PARSE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static DECIMAL_TO_STRING_PARAMS: &[StdParam] = &[StdParam::req("d", "decimal")];
+static DECIMAL_TO_NUMBER_PARAMS: &[StdParam] = &[StdParam::req("d", "decimal")];
+static DECIMAL_ROUND_PARAMS: &[StdParam] = &[
+    StdParam::req("d", "decimal"),
+    StdParam::with_default("places", "number", "0"),
+];
+static DECIMAL_ABS_PARAMS: &[StdParam] = &[StdParam::req("d", "decimal")];
+static DECIMAL_FLOOR_PARAMS: &[StdParam] = &[StdParam::req("d", "decimal")];
+static DECIMAL_CEIL_PARAMS: &[StdParam] = &[StdParam::req("d", "decimal")];
+static DECIMAL_TRUNC_PARAMS: &[StdParam] = &[StdParam::req("d", "decimal")];
+
+static DECIMAL_SIGS: &[(&str, StdSig)] = &[
+    ("from", StdSig { params: DECIMAL_FROM_PARAMS, ret: Some("decimal"), doc: "Construct a decimal from a string or number; panics on invalid input." }),
+    ("parse", StdSig { params: DECIMAL_PARSE_PARAMS, ret: Some("[decimal, err]"), doc: "Safely parse a string into a decimal, returning a [decimal, err] pair." }),
+    ("toString", StdSig { params: DECIMAL_TO_STRING_PARAMS, ret: Some("string"), doc: "Convert a decimal to its string representation, preserving scale." }),
+    ("toNumber", StdSig { params: DECIMAL_TO_NUMBER_PARAMS, ret: Some("number"), doc: "Convert a decimal to a floating-point number (lossy)." }),
+    ("round", StdSig { params: DECIMAL_ROUND_PARAMS, ret: Some("decimal"), doc: "Round a decimal to a given number of decimal places using half-away-from-zero." }),
+    ("abs", StdSig { params: DECIMAL_ABS_PARAMS, ret: Some("decimal"), doc: "Return the absolute value." }),
+    ("floor", StdSig { params: DECIMAL_FLOOR_PARAMS, ret: Some("decimal"), doc: "Return the largest integer decimal that is ≤ d." }),
+    ("ceil", StdSig { params: DECIMAL_CEIL_PARAMS, ret: Some("decimal"), doc: "Return the smallest integer decimal that is ≥ d." }),
+    ("trunc", StdSig { params: DECIMAL_TRUNC_PARAMS, ret: Some("decimal"), doc: "Return the integer part of d, truncating toward zero." }),
+];
+
+static DECIMAL_MEMBERS: &[(&str, MemberKind)] = &[
+    ("from", MemberKind::Fn),
+    ("parse", MemberKind::Fn),
+    ("toString", MemberKind::Fn),
+    ("toNumber", MemberKind::Fn),
+    ("round", MemberKind::Fn),
+    ("abs", MemberKind::Fn),
+    ("floor", MemberKind::Fn),
+    ("ceil", MemberKind::Fn),
+    ("trunc", MemberKind::Fn),
+];
+
+// ── std/json ─────────────────────────────────────────────────────────────────
+
+static JSON_PARSE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static JSON_STRINGIFY_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("value"),
+    StdParam::opt("pretty", "bool"),
+];
+
+static JSON_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: JSON_PARSE_PARAMS, ret: Some("[value, err]"), doc: "Parses a JSON string into an AScript value." }),
+    ("stringify", StdSig { params: JSON_STRINGIFY_PARAMS, ret: Some("[string, err]"), doc: "Serializes an AScript value to a JSON string." }),
+];
+
+static JSON_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("stringify", MemberKind::Fn),
+];
+
+// ── std/csv ──────────────────────────────────────────────────────────────────
+
+static CSV_PARSE_PARAMS: &[StdParam] = &[
+    StdParam::req("text", "string"),
+    StdParam::opt("options", "object"),
+];
+static CSV_STRINGIFY_PARAMS: &[StdParam] = &[StdParam::req("rows", "array")];
+
+static CSV_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: CSV_PARSE_PARAMS, ret: Some("[array, err]"), doc: "Parses CSV text into an array of rows." }),
+    ("stringify", StdSig { params: CSV_STRINGIFY_PARAMS, ret: Some("[string, err]"), doc: "Serializes an array of rows to CSV text." }),
+];
+
+static CSV_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("stringify", MemberKind::Fn),
+];
+
+// ── std/regex ────────────────────────────────────────────────────────────────
+
+static REGEX_COMPILE_PARAMS: &[StdParam] = &[StdParam::req("pattern", "string")];
+static REGEX_TEST_PARAMS: &[StdParam] = &[
+    StdParam::req("pattern", "regex | string"),
+    StdParam::req("text", "string"),
+];
+static REGEX_FIND_PARAMS: &[StdParam] = &[
+    StdParam::req("pattern", "regex | string"),
+    StdParam::req("text", "string"),
+];
+static REGEX_FIND_ALL_PARAMS: &[StdParam] = &[
+    StdParam::req("pattern", "regex | string"),
+    StdParam::req("text", "string"),
+];
+static REGEX_REPLACE_PARAMS: &[StdParam] = &[
+    StdParam::req("pattern", "regex | string"),
+    StdParam::req("text", "string"),
+    StdParam::req("replacement", "string"),
+];
+static REGEX_SPLIT_PARAMS: &[StdParam] = &[
+    StdParam::req("pattern", "regex | string"),
+    StdParam::req("text", "string"),
+];
+
+static REGEX_SIGS: &[(&str, StdSig)] = &[
+    ("compile", StdSig { params: REGEX_COMPILE_PARAMS, ret: Some("[regex, err]"), doc: "Compiles a pattern string into a reusable Regex value." }),
+    ("test", StdSig { params: REGEX_TEST_PARAMS, ret: Some("bool"), doc: "Reports whether the pattern matches anywhere in the string." }),
+    ("find", StdSig { params: REGEX_FIND_PARAMS, ret: None, doc: "Finds the first match and its capture groups." }),
+    ("findAll", StdSig { params: REGEX_FIND_ALL_PARAMS, ret: Some("array"), doc: "Finds every non-overlapping match." }),
+    ("replace", StdSig { params: REGEX_REPLACE_PARAMS, ret: Some("string"), doc: "Replaces every match with a replacement string." }),
+    ("split", StdSig { params: REGEX_SPLIT_PARAMS, ret: Some("array"), doc: "Splits a string on every match of the pattern." }),
+];
+
+static REGEX_MEMBERS: &[(&str, MemberKind)] = &[
+    ("compile", MemberKind::Fn),
+    ("test", MemberKind::Fn),
+    ("find", MemberKind::Fn),
+    ("findAll", MemberKind::Fn),
+    ("replace", MemberKind::Fn),
+    ("split", MemberKind::Fn),
+];
+
+// ── std/encoding ─────────────────────────────────────────────────────────────
+
+static ENCODING_BASE64_ENCODE_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static ENCODING_BASE64_DECODE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static ENCODING_HEX_ENCODE_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static ENCODING_HEX_DECODE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static ENCODING_URL_ENCODE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static ENCODING_URL_DECODE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static ENCODING_UTF8_ENCODE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static ENCODING_UTF8_DECODE_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+
+static ENCODING_SIGS: &[(&str, StdSig)] = &[
+    ("base64Encode", StdSig { params: ENCODING_BASE64_ENCODE_PARAMS, ret: Some("string"), doc: "Encodes bytes or a string as a standard base64 string." }),
+    ("base64Decode", StdSig { params: ENCODING_BASE64_DECODE_PARAMS, ret: Some("[bytes, err]"), doc: "Decodes a standard base64 string into bytes." }),
+    ("hexEncode", StdSig { params: ENCODING_HEX_ENCODE_PARAMS, ret: Some("string"), doc: "Encodes bytes or a string as a lowercase hexadecimal string." }),
+    ("hexDecode", StdSig { params: ENCODING_HEX_DECODE_PARAMS, ret: Some("[bytes, err]"), doc: "Decodes a hexadecimal string into bytes." }),
+    ("urlEncode", StdSig { params: ENCODING_URL_ENCODE_PARAMS, ret: Some("string"), doc: "Percent-encodes a string for use in a URL." }),
+    ("urlDecode", StdSig { params: ENCODING_URL_DECODE_PARAMS, ret: Some("[string, err]"), doc: "Decodes a percent-encoded string." }),
+    ("utf8Encode", StdSig { params: ENCODING_UTF8_ENCODE_PARAMS, ret: Some("bytes"), doc: "Encodes a string into its UTF-8 bytes." }),
+    ("utf8Decode", StdSig { params: ENCODING_UTF8_DECODE_PARAMS, ret: Some("[string, err]"), doc: "Decodes a byte array into a string, validating UTF-8." }),
+];
+
+static ENCODING_MEMBERS: &[(&str, MemberKind)] = &[
+    ("base64Encode", MemberKind::Fn),
+    ("base64Decode", MemberKind::Fn),
+    ("hexEncode", MemberKind::Fn),
+    ("hexDecode", MemberKind::Fn),
+    ("urlEncode", MemberKind::Fn),
+    ("urlDecode", MemberKind::Fn),
+    ("utf8Encode", MemberKind::Fn),
+    ("utf8Decode", MemberKind::Fn),
+];
+
+// ── std/toml ─────────────────────────────────────────────────────────────────
+
+static TOML_PARSE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static TOML_STRINGIFY_PARAMS: &[StdParam] = &[StdParam::req("value", "object")];
+
+static TOML_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: TOML_PARSE_PARAMS, ret: Some("[value, err]"), doc: "Parses a TOML string into an AScript value." }),
+    ("stringify", StdSig { params: TOML_STRINGIFY_PARAMS, ret: Some("[string, err]"), doc: "Serializes an AScript value to TOML text." }),
+];
+
+static TOML_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("stringify", MemberKind::Fn),
+];
+
+// ── std/yaml ─────────────────────────────────────────────────────────────────
+
+static YAML_PARSE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static YAML_STRINGIFY_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+
+static YAML_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: YAML_PARSE_PARAMS, ret: Some("[value, err]"), doc: "Parses a YAML string into an AScript value." }),
+    ("stringify", StdSig { params: YAML_STRINGIFY_PARAMS, ret: Some("[string, err]"), doc: "Serializes an AScript value to YAML text." }),
+];
+
+static YAML_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("stringify", MemberKind::Fn),
+];
+
+// ── std/url ──────────────────────────────────────────────────────────────────
+
+static URL_PARSE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static URL_PARSE_QUERY_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static URL_BUILD_QUERY_PARAMS: &[StdParam] = &[StdParam::req("obj", "object")];
+static URL_BUILD_PARAMS: &[StdParam] = &[StdParam::req("obj", "object")];
+static URL_ENCODE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static URL_DECODE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+
+static URL_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: URL_PARSE_PARAMS, ret: Some("[object, err]"), doc: "Parses a URL string into a component object." }),
+    ("parseQuery", StdSig { params: URL_PARSE_QUERY_PARAMS, ret: Some("object"), doc: "Parses an application/x-www-form-urlencoded query string into an object." }),
+    ("buildQuery", StdSig { params: URL_BUILD_QUERY_PARAMS, ret: Some("string"), doc: "Serializes an object into an application/x-www-form-urlencoded query string." }),
+    ("build", StdSig { params: URL_BUILD_PARAMS, ret: Some("[string, err]"), doc: "Assembles a URL string from a component object." }),
+    ("encode", StdSig { params: URL_ENCODE_PARAMS, ret: Some("string"), doc: "Percent-encodes a single URL component." }),
+    ("decode", StdSig { params: URL_DECODE_PARAMS, ret: Some("[string, err]"), doc: "Percent-decodes a URL component." }),
+];
+
+static URL_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("parseQuery", MemberKind::Fn),
+    ("buildQuery", MemberKind::Fn),
+    ("build", MemberKind::Fn),
+    ("encode", MemberKind::Fn),
+    ("decode", MemberKind::Fn),
+];
+
+// ── std/uuid ─────────────────────────────────────────────────────────────────
+
+static UUID_V4_PARAMS: &[StdParam] = &[];
+static UUID_V7_PARAMS: &[StdParam] = &[];
+
+static UUID_SIGS: &[(&str, StdSig)] = &[
+    ("v4", StdSig { params: UUID_V4_PARAMS, ret: Some("string"), doc: "Generates a random (version 4) UUID." }),
+    ("v7", StdSig { params: UUID_V7_PARAMS, ret: Some("string"), doc: "Generates a time-ordered (version 7) UUID based on the current timestamp." }),
+];
+
+static UUID_MEMBERS: &[(&str, MemberKind)] = &[
+    ("v4", MemberKind::Fn),
+    ("v7", MemberKind::Fn),
+];
+
+// ── std/msgpack ──────────────────────────────────────────────────────────────
+
+static MSGPACK_ENCODE_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static MSGPACK_DECODE_PARAMS: &[StdParam] = &[
+    StdParam::req("bytes", "bytes"),
+    StdParam::opt("schema", "class | schema"),
+];
+
+static MSGPACK_SIGS: &[(&str, StdSig)] = &[
+    ("encode", StdSig { params: MSGPACK_ENCODE_PARAMS, ret: Some("bytes"), doc: "Serialize any data value to MessagePack bytes." }),
+    ("decode", StdSig { params: MSGPACK_DECODE_PARAMS, ret: Some("[value, err]"), doc: "Deserialize MessagePack bytes into an AScript value." }),
+];
+
+static MSGPACK_MEMBERS: &[(&str, MemberKind)] = &[
+    ("encode", MemberKind::Fn),
+    ("decode", MemberKind::Fn),
+];
+
+// ── std/cbor ─────────────────────────────────────────────────────────────────
+
+static CBOR_ENCODE_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static CBOR_DECODE_PARAMS: &[StdParam] = &[
+    StdParam::req("bytes", "bytes"),
+    StdParam::opt("schema", "class | schema"),
+];
+
+static CBOR_SIGS: &[(&str, StdSig)] = &[
+    ("encode", StdSig { params: CBOR_ENCODE_PARAMS, ret: Some("bytes"), doc: "Serialize any data value to CBOR bytes." }),
+    ("decode", StdSig { params: CBOR_DECODE_PARAMS, ret: Some("[value, err]"), doc: "Deserialize CBOR bytes into an AScript value." }),
+];
+
+static CBOR_MEMBERS: &[(&str, MemberKind)] = &[
+    ("encode", MemberKind::Fn),
+    ("decode", MemberKind::Fn),
+];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Master index (covers ONLY the three implemented modules for Task 1.1)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -599,12 +1132,48 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/math", MATH_MEMBERS),
     ("std/string", STRING_MEMBERS),
     ("std/array", ARRAY_MEMBERS),
+    ("std/object", OBJECT_MEMBERS),
+    ("std/map", MAP_MEMBERS),
+    ("std/set", SET_MEMBERS),
+    ("std/bytes", BYTES_MEMBERS),
+    ("std/convert", CONVERT_MEMBERS),
+    ("std/decimal", DECIMAL_MEMBERS),
+    ("std/json", JSON_MEMBERS),
+    ("std/csv", CSV_MEMBERS),
+    ("std/regex", REGEX_MEMBERS),
+    ("std/encoding", ENCODING_MEMBERS),
+    ("std/toml", TOML_MEMBERS),
+    ("std/yaml", YAML_MEMBERS),
+    ("std/url", URL_MEMBERS),
+    ("std/uuid", UUID_MEMBERS),
+    ("std/msgpack", MSGPACK_MEMBERS),
+    ("std/cbor", CBOR_MEMBERS),
 ];
 
 /// The three modules covered in Task 1.1.
 /// Task 1.2 deletes this const and the `table_is_still_partial_pending_task_1_2` test
 /// once ALL of STD_MODULES is filled.
-pub const IMPLEMENTED_MODULES: &[&str] = &["std/math", "std/string", "std/array"];
+pub const IMPLEMENTED_MODULES: &[&str] = &[
+    "std/math",
+    "std/string",
+    "std/array",
+    "std/object",
+    "std/map",
+    "std/set",
+    "std/bytes",
+    "std/convert",
+    "std/decimal",
+    "std/json",
+    "std/csv",
+    "std/regex",
+    "std/encoding",
+    "std/toml",
+    "std/yaml",
+    "std/url",
+    "std/uuid",
+    "std/msgpack",
+    "std/cbor",
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public lookup API (spec §2.1)
@@ -617,6 +1186,22 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/math" => MATH_SIGS,
         "std/string" => STRING_SIGS,
         "std/array" => ARRAY_SIGS,
+        "std/object" => OBJECT_SIGS,
+        "std/map" => MAP_SIGS,
+        "std/set" => SET_SIGS,
+        "std/bytes" => BYTES_SIGS,
+        "std/convert" => CONVERT_SIGS,
+        "std/decimal" => DECIMAL_SIGS,
+        "std/json" => JSON_SIGS,
+        "std/csv" => CSV_SIGS,
+        "std/regex" => REGEX_SIGS,
+        "std/encoding" => ENCODING_SIGS,
+        "std/toml" => TOML_SIGS,
+        "std/yaml" => YAML_SIGS,
+        "std/url" => URL_SIGS,
+        "std/uuid" => UUID_SIGS,
+        "std/msgpack" => MSGPACK_SIGS,
+        "std/cbor" => CBOR_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -657,6 +1242,22 @@ mod tests {
             ("std/math", MATH_SIGS),
             ("std/string", STRING_SIGS),
             ("std/array", ARRAY_SIGS),
+            ("std/object", OBJECT_SIGS),
+            ("std/map", MAP_SIGS),
+            ("std/set", SET_SIGS),
+            ("std/bytes", BYTES_SIGS),
+            ("std/convert", CONVERT_SIGS),
+            ("std/decimal", DECIMAL_SIGS),
+            ("std/json", JSON_SIGS),
+            ("std/csv", CSV_SIGS),
+            ("std/regex", REGEX_SIGS),
+            ("std/encoding", ENCODING_SIGS),
+            ("std/toml", TOML_SIGS),
+            ("std/yaml", YAML_SIGS),
+            ("std/url", URL_SIGS),
+            ("std/uuid", UUID_SIGS),
+            ("std/msgpack", MSGPACK_SIGS),
+            ("std/cbor", CBOR_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {
