@@ -277,22 +277,9 @@ pub(crate) fn render_sig_label(
 }
 
 fn format_std_param(p: &crate::check::std_sigs::StdParam) -> String {
-    let mut s = String::new();
-    if p.variadic {
-        s.push_str("...");
-    }
-    s.push_str(p.name);
-    if let Some(ty) = p.ty {
-        s.push_str(": ");
-        s.push_str(ty);
-    }
-    if p.optional && !p.variadic {
-        if let Some(def) = p.default {
-            s.push_str(" = ");
-            s.push_str(def);
-        }
-    }
-    s
+    // Delegate to the shared per-param renderer so signature-help labels and
+    // completion detail never diverge on optional `?` / variadic `...` notation.
+    crate::check::std_sigs::render_param(p)
 }
 
 /// Count UTF-16 code units in a string (BMP chars = 1, supplementary = 2).

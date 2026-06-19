@@ -2841,14 +2841,33 @@ pub(crate) fn all_modules() -> &'static [(&'static str, &'static [(&'static str,
 /// Render a `StdSig` into a concise `(params...) -> ret` detail string suitable
 /// for the LSP `CompletionItem.detail` field.  Purely formatting — no allocation
 /// at lookup time when the result is cached by the caller.
+/// Render ONE param for display: `...`(variadic) + name + `?`(optional) + `: ty`.
+/// The single per-param renderer shared by completion detail (`render_sig_detail`)
+/// and signature-help labels (`signature.rs::format_std_param`) so the two
+/// consumers never diverge on optionality/variadic notation.
+pub fn render_param(p: &StdParam) -> String {
+    let mut s = String::new();
+    if p.variadic {
+        s.push_str("...");
+    }
+    s.push_str(p.name);
+    if p.optional {
+        s.push('?');
+    }
+    if let Some(ty) = p.ty {
+        s.push_str(": ");
+        s.push_str(ty);
+    }
+    s
+}
+
 pub fn render_sig_detail(sig: &StdSig) -> String {
     let mut s = String::from("(");
     for (i, p) in sig.params.iter().enumerate() {
-        if i > 0 { s.push_str(", "); }
-        if p.variadic { s.push_str("..."); }
-        s.push_str(p.name);
-        if p.optional { s.push('?'); }
-        if let Some(ty) = p.ty { s.push_str(": "); s.push_str(ty); }
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&render_param(p));
     }
     s.push(')');
     if let Some(ret) = sig.ret {
