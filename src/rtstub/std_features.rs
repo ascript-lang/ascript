@@ -65,6 +65,7 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     ("std/net/http",    Some("net")),
     ("std/http/server", Some("net")),
     ("std/net/udp",     Some("net")),
+    ("std/net/unix",    Some("net")),
     ("std/net/ws",      Some("net")),
     ("std/regex",       Some("data")),
     ("std/sqlite",      Some("sql")),
@@ -80,6 +81,7 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     ("std/tui",         Some("tui")),
     ("std/ffi",         Some("ffi")),
     ("std/resilience",  Some("resilience")),
+    ("std/docker",      Some("docker")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.
@@ -104,6 +106,9 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     // ai = ["data", "net", "dep:genai"]
     ("ai", "data"),
     ("ai", "net"),
+    // docker = ["net", "data"]
+    ("docker", "net"),
+    ("docker", "data"),
     // pkg = ["net", "compress", "dep:base64"]
     // (pkg is toolchain-only but included so required_features closure is complete
     //  if someone ever maps a pkg-requiring import — currently no std module needs it)
