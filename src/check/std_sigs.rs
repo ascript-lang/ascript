@@ -1454,6 +1454,39 @@ static COMPRESS_MEMBERS: &[(&str, MemberKind)] = &[
     ("tarExtract", MemberKind::Fn),
 ];
 
+// ── std/archive (BATT B1 §6) ──────────────────────────────────────────────────
+
+static ARCHIVE_TAR_WRITER_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+static ARCHIVE_TAR_ENTRIES_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static ARCHIVE_TAR_APPEND_PARAMS: &[StdParam] = &[
+    StdParam::req("data", "bytes"),
+    StdParam::req("additions", "array"),
+];
+// archiveWriter handle methods (MemberKind::HandleMethod in ARCHIVE_MEMBERS).
+static ARCHIVE_ADD_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req_untyped("data"),
+    StdParam::opt("opts", "object"),
+];
+static ARCHIVE_FINISH_PARAMS: &[StdParam] = &[];
+
+static ARCHIVE_SIGS: &[(&str, StdSig)] = &[
+    ("tarWriter", StdSig { params: ARCHIVE_TAR_WRITER_PARAMS, ret: Some("archiveWriter"), doc: "Opens a streaming tar writer handle. opts: {gzip?, deterministic?}." }),
+    ("tarEntries", StdSig { params: ARCHIVE_TAR_ENTRIES_PARAMS, ret: Some("generator"), doc: "Lazily decodes a (optionally gzipped) tar, yielding one {name, size, mode, isDir, data} per entry; a corrupt entry yields a [nil, err] pair." }),
+    ("tarAppend", StdSig { params: ARCHIVE_TAR_APPEND_PARAMS, ret: Some("[bytes, err]"), doc: "Decodes a tar (preserving its entries) and appends {name, data, mode?, dir?} additions, returning the new archive bytes." }),
+    // archiveWriter handle methods (BATT B1 §6).
+    ("add", StdSig { params: ARCHIVE_ADD_PARAMS, ret: None, doc: "Appends one entry to a tar writer. opts: {dir?, mode?, mtime?}." }),
+    ("finish", StdSig { params: ARCHIVE_FINISH_PARAMS, ret: Some("bytes"), doc: "Finalizes a tar writer and returns the assembled bytes (gzip-wrapped if the writer was opened with {gzip:true})." }),
+];
+static ARCHIVE_MEMBERS: &[(&str, MemberKind)] = &[
+    ("tarWriter", MemberKind::Fn),
+    ("tarEntries", MemberKind::Fn),
+    ("tarAppend", MemberKind::Fn),
+    // archiveWriter handle methods — not module exports.
+    ("add", MemberKind::HandleMethod),
+    ("finish", MemberKind::HandleMethod),
+];
+
 // ── std/net ───────────────────────────────────────────────────────────────────
 
 static NET_LOOKUP_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
@@ -2844,6 +2877,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/resilience", RESIL_MEMBERS),
     ("std/jwt", JWT_MEMBERS),
     ("std/oauth", OAUTH_MEMBERS),
+    ("std/archive", ARCHIVE_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2918,6 +2952,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/resilience" => RESIL_SIGS,
         "std/jwt" => JWT_SIGS,
         "std/oauth" => OAUTH_SIGS,
+        "std/archive" => ARCHIVE_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -3093,6 +3128,7 @@ mod tests {
             ("std/resilience", RESIL_SIGS),
             ("std/jwt", JWT_SIGS),
             ("std/oauth", OAUTH_SIGS),
+            ("std/archive", ARCHIVE_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {

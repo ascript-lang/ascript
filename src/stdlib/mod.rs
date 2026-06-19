@@ -18,6 +18,8 @@ pub mod color;
 #[cfg(feature = "compress")]
 pub mod compress;
 pub mod convert;
+#[cfg(feature = "archive")]
+pub mod archive;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "docker")]
@@ -236,6 +238,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/jwt" => jwt::exports(),
         #[cfg(feature = "auth")]
         "std/oauth" => oauth::exports(),
+        #[cfg(feature = "archive")]
+        "std/archive" => archive::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -312,6 +316,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/docker",
     "std/jwt",
     "std/oauth",
+    "std/archive",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -431,6 +436,16 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         // which also carry network egress). `--deny net`/`--sandbox` blocks it.
         #[cfg(feature = "auth")]
         "oauth" => CapReq::one(Cap::Net),
+        // BATT B1 §6 — `std/archive` is PER-FUNC: the in-memory streaming fns
+        // (`tarWriter`/`tarEntries`/`tarAppend`) touch no OS resource → ungated; the
+        // disk fns (`tarExtractTo`/`zipExtractTo`/`tarCreateFromDir`, added in B2)
+        // read or write the host filesystem → `Fs`. Wiring the `Fs` arm now so the
+        // gate is correct the moment B2 lands the disk fns.
+        #[cfg(feature = "archive")]
+        "archive" => match func {
+            "tarExtractTo" | "zipExtractTo" | "tarCreateFromDir" => CapReq::one(Cap::Fs),
+            _ => CapReq::NONE,
+        },
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
@@ -681,6 +696,8 @@ impl Interp {
             "jwt" => self.call_jwt_async(func, args, span).await,
             #[cfg(feature = "auth")]
             "oauth" => self.call_oauth(func, args, span).await,
+            #[cfg(feature = "archive")]
+            "archive" => archive::call(self, func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1154,6 +1171,17 @@ mod cap_gate_tests {
         assert!(required_cap("caps", "drop").is_empty());
         // resilience is pure / in-memory.
         assert!(required_cap("resilience", "breaker").is_empty());
+        // BATT B1 §6 — archive is PER-FUNC: streaming/in-memory fns ungated; the
+        // disk fns (B2) → Fs.
+        #[cfg(feature = "archive")]
+        {
+            assert!(required_cap("archive", "tarWriter").is_empty());
+            assert!(required_cap("archive", "tarEntries").is_empty());
+            assert!(required_cap("archive", "tarAppend").is_empty());
+            assert_eq!(req("archive", "tarExtractTo"), vec![Cap::Fs]);
+            assert_eq!(req("archive", "zipExtractTo"), vec![Cap::Fs]);
+            assert_eq!(req("archive", "tarCreateFromDir"), vec![Cap::Fs]);
+        }
     }
 
     /// Drift guard: every resource-acquiring module string the dispatch match
@@ -1243,9 +1271,10 @@ mod cap_gate_tests {
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");
-            if key == "os" || key == "jwt" {
+            if key == "os" || key == "jwt" || key == "archive" {
                 // Per-func gating (covered above): os (topology→Net, ambient→None);
-                // jwt (BATT §5.4 — jwks→Net, sign/verify/decode/hmacKey→None). The
+                // jwt (BATT §5.4 — jwks→Net, sign/verify/decode/hmacKey→None);
+                // archive (BATT B1 §6 — disk fns→Fs, streaming/in-memory→None). The
                 // whole-module `__probe__` verdict cannot represent a per-func split.
                 continue;
             }

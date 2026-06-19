@@ -87,6 +87,9 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // needs the net tier (jwks fetch + oauth token calls) — see FEATURE_DEPS.
     ("std/jwt",         Some("auth")),
     ("std/oauth",       Some("auth")),
+    // BATT Phase B — std/archive is gated on the `archive` feature (archive =
+    // compress), so an archive-using bundle pulls the compression tier.
+    ("std/archive",     Some("archive")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.
@@ -125,6 +128,9 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     ("auth", "crypto"),
     ("auth", "data"),
     ("auth", "net"),
+    // BATT Phase B — archive = ["compress"]. A std/archive bundle pulls the
+    // compression tier (tar/gzip over the vendored tar/flate2).
+    ("archive", "compress"),
 ];
 
 /// Collect all `std/` module specifiers imported anywhere in `archive`.

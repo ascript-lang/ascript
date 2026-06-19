@@ -13,6 +13,7 @@ Most of these modules are gated behind Cargo features, all of which are **on by 
 | `std/os` (live metrics: memory, swap, cpuUsage, loadAvg, disks, uptime, networkInterfaces, localIp) | `sysinfo` |
 | `std/crypto` | `crypto` |
 | `std/compress` | `compress` |
+| `std/archive` | `archive` |
 
 > [!TIER1]
 > Fallible I/O follows the **Tier-1** convention: the function returns a `[value, err]` pair. On success `err` is `nil`; on failure `value` is `nil` and `err` is an error object with a `message` field. Always destructure and check, e.g. `let [text, err] = read(path)`.
@@ -956,4 +957,88 @@ is a Tier-2 panic; an I/O failure is Tier-1.
 import { tarCreate, tarExtract } from "std/compress"
 let [archive, e1] = tarCreate([{ name: "a.txt", data: "hello" }])
 let [entries, e2] = tarExtract(archive)
+```
+
+## std/archive
+
+`std/archive` (Cargo feature `archive`, on by default) is the **streaming** superset
+of `std/compress`'s one-shot `tarCreate`/`tarExtract`. Where the compress helpers
+build or read a whole archive in one call, `std/archive` lets you assemble a tar
+incrementally through a **writer handle** and consume one through a **lazy entries
+generator** — so large archives never need to live fully materialized as an entry
+array.
+
+The decoder is **hardened against hostile input**: every allocation is bounded
+(a per-entry cap rejects a header that declares a giant size before any buffer is
+allocated), and a truncated, corrupt, or non-tar stream produces a clean Tier-1
+error rather than a panic or an out-of-memory abort.
+
+> [!NOTE]
+> The disk-touching helpers (`tarExtractTo`, `zipExtractTo`, `tarCreateFromDir`)
+> are filesystem-gated (`Fs` capability) and land in a follow-up; the streaming
+> functions below are pure in-memory and run under `--sandbox`.
+
+### archive.tarWriter
+
+`tarWriter(opts?)` opens a streaming tar writer and returns a handle. The options
+object accepts `gzip` (when true, `finish()` returns gzip-wrapped bytes — a
+`.tar.gz`) and `deterministic` (when true, each entry's mtime/uid/gid is zeroed so
+two identical add-sequences produce **byte-identical** output — reproducible builds).
+
+The handle has two methods. `add(name, data, opts?)` appends one entry — `data` is
+bytes, a string, or `nil`, and the per-entry options are `dir` (write a directory
+entry — `data` is ignored), `mode` (octal permission bits, default `0o644` for
+files / `0o755` for directories), and `mtime`. `finish()` finalizes the archive and
+returns the assembled `bytes`; the handle is then consumed, so calling `add` after
+`finish` is a Tier-2 panic.
+
+```ascript
+import { tarWriter } from "std/archive"
+
+let w = tarWriter({ gzip: true, deterministic: true })
+w.add("README.md", "# hello\n")
+w.add("src/", nil, { dir: true })
+w.add("src/main.as", readFileBytes(), { mode: 0o600 })
+let bytes = w.finish()    // gzip-wrapped tar bytes
+```
+
+### archive.tarEntries
+
+`tarEntries(bytes)` returns a **lazy generator** over a (optionally gzipped — the
+gzip magic is auto-sniffed) tar. Each `next()` decodes one entry and yields an
+object `{ name, size, mode, isDir, data }`. Drive it with `for await`:
+
+```ascript
+import { tarEntries } from "std/archive"
+
+for await (e of tarEntries(bytes)) {
+  if (e.isDir) { continue }
+  print(`${e.name} (${e.size} bytes)`)
+}
+```
+
+If an entry's header is corrupt or the stream is truncated, the **prior entries
+still yield normally**, and the generator surfaces the failure as a final
+`[nil, err]` Tier-1 pair on the pull that reaches the bad entry — so iteration is
+both lazy and fail-safe:
+
+```ascript
+for await (e of tarEntries(bytes)) {
+  if (type(e) == "array") {          // a [nil, err] error sentinel
+    print(`stopped: ${e[1].message}`)
+  } else {
+    print(e.name)
+  }
+}
+```
+
+### archive.tarAppend
+
+`tarAppend(data, additions)` decodes an existing tar (preserving every entry) and
+appends each `{ name, data, mode?, dir? }` of the `additions` array, returning the
+new archive bytes. It is Tier-1: a corrupt source archive yields `[nil, err]`.
+
+```ascript
+import { tarAppend } from "std/archive"
+let [updated, err] = tarAppend(existing, [{ name: "CHANGELOG", data: "v2\n" }])
 ```

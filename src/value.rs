@@ -1341,6 +1341,15 @@ pub enum NativeKind {
     // without `auth` (mirrors the docker/resilience pattern).
     #[cfg(feature = "auth")]
     JwksCache,
+    // BATT B1 §6: a `std/archive` streaming tar writer handle (`tarWriter(opts?)`).
+    // Backed by `ResourceState::ArchiveWriter` — an in-memory `tar::Builder`
+    // (optionally gzip-wrapped, optionally deterministic). Methods: `add(name,
+    // data, opts?)` and `finish()` (returns the assembled bytes + finalizes the
+    // handle). In-memory only → `governing_caps` = NONE (ungated; works under
+    // `--sandbox`). GC-untraced (a plain byte buffer reclaimed by Drop), non-
+    // sendable. Feature-gated — compiled out without `archive`.
+    #[cfg(feature = "archive")]
+    ArchiveWriter,
 }
 
 impl NativeKind {
@@ -1405,6 +1414,8 @@ impl NativeKind {
             NativeKind::DockerStream => "dockerStream",
             #[cfg(feature = "auth")]
             NativeKind::JwksCache => "jwksCache",
+            #[cfg(feature = "archive")]
+            NativeKind::ArchiveWriter => "archiveWriter",
         }
     }
 
@@ -1481,6 +1492,11 @@ impl NativeKind {
             // RESIL §2.2: no OS resource — a pure in-memory marker.
             #[cfg(feature = "resilience")]
             NativeKind::Resilience => CapReq::NONE,
+            // BATT B1 §6: a tar writer assembles bytes in memory — no OS effect at
+            // method time (the disk write is the caller's job) → ungated; `add`/
+            // `finish` work under `--sandbox`.
+            #[cfg(feature = "archive")]
+            NativeKind::ArchiveWriter => CapReq::NONE,
             // CNTR §5.3: operating a docker client drives the Engine API over the
             // network AND can spawn host processes — net ∧ process, the same
             // conjunction the dispatch gate enforces, so a `caps.drop` HOLDS.

@@ -598,6 +598,13 @@ pub(crate) enum ResourceState {
     /// untraced (plain data reclaimed by Drop). Feature `auth`.
     #[cfg(feature = "auth")]
     JwksCache(Box<crate::stdlib::jwt::JwksCacheState>),
+    /// BATT B1 §6: a `std/archive` streaming tar writer (`tarWriter(opts?)`). An
+    /// in-memory `tar::Builder` (optionally gzip-wrapped, optionally
+    /// deterministic). `add` appends one entry; `finish` consumes the builder and
+    /// returns the assembled bytes (the handle is then `Consumed`). GC-untraced
+    /// (a plain byte buffer reclaimed by Drop). Feature `archive`.
+    #[cfg(feature = "archive")]
+    ArchiveWriter(Box<crate::stdlib::archive::ArchiveWriterState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5688,6 +5695,12 @@ impl Interp {
         {
             if matches!(m.receiver.kind, crate::value::NativeKind::JwksCache) {
                 return self.call_jwks_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "archive")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::ArchiveWriter) {
+                return crate::stdlib::archive::call_writer_method(self, &m, &args, span);
             }
         }
         #[cfg(feature = "telemetry")]

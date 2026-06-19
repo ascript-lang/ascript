@@ -219,6 +219,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/docker", "docker.md"),
     ("std/jwt", "auth.md"),
     ("std/oauth", "auth.md"),
+    ("std/archive", "system.md"),
 ];
 
 /// Pure checker (mutation-self-testable): validates a mapping against a module
