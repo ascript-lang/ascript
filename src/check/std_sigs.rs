@@ -2669,6 +2669,7 @@ static RESIL_MEMBERS: &[(&str, MemberKind)] = &[
 // ── std/jwt (BATT §5) ─────────────────────────────────────────────────────────
 
 static JWT_HMAC_KEY_PARAMS: &[StdParam] = &[StdParam::req("secret", "string | bytes")];
+static JWT_PEM_KEY_PARAMS: &[StdParam] = &[StdParam::req("pem", "string")];
 static JWT_SIGN_PARAMS: &[StdParam] = &[
     StdParam::req("claims", "object"),
     StdParam::req_untyped("key"),
@@ -2683,6 +2684,10 @@ static JWT_DECODE_PARAMS: &[StdParam] = &[StdParam::req("token", "string")];
 
 static JWT_SIGS: &[(&str, StdSig)] = &[
     ("hmacKey", StdSig { params: JWT_HMAC_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed HMAC key for HS256/HS384/HS512." }),
+    ("rsaPublicKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed RSA public key (RS256) from a PEM string, validated at construction." }),
+    ("rsaPrivateKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed RSA private key (RS256) from a PEM string, validated at construction." }),
+    ("ecPublicKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed EC (P-256) public key (ES256) from a PEM string, validated at construction." }),
+    ("ecPrivateKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed EC (P-256) private key (ES256) from a PEM string, validated at construction." }),
     ("sign", StdSig { params: JWT_SIGN_PARAMS, ret: Some("[string, err]"), doc: "Signs claims into a compact JWT with a typed key." }),
     ("verify", StdSig { params: JWT_VERIFY_PARAMS, ret: Some("[object, err]"), doc: "Verifies a JWT against a typed key, intersecting the header alg with the key kind's algorithm set." }),
     ("decode", StdSig { params: JWT_DECODE_PARAMS, ret: Some("[object, err]"), doc: "Decodes a JWT WITHOUT verifying its signature (inspection only)." }),
@@ -2690,6 +2695,10 @@ static JWT_SIGS: &[(&str, StdSig)] = &[
 
 static JWT_MEMBERS: &[(&str, MemberKind)] = &[
     ("hmacKey", MemberKind::Fn),
+    ("rsaPublicKey", MemberKind::Fn),
+    ("rsaPrivateKey", MemberKind::Fn),
+    ("ecPublicKey", MemberKind::Fn),
+    ("ecPrivateKey", MemberKind::Fn),
     ("sign", MemberKind::Fn),
     ("verify", MemberKind::Fn),
     ("decode", MemberKind::Fn),

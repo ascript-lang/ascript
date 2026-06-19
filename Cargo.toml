@@ -398,7 +398,8 @@ docker = ["net", "data"]
 tls = ["net", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 # BATT §5 — auth: std/jwt (HS via hmac+sha2; RS256 via rsa; ES256 via p256), std/oauth,
 # signed cookies/sessions. Pulls crypto+data+net + the asymmetric crates (lock-resident).
-auth = ["crypto", "data", "net", "dep:rsa", "dep:p256"]
+# `sha2/oid` is required by `rsa`'s pkcs1v15 SigningKey/VerifyingKey (D: AssociatedOid).
+auth = ["crypto", "data", "net", "dep:rsa", "dep:p256", "sha2/oid"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"

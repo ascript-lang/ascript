@@ -8,9 +8,12 @@ algorithm family it can ever be used with, and `jwt.verify` only accepts a token
 `alg` lies in the intersection of the key's family, the caller's allowlist, and (never) anything
 the token itself claims about where to find a key.
 
-A5 ships the HMAC family — **HS256 / HS384 / HS512** (built on `std/crypto`'s `hmac` + `sha2`).
-RS256 (RSA) and ES256 (P-256) keys, plus JWKS fetching, arrive in a later unit and slot in
-without changing any of the verification logic below.
+`std/jwt` ships three signature families: the **HMAC** family — **HS256 / HS384 / HS512** (built
+on `std/crypto`'s `hmac` + `sha2`) — and the **asymmetric** families **RS256** (RSA, RSASSA-PKCS1-v1_5
+over SHA-256) and **ES256** (ECDSA on the P-256 curve over SHA-256). The asymmetric keys are typed
+exactly like the HMAC key, so the algorithm-confusion defense below extends to them unchanged: an
+RSA/EC **public** key can never HMAC-verify, and an RS256 key can never reach the ES256 path (or
+vice versa).
 
 ```ascript
 import * as jwt from "std/jwt"
@@ -41,6 +44,10 @@ key's kind fixes the algorithm set it can ever participate in:
 | Key kind | Constructor | Algorithms |
 | --- | --- | --- |
 | `hmac` | `jwt.hmacKey(secret)` | HS256, HS384, HS512 |
+| `rsa-public` | `jwt.rsaPublicKey(pem)` | RS256 (verify) |
+| `rsa-private` | `jwt.rsaPrivateKey(pem)` | RS256 (sign + verify) |
+| `ec-public` | `jwt.ecPublicKey(pem)` | ES256 (verify) |
+| `ec-private` | `jwt.ecPrivateKey(pem)` | ES256 (sign + verify) |
 
 `jwt.verify` computes `allowed = algorithms(key) ∩ (opts.algs or algorithms(key))` and rejects any
 token whose header `alg` is not in `allowed`. Three consequences follow directly:
@@ -62,12 +69,57 @@ leaks before the token is proven genuine.
 
 Builds a typed HMAC key usable for HS256/HS384/HS512. `secret` is a `string` or `bytes`.
 
+### `jwt.rsaPublicKey(pem)`
+
+Builds a typed RSA **public** key (RS256, verify-only) from a `pem` string (SPKI or PKCS#1). The
+PEM is validated at construction — a malformed or non-RSA PEM returns a Tier-1 `[nil, err]`.
+
+### `jwt.rsaPrivateKey(pem)`
+
+Builds a typed RSA **private** key (RS256, sign + verify) from a `pem` string (PKCS#8 or PKCS#1).
+Validated at construction.
+
+### `jwt.ecPublicKey(pem)`
+
+Builds a typed EC **public** key (ES256, on the P-256 curve, verify-only) from a `pem` string
+(SPKI). Validated at construction — a non-EC or non-P-256 PEM is a Tier-1 error.
+
+### `jwt.ecPrivateKey(pem)`
+
+Builds a typed EC **private** key (ES256, sign + verify) from a `pem` string (PKCS#8 or SEC1).
+Validated at construction.
+
+## RS256 and ES256 (asymmetric signing)
+
+```ascript
+import * as jwt from "std/jwt"
+
+let signKey = jwt.rsaPrivateKey(privatePem)   // or jwt.ecPrivateKey(...)
+let verifyKey = jwt.rsaPublicKey(publicPem)   // or jwt.ecPublicKey(...)
+
+let [token, _] = jwt.sign({ sub: "alice" }, signKey)              // alg defaults to RS256 / ES256
+let [claims, err] = jwt.verify(token, verifyKey, { algs: ["RS256"] })
+```
+
+Asymmetric keys **store the PEM text** in the key object (the `__jwtkey` tag shows the kind; the
+material is an ordinary field) and re-parse it per operation — keys are not a hot path, and this
+keeps a key both sendable across the worker airlock and printable-safe. Treat the PEM string as you
+would any secret.
+
+::: warning
+**ES256 signatures are fixed-width JOSE (r‖s), never DER.** Per RFC 7518 §3.4 the ECDSA signature is
+the 64-byte concatenation of `r` and `s`, *not* the variable-length ASN.1/DER encoding. `jwt.sign`
+emits the fixed-width form and `jwt.verify` accepts only the fixed-width form — a DER-encoded
+signature (`0x30…`) is rejected by construction.
+:::
+
 ### `jwt.sign(claims, key, opts?)`
 
 Signs `claims` (an object) into a compact JWT string with `key`. Returns `[token, err]`. Claim
 order follows the object's insertion order. `opts`:
 
-- `alg?: string` — one of `HS256`/`HS384`/`HS512` (default `HS256`); must be valid for the key kind.
+- `alg?: string` — one of `HS256`/`HS384`/`HS512`/`RS256`/`ES256`; must be valid for the key kind.
+  Defaults to `HS256` for an HMAC key, or the key kind's sole algorithm (`RS256`/`ES256`) otherwise.
 - `headers?: object` — extra protected headers (e.g. `kid`); cannot override `alg`/`typ`.
 - `expiresIn?: number` — seconds; sets `exp` from the (deterministic-seam) clock.
 

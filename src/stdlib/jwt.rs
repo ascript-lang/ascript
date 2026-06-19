@@ -4,9 +4,39 @@
 //! is rejected before dispatch. Verification failure is Tier-1 [nil, err] ALWAYS
 //! (auth failures are control flow); a non-key where a key is due is Tier-2.
 //!
-//! A5 wires only the `hmac` key kind (HS256/HS384/HS512 over `hmac` + `sha2`).
-//! The `rsa-*`/`ec-*` arms of `algs_for_key_kind` are placeholders A6 fills — so
-//! A6 is purely additive and never re-touches the alg-intersection logic.
+//! A5 wires the `hmac` key kind (HS256/HS384/HS512 over `hmac` + `sha2`); A6 fills
+//! the `rsa-*` (RS256, `rsa` crate) and `ec-*` (ES256, `p256` crate) arms — purely
+//! additive, never re-touching the alg-intersection logic.
+//!
+//! ## Asymmetric keys (A6)
+//!
+//! `jwt.rsaPublicKey`/`rsaPrivateKey`/`ecPublicKey`/`ecPrivateKey` each take a PEM
+//! string, VALIDATE it at construction (a bad/wrong-kind PEM is a Tier-1 error),
+//! and STORE the PEM TEXT in the tagged Object — the key is re-parsed per
+//! sign/verify op. Keys aren't a hot path; storing the PEM (not an opaque native
+//! handle) keeps a key SENDABLE across the worker airlock and PRINTABLE-safe: the
+//! `__jwtkey` tag shows the kind while the key material stays an ordinary string
+//! field. (Treat the PEM string as you would any secret — it is the key material.)
+//!
+//! ## ES256 JOSE encoding (the security pin)
+//!
+//! The ECDSA signature is the FIXED-WIDTH 64-byte `r||s` concatenation (JOSE / RFC
+//! 7518 §3.4), NOT ASN.1/DER. Sign uses `Signature::to_bytes()`; verify uses
+//! `Signature::from_slice` (which is fixed-width and rejects a DER `0x30…` blob by
+//! construction). The `from_der` path is NEVER used — a DER sig must fail verify.
+//!
+//! ## Regenerating the test fixtures (`testdata/jwt_{rsa,ec}_{priv,pub}.pem`)
+//!
+//! ```sh
+//! openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+//!     -out src/stdlib/testdata/jwt_rsa_priv.pem
+//! openssl pkey -in src/stdlib/testdata/jwt_rsa_priv.pem -pubout \
+//!     -out src/stdlib/testdata/jwt_rsa_pub.pem
+//! openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+//!     -out src/stdlib/testdata/jwt_ec_priv.pem
+//! openssl pkey -in src/stdlib/testdata/jwt_ec_priv.pem -pubout \
+//!     -out src/stdlib/testdata/jwt_ec_pub.pem
+//! ```
 
 use super::{arg, bi, want_object};
 use crate::error::AsError;
@@ -31,6 +61,10 @@ const MAX_SEGMENT: usize = 1024 * 1024;
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
         ("hmacKey", bi("jwt.hmacKey")),
+        ("rsaPublicKey", bi("jwt.rsaPublicKey")),
+        ("rsaPrivateKey", bi("jwt.rsaPrivateKey")),
+        ("ecPublicKey", bi("jwt.ecPublicKey")),
+        ("ecPrivateKey", bi("jwt.ecPrivateKey")),
         ("sign", bi("jwt.sign")),
         ("verify", bi("jwt.verify")),
         ("decode", bi("jwt.decode")),
@@ -179,6 +213,10 @@ impl Interp {
     ) -> Result<Value, Control> {
         match func {
             "hmacKey" => jwt_hmac_key(args, span),
+            "rsaPublicKey" => jwt_rsa_public_key(args, span),
+            "rsaPrivateKey" => jwt_rsa_private_key(args, span),
+            "ecPublicKey" => jwt_ec_public_key(args, span),
+            "ecPrivateKey" => jwt_ec_private_key(args, span),
             "sign" => self.jwt_sign(args, span),
             "verify" => self.jwt_verify(args, span),
             "decode" => jwt_decode(args, span),
@@ -200,26 +238,29 @@ impl Interp {
         };
         let opts = arg(args, 2);
 
-        // Algorithm: opts.alg or HS256 default; MUST be in the key kind's set.
-        let alg = opt_str(&opts, "alg").unwrap_or_else(|| "HS256".to_string());
+        // Algorithm: opts.alg or a kind-appropriate default; MUST be in the key
+        // kind's set. The default is HS256 for hmac, else the kind's sole alg —
+        // an asymmetric private key signs with its only algorithm by default.
+        let alg = opt_str(&opts, "alg").unwrap_or_else(|| match kind.as_str() {
+            "hmac" => "HS256".to_string(),
+            _ => algs_for_key_kind(&kind)
+                .first()
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+        });
         if !algs_for_key_kind(&kind).contains(&alg.as_str()) {
             return Ok(tier1(format!(
                 "alg '{alg}' is not valid for a '{kind}' key"
             )));
         }
-        if kind != "hmac" {
-            // A5 only wires hmac signing; A6 fills rsa/ec. Until then a typed key
-            // of another kind is a clean Tier-1 (never a panic, never a silent
-            // wrong token).
+
+        // A public key cannot sign — only the hmac secret and the *private*
+        // asymmetric kinds reach the signing path.
+        if kind == "rsa-public" || kind == "ec-public" {
             return Ok(tier1(format!(
-                "jwt.sign: '{kind}' keys are not supported yet (A5 wires hmac only)"
+                "jwt.sign: a '{kind}' key cannot sign — use the matching private key"
             )));
         }
-        let Some(secret) = hmac_secret(&key) else {
-            return Err(
-                AsError::at("jwt.sign: hmac key is missing a valid 'secret' field", span).into(),
-            );
-        };
 
         // Header: {alg, typ:"JWT"} merged with opts.headers (caller headers do
         // NOT override alg/typ — the protected alg is authoritative).
@@ -264,9 +305,54 @@ impl Interp {
             b64url(header_json.as_bytes()),
             b64url(claims_json.as_bytes())
         );
-        let Some(sig) = hmac_sign(&alg, &secret, signing_input.as_bytes()) else {
-            return Ok(tier1(format!("alg '{alg}' is not an hmac algorithm")));
+
+        // Dispatch the signature by key kind. The alg-intersection above already
+        // proved `alg` ∈ algs_for_key_kind(kind), so each arm sees only its algs.
+        let sig: Vec<u8> = match kind.as_str() {
+            "hmac" => {
+                let Some(secret) = hmac_secret(&key) else {
+                    return Err(AsError::at(
+                        "jwt.sign: hmac key is missing a valid 'secret' field",
+                        span,
+                    )
+                    .into());
+                };
+                match hmac_sign(&alg, &secret, signing_input.as_bytes()) {
+                    Some(s) => s,
+                    None => return Ok(tier1(format!("alg '{alg}' is not an hmac algorithm"))),
+                }
+            }
+            "rsa-private" => {
+                let Some(pem) = key_pem(&key) else {
+                    return Err(AsError::at(
+                        "jwt.sign: rsa key is missing a valid 'pem' field",
+                        span,
+                    )
+                    .into());
+                };
+                match rs256_sign(&pem, signing_input.as_bytes()) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(tier1(format!("rsa sign failed: {e}"))),
+                }
+            }
+            "ec-private" => {
+                let Some(pem) = key_pem(&key) else {
+                    return Err(AsError::at(
+                        "jwt.sign: ec key is missing a valid 'pem' field",
+                        span,
+                    )
+                    .into());
+                };
+                match es256_sign(&pem, signing_input.as_bytes()) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(tier1(format!("ec sign failed: {e}"))),
+                }
+            }
+            other => {
+                return Ok(tier1(format!("jwt.sign: unsupported key kind '{other}'")));
+            }
         };
+
         let token = format!("{}.{}", signing_input, b64url(&sig));
         Ok(make_pair(Value::str(token), Value::nil()))
     }
@@ -348,21 +434,47 @@ impl Interp {
             Err(e) => return Ok(tier1(format!("malformed signature: {e}"))),
         };
 
-        // 6. Recompute + CONSTANT-TIME verify over the EXACT header.payload bytes.
-        if kind != "hmac" {
-            return Ok(tier1(format!(
-                "jwt.verify: '{kind}' keys are not supported yet (A5 wires hmac only)"
-            )));
-        }
-        let Some(secret) = hmac_secret(&key) else {
-            return Err(AsError::at(
-                "jwt.verify: hmac key is missing a valid 'secret' field",
-                span,
-            )
-            .into());
-        };
+        // 6. Recompute + verify over the EXACT header.payload bytes. Dispatch by
+        //    key kind; the intersection above guarantees alg ∈ kind's algs, so the
+        //    hmac path is UNREACHABLE for an rsa/ec key (the structural kill).
         let signing_input = format!("{h_b64}.{p_b64}");
-        if hmac_verify(&alg, &secret, signing_input.as_bytes(), &sig).is_err() {
+        let sig_ok = match kind.as_str() {
+            "hmac" => {
+                // CONSTANT-TIME (the MAC's verify_slice) — never `==` on raw bytes.
+                let Some(secret) = hmac_secret(&key) else {
+                    return Err(AsError::at(
+                        "jwt.verify: hmac key is missing a valid 'secret' field",
+                        span,
+                    )
+                    .into());
+                };
+                hmac_verify(&alg, &secret, signing_input.as_bytes(), &sig).is_ok()
+            }
+            "rsa-public" | "rsa-private" => {
+                let Some(pem) = key_pem(&key) else {
+                    return Err(AsError::at(
+                        "jwt.verify: rsa key is missing a valid 'pem' field",
+                        span,
+                    )
+                    .into());
+                };
+                rs256_verify(&pem, signing_input.as_bytes(), &sig)
+            }
+            "ec-public" | "ec-private" => {
+                let Some(pem) = key_pem(&key) else {
+                    return Err(AsError::at(
+                        "jwt.verify: ec key is missing a valid 'pem' field",
+                        span,
+                    )
+                    .into());
+                };
+                es256_verify(&pem, signing_input.as_bytes(), &sig)
+            }
+            // Any other tagged kind has an empty alg set, so it was already
+            // rejected by the intersection; this is a defensive Tier-1.
+            _ => false,
+        };
+        if !sig_ok {
             return Ok(tier1("signature invalid"));
         }
 
@@ -434,6 +546,177 @@ fn jwt_hmac_key(args: &[Value], span: Span) -> Result<Value, Control> {
     m.insert(KEY_TAG.to_string(), Value::str("hmac"));
     m.insert("secret".to_string(), stored);
     Ok(Value::object(m))
+}
+
+// ── asymmetric key constructors (A6) ─────────────────────────────────────────
+//
+// Each takes a PEM string, VALIDATES it at construction (a malformed or
+// wrong-kind PEM is a Tier-1 [nil, err], naming the expected kind), and STORES
+// the PEM TEXT (re-parsed per op). A non-string argument is a Tier-2 panic (a
+// programming error), mirroring `jwt.hmacKey`.
+
+/// Read the PEM string out of a candidate key value. The arg MUST be a string,
+/// else Tier-2 (programming error).
+fn require_pem_arg(args: &[Value], span: Span, who: &str) -> Result<String, Control> {
+    match arg(args, 0).kind() {
+        ValueKind::Str(s) => Ok(s.to_string()),
+        other => Err(AsError::at(
+            format!("{who}: pem must be a string, got {}", kind_name(&other)),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// Build a tagged asymmetric key Object `{__jwtkey: kind, pem}`.
+fn make_pem_key(kind: &str, pem: String) -> Value {
+    let mut m: IndexMap<String, Value> = IndexMap::new();
+    m.insert(KEY_TAG.to_string(), Value::str(kind));
+    m.insert("pem".to_string(), Value::str(pem));
+    Value::object(m)
+}
+
+/// Read the `pem` field of an asymmetric key. `None` for a malformed key.
+fn key_pem(key: &Value) -> Option<String> {
+    let ValueKind::Object(o) = key.kind() else {
+        return None;
+    };
+    match o.get("pem").as_ref().map(|p| p.kind()) {
+        Some(ValueKind::Str(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// `jwt.rsaPublicKey(pem)` → `{__jwtkey:"rsa-public", pem}` (SPKI/PKCS#1 PEM).
+fn jwt_rsa_public_key(args: &[Value], span: Span) -> Result<Value, Control> {
+    let pem = require_pem_arg(args, span, "jwt.rsaPublicKey")?;
+    match rsa_public_from_pem(&pem) {
+        Ok(_) => Ok(make_pem_key("rsa-public", pem)),
+        Err(e) => Ok(tier1(format!("jwt.rsaPublicKey: not a valid RSA public key PEM: {e}"))),
+    }
+}
+
+/// `jwt.rsaPrivateKey(pem)` → `{__jwtkey:"rsa-private", pem}` (PKCS#8/PKCS#1 PEM).
+fn jwt_rsa_private_key(args: &[Value], span: Span) -> Result<Value, Control> {
+    let pem = require_pem_arg(args, span, "jwt.rsaPrivateKey")?;
+    match rsa_private_from_pem(&pem) {
+        Ok(_) => Ok(make_pem_key("rsa-private", pem)),
+        Err(e) => Ok(tier1(format!("jwt.rsaPrivateKey: not a valid RSA private key PEM: {e}"))),
+    }
+}
+
+/// `jwt.ecPublicKey(pem)` → `{__jwtkey:"ec-public", pem}` (P-256 SPKI PEM).
+fn jwt_ec_public_key(args: &[Value], span: Span) -> Result<Value, Control> {
+    let pem = require_pem_arg(args, span, "jwt.ecPublicKey")?;
+    match ec_public_from_pem(&pem) {
+        Ok(_) => Ok(make_pem_key("ec-public", pem)),
+        Err(e) => Ok(tier1(format!(
+            "jwt.ecPublicKey: not a valid EC (P-256) public key PEM: {e}"
+        ))),
+    }
+}
+
+/// `jwt.ecPrivateKey(pem)` → `{__jwtkey:"ec-private", pem}` (P-256 PKCS#8/SEC1 PEM).
+fn jwt_ec_private_key(args: &[Value], span: Span) -> Result<Value, Control> {
+    let pem = require_pem_arg(args, span, "jwt.ecPrivateKey")?;
+    match ec_private_from_pem(&pem) {
+        Ok(_) => Ok(make_pem_key("ec-private", pem)),
+        Err(e) => Ok(tier1(format!(
+            "jwt.ecPrivateKey: not a valid EC (P-256) private key PEM: {e}"
+        ))),
+    }
+}
+
+// ── RS256 (RSASSA-PKCS1-v1_5 over SHA-256) ───────────────────────────────────
+
+/// Parse an RSA public key from a PEM (SPKI first, PKCS#1 fallback).
+fn rsa_public_from_pem(pem: &str) -> Result<rsa::RsaPublicKey, String> {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+    rsa::RsaPublicKey::from_public_key_pem(pem)
+        .or_else(|_| rsa::RsaPublicKey::from_pkcs1_pem(pem))
+        .map_err(|e| e.to_string())
+}
+
+/// Parse an RSA private key from a PEM (PKCS#8 first, PKCS#1 fallback).
+fn rsa_private_from_pem(pem: &str) -> Result<rsa::RsaPrivateKey, String> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    rsa::RsaPrivateKey::from_pkcs8_pem(pem)
+        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(pem))
+        .map_err(|e| e.to_string())
+}
+
+/// RS256-sign the signing input, returning the raw PKCS#1-v1.5 signature bytes.
+fn rs256_sign(pem: &str, signing_input: &[u8]) -> Result<Vec<u8>, String> {
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    let sk = rsa_private_from_pem(pem)?;
+    let signing_key = SigningKey::<Sha256>::new(sk);
+    let sig = signing_key
+        .try_sign(signing_input)
+        .map_err(|e| e.to_string())?;
+    Ok(sig.to_vec())
+}
+
+/// RS256-verify. Returns `true` iff the signature is valid (any parse/format
+/// error → `false`, mapped to a Tier-1 "signature invalid" by the caller).
+fn rs256_verify(pem: &str, signing_input: &[u8], sig: &[u8]) -> bool {
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    let Ok(pk) = rsa_public_from_pem(pem) else {
+        return false;
+    };
+    let vk: VerifyingKey<Sha256> = VerifyingKey::new(pk);
+    let Ok(signature) = Signature::try_from(sig) else {
+        return false;
+    };
+    vk.verify(signing_input, &signature).is_ok()
+}
+
+// ── ES256 (ECDSA P-256 over SHA-256, FIXED-WIDTH r||s JOSE encoding) ──────────
+
+/// Parse a P-256 public key from a PEM (SPKI).
+fn ec_public_from_pem(pem: &str) -> Result<p256::ecdsa::VerifyingKey, String> {
+    use p256::pkcs8::DecodePublicKey;
+    p256::ecdsa::VerifyingKey::from_public_key_pem(pem).map_err(|e| e.to_string())
+}
+
+/// Parse a P-256 private signing key from a PEM (PKCS#8 first, SEC1 fallback).
+fn ec_private_from_pem(pem: &str) -> Result<p256::ecdsa::SigningKey, String> {
+    use p256::pkcs8::DecodePrivateKey;
+    p256::ecdsa::SigningKey::from_pkcs8_pem(pem)
+        .or_else(|_| {
+            // SEC1 `EC PRIVATE KEY` fallback.
+            p256::SecretKey::from_sec1_pem(pem).map(p256::ecdsa::SigningKey::from)
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// ES256-sign, returning the FIXED-WIDTH 64-byte `r||s` JOSE signature (NOT DER).
+fn es256_sign(pem: &str, signing_input: &[u8]) -> Result<Vec<u8>, String> {
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::Signature;
+    let sk = ec_private_from_pem(pem)?;
+    let sig: Signature = sk.sign(signing_input);
+    // `to_bytes()` is the fixed-width 64-byte r||s — the JOSE encoding.
+    Ok(sig.to_bytes().to_vec())
+}
+
+/// ES256-verify. The signature MUST be the fixed-width 64-byte `r||s` form;
+/// `Signature::from_slice` rejects a DER blob (or any non-64-byte input) by
+/// construction — THE JOSE PIN. Any error → `false`.
+fn es256_verify(pem: &str, signing_input: &[u8], sig: &[u8]) -> bool {
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::Signature;
+    let Ok(vk) = ec_public_from_pem(pem) else {
+        return false;
+    };
+    // FIXED-WIDTH ONLY — never Signature::from_der. A DER `0x30…` blob fails here.
+    let Ok(signature) = Signature::from_slice(sig) else {
+        return false;
+    };
+    vk.verify(signing_input, &signature).is_ok()
 }
 
 /// `jwt.decode(token) -> [{header, claims, signature, verified:false}, err]`.
@@ -954,5 +1237,195 @@ mod tests {
         assert_eq!(algs_for_key_kind("rsa-public"), &["RS256"]);
         assert_eq!(algs_for_key_kind("ec-private"), &["ES256"]);
         assert!(algs_for_key_kind("bogus").is_empty());
+    }
+
+    // ── A6 asymmetric fixtures (see the regen commands in the module header) ──────
+
+    const RSA_PRIV: &str = include_str!("testdata/jwt_rsa_priv.pem");
+    const RSA_PUB: &str = include_str!("testdata/jwt_rsa_pub.pem");
+    const EC_PRIV: &str = include_str!("testdata/jwt_ec_priv.pem");
+    const EC_PUB: &str = include_str!("testdata/jwt_ec_pub.pem");
+
+    // ── A6 (a): RS256 sign↔verify roundtrip + an EXTERNAL byte-level cross-check ──
+    //
+    // The cross-check proves wire-compat with the ecosystem: AScript signs, and the
+    // `rsa` crate's OWN verify (a path independent of jwt_verify) accepts the
+    // resulting signature over the EXACT signing input against the public key.
+    #[test]
+    fn rs256_sign_verify_roundtrip() {
+        let interp = ip();
+        let priv_key = interp
+            .call_jwt("rsaPrivateKey", &[s(RSA_PRIV)], sp())
+            .unwrap();
+        let pub_key = interp.call_jwt("rsaPublicKey", &[s(RSA_PUB)], sp()).unwrap();
+        let claims = obj(&[("sub", s("alice")), ("role", s("admin"))]);
+        let signed = interp
+            .jwt_sign(&[claims, priv_key, obj(&[("alg", s("RS256"))])], sp())
+            .unwrap();
+        let tok = token_str(&signed);
+
+        // AScript verify accepts it.
+        let verified = interp
+            .jwt_verify(&[s(&tok), pub_key.clone()], sp())
+            .unwrap();
+        let (val, err) = pair(&verified);
+        assert!(matches!(err.kind(), ValueKind::Nil), "RS256 verify failed");
+        assert_eq!(claim_str(&val, "sub"), Some("alice".to_string()));
+
+        // INDEPENDENT byte-level cross-check via the rsa crate's own verify over
+        // the exact signing input (header.payload).
+        use rsa::pkcs1v15::{Signature, VerifyingKey};
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::signature::Verifier;
+        use rsa::RsaPublicKey;
+        let parts: Vec<&str> = tok.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig_bytes = b64url_decode(parts[2], MAX_SEGMENT).unwrap();
+        let rsa_pub = RsaPublicKey::from_public_key_pem(RSA_PUB).unwrap();
+        let vk: VerifyingKey<Sha256> = VerifyingKey::new(rsa_pub);
+        let sig = Signature::try_from(sig_bytes.as_slice()).unwrap();
+        vk.verify(signing_input.as_bytes(), &sig)
+            .expect("rsa crate must accept AScript's RS256 signature (wire-compat)");
+    }
+
+    // ── A6 (b): ES256 roundtrip + THE JOSE-ENCODING PIN ──────────────────────────
+    //
+    // The signature segment, b64url-decoded, MUST be EXACTLY 64 bytes (r||s,
+    // fixed-width). A DER (ASN.1, 0x30...) signature of the SAME signature fed as
+    // the token sig MUST FAIL verification (Signature::from_slice is fixed-width).
+    #[test]
+    fn es256_roundtrip_and_jose_pin() {
+        let interp = ip();
+        let priv_key = interp.call_jwt("ecPrivateKey", &[s(EC_PRIV)], sp()).unwrap();
+        let pub_key = interp.call_jwt("ecPublicKey", &[s(EC_PUB)], sp()).unwrap();
+        let claims = obj(&[("sub", s("bob"))]);
+        let signed = interp
+            .jwt_sign(&[claims, priv_key, obj(&[("alg", s("ES256"))])], sp())
+            .unwrap();
+        let tok = token_str(&signed);
+        let parts: Vec<&str> = tok.split('.').collect();
+
+        // THE PIN: the decoded signature is EXACTLY 64 bytes (fixed-width r||s).
+        let sig_bytes = b64url_decode(parts[2], MAX_SEGMENT).unwrap();
+        assert_eq!(
+            sig_bytes.len(),
+            64,
+            "ES256 JOSE signature must be exactly 64 bytes (r||s), got {}",
+            sig_bytes.len()
+        );
+
+        // Roundtrip verify accepts the fixed-width sig.
+        let verified = interp.jwt_verify(&[s(&tok), pub_key.clone()], sp()).unwrap();
+        assert!(!is_err(&verified), "ES256 verify failed: {}", err_msg(&verified));
+
+        // DER REJECTION: re-encode the SAME (r,s) signature as ASN.1 DER and splice
+        // it into the token's sig segment. Verify MUST fail — a DER-encoded ECDSA
+        // signature (variable length, leading 0x30) is NOT valid JOSE.
+        use p256::ecdsa::Signature;
+        let fixed = Signature::from_slice(&sig_bytes).unwrap();
+        let der = fixed.to_der();
+        let der_bytes = der.as_bytes();
+        assert_eq!(der_bytes[0], 0x30, "DER must begin with the SEQUENCE tag");
+        assert_ne!(der_bytes.len(), 64, "DER form must differ in length from r||s");
+        let der_tok = format!("{}.{}.{}", parts[0], parts[1], b64url(der_bytes));
+        let der_verify = interp.jwt_verify(&[s(&der_tok), pub_key], sp()).unwrap();
+        assert!(
+            is_err(&der_verify),
+            "a DER-encoded ECDSA signature MUST be rejected (JOSE is fixed-width only)"
+        );
+    }
+
+    // ── A6 (c): hostile / mismatched PEM at construction → Tier-1 ────────────────
+    #[test]
+    fn asymmetric_key_constructors_reject_bad_pem() {
+        let interp = ip();
+        let garbage = ["", "not a pem", "-----BEGIN PRIVATE KEY-----\nZZZZ\n-----END PRIVATE KEY-----"];
+        for kind in ["rsaPublicKey", "rsaPrivateKey", "ecPublicKey", "ecPrivateKey"] {
+            for bad in garbage {
+                let r = interp.call_jwt(kind, &[s(bad)], sp()).unwrap();
+                assert!(is_err(&r), "{kind}({bad:?}) must be Tier-1 err");
+            }
+        }
+        // An EC PEM fed to rsaPublicKey → Tier-1 naming the mismatch (rsa expected).
+        let ec_to_rsa = interp.call_jwt("rsaPublicKey", &[s(EC_PUB)], sp()).unwrap();
+        assert!(is_err(&ec_to_rsa));
+        assert!(
+            err_msg(&ec_to_rsa).to_lowercase().contains("rsa"),
+            "EC→rsaPublicKey should name rsa, got: {}",
+            err_msg(&ec_to_rsa)
+        );
+        // An RSA PEM fed to ecPublicKey → Tier-1 naming the mismatch (ec expected).
+        let rsa_to_ec = interp.call_jwt("ecPublicKey", &[s(RSA_PUB)], sp()).unwrap();
+        assert!(is_err(&rsa_to_ec));
+        assert!(
+            err_msg(&rsa_to_ec).to_lowercase().contains("ec")
+                || err_msg(&rsa_to_ec).to_lowercase().contains("p-256"),
+            "RSA→ecPublicKey should name ec/p-256, got: {}",
+            err_msg(&rsa_to_ec)
+        );
+        // A non-string key material → Tier-2 (programming error).
+        assert!(interp.call_jwt("rsaPublicKey", &[Value::int(1)], sp()).is_err());
+    }
+
+    // ── A6 (d): THE STRUCTURAL KILL — an RSA public key + alg:HS256 → err ─────────
+    //
+    // The hmac path must NEVER run with an rsa key: algs_for_key_kind("rsa-public")
+    // does not include HS256, so the alg-intersection rejects it before any verify.
+    #[test]
+    fn rsa_key_cannot_hmac_verify() {
+        let interp = ip();
+        let pub_key = interp.call_jwt("rsaPublicKey", &[s(RSA_PUB)], sp()).unwrap();
+        // Forge an HS256 token (anyone can compute an HMAC over a chosen secret —
+        // the attack is to pass it the RSA *public* key as if it were the secret).
+        let hmac_key = jwt_hmac_key(&[s("anything")], sp()).unwrap();
+        let claims = obj(&[("sub", s("attacker"))]);
+        let hs_tok = token_str(
+            &interp
+                .jwt_sign(&[claims, hmac_key, obj(&[("alg", s("HS256"))])], sp())
+                .unwrap(),
+        );
+        // Verifying that HS256 token with the RSA public key MUST fail — the hmac
+        // path is unreachable for an rsa-public kind.
+        let v = interp.jwt_verify(&[s(&hs_tok), pub_key], sp()).unwrap();
+        assert!(is_err(&v), "RSA pubkey + HS256 must be rejected (structural kill)");
+        assert!(
+            err_msg(&v).contains("not allowed") || err_msg(&v).contains("HS256"),
+            "rejection should be the intersection check, got: {}",
+            err_msg(&v)
+        );
+
+        // Symmetrically: an EC public key + HS256 → err.
+        let ec_pub = interp.call_jwt("ecPublicKey", &[s(EC_PUB)], sp()).unwrap();
+        let hmac_key2 = jwt_hmac_key(&[s("anything")], sp()).unwrap();
+        let hs_tok2 = token_str(
+            &interp
+                .jwt_sign(&[obj(&[("sub", s("x"))]), hmac_key2, obj(&[("alg", s("HS256"))])], sp())
+                .unwrap(),
+        );
+        assert!(is_err(&interp.jwt_verify(&[s(&hs_tok2), ec_pub], sp()).unwrap()));
+    }
+
+    // ── A6: cross-confusion — RS256 token must NOT verify with an EC key & v.v. ───
+    #[test]
+    fn rs256_es256_keys_do_not_cross() {
+        let interp = ip();
+        let rsa_priv = interp.call_jwt("rsaPrivateKey", &[s(RSA_PRIV)], sp()).unwrap();
+        let ec_pub = interp.call_jwt("ecPublicKey", &[s(EC_PUB)], sp()).unwrap();
+        let rs_tok = token_str(
+            &interp
+                .jwt_sign(&[obj(&[("sub", s("a"))]), rsa_priv, obj(&[("alg", s("RS256"))])], sp())
+                .unwrap(),
+        );
+        // RS256 token verified with an EC public key → err (alg RS256 ∉ ec algs).
+        assert!(is_err(&interp.jwt_verify(&[s(&rs_tok), ec_pub], sp()).unwrap()));
+
+        let ec_priv = interp.call_jwt("ecPrivateKey", &[s(EC_PRIV)], sp()).unwrap();
+        let rsa_pub = interp.call_jwt("rsaPublicKey", &[s(RSA_PUB)], sp()).unwrap();
+        let es_tok = token_str(
+            &interp
+                .jwt_sign(&[obj(&[("sub", s("a"))]), ec_priv, obj(&[("alg", s("ES256"))])], sp())
+                .unwrap(),
+        );
+        assert!(is_err(&interp.jwt_verify(&[s(&es_tok), rsa_pub], sp()).unwrap()));
     }
 }
