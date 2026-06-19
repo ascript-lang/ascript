@@ -1752,10 +1752,10 @@ Read an unsigned integer of `n` bytes from an offset, using the given endianness
 - `b: bytes` — the buffer
 - `offset: number` — non-negative integer offset
 - `n: number` — byte length, 1–8
-- `endian: string` — `"le"` or `"be"`
+- `endian: string` (optional) — `"le"` or `"be"`; `nil` defaults to big-endian
 - Returns: `int`
 
-> [!TIER2] Panics if `n` is outside 1–8, if `endian` is not `"le"`/`"be"`, or if the read runs out of bounds.
+> [!TIER2] Panics if `n` is outside 1–8, if `endian` is not `"le"`/`"be"`/`nil`, or if the read runs out of bounds.
 
 ```ascript
 let b = bytes.fromArray([1, 2, 3, 4])
@@ -1770,7 +1770,7 @@ Write a non-negative integer of `n` bytes at an offset, using the given endianne
 - `offset: number` — non-negative integer offset
 - `value: number` — finite non-negative integer that fits in `n` bytes
 - `n: number` — byte length, 1–8
-- `endian: string` — `"le"` or `"be"`
+- `endian: string` (optional) — `"le"` or `"be"`; `nil` defaults to big-endian
 - Returns: `nil`
 
 > [!TIER2] Panics if `n` is outside 1–8, if `value` is negative, non-finite, non-integer, or does not fit in `n` bytes, or if the write runs out of bounds.
@@ -1787,10 +1787,10 @@ Read a signed integer of `n` bytes from an offset, using the given endianness. T
 - `b: bytes` — the buffer
 - `offset: number` — non-negative integer offset
 - `n: number` — byte length, 1–8
-- `endian: string` — `"le"` or `"be"`
+- `endian: string` (optional) — `"le"` or `"be"`; `nil` defaults to big-endian
 - Returns: `int`
 
-> [!TIER2] Panics if `n` is outside 1–8, if `endian` is not `"le"`/`"be"`, or if the read runs out of bounds.
+> [!TIER2] Panics if `n` is outside 1–8, if `endian` is not `"le"`/`"be"`/`nil`, or if the read runs out of bounds.
 
 ```ascript
 let b = bytes.fromArray([255, 255])
@@ -1805,7 +1805,7 @@ Write a signed integer of `n` bytes at an offset, using the given endianness. Mu
 - `offset: number` — non-negative integer offset
 - `value: number` — finite integer that fits in a signed `n`-byte field
 - `n: number` — byte length, 1–8
-- `endian: string` — `"le"` or `"be"`
+- `endian: string` (optional) — `"le"` or `"be"`; `nil` defaults to big-endian
 - Returns: `nil`
 
 > [!TIER2] Panics if `n` is outside 1–8, if `value` is non-finite, non-integer, or out of range for a signed `n`-byte field, or if the write runs out of bounds.

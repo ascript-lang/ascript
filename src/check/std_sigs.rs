@@ -783,27 +783,27 @@ static BYTES_READ_UINT_PARAMS: &[StdParam] = &[
     StdParam::req("b", "bytes"),
     StdParam::req("offset", "number"),
     StdParam::req("n", "number"),
-    StdParam::req("endian", "string"),
+    StdParam::opt("endian", "string"),
 ];
 static BYTES_WRITE_UINT_PARAMS: &[StdParam] = &[
     StdParam::req("b", "bytes"),
     StdParam::req("offset", "number"),
     StdParam::req("value", "number"),
     StdParam::req("n", "number"),
-    StdParam::req("endian", "string"),
+    StdParam::opt("endian", "string"),
 ];
 static BYTES_READ_INT_PARAMS: &[StdParam] = &[
     StdParam::req("b", "bytes"),
     StdParam::req("offset", "number"),
     StdParam::req("n", "number"),
-    StdParam::req("endian", "string"),
+    StdParam::opt("endian", "string"),
 ];
 static BYTES_WRITE_INT_PARAMS: &[StdParam] = &[
     StdParam::req("b", "bytes"),
     StdParam::req("offset", "number"),
     StdParam::req("value", "number"),
     StdParam::req("n", "number"),
-    StdParam::req("endian", "string"),
+    StdParam::opt("endian", "string"),
 ];
 
 static BYTES_SIGS: &[(&str, StdSig)] = &[
