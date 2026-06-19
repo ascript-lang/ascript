@@ -218,6 +218,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/resilience", "resilience.md"),
     ("std/docker", "docker.md"),
     ("std/jwt", "auth.md"),
+    ("std/oauth", "auth.md"),
 ];
 
 /// Pure checker (mutation-self-testable): validates a mapping against a module

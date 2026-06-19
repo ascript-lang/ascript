@@ -2681,6 +2681,14 @@ static JWT_VERIFY_PARAMS: &[StdParam] = &[
     StdParam::opt("opts", "object"),
 ];
 static JWT_DECODE_PARAMS: &[StdParam] = &[StdParam::req("token", "string")];
+static JWT_JWKS_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+// JwksCache handle methods (BATT §5.6, MemberKind::HandleMethod in JWT_MEMBERS).
+// The handle `verify` shares the name (and arity row) of the module `jwt.verify`.
+static JWT_JWKS_KEYS_PARAMS: &[StdParam] = &[];
+static JWT_JWKS_CLOSE_PARAMS: &[StdParam] = &[];
 
 static JWT_SIGS: &[(&str, StdSig)] = &[
     ("hmacKey", StdSig { params: JWT_HMAC_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed HMAC key for HS256/HS384/HS512." }),
@@ -2691,6 +2699,11 @@ static JWT_SIGS: &[(&str, StdSig)] = &[
     ("sign", StdSig { params: JWT_SIGN_PARAMS, ret: Some("[string, err]"), doc: "Signs claims into a compact JWT with a typed key." }),
     ("verify", StdSig { params: JWT_VERIFY_PARAMS, ret: Some("[object, err]"), doc: "Verifies a JWT against a typed key, intersecting the header alg with the key kind's algorithm set." }),
     ("decode", StdSig { params: JWT_DECODE_PARAMS, ret: Some("[object, err]"), doc: "Decodes a JWT WITHOUT verifying its signature (inspection only)." }),
+    ("jwks", StdSig { params: JWT_JWKS_PARAMS, ret: Some("[jwksCache, err]"), doc: "Fetches a JWK Set over the network and returns a cache handle whose verify() resolves a token's kid to the matching key. Async; Net-gated." }),
+    // jwksCache handle methods (BATT §5.6). `verify` shares the name of jwt.verify
+    // (the Fn row above provides its arity); `keys`/`close` get their own rows.
+    ("keys", StdSig { params: JWT_JWKS_KEYS_PARAMS, ret: Some("array<string>"), doc: "Return the kids currently cached by a jwksCache handle." }),
+    ("close", StdSig { params: JWT_JWKS_CLOSE_PARAMS, ret: None, doc: "Drop a jwksCache handle's cached keys." }),
 ];
 
 static JWT_MEMBERS: &[(&str, MemberKind)] = &[
@@ -2702,6 +2715,35 @@ static JWT_MEMBERS: &[(&str, MemberKind)] = &[
     ("sign", MemberKind::Fn),
     ("verify", MemberKind::Fn),
     ("decode", MemberKind::Fn),
+    ("jwks", MemberKind::Fn),
+    // jwksCache handle methods — not module exports.
+    ("verify", MemberKind::HandleMethod),
+    ("keys", MemberKind::HandleMethod),
+    ("close", MemberKind::HandleMethod),
+];
+
+// ── std/oauth (BATT §5.6) ──────────────────────────────────────────────────────
+
+static OAUTH_PKCE_PARAMS: &[StdParam] = &[];
+static OAUTH_EXCHANGE_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static OAUTH_CLIENT_CREDS_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static OAUTH_REFRESH_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static OAUTH_DISCOVER_PARAMS: &[StdParam] = &[StdParam::req("issuer", "string")];
+
+static OAUTH_SIGS: &[(&str, StdSig)] = &[
+    ("pkce", StdSig { params: OAUTH_PKCE_PARAMS, ret: Some("object"), doc: "Generate a PKCE verifier/challenge pair (RFC 7636 S256)." }),
+    ("exchangeCode", StdSig { params: OAUTH_EXCHANGE_PARAMS, ret: Some("[object, err]"), doc: "Exchange an authorization code (with a PKCE code_verifier) for tokens. Async; Net-gated." }),
+    ("clientCredentials", StdSig { params: OAUTH_CLIENT_CREDS_PARAMS, ret: Some("[object, err]"), doc: "Obtain tokens via the client_credentials grant (Basic auth). Async; Net-gated." }),
+    ("refresh", StdSig { params: OAUTH_REFRESH_PARAMS, ret: Some("[object, err]"), doc: "Exchange a refresh token for a fresh access token. Async; Net-gated." }),
+    ("discover", StdSig { params: OAUTH_DISCOVER_PARAMS, ret: Some("[object, err]"), doc: "Fetch an issuer's OpenID Connect discovery metadata (.well-known/openid-configuration). Async; Net-gated." }),
+];
+
+static OAUTH_MEMBERS: &[(&str, MemberKind)] = &[
+    ("pkce", MemberKind::Fn),
+    ("exchangeCode", MemberKind::Fn),
+    ("clientCredentials", MemberKind::Fn),
+    ("refresh", MemberKind::Fn),
+    ("discover", MemberKind::Fn),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2774,6 +2816,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/ffi", FFI_MEMBERS),
     ("std/resilience", RESIL_MEMBERS),
     ("std/jwt", JWT_MEMBERS),
+    ("std/oauth", OAUTH_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2847,6 +2890,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/ffi" => FFI_SIGS,
         "std/resilience" => RESIL_SIGS,
         "std/jwt" => JWT_SIGS,
+        "std/oauth" => OAUTH_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -3021,6 +3065,7 @@ mod tests {
             ("std/ffi", FFI_SIGS),
             ("std/resilience", RESIL_SIGS),
             ("std/jwt", JWT_SIGS),
+            ("std/oauth", OAUTH_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {

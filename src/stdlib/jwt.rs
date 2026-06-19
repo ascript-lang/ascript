@@ -68,6 +68,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("sign", bi("jwt.sign")),
         ("verify", bi("jwt.verify")),
         ("decode", bi("jwt.decode")),
+        ("jwks", bi("jwt.jwks")),
     ]
 }
 
@@ -205,6 +206,8 @@ fn is_none_alg(alg: &str) -> bool {
 // ── dispatch ─────────────────────────────────────────────────────────────────
 
 impl Interp {
+    /// Sync jwt dispatch (the pure-crypto funcs). `jwt.jwks` is async (network) and
+    /// routed separately via [`Interp::call_jwt_async`].
     pub(crate) fn call_jwt(
         &self,
         func: &str,
@@ -221,6 +224,21 @@ impl Interp {
             "verify" => self.jwt_verify(args, span),
             "decode" => jwt_decode(args, span),
             _ => Err(AsError::at(format!("std/jwt has no function '{func}'"), span).into()),
+        }
+    }
+
+    /// Async jwt dispatch: `jwt.jwks` (the ONLY network-touching jwt func, Net-gated
+    /// at the dispatch chokepoint) routes here; everything else delegates to the sync
+    /// [`Interp::call_jwt`].
+    pub(crate) async fn call_jwt_async(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        match func {
+            "jwks" => self.jwt_jwks(args, span).await,
+            _ => self.call_jwt(func, args, span),
         }
     }
 
@@ -524,6 +542,320 @@ impl Interp {
 
         Ok(make_pair(claims, Value::nil()))
     }
+}
+
+// ── JWKS fetch + cache (BATT §5.6) ────────────────────────────────────────────
+//
+// `jwt.jwks(url)` fetches a JWK Set over the SHARED pooled client and returns a
+// `JwksCache` native handle. The handle's `.verify(token, opts?)` resolves the
+// token's `kid` header to the matching cached public key, then verifies through
+// the EXACT A5/A6 `jwt.verify` path (so the alg-intersection / alg-confusion
+// defenses are reused, not re-implemented — a JWKS RSA key cannot verify an HS256
+// token, structurally). On an unknown kid the cache REFETCHES exactly once; on a
+// TTL miss the next verify refetches; a verify within TTL never refetches.
+
+/// The default JWKS cache TTL: 5 minutes. A verify within this window reuses the
+/// cached keys; past it, the next verify refetches before resolving the kid.
+const DEFAULT_JWKS_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// A self-contained TTL cache of `kid -> {__jwtkey}` public keys fetched from a
+/// JWKS endpoint. Lives in `Interp.resources` behind a `Value::native(JwksCache)`
+/// handle (BATT §5.6). NOT `std/lru` — it is a tiny per-URL TTL snapshot.
+pub struct JwksCacheState {
+    /// The JWKS endpoint URL (re-fetched on a TTL/unknown-kid miss).
+    pub url: String,
+    /// Cache lifetime in milliseconds.
+    pub ttl_ms: u64,
+    /// kid → the converted `{__jwtkey}` public key Object (rsa-public / ec-public).
+    pub keys: std::collections::HashMap<String, Value>,
+    /// The wall-clock (det-routed) ms at which `keys` was last populated.
+    pub fetched_at_ms: f64,
+}
+
+impl Interp {
+    /// `jwt.jwks(url, opts?) -> [jwksCache, err]`. Fetches the JWK Set once at
+    /// construction (a fetch/parse failure is a Tier-1 err) and returns the cache
+    /// handle. `opts.ttlMs` overrides the default TTL.
+    async fn jwt_jwks(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let url = match arg(args, 0).kind() {
+            ValueKind::Str(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                return Err(AsError::at(
+                    "jwt.jwks: url must be a non-empty string",
+                    span,
+                )
+                .into())
+            }
+        };
+        let opts = arg(args, 1);
+        let ttl_ms = opt_num(&opts, "ttlMs")
+            .filter(|n| *n > 0.0)
+            .map(|n| n as u64)
+            .unwrap_or(DEFAULT_JWKS_TTL_MS);
+
+        // Initial fetch (over the SHARED pooled client). A network/parse failure is
+        // a Tier-1 err — JWKS unavailability is recoverable control flow.
+        let keys = match fetch_jwks_keys(&url).await {
+            Ok(k) => k,
+            Err(e) => return Ok(tier1(format!("jwt.jwks: {e}"))),
+        };
+        let state = JwksCacheState {
+            url,
+            ttl_ms,
+            keys,
+            fetched_at_ms: self.clock_now_ms(),
+        };
+        let handle = self.register_resource(
+            crate::value::NativeKind::JwksCache,
+            IndexMap::new(),
+            crate::interp::ResourceState::JwksCache(Box::new(state)),
+        );
+        Ok(make_pair(handle, Value::nil()))
+    }
+
+    /// Dispatch a method on a `JwksCache` handle: `verify` / `keys` / `close`.
+    pub(crate) async fn call_jwks_method(
+        &self,
+        m: &crate::value::NativeMethod,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match m.method.as_str() {
+            "verify" => self.jwks_verify(m.receiver.id, &args, span).await,
+            "keys" => {
+                // Snapshot the current cached kids as an array of strings.
+                let Some(state) = self.take_resource(m.receiver.id) else {
+                    return Err(AsError::at("jwksCache: handle is closed", span).into());
+                };
+                let crate::interp::ResourceState::JwksCache(b) = state else {
+                    self.return_resource(m.receiver.id, state);
+                    return Err(AsError::at("jwksCache: wrong resource kind", span).into());
+                };
+                let kids: Vec<Value> = b.keys.keys().map(|k| Value::str(k.clone())).collect();
+                self.return_resource(
+                    m.receiver.id,
+                    crate::interp::ResourceState::JwksCache(b),
+                );
+                Ok(Value::array(kids))
+            }
+            "close" => {
+                self.take_resource(m.receiver.id);
+                Ok(Value::nil())
+            }
+            other => Err(AsError::at(
+                format!("jwksCache handle has no method '{other}'"),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// `cache.verify(token, opts?)` — resolve the token's `kid`, refetch on a
+    /// TTL/unknown-kid miss (EXACTLY ONE refetch per verify), then delegate to the
+    /// A5/A6 `jwt.verify` path. Auth failure is Tier-1 throughout.
+    async fn jwks_verify(
+        &self,
+        id: u64,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        let token = match arg(args, 0).kind() {
+            ValueKind::Str(s) => s.to_string(),
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "jwksCache.verify: token must be a string, got {}",
+                        kind_name(&other)
+                    ),
+                    span,
+                )
+                .into())
+            }
+        };
+        let opts = arg(args, 1);
+
+        // Parse the header to read the `kid` (alloc-bounded). A malformed token is
+        // Tier-1 (mirrors jwt.verify), never a refetch trigger.
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Ok(tier1("malformed token: expected 3 dot-separated segments"));
+        }
+        let header_bytes = match b64url_decode(parts[0], MAX_SEGMENT) {
+            Ok(b) => b,
+            Err(e) => return Ok(tier1(format!("malformed header: {e}"))),
+        };
+        let header = match json_parse(&header_bytes) {
+            Ok(v) => v,
+            Err(e) => return Ok(tier1(format!("malformed header: {e}"))),
+        };
+        let kid = match header_field_str(&header, "kid") {
+            Some(k) => k,
+            None => return Ok(tier1("token header is missing 'kid' (required for JWKS)")),
+        };
+
+        // Read the cache snapshot: the URL/ttl, whether the TTL has expired, and the
+        // candidate key for this kid. We take the box OUT (no borrow held across the
+        // refetch await) and put it straight back; the refetch (if any) re-takes it.
+        let (url, ttl_expired, mut key) = {
+            let Some(state) = self.take_jwks(id) else {
+                return Err(AsError::at("jwksCache: handle is closed", span).into());
+            };
+            let now = self.clock_now_ms();
+            let expired = now - state.fetched_at_ms >= state.ttl_ms as f64;
+            let url = state.url.clone();
+            let key = state.keys.get(&kid).cloned();
+            self.return_resource(id, crate::interp::ResourceState::JwksCache(state));
+            (url, expired, key)
+        };
+
+        // Refetch ONCE if the TTL expired OR the kid is unknown. The refetch uses the
+        // take-out-across-await pattern: we do NOT hold the `resources` borrow across
+        // the HTTP `.await`. (The first miss is the only refetch — a still-missing kid
+        // after the refetch is a Tier-1 error, no loop.)
+        if ttl_expired || key.is_none() {
+            match fetch_jwks_keys(&url).await {
+                Ok(fresh) => {
+                    key = fresh.get(&kid).cloned();
+                    // Install the fresh snapshot back into the handle.
+                    if let Some(mut state) = self.take_jwks(id) {
+                        state.keys = fresh;
+                        state.fetched_at_ms = self.clock_now_ms();
+                        self.return_resource(
+                            id,
+                            crate::interp::ResourceState::JwksCache(state),
+                        );
+                    }
+                }
+                Err(e) => {
+                    // A refetch failure on an otherwise-cached key still lets a
+                    // within-TTL hit succeed; only surface the error if we have no key.
+                    if key.is_none() {
+                        return Ok(tier1(format!("jwks refetch failed: {e}")));
+                    }
+                }
+            }
+        }
+
+        let Some(key) = key else {
+            return Ok(tier1(format!("no key in JWKS for kid '{kid}'")));
+        };
+
+        // Delegate to the EXACT A5/A6 verify path — the alg-intersection (and thus the
+        // alg-confusion kill: an RSA JWKS key cannot HS256-verify) is reused verbatim.
+        self.jwt_verify(&[Value::str(token), key, opts], span)
+    }
+
+    /// Take the boxed JWKS state out of the table (for a refetch install). Returns
+    /// `None` if the handle was closed or is the wrong kind.
+    fn take_jwks(&self, id: u64) -> Option<Box<JwksCacheState>> {
+        match self.take_resource(id) {
+            Some(crate::interp::ResourceState::JwksCache(b)) => Some(b),
+            Some(other) => {
+                self.return_resource(id, other);
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+/// Fetch + parse a JWK Set from `url` over the SHARED pooled reqwest client,
+/// converting each supported (RSA / EC P-256) key into a `{__jwtkey}` public key
+/// Object indexed by `kid`. Unsupported `kty`/`crv` and keys without a usable `kid`
+/// are SKIPPED (a JWKS may mix in keys this verifier can't use). Returns a string
+/// error for a network failure / malformed JSON (caller maps to Tier-1).
+async fn fetch_jwks_keys(url: &str) -> Result<std::collections::HashMap<String, Value>, String> {
+    let client = crate::stdlib::net_http::shared_client();
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("fetch failed: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("JWKS endpoint returned status {}", status.as_u16()));
+    }
+    let doc: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("malformed JWKS json: {e}"))?;
+    let arr = doc
+        .get("keys")
+        .and_then(|k| k.as_array())
+        .ok_or_else(|| "JWKS json has no 'keys' array".to_string())?;
+
+    let mut out: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for jwk in arr {
+        // A key with no kid can't be resolved by kid — skip it.
+        let Some(kid) = jwk.get("kid").and_then(|k| k.as_str()) else {
+            continue;
+        };
+        if let Some(key) = jwk_to_jwtkey(jwk) {
+            out.insert(kid.to_string(), key);
+        }
+        // else: unsupported kty/crv or malformed material → skipped (not an error).
+    }
+    Ok(out)
+}
+
+/// Convert ONE JWK (serde_json) into a `{__jwtkey}` public key Object, or `None`
+/// for an unsupported / malformed key (skipped by the caller). Supports RSA (RS256)
+/// and EC P-256 (ES256), the same two asymmetric kinds A6 wired.
+fn jwk_to_jwtkey(jwk: &serde_json::Value) -> Option<Value> {
+    let kty = jwk.get("kty").and_then(|k| k.as_str())?;
+    match kty {
+        "RSA" => {
+            let n = jwk.get("n").and_then(|v| v.as_str())?;
+            let e = jwk.get("e").and_then(|v| v.as_str())?;
+            let pem = rsa_jwk_to_pem(n, e).ok()?;
+            Some(make_pem_key("rsa-public", pem))
+        }
+        "EC" => {
+            // Only P-256 (ES256) is supported (matches A6).
+            let crv = jwk.get("crv").and_then(|v| v.as_str())?;
+            if crv != "P-256" {
+                return None;
+            }
+            let x = jwk.get("x").and_then(|v| v.as_str())?;
+            let y = jwk.get("y").and_then(|v| v.as_str())?;
+            let pem = ec_jwk_to_pem(x, y).ok()?;
+            Some(make_pem_key("ec-public", pem))
+        }
+        _ => None,
+    }
+}
+
+/// Build an RSA public key SPKI PEM from the JWK base64url `n`/`e` parameters, so a
+/// JWKS RSA key becomes a normal A6 `rsa-public` `{__jwtkey}` (re-parsed per verify).
+fn rsa_jwk_to_pem(n_b64: &str, e_b64: &str) -> Result<String, String> {
+    use rsa::pkcs8::EncodePublicKey;
+    use rsa::BigUint;
+    let n = b64url_decode(n_b64, MAX_SEGMENT).map_err(|e| format!("bad 'n': {e}"))?;
+    let e = b64url_decode(e_b64, MAX_SEGMENT).map_err(|e| format!("bad 'e': {e}"))?;
+    let key = rsa::RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e))
+        .map_err(|e| format!("invalid RSA params: {e}"))?;
+    key.to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+        .map_err(|e| format!("pem encode: {e}"))
+}
+
+/// Build a P-256 public key SPKI PEM from the JWK base64url `x`/`y` coordinates, so
+/// a JWKS EC key becomes a normal A6 `ec-public` `{__jwtkey}`.
+fn ec_jwk_to_pem(x_b64: &str, y_b64: &str) -> Result<String, String> {
+    use p256::pkcs8::EncodePublicKey;
+    let x = b64url_decode(x_b64, MAX_SEGMENT).map_err(|e| format!("bad 'x': {e}"))?;
+    let y = b64url_decode(y_b64, MAX_SEGMENT).map_err(|e| format!("bad 'y': {e}"))?;
+    if x.len() != 32 || y.len() != 32 {
+        return Err("P-256 coordinates must be 32 bytes each".to_string());
+    }
+    let point = p256::EncodedPoint::from_affine_coordinates(
+        p256::FieldBytes::from_slice(&x),
+        p256::FieldBytes::from_slice(&y),
+        false,
+    );
+    let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+        .map_err(|e| format!("invalid EC point: {e}"))?;
+    vk.to_public_key_pem(p256::pkcs8::LineEnding::LF)
+        .map_err(|e| format!("pem encode: {e}"))
 }
 
 /// `jwt.hmacKey(secret) -> {__jwtkey:"hmac", secret}`. A string|bytes secret.
@@ -1427,5 +1759,235 @@ mod tests {
                 .unwrap(),
         );
         assert!(is_err(&interp.jwt_verify(&[s(&es_tok), rsa_pub], sp()).unwrap()));
+    }
+
+    // ── A7: JWKS fetch + cache (BATT §5.6) ───────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Build the RSA JWK ({kty,kid,n,e}) for the test RSA public PEM.
+    fn rsa_jwk_json(kid: &str) -> serde_json::Value {
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::traits::PublicKeyParts;
+        let key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUB).unwrap();
+        let n = b64url(&key.n().to_bytes_be());
+        let e = b64url(&key.e().to_bytes_be());
+        serde_json::json!({"kty":"RSA","kid":kid,"alg":"RS256","use":"sig","n":n,"e":e})
+    }
+
+    /// Build the EC P-256 JWK ({kty,crv,kid,x,y}) for the test EC public PEM.
+    fn ec_jwk_json(kid: &str) -> serde_json::Value {
+        use p256::pkcs8::DecodePublicKey;
+        let vk = p256::ecdsa::VerifyingKey::from_public_key_pem(EC_PUB).unwrap();
+        let pt = vk.to_encoded_point(false);
+        let x = b64url(pt.x().unwrap().as_slice());
+        let y = b64url(pt.y().unwrap().as_slice());
+        serde_json::json!({"kty":"EC","crv":"P-256","kid":kid,"alg":"ES256","use":"sig","x":x,"y":y})
+    }
+
+    /// An in-process JWKS endpoint serving `jwks_json`, counting hits in `counter`.
+    mod jwks_fixture {
+        use http_body_util::combinators::BoxBody;
+        use http_body_util::Full;
+        use hyper::body::{Bytes, Incoming};
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        async fn handle(
+            _req: Request<Incoming>,
+            body: Arc<String>,
+            counter: Arc<AtomicUsize>,
+        ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut r = Response::new(Full::new(Bytes::from((*body).clone())));
+            r.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            let (parts, body) = r.into_parts();
+            Ok(Response::from_parts(parts, BoxBody::new(body)))
+        }
+
+        /// Start the JWKS server; returns the `/jwks` URL. `counter` increments once
+        /// per request so a test can assert refetch behavior.
+        pub async fn start(jwks_json: String, counter: Arc<AtomicUsize>) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().unwrap();
+            let body = Arc::new(jwks_json);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    let io = TokioIo::new(stream);
+                    let body = body.clone();
+                    let counter = counter.clone();
+                    tokio::spawn(async move {
+                        let svc =
+                            service_fn(move |req| handle(req, body.clone(), counter.clone()));
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, svc)
+                            .await;
+                    });
+                }
+            });
+            format!("http://127.0.0.1:{}/jwks", addr.port())
+        }
+    }
+
+    /// Sign a token with `priv_key` carrying a `kid` header.
+    fn sign_with_kid(interp: &Interp, priv_key: &Value, kid: &str, alg: &str) -> String {
+        let claims = obj(&[("sub", s("alice"))]);
+        let opts = obj(&[("alg", s(alg)), ("headers", obj(&[("kid", s(kid))]))]);
+        token_str(&interp.jwt_sign(&[claims, priv_key.clone(), opts], sp()).unwrap())
+    }
+
+    // (a) jwks(url) → cache; cache.verify resolves kid → RSA key → RS256 verifies.
+    #[tokio::test]
+    async fn jwks_fetch_and_verify_rsa() {
+        let interp = ip();
+        let jwks = serde_json::json!({"keys":[rsa_jwk_json("rsa-1")]}).to_string();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let url = jwks_fixture::start(jwks, counter.clone()).await;
+
+        let priv_key = interp.call_jwt("rsaPrivateKey", &[s(RSA_PRIV)], sp()).unwrap();
+        let tok = sign_with_kid(&interp, &priv_key, "rsa-1", "RS256");
+
+        let cache = {
+            let (c, e) = pair(&interp.call_jwt_async("jwks", &[s(&url)], sp()).await.unwrap());
+            assert!(matches!(e.kind(), ValueKind::Nil), "jwks fetch failed");
+            c
+        };
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "one fetch at construction");
+        let v = jwks_verify_via_handle(&interp, &cache, &tok).await;
+        let (claims, err) = pair(&v);
+        assert!(matches!(err.kind(), ValueKind::Nil), "RS256 jwks verify failed: {}", err_msg(&v));
+        assert_eq!(claim_str(&claims, "sub"), Some("alice".to_string()));
+        // verify within TTL did NOT refetch.
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "verify within TTL must not refetch");
+    }
+
+    // (a') EC P-256 / ES256 over JWKS.
+    #[tokio::test]
+    async fn jwks_fetch_and_verify_ec() {
+        let interp = ip();
+        let jwks = serde_json::json!({"keys":[ec_jwk_json("ec-1")]}).to_string();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let url = jwks_fixture::start(jwks, counter.clone()).await;
+
+        let priv_key = interp.call_jwt("ecPrivateKey", &[s(EC_PRIV)], sp()).unwrap();
+        let tok = sign_with_kid(&interp, &priv_key, "ec-1", "ES256");
+        let (cache, _) = pair(&interp.call_jwt_async("jwks", &[s(&url)], sp()).await.unwrap());
+        let v = jwks_verify_via_handle(&interp, &cache, &tok).await;
+        assert!(!is_err(&v), "ES256 jwks verify failed: {}", err_msg(&v));
+    }
+
+    // (b) unknown kid → exactly ONE refetch; still missing → Tier-1.
+    #[tokio::test]
+    async fn jwks_unknown_kid_refetches_once_then_tier1() {
+        let interp = ip();
+        let jwks = serde_json::json!({"keys":[rsa_jwk_json("rsa-1")]}).to_string();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let url = jwks_fixture::start(jwks, counter.clone()).await;
+
+        let priv_key = interp.call_jwt("rsaPrivateKey", &[s(RSA_PRIV)], sp()).unwrap();
+        // Sign with a kid the JWKS does NOT contain.
+        let tok = sign_with_kid(&interp, &priv_key, "missing-kid", "RS256");
+        let (cache, _) = pair(&interp.call_jwt_async("jwks", &[s(&url)], sp()).await.unwrap());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let v = jwks_verify_via_handle(&interp, &cache, &tok).await;
+        assert!(is_err(&v), "unknown kid must be Tier-1");
+        assert!(err_msg(&v).contains("missing-kid"), "got: {}", err_msg(&v));
+        // EXACTLY one refetch on the unknown kid (1 construction + 1 refetch = 2).
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "unknown kid → exactly one refetch");
+    }
+
+    // (c) TTL expiry refetches; a verify within TTL does NOT.
+    #[tokio::test]
+    async fn jwks_ttl_expiry_refetches() {
+        let interp = ip();
+        let jwks = serde_json::json!({"keys":[rsa_jwk_json("rsa-1")]}).to_string();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let url = jwks_fixture::start(jwks, counter.clone()).await;
+        let priv_key = interp.call_jwt("rsaPrivateKey", &[s(RSA_PRIV)], sp()).unwrap();
+        let tok = sign_with_kid(&interp, &priv_key, "rsa-1", "RS256");
+        // ttlMs = 0 forces the TTL to be considered expired on every verify (>= cmp).
+        let opts = obj(&[("ttlMs", Value::int(1))]);
+        let (cache, _) = pair(&interp.call_jwt_async("jwks", &[s(&url), opts], sp()).await.unwrap());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        // Sleep so the 1ms TTL is surely past.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let v = jwks_verify_via_handle(&interp, &cache, &tok).await;
+        assert!(!is_err(&v), "verify failed: {}", err_msg(&v));
+        assert!(counter.load(Ordering::SeqCst) >= 2, "TTL expiry must refetch");
+    }
+
+    // (d) malformed JWKS → Tier-1; mixed JWKS (oct skipped) still serves RSA/EC.
+    #[tokio::test]
+    async fn jwks_malformed_and_mixed() {
+        // malformed JSON → Tier-1 at construction.
+        let interp = ip();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let url = jwks_fixture::start("{not json".to_string(), counter.clone()).await;
+        let (c, e) = pair(&interp.call_jwt_async("jwks", &[s(&url)], sp()).await.unwrap());
+        assert!(matches!(c.kind(), ValueKind::Nil) && !matches!(e.kind(), ValueKind::Nil),
+            "malformed JWKS must be Tier-1");
+
+        // mixed: an unsupported `oct` key + a real RSA key. The oct is skipped, the
+        // RSA one is usable.
+        let interp = ip();
+        let mixed = serde_json::json!({"keys":[
+            {"kty":"oct","kid":"sym-1","k":"AAAA"},
+            {"kty":"RSA","kid":"unsupported-no-kid-test"}, // missing n/e → skipped
+            rsa_jwk_json("rsa-1"),
+        ]}).to_string();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let url = jwks_fixture::start(mixed, counter.clone()).await;
+        let priv_key = interp.call_jwt("rsaPrivateKey", &[s(RSA_PRIV)], sp()).unwrap();
+        let tok = sign_with_kid(&interp, &priv_key, "rsa-1", "RS256");
+        let (cache, _) = pair(&interp.call_jwt_async("jwks", &[s(&url)], sp()).await.unwrap());
+        let v = jwks_verify_via_handle(&interp, &cache, &tok).await;
+        assert!(!is_err(&v), "RSA key in a mixed JWKS must be usable: {}", err_msg(&v));
+    }
+
+    // THE alg-confusion kill carries over JWKS: an RSA JWKS key cannot HS256-verify.
+    #[tokio::test]
+    async fn jwks_rsa_key_cannot_hmac_verify() {
+        let interp = ip();
+        let jwks = serde_json::json!({"keys":[rsa_jwk_json("rsa-1")]}).to_string();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let url = jwks_fixture::start(jwks, counter.clone()).await;
+        // Forge an HS256 token whose kid points at the RSA JWKS key.
+        let hmac_key = jwt_hmac_key(&[s("anything")], sp()).unwrap();
+        let claims = obj(&[("sub", s("attacker"))]);
+        let opts = obj(&[("alg", s("HS256")), ("headers", obj(&[("kid", s("rsa-1"))]))]);
+        let hs_tok = token_str(&interp.jwt_sign(&[claims, hmac_key, opts], sp()).unwrap());
+        let (cache, _) = pair(&interp.call_jwt_async("jwks", &[s(&url)], sp()).await.unwrap());
+        let v = jwks_verify_via_handle(&interp, &cache, &hs_tok).await;
+        assert!(is_err(&v), "RSA JWKS key + HS256 must be rejected (alg-confusion kill)");
+    }
+
+    /// Drive `cache.verify(token)` through the native-method dispatch.
+    async fn jwks_verify_via_handle(interp: &Interp, cache: &Value, token: &str) -> Value {
+        let id = match cache.kind() {
+            ValueKind::Native(n) => n.id,
+            _ => panic!("jwks() should return a native handle"),
+        };
+        let _ = id;
+        let m = std::rc::Rc::new(crate::value::NativeMethod {
+            receiver: match cache.kind() {
+                ValueKind::Native(n) => n.clone(),
+                _ => unreachable!(),
+            },
+            method: "verify".to_string(),
+        });
+        interp.call_jwks_method(&m, vec![Value::str(token)], sp()).await.unwrap()
     }
 }

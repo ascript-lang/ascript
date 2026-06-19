@@ -592,6 +592,12 @@ pub(crate) enum ResourceState {
     /// are sizeable). Unix-only.
     #[cfg(all(feature = "docker", unix))]
     DockerStream(Box<crate::stdlib::docker::DockerStreamState>),
+    /// BATT §5.6: a `std/jwt` JWKS cache (`jwt.jwks(url)`). A self-contained TTL
+    /// cache of kid→public-key material fetched from a JWKS URL over the SHARED
+    /// pooled client. Boxed to keep the enum compact (the HashMap of keys). GC-
+    /// untraced (plain data reclaimed by Drop). Feature `auth`.
+    #[cfg(feature = "auth")]
+    JwksCache(Box<crate::stdlib::jwt::JwksCacheState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5676,6 +5682,12 @@ impl Interp {
             }
             if matches!(m.receiver.kind, crate::value::NativeKind::DockerStream) {
                 return self.call_docker_stream_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "auth")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::JwksCache) {
+                return self.call_jwks_method(&m, args, span).await;
             }
         }
         #[cfg(feature = "telemetry")]

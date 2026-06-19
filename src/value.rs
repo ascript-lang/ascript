@@ -1331,6 +1331,16 @@ pub enum NativeKind {
     // without `docker` (mirrors `DockerClient`).
     #[cfg(all(feature = "docker", unix))]
     DockerStream,
+    // BATT §5.6: a `std/jwt` JWKS cache handle (`jwt.jwks(url)`). Backed by
+    // `ResourceState::JwksCache` — a self-contained TTL cache of kid→public-key
+    // material fetched from a JWKS endpoint over the SHARED pooled client.
+    // Methods: `verify(token, opts?)` (kid-resolving verify, ONE refetch on an
+    // unknown kid), `keys()`, `close()`. `governing_caps` = Net (each refetch is
+    // network I/O → a `caps.drop("net")` HOLDS for an already-open cache). GC-
+    // untraced (a plain data cache reclaimed by Drop). Feature-gated — compiled out
+    // without `auth` (mirrors the docker/resilience pattern).
+    #[cfg(feature = "auth")]
+    JwksCache,
 }
 
 impl NativeKind {
@@ -1393,6 +1403,8 @@ impl NativeKind {
             NativeKind::DockerClient => "dockerClient",
             #[cfg(all(feature = "docker", unix))]
             NativeKind::DockerStream => "dockerStream",
+            #[cfg(feature = "auth")]
+            NativeKind::JwksCache => "jwksCache",
         }
     }
 
@@ -1480,6 +1492,13 @@ impl NativeKind {
             // DockerClient + the AiStream per-handle re-check precedent).
             #[cfg(all(feature = "docker", unix))]
             NativeKind::DockerStream => CapReq::one(Cap::Net).and(Cap::Process),
+            // BATT §5.6: operating a JWKS cache can REFETCH keys from the network on
+            // an unknown-kid / TTL miss, so a `caps.drop("net")` after the cache opens
+            // must HOLD (the per-handle re-check mirrors AiStream/HttpBody). A verify
+            // that hits the cache does no network, but the re-check is at the handle
+            // grain (worst case), so it is gated Net.
+            #[cfg(feature = "auth")]
+            NativeKind::JwksCache => CapReq::one(Cap::Net),
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a

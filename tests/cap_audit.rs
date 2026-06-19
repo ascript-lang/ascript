@@ -667,3 +667,62 @@ fn audit_caps_list_reflects_sandbox() {
         "[\"fs\", \"net\", \"process\", \"env\"]\n",
     );
 }
+
+// ───────────────────────── auth: jwt.jwks (Net) + oauth.* (Net) ────────────────
+//
+// BATT §5.6. `std/jwt` is PER-FUNC: `jwks` fetches keys over the network → Net,
+// while `sign`/`verify`/`decode`/`hmacKey` are pure crypto → ungated. `std/oauth`
+// is whole-module Net. We assert BOTH halves: the network funcs are denied under
+// `--deny net`/`--sandbox` (the gate fires BEFORE any fetch), AND `jwt.sign` still
+// works under `--deny net` — the positive proof of the per-func split.
+
+#[cfg(feature = "auth")]
+#[test]
+fn audit_jwt_jwks_denied_by_net() {
+    let imp = "import * as jwt from \"std/jwt\"";
+    let expr = "jwt.jwks(\"http://127.0.0.1:1/jwks\")";
+    assert_denied("audit_jwt_jwks.as", imp, expr, "net", &["--deny", "net"]);
+    assert_denied("audit_jwt_jwks_sbx.as", imp, expr, "net", &["--sandbox"]);
+}
+
+#[cfg(feature = "auth")]
+#[test]
+fn audit_oauth_all_denied_by_net() {
+    let imp = "import * as oauth from \"std/oauth\"";
+    for (name, expr) in [
+        (
+            "audit_oauth_discover.as",
+            "oauth.discover(\"https://issuer.example\")",
+        ),
+        (
+            "audit_oauth_client_creds.as",
+            "oauth.clientCredentials({ tokenUrl: \"http://127.0.0.1:1/t\", clientId: \"a\", clientSecret: \"b\" })",
+        ),
+        (
+            "audit_oauth_refresh.as",
+            "oauth.refresh({ tokenUrl: \"http://127.0.0.1:1/t\", refreshToken: \"r\", clientId: \"a\" })",
+        ),
+    ] {
+        assert_denied(name, imp, expr, "net", &["--deny", "net"]);
+        assert_denied(name, imp, expr, "net", &["--sandbox"]);
+    }
+}
+
+// The per-func split, asserted POSITIVELY: `jwt.sign` is pure crypto and MUST run
+// under `--deny net` (only `jwt.jwks` is gated). This proves the gate is keyed by
+// function, not by the whole `std/jwt` module.
+#[cfg(feature = "auth")]
+#[test]
+fn audit_jwt_sign_ungated_under_deny_net() {
+    let src = "import * as jwt from \"std/jwt\"\n\
+        let key = jwt.hmacKey(\"shared-secret\")\n\
+        let [tok, err] = jwt.sign({ sub: \"alice\" }, key)\n\
+        print(err)\n\
+        print(len(tok) > 0)\n";
+    assert_allowed(
+        "audit_jwt_sign_deny_net.as",
+        src,
+        &["--deny", "net"],
+        "nil\ntrue\n",
+    );
+}

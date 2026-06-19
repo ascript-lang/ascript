@@ -139,3 +139,87 @@ Decodes a token into `{ header, claims, signature, verified: false }` **without 
 signature** — for routing and debugging only. The result's `verified: false` field testifies that
 nothing was checked. Never trust `jwt.decode` output for authentication; use `jwt.verify`.
 :::
+
+## Verifying with a JWKS endpoint
+
+When an identity provider publishes its public keys at a JWKS URL, `jwt.jwks(url)` fetches the JWK
+Set once, caches it, and returns a handle whose `verify` resolves each token's `kid` header to the
+matching cached key. The fetch reuses AScript's **pooled HTTP client** — there is no second network
+stack. `jwt.jwks` is the only network-touching `std/jwt` function, so it is gated by the `net`
+capability (`--deny net` / `--sandbox` block it, while `jwt.sign`/`jwt.verify` stay available as
+pure crypto).
+
+```ascript
+import * as jwt from "std/jwt"
+
+let [keys, fetchErr] = jwt.jwks("https://issuer.example/.well-known/jwks.json")
+if fetchErr != nil { exit(1) }
+
+let [claims, err] = keys.verify(token, { algs: ["RS256"], iss: "https://issuer.example" })
+```
+
+The same algorithm-confusion defense applies: a JWKS key is converted to a typed `rsa-public` /
+`ec-public` key, so a JWKS RSA key can never verify an `HS256` token. Unsupported JWK types
+(`oct`, non-P-256 curves) are skipped; the usable RSA/EC keys remain available.
+
+### `jwt.jwks(url, opts?)`
+
+Fetches a JWK Set from `url` and returns `[cache, err]`. `opts.ttlMs?` sets the cache lifetime
+(default 5 minutes). The returned cache handle has:
+
+- `cache.verify(token, opts?)` — resolve the token's `kid`, then verify through the same path as
+  `jwt.verify` (same `opts`). On an unknown `kid` or an expired TTL the cache **refetches exactly
+  once** before resolving; a verify within the TTL never refetches. Returns `[claims, err]`.
+- `cache.keys()` — the kids currently cached, as `array<string>`.
+- `cache.close()` — drop the cached keys.
+
+## OAuth2 + PKCE
+
+`std/oauth` is a small OAuth2 client over the **same pooled HTTP client**. The whole module is
+`net`-gated. A non-2xx token response is a Tier-1 `[nil, err]` whose error carries the provider's
+response body (so you see `{ error, error_description }`); a wrong argument type is a Tier-2 panic.
+
+```ascript
+import * as oauth from "std/oauth"
+
+// 1. Generate a PKCE pair, send `pkce.challenge` on the authorization request.
+let pkce = oauth.pkce()   // { verifier, challenge, method: "S256" }
+
+// 2. After the redirect, exchange the code (with the verifier) for tokens.
+let [tokens, err] = oauth.exchangeCode({
+  tokenUrl: "https://issuer.example/token",
+  code: authCode,
+  codeVerifier: pkce.verifier,
+  clientId: "my-client",
+  clientSecret: "s3cr3t",          // omit for a public client
+  redirectUri: "https://app.example/callback",
+})
+```
+
+### `oauth.pkce()`
+
+Returns `{ verifier, challenge, method: "S256" }`. The `verifier` is a 43-character base64url string
+(32 bytes of entropy, via the determinism seam so it is reproducible under record/replay); the
+`challenge` is `base64url(sha256(verifier))` per RFC 7636.
+
+### `oauth.exchangeCode(opts)`
+
+Exchanges an authorization `code` for tokens (`grant_type=authorization_code`). A `clientSecret`
+selects HTTP Basic client authentication; otherwise the `clientId` rides in the form (public
+client). `opts`: `tokenUrl`, `code`, `codeVerifier`, `clientId`, `clientSecret?`, `redirectUri?`.
+Returns `[tokens, err]`.
+
+### `oauth.clientCredentials(opts)`
+
+The `client_credentials` grant (machine-to-machine, Basic auth). `opts`: `tokenUrl`, `clientId`,
+`clientSecret`, `scope?`. Returns `[tokens, err]`.
+
+### `oauth.refresh(opts)`
+
+Exchanges a `refreshToken` for a fresh access token (`grant_type=refresh_token`). `opts`:
+`tokenUrl`, `refreshToken`, `clientId`, `clientSecret?`. Returns `[tokens, err]`.
+
+### `oauth.discover(issuer)`
+
+Fetches an issuer's OpenID Connect metadata from `<issuer>/.well-known/openid-configuration` and
+returns `[metadata, err]`.

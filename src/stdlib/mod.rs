@@ -72,6 +72,10 @@ pub mod net_unix;
 #[cfg(feature = "net")]
 pub mod net_ws;
 pub mod object;
+// BATT §5.6 — `std/oauth` (feature `auth`): OAuth2 + PKCE over the SHARED pooled
+// reqwest client (no second HTTP stack).
+#[cfg(feature = "auth")]
+pub mod oauth;
 // BATT §4 — TLS shared plumbing (NOT a script module / not in STD_MODULES): PEM
 // loading + client/server config builders used by net_tcp.connectTls, http_server
 // serve({tls}), and email STARTTLS.
@@ -230,6 +234,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/docker" => docker::exports(),
         #[cfg(feature = "auth")]
         "std/jwt" => jwt::exports(),
+        #[cfg(feature = "auth")]
+        "std/oauth" => oauth::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -305,6 +311,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/resilience",
     "std/docker",
     "std/jwt",
+    "std/oauth",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -411,6 +418,11 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
             "jwks" => CapReq::one(Cap::Net),
             _ => CapReq::NONE,
         },
+        // BATT §5.6 — `std/oauth` drives OAuth2 token endpoints + OIDC discovery
+        // over the network → whole-module `Net` (the same posture as ai/telemetry,
+        // which also carry network egress). `--deny net`/`--sandbox` blocks it.
+        #[cfg(feature = "auth")]
+        "oauth" => CapReq::one(Cap::Net),
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
@@ -658,7 +670,9 @@ impl Interp {
             #[cfg(feature = "docker")]
             "docker" => self.call_docker(func, args, span).await,
             #[cfg(feature = "auth")]
-            "jwt" => self.call_jwt(func, args, span),
+            "jwt" => self.call_jwt_async(func, args, span).await,
+            #[cfg(feature = "auth")]
+            "oauth" => self.call_oauth(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
