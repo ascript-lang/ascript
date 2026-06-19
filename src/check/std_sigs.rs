@@ -1340,6 +1340,18 @@ static CRYPTO_HMAC_SHA256_PARAMS: &[StdParam] = &[
     StdParam::req_untyped("key"),
     StdParam::req_untyped("data"),
 ];
+static CRYPTO_HMAC_SHA384_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("key"),
+    StdParam::req_untyped("data"),
+];
+static CRYPTO_HMAC_SHA512_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("key"),
+    StdParam::req_untyped("data"),
+];
+static CRYPTO_TIMING_SAFE_EQUAL_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
 static CRYPTO_RANDOM_BYTES_PARAMS: &[StdParam] = &[StdParam::req("n", "number")];
 static CRYPTO_HASH_PASSWORD_PARAMS: &[StdParam] = &[StdParam::req_untyped("password")];
 static CRYPTO_VERIFY_PASSWORD_PARAMS: &[StdParam] = &[
@@ -1362,6 +1374,9 @@ static CRYPTO_SIGS: &[(&str, StdSig)] = &[
     ("sha512", StdSig { params: CRYPTO_SHA512_PARAMS, ret: Some("string"), doc: "Computes the SHA-512 digest of the input." }),
     ("md5", StdSig { params: CRYPTO_MD5_PARAMS, ret: Some("string"), doc: "Computes the MD5 digest of the input." }),
     ("hmacSha256", StdSig { params: CRYPTO_HMAC_SHA256_PARAMS, ret: Some("string"), doc: "Computes an HMAC-SHA256 tag." }),
+    ("hmacSha384", StdSig { params: CRYPTO_HMAC_SHA384_PARAMS, ret: Some("string"), doc: "Computes an HMAC-SHA384 tag." }),
+    ("hmacSha512", StdSig { params: CRYPTO_HMAC_SHA512_PARAMS, ret: Some("string"), doc: "Computes an HMAC-SHA512 tag." }),
+    ("timingSafeEqual", StdSig { params: CRYPTO_TIMING_SAFE_EQUAL_PARAMS, ret: Some("bool"), doc: "Compares two byte sequences in constant time." }),
     ("randomBytes", StdSig { params: CRYPTO_RANDOM_BYTES_PARAMS, ret: Some("bytes"), doc: "Generates cryptographically secure random bytes." }),
     ("hashPassword", StdSig { params: CRYPTO_HASH_PASSWORD_PARAMS, ret: Some("[string, err]"), doc: "Hashes a password with Argon2, returning a self-describing PHC string." }),
     ("verifyPassword", StdSig { params: CRYPTO_VERIFY_PASSWORD_PARAMS, ret: Some("bool"), doc: "Verifies a password against an Argon2 PHC string." }),
@@ -1376,6 +1391,9 @@ static CRYPTO_MEMBERS: &[(&str, MemberKind)] = &[
     ("sha512", MemberKind::Fn),
     ("md5", MemberKind::Fn),
     ("hmacSha256", MemberKind::Fn),
+    ("hmacSha384", MemberKind::Fn),
+    ("hmacSha512", MemberKind::Fn),
+    ("timingSafeEqual", MemberKind::Fn),
     ("randomBytes", MemberKind::Fn),
     ("hashPassword", MemberKind::Fn),
     ("verifyPassword", MemberKind::Fn),

@@ -20,7 +20,7 @@ use argon2::Argon2;
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use rand::RngCore;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -28,6 +28,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("sha512", bi("crypto.sha512")),
         ("md5", bi("crypto.md5")),
         ("hmacSha256", bi("crypto.hmacSha256")),
+        ("hmacSha384", bi("crypto.hmacSha384")),
+        ("hmacSha512", bi("crypto.hmacSha512")),
+        ("timingSafeEqual", bi("crypto.timingSafeEqual")),
         ("randomBytes", bi("crypto.randomBytes")),
         ("hashPassword", bi("crypto.hashPassword")),
         ("verifyPassword", bi("crypto.verifyPassword")),
@@ -92,6 +95,51 @@ pub fn call(
             mac.update(&data);
             let tag = mac.finalize().into_bytes();
             Ok(Value::str(hex::encode(tag)))
+        }
+        "hmacSha384" => {
+            let key = source_bytes(&arg(args, 0), span, &ctx("hmacSha384"))?;
+            let data = source_bytes(&arg(args, 1), span, &ctx("hmacSha384"))?;
+            // `new_from_slice` accepts a key of any length (HMAC pads/hashes it),
+            // so this never fails for SHA-384.
+            let mut mac =
+                Hmac::<Sha384>::new_from_slice(&key).expect("HMAC accepts any key length");
+            mac.update(&data);
+            let tag = mac.finalize().into_bytes();
+            Ok(Value::str(hex::encode(tag)))
+        }
+        "hmacSha512" => {
+            let key = source_bytes(&arg(args, 0), span, &ctx("hmacSha512"))?;
+            let data = source_bytes(&arg(args, 1), span, &ctx("hmacSha512"))?;
+            // `new_from_slice` accepts a key of any length (HMAC pads/hashes it),
+            // so this never fails for SHA-512.
+            let mut mac =
+                Hmac::<Sha512>::new_from_slice(&key).expect("HMAC accepts any key length");
+            mac.update(&data);
+            let tag = mac.finalize().into_bytes();
+            Ok(Value::str(hex::encode(tag)))
+        }
+        "timingSafeEqual" => {
+            // Compare two byte sequences (bytes or UTF-8 string) in CONSTANT time.
+            let a = source_bytes(&arg(args, 0), span, &ctx("timingSafeEqual"))?;
+            let b = source_bytes(&arg(args, 1), span, &ctx("timingSafeEqual"))?;
+            // Length is NOT secret (it is observable through the result and other
+            // channels), so a length-mismatch short-circuits to `false` — never a panic.
+            if a.len() != b.len() {
+                return Ok(Value::bool_(false));
+            }
+            // CONSTANT-TIME equality: fold an XOR of every byte pair into `acc` and
+            // only test `acc == 0` at the very end. A naive `a == b` (or any early-exit
+            // compare) returns as soon as the first differing byte is found, so the
+            // running time scales with the number of LEADING matching bytes — an attacker
+            // who controls one operand (e.g. a submitted HMAC/token) can measure that
+            // timing to recover the secret one byte at a time. The unconditional fold
+            // over ALL bytes makes the running time independent of where (or whether)
+            // they differ.
+            let mut acc: u8 = 0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                acc |= x ^ y;
+            }
+            Ok(Value::bool_(acc == 0))
         }
         "randomBytes" => {
             let n = want_number(&arg(args, 0), span, &ctx("randomBytes"))?;
@@ -268,6 +316,76 @@ mod tests {
             .unwrap(),
             s("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
         );
+    }
+
+    #[test]
+    fn hmac_sha384_known_vector() {
+        // RFC 4231 Test Case 2 (key="Jefe", data="what do ya want for nothing?").
+        // Cross-checked against `openssl dgst -sha384 -hmac "Jefe"`.
+        assert_eq!(
+            call(
+                "hmacSha384",
+                &[s("Jefe"), s("what do ya want for nothing?")],
+                sp()
+            )
+            .unwrap(),
+            s("af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649")
+        );
+    }
+
+    #[test]
+    fn hmac_sha512_known_vector() {
+        // RFC 4231 Test Case 2 (key="Jefe", data="what do ya want for nothing?").
+        // Cross-checked against `openssl dgst -sha512 -hmac "Jefe"`.
+        assert_eq!(
+            call(
+                "hmacSha512",
+                &[s("Jefe"), s("what do ya want for nothing?")],
+                sp()
+            )
+            .unwrap(),
+            s("164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737")
+        );
+    }
+
+    #[test]
+    fn timing_safe_equal_truth_table() {
+        // Equal same-length → true (string and bytes).
+        assert_eq!(
+            call("timingSafeEqual", &[s("abc"), s("abc")], sp()).unwrap(),
+            Value::bool_(true)
+        );
+        // Different same-length → false.
+        assert_eq!(
+            call("timingSafeEqual", &[s("abc"), s("abd")], sp()).unwrap(),
+            Value::bool_(false)
+        );
+        // Length-mismatch → false (NOT a panic).
+        assert_eq!(
+            call("timingSafeEqual", &[s("abc"), s("abcd")], sp()).unwrap(),
+            Value::bool_(false)
+        );
+        // Bytes args: equal → true.
+        let b1 = Value::bytes_rc(Rc::new(RefCell::new(b"secret".to_vec())));
+        let b2 = Value::bytes_rc(Rc::new(RefCell::new(b"secret".to_vec())));
+        assert_eq!(
+            call("timingSafeEqual", &[b1, b2], sp()).unwrap(),
+            Value::bool_(true)
+        );
+        // Bytes vs string of the same UTF-8 bytes → true (we compare raw bytes).
+        let b3 = Value::bytes_rc(Rc::new(RefCell::new(b"hello".to_vec())));
+        assert_eq!(
+            call("timingSafeEqual", &[b3, s("hello")], sp()).unwrap(),
+            Value::bool_(true)
+        );
+        // Both empty → true.
+        assert_eq!(
+            call("timingSafeEqual", &[s(""), s("")], sp()).unwrap(),
+            Value::bool_(true)
+        );
+        // Wrong-type arg (number) → Tier-2 panic.
+        assert!(call("timingSafeEqual", &[Value::float(1.0), s("x")], sp()).is_err());
+        assert!(call("timingSafeEqual", &[s("x"), Value::float(1.0)], sp()).is_err());
     }
 
     #[test]
