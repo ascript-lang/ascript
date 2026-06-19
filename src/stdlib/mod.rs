@@ -1087,6 +1087,8 @@ mod cap_gate_tests {
         assert!(required_cap("os", "tempDir").is_empty());
         assert!(required_cap("os", "uptime").is_empty());
         assert!(required_cap("os", "disks").is_empty());
+        // CNTR §8.2 — inContainer() is ungated (pure filesystem probe, no new OS resource).
+        assert!(required_cap("os", "inContainer").is_empty());
         // pure / non-resource modules → empty.
         assert!(required_cap("math", "abs").is_empty());
         assert!(required_cap("json", "parse").is_empty());

@@ -396,15 +396,11 @@ impl ServeOpts {
     }
 }
 
-/// The effective worker count for `workers: 0` (= `num_cpus`), mirroring the worker
-/// pool's `$ASCRIPT_WORKERS`-or-`num_cpus` rule so the server tier and the pool agree.
+/// The effective worker count for `workers: 0`, mirroring the worker pool's sizing
+/// rule (`$ASCRIPT_WORKERS` override → cgroup-aware `min(num_cpus, quota)`) so the
+/// server tier and the pool agree (CNTR §8.1).
 fn num_cpus_for_serve() -> usize {
-    std::env::var("ASCRIPT_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(num_cpus::get)
-        .max(1)
+    crate::worker::pool::effective_parallelism()
 }
 
 /// Whether SO_REUSEPORT (kernel connection load-balancing across N sockets bound to

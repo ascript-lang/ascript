@@ -1,4 +1,5 @@
-//! `std/os` — host OS facts: pid, platform, arch, CPU count, hostname, temp dir.
+//! `std/os` — host OS facts: pid, platform, arch, CPU count, hostname, temp dir,
+//! container detection.
 //!
 //! When the `sysinfo` feature is enabled this module also provides live system
 //! metrics via the `sysinfo` crate:
@@ -9,6 +10,9 @@
 //! All other sysinfo functions are synchronous and are routed through the normal
 //! `os::call` entry point. The async `cpuUsage` is handled in `Interp::call_os`
 //! in `src/stdlib/mod.rs`.
+//!
+//! `os.inContainer()` (CNTR §8.2) is an ungated heuristic — readable even under
+//! `--sandbox`.
 //!
 //! **Network interface IPs** come from `sysinfo::Networks` which in 0.31 provides
 //! `NetworkData::ip_networks()` → `&[IpNetwork { addr: IpAddr, prefix: u8 }]`.
@@ -24,6 +28,54 @@ use crate::value::Value;
 #[cfg(feature = "sysinfo")]
 use indexmap::IndexMap;
 
+// ── CNTR §8.2 — container detection heuristic ────────────────────────────────
+
+/// Inner implementation with an injectable root (for unit tests that pass a temp
+/// dir; production always calls `in_container()` which passes `/`).
+///
+/// Real Linux logic. Non-Linux always returns `false` (no cgroup/procfs).
+#[cfg(target_os = "linux")]
+fn in_container_at(root: &std::path::Path) -> bool {
+    use std::io::BufRead;
+
+    // /.dockerenv → Docker
+    if root.join(".dockerenv").exists() {
+        return true;
+    }
+    // /run/.containerenv → Podman
+    if root.join("run/.containerenv").exists() {
+        return true;
+    }
+    // /proc/1/cgroup contains a line with kubepods/docker/containerd
+    let cgroup_path = root.join("proc/1/cgroup");
+    if let Ok(f) = std::fs::File::open(&cgroup_path) {
+        for line in std::io::BufReader::new(f).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if line.contains("kubepods")
+                || line.contains("docker")
+                || line.contains("containerd")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Non-Linux stub: we have no cgroup/procfs → always `false`.
+#[cfg(not(target_os = "linux"))]
+fn in_container_at(_root: &std::path::Path) -> bool {
+    false
+}
+
+/// Production entry point: uses the real filesystem root `/`.
+pub(crate) fn in_container() -> bool {
+    in_container_at(std::path::Path::new("/"))
+}
+
 pub fn exports() -> Vec<(&'static str, Value)> {
     // Base host facts; the `mut`-less binding keeps the `sysinfo`-off build
     // warning-clean (the metric entries below are only appended when the
@@ -35,6 +87,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("cpuCount", bi("os.cpuCount")),
         ("hostname", bi("os.hostname")),
         ("tempDir", bi("os.tempDir")),
+        // CNTR §8.2 — ungated heuristic container detection (Linux: probes
+        // .dockerenv / run/.containerenv / proc/1/cgroup; non-Linux: false).
+        ("inContainer", bi("os.inContainer")),
     ];
     #[cfg(feature = "sysinfo")]
     let v = {
@@ -98,6 +153,11 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
             let path = std::env::temp_dir().to_string_lossy().into_owned();
             Ok(Value::str(path))
         }
+
+        // inContainer() -> bool — heuristic container detection (CNTR §8.2).
+        // Ungated: readable even under --sandbox (pure filesystem probe, no
+        // new OS resource acquired). Always `false` on non-Linux.
+        "inContainer" => Ok(Value::bool_(in_container())),
 
         // ---- sysinfo-backed synchronous metrics ----
 
@@ -288,6 +348,88 @@ mod tests {
     fn unknown_function_is_tier2_panic() {
         let err = call("noSuchFn", &[], sp());
         assert!(matches!(err, Err(Control::Panic(_))));
+    }
+
+    // CNTR §8.2 — inContainer() returns a bool via the call router
+    #[test]
+    fn in_container_call_returns_bool() {
+        let v = call("inContainer", &[], sp()).unwrap();
+        // On macOS/Windows the stub always returns false; on Linux it probes /.
+        // Either way it must be a Bool.
+        assert!(
+            matches!(v.kind(), ValueKind::Bool(_)),
+            "inContainer() must return a bool, got {:?}",
+            v
+        );
+    }
+
+    // ── CNTR §8.2 — in_container_at fixture tests (Linux-only inner fn) ──
+
+    /// .dockerenv at root → true
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_container_dockerenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".dockerenv"), "").unwrap();
+        assert!(in_container_at(tmp.path()), ".dockerenv should detect Docker");
+    }
+
+    /// run/.containerenv → true (Podman)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_container_containerenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        std::fs::write(tmp.path().join("run/.containerenv"), "").unwrap();
+        assert!(
+            in_container_at(tmp.path()),
+            "run/.containerenv should detect Podman"
+        );
+    }
+
+    /// proc/1/cgroup with a kubepods line → true
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_container_cgroup_kubepods() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("proc/1")).unwrap();
+        std::fs::write(
+            tmp.path().join("proc/1/cgroup"),
+            "12:devices:/kubepods/besteffort/podXXX\n",
+        )
+        .unwrap();
+        assert!(
+            in_container_at(tmp.path()),
+            "cgroup kubepods line should detect Kubernetes"
+        );
+    }
+
+    /// proc/1/cgroup with a docker line → true
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_container_cgroup_docker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("proc/1")).unwrap();
+        std::fs::write(
+            tmp.path().join("proc/1/cgroup"),
+            "11:blkio:/docker/abc123\n",
+        )
+        .unwrap();
+        assert!(
+            in_container_at(tmp.path()),
+            "cgroup docker line should detect Docker"
+        );
+    }
+
+    /// No container markers → false
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_container_none_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            !in_container_at(tmp.path()),
+            "empty root should not detect a container"
+        );
     }
 
     // ---- sysinfo-backed tests (feature = "sysinfo") ----

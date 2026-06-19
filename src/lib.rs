@@ -755,16 +755,11 @@ async fn run_tests_parallel(
     Ok(agg)
 }
 
-/// The isolate-count ceiling shared with the worker pool: `$ASCRIPT_WORKERS` if a positive
-/// integer, else `num_cpus` (min 1). `--parallel=N` is clamped to this so it never
-/// oversubscribes beyond the worker budget.
+/// The isolate-count ceiling shared with the worker pool: `$ASCRIPT_WORKERS` override,
+/// else cgroup-aware `min(num_cpus, quota).max(1)` (CNTR §8.1). `--parallel=N` is
+/// clamped to this so it never oversubscribes beyond the worker budget.
 fn worker_isolate_cap() -> usize {
-    std::env::var("ASCRIPT_WORKERS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or_else(num_cpus::get)
-        .max(1)
+    crate::worker::pool::effective_parallelism()
 }
 
 #[cfg(not(ascript_rt))]

@@ -9,7 +9,7 @@ Most of these modules are gated behind Cargo features, all of which are **on by 
 | Modules | Cargo feature |
 | --- | --- |
 | `std/fs`, `std/env`, `std/process`, `std/io` | `sys` |
-| `std/os` (host facts: pid, platform, arch, cpuCount, hostname, tempDir) | `sys` |
+| `std/os` (host facts: pid, platform, arch, cpuCount, hostname, tempDir, inContainer) | `sys` |
 | `std/os` (live metrics: memory, swap, cpuUsage, loadAvg, disks, uptime, networkInterfaces, localIp) | `sysinfo` |
 | `std/crypto` | `crypto` |
 | `std/compress` | `compress` |
@@ -28,7 +28,7 @@ Host OS facts and live system metrics.
 import * as os from "std/os"
 ```
 
-The **host facts** (`pid`, `platform`, `arch`, `cpuCount`, `hostname`, `tempDir`) are always available under the `sys` Cargo feature (default-on). The **live metrics** (`memory`, `swap`, `cpuUsage`, `loadAvg`, `disks`, `uptime`, `networkInterfaces`, `localIp`) require the separate `sysinfo` Cargo feature (also default-on). Strip `sysinfo` from a custom build to remove the metric APIs and the `sysinfo` crate dependency.
+The **host facts** (`pid`, `platform`, `arch`, `cpuCount`, `hostname`, `tempDir`, `inContainer`) are always available under the `sys` Cargo feature (default-on). The **live metrics** (`memory`, `swap`, `cpuUsage`, `loadAvg`, `disks`, `uptime`, `networkInterfaces`, `localIp`) require the separate `sysinfo` Cargo feature (also default-on). Strip `sysinfo` from a custom build to remove the metric APIs and the `sysinfo` crate dependency.
 
 ### Host facts
 
@@ -40,16 +40,18 @@ All host-fact functions are **synchronous** and infallible (they never return a 
 - `os.cpuCount()` → `number` — the number of logical CPUs available to the process (falls back to `1` if the OS does not report this).
 - `os.hostname()` → `string` — the machine hostname. Returns `"unknown"` if the OS call fails.
 - `os.tempDir()` → `string` — the OS temporary directory path.
+- `os.inContainer()` → `bool` — heuristic container detection. Returns `true` when the process is running inside a Docker, Podman, or Kubernetes container (Linux: probes `/.dockerenv`, `/run/.containerenv`, and `/proc/1/cgroup`); always `false` on non-Linux. Ungated — succeeds even under `--sandbox`.
 
 ```ascript
 import * as os from "std/os"
 
-print(os.pid())        // e.g. 12345
-print(os.platform())   // "macos"
-print(os.arch())       // "aarch64"
-print(os.cpuCount())   // e.g. 10
-print(os.hostname())   // e.g. "my-machine.local"
-print(os.tempDir())    // "/tmp"
+print(os.pid())           // e.g. 12345
+print(os.platform())      // "macos"
+print(os.arch())          // "aarch64"
+print(os.cpuCount())      // e.g. 10
+print(os.hostname())      // e.g. "my-machine.local"
+print(os.tempDir())       // "/tmp"
+print(os.inContainer())   // false (on a dev machine), true (inside Docker)
 ```
 
 ### Live system metrics (sysinfo feature)

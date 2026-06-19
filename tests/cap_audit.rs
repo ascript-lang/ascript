@@ -451,6 +451,20 @@ fn audit_os_ambient_introspection_not_gated() {
     assert_allowed("audit_os_ambient.as", src, &["--sandbox"], "string\ntrue\ntrue\n");
 }
 
+/// CNTR §8.2 — `os.inContainer()` is ungated: a pure filesystem probe that acquires
+/// no new OS resource. It MUST succeed even under `--sandbox`.
+/// Returns a bool (true inside a container, false on this macOS dev machine).
+#[test]
+fn audit_os_in_container_ungated_under_sandbox() {
+    let src = "import * as os from \"std/os\"\nprint(type(os.inContainer()))\n";
+    assert_allowed(
+        "audit_os_in_container.as",
+        src,
+        &["--sandbox"],
+        "bool\n",
+    );
+}
+
 // ───────────────────────────── sqlite/postgres/redis (BLOCKER 2) ──────────────
 // The database modules open OS resources and MUST be gated: sqlite opens/creates a
 // DB file → Fs; postgres/redis open TCP sockets → Net.

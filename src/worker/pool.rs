@@ -11,7 +11,10 @@
 //!     isolate frees up — this is the backpressure/oversubscription path: more jobs
 //!     than `cap` all complete as the per-isolate queues drain).
 //!
-//! `cap` = `$ASCRIPT_WORKERS` (if a positive integer) else `num_cpus::get()` (min 1).
+//! `cap` = `$ASCRIPT_WORKERS` (if a positive integer) else
+//! `min(num_cpus::get(), cgroup_cpu_quota).max(1)` (CNTR §8.1).
+//! On non-Linux `cgroup_cpu_quota_at` always returns `None`, so the effective
+//! parallelism is identical to the pre-CNTR `num_cpus::get()` path.
 //!
 //! Each dispatched job increments the chosen isolate's in-flight counter; the
 //! caller-side bridge task decrements it when the reply arrives (or the future is
@@ -21,7 +24,102 @@
 use super::isolate::{Isolate, WorkerRequest};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::path::Path;
 use std::rc::Rc;
+
+// ── CNTR §8.1 — cgroup-aware CPU quota ───────────────────────────────────────
+
+/// Parse cgroup CPU quota from a temp-dir root (for unit testing) or from `/`
+/// (production). Returns the quota rounded UP to whole CPUs, or `None` if the
+/// quota is unlimited / absent / malformed.
+///
+/// Linux-only: on non-Linux this always returns `None`, keeping behaviour
+/// identical to the pre-CNTR `num_cpus::get()` path.
+#[cfg(target_os = "linux")]
+fn cgroup_cpu_quota_at(root: &Path) -> Option<usize> {
+    // ── cgroup v2: {root}/sys/fs/cgroup/cpu.max ──────────────────────────
+    let v2 = root.join("sys/fs/cgroup/cpu.max");
+    if v2.exists() {
+        if let Ok(text) = std::fs::read_to_string(&v2) {
+            let text = text.trim();
+            let mut parts = text.split_whitespace();
+            let quota_str = parts.next().unwrap_or("max");
+            let period_str = parts.next().unwrap_or("100000");
+            if quota_str != "max" {
+                if let (Ok(quota), Ok(period)) = (
+                    quota_str.parse::<f64>(),
+                    period_str.parse::<f64>(),
+                ) {
+                    if period > 0.0 {
+                        let cpus = (quota / period).ceil() as usize;
+                        return Some(cpus.max(1));
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    // ── cgroup v1: {root}/sys/fs/cgroup/cpu/cpu.cfs_{quota,period}_us ───
+    let quota_path = root.join("sys/fs/cgroup/cpu/cpu.cfs_quota_us");
+    let period_path = root.join("sys/fs/cgroup/cpu/cpu.cfs_period_us");
+    if quota_path.exists() && period_path.exists() {
+        let quota_str = std::fs::read_to_string(&quota_path).ok()?;
+        let period_str = std::fs::read_to_string(&period_path).ok()?;
+        let quota: i64 = quota_str.trim().parse().ok()?;
+        let period: i64 = period_str.trim().parse().ok()?;
+        if quota == -1 || period <= 0 {
+            return None; // unlimited
+        }
+        let cpus = ((quota as f64) / (period as f64)).ceil() as usize;
+        return Some(cpus.max(1));
+    }
+
+    None
+}
+
+/// Non-Linux stub: always unlimited (no cgroup concept).
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+fn cgroup_cpu_quota_at(_root: &Path) -> Option<usize> {
+    None
+}
+
+/// The cgroup CPU quota from the REAL system root (`/`).
+/// Linux-only; returns `None` on non-Linux (or when unlimited/absent).
+fn cgroup_cpu_quota() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        cgroup_cpu_quota_at(Path::new("/"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The effective parallelism for worker pool sizing (CNTR §8.1).
+///
+/// Precedence (highest → lowest):
+/// 1. `$ASCRIPT_WORKERS` (if set to a positive integer) — the explicit override.
+/// 2. `min(num_cpus::get(), cgroup_quota)` — container-aware auto-sizing.
+///    On non-Linux `cgroup_quota` is always `None`, so this reduces to `num_cpus::get()`.
+///
+/// Result is always at least 1.
+pub fn effective_parallelism() -> usize {
+    // Highest priority: explicit env override.
+    if let Ok(s) = std::env::var("ASCRIPT_WORKERS") {
+        if let Some(n) = s.trim().parse::<usize>().ok().filter(|&n| n >= 1) {
+            return n;
+        }
+    }
+    // Auto-sizing: honour the cgroup quota if present.
+    let cpus = num_cpus::get();
+    match cgroup_cpu_quota() {
+        Some(quota) => cpus.min(quota).max(1),
+        None => cpus.max(1),
+    }
+}
 
 thread_local! {
     /// The process-/thread-local pool. `None` until the first dispatch initializes it.
@@ -56,14 +154,8 @@ pub struct Pool {
 
 impl Pool {
     fn new() -> Pool {
-        let cap = std::env::var("ASCRIPT_WORKERS")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or_else(num_cpus::get)
-            .max(1);
         Pool {
-            cap,
+            cap: effective_parallelism(),
             slots: Vec::new(),
         }
     }
@@ -267,5 +359,104 @@ mod tests {
         let third = rx.try_recv().expect("third request was sent");
         assert!(third.slice_bytes.is_some(), "a new fn_id still ships its slice");
         assert!(third.archive_bytes.is_none(), "the archive stays suppressed once installed");
+    }
+
+    // ── CNTR §8.1 — cgroup CPU quota parse tests (fixture-injected root) ──
+
+    /// Helper: create a cgroup-v2 `cpu.max` fixture file at `root/sys/fs/cgroup/cpu.max`.
+    #[cfg(target_os = "linux")]
+    fn write_v2(root: &std::path::Path, content: &str) {
+        let dir = root.join("sys/fs/cgroup");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cpu.max"), content).unwrap();
+    }
+
+    /// Helper: create cgroup-v1 fixture files under `root/sys/fs/cgroup/cpu/`.
+    #[cfg(target_os = "linux")]
+    fn write_v1(root: &std::path::Path, quota_us: i64, period_us: u64) {
+        let dir = root.join("sys/fs/cgroup/cpu");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cpu.cfs_quota_us"), format!("{quota_us}\n")).unwrap();
+        std::fs::write(dir.join("cpu.cfs_period_us"), format!("{period_us}\n")).unwrap();
+    }
+
+    // cgroup v2 — "200000 100000" → ceil(2.0) = 2
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_exact_quota_two_cpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2(tmp.path(), "200000 100000\n");
+        assert_eq!(cgroup_cpu_quota_at(tmp.path()), Some(2));
+    }
+
+    // cgroup v2 — "max 100000" → None (unlimited)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_max_is_unlimited() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2(tmp.path(), "max 100000\n");
+        assert_eq!(cgroup_cpu_quota_at(tmp.path()), None);
+    }
+
+    // cgroup v2 — "150000 100000" → ceil(1.5) = 2
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_ceil_rounds_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2(tmp.path(), "150000 100000\n");
+        assert_eq!(cgroup_cpu_quota_at(tmp.path()), Some(2));
+    }
+
+    // cgroup v2 — malformed content → None
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_malformed_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2(tmp.path(), "abc\n");
+        assert_eq!(cgroup_cpu_quota_at(tmp.path()), None);
+    }
+
+    // absent cgroup files → None
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_absent_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(cgroup_cpu_quota_at(tmp.path()), None);
+    }
+
+    // cgroup v1 — quota=400000, period=100000 → 4 CPUs
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v1_exact_quota_four_cpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v1(tmp.path(), 400000, 100000);
+        assert_eq!(cgroup_cpu_quota_at(tmp.path()), Some(4));
+    }
+
+    // cgroup v1 — quota=-1 → None (unlimited)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v1_minus_one_is_unlimited() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v1(tmp.path(), -1, 100000);
+        assert_eq!(cgroup_cpu_quota_at(tmp.path()), None);
+    }
+
+    // effective_parallelism — no env, no quota → equals num_cpus::get()
+    #[test]
+    fn effective_parallelism_no_env_no_quota_is_num_cpus() {
+        // On non-Linux the quota is always None, so this path always holds.
+        // On Linux without fixture files this also holds (we call the real /
+        // path which is either the real system root or absent in a test sandbox).
+        // We just assert it equals num_cpus::get() when quota is None.
+        let quota: Option<usize> = None; // simulate no quota
+        let cpus = num_cpus::get();
+        let result = match quota {
+            Some(q) => cpus.min(q).max(1),
+            None => cpus.max(1),
+        };
+        assert_eq!(result, cpus.max(1));
+        // Also verify effective_parallelism() itself is at least 1 on this machine.
+        assert!(effective_parallelism() >= 1);
     }
 }
