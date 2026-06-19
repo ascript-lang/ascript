@@ -1152,9 +1152,10 @@ impl Interp {
             }
         }
 
-        // Collect chunks from an array source (a generator source is driven the same
-        // way via the iteration protocol; v1 accepts an array of bytes chunks).
-        let chunks = collect_chunks(&source, span)?;
+        // Prepare a CHUNK SOURCE: either an eager array of chunks or a live generator
+        // we pull ONE chunk at a time (true streaming — a large object is never fully
+        // materialized; only the current part + a one-chunk lookahead are in memory).
+        let mut chunk_source = ChunkSource::new(&source, span)?;
 
         let content_type = opts_ref.and_then(|ov| {
             if let ValueKind::Object(o) = ov.kind() {
@@ -1197,15 +1198,59 @@ impl Interp {
             }
         };
 
-        // 2) UploadPart per chunk — PUT ?partNumber=N&uploadId=...
+        // 2) UploadPart per chunk — PUT ?partNumber=N&uploadId=... STREAMING with a
+        //    one-chunk LOOKAHEAD so we know whether the current part is the FINAL one
+        //    (the 5 MiB floor applies only to non-final parts). We hold at most the
+        //    current chunk + the next (lookahead) in memory at any time.
         let mut part_etags: Vec<(usize, String)> = Vec::new();
         let mut failure: Option<Value> = None;
-        for (i, chunk) in chunks.iter().enumerate() {
-            let part_number = i + 1;
-            let query = format!("partNumber={part_number}&uploadId={upload_id}");
-            // canonicalize (sorts partNumber<uploadId) — sigv4 needs canonical query.
-            let canon = sigv4::canonical_query_string(&query);
-            let req = self.sign_http(cfg, "PUT", &target, &canon, Vec::new(), chunk.clone());
+        let mut part_number: usize = 0;
+        // Prime the pipeline with the first chunk.
+        let mut current = match chunk_source.next(span).await {
+            Ok(c) => c,
+            Err(e) => {
+                // A generator that errors before producing anything → abort + Tier-1
+                // (a propagation/panic from the producer is surfaced as a Tier-2 below).
+                self.abort_multipart(cfg, &target, &upload_id).await;
+                return Err(e);
+            }
+        };
+        if current.is_none() {
+            // An empty source (no chunks) — abort the just-created upload, Tier-1.
+            self.abort_multipart(cfg, &target, &upload_id).await;
+            return Ok(make_pair(
+                Value::nil(),
+                make_error(Value::str("blob.putMultipart: source produced no chunks")),
+            ));
+        }
+        while let Some(chunk) = current.take() {
+            // Pull the NEXT chunk to learn whether `chunk` is the final part.
+            let next = match chunk_source.next(span).await {
+                Ok(c) => c,
+                Err(e) => {
+                    // The producer errored mid-stream: abort + re-raise (Tier-2 propagate
+                    // / panic from a user generator surfaces directly).
+                    self.abort_multipart(cfg, &target, &upload_id).await;
+                    return Err(e);
+                }
+            };
+            let is_final = next.is_none();
+            part_number += 1;
+
+            // RUNTIME-STREAM floor (§9.2): a NON-FINAL pulled chunk below 5 MiB is a
+            // Tier-1 error (distinct from the configured-partSize Tier-2 above).
+            if !is_final && chunk.len() < MIN_PART_SIZE {
+                failure = Some(make_error(Value::str(format!(
+                    "blob.putMultipart: non-final part {part_number} is {} bytes, below the S3 \
+                     minimum of {MIN_PART_SIZE} bytes (5 MiB) — buffer larger chunks from the source",
+                    chunk.len()
+                ))));
+                break;
+            }
+
+            let canon =
+                sigv4::canonical_query_string(&format!("partNumber={part_number}&uploadId={upload_id}"));
+            let req = self.sign_http(cfg, "PUT", &target, &canon, Vec::new(), chunk);
             let resp = match self.send_signed(req).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1233,13 +1278,13 @@ impl Interp {
                     break;
                 }
             }
+            // Advance: the lookahead becomes the current chunk for the next iteration.
+            current = next;
         }
 
         // On ANY part error → AbortMultipartUpload (no orphaned upload), then return.
         if let Some(err) = failure {
-            let abort_q = sigv4::canonical_query_string(&format!("uploadId={upload_id}"));
-            let req = self.sign_http(cfg, "DELETE", &target, &abort_q, Vec::new(), Vec::new());
-            let _ = self.send_signed(req).await; // best-effort
+            self.abort_multipart(cfg, &target, &upload_id).await;
             return Ok(make_pair(Value::nil(), err));
         }
 
@@ -1281,6 +1326,15 @@ impl Interp {
             .unwrap_or_default();
         Ok(make_pair(Value::str(etag), Value::nil()))
     }
+
+    /// AbortMultipartUpload (best-effort) — DELETE ?uploadId=... so a failed/abandoned
+    /// multipart leaves no orphaned upload on the server. Errors are ignored (the part
+    /// failure is the one surfaced to the caller).
+    async fn abort_multipart(&self, cfg: &BlobClientState, target: &Target, upload_id: &str) {
+        let abort_q = sigv4::canonical_query_string(&format!("uploadId={upload_id}"));
+        let req = self.sign_http(cfg, "DELETE", target, &abort_q, Vec::new(), Vec::new());
+        let _ = self.send_signed(req).await;
+    }
 }
 
 /// Build a `{key, size, etag, lastModified}` value from a `<Contents>` element.
@@ -1313,28 +1367,63 @@ fn body_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
     }
 }
 
-/// Collect multipart chunks from an ARRAY of byte/string chunks. (A generator source
-/// is recorded-unsupported in v1 — pass an array; documented in the spec.)
-fn collect_chunks(source: &Value, span: Span) -> Result<Vec<Vec<u8>>, Control> {
-    match source.kind() {
-        ValueKind::Array(a) => {
-            let mut out = Vec::new();
-            for (i, item) in a.borrow().iter().enumerate() {
-                out.push(body_bytes(item, span, &format!("blob.putMultipart chunk[{i}]"))?);
-            }
-            if out.is_empty() {
-                return Err(AsError::at("blob.putMultipart: source has no chunks", span).into());
-            }
-            Ok(out)
+/// A multipart chunk source — the unifying abstraction over the two accepted
+/// `source` shapes so the UploadPart loop has ONE streaming code path:
+///
+/// - `Array` — an eager `array<bytes | string>`; chunks are coerced lazily by index
+///   (no up-front copy of the whole array's bytes beyond what the Value already holds).
+/// - `Generator` — a live `fn*`/`async fn*` value; one chunk is PULLED per part via
+///   `g.resume(...)`, so a large object is never fully materialized — only the current
+///   part plus the loop's one-chunk lookahead are in memory at a time.
+///
+/// A `source` that is neither is a Tier-2 misuse, rejected at construction.
+enum ChunkSource {
+    Array { items: Value, idx: usize },
+    Generator(Rc<crate::coro::GeneratorHandle>),
+}
+
+impl ChunkSource {
+    /// Validate `source` and build the cursor. Tier-2 on a wrong-kind source.
+    fn new(source: &Value, span: Span) -> Result<ChunkSource, Control> {
+        match source.kind() {
+            ValueKind::Array(_) => Ok(ChunkSource::Array { items: source.clone(), idx: 0 }),
+            ValueKind::Generator(g) => Ok(ChunkSource::Generator(g.clone())),
+            _ => Err(AsError::at(
+                format!(
+                    "blob.putMultipart: source must be an array of bytes/string chunks or a generator, got {}",
+                    crate::interp::type_name(source)
+                ),
+                span,
+            )
+            .into()),
         }
-        _ => Err(AsError::at(
-            format!(
-                "blob.putMultipart: source must be an array of bytes/string chunks, got {}",
-                crate::interp::type_name(source)
-            ),
-            span,
-        )
-        .into()),
+    }
+
+    /// Pull the next chunk's bytes, or `None` at end-of-source. A non-bytes/string
+    /// yielded value is a Tier-2 misuse; a generator panic/propagation surfaces as the
+    /// `Control` it raised (the caller aborts the upload before re-raising). The
+    /// generator `.resume` await holds NO resources borrow (a consumer-driven generator
+    /// uses none), satisfying the never-hold-a-borrow-across-await rule.
+    async fn next(&mut self, span: Span) -> Result<Option<Vec<u8>>, Control> {
+        match self {
+            ChunkSource::Array { items, idx } => {
+                let ValueKind::Array(a) = items.kind() else { return Ok(None) };
+                let item = {
+                    let b = a.borrow();
+                    if *idx >= b.len() {
+                        return Ok(None);
+                    }
+                    b[*idx].clone()
+                };
+                let i = *idx;
+                *idx += 1;
+                Ok(Some(body_bytes(&item, span, &format!("blob.putMultipart chunk[{i}]"))?))
+            }
+            ChunkSource::Generator(g) => match g.resume(Value::nil()).await? {
+                Some(v) => Ok(Some(body_bytes(&v, span, "blob.putMultipart generator chunk")?)),
+                None => Ok(None),
+            },
+        }
     }
 }
 

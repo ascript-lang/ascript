@@ -111,10 +111,29 @@ call is `net`-gated because the URL carries the secret key's authority.
 ## `client.putMultipart(key, source, opts?) -> [etag, err]`
 
 Uploads a large object in parts: it initiates a multipart upload, uploads each chunk
-as a part (in order), then completes the upload. On **any** part error it issues an
-`AbortMultipartUpload` so no orphaned upload is left behind. `source` is an array of
-`bytes`/`string` chunks. A configured `opts.partSize` below 5 MiB (S3's floor for
-non-final parts) is a Tier-2 error. Returns the final object ETag.
+as a part (in order), then completes the upload. On **any** part error — a failed
+`UploadPart`, or a generator that errors mid-stream — it issues an
+`AbortMultipartUpload` so no orphaned upload is left behind. Returns the final object
+ETag.
+
+`source` is either:
+
+- an **array** of `bytes`/`string` chunks, or
+- a **generator** (a `fn*`/`async fn*` value) that is pulled **one chunk at a time** —
+  true streaming, so a large object is never fully buffered in memory. Only the current
+  part plus a one-chunk lookahead are held at any time.
+
+S3 requires every **non-final** part to be at least 5 MiB. A non-final part smaller
+than that is a **Tier-1** stream error (the upload aborts); a configured
+`opts.partSize` below 5 MiB is a **Tier-2** error. The final part may be any size.
+
+```ascript
+// stream a large object without buffering it whole
+fn* readChunks(path) {
+  // yield 5 MiB+ chunks from a file/socket/etc.
+}
+let [etag, err] = client.putMultipart("backups/large.tar", readChunks("large.tar"))
+```
 
 ## Errors
 

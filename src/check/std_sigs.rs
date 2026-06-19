@@ -1622,7 +1622,7 @@ static BLOB_SIGS: &[(&str, StdSig)] = &[
     ("delete", StdSig { params: BLOB_DELETE_PARAMS, ret: Some("[nil, err]"), doc: "Deletes an object and returns [nil, err]. opts: {bucket?}. Async." }),
     ("list", StdSig { params: BLOB_LIST_PARAMS, ret: Some("generator"), doc: "Returns a LAZY generator that yields {key, size, etag, lastModified} per object, paginating across continuation tokens (page N+1 fetched only when iteration crosses it). opts: {prefix?, delimiter?, bucket?, pageSize?}." }),
     ("presign", StdSig { params: BLOB_PRESIGN_PARAMS, ret: Some("[string, err]"), doc: "Mints a presigned URL (no network) and returns [url, err]. opts: {expires?: seconds (default 900), bucket?, contentType?}. Net-gated (the URL carries the signing secret's authority)." }),
-    ("putMultipart", StdSig { params: BLOB_PUT_MULTIPART_PARAMS, ret: Some("[string, err]"), doc: "Uploads a large object in parts (create → UploadPart per chunk → complete; aborts the upload on any part error so no orphan remains) and returns [etag, err]. source is an array of bytes/string chunks. A configured partSize below 5 MiB is a Tier-2 error. Async." }),
+    ("putMultipart", StdSig { params: BLOB_PUT_MULTIPART_PARAMS, ret: Some("[string, err]"), doc: "Uploads a large object in parts (create → UploadPart per chunk → complete; aborts the upload on any part error so no orphan remains) and returns [etag, err]. source is an array of bytes/string chunks OR a generator that is pulled one chunk at a time (true streaming — a large object is never fully buffered). A non-final part below 5 MiB is a Tier-1 stream error; a configured partSize below 5 MiB is a Tier-2 error. Async." }),
 ];
 
 static BLOB_MEMBERS: &[(&str, MemberKind)] = &[

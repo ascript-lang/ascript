@@ -515,24 +515,24 @@ fn blob_multipart_upload_order() {
         }
     });
     let (port, rec) = spawn_stub(5, router);
-    // Three chunks, each ≥ 5 MiB would be huge; for non-final parts the 5 MiB floor
-    // applies only to a CONFIGURED partSize. Here we pass explicit chunks (a generator
-    // of byte chunks); the final part may be small. We send 3 chunks via an array.
+    // Three chunks. The 5 MiB non-final-part floor (an S3 server constraint) applies to
+    // ANY source, so the two NON-FINAL parts are 5 MiB; the FINAL part may be small.
     let src = format!(
         "{}{}",
         client_src(port),
         r#"
+let big = string.repeat("z", 5 * 1024 * 1024)   // 5 MiB, meets the non-final floor
 let chunks = [
-  encoding.utf8Encode("part-one-data"),
-  encoding.utf8Encode("part-two-data"),
-  encoding.utf8Encode("part-three"),
+  encoding.utf8Encode(big),       // part 1 (non-final, 5 MiB)
+  encoding.utf8Encode(big),       // part 2 (non-final, 5 MiB)
+  encoding.utf8Encode("tail"),    // part 3 (final, small — allowed)
 ]
 let [etag, err] = client.putMultipart("big.bin", chunks)
 if (err != nil) { print(`mp-err: ${err.message}`); exit(1) }
 print(`etag=${etag}`)
 "#
     );
-    let full = format!("import * as encoding from \"std/encoding\"\n{src}");
+    let full = format!("import * as string from \"std/string\"\nimport * as encoding from \"std/encoding\"\n{src}");
     let (ok, out, err) = run_script(&full, "blob_multipart.as", &[]);
     assert!(ok, "script failed: {out}\n{err}");
     assert!(out.contains("etag=final-etag") || out.contains("etag=\"final-etag\""), "etag: {out}");
@@ -584,13 +584,15 @@ fn blob_multipart_aborts_on_part_failure() {
         }
     });
     let (port, rec) = spawn_stub(4, router);
+    // Non-final parts are 5 MiB (the floor); part 2 triggers the stub 500.
     let src = format!(
-        "import * as encoding from \"std/encoding\"\n{}{}",
+        "import * as string from \"std/string\"\nimport * as encoding from \"std/encoding\"\n{}{}",
         client_src(port),
         r#"
+let big = string.repeat("w", 5 * 1024 * 1024)
 let chunks = [
-  encoding.utf8Encode("part-one"),
-  encoding.utf8Encode("part-two"),
+  encoding.utf8Encode(big),
+  encoding.utf8Encode(big),
   encoding.utf8Encode("part-three"),
 ]
 let [etag, err] = client.putMultipart("big.bin", chunks)
@@ -614,6 +616,193 @@ print(`mp-err: ${err.message}`)
         !reqs.iter().any(|r| r.method == "PUT" && r.query.contains("partNumber=3")),
         "part 3 uploaded after failure (no abort-on-error): {:?}",
         reqs.iter().map(|r| r.query.clone()).collect::<Vec<_>>()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (d3) multipart over a GENERATOR source — streaming pull, same lifecycle/order
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn blob_multipart_generator_source_order() {
+    let init = r#"<?xml version="1.0"?><InitiateMultipartUploadResult><UploadId>GENUP1</UploadId></InitiateMultipartUploadResult>"#;
+    let complete = r#"<?xml version="1.0"?><CompleteMultipartUploadResult><ETag>"gen-final-etag"</ETag></CompleteMultipartUploadResult>"#;
+    let init = init.to_string();
+    let complete = complete.to_string();
+    let router: Router = Arc::new(move |rec: &Recorded| {
+        if rec.method == "POST" && rec.query.contains("uploads") {
+            Response::ok_xml(&init)
+        } else if rec.method == "POST" && rec.query.contains("uploadId=GENUP1") {
+            Response::ok_xml(&complete)
+        } else if rec.method == "PUT" && rec.query.contains("partNumber=") {
+            let pn = rec
+                .query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("partNumber="))
+                .unwrap_or("0");
+            Response {
+                status: 200,
+                headers: vec![("ETag".into(), format!("\"genpart{pn}\""))],
+                body: Vec::new(),
+            }
+        } else {
+            Response::ok_xml("<Error/>")
+        }
+    });
+    let (port, rec) = spawn_stub(5, router);
+    // The source is a `fn*` generator yielding 3 chunks. Each non-final chunk is ≥ 5
+    // MiB (the streaming floor) so a genuine large-object stream is exercised; the
+    // final chunk may be small. To keep the test fast we build the 5 MiB chunks with a
+    // string repeat, NOT a literal.
+    let src = format!(
+        "import * as encoding from \"std/encoding\"\n{}{}",
+        client_src(port),
+        r#"
+let big = string.repeat("x", 5 * 1024 * 1024)   // 5 MiB, meets the non-final floor
+fn* parts() {
+  yield encoding.utf8Encode(big)        // part 1 (5 MiB)
+  yield encoding.utf8Encode(big)        // part 2 (5 MiB)
+  yield encoding.utf8Encode("tail")     // part 3 (final, small — allowed)
+}
+let [etag, err] = client.putMultipart("streamed.bin", parts())
+if (err != nil) { print(`mp-err: ${err.message}`); exit(1) }
+print(`etag=${etag}`)
+"#
+    );
+    let full = format!("import * as string from \"std/string\"\n{src}");
+    let (ok, out, err) = run_script(&full, "blob_multipart_gen.as", &[]);
+    assert!(ok, "script failed: {out}\n{err}");
+    assert!(out.contains("etag=gen-final-etag") || out.contains("etag=\"gen-final-etag\""), "etag: {out}");
+
+    let reqs = recorded(&rec);
+    let methods: Vec<String> = reqs.iter().map(|r| format!("{} {}", r.method, r.query)).collect();
+    assert!(methods[0].starts_with("POST") && methods[0].contains("uploads"), "first req not initiate: {methods:?}");
+    let part_nums: Vec<&str> = reqs
+        .iter()
+        .filter(|r| r.method == "PUT")
+        .map(|r| r.query.split('&').find_map(|kv| kv.strip_prefix("partNumber=")).unwrap_or("?"))
+        .collect();
+    assert_eq!(part_nums, vec!["1", "2", "3"], "generator parts not in order: {part_nums:?}");
+    let last = methods.last().unwrap();
+    assert!(last.starts_with("POST") && last.contains("uploadId=GENUP1"), "last req not complete: {last}");
+    let complete_req = reqs.iter().rfind(|r| r.method == "POST" && r.query.contains("uploadId")).unwrap();
+    let body = String::from_utf8_lossy(&complete_req.body);
+    assert!(
+        body.contains("genpart1") && body.contains("genpart2") && body.contains("genpart3"),
+        "complete body etags: {body}"
+    );
+    // The final (small) part rode through; the non-final 5 MiB parts uploaded their bytes.
+    let part2 = reqs.iter().find(|r| r.method == "PUT" && r.query.contains("partNumber=2")).unwrap();
+    assert_eq!(part2.body.len(), 5 * 1024 * 1024, "part 2 (non-final) should carry 5 MiB");
+    let part3 = reqs.iter().find(|r| r.method == "PUT" && r.query.contains("partNumber=3")).unwrap();
+    assert_eq!(part3.body, b"tail", "final part bytes");
+}
+
+#[test]
+fn blob_multipart_generator_aborts_on_part_failure() {
+    let init = r#"<?xml version="1.0"?><InitiateMultipartUploadResult><UploadId>GENUP500</UploadId></InitiateMultipartUploadResult>"#;
+    let init = init.to_string();
+    let router: Router = Arc::new(move |rec: &Recorded| {
+        if rec.method == "POST" && rec.query.contains("uploads") {
+            Response::ok_xml(&init)
+        } else if rec.method == "PUT" && rec.query.contains("partNumber=1") {
+            Response { status: 200, headers: vec![("ETag".into(), "\"g1\"".into())], body: Vec::new() }
+        } else if rec.method == "PUT" && rec.query.contains("partNumber=2") {
+            Response {
+                status: 500,
+                headers: vec![("content-type".into(), "application/xml".into())],
+                body: br#"<?xml version="1.0"?><Error><Code>InternalError</Code><Message>boom</Message></Error>"#.to_vec(),
+            }
+        } else if rec.method == "DELETE" && rec.query.contains("uploadId=GENUP500") {
+            Response { status: 204, headers: vec![], body: Vec::new() }
+        } else {
+            Response::ok_xml("<Error/>")
+        }
+    });
+    let (port, rec) = spawn_stub(4, router);
+    // A generator whose 2nd pulled chunk triggers a stub 500 on UploadPart → abort.
+    // Non-final parts are 5 MiB to satisfy the streaming floor.
+    let src = format!(
+        "import * as string from \"std/string\"\nimport * as encoding from \"std/encoding\"\n{}{}",
+        client_src(port),
+        r#"
+let big = string.repeat("y", 5 * 1024 * 1024)
+fn* parts() {
+  yield encoding.utf8Encode(big)
+  yield encoding.utf8Encode(big)
+  yield encoding.utf8Encode("never-reached")
+}
+let [etag, err] = client.putMultipart("streamed.bin", parts())
+if (err == nil) { print("FAIL: should have errored"); exit(1) }
+print(`mp-err: ${err.message}`)
+"#
+    );
+    let (ok, out, err) = run_script(&src, "blob_multipart_gen_abort.as", &[]);
+    assert!(ok, "script should run (Tier-1): {out}\n{err}");
+    assert!(out.contains("mp-err:"), "expected mp error: {out}");
+
+    let reqs = recorded(&rec);
+    assert!(
+        reqs.iter().any(|r| r.method == "DELETE" && r.query.contains("uploadId=GENUP500")),
+        "AbortMultipartUpload not observed: {:?}",
+        reqs.iter().map(|r| format!("{} {}", r.method, r.query)).collect::<Vec<_>>()
+    );
+    // The generator must NOT have been driven past the failing part (no part 3).
+    assert!(
+        !reqs.iter().any(|r| r.method == "PUT" && r.query.contains("partNumber=3")),
+        "part 3 uploaded after failure (generator over-driven): {:?}",
+        reqs.iter().map(|r| r.query.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn blob_multipart_generator_nonfinal_part_too_small_is_tier1() {
+    // A NON-FINAL pulled chunk below the 5 MiB floor is a runtime-stream Tier-1 error
+    // (distinct from a configured-partSize Tier-2). The upload must abort.
+    let init = r#"<?xml version="1.0"?><InitiateMultipartUploadResult><UploadId>GENSMALL</UploadId></InitiateMultipartUploadResult>"#;
+    let init = init.to_string();
+    let router: Router = Arc::new(move |rec: &Recorded| {
+        if rec.method == "POST" && rec.query.contains("uploads") {
+            Response::ok_xml(&init)
+        } else if rec.method == "PUT" && rec.query.contains("partNumber=1") {
+            // Part 1 may be uploaded before we see part 2 is too small, OR the floor is
+            // checked with lookahead before uploading part 1. Either way the stub answers.
+            Response { status: 200, headers: vec![("ETag".into(), "\"s1\"".into())], body: Vec::new() }
+        } else if rec.method == "DELETE" && rec.query.contains("uploadId=GENSMALL") {
+            Response { status: 204, headers: vec![], body: Vec::new() }
+        } else {
+            Response::ok_xml("<Error/>")
+        }
+    });
+    // At most: init + (maybe part1) + abort = 3 requests.
+    let (port, rec) = spawn_stub(3, router);
+    let src = format!(
+        "import * as encoding from \"std/encoding\"\n{}{}",
+        client_src(port),
+        r#"
+fn* parts() {
+  yield encoding.utf8Encode("too-small-nonfinal")   // < 5 MiB but NOT the last chunk
+  yield encoding.utf8Encode("there-is-a-second")     // makes the first one non-final
+}
+let [etag, err] = client.putMultipart("streamed.bin", parts())
+if (err == nil) { print("FAIL: should have errored"); exit(1) }
+print(`mp-err: ${err.message}`)
+"#
+    );
+    let (ok, out, err) = run_script(&src, "blob_multipart_gen_small.as", &[]);
+    assert!(ok, "script should run (Tier-1, not a panic): {out}\n{err}");
+    assert!(out.contains("mp-err:"), "expected mp error: {out}");
+    assert!(
+        out.to_lowercase().contains("5 mib") || out.to_lowercase().contains("part") && out.to_lowercase().contains("small")
+            || out.to_lowercase().contains("minimum"),
+        "error should explain the non-final part floor: {out}"
+    );
+    // The upload must have been aborted (no orphan).
+    let reqs = recorded(&rec);
+    assert!(
+        reqs.iter().any(|r| r.method == "DELETE" && r.query.contains("uploadId=GENSMALL")),
+        "AbortMultipartUpload not observed after a too-small non-final part: {:?}",
+        reqs.iter().map(|r| format!("{} {}", r.method, r.query)).collect::<Vec<_>>()
     );
 }
 
