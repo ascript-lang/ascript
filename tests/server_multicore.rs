@@ -537,24 +537,23 @@ fn sigterm_triggers_graceful_drain() {
     }
     // CNTR §6 exit-hang fix: the process must now EXIT CLEANLY on its own (no kill),
     // since `main` returned normally and the daemon listener is aborted at program end.
-    let mut exited = false;
+    let mut exit_status = None;
     let exit_deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < exit_deadline {
         if let Ok(Some(status)) = child.try_wait() {
-            assert!(
-                status.success(),
-                "program ended normally → clean exit, got {status:?}"
-            );
-            exited = true;
+            exit_status = Some(status);
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if !exited {
+    if exit_status.is_none() {
         let _ = child.kill();
-        let _ = child.wait();
     }
+    // Always reap (also satisfies clippy::zombie_processes); a child that already
+    // exited via `try_wait` returns its status again harmlessly.
+    let _ = child.wait();
     let _ = std::fs::remove_file(&marker);
+    let exited = exit_status.map(|s| s.success()).unwrap_or(false);
     assert!(
         drained,
         "the SIGTERM → s.shutdown() → graceful-drain composition must run to completion \

@@ -3783,6 +3783,83 @@ print("done")
         assert!(out.contains("done"));
     }
 
+    /// Reviewer adversarial probe (CNTR §7): `shutdown()` fired TWICE with the SECOND
+    /// call landing DURING the in-flight drain (the first stopped the accept loop; the
+    /// second arrives while a slow handler is still draining). It must be a no-op:
+    /// onShutdown runs EXACTLY ONCE, no double-callback, no panic, the in-flight
+    /// request still completes, and serve resolves cleanly.
+    #[tokio::test]
+    async fn shutdown_twice_second_during_drain_is_noop() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as task from "std/task"
+import * as time from "std/time"
+let s = create()
+s.route("GET", "/slow", async (req) => {{
+  await time.sleep(300)
+  return "drained"
+}})
+await s.bind("127.0.0.1", {port})
+// First shutdown ~120ms in (request mid-flight → stops accept, begins drain).
+// Second shutdown ~200ms in (still inside the 300ms drain window).
+task.spawn(async () => {{ await time.sleep(120); s.shutdown() }})
+task.spawn(async () => {{ await time.sleep(200); s.shutdown() }})
+await s.serve({{ onShutdown: () => print("onShutdown") }})
+print("served-returned")
+"#
+        );
+        let interp = new_interp();
+        let url = format!("http://127.0.0.1:{port}/slow");
+        let client = tokio::spawn(async move { client_request("GET", &url, None).await });
+        run_on(&interp, &src).await.expect("server ran");
+        let (status, body) = client.await.unwrap();
+        assert_eq!(status, "HTTP/1.1 200 OK", "in-flight request must still complete");
+        assert_eq!(body, "drained");
+        let out = interp.output();
+        assert_eq!(
+            out.matches("onShutdown").count(),
+            1,
+            "a second shutdown DURING drain must not re-run onShutdown (out={out:?})"
+        );
+        assert!(out.contains("served-returned"), "serve must resolve cleanly");
+    }
+
+    /// Reviewer adversarial probe (CNTR §7): `s.shutdown()` called from INSIDE a request
+    /// handler. The handler that armed the shutdown must still complete + write its
+    /// response (it is the in-flight request being drained), and serve resolves.
+    #[tokio::test]
+    async fn shutdown_from_inside_request_handler() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/stop", async (req) => {{
+  s.shutdown()
+  return "stopping"
+}})
+await s.bind("127.0.0.1", {port})
+await s.serve({{ onShutdown: () => print("onShutdown") }})
+print("served-returned")
+"#
+        );
+        let interp = new_interp();
+        let url = format!("http://127.0.0.1:{port}/stop");
+        let client = tokio::spawn(async move { client_request("GET", &url, None).await });
+        run_on(&interp, &src).await.expect("server ran");
+        let (status, body) = client.await.unwrap();
+        assert_eq!(
+            status, "HTTP/1.1 200 OK",
+            "the handler that triggered shutdown must still complete its response"
+        );
+        assert_eq!(body, "stopping");
+        let out = interp.output();
+        assert_eq!(out.matches("onShutdown").count(), 1, "onShutdown once (out={out:?})");
+        assert!(out.contains("served-returned"), "serve must resolve after the handler drains");
+    }
+
     /// Like `client_request` but returns the FULL raw response text (head + body)
     /// so tests can assert on headers.
     async fn client_request_raw(method: &str, url: &str, body: Option<String>) -> (String, String) {

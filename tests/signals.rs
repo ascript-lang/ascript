@@ -272,6 +272,14 @@ print("done")
     }
 }
 
+// NOTE on a deliberately-OMITTED probe: a "send SIGTERM twice, assert the handler
+// runs TWICE" real-signal test is inherently flaky — the OS coalesces rapid signal
+// bursts into a single receipt (spec §6.1: "coalescing of bursts is the documented OS
+// behavior"), so the second receipt is timing-dependent. The DETERMINISTIC double-fire
+// case (a second shutdown DURING the drain → onShutdown still runs exactly once, no
+// panic) is covered in-process by
+// `stdlib::http_server::tests::shutdown_twice_second_during_drain_is_noop`.
+
 #[test]
 fn last_on_wins_second_handler_runs() {
     // Two `on`s for SIGTERM: the SECOND handler is the live one (registry swap).

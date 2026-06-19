@@ -1425,6 +1425,37 @@ print(r[1].message != nil)
     }
 
     #[tokio::test]
+    async fn off_never_registered_is_clean_noop() {
+        // Reviewer probe (CNTR §6): `off` for a signal that was never `on`'d is a
+        // silent no-op — it validates the name, finds no entry, and returns nil with
+        // NO panic and NO spawned listener (the OS default already applies).
+        let out = run(r#"
+import { off } from "std/process"
+let r = off("SIGTERM")
+print(r == nil)
+print("done")
+"#)
+        .await;
+        assert_eq!(
+            out, "true\ndone\n",
+            "off() for a never-registered signal must be a clean no-op, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_unknown_signal_name_is_tier2() {
+        // `off` validates the name like `on` — an unknown name is a Tier-2 panic, not
+        // a silent no-op (a typo'd signal must be loud).
+        let out = run(r#"
+import { off } from "std/process"
+let r = recover(() => off("SIGFOO"))
+print(r[1] != nil)
+"#)
+        .await;
+        assert_eq!(out, "true\n", "off() with an unknown name must be Tier-2");
+    }
+
+    #[tokio::test]
     async fn on_in_worker_isolate_is_refused() {
         // A `worker fn` calling `process.on` must be a Tier-2 refusal (main-isolate
         // only). The refusal propagates out of `await w(1)` as a Tier-2 panic; `recover`
