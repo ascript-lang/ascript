@@ -9,6 +9,7 @@ pub mod infer;
 pub mod render;
 pub mod rules;
 pub mod std_arity;
+pub mod std_sigs;
 pub mod suggest;
 pub use analyze::{analyze, Analysis};
 pub use config::{LintConfig, RULE_CODES};
