@@ -1028,6 +1028,11 @@ impl LanguageServer for Backend {
         // Project-wide: every indexed file → a workspace full report. Build a model
         // per file off its cached text (config-aware via the per-path lint config),
         // returning the SAME diagnostics the push/document-pull paths compute.
+        //
+        // C2 — yield between files so interleaved requests (hover/completion) are
+        // serviced promptly. The index read guard is dropped BEFORE we enter the loop
+        // (the file list is cloned out); within the loop the document store is consulted
+        // WITHOUT holding any guard across the yield.
         let files: Vec<(PathBuf, String)> = {
             match self.index.read().ok() {
                 Some(idx) => idx
@@ -1037,24 +1042,44 @@ impl LanguageServer for Backend {
                     .collect(),
                 None => Vec::new(),
             }
+            // index read guard is dropped here
         };
         let mut items: Vec<WorkspaceDocumentDiagnosticReport> = Vec::with_capacity(files.len());
         for (path, text) in files {
             let Some(uri) = canon_to_url(&path) else {
+                // yield even on skip so the loop stays interruptible
+                tokio::task::yield_now().await;
                 continue;
             };
-            let config = crate::lsp::model::config_for_path(&path);
-            let model = crate::lsp::model::SemanticModel::build(text, None, &config);
+            // C2: try to reuse the cached model for an open document whose text matches.
+            // Acquire the store lock, extract what we need, then DROP the guard before
+            // any further await — never hold a Mutex guard across an await point.
+            let cached_diags: Option<Vec<tower_lsp::lsp_types::Diagnostic>> = {
+                let store = self.documents.lock().await;
+                store.get(&uri).filter(|m| m.text == text).map(|m| m.lsp_diagnostics())
+                // store lock guard is dropped here at the end of the block
+            };
+            let diag_items = match cached_diags {
+                Some(diags) => diags,
+                None => {
+                    let config = crate::lsp::model::config_for_path(&path);
+                    crate::lsp::model::SemanticModel::build(text, None, &config).lsp_diagnostics()
+                }
+            };
             items.push(WorkspaceDocumentDiagnosticReport::Full(
                 WorkspaceFullDocumentDiagnosticReport {
                     uri,
                     version: None,
                     full_document_diagnostic_report: FullDocumentDiagnosticReport {
                         result_id: None,
-                        items: model.lsp_diagnostics(),
+                        items: diag_items,
                     },
                 },
             ));
+            // C2: yield after each file so other requests can be serviced. No lock is
+            // held at this point — the store block above dropped its guard, and the
+            // index read guard was dropped before the loop.
+            tokio::task::yield_now().await;
         }
         Ok(WorkspaceDiagnosticReportResult::Report(
             WorkspaceDiagnosticReport { items },
@@ -1676,6 +1701,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        // Collect the removed root paths (before we mutate self.roots).
+        let removed_roots: Vec<PathBuf> = params
+            .event
+            .removed
+            .iter()
+            .filter_map(|f| f.uri.to_file_path().ok())
+            .collect();
+
         if let Ok(mut roots) = self.roots.write() {
             for added in &params.event.added {
                 if let Ok(p) = added.uri.to_file_path() {
@@ -1690,10 +1723,43 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        // Re-warm the index over the (new) root set.
-        let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+
+        // C4: for each removed root, collect the indexed files that live under it AND
+        // do NOT live under any surviving root. Then fully_unindex them so their symbols
+        // no longer appear in workspace/symbol or cross-file navigation.
+        //
+        // A file that happens to be under BOTH a removed and a surviving root is kept
+        // (survives in the "under any surviving root" check), which is the safe
+        // conservative choice (re-warming will re-sync it anyway).
+        //
+        // We do this in ONE index write guard (no await inside) so no lock is held
+        // across an await point — full compliance with `await_holding_lock`.
+        let surviving_roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        if !removed_roots.is_empty() {
+            if let Ok(mut idx) = self.index.write() {
+                // Collect orphaned paths first (can't mutate idx.files while iterating it).
+                let to_remove: Vec<PathBuf> = idx
+                    .files
+                    .keys()
+                    .filter(|p| {
+                        // Under at least one removed root...
+                        removed_roots.iter().any(|r| p.starts_with(r))
+                            // ...and NOT under any surviving root.
+                            && !surviving_roots.iter().any(|r| p.starts_with(r))
+                    })
+                    .cloned()
+                    .collect();
+                for path in to_remove {
+                    idx.fully_unindex(&path);
+                }
+            }
+        }
+
+        // Re-warm the index over the (new / surviving) root set.
+        // std::fs::read_to_string is synchronous — no await in this block, so the
+        // index write guard below is never held across an await.
         if let Ok(mut idx) = self.index.write() {
-            for root in &roots {
+            for root in &surviving_roots {
                 for path in workspace::discover_as_files(root) {
                     if let Ok(text) = std::fs::read_to_string(&path) {
                         idx.reindex_file(&path, &text);
