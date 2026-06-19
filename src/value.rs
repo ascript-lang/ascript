@@ -1169,6 +1169,10 @@ pub enum NativeKind {
     // M14 networking handles (registered only under feature `net`).
     TcpListener,
     TcpStream,
+    // BATT §4.3 std/net/tcp: a TLS-wrapped client stream (`tcp.connectTls`), mirroring
+    // `TcpStream` over `tokio_rustls::client::TlsStream`. Registered only under feature
+    // `tls`. Methods: read/readLine/readToEnd/write/close + `alpn`.
+    TlsStream,
     // CNTR §3.1 std/net/unix: a bound Unix-domain listener and a buffered
     // client/accepted stream (registered only under feature `net`, unix only). The
     // listener unlinks its socket file on drop; the stream mirrors `TcpStream`.
@@ -1339,6 +1343,7 @@ impl NativeKind {
             NativeKind::Writer => "writer",
             NativeKind::TcpListener => "tcpListener",
             NativeKind::TcpStream => "tcpStream",
+            NativeKind::TlsStream => "tlsStream",
             NativeKind::UnixListener => "unixListener",
             NativeKind::UnixStream => "unixStream",
             NativeKind::HttpResponse => "httpResponse",
@@ -1417,6 +1422,7 @@ impl NativeKind {
             // Networking handles — operating them is live network I/O.
             NativeKind::TcpListener
             | NativeKind::TcpStream
+            | NativeKind::TlsStream
             | NativeKind::UnixListener
             | NativeKind::UnixStream
             | NativeKind::HttpResponse
@@ -4095,6 +4101,7 @@ mod tests {
         // ── old Some(Cap::Net) arms ──────────────────────────────────────────
         one(NativeKind::TcpListener, Cap::Net);
         one(NativeKind::TcpStream, Cap::Net);
+        one(NativeKind::TlsStream, Cap::Net);
         one(NativeKind::UnixListener, Cap::Net);
         one(NativeKind::UnixStream, Cap::Net);
         one(NativeKind::HttpResponse, Cap::Net);

@@ -68,6 +68,11 @@ pub mod net_unix;
 #[cfg(feature = "net")]
 pub mod net_ws;
 pub mod object;
+// BATT §4 — TLS shared plumbing (NOT a script module / not in STD_MODULES): PEM
+// loading + client/server config builders used by net_tcp.connectTls, http_server
+// serve({tls}), and email STARTTLS.
+#[cfg(feature = "tls")]
+pub mod tls;
 #[cfg(feature = "sys")]
 pub mod os;
 #[cfg(feature = "postgres")]
