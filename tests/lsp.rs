@@ -3394,3 +3394,63 @@ fn lsp_hover_stdlib_member_shows_signature() {
     client.close_stdin();
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
+
+/// SIG Task 3.1 C1: manual-invoke completion at `math.sq` (no trigger char) offers
+/// `sqrt` with `filterText` = `"sq"` over the wire.
+#[test]
+fn lsp_completion_partial_identifier_member_context() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://partial_member.as";
+    // line 0: import * as math from "std/math"
+    // line 1: let y = math.sq
+    // `let y = math.sq` — chars 0..15, cursor after `q` = char 15.
+    let text = "import * as math from \"std/math\"\nlet y = math.sq\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Manual invoke (no triggerCharacter) at the end of `math.sq`.
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 15 },
+            "context": { "triggerKind": 1 }
+        }),
+    );
+    let resp = client.read_response(2, overall);
+    let items = resp["result"]
+        .as_array()
+        .expect("completion result array");
+    let sqrt = items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("sqrt"))
+        .unwrap_or_else(|| panic!("sqrt must be offered at math.sq|; labels: {:?}",
+            items.iter().map(|i| i["label"].as_str().unwrap_or("")).collect::<Vec<_>>()
+        ));
+    assert_eq!(
+        sqrt["filterText"].as_str(),
+        Some("sq"),
+        "filterText must equal the typed prefix 'sq': {sqrt}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}

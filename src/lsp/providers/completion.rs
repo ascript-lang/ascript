@@ -278,14 +278,18 @@ pub fn resolve_completion_static(item: &mut CompletionItem) -> bool {
 /// Context detection is done by simple, parser-free scanning of the raw text around
 /// the cursor, so it works on documents that do not yet parse:
 /// - inside an `import ... from "..."` / `'...'` string → stdlib module paths;
-/// - right after `<ident>.` where `<ident>` is a `import * as <ident>` namespace of a
-///   known std module → that module's exports.
+/// - right after `<ident>.` (with an optional partial identifier after the dot, e.g.
+///   `math.sq`) where `<ident>` is a `import * as <ident>` namespace of a known std
+///   module → that module's exports (with `filter_text` = the typed prefix so the
+///   client filters correctly);
+/// - inside a plain string body or comment → NO items (C8 suppression).
 pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> {
     let text = &model.text;
     let chars: Vec<char> = text.chars().collect();
     let offset = offset.min(chars.len());
 
     // Context 1: inside an import-from string literal → offer module paths.
+    // This is checked BEFORE the C8 string-suppression so import paths still complete.
     if in_import_path_string(&chars, offset) {
         return STD_MODULE_PATHS
             .iter()
@@ -293,8 +297,16 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
             .collect();
     }
 
-    // Context 2: member access `<ident>.` where ident is a namespace import.
-    if let Some(alias) = member_access_alias(&chars, offset) {
+    // C8: suppress inside plain string bodies and comments.
+    // Template INTERPOLATION interiors land on ordinary tokens (Ident etc.) and are
+    // NOT suppressed — only the TemplateStart/Middle/End/TemplateStr literal parts are.
+    if token_kind_at_cursor(&model.tokens, offset, &chars).is_some_and(suppressed_token_kind) {
+        return Vec::new();
+    }
+
+    // Context 2: member access `<ident>.<prefix>` where ident is a namespace import.
+    // C1: also fires when the cursor is after a partial identifier (`math.sq|`).
+    if let Some((alias, prefix)) = member_access_alias(&chars, offset) {
         if let Some(module) = namespace_import_module(text, &alias) {
             // Use the curated member table when available (provides real kinds,
             // detail, and data for lazy doc resolution). Fall back to the runtime
@@ -311,12 +323,18 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                                     let mut it = item(name, CompletionItemKind::FUNCTION);
                                     it.detail = std_sig(&module, name).map(render_sig_detail);
                                     it.data = Some(serde_json::json!({"module": module, "name": name}));
+                                    if !prefix.is_empty() {
+                                        it.filter_text = Some(prefix.clone());
+                                    }
                                     Some(it)
                                 }
                                 MemberKind::Const(ty) => {
                                     let mut it = item(name, CompletionItemKind::CONSTANT);
                                     it.detail = Some((*ty).to_string());
                                     it.data = Some(serde_json::json!({"module": module, "name": name}));
+                                    if !prefix.is_empty() {
+                                        it.filter_text = Some(prefix.clone());
+                                    }
                                     Some(it)
                                 }
                             }
@@ -327,7 +345,13 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                 if !exports.is_empty() {
                     return exports
                         .into_iter()
-                        .map(|(name, _)| item(&name, CompletionItemKind::FUNCTION))
+                        .map(|(name, _)| {
+                            let mut it = item(&name, CompletionItemKind::FUNCTION);
+                            if !prefix.is_empty() {
+                                it.filter_text = Some(prefix.clone());
+                            }
+                            it
+                        })
                         .collect();
                 }
             }
@@ -342,13 +366,25 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                 return info
                     .variants
                     .iter()
-                    .map(|v| variant_completion_item(v, info, &table))
+                    .map(|v| {
+                        let mut it = variant_completion_item(v, info, &table);
+                        if !prefix.is_empty() {
+                            it.filter_text = Some(prefix.clone());
+                        }
+                        it
+                    })
                     .collect();
             }
         }
         if let Some(cid) = table.class_id(&alias) {
             if let Some(info) = table.class(cid) {
-                return class_member_items(info);
+                let mut items = class_member_items(info);
+                if !prefix.is_empty() {
+                    for it in &mut items {
+                        it.filter_text = Some(prefix.clone());
+                    }
+                }
+                return items;
             }
         }
 
@@ -358,8 +394,16 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
         // `hover_type_at` entry point hover/inlay use), extract its class name, and
         // offer that class's fields + methods. The LSP runs NO code — `hover_type_at`
         // is a pure static inference pass.
-        if let Some(info) = receiver_class_info(model, &chars, offset, &alias, &table) {
-            return class_member_items(info);
+        // Compute the dot position: offset - prefix.len() - 1 (the char before the prefix).
+        let dot_pos = offset.saturating_sub(prefix.chars().count()).saturating_sub(1);
+        if let Some(info) = receiver_class_info(model, &chars, dot_pos, &alias, &table) {
+            let mut items = class_member_items(info);
+            if !prefix.is_empty() {
+                for it in &mut items {
+                    it.filter_text = Some(prefix.clone());
+                }
+            }
+            return items;
         }
     }
 
@@ -438,26 +482,25 @@ fn class_member_items(info: &crate::check::infer::table::ClassInfo) -> Vec<Compl
     out
 }
 
-/// Context 4: if the receiver `alias` ending just before the dot at `offset` is a
-/// VALUE whose inferred type names a known class, return that `ClassInfo`. The
-/// receiver's type is resolved via `crate::check::infer::hover_type_at` (the static
-/// inference pass hover/inlay already use — runs NO code), the leading class
-/// identifier is extracted from the rendered type, and looked up in the SP10 table.
-/// `None` when the type is a primitive / `Any` / a non-class (then completion falls
-/// back to the baseline).
+/// Context 4: if the receiver `alias` ending just before the dot (at `dot_pos` in
+/// char space) is a VALUE whose inferred type names a known class, return that
+/// `ClassInfo`. The receiver's type is resolved via
+/// `crate::check::infer::hover_type_at` (the static inference pass hover/inlay
+/// already use — runs NO code), the leading class identifier is extracted from the
+/// rendered type, and looked up in the SP10 table. `None` when the type is a
+/// primitive / `Any` / a non-class (then completion falls back to the baseline).
 fn receiver_class_info<'t>(
     model: &SemanticModel,
     chars: &[char],
-    offset: usize,
+    dot_pos: usize,
     alias: &str,
     table: &'t crate::check::infer::table::Table,
 ) -> Option<&'t crate::check::infer::table::ClassInfo> {
     // The receiver identifier occupies `[dot - alias_len, dot)` in CHAR space; aim at
     // its middle char so the inference hover-span lookup lands inside the name. Convert
     // to the BYTE offset `hover_type_at` expects (it operates on the raw source bytes).
-    let dot = offset.checked_sub(1)?;
     let alias_chars = alias.chars().count();
-    let recv_start = dot.checked_sub(alias_chars)?;
+    let recv_start = dot_pos.checked_sub(alias_chars)?;
     let recv_mid_char = recv_start + alias_chars / 2;
     let byte_off = crate::lsp::convert::char_to_byte(&model.text, recv_mid_char.min(chars.len()));
     let rendered = crate::check::infer::hover_type_at(&model.text, byte_off)?;
@@ -491,29 +534,51 @@ fn first_class_ident(rendered: &str) -> Option<String> {
     None
 }
 
-/// If the text immediately before `offset` is `<ident>.`, return `<ident>`.
-fn member_access_alias(chars: &[char], offset: usize) -> Option<String> {
+/// If the text at `offset` is `<ident>.<prefix>` (prefix may be empty, i.e. the
+/// cursor is right after the dot), return `(alias, prefix)` where `alias` is the
+/// identifier ending just before the LAST dot before the prefix, and `prefix` is the
+/// typed portion after the dot up to the cursor.
+///
+/// C1 support: `math.|` → `("math", "")`, `math.sq|` → `("math", "sq")`.
+/// Chain case: for `a.b.c|`, prefix = `"c"`, alias = `"b"` (the ident immediately
+/// before the dot that precedes the prefix).
+fn member_access_alias(chars: &[char], offset: usize) -> Option<(String, String)> {
     if offset == 0 {
         return None;
     }
-    // The char right before the cursor must be a dot.
-    if chars[offset - 1] != '.' {
+    // Backtrack over trailing ident chars to find where the prefix starts.
+    let prefix_end = offset;
+    let mut prefix_start = prefix_end;
+    while prefix_start > 0 && is_ident_char(chars[prefix_start - 1]) {
+        prefix_start -= 1;
+    }
+    // The first ident-start char of the prefix must not be a digit (a digit-led run
+    // would be a number, not an identifier prefix). If the run is empty (cursor right
+    // after dot) the check is vacuously fine.
+    if prefix_start < prefix_end && chars[prefix_start].is_ascii_digit() {
         return None;
     }
-    // Collect the identifier ending just before the dot.
-    let dot = offset - 1;
-    let mut start = dot;
-    while start > 0 && is_ident_char(chars[start - 1]) {
-        start -= 1;
+    // There must be a dot immediately before the prefix.
+    if prefix_start == 0 || chars[prefix_start - 1] != '.' {
+        return None;
     }
-    if start == dot {
+    let dot = prefix_start - 1;
+    // Collect the identifier ending just before the dot (the alias).
+    let alias_end = dot;
+    let mut alias_start = alias_end;
+    while alias_start > 0 && is_ident_char(chars[alias_start - 1]) {
+        alias_start -= 1;
+    }
+    if alias_start == alias_end {
         return None; // no ident before the dot
     }
-    // The first char must be a valid identifier start (not a digit).
-    if chars[start].is_ascii_digit() {
+    // The first char of the alias must be a valid identifier start (not a digit).
+    if chars[alias_start].is_ascii_digit() {
         return None;
     }
-    Some(chars[start..dot].iter().collect())
+    let alias: String = chars[alias_start..alias_end].iter().collect();
+    let prefix: String = chars[prefix_start..prefix_end].iter().collect();
+    Some((alias, prefix))
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -563,6 +628,59 @@ fn namespace_import_module(text: &str, alias: &str) -> Option<String> {
         return Some(path);
     }
     None
+}
+
+/// C8: return the `SyntaxKind` of the token whose character range CONTAINS the cursor
+/// at `char_offset`, or `None` if the cursor falls between tokens (e.g. at a boundary
+/// between whitespace and code, or past the end of the file).
+///
+/// `LexToken` carries no byte/char ranges — compute them by walking the token list and
+/// accumulating char lengths. The token stream is lossless (concatenating all texts
+/// reproduces the source), so char positions are exact.
+///
+/// We want the token that OWNS the cursor: the one where
+/// `tok_start < char_offset <= tok_end` (exclusive on the left, inclusive on the
+/// right — a cursor right at the end of a token is still "inside" it for suppression
+/// purposes, e.g. `"hel|` with cursor after `l` is inside the Str token).
+fn token_kind_at_cursor(
+    tokens: &[crate::syntax::lexer::LexToken],
+    char_offset: usize,
+    _chars: &[char],
+) -> Option<crate::syntax::kind::SyntaxKind> {
+    let mut pos = 0usize;
+    for tok in tokens {
+        let tok_len = tok.text.chars().count();
+        let tok_end = pos + tok_len;
+        // The cursor is inside this token if it falls in (pos, tok_end].
+        // We use a half-open interval: cursor > pos (not at the very start of this
+        // token, which belongs to the previous) AND cursor <= tok_end.
+        if char_offset > pos && char_offset <= tok_end {
+            return Some(tok.kind);
+        }
+        pos = tok_end;
+    }
+    None
+}
+
+/// C8: whether a `SyntaxKind` is a suppressed token (plain string body or comment).
+/// Template INTERPOLATION interiors use normal token kinds (Ident, Number, etc.) so
+/// they are NOT in this set — completion inside `${n` works normally.
+/// TemplateStr (a template with no interpolation, `` `plain` ``) IS suppressed because
+/// the cursor is inside the literal string body.
+/// TemplateStart/Middle/End contain the literal parts (`` `text${ `` / ``}text${ `` /
+/// ``}text` ``) — suppress cursor positions inside those literal parts.
+fn suppressed_token_kind(kind: crate::syntax::kind::SyntaxKind) -> bool {
+    use crate::syntax::kind::SyntaxKind;
+    matches!(
+        kind,
+        SyntaxKind::Str
+            | SyntaxKind::TemplateStr
+            | SyntaxKind::TemplateStart
+            | SyntaxKind::TemplateMiddle
+            | SyntaxKind::TemplateEnd
+            | SyntaxKind::LineComment
+            | SyntaxKind::BlockComment
+    )
 }
 
 #[cfg(test)]
@@ -665,13 +783,16 @@ mod tests {
 
     #[test]
     fn completions_on_garbage_returns_baseline_no_panic() {
-        for src in ["", "@#$%^", "fn fn fn (((", "import * as", "\"unterminated"] {
+        // Non-string, non-comment garbage → baseline still offered.
+        for src in ["", "@#$%^", "fn fn fn (((", "import * as"] {
             let it = items(src);
             assert!(
                 labels(&it).contains(&"let"),
                 "garbage {src:?} should still yield baseline"
             );
         }
+        // Unterminated string: C8 suppresses (returns empty — not baseline). Must NOT panic.
+        let _ = items("\"unterminated");
         // An out-of-range offset must not panic.
         let model = SemanticModel::build("let x".to_string(), None, &LintConfig::default());
         let _ = completions(&model, 9999);
@@ -998,5 +1119,30 @@ mod tests {
         assert!(abs.sort_text.as_deref().unwrap_or("").starts_with("zz"),
             "auto-import must sort after locals: {:?}", abs.sort_text);
         assert!(std::ptr::eq(auto_import_entries(), auto_import_entries()));
+    }
+
+    // ── SIG Task 3.1 C1: partial-identifier member completion ────────────────────
+
+    #[test]
+    fn member_completion_with_partial_identifier_after_dot() {
+        // C1: manual invoke at `math.sq|` must offer members (filtered client-side).
+        let it = items("import * as math from \"std/math\"\nlet y = math.sq");
+        let sqrt = it.iter().find(|i| i.label == "sqrt").expect("sqrt offered at math.sq|");
+        assert_eq!(sqrt.filter_text.as_deref(), Some("sq"), "typed prefix as filter_text");
+    }
+
+    // ── SIG Task 3.1 C8: string/comment suppression ──────────────────────────────
+
+    #[test]
+    fn no_completion_inside_strings_and_comments() {
+        // C8: a plain string body and a comment body yield NO items…
+        assert!(items("let s = \"hel").is_empty(), "inside plain string must yield no items");
+        assert!(items("// com").is_empty(), "inside line comment must yield no items");
+        assert!(items("/* blo").is_empty(), "inside block comment must yield no items");
+        // …but the import-path context still completes,
+        assert!(!items("import { x } from \"std/").is_empty(), "import path must still complete");
+        // and a template INTERPOLATION completes normally.
+        let it = items("let n = 1\nlet s = `v: ${n");
+        assert!(it.iter().any(|i| i.label == "print"), "template interp should complete");
     }
 }
