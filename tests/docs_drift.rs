@@ -159,6 +159,7 @@ fn ascript_env_var_extractor_trims_trailing_underscore() {
 const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/ai", "ai.md"),
     ("std/assert", "assert.md"),
+    ("std/test", "assert.md"),
     ("std/bench", "bench.md"),
     ("std/cli", "cli.md"),
     ("std/color", "cli.md"),

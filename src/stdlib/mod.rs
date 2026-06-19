@@ -120,6 +120,9 @@ pub mod task_mod;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod template;
+// BATT C2 (§10.4) — std/test generator combinators. CORE (no feature gate), like
+// std/assert / std/bench.
+pub mod test_mod;
 pub mod time;
 pub mod time_timers;
 #[cfg(feature = "data")]
@@ -151,6 +154,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         #[cfg(feature = "ai")]
         "std/ai" => ai::exports(),
         "std/assert" => assert_mod::exports(),
+        "std/test" => test_mod::exports(),
         "std/bench" => bench::exports(),
         "std/cli" => cli::exports(),
         "std/color" => color::exports(),
@@ -276,6 +280,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
 pub const STD_MODULES: &[&str] = &[
     "std/ai",
     "std/assert",
+    "std/test",
     "std/bench",
     "std/cli",
     "std/color",
@@ -622,6 +627,7 @@ impl Interp {
             #[cfg(feature = "ai")]
             "ai" => self.call_ai(func, args, span).await,
             "assert" => self.call_assert(func, args, span).await,
+            "test" => self.call_test(func, args, span).await,
             "bench" => self.call_bench(func, args, span).await,
             "cli" => self.call_cli(func, args, span).await,
             "color" => color::call(func, args, span),
@@ -1337,6 +1343,9 @@ mod cap_gate_tests {
         // revisit if raw-tty input ever becomes a gated input channel. `log` writes
         // stderr / a capture buffer, never an arbitrary file. `cli` reads start-time argv.)
         const KNOWN_UNGATED: &[&str] = &[
+            // BATT C2 §10.4: std/test is pure generator combinators + the (core)
+            // determinism seam — no OS resource, so it acquires no cap.
+            "test",
             "assert", "bench", "cli", "color", "decimal", "math", "string", "array",
             "object", "map", "schema", "shared", "set", "lru", "events", "template", "bytes", "caps",
             "convert", "task", "time", "sync", "stream", "date", "intl", "json", "log",

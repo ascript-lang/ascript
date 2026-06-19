@@ -270,3 +270,28 @@ test("stream result shape", () => {
 
 Run with `ascript test file.as`. See [the CLI docs](../cli) for details on the
 test runner.
+
+## Property testing (std/test)
+
+`std/test` is a **core** module (available even in a minimal build) that provides
+**value generators** for property-based testing. A generator is an inert tagged
+object you compose with combinators; the property runner (and the `--seed` /
+`--frozen-time` flags) draws concrete values from it with a deterministic,
+edge-biased sampler — the same boundary-favouring philosophy as the internal
+fuzzer, so corner cases (`min`, `max`, `0`, `±1`, empty/single collections) are
+hit far more often than uniform sampling would.
+
+```ascript
+import { gen } from "std/test"
+
+let smallInt = gen.int(0, 100)
+let names = gen.arrayOf(gen.string({ minLen: 1, maxLen: 8, charset: "alpha" }))
+let users = gen.objectWith({ id: gen.int(1, 999), active: gen.bool() })
+```
+
+The combinators are: `gen.int`, `gen.float`, `gen.bool`, `gen.constant`,
+`gen.string`, `gen.oneOf`, `gen.frequency`, `gen.arrayOf`, `gen.objectWith`,
+`gen.map`, `gen.filter`, and `gen.nilOr`. Each returns a generator object; nested
+generators (`gen.arrayOf(gen.objectWith(...))`) compose freely up to a bounded
+recursion depth. The `prop()` runner that consumes these generators is documented
+alongside the deterministic-testing flags.

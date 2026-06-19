@@ -1955,6 +1955,69 @@ static AI_MEMBERS: &[(&str, MemberKind)] = &[
     ("tool", MemberKind::Fn),
 ];
 
+// ── std/test (BATT C2 §10.4 — generator combinators) ───────────────────────────
+
+static TEST_INT_PARAMS: &[StdParam] = &[
+    StdParam::opt("min", "int"),
+    StdParam::opt("max", "int"),
+];
+static TEST_FLOAT_PARAMS: &[StdParam] = &[
+    StdParam::opt("min", "float"),
+    StdParam::opt("max", "float"),
+];
+static TEST_BOOL_PARAMS: &[StdParam] = &[];
+static TEST_CONSTANT_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static TEST_STRING_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+static TEST_ONE_OF_PARAMS: &[StdParam] = &[StdParam::variadic("values", "any")];
+static TEST_FREQUENCY_PARAMS: &[StdParam] = &[StdParam::req("pairs", "array")];
+static TEST_ARRAY_OF_PARAMS: &[StdParam] = &[
+    StdParam::req("gen", "object"),
+    StdParam::opt("opts", "object"),
+];
+static TEST_OBJECT_WITH_PARAMS: &[StdParam] = &[StdParam::req("shape", "object")];
+static TEST_MAP_PARAMS: &[StdParam] = &[
+    StdParam::req("gen", "object"),
+    StdParam::req("fn", "function"),
+];
+static TEST_FILTER_PARAMS: &[StdParam] = &[
+    StdParam::req("gen", "object"),
+    StdParam::req("pred", "function"),
+    StdParam::opt("opts", "object"),
+];
+static TEST_NIL_OR_PARAMS: &[StdParam] = &[StdParam::req("gen", "object")];
+
+static TEST_SIGS: &[(&str, StdSig)] = &[
+    ("int", StdSig { params: TEST_INT_PARAMS, ret: Some("object"), doc: "A generator of integers in [min, max] with edge-case bias toward boundary values." }),
+    ("float", StdSig { params: TEST_FLOAT_PARAMS, ret: Some("object"), doc: "A generator of floats in [min, max] with edge-case bias toward boundary values." }),
+    ("bool", StdSig { params: TEST_BOOL_PARAMS, ret: Some("object"), doc: "A generator of booleans." }),
+    ("constant", StdSig { params: TEST_CONSTANT_PARAMS, ret: Some("object"), doc: "A generator that always produces the given value." }),
+    ("string", StdSig { params: TEST_STRING_PARAMS, ret: Some("object"), doc: "A generator of strings; opts may set minLen, maxLen, and charset (ascii/alpha/alphanumeric/digit/unicode or a literal character set)." }),
+    ("oneOf", StdSig { params: TEST_ONE_OF_PARAMS, ret: Some("object"), doc: "A generator that picks one of the given values (or one element of a single array argument)." }),
+    ("frequency", StdSig { params: TEST_FREQUENCY_PARAMS, ret: Some("object"), doc: "A weighted-choice generator over an array of [weight, generator] pairs." }),
+    ("arrayOf", StdSig { params: TEST_ARRAY_OF_PARAMS, ret: Some("object"), doc: "A generator of arrays whose elements are drawn from another generator; opts may set minLen and maxLen." }),
+    ("objectWith", StdSig { params: TEST_OBJECT_WITH_PARAMS, ret: Some("object"), doc: "A generator of fixed-shape objects, drawing each field from its own generator." }),
+    ("map", StdSig { params: TEST_MAP_PARAMS, ret: Some("object"), doc: "A generator that applies a function to each value drawn from another generator." }),
+    ("filter", StdSig { params: TEST_FILTER_PARAMS, ret: Some("object"), doc: "A generator that redraws until a predicate holds; exhausting maxDiscard yields a Tier-1 error." }),
+    ("nilOr", StdSig { params: TEST_NIL_OR_PARAMS, ret: Some("object"), doc: "A generator that produces nil or a value drawn from another generator." }),
+];
+
+static TEST_MEMBERS: &[(&str, MemberKind)] = &[
+    // The `gen` namespace export (an Object whose fields are the combinators).
+    ("gen", MemberKind::Const("object")),
+    ("int", MemberKind::Fn),
+    ("float", MemberKind::Fn),
+    ("bool", MemberKind::Fn),
+    ("constant", MemberKind::Fn),
+    ("string", MemberKind::Fn),
+    ("oneOf", MemberKind::Fn),
+    ("frequency", MemberKind::Fn),
+    ("arrayOf", MemberKind::Fn),
+    ("objectWith", MemberKind::Fn),
+    ("map", MemberKind::Fn),
+    ("filter", MemberKind::Fn),
+    ("nilOr", MemberKind::Fn),
+];
+
 // ── std/assert ────────────────────────────────────────────────────────────────
 
 static ASSERT_EQ_PARAMS: &[StdParam] = &[
@@ -3004,6 +3067,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     //           tui + ffi + resilience
     ("std/ai", AI_MEMBERS),
     ("std/assert", ASSERT_MEMBERS),
+    ("std/test", TEST_MEMBERS),
     ("std/bench", BENCH_MEMBERS),
     ("std/cli", CLI_MEMBERS),
     ("std/color", COLOR_MEMBERS),
@@ -3083,6 +3147,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         // batch 3
         "std/ai" => AI_SIGS,
         "std/assert" => ASSERT_SIGS,
+        "std/test" => TEST_SIGS,
         "std/bench" => BENCH_SIGS,
         "std/cli" => CLI_SIGS,
         "std/color" => COLOR_SIGS,
@@ -3263,6 +3328,7 @@ mod tests {
             // batch 3
             ("std/ai", AI_SIGS),
             ("std/assert", ASSERT_SIGS),
+            ("std/test", TEST_SIGS),
             ("std/bench", BENCH_SIGS),
             ("std/cli", CLI_SIGS),
             ("std/color", COLOR_SIGS),
