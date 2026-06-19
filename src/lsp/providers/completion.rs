@@ -503,7 +503,7 @@ fn receiver_class_info<'t>(
     let recv_start = dot_pos.checked_sub(alias_chars)?;
     let recv_mid_char = recv_start + alias_chars / 2;
     let byte_off = crate::lsp::convert::char_to_byte(&model.text, recv_mid_char.min(chars.len()));
-    let rendered = crate::check::infer::hover_type_at(&model.text, byte_off)?;
+    let rendered = crate::check::infer::hover_type_in(model.infer_cache(), byte_off)?;
     let class_name = first_class_ident(&rendered)?;
     let cid = table.class_id(&class_name)?;
     table.class(cid)

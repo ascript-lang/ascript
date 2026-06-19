@@ -52,7 +52,7 @@ fn type_hints(model: &SemanticModel) -> Vec<InlayHint> {
         let name_start = usize::from(name_tok.text_range().start());
         // Inferred type at the binding NAME (the SP10 pass records an un-annotated
         // `let`/`const` binding's inferred type on its name-token range in hover mode).
-        let Some(ty) = crate::check::infer::hover_type_at(&model.text, name_start) else {
+        let Some(ty) = crate::check::infer::hover_type_in(model.infer_cache(), name_start) else {
             continue;
         };
         // Don't emit a noise hint for an unknown/`any` type.

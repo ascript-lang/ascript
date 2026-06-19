@@ -68,21 +68,87 @@ pub fn elision_proofs_for(
     pass::collect_elision(tree, resolved, src, &table)
 }
 
+/// Pre-built artifacts from the inference pass needed by the LSP hover provider.
+///
+/// Holds only owned, `Send + Sync` data (a `Vec` of `ByteSpan + String` pairs).
+/// `Table` is intentionally excluded: `CheckTy::EnumVariant` carries an
+/// `Rc<str>`, making `Table` `!Send`; and the hover use-case needs only the
+/// RENDERED strings that `collect_hover_types` already produced.
+pub struct InferArtifacts {
+    /// All name-use hover spans for the file (byte range → rendered `CheckTy`).
+    pub hovers: Vec<pass::HoverType>,
+}
+
+// Compile-time gate: `InferArtifacts` must be `Send + Sync` so that
+// `OnceLock<InferArtifacts>` can live on `SemanticModel` (which is `Send + Sync`).
+const _: fn() = || {
+    fn a<T: Send + Sync>() {}
+    a::<InferArtifacts>();
+};
+
+/// Build the [`InferArtifacts`] for a file from its already-parsed/resolved tree.
+/// No re-parse: the callers (typically the LSP `SemanticModel`) supply the tree and
+/// resolve result they already hold. The `Table` is built internally and dropped
+/// after hover collection (it is `!Send` and is not stored).
+pub fn build_artifacts(
+    tree: &crate::syntax::cst::ResolvedNode,
+    resolved: &crate::syntax::resolve::types::ResolveResult,
+    src: &str,
+) -> InferArtifacts {
+    let table = table::Table::build(tree, resolved);
+    let hovers = pass::collect_hover_types(tree, resolved, src, &table);
+    InferArtifacts { hovers }
+}
+
+/// Like [`hover_type_at`] but operates on pre-built [`InferArtifacts`] (the cached
+/// path). No re-parse, no re-resolve, no re-infer — just a linear scan over the
+/// already-collected hover spans.
+///
+/// When several spans contain the offset the NARROWEST (innermost) wins, matching
+/// `hover_type_at`'s contract exactly.
+pub fn hover_type_in(artifacts: &InferArtifacts, byte_offset: usize) -> Option<String> {
+    artifacts
+        .hovers
+        .iter()
+        .filter(|h| byte_offset >= h.range.start && byte_offset < h.range.end)
+        .min_by_key(|h| h.range.end - h.range.start)
+        .map(|h| h.ty.clone())
+}
+
 /// The inferred/declared type (rendered `CheckTy`) of the name use whose byte span
 /// contains `byte_offset`, if any. Runs the CST front-end + the SP10 inference pass
 /// in hover-collection mode (NO interpreter). Used by the LSP hover hook.
 ///
 /// When several recorded spans contain the offset, the NARROWEST (innermost) wins,
 /// so a precise reference is preferred over an enclosing one.
+///
+/// **Prefer [`hover_type_in`] with a cached [`InferArtifacts`] when the caller
+/// already has a [`crate::lsp::model::SemanticModel`]** — this function re-parses and
+/// re-resolves on every call.
 pub fn hover_type_at(src: &str, byte_offset: usize) -> Option<String> {
     use crate::syntax::{resolve, tree_builder};
     let tree = tree_builder::build_tree(crate::syntax::parser::parse(src));
     let resolved = resolve::resolve(&tree);
-    let table = table::Table::build(&tree, &resolved);
-    let hovers = pass::collect_hover_types(&tree, &resolved, src, &table);
-    hovers
-        .into_iter()
-        .filter(|h| byte_offset >= h.range.start && byte_offset < h.range.end)
-        .min_by_key(|h| h.range.end - h.range.start)
-        .map(|h| h.ty)
+    let artifacts = build_artifacts(&tree, &resolved, src);
+    hover_type_in(&artifacts, byte_offset)
+}
+
+#[cfg(test)]
+mod infer_cache_tests {
+    use super::*;
+
+    #[test]
+    fn hover_type_in_matches_hover_type_at() {
+        let src = "let n: int = 1\nfn f(a: string) { return a }\nlet y = f(\"hi\")\n";
+        let tree = crate::syntax::tree_builder::build_tree(crate::syntax::parser::parse(src));
+        let resolved = crate::syntax::resolve::resolve(&tree);
+        let artifacts = build_artifacts(&tree, &resolved, src);
+        for off in 0..src.len() {
+            assert_eq!(
+                hover_type_in(&artifacts, off),
+                hover_type_at(src, off),
+                "mismatch at byte offset {off}"
+            );
+        }
+    }
 }

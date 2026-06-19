@@ -292,7 +292,7 @@ pub fn declaration_in_file(model: &SemanticModel, offset: usize) -> Option<Range
 /// not in this file (cross-module types are `Any` under SP10 — a documented
 /// limitation).
 pub fn type_definition_in_file(model: &SemanticModel, offset: usize) -> Option<Range> {
-    let ty = crate::check::infer::hover_type_at(&model.text, offset)?;
+    let ty = crate::check::infer::hover_type_in(model.infer_cache(), offset)?;
     // The rendered type may be `User`, `User?`, `array<User>`, etc. Extract the
     // first bare identifier (a class/enum name) from the rendering.
     let type_name = first_type_ident(&ty)?;

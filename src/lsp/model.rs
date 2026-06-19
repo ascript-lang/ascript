@@ -22,6 +22,9 @@ pub struct SemanticModel {
     /// `DocumentStore::set_versioned` (0 for a model built directly via `build`).
     /// Handlers capture it at entry to detect supersession by a newer edit.
     pub generation: u64,
+    /// Per-model inference cache. Built lazily on first access by `infer_cache()`;
+    /// stores the hover spans collected by the SP10 pass without re-parsing.
+    infer: std::sync::OnceLock<crate::check::infer::InferArtifacts>,
 }
 
 impl SemanticModel {
@@ -42,6 +45,7 @@ impl SemanticModel {
             tokens,
             line_index,
             generation: 0,
+            infer: std::sync::OnceLock::new(),
         }
     }
 }
@@ -49,6 +53,18 @@ impl SemanticModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn infer_cache_builds_once_per_model() {
+        let m = SemanticModel::build(
+            "let x: int = 1\nprint(x)\n".to_string(),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        let c1 = m.infer_cache() as *const _;
+        let c2 = m.infer_cache() as *const _;
+        assert!(std::ptr::eq(c1, c2), "second access must hit the OnceLock");
+    }
 
     #[test]
     fn build_clean_program_has_no_diagnostics() {
@@ -63,6 +79,19 @@ mod tests {
         let m = SemanticModel::build(src.to_string(), None, &LintConfig::default());
         let direct = crate::check::analyze::analyze_with_config(src, &LintConfig::default()).diagnostics;
         assert_eq!(m.diagnostics, direct);
+    }
+}
+
+impl SemanticModel {
+    /// Return a reference to the lazily-built inference cache for this model.
+    ///
+    /// On first call the SP10 type-inference pass is driven over the model's
+    /// already-built `tree`/`resolved` (no re-parse, no re-resolve). Subsequent
+    /// calls return the cached result at the cost of a single atomic load.
+    pub fn infer_cache(&self) -> &crate::check::infer::InferArtifacts {
+        self.infer.get_or_init(|| {
+            crate::check::infer::build_artifacts(&self.tree, &self.resolved, &self.text)
+        })
     }
 }
 

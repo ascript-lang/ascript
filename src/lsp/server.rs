@@ -627,14 +627,33 @@ impl LanguageServer for Backend {
         // Hover while typing races the same debounce window — serve it from the
         // freshest text (cheap: a no-op when nothing is pending).
         self.flush_pending_for(&uri).await;
-        let (gen, result) = {
+        // Hover size-class gate: Large/Huge files skip the inferred-type block to
+        // avoid paying the SP10 inference cost for a file that was already expensive
+        // to parse. Stdlib sig + builtin/keyword docs still render (`with_types=false`
+        // is NOT a no-op hover — only the type-inference part is gated out).
+        // A one-line note is logged for huge files, matching the inlay-hints pattern.
+        let (gen, result, huge_note) = {
             let store = self.documents.lock().await;
             let Some(model) = store.get(&uri) else {
                 return Ok(None);
             };
             let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
-            (model.generation, crate::lsp::providers::hover::hover(model, offset))
+            let (with_types, note) = match model.size_class() {
+                crate::lsp::model::SizeClass::Normal => (true, None),
+                crate::lsp::model::SizeClass::Large => (false, None),
+                crate::lsp::model::SizeClass::Huge => {
+                    (false, Some(format!("ascript: {uri} is huge — hover types disabled")))
+                }
+            };
+            (
+                model.generation,
+                crate::lsp::providers::hover::hover(model, offset, with_types),
+                note,
+            )
         };
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
         // Supersession: a hover computed against now-stale text is dropped. (Only the
         // noisy while-typing requests — completion/hover — are guarded; user-initiated
         // navigation/symbol requests rarely race, so they stay unguarded.)
