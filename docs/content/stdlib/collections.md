@@ -1839,7 +1839,7 @@ set.new()   // set {}
 
 Build a set from an array, deduplicating elements. Preserves the first occurrence order.
 
-- `arr: array` — the source array; each element must be hashable
+- `arr: array` (optional) — the source array; each element must be hashable; `nil` or omitted yields an empty set
 - Returns: a new `set`
 
 > [!TIER2] Panics if `arr` is not an array or if any element is not hashable.

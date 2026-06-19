@@ -705,7 +705,7 @@ static MAP_MEMBERS: &[(&str, MemberKind)] = &[
 // ── std/set ──────────────────────────────────────────────────────────────────
 
 static SET_NEW_PARAMS: &[StdParam] = &[];
-static SET_FROM_PARAMS: &[StdParam] = &[StdParam::req("arr", "array")];
+static SET_FROM_PARAMS: &[StdParam] = &[StdParam::opt("arr", "array")];
 static SET_ADD_PARAMS: &[StdParam] = &[
     StdParam::req("s", "set"),
     StdParam::req_untyped("value"),
@@ -2243,10 +2243,14 @@ static STREAM_MEMBERS: &[(&str, MemberKind)] = &[
 
 static DATE_ZERO_PARAMS: &[StdParam] = &[];
 static DATE_FROM_EPOCH_PARAMS: &[StdParam] = &[StdParam::req("ms", "number")];
-static DATE_PARSE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static DATE_PARSE_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "string"),
+    StdParam::opt("fmt", "string"),
+];
 static DATE_FORMAT_PARAMS: &[StdParam] = &[
     StdParam::req("date", "object"),
     StdParam::req("fmt", "string"),
+    StdParam::opt("offsetMinutes", "number"),
 ];
 static DATE_ADD_DAYS_PARAMS: &[StdParam] = &[
     StdParam::req("date", "object"),
