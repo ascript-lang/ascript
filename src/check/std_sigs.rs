@@ -1638,12 +1638,49 @@ static REDIS_MEMBERS: &[(&str, MemberKind)] = &[
 
 static DOCKER_CONNECT_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
 
+// Handle-method sigs for dockerClient methods — NOT module exports; added so
+// the derivation in std_arity.rs can compute their min-arity (SIG §2.5).
+// Each takes exactly one required arg (the container/image/exec id); `remove`
+// and `removeImage` also accept an optional `{force}` opts, but the required
+// id counts as the leading required param → min = 1.
+static DOCKER_ID_PARAMS: &[StdParam] = &[StdParam::req("id", "string")];
+// execCreate takes (containerId, opts?) — leading required param is the id.
+static DOCKER_EXEC_CREATE_PARAMS: &[StdParam] = &[
+    StdParam::req("containerId", "string"),
+    StdParam::opt("opts", "object"),
+];
+
 static DOCKER_SIGS: &[(&str, StdSig)] = &[
     ("connect", StdSig { params: DOCKER_CONNECT_PARAMS, ret: Some("[client, err]"), doc: "Connects to the local Docker Engine over its Unix-domain socket, negotiating the API version. Async." }),
+    // Handle methods on a dockerClient — not module exports; included for
+    // std_arity derivation (SIG §2.5). MemberKind::HandleMethod in DOCKER_MEMBERS.
+    ("inspect", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[object, err]"), doc: "Inspect a container by id, returning the full Docker inspect JSON. Async." }),
+    ("start", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[nil, err]"), doc: "Start a stopped container by id. Async." }),
+    ("stop", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[nil, err]"), doc: "Stop a running container by id. Async." }),
+    ("restart", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[nil, err]"), doc: "Restart a container by id. Async." }),
+    ("wait", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[int, err]"), doc: "Wait for a container to exit, returning its exit code. Async." }),
+    ("remove", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[nil, err]"), doc: "Remove a container by id. Async." }),
+    ("removeImage", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[nil, err]"), doc: "Remove an image by id or tag. Async." }),
+    ("execCreate", StdSig { params: DOCKER_EXEC_CREATE_PARAMS, ret: Some("[string, err]"), doc: "Create an exec instance on a container and return its exec id. Async." }),
+    ("execStart", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[nil, err]"), doc: "Start an exec instance by exec id. Async." }),
+    ("execInspect", StdSig { params: DOCKER_ID_PARAMS, ret: Some("[object, err]"), doc: "Inspect an exec instance by exec id. Async." }),
+    ("exec", StdSig { params: DOCKER_EXEC_CREATE_PARAMS, ret: Some("[object, err]"), doc: "Create, start, and inspect an exec on a container in one step. Async." }),
 ];
 
 static DOCKER_MEMBERS: &[(&str, MemberKind)] = &[
     ("connect", MemberKind::Fn),
+    // Handle methods on dockerClient — not module exports.
+    ("inspect", MemberKind::HandleMethod),
+    ("start", MemberKind::HandleMethod),
+    ("stop", MemberKind::HandleMethod),
+    ("restart", MemberKind::HandleMethod),
+    ("wait", MemberKind::HandleMethod),
+    ("remove", MemberKind::HandleMethod),
+    ("removeImage", MemberKind::HandleMethod),
+    ("execCreate", MemberKind::HandleMethod),
+    ("execStart", MemberKind::HandleMethod),
+    ("execInspect", MemberKind::HandleMethod),
+    ("exec", MemberKind::HandleMethod),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2487,6 +2524,16 @@ static FFI_SET_PARAMS: &[StdParam] = &[
     StdParam::req_untyped("value"),
 ];
 
+// Handle-method sigs for `lib.symbol(name, argtypes, rettype)` and
+// `sym.call(args)` — NOT module exports; added so the derivation in
+// std_arity.rs can compute their min-arity via std_sig (SIG §2.5).
+static FFI_SYMBOL_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("argtypes", "array"),
+    StdParam::req("rettype", "object"),
+];
+static FFI_CALL_PARAMS: &[StdParam] = &[StdParam::req("args", "array")];
+
 static FFI_SIGS: &[(&str, StdSig)] = &[
     ("open", StdSig { params: FFI_OPEN_PARAMS, ret: Some("[lib, err]"), doc: "Load a native shared library from the filesystem path and return a library handle." }),
     ("struct", StdSig { params: FFI_STRUCT_PARAMS, ret: Some("object"), doc: "Build a C struct layout descriptor from an array of [name, ffi.<type>] field pairs." }),
@@ -2495,6 +2542,10 @@ static FFI_SIGS: &[(&str, StdSig)] = &[
     ("alloc", StdSig { params: FFI_ALLOC_PARAMS, ret: Some("bytes"), doc: "Allocate a zero-filled bytes buffer sized to hold a C struct described by the layout." }),
     ("get", StdSig { params: FFI_GET_PARAMS, ret: None, doc: "Read a named field from a struct buffer using its layout descriptor." }),
     ("set", StdSig { params: FFI_SET_PARAMS, ret: None, doc: "Write a value into a named field of a struct buffer using its layout descriptor." }),
+    // Handle methods — included for std_arity derivation (SIG §2.5); skipped by
+    // the export cross-check (MemberKind::HandleMethod in FFI_MEMBERS).
+    ("symbol", StdSig { params: FFI_SYMBOL_PARAMS, ret: Some("[sym, err]"), doc: "Resolve a symbol from an open foreign library handle by name, binding its argument and return types." }),
+    ("call", StdSig { params: FFI_CALL_PARAMS, ret: None, doc: "Invoke the bound foreign symbol through the libffi trampoline, marshalling the args array." }),
 ];
 
 static FFI_MEMBERS: &[(&str, MemberKind)] = &[
@@ -2518,6 +2569,9 @@ static FFI_MEMBERS: &[(&str, MemberKind)] = &[
     ("alloc", MemberKind::Fn),
     ("get", MemberKind::Fn),
     ("set", MemberKind::Fn),
+    // Handle methods on ForeignLib / ForeignSymbol handles — not module exports.
+    ("symbol", MemberKind::HandleMethod),
+    ("call", MemberKind::HandleMethod),
 ];
 
 // ── std/resilience ────────────────────────────────────────────────────────────
