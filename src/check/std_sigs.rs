@@ -12,15 +12,11 @@
 //! `validate_param_order` called from the `table_ordering_invariant` test.
 //!
 //! The doc string for each entry is the **first sentence** of the corresponding
-//! `docs/content/stdlib/collections.md` prose paragraph.
+//! `docs/content/stdlib/*.md` prose paragraph.
 //!
 //! ## Coverage scope
 //!
-//! This file covers the three modules listed in `IMPLEMENTED_MODULES`.
-//! Task 1.2 fills the rest of STD_MODULES and deletes the partial-coverage
-//! marker below.
-//!
-// SIG Task 1.2 fills the remainder
+//! This file covers ALL of STD_MODULES (60 modules, batches 1–3).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types (spec §2.1)
@@ -1651,7 +1647,941 @@ static DOCKER_MEMBERS: &[(&str, MemberKind)] = &[
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Master index (batch 1 + batch 2 — 37 modules total)
+// Batch 3 — 23 remaining modules
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── std/ai ────────────────────────────────────────────────────────────────────
+
+static AI_PROVIDER_PARAMS: &[StdParam] = &[
+    StdParam::req("kind", "string"),
+    StdParam::opt("config", "object"),
+];
+static AI_GENERATE_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static AI_STREAM_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static AI_EMBED_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static AI_EMBED_MANY_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static AI_TOOL_PARAMS: &[StdParam] = &[StdParam::req("def", "object")];
+
+static AI_SIGS: &[(&str, StdSig)] = &[
+    ("provider", StdSig { params: AI_PROVIDER_PARAMS, ret: Some("provider"), doc: "Create an AI provider handle for a named backend (e.g. 'anthropic', 'openai')." }),
+    ("generate", StdSig { params: AI_GENERATE_PARAMS, ret: Some("[object, err]"), doc: "Send a chat/completion request and return the full response. Async." }),
+    ("stream", StdSig { params: AI_STREAM_PARAMS, ret: Some("[stream, err]"), doc: "Send a streaming chat/completion request and return an async token stream. Async." }),
+    ("embed", StdSig { params: AI_EMBED_PARAMS, ret: Some("[array<float>, err]"), doc: "Compute an embedding vector for a single input. Async." }),
+    ("embedMany", StdSig { params: AI_EMBED_MANY_PARAMS, ret: Some("[array<array<float>>, err]"), doc: "Compute embedding vectors for multiple inputs in one request. Async." }),
+    ("tool", StdSig { params: AI_TOOL_PARAMS, ret: Some("object"), doc: "Define a tool descriptor for use with ai.generate's 'tools' option." }),
+];
+
+static AI_MEMBERS: &[(&str, MemberKind)] = &[
+    ("provider", MemberKind::Fn),
+    ("generate", MemberKind::Fn),
+    ("stream", MemberKind::Fn),
+    ("embed", MemberKind::Fn),
+    ("embedMany", MemberKind::Fn),
+    ("tool", MemberKind::Fn),
+];
+
+// ── std/assert ────────────────────────────────────────────────────────────────
+
+static ASSERT_EQ_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static ASSERT_DEEP_EQ_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static ASSERT_NE_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static ASSERT_IS_TRUE_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static ASSERT_IS_FALSE_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static ASSERT_IS_NIL_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static ASSERT_NOT_NIL_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static ASSERT_GT_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static ASSERT_GTE_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static ASSERT_LT_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static ASSERT_LTE_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
+static ASSERT_CONTAINS_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("container"),
+    StdParam::req_untyped("item"),
+];
+static ASSERT_APPROX_EQ_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+    StdParam::opt("epsilon", "number"),
+];
+static ASSERT_THROWS_PARAMS: &[StdParam] = &[StdParam::req("f", "fn()")];
+static ASSERT_THROWS_WITH_PARAMS: &[StdParam] = &[
+    StdParam::req("f", "fn()"),
+    StdParam::req("msg", "string"),
+];
+static ASSERT_MATCHES_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("value"),
+    StdParam::req("pattern", "regex | string"),
+];
+static ASSERT_SNAPSHOT_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("value"),
+    StdParam::opt("name", "string"),
+];
+
+static ASSERT_SIGS: &[(&str, StdSig)] = &[
+    ("eq", StdSig { params: ASSERT_EQ_PARAMS, ret: None, doc: "Assert that two values are strictly equal (===); panics with a diff on failure." }),
+    ("deepEq", StdSig { params: ASSERT_DEEP_EQ_PARAMS, ret: None, doc: "Assert that two values are deeply structurally equal; panics with a diff on failure." }),
+    ("ne", StdSig { params: ASSERT_NE_PARAMS, ret: None, doc: "Assert that two values are NOT equal." }),
+    ("isTrue", StdSig { params: ASSERT_IS_TRUE_PARAMS, ret: None, doc: "Assert that a value is strictly true." }),
+    ("isFalse", StdSig { params: ASSERT_IS_FALSE_PARAMS, ret: None, doc: "Assert that a value is strictly false." }),
+    ("isNil", StdSig { params: ASSERT_IS_NIL_PARAMS, ret: None, doc: "Assert that a value is nil." }),
+    ("notNil", StdSig { params: ASSERT_NOT_NIL_PARAMS, ret: None, doc: "Assert that a value is not nil." }),
+    ("gt", StdSig { params: ASSERT_GT_PARAMS, ret: None, doc: "Assert that a is greater than b." }),
+    ("gte", StdSig { params: ASSERT_GTE_PARAMS, ret: None, doc: "Assert that a is greater than or equal to b." }),
+    ("lt", StdSig { params: ASSERT_LT_PARAMS, ret: None, doc: "Assert that a is less than b." }),
+    ("lte", StdSig { params: ASSERT_LTE_PARAMS, ret: None, doc: "Assert that a is less than or equal to b." }),
+    ("contains", StdSig { params: ASSERT_CONTAINS_PARAMS, ret: None, doc: "Assert that a container (string, array, object) contains an item or key." }),
+    ("approxEq", StdSig { params: ASSERT_APPROX_EQ_PARAMS, ret: None, doc: "Assert that two numbers are within epsilon of each other (default 1e-9)." }),
+    ("throws", StdSig { params: ASSERT_THROWS_PARAMS, ret: None, doc: "Assert that a zero-argument function throws a panic." }),
+    ("throwsWith", StdSig { params: ASSERT_THROWS_WITH_PARAMS, ret: None, doc: "Assert that a function throws and the panic message contains a substring." }),
+    ("matches", StdSig { params: ASSERT_MATCHES_PARAMS, ret: None, doc: "Assert that a value matches a regex pattern." }),
+    ("snapshot", StdSig { params: ASSERT_SNAPSHOT_PARAMS, ret: None, doc: "Assert that a value matches a persisted snapshot, creating it on first run." }),
+];
+
+static ASSERT_MEMBERS: &[(&str, MemberKind)] = &[
+    ("eq", MemberKind::Fn),
+    ("deepEq", MemberKind::Fn),
+    ("ne", MemberKind::Fn),
+    ("isTrue", MemberKind::Fn),
+    ("isFalse", MemberKind::Fn),
+    ("isNil", MemberKind::Fn),
+    ("notNil", MemberKind::Fn),
+    ("gt", MemberKind::Fn),
+    ("gte", MemberKind::Fn),
+    ("lt", MemberKind::Fn),
+    ("lte", MemberKind::Fn),
+    ("contains", MemberKind::Fn),
+    ("approxEq", MemberKind::Fn),
+    ("throws", MemberKind::Fn),
+    ("throwsWith", MemberKind::Fn),
+    ("matches", MemberKind::Fn),
+    ("snapshot", MemberKind::Fn),
+];
+
+// ── std/bench ─────────────────────────────────────────────────────────────────
+
+static BENCH_MEASURE_PARAMS: &[StdParam] = &[
+    StdParam::req("f", "fn()"),
+    StdParam::opt("opts", "object"),
+];
+static BENCH_COMPARE_PARAMS: &[StdParam] = &[
+    StdParam::req("fns", "array"),
+    StdParam::opt("opts", "object"),
+];
+
+static BENCH_SIGS: &[(&str, StdSig)] = &[
+    ("measure", StdSig { params: BENCH_MEASURE_PARAMS, ret: Some("object"), doc: "Benchmark a zero-argument function and return timing statistics (iterations, totalMs, avgMs). Async." }),
+    ("compare", StdSig { params: BENCH_COMPARE_PARAMS, ret: Some("array"), doc: "Run multiple benchmark functions and return their timing results for comparison. Async." }),
+];
+
+static BENCH_MEMBERS: &[(&str, MemberKind)] = &[
+    ("measure", MemberKind::Fn),
+    ("compare", MemberKind::Fn),
+];
+
+// ── std/cli ───────────────────────────────────────────────────────────────────
+
+static CLI_PARSE_PARAMS: &[StdParam] = &[StdParam::req("spec", "object")];
+
+static CLI_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: CLI_PARSE_PARAMS, ret: Some("object"), doc: "Parse process arguments according to a CLI spec and return the parsed flags and positionals." }),
+];
+
+static CLI_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+];
+
+// ── std/color ─────────────────────────────────────────────────────────────────
+
+static COLOR_FG_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static COLOR_RGB_PARAMS: &[StdParam] = &[
+    StdParam::req("r", "int"),
+    StdParam::req("g", "int"),
+    StdParam::req("b", "int"),
+];
+static COLOR_BG_RGB_PARAMS: &[StdParam] = &[
+    StdParam::req("r", "int"),
+    StdParam::req("g", "int"),
+    StdParam::req("b", "int"),
+];
+static COLOR_STRIP_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+
+static COLOR_SIGS: &[(&str, StdSig)] = &[
+    ("black", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI black foreground color escape codes." }),
+    ("red", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI red foreground color escape codes." }),
+    ("green", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI green foreground color escape codes." }),
+    ("yellow", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI yellow foreground color escape codes." }),
+    ("blue", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI blue foreground color escape codes." }),
+    ("magenta", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI magenta foreground color escape codes." }),
+    ("cyan", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI cyan foreground color escape codes." }),
+    ("white", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI white foreground color escape codes." }),
+    ("gray", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI gray foreground color escape codes." }),
+    ("grey", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Alias for color.gray." }),
+    ("bold", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI bold style escape codes." }),
+    ("dim", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI dim style escape codes." }),
+    ("italic", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI italic style escape codes." }),
+    ("underline", StdSig { params: COLOR_FG_PARAMS, ret: Some("string"), doc: "Wrap text in ANSI underline style escape codes." }),
+    ("rgb", StdSig { params: COLOR_RGB_PARAMS, ret: Some("fn(string) -> string"), doc: "Return a function that wraps text in 24-bit (truecolor) foreground ANSI escape codes." }),
+    ("bgRgb", StdSig { params: COLOR_BG_RGB_PARAMS, ret: Some("fn(string) -> string"), doc: "Return a function that wraps text in 24-bit (truecolor) background ANSI escape codes." }),
+    ("strip", StdSig { params: COLOR_STRIP_PARAMS, ret: Some("string"), doc: "Remove all ANSI escape sequences from a string." }),
+];
+
+static COLOR_MEMBERS: &[(&str, MemberKind)] = &[
+    ("black", MemberKind::Fn),
+    ("red", MemberKind::Fn),
+    ("green", MemberKind::Fn),
+    ("yellow", MemberKind::Fn),
+    ("blue", MemberKind::Fn),
+    ("magenta", MemberKind::Fn),
+    ("cyan", MemberKind::Fn),
+    ("white", MemberKind::Fn),
+    ("gray", MemberKind::Fn),
+    ("grey", MemberKind::Fn),
+    ("bold", MemberKind::Fn),
+    ("dim", MemberKind::Fn),
+    ("italic", MemberKind::Fn),
+    ("underline", MemberKind::Fn),
+    ("rgb", MemberKind::Fn),
+    ("bgRgb", MemberKind::Fn),
+    ("strip", MemberKind::Fn),
+];
+
+// ── std/schema ────────────────────────────────────────────────────────────────
+
+static SCHEMA_ZERO_PARAMS: &[StdParam] = &[];
+static SCHEMA_ONE_VALUE_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static SCHEMA_ONE_SCHEMA_PARAMS: &[StdParam] = &[StdParam::req("schema", "object")];
+static SCHEMA_SCHEMA_NUM_PARAMS: &[StdParam] = &[
+    StdParam::req("schema", "object"),
+    StdParam::req("n", "number"),
+];
+static SCHEMA_SCHEMA_STR_PARAMS: &[StdParam] = &[
+    StdParam::req("schema", "object"),
+    StdParam::req("pattern", "string"),
+];
+static SCHEMA_REFINE_PARAMS: &[StdParam] = &[
+    StdParam::req("schema", "object"),
+    StdParam::req("f", "fn(value)"),
+    StdParam::req("message", "string"),
+];
+static SCHEMA_DEFAULT_PARAMS: &[StdParam] = &[
+    StdParam::req("schema", "object"),
+    StdParam::req_untyped("default"),
+];
+static SCHEMA_PARSE_PARAMS: &[StdParam] = &[
+    StdParam::req("schema", "object"),
+    StdParam::req_untyped("value"),
+    StdParam::opt("opts", "object"),
+];
+static SCHEMA_MAP_PARAMS: &[StdParam] = &[
+    StdParam::req("keySchema", "object"),
+    StdParam::req("valSchema", "object"),
+];
+static SCHEMA_STRICT_PARAMS: &[StdParam] = &[StdParam::req("objSchema", "object")];
+static SCHEMA_FROM_CLASS_PARAMS: &[StdParam] = &[StdParam::req("Class", "class")];
+
+static SCHEMA_SIGS: &[(&str, StdSig)] = &[
+    ("string", StdSig { params: SCHEMA_ZERO_PARAMS, ret: Some("schema"), doc: "Create a schema that validates string values." }),
+    ("number", StdSig { params: SCHEMA_ZERO_PARAMS, ret: Some("schema"), doc: "Create a schema that validates numeric values." }),
+    ("bool", StdSig { params: SCHEMA_ZERO_PARAMS, ret: Some("schema"), doc: "Create a schema that validates boolean values." }),
+    ("nilType", StdSig { params: SCHEMA_ZERO_PARAMS, ret: Some("schema"), doc: "Create a schema that validates nil values (the nil-type constructor; 'nil' is a reserved keyword)." }),
+    ("any", StdSig { params: SCHEMA_ZERO_PARAMS, ret: Some("schema"), doc: "Create a schema that accepts any value." }),
+    ("literal", StdSig { params: SCHEMA_ONE_VALUE_PARAMS, ret: Some("schema"), doc: "Create a schema that validates a single literal value." }),
+    ("array", StdSig { params: SCHEMA_ONE_SCHEMA_PARAMS, ret: Some("schema"), doc: "Create a schema that validates an array whose every element satisfies elem." }),
+    ("object", StdSig { params: SCHEMA_ONE_VALUE_PARAMS, ret: Some("schema"), doc: "Create a schema that validates an object against a fields descriptor." }),
+    ("strict", StdSig { params: SCHEMA_STRICT_PARAMS, ret: Some("schema"), doc: "Clone an object schema and enable strict mode (reject unknown keys)." }),
+    ("map", StdSig { params: SCHEMA_MAP_PARAMS, ret: Some("schema"), doc: "Create a schema that validates a map with the given key and value schemas." }),
+    ("optional", StdSig { params: SCHEMA_ONE_SCHEMA_PARAMS, ret: Some("schema"), doc: "Create a schema that accepts nil or any value satisfying the inner schema." }),
+    ("union", StdSig { params: SCHEMA_ONE_VALUE_PARAMS, ret: Some("schema"), doc: "Create a schema that accepts a value matching any schema in an array of options." }),
+    ("oneOf", StdSig { params: SCHEMA_ONE_VALUE_PARAMS, ret: Some("schema"), doc: "Create a schema that accepts a value equal to one of the allowed literal values (enum discriminant)." }),
+    ("parse", StdSig { params: SCHEMA_PARSE_PARAMS, ret: Some("[value, err]"), doc: "Validate a value against a schema, returning a Tier-1 [value, err] pair." }),
+    ("parseAll", StdSig { params: SCHEMA_PARSE_PARAMS, ret: Some("[value, errors]"), doc: "Validate a value against a schema, collecting ALL validation errors before returning." }),
+    ("min", StdSig { params: SCHEMA_SCHEMA_NUM_PARAMS, ret: Some("schema"), doc: "Add a minimum constraint to a numeric or array/string-length schema." }),
+    ("max", StdSig { params: SCHEMA_SCHEMA_NUM_PARAMS, ret: Some("schema"), doc: "Add a maximum constraint to a numeric or array/string-length schema." }),
+    ("minLength", StdSig { params: SCHEMA_SCHEMA_NUM_PARAMS, ret: Some("schema"), doc: "Add a minimum character/element length constraint to a string or array schema." }),
+    ("maxLength", StdSig { params: SCHEMA_SCHEMA_NUM_PARAMS, ret: Some("schema"), doc: "Add a maximum character/element length constraint to a string or array schema." }),
+    ("pattern", StdSig { params: SCHEMA_SCHEMA_STR_PARAMS, ret: Some("schema"), doc: "Add a regex pattern constraint to a string schema." }),
+    ("refine", StdSig { params: SCHEMA_REFINE_PARAMS, ret: Some("schema"), doc: "Add a custom predicate refinement to a schema; f must return truthy or the message is reported." }),
+    ("default", StdSig { params: SCHEMA_DEFAULT_PARAMS, ret: Some("schema"), doc: "Attach a default value to a schema so nil inputs are substituted before validation." }),
+    ("fromClass", StdSig { params: SCHEMA_FROM_CLASS_PARAMS, ret: Some("schema"), doc: "Derive a schema from a class's declared field types." }),
+];
+
+static SCHEMA_MEMBERS: &[(&str, MemberKind)] = &[
+    ("string", MemberKind::Fn),
+    ("number", MemberKind::Fn),
+    ("bool", MemberKind::Fn),
+    ("nilType", MemberKind::Fn),
+    ("any", MemberKind::Fn),
+    ("literal", MemberKind::Fn),
+    ("array", MemberKind::Fn),
+    ("object", MemberKind::Fn),
+    ("strict", MemberKind::Fn),
+    ("map", MemberKind::Fn),
+    ("optional", MemberKind::Fn),
+    ("union", MemberKind::Fn),
+    ("oneOf", MemberKind::Fn),
+    ("parse", MemberKind::Fn),
+    ("parseAll", MemberKind::Fn),
+    ("min", MemberKind::Fn),
+    ("max", MemberKind::Fn),
+    ("minLength", MemberKind::Fn),
+    ("maxLength", MemberKind::Fn),
+    ("pattern", MemberKind::Fn),
+    ("refine", MemberKind::Fn),
+    ("default", MemberKind::Fn),
+    ("fromClass", MemberKind::Fn),
+];
+
+// ── std/shared ────────────────────────────────────────────────────────────────
+
+static SHARED_FREEZE_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+static SHARED_IS_SHARED_PARAMS: &[StdParam] = &[StdParam::req_untyped("value")];
+
+static SHARED_SIGS: &[(&str, StdSig)] = &[
+    ("freeze", StdSig { params: SHARED_FREEZE_PARAMS, ret: None, doc: "Deep-convert a value into an immutable, Arc-backed shared value that can cross worker isolate boundaries." }),
+    ("isShared", StdSig { params: SHARED_IS_SHARED_PARAMS, ret: Some("bool"), doc: "Return true if a value is a frozen shared node." }),
+];
+
+static SHARED_MEMBERS: &[(&str, MemberKind)] = &[
+    ("freeze", MemberKind::Fn),
+    ("isShared", MemberKind::Fn),
+];
+
+// ── std/lru ───────────────────────────────────────────────────────────────────
+
+static LRU_NEW_PARAMS: &[StdParam] = &[StdParam::req("capacity", "int")];
+
+static LRU_SIGS: &[(&str, StdSig)] = &[
+    ("new", StdSig { params: LRU_NEW_PARAMS, ret: None, doc: "Create a new LRU cache handle with the given maximum capacity." }),
+];
+
+static LRU_MEMBERS: &[(&str, MemberKind)] = &[
+    ("new", MemberKind::Fn),
+];
+
+// ── std/events ────────────────────────────────────────────────────────────────
+
+static EVENTS_NEW_PARAMS: &[StdParam] = &[];
+
+static EVENTS_SIGS: &[(&str, StdSig)] = &[
+    ("new", StdSig { params: EVENTS_NEW_PARAMS, ret: None, doc: "Create a new event bus handle for pub/sub messaging within an isolate." }),
+];
+
+static EVENTS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("new", MemberKind::Fn),
+];
+
+// ── std/template ──────────────────────────────────────────────────────────────
+
+static TEMPLATE_RENDER_PARAMS: &[StdParam] = &[
+    StdParam::req("template", "string"),
+    StdParam::req("vars", "object"),
+];
+
+static TEMPLATE_SIGS: &[(&str, StdSig)] = &[
+    ("render", StdSig { params: TEMPLATE_RENDER_PARAMS, ret: Some("string"), doc: "Render a Mustache-style template string, substituting {{key}} placeholders with values from the vars object." }),
+];
+
+static TEMPLATE_MEMBERS: &[(&str, MemberKind)] = &[
+    ("render", MemberKind::Fn),
+];
+
+// ── std/caps ──────────────────────────────────────────────────────────────────
+
+static CAPS_HAS_PARAMS: &[StdParam] = &[StdParam::req("cap", "string")];
+static CAPS_LIST_PARAMS: &[StdParam] = &[];
+static CAPS_DROP_PARAMS: &[StdParam] = &[StdParam::req("cap", "string")];
+static CAPS_DROP_ALL_PARAMS: &[StdParam] = &[];
+
+static CAPS_SIGS: &[(&str, StdSig)] = &[
+    ("has", StdSig { params: CAPS_HAS_PARAMS, ret: Some("bool"), doc: "Return whether the named capability (fs/net/process/ffi/env) is currently granted." }),
+    ("list", StdSig { params: CAPS_LIST_PARAMS, ret: Some("array<string>"), doc: "Return the list of currently granted capability names." }),
+    ("drop", StdSig { params: CAPS_DROP_PARAMS, ret: None, doc: "Irreversibly revoke a capability from the current isolate." }),
+    ("dropAll", StdSig { params: CAPS_DROP_ALL_PARAMS, ret: None, doc: "Irreversibly revoke all capabilities from the current isolate." }),
+];
+
+static CAPS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("has", MemberKind::Fn),
+    ("list", MemberKind::Fn),
+    ("drop", MemberKind::Fn),
+    ("dropAll", MemberKind::Fn),
+];
+
+// ── std/task ──────────────────────────────────────────────────────────────────
+
+static TASK_SPAWN_PARAMS: &[StdParam] = &[StdParam::req("f", "fn()")];
+static TASK_GATHER_PARAMS: &[StdParam] = &[StdParam::req("futures", "array")];
+static TASK_RACE_PARAMS: &[StdParam] = &[StdParam::req("futures", "array")];
+static TASK_TIMEOUT_PARAMS: &[StdParam] = &[
+    StdParam::req("ms", "number"),
+    StdParam::req("future", "future"),
+];
+static TASK_RETRY_PARAMS: &[StdParam] = &[
+    StdParam::req("f", "fn()"),
+    StdParam::opt("opts", "object"),
+];
+static TASK_PIPE_PARAMS: &[StdParam] = &[
+    StdParam::req("gen", "generator"),
+    StdParam::req("bus", "events"),
+];
+static TASK_PMAP_PARAMS: &[StdParam] = &[
+    StdParam::req("data", "array"),
+    StdParam::req("f", "worker fn"),
+    StdParam::opt("opts", "object"),
+];
+static TASK_PREDUCE_PARAMS: &[StdParam] = &[
+    StdParam::req("data", "array"),
+    StdParam::req("f", "worker fn"),
+    StdParam::req_untyped("init"),
+    StdParam::opt("opts", "object"),
+];
+
+static TASK_SIGS: &[(&str, StdSig)] = &[
+    ("spawn", StdSig { params: TASK_SPAWN_PARAMS, ret: Some("future"), doc: "Detach a future as an independent task that continues after the call site." }),
+    ("gather", StdSig { params: TASK_GATHER_PARAMS, ret: Some("future<array>"), doc: "Await all futures in an array concurrently and return their results in order." }),
+    ("race", StdSig { params: TASK_RACE_PARAMS, ret: Some("future"), doc: "Await the first future to complete, cancelling all losers." }),
+    ("timeout", StdSig { params: TASK_TIMEOUT_PARAMS, ret: Some("[value, err]"), doc: "Race a future against a timer; return [nil, err] if the timer fires first." }),
+    ("retry", StdSig { params: TASK_RETRY_PARAMS, ret: Some("future"), doc: "Retry a function up to the configured number of times with optional back-off." }),
+    ("pipe", StdSig { params: TASK_PIPE_PARAMS, ret: Some("future"), doc: "Bridge a worker generator stream onto a local event bus by forwarding each yielded value." }),
+    ("pmap", StdSig { params: TASK_PMAP_PARAMS, ret: Some("future<array>"), doc: "Parallel-map an array across the worker pool, chunking the work for multi-core throughput. Async." }),
+    ("preduce", StdSig { params: TASK_PREDUCE_PARAMS, ret: Some("future"), doc: "Parallel-reduce an array across the worker pool, folding per-chunk then combining with init. Async." }),
+];
+
+static TASK_MEMBERS: &[(&str, MemberKind)] = &[
+    ("spawn", MemberKind::Fn),
+    ("gather", MemberKind::Fn),
+    ("race", MemberKind::Fn),
+    ("timeout", MemberKind::Fn),
+    ("retry", MemberKind::Fn),
+    ("pipe", MemberKind::Fn),
+    ("pmap", MemberKind::Fn),
+    ("preduce", MemberKind::Fn),
+];
+
+// ── std/time ──────────────────────────────────────────────────────────────────
+
+static TIME_ZERO_PARAMS: &[StdParam] = &[];
+static TIME_MS_PARAMS: &[StdParam] = &[StdParam::req("ms", "number")];
+static TIME_INTERVAL_PARAMS: &[StdParam] = &[StdParam::req("ms", "number")];
+static TIME_DEBOUNCE_PARAMS: &[StdParam] = &[
+    StdParam::req("f", "fn()"),
+    StdParam::req("ms", "number"),
+];
+static TIME_THROTTLE_PARAMS: &[StdParam] = &[
+    StdParam::req("f", "fn()"),
+    StdParam::req("ms", "number"),
+];
+
+static TIME_SIGS: &[(&str, StdSig)] = &[
+    ("now", StdSig { params: TIME_ZERO_PARAMS, ret: Some("float"), doc: "Return the current wall-clock time as milliseconds since the Unix epoch." }),
+    ("monotonic", StdSig { params: TIME_ZERO_PARAMS, ret: Some("float"), doc: "Return a monotonic timestamp in milliseconds since process start." }),
+    ("sleep", StdSig { params: TIME_MS_PARAMS, ret: None, doc: "Suspend the current async task for at least ms milliseconds. Async." }),
+    ("millis", StdSig { params: TIME_MS_PARAMS, ret: Some("float"), doc: "Return ms unchanged (identity helper for duration clarity)." }),
+    ("seconds", StdSig { params: TIME_MS_PARAMS, ret: Some("float"), doc: "Convert a number of seconds to milliseconds." }),
+    ("minutes", StdSig { params: TIME_MS_PARAMS, ret: Some("float"), doc: "Convert a number of minutes to milliseconds." }),
+    ("hours", StdSig { params: TIME_MS_PARAMS, ret: Some("float"), doc: "Convert a number of hours to milliseconds." }),
+    ("interval", StdSig { params: TIME_INTERVAL_PARAMS, ret: None, doc: "Create a periodic timer handle that ticks every ms milliseconds." }),
+    ("debounce", StdSig { params: TIME_DEBOUNCE_PARAMS, ret: None, doc: "Return a debounced wrapper of f that only fires ms after the last call." }),
+    ("throttle", StdSig { params: TIME_THROTTLE_PARAMS, ret: None, doc: "Return a throttled wrapper of f that fires at most once per ms window." }),
+];
+
+static TIME_MEMBERS: &[(&str, MemberKind)] = &[
+    ("now", MemberKind::Fn),
+    ("monotonic", MemberKind::Fn),
+    ("sleep", MemberKind::Fn),
+    ("millis", MemberKind::Fn),
+    ("seconds", MemberKind::Fn),
+    ("minutes", MemberKind::Fn),
+    ("hours", MemberKind::Fn),
+    ("interval", MemberKind::Fn),
+    ("debounce", MemberKind::Fn),
+    ("throttle", MemberKind::Fn),
+];
+
+// ── std/sync ──────────────────────────────────────────────────────────────────
+
+static SYNC_CHANNEL_PARAMS: &[StdParam] = &[StdParam::opt("capacity", "int")];
+static SYNC_SEND_PARAMS: &[StdParam] = &[
+    StdParam::req("ch", "channel"),
+    StdParam::req_untyped("value"),
+];
+static SYNC_RECV_PARAMS: &[StdParam] = &[StdParam::req("ch", "channel")];
+static SYNC_TRY_RECV_PARAMS: &[StdParam] = &[StdParam::req("ch", "channel")];
+static SYNC_CLOSE_PARAMS: &[StdParam] = &[StdParam::req("ch", "channel")];
+static SYNC_SEMAPHORE_PARAMS: &[StdParam] = &[StdParam::req("permits", "int")];
+static SYNC_ACQUIRE_PARAMS: &[StdParam] = &[StdParam::req("sem", "semaphore")];
+static SYNC_RELEASE_PARAMS: &[StdParam] = &[StdParam::req("sem", "semaphore")];
+static SYNC_WITH_PERMIT_PARAMS: &[StdParam] = &[
+    StdParam::req("sem", "semaphore"),
+    StdParam::req("f", "fn()"),
+];
+static SYNC_AVAILABLE_PARAMS: &[StdParam] = &[StdParam::req("sem", "semaphore")];
+static SYNC_RATE_LIMITER_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+
+static SYNC_SIGS: &[(&str, StdSig)] = &[
+    ("channel", StdSig { params: SYNC_CHANNEL_PARAMS, ret: None, doc: "Create a channel handle for passing values between tasks; optional capacity makes it bounded." }),
+    ("send", StdSig { params: SYNC_SEND_PARAMS, ret: Some("[nil, err]"), doc: "Send a value into a channel, blocking if the buffer is full. Async." }),
+    ("recv", StdSig { params: SYNC_RECV_PARAMS, ret: Some("[value, err]"), doc: "Receive the next value from a channel, blocking until one is available. Async." }),
+    ("tryRecv", StdSig { params: SYNC_TRY_RECV_PARAMS, ret: Some("[value, err]"), doc: "Non-blocking receive: return immediately with [nil, err] if no value is ready." }),
+    ("close", StdSig { params: SYNC_CLOSE_PARAMS, ret: None, doc: "Close a channel so further sends return an error and pending recvs drain remaining values." }),
+    ("semaphore", StdSig { params: SYNC_SEMAPHORE_PARAMS, ret: None, doc: "Create a semaphore with an initial permit count for limiting concurrency." }),
+    ("acquire", StdSig { params: SYNC_ACQUIRE_PARAMS, ret: None, doc: "Acquire one permit from a semaphore, blocking until one is available. Async." }),
+    ("release", StdSig { params: SYNC_RELEASE_PARAMS, ret: None, doc: "Release one permit back to a semaphore, waking a waiting acquirer." }),
+    ("withPermit", StdSig { params: SYNC_WITH_PERMIT_PARAMS, ret: None, doc: "Acquire a permit, run a function, then release the permit on all paths. Async." }),
+    ("available", StdSig { params: SYNC_AVAILABLE_PARAMS, ret: Some("int"), doc: "Return the current number of available permits in a semaphore." }),
+    ("rateLimiter", StdSig { params: SYNC_RATE_LIMITER_PARAMS, ret: None, doc: "Create a token-bucket rate limiter handle from an opts object ({perSecond} or {count, windowMs})." }),
+];
+
+static SYNC_MEMBERS: &[(&str, MemberKind)] = &[
+    ("channel", MemberKind::Fn),
+    ("send", MemberKind::Fn),
+    ("recv", MemberKind::Fn),
+    ("tryRecv", MemberKind::Fn),
+    ("close", MemberKind::Fn),
+    ("semaphore", MemberKind::Fn),
+    ("acquire", MemberKind::Fn),
+    ("release", MemberKind::Fn),
+    ("withPermit", MemberKind::Fn),
+    ("available", MemberKind::Fn),
+    ("rateLimiter", MemberKind::Fn),
+];
+
+// ── std/stream ────────────────────────────────────────────────────────────────
+
+static STREAM_FROM_PARAMS: &[StdParam] = &[StdParam::req_untyped("source")];
+static STREAM_RANGE_PARAMS: &[StdParam] = &[
+    StdParam::req("start", "number"),
+    StdParam::req("end", "number"),
+    StdParam::opt("step", "number"),
+];
+static STREAM_TRANSFORM_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "stream"),
+    StdParam::req("f", "fn(item)"),
+];
+static STREAM_TAKE_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "stream"),
+    StdParam::req("n", "number"),
+];
+static STREAM_DROP_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "stream"),
+    StdParam::req("n", "number"),
+];
+static STREAM_ENUMERATE_PARAMS: &[StdParam] = &[StdParam::req("s", "stream")];
+static STREAM_ZIP_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "stream"),
+    StdParam::req("t", "stream"),
+];
+static STREAM_COLLECT_PARAMS: &[StdParam] = &[StdParam::req("s", "stream")];
+static STREAM_REDUCE_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "stream"),
+    StdParam::req("f", "fn(acc, item)"),
+    StdParam::req_untyped("init"),
+];
+static STREAM_COUNT_PARAMS: &[StdParam] = &[StdParam::req("s", "stream")];
+static STREAM_FIND_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "stream"),
+    StdParam::req("f", "fn(item)"),
+];
+static STREAM_FIRST_PARAMS: &[StdParam] = &[StdParam::req("s", "stream")];
+
+static STREAM_SIGS: &[(&str, StdSig)] = &[
+    ("from", StdSig { params: STREAM_FROM_PARAMS, ret: None, doc: "Create a lazy stream from an array or generator." }),
+    ("range", StdSig { params: STREAM_RANGE_PARAMS, ret: None, doc: "Create a lazy numeric stream from start to end with an optional step." }),
+    ("map", StdSig { params: STREAM_TRANSFORM_PARAMS, ret: None, doc: "Append a map stage to a stream, applying f to each item." }),
+    ("filter", StdSig { params: STREAM_TRANSFORM_PARAMS, ret: None, doc: "Append a filter stage to a stream, keeping only items for which f is truthy." }),
+    ("take", StdSig { params: STREAM_TAKE_PARAMS, ret: None, doc: "Append a take stage that limits the stream to the first n items." }),
+    ("drop", StdSig { params: STREAM_DROP_PARAMS, ret: None, doc: "Append a drop stage that skips the first n items." }),
+    ("flatMap", StdSig { params: STREAM_TRANSFORM_PARAMS, ret: None, doc: "Append a flatMap stage that applies f and flattens one level of nested streams or arrays." }),
+    ("enumerate", StdSig { params: STREAM_ENUMERATE_PARAMS, ret: None, doc: "Append an enumerate stage that pairs each item with its zero-based index as [index, value]." }),
+    ("zip", StdSig { params: STREAM_ZIP_PARAMS, ret: None, doc: "Append a zip stage pairing items from two streams element-by-element." }),
+    ("collect", StdSig { params: STREAM_COLLECT_PARAMS, ret: Some("future<array>"), doc: "Pull all items from a stream into an array. Async." }),
+    ("forEach", StdSig { params: STREAM_TRANSFORM_PARAMS, ret: Some("future"), doc: "Pull all items from a stream and call f for each side effect. Async." }),
+    ("reduce", StdSig { params: STREAM_REDUCE_PARAMS, ret: Some("future"), doc: "Fold a stream into a single value by applying f to each item with an accumulator. Async." }),
+    ("count", StdSig { params: STREAM_COUNT_PARAMS, ret: Some("future<int>"), doc: "Count the total number of items in a stream. Async." }),
+    ("find", StdSig { params: STREAM_FIND_PARAMS, ret: Some("future"), doc: "Return the first item for which f is truthy, or nil if none. Async." }),
+    ("first", StdSig { params: STREAM_FIRST_PARAMS, ret: Some("future"), doc: "Return the first item of a stream, or nil if empty. Async." }),
+];
+
+static STREAM_MEMBERS: &[(&str, MemberKind)] = &[
+    ("from", MemberKind::Fn),
+    ("range", MemberKind::Fn),
+    ("map", MemberKind::Fn),
+    ("filter", MemberKind::Fn),
+    ("take", MemberKind::Fn),
+    ("drop", MemberKind::Fn),
+    ("flatMap", MemberKind::Fn),
+    ("enumerate", MemberKind::Fn),
+    ("zip", MemberKind::Fn),
+    ("collect", MemberKind::Fn),
+    ("forEach", MemberKind::Fn),
+    ("reduce", MemberKind::Fn),
+    ("count", MemberKind::Fn),
+    ("find", MemberKind::Fn),
+    ("first", MemberKind::Fn),
+];
+
+// ── std/date ──────────────────────────────────────────────────────────────────
+
+static DATE_ZERO_PARAMS: &[StdParam] = &[];
+static DATE_FROM_EPOCH_PARAMS: &[StdParam] = &[StdParam::req("ms", "number")];
+static DATE_PARSE_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static DATE_FORMAT_PARAMS: &[StdParam] = &[
+    StdParam::req("date", "object"),
+    StdParam::req("fmt", "string"),
+];
+static DATE_ADD_DAYS_PARAMS: &[StdParam] = &[
+    StdParam::req("date", "object"),
+    StdParam::req("n", "number"),
+];
+static DATE_DIFF_MS_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "object"),
+    StdParam::req("b", "object"),
+];
+
+static DATE_SIGS: &[(&str, StdSig)] = &[
+    ("now", StdSig { params: DATE_ZERO_PARAMS, ret: Some("object"), doc: "Return the current local date and time as a date object." }),
+    ("fromEpochMs", StdSig { params: DATE_FROM_EPOCH_PARAMS, ret: Some("object"), doc: "Create a date object from a Unix epoch timestamp in milliseconds." }),
+    ("parse", StdSig { params: DATE_PARSE_PARAMS, ret: Some("[object, err]"), doc: "Parse an ISO 8601 date/time string into a date object." }),
+    ("format", StdSig { params: DATE_FORMAT_PARAMS, ret: Some("string"), doc: "Format a date object using a strftime-style format string." }),
+    ("addDays", StdSig { params: DATE_ADD_DAYS_PARAMS, ret: Some("object"), doc: "Return a new date object with n days added." }),
+    ("addHours", StdSig { params: DATE_ADD_DAYS_PARAMS, ret: Some("object"), doc: "Return a new date object with n hours added." }),
+    ("addMinutes", StdSig { params: DATE_ADD_DAYS_PARAMS, ret: Some("object"), doc: "Return a new date object with n minutes added." }),
+    ("addSeconds", StdSig { params: DATE_ADD_DAYS_PARAMS, ret: Some("object"), doc: "Return a new date object with n seconds added." }),
+    ("addMonths", StdSig { params: DATE_ADD_DAYS_PARAMS, ret: Some("object"), doc: "Return a new date object with n months added." }),
+    ("addYears", StdSig { params: DATE_ADD_DAYS_PARAMS, ret: Some("object"), doc: "Return a new date object with n years added." }),
+    ("diffMs", StdSig { params: DATE_DIFF_MS_PARAMS, ret: Some("float"), doc: "Return the difference between two date objects in milliseconds (a − b)." }),
+];
+
+static DATE_MEMBERS: &[(&str, MemberKind)] = &[
+    ("now", MemberKind::Fn),
+    ("fromEpochMs", MemberKind::Fn),
+    ("parse", MemberKind::Fn),
+    ("format", MemberKind::Fn),
+    ("addDays", MemberKind::Fn),
+    ("addHours", MemberKind::Fn),
+    ("addMinutes", MemberKind::Fn),
+    ("addSeconds", MemberKind::Fn),
+    ("addMonths", MemberKind::Fn),
+    ("addYears", MemberKind::Fn),
+    ("diffMs", MemberKind::Fn),
+];
+
+// ── std/intl ──────────────────────────────────────────────────────────────────
+
+static INTL_FORMAT_NUMBER_PARAMS: &[StdParam] = &[
+    StdParam::req("n", "number"),
+    StdParam::opt("opts", "object"),
+];
+static INTL_FORMAT_CURRENCY_PARAMS: &[StdParam] = &[
+    StdParam::req("n", "number"),
+    StdParam::req("currency", "string"),
+    StdParam::opt("opts", "object"),
+];
+static INTL_FORMAT_DATE_PARAMS: &[StdParam] = &[
+    StdParam::req("date", "object"),
+    StdParam::opt("opts", "object"),
+];
+static INTL_CASE_UPPER_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "string"),
+    StdParam::opt("locale", "string"),
+];
+static INTL_CASE_LOWER_PARAMS: &[StdParam] = &[
+    StdParam::req("s", "string"),
+    StdParam::opt("locale", "string"),
+];
+static INTL_COMPARE_PARAMS: &[StdParam] = &[
+    StdParam::req("a", "string"),
+    StdParam::req("b", "string"),
+    StdParam::opt("opts", "object"),
+];
+
+static INTL_SIGS: &[(&str, StdSig)] = &[
+    ("formatNumber", StdSig { params: INTL_FORMAT_NUMBER_PARAMS, ret: Some("string"), doc: "Format a number using locale-aware formatting rules." }),
+    ("formatCurrency", StdSig { params: INTL_FORMAT_CURRENCY_PARAMS, ret: Some("string"), doc: "Format a number as a currency amount with the given ISO 4217 currency code." }),
+    ("formatDate", StdSig { params: INTL_FORMAT_DATE_PARAMS, ret: Some("string"), doc: "Format a date object using locale-aware date formatting." }),
+    ("caseUpper", StdSig { params: INTL_CASE_UPPER_PARAMS, ret: Some("string"), doc: "Convert a string to uppercase using Unicode locale-aware case folding." }),
+    ("caseLower", StdSig { params: INTL_CASE_LOWER_PARAMS, ret: Some("string"), doc: "Convert a string to lowercase using Unicode locale-aware case folding." }),
+    ("compare", StdSig { params: INTL_COMPARE_PARAMS, ret: Some("int"), doc: "Compare two strings with locale-aware collation; returns -1, 0, or 1." }),
+];
+
+static INTL_MEMBERS: &[(&str, MemberKind)] = &[
+    ("formatNumber", MemberKind::Fn),
+    ("formatCurrency", MemberKind::Fn),
+    ("formatDate", MemberKind::Fn),
+    ("caseUpper", MemberKind::Fn),
+    ("caseLower", MemberKind::Fn),
+    ("compare", MemberKind::Fn),
+];
+
+// ── std/log ───────────────────────────────────────────────────────────────────
+
+static LOG_MSG_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("message"),
+    StdParam::opt("fields", "object"),
+];
+static LOG_SET_LEVEL_PARAMS: &[StdParam] = &[StdParam::req("level", "string")];
+static LOG_SET_FORMAT_PARAMS: &[StdParam] = &[StdParam::req("format", "string")];
+
+static LOG_SIGS: &[(&str, StdSig)] = &[
+    ("debug", StdSig { params: LOG_MSG_PARAMS, ret: None, doc: "Emit a debug-level log message with optional structured fields." }),
+    ("info", StdSig { params: LOG_MSG_PARAMS, ret: None, doc: "Emit an info-level log message with optional structured fields." }),
+    ("warn", StdSig { params: LOG_MSG_PARAMS, ret: None, doc: "Emit a warn-level log message with optional structured fields." }),
+    ("error", StdSig { params: LOG_MSG_PARAMS, ret: None, doc: "Emit an error-level log message with optional structured fields." }),
+    ("setLevel", StdSig { params: LOG_SET_LEVEL_PARAMS, ret: None, doc: "Set the minimum log level (debug/info/warn/error); messages below it are suppressed." }),
+    ("setFormat", StdSig { params: LOG_SET_FORMAT_PARAMS, ret: None, doc: "Set the log output format ('text' or 'json')." }),
+];
+
+static LOG_MEMBERS: &[(&str, MemberKind)] = &[
+    ("debug", MemberKind::Fn),
+    ("info", MemberKind::Fn),
+    ("warn", MemberKind::Fn),
+    ("error", MemberKind::Fn),
+    ("setLevel", MemberKind::Fn),
+    ("setFormat", MemberKind::Fn),
+];
+
+// ── std/workflow ──────────────────────────────────────────────────────────────
+
+static WORKFLOW_ACTIVITY_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("f", "fn()"),
+];
+static WORKFLOW_RUN_PARAMS: &[StdParam] = &[
+    StdParam::req("wf", "fn(ctx, input)"),
+    StdParam::req_untyped("input"),
+    StdParam::opt("opts", "object"),
+];
+static WORKFLOW_RESUME_PARAMS: &[StdParam] = &[
+    StdParam::req("wf", "fn(ctx, input)"),
+    StdParam::req_untyped("input"),
+    StdParam::opt("opts", "object"),
+];
+
+static WORKFLOW_SIGS: &[(&str, StdSig)] = &[
+    ("activity", StdSig { params: WORKFLOW_ACTIVITY_PARAMS, ret: Some("object"), doc: "Define a named durable activity descriptor that a workflow can execute." }),
+    ("run", StdSig { params: WORKFLOW_RUN_PARAMS, ret: Some("[value, err]"), doc: "Run a workflow function in Record mode, persisting events to a durable log. Async." }),
+    ("resume", StdSig { params: WORKFLOW_RESUME_PARAMS, ret: Some("[value, err]"), doc: "Resume a previously started workflow from its durable log, replaying past events. Async." }),
+];
+
+static WORKFLOW_MEMBERS: &[(&str, MemberKind)] = &[
+    ("activity", MemberKind::Fn),
+    ("run", MemberKind::Fn),
+    ("resume", MemberKind::Fn),
+];
+
+// ── std/telemetry ─────────────────────────────────────────────────────────────
+
+static TELEMETRY_INIT_PARAMS: &[StdParam] = &[StdParam::req("config", "object")];
+static TELEMETRY_EXPORTER_PARAMS: &[StdParam] = &[StdParam::req("config", "object")];
+static TELEMETRY_ZERO_PARAMS: &[StdParam] = &[];
+static TELEMETRY_SPAN_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::opt("opts", "object"),
+];
+static TELEMETRY_SCOPED_SPAN_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("f", "fn()"),
+];
+static TELEMETRY_INSTRUMENT_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::opt("opts", "object"),
+];
+static TELEMETRY_CAPTURE_PARAMS: &[StdParam] = &[
+    StdParam::req("event", "string"),
+    StdParam::opt("opts", "object"),
+];
+static TELEMETRY_IDENTIFY_PARAMS: &[StdParam] = &[
+    StdParam::req("distinctId", "string"),
+    StdParam::opt("props", "object"),
+];
+
+static TELEMETRY_SIGS: &[(&str, StdSig)] = &[
+    ("init", StdSig { params: TELEMETRY_INIT_PARAMS, ret: Some("[nil, err]"), doc: "Initialize telemetry with a configuration object specifying exporters and service metadata. Async." }),
+    ("otlp", StdSig { params: TELEMETRY_EXPORTER_PARAMS, ret: Some("object"), doc: "Build an OTLP exporter descriptor for use with telemetry.init." }),
+    ("sentry", StdSig { params: TELEMETRY_EXPORTER_PARAMS, ret: Some("object"), doc: "Build a Sentry exporter descriptor for use with telemetry.init." }),
+    ("posthog", StdSig { params: TELEMETRY_EXPORTER_PARAMS, ret: Some("object"), doc: "Build a PostHog analytics exporter descriptor for use with telemetry.init." }),
+    ("flush", StdSig { params: TELEMETRY_ZERO_PARAMS, ret: Some("[nil, err]"), doc: "Force-export all buffered telemetry signals to the configured exporters. Async." }),
+    ("shutdown", StdSig { params: TELEMETRY_ZERO_PARAMS, ret: Some("[nil, err]"), doc: "Flush and shut down the telemetry pipeline. Async." }),
+    ("startSpan", StdSig { params: TELEMETRY_SPAN_PARAMS, ret: None, doc: "Open a distributed tracing span and return a handle; caller must close it." }),
+    ("span", StdSig { params: TELEMETRY_SCOPED_SPAN_PARAMS, ret: Some("future<[value, err]>"), doc: "Open a span, run a scoped async callback, close the span on completion. Async." }),
+    ("counter", StdSig { params: TELEMETRY_INSTRUMENT_PARAMS, ret: None, doc: "Create a monotonic counter metric instrument." }),
+    ("histogram", StdSig { params: TELEMETRY_INSTRUMENT_PARAMS, ret: None, doc: "Create a histogram metric instrument for recording distributions." }),
+    ("gauge", StdSig { params: TELEMETRY_INSTRUMENT_PARAMS, ret: None, doc: "Create a gauge metric instrument for recording point-in-time values." }),
+    ("capture", StdSig { params: TELEMETRY_CAPTURE_PARAMS, ret: None, doc: "Emit a named analytics event to the configured analytics exporter." }),
+    ("identify", StdSig { params: TELEMETRY_IDENTIFY_PARAMS, ret: None, doc: "Associate a user identity with a distinct ID and optional properties." }),
+];
+
+static TELEMETRY_MEMBERS: &[(&str, MemberKind)] = &[
+    ("init", MemberKind::Fn),
+    ("otlp", MemberKind::Fn),
+    ("sentry", MemberKind::Fn),
+    ("posthog", MemberKind::Fn),
+    ("flush", MemberKind::Fn),
+    ("shutdown", MemberKind::Fn),
+    ("startSpan", MemberKind::Fn),
+    ("span", MemberKind::Fn),
+    ("counter", MemberKind::Fn),
+    ("histogram", MemberKind::Fn),
+    ("gauge", MemberKind::Fn),
+    ("capture", MemberKind::Fn),
+    ("identify", MemberKind::Fn),
+];
+
+// ── std/tui ───────────────────────────────────────────────────────────────────
+
+static TUI_INIT_PARAMS: &[StdParam] = &[];
+static TUI_BUFFER_PARAMS: &[StdParam] = &[
+    StdParam::req("width", "int"),
+    StdParam::req("height", "int"),
+];
+
+static TUI_SIGS: &[(&str, StdSig)] = &[
+    ("init", StdSig { params: TUI_INIT_PARAMS, ret: Some("[term, err]"), doc: "Initialize the terminal for full-screen TUI rendering, returning a terminal handle." }),
+    ("buffer", StdSig { params: TUI_BUFFER_PARAMS, ret: Some("buffer"), doc: "Create an off-screen character buffer of width × height cells." }),
+];
+
+static TUI_MEMBERS: &[(&str, MemberKind)] = &[
+    ("init", MemberKind::Fn),
+    ("buffer", MemberKind::Fn),
+];
+
+// ── std/ffi ───────────────────────────────────────────────────────────────────
+
+static FFI_OPEN_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FFI_STRUCT_PARAMS: &[StdParam] = &[StdParam::req("fields", "array")];
+static FFI_CSTR_PARAMS: &[StdParam] = &[StdParam::req("s", "string")];
+static FFI_READ_CSTR_PARAMS: &[StdParam] = &[StdParam::req_untyped("ptr")];
+static FFI_ALLOC_PARAMS: &[StdParam] = &[StdParam::req("layout", "object")];
+static FFI_GET_PARAMS: &[StdParam] = &[
+    StdParam::req("layout", "object"),
+    StdParam::req("buf", "bytes"),
+    StdParam::req("name", "string"),
+];
+static FFI_SET_PARAMS: &[StdParam] = &[
+    StdParam::req("layout", "object"),
+    StdParam::req("buf", "bytes"),
+    StdParam::req("name", "string"),
+    StdParam::req_untyped("value"),
+];
+
+static FFI_SIGS: &[(&str, StdSig)] = &[
+    ("open", StdSig { params: FFI_OPEN_PARAMS, ret: Some("[lib, err]"), doc: "Load a native shared library from the filesystem path and return a library handle." }),
+    ("struct", StdSig { params: FFI_STRUCT_PARAMS, ret: Some("object"), doc: "Build a C struct layout descriptor from an array of [name, ffi.<type>] field pairs." }),
+    ("cstr", StdSig { params: FFI_CSTR_PARAMS, ret: Some("bytes"), doc: "Convert a string to a NUL-terminated C string in a bytes buffer." }),
+    ("read_cstr", StdSig { params: FFI_READ_CSTR_PARAMS, ret: Some("string"), doc: "Read a NUL-terminated C string from a bytes buffer or foreign pointer." }),
+    ("alloc", StdSig { params: FFI_ALLOC_PARAMS, ret: Some("bytes"), doc: "Allocate a zero-filled bytes buffer sized to hold a C struct described by the layout." }),
+    ("get", StdSig { params: FFI_GET_PARAMS, ret: None, doc: "Read a named field from a struct buffer using its layout descriptor." }),
+    ("set", StdSig { params: FFI_SET_PARAMS, ret: None, doc: "Write a value into a named field of a struct buffer using its layout descriptor." }),
+];
+
+static FFI_MEMBERS: &[(&str, MemberKind)] = &[
+    ("i8", MemberKind::Const("object")),
+    ("i16", MemberKind::Const("object")),
+    ("i32", MemberKind::Const("object")),
+    ("i64", MemberKind::Const("object")),
+    ("u8", MemberKind::Const("object")),
+    ("u16", MemberKind::Const("object")),
+    ("u32", MemberKind::Const("object")),
+    ("u64", MemberKind::Const("object")),
+    ("size", MemberKind::Const("object")),
+    ("f32", MemberKind::Const("object")),
+    ("f64", MemberKind::Const("object")),
+    ("ptr", MemberKind::Const("object")),
+    ("void", MemberKind::Const("object")),
+    ("open", MemberKind::Fn),
+    ("struct", MemberKind::Fn),
+    ("cstr", MemberKind::Fn),
+    ("read_cstr", MemberKind::Fn),
+    ("alloc", MemberKind::Fn),
+    ("get", MemberKind::Fn),
+    ("set", MemberKind::Fn),
+];
+
+// ── std/resilience ────────────────────────────────────────────────────────────
+
+static RESIL_OPTS_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static RESIL_FALLBACK_PARAMS: &[StdParam] = &[
+    StdParam::req("f", "fn()"),
+    StdParam::req_untyped("fallback"),
+];
+static RESIL_SINGLEFLIGHT_PARAMS: &[StdParam] = &[
+    StdParam::req("key", "string"),
+    StdParam::req("f", "fn()"),
+];
+static RESIL_DEADLINE_PARAMS: &[StdParam] = &[
+    StdParam::req("ms", "number"),
+    StdParam::req("f", "fn()"),
+];
+static RESIL_DEADLINE_REMAINING_PARAMS: &[StdParam] = &[];
+static RESIL_WITH_TRACE_PARAMS: &[StdParam] = &[
+    StdParam::req("id", "string"),
+    StdParam::req("f", "fn()"),
+];
+static RESIL_TRACE_ID_PARAMS: &[StdParam] = &[];
+static RESIL_METRICS_HANDLER_PARAMS: &[StdParam] = &[];
+static RESIL_HEALTH_PARAMS: &[StdParam] = &[StdParam::req("config", "object")];
+static RESIL_HANDLER_PARAMS: &[StdParam] = &[
+    StdParam::req("policies", "object"),
+    StdParam::req("f", "fn(req)"),
+];
+
+static RESIL_SIGS: &[(&str, StdSig)] = &[
+    ("breaker", StdSig { params: RESIL_OPTS_PARAMS, ret: Some("object"), doc: "Create a circuit-breaker policy that trips after a configurable failure threshold." }),
+    ("limiter", StdSig { params: RESIL_OPTS_PARAMS, ret: Some("object"), doc: "Create a rate-limiter policy using a token-bucket algorithm." }),
+    ("keyedLimiter", StdSig { params: RESIL_OPTS_PARAMS, ret: Some("object"), doc: "Create a per-key rate-limiter policy backed by an LRU cache of token buckets." }),
+    ("bulkhead", StdSig { params: RESIL_OPTS_PARAMS, ret: Some("object"), doc: "Create a bulkhead policy that limits the number of concurrent in-flight calls." }),
+    ("retry", StdSig { params: RESIL_OPTS_PARAMS, ret: Some("object"), doc: "Create a retry policy with configurable attempts, back-off, and jitter." }),
+    ("fallback", StdSig { params: RESIL_FALLBACK_PARAMS, ret: Some("future<[value, err]>"), doc: "Call f and, on failure, return the fallback value instead. Async." }),
+    ("singleflight", StdSig { params: RESIL_SINGLEFLIGHT_PARAMS, ret: Some("future"), doc: "Deduplicate concurrent calls for the same key so only one runs at a time. Async." }),
+    ("memoize", StdSig { params: RESIL_OPTS_PARAMS, ret: Some("object"), doc: "Create a memoize policy that caches function results by their arguments." }),
+    ("deadline", StdSig { params: RESIL_DEADLINE_PARAMS, ret: Some("future<[value, err]>"), doc: "Run f with a deadline of ms milliseconds; return [nil, err] if the deadline expires. Async." }),
+    ("deadlineRemaining", StdSig { params: RESIL_DEADLINE_REMAINING_PARAMS, ret: Some("float?"), doc: "Return the milliseconds remaining on the current task's deadline, or nil if no deadline is set." }),
+    ("withTrace", StdSig { params: RESIL_WITH_TRACE_PARAMS, ret: Some("future"), doc: "Run f with a trace ID set in task-local context; child tasks inherit it. Async." }),
+    ("traceId", StdSig { params: RESIL_TRACE_ID_PARAMS, ret: Some("string?"), doc: "Return the current task's trace ID, or nil if none is set." }),
+    ("metricsHandler", StdSig { params: RESIL_METRICS_HANDLER_PARAMS, ret: None, doc: "Return an HTTP handler that serves per-isolate resilience metrics in Prometheus text format." }),
+    ("health", StdSig { params: RESIL_HEALTH_PARAMS, ret: None, doc: "Return an HTTP readiness/liveness handler that runs configured health checks." }),
+    ("handler", StdSig { params: RESIL_HANDLER_PARAMS, ret: None, doc: "Wrap an HTTP handler function with a set of resilience policies (retry, breaker, etc.)." }),
+];
+
+static RESIL_MEMBERS: &[(&str, MemberKind)] = &[
+    ("breaker", MemberKind::Fn),
+    ("limiter", MemberKind::Fn),
+    ("keyedLimiter", MemberKind::Fn),
+    ("bulkhead", MemberKind::Fn),
+    ("retry", MemberKind::Fn),
+    ("fallback", MemberKind::Fn),
+    ("singleflight", MemberKind::Fn),
+    ("memoize", MemberKind::Fn),
+    ("deadline", MemberKind::Fn),
+    ("deadlineRemaining", MemberKind::Fn),
+    ("withTrace", MemberKind::Fn),
+    ("traceId", MemberKind::Fn),
+    ("metricsHandler", MemberKind::Fn),
+    ("health", MemberKind::Fn),
+    ("handler", MemberKind::Fn),
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Master index (batch 1 + batch 2 + batch 3 — 60 modules total)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
@@ -1693,50 +2623,32 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/postgres", POSTGRES_MEMBERS),
     ("std/redis", REDIS_MEMBERS),
     ("std/docker", DOCKER_MEMBERS),
-];
-
-/// Modules covered in Task 1.1 + Task 1.2 (batches 1 and 2).
-/// Task 1.3 (final batch) deletes this const and the `table_is_still_partial_pending_task_1_2`
-/// test once ALL of STD_MODULES is filled.
-pub const IMPLEMENTED_MODULES: &[&str] = &[
-    "std/math",
-    "std/string",
-    "std/array",
-    "std/object",
-    "std/map",
-    "std/set",
-    "std/bytes",
-    "std/convert",
-    "std/decimal",
-    "std/json",
-    "std/csv",
-    "std/regex",
-    "std/encoding",
-    "std/toml",
-    "std/yaml",
-    "std/url",
-    "std/uuid",
-    "std/msgpack",
-    "std/cbor",
-    // batch 2
-    "std/fs",
-    "std/env",
-    "std/io",
-    "std/process",
-    "std/os",
-    "std/crypto",
-    "std/compress",
-    "std/net",
-    "std/net/tcp",
-    "std/net/udp",
-    "std/net/unix",
-    "std/net/ws",
-    "std/net/http",
-    "std/http/server",
-    "std/sqlite",
-    "std/postgres",
-    "std/redis",
-    "std/docker",
+    // batch 3 — ai + assert + bench + cli + color + schema + shared + lru + events + template +
+    //           caps + task + time + sync + stream + date + intl + log + workflow + telemetry +
+    //           tui + ffi + resilience
+    ("std/ai", AI_MEMBERS),
+    ("std/assert", ASSERT_MEMBERS),
+    ("std/bench", BENCH_MEMBERS),
+    ("std/cli", CLI_MEMBERS),
+    ("std/color", COLOR_MEMBERS),
+    ("std/schema", SCHEMA_MEMBERS),
+    ("std/shared", SHARED_MEMBERS),
+    ("std/lru", LRU_MEMBERS),
+    ("std/events", EVENTS_MEMBERS),
+    ("std/template", TEMPLATE_MEMBERS),
+    ("std/caps", CAPS_MEMBERS),
+    ("std/task", TASK_MEMBERS),
+    ("std/time", TIME_MEMBERS),
+    ("std/sync", SYNC_MEMBERS),
+    ("std/stream", STREAM_MEMBERS),
+    ("std/date", DATE_MEMBERS),
+    ("std/intl", INTL_MEMBERS),
+    ("std/log", LOG_MEMBERS),
+    ("std/workflow", WORKFLOW_MEMBERS),
+    ("std/telemetry", TELEMETRY_MEMBERS),
+    ("std/tui", TUI_MEMBERS),
+    ("std/ffi", FFI_MEMBERS),
+    ("std/resilience", RESIL_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1785,15 +2697,74 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/postgres" => POSTGRES_SIGS,
         "std/redis" => REDIS_SIGS,
         "std/docker" => DOCKER_SIGS,
+        // batch 3
+        "std/ai" => AI_SIGS,
+        "std/assert" => ASSERT_SIGS,
+        "std/bench" => BENCH_SIGS,
+        "std/cli" => CLI_SIGS,
+        "std/color" => COLOR_SIGS,
+        "std/schema" => SCHEMA_SIGS,
+        "std/shared" => SHARED_SIGS,
+        "std/lru" => LRU_SIGS,
+        "std/events" => EVENTS_SIGS,
+        "std/template" => TEMPLATE_SIGS,
+        "std/caps" => CAPS_SIGS,
+        "std/task" => TASK_SIGS,
+        "std/time" => TIME_SIGS,
+        "std/sync" => SYNC_SIGS,
+        "std/stream" => STREAM_SIGS,
+        "std/date" => DATE_SIGS,
+        "std/intl" => INTL_SIGS,
+        "std/log" => LOG_SIGS,
+        "std/workflow" => WORKFLOW_SIGS,
+        "std/telemetry" => TELEMETRY_SIGS,
+        "std/tui" => TUI_SIGS,
+        "std/ffi" => FFI_SIGS,
+        "std/resilience" => RESIL_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
 }
 
+// ── Global builtins ───────────────────────────────────────────────────────────
+
+static BUILTIN_PRINT_PARAMS: &[StdParam] = &[StdParam::variadic("values", "any")];
+static BUILTIN_LEN_PARAMS: &[StdParam] = &[StdParam::req("value", "any")];
+static BUILTIN_TYPE_PARAMS: &[StdParam] = &[StdParam::req("value", "any")];
+static BUILTIN_ASSERT_PARAMS: &[StdParam] = &[
+    StdParam::req("cond", "bool"),
+    StdParam::opt("message", "string"),
+];
+static BUILTIN_RANGE_PARAMS: &[StdParam] = &[
+    StdParam::req("start_or_end", "number"),
+    StdParam::opt("end", "number"),
+    StdParam::opt("step", "number"),
+];
+static BUILTIN_OK_PARAMS: &[StdParam] = &[StdParam::opt("value", "any")];
+static BUILTIN_ERR_PARAMS: &[StdParam] = &[StdParam::opt("error", "any")];
+static BUILTIN_RECOVER_PARAMS: &[StdParam] = &[StdParam::req("f", "fn()")];
+static BUILTIN_TEST_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("f", "fn()"),
+];
+static BUILTIN_EXIT_PARAMS: &[StdParam] = &[StdParam::opt("code", "int")];
+
+static BUILTIN_SIGS: &[(&str, StdSig)] = &[
+    ("print",   StdSig { params: BUILTIN_PRINT_PARAMS,  ret: None,           doc: "Print values to stdout, separated by spaces." }),
+    ("len",     StdSig { params: BUILTIN_LEN_PARAMS,    ret: Some("int"),    doc: "Return the length of a string, array, map, set, object, or bytes value." }),
+    ("type",    StdSig { params: BUILTIN_TYPE_PARAMS,   ret: Some("string"), doc: "Return the runtime type name of a value as a string." }),
+    ("assert",  StdSig { params: BUILTIN_ASSERT_PARAMS, ret: None,           doc: "Panic with a Tier-2 error if cond is falsy; optional message overrides the default." }),
+    ("range",   StdSig { params: BUILTIN_RANGE_PARAMS,  ret: Some("array<int>"), doc: "Return an integer array. range(end), range(start,end), or range(start,end,step)." }),
+    ("Ok",      StdSig { params: BUILTIN_OK_PARAMS,     ret: Some("[value, nil]"), doc: "Construct a successful Tier-1 result pair [value, nil]." }),
+    ("Err",     StdSig { params: BUILTIN_ERR_PARAMS,    ret: Some("[nil, err]"),   doc: "Construct a Tier-1 error pair [nil, error]." }),
+    ("recover", StdSig { params: BUILTIN_RECOVER_PARAMS, ret: None,          doc: "Call f, catching any Tier-2 panic as a Tier-1 [nil, err] result instead of aborting." }),
+    ("test",    StdSig { params: BUILTIN_TEST_PARAMS,   ret: None,           doc: "Register a named test case. Collected and run by `ascript test`." }),
+    ("exit",    StdSig { params: BUILTIN_EXIT_PARAMS,   ret: None,           doc: "Terminate the process immediately with the given exit code (0–255; default 0)." }),
+];
+
 /// Look up the curated signature for a global builtin function.
-/// Returns `None` for everything in Task 1.1 — builtins are filled in Task 1.2.
-pub fn builtin_sig(_name: &str) -> Option<&'static StdSig> {
-    None
+pub fn builtin_sig(name: &str) -> Option<&'static StdSig> {
+    BUILTIN_SIGS.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
 }
 
 /// The member list (name → kind) for a module, or `None` if not implemented.
@@ -1860,6 +2831,30 @@ mod tests {
             ("std/postgres", POSTGRES_SIGS),
             ("std/redis", REDIS_SIGS),
             ("std/docker", DOCKER_SIGS),
+            // batch 3
+            ("std/ai", AI_SIGS),
+            ("std/assert", ASSERT_SIGS),
+            ("std/bench", BENCH_SIGS),
+            ("std/cli", CLI_SIGS),
+            ("std/color", COLOR_SIGS),
+            ("std/schema", SCHEMA_SIGS),
+            ("std/shared", SHARED_SIGS),
+            ("std/lru", LRU_SIGS),
+            ("std/events", EVENTS_SIGS),
+            ("std/template", TEMPLATE_SIGS),
+            ("std/caps", CAPS_SIGS),
+            ("std/task", TASK_SIGS),
+            ("std/time", TIME_SIGS),
+            ("std/sync", SYNC_SIGS),
+            ("std/stream", STREAM_SIGS),
+            ("std/date", DATE_SIGS),
+            ("std/intl", INTL_SIGS),
+            ("std/log", LOG_SIGS),
+            ("std/workflow", WORKFLOW_SIGS),
+            ("std/telemetry", TELEMETRY_SIGS),
+            ("std/tui", TUI_SIGS),
+            ("std/ffi", FFI_SIGS),
+            ("std/resilience", RESIL_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {
@@ -1870,10 +2865,10 @@ mod tests {
     }
 
     /// §2.3 drift (a), direction 1: every export of every buildable module has a
-    /// table row, kind-consistent with the export's Value kind. SCOPED to IMPLEMENTED_MODULES for now.
+    /// table row, kind-consistent with the export's Value kind.
     #[test]
     fn every_export_has_a_table_row_with_consistent_kind() {
-        for module in IMPLEMENTED_MODULES {
+        for module in crate::stdlib::STD_MODULES {
             let Some(exports) = crate::stdlib::std_module_exports(module) else {
                 continue; // feature-gated out of THIS build — covered by the other config
             };
@@ -1911,12 +2906,14 @@ mod tests {
         }
     }
 
-    /// While the table is partial (Task 1.1), IMPLEMENTED_MODULES must be a strict subset.
-    /// Task 1.2 deletes IMPLEMENTED_MODULES + this test, flipping coverage to ALL of STD_MODULES.
-    /// The `// SIG Task 1.2 fills the remainder` marker below MUST exist while this holds.
+    /// Every global builtin in scope has a sig row, and key invariants hold.
     #[test]
-    fn table_is_still_partial_pending_task_1_2() {
-        assert!(IMPLEMENTED_MODULES.len() < crate::stdlib::STD_MODULES.len(),
-            "once full, delete IMPLEMENTED_MODULES + the marker and let the completeness test cover all modules (Task 1.2)");
+    fn global_builtins_have_sigs() {
+        for b in ["print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test", "exit"] {
+            assert!(builtin_sig(b).is_some(), "builtin '{b}' missing from BUILTIN_SIGS");
+        }
+        let len = builtin_sig("len").unwrap();
+        assert_eq!(len.params.len(), 1, "len() must have exactly one param");
+        assert_eq!(len.params[0].name, "value", "len()'s single param must be named 'value'");
     }
 }
