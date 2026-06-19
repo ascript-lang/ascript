@@ -9,6 +9,10 @@ pub mod ai;
 pub mod array;
 pub mod assert_mod;
 pub mod bench;
+// B7: SigV4 core only — NOT yet registered in STD_MODULES / routing / std_sigs / rtstub.
+// The client + operations (B8) wire it in. Private `mod` so it stays off the drift surface.
+#[cfg(feature = "blob")]
+mod blob;
 pub mod bytes;
 pub mod caps;
 #[cfg(feature = "binary")]
