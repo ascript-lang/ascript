@@ -188,6 +188,47 @@ fn snippet_completions() -> Vec<CompletionItem> {
         .collect()
 }
 
+/// Lazily-built, process-scoped cache of ALL auto-import completion items across
+/// every std module. Built once on first call and shared across all subsequent
+/// requests — avoids re-iterating ~60 modules × N exports on every keystroke.
+///
+/// Each entry carries:
+/// - label    = export name
+/// - kind     = FUNCTION or CONSTANT (HandleMethod entries are skipped)
+/// - detail   = `"auto-import from <module>"`
+/// - sort_text = `"zz<name>"` — sorts AFTER in-scope bindings and builtins
+/// - additional_text_edits = the import insertion at line 0
+///
+/// The caller (`auto_import_candidates`) filters out already-imported names by
+/// iterating this slice — a cheap O(n) scan over a shared `&'static` allocation.
+pub fn auto_import_entries() -> &'static [CompletionItem] {
+    use crate::check::std_sigs::{module_members, MemberKind};
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<CompletionItem>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out = Vec::new();
+        for path in STD_MODULE_PATHS {
+            let Some(members) = module_members(path) else { continue; };
+            for &(name, ref kind) in members {
+                let ck = match kind {
+                    MemberKind::Fn => CompletionItemKind::FUNCTION,
+                    MemberKind::Const(_) => CompletionItemKind::CONSTANT,
+                    MemberKind::HandleMethod => continue,
+                };
+                let mut ci = item(name, ck);
+                ci.detail = Some(format!("auto-import from {path}"));
+                ci.sort_text = Some(format!("zz{name}"));
+                ci.additional_text_edits = Some(vec![TextEdit {
+                    range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                    new_text: format!("import {{ {name} }} from \"{path}\"\n"),
+                }]);
+                out.push(ci);
+            }
+        }
+        out
+    })
+}
+
 /// Auto-import candidates: every std export NOT already imported, each carrying an
 /// `additionalTextEdits` that inserts an `import { name } from "<path>"` line at the
 /// top of the file. Reuses the `STD_MODULE_PATHS` set the import-path-string context
@@ -203,25 +244,31 @@ fn auto_import_candidates(model: &SemanticModel) -> Vec<CompletionItem> {
         .map(|b| b.name.clone())
         .collect();
 
-    let mut out = Vec::new();
-    for path in STD_MODULE_PATHS {
-        let Some(exports) = crate::stdlib::std_module_exports(path) else {
-            continue;
-        };
-        for (name, _value) in exports {
-            if imported.contains(&name) {
-                continue;
-            }
-            let mut ci = item(&name, CompletionItemKind::FUNCTION);
-            ci.detail = Some(format!("auto-import from {path}"));
-            ci.additional_text_edits = Some(vec![TextEdit {
-                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                new_text: format!("import {{ {name} }} from \"{path}\"\n"),
-            }]);
-            out.push(ci);
+    auto_import_entries()
+        .iter()
+        .filter(|ci| !imported.contains(&ci.label))
+        .cloned()
+        .collect()
+}
+
+/// Fill `documentation` from the stdlib signature table for a completion item that
+/// carries `data: { module, name }`. Returns `true` if the item was handled (whether
+/// or not a doc was found). This is the fast, model-free path used in
+/// `completionItem/resolve` before falling back to the SemanticModel-based resolver.
+pub fn resolve_completion_static(item: &mut CompletionItem) -> bool {
+    use crate::check::std_sigs::std_sig;
+    let Some(data) = item.data.as_ref() else { return false; };
+    let Some(module) = data.get("module").and_then(|v| v.as_str()) else { return false; };
+    let Some(name) = data.get("name").and_then(|v| v.as_str()) else { return false; };
+    if let Some(sig) = std_sig(module, name) {
+        if !sig.doc.is_empty() {
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: sig.doc.to_string(),
+            }));
         }
     }
-    out
+    true
 }
 
 /// Completions at char `offset` in the model's text. Pure and robust: never panics,
@@ -249,7 +296,34 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
     // Context 2: member access `<ident>.` where ident is a namespace import.
     if let Some(alias) = member_access_alias(&chars, offset) {
         if let Some(module) = namespace_import_module(text, &alias) {
-            if let Some(exports) = crate::stdlib::std_module_exports(&module) {
+            // Use the curated member table when available (provides real kinds,
+            // detail, and data for lazy doc resolution). Fall back to the runtime
+            // exports table for modules not yet covered by std_sigs.
+            use crate::check::std_sigs::{module_members, std_sig, render_sig_detail, MemberKind};
+            if let Some(members) = module_members(&module) {
+                if !members.is_empty() {
+                    return members
+                        .iter()
+                        .filter_map(|&(name, ref kind)| {
+                            match kind {
+                                MemberKind::HandleMethod => None,
+                                MemberKind::Fn => {
+                                    let mut it = item(name, CompletionItemKind::FUNCTION);
+                                    it.detail = std_sig(&module, name).map(render_sig_detail);
+                                    it.data = Some(serde_json::json!({"module": module, "name": name}));
+                                    Some(it)
+                                }
+                                MemberKind::Const(ty) => {
+                                    let mut it = item(name, CompletionItemKind::CONSTANT);
+                                    it.detail = Some((*ty).to_string());
+                                    it.data = Some(serde_json::json!({"module": module, "name": name}));
+                                    Some(it)
+                                }
+                            }
+                        })
+                        .collect();
+                }
+            } else if let Some(exports) = crate::stdlib::std_module_exports(&module) {
                 if !exports.is_empty() {
                     return exports
                         .into_iter()
@@ -894,5 +968,35 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"abs"), "module export abs must be offered: {labels:?}");
         assert!(labels.contains(&"sqrt"), "module export sqrt must be offered: {labels:?}");
+    }
+
+    // ── SIG Task 2.3: stdlib member kind/detail/docs + cached auto-import ───────
+
+    #[test]
+    fn member_items_carry_real_kind_detail_and_resolve_docs() {
+        let it = items("import * as math from \"std/math\"\nlet y = math.");
+        let pi = it.iter().find(|i| i.label == "pi").expect("pi offered");
+        assert_eq!(pi.kind, Some(CompletionItemKind::CONSTANT), "pi is a constant");
+        assert_eq!(pi.detail.as_deref(), Some("float"));
+        let pow = it.iter().find(|i| i.label == "pow").expect("pow offered");
+        assert_eq!(pow.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(pow.detail.as_deref(), Some("(base: number, exp: number) -> float"));
+        let mut pow = pow.clone();
+        resolve_completion_static(&mut pow);
+        let Some(Documentation::MarkupContent(mk)) = &pow.documentation else {
+            panic!("resolve should fill stdlib docs")
+        };
+        assert!(mk.value.contains("Raise a base"));
+    }
+
+    #[test]
+    fn auto_import_items_are_deprioritized_and_cached() {
+        let a = items("ab\n");
+        let abs = a.iter()
+            .find(|i| i.detail.as_deref() == Some("auto-import from std/math") && i.label == "abs")
+            .expect("abs auto-import");
+        assert!(abs.sort_text.as_deref().unwrap_or("").starts_with("zz"),
+            "auto-import must sort after locals: {:?}", abs.sort_text);
+        assert!(std::ptr::eq(auto_import_entries(), auto_import_entries()));
     }
 }

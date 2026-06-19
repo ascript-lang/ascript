@@ -2640,10 +2640,14 @@ fn lsp_didchange_trigger_completion_sees_fresh_text() {
     // NOT enough: the stale-text BASELINE also contains a `sqrt` item via the
     // auto-import flood (`detail: "auto-import from std/math"`), which is exactly
     // how a weak assertion would mask the staleness bug. So pin the member
-    // context: a `sqrt` item with NO auto-import detail, and NO keyword items
-    // (the baseline's `let` would prove we were served the stale pre-dot model).
+    // context: a `sqrt` item whose detail is NOT the auto-import string, and NO
+    // keyword items (the baseline's `let` would prove we were served the stale
+    // pre-dot model). (Since SIG Task 2.3, module-member items now carry a
+    // signature detail — we distinguish them from auto-import items by the
+    // detail NOT starting with "auto-import".)
     assert!(
-        items.iter().any(|i| i["label"].as_str() == Some("sqrt") && i["detail"].is_null()),
+        items.iter().any(|i| i["label"].as_str() == Some("sqrt")
+            && i["detail"].as_str().is_none_or(|d| !d.starts_with("auto-import"))),
         "completion right after the `.` didChange must offer the math MEMBER `sqrt` \
          (pending edit flushed, not a stale-model auto-import item); got: {labels:?}"
     );
@@ -2904,6 +2908,87 @@ fn lsp_signature_help_cross_file_imported_fn() {
     client.notify_no_params("exit");
     let _ = client.wait_for_exit(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SIG Task 2.3: stdlib member completion items carry real kind/detail; a
+/// `completionItem/resolve` on a stdlib member fills documentation from the static
+/// sig table (no SemanticModel round-trip needed).
+#[test]
+fn lsp_stdlib_member_kind_detail_and_docs() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://stdlib_member.as";
+    // Cursor at the end of `math.` on line 1.
+    let text = "import * as math from \"std/math\"\nlet y = math.\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // `math.` — cursor at char 13 on line 1 (just past the dot).
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 13 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+
+    // `pi` is a constant export — kind must be CONSTANT (21), detail must be "float".
+    let pi = items.iter().find(|i| i["label"].as_str() == Some("pi"))
+        .unwrap_or_else(|| panic!("pi not offered; got: {:?}", items.iter().map(|i| i["label"].as_str()).collect::<Vec<_>>()));
+    assert_eq!(
+        pi["kind"].as_u64(), Some(21),
+        "pi kind must be CONSTANT (21): {:?}", pi
+    );
+    assert_eq!(
+        pi["detail"].as_str(), Some("float"),
+        "pi detail must be 'float': {:?}", pi
+    );
+
+    // `pow` is a function — kind must be FUNCTION (3), detail must contain the param list.
+    let pow = items.iter().find(|i| i["label"].as_str() == Some("pow"))
+        .unwrap_or_else(|| panic!("pow not offered"));
+    assert_eq!(
+        pow["kind"].as_u64(), Some(3),
+        "pow kind must be FUNCTION (3): {:?}", pow
+    );
+    let pow_detail = pow["detail"].as_str().unwrap_or("");
+    assert!(
+        pow_detail.contains("base") && pow_detail.contains("exp"),
+        "pow detail must contain param names; got: {pow_detail:?}"
+    );
+
+    // `completionItem/resolve` on the `pow` item must fill documentation.
+    client.request(3, "completionItem/resolve", pow.clone());
+    let resolve_resp = client.read_response(3, overall);
+    let doc = resolve_resp["result"]["documentation"]["value"].as_str().unwrap_or("");
+    assert!(
+        doc.contains("Raise a base"),
+        "resolved pow documentation must contain 'Raise a base'; got: {doc:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
 // ─── DX D3 Task 11: the LSP identity unification ─────────────────────────────

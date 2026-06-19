@@ -2838,6 +2838,26 @@ pub(crate) fn all_modules() -> &'static [(&'static str, &'static [(&'static str,
     ALL_MODULES
 }
 
+/// Render a `StdSig` into a concise `(params...) -> ret` detail string suitable
+/// for the LSP `CompletionItem.detail` field.  Purely formatting — no allocation
+/// at lookup time when the result is cached by the caller.
+pub fn render_sig_detail(sig: &StdSig) -> String {
+    let mut s = String::from("(");
+    for (i, p) in sig.params.iter().enumerate() {
+        if i > 0 { s.push_str(", "); }
+        if p.variadic { s.push_str("..."); }
+        s.push_str(p.name);
+        if p.optional { s.push('?'); }
+        if let Some(ty) = p.ty { s.push_str(": "); s.push_str(ty); }
+    }
+    s.push(')');
+    if let Some(ret) = sig.ret {
+        s.push_str(" -> ");
+        s.push_str(ret);
+    }
+    s
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────

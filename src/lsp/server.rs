@@ -677,15 +677,20 @@ impl LanguageServer for Backend {
         &self,
         mut item: CompletionItem,
     ) -> tower_lsp::jsonrpc::Result<CompletionItem> {
-        // Resolve uses the docs table only (no document context needed); a
-        // synthetic empty model is sufficient because `resolve_completion`
-        // ignores the model for builtins/keywords.
-        let model = crate::lsp::model::SemanticModel::build(
-            String::new(),
-            None,
-            &crate::check::LintConfig::default(),
-        );
-        crate::lsp::providers::completion::resolve_completion(&model, &mut item);
+        // Fast path: resolve stdlib member docs from the static signature table
+        // (no SemanticModel needed — the item carries { module, name } in `data`).
+        crate::lsp::providers::completion::resolve_completion_static(&mut item);
+        // Slow path: resolve builtins/keywords from the shared docs table when the
+        // fast path did not fill documentation (a synthetic empty model suffices
+        // because `resolve_completion` ignores the model for builtins/keywords).
+        if item.documentation.is_none() {
+            let model = crate::lsp::model::SemanticModel::build(
+                String::new(),
+                None,
+                &crate::check::LintConfig::default(),
+            );
+            crate::lsp::providers::completion::resolve_completion(&model, &mut item);
+        }
         Ok(item)
     }
 
