@@ -1125,7 +1125,533 @@ static CBOR_MEMBERS: &[(&str, MemberKind)] = &[
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Master index (covers ONLY the three implemented modules for Task 1.1)
+// SIG Task 1.2 fills the remainder
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── std/fs ───────────────────────────────────────────────────────────────────
+
+static FS_READ_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_READ_BYTES_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_WRITE_PARAMS: &[StdParam] = &[
+    StdParam::req("path", "string"),
+    StdParam::req_untyped("data"),
+];
+static FS_APPEND_PARAMS: &[StdParam] = &[
+    StdParam::req("path", "string"),
+    StdParam::req_untyped("data"),
+];
+static FS_EXISTS_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_STAT_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_MKDIR_PARAMS: &[StdParam] = &[
+    StdParam::req("path", "string"),
+    StdParam::opt("recursive", "bool"),
+];
+static FS_REMOVE_PARAMS: &[StdParam] = &[
+    StdParam::req("path", "string"),
+    StdParam::opt("recursive", "bool"),
+];
+static FS_READ_DIR_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_WALK_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_JOIN_PARAMS: &[StdParam] = &[StdParam::variadic("parts", "string")];
+static FS_DIRNAME_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_BASENAME_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_EXTNAME_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_IS_ABSOLUTE_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static FS_GREP_PARAMS: &[StdParam] = &[
+    StdParam::req("pattern", "string"),
+    StdParam::req("dir", "string"),
+    StdParam::opt("opts", "object"),
+];
+
+static FS_SIGS: &[(&str, StdSig)] = &[
+    ("read", StdSig { params: FS_READ_PARAMS, ret: Some("[string, err]"), doc: "Reads a file as UTF-8 text." }),
+    ("readBytes", StdSig { params: FS_READ_BYTES_PARAMS, ret: Some("[bytes, err]"), doc: "Reads a file as raw bytes." }),
+    ("write", StdSig { params: FS_WRITE_PARAMS, ret: Some("[nil, err]"), doc: "Writes data to a file, creating or truncating it." }),
+    ("append", StdSig { params: FS_APPEND_PARAMS, ret: Some("[nil, err]"), doc: "Appends data to a file, creating it if it does not exist." }),
+    ("exists", StdSig { params: FS_EXISTS_PARAMS, ret: Some("bool"), doc: "Reports whether a path exists." }),
+    ("stat", StdSig { params: FS_STAT_PARAMS, ret: Some("[{size, isFile, isDir, modifiedMs}, err]"), doc: "Reads metadata for a path." }),
+    ("mkdir", StdSig { params: FS_MKDIR_PARAMS, ret: Some("[nil, err]"), doc: "Creates a directory." }),
+    ("remove", StdSig { params: FS_REMOVE_PARAMS, ret: Some("[nil, err]"), doc: "Removes a file or directory." }),
+    ("readDir", StdSig { params: FS_READ_DIR_PARAMS, ret: Some("[array, err]"), doc: "Lists the immediate entries of a directory." }),
+    ("walk", StdSig { params: FS_WALK_PARAMS, ret: Some("[array, err]"), doc: "Recursively walks a directory tree." }),
+    ("join", StdSig { params: FS_JOIN_PARAMS, ret: Some("string"), doc: "Joins path segments into a single path. Pure and infallible." }),
+    ("dirname", StdSig { params: FS_DIRNAME_PARAMS, ret: Some("string"), doc: "Returns the parent path of a path. Pure and infallible." }),
+    ("basename", StdSig { params: FS_BASENAME_PARAMS, ret: Some("string"), doc: "Returns the final component of a path. Pure and infallible." }),
+    ("extname", StdSig { params: FS_EXTNAME_PARAMS, ret: Some("string"), doc: "Returns the extension of a path, including the leading dot. Pure and infallible." }),
+    ("isAbsolute", StdSig { params: FS_IS_ABSOLUTE_PARAMS, ret: Some("bool"), doc: "Reports whether a path is absolute. Pure and infallible." }),
+    ("grep", StdSig { params: FS_GREP_PARAMS, ret: Some("[array, err]"), doc: "Searches a directory tree for a regular-expression pattern, line by line." }),
+];
+
+static FS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("read", MemberKind::Fn),
+    ("readBytes", MemberKind::Fn),
+    ("write", MemberKind::Fn),
+    ("append", MemberKind::Fn),
+    ("exists", MemberKind::Fn),
+    ("stat", MemberKind::Fn),
+    ("mkdir", MemberKind::Fn),
+    ("remove", MemberKind::Fn),
+    ("readDir", MemberKind::Fn),
+    ("walk", MemberKind::Fn),
+    ("join", MemberKind::Fn),
+    ("dirname", MemberKind::Fn),
+    ("basename", MemberKind::Fn),
+    ("extname", MemberKind::Fn),
+    ("isAbsolute", MemberKind::Fn),
+    ("grep", MemberKind::Fn),
+];
+
+// ── std/env ──────────────────────────────────────────────────────────────────
+
+static ENV_GET_PARAMS: &[StdParam] = &[StdParam::req("name", "string")];
+static ENV_SET_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("value", "string"),
+];
+static ENV_UNSET_PARAMS: &[StdParam] = &[StdParam::req("name", "string")];
+static ENV_VARS_PARAMS: &[StdParam] = &[];
+static ENV_LOAD_DOTENV_PARAMS: &[StdParam] = &[StdParam::opt("path", "string")];
+static ENV_ARGS_PARAMS: &[StdParam] = &[];
+
+static ENV_SIGS: &[(&str, StdSig)] = &[
+    ("get", StdSig { params: ENV_GET_PARAMS, ret: Some("string | nil"), doc: "Reads an environment variable." }),
+    ("set", StdSig { params: ENV_SET_PARAMS, ret: None, doc: "Sets an environment variable. Mutates the process-global environment." }),
+    ("unset", StdSig { params: ENV_UNSET_PARAMS, ret: None, doc: "Removes an environment variable. Mutates the process-global environment." }),
+    ("vars", StdSig { params: ENV_VARS_PARAMS, ret: Some("object"), doc: "Snapshots all current environment variables." }),
+    ("loadDotenv", StdSig { params: ENV_LOAD_DOTENV_PARAMS, ret: Some("[number, err]"), doc: "Loads a `.env` file into the process environment." }),
+    ("args", StdSig { params: ENV_ARGS_PARAMS, ret: Some("array<string>"), doc: "Returns the script's trailing CLI arguments." }),
+];
+
+static ENV_MEMBERS: &[(&str, MemberKind)] = &[
+    ("get", MemberKind::Fn),
+    ("set", MemberKind::Fn),
+    ("unset", MemberKind::Fn),
+    ("vars", MemberKind::Fn),
+    ("loadDotenv", MemberKind::Fn),
+    ("args", MemberKind::Fn),
+];
+
+// ── std/io ───────────────────────────────────────────────────────────────────
+
+static IO_READ_LINE_PARAMS: &[StdParam] = &[];
+static IO_READ_ALL_PARAMS: &[StdParam] = &[];
+static IO_READ_LINES_PARAMS: &[StdParam] = &[];
+
+static IO_SIGS: &[(&str, StdSig)] = &[
+    ("readLine", StdSig { params: IO_READ_LINE_PARAMS, ret: Some("string | nil"), doc: "Reads one line from stdin, stripping the trailing newline." }),
+    ("readAll", StdSig { params: IO_READ_ALL_PARAMS, ret: Some("string"), doc: "Reads all remaining stdin as a single UTF-8 string (lossy)." }),
+    ("readLines", StdSig { params: IO_READ_LINES_PARAMS, ret: Some("array<string>"), doc: "Reads every remaining line of stdin and returns them as an array." }),
+];
+
+static IO_MEMBERS: &[(&str, MemberKind)] = &[
+    ("readLine", MemberKind::Fn),
+    ("readAll", MemberKind::Fn),
+    ("readLines", MemberKind::Fn),
+];
+
+// ── std/process ──────────────────────────────────────────────────────────────
+
+static PROCESS_RUN_PARAMS: &[StdParam] = &[
+    StdParam::req("cmd", "string"),
+    StdParam::opt("args", "array"),
+    StdParam::opt("opts", "object"),
+];
+static PROCESS_SPAWN_PARAMS: &[StdParam] = &[
+    StdParam::req("cmd", "string"),
+    StdParam::opt("args", "array"),
+    StdParam::opt("opts", "object"),
+];
+static PROCESS_ON_PARAMS: &[StdParam] = &[
+    StdParam::req("signalName", "string"),
+    StdParam::req("handler", "fn"),
+];
+static PROCESS_OFF_PARAMS: &[StdParam] = &[StdParam::req("signalName", "string")];
+
+static PROCESS_SIGS: &[(&str, StdSig)] = &[
+    ("run", StdSig { params: PROCESS_RUN_PARAMS, ret: Some("[result, err]"), doc: "Runs a command to completion and captures its output. Async — must be awaited." }),
+    ("spawn", StdSig { params: PROCESS_SPAWN_PARAMS, ret: Some("[child, err]"), doc: "Spawns a command and returns a live ChildProcess handle for streaming I/O. Async — must be awaited." }),
+    ("on", StdSig { params: PROCESS_ON_PARAMS, ret: None, doc: "Registers a handler for an inbound OS signal." }),
+    ("off", StdSig { params: PROCESS_OFF_PARAMS, ret: None, doc: "Removes a previously-registered signal handler." }),
+];
+
+static PROCESS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("run", MemberKind::Fn),
+    ("spawn", MemberKind::Fn),
+    ("on", MemberKind::Fn),
+    ("off", MemberKind::Fn),
+];
+
+// ── std/os ───────────────────────────────────────────────────────────────────
+
+static OS_PID_PARAMS: &[StdParam] = &[];
+static OS_PLATFORM_PARAMS: &[StdParam] = &[];
+static OS_ARCH_PARAMS: &[StdParam] = &[];
+static OS_CPU_COUNT_PARAMS: &[StdParam] = &[];
+static OS_HOSTNAME_PARAMS: &[StdParam] = &[];
+static OS_TEMP_DIR_PARAMS: &[StdParam] = &[];
+static OS_IN_CONTAINER_PARAMS: &[StdParam] = &[];
+static OS_MEMORY_PARAMS: &[StdParam] = &[];
+static OS_SWAP_PARAMS: &[StdParam] = &[];
+static OS_CPU_USAGE_PARAMS: &[StdParam] = &[];
+static OS_LOAD_AVG_PARAMS: &[StdParam] = &[];
+static OS_DISKS_PARAMS: &[StdParam] = &[];
+static OS_UPTIME_PARAMS: &[StdParam] = &[];
+static OS_NETWORK_INTERFACES_PARAMS: &[StdParam] = &[];
+static OS_LOCAL_IP_PARAMS: &[StdParam] = &[];
+
+static OS_SIGS: &[(&str, StdSig)] = &[
+    ("pid", StdSig { params: OS_PID_PARAMS, ret: Some("number"), doc: "Returns the current process ID." }),
+    ("platform", StdSig { params: OS_PLATFORM_PARAMS, ret: Some("string"), doc: "Returns the OS name: \"macos\", \"linux\", \"windows\", etc." }),
+    ("arch", StdSig { params: OS_ARCH_PARAMS, ret: Some("string"), doc: "Returns the CPU architecture: \"aarch64\", \"x86_64\", etc." }),
+    ("cpuCount", StdSig { params: OS_CPU_COUNT_PARAMS, ret: Some("number"), doc: "Returns the number of logical CPUs available to the process." }),
+    ("hostname", StdSig { params: OS_HOSTNAME_PARAMS, ret: Some("string"), doc: "Returns the machine hostname. Returns \"unknown\" if the OS call fails." }),
+    ("tempDir", StdSig { params: OS_TEMP_DIR_PARAMS, ret: Some("string"), doc: "Returns the OS temporary directory path." }),
+    ("inContainer", StdSig { params: OS_IN_CONTAINER_PARAMS, ret: Some("bool"), doc: "Heuristic container detection; returns true when running inside Docker, Podman, or Kubernetes." }),
+    ("memory", StdSig { params: OS_MEMORY_PARAMS, ret: Some("{total, used, free, available}"), doc: "Snapshots the current RAM allocation from the OS." }),
+    ("swap", StdSig { params: OS_SWAP_PARAMS, ret: Some("{total, used, free}"), doc: "Snapshots the current swap-space allocation from the OS." }),
+    ("cpuUsage", StdSig { params: OS_CPU_USAGE_PARAMS, ret: Some("number"), doc: "Samples the CPU twice (~200 ms apart) and returns the average utilization percentage. Async." }),
+    ("loadAvg", StdSig { params: OS_LOAD_AVG_PARAMS, ret: Some("{one, five, fifteen}"), doc: "Returns the 1-, 5-, and 15-minute load averages." }),
+    ("disks", StdSig { params: OS_DISKS_PARAMS, ret: Some("array"), doc: "Returns one entry per disk with mount, total, free, and available fields." }),
+    ("uptime", StdSig { params: OS_UPTIME_PARAMS, ret: Some("number"), doc: "Returns the system uptime in seconds." }),
+    ("networkInterfaces", StdSig { params: OS_NETWORK_INTERFACES_PARAMS, ret: Some("array"), doc: "Returns one entry per network interface with name and addresses fields." }),
+    ("localIp", StdSig { params: OS_LOCAL_IP_PARAMS, ret: Some("[string, err]"), doc: "Returns the first non-loopback, non-link-local IPv4 address found across all interfaces." }),
+];
+
+static OS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("pid", MemberKind::Fn),
+    ("platform", MemberKind::Fn),
+    ("arch", MemberKind::Fn),
+    ("cpuCount", MemberKind::Fn),
+    ("hostname", MemberKind::Fn),
+    ("tempDir", MemberKind::Fn),
+    ("inContainer", MemberKind::Fn),
+    ("memory", MemberKind::Fn),
+    ("swap", MemberKind::Fn),
+    ("cpuUsage", MemberKind::Fn),
+    ("loadAvg", MemberKind::Fn),
+    ("disks", MemberKind::Fn),
+    ("uptime", MemberKind::Fn),
+    ("networkInterfaces", MemberKind::Fn),
+    ("localIp", MemberKind::Fn),
+];
+
+// ── std/crypto ───────────────────────────────────────────────────────────────
+
+static CRYPTO_SHA256_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static CRYPTO_SHA512_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static CRYPTO_MD5_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static CRYPTO_HMAC_SHA256_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("key"),
+    StdParam::req_untyped("data"),
+];
+static CRYPTO_RANDOM_BYTES_PARAMS: &[StdParam] = &[StdParam::req("n", "number")];
+static CRYPTO_HASH_PASSWORD_PARAMS: &[StdParam] = &[StdParam::req_untyped("password")];
+static CRYPTO_VERIFY_PASSWORD_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("password"),
+    StdParam::req("phc", "string"),
+];
+static CRYPTO_BCRYPT_HASH_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("password"),
+    StdParam::opt("cost", "number"),
+];
+static CRYPTO_BCRYPT_VERIFY_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("password"),
+    StdParam::req("hash", "string"),
+];
+static CRYPTO_CRC32_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static CRYPTO_XXHASH_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+
+static CRYPTO_SIGS: &[(&str, StdSig)] = &[
+    ("sha256", StdSig { params: CRYPTO_SHA256_PARAMS, ret: Some("string"), doc: "Computes the SHA-256 digest of the input." }),
+    ("sha512", StdSig { params: CRYPTO_SHA512_PARAMS, ret: Some("string"), doc: "Computes the SHA-512 digest of the input." }),
+    ("md5", StdSig { params: CRYPTO_MD5_PARAMS, ret: Some("string"), doc: "Computes the MD5 digest of the input." }),
+    ("hmacSha256", StdSig { params: CRYPTO_HMAC_SHA256_PARAMS, ret: Some("string"), doc: "Computes an HMAC-SHA256 tag." }),
+    ("randomBytes", StdSig { params: CRYPTO_RANDOM_BYTES_PARAMS, ret: Some("bytes"), doc: "Generates cryptographically secure random bytes." }),
+    ("hashPassword", StdSig { params: CRYPTO_HASH_PASSWORD_PARAMS, ret: Some("[string, err]"), doc: "Hashes a password with Argon2, returning a self-describing PHC string." }),
+    ("verifyPassword", StdSig { params: CRYPTO_VERIFY_PASSWORD_PARAMS, ret: Some("bool"), doc: "Verifies a password against an Argon2 PHC string." }),
+    ("bcryptHash", StdSig { params: CRYPTO_BCRYPT_HASH_PARAMS, ret: Some("[string, err]"), doc: "Hashes a password with bcrypt." }),
+    ("bcryptVerify", StdSig { params: CRYPTO_BCRYPT_VERIFY_PARAMS, ret: Some("bool"), doc: "Verifies a password against a bcrypt hash." }),
+    ("crc32", StdSig { params: CRYPTO_CRC32_PARAMS, ret: Some("number"), doc: "CRC-32 checksum (IEEE polynomial). Fast, non-cryptographic." }),
+    ("xxhash", StdSig { params: CRYPTO_XXHASH_PARAMS, ret: Some("string"), doc: "xxHash-64 (XXH64) with seed 0. Extremely fast, non-cryptographic." }),
+];
+
+static CRYPTO_MEMBERS: &[(&str, MemberKind)] = &[
+    ("sha256", MemberKind::Fn),
+    ("sha512", MemberKind::Fn),
+    ("md5", MemberKind::Fn),
+    ("hmacSha256", MemberKind::Fn),
+    ("randomBytes", MemberKind::Fn),
+    ("hashPassword", MemberKind::Fn),
+    ("verifyPassword", MemberKind::Fn),
+    ("bcryptHash", MemberKind::Fn),
+    ("bcryptVerify", MemberKind::Fn),
+    ("crc32", MemberKind::Fn),
+    ("xxhash", MemberKind::Fn),
+];
+
+// ── std/compress ─────────────────────────────────────────────────────────────
+
+static COMPRESS_GZIP_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static COMPRESS_GUNZIP_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static COMPRESS_DEFLATE_PARAMS: &[StdParam] = &[StdParam::req_untyped("data")];
+static COMPRESS_INFLATE_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static COMPRESS_ZIP_CREATE_PARAMS: &[StdParam] = &[StdParam::req("entries", "array")];
+static COMPRESS_ZIP_EXTRACT_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static COMPRESS_ZSTD_COMPRESS_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("data"),
+    StdParam::opt("level", "number"),
+];
+static COMPRESS_ZSTD_DECOMPRESS_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static COMPRESS_BROTLI_COMPRESS_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("data"),
+    StdParam::opt("quality", "number"),
+];
+static COMPRESS_BROTLI_DECOMPRESS_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static COMPRESS_TAR_CREATE_PARAMS: &[StdParam] = &[StdParam::req("entries", "array")];
+static COMPRESS_TAR_EXTRACT_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+
+static COMPRESS_SIGS: &[(&str, StdSig)] = &[
+    ("gzip", StdSig { params: COMPRESS_GZIP_PARAMS, ret: Some("bytes"), doc: "Compresses data with gzip." }),
+    ("gunzip", StdSig { params: COMPRESS_GUNZIP_PARAMS, ret: Some("[bytes, err]"), doc: "Decompresses gzip data." }),
+    ("deflate", StdSig { params: COMPRESS_DEFLATE_PARAMS, ret: Some("bytes"), doc: "Compresses data with raw deflate." }),
+    ("inflate", StdSig { params: COMPRESS_INFLATE_PARAMS, ret: Some("[bytes, err]"), doc: "Decompresses raw deflate data." }),
+    ("zipCreate", StdSig { params: COMPRESS_ZIP_CREATE_PARAMS, ret: Some("[bytes, err]"), doc: "Builds an in-memory zip archive." }),
+    ("zipExtract", StdSig { params: COMPRESS_ZIP_EXTRACT_PARAMS, ret: Some("[array, err]"), doc: "Extracts an in-memory zip archive." }),
+    ("zstdCompress", StdSig { params: COMPRESS_ZSTD_COMPRESS_PARAMS, ret: Some("bytes"), doc: "Compresses data with zstd (Zstandard)." }),
+    ("zstdDecompress", StdSig { params: COMPRESS_ZSTD_DECOMPRESS_PARAMS, ret: Some("[bytes, err]"), doc: "Decompresses zstd-compressed data." }),
+    ("brotliCompress", StdSig { params: COMPRESS_BROTLI_COMPRESS_PARAMS, ret: Some("bytes"), doc: "Compresses data with brotli." }),
+    ("brotliDecompress", StdSig { params: COMPRESS_BROTLI_DECOMPRESS_PARAMS, ret: Some("[bytes, err]"), doc: "Decompresses brotli-compressed data." }),
+    ("tarCreate", StdSig { params: COMPRESS_TAR_CREATE_PARAMS, ret: Some("[bytes, err]"), doc: "Builds an in-memory tar archive from an array of {name, data} entries." }),
+    ("tarExtract", StdSig { params: COMPRESS_TAR_EXTRACT_PARAMS, ret: Some("[array, err]"), doc: "Extracts a tar archive into an array of {name, data} entries." }),
+];
+
+static COMPRESS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("gzip", MemberKind::Fn),
+    ("gunzip", MemberKind::Fn),
+    ("deflate", MemberKind::Fn),
+    ("inflate", MemberKind::Fn),
+    ("zipCreate", MemberKind::Fn),
+    ("zipExtract", MemberKind::Fn),
+    ("zstdCompress", MemberKind::Fn),
+    ("zstdDecompress", MemberKind::Fn),
+    ("brotliCompress", MemberKind::Fn),
+    ("brotliDecompress", MemberKind::Fn),
+    ("tarCreate", MemberKind::Fn),
+    ("tarExtract", MemberKind::Fn),
+];
+
+// ── std/net ───────────────────────────────────────────────────────────────────
+
+static NET_LOOKUP_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
+static NET_LOOKUP_ONE_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
+
+static NET_SIGS: &[(&str, StdSig)] = &[
+    ("lookup", StdSig { params: NET_LOOKUP_PARAMS, ret: Some("[array<string>, err]"), doc: "Resolves a hostname to a de-duplicated list of IP-address strings. Async." }),
+    ("lookupOne", StdSig { params: NET_LOOKUP_ONE_PARAMS, ret: Some("[string, err]"), doc: "Resolves a hostname and returns only the first IP address. Async." }),
+];
+
+static NET_MEMBERS: &[(&str, MemberKind)] = &[
+    ("lookup", MemberKind::Fn),
+    ("lookupOne", MemberKind::Fn),
+];
+
+// ── std/net/tcp ───────────────────────────────────────────────────────────────
+
+static NET_TCP_CONNECT_PARAMS: &[StdParam] = &[
+    StdParam::req("host", "string"),
+    StdParam::req("port", "number"),
+];
+static NET_TCP_LISTEN_PARAMS: &[StdParam] = &[
+    StdParam::req("host", "string"),
+    StdParam::req("port", "number"),
+];
+
+static NET_TCP_SIGS: &[(&str, StdSig)] = &[
+    ("connect", StdSig { params: NET_TCP_CONNECT_PARAMS, ret: Some("[stream, err]"), doc: "Opens a client TCP connection. Async." }),
+    ("listen", StdSig { params: NET_TCP_LISTEN_PARAMS, ret: Some("[listener, err]"), doc: "Binds a TCP listener. Async." }),
+];
+
+static NET_TCP_MEMBERS: &[(&str, MemberKind)] = &[
+    ("connect", MemberKind::Fn),
+    ("listen", MemberKind::Fn),
+];
+
+// ── std/net/udp ───────────────────────────────────────────────────────────────
+
+static NET_UDP_BIND_PARAMS: &[StdParam] = &[StdParam::req("addr", "string")];
+
+static NET_UDP_SIGS: &[(&str, StdSig)] = &[
+    ("bind", StdSig { params: NET_UDP_BIND_PARAMS, ret: Some("[socket, err]"), doc: "Binds a UDP socket to a local address." }),
+];
+
+static NET_UDP_MEMBERS: &[(&str, MemberKind)] = &[
+    ("bind", MemberKind::Fn),
+];
+
+// ── std/net/unix ──────────────────────────────────────────────────────────────
+
+static NET_UNIX_CONNECT_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+static NET_UNIX_LISTEN_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+
+static NET_UNIX_SIGS: &[(&str, StdSig)] = &[
+    ("connect", StdSig { params: NET_UNIX_CONNECT_PARAMS, ret: Some("[stream, err]"), doc: "Opens a client stream to the Unix-domain socket at path. Async." }),
+    ("listen", StdSig { params: NET_UNIX_LISTEN_PARAMS, ret: Some("[listener, err]"), doc: "Binds a Unix-domain listener at the filesystem path; unlinks the socket on close. Async." }),
+];
+
+static NET_UNIX_MEMBERS: &[(&str, MemberKind)] = &[
+    ("connect", MemberKind::Fn),
+    ("listen", MemberKind::Fn),
+];
+
+// ── std/net/ws ────────────────────────────────────────────────────────────────
+
+static NET_WS_CONNECT_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_WS_LISTEN_PARAMS: &[StdParam] = &[
+    StdParam::req("host", "string"),
+    StdParam::req("port", "number"),
+];
+
+static NET_WS_SIGS: &[(&str, StdSig)] = &[
+    ("connect", StdSig { params: NET_WS_CONNECT_PARAMS, ret: Some("[conn, err]"), doc: "Opens a client WebSocket to a ws:// or wss:// URL. Async." }),
+    ("listen", StdSig { params: NET_WS_LISTEN_PARAMS, ret: Some("[listener, err]"), doc: "Binds a TCP listener for accepting WebSocket connections. Async." }),
+];
+
+static NET_WS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("connect", MemberKind::Fn),
+    ("listen", MemberKind::Fn),
+];
+
+// ── std/net/http ──────────────────────────────────────────────────────────────
+
+static NET_HTTP_GET_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_HTTP_POST_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_HTTP_PUT_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_HTTP_PATCH_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_HTTP_DELETE_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_HTTP_HEAD_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_HTTP_OPTIONS_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+static NET_HTTP_REQUEST_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static NET_HTTP_CANCEL_TOKEN_PARAMS: &[StdParam] = &[];
+static NET_HTTP_SSE_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+
+static NET_HTTP_SIGS: &[(&str, StdSig)] = &[
+    ("get", StdSig { params: NET_HTTP_GET_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP GET request. Async." }),
+    ("post", StdSig { params: NET_HTTP_POST_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP POST request. Async." }),
+    ("put", StdSig { params: NET_HTTP_PUT_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP PUT request. Async." }),
+    ("patch", StdSig { params: NET_HTTP_PATCH_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP PATCH request. Async." }),
+    ("delete", StdSig { params: NET_HTTP_DELETE_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP DELETE request. Async." }),
+    ("head", StdSig { params: NET_HTTP_HEAD_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP HEAD request. Async." }),
+    ("options", StdSig { params: NET_HTTP_OPTIONS_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP OPTIONS request. Async." }),
+    ("request", StdSig { params: NET_HTTP_REQUEST_PARAMS, ret: Some("[resp, err]"), doc: "Sends an HTTP request using a full options object; opts.method selects the verb (default GET). Async." }),
+    ("cancelToken", StdSig { params: NET_HTTP_CANCEL_TOKEN_PARAMS, ret: None, doc: "Returns a cancel-token handle; pass it as opts.cancel to abort an in-flight request." }),
+    ("sse", StdSig { params: NET_HTTP_SSE_PARAMS, ret: Some("[stream, err]"), doc: "Opens a first-class Server-Sent Events client stream. Async." }),
+];
+
+static NET_HTTP_MEMBERS: &[(&str, MemberKind)] = &[
+    ("get", MemberKind::Fn),
+    ("post", MemberKind::Fn),
+    ("put", MemberKind::Fn),
+    ("patch", MemberKind::Fn),
+    ("delete", MemberKind::Fn),
+    ("head", MemberKind::Fn),
+    ("options", MemberKind::Fn),
+    ("request", MemberKind::Fn),
+    ("cancelToken", MemberKind::Fn),
+    ("sse", MemberKind::Fn),
+];
+
+// ── std/http/server ───────────────────────────────────────────────────────────
+
+static HTTP_SERVER_CREATE_PARAMS: &[StdParam] = &[];
+static HTTP_SERVER_SERVE_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+
+static HTTP_SERVER_SIGS: &[(&str, StdSig)] = &[
+    ("create", StdSig { params: HTTP_SERVER_CREATE_PARAMS, ret: None, doc: "Creates and returns a new HTTP server handle." }),
+    ("serve", StdSig { params: HTTP_SERVER_SERVE_PARAMS, ret: Some("[nil, err]"), doc: "Multi-isolate REUSEPORT serve: spreads the accept loop across N shared-nothing isolates. Async." }),
+];
+
+static HTTP_SERVER_MEMBERS: &[(&str, MemberKind)] = &[
+    ("create", MemberKind::Fn),
+    ("serve", MemberKind::Fn),
+];
+
+// ── std/sqlite ────────────────────────────────────────────────────────────────
+
+static SQLITE_OPEN_PARAMS: &[StdParam] = &[StdParam::req("path", "string")];
+
+static SQLITE_SIGS: &[(&str, StdSig)] = &[
+    ("open", StdSig { params: SQLITE_OPEN_PARAMS, ret: Some("[connection, err]"), doc: "Opens (or creates) a SQLite database file and returns a connection handle." }),
+];
+
+static SQLITE_MEMBERS: &[(&str, MemberKind)] = &[
+    ("open", MemberKind::Fn),
+];
+
+// ── std/postgres ──────────────────────────────────────────────────────────────
+
+static POSTGRES_CONNECT_PARAMS: &[StdParam] = &[StdParam::req("url", "string")];
+
+static POSTGRES_SIGS: &[(&str, StdSig)] = &[
+    ("connect", StdSig { params: POSTGRES_CONNECT_PARAMS, ret: Some("[conn, err]"), doc: "Opens an async PostgreSQL connection from a postgres:// URL. Async." }),
+];
+
+static POSTGRES_MEMBERS: &[(&str, MemberKind)] = &[
+    ("connect", MemberKind::Fn),
+];
+
+// ── std/redis ─────────────────────────────────────────────────────────────────
+
+static REDIS_CONNECT_PARAMS: &[StdParam] = &[StdParam::req("url", "string")];
+
+static REDIS_SIGS: &[(&str, StdSig)] = &[
+    ("connect", StdSig { params: REDIS_CONNECT_PARAMS, ret: Some("[conn, err]"), doc: "Opens a multiplexed Redis connection from a redis:// URL. Async." }),
+];
+
+static REDIS_MEMBERS: &[(&str, MemberKind)] = &[
+    ("connect", MemberKind::Fn),
+];
+
+// ── std/docker ────────────────────────────────────────────────────────────────
+
+static DOCKER_CONNECT_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+
+static DOCKER_SIGS: &[(&str, StdSig)] = &[
+    ("connect", StdSig { params: DOCKER_CONNECT_PARAMS, ret: Some("[client, err]"), doc: "Connects to the local Docker Engine over its Unix-domain socket, negotiating the API version. Async." }),
+];
+
+static DOCKER_MEMBERS: &[(&str, MemberKind)] = &[
+    ("connect", MemberKind::Fn),
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Master index (batch 1 + batch 2 — 37 modules total)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
@@ -1148,11 +1674,30 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/uuid", UUID_MEMBERS),
     ("std/msgpack", MSGPACK_MEMBERS),
     ("std/cbor", CBOR_MEMBERS),
+    // batch 2 — system + net + db + docker
+    ("std/fs", FS_MEMBERS),
+    ("std/env", ENV_MEMBERS),
+    ("std/io", IO_MEMBERS),
+    ("std/process", PROCESS_MEMBERS),
+    ("std/os", OS_MEMBERS),
+    ("std/crypto", CRYPTO_MEMBERS),
+    ("std/compress", COMPRESS_MEMBERS),
+    ("std/net", NET_MEMBERS),
+    ("std/net/tcp", NET_TCP_MEMBERS),
+    ("std/net/udp", NET_UDP_MEMBERS),
+    ("std/net/unix", NET_UNIX_MEMBERS),
+    ("std/net/ws", NET_WS_MEMBERS),
+    ("std/net/http", NET_HTTP_MEMBERS),
+    ("std/http/server", HTTP_SERVER_MEMBERS),
+    ("std/sqlite", SQLITE_MEMBERS),
+    ("std/postgres", POSTGRES_MEMBERS),
+    ("std/redis", REDIS_MEMBERS),
+    ("std/docker", DOCKER_MEMBERS),
 ];
 
-/// The three modules covered in Task 1.1.
-/// Task 1.2 deletes this const and the `table_is_still_partial_pending_task_1_2` test
-/// once ALL of STD_MODULES is filled.
+/// Modules covered in Task 1.1 + Task 1.2 (batches 1 and 2).
+/// Task 1.3 (final batch) deletes this const and the `table_is_still_partial_pending_task_1_2`
+/// test once ALL of STD_MODULES is filled.
 pub const IMPLEMENTED_MODULES: &[&str] = &[
     "std/math",
     "std/string",
@@ -1173,6 +1718,25 @@ pub const IMPLEMENTED_MODULES: &[&str] = &[
     "std/uuid",
     "std/msgpack",
     "std/cbor",
+    // batch 2
+    "std/fs",
+    "std/env",
+    "std/io",
+    "std/process",
+    "std/os",
+    "std/crypto",
+    "std/compress",
+    "std/net",
+    "std/net/tcp",
+    "std/net/udp",
+    "std/net/unix",
+    "std/net/ws",
+    "std/net/http",
+    "std/http/server",
+    "std/sqlite",
+    "std/postgres",
+    "std/redis",
+    "std/docker",
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1202,6 +1766,25 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/uuid" => UUID_SIGS,
         "std/msgpack" => MSGPACK_SIGS,
         "std/cbor" => CBOR_SIGS,
+        // batch 2
+        "std/fs" => FS_SIGS,
+        "std/env" => ENV_SIGS,
+        "std/io" => IO_SIGS,
+        "std/process" => PROCESS_SIGS,
+        "std/os" => OS_SIGS,
+        "std/crypto" => CRYPTO_SIGS,
+        "std/compress" => COMPRESS_SIGS,
+        "std/net" => NET_SIGS,
+        "std/net/tcp" => NET_TCP_SIGS,
+        "std/net/udp" => NET_UDP_SIGS,
+        "std/net/unix" => NET_UNIX_SIGS,
+        "std/net/ws" => NET_WS_SIGS,
+        "std/net/http" => NET_HTTP_SIGS,
+        "std/http/server" => HTTP_SERVER_SIGS,
+        "std/sqlite" => SQLITE_SIGS,
+        "std/postgres" => POSTGRES_SIGS,
+        "std/redis" => REDIS_SIGS,
+        "std/docker" => DOCKER_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -1258,6 +1841,25 @@ mod tests {
             ("std/uuid", UUID_SIGS),
             ("std/msgpack", MSGPACK_SIGS),
             ("std/cbor", CBOR_SIGS),
+            // batch 2
+            ("std/fs", FS_SIGS),
+            ("std/env", ENV_SIGS),
+            ("std/io", IO_SIGS),
+            ("std/process", PROCESS_SIGS),
+            ("std/os", OS_SIGS),
+            ("std/crypto", CRYPTO_SIGS),
+            ("std/compress", COMPRESS_SIGS),
+            ("std/net", NET_SIGS),
+            ("std/net/tcp", NET_TCP_SIGS),
+            ("std/net/udp", NET_UDP_SIGS),
+            ("std/net/unix", NET_UNIX_SIGS),
+            ("std/net/ws", NET_WS_SIGS),
+            ("std/net/http", NET_HTTP_SIGS),
+            ("std/http/server", HTTP_SERVER_SIGS),
+            ("std/sqlite", SQLITE_SIGS),
+            ("std/postgres", POSTGRES_SIGS),
+            ("std/redis", REDIS_SIGS),
+            ("std/docker", DOCKER_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {
