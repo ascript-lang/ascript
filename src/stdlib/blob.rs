@@ -29,8 +29,14 @@
 /// constant + the `SignedRequest`/`PresignedQuery` accessor fields). The B8 client
 /// reaches most of it; the remainder is exercised by the `sigv4_vector_battery` and is
 /// part of the audited, vector-pinned public API — kept whole on purpose.
+/// `pub` + `#[doc(hidden)]`: these pure functions are reachable from the
+/// integration test (`tests/blob.rs`) so the S3 stub can RECOMPUTE the SigV4
+/// signature of every received request (the durable guard against a double-encode
+/// regression). They are not part of the stable public API — do not depend on them
+/// outside the test harness.
 #[allow(dead_code)]
-pub(crate) mod sigv4 {
+#[doc(hidden)]
+pub mod sigv4 {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
 
@@ -262,6 +268,10 @@ pub(crate) mod sigv4 {
     /// Sign a request for the `Authorization`-header variant (Stages 1–10).
     ///
     /// `amz_datetime` is `YYYYMMDDTHHMMSSZ`; `date` is its `YYYYMMDD` prefix.
+    /// `uri_path` is the RAW (unencoded) path and `query` is a RAW `k=v&...` string —
+    /// this fn applies the single canonical encoding. Callers that already hold the
+    /// canonical URI/query (and reuse it for the wire URL) should use
+    /// [`sign_canonical`] instead so the encoding is shared and cannot diverge.
     #[allow(clippy::too_many_arguments)]
     pub fn sign_request(
         method: &str,
@@ -278,11 +288,37 @@ pub(crate) mod sigv4 {
     ) -> SignedRequest {
         let c_uri = canonical_uri(uri_path);
         let c_query = canonical_query_string(query);
+        sign_canonical(
+            method, &c_uri, &c_query, headers, payload_hash, region, service, amz_datetime,
+            date, access_key, secret_key,
+        )
+    }
+
+    /// Sign a request whose canonical URI and canonical query are ALREADY computed
+    /// (`canonical_uri` / `canonical_query_pairs` output) — this fn does NOT re-encode
+    /// them. The single source of truth for the blob client: it computes `c_uri` /
+    /// `c_query` once, builds the wire URL from them, and signs with this fn over the
+    /// SAME strings, so the wire request and the signed canonical request are identical
+    /// by construction (no double-encode possible).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_canonical(
+        method: &str,
+        canonical_uri: &str,
+        canonical_query: &str,
+        headers: &[(String, String)],
+        payload_hash: &str,
+        region: &str,
+        service: &str,
+        amz_datetime: &str,
+        date: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> SignedRequest {
         let (c_headers, signed_headers) = canonical_headers(headers);
         let c_req = canonical_request(
             method,
-            &c_uri,
-            &c_query,
+            canonical_uri,
+            canonical_query,
             &c_headers,
             &signed_headers,
             payload_hash,
@@ -506,13 +542,18 @@ fn parse_client_config(config: &Value, span: Span) -> Result<BlobClientState, Co
     })
 }
 
-/// A built request target: the absolute URL, the host header to sign, and the
-/// canonical URI path (already split so the host carries no path).
+/// A built request target. Carries the RAW (unencoded) path so the SINGLE percent-
+/// encoding happens EXACTLY ONCE — at signing time, inside `sigv4::canonical_uri` —
+/// and the wire URL is built from that SAME canonical output. (The previous design
+/// stored a pre-encoded path which `sigv4::sign_request` then encoded AGAIN, producing
+/// a double-encoded signature that did not match the single-encoded wire URL.)
 struct Target {
-    url: String,
+    /// `scheme://authority` (NO path) — the wire URL base.
+    base: String,
     host: String,
-    /// The path component to sign (begins with `/`).
-    path: String,
+    /// The RAW, UNENCODED path (begins with `/`, e.g. `/my-bucket/a b/c+d.txt`). The
+    /// single percent-encoding is applied once at signing time.
+    raw_path: String,
 }
 
 impl BlobClientState {
@@ -537,40 +578,42 @@ impl BlobClientState {
         })
     }
 
-    /// Build the URL + host + signing path for a (bucket, key) under the configured
-    /// addressing style. `key` may be empty (bucket-level operations like `list`).
+    /// Build the wire base + host + RAW signing path for a (bucket, key) under the
+    /// configured addressing style. `key` may be empty (bucket-level operations like
+    /// `list`). The path is kept UNENCODED here — the single percent-encoding happens
+    /// once at signing time (`sign_http`), and the wire URL is built from that same
+    /// canonical output, so wire ≡ signed by construction.
     fn target(&self, bucket: &str, key: &str) -> Target {
         // Split the endpoint into scheme + authority (host[:port]).
         let (scheme, authority) = match self.endpoint.split_once("://") {
             Some((s, rest)) => (s, rest),
             None => ("https", self.endpoint.as_str()),
         };
-        // Encode each key path segment (S3 single-encode, preserving `/`).
-        let key_path = if key.is_empty() {
+        let raw_key = if key.is_empty() {
             String::new()
         } else {
-            sigv4::canonical_uri(&format!("/{}", key.trim_start_matches('/')))
+            format!("/{}", key.trim_start_matches('/'))
         };
         if self.path_style {
             // endpoint/bucket/key — host is the endpoint authority unchanged.
-            let path = if key.is_empty() {
+            let raw_path = if key.is_empty() {
                 format!("/{bucket}")
             } else {
-                format!("/{bucket}{key_path}")
+                format!("/{bucket}{raw_key}")
             };
             Target {
-                url: format!("{scheme}://{authority}{path}"),
+                base: format!("{scheme}://{authority}"),
                 host: authority.to_string(),
-                path,
+                raw_path,
             }
         } else {
             // virtual-host: bucket.host/key
             let vhost = format!("{bucket}.{authority}");
-            let path = if key.is_empty() { "/".to_string() } else { key_path };
+            let raw_path = if key.is_empty() { "/".to_string() } else { raw_key };
             Target {
-                url: format!("{scheme}://{vhost}{path}"),
+                base: format!("{scheme}://{vhost}"),
                 host: vhost,
-                path,
+                raw_path,
             }
         }
     }
@@ -736,17 +779,29 @@ impl Interp {
     /// Sign a request: build the canonical headers (host, x-amz-date,
     /// x-amz-content-sha256, optional x-amz-security-token), run SigV4, and return
     /// the ready-to-send request. Time from the determinism seam.
+    ///
+    /// `query_pairs` are RAW (unencoded) `(key, value)` pairs — NOT a pre-joined string
+    /// (a joined `k=v&...` is ambiguous when a value contains `=`/`&`, which S3
+    /// continuation tokens do). This fn computes the canonical URI and canonical query
+    /// EXACTLY ONCE (`canonical_uri` / `canonical_query_pairs`), builds the wire URL
+    /// from those SAME strings, and signs over them via `sign_canonical` — so the wire
+    /// request and the signed canonical request are identical by construction (no
+    /// double-encode is possible).
     fn sign_http(
         &self,
         cfg: &BlobClientState,
         method: &str,
         target: &Target,
-        query: &str,
+        query_pairs: &[(String, String)],
         mut extra_headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> SignedHttp {
         let (amz_datetime, date) = amz_dates(self.clock_now_ms());
         let payload_hash = sigv4::sha256_hex(&body);
+
+        // Single encoding of path + query, reused for BOTH the wire URL and the signature.
+        let c_uri = sigv4::canonical_uri(&target.raw_path);
+        let c_query = sigv4::canonical_query_pairs(query_pairs);
 
         let mut headers: Vec<(String, String)> = vec![
             ("host".to_string(), target.host.clone()),
@@ -758,10 +813,10 @@ impl Interp {
         }
         headers.append(&mut extra_headers);
 
-        let signed = sigv4::sign_request(
+        let signed = sigv4::sign_canonical(
             method,
-            &target.path,
-            query,
+            &c_uri,
+            &c_query,
             &headers,
             &payload_hash,
             &cfg.region,
@@ -772,10 +827,11 @@ impl Interp {
             &cfg.secret_key,
         );
 
-        let url = if query.is_empty() {
-            target.url.clone()
+        // Wire URL is built from the SAME canonical strings used to sign.
+        let url = if c_query.is_empty() {
+            format!("{}{}", target.base, c_uri)
         } else {
-            format!("{}?{}", target.url, query)
+            format!("{}{}?{}", target.base, c_uri, c_query)
         };
         // Attach the Authorization header to the wire headers.
         headers.push(("authorization".to_string(), signed.authorization));
@@ -837,7 +893,7 @@ impl Interp {
         }
 
         let target = cfg.target(&bucket, &key);
-        let req = self.sign_http(cfg, "PUT", &target, "", headers, data);
+        let req = self.sign_http(cfg, "PUT", &target, &[], headers, data);
         let resp = match self.send_signed(req).await {
             Ok(r) => r,
             Err(e) => return Ok(make_pair(Value::nil(), e)),
@@ -880,7 +936,7 @@ impl Interp {
         }
 
         let target = cfg.target(&bucket, &key);
-        let req = self.sign_http(cfg, "GET", &target, "", headers, Vec::new());
+        let req = self.sign_http(cfg, "GET", &target, &[], headers, Vec::new());
         let resp = match self.send_signed(req).await {
             Ok(r) => r,
             Err(e) => return Ok(make_pair(Value::nil(), e)),
@@ -905,7 +961,7 @@ impl Interp {
         let bucket = cfg.bucket_for(opts_ref, span)?;
 
         let target = cfg.target(&bucket, &key);
-        let req = self.sign_http(cfg, "HEAD", &target, "", Vec::new(), Vec::new());
+        let req = self.sign_http(cfg, "HEAD", &target, &[], Vec::new(), Vec::new());
         let resp = match self.send_signed(req).await {
             Ok(r) => r,
             Err(e) => return Ok(make_pair(Value::nil(), e)),
@@ -948,7 +1004,7 @@ impl Interp {
         let bucket = cfg.bucket_for(opts_ref, span)?;
 
         let target = cfg.target(&bucket, &key);
-        let req = self.sign_http(cfg, "DELETE", &target, "", Vec::new(), Vec::new());
+        let req = self.sign_http(cfg, "DELETE", &target, &[], Vec::new(), Vec::new());
         let resp = match self.send_signed(req).await {
             Ok(r) => r,
             Err(e) => return Ok(make_pair(Value::nil(), e)),
@@ -1025,12 +1081,13 @@ impl Interp {
                         pairs.push(("max-keys".into(), ps.to_string()));
                     }
                     if let Some(tok) = &continuation {
+                        // RAW token — sign_http encodes it exactly once (a base64 token
+                        // with +,/,= must not be double-encoded, or page 2 fails).
                         pairs.push(("continuation-token".into(), tok.clone()));
                     }
-                    let query = sigv4::canonical_query_pairs(&pairs);
 
                     let target = cfg.target(&bucket, "");
-                    let req = me.sign_http(&cfg, "GET", &target, &query, Vec::new(), Vec::new());
+                    let req = me.sign_http(&cfg, "GET", &target, &pairs, Vec::new(), Vec::new());
                     let resp = match me.send_signed(req).await {
                         Ok(r) => r,
                         Err(e) => {
@@ -1101,9 +1158,14 @@ impl Interp {
 
         let target = cfg.target(&bucket, &key);
         let (amz_datetime, date) = amz_dates(self.clock_now_ms());
+        // `sigv4::presign` canonical-encodes `uri_path` ONCE internally — so it gets the
+        // RAW path. The wire URL is built from the SAME canonical_uri output so wire ≡
+        // signed (no double-encode; the previous design passed a pre-encoded path,
+        // double-encoding the signed canonical request).
+        let c_uri = sigv4::canonical_uri(&target.raw_path);
         let p = sigv4::presign(
             &method,
-            &target.path,
+            &target.raw_path,
             &target.host,
             &cfg.region,
             SERVICE,
@@ -1115,7 +1177,7 @@ impl Interp {
             cfg.session_token.as_deref(),
             &[],
         );
-        let url = format!("{}?{}", target.url, p.query);
+        let url = format!("{}{}?{}", target.base, c_uri, p.query);
         Ok(make_pair(Value::str(url), Value::nil()))
     }
 
@@ -1174,7 +1236,14 @@ impl Interp {
         if let Some(ct) = &content_type {
             init_headers.push(("content-type".to_string(), ct.clone()));
         }
-        let req = self.sign_http(cfg, "POST", &target, "uploads=", init_headers, Vec::new());
+        let req = self.sign_http(
+            cfg,
+            "POST",
+            &target,
+            &[("uploads".to_string(), String::new())],
+            init_headers,
+            Vec::new(),
+        );
         let resp = match self.send_signed(req).await {
             Ok(r) => r,
             Err(e) => return Ok(make_pair(Value::nil(), e)),
@@ -1248,9 +1317,13 @@ impl Interp {
                 break;
             }
 
-            let canon =
-                sigv4::canonical_query_string(&format!("partNumber={part_number}&uploadId={upload_id}"));
-            let req = self.sign_http(cfg, "PUT", &target, &canon, Vec::new(), chunk);
+            // RAW pairs — sign_http encodes partNumber/uploadId exactly once (an
+            // uploadId can contain '/'/'+'; a pre-encoded string would double-encode).
+            let part_pairs = [
+                ("partNumber".to_string(), part_number.to_string()),
+                ("uploadId".to_string(), upload_id.clone()),
+            ];
+            let req = self.sign_http(cfg, "PUT", &target, &part_pairs, Vec::new(), chunk);
             let resp = match self.send_signed(req).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1297,12 +1370,11 @@ impl Interp {
             ));
         }
         xml.push_str("</CompleteMultipartUpload>");
-        let complete_q = sigv4::canonical_query_string(&format!("uploadId={upload_id}"));
         let req = self.sign_http(
             cfg,
             "POST",
             &target,
-            &complete_q,
+            &[("uploadId".to_string(), upload_id.clone())],
             vec![("content-type".to_string(), "application/xml".to_string())],
             xml.into_bytes(),
         );
@@ -1331,8 +1403,14 @@ impl Interp {
     /// multipart leaves no orphaned upload on the server. Errors are ignored (the part
     /// failure is the one surfaced to the caller).
     async fn abort_multipart(&self, cfg: &BlobClientState, target: &Target, upload_id: &str) {
-        let abort_q = sigv4::canonical_query_string(&format!("uploadId={upload_id}"));
-        let req = self.sign_http(cfg, "DELETE", target, &abort_q, Vec::new(), Vec::new());
+        let req = self.sign_http(
+            cfg,
+            "DELETE",
+            target,
+            &[("uploadId".to_string(), upload_id.to_string())],
+            Vec::new(),
+            Vec::new(),
+        );
         let _ = self.send_signed(req).await;
     }
 }

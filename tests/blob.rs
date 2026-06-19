@@ -30,8 +30,126 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+// The crate's own audited SigV4 primitives — REUSED by the stub to RECOMPUTE the
+// signature of every received request from the canonical request built off the WIRE
+// (the path + query AS-RECEIVED). This is the durable guard: a client that signs a
+// different (e.g. double-encoded) canonical request than the one it puts on the wire
+// produces a signature the stub cannot reproduce → 403 SignatureDoesNotMatch.
+use ascript::stdlib::blob::sigv4;
+
 const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+/// Verify the SigV4 `Authorization` of a received request by RECOMPUTING the signature
+/// from the canonical request built off the WIRE (`method`, `wire_path` and
+/// `wire_query` exactly as received, the signed headers, the body's sha256). Returns
+/// `Ok(())` if the recomputed signature matches the `Signature=` the client sent, or
+/// `Err(reason)` (→ the stub answers 403 SignatureDoesNotMatch).
+///
+/// AWS rule: the wire path/query ARE the canonical URI/query (the client must encode
+/// EXACTLY ONCE), so the stub uses them verbatim. A double-encoding client signs a
+/// different canonical request than it transmits → mismatch here.
+fn verify_sigv4(
+    method: &str,
+    wire_path: &str,
+    wire_query: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(), String> {
+    let authz = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| "no Authorization header".to_string())?;
+
+    // Parse `AWS4-HMAC-SHA256 Credential=<ak>/<date>/<region>/<service>/aws4_request,
+    //                        SignedHeaders=<h;h>, Signature=<hex>`.
+    let rest = authz
+        .strip_prefix("AWS4-HMAC-SHA256 ")
+        .ok_or_else(|| format!("bad algorithm prefix: {authz}"))?;
+    let mut credential = None;
+    let mut signed_headers = None;
+    let mut claimed_sig = None;
+    for part in rest.split(',') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("Credential=") {
+            credential = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
+            signed_headers = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("Signature=") {
+            claimed_sig = Some(v.to_string());
+        }
+    }
+    let credential = credential.ok_or("no Credential")?;
+    let signed_headers = signed_headers.ok_or("no SignedHeaders")?;
+    let claimed_sig = claimed_sig.ok_or("no Signature")?;
+
+    // Credential = <ak>/<date>/<region>/<service>/aws4_request
+    let cred_parts: Vec<&str> = credential.split('/').collect();
+    if cred_parts.len() != 5 || cred_parts[4] != "aws4_request" {
+        return Err(format!("malformed Credential: {credential}"));
+    }
+    let (date, region, service) = (cred_parts[1], cred_parts[2], cred_parts[3]);
+    let amz_datetime = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-date"))
+        .map(|(_, v)| v.clone())
+        .ok_or("no x-amz-date")?;
+    let payload_hash = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-content-sha256"))
+        .map(|(_, v)| v.clone())
+        .ok_or("no x-amz-content-sha256")?;
+
+    // Defensive: the payload hash the client SIGNED must match the body actually sent.
+    let body_hash = sigv4::sha256_hex(body);
+    if payload_hash != body_hash {
+        return Err(format!(
+            "x-amz-content-sha256 ({payload_hash}) does not match the received body hash ({body_hash})"
+        ));
+    }
+
+    // Build the canonical headers block from ONLY the signed-headers set, in the order
+    // the SignedHeaders list declares (lowercased names; values trimmed by canonical).
+    let wanted: Vec<&str> = signed_headers.split(';').collect();
+    let mut hpairs: Vec<(String, String)> = Vec::new();
+    for name in &wanted {
+        let val = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| format!("signed header '{name}' not present"))?;
+        hpairs.push((name.to_string(), val));
+    }
+    let (c_headers, derived_signed) = sigv4::canonical_headers(&hpairs);
+    if derived_signed != signed_headers {
+        return Err(format!(
+            "signed-headers mismatch: claimed {signed_headers}, derived {derived_signed}"
+        ));
+    }
+
+    // The WIRE path/query are the canonical URI/query (client encodes exactly once).
+    let c_uri = if wire_path.is_empty() { "/" } else { wire_path };
+    let c_req = sigv4::canonical_request(
+        method,
+        c_uri,
+        wire_query,
+        &c_headers,
+        &signed_headers,
+        &payload_hash,
+    );
+    let scope = sigv4::credential_scope(date, region, service);
+    let sts = sigv4::string_to_sign(&amz_datetime, &scope, &c_req);
+    let key = sigv4::signing_key(SECRET_KEY, date, region, service);
+    let recomputed = sigv4::signature(&key, &sts);
+    if recomputed != claimed_sig {
+        return Err(format!(
+            "SignatureDoesNotMatch: client signed {claimed_sig} but the canonical request \
+             over the WIRE (path={c_uri:?} query={wire_query:?}) yields {recomputed}"
+        ));
+    }
+    Ok(())
+}
 
 /// One served HTTP request the stub recorded.
 #[derive(Clone, Debug)]
@@ -213,7 +331,22 @@ async fn serve_conn(
 
         recorded.lock().unwrap().push(rec.clone());
 
-        let resp = router(&rec);
+        // RECOMPUTE the SigV4 signature from the wire request. A mismatch (e.g. a
+        // double-encoded signed path/query vs the single-encoded wire) → 403, exactly
+        // as a real S3 endpoint would respond.
+        let resp = match verify_sigv4(&method, &path, &query, &headers, &body) {
+            Ok(()) => router(&rec),
+            Err(reason) => Response {
+                status: 403,
+                headers: vec![("content-type".into(), "application/xml".into())],
+                body: format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <Error><Code>SignatureDoesNotMatch</Code><Message>{}</Message></Error>",
+                    xml_escape_text(&reason)
+                )
+                .into_bytes(),
+            },
+        };
         let mut out = format!(
             "HTTP/1.1 {} {}\r\n",
             resp.status,
@@ -250,6 +383,11 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|w| w == needle)
+}
+
+/// Escape XML text so a recompute-failure reason rides safely in the error body.
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn status_text(s: u16) -> &'static str {
@@ -388,6 +526,160 @@ print("deleted")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// (a2) SPECIAL-CHAR KEY roundtrip — space + '+' + Unicode. The verifying stub
+//      RECOMPUTES the signature from the wire path, so a double-encoded signed path
+//      (vs the single-encoded wire) is a 403 SignatureDoesNotMatch. This is the
+//      regression guard for the B8 double-encode blocker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn blob_special_char_key_put_get_head_delete() {
+    let router: Router = Arc::new(|rec: &Recorded| match rec.method.as_str() {
+        "PUT" => Response { status: 200, headers: vec![("ETag".into(), "\"k1\"".into())], body: Vec::new() },
+        "GET" => Response {
+            status: 200,
+            headers: vec![("ETag".into(), "\"k1\"".into()), ("Content-Type".into(), "text/plain".into())],
+            body: b"payload".to_vec(),
+        },
+        "HEAD" => Response {
+            status: 200,
+            headers: vec![
+                ("ETag".into(), "\"k1\"".into()),
+                ("Content-Type".into(), "text/plain".into()),
+                ("Content-Length".into(), "7".into()),
+            ],
+            body: Vec::new(),
+        },
+        "DELETE" => Response { status: 204, headers: vec![], body: Vec::new() },
+        _ => Response::ok_xml("<Error/>"),
+    });
+    let (port, rec) = spawn_stub(4, router);
+    // Key with a SPACE, a '+', and a Unicode char — each must percent-encode EXACTLY
+    // once in both the wire path AND the signed canonical (the verifying stub checks).
+    let key = "logs/a b/c+d é.txt";
+    let prog = format!(
+        r#"
+let key = "{key}"
+let [etag, perr] = client.put(key, "payload", {{ contentType: "text/plain" }})
+if (perr != nil) {{ print(`put-err: ${{perr.message}}`); exit(1) }}
+print(`put-etag=${{etag}}`)
+let [data, gerr] = client.get(key)
+if (gerr != nil) {{ print(`get-err: ${{gerr.message}}`); exit(1) }}
+print(`get=${{encoding.utf8Decode(data)[0]}}`)
+let [meta, herr] = client.head(key)
+if (herr != nil) {{ print(`head-err: ${{herr.message}}`); exit(1) }}
+print(`size=${{meta.size}}`)
+let [_, derr] = client.delete(key)
+if (derr != nil) {{ print(`del-err: ${{derr.message}}`); exit(1) }}
+print("ok")
+"#
+    );
+    let src = format!(
+        "import * as encoding from \"std/encoding\"\n{}{prog}",
+        client_src(port),
+    );
+    let (ok, out, err) = run_script(&src, "blob_special_key.as", &[]);
+    assert!(ok, "script failed: {out}\n{err}");
+    assert!(out.contains("put-etag=k1"), "put etag (sig mismatch?): {out}");
+    assert!(out.contains("get=payload"), "get body: {out}");
+    assert!(out.contains("size=7"), "head size: {out}");
+    assert!(out.contains("ok"), "delete: {out}");
+
+    // The WIRE path must be SINGLE percent-encoded: space→%20, '+'→%2B, é→%C3%A9.
+    let reqs = recorded(&rec);
+    let get = reqs.iter().find(|r| r.method == "GET").unwrap();
+    assert_eq!(
+        get.path, "/my-bucket/logs/a%20b/c%2Bd%20%C3%A9.txt",
+        "wire path not single-encoded: {}",
+        get.path
+    );
+    // It must NOT be double-encoded (no %25 sequences from %20→%2520).
+    assert!(!get.path.contains("%25"), "wire path is double-encoded: {}", get.path);
+}
+
+#[test]
+fn blob_special_char_key_presign() {
+    // presign is pure (no network) but the stub-less check still proves single-encoding:
+    // the presigned URL's path is single-encoded AND the X-Amz-Signature was computed
+    // over that same single-encoded canonical (we recompute below to be sure).
+    let src = format!(
+        r#"import * as blob from "std/blob"
+let client = blob.client({{ endpoint: "https://s3.example.com", region: "us-east-1",
+  accessKey: "{ACCESS_KEY}", secretKey: "{SECRET_KEY}", bucket: "my-bucket", pathStyle: true }})
+let [url, err] = client.presign("GET", "a b/c+d.txt")
+if (err != nil) {{ print(`presign-err: ${{err.message}}`); exit(1) }}
+print(`url=${{url}}`)
+"#
+    );
+    let (ok, out, err) = run_script(&src, "blob_special_presign.as", &[]);
+    assert!(ok, "script failed: {out}\n{err}");
+    let line = out.lines().find(|l| l.starts_with("url=")).unwrap();
+    let url = line.strip_prefix("url=").unwrap();
+    // Path single-encoded, NOT double.
+    assert!(
+        url.contains("/my-bucket/a%20b/c%2Bd.txt?"),
+        "presign path not single-encoded: {url}"
+    );
+    assert!(!url.contains("%2520") && !url.contains("%252B"), "presign path double-encoded: {url}");
+    assert!(url.contains("X-Amz-Signature="), "no signature: {url}");
+
+    // RECOMPUTE the presign signature over the WIRE path — the durable guard that the
+    // signature matches the single-encoded path the client actually emits. (Before the
+    // fix, presign signed a DOUBLE-encoded path while emitting a single-encoded URL.)
+    let (path, q) = url.split_once('?').unwrap();
+    let wire_path = path.split_once("s3.example.com").unwrap().1; // strip scheme+host
+    // Split the query into the auth params; pull out X-Amz-Signature; rebuild the
+    // canonical query (everything except the signature) and the scope from Credential.
+    let mut params: Vec<(String, String)> = Vec::new();
+    let mut claimed_sig = String::new();
+    let mut credential = String::new();
+    let mut amz_date = String::new();
+    for kv in q.split('&') {
+        let (k, v) = kv.split_once('=').unwrap();
+        if k == "X-Amz-Signature" {
+            claimed_sig = v.to_string();
+            continue;
+        }
+        if k == "X-Amz-Credential" {
+            credential = v.to_string();
+        }
+        if k == "X-Amz-Date" {
+            amz_date = v.to_string();
+        }
+        // The query on the wire is already canonical/encoded; pass it through verbatim
+        // to canonical_request (do NOT re-encode).
+        params.push((k.to_string(), v.to_string()));
+    }
+    // Canonical query = the wire params (already sorted+encoded), re-joined verbatim.
+    let canonical_query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    // Credential = <ak>%2F<date>%2F<region>%2F<service>%2Faws4_request (encoded '/').
+    let cred_dec = credential.replace("%2F", "/");
+    let cp: Vec<&str> = cred_dec.split('/').collect();
+    let (date, region, service) = (cp[1], cp[2], cp[3]);
+    let c_headers = "host:s3.example.com\n".to_string();
+    let c_req = sigv4::canonical_request(
+        "GET",
+        wire_path,
+        &canonical_query,
+        &c_headers,
+        "host",
+        "UNSIGNED-PAYLOAD",
+    );
+    let scope = sigv4::credential_scope(date, region, service);
+    let sts = sigv4::string_to_sign(&amz_date, &scope, &c_req);
+    let key = sigv4::signing_key(SECRET_KEY, date, region, service);
+    let recomputed = sigv4::signature(&key, &sts);
+    assert_eq!(
+        recomputed, claimed_sig,
+        "presign signature does not match the WIRE path {wire_path:?} (double-encode?)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // (b) list generator — paginates across 2 pages, LAZILY
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -450,6 +742,76 @@ print(`keys=${keys}`)
     assert!(reqs[1].query.contains("continuation-token=TOKEN_PAGE2"), "page2 query: {}", reqs[1].query);
     // list-type=2 is the v2 ListObjects marker.
     assert!(reqs[0].query.contains("list-type=2"), "missing list-type=2: {}", reqs[0].query);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (b2) list with a SPACE prefix and a base64 continuation-token containing '+' '/' '='
+//      — the page-2 query double-encode regression guard. Against the verifying stub,
+//      a double-encoded signed query (vs the single-encoded wire) is a 403, AND the
+//      page-2 token must round-trip so the stub matches the token route.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn blob_list_special_prefix_and_continuation_token() {
+    // A realistic base64 continuation token: contains '+', '/', and '=' padding.
+    const TOKEN: &str = "ab+cd/ef==";
+    let page1 = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>my-bucket</Name>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>{TOKEN}</NextContinuationToken>
+  <Contents><Key>logs/x y.txt</Key><Size>10</Size><ETag>"e1"</ETag><LastModified>2013-05-24T00:00:00.000Z</LastModified></Contents>
+</ListBucketResult>"#
+    );
+    let page2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>my-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>logs/z.txt</Key><Size>20</Size><ETag>"e2"</ETag><LastModified>2013-05-24T00:00:01.000Z</LastModified></Contents>
+</ListBucketResult>"#;
+    let p1 = page1.clone();
+    let p2 = page2.to_string();
+    let router: Router = Arc::new(move |rec: &Recorded| {
+        // page 2 is requested with the SINGLE-encoded token: '+'→%2B, '/'→%2F, '='→%3D.
+        if rec.query.contains("continuation-token=ab%2Bcd%2Fef%3D%3D") {
+            Response::ok_xml(&p2)
+        } else {
+            Response::ok_xml(&p1)
+        }
+    });
+    let (port, rec) = spawn_stub(2, router);
+    let src = format!(
+        "{}{}",
+        client_src(port),
+        r#"
+let g = client.list({ prefix: "logs/a b" })
+let keys = []
+for await (item in g) {
+  keys = [...keys, item.key]
+}
+print(`count=${len(keys)}`)
+print(`keys=${keys}`)
+"#
+    );
+    let (ok, out, err) = run_script(&src, "blob_list_special.as", &[]);
+    assert!(ok, "script failed: {out}\n{err}");
+    // BOTH pages must have been fetched (page 2 succeeded → token round-tripped + signed
+    // correctly), yielding 2 keys.
+    assert!(out.contains("count=2"), "page 2 did not succeed (token/sig?): {out}");
+
+    let reqs = recorded(&rec);
+    assert_eq!(reqs.len(), 2, "expected 2 list pages: {:?}", reqs.iter().map(|r| r.query.clone()).collect::<Vec<_>>());
+    // Page-1 wire query: the space prefix is single-encoded (%20), not double (%2520).
+    assert!(reqs[0].query.contains("prefix=logs%2Fa%20b"), "page1 prefix not single-encoded: {}", reqs[0].query);
+    assert!(!reqs[0].query.contains("%2520"), "page1 query double-encoded: {}", reqs[0].query);
+    // Page-2 wire query: the base64 token is single-encoded.
+    assert!(
+        reqs[1].query.contains("continuation-token=ab%2Bcd%2Fef%3D%3D"),
+        "page2 token not single-encoded: {}",
+        reqs[1].query
+    );
+    assert!(!reqs[1].query.contains("%252B") && !reqs[1].query.contains("%253D"), "page2 token double-encoded: {}", reqs[1].query);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -554,6 +916,65 @@ print(`etag=${etag}`)
     let complete_req = reqs.iter().rfind(|r| r.method == "POST" && r.query.contains("uploadId")).unwrap();
     let body = String::from_utf8_lossy(&complete_req.body);
     assert!(body.contains("part1etag") && body.contains("part2etag") && body.contains("part3etag"), "complete body etags: {body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (d1b) multipart whose uploadId contains '/' and '+' — the UploadPart/complete/abort
+//       sub-query double-encode regression guard. Against the verifying stub, the
+//       single-encoded wire uploadId must round-trip AND sign correctly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn blob_multipart_special_upload_id() {
+    // An uploadId with '/' and '+' (real S3 uploadIds are opaque, can contain these).
+    const UPLOAD_ID: &str = "abc/def+ghi";
+    let init = format!(
+        r#"<?xml version="1.0"?><InitiateMultipartUploadResult><UploadId>{UPLOAD_ID}</UploadId></InitiateMultipartUploadResult>"#
+    );
+    let complete = r#"<?xml version="1.0"?><CompleteMultipartUploadResult><ETag>"sp-final"</ETag></CompleteMultipartUploadResult>"#;
+    let init = init.clone();
+    let complete = complete.to_string();
+    // Single-encoded uploadId on the wire: '/'→%2F, '+'→%2B.
+    const ENC_ID: &str = "abc%2Fdef%2Bghi";
+    let router: Router = Arc::new(move |rec: &Recorded| {
+        if rec.method == "POST" && rec.query.contains("uploads") {
+            Response::ok_xml(&init)
+        } else if rec.method == "POST" && rec.query.contains(&format!("uploadId={ENC_ID}")) {
+            Response::ok_xml(&complete)
+        } else if rec.method == "PUT" && rec.query.contains(&format!("uploadId={ENC_ID}")) {
+            let pn = rec.query.split('&').find_map(|kv| kv.strip_prefix("partNumber=")).unwrap_or("0");
+            Response { status: 200, headers: vec![("ETag".into(), format!("\"sp{pn}\""))], body: Vec::new() }
+        } else {
+            // Wrong (double?) encoding or unknown route → fail loudly so the test catches it.
+            Response::ok_xml("<Error><Code>RouteMiss</Code><Message>unexpected query</Message></Error>")
+        }
+    });
+    let (port, rec) = spawn_stub(4, router);
+    let src = format!(
+        "import * as string from \"std/string\"\nimport * as encoding from \"std/encoding\"\n{}{}",
+        client_src(port),
+        r#"
+let big = string.repeat("q", 5 * 1024 * 1024)
+let chunks = [encoding.utf8Encode(big), encoding.utf8Encode("tail")]
+let [etag, err] = client.putMultipart("big.bin", chunks)
+if (err != nil) { print(`mp-err: ${err.message}`); exit(1) }
+print(`etag=${etag}`)
+"#
+    );
+    let (ok, out, err) = run_script(&src, "blob_multipart_special_id.as", &[]);
+    assert!(ok, "script failed: {out}\n{err}");
+    assert!(out.contains("etag=sp-final") || out.contains("etag=\"sp-final\""), "etag (sig/encode?): {out}");
+
+    let reqs = recorded(&rec);
+    // Every UploadPart + complete carried the SINGLE-encoded uploadId on the wire.
+    for r in reqs.iter().filter(|r| r.method == "PUT" || (r.method == "POST" && r.query.contains("uploadId"))) {
+        assert!(
+            r.query.contains(&format!("uploadId={ENC_ID}")),
+            "uploadId not single-encoded on the wire: {}",
+            r.query
+        );
+        assert!(!r.query.contains("%252F") && !r.query.contains("%252B"), "uploadId double-encoded: {}", r.query);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
