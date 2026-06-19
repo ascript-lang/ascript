@@ -2815,6 +2815,97 @@ fn lsp_didclose_purges_pending_no_ghost_republish() {
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
+/// SIG §3.1(c): signature help for a cross-file imported user fn shows param NAMES
+/// and annotations (the index's `exported_fn_sig_from_decl` ParamList walk returns
+/// names and types, not just arity). A defaulted param is rendered as `name?: type`.
+#[test]
+fn lsp_signature_help_cross_file_imported_fn() {
+    let dir = std::env::temp_dir()
+        .join(format!("ascript_lsp_sig_xfile_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // util.as: exports `add` with one required and one defaulted param.
+    std::fs::write(
+        dir.join("util.as"),
+        "export fn add(first: number, second: number = 0) { return first + second }\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.as");
+    // main.as: imports `add` from util and calls it.  The file must parse cleanly so
+    // the workspace index can record the import edge (an unparseable file gets an
+    // empty-imports placeholder).  The cursor lands INSIDE the arg list of `add(0)`.
+    let main_text = "import { add } from \"./util\"\nlet r = add(0)\n";
+    std::fs::write(&main_path, main_text).unwrap();
+
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+
+    let root_uri = format!("file://{}", dir.display());
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let util_uri = format!("file://{}", dir.join("util.as").display());
+    let main_uri = format!("file://{}", main_path.display());
+
+    // Open util.as first so the workspace index picks up the export.
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": util_uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": "export fn add(first: number, second: number = 0) { return first + second }\n"
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Open main.as — this triggers indexing of the import edge.
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": main_text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Request signature help inside `add(0)` on line 1.
+    // "let r = add(0)\n" — `add(` starts at char 8, so char 12 is inside the arg list.
+    client.request(
+        2,
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 1, "character": 12 }
+        }),
+    );
+    let resp = client.read_response(2, overall);
+    let label = resp["result"]["signatures"][0]["label"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing signature label: {resp}"));
+    assert_eq!(
+        label,
+        "add(first: number, second?: number)",
+        "names + annotations expected; defaulted param should be `second?: number`: {resp}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ─── DX D3 Task 11: the LSP identity unification ─────────────────────────────
 //
 // These exercise `WorkspaceIndex` directly (in-process — no wire) to pin the

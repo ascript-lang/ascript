@@ -424,6 +424,12 @@ fn format_exported_param(p: &crate::lsp::workspace::ExportedParam) -> String {
         s.push_str("...");
     }
     s.push_str(&p.name);
+    // A param with a default value is rendered as `name?: type` (the `?` signals
+    // optional; the default value itself is omitted in v1 — callers see the shape,
+    // not the concrete default expression).
+    if p.optional && !p.variadic {
+        s.push('?');
+    }
     if let Some(ty) = &p.ty {
         s.push_str(": ");
         s.push_str(ty);

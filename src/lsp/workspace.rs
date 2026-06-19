@@ -1071,7 +1071,7 @@ fn exported_fn_sig_from_decl(fn_decl: &crate::syntax::cst::ResolvedNode) -> Expo
             let ty = p
                 .children()
                 .find(|c| is_type_kind(c.kind()))
-                .map(|t| t.text().to_string());
+                .map(|t| t.text().to_string().trim().to_string());
             params.push(ExportedParam { name, ty, optional, variadic });
         }
     }
@@ -1081,7 +1081,7 @@ fn exported_fn_sig_from_decl(fn_decl: &crate::syntax::cst::ResolvedNode) -> Expo
         .children()
         .filter(|c| is_type_kind(c.kind()))
         .last()
-        .map(|t| t.text().to_string());
+        .map(|t| t.text().to_string().trim().to_string());
     ExportedFnSig { params, ret }
 }
 
