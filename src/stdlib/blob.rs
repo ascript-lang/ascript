@@ -122,6 +122,10 @@ pub(crate) mod sigv4 {
     /// Trim + collapse internal runs of whitespace in a header value to a single
     /// space (AWS canonicalization). Leading/trailing whitespace removed.
     fn canonical_header_value(v: &str) -> String {
+        // AWS's wording is "convert sequential spaces to a single space"; we also
+        // collapse tabs into the same run. This is an intentional superset that matches
+        // every real AWS SDK's trimall and the test-suite vectors — do not "fix" it back
+        // to spaces-only.
         let mut out = String::with_capacity(v.len());
         let mut prev_space = false;
         for ch in v.trim().chars() {
