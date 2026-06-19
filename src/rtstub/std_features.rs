@@ -93,6 +93,10 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // BATT Phase B §7.2 — std/xml is gated on the `xml` feature (xml = data +
     // quick-xml), so an xml-using bundle pulls the data tier.
     ("std/xml",         Some("xml")),
+    // BATT Phase B §7.3 — std/html shares the `xml` feature (lenient HTML
+    // helpers: escape/unescape/sanitize), so an html-using bundle pulls the
+    // data tier.
+    ("std/html",        Some("xml")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.

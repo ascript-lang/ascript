@@ -1533,6 +1533,27 @@ static XML_MEMBERS: &[(&str, MemberKind)] = &[
     ("unescape", MemberKind::Fn),
 ];
 
+// ── std/html (BATT B4 §7.3) ─────────────────────────────────────────────────
+
+static HTML_ESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static HTML_UNESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static HTML_SANITIZE_PARAMS: &[StdParam] = &[
+    StdParam::req("text", "string"),
+    StdParam::opt("options", "object"),
+];
+
+static HTML_SIGS: &[(&str, StdSig)] = &[
+    ("escape", StdSig { params: HTML_ESCAPE_PARAMS, ret: Some("string"), doc: "Escapes the HTML special characters (& < > \" ') in text for safe inclusion in element content or a double-quoted attribute value." }),
+    ("unescape", StdSig { params: HTML_UNESCAPE_PARAMS, ret: Some("string"), doc: "Decodes HTML named entities (the HTML5 core set) plus numeric character references (&#NN; / &#xNN;). An unrecognized entity is left verbatim." }),
+    ("sanitize", StdSig { params: HTML_SANITIZE_PARAMS, ret: Some("string"), doc: "Fail-closed allowlist sanitizer: a lenient tokenizer feeds a canonical serializer that re-emits only allowlisted tags/attributes with all values re-escaped and URL schemes checked; everything unrecognized is escaped as inert text. options: {tags?, attrs?, schemes?} (each REPLACES the corresponding default)." }),
+];
+
+static HTML_MEMBERS: &[(&str, MemberKind)] = &[
+    ("escape", MemberKind::Fn),
+    ("unescape", MemberKind::Fn),
+    ("sanitize", MemberKind::Fn),
+];
+
 // ── std/net ───────────────────────────────────────────────────────────────────
 
 static NET_LOOKUP_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
@@ -2925,6 +2946,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/oauth", OAUTH_MEMBERS),
     ("std/archive", ARCHIVE_MEMBERS),
     ("std/xml", XML_MEMBERS),
+    ("std/html", HTML_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3001,6 +3023,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/oauth" => OAUTH_SIGS,
         "std/archive" => ARCHIVE_SIGS,
         "std/xml" => XML_SIGS,
+        "std/html" => HTML_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)

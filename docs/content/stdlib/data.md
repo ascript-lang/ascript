@@ -744,6 +744,66 @@ let [s, err] = xml.unescape("a &amp; b &lt; c") // s == "a & b < c", err == nil
 let [ab, _] = xml.unescape("&#65;&#x42;")        // ab == "AB"
 ```
 
+## std/html
+
+Lenient HTML helpers — escape / unescape and a **fail-closed** allowlist sanitizer (the `xml` Cargo feature, on by default; `std/html` is a sibling of `std/xml`). `std/html` is a pure string transform and requires **no capability**.
+
+HTML is not XML, so the sanitizer cannot use a strict parser: a strict parser that *rejected* malformed markup would leave the raw bytes un-sanitized — a fail-OPEN hole and a direct XSS vector. Instead `std/html` is **emit-from-parse**:
+
+- A lenient tokenizer that **never errors** turns the input into text / start-tag / end-tag / comment tokens. Anything it cannot parse (`<<script>`, an unterminated `<a href="x`) becomes literal text.
+- A canonical serializer re-emits **only allowlisted tags**, with **only allowlisted attributes**, every text and attribute value re-escaped on emission. The raw input bytes of a tag are **never echoed**.
+- A non-allowlisted tag is **escaped as text** (`<script>` → `&lt;script&gt;`) — visible but inert, never silently dropped.
+- `href`/`src`/`action`/`cite`/… URL values are scheme-checked **after** entity-decoding, control/whitespace-stripping, and lowercasing, so `javascript:`, ` javascript:`, `java&#x09;script:`, `&#106;avascript:`, and `JaVaScRiPt:` are all neutralized.
+- Comments, CDATA, processing instructions, doctypes, and the raw content of `<script>`/`<style>`/`<iframe>`/… are stripped.
+
+**Default allowlist.** Tags: `p`, `br`, `b`, `strong`, `i`, `em`, `u`, `s`, `code`, `pre`, `blockquote`, `h1`–`h6`, `ul`, `ol`, `li`, `a`, `img`, `table`, `thead`, `tbody`, `tr`, `th`, `td`, `hr`, `span`. Attributes: `a` → `href`, `title`; `img` → `src`, `alt`, `title` (every other tag has none). URL schemes: `http`, `https`, `mailto` — plus relative URLs (no scheme).
+
+```ascript
+import * as html from "std/html"
+```
+
+### html.escape
+
+Escapes the HTML special characters (`&`, `<`, `>`, `"`, `'`) for safe inclusion in element content or a double-quoted attribute value.
+
+- `text` (string) — the raw text to escape.
+- Returns `string` — the escaped text.
+
+```ascript
+html.escape("<b> & 'x'") // == "&lt;b&gt; &amp; &#39;x&#39;"
+```
+
+### html.unescape
+
+Decodes HTML named entities (the HTML5 core set) plus numeric character references (`&#NN;` / `&#xNN;`). An unrecognized `&name;` is left verbatim (matching browser parse-error recovery).
+
+- `text` (string) — the escaped text.
+- Returns `string` — the decoded text.
+
+```ascript
+html.unescape("a &amp; b &copy; c") // == "a & b © c"
+html.unescape("&#65;&#x42;")        // == "AB"
+```
+
+### html.sanitize
+
+Fail-closed allowlist sanitizer (see the module overview). A lenient tokenizer feeds a canonical serializer that re-emits only allowlisted tags/attributes with all values re-escaped and URL schemes checked; everything unrecognized is escaped as inert text.
+
+- `text` (string) — the untrusted HTML to sanitize.
+- `options` (object) — *(optional)* `{ tags?: array<string>, attrs?: object<string, array<string>>, schemes?: array<string> }`. Each field, when present, **REPLACES** the corresponding default (the default schemes are `["http", "https", "mailto"]`).
+- Returns `string` — sanitized HTML containing only allowlisted, canonically-serialized markup.
+
+```ascript
+html.sanitize("<script>alert(1)</script><b>hi</b>")
+// == "&lt;script&gt;alert(1)&lt;/script&gt;<b>hi</b>"
+
+html.sanitize(`<a href="javascript:alert(1)">x</a>`)
+// == "<a>x</a>"   (the unsafe href is dropped)
+
+html.sanitize("<mark>m</mark>", { tags: ["mark"] })
+// == "<mark>m</mark>"
+```
+
 ## std/decimal
 
 Exact decimal arithmetic backed by a 96-bit scaled integer (`rust_decimal`). Use it wherever floating-point rounding is unacceptable: money, pricing, financial totals, or any domain where `0.1 + 0.2 == 0.3` must hold.

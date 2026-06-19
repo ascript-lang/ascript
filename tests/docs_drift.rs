@@ -212,6 +212,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/toml", "data.md"),
     ("std/yaml", "data.md"),
     ("std/xml", "data.md"),
+    ("std/html", "data.md"),
     ("std/msgpack", "data.md"),
     ("std/cbor", "data.md"),
     ("std/tui", "tui.md"),

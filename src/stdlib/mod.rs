@@ -22,6 +22,8 @@ pub mod convert;
 pub mod archive;
 #[cfg(feature = "xml")]
 pub mod xml;
+#[cfg(feature = "xml")]
+pub mod html;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "docker")]
@@ -244,6 +246,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/archive" => archive::exports(),
         #[cfg(feature = "xml")]
         "std/xml" => xml::exports(),
+        #[cfg(feature = "xml")]
+        "std/html" => html::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -322,6 +326,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/oauth",
     "std/archive",
     "std/xml",
+    "std/html",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -705,6 +710,8 @@ impl Interp {
             "archive" => archive::call(self, func, args, span),
             #[cfg(feature = "xml")]
             "xml" => xml::call(func, args, span),
+            #[cfg(feature = "xml")]
+            "html" => html::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1281,6 +1288,9 @@ mod cap_gate_tests {
             // BATT B3 §7.2: std/xml is pure parsing/serialization — no net/fs (the
             // structural XXE / external-entity defense), so it acquires no cap.
             "xml",
+            // BATT B4 §7.3: std/html is a pure string transform (escape/unescape/
+            // sanitize) — no OS resource, so it acquires no cap.
+            "html",
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");
