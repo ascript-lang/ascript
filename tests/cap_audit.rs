@@ -173,6 +173,76 @@ fn audit_net_tcp_connect_listen_denied() {
     assert_denied("audit_tcp_connect_sbx.as", imp, "tcp.connect(\"127.0.0.1\", 9)", "net", &["--sandbox"]);
 }
 
+// BATT A3 §3 — `tcp.connectTls` is gated by `Net` exactly like the plain
+// `tcp.connect` above. The TLS handshake goes through the same `required_cap`
+// dispatch chokepoint before any socket I/O (hermetic — no real network needed;
+// port 9 is effectively unreachable on loopback, but the gate fires before
+// `connect()` so no real packet is ever sent). `--deny net`, `--sandbox`, and
+// in-code `caps.drop("net")` all produce `capability 'net' denied`.
+#[cfg(all(feature = "net", feature = "tls"))]
+#[test]
+fn audit_net_tls_connect_denied() {
+    let imp = "import * as tcp from \"std/net/tcp\"";
+    // `tcp.connectTls(host, port, opts?)` — gated by Net at the dispatch chokepoint.
+    assert_denied(
+        "audit_tls_connect_deny.as",
+        imp,
+        "tcp.connectTls(\"127.0.0.1\", 9, {})",
+        "net",
+        &["--deny", "net"],
+    );
+    assert_denied(
+        "audit_tls_connect_sbx.as",
+        imp,
+        "tcp.connectTls(\"127.0.0.1\", 9, {})",
+        "net",
+        &["--sandbox"],
+    );
+
+    // in-code `caps.drop("net")` — irreversible; the gate fires after the drop.
+    let src = "import * as tcp from \"std/net/tcp\"\n\
+               import * as caps from \"std/caps\"\n\
+               caps.drop(\"net\")\n\
+               let r = recover(() => tcp.connectTls(\"127.0.0.1\", 9, {}))\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "audit_tls_connect_drop.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(
+        out,
+        "capability 'net' denied\n",
+        "caps.drop(\"net\") must deny tcp.connectTls"
+    );
+}
+
+// BATT A3 §3 positive — `tcp.connectTls` is ALLOWED when `net` is granted (the
+// normal case). The handshake will fail (port 9 is unreachable), but the
+// capability gate PASSES and the error is a Tier-1 connection error, NOT a
+// denial. We use `--deny fs` (fs denied, net still granted) to confirm the
+// cap gate does not over-block.
+#[cfg(all(feature = "net", feature = "tls"))]
+#[test]
+fn audit_net_tls_connect_allowed_when_net_granted() {
+    // `tcp.connectTls` to a guaranteed-unreachable port: the cap gate passes, the
+    // call returns `[nil, err]` with a connection error (NOT a denial message).
+    let src = "import * as tcp from \"std/net/tcp\"\n\
+               let [_, e] = await tcp.connectTls(\"127.0.0.1\", 9, {})\n\
+               print(e != nil)\n\
+               print(e.message != nil)\n";
+    // Under --deny fs: net is still granted → gate passes.
+    let (ok, out, err) = run_with_args(src, "audit_tls_connect_allowed.as", &["--deny", "fs"]);
+    assert!(ok, "[audit_tls_connect_allowed] stderr: {err}");
+    // Should print "true\ntrue\n" (got a non-nil err, and err.message is non-nil) —
+    // a connection error, NOT a denial.
+    assert!(
+        !out.contains("capability 'net' denied"),
+        "[audit_tls_connect_allowed] must not produce a denial when net is granted; got {out:?}"
+    );
+    assert_eq!(
+        out, "true\ntrue\n",
+        "[audit_tls_connect_allowed] expected connection-error pair, got {out:?} (stderr {err:?})"
+    );
+}
+
 // CNTR §3.1 std/net/unix — a UDS connect/listen is gated by `Net` exactly like TCP.
 // `--deny net` AND `--sandbox` deny BEFORE any bind/connect (no real socket touched).
 #[cfg(all(unix, feature = "net"))]
@@ -595,5 +665,64 @@ fn audit_caps_list_reflects_sandbox() {
         src,
         &["--deny", "ffi"],
         "[\"fs\", \"net\", \"process\", \"env\"]\n",
+    );
+}
+
+// ───────────────────────── auth: jwt.jwks (Net) + oauth.* (Net) ────────────────
+//
+// BATT §5.6. `std/jwt` is PER-FUNC: `jwks` fetches keys over the network → Net,
+// while `sign`/`verify`/`decode`/`hmacKey` are pure crypto → ungated. `std/oauth`
+// is whole-module Net. We assert BOTH halves: the network funcs are denied under
+// `--deny net`/`--sandbox` (the gate fires BEFORE any fetch), AND `jwt.sign` still
+// works under `--deny net` — the positive proof of the per-func split.
+
+#[cfg(feature = "auth")]
+#[test]
+fn audit_jwt_jwks_denied_by_net() {
+    let imp = "import * as jwt from \"std/jwt\"";
+    let expr = "jwt.jwks(\"http://127.0.0.1:1/jwks\")";
+    assert_denied("audit_jwt_jwks.as", imp, expr, "net", &["--deny", "net"]);
+    assert_denied("audit_jwt_jwks_sbx.as", imp, expr, "net", &["--sandbox"]);
+}
+
+#[cfg(feature = "auth")]
+#[test]
+fn audit_oauth_all_denied_by_net() {
+    let imp = "import * as oauth from \"std/oauth\"";
+    for (name, expr) in [
+        (
+            "audit_oauth_discover.as",
+            "oauth.discover(\"https://issuer.example\")",
+        ),
+        (
+            "audit_oauth_client_creds.as",
+            "oauth.clientCredentials({ tokenUrl: \"http://127.0.0.1:1/t\", clientId: \"a\", clientSecret: \"b\" })",
+        ),
+        (
+            "audit_oauth_refresh.as",
+            "oauth.refresh({ tokenUrl: \"http://127.0.0.1:1/t\", refreshToken: \"r\", clientId: \"a\" })",
+        ),
+    ] {
+        assert_denied(name, imp, expr, "net", &["--deny", "net"]);
+        assert_denied(name, imp, expr, "net", &["--sandbox"]);
+    }
+}
+
+// The per-func split, asserted POSITIVELY: `jwt.sign` is pure crypto and MUST run
+// under `--deny net` (only `jwt.jwks` is gated). This proves the gate is keyed by
+// function, not by the whole `std/jwt` module.
+#[cfg(feature = "auth")]
+#[test]
+fn audit_jwt_sign_ungated_under_deny_net() {
+    let src = "import * as jwt from \"std/jwt\"\n\
+        let key = jwt.hmacKey(\"shared-secret\")\n\
+        let [tok, err] = jwt.sign({ sub: \"alice\" }, key)\n\
+        print(err)\n\
+        print(len(tok) > 0)\n";
+    assert_allowed(
+        "audit_jwt_sign_deny_net.as",
+        src,
+        &["--deny", "net"],
+        "nil\ntrue\n",
     );
 }

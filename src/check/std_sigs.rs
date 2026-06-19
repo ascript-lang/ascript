@@ -1340,6 +1340,18 @@ static CRYPTO_HMAC_SHA256_PARAMS: &[StdParam] = &[
     StdParam::req_untyped("key"),
     StdParam::req_untyped("data"),
 ];
+static CRYPTO_HMAC_SHA384_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("key"),
+    StdParam::req_untyped("data"),
+];
+static CRYPTO_HMAC_SHA512_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("key"),
+    StdParam::req_untyped("data"),
+];
+static CRYPTO_TIMING_SAFE_EQUAL_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("a"),
+    StdParam::req_untyped("b"),
+];
 static CRYPTO_RANDOM_BYTES_PARAMS: &[StdParam] = &[StdParam::req("n", "number")];
 static CRYPTO_HASH_PASSWORD_PARAMS: &[StdParam] = &[StdParam::req_untyped("password")];
 static CRYPTO_VERIFY_PASSWORD_PARAMS: &[StdParam] = &[
@@ -1362,6 +1374,9 @@ static CRYPTO_SIGS: &[(&str, StdSig)] = &[
     ("sha512", StdSig { params: CRYPTO_SHA512_PARAMS, ret: Some("string"), doc: "Computes the SHA-512 digest of the input." }),
     ("md5", StdSig { params: CRYPTO_MD5_PARAMS, ret: Some("string"), doc: "Computes the MD5 digest of the input." }),
     ("hmacSha256", StdSig { params: CRYPTO_HMAC_SHA256_PARAMS, ret: Some("string"), doc: "Computes an HMAC-SHA256 tag." }),
+    ("hmacSha384", StdSig { params: CRYPTO_HMAC_SHA384_PARAMS, ret: Some("string"), doc: "Computes an HMAC-SHA384 tag." }),
+    ("hmacSha512", StdSig { params: CRYPTO_HMAC_SHA512_PARAMS, ret: Some("string"), doc: "Computes an HMAC-SHA512 tag." }),
+    ("timingSafeEqual", StdSig { params: CRYPTO_TIMING_SAFE_EQUAL_PARAMS, ret: Some("bool"), doc: "Compares two byte sequences in constant time." }),
     ("randomBytes", StdSig { params: CRYPTO_RANDOM_BYTES_PARAMS, ret: Some("bytes"), doc: "Generates cryptographically secure random bytes." }),
     ("hashPassword", StdSig { params: CRYPTO_HASH_PASSWORD_PARAMS, ret: Some("[string, err]"), doc: "Hashes a password with Argon2, returning a self-describing PHC string." }),
     ("verifyPassword", StdSig { params: CRYPTO_VERIFY_PASSWORD_PARAMS, ret: Some("bool"), doc: "Verifies a password against an Argon2 PHC string." }),
@@ -1376,6 +1391,9 @@ static CRYPTO_MEMBERS: &[(&str, MemberKind)] = &[
     ("sha512", MemberKind::Fn),
     ("md5", MemberKind::Fn),
     ("hmacSha256", MemberKind::Fn),
+    ("hmacSha384", MemberKind::Fn),
+    ("hmacSha512", MemberKind::Fn),
+    ("timingSafeEqual", MemberKind::Fn),
     ("randomBytes", MemberKind::Fn),
     ("hashPassword", MemberKind::Fn),
     ("verifyPassword", MemberKind::Fn),
@@ -1462,13 +1480,23 @@ static NET_TCP_LISTEN_PARAMS: &[StdParam] = &[
     StdParam::req("port", "number"),
 ];
 
+static NET_TCP_CONNECT_TLS_PARAMS: &[StdParam] = &[
+    StdParam::req("host", "string"),
+    StdParam::req("port", "number"),
+    StdParam::opt("opts", "object"),
+];
+
 static NET_TCP_SIGS: &[(&str, StdSig)] = &[
     ("connect", StdSig { params: NET_TCP_CONNECT_PARAMS, ret: Some("[stream, err]"), doc: "Opens a client TCP connection. Async." }),
+    // BATT A1 — TLS client connect (feature `tls`); the row is unconditional (the export
+    // is present wherever `std/net/tcp` is buildable in the test configs that exercise it).
+    ("connectTls", StdSig { params: NET_TCP_CONNECT_TLS_PARAMS, ret: Some("[stream, err]"), doc: "Opens a client TCP connection and performs a TLS handshake. opts: {caCert?, serverName?, alpn?}. Async." }),
     ("listen", StdSig { params: NET_TCP_LISTEN_PARAMS, ret: Some("[listener, err]"), doc: "Binds a TCP listener. Async." }),
 ];
 
 static NET_TCP_MEMBERS: &[(&str, MemberKind)] = &[
     ("connect", MemberKind::Fn),
+    ("connectTls", MemberKind::Fn),
     ("listen", MemberKind::Fn),
 ];
 
@@ -1587,15 +1615,42 @@ static NET_HTTP_MEMBERS: &[(&str, MemberKind)] = &[
 
 static HTTP_SERVER_CREATE_PARAMS: &[StdParam] = &[];
 static HTTP_SERVER_SERVE_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+// BATT A8 §5.7 — signed cookies + sessions (the `auth` feature).
+static HTTP_SERVER_SIGN_COOKIE_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req_untyped("value"),
+    StdParam::req("secret", "string | bytes"),
+];
+static HTTP_SERVER_VERIFY_COOKIE_PARAMS: &[StdParam] = &[
+    StdParam::req("signedValue", "string"),
+    StdParam::req("secret", "string | bytes"),
+];
+static HTTP_SERVER_SET_COOKIE_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("value", "string"),
+    StdParam::opt("opts", "object"),
+];
+static HTTP_SERVER_SESSION_PARAMS: &[StdParam] = &[
+    StdParam::req("req", "object"),
+    StdParam::req("secret", "string | bytes"),
+];
 
 static HTTP_SERVER_SIGS: &[(&str, StdSig)] = &[
     ("create", StdSig { params: HTTP_SERVER_CREATE_PARAMS, ret: None, doc: "Creates and returns a new HTTP server handle." }),
     ("serve", StdSig { params: HTTP_SERVER_SERVE_PARAMS, ret: Some("[nil, err]"), doc: "Multi-isolate REUSEPORT serve: spreads the accept loop across N shared-nothing isolates. Async." }),
+    ("signCookie", StdSig { params: HTTP_SERVER_SIGN_COOKIE_PARAMS, ret: Some("string"), doc: "Signs a cookie value with HMAC-SHA256 into a tamper-evident string." }),
+    ("verifyCookie", StdSig { params: HTTP_SERVER_VERIFY_COOKIE_PARAMS, ret: Some("[value, err]"), doc: "Verifies a signed cookie value in constant time, returning the original value or a Tier-1 error." }),
+    ("setCookie", StdSig { params: HTTP_SERVER_SET_COOKIE_PARAMS, ret: Some("string"), doc: "Renders a Set-Cookie header value with attributes (httpOnly defaults true, sameSite defaults Lax); CR/LF in name or value is a Tier-2 panic." }),
+    ("session", StdSig { params: HTTP_SERVER_SESSION_PARAMS, ret: Some("[object, err]"), doc: "Reads and verifies the signed session cookie from a request; an absent cookie yields an empty session." }),
 ];
 
 static HTTP_SERVER_MEMBERS: &[(&str, MemberKind)] = &[
     ("create", MemberKind::Fn),
     ("serve", MemberKind::Fn),
+    ("signCookie", MemberKind::Fn),
+    ("verifyCookie", MemberKind::Fn),
+    ("setCookie", MemberKind::Fn),
+    ("session", MemberKind::Fn),
 ];
 
 // ── std/sqlite ────────────────────────────────────────────────────────────────
@@ -2638,6 +2693,86 @@ static RESIL_MEMBERS: &[(&str, MemberKind)] = &[
     ("handler", MemberKind::Fn),
 ];
 
+// ── std/jwt (BATT §5) ─────────────────────────────────────────────────────────
+
+static JWT_HMAC_KEY_PARAMS: &[StdParam] = &[StdParam::req("secret", "string | bytes")];
+static JWT_PEM_KEY_PARAMS: &[StdParam] = &[StdParam::req("pem", "string")];
+static JWT_SIGN_PARAMS: &[StdParam] = &[
+    StdParam::req("claims", "object"),
+    StdParam::req_untyped("key"),
+    StdParam::opt("opts", "object"),
+];
+static JWT_VERIFY_PARAMS: &[StdParam] = &[
+    StdParam::req("token", "string"),
+    StdParam::req_untyped("key"),
+    StdParam::opt("opts", "object"),
+];
+static JWT_DECODE_PARAMS: &[StdParam] = &[StdParam::req("token", "string")];
+static JWT_JWKS_PARAMS: &[StdParam] = &[
+    StdParam::req("url", "string"),
+    StdParam::opt("opts", "object"),
+];
+// JwksCache handle methods (BATT §5.6, MemberKind::HandleMethod in JWT_MEMBERS).
+// The handle `verify` shares the name (and arity row) of the module `jwt.verify`.
+static JWT_JWKS_KEYS_PARAMS: &[StdParam] = &[];
+static JWT_JWKS_CLOSE_PARAMS: &[StdParam] = &[];
+
+static JWT_SIGS: &[(&str, StdSig)] = &[
+    ("hmacKey", StdSig { params: JWT_HMAC_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed HMAC key for HS256/HS384/HS512." }),
+    ("rsaPublicKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed RSA public key (RS256) from a PEM string, validated at construction." }),
+    ("rsaPrivateKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed RSA private key (RS256) from a PEM string, validated at construction." }),
+    ("ecPublicKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed EC (P-256) public key (ES256) from a PEM string, validated at construction." }),
+    ("ecPrivateKey", StdSig { params: JWT_PEM_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed EC (P-256) private key (ES256) from a PEM string, validated at construction." }),
+    ("sign", StdSig { params: JWT_SIGN_PARAMS, ret: Some("[string, err]"), doc: "Signs claims into a compact JWT with a typed key." }),
+    ("verify", StdSig { params: JWT_VERIFY_PARAMS, ret: Some("[object, err]"), doc: "Verifies a JWT against a typed key, intersecting the header alg with the key kind's algorithm set." }),
+    ("decode", StdSig { params: JWT_DECODE_PARAMS, ret: Some("[object, err]"), doc: "Decodes a JWT WITHOUT verifying its signature (inspection only)." }),
+    ("jwks", StdSig { params: JWT_JWKS_PARAMS, ret: Some("[jwksCache, err]"), doc: "Fetches a JWK Set over the network and returns a cache handle whose verify() resolves a token's kid to the matching key. Async; Net-gated." }),
+    // jwksCache handle methods (BATT §5.6). `verify` shares the name of jwt.verify
+    // (the Fn row above provides its arity); `keys`/`close` get their own rows.
+    ("keys", StdSig { params: JWT_JWKS_KEYS_PARAMS, ret: Some("array<string>"), doc: "Return the kids currently cached by a jwksCache handle." }),
+    ("close", StdSig { params: JWT_JWKS_CLOSE_PARAMS, ret: None, doc: "Drop a jwksCache handle's cached keys." }),
+];
+
+static JWT_MEMBERS: &[(&str, MemberKind)] = &[
+    ("hmacKey", MemberKind::Fn),
+    ("rsaPublicKey", MemberKind::Fn),
+    ("rsaPrivateKey", MemberKind::Fn),
+    ("ecPublicKey", MemberKind::Fn),
+    ("ecPrivateKey", MemberKind::Fn),
+    ("sign", MemberKind::Fn),
+    ("verify", MemberKind::Fn),
+    ("decode", MemberKind::Fn),
+    ("jwks", MemberKind::Fn),
+    // jwksCache handle methods — not module exports.
+    ("verify", MemberKind::HandleMethod),
+    ("keys", MemberKind::HandleMethod),
+    ("close", MemberKind::HandleMethod),
+];
+
+// ── std/oauth (BATT §5.6) ──────────────────────────────────────────────────────
+
+static OAUTH_PKCE_PARAMS: &[StdParam] = &[];
+static OAUTH_EXCHANGE_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static OAUTH_CLIENT_CREDS_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static OAUTH_REFRESH_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static OAUTH_DISCOVER_PARAMS: &[StdParam] = &[StdParam::req("issuer", "string")];
+
+static OAUTH_SIGS: &[(&str, StdSig)] = &[
+    ("pkce", StdSig { params: OAUTH_PKCE_PARAMS, ret: Some("object"), doc: "Generate a PKCE verifier/challenge pair (RFC 7636 S256)." }),
+    ("exchangeCode", StdSig { params: OAUTH_EXCHANGE_PARAMS, ret: Some("[object, err]"), doc: "Exchange an authorization code (with a PKCE code_verifier) for tokens. Async; Net-gated." }),
+    ("clientCredentials", StdSig { params: OAUTH_CLIENT_CREDS_PARAMS, ret: Some("[object, err]"), doc: "Obtain tokens via the client_credentials grant (Basic auth). Async; Net-gated." }),
+    ("refresh", StdSig { params: OAUTH_REFRESH_PARAMS, ret: Some("[object, err]"), doc: "Exchange a refresh token for a fresh access token. Async; Net-gated." }),
+    ("discover", StdSig { params: OAUTH_DISCOVER_PARAMS, ret: Some("[object, err]"), doc: "Fetch an issuer's OpenID Connect discovery metadata (.well-known/openid-configuration). Async; Net-gated." }),
+];
+
+static OAUTH_MEMBERS: &[(&str, MemberKind)] = &[
+    ("pkce", MemberKind::Fn),
+    ("exchangeCode", MemberKind::Fn),
+    ("clientCredentials", MemberKind::Fn),
+    ("refresh", MemberKind::Fn),
+    ("discover", MemberKind::Fn),
+];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Master index (batch 1 + batch 2 + batch 3 — 60 modules total)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2707,6 +2842,8 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/tui", TUI_MEMBERS),
     ("std/ffi", FFI_MEMBERS),
     ("std/resilience", RESIL_MEMBERS),
+    ("std/jwt", JWT_MEMBERS),
+    ("std/oauth", OAUTH_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2779,6 +2916,8 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/tui" => TUI_SIGS,
         "std/ffi" => FFI_SIGS,
         "std/resilience" => RESIL_SIGS,
+        "std/jwt" => JWT_SIGS,
+        "std/oauth" => OAUTH_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -2952,6 +3091,8 @@ mod tests {
             ("std/tui", TUI_SIGS),
             ("std/ffi", FFI_SIGS),
             ("std/resilience", RESIL_SIGS),
+            ("std/jwt", JWT_SIGS),
+            ("std/oauth", OAUTH_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {

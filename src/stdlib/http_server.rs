@@ -113,6 +113,17 @@ const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// usage so a flood of slow clients can't spawn unbounded tasks.
 const DEFAULT_MAX_CONCURRENT: usize = 256;
 
+/// BATT A2 §4.2 — an accepted connection's transport, after any TLS handshake. The
+/// accept loop produces a `Conn` (plain or, post-handshake, TLS) and hands it to the
+/// SAME generic `handle_connection`. The `TlsStream` is boxed (it is large relative to
+/// a `TcpStream`) so a plain `Conn` stays small. Without the `tls` feature only the
+/// `Plain` variant exists (and the match has a single arm).
+enum Conn {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+}
+
 /// Why reading a request failed, so the loop can pick the right status code.
 enum ReadError {
     /// Header block exceeded `MAX_HEADER_BYTES` before the terminator → 431.
@@ -277,6 +288,17 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         // `workers` absent/1 runs setup single-isolate. Distinct from the handle method
         // `s.serve(opts)` (which serves a pre-bound single handle).
         ("serve", bi("http_server.serve")),
+        // BATT A8 §5.7 — signed cookies + sessions. HMAC-SHA256-signed cookie values
+        // (verified constant-time), `Set-Cookie` rendering with a CR/LF header-injection
+        // guard, and a `session(req, secret)` reader. The `auth` feature.
+        #[cfg(feature = "auth")]
+        ("signCookie", bi("http_server.signCookie")),
+        #[cfg(feature = "auth")]
+        ("verifyCookie", bi("http_server.verifyCookie")),
+        #[cfg(feature = "auth")]
+        ("setCookie", bi("http_server.setCookie")),
+        #[cfg(feature = "auth")]
+        ("session", bi("http_server.session")),
     ]
 }
 
@@ -288,12 +310,319 @@ fn obj(map: IndexMap<String, Value>) -> Value {
     Value::object(map)
 }
 
+// ── BATT A8 §5.7 — signed cookies + sessions ──────────────────────────────────
+//
+// Cookie signing is the sibling of `std/jwt`'s HMAC: a value is JSON-serialized,
+// base64url-encoded, and authenticated with HMAC-SHA256 over the encoded payload,
+// then verified in CONSTANT TIME (`hmac`'s `verify_slice`). The scheme:
+//
+//   signed  =  base64url(json(value)) "." base64url(hmac_sha256(secret, payload_b64))
+//
+// Verification splits on the single `.`, recomputes the HMAC over the payload
+// segment, and compares the tags constant-time (never `==` on raw sig bytes); any
+// mismatch / malformed input / wrong secret fails CLOSED to a Tier-1 `[nil, err]`.
+//
+// The `Set-Cookie` RENDERING path (`setCookie`) is a header-injection chokepoint:
+// a CR, LF, or other control byte in a cookie NAME or VALUE is a PROGRAMMER bug
+// (the sibling of the SMTP header-injection guard), so it is a Tier-2 panic — the
+// malformed cookie is never rendered into a response header.
+#[cfg(feature = "auth")]
+mod cookie {
+    use super::{make_error, make_pair, Control, Value, ValueKind};
+    use crate::error::AsError;
+    use crate::span::Span;
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    fn b64url(data: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+    }
+
+    fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s.as_bytes())
+            .map_err(|e| format!("invalid base64url: {e}"))
+    }
+
+    /// Raw HMAC-SHA256 tag of `data` under `secret`.
+    fn hmac_sha256(secret: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key len");
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    /// Constant-time verify of `sig` against the HMAC of `data`. `Ok(())` iff valid.
+    fn hmac_verify(secret: &[u8], data: &[u8], sig: &[u8]) -> Result<(), ()> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key len");
+        mac.update(data);
+        mac.verify_slice(sig).map_err(|_| ())
+    }
+
+    /// Secret as bytes (string → UTF-8, bytes → raw). Tier-2 otherwise.
+    fn secret_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
+        match v.kind() {
+            ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
+            ValueKind::Bytes(b) => Ok(b.borrow().clone()),
+            _ => Err(AsError::at(
+                format!(
+                    "{ctx}: secret must be a string or bytes, got {}",
+                    crate::interp::type_name(v)
+                ),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    fn want_str(v: &Value, span: Span, ctx: &str) -> Result<String, Control> {
+        match v.kind() {
+            ValueKind::Str(s) => Ok(s.to_string()),
+            _ => Err(AsError::at(
+                format!("{ctx}: expected string, got {}", crate::interp::type_name(v)),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// A cookie NAME/VALUE may not contain CR, LF, or other control characters —
+    /// rendering one into a `Set-Cookie` header would enable response-splitting.
+    /// Tier-2 (programmer bug, mirrors the SMTP/header-injection guards).
+    fn guard_crlf(field: &str, s: &str, span: Span) -> Result<(), Control> {
+        if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(AsError::at(
+                format!("cookie {field} may not contain CR/LF or control characters (header-injection guard)"),
+                span,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn json_compact(v: &Value) -> Result<String, String> {
+        let jv = crate::stdlib::json::from_ascript(v, &mut Vec::new())?;
+        serde_json::to_string(&jv).map_err(|e| format!("cannot serialize: {e}"))
+    }
+
+    fn json_parse(bytes: &[u8]) -> Result<Value, String> {
+        let jv: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| format!("invalid json: {e}"))?;
+        Ok(crate::stdlib::json::to_ascript(&jv))
+    }
+
+    /// `server.signCookie(name, value, secret) -> string`. The signed, tamper-evident
+    /// cookie value. `name` is CR/LF-guarded here (it travels with the value into the
+    /// `Set-Cookie` render) but is NOT part of the signature (so `verifyCookie` needs
+    /// only `(signedValue, secret)`).
+    pub(super) fn sign(args: &[Value], span: Span) -> Result<Value, Control> {
+        let name = want_str(args.first().unwrap_or(&Value::nil()), span, "signCookie name")?;
+        guard_crlf("name", &name, span)?;
+        let value = args.get(1).cloned().unwrap_or(Value::nil());
+        let secret = secret_bytes(args.get(2).unwrap_or(&Value::nil()), span, "signCookie")?;
+        let payload_json = match json_compact(&value) {
+            Ok(s) => s,
+            Err(e) => return Err(AsError::at(format!("signCookie: {e}"), span).into()),
+        };
+        let payload_b64 = b64url(payload_json.as_bytes());
+        let sig = hmac_sha256(&secret, payload_b64.as_bytes());
+        let sig_b64 = b64url(&sig);
+        Ok(Value::str(format!("{payload_b64}.{sig_b64}")))
+    }
+
+    /// `server.verifyCookie(signedValue, secret) -> [value, err]`. Fails CLOSED.
+    pub(super) fn verify(args: &[Value], span: Span) -> Result<Value, Control> {
+        let signed = want_str(args.first().unwrap_or(&Value::nil()), span, "verifyCookie signed")?;
+        let secret = secret_bytes(args.get(1).unwrap_or(&Value::nil()), span, "verifyCookie")?;
+        Ok(verify_str(&signed, &secret))
+    }
+
+    /// The shared verify core: `signed` already a string, `secret` bytes. Returns a
+    /// Tier-1 `[value, err]` pair (never a Tier-2 panic — all failures are values).
+    pub(super) fn verify_str(signed: &str, secret: &[u8]) -> Value {
+        let Some((payload_b64, sig_b64)) = signed.split_once('.') else {
+            return err("malformed signed cookie (no '.' separator)");
+        };
+        let sig = match b64url_decode(sig_b64) {
+            Ok(s) => s,
+            Err(_) => return err("malformed signed cookie signature"),
+        };
+        if hmac_verify(secret, payload_b64.as_bytes(), &sig).is_err() {
+            return err("cookie signature verification failed");
+        }
+        let payload = match b64url_decode(payload_b64) {
+            Ok(p) => p,
+            Err(_) => return err("malformed signed cookie payload"),
+        };
+        match json_parse(&payload) {
+            Ok(v) => make_pair(v, Value::nil()),
+            Err(_) => err("malformed signed cookie payload"),
+        }
+    }
+
+    fn err(msg: &str) -> Value {
+        make_pair(Value::nil(), make_error(Value::str(msg.to_string())))
+    }
+
+    /// `server.setCookie(name, value, opts?) -> string`. Renders a `Set-Cookie`
+    /// header value with the §5.7 defaults: `HttpOnly` true, `SameSite=Lax`.
+    /// CR/LF/control bytes in the name or value are a Tier-2 panic.
+    pub(super) fn set(args: &[Value], span: Span) -> Result<Value, Control> {
+        let name = want_str(args.first().unwrap_or(&Value::nil()), span, "setCookie name")?;
+        let value = want_str(args.get(1).unwrap_or(&Value::nil()), span, "setCookie value")?;
+        guard_crlf("name", &name, span)?;
+        guard_crlf("value", &value, span)?;
+
+        let opts = args.get(2).cloned().unwrap_or(Value::nil());
+        let getf = |key: &str| -> Option<Value> {
+            match opts.kind() {
+                ValueKind::Object(o) => o.get(key),
+                _ => None,
+            }
+        };
+        let truthy = |v: &Value| !matches!(v.kind(), ValueKind::Nil | ValueKind::Bool(false));
+
+        let mut out = format!("{name}={value}");
+
+        // Domain / Path are bytes that ride into the header — CR/LF-guard them too.
+        if let Some(d) = getf("domain") {
+            let d = want_str(&d, span, "setCookie domain")?;
+            guard_crlf("domain", &d, span)?;
+            out.push_str(&format!("; Domain={d}"));
+        }
+        if let Some(p) = getf("path") {
+            let p = want_str(&p, span, "setCookie path")?;
+            guard_crlf("path", &p, span)?;
+            out.push_str(&format!("; Path={p}"));
+        }
+        // Max-Age: an int (seconds). `0` is meaningful (expire now) → always rendered.
+        if let Some(m) = getf("maxAge") {
+            match m.kind() {
+                ValueKind::Int(n) => out.push_str(&format!("; Max-Age={n}")),
+                ValueKind::Nil => {}
+                _ => {
+                    return Err(AsError::at(
+                        format!(
+                            "setCookie maxAge: expected int, got {}",
+                            crate::interp::type_name(&m)
+                        ),
+                        span,
+                    )
+                    .into())
+                }
+            }
+        }
+        if getf("secure").as_ref().is_some_and(truthy) {
+            out.push_str("; Secure");
+        }
+        // httpOnly DEFAULTS to true (only an explicit `false` drops it).
+        let http_only = match getf("httpOnly") {
+            Some(v) => truthy(&v),
+            None => true,
+        };
+        if http_only {
+            out.push_str("; HttpOnly");
+        }
+        // sameSite DEFAULTS to "Lax"; must be one of Strict | Lax | None.
+        let same_site = match getf("sameSite") {
+            Some(v) => want_str(&v, span, "setCookie sameSite")?,
+            None => "Lax".to_string(),
+        };
+        match same_site.as_str() {
+            "Strict" | "Lax" | "None" => out.push_str(&format!("; SameSite={same_site}")),
+            other => {
+                return Err(AsError::at(
+                    format!("setCookie sameSite must be one of \"Strict\", \"Lax\", \"None\", got {other:?}"),
+                    span,
+                )
+                .into())
+            }
+        }
+        Ok(Value::str(out))
+    }
+
+    /// `server.session(req, secret) -> [object, err]`. Reads the `session` cookie from
+    /// the request's `Cookie` header and verifies it. An ABSENT cookie → `[{}, nil]`
+    /// (empty session, no error); a present valid cookie → the decoded object; a
+    /// tampered cookie → `[nil, err]`.
+    pub(super) fn session(args: &[Value], span: Span) -> Result<Value, Control> {
+        let req = args.first().cloned().unwrap_or(Value::nil());
+        let secret = secret_bytes(args.get(1).unwrap_or(&Value::nil()), span, "session")?;
+
+        // req.headers.cookie (headers are an Object with lowercase keys).
+        let cookie_header = match req.kind() {
+            ValueKind::Object(o) => match o.get("headers") {
+                Some(h) => match h.kind() {
+                    ValueKind::Object(ho) => match ho.get("cookie") {
+                        Some(c) => match c.kind() {
+                            ValueKind::Str(s) => Some(s.to_string()),
+                            _ => None,
+                        },
+                        None => None,
+                    },
+                    _ => None,
+                },
+                None => None,
+            },
+            _ => {
+                return Err(AsError::at(
+                    format!(
+                        "session: req must be a request object, got {}",
+                        crate::interp::type_name(&req)
+                    ),
+                    span,
+                )
+                .into())
+            }
+        };
+
+        let Some(header) = cookie_header else {
+            // No Cookie header at all → empty session, no error.
+            return Ok(make_pair(Value::object(Default::default()), Value::nil()));
+        };
+        let Some(raw) = find_cookie(&header, "session") else {
+            // Cookie header present but no `session` cookie → empty session.
+            return Ok(make_pair(Value::object(Default::default()), Value::nil()));
+        };
+        Ok(verify_str(&raw, &secret))
+    }
+
+    /// Find the value of cookie `name` in a `Cookie:` header (`a=b; c=d`).
+    fn find_cookie(header: &str, name: &str) -> Option<String> {
+        for pair in header.split(';') {
+            let pair = pair.trim();
+            if let Some((k, v)) = pair.split_once('=') {
+                if k.trim() == name {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
 // ── SRV Part A — multi-isolate REUSEPORT serve helpers ────────────────────────
+
+/// BATT A2 §4.2 — the parsed `serve({tls})` config. All-`String` (PEM bytes + SNI
+/// host/cert/key triples), so it is `Send` and crosses into a worker isolate UNCHANGED
+/// (each isolate builds its OWN `rustls::ServerConfig`/acceptor from these strings — the
+/// `Arc<ServerConfig>` itself is never shipped). The acceptor is built ONCE per accept
+/// loop (in `accept_loop`) from this config; a bad PEM surfaces as a Tier-1 error BEFORE
+/// the loop accepts a single connection.
+#[cfg(feature = "tls")]
+#[derive(Clone)]
+struct TlsServeCfg {
+    cert: String,
+    key: String,
+    /// SNI extras: `(host, cert PEM, key PEM)` per `tls::server_config`'s contract.
+    sni: Vec<(String, String, String)>,
+}
 
 /// Parsed `serve` options, shared by the handle method `s.serve(opts)` and the
 /// module-level `server.serve(opts)`. The per-request limits (`maxBodySize`,
 /// `requestTimeout`, `maxConcurrent`) and `maxRequests` shutdown were always here; SRV
-/// Part A adds the multi-isolate fields (`workers`/`setup`/`args`/`host`/`port`).
+/// Part A adds the multi-isolate fields (`workers`/`setup`/`args`/`host`/`port`); BATT
+/// A2 adds `tls`.
 struct ServeOpts {
     max_requests: Option<usize>,
     max_body: usize,
@@ -312,12 +641,21 @@ struct ServeOpts {
     /// tasks are `.abort()`ed and the aborted count is `warn`-logged. `None` = wait
     /// indefinitely for in-flight requests to complete.
     drain_timeout_ms: Option<u64>,
+    /// BATT A2 §4.2 — TLS termination config (PEM strings + optional SNI). `None` =
+    /// plain HTTP (the existing byte-identical path). `Some` builds a TLS acceptor once
+    /// per accept loop; the strings are `Send` so they cross into worker isolates.
+    #[cfg(feature = "tls")]
+    tls: Option<TlsServeCfg>,
 }
 
 impl ServeOpts {
     /// Parse the (optional) opts object — the first positional arg. Numbers may be
-    /// `Int` or `Float` (NUM §4); a missing/non-object arg yields all defaults.
-    fn parse(args: &[Value]) -> ServeOpts {
+    /// `Int` or `Float` (NUM §4); a missing/non-object arg yields all defaults. The
+    /// numeric/string opts are coerced leniently (a wrong-typed value is ignored, the
+    /// established parser convention); the `tls` opt (BATT A2) is the ONE exception —
+    /// a present-but-wrong-shape `tls` (non-object, or a non-string `cert`/`key`) is a
+    /// Tier-2 panic (`span`), consistent with "argument-type misuse is a Tier-2 panic".
+    fn parse(args: &[Value], span: Span) -> Result<ServeOpts, Control> {
         let mut o = ServeOpts {
             max_requests: None,
             max_body: DEFAULT_MAX_BODY_BYTES,
@@ -330,6 +668,8 @@ impl ServeOpts {
             port: None,
             on_shutdown: None,
             drain_timeout_ms: None,
+            #[cfg(feature = "tls")]
+            tls: None,
         };
         if let ValueKind::Object(obj) = arg(args, 0).kind() {
             if let Some(n) = obj.get("maxRequests").and_then(|v| v.as_f64()) {
@@ -384,8 +724,17 @@ impl ServeOpts {
                     o.drain_timeout_ms = Some(n as u64);
                 }
             }
+            // BATT A2 §4.2 — `tls: { cert, key, sni? }`. PEM strings only (caps honesty);
+            // the acceptor is built later (once, in `accept_loop`). A wrong-shaped `tls`
+            // is a Tier-2 panic (a present misuse must be loud, not silently plain-HTTP).
+            #[cfg(feature = "tls")]
+            if let Some(tls_val) = obj.get("tls") {
+                if !matches!(tls_val.kind(), ValueKind::Nil) {
+                    o.tls = Some(parse_tls_cfg(&tls_val, span)?);
+                }
+            }
         }
-        o
+        Ok(o)
     }
 
     /// The effective isolate count: `workers: 0` resolves to `num_cpus`, any `N>=1`
@@ -401,6 +750,92 @@ impl ServeOpts {
 /// server tier and the pool agree (CNTR §8.1).
 fn num_cpus_for_serve() -> usize {
     crate::worker::pool::effective_parallelism()
+}
+
+/// BATT A2 §4.2 — convert a `serve` opt `tls` value into a `TlsServeCfg`. Shape:
+/// `{ cert: string, key: string, sni?: [{ host, cert, key }] }`. `cert`/`key` are
+/// REQUIRED strings; `sni` (optional) is an array of `{host,cert,key}` string objects.
+/// A wrong shape (non-object `tls`, missing/non-string `cert`/`key`, a non-array `sni`,
+/// or a malformed SNI entry) is a Tier-2 panic — a present-but-broken `tls` must fail
+/// loudly, never silently degrade to plain HTTP. The PEM *content* is NOT validated here
+/// (that is `tls::server_config`'s job → a Tier-1 error built once in `accept_loop`).
+#[cfg(feature = "tls")]
+fn parse_tls_cfg(tls_val: &Value, span: Span) -> Result<TlsServeCfg, Control> {
+    // A required string field on a `tls`/`sni` object: missing → loud "required"; wrong
+    // type → `want_string`'s "expects a string" Tier-2. `field` reads under a short
+    // borrow (the `Cc<ObjectCell>::get` returns an owned `Value`).
+    fn want_field(
+        v: &Value,
+        key: &str,
+        ctx: &str,
+        span: Span,
+    ) -> Result<String, Control> {
+        let field = match v.kind() {
+            ValueKind::Object(o) => o.get(key),
+            _ => None,
+        };
+        match field {
+            Some(fv) => Ok(want_string(&fv, span, &format!("server.serve `{ctx}{key}`"))?.to_string()),
+            None => Err(AsError::at(
+                format!("server.serve: `{ctx}{key}` is required (a PEM string)"),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    if !matches!(tls_val.kind(), ValueKind::Object(_)) {
+        return Err(AsError::at(
+            format!(
+                "server.serve: `tls` must be an object {{cert, key, sni?}}, got {}",
+                crate::interp::type_name(tls_val)
+            ),
+            span,
+        )
+        .into());
+    }
+    let cert = want_field(tls_val, "cert", "tls.", span)?;
+    let key = want_field(tls_val, "key", "tls.", span)?;
+
+    let mut sni: Vec<(String, String, String)> = Vec::new();
+    let sni_val = match tls_val.kind() {
+        ValueKind::Object(o) => o.get("sni"),
+        _ => None,
+    };
+    if let Some(sni_val) = sni_val {
+        if !matches!(sni_val.kind(), ValueKind::Nil) {
+            let sni_type = crate::interp::type_name(&sni_val);
+            let entries: Vec<Value> = match sni_val.into_kind() {
+                OwnedKind::Array(a) => a.borrow().clone(),
+                _ => {
+                    return Err(AsError::at(
+                        format!(
+                            "server.serve: `tls.sni` must be an array of {{host, cert, key}}, got {sni_type}"
+                        ),
+                        span,
+                    )
+                    .into())
+                }
+            };
+            for item in &entries {
+                if !matches!(item.kind(), ValueKind::Object(_)) {
+                    return Err(AsError::at(
+                        format!(
+                            "server.serve: each `tls.sni` entry must be an object {{host, cert, key}}, got {}",
+                            crate::interp::type_name(item)
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+                let host = want_field(item, "host", "tls.sni.", span)?;
+                let c = want_field(item, "cert", "tls.sni.", span)?;
+                let k = want_field(item, "key", "tls.sni.", span)?;
+                sni.push((host, c, k));
+            }
+        }
+    }
+    Ok(TlsServeCfg { cert, key, sni })
 }
 
 /// Whether SO_REUSEPORT (kernel connection load-balancing across N sockets bound to
@@ -491,6 +926,10 @@ async fn run_isolate_server(
     max_body: usize,
     timeout_ms: u64,
     max_concurrent: usize,
+    // BATT A2 §4.2 — the TLS config as `Send` PEM strings (NOT an `Arc<ServerConfig>`):
+    // each isolate builds its OWN acceptor inside its own `accept_loop` from these
+    // strings. `None` = plain HTTP. Always-present param (the cfg-gate is on the type).
+    #[cfg(feature = "tls")] tls: Option<TlsServeCfg>,
 ) -> Result<(), String> {
     // Define the setup slice's globals on this isolate's Vm (entry + transitive deps).
     crate::worker::isolate::load_slice(vm, Some(slice_bytes)).await?;
@@ -523,8 +962,19 @@ async fn run_isolate_server(
     // the fused stop/drain signal that reaches every isolate.
     match iso
         .accept_loop(
-            listener, id, max_body, timeout_ms, max_concurrent, budget, shutdown, bounded, None,
-            drain_timeout_ms, span,
+            listener,
+            id,
+            max_body,
+            timeout_ms,
+            max_concurrent,
+            budget,
+            shutdown,
+            bounded,
+            None,
+            drain_timeout_ms,
+            #[cfg(feature = "tls")]
+            tls,
+            span,
         )
         .await
     {
@@ -546,10 +996,15 @@ struct RawRequest {
 /// Read and parse a single HTTP/1 request from `stream`. Returns `Ok(None)` on a
 /// clean EOF before any bytes (client closed), or a `ReadError` (→ 4xx) on a
 /// limit violation / malformed request. `max_body` caps the body size (413).
-async fn read_request(
-    stream: &mut TcpStream,
+async fn read_request<S>(
+    stream: &mut S,
     max_body: usize,
-) -> Result<Option<RawRequest>, ReadError> {
+) -> Result<Option<RawRequest>, ReadError>
+where
+    // BATT A2 §4.2 — generic over the transport (plain `TcpStream` or a TLS stream); the
+    // framing logic only needs `AsyncRead` (+ `Unpin` for `.read()` on `&mut`).
+    S: tokio::io::AsyncRead + Unpin,
+{
     // Read until we have the full header block (terminated by CRLF CRLF), bounding
     // the buffer at MAX_HEADER_BYTES so a client that never sends the terminator
     // can't exhaust memory.
@@ -1066,7 +1521,7 @@ impl Interp {
             // builds every isolate's handle via `setup`: `workers > 1` fans out across N
             // REUSEPORT isolates; `workers` absent/<=1 runs `setup` single-isolate.
             "serve" => {
-                let opts = ServeOpts::parse(args);
+                let opts = ServeOpts::parse(args, span)?;
                 let n = opts.effective_workers().unwrap_or(1);
                 if n > 1 {
                     // Module-level `server.serve` has no pre-bound handle → no external
@@ -1076,6 +1531,8 @@ impl Interp {
                 } else {
                     // Single-isolate, but still `setup`-driven (no pre-bound handle on the
                     // module path) — reuse the fallback, which runs setup on this interp.
+                    #[cfg(feature = "tls")]
+                    let tls = opts.tls.clone();
                     let ServeOpts {
                         setup_fn,
                         setup_args,
@@ -1100,11 +1557,24 @@ impl Interp {
                         max_concurrent,
                         on_shutdown,
                         drain_timeout_ms,
+                        #[cfg(feature = "tls")]
+                        tls,
                         span,
                     )
                     .await
                 }
             }
+            // BATT A8 §5.7 — signed cookies + sessions (the `auth` feature). Pure,
+            // synchronous value transforms (no I/O), so they route straight to the
+            // `cookie` helper module.
+            #[cfg(feature = "auth")]
+            "signCookie" => cookie::sign(args, span),
+            #[cfg(feature = "auth")]
+            "verifyCookie" => cookie::verify(args, span),
+            #[cfg(feature = "auth")]
+            "setCookie" => cookie::set(args, span),
+            #[cfg(feature = "auth")]
+            "session" => cookie::session(args, span),
             // Internal terminal "handler" used when no route matched: returns a 404.
             // (Runs after any middleware, so middleware still sees unmatched requests.)
             "__not_found" => Ok(Value::object({
@@ -1301,7 +1771,7 @@ impl Interp {
         args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
-        let opts = ServeOpts::parse(args);
+        let opts = ServeOpts::parse(args, span)?;
 
         // SRV Part A — multi-isolate: when `workers > 1` (0 = num_cpus) the request is
         // fanned out across N shared-nothing REUSEPORT isolates, each building its OWN
@@ -1326,6 +1796,8 @@ impl Interp {
             max_concurrent,
             on_shutdown,
             drain_timeout_ms,
+            #[cfg(feature = "tls")]
+            tls,
             ..
         } = opts;
 
@@ -1372,6 +1844,8 @@ impl Interp {
             bounded,
             on_shutdown,
             drain_timeout_ms,
+            #[cfg(feature = "tls")]
+            tls,
             span,
         )
         .await
@@ -1404,8 +1878,22 @@ impl Interp {
         bounded: bool,
         on_shutdown: Option<Value>,
         drain_timeout_ms: Option<u64>,
+        #[cfg(feature = "tls")] tls: Option<TlsServeCfg>,
         span: Span,
     ) -> Result<Value, Control> {
+        // BATT A2 §4.2 — build the TLS acceptor ONCE, up front, BEFORE the accept loop.
+        // A malformed cert/key PEM surfaces here as a Tier-1 `[nil, err]` BEFORE a single
+        // connection is accepted (test b). The `Arc<ServerConfig>` is shared by every
+        // handshake on THIS loop (one config, many connections); the multi-isolate path
+        // ships PEM strings (not this `Arc`) so each isolate builds its own acceptor.
+        #[cfg(feature = "tls")]
+        let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = match &tls {
+            Some(cfg) => match crate::stdlib::tls::server_config(&cfg.cert, &cfg.key, &cfg.sni) {
+                Ok(server_cfg) => Some(tokio_rustls::TlsAcceptor::from(server_cfg)),
+                Err(e) => return Ok(err_pair(format!("server.serve: {e}"))),
+            },
+            None => None,
+        };
         // CNTR §7 — the budget-exhaustion `stop` Notify is FUSED with the handle's
         // graceful-drain Notify: there is now ONE signal (`shutdown.notify`) that wakes
         // a parked `accept()`, fired by BOTH `srv.shutdown()` AND the budget-exhaustion
@@ -1487,6 +1975,37 @@ impl Interp {
                 // armed) — drain + return.
                 None => break,
             };
+            // BATT A2 §4.2 — TLS handshake (inline, BEFORE the budget claim). A handshake
+            // is driven HERE rather than in the spawned task so that a FAILED handshake
+            // (a plain-HTTP/garbage probe, a wrong client) counts NOTHING toward the
+            // `maxRequests` budget — it is a `continue` that never claims, permits, or
+            // spawns (test c). The handshake is bounded by `requestTimeout` so a stalled
+            // handshake cannot wedge the accept loop (a slowloris-at-handshake bound; the
+            // documented v1 trade-off is that TLS handshakes are serialized on the accept
+            // loop). On success the connection becomes a `Conn::Tls` carrying the
+            // negotiated stream; a plain server makes a `Conn::Plain`. (`Conn` is a thin
+            // transport enum so the rest of the loop — claim/permit/spawn — is shared.)
+            #[cfg(feature = "tls")]
+            let conn: Conn = if let Some(acceptor) = &tls_acceptor {
+                let handshake = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    acceptor.accept(stream),
+                )
+                .await;
+                match handshake {
+                    Ok(Ok(tls_stream)) => Conn::Tls(Box::new(tls_stream)),
+                    // Handshake failed (not a TLS client / bad cert / protocol error) OR
+                    // timed out: log + continue. Counts NOTHING (no claim/permit/spawn).
+                    Ok(Err(_)) | Err(_) => {
+                        self.log_tls_handshake_error().await;
+                        continue;
+                    }
+                }
+            } else {
+                Conn::Plain(stream)
+            };
+            #[cfg(not(feature = "tls"))]
+            let conn: Conn = Conn::Plain(stream);
             // We have a connection in hand — now CLAIM one unit of the shared budget.
             // The claim is the source of truth for "exactly `maxRequests` total" (a
             // saturating `fetch_update`: an exhausted budget stays at 0, never wraps).
@@ -1506,8 +2025,8 @@ impl Interp {
                     .is_ok();
                 if !claimed {
                     // A sibling claimed the last unit first; release this connection
-                    // and stop. (`stream` drops here → the socket closes.)
-                    drop(stream);
+                    // and stop. (`conn` drops here → the socket closes.)
+                    drop(conn);
                     stop.notify_waiters();
                     break;
                 }
@@ -1527,6 +2046,12 @@ impl Interp {
             // genuine internal `Control` is swallowed there too) so a task can't
             // abort the process or the accept loop. The permit is moved in and held
             // for the task's whole lifetime, then dropped (released) on completion.
+            //
+            // BATT A2 §4.2: a TLS handshake already succeeded inline (the `conn` is a
+            // `Conn::Tls` carrying the negotiated `TlsStream`); a plain server carries a
+            // `Conn::Plain(TcpStream)`. Both flow into the SAME generic `handle_connection`
+            // (hyper-free hand-rolled HTTP/1 over any `AsyncRead+AsyncWrite+Unpin`) — the
+            // per-request limits + dispatch are byte-identical regardless of transport.
             let handle = tokio::task::spawn_local(async move {
                 let _permit = permit;
                 // RESIL §5.1/§6.4: each connection task gets a FRESH `ambient_root_scope`
@@ -1536,10 +2061,21 @@ impl Interp {
                 // its OWN deadline local in-server; without the scope `call_deadline`'s
                 // `try_with` errs and the deadline silently no-ops. Also gives top-level
                 // telemetry spans in a handler a root scope.
-                crate::interp::ambient_root_scope(vm.handle_connection(
-                    id, stream, max_body, timeout_ms, span,
-                ))
-                .await;
+                match conn {
+                    Conn::Plain(stream) => {
+                        crate::interp::ambient_root_scope(vm.handle_connection(
+                            id, stream, max_body, timeout_ms, span,
+                        ))
+                        .await;
+                    }
+                    #[cfg(feature = "tls")]
+                    Conn::Tls(stream) => {
+                        crate::interp::ambient_root_scope(vm.handle_connection(
+                            id, *stream, max_body, timeout_ms, span,
+                        ))
+                        .await;
+                    }
+                }
             });
             // CNTR §7: ALWAYS retain the handle so the graceful-drain path can await
             // this in-flight handler before `serve` returns (finished handles are reaped
@@ -1692,6 +2228,10 @@ impl Interp {
             drain_timeout_ms,
             ..
         } = opts;
+        // BATT A2 §4.2 — the TLS config (PEM strings) is `Send`; each isolate clones it
+        // and builds its OWN acceptor (the `Arc<ServerConfig>` is never shipped).
+        #[cfg(feature = "tls")]
+        let tls = opts.tls.clone();
         let host = host.as_str();
         // Platform gate (SRV §2.2): SO_REUSEPORT is Unix-only. On Windows / any platform
         // without it, fall back to the single-isolate path + a one-time warn — honest
@@ -1710,6 +2250,8 @@ impl Interp {
                     max_concurrent,
                     on_shutdown.clone(),
                     drain_timeout_ms,
+                    #[cfg(feature = "tls")]
+                    tls,
                     span,
                 )
                 .await;
@@ -1830,6 +2372,11 @@ impl Interp {
             let shutdown_iso = shutdown.clone();
             let done_tx = done_tx.clone();
             let caps = self.caps();
+            // BATT A2 §4.2 — clone the `Send` PEM strings into THIS isolate's closure; it
+            // builds its OWN acceptor inside `run_isolate_server`'s `accept_loop` (no
+            // `Arc<ServerConfig>` crosses the airlock).
+            #[cfg(feature = "tls")]
+            let tls_iso = tls.clone();
 
             let spawned = crate::worker::isolate::spawn_isolate(move |vm, _inbound| async move {
                 // Inside the fresh, shared-nothing isolate (its own thread + Interp/Vm).
@@ -1854,6 +2401,8 @@ impl Interp {
                     max_body,
                     timeout_ms,
                     max_concurrent,
+                    #[cfg(feature = "tls")]
+                    tls_iso,
                 )
                 .await;
                 let _ = done_tx.send(result);
@@ -1939,6 +2488,7 @@ impl Interp {
         max_concurrent: usize,
         on_shutdown: Option<Value>,
         drain_timeout_ms: Option<u64>,
+        #[cfg(feature = "tls")] tls: Option<TlsServeCfg>,
         span: Span,
     ) -> Result<Value, Control> {
         // If a `setup` was supplied, run it on THIS interp to build the server handle
@@ -1980,8 +2530,19 @@ impl Interp {
         let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
         let bounded = max_requests.is_some();
         self.accept_loop(
-            listener, id, max_body, timeout_ms, max_concurrent, budget, shutdown, bounded,
-            on_shutdown, drain_timeout_ms, span,
+            listener,
+            id,
+            max_body,
+            timeout_ms,
+            max_concurrent,
+            budget,
+            shutdown,
+            bounded,
+            on_shutdown,
+            drain_timeout_ms,
+            #[cfg(feature = "tls")]
+            tls,
+            span,
         )
         .await
     }
@@ -2043,19 +2604,46 @@ impl Interp {
         }
     }
 
+    /// BATT A2 §4.2 — a TLS handshake failed (a non-TLS / garbage probe, a wrong client,
+    /// or a handshake that timed out). The accept loop `continue`s (the connection counts
+    /// NOTHING toward `maxRequests`); this records the event at `debug` level (a failed
+    /// handshake is expected background noise — port scanners, health checks, plain-HTTP
+    /// probes — so it must NOT spam `warn`/`error`). Routed through `std/log` when the
+    /// `log` feature is on (capture buffer in tests / stderr live), else a no-op (a
+    /// handshake failure is not worth an unconditional stderr line).
+    #[cfg(feature = "tls")]
+    async fn log_tls_handshake_error(&self) {
+        #[cfg(feature = "log")]
+        {
+            let _ = self
+                .call_log(
+                    "debug",
+                    &[Value::str("TLS handshake failed; connection dropped")],
+                    Span::new(0, 0),
+                )
+                .await;
+        }
+    }
+
     /// Handle one accepted connection end-to-end on a spawned task: read the request
     /// (bounded by `timeout_ms`/`max_body`), dispatch it through the interpreter
     /// (handler panics/propagation → 500), then write + close. Never panics out of
     /// the task: a genuine internal `Control` escaping dispatch is swallowed (logged
     /// as a 500) so one connection can't take down the accept loop or the process.
-    async fn handle_connection(
+    async fn handle_connection<S>(
         &self,
         id: u64,
-        mut stream: TcpStream,
+        mut stream: S,
         max_body: usize,
         timeout_ms: u64,
         span: Span,
-    ) {
+    ) where
+        // BATT A2 §4.2 — generic over the transport so the SAME hand-rolled HTTP/1
+        // read/dispatch/write path serves both a plain `TcpStream` and a
+        // `tokio_rustls::server::TlsStream<TcpStream>`. Both implement
+        // `AsyncRead + AsyncWrite + Unpin`; nothing in the body is TCP-specific.
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         // The whole request read is bounded by `requestTimeout` so a slow/stalled
         // client can't hang this connection's task — on expiry we answer 408.
         let read = tokio::time::timeout(
@@ -2433,17 +3021,28 @@ mod tests {
 
     /// Build a fresh interpreter as an `Rc` with its self-reference installed (so
     /// `serve`'s per-connection `self.rc()` / `spawn_local` works — see M17).
-    fn new_interp() -> Rc<Interp> {
+    pub(super) fn new_interp() -> Rc<Interp> {
         let interp = Rc::new(Interp::new());
         interp.install_self();
         interp
+    }
+
+    /// Run a program inline (capture mode) and return its captured `print` output. Used
+    /// by the TLS tests to assert a Tier-1 `serve` error message without a client (BATT
+    /// A2 test b). Reuses `run_on`'s LocalSet drive; `interp` is capture-mode by default.
+    #[cfg(feature = "tls")]
+    pub(super) async fn run_capture(interp: &Rc<Interp>, src: &str) -> String {
+        run_on(interp, src)
+            .await
+            .unwrap_or_else(|e| panic!("server: {e}"));
+        interp.output()
     }
 
     /// Run an AScript program on a caller-held interp (so we can drive `serve` and
     /// inspect output) INSIDE a `LocalSet`, the shape `run_file`/`run_source` use:
     /// the server's per-connection handler tasks are `spawn_local`'d, which requires
     /// an active `LocalSet`; we `run_until` the program then drain remaining tasks.
-    async fn run_on(interp: &Rc<Interp>, src: &str) -> Result<(), String> {
+    pub(super) async fn run_on(interp: &Rc<Interp>, src: &str) -> Result<(), String> {
         let tokens = crate::lexer::lex(src).map_err(|e| e.message)?;
         let program = crate::parser::parse(&tokens).map_err(|e| e.message)?;
         let env = crate::interp::global_env().child();
@@ -2461,7 +3060,7 @@ mod tests {
 
     /// Reserve an ephemeral port (bind+drop) so the AScript server can bind it and
     /// a raw client can retry-connect until it's up.
-    async fn reserve_port() -> u16 {
+    pub(super) async fn reserve_port() -> u16 {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap().port()
     }
@@ -2470,7 +3069,7 @@ mod tests {
     /// `!Send` so it can't be spawned), while `client` runs in a spawned task and
     /// hits the server. The server `src` should `serve` with a `maxRequests` so it
     /// returns once the client's request(s) are handled.
-    async fn with_server<F, Fut, T>(src: &str, client: F) -> T
+    pub(super) async fn with_server<F, Fut, T>(src: &str, client: F) -> T
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T> + Send + 'static,
@@ -4281,5 +4880,478 @@ await s.serve({{ maxRequests: 1 }})
             "identical duplicate Content-Length should be accepted:\n{resp}"
         );
         assert!(resp.ends_with("got:hello"), "body wrong:\n{resp}");
+    }
+    // ── BATT A8 §5.7 — signed cookies + sessions ──────────────────────────────
+
+    /// Run a small program and return its captured `print` output (one line per
+    /// `print`). Shared by the cookie/session unit tests.
+    #[cfg(feature = "auth")]
+    async fn cookie_capture(src: &str) -> String {
+        let interp = new_interp();
+        run_on(&interp, src)
+            .await
+            .unwrap_or_else(|e| panic!("program: {e}"));
+        interp.output()
+    }
+
+    /// (a) sign → verify roundtrip yields the original value with no error.
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn cookie_sign_verify_roundtrip() {
+        let out = cookie_capture(
+            r#"
+import * as server from "std/http/server"
+let signed = server.signCookie("sid", "alice-42", "s3cret")
+print(signed != "alice-42")
+let [value, err] = server.verifyCookie(signed, "s3cret")
+print(value)
+print(err)
+"#,
+        )
+        .await;
+        assert_eq!(out, "true\nalice-42\nnil\n");
+    }
+
+    /// sign → verify roundtrip of a non-string value (object) survives JSON.
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn cookie_sign_verify_object_roundtrip() {
+        let out = cookie_capture(
+            r#"
+import * as server from "std/http/server"
+let signed = server.signCookie("sess", { user: "ada", admin: true, n: 7 }, "k")
+let [value, err] = server.verifyCookie(signed, "k")
+print(err)
+print(value.user)
+print(value.admin)
+print(value.n)
+"#,
+        )
+        .await;
+        assert_eq!(out, "nil\nada\ntrue\n7\n");
+    }
+
+    /// (b) a tampered VALUE or a tampered SIG or a wrong SECRET fails closed → [nil, err].
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn cookie_verify_fails_closed() {
+        let out = cookie_capture(
+            r#"
+import * as server from "std/http/server"
+import * as string from "std/string"
+let signed = server.signCookie("sid", "alice", "secret")
+let parts = string.split(signed, ".")
+// tamper the payload (first segment): flip its first char's case-ish by re-signing nothing
+let tamperedPayload = "AAAA." + parts[1]
+let [v1, e1] = server.verifyCookie(tamperedPayload, "secret")
+print(v1)
+print(e1 != nil)
+// tamper the signature (second segment)
+let tamperedSig = parts[0] + ".AAAA"
+let [v2, e2] = server.verifyCookie(tamperedSig, "secret")
+print(v2)
+print(e2 != nil)
+// wrong secret entirely
+let [v3, e3] = server.verifyCookie(signed, "WRONG")
+print(v3)
+print(e3 != nil)
+// malformed (no dot)
+let [v4, e4] = server.verifyCookie("nodot", "secret")
+print(v4)
+print(e4 != nil)
+"#,
+        )
+        .await;
+        assert_eq!(out, "nil\ntrue\nnil\ntrue\nnil\ntrue\nnil\ntrue\n");
+    }
+
+    /// (c) a CR/LF or control char in a cookie NAME or VALUE for the rendering path
+    /// (`setCookie`) is a Tier-2 panic (header-injection guard). Loop several inputs.
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn set_cookie_crlf_injection_is_tier2() {
+        // Each of these must raise the Tier-2 CR/LF panic when rendered.
+        let bad_name = ["a\rb", "a\nb", "a\r\nb", "x\u{0000}y", "tab\there"];
+        for n in bad_name {
+            let interp = new_interp();
+            let src = format!(
+                r#"
+import * as server from "std/http/server"
+let c = server.setCookie({:?}, "ok", {{}})
+print(c)
+"#,
+                n
+            );
+            let r = run_on(&interp, &src).await;
+            assert!(
+                r.is_err(),
+                "cookie NAME {:?} must be a Tier-2 panic (CR/LF/control guard), got Ok",
+                n
+            );
+            let msg = format!("{:?}", r.unwrap_err());
+            assert!(
+                msg.contains("CR/LF") || msg.contains("CR or LF") || msg.contains("control"),
+                "panic for name {:?} must mention the CR/LF/control guard, got: {}",
+                n,
+                msg
+            );
+        }
+        let bad_value = ["v\r1", "v\n1", "v\r\n1", "v\u{0000}1"];
+        for v in bad_value {
+            let interp = new_interp();
+            let src = format!(
+                r#"
+import * as server from "std/http/server"
+let c = server.setCookie("name", {:?}, {{}})
+print(c)
+"#,
+                v
+            );
+            let r = run_on(&interp, &src).await;
+            assert!(
+                r.is_err(),
+                "cookie VALUE {:?} must be a Tier-2 panic (CR/LF/control guard), got Ok",
+                v
+            );
+        }
+    }
+
+    /// (d) attribute rendering matrix with the §5.7 DEFAULTS.
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn set_cookie_attribute_matrix() {
+        let out = cookie_capture(
+            r#"
+import * as server from "std/http/server"
+// defaults: httpOnly true, sameSite "Lax", secure absent
+print(server.setCookie("sid", "abc", {}))
+// secure on, httpOnly off, path + maxAge
+print(server.setCookie("sid", "abc", { httpOnly: false, secure: true, path: "/", maxAge: 3600 }))
+// maxAge 0 edge (must render Max-Age=0, not be dropped)
+print(server.setCookie("t", "x", { maxAge: 0 }))
+// sameSite None + domain
+print(server.setCookie("c", "v", { sameSite: "None", secure: true, domain: "example.com" }))
+// sameSite Strict
+print(server.setCookie("c", "v", { sameSite: "Strict" }))
+"#,
+        )
+        .await;
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0], "sid=abc; HttpOnly; SameSite=Lax",
+            "default render"
+        );
+        assert_eq!(
+            lines[1], "sid=abc; Path=/; Max-Age=3600; Secure; SameSite=Lax",
+            "secure+path+maxAge, httpOnly off"
+        );
+        assert_eq!(lines[2], "t=x; Max-Age=0; HttpOnly; SameSite=Lax", "maxAge 0 edge");
+        assert_eq!(
+            lines[3], "c=v; Domain=example.com; Secure; HttpOnly; SameSite=None",
+            "sameSite None + domain (httpOnly defaults true)"
+        );
+        assert_eq!(lines[4], "c=v; HttpOnly; SameSite=Strict", "sameSite Strict");
+    }
+
+    /// setCookie with an invalid sameSite is a Tier-2 panic.
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn set_cookie_bad_samesite_is_tier2() {
+        let interp = new_interp();
+        let r = run_on(
+            &interp,
+            r#"
+import * as server from "std/http/server"
+print(server.setCookie("c", "v", { sameSite: "Bogus" }))
+"#,
+        )
+        .await;
+        assert!(r.is_err(), "invalid sameSite must be Tier-2");
+    }
+
+    /// (e) session() on an ABSENT cookie → [{}, nil]; on a present valid signed
+    /// session cookie → the decoded object; tampered → [nil, err].
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn session_absent_present_tampered() {
+        let out = cookie_capture(
+            r#"
+import * as server from "std/http/server"
+// absent: no cookie header at all
+let reqNone = { headers: {} }
+let [s0, e0] = server.session(reqNone, "secret")
+print(len(s0))     // empty session object
+print(e0)          // nil
+
+// present + valid
+let signed = server.signCookie("session", { user: "bob" }, "secret")
+let reqOk = { headers: { cookie: "session=" + signed } }
+let [s1, e1] = server.session(reqOk, "secret")
+print(e1)
+print(s1.user)
+
+// present alongside other cookies
+let reqMulti = { headers: { cookie: "foo=bar; session=" + signed + "; x=y" } }
+let [s2, e2] = server.session(reqMulti, "secret")
+print(e2)
+print(s2.user)
+
+// tampered
+let reqBad = { headers: { cookie: "session=" + signed + "TAMPER" } }
+let [s3, e3] = server.session(reqBad, "secret")
+print(s3)
+print(e3 != nil)
+"#,
+        )
+        .await;
+        assert_eq!(out, "0\nnil\nnil\nbob\nnil\nbob\nnil\ntrue\n");
+    }
+
+    /// (f) a real loopback request cycle: request 1 logs in and the server sets a
+    /// signed session cookie; the client echoes it back on request 2 and the server
+    /// reads it via `server.session`.
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn session_full_request_cycle() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as server from "std/http/server"
+let s = create()
+const SECRET = "top-secret-key"
+s.route("POST", "/login", (req) => {{
+  let signed = server.signCookie("session", {{ user: "carol" }}, SECRET)
+  return {{
+    status: 200,
+    headers: {{ "set-cookie": server.setCookie("session", signed, {{ path: "/" }}) }},
+    body: "logged-in"
+  }}
+}})
+s.route("GET", "/me", (req) => {{
+  let [sess, err] = server.session(req, SECRET)
+  if (err != nil) {{ return {{ status: 401, body: "bad session" }} }}
+  if (sess.user == nil) {{ return {{ status: 401, body: "no session" }} }}
+  return "hello " + sess.user
+}})
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 2 }})
+"#
+        );
+        let login_url = format!("http://127.0.0.1:{port}/login");
+        let me_hostport = format!("127.0.0.1:{port}");
+        let body = with_server(&src, move || async move {
+            // request 1: login, capture the Set-Cookie
+            let (status1, full1) =
+                client_request_raw("POST", &login_url, Some(String::new())).await;
+            assert!(status1.contains("200"), "login status: {status1}");
+            // pull the signed cookie out of the Set-Cookie header
+            let set_cookie_line = full1
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+                .expect("a Set-Cookie response header");
+            // Set-Cookie: session=<value>; Path=/; HttpOnly; SameSite=Lax
+            let cookie_pair = set_cookie_line
+                .split_once(':')
+                .unwrap()
+                .1
+                .trim()
+                .split(';')
+                .next()
+                .unwrap()
+                .trim()
+                .to_string();
+            // request 2: echo the cookie back
+            let raw = format!(
+                "GET /me HTTP/1.1\r\nHost: {me_hostport}\r\nCookie: {cookie_pair}\r\nConnection: close\r\n\r\n"
+            );
+            let full2 = send_raw(me_hostport.clone(), raw).await;
+            let (_head, b) = full2.split_once("\r\n\r\n").unwrap_or((&full2, ""));
+            b.to_string()
+        })
+        .await;
+        assert_eq!(body, "hello carol");
+    }
+}
+
+// ── BATT A2 — `server.serve({tls})` TLS termination tests ─────────────────────
+//
+// These drive the SINGLE-isolate `server.serve({tls})` path end-to-end: a real
+// AScript server program runs INLINE on the test runtime (the interp is `!Send`),
+// terminates TLS with the baked self-signed cert/key (`testdata/tls_test_{cert,key}.pem`,
+// CN/SAN `localhost`), and a reqwest client in a spawned task — built with the test
+// cert as a trusted CA (NO `danger_accept_invalid_certs`) — performs a real HTTPS
+// handshake against it. Covers: (a) happy 200 round-trip; (b) malformed PEM → Tier-1
+// `[nil, err]` BEFORE accepting; (c) a plain-HTTP / garbage-bytes probe fails the
+// handshake and the server KEEPS serving (handshake error → continue, counts nothing);
+// (d) the `sni` Vec parses + serves. The multi-isolate `workers: 2` + tls case is a
+// spawned-binary integration test in `tests/server_multicore.rs` (it needs the real
+// worker-source / spawn_isolate path, which the in-process harness here cannot set up).
+#[cfg(all(test, feature = "tls"))]
+mod tls_serve_tests {
+    use super::tests::*;
+
+    const CERT: &str = include_str!("testdata/tls_test_cert.pem");
+    const KEY: &str = include_str!("testdata/tls_test_key.pem");
+
+    /// Build a reqwest client that trusts ONLY the baked test cert as a root CA and
+    /// pins `localhost` → `127.0.0.1:port` so a request to `https://localhost:port/`
+    /// connects to the in-process server while presenting SNI/hostname `localhost`
+    /// (the cert's SAN). NO `danger_accept_invalid_certs` — a real chain+hostname
+    /// verification against the test CA.
+    fn tls_client(port: u16) -> reqwest::Client {
+        let ca = reqwest::Certificate::from_pem(CERT.as_bytes()).expect("parse test CA");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        reqwest::Client::builder()
+            .add_root_certificate(ca)
+            .resolve("localhost", addr)
+            .build()
+            .expect("build reqwest client")
+    }
+
+    /// (a) `serve({tls:{cert,key}})` terminates TLS; an HTTPS GET returns 200 + body.
+    #[tokio::test]
+    async fn tls_serve_round_trip_returns_200() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/", (req) => "secure world")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ tls: {{ cert: {cert:?}, key: {key:?} }}, maxRequests: 1 }})
+"#,
+            cert = CERT,
+            key = KEY,
+        );
+        let url = format!("https://localhost:{port}/");
+        let (status, body) = with_server(&src, move || async move {
+            let client = tls_client(port);
+            let resp = client.get(&url).send().await.expect("https GET");
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            (status, body)
+        })
+        .await;
+        assert_eq!(status, 200, "expected 200 over TLS");
+        assert_eq!(body, "secure world");
+    }
+
+    /// (b) A malformed cert PEM in `{tls:{cert:"garbage",…}}` makes `serve` return a
+    /// Tier-1 `[nil, err]` BEFORE accepting any connection (the acceptor is built up
+    /// front; the program prints the err message — non-nil — and exits cleanly).
+    #[tokio::test]
+    async fn tls_serve_bad_pem_is_tier1_before_accept() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/", (req) => "never")
+await s.bind("127.0.0.1", {port})
+let [v, err] = await s.serve({{ tls: {{ cert: "garbage", key: {key:?} }}, maxRequests: 1 }})
+print(err != nil)
+print(err.message)
+"#,
+            key = KEY,
+        );
+        // No client connects — `serve` must return the error WITHOUT blocking on accept.
+        let interp = new_interp();
+        let out = run_capture(&interp, &src).await;
+        assert!(
+            out.starts_with("true\n"),
+            "bad TLS PEM must yield a non-nil Tier-1 err before accept:\n{out}"
+        );
+        assert!(
+            out.contains("certificate") || out.contains("PEM") || out.contains("cert"),
+            "err message should mention the cert/PEM problem:\n{out}"
+        );
+    }
+
+    /// (c) A plain-HTTP / garbage-bytes probe against the TLS port fails the handshake;
+    /// the server logs+continues (counts NOTHING toward maxRequests) and a subsequent
+    /// real TLS request still succeeds. `maxRequests:1` proves the garbage didn't count:
+    /// if the handshake error had been counted, the server would have stopped before the
+    /// real request.
+    #[tokio::test]
+    async fn tls_handshake_error_continues_and_counts_nothing() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/", (req) => "ok-after-garbage")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ tls: {{ cert: {cert:?}, key: {key:?} }}, maxRequests: 1 }})
+"#,
+            cert = CERT,
+            key = KEY,
+        );
+        let url = format!("https://localhost:{port}/");
+        let (status, body) = with_server(&src, move || async move {
+            use tokio::io::AsyncWriteExt;
+            // First: a raw plain-HTTP/garbage write — not a TLS ClientHello. The server's
+            // `acceptor.accept` handshake fails; the loop must `continue` (count nothing).
+            if let Ok(mut sock) =
+                tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await
+            {
+                let _ = sock
+                    .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nnot-tls-garbage")
+                    .await;
+                let _ = sock.flush().await;
+                // Give the server a moment to process+discard the failed handshake.
+                drop(sock);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Then: a REAL TLS request — it must still be served (the garbage counted 0).
+            let client = tls_client(port);
+            let resp = client.get(&url).send().await.expect("https GET after garbage");
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            (status, body)
+        })
+        .await;
+        assert_eq!(status, 200, "the real TLS request after garbage must be served");
+        assert_eq!(body, "ok-after-garbage");
+    }
+
+    /// (d) The `sni` array of `{host,cert,key}` objects parses and serves. We reuse the
+    /// single baked cert for the SNI host `localhost` (generating a second independent
+    /// CA is heavy); the assertion is that the `sni` Vec is parsed + a request to the
+    /// SNI host is served over TLS. (PARTIAL COVERAGE: this proves sni-parse +
+    /// resolver-serve; a full two-distinct-CA SNI selection assertion is not made — the
+    /// second-cert generation was deemed out of scope, NOTED in the A2 report.)
+    #[tokio::test]
+    async fn tls_serve_with_sni_parses_and_serves() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/", (req) => "sni-ok")
+await s.bind("127.0.0.1", {port})
+await s.serve({{
+  tls: {{
+    cert: {cert:?},
+    key: {key:?},
+    sni: [{{ host: "localhost", cert: {cert:?}, key: {key:?} }}]
+  }},
+  maxRequests: 1
+}})
+"#,
+            cert = CERT,
+            key = KEY,
+        );
+        let url = format!("https://localhost:{port}/");
+        let (status, body) = with_server(&src, move || async move {
+            let client = tls_client(port);
+            let resp = client.get(&url).send().await.expect("https GET sni");
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            (status, body)
+        })
+        .await;
+        assert_eq!(status, 200, "SNI-routed TLS request must be served");
+        assert_eq!(body, "sni-ok");
     }
 }

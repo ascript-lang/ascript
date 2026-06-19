@@ -82,6 +82,11 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     ("std/ffi",         Some("ffi")),
     ("std/resilience",  Some("resilience")),
     ("std/docker",      Some("docker")),
+    // BATT Phase A — std/jwt + std/oauth are gated on the `auth` feature
+    // (auth = crypto + data + net + rsa/p256). An auth-using bundle therefore
+    // needs the net tier (jwks fetch + oauth token calls) — see FEATURE_DEPS.
+    ("std/jwt",         Some("auth")),
+    ("std/oauth",       Some("auth")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.
@@ -114,6 +119,12 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     //  if someone ever maps a pkg-requiring import — currently no std module needs it)
     ("pkg", "net"),
     ("pkg", "compress"),
+    // BATT Phase A — auth = ["crypto", "data", "net", "dep:rsa", "dep:p256", "sha2/oid"].
+    // The net edge is load-bearing: a std/jwt (jwks) or std/oauth bundle must select
+    // the net tier so the runtime stub can fetch JWKS / OAuth token endpoints.
+    ("auth", "crypto"),
+    ("auth", "data"),
+    ("auth", "net"),
 ];
 
 /// Collect all `std/` module specifiers imported anywhere in `archive`.

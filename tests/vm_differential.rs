@@ -1147,6 +1147,15 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/server_multicore.as",
         SkipReason::LongRunningServer,
     ),
+    // BATT A3: HTTPS server using `serve({tls})` — binds a fixed port (8443) and
+    // loops forever awaiting clients. It cannot run headless (same class as
+    // http_server.as / ws_server.as / server_multicore.as). The TLS round-trip
+    // behavior is proven by `tests/tls_server.rs` (a reqwest-driven integration
+    // test against the running binary, mirroring the server_multicore.rs precedent).
+    (
+        "examples/advanced/https_server.as",
+        SkipReason::LongRunningServer,
+    ),
     // BNDL: the self-contained-bundles entry imports a sibling (`./bundle_util`). The
     // source-only corpus oracle can't resolve a relative import (no real file path), so
     // it is documented-only here and covered by `tests/archive.rs` + the CLI run. The

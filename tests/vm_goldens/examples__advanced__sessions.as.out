@@ -1,0 +1,6 @@
+# exit: none
+anon /me: 401
+login: 200 logged-in
+got signed cookie: true
+authed /me: 200 hello ada (admin)
+sessions ok

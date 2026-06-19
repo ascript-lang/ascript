@@ -395,6 +395,12 @@ pub(crate) enum ResourceState {
     TcpListener(tokio::net::TcpListener),
     #[cfg(feature = "net")]
     TcpStream(crate::stdlib::net_tcp::TcpStreamState),
+    // BATT §4.3 std/net/tcp: a TLS-wrapped client stream (`tcp.connectTls`). Mirrors
+    // `TcpStream` over `tokio_rustls::client::TlsStream`. Registered only under `tls`.
+    // Boxed — the rustls connection state is ~1KB; boxing keeps the `ResourceState`
+    // enum compact (`clippy::large_enum_variant`).
+    #[cfg(feature = "tls")]
+    TlsStream(Box<crate::stdlib::net_tcp::TlsStreamState>),
     // CNTR §3.1 std/net/unix: a bound Unix-domain listener (unlinks its socket file on
     // drop) and a buffered client/accepted stream (BufReader for `readLine`). Mirrors
     // the TCP variants; unix-only (a `UnixListener`/`UnixStream` is POSIX).
@@ -586,6 +592,12 @@ pub(crate) enum ResourceState {
     /// are sizeable). Unix-only.
     #[cfg(all(feature = "docker", unix))]
     DockerStream(Box<crate::stdlib::docker::DockerStreamState>),
+    /// BATT §5.6: a `std/jwt` JWKS cache (`jwt.jwks(url)`). A self-contained TTL
+    /// cache of kid→public-key material fetched from a JWKS URL over the SHARED
+    /// pooled client. Boxed to keep the enum compact (the HashMap of keys). GC-
+    /// untraced (plain data reclaimed by Drop). Feature `auth`.
+    #[cfg(feature = "auth")]
+    JwksCache(Box<crate::stdlib::jwt::JwksCacheState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5590,6 +5602,10 @@ impl Interp {
             if matches!(m.receiver.kind, TcpListener | TcpStream) {
                 return self.call_tcp_method(&m, args, span).await;
             }
+            #[cfg(feature = "tls")]
+            if matches!(m.receiver.kind, TlsStream) {
+                return self.call_tcp_method(&m, args, span).await;
+            }
             #[cfg(unix)]
             if matches!(m.receiver.kind, UnixListener | UnixStream) {
                 return self.call_unix_method(&m, args, span).await;
@@ -5666,6 +5682,12 @@ impl Interp {
             }
             if matches!(m.receiver.kind, crate::value::NativeKind::DockerStream) {
                 return self.call_docker_stream_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "auth")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::JwksCache) {
+                return self.call_jwks_method(&m, args, span).await;
             }
         }
         #[cfg(feature = "telemetry")]

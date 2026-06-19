@@ -687,6 +687,48 @@ import { hmacSha256 } from "std/crypto"
 print(hmacSha256("key", "The quick brown fox"))
 ```
 
+### crypto.hmacSha384
+
+Computes an HMAC-SHA384 tag.
+
+- **key** `string | bytes` — the secret key (any length).
+- **data** `string | bytes` — the message.
+- **Returns** `string` — a 96-character lowercase-hex tag.
+
+```ascript
+import { hmacSha384 } from "std/crypto"
+print(hmacSha384("key", "The quick brown fox"))
+```
+
+### crypto.hmacSha512
+
+Computes an HMAC-SHA512 tag.
+
+- **key** `string | bytes` — the secret key (any length).
+- **data** `string | bytes` — the message.
+- **Returns** `string` — a 128-character lowercase-hex tag.
+
+```ascript
+import { hmacSha512 } from "std/crypto"
+print(hmacSha512("key", "The quick brown fox"))
+```
+
+### crypto.timingSafeEqual
+
+Compares two byte sequences in constant time. Use this to compare secrets (HMAC tags, session tokens, API keys) — a naive `a == b` returns as soon as the first differing byte is found, so its running time leaks how many leading bytes matched, letting an attacker recover the secret one byte at a time. `timingSafeEqual` folds an XOR over every byte unconditionally, so its running time is independent of where the inputs differ.
+
+- **a** `string | bytes` — the first value (raw bytes are compared; a string is its UTF-8 bytes).
+- **b** `string | bytes` — the second value.
+- **Returns** `bool` — `true` iff the byte sequences are equal. A length mismatch returns `false` (length is not secret), never a panic.
+
+```ascript
+import { hmacSha256, timingSafeEqual } from "std/crypto"
+let expected = hmacSha256(key, body)
+if timingSafeEqual(expected, providedSignature) {
+  print("signature ok")
+}
+```
+
 ### crypto.randomBytes
 
 Generates cryptographically secure random bytes.

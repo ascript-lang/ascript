@@ -44,6 +44,10 @@ pub mod http_server;
 pub mod intl;
 #[cfg(feature = "sys")]
 pub mod io;
+// BATT §5 — `std/jwt` (feature `auth`): JSON Web Tokens with typed keys that
+// structurally kill alg-confusion. A5 wires HS256/384/512 (hmac+sha2).
+#[cfg(feature = "auth")]
+pub mod jwt;
 #[cfg(feature = "data")]
 pub mod json;
 #[cfg(feature = "log")]
@@ -68,6 +72,15 @@ pub mod net_unix;
 #[cfg(feature = "net")]
 pub mod net_ws;
 pub mod object;
+// BATT §5.6 — `std/oauth` (feature `auth`): OAuth2 + PKCE over the SHARED pooled
+// reqwest client (no second HTTP stack).
+#[cfg(feature = "auth")]
+pub mod oauth;
+// BATT §4 — TLS shared plumbing (NOT a script module / not in STD_MODULES): PEM
+// loading + client/server config builders used by net_tcp.connectTls, http_server
+// serve({tls}), and email STARTTLS.
+#[cfg(feature = "tls")]
+pub mod tls;
 #[cfg(feature = "sys")]
 pub mod os;
 #[cfg(feature = "postgres")]
@@ -219,6 +232,10 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/ffi" => ffi::exports(),
         #[cfg(feature = "docker")]
         "std/docker" => docker::exports(),
+        #[cfg(feature = "auth")]
+        "std/jwt" => jwt::exports(),
+        #[cfg(feature = "auth")]
+        "std/oauth" => oauth::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -293,6 +310,8 @@ pub const STD_MODULES: &[&str] = &[
     "std/ffi",
     "std/resilience",
     "std/docker",
+    "std/jwt",
+    "std/oauth",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -355,9 +374,17 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         // All network modules — sockets, HTTP, DNS, UDP, WebSocket, servers, Unix-domain.
         // `"net"` covers `net.lookup`/`lookupOne` (DNS) by construction. `net_unix` is a
         // UDS byte pipe — single-cap `net` (it conveys no process authority; CNTR §5.1).
-        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server" => {
-            CapReq::one(Cap::Net)
-        }
+        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" => CapReq::one(Cap::Net),
+        // BATT A8 §5.7 — `http_server` is PER-FUNC (the `jwt` precedent): `create`/`serve`
+        // bind + accept sockets → `Net`; the signed-cookie + session helpers
+        // (`signCookie`/`verifyCookie`/`setCookie`/`session`) are PURE crypto / string
+        // rendering (no I/O) → ungated, so they work under `--sandbox` (a handler may
+        // verify a session in a `run_in_worker({deny net})` isolate). `auth`-only funcs.
+        "http_server" => match func {
+            #[cfg(feature = "auth")]
+            "signCookie" | "verifyCookie" | "setCookie" | "session" => CapReq::NONE,
+            _ => CapReq::one(Cap::Net),
+        },
         #[cfg(feature = "net")]
         "net_unix" => CapReq::one(Cap::Net),
         // CNTR §5.2 — the FIRST conjunction: `docker.*` drives the Engine API over the
@@ -390,6 +417,20 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         // ungated-OS-module class as ai/telemetry.)
         #[cfg(feature = "workflow")]
         "workflow" => CapReq::one(Cap::Fs),
+        // BATT §5.4 — `std/jwt` is PER-FUNC (the `os` precedent): `jwks` fetches keys
+        // over the network → `Net`; `sign`/`verify`/`decode`/`hmacKey` are pure crypto
+        // → ungated. A5 ships only the ungated funcs (the `jwks` arm is the shape A7
+        // fills). Feature-gated like the dispatch arms.
+        #[cfg(feature = "auth")]
+        "jwt" => match func {
+            "jwks" => CapReq::one(Cap::Net),
+            _ => CapReq::NONE,
+        },
+        // BATT §5.6 — `std/oauth` drives OAuth2 token endpoints + OIDC discovery
+        // over the network → whole-module `Net` (the same posture as ai/telemetry,
+        // which also carry network egress). `--deny net`/`--sandbox` blocks it.
+        #[cfg(feature = "auth")]
+        "oauth" => CapReq::one(Cap::Net),
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
@@ -636,6 +677,10 @@ impl Interp {
             "ffi" => self.call_ffi(func, args, span).await,
             #[cfg(feature = "docker")]
             "docker" => self.call_docker(func, args, span).await,
+            #[cfg(feature = "auth")]
+            "jwt" => self.call_jwt_async(func, args, span).await,
+            #[cfg(feature = "auth")]
+            "oauth" => self.call_oauth(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1063,6 +1108,17 @@ mod cap_gate_tests {
         // DNS specifically: net.lookup / lookupOne route through "net" → Net.
         assert_eq!(req("net", "lookup"), vec![Cap::Net]);
         assert_eq!(req("net", "lookupOne"), vec![Cap::Net]);
+        // BATT A8 §5.7 — http_server is per-func (the jwt precedent): create/serve bind
+        // + accept sockets → Net; the cookie/session helpers are pure crypto → ungated.
+        assert_eq!(req("http_server", "create"), vec![Cap::Net]);
+        assert_eq!(req("http_server", "serve"), vec![Cap::Net]);
+        #[cfg(feature = "auth")]
+        {
+            assert!(required_cap("http_server", "signCookie").is_empty());
+            assert!(required_cap("http_server", "verifyCookie").is_empty());
+            assert!(required_cap("http_server", "setCookie").is_empty());
+            assert!(required_cap("http_server", "session").is_empty());
+        }
         // CNTR §5.1: net_unix is a single-cap `net` (a UDS pipe conveys no process authority).
         #[cfg(feature = "net")]
         assert_eq!(req("net_unix", "connect"), vec![Cap::Net]);
@@ -1187,8 +1243,11 @@ mod cap_gate_tests {
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");
-            if key == "os" {
-                continue; // per-func (topology→Net, ambient→None); covered above.
+            if key == "os" || key == "jwt" {
+                // Per-func gating (covered above): os (topology→Net, ambient→None);
+                // jwt (BATT §5.4 — jwks→Net, sign/verify/decode/hmacKey→None). The
+                // whole-module `__probe__` verdict cannot represent a per-func split.
+                continue;
             }
             let gated = !required_cap(&key, "__probe__").is_empty();
             let ungated = KNOWN_UNGATED.contains(&key.as_str());
