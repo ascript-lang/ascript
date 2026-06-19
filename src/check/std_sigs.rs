@@ -1454,6 +1454,189 @@ static COMPRESS_MEMBERS: &[(&str, MemberKind)] = &[
     ("tarExtract", MemberKind::Fn),
 ];
 
+// ── std/archive (BATT B1 §6) ──────────────────────────────────────────────────
+
+static ARCHIVE_TAR_WRITER_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+static ARCHIVE_TAR_ENTRIES_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static ARCHIVE_TAR_APPEND_PARAMS: &[StdParam] = &[
+    StdParam::req("data", "bytes"),
+    StdParam::req("additions", "array"),
+];
+// archiveWriter handle methods (MemberKind::HandleMethod in ARCHIVE_MEMBERS).
+static ARCHIVE_ADD_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req_untyped("data"),
+    StdParam::opt("opts", "object"),
+];
+static ARCHIVE_FINISH_PARAMS: &[StdParam] = &[];
+// B2 — zip plane + Fs-gated disk helpers.
+static ARCHIVE_ZIP_WRITER_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+static ARCHIVE_ZIP_ENTRIES_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static ARCHIVE_EXTRACT_TO_PARAMS: &[StdParam] = &[
+    StdParam::req("data", "bytes"),
+    StdParam::req("dest", "string"),
+    StdParam::opt("opts", "object"),
+];
+static ARCHIVE_CREATE_FROM_DIR_PARAMS: &[StdParam] = &[
+    StdParam::req("dir", "string"),
+    StdParam::opt("opts", "object"),
+];
+
+static ARCHIVE_SIGS: &[(&str, StdSig)] = &[
+    ("tarWriter", StdSig { params: ARCHIVE_TAR_WRITER_PARAMS, ret: Some("archiveWriter"), doc: "Opens a streaming tar writer handle. opts: {gzip?, deterministic?}." }),
+    ("tarEntries", StdSig { params: ARCHIVE_TAR_ENTRIES_PARAMS, ret: Some("generator"), doc: "Lazily decodes a (optionally gzipped) tar, yielding one {name, size, mode, isDir, data} per entry; a corrupt entry yields a [nil, err] pair." }),
+    ("tarAppend", StdSig { params: ARCHIVE_TAR_APPEND_PARAMS, ret: Some("[bytes, err]"), doc: "Decodes a tar (preserving its entries) and appends {name, data, mode?, dir?} additions, returning the new archive bytes." }),
+    ("zipWriter", StdSig { params: ARCHIVE_ZIP_WRITER_PARAMS, ret: Some("archiveWriter"), doc: "Opens a streaming zip writer handle. opts: {store?} (store=true → no compression)." }),
+    ("zipEntries", StdSig { params: ARCHIVE_ZIP_ENTRIES_PARAMS, ret: Some("generator"), doc: "Lazily decodes a zip, yielding one {name, size, compressedSize, mode, isDir, data} per entry; a corrupt entry yields a [nil, err] pair." }),
+    ("tarExtractTo", StdSig { params: ARCHIVE_EXTRACT_TO_PARAMS, ret: Some("[string, err]"), doc: "Extracts a (optionally gzipped) tar to a destination directory with a zip-slip / path-traversal defense; symlinks are skipped by default ({links:\"error\"} rejects them). Fs-gated." }),
+    ("zipExtractTo", StdSig { params: ARCHIVE_EXTRACT_TO_PARAMS, ret: Some("[string, err]"), doc: "Extracts a zip to a destination directory with the same zip-slip / path-traversal defense as tarExtractTo. Fs-gated." }),
+    ("tarCreateFromDir", StdSig { params: ARCHIVE_CREATE_FROM_DIR_PARAMS, ret: Some("[bytes, err]"), doc: "Walks a directory and builds a tar of its contents. opts: {gzip?, deterministic?} (deterministic → byte-stable across runs). Symlinks are skipped. Fs-gated." }),
+    // archiveWriter handle methods (BATT B1 §6 + B2 zip).
+    ("add", StdSig { params: ARCHIVE_ADD_PARAMS, ret: None, doc: "Appends one entry to a tar/zip writer. opts: {dir?, mode?, mtime?} (tar) / {dir?, mode?, store?} (zip)." }),
+    ("finish", StdSig { params: ARCHIVE_FINISH_PARAMS, ret: Some("bytes"), doc: "Finalizes a tar/zip writer and returns the assembled bytes (gzip-wrapped if the tar writer was opened with {gzip:true})." }),
+];
+static ARCHIVE_MEMBERS: &[(&str, MemberKind)] = &[
+    ("tarWriter", MemberKind::Fn),
+    ("tarEntries", MemberKind::Fn),
+    ("tarAppend", MemberKind::Fn),
+    ("zipWriter", MemberKind::Fn),
+    ("zipEntries", MemberKind::Fn),
+    ("tarExtractTo", MemberKind::Fn),
+    ("zipExtractTo", MemberKind::Fn),
+    ("tarCreateFromDir", MemberKind::Fn),
+    // archiveWriter handle methods — not module exports.
+    ("add", MemberKind::HandleMethod),
+    ("finish", MemberKind::HandleMethod),
+];
+
+// ── std/xml ───────────────────────────────────────────────────────────────────
+
+static XML_PARSE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static XML_STRINGIFY_PARAMS: &[StdParam] = &[
+    StdParam::req("node", "object"),
+    StdParam::opt("options", "object"),
+];
+static XML_ESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static XML_UNESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+
+static XML_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: XML_PARSE_PARAMS, ret: Some("[object, err]"), doc: "Parses XML text into a stable {tag, attrs, children} element tree. Comments and processing instructions are dropped; CDATA folds into text. Custom/external DTD entities are NEVER expanded (a [nil, err] undefined-entity result)." }),
+    ("stringify", StdSig { params: XML_STRINGIFY_PARAMS, ret: Some("[string, err]"), doc: "Serializes a {tag, attrs, children} element tree to XML text. options: {indent?} (a positive integer pretty-prints)." }),
+    ("escape", StdSig { params: XML_ESCAPE_PARAMS, ret: Some("string"), doc: "Escapes the five predefined XML entities (& < > \" ') in text." }),
+    ("unescape", StdSig { params: XML_UNESCAPE_PARAMS, ret: Some("[string, err]"), doc: "Unescapes the five predefined XML entities plus numeric character references (&#NN; / &#xNN;); an undefined named entity yields a [nil, err] result." }),
+];
+
+static XML_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("stringify", MemberKind::Fn),
+    ("escape", MemberKind::Fn),
+    ("unescape", MemberKind::Fn),
+];
+
+// ── std/html (BATT B4 §7.3) ─────────────────────────────────────────────────
+
+static HTML_ESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static HTML_UNESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static HTML_SANITIZE_PARAMS: &[StdParam] = &[
+    StdParam::req("text", "string"),
+    StdParam::opt("options", "object"),
+];
+
+static HTML_SIGS: &[(&str, StdSig)] = &[
+    ("escape", StdSig { params: HTML_ESCAPE_PARAMS, ret: Some("string"), doc: "Escapes the HTML special characters (& < > \" ') in text for safe inclusion in element content or a double-quoted attribute value." }),
+    ("unescape", StdSig { params: HTML_UNESCAPE_PARAMS, ret: Some("string"), doc: "Decodes HTML named entities (the HTML5 core set) plus numeric character references (&#NN; / &#xNN;). An unrecognized entity is left verbatim." }),
+    ("sanitize", StdSig { params: HTML_SANITIZE_PARAMS, ret: Some("string"), doc: "Fail-closed allowlist sanitizer: a lenient tokenizer feeds a canonical serializer that re-emits only allowlisted tags/attributes with all values re-escaped and URL schemes checked; everything unrecognized is escaped as inert text. options: {tags?, attrs?, schemes?} (each REPLACES the corresponding default)." }),
+];
+
+static HTML_MEMBERS: &[(&str, MemberKind)] = &[
+    ("escape", MemberKind::Fn),
+    ("unescape", MemberKind::Fn),
+    ("sanitize", MemberKind::Fn),
+];
+
+// ── std/email (BATT B5 §8.1) ─────────────────────────────────────────────────
+
+static EMAIL_MESSAGE_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static EMAIL_VALIDATE_ADDRESS_PARAMS: &[StdParam] = &[StdParam::req("addr", "string")];
+// message-handle method (`msg.raw()`).
+static EMAIL_RAW_PARAMS: &[StdParam] = &[];
+// SMTP client (BATT B6 §8.2).
+static EMAIL_SEND_PARAMS: &[StdParam] = &[StdParam::req("msg", "object"), StdParam::req("opts", "object")];
+static EMAIL_CONNECT_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+// SmtpClient handle methods.
+static EMAIL_CLIENT_SEND_PARAMS: &[StdParam] = &[StdParam::req("msg", "object")];
+static EMAIL_CLIENT_CLOSE_PARAMS: &[StdParam] = &[];
+
+static EMAIL_SIGS: &[(&str, StdSig)] = &[
+    ("message", StdSig { params: EMAIL_MESSAGE_PARAMS, ret: Some("[object, err]"), doc: "Builds an email message (the pure builder; the SMTP client is separate). opts: {from, to, cc?, bcc?, subject, text?, html?, attachments?, headers?}. text+html → multipart/alternative; attachments → multipart/mixed (base64, wrapped at 76 cols); non-ASCII headers → RFC 2047 encoded-words; the boundary is content-deterministic. Every address/header is CRLF/NUL-rejected (Tier-2) to kill SMTP header injection; bcc stays in the envelope, never a header." }),
+    ("validateAddress", StdSig { params: EMAIL_VALIDATE_ADDRESS_PARAMS, ret: Some("bool"), doc: "Validates a bare local@domain address against a pragmatic RFC 5321 subset (dotted domain, no spaces/controls, ≤254 chars). Quoted-local forms are a documented-unsupported false." }),
+    ("send", StdSig { params: EMAIL_SEND_PARAMS, ret: Some("[object, err]"), doc: "Sends a built message over SMTP and returns [{accepted, rejected}, err]. opts: {host, port?, tls?: \"starttls\"|\"implicit\"|\"none\" (default \"starttls\"; ports 587/465/25), username?, password?, authMethod?: \"plain\"|\"login\", allowInsecureAuth?, caCert?, serverName?, timeout?}. STARTTLS is required when requested — an unavailable/failed upgrade is a Tier-1 error (NEVER a silent plaintext downgrade). AUTH over a non-TLS connection is a Tier-2 error unless allowInsecureAuth:true. Net-gated. Async." }),
+    ("connect", StdSig { params: EMAIL_CONNECT_PARAMS, ret: Some("[smtpClient, err]"), doc: "Opens a reusable SMTP connection (same opts as send) and returns [client, err]. The client exposes send(msg)/close(). Net-gated. Async." }),
+    // message-handle method.
+    ("raw", StdSig { params: EMAIL_RAW_PARAMS, ret: Some("string"), doc: "Returns the RFC 5322 wire form of a built message (for tests/inspection). The wire form is computed eagerly at build time and is byte-stable." }),
+    // SmtpClient handle methods.
+    ("send", StdSig { params: EMAIL_CLIENT_SEND_PARAMS, ret: Some("[object, err]"), doc: "Sends one message over the open SMTP connection; returns [{accepted, rejected}, err]. The envelope is re-validated for CRLF/NUL injection at the wire layer. The connection stays open for reuse." }),
+    ("close", StdSig { params: EMAIL_CLIENT_CLOSE_PARAMS, ret: Some("nil"), doc: "Sends a best-effort QUIT and closes the SMTP connection (reclaims the socket)." }),
+];
+
+static EMAIL_MEMBERS: &[(&str, MemberKind)] = &[
+    ("message", MemberKind::Fn),
+    ("validateAddress", MemberKind::Fn),
+    ("send", MemberKind::Fn),
+    ("connect", MemberKind::Fn),
+    // message-handle + SmtpClient-handle methods — not module exports.
+    ("raw", MemberKind::HandleMethod),
+    ("close", MemberKind::HandleMethod),
+];
+
+// ── std/blob (BATT B8 §9.2) ───────────────────────────────────────────────────
+
+static BLOB_CLIENT_PARAMS: &[StdParam] = &[StdParam::req("config", "object")];
+// BlobClient handle methods.
+static BLOB_PUT_PARAMS: &[StdParam] = &[
+    StdParam::req("key", "string"),
+    StdParam::req("data", "bytes | string"),
+    StdParam::opt("opts", "object"),
+];
+static BLOB_GET_PARAMS: &[StdParam] = &[StdParam::req("key", "string"), StdParam::opt("opts", "object")];
+static BLOB_HEAD_PARAMS: &[StdParam] = &[StdParam::req("key", "string"), StdParam::opt("opts", "object")];
+static BLOB_DELETE_PARAMS: &[StdParam] = &[StdParam::req("key", "string"), StdParam::opt("opts", "object")];
+static BLOB_LIST_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+static BLOB_PRESIGN_PARAMS: &[StdParam] = &[
+    StdParam::req("method", "string"),
+    StdParam::req("key", "string"),
+    StdParam::opt("opts", "object"),
+];
+static BLOB_PUT_MULTIPART_PARAMS: &[StdParam] = &[
+    StdParam::req("key", "string"),
+    StdParam::req("source", "array | generator"),
+    StdParam::opt("opts", "object"),
+];
+
+static BLOB_SIGS: &[(&str, StdSig)] = &[
+    ("client", StdSig { params: BLOB_CLIENT_PARAMS, ret: Some("blobClient"), doc: "Builds an S3-compatible client over the shared pooled HTTP client with SigV4 signing. config: {endpoint, region, accessKey, secretKey, sessionToken?, bucket?, pathStyle?}. The handle exposes put/get/head/delete/list/presign/putMultipart. Net-gated (whole module, including presign)." }),
+    // BlobClient handle methods.
+    ("put", StdSig { params: BLOB_PUT_PARAMS, ret: Some("[string, err]"), doc: "Uploads an object and returns [etag, err]. opts: {contentType?, metadata?, bucket?}. data is a string or bytes. Async." }),
+    ("get", StdSig { params: BLOB_GET_PARAMS, ret: Some("[bytes, err]"), doc: "Downloads an object and returns [bytes, err]. opts: {bucket?, range?: [start, end]}. Async." }),
+    ("head", StdSig { params: BLOB_HEAD_PARAMS, ret: Some("[object, err]"), doc: "Fetches object metadata and returns [{size, etag, contentType, lastModified, metadata}, err]. opts: {bucket?}. Async." }),
+    ("delete", StdSig { params: BLOB_DELETE_PARAMS, ret: Some("[nil, err]"), doc: "Deletes an object and returns [nil, err]. opts: {bucket?}. Async." }),
+    ("list", StdSig { params: BLOB_LIST_PARAMS, ret: Some("generator"), doc: "Returns a LAZY generator that yields {key, size, etag, lastModified} per object, paginating across continuation tokens (page N+1 fetched only when iteration crosses it). opts: {prefix?, delimiter?, bucket?, pageSize?}." }),
+    ("presign", StdSig { params: BLOB_PRESIGN_PARAMS, ret: Some("[string, err]"), doc: "Mints a presigned URL (no network) and returns [url, err]. opts: {expires?: seconds (default 900), bucket?, contentType?}. Net-gated (the URL carries the signing secret's authority)." }),
+    ("putMultipart", StdSig { params: BLOB_PUT_MULTIPART_PARAMS, ret: Some("[string, err]"), doc: "Uploads a large object in parts (create → UploadPart per chunk → complete; aborts the upload on any part error so no orphan remains) and returns [etag, err]. source is an array of bytes/string chunks OR a generator that is pulled one chunk at a time (true streaming — a large object is never fully buffered). A non-final part below 5 MiB is a Tier-1 stream error; a configured partSize below 5 MiB is a Tier-2 error. Async." }),
+];
+
+static BLOB_MEMBERS: &[(&str, MemberKind)] = &[
+    ("client", MemberKind::Fn),
+    // BlobClient handle methods — not module exports.
+    ("put", MemberKind::HandleMethod),
+    ("get", MemberKind::HandleMethod),
+    ("head", MemberKind::HandleMethod),
+    ("delete", MemberKind::HandleMethod),
+    ("list", MemberKind::HandleMethod),
+    ("presign", MemberKind::HandleMethod),
+    ("putMultipart", MemberKind::HandleMethod),
+];
+
 // ── std/net ───────────────────────────────────────────────────────────────────
 
 static NET_LOOKUP_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
@@ -2844,6 +3027,11 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/resilience", RESIL_MEMBERS),
     ("std/jwt", JWT_MEMBERS),
     ("std/oauth", OAUTH_MEMBERS),
+    ("std/archive", ARCHIVE_MEMBERS),
+    ("std/xml", XML_MEMBERS),
+    ("std/html", HTML_MEMBERS),
+    ("std/email", EMAIL_MEMBERS),
+    ("std/blob", BLOB_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2918,6 +3106,11 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/resilience" => RESIL_SIGS,
         "std/jwt" => JWT_SIGS,
         "std/oauth" => OAUTH_SIGS,
+        "std/archive" => ARCHIVE_SIGS,
+        "std/xml" => XML_SIGS,
+        "std/html" => HTML_SIGS,
+        "std/email" => EMAIL_SIGS,
+        "std/blob" => BLOB_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -3093,6 +3286,8 @@ mod tests {
             ("std/resilience", RESIL_SIGS),
             ("std/jwt", JWT_SIGS),
             ("std/oauth", OAUTH_SIGS),
+            ("std/archive", ARCHIVE_SIGS),
+            ("std/blob", BLOB_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {

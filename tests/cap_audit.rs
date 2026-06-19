@@ -243,6 +243,112 @@ fn audit_net_tls_connect_allowed_when_net_granted() {
     );
 }
 
+// BATT B6 §8.2 — the `std/email` SMTP client (`email.send` / `email.connect`) is
+// gated by `Net` at the dispatch chokepoint, BEFORE any socket I/O (port 9 is
+// effectively unreachable on loopback, but the gate fires before `connect()` so no
+// real packet is ever sent). The pure builders (`email.message` /
+// `email.validateAddress`) touch no OS resource → they WORK under `--sandbox`.
+#[cfg(all(feature = "email", feature = "net", feature = "tls"))]
+#[test]
+fn audit_email_send_connect_denied() {
+    let imp = "import * as email from \"std/email\"";
+    // `email.send(msg, opts)` — gated by Net. We build a real message first so the
+    // denial is the SEND gate, not a builder error.
+    let send_expr =
+        "email.send(email.message({from:\"a@b.com\",to:\"c@d.com\",subject:\"x\",text:\"y\"})[0], \
+         {host:\"127.0.0.1\", port:9, tls:\"none\"})";
+    assert_denied("audit_email_send_deny.as", imp, send_expr, "net", &["--deny", "net"]);
+    assert_denied("audit_email_send_sbx.as", imp, send_expr, "net", &["--sandbox"]);
+    // `email.connect(opts)` — gated by Net.
+    let conn_expr = "email.connect({host:\"127.0.0.1\", port:9, tls:\"none\"})";
+    assert_denied("audit_email_connect_deny.as", imp, conn_expr, "net", &["--deny", "net"]);
+    assert_denied("audit_email_connect_sbx.as", imp, conn_expr, "net", &["--sandbox"]);
+
+    // in-code `caps.drop("net")` — irreversible; the gate fires after the drop.
+    let src = "import * as email from \"std/email\"\n\
+               import * as caps from \"std/caps\"\n\
+               caps.drop(\"net\")\n\
+               let r = recover(() => email.connect({host:\"127.0.0.1\", port:9, tls:\"none\"}))\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "audit_email_connect_drop.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(out, "capability 'net' denied\n", "caps.drop(\"net\") must deny email.connect");
+}
+
+// BATT B6 §8.1 positive — the pure email builders WORK under `--sandbox` (no OS
+// resource). `email.message(...)` returns a built message even with all caps dropped.
+#[cfg(feature = "email")]
+#[test]
+fn audit_email_message_builder_allowed_under_sandbox() {
+    let src = "import * as email from \"std/email\"\n\
+               let [msg, e] = email.message({from:\"a@b.com\",to:\"c@d.com\",subject:\"hi\",text:\"body\"})\n\
+               print(e == nil)\n\
+               print(email.validateAddress(\"a@b.com\"))\n";
+    let (ok, out, err) = run_with_args(src, "audit_email_message_sbx.as", &["--sandbox"]);
+    assert!(ok, "[audit_email_message_sbx] stderr: {err}");
+    assert_eq!(out, "true\ntrue\n", "email.message/validateAddress must work under --sandbox");
+}
+
+// BATT B8 §9.2 — the `std/blob` S3 client is WHOLE-MODULE `Net`, INCLUDING `presign`
+// (the deliberate decision: a presigned URL mints capability-bearing authority from
+// the secret key, so it is gated alongside the network ops). `--deny net`, `--sandbox`,
+// and in-code `caps.drop("net")` all deny EVERY blob op (`blob.client` constructs a
+// handle, but operating it — put/get/head/delete/list/presign/putMultipart — is denied
+// at the per-handle Net re-check, BEFORE any request leaves the host).
+#[cfg(feature = "blob")]
+#[test]
+fn audit_blob_all_ops_denied() {
+    // Whole-module Net: `blob.client(...)` is gated at the dispatch chokepoint AND each
+    // op (incl. presign) is gated at the per-handle re-check. We recover around the
+    // WHOLE chain (construct + op) so the denial surfaces wherever it fires first.
+    let mk = |op: &str| {
+        format!(
+            "import * as blob from \"std/blob\"\n\
+             let r = recover(() => {{\n\
+               let client = blob.client({{endpoint:\"http://127.0.0.1:9\", region:\"us-east-1\", \
+               accessKey:\"AKIDEXAMPLE\", secretKey:\"secret\", bucket:\"b\", pathStyle:true}})\n\
+               return {op}\n\
+             }})\n\
+             print(r[1].message)\n"
+        )
+    };
+    for (name, op) in [
+        ("audit_blob_put.as", "client.put(\"k\", \"v\")"),
+        ("audit_blob_get.as", "client.get(\"k\")"),
+        ("audit_blob_head.as", "client.head(\"k\")"),
+        ("audit_blob_delete.as", "client.delete(\"k\")"),
+        // presign is gated too (the deliberate whole-module decision).
+        ("audit_blob_presign.as", "client.presign(\"GET\", \"k\")"),
+        ("audit_blob_multipart.as", "client.putMultipart(\"k\", [\"a\"])"),
+        // even constructing the client is denied (the module dispatch gate).
+        ("audit_blob_client.as", "client"),
+    ] {
+        for flags in [&["--deny", "net"][..], &["--sandbox"][..]] {
+            let src = mk(op);
+            let (ok, out, err) = run_with_args(&src, name, flags);
+            assert!(ok, "[{name}] {flags:?} denial is recoverable; stderr: {err}");
+            assert_eq!(
+                out.trim(),
+                "capability 'net' denied",
+                "[{name}] {flags:?} expected net denial, got {out:?}"
+            );
+        }
+    }
+    // in-code caps.drop("net") — irreversible; the gate fires after the drop. The
+    // client is built BEFORE the drop (so it exists); presign on it is then denied at
+    // the per-handle re-check.
+    let src = "import * as blob from \"std/blob\"\n\
+        import * as caps from \"std/caps\"\n\
+        let client = blob.client({endpoint:\"http://127.0.0.1:9\", region:\"us-east-1\", \
+        accessKey:\"AKIDEXAMPLE\", secretKey:\"secret\", bucket:\"b\", pathStyle:true})\n\
+        caps.drop(\"net\")\n\
+        let r = recover(() => client.presign(\"GET\", \"k\"))\n\
+        print(r[1].message)\n";
+    let (ok, out, _err) = run_with_args(src, "audit_blob_presign_drop.as", &[]);
+    assert!(ok, "blob presign drop should run (recoverable)");
+    assert_eq!(out.trim(), "capability 'net' denied", "caps.drop(\"net\") must deny blob.presign");
+}
+
 // CNTR §3.1 std/net/unix — a UDS connect/listen is gated by `Net` exactly like TCP.
 // `--deny net` AND `--sandbox` deny BEFORE any bind/connect (no real socket touched).
 #[cfg(all(unix, feature = "net"))]
@@ -725,4 +831,51 @@ fn audit_jwt_sign_ungated_under_deny_net() {
         &["--deny", "net"],
         "nil\ntrue\n",
     );
+}
+
+// ───────────────────────────── std/archive (BATT B2 §6.5) ─────────────────────
+// The disk-touching helpers (`tarExtractTo`/`zipExtractTo`/`tarCreateFromDir`) write
+// to / read from the filesystem and MUST be `Fs`-gated. `--deny fs` AND `--sandbox`
+// both deny them BEFORE any disk touch. The in-memory streaming fns
+// (`tarWriter`/`zipWriter`/`tarEntries`/`zipEntries`/`tarAppend`) touch NO OS
+// resource and run under `--sandbox` (the positive half).
+
+#[cfg(all(feature = "archive", feature = "sys"))]
+#[test]
+fn audit_archive_disk_fns_denied_by_fs() {
+    let imp = "import * as archive from \"std/archive\"";
+    for (name, expr) in [
+        (
+            "audit_archive_tar_extract.as",
+            "archive.tarExtractTo(\"\", \"/tmp/ascript_audit_ax\")",
+        ),
+        (
+            "audit_archive_zip_extract.as",
+            "archive.zipExtractTo(\"\", \"/tmp/ascript_audit_az\")",
+        ),
+        (
+            "audit_archive_create.as",
+            "archive.tarCreateFromDir(\"/tmp\")",
+        ),
+    ] {
+        assert_denied(name, imp, expr, "fs", &["--deny", "fs"]);
+        assert_denied(name, imp, expr, "fs", &["--sandbox"]);
+    }
+}
+
+/// The in-memory writer runs under `--sandbox` — it opens no OS resource, so it is
+/// NOT gated (positive per-func assertion, mirroring the fs/jwt splits).
+#[cfg(feature = "archive")]
+#[test]
+fn audit_archive_in_memory_ungated_under_sandbox() {
+    let src = "import * as archive from \"std/archive\"\n\
+        let w = archive.tarWriter()\n\
+        w.add(\"a.txt\", \"hello\")\n\
+        let b = w.finish()\n\
+        print(len(b) > 0)\n\
+        let z = archive.zipWriter()\n\
+        z.add(\"b.txt\", \"world\")\n\
+        let zb = z.finish()\n\
+        print(len(zb) > 0)\n";
+    assert_allowed("audit_archive_inmem.as", src, &["--sandbox"], "true\ntrue\n");
 }

@@ -598,6 +598,30 @@ pub(crate) enum ResourceState {
     /// untraced (plain data reclaimed by Drop). Feature `auth`.
     #[cfg(feature = "auth")]
     JwksCache(Box<crate::stdlib::jwt::JwksCacheState>),
+    /// BATT B1 §6: a `std/archive` streaming tar writer (`tarWriter(opts?)`). An
+    /// in-memory `tar::Builder` (optionally gzip-wrapped, optionally
+    /// deterministic). `add` appends one entry; `finish` consumes the builder and
+    /// returns the assembled bytes (the handle is then `Consumed`). GC-untraced
+    /// (a plain byte buffer reclaimed by Drop). Feature `archive`.
+    #[cfg(feature = "archive")]
+    ArchiveWriter(Box<crate::stdlib::archive::ArchiveWriterState>),
+    /// BATT B6 §8.2: a `std/email` SMTP client (`email.connect`, or the transient
+    /// handle inside `email.send`). A hand-rolled SMTP connection over a plaintext
+    /// `TcpStream` or a STARTTLS/implicit `TlsStream`. Boxed to keep the enum compact
+    /// (the buffered reader + the negotiated session flags). Its `Drop` is a plain
+    /// socket close (a best-effort QUIT is sent by `close()`/`send` paths, which own
+    /// the take-out-across-await; the bare Drop just reclaims the fd). GC-untraced
+    /// (a live socket), non-sendable (the worker airlock rejects the handle). Feature
+    /// `email`.
+    #[cfg(feature = "email")]
+    SmtpClient(Box<crate::stdlib::email::SmtpClientState>),
+    /// BATT B8 §9.2: a `std/blob` S3-compatible client (`blob.client(config)`). CONFIG
+    /// ONLY (endpoint, region, creds, default bucket, path-style) — no socket; every op
+    /// makes a fresh signed request through the shared pooled reqwest client. Boxed to
+    /// keep the enum compact. Plain data reclaimed by Drop; GC-untraced; non-sendable.
+    /// Feature `blob`.
+    #[cfg(feature = "blob")]
+    BlobClient(Box<crate::stdlib::blob::BlobClientState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5690,6 +5714,24 @@ impl Interp {
                 return self.call_jwks_method(&m, args, span).await;
             }
         }
+        #[cfg(feature = "archive")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::ArchiveWriter) {
+                return crate::stdlib::archive::call_writer_method(self, &m, &args, span);
+            }
+        }
+        #[cfg(feature = "email")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::SmtpClient) {
+                return self.call_smtp_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "blob")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::BlobClient) {
+                return self.call_blob_method(&m, args, span).await;
+            }
+        }
         #[cfg(feature = "telemetry")]
         {
             use crate::value::NativeKind::*;
@@ -6040,6 +6082,13 @@ impl Interp {
         {
             return true;
         }
+        // BATT B5 §8.1 — email-message `msg.raw()` call-position hook.
+        #[cfg(feature = "email")]
+        if crate::stdlib::email::is_email_value(recv)
+            && crate::stdlib::email::is_email_method(name)
+        {
+            return true;
+        }
         #[cfg(feature = "workflow")]
         if crate::stdlib::workflow::is_ctx_value(recv)
             && crate::stdlib::workflow::is_ctx_method(name)
@@ -6096,6 +6145,17 @@ impl Interp {
             rargs.push(recv);
             rargs.extend(args);
             return self.call_resilience_method(name, &rargs, span).await;
+        }
+        // BATT B5 §8.1 — email-message `msg.raw()` call-position hook. The builder is
+        // pure, so this is a synchronous dispatch (no `Interp` state, no `.await`).
+        #[cfg(feature = "email")]
+        if crate::stdlib::email::is_email_value(&recv)
+            && crate::stdlib::email::is_email_method(name)
+        {
+            let mut eargs = Vec::with_capacity(args.len() + 1);
+            eargs.push(recv);
+            eargs.extend(args);
+            return crate::stdlib::email::call_email_method(name, &eargs, span);
         }
         // Workflow ctx hook.
         #[cfg(feature = "workflow")]

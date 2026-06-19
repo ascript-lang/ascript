@@ -8778,6 +8778,21 @@ impl Vm {
             fiber.push(v);
             return Ok(());
         }
+        // (1a) BATT B5 §8.1: email-message `msg.raw()` call-position hook (same
+        // predicate + shape as the schema hook; the builder is pure so this is a
+        // synchronous `call_email_method` — no `Interp` state, no `.await`). Mirrors
+        // the tree-walker `call_method_recv` hook byte-for-byte.
+        #[cfg(feature = "email")]
+        if crate::stdlib::email::is_email_value(&recv)
+            && crate::stdlib::email::is_email_method(name)
+        {
+            let mut eargs = Vec::with_capacity(args.len() + 1);
+            eargs.push(recv);
+            eargs.extend(args);
+            let v = crate::stdlib::email::call_email_method(name, &eargs, span)?;
+            fiber.push(v);
+            return Ok(());
+        }
         // (1a) SP9 §2: workflow `ctx.<method>()` hook (same predicate + shape as the
         // schema hook, same routing to the shared `Interp`).
         #[cfg(feature = "workflow")]

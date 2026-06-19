@@ -1,0 +1,6 @@
+# exit: none
+put error: nil
+get error: nil
+round-tripped body: Hello from std/blob!
+listed keys: greeting.txt, notes-day1.md
+blob_basics ok

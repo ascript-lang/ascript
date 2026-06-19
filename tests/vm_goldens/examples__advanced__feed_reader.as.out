@@ -1,0 +1,8 @@
+# exit: none
+feed: AScript Weekly
+  [1] Bytecode VM ships
+      <p>The <b>async VM</b> is now the default engine.</p>
+  [2] Security note
+      <p>Click <a>here</a> or <a href="https://example.com">the docs</a>.</p>
+items: 2
+feed_reader ok

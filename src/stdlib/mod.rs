@@ -9,6 +9,12 @@ pub mod ai;
 pub mod array;
 pub mod assert_mod;
 pub mod bench;
+// BATT B8 §9.2 — `std/blob` S3-compatible object storage (the SigV4 core in B7 +
+// the client/operations here). Registered in STD_MODULES / routing / required_cap /
+// std_sigs / rtstub / docs. `pub` so `blob::BlobClientState` is reachable from the
+// `ResourceState` enum in `interp.rs`.
+#[cfg(feature = "blob")]
+pub mod blob;
 pub mod bytes;
 pub mod caps;
 #[cfg(feature = "binary")]
@@ -18,6 +24,14 @@ pub mod color;
 #[cfg(feature = "compress")]
 pub mod compress;
 pub mod convert;
+#[cfg(feature = "archive")]
+pub mod archive;
+#[cfg(feature = "xml")]
+pub mod xml;
+#[cfg(feature = "xml")]
+pub mod html;
+#[cfg(feature = "email")]
+pub mod email;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "docker")]
@@ -236,6 +250,16 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/jwt" => jwt::exports(),
         #[cfg(feature = "auth")]
         "std/oauth" => oauth::exports(),
+        #[cfg(feature = "archive")]
+        "std/archive" => archive::exports(),
+        #[cfg(feature = "xml")]
+        "std/xml" => xml::exports(),
+        #[cfg(feature = "xml")]
+        "std/html" => html::exports(),
+        #[cfg(feature = "email")]
+        "std/email" => email::exports(),
+        #[cfg(feature = "blob")]
+        "std/blob" => blob::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -312,6 +336,11 @@ pub const STD_MODULES: &[&str] = &[
     "std/docker",
     "std/jwt",
     "std/oauth",
+    "std/archive",
+    "std/xml",
+    "std/html",
+    "std/email",
+    "std/blob",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -431,6 +460,33 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         // which also carry network egress). `--deny net`/`--sandbox` blocks it.
         #[cfg(feature = "auth")]
         "oauth" => CapReq::one(Cap::Net),
+        // BATT B8 §9.2 — `std/blob` is WHOLE-MODULE `Net` (incl. `presign`): the
+        // S3 ops make signed network requests, and `presign` mints a
+        // capability-bearing URL from the secret key — gating the whole
+        // secret-handling surface is the deliberate decision (a denied `net`
+        // blocks `presign` too). Feature-gated like the dispatch arm.
+        #[cfg(feature = "blob")]
+        "blob" => CapReq::one(Cap::Net),
+        // BATT B1 §6 — `std/archive` is PER-FUNC: the in-memory streaming fns
+        // (`tarWriter`/`tarEntries`/`tarAppend`) touch no OS resource → ungated; the
+        // disk fns (`tarExtractTo`/`zipExtractTo`/`tarCreateFromDir`, added in B2)
+        // read or write the host filesystem → `Fs`. Wiring the `Fs` arm now so the
+        // gate is correct the moment B2 lands the disk fns.
+        #[cfg(feature = "archive")]
+        "archive" => match func {
+            "tarExtractTo" | "zipExtractTo" | "tarCreateFromDir" => CapReq::one(Cap::Fs),
+            _ => CapReq::NONE,
+        },
+        // BATT B5 §8.1/§8.2 — `std/email` is PER-FUNC (the `jwt`/`archive` precedent):
+        // the SMTP client funcs (`send`/`connect`, B6) open a network socket → `Net`;
+        // the pure message builders (`message`/`validateAddress`) touch no OS resource
+        // → ungated (they work under `--sandbox`). Wiring the `Net` arm now so the gate
+        // is correct the moment B6 lands the client.
+        #[cfg(feature = "email")]
+        "email" => match func {
+            "send" | "connect" => CapReq::one(Cap::Net),
+            _ => CapReq::NONE,
+        },
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
@@ -681,6 +737,21 @@ impl Interp {
             "jwt" => self.call_jwt_async(func, args, span).await,
             #[cfg(feature = "auth")]
             "oauth" => self.call_oauth(func, args, span).await,
+            #[cfg(feature = "archive")]
+            "archive" => archive::call(self, func, args, span),
+            #[cfg(feature = "xml")]
+            "xml" => xml::call(func, args, span),
+            #[cfg(feature = "xml")]
+            "html" => html::call(func, args, span),
+            #[cfg(feature = "email")]
+            "email" => match func {
+                // The SMTP client funcs need `&self` (resource registration + async
+                // socket I/O); the pure builders stay sync.
+                "send" | "connect" => self.call_email_async(func, args, span).await,
+                _ => email::call(func, args, span),
+            },
+            #[cfg(feature = "blob")]
+            "blob" => self.call_blob(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1154,6 +1225,36 @@ mod cap_gate_tests {
         assert!(required_cap("caps", "drop").is_empty());
         // resilience is pure / in-memory.
         assert!(required_cap("resilience", "breaker").is_empty());
+        // BATT B3 §7.2 — std/xml is pure parsing (no net/fs) → ungated.
+        assert!(required_cap("xml", "parse").is_empty());
+        assert!(required_cap("xml", "stringify").is_empty());
+        // BATT B1 §6 — archive is PER-FUNC: streaming/in-memory fns ungated; the
+        // disk fns (B2) → Fs.
+        #[cfg(feature = "archive")]
+        {
+            assert!(required_cap("archive", "tarWriter").is_empty());
+            assert!(required_cap("archive", "tarEntries").is_empty());
+            assert!(required_cap("archive", "tarAppend").is_empty());
+            assert_eq!(req("archive", "tarExtractTo"), vec![Cap::Fs]);
+            assert_eq!(req("archive", "zipExtractTo"), vec![Cap::Fs]);
+            assert_eq!(req("archive", "tarCreateFromDir"), vec![Cap::Fs]);
+        }
+        // BATT B5 §8 — email is PER-FUNC: the pure builders (message/validateAddress)
+        // are ungated; the SMTP client (send/connect, B6) → Net.
+        #[cfg(feature = "email")]
+        {
+            assert!(required_cap("email", "message").is_empty());
+            assert!(required_cap("email", "validateAddress").is_empty());
+            assert_eq!(req("email", "send"), vec![Cap::Net]);
+            assert_eq!(req("email", "connect"), vec![Cap::Net]);
+        }
+        // BATT B8 §9.2 — blob is WHOLE-MODULE Net (incl. presign).
+        #[cfg(feature = "blob")]
+        {
+            assert_eq!(req("blob", "client"), vec![Cap::Net]);
+            assert_eq!(req("blob", "presign"), vec![Cap::Net]);
+            assert_eq!(req("blob", "anything"), vec![Cap::Net]);
+        }
     }
 
     /// Drift guard: every resource-acquiring module string the dispatch match
@@ -1193,6 +1294,9 @@ mod cap_gate_tests {
             ("telemetry", Cap::Net),
             #[cfg(feature = "workflow")]
             ("workflow", Cap::Fs),
+            // BATT B8 §9.2 — blob is whole-module Net (the S3 client + presign).
+            #[cfg(feature = "blob")]
+            ("blob", Cap::Net),
         ];
         for (m, want) in gated {
             assert_eq!(
@@ -1240,13 +1344,21 @@ mod cap_gate_tests {
             "msgpack", "cbor", "tui",
             // RESIL §0: pure / in-memory policy kit — no OS resource, no cap.
             "resilience",
+            // BATT B3 §7.2: std/xml is pure parsing/serialization — no net/fs (the
+            // structural XXE / external-entity defense), so it acquires no cap.
+            "xml",
+            // BATT B4 §7.3: std/html is a pure string transform (escape/unescape/
+            // sanitize) — no OS resource, so it acquires no cap.
+            "html",
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");
-            if key == "os" || key == "jwt" {
+            if key == "os" || key == "jwt" || key == "archive" || key == "email" {
                 // Per-func gating (covered above): os (topology→Net, ambient→None);
-                // jwt (BATT §5.4 — jwks→Net, sign/verify/decode/hmacKey→None). The
-                // whole-module `__probe__` verdict cannot represent a per-func split.
+                // jwt (BATT §5.4 — jwks→Net, sign/verify/decode/hmacKey→None);
+                // archive (BATT B1 §6 — disk fns→Fs, streaming/in-memory→None);
+                // email (BATT B5 §8 — send/connect→Net, message/validateAddress→None).
+                // The whole-module `__probe__` verdict cannot represent a per-func split.
                 continue;
             }
             let gated = !required_cap(&key, "__probe__").is_empty();

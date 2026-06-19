@@ -13,6 +13,7 @@ Most of these modules are gated behind Cargo features, all of which are **on by 
 | `std/os` (live metrics: memory, swap, cpuUsage, loadAvg, disks, uptime, networkInterfaces, localIp) | `sysinfo` |
 | `std/crypto` | `crypto` |
 | `std/compress` | `compress` |
+| `std/archive` | `archive` |
 
 > [!TIER1]
 > Fallible I/O follows the **Tier-1** convention: the function returns a `[value, err]` pair. On success `err` is `nil`; on failure `value` is `nil` and `err` is an error object with a `message` field. Always destructure and check, e.g. `let [text, err] = read(path)`.
@@ -957,3 +958,188 @@ import { tarCreate, tarExtract } from "std/compress"
 let [archive, e1] = tarCreate([{ name: "a.txt", data: "hello" }])
 let [entries, e2] = tarExtract(archive)
 ```
+
+> [!NOTE]
+> These are the **one-shot** helpers — they materialize the whole archive at once.
+> For **streaming** writers and **lazy** entry generators (so a large archive is
+> never fully in memory), **hardened** zip-slip-safe disk extraction, gzip-tar, and
+> reproducible (`deterministic`) output, see [`std/archive`](#stdarchive) below.
+
+## std/archive
+
+`std/archive` (Cargo feature `archive`, on by default) is the **streaming** superset
+of `std/compress`'s one-shot `tarCreate`/`tarExtract`. Where the compress helpers
+build or read a whole archive in one call, `std/archive` lets you assemble a tar
+incrementally through a **writer handle** and consume one through a **lazy entries
+generator** — so large archives never need to live fully materialized as an entry
+array.
+
+The decoder is **hardened against hostile input**: every allocation is bounded
+(a per-entry cap rejects a header that declares a giant size before any buffer is
+allocated), and a truncated, corrupt, or non-tar stream produces a clean Tier-1
+error rather than a panic or an out-of-memory abort.
+
+The module has two planes — **tar** and **zip** — with matching in-memory writers
+and lazy entries generators, plus three **filesystem-gated** disk helpers
+(`tarExtractTo`, `zipExtractTo`, `tarCreateFromDir`).
+
+> [!NOTE]
+> The in-memory functions (`tarWriter`/`zipWriter`, `tarEntries`/`zipEntries`,
+> `tarAppend`) are pure and run under `--sandbox`. The disk helpers
+> (`tarExtractTo`/`zipExtractTo`/`tarCreateFromDir`) touch the filesystem and are
+> **`Fs`-capability gated** — denied under `--sandbox` / `--deny fs` *before* any
+> disk access. They additionally require the `sys` feature (they are absent from
+> the module when `sys` is off).
+
+### archive.tarWriter
+
+`tarWriter(opts?)` opens a streaming tar writer and returns a handle. The options
+object accepts `gzip` (when true, `finish()` returns gzip-wrapped bytes — a
+`.tar.gz`) and `deterministic` (when true, each entry's mtime/uid/gid is zeroed so
+two identical add-sequences produce **byte-identical** output — reproducible builds).
+
+The handle has two methods. `add(name, data, opts?)` appends one entry — `data` is
+bytes, a string, or `nil`, and the per-entry options are `dir` (write a directory
+entry — `data` is ignored), `mode` (octal permission bits, default `0o644` for
+files / `0o755` for directories), and `mtime`. `finish()` finalizes the archive and
+returns the assembled `bytes`; the handle is then consumed, so calling `add` after
+`finish` is a Tier-2 panic.
+
+```ascript
+import { tarWriter } from "std/archive"
+
+let w = tarWriter({ gzip: true, deterministic: true })
+w.add("README.md", "# hello\n")
+w.add("src/", nil, { dir: true })
+w.add("src/main.as", readFileBytes(), { mode: 0o600 })
+let bytes = w.finish()    // gzip-wrapped tar bytes
+```
+
+### archive.tarEntries
+
+`tarEntries(bytes)` returns a **lazy generator** over a (optionally gzipped — the
+gzip magic is auto-sniffed) tar. Each `next()` decodes one entry and yields an
+object `{ name, size, mode, isDir, data }`. Drive it with `for await`:
+
+```ascript
+import { tarEntries } from "std/archive"
+
+for await (e of tarEntries(bytes)) {
+  if (e.isDir) { continue }
+  print(`${e.name} (${e.size} bytes)`)
+}
+```
+
+If an entry's header is corrupt or the stream is truncated, the **prior entries
+still yield normally**, and the generator surfaces the failure as a final
+`[nil, err]` Tier-1 pair on the pull that reaches the bad entry — so iteration is
+both lazy and fail-safe:
+
+```ascript
+for await (e of tarEntries(bytes)) {
+  if (type(e) == "array") {          // a [nil, err] error sentinel
+    print(`stopped: ${e[1].message}`)
+  } else {
+    print(e.name)
+  }
+}
+```
+
+### archive.tarAppend
+
+`tarAppend(data, additions)` decodes an existing tar (preserving every entry) and
+appends each `{ name, data, mode?, dir? }` of the `additions` array, returning the
+new archive bytes. It is Tier-1: a corrupt source archive yields `[nil, err]`.
+
+```ascript
+import { tarAppend } from "std/archive"
+let [updated, err] = tarAppend(existing, [{ name: "CHANGELOG", data: "v2\n" }])
+```
+
+### archive.zipWriter
+
+`zipWriter(opts?)` opens a streaming **zip** writer and returns a handle — the zip
+analogue of `tarWriter`. The options object accepts `store` (when true, entries are
+**stored without compression** by default; otherwise deflate is used). The handle's
+`add(name, data, opts?)` per-entry options are `dir` (write a directory entry),
+`mode` (unix permission bits), and `store` (override compression for this entry).
+`finish()` returns the assembled zip `bytes`.
+
+```ascript
+import { zipWriter } from "std/archive"
+
+let w = zipWriter()
+w.add("a.txt", "hello")
+w.add("raw.bin", rawBytes, { store: true })   // no compression for this entry
+let bytes = w.finish()
+```
+
+### archive.zipEntries
+
+`zipEntries(bytes)` returns a **lazy generator** over a zip. Each `next()` yields
+`{ name, size, compressedSize, mode, isDir, data }` — `compressedSize` is the
+on-disk compressed length (zip carries it; tar does not). A corrupt entry surfaces
+as a trailing `[nil, err]` pair, exactly like `tarEntries`.
+
+```ascript
+import { zipEntries } from "std/archive"
+for await (e of zipEntries(bytes)) {
+  print(`${e.name}: ${e.size} → ${e.compressedSize} bytes`)
+}
+```
+
+### archive.tarExtractTo / archive.zipExtractTo
+
+`tarExtractTo(data, dest, opts?)` and `zipExtractTo(data, dest, opts?)` extract an
+archive's contents to the `dest` directory (created if missing). Both return
+`[dest, err]` (Tier-1). They are **`Fs`-capability gated** (denied under
+`--sandbox` / `--deny fs`).
+
+These functions implement a **bulletproof zip-slip / path-traversal defense** —
+extracting a hostile archive is otherwise an arbitrary-file-write vulnerability:
+
+- The destination is **canonicalized first** and becomes the jail root.
+- Each entry name is **lexically normalized** component-by-component (splitting on
+  both `/` and `\`, processing `.`/`..` *without touching the filesystem* — no
+  TOCTOU). An entry that would **escape** the root (a `..` past the top, an
+  **absolute** path, a Windows **drive** `C:` or **UNC** `\\server`, or an embedded
+  **NUL** byte) is rejected with a Tier-1 error **naming the offending entry**, and
+  the lexically-joined write path is re-checked with `starts_with(dest)` as a
+  belt-and-suspenders guard.
+- **Symlinks and hardlinks are skipped by default** (never materialized) — this
+  defeats the **second-order** attack where one entry plants a symlink and a later
+  entry writes *through* it. Pass `{ links: "error" }` to fail the extract with a
+  Tier-1 error on the first link instead. Parent directories are created
+  **without following an existing symlink**, so a pre-existing symlinked subdir in
+  `dest` cannot be used to escape.
+- The extract **fails on the first hostile entry** and best-effort removes anything
+  already written — nothing outside `dest` is ever written, on any input.
+
+```ascript
+import { tarExtractTo, zipExtractTo } from "std/archive"
+
+let [out, err] = tarExtractTo(tarGzBytes, "/tmp/unpacked")
+if (err != nil) { print(`extract refused: ${err.message}`) }
+
+// Strict mode: any symlink entry is a hard error.
+let [_, e2] = zipExtractTo(zipBytes, "/tmp/zip-out", { links: "error" })
+```
+
+### archive.tarCreateFromDir
+
+`tarCreateFromDir(dir, opts?)` walks `dir` recursively and builds a tar of its
+files and directories, returning `[bytes, err]`. Options: `gzip` (gzip-wrap) and
+`deterministic` (zero each entry's mtime/uid/gid **and** sort entries by path, so
+two runs over the same tree produce **byte-identical** output). Symlinks inside the
+tree are **skipped** (never embedded), mirroring the extraction defense. It is
+**`Fs`-capability gated**.
+
+```ascript
+import { tarCreateFromDir } from "std/archive"
+let [bytes, err] = tarCreateFromDir("./dist", { gzip: true, deterministic: true })
+```
+
+### Examples
+
+- [`examples/archive_roundtrip.as`](https://github.com/ascript-lang/ascript/blob/main/examples/archive_roundtrip.as) — tar, tar.gz, and zip round-trips in memory, with deterministic byte-stability.
+- [`examples/advanced/backup_tool.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/backup_tool.as) — walk a directory → reproducible deterministic `tar.gz` → verify the entries.

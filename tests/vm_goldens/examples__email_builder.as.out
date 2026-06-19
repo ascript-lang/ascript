@@ -1,0 +1,11 @@
+# exit: none
+build error: nil
+has From header: true
+has Subject header: true
+is text/plain: true
+is multipart/alternative: true
+bcc not in headers: true
+valid address: true
+invalid address: false
+injection rejected: true
+email_builder ok

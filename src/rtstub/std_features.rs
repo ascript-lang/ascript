@@ -87,6 +87,24 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // needs the net tier (jwks fetch + oauth token calls) — see FEATURE_DEPS.
     ("std/jwt",         Some("auth")),
     ("std/oauth",       Some("auth")),
+    // BATT Phase B — std/archive is gated on the `archive` feature (archive =
+    // compress), so an archive-using bundle pulls the compression tier.
+    ("std/archive",     Some("archive")),
+    // BATT Phase B §7.2 — std/xml is gated on the `xml` feature (xml = data +
+    // quick-xml), so an xml-using bundle pulls the data tier.
+    ("std/xml",         Some("xml")),
+    // BATT Phase B §7.3 — std/html shares the `xml` feature (lenient HTML
+    // helpers: escape/unescape/sanitize), so an html-using bundle pulls the
+    // data tier.
+    ("std/html",        Some("xml")),
+    // BATT Phase B §8 — std/email is gated on the `email` feature (email = net +
+    // tls + data). The net edge is load-bearing for tier selection: an email
+    // bundle (B6 SMTP client) must select the net tier.
+    ("std/email",       Some("email")),
+    // BATT B8 §9 — std/blob is gated on the `blob` feature (blob = net + crypto +
+    // data + xml). The net edge is load-bearing for tier selection: a blob bundle
+    // (the S3 client) must select the net tier; xml decodes the S3 responses.
+    ("std/blob",        Some("blob")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.
@@ -125,6 +143,31 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     ("auth", "crypto"),
     ("auth", "data"),
     ("auth", "net"),
+    // BATT Phase B — archive = ["compress"]. A std/archive bundle pulls the
+    // compression tier (tar/gzip over the vendored tar/flate2).
+    ("archive", "compress"),
+    // BATT Phase B §7.2 — xml = ["data", "dep:quick-xml"]. A std/xml bundle pulls
+    // the data tier.
+    ("xml", "data"),
+    // BATT Phase B §8 — email = ["net", "tls", "data"]. A std/email bundle pulls
+    // the net + data tiers (the SMTP client fetches over the network; the builder
+    // reuses base64/sha2 from the data tier) PLUS the tls tier (STARTTLS/implicit
+    // TLS in B6). All THREE bare feature→feature edges must be tracked so the
+    // `closure_drift` reverse check stays green; following `email → tls` makes
+    // `tls` closure-relevant, so its own `tls → net` edge is tracked too.
+    ("email", "net"),
+    ("email", "tls"),
+    ("email", "data"),
+    // tls = ["net", ...]. First reached transitively via `email → tls`.
+    ("tls", "net"),
+    // BATT B8 §9 — blob = ["net", "crypto", "data", "xml"]. A std/blob bundle pulls
+    // the net tier (the S3 client), crypto (SigV4 HMAC-SHA256), data (base64/sha2),
+    // and xml (decoding S3 list/error responses). All four bare feature→feature edges
+    // must be tracked so the `closure_drift` reverse check stays green.
+    ("blob", "net"),
+    ("blob", "crypto"),
+    ("blob", "data"),
+    ("blob", "xml"),
 ];
 
 /// Collect all `std/` module specifiers imported anywhere in `archive`.

@@ -230,10 +230,11 @@ ascript run hello.as
 | Domain | Modules |
 |---|---|
 | Core & collections | `std/string` · `std/array` · `std/object` · `std/map` · `std/set` (insertion-ordered hash set) · `std/math` · `std/convert` · `std/bytes` |
-| Data & serialization | `std/json` · `std/csv` · `std/toml` · `std/yaml` (all with typed `parse(text, Class\|schema)`) · `std/msgpack` · `std/cbor` (binary) · `std/encoding` · `std/regex` · `std/uuid` · `std/url` · `std/decimal` (exact 96-bit decimal arithmetic) |
+| Data & serialization | `std/json` · `std/csv` · `std/toml` · `std/yaml` (all with typed `parse(text, Class\|schema)`) · `std/msgpack` · `std/cbor` (binary) · `std/encoding` · `std/regex` · `std/uuid` · `std/url` · `std/xml` (strict XML 1.0 parse/stringify) · `std/html` (escape/unescape · fail-closed allowlist `sanitize`) · `std/decimal` (exact 96-bit decimal arithmetic) |
 | Validation & schema | `std/schema` (composable validators: object/array/map/union/oneOf/optional, constraints, refine, coerce, fromClass, `parseAll` collect-all-errors) |
-| System & files | `std/fs` · `std/env` · `std/io` · `std/process` · `std/crypto` · `std/compress` (gzip/deflate/zip · zstd · brotli · tar) · `std/sqlite` |
+| System & files | `std/fs` · `std/env` · `std/io` · `std/process` · `std/crypto` · `std/compress` (gzip/deflate/zip · zstd · brotli · tar) · `std/archive` (streaming tar/zip writers + lazy entry generators · gzip-tar · `deterministic` reproducible output · hardened zip-slip-safe disk extraction) · `std/sqlite` |
 | Databases | `std/postgres` · `std/redis` (async network clients; native-resource handles) |
+| Mail & object storage | `std/email` (RFC 5322 message builder — `multipart/alternative`/`mixed`, RFC 2047 encoded-words, header-injection-proof — + a hand-rolled SMTP client: EHLO/STARTTLS/AUTH/`send`) · `std/blob` (S3-compatible object storage over AWS SigV4: `put`/`get`/`head`/`delete` · lazy `list` · `presign` · streaming `putMultipart`; works against S3, R2, MinIO, B2) |
 | Utilities | `std/lru` (bounded LRU cache) · `std/events` (event-emitter) · `std/template` (`{{name}}` templating) |
 | Host & OS | `std/os` (pid · platform · arch · cpuCount · hostname · tempDir; live metrics via `sysinfo` feature: memory · swap · cpuUsage · loadAvg · disks · uptime · networkInterfaces · localIp) |
 | CLI & terminal | `std/cli` (declarative arg parser) · `std/color` (ANSI colors & styles, NO_COLOR-aware) |

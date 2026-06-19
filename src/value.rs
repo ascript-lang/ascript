@@ -1341,6 +1341,35 @@ pub enum NativeKind {
     // without `auth` (mirrors the docker/resilience pattern).
     #[cfg(feature = "auth")]
     JwksCache,
+    // BATT B6 §8.2: a `std/email` SMTP client handle (`email.connect`, or the
+    // transient handle behind `email.send`). Backed by `ResourceState::SmtpClient`
+    // — a hand-rolled SMTP connection over a `TcpStream` OR a (STARTTLS/implicit)
+    // `tokio_rustls::client::TlsStream`. Methods: `send(msg)` (drives MAIL/RCPT/DATA
+    // and returns `[{accepted, rejected}, err]`) and `close()` (best-effort QUIT +
+    // fd reclaim via Drop). `governing_caps` = Net (each command round-trip is live
+    // network I/O → a `caps.drop("net")` HOLDS for an already-open client). GC-
+    // untraced (a live socket reclaimed by Drop), non-sendable (the worker airlock
+    // rejects it). Feature-gated — compiled out without `email`.
+    #[cfg(feature = "email")]
+    SmtpClient,
+    // BATT B1 §6: a `std/archive` streaming tar writer handle (`tarWriter(opts?)`).
+    // Backed by `ResourceState::ArchiveWriter` — an in-memory `tar::Builder`
+    // (optionally gzip-wrapped, optionally deterministic). Methods: `add(name,
+    // data, opts?)` and `finish()` (returns the assembled bytes + finalizes the
+    // handle). In-memory only → `governing_caps` = NONE (ungated; works under
+    // `--sandbox`). GC-untraced (a plain byte buffer reclaimed by Drop), non-
+    // sendable. Feature-gated — compiled out without `archive`.
+    #[cfg(feature = "archive")]
+    ArchiveWriter,
+    // BATT B8 §9.2: a `std/blob` S3-compatible client handle (`blob.client(config)`).
+    // Backed by `ResourceState::BlobClient` — CONFIG ONLY (endpoint, region, creds,
+    // default bucket, path-style); every op makes a fresh signed request through the
+    // SHARED pooled reqwest client, so there is no socket to reclaim. `governing_caps`
+    // = Net (operating it — incl. `presign`, which mints a capability-bearing URL from
+    // the secret — is gated; a `caps.drop("net")` HOLDS for an already-built client).
+    // GC-untraced (plain data reclaimed by Drop), non-sendable. Feature `blob`.
+    #[cfg(feature = "blob")]
+    BlobClient,
 }
 
 impl NativeKind {
@@ -1405,6 +1434,12 @@ impl NativeKind {
             NativeKind::DockerStream => "dockerStream",
             #[cfg(feature = "auth")]
             NativeKind::JwksCache => "jwksCache",
+            #[cfg(feature = "archive")]
+            NativeKind::ArchiveWriter => "archiveWriter",
+            #[cfg(feature = "email")]
+            NativeKind::SmtpClient => "smtpClient",
+            #[cfg(feature = "blob")]
+            NativeKind::BlobClient => "blobClient",
         }
     }
 
@@ -1481,6 +1516,11 @@ impl NativeKind {
             // RESIL §2.2: no OS resource — a pure in-memory marker.
             #[cfg(feature = "resilience")]
             NativeKind::Resilience => CapReq::NONE,
+            // BATT B1 §6: a tar writer assembles bytes in memory — no OS effect at
+            // method time (the disk write is the caller's job) → ungated; `add`/
+            // `finish` work under `--sandbox`.
+            #[cfg(feature = "archive")]
+            NativeKind::ArchiveWriter => CapReq::NONE,
             // CNTR §5.3: operating a docker client drives the Engine API over the
             // network AND can spawn host processes — net ∧ process, the same
             // conjunction the dispatch gate enforces, so a `caps.drop` HOLDS.
@@ -1499,6 +1539,17 @@ impl NativeKind {
             // grain (worst case), so it is gated Net.
             #[cfg(feature = "auth")]
             NativeKind::JwksCache => CapReq::one(Cap::Net),
+            // BATT B6 §8.2: an OPEN SMTP client drives MAIL/RCPT/DATA over a live
+            // socket on each `.send()`, so a `caps.drop("net")` after the client
+            // opens must HOLD (the per-handle re-check mirrors TcpStream/HttpBody).
+            #[cfg(feature = "email")]
+            NativeKind::SmtpClient => CapReq::one(Cap::Net),
+            // BATT B8 §9.2: operating a blob client makes a signed S3 request over the
+            // network on each op (and `presign` mints a capability-bearing URL from the
+            // secret key), so a `caps.drop("net")` after the client is built must HOLD
+            // (the per-handle re-check mirrors TcpStream/SmtpClient).
+            #[cfg(feature = "blob")]
+            NativeKind::BlobClient => CapReq::one(Cap::Net),
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a

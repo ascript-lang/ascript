@@ -211,6 +211,8 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/csv", "data.md"),
     ("std/toml", "data.md"),
     ("std/yaml", "data.md"),
+    ("std/xml", "data.md"),
+    ("std/html", "data.md"),
     ("std/msgpack", "data.md"),
     ("std/cbor", "data.md"),
     ("std/tui", "tui.md"),
@@ -219,6 +221,9 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/docker", "docker.md"),
     ("std/jwt", "auth.md"),
     ("std/oauth", "auth.md"),
+    ("std/archive", "system.md"),
+    ("std/email", "email.md"),
+    ("std/blob", "blob.md"),
 ];
 
 /// Pure checker (mutation-self-testable): validates a mapping against a module

@@ -1,0 +1,13 @@
+# exit: none
+seeded 4 files
+reproducible: true
+archive contents:
+  README.md (40B)
+  docs/ (0B)
+  docs/guide.md (32B)
+  src/ (0B)
+  src/main.as (32B)
+  src/util.as (29B)
+README round-trips: true
+non-empty entries: 4
+backup_tool ok
