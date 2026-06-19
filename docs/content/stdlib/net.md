@@ -202,6 +202,103 @@ conn.close()
 server.close()
 ```
 
+## TLS
+
+AScript supports TLS on two surfaces: **outbound connections** via `tcp.connectTls` and **inbound TLS termination** via `server.serve({ tls })`. Both are provided by the `tls` Cargo feature (enabled by default; backed by rustls).
+
+### PEM strings, not paths
+
+Credentials are passed as **PEM-encoded strings** rather than filesystem paths. This is a deliberate capability-honesty design (§4.1):
+
+- A path-based API would perform a filesystem read at server startup, requiring the `fs` capability even for a server that only needs `net`. Passing the PEM content directly means only `net` is needed.
+- The material stays in-process (no accidental path-traversal); the string is shipped across the worker airlock to each isolate, which builds its own TLS acceptor.
+
+In production, inject PEM content via an environment variable or a secrets manager and pass the string directly:
+
+```ascript
+import * as env from "std/env"
+let cert = env.get("TLS_CERT_PEM")   // the full PEM string, not a file path
+let key  = env.get("TLS_KEY_PEM")
+```
+
+### TLS scope (§4.1)
+
+- **Supported:** TLS 1.2 and TLS 1.3 (rustls defaults).
+- **Server-side:** certificate + private key in PEM format; optional SNI map for virtual hosting.
+- **Client-side:** optional custom CA bundle (overrides the system root store); optional explicit `serverName`; optional ALPN protocol list.
+- **Not in v1:** client-certificate authentication (mutual TLS); post-handshake renegotiation; session tickets (rustls stateless tickets are always on); raw DER input.
+
+### tcp.connectTls
+
+`tcp.connectTls(host, port, opts?) -> future<[stream, err]>`
+
+Opens a TCP connection and performs a TLS client handshake. The returned stream is a **TlsStream** with the same read/write/close interface as a plain TCP stream, plus an `alpn()` reader.
+
+- `host` (string) — the target hostname. Used for SNI unless overridden by `opts.serverName`.
+- `port` (number) — an integer in `0..=65535`.
+- `opts?` (object) — optional TLS options:
+
+| option | type | meaning |
+| --- | --- | --- |
+| `caCert` | string | PEM-encoded CA certificate to trust **instead of** the system root store. Use this to trust a self-signed cert (e.g. for testing or private services). |
+| `serverName` | string | Override the SNI hostname sent in the handshake (defaults to `host`). Useful when connecting by IP but the cert has a DNS SAN. |
+| `alpn` | array&lt;string&gt; | Preferred ALPN protocol list (e.g. `["h2", "http/1.1"]`). The negotiated protocol is readable via `stream.alpn()`. |
+
+A connect failure, TLS handshake failure, or invalid `serverName` returns `[nil, err]` (Tier-1). A malformed `opts` is a Tier-2 panic.
+
+```ascript
+import * as tcp from "std/net/tcp"
+
+let [stream, err] = await tcp.connectTls("example.com", 443, {
+  alpn: ["http/1.1"],
+})
+if (err != nil) { print("TLS connect failed: " + err.message) }
+let proto = stream.alpn()   // "http/1.1" or nil if not negotiated
+```
+
+#### TlsStream methods
+
+A `TlsStream` handle exposes the same interface as a plain TCP stream:
+
+- `await stream.read(n?)` — reads up to `n` bytes (default 64 KiB). Returns bytes, or `nil` at EOF.
+- `await stream.readLine()` — reads a single UTF-8-lossy line (trailing `\n` stripped). Returns a string, or `nil` at EOF.
+- `await stream.readToEnd()` — reads to end-of-stream. Always returns bytes.
+- `await stream.write(data)` — writes a string or bytes. Returns `[nil, err]`.
+- `stream.close()` — synchronous; drops the socket. Idempotent.
+- `stream.alpn()` — returns the negotiated ALPN protocol string (e.g. `"h2"`), or `nil` if ALPN was not negotiated.
+
+#### Capabilities
+
+`tcp.connectTls` is gated by the `net` capability exactly like `tcp.connect`: `--deny net`, `--sandbox`, or `caps.drop("net")` all deny it before any socket I/O.
+
+### server.serve({ tls })
+
+The HTTP server's `serve` options accept a `tls` field to enable TLS termination:
+
+```
+await app.serve({ tls: { cert, key, sni? }, … })
+```
+
+| field | type | meaning |
+| --- | --- | --- |
+| `tls.cert` | string | PEM-encoded server certificate (full chain). |
+| `tls.key` | string | PEM-encoded private key matching the certificate. |
+| `tls.sni` | object | Optional SNI map: `{ "example.com": { cert, key }, … }` for virtual hosting. Each entry is the same `{cert, key}` shape. |
+
+When `tls` is supplied every accepted TCP connection is wrapped in a rustls TLS handshake before being handed to the HTTP layer. The `cert`/`key` strings are shipped across the worker airlock in multi-isolate mode (`workers: N`), so each isolate builds its own acceptor independently.
+
+```ascript
+import { create } from "std/http/server"
+
+let app = create()
+app.route("GET", "/", (req) => "ok")
+
+let [port, _] = await app.bind("127.0.0.1", 8443)
+await app.serve({ tls: { cert: CERT, key: KEY } })
+```
+
+See `examples/tls_echo.as` for a self-contained loopback round-trip and `examples/advanced/https_server.as` for a production-shaped HTTPS server.
+
 ## std/net/unix
 
 Unix-domain-socket (UDS) client and server handles, built on tokio's `UnixStream`/`UnixListener`. The API is the byte-for-byte structural mirror of `std/net/tcp` over a filesystem socket path instead of a host/port — a stream supports `read`/`readLine`/`readToEnd`/`write`/`close`; a listener supports `accept`/`close`. UDS are a POSIX concept; on a non-Unix platform `connect`/`listen` raise a Tier-2 panic.
