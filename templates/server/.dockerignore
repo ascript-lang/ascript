@@ -1,0 +1,10 @@
+# Keep the build context small + reproducible.
+.git
+.gitignore
+*.aso
+target/
+ascript.lock
+README.md
+Dockerfile
+.dockerignore
+**/*.log

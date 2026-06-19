@@ -887,12 +887,21 @@ if (err != nil) { log.error("serve failed", { error: err.message }) }
 
 ## Deferred (owner-noted, never silent)
 
-- **RT-DEPENDENT:** scratch/distroless base images + published `ascript-rt` image (spec §9.1) —
-  blocked on RT shipping (`2026-06-12-native-runtime-stubs-design.md` — specced: stub tier
-  matrix §3, `--oci` §8; unshipped).
-- **RESIL-DEPENDENT:** template upgrade from `task.retry` to `std/resilience` policies (spec
-  §9.3) — blocked on RESIL shipping (`2026-06-12-resilience-stdlib-design.md` — specced,
-  unshipped).
+- **RT (now ENABLED — RT merged):** scratch/distroless variant + a published `ascript-rt` base
+  image for the Dockerfiles (spec §9.1). RT shipped (`2026-06-12-native-runtime-stubs`): the
+  stub tier matrix + `--oci` (a Docker-less scratch OCI image) are real today, so a follow-up
+  can swap the `debian:bookworm-slim` runtime stage for a `FROM scratch`/distroless base built
+  on the rt stub, or document `ascript build --native --oci` as the image path. No longer
+  blocked — this is an enabled follow-up, not deferred-on-dependency. (Task 7.1 ships the
+  shipped-today `--native` + `debian:bookworm-slim` form; the upgrade point is marked in both
+  Dockerfiles + the template README.)
+- **RESIL (now ENABLED — RESIL merged):** template upgrade from the hand-rolled `task.retry` in
+  the `/proxy` route to a composed `std/resilience` policy (deadline → breaker → retry, per-client
+  rate limits) (spec §9.3). RESIL shipped (`2026-06-12-resilience-stdlib`): `resilience.retry`/
+  `breaker`/`deadline`/`handler` are real today (see `examples/advanced/resilient_gateway.as`),
+  so a follow-up swaps the template's `/proxy` route over. No longer blocked. (Task 7.1 ships the
+  shipped-today `task.retry` form with the §9.3 upgrade point marked as a comment in `main.as` +
+  the README — working code, not a placeholder API.)
 - Windows named pipes for docker; docker keep-alive connection pool; interactive exec stdin;
   request streaming over UDS; `std/k8s` (parked with sketch) — all spec §12, each surfaced as a
   loud error or doc note where reachable.

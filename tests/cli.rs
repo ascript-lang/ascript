@@ -5091,3 +5091,224 @@ print(r)
 
     let _ = std::fs::remove_file(&src);
 }
+
+// ── CNTR §9.3 — `ascript init --template server` container-ready scaffold ─────
+
+/// A fresh, unique scratch directory under the system temp dir (the test owns it
+/// and cleans it up). Avoids `tempfile` to keep cli.rs dependency-free.
+fn init_scratch_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ascript_init_{tag}_{}_{}", std::process::id(), nanos));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// `ascript init --template server <dir>` scaffolds all five files, the scaffolded
+/// program is `check`-clean, conflict detection refuses to clobber without `--force`,
+/// and `--force` overwrites cleanly.
+#[test]
+fn init_server_template_scaffolds_and_checks_clean() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = init_scratch_dir("scaffold");
+
+    let out = Command::new(bin)
+        .args(["init", "--template", "server"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init should succeed into an empty dir: {out:?}"
+    );
+
+    // All template files exist.
+    for f in ["main.as", "Dockerfile", ".dockerignore", "ascript.toml", "README.md"] {
+        assert!(
+            dir.join(f).is_file(),
+            "init must scaffold {f}; got:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // The scaffolded program is check-clean (exit 0).
+    let check = Command::new(bin)
+        .arg("check")
+        .arg(dir.join("main.as"))
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "the scaffolded main.as must `check` clean (exit 0); got:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // Re-run WITHOUT --force → nonzero + a conflict list naming the existing files.
+    let conflict = Command::new(bin)
+        .args(["init", "--template", "server"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        !conflict.status.success(),
+        "init must refuse to overwrite without --force: {conflict:?}"
+    );
+    let conflict_err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(
+        conflict_err.contains("main.as"),
+        "the conflict report must name an existing file (main.as); got:\n{conflict_err}"
+    );
+
+    // Sentinel: an existing file is NOT clobbered without --force.
+    std::fs::write(dir.join("main.as"), "// sentinel\n").unwrap();
+    let conflict2 = Command::new(bin)
+        .args(["init", "--template", "server"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(!conflict2.status.success());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.as")).unwrap(),
+        "// sentinel\n",
+        "init without --force must NOT modify the existing file"
+    );
+
+    // --force → overwrites cleanly (the sentinel is replaced by the real template).
+    let forced = Command::new(bin)
+        .args(["init", "--template", "server", "--force"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        forced.status.success(),
+        "init --force should overwrite cleanly: {forced:?}"
+    );
+    let main_src = std::fs::read_to_string(dir.join("main.as")).unwrap();
+    assert!(
+        main_src.contains("server.create()") && !main_src.contains("sentinel"),
+        "--force must replace the sentinel with the real template"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ascript init` (no flags) defaults to the `server` template into the current dir.
+#[test]
+fn init_defaults_to_server_template() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = init_scratch_dir("defaults");
+
+    let out = Command::new(bin)
+        .arg("init")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "bare `init` should default: {out:?}");
+    assert!(
+        dir.join("main.as").is_file() && dir.join("Dockerfile").is_file(),
+        "bare `init` must scaffold into the current directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CNTR §9.3 end-to-end: scaffold → run on an ephemeral port → GET /healthz → 200
+/// JSON → SIGTERM → clean exit 0 with the drain log line. This is the proof that the
+/// graceful-shutdown composition (process.on("SIGTERM") → srv.shutdown() +
+/// serve({onShutdown, drainTimeout})) in the scaffolded template actually works.
+#[cfg(unix)]
+#[test]
+fn init_server_template_runs_and_drains_on_sigterm() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = init_scratch_dir("e2e");
+    let out = Command::new(bin)
+        .args(["init", "--template", "server"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "scaffold failed: {out:?}");
+
+    // Reserve an ephemeral port by binding then dropping the listener.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(dir.join("main.as"))
+        .env("PORT", port.to_string())
+        .env("HOST", "127.0.0.1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Wait until /healthz answers 200.
+    let mut body = String::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ok = false;
+    while Instant::now() < deadline {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = write!(
+                s,
+                "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let mut resp = String::new();
+            let _ = s.read_to_string(&mut resp);
+            if resp.contains("200") && resp.contains("\"ok\":true") {
+                body = resp;
+                ok = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        ok,
+        "the scaffolded server must answer /healthz with 200 JSON; last response:\n{body}"
+    );
+
+    // SIGTERM → graceful drain → clean exit.
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+
+    let mut status = None;
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < exit_deadline {
+        if let Ok(Some(s)) = child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    // Reap + collect stderr (the drain log rides std/log → stderr).
+    let mut stderr = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        status.map(|s| s.success()).unwrap_or(false),
+        "SIGTERM must trigger a graceful drain → clean exit 0; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("drain started") && stderr.contains("stopped"),
+        "the drain log line (onShutdown 'drain started' + 'stopped') must appear; stderr:\n{stderr}"
+    );
+}

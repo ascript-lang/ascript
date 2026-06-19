@@ -403,6 +403,29 @@ default (`~/Library/Caches/ascript` on macOS, `$XDG_CACHE_HOME/ascript` or `~/.c
 on Linux, `%LOCALAPPDATA%\ascript\Cache` on Windows). Set `$ASCRIPT_CACHE` to redirect the cache
 to a custom location (useful in CI or sandboxed environments).
 
+## `ascript init`
+
+Scaffold a new project from an embedded template. The default (and currently only) template is
+`server` — a container-ready HTTP service with a graceful SIGTERM drain, a `/healthz` liveness
+probe, a resilient upstream call, plus a multi-stage `Dockerfile`, `.dockerignore`, `ascript.toml`,
+and `README.md`.
+
+```text
+ascript init                                  # scaffold the server template into .
+ascript init --template server ./my-service   # into a named directory
+ascript init --force                          # overwrite existing files
+```
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--template <NAME>` | The template to scaffold (default `server`; currently the only one). |
+| `--force` | Overwrite existing files. Without it, `init` refuses to clobber: it lists the conflicting files and exits non-zero. |
+
+The target directory is the trailing argument (default `.`; created if needed). Template files are
+embedded in the binary — `init` makes no network calls. After scaffolding, `cd` into the directory
+and run `ascript run main.as`, or build a container with the included `Dockerfile` (a multi-stage
+native build with a non-root runtime and `STOPSIGNAL SIGTERM`).
+
 ## `ascript dap`
 
 Run a standalone Debug Adapter Protocol server over stdio. An editor's DAP client connects to the
