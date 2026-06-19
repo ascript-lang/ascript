@@ -801,7 +801,14 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
-        Ok(crate::lsp::providers::signature::signature_help(model, offset))
+        let path = url_to_canon(&uri);
+        let idx = self.index.read().ok();
+        Ok(crate::lsp::providers::signature::signature_help(
+            model,
+            offset,
+            idx.as_deref(),
+            path.as_deref(),
+        ))
     }
 
     async fn inlay_hint(

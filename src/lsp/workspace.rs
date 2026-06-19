@@ -72,6 +72,22 @@ pub struct UseSite {
     pub target: ResolvedTarget,
 }
 
+/// One parameter of an exported function, extracted from the CST for signature help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedParam {
+    pub name: String,
+    pub ty: Option<String>,
+    pub optional: bool,
+    pub variadic: bool,
+}
+
+/// The parameter signature of an exported function, for cross-file signature help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedFnSig {
+    pub params: Vec<ExportedParam>,
+    pub ret: Option<String>,
+}
+
 /// An import edge: `importer -> (specifier, resolved path, imported names)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportEdge {
@@ -442,6 +458,68 @@ impl WorkspaceIndex {
                 && ByteSpan::from(name_range_of(n)) == def.name_range
         })?;
         Some(crate::check::rules::decl_arity(fn_decl))
+    }
+
+    /// The exported-function parameter signature for `(module, name)`, for
+    /// signature-help cross-file resolution (SIG §3.1 rung c). Returns `None`
+    /// when the module is not indexed, has parse errors, or does not export
+    /// exactly one fn of that name.
+    pub(crate) fn exported_fn_signature(
+        &self,
+        module: &Path,
+        name: &str,
+    ) -> Option<ExportedFnSig> {
+        let canon = canonicalize(module);
+        let file = self.files.get(&canon)?;
+        if !file.parsed_ok {
+            return None;
+        }
+        let def = file.exports.get(name)?;
+        if def.kind != DefKind::Fn {
+            return None;
+        }
+        let parsed = crate::syntax::parser::parse(&file.text);
+        if !parsed.errors.is_empty() {
+            return None;
+        }
+        let tree = crate::syntax::tree_builder::build_tree(parsed);
+        let fn_decl = tree.descendants().find(|n| {
+            n.kind() == SyntaxKind::FnDecl
+                && crate::syntax::resolve::ident_text(n).as_deref() == Some(name)
+                && ByteSpan::from(name_range_of(n)) == def.name_range
+        })?;
+        Some(exported_fn_sig_from_decl(fn_decl))
+    }
+
+    /// Signature-help variant: look up a cross-file fn by tracing the import edge
+    /// from the current document. Returns `None` when the import is ambiguous,
+    /// unresolved, or the module is not indexed.
+    pub(crate) fn exported_fn_signature_by_import(
+        &self,
+        model: &crate::lsp::model::SemanticModel,
+        doc_path: &Path,
+        name: &str,
+    ) -> Option<ExportedFnSig> {
+        let canon = canonicalize(doc_path);
+        let file = self.files.get(&canon)?;
+        let mut count = 0usize;
+        let mut target: Option<&std::path::PathBuf> = None;
+        for e in &file.imports {
+            if let Some(resolved) = &e.resolved {
+                for n in &e.names {
+                    if n == name {
+                        count += 1;
+                        target = Some(resolved);
+                    }
+                }
+            }
+        }
+        // Std/* imports are handled by the stdlib rung, not here.
+        if count != 1 {
+            return None;
+        }
+        let _ = model;
+        self.exported_fn_signature(target?, name)
     }
 
     // ---- D-arity: index-backed file-module call-arity ---------------------
@@ -970,6 +1048,41 @@ fn discover_into(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// Build an `ExportedFnSig` from a `FnDecl` CST node by reading its `ParamList`.
+fn exported_fn_sig_from_decl(fn_decl: &crate::syntax::cst::ResolvedNode) -> ExportedFnSig {
+    use crate::check::rules::is_type_kind;
+    use SyntaxKind::*;
+    let param_list = fn_decl.children().find(|c| c.kind() == ParamList);
+    let mut params = Vec::new();
+    if let Some(list) = param_list {
+        for p in list.children().filter(|c| c.kind() == Param) {
+            let variadic = p
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == DotDotDot);
+            let Some(name) = crate::syntax::resolve::ident_text(p) else {
+                continue;
+            };
+            let optional = p
+                .children()
+                .any(|c| crate::check::rules::is_expr_kind(c.kind()));
+            let ty = p
+                .children()
+                .find(|c| is_type_kind(c.kind()))
+                .map(|t| t.text().to_string());
+            params.push(ExportedParam { name, ty, optional, variadic });
+        }
+    }
+    // Attempt to extract the return-type annotation (the last type child of fn_decl
+    // that is NOT inside the ParamList or body block).
+    let ret = fn_decl
+        .children()
+        .filter(|c| is_type_kind(c.kind()))
+        .last()
+        .map(|t| t.text().to_string());
+    ExportedFnSig { params, ret }
 }
 
 /// Lexically canonicalize a path (resolve `.`/`..` components) WITHOUT touching

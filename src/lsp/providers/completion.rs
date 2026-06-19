@@ -446,6 +446,11 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Public re-export for the signature provider (same logic, pub(crate) visibility).
+pub(crate) fn namespace_import_module_pub(text: &str, alias: &str) -> Option<String> {
+    namespace_import_module(text, alias)
+}
+
 /// Scan `text` for `import * as <alias> from "std/<mod>"` and return the module path.
 /// Parser-free (works on broken docs): a regex-like manual scan per line.
 fn namespace_import_module(text: &str, alias: &str) -> Option<String> {

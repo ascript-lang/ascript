@@ -83,7 +83,7 @@ fn signature_help_never_panics_over_corpus_offsets() {
         let m = SemanticModel::build(src.clone(), None, &LintConfig::default());
         // Probe every byte offset that is a char boundary; must not panic.
         for (off, _) in src.char_indices() {
-            let _ = signature::signature_help(&m, off);
+            let _ = signature::signature_help(&m, off, None, None);
         }
     }
 }
