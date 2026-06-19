@@ -2666,6 +2666,35 @@ static RESIL_MEMBERS: &[(&str, MemberKind)] = &[
     ("handler", MemberKind::Fn),
 ];
 
+// ── std/jwt (BATT §5) ─────────────────────────────────────────────────────────
+
+static JWT_HMAC_KEY_PARAMS: &[StdParam] = &[StdParam::req("secret", "string | bytes")];
+static JWT_SIGN_PARAMS: &[StdParam] = &[
+    StdParam::req("claims", "object"),
+    StdParam::req_untyped("key"),
+    StdParam::opt("opts", "object"),
+];
+static JWT_VERIFY_PARAMS: &[StdParam] = &[
+    StdParam::req("token", "string"),
+    StdParam::req_untyped("key"),
+    StdParam::opt("opts", "object"),
+];
+static JWT_DECODE_PARAMS: &[StdParam] = &[StdParam::req("token", "string")];
+
+static JWT_SIGS: &[(&str, StdSig)] = &[
+    ("hmacKey", StdSig { params: JWT_HMAC_KEY_PARAMS, ret: Some("object"), doc: "Builds a typed HMAC key for HS256/HS384/HS512." }),
+    ("sign", StdSig { params: JWT_SIGN_PARAMS, ret: Some("[string, err]"), doc: "Signs claims into a compact JWT with a typed key." }),
+    ("verify", StdSig { params: JWT_VERIFY_PARAMS, ret: Some("[object, err]"), doc: "Verifies a JWT against a typed key, intersecting the header alg with the key kind's algorithm set." }),
+    ("decode", StdSig { params: JWT_DECODE_PARAMS, ret: Some("[object, err]"), doc: "Decodes a JWT WITHOUT verifying its signature (inspection only)." }),
+];
+
+static JWT_MEMBERS: &[(&str, MemberKind)] = &[
+    ("hmacKey", MemberKind::Fn),
+    ("sign", MemberKind::Fn),
+    ("verify", MemberKind::Fn),
+    ("decode", MemberKind::Fn),
+];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Master index (batch 1 + batch 2 + batch 3 — 60 modules total)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2735,6 +2764,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/tui", TUI_MEMBERS),
     ("std/ffi", FFI_MEMBERS),
     ("std/resilience", RESIL_MEMBERS),
+    ("std/jwt", JWT_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2807,6 +2837,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/tui" => TUI_SIGS,
         "std/ffi" => FFI_SIGS,
         "std/resilience" => RESIL_SIGS,
+        "std/jwt" => JWT_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -2980,6 +3011,7 @@ mod tests {
             ("std/tui", TUI_SIGS),
             ("std/ffi", FFI_SIGS),
             ("std/resilience", RESIL_SIGS),
+            ("std/jwt", JWT_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {

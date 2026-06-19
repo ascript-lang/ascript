@@ -44,6 +44,10 @@ pub mod http_server;
 pub mod intl;
 #[cfg(feature = "sys")]
 pub mod io;
+// BATT §5 — `std/jwt` (feature `auth`): JSON Web Tokens with typed keys that
+// structurally kill alg-confusion. A5 wires HS256/384/512 (hmac+sha2).
+#[cfg(feature = "auth")]
+pub mod jwt;
 #[cfg(feature = "data")]
 pub mod json;
 #[cfg(feature = "log")]
@@ -224,6 +228,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/ffi" => ffi::exports(),
         #[cfg(feature = "docker")]
         "std/docker" => docker::exports(),
+        #[cfg(feature = "auth")]
+        "std/jwt" => jwt::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -298,6 +304,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/ffi",
     "std/resilience",
     "std/docker",
+    "std/jwt",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -395,6 +402,15 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         // ungated-OS-module class as ai/telemetry.)
         #[cfg(feature = "workflow")]
         "workflow" => CapReq::one(Cap::Fs),
+        // BATT §5.4 — `std/jwt` is PER-FUNC (the `os` precedent): `jwks` fetches keys
+        // over the network → `Net`; `sign`/`verify`/`decode`/`hmacKey` are pure crypto
+        // → ungated. A5 ships only the ungated funcs (the `jwks` arm is the shape A7
+        // fills). Feature-gated like the dispatch arms.
+        #[cfg(feature = "auth")]
+        "jwt" => match func {
+            "jwks" => CapReq::one(Cap::Net),
+            _ => CapReq::NONE,
+        },
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
         // is ambient self-introspection and ungated.
         "os" => match func {
@@ -641,6 +657,8 @@ impl Interp {
             "ffi" => self.call_ffi(func, args, span).await,
             #[cfg(feature = "docker")]
             "docker" => self.call_docker(func, args, span).await,
+            #[cfg(feature = "auth")]
+            "jwt" => self.call_jwt(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1192,8 +1210,11 @@ mod cap_gate_tests {
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");
-            if key == "os" {
-                continue; // per-func (topology→Net, ambient→None); covered above.
+            if key == "os" || key == "jwt" {
+                // Per-func gating (covered above): os (topology→Net, ambient→None);
+                // jwt (BATT §5.4 — jwks→Net, sign/verify/decode/hmacKey→None). The
+                // whole-module `__probe__` verdict cannot represent a per-func split.
+                continue;
             }
             let gated = !required_cap(&key, "__probe__").is_empty();
             let ungated = KNOWN_UNGATED.contains(&key.as_str());

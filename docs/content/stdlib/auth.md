@@ -1,0 +1,89 @@
+::: eyebrow Standard library
+
+# Auth (JWT, OAuth2, sessions)
+
+`std/jwt` issues and verifies **JSON Web Tokens** with a security model that makes the classic
+**algorithm-confusion bypass structurally impossible**. Keys are *typed*: a key carries the
+algorithm family it can ever be used with, and `jwt.verify` only accepts a token whose header
+`alg` lies in the intersection of the key's family, the caller's allowlist, and (never) anything
+the token itself claims about where to find a key.
+
+A5 ships the HMAC family — **HS256 / HS384 / HS512** (built on `std/crypto`'s `hmac` + `sha2`).
+RS256 (RSA) and ES256 (P-256) keys, plus JWKS fetching, arrive in a later unit and slot in
+without changing any of the verification logic below.
+
+```ascript
+import * as jwt from "std/jwt"
+
+let key = jwt.hmacKey("a-strong-shared-secret")
+
+let [token, signErr] = jwt.sign({ sub: "alice", role: "admin" }, key, { expiresIn: 3600 })
+let [claims, verifyErr] = jwt.verify(token, key, { algs: ["HS256"], leeway: 30 })
+if verifyErr != nil {
+  print("rejected:", verifyErr.message)   // auth failure is a Tier-1 [value, err]
+} else {
+  print("subject:", claims.sub)
+}
+```
+
+## Errors are values, not panics
+
+A failed verification is **never** a panic — it is a Tier-1 `[nil, err]` pair, because
+authentication failure is ordinary control flow (an expired token, a tampered signature, a
+disallowed algorithm). Passing a value that is not a key where a key is required *is* a Tier-2
+panic, because that is a programming error.
+
+## Typed keys kill algorithm confusion
+
+A key is a tagged object — `jwt.hmacKey(secret)` produces `{ __jwtkey: "hmac", secret }` — and the
+key's kind fixes the algorithm set it can ever participate in:
+
+| Key kind | Constructor | Algorithms |
+| --- | --- | --- |
+| `hmac` | `jwt.hmacKey(secret)` | HS256, HS384, HS512 |
+
+`jwt.verify` computes `allowed = algorithms(key) ∩ (opts.algs or algorithms(key))` and rejects any
+token whose header `alg` is not in `allowed`. Three consequences follow directly:
+
+- **`alg: "none"` is rejected unconditionally** — in any casing (`none`, `None`, `NONE`) — *before*
+  any key dispatch, so a signature-stripped token can never be accepted.
+- An HMAC key can only ever HS-verify; once asymmetric keys land, an RSA/EC **public** key can never
+  HMAC-verify, so the public-key-as-HMAC-secret confusion is unrepresentable.
+- The `kid`, `jku`, `jwk`, and `x5u` header fields are **never read** — keys come *only* from the
+  `key` argument you pass. A token can advertise any key location it likes; it is ignored.
+
+The signature is verified in **constant time** (the underlying MAC's `verify_slice`), and
+authenticity is checked **before** any claim (`exp`/`nbf`/`iss`/`aud`), so a claim failure never
+leaks before the token is proven genuine.
+
+---
+
+### `jwt.hmacKey(secret)`
+
+Builds a typed HMAC key usable for HS256/HS384/HS512. `secret` is a `string` or `bytes`.
+
+### `jwt.sign(claims, key, opts?)`
+
+Signs `claims` (an object) into a compact JWT string with `key`. Returns `[token, err]`. Claim
+order follows the object's insertion order. `opts`:
+
+- `alg?: string` — one of `HS256`/`HS384`/`HS512` (default `HS256`); must be valid for the key kind.
+- `headers?: object` — extra protected headers (e.g. `kid`); cannot override `alg`/`typ`.
+- `expiresIn?: number` — seconds; sets `exp` from the (deterministic-seam) clock.
+
+### `jwt.verify(token, key, opts?)`
+
+Verifies `token` against `key` and returns `[claims, err]`. `opts`:
+
+- `algs?: array<string>` — an allowlist, **intersected** with the key kind's algorithm set.
+- `iss?: string` / `aud?: string` — expected issuer / audience (a mismatch fails).
+- `leeway?: number` — clock-skew tolerance in seconds for `exp`/`nbf`.
+- `clock?: number` — override the current time (ms epoch) for testing.
+
+::: warning
+### `jwt.decode(token)`
+
+Decodes a token into `{ header, claims, signature, verified: false }` **without verifying the
+signature** — for routing and debugging only. The result's `verified: false` field testifies that
+nothing was checked. Never trust `jwt.decode` output for authentication; use `jwt.verify`.
+:::
