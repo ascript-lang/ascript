@@ -111,7 +111,11 @@ impl SmtpClientState {
                             break;
                         }
                         Some(b'\n') => break,
-                        Some(b'\r') => { /* swallow; the \n ends the line */ }
+                        // Swallow CR (the \n ends the line). A pathological server
+                        // streaming bare \r forever is not byte-counted here, but the
+                        // `tokio::time::timeout` wrapper below is the backstop (bounded
+                        // by time, not MAX_REPLY_BYTES, in that never-\n case).
+                        Some(b'\r') => {}
                         Some(b) => {
                             line.push(b);
                             total += 1;
@@ -506,15 +510,13 @@ fn extract_envelope(msg: &Value, span: Span) -> Result<Envelope, Control> {
 fn dot_stuff(raw: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len() + raw.len() / 64 + 8);
     // Split on \n, stripping a trailing \r so we can re-emit canonical CRLF.
-    let mut lines = raw.split('\n').peekable();
-    while let Some(line) = lines.next() {
+    for line in raw.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.starts_with('.') {
             out.push(b'.'); // the stuffed extra dot
         }
         out.extend_from_slice(line.as_bytes());
         out.extend_from_slice(b"\r\n");
-        let _ = lines.peek();
     }
     // Terminator.
     out.extend_from_slice(b".\r\n");
