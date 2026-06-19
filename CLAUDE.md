@@ -603,6 +603,25 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   byte-identical across modes via the mock). Docs `docs/content/{deploying,stdlib/docker}.md`. **Recorded
   ENABLED follow-ups** (RT+RESIL both merged): a `scratch`/`--oci` rt-stub image base for the Dockerfiles; the
   template `/proxy` upgrade from `task.retry` to `std/resilience` policies.
+- **SIG — stdlib signature table + LSP enrichment + audit hardening** (LSP/checker-static-only; spec
+  `superpowers/specs/2026-06-12-lsp-stdlib-signatures-design.md`, plan
+  `superpowers/plans/2026-06-12-lsp-stdlib-signatures.md`; **no engine surface, `ASO_FORMAT_VERSION` 29
+  unchanged, `vm_differential` untouched**). **The machine source of truth** for every `std/*` fn signature
+  (params + optionality + return type + one-line doc) is `src/check/std_sigs.rs` — ~60 STD_MODULES + 10
+  global builtins. The docs pages remain the social/prose source; two drift-test families bind them
+  bidirectionally: `tests/std_sigs_docs.rs` (docs↔table notation consistency) + the in-module completeness
+  pair (`all_modules_have_entries` / `all_entries_reference_known_modules`). **Adding a stdlib fn = a docs
+  entry + a table row or CI fails in both drift directions.** `src/check/std_arity.rs` now DERIVES its
+  min-arity from the table (one source of truth; the separate arity table is gone). **Three LSP consumers**
+  read the table: (1) `signatureHelp` — a resolution ladder over stdlib members, global builtins, typed-receiver
+  methods, and cross-file imported user fns (param names + annotations), with active-parameter advancement,
+  variadic clamp, and one-line docs; (2) `completion` — real FUNCTION/CONSTANT kind, signature detail, and
+  docs for stdlib members (resolved lazily); cached + deprioritized auto-import; partial-identifier member
+  completion (`math.sq` → `sqrt`); suppressed inside strings/comments; snippet bodies gated on
+  `completionItem.snippetSupport`; (3) `hover` — curated signature + doc for stdlib members. **C1–C8 audit
+  hardening:** per-model `OnceLock<InferCache>` (no repeated inference work per handler), fs-canonical
+  `WorkspaceIndex` keys, `snippetSupport` gating, workspace-diagnostic yielding, folder-removal unindex,
+  and `did_close` pending purge. LSP feature only (`lsp`, default-on); no tree-walker change.
 
 ## Commands
 
