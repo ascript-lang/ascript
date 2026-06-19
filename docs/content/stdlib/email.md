@@ -155,3 +155,8 @@ The client is built around three defenses, all documented as part of its contrac
   builder's CRLF/NUL guard is **re-validated** (`from` and every recipient) at the wire layer
   before any `MAIL`/`RCPT` is written — a smuggled `\r\n` is a Tier-2 panic. The `DATA` body
   is dot-stuffed (a line starting with `.` is escaped) per RFC 5321.
+
+## Examples
+
+- [`examples/email_builder.as`](https://github.com/ascript-lang/ascript/blob/main/examples/email_builder.as) — the pure, deterministic message builder: plain-text + `multipart/alternative`, `bcc` envelope handling, `validateAddress`, and a header-injection rejection demo.
+- [`examples/advanced/smtp_send.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/smtp_send.as) — `email.send` driven against an in-process SMTP sink (no external server), capturing the envelope + `DATA` payload.

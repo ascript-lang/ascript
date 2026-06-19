@@ -146,3 +146,8 @@ An S3 error response surfaces as a structured error value:
 | `status` | `int` | the HTTP status code. |
 
 A malformed XML body still yields a clean error carrying the status — never a panic.
+
+## Examples
+
+- [`examples/blob_basics.as`](https://github.com/ascript-lang/ascript/blob/main/examples/blob_basics.as) — `put` / `get` / `list` against an in-script S3 stub that **recomputes the SigV4 signature server-side** (the four-HMAC signing-key chain in `.as`) and rejects any request whose `Authorization` does not match — proof the client signs correctly.
+- [`examples/advanced/blob_sync.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/blob_sync.as) — a `putMultipart` streaming upload (initiate → part uploads → complete) over the same signature-verifying stub.

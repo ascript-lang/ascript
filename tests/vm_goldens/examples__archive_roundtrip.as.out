@@ -1,0 +1,17 @@
+# exit: none
+tar entries:
+  README.md  (9 bytes)
+  src/main.as  (9 bytes)
+  data/notes.txt  (31 bytes)
+tar deterministic: true
+gzip smaller than gz overhead floor: true
+tar.gz entries:
+  README.md  data="# project"
+  src/main.as  data="print(ok)"
+  data/notes.txt  data="café — unicode name handling"
+zip entries:
+  a.txt  (5 bytes)  data="first"
+  b.txt  (6 bytes)  data="second"
+empty archive entry count: 0
+zero-byte entry: zero.bin size=0
+archive_roundtrip ok

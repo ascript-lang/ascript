@@ -804,6 +804,11 @@ html.sanitize("<mark>m</mark>", { tags: ["mark"] })
 // == "<mark>m</mark>"
 ```
 
+### Examples
+
+- [`examples/xml_basics.as`](https://github.com/ascript-lang/ascript/blob/main/examples/xml_basics.as) — parse a document, read nodes + attributes, stringify (incl. pretty-print), and reject malformed XML.
+- [`examples/advanced/feed_reader.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/feed_reader.as) — the canonical `xml` → `html.sanitize` pipeline: parse an RSS feed, then sanitize each item's untrusted HTML description.
+
 ## std/decimal
 
 Exact decimal arithmetic backed by a 96-bit scaled integer (`rust_decimal`). Use it wherever floating-point rounding is unacceptable: money, pricing, financial totals, or any domain where `0.1 + 0.2 == 0.3` must hold.

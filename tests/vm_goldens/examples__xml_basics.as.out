@@ -1,0 +1,23 @@
+# exit: none
+root: <catalog> with 2 books
+  bk101 (en): "XML for Everyone" by A. Writer — 19.95 USD
+  bk102 (fr): "Le Café & Co" by B. Auteur — 24.50 EUR
+re-stringify ok: true
+round-trip root: <catalog> books=2
+pretty:
+<catalog>
+  <book id="bk101" lang="en">
+    <title>XML for Everyone</title>
+    <author>A. Writer</author>
+    <price currency="USD">19.95</price>
+  </book>
+  <book id="bk102" lang="fr">
+    <title>Le Café &amp; Co</title>
+    <author>B. Auteur</author>
+    <price currency="EUR">24.50</price>
+  </book>
+</catalog>
+
+escape: if a &lt; b &amp;&amp; c &gt; d then &quot;go&quot;
+malformed rejected: true
+xml_basics ok

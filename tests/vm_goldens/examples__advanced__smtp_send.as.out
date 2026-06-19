@@ -1,0 +1,8 @@
+# exit: none
+accepted: bob@example.com, carol@example.com
+rejected count: 0
+sink saw MAIL FROM: alice@example.com
+sink saw RCPT TO: bob@example.com, carol@example.com
+sink saw Subject: Deployment complete
+sink received DATA body lines > 0: true
+smtp_send ok

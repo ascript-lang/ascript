@@ -959,6 +959,12 @@ let [archive, e1] = tarCreate([{ name: "a.txt", data: "hello" }])
 let [entries, e2] = tarExtract(archive)
 ```
 
+> [!NOTE]
+> These are the **one-shot** helpers — they materialize the whole archive at once.
+> For **streaming** writers and **lazy** entry generators (so a large archive is
+> never fully in memory), **hardened** zip-slip-safe disk extraction, gzip-tar, and
+> reproducible (`deterministic`) output, see [`std/archive`](#stdarchive) below.
+
 ## std/archive
 
 `std/archive` (Cargo feature `archive`, on by default) is the **streaming** superset
@@ -1132,3 +1138,8 @@ tree are **skipped** (never embedded), mirroring the extraction defense. It is
 import { tarCreateFromDir } from "std/archive"
 let [bytes, err] = tarCreateFromDir("./dist", { gzip: true, deterministic: true })
 ```
+
+### Examples
+
+- [`examples/archive_roundtrip.as`](https://github.com/ascript-lang/ascript/blob/main/examples/archive_roundtrip.as) — tar, tar.gz, and zip round-trips in memory, with deterministic byte-stability.
+- [`examples/advanced/backup_tool.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/backup_tool.as) — walk a directory → reproducible deterministic `tar.gz` → verify the entries.
