@@ -5312,3 +5312,316 @@ fn init_server_template_runs_and_drains_on_sigterm() {
         "the drain log line (onShutdown 'drain started' + 'stopped') must appear; stderr:\n{stderr}"
     );
 }
+
+// ============================================================================
+// BATT C1 — deterministic test runs via --seed / --frozen-time (§10.1–§10.3)
+// ============================================================================
+//
+// `print` inside a test runs under OutputSink::Capture (not visible on stdout), so these
+// tests surface the deterministic RNG/clock values through the FAILURE message: a test
+// that asserts false with the drawn values in a backtick-template message → the runner
+// prints `FAIL <name>: <message>` on stdout, where we can read it.
+
+/// Helper: write a single-file `.as` test corpus to a fresh temp path and return it.
+fn write_det_test_file(tag: &str, body: &str) -> std::path::PathBuf {
+    let file =
+        std::env::temp_dir().join(format!("ascript_detc1_{}_{}.as", tag, std::process::id()));
+    std::fs::write(&file, body).unwrap();
+    file
+}
+
+/// (a) `--seed N` makes `math.random()` + `time.now()` INSIDE a test byte-identical across
+/// two runs; a DIFFERENT seed produces different output.
+#[test]
+fn det_seed_makes_random_and_time_reproducible() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = write_det_test_file(
+        "seed_repro",
+        "import * as math from \"std/math\"\n\
+         import * as time from \"std/time\"\n\
+         test(\"draws\", () => {\n\
+           let r = math.random()\n\
+           let t = time.now()\n\
+           assert(false, `R=${r} T=${t}`)\n\
+         })\n",
+    );
+    let run = |seed: &str| {
+        std::process::Command::new(bin)
+            .arg("test")
+            .arg("--seed")
+            .arg(seed)
+            .arg(&file)
+            .output()
+            .unwrap()
+    };
+    let a = run("42");
+    let b = run("42");
+    let c = run("99");
+    let _ = std::fs::remove_file(&file);
+
+    let sa = String::from_utf8_lossy(&a.stdout).into_owned();
+    let sb = String::from_utf8_lossy(&b.stdout).into_owned();
+    let sc = String::from_utf8_lossy(&c.stdout).into_owned();
+    assert!(sa.contains("R=") && sa.contains("T="), "expected draws: {sa}");
+    assert_eq!(sa, sb, "same --seed must be byte-identical:\nA={sa}\nB={sb}");
+    assert_ne!(sa, sc, "different --seed must differ:\nA={sa}\nC={sc}");
+}
+
+/// (b) `--frozen-time <RFC3339>` freezes `time.now()` inside a test to EXACTLY that epoch-ms.
+#[test]
+fn det_frozen_time_rfc3339_freezes_time_now() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = write_det_test_file(
+        "frozen_rfc",
+        "import * as time from \"std/time\"\n\
+         test(\"clock\", () => { let t = time.now(); assert(false, `T=${t}`) })\n",
+    );
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--frozen-time")
+        .arg("2026-01-02T03:04:05Z")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    // 2026-01-02T03:04:05Z = 1767323045000 ms epoch; printed as a float ("…000.0").
+    assert!(
+        s.contains("T=1767323045000"),
+        "frozen time.now must print the exact epoch-ms; got:\n{s}"
+    );
+}
+
+/// (b') epoch-ms is accepted for `--frozen-time` in BOTH feature configs.
+#[test]
+fn det_frozen_time_epoch_ms_freezes_time_now() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = write_det_test_file(
+        "frozen_epoch",
+        "import * as time from \"std/time\"\n\
+         test(\"clock\", () => { let t = time.now(); assert(false, `T=${t}`) })\n",
+    );
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--frozen-time")
+        .arg("1767323045000")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        s.contains("T=1767323045000"),
+        "epoch-ms --frozen-time must freeze time.now; got:\n{s}"
+    );
+}
+
+/// (c) module TOP-LEVEL `time.now()` is NOT frozen — only code inside a registered test
+/// sees the determinism context (§10.2 decision).
+#[test]
+fn det_module_top_level_time_is_not_frozen() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    // Module top-level draws into a global, then a test compares it to the in-test now().
+    // If top-level were frozen too, they would be equal (the frozen value); the §10.2
+    // decision says load runs WITHOUT the context, so the top-level value is the real
+    // clock and the in-test value is the frozen base — they DIFFER. The test reports both.
+    let file = write_det_test_file(
+        "toplevel",
+        "import * as time from \"std/time\"\n\
+         let topLevel = time.now()\n\
+         test(\"inside\", () => {\n\
+           let inTest = time.now()\n\
+           assert(false, `top=${topLevel} in=${inTest}`)\n\
+         })\n",
+    );
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--frozen-time")
+        .arg("2026-01-02T03:04:05Z")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    let frozen = "1767323045000";
+    // The in-test now() IS frozen.
+    assert!(
+        s.contains(&format!("in={frozen}")),
+        "the in-test time.now must be frozen; got:\n{s}"
+    );
+    // The top-level now() must NOT be the frozen value (real clock at load time).
+    assert!(
+        !s.contains(&format!("top={frozen}")),
+        "module top-level time.now must NOT be frozen; got:\n{s}"
+    );
+}
+
+/// (d) two tests in one file get INDEPENDENT IDENTICAL streams: filtering out test A must
+/// not change test B's output (each test installs a FRESH context, same seed).
+#[test]
+fn det_each_test_gets_independent_identical_stream() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = write_det_test_file(
+        "independent",
+        "import * as math from \"std/math\"\n\
+         test(\"a_first\", () => { let x = math.random(); let y = math.random(); assert(false, `A=${x},${y}`) })\n\
+         test(\"b_second\", () => { let z = math.random(); assert(false, `B=${z}`) })\n",
+    );
+    let run_filter = |f: Option<&str>| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("test").arg("--seed").arg("7");
+        if let Some(f) = f {
+            cmd.arg("--filter").arg(f);
+        }
+        cmd.arg(&file).output().unwrap()
+    };
+    let both = run_filter(None);
+    let only_b = run_filter(Some("b_second"));
+    let _ = std::fs::remove_file(&file);
+
+    // Extract the `B=...` token from the FAIL line of each run.
+    let extract_b = |out: &std::process::Output| {
+        let s = String::from_utf8_lossy(&out.stdout).into_owned();
+        s.lines()
+            .find_map(|l| l.find("B=").map(|i| l[i..].to_string()))
+            .unwrap_or_default()
+    };
+    let b_when_both = extract_b(&both);
+    let b_when_alone = extract_b(&only_b);
+    assert!(!b_when_both.is_empty(), "test B output missing in full run: {}", String::from_utf8_lossy(&both.stdout));
+    assert_eq!(
+        b_when_both, b_when_alone,
+        "test B's RNG draw must be independent of whether test A ran (fresh-per-test): \
+         both={b_when_both} alone={b_when_alone}"
+    );
+}
+
+/// (e) `--parallel=2` with `--seed` produces a summary byte-identical to the serial run
+/// (the §7 parallel-determinism contract under a seeded det context).
+#[test]
+fn det_parallel_summary_matches_serial_under_seed() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_detc1_par_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let a = dir.join("a.as");
+    let b = dir.join("b.as");
+    std::fs::write(
+        &a,
+        "import * as math from \"std/math\"\n\
+         test(\"a_rng\", () => { let v = math.random(); assert(false, `A=${v}`) })\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        "import * as math from \"std/math\"\n\
+         test(\"b_rng\", () => { let v = math.random(); assert(false, `B=${v}`) })\n",
+    )
+    .unwrap();
+
+    let run = |parallel: &str| {
+        std::process::Command::new(bin)
+            .arg("test")
+            .arg(parallel)
+            .arg("--seed")
+            .arg("123")
+            .arg(&a)
+            .arg(&b)
+            .output()
+            .unwrap()
+    };
+    let serial = run("--parallel=1");
+    let par = run("--parallel=2");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        String::from_utf8_lossy(&serial.stdout),
+        String::from_utf8_lossy(&par.stdout),
+        "parallel summary must be byte-identical to serial under --seed"
+    );
+    assert_eq!(serial.status.code(), par.status.code());
+}
+
+/// (f) a malformed `--frozen-time` is a CLEAN CLI error (non-zero exit, a message, no
+/// panic/backtrace).
+#[test]
+fn det_frozen_time_garbage_is_clean_error() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = write_det_test_file("garbage", "test(\"x\", () => { assert(true) })\n");
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg("--frozen-time")
+        .arg("garbage")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        !out.status.success(),
+        "malformed --frozen-time must be a non-zero exit"
+    );
+    let s =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        s.to_lowercase().contains("frozen-time") || s.to_lowercase().contains("error"),
+        "a clean error message must mention the problem; got:\n{s}"
+    );
+    assert!(
+        !s.contains("panicked") && !s.contains("RUST_BACKTRACE"),
+        "must NOT panic on a malformed --frozen-time; got:\n{s}"
+    );
+}
+
+/// (g) THE INERT PIN: a plain `ascript test` (no det flags) is unaffected. A pure test is
+/// byte-stable, and a time-using test reports the REAL clock (a recent epoch-ms, far past
+/// the deterministic base) — proving the determinism context is NOT installed on the
+/// default path.
+#[test]
+fn det_no_flags_is_inert() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = write_det_test_file(
+        "inert",
+        "test(\"pure\", () => { assert(1 + 1 == 2) })\n",
+    );
+    let plain1 = std::process::Command::new(bin)
+        .arg("test")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let plain2 = std::process::Command::new(bin)
+        .arg("test")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(plain1.status.success(), "inert run must pass");
+    assert_eq!(
+        String::from_utf8_lossy(&plain1.stdout),
+        String::from_utf8_lossy(&plain2.stdout),
+        "a no-flag (inert) run must be byte-stable for a pure test"
+    );
+
+    // Load-bearing: a no-flag run of a time-using test produces a REAL clock value (a
+    // present-day epoch-ms, well past the deterministic base 1_672_531_200_000 of 2023),
+    // never a frozen one — the determinism context is NOT installed on the default path.
+    let tfile = write_det_test_file(
+        "inert_time",
+        "import * as time from \"std/time\"\n\
+         test(\"t\", () => { let t = time.now(); assert(false, `T=${t}`) })\n",
+    );
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg(&tfile)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&tfile);
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    let v: f64 = s
+        .lines()
+        .find_map(|l| l.find("T=").map(|i| &l[i + 2..]))
+        .and_then(|tok| tok.trim().trim_end_matches(".0").parse::<f64>().ok())
+        .expect("a numeric time.now value in the FAIL line");
+    assert!(
+        v > 1_700_000_000_000.0,
+        "a no-flag time.now must be a real (recent) clock, not a frozen base; got {v}"
+    );
+}
