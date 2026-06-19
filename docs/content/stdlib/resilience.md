@@ -462,7 +462,7 @@ is a **Tier-2 panic** — the stdlib-wide rule.
 
 ## Deadline propagation
 
-### `resilience.deadline(ms, fn) -> [value, err]`
+### `resilience.deadline(ms, f) -> [value, err]`
 
 Set a total time budget for `fn` and everything it awaits. Nested deadlines **only shrink** — a
 callee can never extend its caller's budget (the gRPC deadline rule).
@@ -535,7 +535,7 @@ Programs that never call `resilience.deadline` take the `nil` fast path everywhe
 
 ## Trace / request ID
 
-### `resilience.withTrace(id, fn) -> fn's result`
+### `resilience.withTrace(id, f) -> f's result`
 
 Scope a trace/request ID for `fn` and everything it calls. Sets the ambient `traceId` for log
 records and telemetry spans within the scope (save → set → restore on all exits, including panic).
@@ -572,7 +572,7 @@ Renders the per-isolate metrics registry as **Prometheus text exposition format 
 (`# TYPE` lines, deterministic label order, proper escaping). Response: status 200,
 `content-type: text/plain; version=0.0.4`.
 
-### `resilience.health(opts) -> handler`
+### `resilience.health(config) -> handler`
 
 Health/readiness handler. Liveness (no checks) always returns 200. Readiness runs each check
 function and reports `200 {"status":"ok","checks":{…}}` if all pass, or
@@ -591,7 +591,7 @@ app.route("GET", "/healthz", resilience.health({}))
 app.route("GET", "/readyz", resilience.health({ checks: { db: pingDb }, timeoutMs: 1000 }))
 ```
 
-### `resilience.handler(policies, fn) -> handler`
+### `resilience.handler(policies, f) -> handler`
 
 Wrap a route handler with policies, mapping rejection codes to HTTP statuses:
 

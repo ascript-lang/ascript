@@ -1733,8 +1733,8 @@ static ASSERT_MATCHES_PARAMS: &[StdParam] = &[
     StdParam::req("pattern", "regex | string"),
 ];
 static ASSERT_SNAPSHOT_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
     StdParam::req_untyped("value"),
-    StdParam::opt("name", "string"),
 ];
 
 static ASSERT_SIGS: &[(&str, StdSig)] = &[

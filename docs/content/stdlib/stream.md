@@ -53,7 +53,7 @@ build two `stream.from(arr)` streams.
 
 ## Sources
 
-### `stream.from(x)`
+### `stream.from(source)`
 
 Create a stream from an **array** (index-pull) or a **generator** (resume-pull).
 
@@ -92,7 +92,7 @@ stream.range(1, 10, -2)    // panic: step -2 moves away from end (10); range can
 Every combinator takes an existing stream as its **first argument** and returns
 a new stream. No items are pulled until a terminal runs.
 
-### `stream.map(s, fn)`
+### `stream.map(s, f)`
 
 Apply `fn(value) -> value` to every item.
 
@@ -101,7 +101,7 @@ await stream.collect(stream.map(stream.from([1, 2, 3]), x => x * 10))
 // [10, 20, 30]
 ```
 
-### `stream.filter(s, fn)`
+### `stream.filter(s, f)`
 
 Keep only items where `fn(value)` is truthy.
 
@@ -129,7 +129,7 @@ await stream.collect(stream.drop(stream.from([1, 2, 3, 4, 5]), 2))
 // [3, 4, 5]
 ```
 
-### `stream.flatMap(s, fn)`
+### `stream.flatMap(s, f)`
 
 Call `fn(value)` for each item. `fn` must return an **array**; those elements
 replace the original item in the output (one level of flattening).
@@ -179,7 +179,7 @@ Drain the stream into an array.
 let items = await stream.collect(stream.range(1, 4))   // [1, 2, 3]
 ```
 
-### `stream.forEach(s, fn) -> nil`
+### `stream.forEach(s, f) -> nil`
 
 Pull every item and call `fn(value)` for its side effect. Returns `nil`.
 
@@ -187,7 +187,7 @@ Pull every item and call `fn(value)` for its side effect. Returns `nil`.
 await stream.forEach(stream.from([1, 2, 3]), x => print(x))
 ```
 
-### `stream.reduce(s, fn, init) -> value`
+### `stream.reduce(s, f, init) -> value`
 
 Fold with `fn(acc, value) -> acc`, starting from `init`.
 
@@ -203,7 +203,7 @@ Number of items the stream produces (drains the whole stream).
 await stream.count(stream.filter(stream.from([1, 2, 3, 4, 5]), x => x > 2))   // 3
 ```
 
-### `stream.find(s, fn) -> value | nil`
+### `stream.find(s, f) -> value | nil`
 
 Return the **first** item where `fn(value)` is truthy. Short-circuits —
 no further items are pulled after the match.
