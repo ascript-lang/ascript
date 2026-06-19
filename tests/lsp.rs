@@ -3465,29 +3465,24 @@ fn lsp_completion_partial_identifier_member_context() {
 /// tight deadline — substantially before the workspace diagnostic would complete if it
 /// ran the full file list without yielding.
 ///
-/// This is a SOUND WEAKER assertion rather than strict arrival-order because strict
-/// arrival-order is non-deterministic over a subprocess stdio channel on a
-/// `current_thread` runtime under scheduler load: the subprocess's internal task order
-/// is unobservable from outside. What IS deterministic: if the hover request is
-/// answered correctly within a tight wall-clock deadline, the handler CANNOT have been
-/// blocked behind the full workspace scan (which itself takes many seconds on FILE_COUNT
-/// files in a debug binary). The logical implication holds because the workspace scan
-/// under the "no yield" hypothesis would block the entire LocalSet until all files are
-/// processed, preventing the hover from being serviced until after the scan completes.
-///
-/// WHY sound-weaker rather than strict order: the LSP server's `current_thread` tokio
-/// runtime serves requests concurrently via `spawn_local`, but the stdio transport
-/// layer on the TEST side is a separate OS-level pipe buffer — we can only observe
-/// byte arrival order across the pipe, which is subject to OS scheduler decisions
-/// independent of internal async ordering. The deadline approach is deterministic:
-/// if the hover completes within the deadline, it was NOT blocked for the full scan
-/// duration; if it timed out, the scan was blocking. This is a one-sided proof that
-/// is immune to scheduling jitter.
+/// SCOPE (honest): this is a NO-DEADLOCK / report-well-formedness SMOKE TEST, not a
+/// strict proof that the `yield_now()` calls are load-bearing. The `workspace_diagnostic`
+/// loop already `.await`s `self.documents.lock()` per file (itself a scheduler yield
+/// point), so a concurrently-issued hover would interleave even with the explicit
+/// `yield_now()` calls removed — the wall-clock deadline below therefore cannot ISOLATE
+/// the `yield_now()` contribution. The C2 yield + open-model reuse are
+/// scheduling/perf optimizations with NO observable behavioral difference (reuse returns
+/// identical diagnostics to a fresh build); their correctness is verified structurally in
+/// the handler (no lock guard held across any `.await`) and by clippy `await_holding_lock`,
+/// not by this test. What this test DOES guarantee: firing `workspace/diagnostic` over a
+/// many-file project and immediately issuing a `textDocument/hover` produces a correct
+/// hover and a well-formed workspace report within a generous deadline — i.e. no hang, no
+/// deadlock, no starvation severe enough to blow the deadline. The C4 half of this commit
+/// (`lsp_workspace_folder_removal_unindexes`) is the behaviorally-guarded test.
 #[test]
 fn lsp_workspace_diagnostic_yields() {
-    // FILE_COUNT large enough that a no-yield full scan takes >> the hover time.
-    // In debug mode on a typical machine, SemanticModel::build per file ~10-50ms,
-    // so 40 files = 400ms–2s of scan time — easily observable vs a ~5ms hover.
+    // Enough files that the workspace pull does real, multi-file work (so the smoke
+    // test exercises the per-file reuse + yield loop, not a trivial 1-file scan).
     const FILE_COUNT: usize = 40;
 
     let dir = std::env::temp_dir().join(format!("ascript_lsp_diag_yield_{}", std::process::id()));
