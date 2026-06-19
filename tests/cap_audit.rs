@@ -726,3 +726,50 @@ fn audit_jwt_sign_ungated_under_deny_net() {
         "nil\ntrue\n",
     );
 }
+
+// ───────────────────────────── std/archive (BATT B2 §6.5) ─────────────────────
+// The disk-touching helpers (`tarExtractTo`/`zipExtractTo`/`tarCreateFromDir`) write
+// to / read from the filesystem and MUST be `Fs`-gated. `--deny fs` AND `--sandbox`
+// both deny them BEFORE any disk touch. The in-memory streaming fns
+// (`tarWriter`/`zipWriter`/`tarEntries`/`zipEntries`/`tarAppend`) touch NO OS
+// resource and run under `--sandbox` (the positive half).
+
+#[cfg(all(feature = "archive", feature = "sys"))]
+#[test]
+fn audit_archive_disk_fns_denied_by_fs() {
+    let imp = "import * as archive from \"std/archive\"";
+    for (name, expr) in [
+        (
+            "audit_archive_tar_extract.as",
+            "archive.tarExtractTo(\"\", \"/tmp/ascript_audit_ax\")",
+        ),
+        (
+            "audit_archive_zip_extract.as",
+            "archive.zipExtractTo(\"\", \"/tmp/ascript_audit_az\")",
+        ),
+        (
+            "audit_archive_create.as",
+            "archive.tarCreateFromDir(\"/tmp\")",
+        ),
+    ] {
+        assert_denied(name, imp, expr, "fs", &["--deny", "fs"]);
+        assert_denied(name, imp, expr, "fs", &["--sandbox"]);
+    }
+}
+
+/// The in-memory writer runs under `--sandbox` — it opens no OS resource, so it is
+/// NOT gated (positive per-func assertion, mirroring the fs/jwt splits).
+#[cfg(feature = "archive")]
+#[test]
+fn audit_archive_in_memory_ungated_under_sandbox() {
+    let src = "import * as archive from \"std/archive\"\n\
+        let w = archive.tarWriter()\n\
+        w.add(\"a.txt\", \"hello\")\n\
+        let b = w.finish()\n\
+        print(len(b) > 0)\n\
+        let z = archive.zipWriter()\n\
+        z.add(\"b.txt\", \"world\")\n\
+        let zb = z.finish()\n\
+        print(len(zb) > 0)\n";
+    assert_allowed("audit_archive_inmem.as", src, &["--sandbox"], "true\ntrue\n");
+}

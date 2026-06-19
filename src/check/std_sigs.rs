@@ -1469,19 +1469,41 @@ static ARCHIVE_ADD_PARAMS: &[StdParam] = &[
     StdParam::opt("opts", "object"),
 ];
 static ARCHIVE_FINISH_PARAMS: &[StdParam] = &[];
+// B2 — zip plane + Fs-gated disk helpers.
+static ARCHIVE_ZIP_WRITER_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+static ARCHIVE_ZIP_ENTRIES_PARAMS: &[StdParam] = &[StdParam::req("data", "bytes")];
+static ARCHIVE_EXTRACT_TO_PARAMS: &[StdParam] = &[
+    StdParam::req("data", "bytes"),
+    StdParam::req("dest", "string"),
+    StdParam::opt("opts", "object"),
+];
+static ARCHIVE_CREATE_FROM_DIR_PARAMS: &[StdParam] = &[
+    StdParam::req("dir", "string"),
+    StdParam::opt("opts", "object"),
+];
 
 static ARCHIVE_SIGS: &[(&str, StdSig)] = &[
     ("tarWriter", StdSig { params: ARCHIVE_TAR_WRITER_PARAMS, ret: Some("archiveWriter"), doc: "Opens a streaming tar writer handle. opts: {gzip?, deterministic?}." }),
     ("tarEntries", StdSig { params: ARCHIVE_TAR_ENTRIES_PARAMS, ret: Some("generator"), doc: "Lazily decodes a (optionally gzipped) tar, yielding one {name, size, mode, isDir, data} per entry; a corrupt entry yields a [nil, err] pair." }),
     ("tarAppend", StdSig { params: ARCHIVE_TAR_APPEND_PARAMS, ret: Some("[bytes, err]"), doc: "Decodes a tar (preserving its entries) and appends {name, data, mode?, dir?} additions, returning the new archive bytes." }),
-    // archiveWriter handle methods (BATT B1 §6).
-    ("add", StdSig { params: ARCHIVE_ADD_PARAMS, ret: None, doc: "Appends one entry to a tar writer. opts: {dir?, mode?, mtime?}." }),
-    ("finish", StdSig { params: ARCHIVE_FINISH_PARAMS, ret: Some("bytes"), doc: "Finalizes a tar writer and returns the assembled bytes (gzip-wrapped if the writer was opened with {gzip:true})." }),
+    ("zipWriter", StdSig { params: ARCHIVE_ZIP_WRITER_PARAMS, ret: Some("archiveWriter"), doc: "Opens a streaming zip writer handle. opts: {store?} (store=true → no compression)." }),
+    ("zipEntries", StdSig { params: ARCHIVE_ZIP_ENTRIES_PARAMS, ret: Some("generator"), doc: "Lazily decodes a zip, yielding one {name, size, compressedSize, mode, isDir, data} per entry; a corrupt entry yields a [nil, err] pair." }),
+    ("tarExtractTo", StdSig { params: ARCHIVE_EXTRACT_TO_PARAMS, ret: Some("[string, err]"), doc: "Extracts a (optionally gzipped) tar to a destination directory with a zip-slip / path-traversal defense; symlinks are skipped by default ({links:\"error\"} rejects them). Fs-gated." }),
+    ("zipExtractTo", StdSig { params: ARCHIVE_EXTRACT_TO_PARAMS, ret: Some("[string, err]"), doc: "Extracts a zip to a destination directory with the same zip-slip / path-traversal defense as tarExtractTo. Fs-gated." }),
+    ("tarCreateFromDir", StdSig { params: ARCHIVE_CREATE_FROM_DIR_PARAMS, ret: Some("[bytes, err]"), doc: "Walks a directory and builds a tar of its contents. opts: {gzip?, deterministic?} (deterministic → byte-stable across runs). Symlinks are skipped. Fs-gated." }),
+    // archiveWriter handle methods (BATT B1 §6 + B2 zip).
+    ("add", StdSig { params: ARCHIVE_ADD_PARAMS, ret: None, doc: "Appends one entry to a tar/zip writer. opts: {dir?, mode?, mtime?} (tar) / {dir?, mode?, store?} (zip)." }),
+    ("finish", StdSig { params: ARCHIVE_FINISH_PARAMS, ret: Some("bytes"), doc: "Finalizes a tar/zip writer and returns the assembled bytes (gzip-wrapped if the tar writer was opened with {gzip:true})." }),
 ];
 static ARCHIVE_MEMBERS: &[(&str, MemberKind)] = &[
     ("tarWriter", MemberKind::Fn),
     ("tarEntries", MemberKind::Fn),
     ("tarAppend", MemberKind::Fn),
+    ("zipWriter", MemberKind::Fn),
+    ("zipEntries", MemberKind::Fn),
+    ("tarExtractTo", MemberKind::Fn),
+    ("zipExtractTo", MemberKind::Fn),
+    ("tarCreateFromDir", MemberKind::Fn),
     // archiveWriter handle methods — not module exports.
     ("add", MemberKind::HandleMethod),
     ("finish", MemberKind::HandleMethod),
