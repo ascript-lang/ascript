@@ -1462,13 +1462,23 @@ static NET_TCP_LISTEN_PARAMS: &[StdParam] = &[
     StdParam::req("port", "number"),
 ];
 
+static NET_TCP_CONNECT_TLS_PARAMS: &[StdParam] = &[
+    StdParam::req("host", "string"),
+    StdParam::req("port", "number"),
+    StdParam::opt("opts", "object"),
+];
+
 static NET_TCP_SIGS: &[(&str, StdSig)] = &[
     ("connect", StdSig { params: NET_TCP_CONNECT_PARAMS, ret: Some("[stream, err]"), doc: "Opens a client TCP connection. Async." }),
+    // BATT A1 — TLS client connect (feature `tls`); the row is unconditional (the export
+    // is present wherever `std/net/tcp` is buildable in the test configs that exercise it).
+    ("connectTls", StdSig { params: NET_TCP_CONNECT_TLS_PARAMS, ret: Some("[stream, err]"), doc: "Opens a client TCP connection and performs a TLS handshake. opts: {caCert?, serverName?, alpn?}. Async." }),
     ("listen", StdSig { params: NET_TCP_LISTEN_PARAMS, ret: Some("[listener, err]"), doc: "Binds a TCP listener. Async." }),
 ];
 
 static NET_TCP_MEMBERS: &[(&str, MemberKind)] = &[
     ("connect", MemberKind::Fn),
+    ("connectTls", MemberKind::Fn),
     ("listen", MemberKind::Fn),
 ];
 

@@ -703,3 +703,133 @@ fn windows_workers_falls_back_to_single_isolate_with_warn() {
         "the one-time REUSEPORT-unavailable warn must surface on Windows (stderr={stderr:?})"
     );
 }
+
+// ── BATT A2 §4.2 — multi-isolate `server.serve({workers, tls})` integration ───
+//
+// The TLS analogue of `multi_isolate_max_requests_is_exact_total`: N shared-nothing
+// REUSEPORT isolates each build their OWN `rustls` acceptor from the SAME (Send) PEM
+// strings shipped across the airlock, terminate TLS, and serve against ONE shared
+// `maxRequests` budget. We assert only the TOTAL (exactly K served, the group then stops
+// cleanly) — never the per-isolate split (OS scheduling, §4.1/§5) — exactly like the
+// plain-HTTP budget test. The client is a real reqwest HTTPS client trusting the baked
+// test CA (NO `danger_accept_invalid_certs`); `localhost` is pinned to `127.0.0.1:port`
+// so SNI/hostname verification passes against the cert's `localhost` SAN.
+//
+// Unix-only: SO_REUSEPORT is the multi-isolate path (Windows degrades to single-isolate,
+// covered elsewhere). `tls`-gated: the whole module needs the rustls stack + the client.
+#[cfg(all(unix, feature = "tls"))]
+mod tls_multi {
+    use super::{reserve_port, spawn_server, wait_with_timeout};
+    use std::time::Duration;
+
+    const CERT: &str = include_str!("../src/stdlib/testdata/tls_test_cert.pem");
+    const KEY: &str = include_str!("../src/stdlib/testdata/tls_test_key.pem");
+
+    /// The multi-isolate TLS server program: each isolate's `setup` builds a server that
+    /// serves `"hi"` over HTTPS; `server.serve({workers, tls, maxRequests})` bounds the
+    /// TOTAL served across isolates. The cert/key are embedded as PEM string literals
+    /// (the Send airlock ships these strings to each isolate, which builds its own
+    /// acceptor). NB: `{{`/`}}` are `format!` escapes.
+    fn tls_server_program(workers: usize, k: usize) -> String {
+        format!(
+            r#"
+import * as server from "std/http/server"
+import * as env from "std/env"
+
+let cert = {cert:?}
+let key = {key:?}
+
+worker fn boot(cert, key) {{
+  let app = server.create()
+  app.route("GET", "/who", (req) => "hi")
+  return app
+}}
+
+async fn main() {{
+  let [port, perr] = int(env.get("ASC_SERVE_PORT"))
+  await server.serve({{
+    port: port,
+    host: "127.0.0.1",
+    workers: {workers},
+    setup: boot,
+    args: [cert, key],
+    tls: {{ cert: cert, key: key }},
+    maxRequests: {k},
+  }})
+}}
+await main()
+"#,
+            cert = CERT,
+            key = KEY,
+        )
+    }
+
+    /// A reqwest HTTPS client trusting ONLY the baked test CA; `localhost` → `127.0.0.1`.
+    fn tls_client(port: u16) -> reqwest::Client {
+        let ca = reqwest::Certificate::from_pem(CERT.as_bytes()).expect("parse test CA");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        reqwest::Client::builder()
+            .add_root_certificate(ca)
+            .resolve("localhost", addr)
+            .build()
+            .expect("build reqwest client")
+    }
+
+    /// One HTTPS GET to `https://localhost:port/who`, retrying the connect for up to ~6s
+    /// (the server boots N isolates first). Returns the body on a 200, else `None`.
+    async fn https_get(client: &reqwest::Client, port: u16) -> Option<String> {
+        let url = format!("https://localhost:{port}/who");
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp.text().await.ok();
+                }
+                _ => {
+                    if std::time::Instant::now() > deadline {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_isolate_tls_serves_exact_total_budget() {
+        let port = reserve_port();
+        let workers = 3usize;
+        let k = 4usize;
+        let src = tls_server_program(workers, k);
+        let mut child = spawn_server("tls_exact", &src, port);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let served = rt.block_on(async {
+            let client = tls_client(port);
+            let mut served = 0usize;
+            for _ in 0..k {
+                if https_get(&client, port).await.as_deref() == Some("hi") {
+                    served += 1;
+                }
+            }
+            served
+        });
+
+        assert_eq!(
+            served, k,
+            "exactly maxRequests={k} HTTPS requests must be served across the TLS isolates"
+        );
+
+        // The group has reached the global budget; it must stop cleanly (process exit 0,
+        // no hung isolate thread / leaked fd). The per-isolate split is NOT asserted.
+        let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+        assert!(
+            matches!(status, Some(s) if s.success()),
+            "the multi-isolate TLS server must stop cleanly after exactly K total \
+             (status={status:?})"
+        );
+    }
+}
