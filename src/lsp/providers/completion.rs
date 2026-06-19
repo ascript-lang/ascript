@@ -65,12 +65,16 @@ fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
 
 /// ADT: a completion item for an enum variant offered after `Enum.`. A unit variant
 /// is a plain `ENUM_MEMBER` insert (`Point`); a payload variant gets a `detail`
-/// showing its signature (`(radius: float)`) and a SNIPPET insert with one tab-stop
-/// per field placeholder (`Circle(${1:radius})`), so the call form is pre-filled.
+/// showing its signature (`(radius: float)`) and (when `snippet_support` is true) a
+/// SNIPPET insert with one tab-stop per field placeholder (`Circle(${1:radius})`),
+/// so the call form is pre-filled. When `snippet_support` is false, a plain text body
+/// (`Circle(radius)`) is emitted instead so clients that do not handle tab-stops do
+/// not display raw `${…}` syntax.
 fn variant_completion_item(
     variant: &str,
     info: &crate::check::infer::table::EnumInfo,
     table: &crate::check::infer::table::Table,
+    snippet_support: bool,
 ) -> CompletionItem {
     let mut ci = item(variant, CompletionItemKind::ENUM_MEMBER);
     let fields = info.fields_of(variant).unwrap_or(&[]);
@@ -87,25 +91,40 @@ fn variant_completion_item(
         })
         .collect();
     ci.detail = Some(format!("({})", sig.join(", ")));
-    // Snippet insert with a placeholder per field. A MULTI-field named variant MUST
-    // be constructed with named args — the engine rejects a positional call
-    // (`interp.rs`: `is_named() && fields.len() > 1` → "requires named fields"), so the
-    // snippet emits the `name: <type>` call form, otherwise tab-completing it would
-    // lead straight into a runtime error. Single-field named (`Circle(radius)`) and
-    // positional variants accept positional args, so they keep the bare placeholder
-    // (field name as label for named, type for positional).
-    let named_call = fields.len() > 1 && fields.iter().all(|f| f.name.is_some());
-    let placeholders: Vec<String> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, f)| match &f.name {
-            Some(n) if named_call => format!("{n}: ${{{}:{}}}", i + 1, f.ty.display(table)),
-            Some(n) => format!("${{{}:{}}}", i + 1, n),
-            None => format!("${{{}:{}}}", i + 1, f.ty.display(table)),
-        })
-        .collect();
-    ci.insert_text = Some(format!("{variant}({})", placeholders.join(", ")));
-    ci.insert_text_format = Some(InsertTextFormat::SNIPPET);
+    if snippet_support {
+        // Snippet insert with a placeholder per field. A MULTI-field named variant MUST
+        // be constructed with named args — the engine rejects a positional call
+        // (`interp.rs`: `is_named() && fields.len() > 1` → "requires named fields"), so the
+        // snippet emits the `name: <type>` call form, otherwise tab-completing it would
+        // lead straight into a runtime error. Single-field named (`Circle(radius)`) and
+        // positional variants accept positional args, so they keep the bare placeholder
+        // (field name as label for named, type for positional).
+        let named_call = fields.len() > 1 && fields.iter().all(|f| f.name.is_some());
+        let placeholders: Vec<String> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| match &f.name {
+                Some(n) if named_call => format!("{n}: ${{{}:{}}}", i + 1, f.ty.display(table)),
+                Some(n) => format!("${{{}:{}}}", i + 1, n),
+                None => format!("${{{}:{}}}", i + 1, f.ty.display(table)),
+            })
+            .collect();
+        ci.insert_text = Some(format!("{variant}({})", placeholders.join(", ")));
+        ci.insert_text_format = Some(InsertTextFormat::SNIPPET);
+    } else {
+        // Plain-text fallback: no tab-stops, just the variant name with field names.
+        let named_call = fields.len() > 1 && fields.iter().all(|f| f.name.is_some());
+        let args: Vec<String> = fields
+            .iter()
+            .map(|f| match &f.name {
+                Some(n) if named_call => format!("{n}: {}", f.ty.display(table)),
+                Some(n) => n.to_string(),
+                None => f.ty.display(table),
+            })
+            .collect();
+        ci.insert_text = Some(format!("{variant}({})", args.join(", ")));
+        ci.insert_text_format = Some(InsertTextFormat::PLAIN_TEXT);
+    }
     ci
 }
 
@@ -164,28 +183,86 @@ fn binding_completions(model: &SemanticModel, char_offset: usize) -> Vec<Complet
     out
 }
 
-/// Curated control-flow snippets. Each is a SNIPPET-format item with `${n:…}`
-/// tab-stops and a `$0` final cursor.
-fn snippet_completions() -> Vec<CompletionItem> {
-    const SNIPPETS: &[(&str, &str)] = &[
-        ("fn", "fn ${1:name}(${2:params}) {\n  $0\n}"),
-        ("if", "if (${1:cond}) {\n  $0\n}"),
-        ("for", "for (${1:item} of ${2:iter}) {\n  $0\n}"),
-        ("while", "while (${1:cond}) {\n  $0\n}"),
-        ("defer", "defer ${1:resource}.close()"),
-        ("match", "match ${1:subject} {\n  ${2:pattern} => $0,\n}"),
-        ("class", "class ${1:Name} {\n  $0\n}"),
+/// Curated control-flow snippets.
+///
+/// When `snippet_support` is `true`, each item is a SNIPPET-format item with
+/// `${n:…}` tab-stops and a `$0` final cursor. When `false`, the tab-stop syntax
+/// is stripped and items are emitted as plain text so clients that do not handle
+/// snippets do not display raw `${…}` text.
+fn snippet_completions(snippet_support: bool) -> Vec<CompletionItem> {
+    // (label, snippet_body, plain_body)
+    const SNIPPETS: &[(&str, &str, &str)] = &[
+        ("fn",    "fn ${1:name}(${2:params}) {\n  $0\n}",     "fn name(params) {\n  \n}"),
+        ("if",    "if (${1:cond}) {\n  $0\n}",                 "if (cond) {\n  \n}"),
+        ("for",   "for (${1:item} of ${2:iter}) {\n  $0\n}",   "for (item of iter) {\n  \n}"),
+        ("while", "while (${1:cond}) {\n  $0\n}",              "while (cond) {\n  \n}"),
+        ("defer", "defer ${1:resource}.close()",               "defer resource.close()"),
+        ("match", "match ${1:subject} {\n  ${2:pattern} => $0,\n}", "match subject {\n  pattern => ,\n}"),
+        ("class", "class ${1:Name} {\n  $0\n}",               "class Name {\n  \n}"),
     ];
     SNIPPETS
         .iter()
-        .map(|(label, body)| CompletionItem {
-            label: label.to_string(),
-            kind: Some(CompletionItemKind::SNIPPET),
-            insert_text: Some(body.to_string()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
-            ..CompletionItem::default()
+        .map(|(label, snip_body, plain_body)| {
+            if snippet_support {
+                CompletionItem {
+                    label: label.to_string(),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    insert_text: Some(snip_body.to_string()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..CompletionItem::default()
+                }
+            } else {
+                CompletionItem {
+                    label: label.to_string(),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    insert_text: Some(plain_body.to_string()),
+                    insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                    ..CompletionItem::default()
+                }
+            }
         })
         .collect()
+}
+
+/// Lazily-built, process-scoped cache of ALL auto-import completion items across
+/// every std module. Built once on first call and shared across all subsequent
+/// requests — avoids re-iterating ~60 modules × N exports on every keystroke.
+///
+/// Each entry carries:
+/// - label    = export name
+/// - kind     = FUNCTION or CONSTANT (HandleMethod entries are skipped)
+/// - detail   = `"auto-import from <module>"`
+/// - sort_text = `"zz<name>"` — sorts AFTER in-scope bindings and builtins
+/// - additional_text_edits = the import insertion at line 0
+///
+/// The caller (`auto_import_candidates`) filters out already-imported names by
+/// iterating this slice — a cheap O(n) scan over a shared `&'static` allocation.
+pub fn auto_import_entries() -> &'static [CompletionItem] {
+    use crate::check::std_sigs::{module_members, MemberKind};
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<CompletionItem>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out = Vec::new();
+        for path in STD_MODULE_PATHS {
+            let Some(members) = module_members(path) else { continue; };
+            for &(name, ref kind) in members {
+                let ck = match kind {
+                    MemberKind::Fn => CompletionItemKind::FUNCTION,
+                    MemberKind::Const(_) => CompletionItemKind::CONSTANT,
+                    MemberKind::HandleMethod => continue,
+                };
+                let mut ci = item(name, ck);
+                ci.detail = Some(format!("auto-import from {path}"));
+                ci.sort_text = Some(format!("zz{name}"));
+                ci.additional_text_edits = Some(vec![TextEdit {
+                    range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                    new_text: format!("import {{ {name} }} from \"{path}\"\n"),
+                }]);
+                out.push(ci);
+            }
+        }
+        out
+    })
 }
 
 /// Auto-import candidates: every std export NOT already imported, each carrying an
@@ -203,25 +280,31 @@ fn auto_import_candidates(model: &SemanticModel) -> Vec<CompletionItem> {
         .map(|b| b.name.clone())
         .collect();
 
-    let mut out = Vec::new();
-    for path in STD_MODULE_PATHS {
-        let Some(exports) = crate::stdlib::std_module_exports(path) else {
-            continue;
-        };
-        for (name, _value) in exports {
-            if imported.contains(&name) {
-                continue;
-            }
-            let mut ci = item(&name, CompletionItemKind::FUNCTION);
-            ci.detail = Some(format!("auto-import from {path}"));
-            ci.additional_text_edits = Some(vec![TextEdit {
-                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                new_text: format!("import {{ {name} }} from \"{path}\"\n"),
-            }]);
-            out.push(ci);
+    auto_import_entries()
+        .iter()
+        .filter(|ci| !imported.contains(&ci.label))
+        .cloned()
+        .collect()
+}
+
+/// Fill `documentation` from the stdlib signature table for a completion item that
+/// carries `data: { module, name }`. Returns `true` if the item was handled (whether
+/// or not a doc was found). This is the fast, model-free path used in
+/// `completionItem/resolve` before falling back to the SemanticModel-based resolver.
+pub fn resolve_completion_static(item: &mut CompletionItem) -> bool {
+    use crate::check::std_sigs::std_sig;
+    let Some(data) = item.data.as_ref() else { return false; };
+    let Some(module) = data.get("module").and_then(|v| v.as_str()) else { return false; };
+    let Some(name) = data.get("name").and_then(|v| v.as_str()) else { return false; };
+    if let Some(sig) = std_sig(module, name) {
+        if !sig.doc.is_empty() {
+            item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: sig.doc.to_string(),
+            }));
         }
     }
-    out
+    true
 }
 
 /// Completions at char `offset` in the model's text. Pure and robust: never panics,
@@ -231,14 +314,22 @@ fn auto_import_candidates(model: &SemanticModel) -> Vec<CompletionItem> {
 /// Context detection is done by simple, parser-free scanning of the raw text around
 /// the cursor, so it works on documents that do not yet parse:
 /// - inside an `import ... from "..."` / `'...'` string → stdlib module paths;
-/// - right after `<ident>.` where `<ident>` is a `import * as <ident>` namespace of a
-///   known std module → that module's exports.
-pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> {
+/// - right after `<ident>.` (with an optional partial identifier after the dot, e.g.
+///   `math.sq`) where `<ident>` is a `import * as <ident>` namespace of a known std
+///   module → that module's exports (with `filter_text` = the typed prefix so the
+///   client filters correctly);
+/// - inside a plain string body or comment → NO items (C8 suppression).
+///
+/// `snippet_support` mirrors the client's `completionItem.snippetSupport` capability.
+/// When `false`, snippet bodies are downgraded to plain text so clients that do not
+/// handle snippets do not display raw `${…}` tab-stop syntax.
+pub fn completions(model: &SemanticModel, offset: usize, snippet_support: bool) -> Vec<CompletionItem> {
     let text = &model.text;
     let chars: Vec<char> = text.chars().collect();
     let offset = offset.min(chars.len());
 
     // Context 1: inside an import-from string literal → offer module paths.
+    // This is checked BEFORE the C8 string-suppression so import paths still complete.
     if in_import_path_string(&chars, offset) {
         return STD_MODULE_PATHS
             .iter()
@@ -246,14 +337,61 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
             .collect();
     }
 
-    // Context 2: member access `<ident>.` where ident is a namespace import.
-    if let Some(alias) = member_access_alias(&chars, offset) {
+    // C8: suppress inside plain string bodies and comments.
+    // Template INTERPOLATION interiors land on ordinary tokens (Ident etc.) and are
+    // NOT suppressed — only the TemplateStart/Middle/End/TemplateStr literal parts are.
+    if token_kind_at_cursor(&model.tokens, offset, &chars).is_some_and(suppressed_token_kind) {
+        return Vec::new();
+    }
+
+    // Context 2: member access `<ident>.<prefix>` where ident is a namespace import.
+    // C1: also fires when the cursor is after a partial identifier (`math.sq|`).
+    if let Some((alias, prefix)) = member_access_alias(&chars, offset) {
         if let Some(module) = namespace_import_module(text, &alias) {
-            if let Some(exports) = crate::stdlib::std_module_exports(&module) {
+            // Use the curated member table when available (provides real kinds,
+            // detail, and data for lazy doc resolution). Fall back to the runtime
+            // exports table for modules not yet covered by std_sigs.
+            use crate::check::std_sigs::{module_members, std_sig, render_sig_detail, MemberKind};
+            if let Some(members) = module_members(&module) {
+                if !members.is_empty() {
+                    return members
+                        .iter()
+                        .filter_map(|&(name, ref kind)| {
+                            match kind {
+                                MemberKind::HandleMethod => None,
+                                MemberKind::Fn => {
+                                    let mut it = item(name, CompletionItemKind::FUNCTION);
+                                    it.detail = std_sig(&module, name).map(render_sig_detail);
+                                    it.data = Some(serde_json::json!({"module": module, "name": name}));
+                                    if !prefix.is_empty() {
+                                        it.filter_text = Some(prefix.clone());
+                                    }
+                                    Some(it)
+                                }
+                                MemberKind::Const(ty) => {
+                                    let mut it = item(name, CompletionItemKind::CONSTANT);
+                                    it.detail = Some((*ty).to_string());
+                                    it.data = Some(serde_json::json!({"module": module, "name": name}));
+                                    if !prefix.is_empty() {
+                                        it.filter_text = Some(prefix.clone());
+                                    }
+                                    Some(it)
+                                }
+                            }
+                        })
+                        .collect();
+                }
+            } else if let Some(exports) = crate::stdlib::std_module_exports(&module) {
                 if !exports.is_empty() {
                     return exports
                         .into_iter()
-                        .map(|(name, _)| item(&name, CompletionItemKind::FUNCTION))
+                        .map(|(name, _)| {
+                            let mut it = item(&name, CompletionItemKind::FUNCTION);
+                            if !prefix.is_empty() {
+                                it.filter_text = Some(prefix.clone());
+                            }
+                            it
+                        })
                         .collect();
                 }
             }
@@ -268,13 +406,25 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                 return info
                     .variants
                     .iter()
-                    .map(|v| variant_completion_item(v, info, &table))
+                    .map(|v| {
+                        let mut it = variant_completion_item(v, info, &table, snippet_support);
+                        if !prefix.is_empty() {
+                            it.filter_text = Some(prefix.clone());
+                        }
+                        it
+                    })
                     .collect();
             }
         }
         if let Some(cid) = table.class_id(&alias) {
             if let Some(info) = table.class(cid) {
-                return class_member_items(info);
+                let mut items = class_member_items(info);
+                if !prefix.is_empty() {
+                    for it in &mut items {
+                        it.filter_text = Some(prefix.clone());
+                    }
+                }
+                return items;
             }
         }
 
@@ -284,14 +434,22 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
         // `hover_type_at` entry point hover/inlay use), extract its class name, and
         // offer that class's fields + methods. The LSP runs NO code — `hover_type_at`
         // is a pure static inference pass.
-        if let Some(info) = receiver_class_info(model, &chars, offset, &alias, &table) {
-            return class_member_items(info);
+        // Compute the dot position: offset - prefix.len() - 1 (the char before the prefix).
+        let dot_pos = offset.saturating_sub(prefix.chars().count()).saturating_sub(1);
+        if let Some(info) = receiver_class_info(model, &chars, dot_pos, &alias, &table) {
+            let mut items = class_member_items(info);
+            if !prefix.is_empty() {
+                for it in &mut items {
+                    it.filter_text = Some(prefix.clone());
+                }
+            }
+            return items;
         }
     }
 
     let mut base = baseline_completions();
     base.extend(binding_completions(model, offset));
-    base.extend(snippet_completions());
+    base.extend(snippet_completions(snippet_support));
     base.extend(auto_import_candidates(model));
     base
 }
@@ -364,29 +522,28 @@ fn class_member_items(info: &crate::check::infer::table::ClassInfo) -> Vec<Compl
     out
 }
 
-/// Context 4: if the receiver `alias` ending just before the dot at `offset` is a
-/// VALUE whose inferred type names a known class, return that `ClassInfo`. The
-/// receiver's type is resolved via `crate::check::infer::hover_type_at` (the static
-/// inference pass hover/inlay already use — runs NO code), the leading class
-/// identifier is extracted from the rendered type, and looked up in the SP10 table.
-/// `None` when the type is a primitive / `Any` / a non-class (then completion falls
-/// back to the baseline).
+/// Context 4: if the receiver `alias` ending just before the dot (at `dot_pos` in
+/// char space) is a VALUE whose inferred type names a known class, return that
+/// `ClassInfo`. The receiver's type is resolved via
+/// `crate::check::infer::hover_type_at` (the static inference pass hover/inlay
+/// already use — runs NO code), the leading class identifier is extracted from the
+/// rendered type, and looked up in the SP10 table. `None` when the type is a
+/// primitive / `Any` / a non-class (then completion falls back to the baseline).
 fn receiver_class_info<'t>(
     model: &SemanticModel,
     chars: &[char],
-    offset: usize,
+    dot_pos: usize,
     alias: &str,
     table: &'t crate::check::infer::table::Table,
 ) -> Option<&'t crate::check::infer::table::ClassInfo> {
     // The receiver identifier occupies `[dot - alias_len, dot)` in CHAR space; aim at
     // its middle char so the inference hover-span lookup lands inside the name. Convert
     // to the BYTE offset `hover_type_at` expects (it operates on the raw source bytes).
-    let dot = offset.checked_sub(1)?;
     let alias_chars = alias.chars().count();
-    let recv_start = dot.checked_sub(alias_chars)?;
+    let recv_start = dot_pos.checked_sub(alias_chars)?;
     let recv_mid_char = recv_start + alias_chars / 2;
     let byte_off = crate::lsp::convert::char_to_byte(&model.text, recv_mid_char.min(chars.len()));
-    let rendered = crate::check::infer::hover_type_at(&model.text, byte_off)?;
+    let rendered = crate::check::infer::hover_type_in(model.infer_cache(), byte_off)?;
     let class_name = first_class_ident(&rendered)?;
     let cid = table.class_id(&class_name)?;
     table.class(cid)
@@ -417,33 +574,60 @@ fn first_class_ident(rendered: &str) -> Option<String> {
     None
 }
 
-/// If the text immediately before `offset` is `<ident>.`, return `<ident>`.
-fn member_access_alias(chars: &[char], offset: usize) -> Option<String> {
+/// If the text at `offset` is `<ident>.<prefix>` (prefix may be empty, i.e. the
+/// cursor is right after the dot), return `(alias, prefix)` where `alias` is the
+/// identifier ending just before the LAST dot before the prefix, and `prefix` is the
+/// typed portion after the dot up to the cursor.
+///
+/// C1 support: `math.|` → `("math", "")`, `math.sq|` → `("math", "sq")`.
+/// Chain case: for `a.b.c|`, prefix = `"c"`, alias = `"b"` (the ident immediately
+/// before the dot that precedes the prefix).
+fn member_access_alias(chars: &[char], offset: usize) -> Option<(String, String)> {
     if offset == 0 {
         return None;
     }
-    // The char right before the cursor must be a dot.
-    if chars[offset - 1] != '.' {
+    // Backtrack over trailing ident chars to find where the prefix starts.
+    let prefix_end = offset;
+    let mut prefix_start = prefix_end;
+    while prefix_start > 0 && is_ident_char(chars[prefix_start - 1]) {
+        prefix_start -= 1;
+    }
+    // The first ident-start char of the prefix must not be a digit (a digit-led run
+    // would be a number, not an identifier prefix). If the run is empty (cursor right
+    // after dot) the check is vacuously fine.
+    if prefix_start < prefix_end && chars[prefix_start].is_ascii_digit() {
         return None;
     }
-    // Collect the identifier ending just before the dot.
-    let dot = offset - 1;
-    let mut start = dot;
-    while start > 0 && is_ident_char(chars[start - 1]) {
-        start -= 1;
+    // There must be a dot immediately before the prefix.
+    if prefix_start == 0 || chars[prefix_start - 1] != '.' {
+        return None;
     }
-    if start == dot {
+    let dot = prefix_start - 1;
+    // Collect the identifier ending just before the dot (the alias).
+    let alias_end = dot;
+    let mut alias_start = alias_end;
+    while alias_start > 0 && is_ident_char(chars[alias_start - 1]) {
+        alias_start -= 1;
+    }
+    if alias_start == alias_end {
         return None; // no ident before the dot
     }
-    // The first char must be a valid identifier start (not a digit).
-    if chars[start].is_ascii_digit() {
+    // The first char of the alias must be a valid identifier start (not a digit).
+    if chars[alias_start].is_ascii_digit() {
         return None;
     }
-    Some(chars[start..dot].iter().collect())
+    let alias: String = chars[alias_start..alias_end].iter().collect();
+    let prefix: String = chars[prefix_start..prefix_end].iter().collect();
+    Some((alias, prefix))
 }
 
 fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Public re-export for the signature provider (same logic, pub(crate) visibility).
+pub(crate) fn namespace_import_module_pub(text: &str, alias: &str) -> Option<String> {
+    namespace_import_module(text, alias)
 }
 
 /// Scan `text` for `import * as <alias> from "std/<mod>"` and return the module path.
@@ -486,15 +670,68 @@ fn namespace_import_module(text: &str, alias: &str) -> Option<String> {
     None
 }
 
+/// C8: return the `SyntaxKind` of the token whose character range CONTAINS the cursor
+/// at `char_offset`, or `None` if the cursor falls between tokens (e.g. at a boundary
+/// between whitespace and code, or past the end of the file).
+///
+/// `LexToken` carries no byte/char ranges — compute them by walking the token list and
+/// accumulating char lengths. The token stream is lossless (concatenating all texts
+/// reproduces the source), so char positions are exact.
+///
+/// We want the token that OWNS the cursor: the one where
+/// `tok_start < char_offset <= tok_end` (exclusive on the left, inclusive on the
+/// right — a cursor right at the end of a token is still "inside" it for suppression
+/// purposes, e.g. `"hel|` with cursor after `l` is inside the Str token).
+fn token_kind_at_cursor(
+    tokens: &[crate::syntax::lexer::LexToken],
+    char_offset: usize,
+    _chars: &[char],
+) -> Option<crate::syntax::kind::SyntaxKind> {
+    let mut pos = 0usize;
+    for tok in tokens {
+        let tok_len = tok.text.chars().count();
+        let tok_end = pos + tok_len;
+        // The cursor is inside this token if it falls in (pos, tok_end].
+        // We use a half-open interval: cursor > pos (not at the very start of this
+        // token, which belongs to the previous) AND cursor <= tok_end.
+        if char_offset > pos && char_offset <= tok_end {
+            return Some(tok.kind);
+        }
+        pos = tok_end;
+    }
+    None
+}
+
+/// C8: whether a `SyntaxKind` is a suppressed token (plain string body or comment).
+/// Template INTERPOLATION interiors use normal token kinds (Ident, Number, etc.) so
+/// they are NOT in this set — completion inside `${n` works normally.
+/// TemplateStr (a template with no interpolation, `` `plain` ``) IS suppressed because
+/// the cursor is inside the literal string body.
+/// TemplateStart/Middle/End contain the literal parts (`` `text${ `` / ``}text${ `` /
+/// ``}text` ``) — suppress cursor positions inside those literal parts.
+fn suppressed_token_kind(kind: crate::syntax::kind::SyntaxKind) -> bool {
+    use crate::syntax::kind::SyntaxKind;
+    matches!(
+        kind,
+        SyntaxKind::Str
+            | SyntaxKind::TemplateStr
+            | SyntaxKind::TemplateStart
+            | SyntaxKind::TemplateMiddle
+            | SyntaxKind::TemplateEnd
+            | SyntaxKind::LineComment
+            | SyntaxKind::BlockComment
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::check::LintConfig;
 
-    /// Build a model and complete at the END of `src` (its char count).
+    /// Build a model and complete at the END of `src` (its char count), with snippet support enabled.
     fn items(src: &str) -> Vec<CompletionItem> {
         let model = SemanticModel::build(src.to_string(), None, &LintConfig::default());
-        completions(&model, src.chars().count())
+        completions(&model, src.chars().count(), true)
     }
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
@@ -586,16 +823,19 @@ mod tests {
 
     #[test]
     fn completions_on_garbage_returns_baseline_no_panic() {
-        for src in ["", "@#$%^", "fn fn fn (((", "import * as", "\"unterminated"] {
+        // Non-string, non-comment garbage → baseline still offered.
+        for src in ["", "@#$%^", "fn fn fn (((", "import * as"] {
             let it = items(src);
             assert!(
                 labels(&it).contains(&"let"),
                 "garbage {src:?} should still yield baseline"
             );
         }
+        // Unterminated string: C8 suppresses (returns empty — not baseline). Must NOT panic.
+        let _ = items("\"unterminated");
         // An out-of-range offset must not panic.
         let model = SemanticModel::build("let x".to_string(), None, &LintConfig::default());
-        let _ = completions(&model, 9999);
+        let _ = completions(&model, 9999, true);
     }
 
     #[test]
@@ -641,7 +881,7 @@ mod tests {
         // An export unique to a newly-included module is offered as an auto-import
         // with the matching import edit.
         let model = SemanticModel::build("sp\n".to_string(), None, &LintConfig::default());
-        let items = completions(&model, 2);
+        let items = completions(&model, 2, true);
         let spawn = items
             .iter()
             .find(|i| {
@@ -701,7 +941,7 @@ mod tests {
         // `abs` is exported by std/math; nothing imports it yet.
         let src = "ab\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
-        let items = completions(&model, 2);
+        let items = completions(&model, 2, true);
         // `abs` is exported by more than one module (std/decimal AND std/math, both
         // in the canonical list) — each gets its own auto-import item; pick math's.
         let abs = items
@@ -721,19 +961,41 @@ mod tests {
         assert_eq!(edits[0].range.start.line, 0);
     }
 
+    /// C7: when `snippet_support` is `true`, control-flow items carry `${…}` tab-stops.
     #[test]
-    fn baseline_includes_snippets() {
+    fn baseline_includes_snippets_when_snippet_support_true() {
         let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
-        let items = completions(&model, 1);
+        let items = completions(&model, 1, true);
         let fn_snip = items
             .iter()
             .find(|i| i.label == "fn" && i.insert_text_format == Some(InsertTextFormat::SNIPPET))
-            .expect("fn snippet present");
+            .expect("fn snippet present with snippet_support=true");
         assert!(
             fn_snip.insert_text.as_deref().unwrap_or("").contains("$0")
                 || fn_snip.insert_text.as_deref().unwrap_or("").contains("${1"),
             "snippet has a tab-stop: {:?}",
             fn_snip.insert_text
+        );
+    }
+
+    /// C7: when `snippet_support` is `false`, NO completion item's insertText
+    /// should contain raw `${…}` tab-stop syntax.
+    #[test]
+    fn no_snippets_when_snippet_support_false() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let items = completions(&model, 1, false);
+        let with_tabstops: Vec<&CompletionItem> = items
+            .iter()
+            .filter(|i| i.insert_text.as_deref().unwrap_or("").contains("${"))
+            .collect();
+        assert!(
+            with_tabstops.is_empty(),
+            "no item must have ${{…}} syntax when snippet_support=false; got: {with_tabstops:?}"
+        );
+        // Snippet-kind items (fn/if/for/…) must still be offered, just as plain text.
+        assert!(
+            items.iter().any(|i| i.label == "fn" && i.kind == Some(CompletionItemKind::SNIPPET)),
+            "fn snippet-kind item must still be offered even with snippet_support=false"
         );
     }
 
@@ -743,12 +1005,12 @@ mod tests {
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
 
         let color_off = src.find("Color.\n").unwrap() + "Color.".len();
-        let cl = completions(&model, color_off);
+        let cl = completions(&model, color_off, true);
         let cls: Vec<&str> = cl.iter().map(|i| i.label.as_str()).collect();
         assert!(cls.contains(&"Red") && cls.contains(&"Green"), "enum variants: {cls:?}");
 
         let point_off = src.find("Point.\n").unwrap() + "Point.".len();
-        let pl = completions(&model, point_off);
+        let pl = completions(&model, point_off, true);
         let pls: Vec<&str> = pl.iter().map(|i| i.label.as_str()).collect();
         assert!(pls.contains(&"x"), "class field: {pls:?}");
         assert!(pls.contains(&"dist"), "class method: {pls:?}");
@@ -762,7 +1024,7 @@ mod tests {
         let src = "enum Shape {\n  Circle(radius: float),\n  Rect(w: float, h: float),\n  Pair(int, int),\n  Point,\n}\nShape.\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind("Shape.\n").unwrap() + "Shape.".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let find = |label: &str| items.iter().find(|i| i.label == label).cloned();
 
         let circle = find("Circle").expect("Circle offered");
@@ -795,7 +1057,7 @@ mod tests {
         let src = "let total = 1\nfn helper() {}\nt\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind('t').unwrap() + 1; // just after the `t` on the last line
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"total"), "missing local binding: {labels:?}");
         assert!(labels.contains(&"helper"), "missing fn binding: {labels:?}");
@@ -826,7 +1088,7 @@ mod tests {
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         // Cursor just after the lone `f` on line 3 (inside a's body).
         let off = src.find("  f\n").unwrap() + "  f".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"foo"), "a's own local foo must be offered: {labels:?}");
         assert!(!labels.contains(&"bar"), "sibling b's local bar must NOT be offered: {labels:?}");
@@ -842,7 +1104,7 @@ mod tests {
         let src = "fn outer() {\n  let captured = 1\n  fn inner() {\n    c\n  }\n}\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.find("    c\n").unwrap() + "    c".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"captured"),
@@ -857,7 +1119,7 @@ mod tests {
         let src = "fn a() {\n  x\n}\nfn b() {\n  let later = 2\n}\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.find("  x\n").unwrap() + "  x".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             !labels.contains(&"later"),
@@ -873,7 +1135,7 @@ mod tests {
         let src = "class C {\n  x: number\n  fn m() {}\n}\nlet c = C()\nc.\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind("c.\n").unwrap() + "c.".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"x"), "instance field x must be offered: {labels:?}");
         assert!(labels.contains(&"m"), "instance method m must be offered: {labels:?}");
@@ -885,9 +1147,64 @@ mod tests {
         let src = "import * as math from \"std/math\"\nmath.\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind("math.\n").unwrap() + "math.".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"abs"), "module export abs must be offered: {labels:?}");
         assert!(labels.contains(&"sqrt"), "module export sqrt must be offered: {labels:?}");
+    }
+
+    // ── SIG Task 2.3: stdlib member kind/detail/docs + cached auto-import ───────
+
+    #[test]
+    fn member_items_carry_real_kind_detail_and_resolve_docs() {
+        let it = items("import * as math from \"std/math\"\nlet y = math.");
+        let pi = it.iter().find(|i| i.label == "pi").expect("pi offered");
+        assert_eq!(pi.kind, Some(CompletionItemKind::CONSTANT), "pi is a constant");
+        assert_eq!(pi.detail.as_deref(), Some("float"));
+        let pow = it.iter().find(|i| i.label == "pow").expect("pow offered");
+        assert_eq!(pow.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(pow.detail.as_deref(), Some("(base: number, exp: number) -> float"));
+        let mut pow = pow.clone();
+        resolve_completion_static(&mut pow);
+        let Some(Documentation::MarkupContent(mk)) = &pow.documentation else {
+            panic!("resolve should fill stdlib docs")
+        };
+        assert!(mk.value.contains("Raise a base"));
+    }
+
+    #[test]
+    fn auto_import_items_are_deprioritized_and_cached() {
+        let a = items("ab\n");
+        let abs = a.iter()
+            .find(|i| i.detail.as_deref() == Some("auto-import from std/math") && i.label == "abs")
+            .expect("abs auto-import");
+        assert!(abs.sort_text.as_deref().unwrap_or("").starts_with("zz"),
+            "auto-import must sort after locals: {:?}", abs.sort_text);
+        assert!(std::ptr::eq(auto_import_entries(), auto_import_entries()));
+    }
+
+    // ── SIG Task 3.1 C1: partial-identifier member completion ────────────────────
+
+    #[test]
+    fn member_completion_with_partial_identifier_after_dot() {
+        // C1: manual invoke at `math.sq|` must offer members (filtered client-side).
+        let it = items("import * as math from \"std/math\"\nlet y = math.sq");
+        let sqrt = it.iter().find(|i| i.label == "sqrt").expect("sqrt offered at math.sq|");
+        assert_eq!(sqrt.filter_text.as_deref(), Some("sq"), "typed prefix as filter_text");
+    }
+
+    // ── SIG Task 3.1 C8: string/comment suppression ──────────────────────────────
+
+    #[test]
+    fn no_completion_inside_strings_and_comments() {
+        // C8: a plain string body and a comment body yield NO items…
+        assert!(items("let s = \"hel").is_empty(), "inside plain string must yield no items");
+        assert!(items("// com").is_empty(), "inside line comment must yield no items");
+        assert!(items("/* blo").is_empty(), "inside block comment must yield no items");
+        // …but the import-path context still completes,
+        assert!(!items("import { x } from \"std/").is_empty(), "import path must still complete");
+        // and a template INTERPOLATION completes normally.
+        let it = items("let n = 1\nlet s = `v: ${n");
+        assert!(it.iter().any(|i| i.label == "print"), "template interp should complete");
     }
 }

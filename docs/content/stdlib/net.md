@@ -28,7 +28,7 @@ import * as net from "std/net"
 Resolves a hostname to a de-duplicated list of IP-address strings. Async; returns `[array<string>, err]`.
 
 - `host` (string) — a hostname (e.g. `"localhost"`, `"example.com"`) or a `"host:port"` pair. A bare hostname without a port has `:0` appended internally before resolution. The returned strings contain only the IP address (port stripped).
-- Returns: `[ips, err]` — `ips` is an `array<string>` of resolved IPs in first-seen order, de-duplicated. On failure, `[nil, err]`.
+- Returns: `[array<string>, err]` — resolved IPs in first-seen order, de-duplicated. On failure, `[nil, err]`.
 
 ```ascript
 import * as net from "std/net"
@@ -43,7 +43,7 @@ print(ips)   // e.g. ["127.0.0.1", "::1"]
 Resolves a hostname and returns only the first IP address. Async; returns `[string, err]`.
 
 - `host` (string) — same form as `net.lookup`.
-- Returns: `[ip, err]` — the first resolved IP as a string, or `[nil, err]` if resolution fails or returns zero addresses.
+- Returns: `[string, err]` — the first resolved IP as a string, or `[nil, err]` if resolution fails or returns zero addresses.
 
 ```ascript
 import * as net from "std/net"

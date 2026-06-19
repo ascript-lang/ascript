@@ -599,14 +599,17 @@ fn lsp_protocol_end_to_end() {
         comp_labels.contains(&"print") && comp_labels.contains(&"let"),
         "completion should preserve builtins + keywords: {comp_labels:?}"
     );
-    // A snippet item (`match`) carries insertTextFormat == Snippet (2).
+    // A snippet-KIND item (`match`) is always offered; its insertTextFormat depends on
+    // whether the client advertised snippetSupport. This test uses `capabilities: {}`
+    // (no snippetSupport), so the format is PLAIN_TEXT (1) and `${…}` is absent.
+    // C7: clients without snippetSupport receive plain bodies.
     let snippet = comp_items
         .iter()
-        .find(|i| i["label"].as_str() == Some("match") && i["insertTextFormat"].as_i64() == Some(2))
-        .expect("a snippet completion item");
+        .find(|i| i["label"].as_str() == Some("match") && i["kind"].as_i64() == Some(15))
+        .expect("a snippet-kind completion item for 'match'");
     assert!(
-        snippet["insertText"].as_str().is_some_and(|t| t.contains("$")),
-        "snippet has a tab-stop: {snippet}"
+        !snippet["insertText"].as_str().unwrap_or("").contains("${"),
+        "client without snippetSupport must not see ${{…}} syntax: {snippet}"
     );
 
     // 5c. semanticTokens/full on the symbols doc -> a non-empty token stream.
@@ -795,6 +798,11 @@ fn lsp_cross_file_goto_definition_and_rename() {
     let b_path = dir.join("b.as");
     std::fs::write(&a_path, "export fn f(x) { return x }\n").unwrap();
     std::fs::write(&b_path, "import { f } from \"./a\"\nprint(f(1))\n").unwrap();
+    // Canonicalize paths so URI keys match what the server produces after C5
+    // (the server uses std::fs::canonicalize internally, which resolves /var → /private/var on macOS).
+    let a_path = std::fs::canonicalize(&a_path).unwrap_or(a_path);
+    let b_path = std::fs::canonicalize(&b_path).unwrap_or(b_path);
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let a_uri = format!("file://{}", a_path.display());
     let b_uri = format!("file://{}", b_path.display());
     let root_uri = format!("file://{}", dir.display());
@@ -927,6 +935,10 @@ fn lsp_cross_file_rename_respects_shadowing_local() {
     let b_text = "import { x } from \"./a\"\nfn g() {\n  let x = 2\n  return x\n}\nprint(x)\n";
     std::fs::write(&a_path, a_text).unwrap();
     std::fs::write(&b_path, b_text).unwrap();
+    // Canonicalize so URI keys match what the server produces after C5.
+    let a_path = std::fs::canonicalize(&a_path).unwrap_or(a_path);
+    let b_path = std::fs::canonicalize(&b_path).unwrap_or(b_path);
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let a_uri = format!("file://{}", a_path.display());
     let b_uri = format!("file://{}", b_path.display());
     let root_uri = format!("file://{}", dir.display());
@@ -2640,10 +2652,14 @@ fn lsp_didchange_trigger_completion_sees_fresh_text() {
     // NOT enough: the stale-text BASELINE also contains a `sqrt` item via the
     // auto-import flood (`detail: "auto-import from std/math"`), which is exactly
     // how a weak assertion would mask the staleness bug. So pin the member
-    // context: a `sqrt` item with NO auto-import detail, and NO keyword items
-    // (the baseline's `let` would prove we were served the stale pre-dot model).
+    // context: a `sqrt` item whose detail is NOT the auto-import string, and NO
+    // keyword items (the baseline's `let` would prove we were served the stale
+    // pre-dot model). (Since SIG Task 2.3, module-member items now carry a
+    // signature detail — we distinguish them from auto-import items by the
+    // detail NOT starting with "auto-import".)
     assert!(
-        items.iter().any(|i| i["label"].as_str() == Some("sqrt") && i["detail"].is_null()),
+        items.iter().any(|i| i["label"].as_str() == Some("sqrt")
+            && i["detail"].as_str().is_none_or(|d| !d.starts_with("auto-import"))),
         "completion right after the `.` didChange must offer the math MEMBER `sqrt` \
          (pending edit flushed, not a stale-model auto-import item); got: {labels:?}"
     );
@@ -2810,6 +2826,178 @@ fn lsp_didclose_purges_pending_no_ghost_republish() {
         }
     }
 
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// SIG §3.1(c): signature help for a cross-file imported user fn shows param NAMES
+/// and annotations (the index's `exported_fn_sig_from_decl` ParamList walk returns
+/// names and types, not just arity). A defaulted param is rendered as `name?: type`.
+#[test]
+fn lsp_signature_help_cross_file_imported_fn() {
+    let dir = std::env::temp_dir()
+        .join(format!("ascript_lsp_sig_xfile_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // util.as: exports `add` with one required and one defaulted param.
+    std::fs::write(
+        dir.join("util.as"),
+        "export fn add(first: number, second: number = 0) { return first + second }\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.as");
+    // main.as: imports `add` from util and calls it.  The file must parse cleanly so
+    // the workspace index can record the import edge (an unparseable file gets an
+    // empty-imports placeholder).  The cursor lands INSIDE the arg list of `add(0)`.
+    let main_text = "import { add } from \"./util\"\nlet r = add(0)\n";
+    std::fs::write(&main_path, main_text).unwrap();
+
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+
+    let root_uri = format!("file://{}", dir.display());
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let util_uri = format!("file://{}", dir.join("util.as").display());
+    let main_uri = format!("file://{}", main_path.display());
+
+    // Open util.as first so the workspace index picks up the export.
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": util_uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": "export fn add(first: number, second: number = 0) { return first + second }\n"
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Open main.as — this triggers indexing of the import edge.
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": main_text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Request signature help inside `add(0)` on line 1.
+    // "let r = add(0)\n" — `add(` starts at char 8, so char 12 is inside the arg list.
+    client.request(
+        2,
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 1, "character": 12 }
+        }),
+    );
+    let resp = client.read_response(2, overall);
+    let label = resp["result"]["signatures"][0]["label"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing signature label: {resp}"));
+    assert_eq!(
+        label,
+        "add(first: number, second?: number)",
+        "names + annotations expected; defaulted param should be `second?: number`: {resp}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SIG Task 2.3: stdlib member completion items carry real kind/detail; a
+/// `completionItem/resolve` on a stdlib member fills documentation from the static
+/// sig table (no SemanticModel round-trip needed).
+#[test]
+fn lsp_stdlib_member_kind_detail_and_docs() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://stdlib_member.as";
+    // Cursor at the end of `math.` on line 1.
+    let text = "import * as math from \"std/math\"\nlet y = math.\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // `math.` — cursor at char 13 on line 1 (just past the dot).
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 13 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+
+    // `pi` is a constant export — kind must be CONSTANT (21), detail must be "float".
+    let pi = items.iter().find(|i| i["label"].as_str() == Some("pi"))
+        .unwrap_or_else(|| panic!("pi not offered; got: {:?}", items.iter().map(|i| i["label"].as_str()).collect::<Vec<_>>()));
+    assert_eq!(
+        pi["kind"].as_u64(), Some(21),
+        "pi kind must be CONSTANT (21): {:?}", pi
+    );
+    assert_eq!(
+        pi["detail"].as_str(), Some("float"),
+        "pi detail must be 'float': {:?}", pi
+    );
+
+    // `pow` is a function — kind must be FUNCTION (3), detail must contain the param list.
+    let pow = items.iter().find(|i| i["label"].as_str() == Some("pow"))
+        .unwrap_or_else(|| panic!("pow not offered"));
+    assert_eq!(
+        pow["kind"].as_u64(), Some(3),
+        "pow kind must be FUNCTION (3): {:?}", pow
+    );
+    let pow_detail = pow["detail"].as_str().unwrap_or("");
+    assert!(
+        pow_detail.contains("base") && pow_detail.contains("exp"),
+        "pow detail must contain param names; got: {pow_detail:?}"
+    );
+
+    // `completionItem/resolve` on the `pow` item must fill documentation.
+    client.request(3, "completionItem/resolve", pow.clone());
+    let resolve_resp = client.read_response(3, overall);
+    let doc = resolve_resp["result"]["documentation"]["value"].as_str().unwrap_or("");
+    assert!(
+        doc.contains("Raise a base"),
+        "resolved pow documentation must contain 'Raise a base'; got: {doc:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
     client.notify_no_params("exit");
     client.close_stdin();
     let _ = client.wait_for_exit(Duration::from_secs(10));
@@ -3166,4 +3354,526 @@ fn dim(s: Shape): int {\n  return match s {\n    Shape.Circle(r) | Shape.Square(
             "importers[dep] must now record new.as: {dep_importers:?}"
         );
     }
+}
+
+/// SIG §3.3: hovering a stdlib member (`math.sqrt`) over the wire returns a
+/// hover response whose content includes the curated signature label.
+#[test]
+fn lsp_hover_stdlib_member_shows_signature() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://stdlib_hover.as";
+    // line 0: import * as math from "std/math"
+    // line 1: let y = math.sqrt(2)
+    let text = "import * as math from \"std/math\"\nlet y = math.sqrt(2)\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Hover on `sqrt` in `math.sqrt(2)` (line 1, char 13 — inside `sqrt`).
+    client.request(
+        2,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 13 }
+        }),
+    );
+    let hover_resp = client.read_response(2, overall);
+    let content = hover_resp["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        content.contains("math.sqrt("),
+        "hover on math.sqrt must show the signature; got: {content:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// SIG Task 3.1 C1: manual-invoke completion at `math.sq` (no trigger char) offers
+/// `sqrt` with `filterText` = `"sq"` over the wire.
+#[test]
+fn lsp_completion_partial_identifier_member_context() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://partial_member.as";
+    // line 0: import * as math from "std/math"
+    // line 1: let y = math.sq
+    // `let y = math.sq` — chars 0..15, cursor after `q` = char 15.
+    let text = "import * as math from \"std/math\"\nlet y = math.sq\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Manual invoke (no triggerCharacter) at the end of `math.sq`.
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 15 },
+            "context": { "triggerKind": 1 }
+        }),
+    );
+    let resp = client.read_response(2, overall);
+    let items = resp["result"]
+        .as_array()
+        .expect("completion result array");
+    let sqrt = items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("sqrt"))
+        .unwrap_or_else(|| panic!("sqrt must be offered at math.sq|; labels: {:?}",
+            items.iter().map(|i| i["label"].as_str().unwrap_or("")).collect::<Vec<_>>()
+        ));
+    assert_eq!(
+        sqrt["filterText"].as_str(),
+        Some("sq"),
+        "filterText must equal the typed prefix 'sq': {sqrt}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// SIG C2: `workspace/diagnostic` yields between files so interleaved requests
+/// (hover, completion) are serviced promptly rather than starved.
+///
+/// Test strategy: create a workspace with many `.as` files and force-index ALL of
+/// them via `didOpen` (draining `publishDiagnostics` to confirm reindexing). Then
+/// fire `workspace/diagnostic` (id A) and IMMEDIATELY fire `textDocument/hover` (id B)
+/// on the hover-target file. Assert that the hover response (id B) arrives within a
+/// tight deadline — substantially before the workspace diagnostic would complete if it
+/// ran the full file list without yielding.
+///
+/// SCOPE (honest): this is a NO-DEADLOCK / report-well-formedness SMOKE TEST, not a
+/// strict proof that the `yield_now()` calls are load-bearing. The `workspace_diagnostic`
+/// loop already `.await`s `self.documents.lock()` per file (itself a scheduler yield
+/// point), so a concurrently-issued hover would interleave even with the explicit
+/// `yield_now()` calls removed — the wall-clock deadline below therefore cannot ISOLATE
+/// the `yield_now()` contribution. The C2 yield + open-model reuse are
+/// scheduling/perf optimizations with NO observable behavioral difference (reuse returns
+/// identical diagnostics to a fresh build); their correctness is verified structurally in
+/// the handler (no lock guard held across any `.await`) and by clippy `await_holding_lock`,
+/// not by this test. What this test DOES guarantee: firing `workspace/diagnostic` over a
+/// many-file project and immediately issuing a `textDocument/hover` produces a correct
+/// hover and a well-formed workspace report within a generous deadline — i.e. no hang, no
+/// deadlock, no starvation severe enough to blow the deadline. The C4 half of this commit
+/// (`lsp_workspace_folder_removal_unindexes`) is the behaviorally-guarded test.
+#[test]
+fn lsp_workspace_diagnostic_yields() {
+    // Enough files that the workspace pull does real, multi-file work (so the smoke
+    // test exercises the per-file reuse + yield loop, not a trivial 1-file scan).
+    const FILE_COUNT: usize = 40;
+
+    let dir = std::env::temp_dir().join(format!("ascript_lsp_diag_yield_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Each file has several functions so SemanticModel::build does real work.
+    let mut file_texts: Vec<(String, String)> = Vec::with_capacity(FILE_COUNT);
+    for i in 0..FILE_COUNT {
+        let content = format!(
+            "fn func_{i}_a(x) {{ return x + 1 }}\n\
+             fn func_{i}_b(y) {{ return y * 2 }}\n\
+             fn func_{i}_c(z) {{ return z - 1 }}\n"
+        );
+        let fname = format!("f{i:02}.as");
+        std::fs::write(dir.join(&fname), &content).unwrap();
+        file_texts.push((fname, content));
+    }
+
+    // C5: canonicalize so URIs match the server's fs-canonical index keys (e.g. /var → /private/var on macOS).
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let root_uri = format!("file://{}", dir.display());
+    // hover-target = first file; it will be in the document store so C2's reuse path is exercised.
+    let hover_uri = format!("file://{}/{}", dir.display(), file_texts[0].0);
+
+    // Generous overall deadline — this is a correctness test, not a latency test.
+    let overall = Instant::now() + Duration::from_secs(120);
+    // The hover must arrive within this tight window. 30 s is intentionally generous
+    // to avoid flakiness under load, while still being well below what a no-yield full
+    // scan of 40 files would take in a debug binary under heavy concurrent compilation.
+    let hover_deadline = Duration::from_secs(30);
+
+    let mut client = LspClient::spawn();
+
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    // Force-index ALL files via didOpen so the workspace/diagnostic scan has real work
+    // to do. Draining publishDiagnostics for each file guarantees reindexing completed
+    // before we fire the workspace pull (reindex_uri runs synchronously inside did_open,
+    // before analyze_and_publish, which emits publishDiagnostics when it finishes).
+    for (fname, text) in &file_texts {
+        let uri = format!("file://{}/{}", dir.display(), fname);
+        client.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "ascript",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+    }
+    // Drain all FILE_COUNT publishDiagnostics notifications before querying.
+    for _ in 0..FILE_COUNT {
+        let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+    }
+
+    // All FILE_COUNT files are now in the index AND the document store.
+    // Fire workspace/diagnostic (id 10) immediately followed by hover (id 11).
+    // With no yields, the diagnostic scan blocks the task loop until all 40 files
+    // are processed; the hover is starved. With yields, the hover is serviced
+    // between file iterations.
+    client.request(10, "workspace/diagnostic", json!({ "previousResultIds": [] }));
+    // Send hover immediately — no sleep — so it races the ongoing diagnostic scan.
+    client.request(
+        11,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": hover_uri },
+            "position": { "line": 0, "character": 3 }
+        }),
+    );
+
+    // The hover (id 11) must complete within `hover_deadline`. The harness skips any
+    // message with a different id, so we read specifically for id 11 while id 10 may
+    // still be in-flight.
+    let hover_abs_deadline = Instant::now() + hover_deadline;
+    let hover_resp = client.read_response(11, hover_abs_deadline);
+    assert!(
+        hover_resp.get("result").is_some() && hover_resp.get("error").is_none(),
+        "hover must return a well-formed result even while workspace/diagnostic is in flight: {hover_resp}"
+    );
+
+    // Now drain the workspace/diagnostic response (id 10) — it arrives after hover.
+    let diag_resp = client.read_response(10, overall);
+    assert!(
+        diag_resp.get("result").is_some() && diag_resp.get("error").is_none(),
+        "workspace/diagnostic must return a well-formed result: {diag_resp}"
+    );
+    let items = diag_resp["result"]["items"]
+        .as_array()
+        .expect("workspace/diagnostic items array");
+    // All FILE_COUNT files were indexed before the pull — the report must cover them all.
+    assert_eq!(
+        items.len(),
+        FILE_COUNT,
+        "workspace/diagnostic must return one report per indexed file"
+    );
+    // The hover-target file must appear in the workspace report.
+    assert!(
+        items.iter().any(|r| r["uri"].as_str() == Some(hover_uri.as_str())),
+        "workspace/diagnostic must include the hover-target file: {hover_uri}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SIG C4: `didChangeWorkspaceFolders` with a removal purges the removed root's
+/// files from the workspace index. Symbols defined only in the removed root must
+/// vanish from `workspace/symbol`; symbols from surviving roots must remain.
+#[test]
+fn lsp_workspace_folder_removal_unindexes() {
+    let dir =
+        std::env::temp_dir().join(format!("ascript_lsp_folder_rm_{}", std::process::id()));
+    let root_a = dir.join("root_a");
+    let root_b = dir.join("root_b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    // Each root has a uniquely-named function so we can distinguish them in symbol search.
+    let text_a = "fn alpha_only() { return 1 }\n";
+    let text_b = "fn beta_only() { return 2 }\n";
+    let path_a = root_a.join("a.as");
+    let path_b = root_b.join("b.as");
+    std::fs::write(&path_a, text_a).unwrap();
+    std::fs::write(&path_b, text_b).unwrap();
+
+    // C5: canonicalize so URIs match the server's fs-canonical index keys (e.g. /var → /private/var on macOS).
+    let root_a = std::fs::canonicalize(&root_a).unwrap_or(root_a);
+    let root_b = std::fs::canonicalize(&root_b).unwrap_or(root_b);
+    let path_a = std::fs::canonicalize(&path_a).unwrap_or(path_a);
+    let path_b = std::fs::canonicalize(&path_b).unwrap_or(path_b);
+    let uri_a_root = format!("file://{}", root_a.display());
+    let uri_b_root = format!("file://{}", root_b.display());
+    let uri_a_file = format!("file://{}", path_a.display());
+    let uri_b_file = format!("file://{}", path_b.display());
+
+    let overall = Instant::now() + Duration::from_secs(90);
+    let mut client = LspClient::spawn();
+
+    // Initialize with both roots. Use root_a as rootUri.
+    client.request(
+        1,
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": uri_a_root,
+            "capabilities": {},
+            "workspaceFolders": [
+                { "uri": uri_a_root, "name": "root_a" },
+                { "uri": uri_b_root, "name": "root_b" }
+            ]
+        }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    // Open both files via didOpen — `reindex_uri` runs synchronously inside did_open,
+    // so once publishDiagnostics arrives both files are guaranteed to be in the index.
+    for (uri, text) in [(&uri_a_file, text_a), (&uri_b_file, text_b)] {
+        client.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "ascript",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+        // Drain publishDiagnostics to confirm reindexing completed for this file.
+        let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+    }
+
+    // Both symbols must be visible before the removal.
+    client.request(2, "workspace/symbol", json!({ "query": "only" }));
+    let before = client.read_response(2, overall);
+    let empty_before = vec![];
+    let before_names: Vec<&str> = before["result"]
+        .as_array()
+        .unwrap_or(&empty_before)
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        before_names.contains(&"alpha_only"),
+        "alpha_only must be indexed before removal: {before_names:?}"
+    );
+    assert!(
+        before_names.contains(&"beta_only"),
+        "beta_only must be indexed before removal: {before_names:?}"
+    );
+
+    // Remove root_b via didChangeWorkspaceFolders.
+    client.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [{ "uri": uri_b_root, "name": "root_b" }]
+            }
+        }),
+    );
+
+    // The notification is handled asynchronously; we cannot await its completion.
+    // Use a round-trip request as a fence: the server processes notifications in
+    // FIFO order before starting the next request, so a workspace/symbol query sent
+    // after the notification is guaranteed to run AFTER the removal handler finishes.
+    // We give it a small sleep as extra headroom for the write-lock release.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // After removal: beta_only must be GONE; alpha_only must survive.
+    client.request(3, "workspace/symbol", json!({ "query": "only" }));
+    let after = client.read_response(3, overall);
+    let empty_after = vec![];
+    let after_names: Vec<&str> = after["result"]
+        .as_array()
+        .unwrap_or(&empty_after)
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !after_names.contains(&"beta_only"),
+        "beta_only must be gone after root_b removal: {after_names:?}"
+    );
+    assert!(
+        after_names.contains(&"alpha_only"),
+        "alpha_only must survive after root_b removal: {after_names:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C7: a client that does NOT advertise `completionItem.snippetSupport` must NOT
+/// receive `${…}` tab-stop syntax in any completion's `insertText`.
+#[test]
+fn lsp_no_snippets_without_snippet_support() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    // Initialize with empty capabilities — no snippetSupport advertised.
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://no_snip.as";
+    let text = "fn f() {\n  \n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+
+    // No item's insertText must contain `${` when snippetSupport is not advertised.
+    let bad: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|i| i["insertText"].as_str().unwrap_or("").contains("${"))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "client without snippetSupport must not receive ${{…}} syntax; offending items: {bad:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// C7: a client that DOES advertise `completionItem.snippetSupport` must receive
+/// the `fn` snippet with `${…}` tab-stops.
+#[test]
+fn lsp_snippets_with_snippet_support() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    // Initialize with explicit snippetSupport = true.
+    client.request(
+        1,
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "completion": {
+                        "completionItem": {
+                            "snippetSupport": true
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://with_snip.as";
+    let text = "fn f() {\n  \n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+
+    // The `fn` snippet must be present and contain `${` tab-stops.
+    let fn_item = items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("fn") && i["kind"].as_u64() == Some(15))
+        .expect("fn snippet-kind item must be offered");
+    assert!(
+        fn_item["insertText"].as_str().unwrap_or("").contains("${"),
+        "fn snippet must contain ${{…}} tab-stops with snippetSupport=true; got: {fn_item}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
 }

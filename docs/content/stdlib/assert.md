@@ -74,19 +74,19 @@ assert.ne([1], [2])
 
 ## Boolean / nil assertions
 
-### `assert.isTrue(x)`
+### `assert.isTrue(value)`
 
 Fail if `x` is falsy (`false` or `nil`).
 
-### `assert.isFalse(x)`
+### `assert.isFalse(value)`
 
 Fail if `x` is truthy (anything other than `false` or `nil`).
 
-### `assert.isNil(x)`
+### `assert.isNil(value)`
 
 Fail if `x` is not `nil`.
 
-### `assert.notNil(x)`
+### `assert.notNil(value)`
 
 Fail if `x` is `nil`. Useful after a function that should have returned a value.
 
@@ -119,7 +119,7 @@ assert.lte(7, 7)
 
 ## Container membership
 
-### `assert.contains(haystack, needle)`
+### `assert.contains(container, item)`
 
 | Haystack type | Needle type | Check |
 |---|---|---|
@@ -134,7 +134,7 @@ assert.contains([1, 2, 3], 2)
 assert.contains({ name: "Ada" }, "name")
 ```
 
-### `assert.matches(value, regex)`
+### `assert.matches(value, pattern)`
 
 Fail unless the string `value` matches `regex`. The pattern may be a compiled
 `regex` value or a pattern string (compiled on the fly, like `regex.test`). A
@@ -167,7 +167,7 @@ assert.approxEq(1.0, 2.0)                 // ❌  fails
 
 ## Capturing a panic
 
-### `assert.throws(fn) -> errValue`
+### `assert.throws(f) -> errValue`
 
 Call `fn` with no arguments. If `fn` (or any async fn it returns) panics, the
 error is **caught and returned** as an object `{ message }` — the same shape
@@ -188,7 +188,7 @@ let e = await assert.throws(risky)
 assert.notNil(e.message)
 ```
 
-### `assert.throwsWith(fn, substr) -> errValue`
+### `assert.throwsWith(f, msg) -> errValue`
 
 Like `assert.throws`, but **also** asserts the recovered error message contains
 `substr`. A throw whose message does NOT contain `substr` fails (showing the

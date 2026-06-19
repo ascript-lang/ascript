@@ -45,9 +45,9 @@ advisory type inferencer) — the server never runs your code. The list mirrors
 
 | Method | Notes |
 |---|---|
-| `textDocument/hover` | Inferred/declared type (SP10) plus docs. |
-| `textDocument/signatureHelp` | Active parameter while typing a call. Triggers on `(` and `,`. |
-| `textDocument/completion` (+ `completionItem/resolve`) | Scope bindings, members, fields/methods, enum variants, module exports, keywords, control-flow snippets, and auto-import items. Triggers on `.`, `"`, `'`. |
+| `textDocument/hover` | Inferred/declared type (SP10) plus docs. For stdlib members (`math.sqrt`, `array.map`) the curated signature and one-line doc from the `std_sigs` table are shown in addition to the inferred type. |
+| `textDocument/signatureHelp` | Active parameter while typing a call. Triggers on `(` and `,`. Resolves four call shapes: stdlib members (`math.pow(base: number, exp: number) -> float`), global builtins (`print`, `len`), typed-receiver methods, and cross-file imported user fns (param names + annotations from their declaration). Active parameter advances on `,` and clamps for a variadic `...rest` param; one-line docs shown. **V1 limitation:** cross-file imported-fn signature help requires the calling file to parse cleanly (the import edge is recorded from a clean parse); in-file and stdlib signatures work on incomplete/unterminated calls. |
+| `textDocument/completion` (+ `completionItem/resolve`) | Scope bindings, members, fields/methods, enum variants, module exports, keywords, control-flow snippets, and auto-import items. Triggers on `.`, `"`, `'`. Stdlib member items carry real kind (FUNCTION vs CONSTANT), signature detail, and one-line docs (resolved lazily via `completionItem/resolve`). Auto-import candidates are deprioritized (sorted after locals/members). Partial-identifier member completion is supported (`math.sq` offers `sqrt`). Completion is suppressed inside string and comment bodies (except import-path strings and template `${…}` interpolations). Snippet bodies (`fn foo($1)`) are emitted only when the client advertises `completionItem.snippetSupport`; clients without that capability receive plain insert text. |
 
 ## Editing power-tools
 

@@ -299,7 +299,7 @@ string.splitN("a:b:c:d", ":", 3)   // ["a", "b", "c:d"]
 Return the string's Unicode scalar values as an `array<int>` (the Go "rune" model — AScript has no `char` type; a code point is just an `int`).
 
 - `s: string` — the source string
-- Returns: `array` of `int` (one per character)
+- Returns: `array<int>` (one per character)
 
 ```ascript
 string.codepoints("Hi")   // [72, 105]
@@ -1016,7 +1016,7 @@ returns the same numeric subtype it was given: `abs(int) -> int`,
 counterpart) is a checked-overflow panic, never a silent wrap.
 
 - `x: number`
-- Returns: `int` if `x` is an `int`, otherwise `float`
+- Returns: `number` (subtype-preserving: `int→int`, `float→float`)
 
 ```ascript
 math.abs(-3)     // 3    (int → int)
@@ -1118,7 +1118,7 @@ math.max(1, 9, 4)   // 9.0
 
 Return a pseudo-random number in the half-open range `[0, 1)`. The generator is fast but **not** cryptographic.
 
-- Returns: `number` in `[0, 1)`
+- Returns: `float` in `[0, 1)`
 
 ```ascript
 math.random()   // e.g. 0.7421…
@@ -1136,7 +1136,7 @@ math.random()   // e.g. 0.7421…
 Sine of an angle in radians.
 
 - `x: number` — angle in radians
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
 math.sin(0)          // 0.0
@@ -1148,7 +1148,7 @@ math.sin(math.pi)    // ≈ 0 (floating-point rounding)
 Cosine of an angle in radians.
 
 - `x: number` — angle in radians
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
 math.cos(0)   // 1.0
@@ -1159,7 +1159,7 @@ math.cos(0)   // 1.0
 Tangent of an angle in radians.
 
 - `x: number` — angle in radians
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
 math.tan(0)   // 0.0
@@ -1170,7 +1170,7 @@ math.tan(0)   // 0.0
 Arc-sine (inverse sine). Returns a value in `[-π/2, π/2]`.
 
 - `x: number` — value in `[-1, 1]`
-- Returns: `number` — angle in radians
+- Returns: `float` — angle in radians
 
 ```ascript
 math.asin(0)   // 0.0
@@ -1182,7 +1182,7 @@ math.asin(1)   // π/2 ≈ 1.5708
 Arc-cosine (inverse cosine). Returns a value in `[0, π]`.
 
 - `x: number` — value in `[-1, 1]`
-- Returns: `number` — angle in radians
+- Returns: `float` — angle in radians
 
 ```ascript
 math.acos(1)   // 0.0
@@ -1194,7 +1194,7 @@ math.acos(0)   // π/2 ≈ 1.5708
 Arc-tangent (inverse tangent). Returns a value in `(-π/2, π/2)`.
 
 - `x: number`
-- Returns: `number` — angle in radians
+- Returns: `float` — angle in radians
 
 ```ascript
 math.atan(0)   // 0.0
@@ -1207,7 +1207,7 @@ Two-argument arc-tangent. Returns the angle in radians between the positive x-ax
 
 - `y: number`
 - `x: number`
-- Returns: `number` — angle in radians
+- Returns: `float` — angle in radians
 
 ```ascript
 math.atan2(1, 1)    // π/4 ≈ 0.7854
@@ -1219,7 +1219,7 @@ math.atan2(0, -1)   // π ≈ 3.1416
 Euler's number raised to the power `x` (eˣ).
 
 - `x: number`
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
 math.exp(0)   // 1.0
@@ -1231,7 +1231,7 @@ math.exp(1)   // e ≈ 2.7183
 Natural logarithm (base e).
 
 - `x: number` — positive value
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
 math.ln(1)          // 0.0
@@ -1243,7 +1243,7 @@ math.ln(math.e)     // 1.0
 Base-2 logarithm.
 
 - `x: number` — positive value
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
 math.log2(8)    // 3.0
@@ -1255,7 +1255,7 @@ math.log2(1)    // 0.0
 Base-10 logarithm.
 
 - `x: number` — positive value
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
 math.log10(1000)   // 3.0
@@ -1448,7 +1448,7 @@ math.shuffle([1, 2, 3, 4, 5])   // e.g. [3, 1, 5, 2, 4]
 Return a uniformly random element from a non-empty array. Returns `nil` for an empty array.
 
 - `arr: array` — the source array
-- Returns: a random element, or `nil`
+- Returns: `any` (a random element, or `nil` for an empty array)
 
 ```ascript
 math.choice(["rock", "paper", "scissors"])   // e.g. "paper"
@@ -1711,7 +1711,7 @@ Write a single byte at an index, mutating the buffer in place.
 
 - `b: bytes` — the buffer to mutate
 - `i: number` — non-negative integer index
-- `value: number` — byte value `0..=255`
+- `v: number` — byte value `0..=255`
 - Returns: `nil`
 
 > [!TIER2] Panics if `value` is out of `0..=255`, or if the index is out of bounds.
@@ -1753,7 +1753,7 @@ Read an unsigned integer of `n` bytes from an offset, using the given endianness
 - `offset: number` — non-negative integer offset
 - `n: number` — byte length, 1–8
 - `endian: string` (optional) — `"le"` or `"be"`; `nil` defaults to big-endian
-- Returns: `number`
+- Returns: `int`
 
 > [!TIER2] Panics if `n` is outside 1–8, if `endian` is not `"le"`/`"be"`/`nil`, or if the read runs out of bounds.
 
@@ -1788,7 +1788,7 @@ Read a signed integer of `n` bytes from an offset, using the given endianness. T
 - `offset: number` — non-negative integer offset
 - `n: number` — byte length, 1–8
 - `endian: string` (optional) — `"le"` or `"be"`; `nil` defaults to big-endian
-- Returns: `number`
+- Returns: `int`
 
 > [!TIER2] Panics if `n` is outside 1–8, if `endian` is not `"le"`/`"be"`/`nil`, or if the read runs out of bounds.
 
@@ -1839,7 +1839,7 @@ set.new()   // set {}
 
 Build a set from an array, deduplicating elements. Preserves the first occurrence order.
 
-- `arr: array` — the source array; each element must be hashable
+- `arr: array` (optional) — the source array; each element must be hashable; `nil` or omitted yields an empty set
 - Returns: a new `set`
 
 > [!TIER2] Panics if `arr` is not an array or if any element is not hashable.
@@ -1856,7 +1856,7 @@ Insert a value into the set. If the value is already present, this is a no-op. R
 
 - `s: set` — the set to mutate
 - `value` — a hashable value
-- Returns: `s`
+- Returns: `set` (the same set, for chaining)
 
 > [!TIER2] Panics if `value` is not hashable.
 

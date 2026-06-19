@@ -771,6 +771,40 @@ The `pkg::cache::cache_root` duplication was hoisted to the single canonical lib
   requires the maintainer to regenerate it (`rt-manifest-gen --genkey`), recompile the pubkey
   into `PRODUCTION_PUBKEY`, and set the CI secret.
 
+## SIG — stdlib signature table + LSP enrichment + audit hardening ✅ MERGED
+
+Spec `superpowers/specs/2026-06-12-lsp-stdlib-signatures-design.md`, plan
+`superpowers/plans/2026-06-12-lsp-stdlib-signatures.md`. LSP/checker-static-only;
+**no engine, VM, compiler, `.aso`, or grammar surface** — `ASO_FORMAT_VERSION` 29 unchanged,
+`vm_differential` untouched and re-run once as proof.
+
+- **`src/check/std_sigs.rs` — the machine source of truth.** A curated, drift-tested table of
+  every `std/*` fn signature (params + optionality + return type + one-line doc) across all
+  ~60 STD_MODULES + 10 global builtins. The docs pages remain the social/prose source; two
+  drift-test families bind them bidirectionally: `tests/std_sigs_docs.rs` (docs↔table notation
+  consistency — every table entry's doc notation matches its owning stdlib docs page) + an in-module
+  completeness pair (`all_modules_have_entries` / `all_entries_reference_known_modules`). **Adding a
+  stdlib fn requires BOTH a docs entry and a table row or CI fails in both drift directions.**
+  `src/check/std_arity.rs` now DERIVES min-arity from the table (single source of truth; the
+  formerly-independent arity table is subsumed).
+- **Three LSP consumers:** (1) `textDocument/signatureHelp` — a resolution ladder covering stdlib
+  members (`math.pow(base: number, exp: number) -> float`), global builtins, typed-receiver methods,
+  and cross-file imported user fns (param names + annotations from their declaration, reusing the
+  workspace-index walk that previously discarded everything but arity); active-parameter advances on
+  `,` and clamps for a variadic `...rest`; one-line docs shown. (2) `textDocument/completion` —
+  real FUNCTION/CONSTANT kind, signature detail, and docs for stdlib members (resolved lazily via
+  `completionItem/resolve`); auto-import candidates deprioritized (sorted after locals/members);
+  partial-identifier member completion (`math.sq` → `sqrt`); suppressed inside string/comment
+  bodies (except import-path strings and template `${…}` interpolations); snippet bodies gated on
+  client `completionItem.snippetSupport`. (3) `textDocument/hover` — curated signature + doc for
+  stdlib members, alongside the existing inferred/declared type.
+- **C1–C8 audit hardening:** per-model `OnceLock<InferCache>` (no repeated inference work per
+  handler invocation); fs-canonical `WorkspaceIndex` keys; `snippetSupport` gating; workspace-
+  diagnostic yielding; folder-removal unindex; `did_close` pending-flush purge.
+- No tree-walker change, no new value kind, no opcode. LSP feature (`lsp`, default-on).
+  Examples: stdlib completions, hover, and signature help verified via `tests/lsp.rs` JSON-RPC
+  harness. Gate: `tests/std_sigs_docs.rs` + `tests/docs_drift.rs` green (both drift directions).
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred
