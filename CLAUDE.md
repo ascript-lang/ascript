@@ -563,6 +563,46 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   RSS flat; compute floor geomean 5.32× ≥ 2×. Examples: `examples/resilience.as`, `examples/advanced/
   resilient_gateway.as`; docs `docs/content/stdlib/resilience.md`. (Note: the sleep fn is `time.sleep`, NOT a
   non-existent `task.sleep`.)
+- **CNTR — container-native runtime + `std/docker`** (spec `superpowers/specs/2026-06-12-containers-docker-design.md`;
+  `docker` feature = `["net","data"]`, default-on; **NO `.aso`/opcode/grammar change**, `ASO_FORMAT_VERSION` 29
+  unchanged; pure stdlib + cap-gate generalization + a server-drain seam). **The cap chokepoint is now a CONJUNCTION:**
+  `required_cap`/`NativeKind::governing_caps` returns a `CapReq` (a `Copy(u8)` bitset newtype in `src/stdlib/caps.rs`:
+  `NONE`/`one`/`and`/`is_empty`/`iter`-in-`Cap::ALL`-order) instead of `Option<Cap>`, so `docker` can require **net ∧
+  process** (the first-denied-in-`Cap::ALL`-order names the error). The gate at `call_stdlib` + the per-handle re-check
+  at `call_native_method` iterate `required_cap(...).iter()` / `governing_caps().iter()` behind the unchanged
+  `!all_granted()` short-circuit → the default all-granted path is byte-identical (single-cap = one iteration =
+  old behavior; `cap_audit` 100% green = verdict-preservation proof). **`std/net/unix`** (UDS connect/listen handles,
+  the structural mirror of `net_tcp.rs`, `NativeKind::{UnixStream,UnixListener}`, Drop-unlinks-the-bound-path) + a
+  stage-2 carve-out `Interp::check_unix_path` (`None` net-scope → zero-cost Ok; else allow iff `unix:<canonical>` is
+  allow-listed). **HTTP over UDS, NOT reqwest:** `src/stdlib/http1.rs` — a small HARDENED HTTP/1.1 client codec
+  (generic over the transport; bounds `MAX_HEADER_BLOCK=64KiB`/`MAX_HEADERS=256`/`MAX_CHUNK_SIZE=16MiB`; hostile
+  input → clean Tier-1, never panic/hang/OOM; `read_to_end` never pre-`reserve`s an attacker length; `101`→`Upgraded
+  {transport,leftover}`). `std/net/http` routes `{socketPath}` requests through it (`call_http_send_uds`,
+  surface-identical to the reqwest TCP path incl. `errorOnStatus`/stream/json). **`std/docker`** (`src/stdlib/
+  docker.rs`): `docker.connect` (socket resolution opts→`$DOCKER_HOST`→`/var/run/docker.sock`; `tcp://`→Tier-1) +
+  version negotiation (clamp `[1.24,1.43]`, floor-reject) + the unary table + `logs`/`events`/`pull`/exec streams
+  (`NativeKind::DockerStream`, `native_stream_method=>Some("next")` makes `for await` work on BOTH engines) over the
+  **8-byte multiplexed demux** (stdout/stderr type + big-endian size, Multiplexed/Tty auto-detect on the first 8
+  bytes, JsonLines for events/pull; oversize-no-alloc + partial-frame reassembly + truncation→Tier-1). exec via the
+  `Upgraded` hijack. Return shapes per spec §4.2 (`ping`→`[true]`, `wait`→`[StatusCode int]`). `DockerClient`/
+  `DockerStream` `governing_caps` = net∧process; all four new handles GC-untraced + non-sendable (worker airlock
+  field-path panic). Hermetic: a recorded-fixture **mock Engine daemon** (`tests/docker.rs`) makes the whole module
+  testable with NO Docker installed; live tests env-gated on `ASCRIPT_DOCKER_LIVE=1`. **Inbound signals + graceful
+  drain** (§6–§7): `process.on`/`process.off` (`tokio::signal`, MAIN-ISOLATE only — worker→Tier-2 via `in_isolate()`;
+  `off` → emulated default-kill `exit(128+signo)` on next receipt; the signal listeners are daemon tasks ABORTED at
+  program end via `Interp::abort_signal_listeners()` before the `local.await` drain — else a registered handler hangs
+  the process). `srv.shutdown()` + `serve({onShutdown,drainTimeout})` graceful drain: the accept_loop predicate
+  generalized `budget==0` → `budget==0 || shutdown.is_armed()` with the lost-wakeup register→`enable()`→recheck
+  sequence **PRESERVED** (the existing server battery byte-identical = the proof); `onShutdown` once
+  (`AtomicBool::swap`); drain awaits in-flight raced vs `drainTimeout`, aborts losers. **cgroup-aware sizing** (§8):
+  `effective_parallelism()` = `$ASCRIPT_WORKERS || min(num_cpus, cgroup_quota)` (cgroup v2 `cpu.max` / v1
+  `cfs_quota`, Linux-only → `None` elsewhere so non-Linux is byte-identical to `main`) swapped into the 4 pool/worker
+  sizing sites; `os.inContainer()` (ungated). `ascript init --template server` scaffolds a container-ready server.
+  Examples `examples/docker_info.as` + `examples/advanced/docker_supervisor.as` are four-mode-PROVEN against the mock
+  (in `EXAMPLE_SKIPS` `DaemonDependent` — they need a daemon, so they're out of the run-to-completion corpus but
+  byte-identical across modes via the mock). Docs `docs/content/{deploying,stdlib/docker}.md`. **Recorded
+  ENABLED follow-ups** (RT+RESIL both merged): a `scratch`/`--oci` rt-stub image base for the Dockerfiles; the
+  template `/proxy` upgrade from `task.retry` to `std/resilience` policies.
 
 ## Commands
 

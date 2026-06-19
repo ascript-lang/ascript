@@ -224,3 +224,56 @@ fn rust_frontends_have_no_docker_keyword_or_node() {
         }
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Pin: CNTR added NO new `Value` variant — only `NativeKind`s (which ride the
+// existing `Value::Native`). `Value` stays `size_of == 24` (NANB's FINAL size)
+// and `!Send`. A new top-level `Value` variant would change the size / break the
+// `assert_not_impl_any!(Value: Send)` in value.rs.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn value_has_no_new_variant_from_cntr() {
+    assert_eq!(
+        std::mem::size_of::<ascript::value::Value>(),
+        24,
+        "Value size changed — CNTR must add NO new Value variant (UDS/docker handles \
+         ride the existing Value::Native via new NativeKinds, never a new top-level variant)"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Pin: the FOUR new native-resource handles (UnixStream, UnixListener,
+// DockerClient, DockerStream) are NON-SENDABLE — the worker airlock rejects each
+// with a field-path `("native")` error. A handle silently crossing to a worker
+// would fork its OS resource (fd / socket) — the §7.1-class invariant.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(unix, feature = "net"))]
+fn assert_native_kind_non_sendable(kind: ascript::value::NativeKind) {
+    use ascript::value::{NativeObject, Value};
+    let handle = Value::native(std::rc::Rc::new(NativeObject {
+        id: 1,
+        kind,
+        fields: indexmap::IndexMap::new(),
+    }));
+    let err = ascript::worker::serialize::check_sendable(&handle)
+        .expect_err("the handle must be rejected by the worker airlock");
+    assert_eq!(err.kind, "native", "expected a field-path native-rejection");
+}
+
+#[cfg(all(unix, feature = "net"))]
+#[test]
+fn unix_stream_and_listener_handles_are_non_sendable() {
+    use ascript::value::NativeKind;
+    assert_native_kind_non_sendable(NativeKind::UnixStream);
+    assert_native_kind_non_sendable(NativeKind::UnixListener);
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn docker_client_and_stream_handles_are_non_sendable() {
+    use ascript::value::NativeKind;
+    assert_native_kind_non_sendable(NativeKind::DockerClient);
+    assert_native_kind_non_sendable(NativeKind::DockerStream);
+}
