@@ -449,10 +449,23 @@ fn enclosing_call(model: &SemanticModel, offset: usize) -> Option<(Callee, Resol
         };
         let r = arg_list.text_range();
         let (s, e) = (usize::from(r.start()), usize::from(r.end()));
-        // Allow up to 2 bytes past the ArgList end to handle trailing whitespace
-        // in incomplete calls (e.g. `f(a, <cursor>` where the space after `,` is
-        // outside the ArgList range because no closing `)` is present).
-        if offset < s || offset > e + 2 {
+        // The upper bound for "cursor is inside this call's arguments":
+        //  - TERMINATED call (has a closing `)`): the `)` token's start position.
+        //    A cursor at or before the `)` is inside; anything past it is not — so
+        //    a completed INNER call cannot win over the enclosing call once the
+        //    cursor is past the inner `)` (e.g. `pow(abs(x), 2)`: the `2` is in
+        //    pow's args, not abs's). This is the nested-call correctness fix.
+        //  - UNTERMINATED call (no `)` yet): keep a 2-byte slop past the ArgList
+        //    end so a trailing `f(a, <cursor>` (whose space falls outside the
+        //    range because no `)` was parsed) still resolves.
+        let rparen_start = arg_list
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == SyntaxKind::RParen)
+            .last()
+            .map(|t| usize::from(t.text_range().start()));
+        let upper = rparen_start.unwrap_or(e + 2);
+        if offset < s || offset > upper {
             continue;
         }
         let len = e - s;
@@ -570,6 +583,31 @@ mod tests {
         let help = signature_help(&m, off, None, None).expect("help");
         assert_eq!(help.signatures[0].label, "add(a, b)");
         assert_eq!(help.active_parameter, Some(0));
+    }
+
+    #[test]
+    fn nested_call_inner_arg_picks_inner_outer_arg_picks_outer() {
+        // Regression (SIG §3.1): a completed inner call must NOT win past its own
+        // closing `)`. For `math.pow(math.abs(x), 2)` the cursor on pow's SECOND
+        // argument (the `2`) must show `math.pow`, not the inner `math.abs`.
+        let src = "import * as math from \"std/math\"\nmath.pow(math.abs(x), 2)\n";
+        let m = model(src);
+        // Cursor inside the INNER abs( arg list → inner signature.
+        let off_inner = src.rfind("abs(").unwrap() + "abs(".len();
+        let inner = signature_help(&m, off_inner, None, None).expect("inner help");
+        assert!(
+            inner.signatures[0].label.starts_with("math.abs("),
+            "inner arg should resolve abs, got {}",
+            inner.signatures[0].label
+        );
+        // Cursor on pow's second argument (the `2`) → OUTER signature.
+        let off_outer = src.rfind('2').unwrap();
+        let outer = signature_help(&m, off_outer, None, None).expect("outer help");
+        assert!(
+            outer.signatures[0].label.starts_with("math.pow("),
+            "second arg of pow should resolve pow, got {}",
+            outer.signatures[0].label
+        );
     }
 
     #[test]
