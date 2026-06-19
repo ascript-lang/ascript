@@ -135,6 +135,13 @@ pub fn version_old_http() -> Vec<u8> {
     http_response("HTTP/1.1 200 OK", &[], body)
 }
 
+/// `GET /info` → 200, daemon system-info with stable counters (no timestamps/ids
+/// that vary). Exercised by `examples/docker_info.as` (deterministic fields only).
+pub fn info_http() -> Vec<u8> {
+    let body = br#"{"ID":"MOCK:DAEMON:0000","Containers":2,"ContainersRunning":2,"ContainersPaused":0,"ContainersStopped":0,"Images":2,"Driver":"overlay2","ServerVersion":"24.0.0","OperatingSystem":"Mock Engine","OSType":"linux","Architecture":"amd64","NCPU":4,"MemTotal":8589934592,"Name":"mockhost"}"#;
+    http_response("HTTP/1.1 200 OK", &[], body)
+}
+
 /// `GET /_ping` → 200, body `OK`.
 pub fn ping_http() -> Vec<u8> {
     let body = b"OK";
@@ -228,6 +235,19 @@ pub fn events_jsonl_http() -> Vec<u8> {
         r#"{"Type":"container","Action":"start","Actor":{"ID":"abc123","Attributes":{"image":"nginx:latest","name":"web"}},"scope":"local","time":1700000001,"timeNano":1700000001000000000}"#, "\n",
         r#"{"Type":"container","Action":"stop","Actor":{"ID":"abc123","Attributes":{"image":"nginx:latest","name":"web"}},"scope":"local","time":1700000002,"timeNano":1700000002000000000}"#, "\n",
         r#"{"Type":"image","Action":"pull","Actor":{"ID":"nginx:latest","Attributes":{"name":"nginx:latest"}},"scope":"local","time":1700000003,"timeNano":1700000003000000000}"#, "\n",
+    );
+    http_chunked_response("HTTP/1.1 200 OK", &[], body.as_bytes())
+}
+
+/// `GET /events` for `examples/advanced/docker_supervisor.as` → 200 chunked, a
+/// SCRIPTED sequence: a `die` event for the supervised label, then EOF. The example
+/// filters with `{event:["die"], label:["app=web"]}`, so this route is selected by
+/// the presence of `die` in the `filters` query. The stream ENDS (the daemon closes
+/// the connection) so the example's `for await` terminates deterministically.
+pub fn events_supervisor_http() -> Vec<u8> {
+    // One `die` event for the supervised container, then the connection closes.
+    let body = concat!(
+        r#"{"Type":"container","Action":"die","Actor":{"ID":"abc123def456","Attributes":{"image":"nginx:latest","name":"web","app":"web","exitCode":"1"}},"scope":"local","time":1700000010,"timeNano":1700000010000000000}"#, "\n",
     );
     http_chunked_response("HTTP/1.1 200 OK", &[], body.as_bytes())
 }
@@ -571,6 +591,7 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
     match (method.as_str(), path.as_str()) {
         ("GET", "/_ping") => Some(ping_http()),
         ("GET", "/version") => Some(version_http()),
+        ("GET", "/info") => Some(info_http()),
         ("GET", "/containers/json") => Some(containers_list_http()),
         // CNTR §4.3 logs streams — the container id selects the fixture variant so a
         // single route covers happy/TTY/hostile paths (a real daemon keys on the id
@@ -587,6 +608,13 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
                 Some(logs_multiplexed_http())
             }
         }
+        // A reserved id (`missing404`) 404s, so a test can exercise the non-2xx →
+        // `[nil, {statusCode, message}]` mapping; every other inspect 200s.
+        ("GET", p)
+            if p.starts_with("/containers/") && p.ends_with("/json") && p.contains("missing404") =>
+        {
+            Some(error_404_http())
+        }
         ("GET", p) if p.starts_with("/containers/") && p.ends_with("/json") => {
             Some(inspect_http())
         }
@@ -597,13 +625,25 @@ fn route_request(request_line: &str) -> Option<Vec<u8>> {
         ("POST", p) if p.starts_with("/containers/") && p.ends_with("/stop") => {
             Some(stop_204_http())
         }
+        ("POST", p) if p.starts_with("/containers/") && p.ends_with("/restart") => {
+            Some(start_204_http())
+        }
         ("DELETE", p) if p.starts_with("/containers/") => Some(remove_204_http()),
         ("POST", p) if p.starts_with("/containers/") && p.ends_with("/wait") => {
             Some(wait_http())
         }
         ("GET", "/images/json") => Some(images_list_http()),
         ("DELETE", p) if p.starts_with("/images/") => Some(image_remove_http()),
-        ("GET", "/events") => Some(events_jsonl_http()),
+        // CNTR §10.1 — the supervisor example filters events with `{event:["die"]}`;
+        // that query selects the scripted `die`-then-EOF sequence. Every other events
+        // request (no `die` filter) gets the original 3-event fixture.
+        ("GET", "/events") => {
+            if query.contains("die") {
+                Some(events_supervisor_http())
+            } else {
+                Some(events_jsonl_http())
+            }
+        }
         // CNTR §4.3 pull — the `fromImage` query selects the fixture: a `nonexistent`
         // image returns the in-stream-error progress stream; anything else succeeds.
         ("POST", "/images/create") => {
@@ -1093,24 +1133,23 @@ print(err != nil)
 #[tokio::test]
 async fn inspect_404_has_status_code_and_message() {
     let (sock, _guard) = mock_daemon().await;
-    // The mock returns 404 for a `GET /containers/<id>/json` whose id is unknown?
-    // Actually the mock routes ANY `/containers/.../json` to inspect_http (200). To
-    // exercise the 404 mapping we hit a path the mock 404s: removeImage of an unknown
-    // image returns the image_remove (200). The reliably-404 route is an unknown
-    // endpoint — `info` is not routed by the mock → 404.
+    // The mock routes any `GET /containers/<id>/json` to inspect_http (200) EXCEPT the
+    // reserved `missing404` id, which returns the 404 fixture — so this exercises the
+    // non-2xx → `[nil, {statusCode, message}]` mapping. (`/info` is now a real 200
+    // route used by examples/docker_info.as, so it is no longer the 404 stand-in.)
     let src = format!(
         r#"
 import * as docker from "std/docker"
 let [d, err] = await docker.connect({{ socketPath: "{sock}" }})
 print(err)
-let [v, e2] = await d.info()
+let [v, e2] = await d.inspect("missing404")
 print(v)
 print(e2.statusCode)
 print(e2.message)
 "#
     );
     let out = run(&src).await;
-    assert!(out.starts_with("nil\nnil\n"), "connect ok + info nil val, got:\n{out}");
+    assert!(out.starts_with("nil\nnil\n"), "connect ok + inspect nil val, got:\n{out}");
     assert!(out.contains("404"), "expected statusCode 404, got:\n{out}");
     assert!(out.contains("No such container"), "expected daemon message, got:\n{out}");
 }
@@ -1909,4 +1948,182 @@ print("LIVE ROUND-TRIP OK")
     assert!(out.contains("LOGS OK"), "live logs must have both stdout+stderr; got:\n{out}");
     assert!(out.contains("REMOVED"), "live remove must succeed; got:\n{out}");
     assert!(out.contains("LIVE ROUND-TRIP OK"), "live round-trip did not complete; got:\n{out}");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CNTR Phase 7, Task 7.2 — the docker EXAMPLES, four-mode-proven against the mock.
+//
+// `examples/docker_info.as` and `examples/advanced/docker_supervisor.as` are
+// daemon-dependent, so they are EXCLUDED from the blind whole-corpus oracle
+// (`EXAMPLE_SKIPS` in tests/vm_differential.rs, reason `DaemonDependent`). Their real
+// four-mode proof lives HERE: each runs under tree-walker / specialized-VM /
+// generic-VM / `.aso` (compile→serialize→verify→run) against the recorded-fixture
+// `mock_daemon()` UDS, with `DOCKER_SOCK` pointed at the mock socket. We assert the
+// four engines are byte-identical AND that the output is stable across two runs (the
+// mock plays deterministic fixtures, incl. the supervisor's scripted `die`-then-EOF
+// event stream). This is the `server_multicore.rs` precedent: excluded from the
+// blind corpus, four-mode-proven in its own harness.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Run the BUILT binary against the example, with `DOCKER_SOCK` pointed at the mock,
+/// returning its captured stdout. Uses `tokio::process` so the test's async runtime
+/// keeps driving the mock `UnixListener` while the child runs. `extra_args` precede
+/// the file path (e.g. `["run", "--tree-walker"]`); `aso_path` (when `Some`) runs that
+/// compiled artifact instead of the source file.
+///
+/// The binary (CLI `run`) is the path that handles `process.on`'s daemon signal
+/// listener teardown at program end (tests/signals.rs `registered_handler_does_not_
+/// keep_process_alive`) — the in-process `vm_run_source` entry point does NOT abort
+/// that listener, so the supervisor example (which registers a SIGTERM handler for
+/// the production-shaped graceful shutdown) is four-mode-proven via the binary, the
+/// `server_multicore.rs` precedent.
+#[cfg(all(feature = "docker", unix))]
+async fn run_example_binary(
+    args: &[&str],
+    file: &std::path::Path,
+    sock: &str,
+    label: &str,
+) -> String {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let file = file.to_path_buf();
+    let sock = sock.to_string();
+    let env_extra: Vec<(String, String)> = vec![("DOCKER_SOCK".to_string(), sock)];
+    let label_owned = label.to_string();
+    // Use std::process via spawn_blocking so the test's async runtime keeps driving the
+    // mock UnixListener (the child connects back to it) while we wait on the child.
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(&args).arg(&file);
+        for (k, v) in &env_extra {
+            cmd.env(k, v);
+        }
+        cmd.output()
+            .unwrap_or_else(|e| panic!("{label_owned}: spawn failed: {e}"))
+    })
+    .await
+    .unwrap_or_else(|e| panic!("{label}: join failed: {e}"));
+    assert!(
+        out.status.success(),
+        "{label}: non-zero exit {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8(out.stdout).unwrap_or_else(|_| panic!("{label}: non-utf8 stdout"))
+}
+
+/// Run an example through all FOUR engines via the built binary against the mock
+/// socket — tree-walker / specialized-VM (default) / generic-VM
+/// (`ASCRIPT_NO_SPECIALIZE=1`) / `.aso` (build → run the artifact) — asserting all
+/// four are byte-identical AND stable across two runs.
+#[cfg(all(feature = "docker", unix))]
+async fn four_mode_example_against_mock(rel_path: &str, sock: &str) -> String {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let file = std::path::Path::new(root).join(rel_path);
+
+    // Mode 1 — tree-walker (the differential oracle).
+    let tw = run_example_binary(&["run", "--tree-walker"], &file, sock, "tree-walker").await;
+    // Mode 2 — specialized VM (the default engine).
+    let spec = run_example_binary(&["run"], &file, sock, "specialized VM").await;
+    // Mode 3 — generic VM (`--no-specialize` via the env kill switch).
+    let gen = {
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let file2 = file.clone();
+        let sock2 = sock.to_string();
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(bin)
+                .arg("run")
+                .arg(&file2)
+                .env("DOCKER_SOCK", &sock2)
+                .env("ASCRIPT_NO_SPECIALIZE", "1")
+                .output()
+                .expect("generic VM: spawn")
+        })
+        .await
+        .expect("generic VM: join");
+        assert!(
+            out.status.success(),
+            "generic VM: non-zero exit\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("generic VM: utf8")
+    };
+    // Mode 4 — `.aso`: build the artifact, then run it (the real CLI build+run path).
+    let aso_out = {
+        let tmp = tempfile::Builder::new()
+            .prefix("ascript_docker_example_")
+            .suffix(".aso")
+            .tempfile()
+            .expect("temp .aso");
+        let aso_path = tmp.path().to_path_buf();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        let file2 = file.clone();
+        let aso2 = aso_path.clone();
+        let build = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(bin)
+                .arg("build")
+                .arg(&file2)
+                .arg("-o")
+                .arg(&aso2)
+                .output()
+                .expect(".aso build: spawn")
+        })
+        .await
+        .expect(".aso build: join");
+        assert!(
+            build.status.success(),
+            ".aso build failed:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        run_example_binary(&["run"], &aso_path, sock, ".aso").await
+    };
+
+    // Run-stability: a second tree-walker run must match the first.
+    let tw2 = run_example_binary(&["run", "--tree-walker"], &file, sock, "tree-walker (2nd)").await;
+
+    assert_eq!(tw, spec, "{rel_path}: tree-walker vs specialized VM diverge");
+    assert_eq!(tw, gen, "{rel_path}: tree-walker vs generic VM diverge");
+    assert_eq!(tw, aso_out, "{rel_path}: tree-walker vs .aso diverge");
+    assert_eq!(tw, tw2, "{rel_path}: output not stable across two runs");
+    tw
+}
+
+/// `examples/docker_info.as` — connect → version/info/containers, four-mode-identical
+/// against the mock daemon (every deterministic field stable across the four engines).
+#[cfg(all(feature = "docker", unix))]
+#[tokio::test]
+async fn example_docker_info_four_mode_against_mock() {
+    let (sock, _guard) = mock_daemon().await;
+    let out = four_mode_example_against_mock("examples/docker_info.as", &sock).await;
+    let expected = "apiVersion: 1.43\n\
+                    engine: 24.0.0\n\
+                    os: linux/amd64\n\
+                    containers: 2\n\
+                    running: 2\n\
+                    images: 2\n\
+                    listed: 2\n  \
+                    /web (nginx:latest) running\n  \
+                    /db (postgres:15) running\n\
+                    done\n";
+    assert_eq!(out, expected, "docker_info.as output drifted:\n{out}");
+}
+
+/// `examples/advanced/docker_supervisor.as` — the events→inspect→restart→logs
+/// supervision loop, four-mode-identical against the mock daemon. The mock plays one
+/// scripted `die` event then EOF, so the `for await` terminates deterministically.
+#[cfg(all(feature = "docker", unix))]
+#[tokio::test]
+async fn example_docker_supervisor_four_mode_against_mock() {
+    let (sock, _guard) = mock_daemon().await;
+    let out = four_mode_example_against_mock("examples/advanced/docker_supervisor.as", &sock).await;
+    // One die event handled → one restart (1 attempt, mock returns 204) → the logs
+    // multiplex fixture yields 2 demuxed lines (stdout "hello\n" + stderr "oops\n").
+    let expected = "label: app=web\n\
+                    events handled: 1\n\
+                    restarted: 1\n\
+                    restart attempts: 1\n\
+                    log lines seen: 2\n\
+                    supervisor: done\n";
+    assert_eq!(out, expected, "docker_supervisor.as output drifted:\n{out}");
 }

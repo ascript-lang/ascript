@@ -978,6 +978,19 @@ enum SkipReason {
     /// Documented-only; not executed here. Covered instead by `tests/archive.rs`
     /// (which builds the module archive from the real files) and the CLI run above.
     RelativeImports,
+    /// A DOCKER-daemon-dependent example: it `docker.connect`s to a Unix socket and
+    /// drives the Engine API. The blind corpus oracle runs `run_source_exit(&src)`
+    /// with no daemon reachable — the example takes its deterministic `docker:
+    /// unavailable` early-exit branch, which is NOT the behavior being demonstrated
+    /// (version/info/containers, or the events→restart→logs supervision loop). The
+    /// real four-mode proof needs the recorded-fixture mock daemon (a live UDS), which
+    /// the blind oracle cannot stand up. So these are excluded from the corpus gate and
+    /// instead get a dedicated four-mode test in `tests/docker.rs`
+    /// (`example_docker_info_four_mode_against_mock` /
+    /// `example_docker_supervisor_four_mode_against_mock`) that runs each under
+    /// tree-walker / specialized / generic / `.aso` against the mock socket and asserts
+    /// byte-identical, run-stable output — the `server_multicore.as` precedent.
+    DaemonDependent,
 }
 
 /// The explicit, per-file SKIP list for the whole-corpus opt-out gate. EVERY entry
@@ -1154,6 +1167,20 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     (
         "examples/advanced/bundle_caps.as",
         SkipReason::RelativeImports,
+    ),
+    // CNTR §10.1 — DOCKER-daemon-dependent examples. Both `docker.connect` to a Unix
+    // socket; with no daemon the blind oracle takes the `docker: unavailable` early
+    // exit, not the demonstrated behavior. Four-mode-proven against the recorded mock
+    // daemon in `tests/docker.rs` (`example_docker_info_four_mode_against_mock` /
+    // `example_docker_supervisor_four_mode_against_mock`) — the `server_multicore.as`
+    // precedent: excluded from the blind corpus, proven in its own harness.
+    (
+        "examples/docker_info.as",
+        SkipReason::DaemonDependent,
+    ),
+    (
+        "examples/advanced/docker_supervisor.as",
+        SkipReason::DaemonDependent,
     ),
 ];
 
@@ -1517,12 +1544,14 @@ async fn vm_whole_corpus_skips_are_still_justified() {
             SkipReason::Nondeterministic
             | SkipReason::SharedExternalState
             | SkipReason::LongRunningServer
-            | SkipReason::RelativeImports => {
+            | SkipReason::RelativeImports
+            | SkipReason::DaemonDependent => {
                 // Documented-only; not executed (random/time/network bytes can't
                 // match across two runs, a shared-/tmp file races across the
-                // parallel oracles, a server blocks forever, or a relative import
-                // can't resolve in the source-only oracle). Existence is already
-                // asserted above.
+                // parallel oracles, a server blocks forever, a relative import
+                // can't resolve in the source-only oracle, or a docker example needs
+                // a live mock daemon — four-mode-proven in tests/docker.rs instead).
+                // Existence is already asserted above.
             }
         }
     }
