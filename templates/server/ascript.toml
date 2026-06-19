@@ -1,0 +1,12 @@
+[package]
+name = "server"
+version = "0.1.0"
+
+[dependencies]
+
+# Opt out of capabilities the server doesn't need (defense in depth). Denial is
+# monotone — the CLI and ascript.toml can only subtract, never re-grant. A network
+# server needs `net`; deny the rest to shrink the blast radius. Uncomment to enable:
+#
+# [capabilities]
+# deny = ["ffi", "process"]

@@ -75,6 +75,34 @@ gone for the life of the (dedicated / top-level) isolate, so a program can drop
 dangerous capabilities *before* dispatching untrusted code and trust the drop holds
 (the same one-way narrowing that makes OpenBSD `pledge` / Linux `seccomp` trustworthy).
 
+## `std/docker` — the dual-cap conjunction
+
+`std/docker` is the first stdlib module that requires **two capabilities at once**:
+both `net` (socket I/O) and `process` (the Docker socket is host-root-equivalent —
+anyone who can reach it can bind-mount `/` and spawn arbitrary host processes). Either
+denial is sufficient to block every `docker.*` call. When multiple caps are denied, the
+check fires in `Cap::ALL` order (`fs, net, process, ffi, env`), so:
+
+| Flags | Error |
+| --- | --- |
+| `--deny net` | `capability 'net' denied` |
+| `--deny process` | `capability 'process' denied` |
+| `--deny net --deny process` | `capability 'net' denied` (net fires first) |
+| `--sandbox` | `capability 'net' denied` |
+
+The gate fires at the `call_stdlib` dispatch gate **before any socket I/O**, so
+probing for a Docker daemon with a reduced capability set produces an immediate
+denial, never a partially-executed connect.
+
+The re-check also applies to **open handles**: calling a method on a live
+`dockerClient` after `caps.drop("process")` is also denied — the handle's
+`governing_caps` are `net ∧ process`, so a post-drop method call fails the same
+per-handle re-check the FFI handles use. This holds for `dockerStream` handles too.
+
+`std/net/unix` itself stays single-cap `net` — a UDS byte pipe conveys no process
+authority. Only the Docker client (which drives the container daemon) requires the
+conjunction.
+
 ## Granular fs/net carve-outs
 
 `fs` and `net` support "deny the class, allow a carve-out":
@@ -85,6 +113,19 @@ dangerous capabilities *before* dispatching untrusted code and trust the drop ho
 - **net** — `deny = "external"` allows loopback/private addresses but blocks public
   ones; `allow` carves specific hosts back. Enforced at connect/bind with the resolved
   address.
+
+**Unix-socket carve-out:** a granular net carve-out (`deny = "external"` + `allow`)
+can reinstate a specific UDS path with a `unix:<path>` entry:
+
+```toml
+# ascript.toml
+[capabilities]
+net = { deny = "external", allow = ["127.0.0.1", "unix:/var/run/docker.sock"] }
+```
+
+This permits `std/net/unix` connects and `std/docker` connects to that specific socket
+while blocking external TCP. A UDS path not on the allow list is denied
+(`capability 'net' denied for unix socket '<path>'`).
 
 These are the only granularity in the model — deliberately small for comprehensibility.
 

@@ -375,6 +375,21 @@ pub enum Command {
     /// Re-hash the cache store against the lock integrity (fail-closed).
     #[cfg(feature = "pkg")]
     Verify,
+    /// Scaffold a new project from a template (CNTR §9.3). The `server` template is
+    /// a container-ready HTTP service: graceful SIGTERM drain, a /healthz probe, a
+    /// resilient upstream call, plus a multi-stage Dockerfile, .dockerignore,
+    /// ascript.toml, and README. Refuses to overwrite existing files unless `--force`.
+    Init {
+        /// The template to scaffold (currently only `server`).
+        #[arg(long = "template", value_name = "NAME", default_value = "server")]
+        template: String,
+        /// Overwrite existing files instead of refusing with a conflict list.
+        #[arg(long = "force")]
+        force: bool,
+        /// Target directory (created if needed; defaults to the current directory).
+        #[arg(default_value = ".")]
+        dir: String,
+    },
     /// Manage the compile cache
     Cache {
         #[command(subcommand)]

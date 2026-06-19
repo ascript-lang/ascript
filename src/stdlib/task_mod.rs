@@ -19,8 +19,9 @@ use crate::value::{OwnedKind, Value, ValueKind};
 use crate::worker::isolate::{ChunkJob, ChunkKind};
 
 /// Aborts a `spawn_local` task when dropped. Used by `race` to cancel the resolver
-/// tasks (and thereby the losing futures) once a winner is decided.
-struct AbortOnDrop(tokio::task::AbortHandle);
+/// tasks (and thereby the losing futures) once a winner is decided, and by CNTR §6's
+/// signal-handler registry to abort each listener task on `Interp` teardown.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -1280,14 +1281,10 @@ pub(crate) fn chunk_plan(len: usize, cap: usize, min_chunk: usize) -> Vec<(usize
 }
 
 /// PAR spec §3.3.1: resolve the worker-pool cap for default chunk count.
-/// Mirrors `src/worker/pool.rs:59-64` — does NOT couple to private pool state.
+/// Delegates to `effective_parallelism()` (CNTR §8.1) so PAR and the pool
+/// agree: `$ASCRIPT_WORKERS` override → cgroup-aware `min(num_cpus, quota)`.
 pub(crate) fn pool_cap() -> usize {
-    std::env::var("ASCRIPT_WORKERS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or_else(num_cpus::get)
-        .max(1)
+    crate::worker::pool::effective_parallelism()
 }
 
 /// PAR spec §3.1: the two accepted input forms. Created synchronously inside

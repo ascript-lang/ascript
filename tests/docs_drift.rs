@@ -200,6 +200,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/net/http", "net.md"),
     ("std/http/server", "net.md"),
     ("std/net/udp", "net.md"),
+    ("std/net/unix", "net.md"),
     ("std/net/ws", "net.md"),
     ("std/regex", "data.md"),
     ("std/sqlite", "db.md"),
@@ -215,6 +216,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/tui", "tui.md"),
     ("std/ffi", "ffi.md"),
     ("std/resilience", "resilience.md"),
+    ("std/docker", "docker.md"),
 ];
 
 /// Pure checker (mutation-self-testable): validates a mapping against a module

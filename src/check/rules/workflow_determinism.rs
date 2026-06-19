@@ -46,7 +46,7 @@ const SEAM_CALLS: &[(&str, &str)] = &[
     ("uuid", "v7"),
 ];
 /// Whole modules whose every call is non-deterministic I/O.
-const SEAM_MODULES: &[&str] = &["net", "fs", "sql", "process", "http"];
+const SEAM_MODULES: &[&str] = &["net", "fs", "sql", "process", "http", "docker"];
 
 pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
     use SyntaxKind::*;
@@ -267,6 +267,76 @@ await run((ctx, input) => {
     fn actor_spawn_outside_workflow_not_flagged() {
         let src = "let a = Counter.spawn()\n";
         assert!(!has(src, "workflow-determinism"));
+    }
+
+    /// CNTR §4.6: a `docker.*` call inside an inline workflow body is flagged
+    /// (network side effects + host-process spawning — non-deterministic across replay).
+    #[test]
+    fn flags_docker_call_in_inline_workflow() {
+        let src = r#"
+import { run } from "std/workflow"
+import * as docker from "std/docker"
+await run((ctx, input) => {
+  let [d, _] = docker.connect({ socketPath: "/var/run/docker.sock" })
+  return d
+}, 0, { log: "x" })
+"#;
+        assert!(
+            has(src, "workflow-determinism"),
+            "docker.connect inside a workflow body must be flagged: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    /// A `docker.*` call wrapped in an `activity` is NOT flagged — it is the correct,
+    /// event-sourced form.
+    #[test]
+    fn docker_call_inside_activity_not_flagged() {
+        let src = r#"
+import { run, activity } from "std/workflow"
+import * as docker from "std/docker"
+let dockerPing = activity("dockerPing", (ctx) => docker.connect({ socketPath: "/var/run/docker.sock" }))
+await run((ctx, input) => {
+  return ctx.call(dockerPing, input)
+}, 0, { log: "x" })
+"#;
+        assert!(
+            !has(src, "workflow-determinism"),
+            "docker.connect inside an activity must NOT be flagged"
+        );
+    }
+
+    /// A `docker.*` call OUTSIDE any workflow is not flagged.
+    #[test]
+    fn docker_call_outside_workflow_not_flagged() {
+        let src = r#"
+import * as docker from "std/docker"
+let [d, _] = docker.connect({ socketPath: "/var/run/docker.sock" })
+"#;
+        assert!(
+            !has(src, "workflow-determinism"),
+            "docker.connect outside a workflow must not be flagged"
+        );
+    }
+
+    /// CNTR §6: a `process.on(...)` (inbound-signal handler registration) inside an
+    /// inline workflow body is flagged — `process` is in `SEAM_MODULES`, so the signal
+    /// seam is non-deterministic-across-replay like every other `process.*` call.
+    #[test]
+    fn flags_process_on_in_inline_workflow() {
+        let src = r#"
+import { run } from "std/workflow"
+import * as process from "std/process"
+await run((ctx, input) => {
+  process.on("SIGTERM", (s) => { print(s) })
+  return input
+}, 0, { log: "x" })
+"#;
+        assert!(
+            has(src, "workflow-determinism"),
+            "process.on inside a workflow body must be flagged: {:?}",
+            analyze(src).diagnostics
+        );
     }
 
     /// AScript has no `fn` *expression* form: `fn`/`fn name` is statement-only on

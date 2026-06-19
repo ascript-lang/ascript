@@ -93,7 +93,7 @@ use crate::span::Span;
 use crate::value::{NativeKind, NativeMethod, OwnedKind, Value, ValueKind};
 use indexmap::IndexMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -193,6 +193,55 @@ fn route_schemas_from_arg(arg: &Value) -> Option<RouteSchemas> {
     None
 }
 
+/// CNTR §7 — the per-handle graceful-drain coordination. Created at handle creation
+/// (`server.create()`), so `srv.shutdown()` can arm it BEFORE `serve` ever runs (the
+/// shutdown-before-serve case). `armed` is the SoT the accept loop re-checks (the
+/// budget-style recheck that closes the lost-wakeup window); `notify` wakes any accept
+/// loop parked in `accept()`. Both `Arc`-backed: the SAME pair is cloned into every
+/// isolate's `accept_loop` on the multi-isolate path (the shared stop the §7 fusion
+/// requires), so a single `shutdown()` reaches all isolates.
+#[derive(Clone)]
+pub struct ShutdownState {
+    /// Set true by `srv.shutdown()`. The accept loop re-checks this (alongside the
+    /// budget) under the lost-wakeup register→enable→recheck sequence.
+    armed: Arc<AtomicBool>,
+    /// Woken by `srv.shutdown()` (`notify_waiters`) so a parked `accept()` wakes and
+    /// re-checks `armed`. Also fired by the budget-exhaustion path (fused with the
+    /// old `stop` Notify) so a sibling reaching the global budget stops every isolate.
+    notify: Arc<tokio::sync::Notify>,
+    /// One-shot guard so `onShutdown` runs EXACTLY ONCE even across N isolates (each
+    /// would otherwise call it). `swap(true)` returns false to the single winner.
+    did_onshutdown: Arc<AtomicBool>,
+}
+
+impl ShutdownState {
+    fn new() -> Self {
+        ShutdownState {
+            armed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            did_onshutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Arm the shutdown + wake every parked accept loop. SYNC + idempotent (`store`
+    /// then `notify_waiters` are both no-ops the second time).
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
+    }
+
+    /// Claim the right to run `onShutdown`. Returns true to EXACTLY ONE caller (the
+    /// first to swap the flag from false), false to every subsequent call — so the
+    /// callback runs once whether it's one accept loop or N isolates contending.
+    fn claim_onshutdown(&self) -> bool {
+        !self.did_onshutdown.swap(true, Ordering::SeqCst)
+    }
+}
+
 /// Routes + middleware + the (optionally) bound listener for one server handle.
 pub struct HttpServerState {
     /// `(method_uppercase, path_pattern, schemas, handler)`. Path may contain
@@ -203,6 +252,9 @@ pub struct HttpServerState {
     pub middleware: Vec<Value>,
     /// The bound listener, present after `bind`/`listen`. `serve` accepts on it.
     pub listener: Option<TcpListener>,
+    /// CNTR §7 — the graceful-drain signal. Created at `create()` so `srv.shutdown()`
+    /// is valid before/after `serve` and across the isolate boundary (cloned in).
+    pub shutdown: ShutdownState,
 }
 
 impl HttpServerState {
@@ -211,6 +263,7 @@ impl HttpServerState {
             routes: Vec::new(),
             middleware: Vec::new(),
             listener: None,
+            shutdown: ShutdownState::new(),
         }
     }
 }
@@ -251,6 +304,14 @@ struct ServeOpts {
     setup_args: Vec<Value>,
     host: String,
     port: Option<u16>,
+    /// CNTR §7 — a callback run ONCE on the main side when shutdown begins, BEFORE the
+    /// drain wait. On the multi-isolate path it runs on the main caller, not inside any
+    /// isolate (else it would run N times).
+    on_shutdown: Option<Value>,
+    /// CNTR §7 — bound the post-shutdown drain wait; on timeout, in-flight handler
+    /// tasks are `.abort()`ed and the aborted count is `warn`-logged. `None` = wait
+    /// indefinitely for in-flight requests to complete.
+    drain_timeout_ms: Option<u64>,
 }
 
 impl ServeOpts {
@@ -267,6 +328,8 @@ impl ServeOpts {
             setup_args: Vec::new(),
             host: String::from("127.0.0.1"),
             port: None,
+            on_shutdown: None,
+            drain_timeout_ms: None,
         };
         if let ValueKind::Object(obj) = arg(args, 0).kind() {
             if let Some(n) = obj.get("maxRequests").and_then(|v| v.as_f64()) {
@@ -310,6 +373,17 @@ impl ServeOpts {
                     o.port = Some(n as u16);
                 }
             }
+            // CNTR §7 — graceful drain options.
+            if let Some(cb) = obj.get("onShutdown") {
+                if is_callable(&cb) {
+                    o.on_shutdown = Some(cb);
+                }
+            }
+            if let Some(n) = obj.get("drainTimeout").and_then(|v| v.as_f64()) {
+                if n >= 0.0 {
+                    o.drain_timeout_ms = Some(n as u64);
+                }
+            }
         }
         o
     }
@@ -322,15 +396,11 @@ impl ServeOpts {
     }
 }
 
-/// The effective worker count for `workers: 0` (= `num_cpus`), mirroring the worker
-/// pool's `$ASCRIPT_WORKERS`-or-`num_cpus` rule so the server tier and the pool agree.
+/// The effective worker count for `workers: 0`, mirroring the worker pool's sizing
+/// rule (`$ASCRIPT_WORKERS` override → cgroup-aware `min(num_cpus, quota)`) so the
+/// server tier and the pool agree (CNTR §8.1).
 fn num_cpus_for_serve() -> usize {
-    std::env::var("ASCRIPT_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(num_cpus::get)
-        .max(1)
+    crate::worker::pool::effective_parallelism()
 }
 
 /// Whether SO_REUSEPORT (kernel connection load-balancing across N sockets bound to
@@ -415,8 +485,9 @@ async fn run_isolate_server(
     encoded_shared: &[std::sync::Arc<crate::value::SharedNode>],
     std_listener: std::net::TcpListener,
     budget: Arc<AtomicUsize>,
-    stop: Arc<tokio::sync::Notify>,
+    shutdown: ShutdownState,
     bounded: bool,
+    drain_timeout_ms: Option<u64>,
     max_body: usize,
     timeout_ms: u64,
     max_concurrent: usize,
@@ -446,10 +517,14 @@ async fn run_isolate_server(
     // bind time). Each isolate accepts on its OWN socket in the shared kernel group.
     let listener = TcpListener::from_std(std_listener)
         .map_err(|e| format!("server.serve: could not register listener with tokio: {e}"))?;
-    // Run the shared accept loop on this isolate, against the group budget/stop.
+    // Run the shared accept loop on this isolate, against the group budget/stop. The
+    // `onShutdown` callback runs on the MAIN side ONCE (not here — else it would fire N
+    // times), so this isolate passes `None`. The shared `ShutdownState` (cloned in) is
+    // the fused stop/drain signal that reaches every isolate.
     match iso
         .accept_loop(
-            listener, id, max_body, timeout_ms, max_concurrent, budget, stop, bounded, span,
+            listener, id, max_body, timeout_ms, max_concurrent, budget, shutdown, bounded, None,
+            drain_timeout_ms, span,
         )
         .await
     {
@@ -994,19 +1069,37 @@ impl Interp {
                 let opts = ServeOpts::parse(args);
                 let n = opts.effective_workers().unwrap_or(1);
                 if n > 1 {
-                    self.http_server_serve_multi(n, opts, span).await
+                    // Module-level `server.serve` has no pre-bound handle → no external
+                    // `srv.shutdown()` trigger; a fresh `ShutdownState` coordinates the
+                    // budget-exhaustion stop + onShutdown/drainTimeout across isolates.
+                    self.http_server_serve_multi(n, opts, None, span).await
                 } else {
                     // Single-isolate, but still `setup`-driven (no pre-bound handle on the
                     // module path) — reuse the fallback, which runs setup on this interp.
+                    let ServeOpts {
+                        setup_fn,
+                        setup_args,
+                        host,
+                        port,
+                        max_requests,
+                        max_body,
+                        timeout_ms,
+                        max_concurrent,
+                        on_shutdown,
+                        drain_timeout_ms,
+                        ..
+                    } = opts;
                     self.http_server_serve_single_fallback(
-                        opts.setup_fn,
-                        opts.setup_args,
-                        &opts.host,
-                        opts.port,
-                        opts.max_requests,
-                        opts.max_body,
-                        opts.timeout_ms,
-                        opts.max_concurrent,
+                        setup_fn,
+                        setup_args,
+                        &host,
+                        port,
+                        max_requests,
+                        max_body,
+                        timeout_ms,
+                        max_concurrent,
+                        on_shutdown,
+                        drain_timeout_ms,
                         span,
                     )
                     .await
@@ -1176,6 +1269,17 @@ impl Interp {
                 let serve_args = vec![arg(&args, 2)];
                 self.http_server_serve(id, &serve_args, span).await
             }
+            // CNTR §7 — graceful shutdown: arm the drain signal + wake every accept loop
+            // (single- or multi-isolate). SYNC + idempotent: arming twice is a no-op. If
+            // the handle is already closed there is nothing to stop — a clean no-op nil.
+            "shutdown" => {
+                if let Some(s) = self.http_server_mut(id) {
+                    let sd = s.shutdown.clone();
+                    drop(s);
+                    sd.arm();
+                }
+                Ok(Value::nil())
+            }
             "close" => {
                 self.take_resource(id);
                 Ok(Value::nil())
@@ -1205,7 +1309,13 @@ impl Interp {
         // THIS pre-bound handle, byte-for-byte unchanged.
         if let Some(n) = opts.effective_workers() {
             if n > 1 {
-                return self.http_server_serve_multi(n, opts, span).await;
+                // Handle-method `s.serve({workers:N})`: clone THIS handle's ShutdownState
+                // so `srv.shutdown()` (e.g. from a process.on("SIGTERM") handler) reaches
+                // the shared cross-isolate stop. (Borrow scoped — not held across await.)
+                let handle_shutdown = self.http_server_mut(id).map(|s| s.shutdown.clone());
+                return self
+                    .http_server_serve_multi(n, opts, handle_shutdown, span)
+                    .await;
             }
         }
 
@@ -1214,35 +1324,41 @@ impl Interp {
             max_body,
             timeout_ms,
             max_concurrent,
+            on_shutdown,
+            drain_timeout_ms,
             ..
         } = opts;
 
         // Take the listener out of the resource so we own it across awaits (the
-        // resource table can't lend `&mut TcpListener` across a `call_value`).
-        let listener = match self.http_server_mut(id) {
-            Some(mut s) => match s.listener.take() {
-                Some(l) => l,
-                None => {
-                    return Ok(err_pair(
-                        "server.serve: not bound (call bind/listen first)".into(),
-                    ))
+        // resource table can't lend `&mut TcpListener` across a `call_value`). In the
+        // SAME borrow, CLONE the handle's `ShutdownState` (created at `create()`) so
+        // `srv.shutdown()` reaches THIS accept loop's stop signal. Neither the borrow
+        // guard nor any `RefMut` is held across the `.await` below.
+        let (listener, shutdown) = match self.http_server_mut(id) {
+            Some(mut s) => {
+                let shutdown = s.shutdown.clone();
+                match s.listener.take() {
+                    Some(l) => (l, shutdown),
+                    None => {
+                        return Ok(err_pair(
+                            "server.serve: not bound (call bind/listen first)".into(),
+                        ))
+                    }
                 }
-            },
+            }
             None => return Ok(err_pair("server.serve: server is closed".into())),
         };
 
-        // Seed the SHARED accept budget + stop signal that `accept_loop` runs against.
-        // For the single-isolate path these are private to this one loop: the budget
-        // is `maxRequests` (or `usize::MAX` = unbounded), and the stop `Notify` is
-        // never fired by anyone but this loop reaching budget 0. The multi-isolate
-        // path (SRV Part A, Task 8) clones the SAME `Arc<AtomicUsize>` budget +
-        // `Arc<Notify>` into every isolate's `accept_loop`, which is exactly why the
-        // body is factored out here. Single-isolate behavior is byte-for-byte the same
-        // as the prior inline loop (budget reproduces `served`/`maxRequests`).
+        // Seed the SHARED accept budget that `accept_loop` runs against. For the
+        // single-isolate path the budget is private to this one loop (`maxRequests` or
+        // `usize::MAX` = unbounded). The stop signal is the handle's `ShutdownState`
+        // notify (CNTR §7 fused it with the old budget-exhaustion `stop`): fired by both
+        // `srv.shutdown()` and the budget-exhaustion path. The multi-isolate path clones
+        // the SAME budget + `ShutdownState` into every isolate's `accept_loop`. Behavior
+        // with no shutdown fired reproduces the old loop (budget reproduces `served`).
         let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
-        let stop = Arc::new(tokio::sync::Notify::new());
-        // `bounded` mirrors the old `max_requests.is_some()` — when set, the loop
-        // retains + drains in-flight handler tasks and observes the shared stop.
+        // `bounded` still mirrors `max_requests.is_some()` — it gates the budget CLAIM
+        // (exact-total accounting); the stop/drain is now ALWAYS observed (stoppable).
         let bounded = max_requests.is_some();
 
         self.accept_loop(
@@ -1252,8 +1368,10 @@ impl Interp {
             timeout_ms,
             max_concurrent,
             budget,
-            stop,
+            shutdown,
             bounded,
+            on_shutdown,
+            drain_timeout_ms,
             span,
         )
         .await
@@ -1282,10 +1400,22 @@ impl Interp {
         timeout_ms: u64,
         max_concurrent: usize,
         budget: Arc<AtomicUsize>,
-        stop: Arc<tokio::sync::Notify>,
+        shutdown: ShutdownState,
         bounded: bool,
+        on_shutdown: Option<Value>,
+        drain_timeout_ms: Option<u64>,
         span: Span,
     ) -> Result<Value, Control> {
+        // CNTR §7 — the budget-exhaustion `stop` Notify is FUSED with the handle's
+        // graceful-drain Notify: there is now ONE signal (`shutdown.notify`) that wakes
+        // a parked `accept()`, fired by BOTH `srv.shutdown()` AND the budget-exhaustion
+        // path. The stop condition generalizes `bounded` → `bounded || stoppable`; for
+        // `serve` a shutdown is ALWAYS arm-able, so `stoppable` is always true and the
+        // race-select always runs. When no shutdown is ever fired AND `maxRequests` is
+        // unset, the budget stays `usize::MAX` and `shutdown.notify` never fires, so the
+        // select parks in `accept()` exactly like the old unbounded loop (no behavior
+        // change — the in-process/integration server battery is the byte-identity proof).
+        let stop = shutdown.notify.clone();
         // Bounds the number of connections handled at once. Each spawned handler
         // task holds an `OwnedSemaphorePermit` for its lifetime; the permit is
         // released (returned to the semaphore) when the task finishes. This caps
@@ -1295,39 +1425,50 @@ impl Interp {
         // spawned handler task. Arc is fine in this `!Send` single-threaded runtime —
         // the permit never crosses a thread (every task stays on the LocalSet).
         let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        // In-flight handler tasks, retained ONLY when bounded (`maxRequests` set) so
-        // the shutdown path can DRAIN them (await completion) before returning —
-        // otherwise an accepted-but-not-yet-finished slow handler's response could be
-        // lost. Without `maxRequests` (an unbounded `serve`) tasks are detached; the
-        // semaphore alone bounds concurrency and finished tasks free themselves, so
-        // we don't accumulate join handles forever.
+        // In-flight handler tasks, retained ALWAYS (CNTR §7) so the graceful-drain path
+        // can await their completion before `serve` returns — an accepted-but-not-yet-
+        // finished slow handler's response must not be lost on shutdown. To keep an
+        // UNBOUNDED `serve` from accumulating join handles forever, we REAP finished
+        // handles per iteration (`is_finished()` swap-remove, bounded by
+        // `max_concurrent` — at most that many can ever be live, the semaphore cap).
         let mut inflight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         loop {
-            // Accept the next connection. On the bounded path we race `accept()` against
-            // the shared `stop` so a sibling reaching the global budget wakes THIS loop
-            // out of a blocking `accept()` (otherwise it would hang). On the unbounded
-            // path `stop` is never fired, so we await `accept()` directly (byte-identical
-            // to the old loop).
-            let accepted = if bounded {
-                // LOST-WAKEUP FIX: `Notify::notify_waiters` only wakes ALREADY-registered
-                // waiters (it stores no permit). So we REGISTER the `stop` waiter FIRST,
-                // then re-check the budget. A sibling that drove the budget to 0 and fired
-                // `notify_waiters` BEFORE we registered is caught by this budget re-check
-                // (it set budget=0 before notifying); one that fires AFTER is delivered to
-                // our already-registered `notified`. Either way an idle isolate can no
-                // longer miss the shutdown and park in `accept()` forever (which would hang
-                // its thread → `serve` never returns). Reading 0 here means this loop or a
-                // sibling claimed the global total — wake every sibling, then drain+return.
+            // Reap any finished handler tasks so an unbounded server's `inflight` vec
+            // stays bounded (the live count never exceeds `max_concurrent`). Cheap: a
+            // single scan of a vec whose length is ≤ the concurrency cap.
+            inflight.retain(|h| !h.is_finished());
+            // Accept the next connection, racing `accept()` against the shared
+            // `shutdown.notify` so a `srv.shutdown()` OR a sibling reaching the global
+            // budget wakes THIS loop out of a blocking `accept()`. `bounded || stoppable`
+            // — `stoppable` is always true for `serve` (shutdown is always arm-able), so
+            // the race always runs. With no shutdown fired and `maxRequests` unset the
+            // notify never fires and the budget stays MAX, so this is observably the old
+            // unbounded `accept().await`.
+            let accepted = {
+                // LOST-WAKEUP FIX (unchanged from the SRV budget path, now also guarding
+                // shutdown): `Notify::notify_waiters` only wakes ALREADY-registered
+                // waiters (it stores no permit). So we REGISTER the waiter FIRST, then
+                // re-check the stop condition. A signaller that drove the condition true
+                // and fired `notify_waiters` BEFORE we registered is caught by this
+                // re-check (it set the flag before notifying); one that fires AFTER is
+                // delivered to our already-registered `notified`. Either way an idle
+                // isolate can no longer miss the stop and park in `accept()` forever
+                // (which would hang its thread → `serve` never returns). Reading the stop
+                // condition here means this loop or a sibling claimed the total / a
+                // shutdown was armed — wake every sibling, then drain+return.
                 let notified = stop.notified();
                 tokio::pin!(notified);
                 // `Notified` registers its waiter on first POLL, not on creation — so we
-                // `enable()` it to register NOW, BEFORE the budget re-check. Without this
-                // the register-before-check is a no-op (the select would register only
-                // after the check, re-opening the lost-wakeup window). With it: a sibling
-                // that fired `notify_waiters` after this `enable()` reaches our registered
-                // waiter; one that fired before set budget=0 first, caught by the re-check.
+                // `enable()` it to register NOW, BEFORE the re-check. Without this the
+                // register-before-check is a no-op (the select would register only after
+                // the check, re-opening the lost-wakeup window). With it: a signaller that
+                // fired `notify_waiters` after this `enable()` reaches our registered
+                // waiter; one that fired before set the flag first, caught by the re-check.
                 notified.as_mut().enable();
-                if budget.load(Ordering::SeqCst) == 0 {
+                // The generalized stop condition: the global budget is exhausted (SRV) OR
+                // a graceful shutdown was armed (CNTR §7). Both are re-checked AFTER
+                // `enable()`, inside the lost-wakeup-safe window.
+                if budget.load(Ordering::SeqCst) == 0 || shutdown.is_armed() {
                     stop.notify_waiters();
                     break;
                 }
@@ -1336,15 +1477,14 @@ impl Interp {
                     r = listener.accept() => Some(r),
                     _ = &mut notified => None,
                 }
-            } else {
-                Some(listener.accept().await)
             };
             let (stream, _peer) = match accepted {
                 Some(Ok(pair)) => pair,
                 Some(Err(e)) => {
                     return Ok(err_pair(format!("server.serve accept failed: {}", e)))
                 }
-                // Woken by `stop` (a sibling hit the global budget) — drain + return.
+                // Woken by `stop` (a sibling hit the global budget OR a shutdown was
+                // armed) — drain + return.
                 None => break,
             };
             // We have a connection in hand — now CLAIM one unit of the shared budget.
@@ -1401,16 +1541,17 @@ impl Interp {
                 ))
                 .await;
             });
+            // CNTR §7: ALWAYS retain the handle so the graceful-drain path can await
+            // this in-flight handler before `serve` returns (finished handles are reaped
+            // at the top of the loop so an unbounded server's vec stays bounded).
+            inflight.push(handle);
             if bounded {
-                inflight.push(handle);
                 // If that claim drove the budget to 0, signal every sibling to stop
                 // (and stop ourselves on the next iteration's budget==0 check).
                 if budget.load(Ordering::SeqCst) == 0 {
                     stop.notify_waiters();
                 }
             }
-            // (Unbounded serve: the handle is dropped — the task is detached and runs
-            // to completion on the LocalSet; the semaphore bounds concurrency.)
 
             // Periodic cycle collection (V13-T3): a long-running `serve` is THE soak
             // target — each request may build and drop a cyclic `Cc` graph that
@@ -1421,13 +1562,92 @@ impl Interp {
             crate::gc::maybe_collect();
         }
 
-        // Deterministic shutdown: drain every in-flight handler task so all accepted
-        // connections have had their responses written before `serve` returns.
-        for handle in inflight {
-            let _ = handle.await;
+        // CNTR §7 — graceful drain. The accept loop has stopped (budget exhausted OR a
+        // shutdown armed). Run `onShutdown` ONCE on this side (the single-isolate path
+        // passes it here; multi-isolate runs it on the main caller and passes None), then
+        // drain the in-flight handler tasks so accepted connections finish writing their
+        // responses before `serve` returns.
+        if let Some(cb) = &on_shutdown {
+            if shutdown.claim_onshutdown() {
+                // Run the callback; a panic inside it is swallowed (best-effort cleanup
+                // hook — it must never abort the shutdown drain).
+                let _ = self.call_value(cb.clone(), vec![], span).await;
+            }
         }
+        self.drain_inflight(inflight, drain_timeout_ms).await;
 
         Ok(make_pair(Value::nil(), Value::nil()))
+    }
+
+    /// CNTR §7 — drain the retained in-flight handler tasks. Without a `drain_timeout`
+    /// we await them all (every accepted connection finishes). With one, we RACE the
+    /// drain against a timeout sleep; on timeout we `.abort()` the still-running losers
+    /// and `warn`-log the aborted count (a slow/stuck handler must not block shutdown
+    /// forever). Reaped finished handles are already removed, so this awaits only the
+    /// genuinely-live ones.
+    async fn drain_inflight(
+        &self,
+        inflight: Vec<tokio::task::JoinHandle<()>>,
+        drain_timeout_ms: Option<u64>,
+    ) {
+        match drain_timeout_ms {
+            None => {
+                for handle in inflight {
+                    let _ = handle.await;
+                }
+            }
+            Some(ms) => {
+                // Race awaiting all in-flight tasks against the drain deadline. We keep
+                // the handles (so we can abort on timeout) by awaiting via references.
+                let mut handles = inflight;
+                let drain = async {
+                    for handle in handles.iter_mut() {
+                        let _ = handle.await;
+                    }
+                };
+                let timed_out = tokio::time::timeout(
+                    std::time::Duration::from_millis(ms),
+                    drain,
+                )
+                .await
+                .is_err();
+                if timed_out {
+                    // Abort every handler that did not finish within the drain window and
+                    // count them for the warn line.
+                    let mut aborted = 0usize;
+                    for handle in &handles {
+                        if !handle.is_finished() {
+                            handle.abort();
+                            aborted += 1;
+                        }
+                    }
+                    if aborted > 0 {
+                        self.warn_drain_timeout(aborted, ms).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit a `warn` that the graceful-drain timeout fired and `n` in-flight handler
+    /// tasks were aborted (CNTR §7). Routed through `std/log` when the `log` feature is
+    /// on (stderr/Live or the test capture buffer), else a plain stderr line.
+    async fn warn_drain_timeout(&self, n: usize, ms: u64) {
+        let msg = format!(
+            "server shutdown drain timed out after {ms}ms; aborted {n} in-flight request \
+             handler{}",
+            if n == 1 { "" } else { "s" }
+        );
+        #[cfg(feature = "log")]
+        {
+            let _ = self
+                .call_log("warn", &[Value::str(msg)], Span::new(0, 0))
+                .await;
+        }
+        #[cfg(not(feature = "log"))]
+        {
+            eprintln!("warning: {msg}");
+        }
     }
 
     /// SRV Part A — the multi-isolate REUSEPORT serve path. Spawns `n` shared-nothing
@@ -1456,6 +1676,7 @@ impl Interp {
         &self,
         n: usize,
         opts: ServeOpts,
+        handle_shutdown: Option<ShutdownState>,
         span: Span,
     ) -> Result<Value, Control> {
         let ServeOpts {
@@ -1467,6 +1688,8 @@ impl Interp {
             max_body,
             timeout_ms,
             max_concurrent,
+            ref on_shutdown,
+            drain_timeout_ms,
             ..
         } = opts;
         let host = host.as_str();
@@ -1485,6 +1708,8 @@ impl Interp {
                     max_body,
                     timeout_ms,
                     max_concurrent,
+                    on_shutdown.clone(),
+                    drain_timeout_ms,
                     span,
                 )
                 .await;
@@ -1556,10 +1781,37 @@ impl Interp {
         }
 
         // The SHARED coordination state: one budget (remaining global request count;
-        // usize::MAX = unbounded) + one stop signal, cloned into every isolate.
+        // usize::MAX = unbounded) + one `ShutdownState`, cloned into every isolate. When
+        // the handle method `s.serve({workers})` called us we reuse THIS handle's
+        // ShutdownState (so `srv.shutdown()`, e.g. from a SIGTERM handler, reaches every
+        // isolate's fused stop signal — CNTR §7); the module-level `server.serve` path
+        // has no handle, so a fresh one coordinates the budget-exhaustion stop.
         let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
-        let stop = Arc::new(tokio::sync::Notify::new());
+        let shutdown = handle_shutdown.unwrap_or_else(ShutdownState::new);
         let bounded = max_requests.is_some();
+
+        // CNTR §7 — run `onShutdown` ONCE on the MAIN side (not inside each isolate, else
+        // N runs). A watcher task waits on the SAME shutdown notify (fired by
+        // `srv.shutdown()` OR the budget-exhaustion path) and runs the callback once,
+        // guarded by the `claim_onshutdown` swap. It is aborted when `serve` returns.
+        let onshutdown_watcher = on_shutdown.clone().map(|cb| {
+            let shutdown = shutdown.clone();
+            let me = self.rc();
+            tokio::task::spawn_local(async move {
+                // Register the waiter BEFORE re-checking `armed` (same lost-wakeup-safe
+                // sequence the accept loop uses): if shutdown was armed before serve, the
+                // re-check fires immediately; otherwise the registered waiter catches it.
+                let notified = shutdown.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !shutdown.is_armed() {
+                    notified.await;
+                }
+                if shutdown.claim_onshutdown() {
+                    let _ = me.call_value(cb, vec![], span).await;
+                }
+            })
+        });
 
         // Spawn N dedicated isolates. Each captures (a CLONE of) the slice bytes, the
         // encoded args + frozen-`Arc` side-vector, ITS listener, the shared budget/stop
@@ -1575,7 +1827,7 @@ impl Interp {
             let encoded_args = encoded_args.clone();
             let encoded_shared = encoded_shared.clone();
             let budget = budget.clone();
-            let stop_iso = stop.clone();
+            let shutdown_iso = shutdown.clone();
             let done_tx = done_tx.clone();
             let caps = self.caps();
 
@@ -1596,8 +1848,9 @@ impl Interp {
                     &encoded_shared,
                     std_listener,
                     budget,
-                    stop_iso,
+                    shutdown_iso,
                     bounded,
+                    drain_timeout_ms,
                     max_body,
                     timeout_ms,
                     max_concurrent,
@@ -1612,9 +1865,13 @@ impl Interp {
             match spawned {
                 Ok(h) => handles.push(h),
                 Err(e) => {
-                    // A spawn failure: fire the stop so any already-running isolate
+                    // A spawn failure: ARM the shutdown so any already-running isolate's
+                    // accept loop sees the stop condition on its lost-wakeup re-check and
                     // halts, drop the handles (joins their threads), and report.
-                    stop.notify_waiters();
+                    shutdown.arm();
+                    if let Some(w) = onshutdown_watcher {
+                        w.abort();
+                    }
                     drop(handles);
                     return Ok(err_pair(format!(
                         "server.serve: could not spawn worker isolate: {e}"
@@ -1651,6 +1908,14 @@ impl Interp {
         .await
         .unwrap_or(None);
 
+        // All isolates have stopped → `serve` is resolving. Stop the onShutdown watcher
+        // (it may still be parked on the notify if shutdown was never armed, e.g. all
+        // isolates exited via the unbounded path being torn down). `claim_onshutdown`
+        // already guaranteed at-most-once, so an abort here can never drop a pending run.
+        if let Some(w) = onshutdown_watcher {
+            w.abort();
+        }
+
         match first_err {
             Some(e) => Ok(err_pair(e)),
             None => Ok(make_pair(Value::nil(), Value::nil())),
@@ -1672,6 +1937,8 @@ impl Interp {
         max_body: usize,
         timeout_ms: u64,
         max_concurrent: usize,
+        on_shutdown: Option<Value>,
+        drain_timeout_ms: Option<u64>,
         span: Span,
     ) -> Result<Value, Control> {
         // If a `setup` was supplied, run it on THIS interp to build the server handle
@@ -1697,6 +1964,12 @@ impl Interp {
                 ))
             }
         };
+        // Clone the inline handle's own ShutdownState so `srv.shutdown()` on the handle
+        // `setup` returned reaches this loop (CNTR §7). Borrow scoped — not held over await.
+        let shutdown = self
+            .http_server_mut(id)
+            .map(|s| s.shutdown.clone())
+            .unwrap_or_else(ShutdownState::new);
         // Bind a plain listener on this interp's resource and serve single-isolate.
         let bind_port = port.unwrap_or(0);
         let addr = format!("{host}:{bind_port}");
@@ -1705,10 +1978,10 @@ impl Interp {
             Err(e) => return Ok(err_pair(format!("server.serve bind on {addr} failed: {e}"))),
         };
         let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
-        let stop = Arc::new(tokio::sync::Notify::new());
         let bounded = max_requests.is_some();
         self.accept_loop(
-            listener, id, max_body, timeout_ms, max_concurrent, budget, stop, bounded, span,
+            listener, id, max_body, timeout_ms, max_concurrent, budget, shutdown, bounded,
+            on_shutdown, drain_timeout_ms, span,
         )
         .await
     }
@@ -3350,6 +3623,238 @@ await s.serve({{ maxRequests: 1 }})
     }
 
     // ── End schema-validated route tests ──────────────────────────────────────
+
+    // ── CNTR §7 — graceful drain: srv.shutdown() + onShutdown/drainTimeout ─────
+
+    /// Single-isolate drain proof: a SLOW handler (300ms sleep) is in-flight when a
+    /// spawned task calls `s.shutdown()`. `serve` must resolve only AFTER the in-flight
+    /// response is written (the client gets a 200 — the drain completed the request),
+    /// and `onShutdown` printed EXACTLY ONCE before the drain wait.
+    #[tokio::test]
+    async fn shutdown_drains_inflight_request() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as task from "std/task"
+import * as time from "std/time"
+let s = create()
+s.route("GET", "/slow", async (req) => {{
+  await time.sleep(300)
+  return "drained"
+}})
+await s.bind("127.0.0.1", {port})
+// Fire the shutdown ~120ms in (the request is mid-flight in its 300ms sleep).
+task.spawn(async () => {{
+  await time.sleep(120)
+  s.shutdown()
+}})
+await s.serve({{ onShutdown: () => print("onShutdown") }})
+print("served-returned")
+"#
+        );
+        let interp = new_interp();
+        let url = format!("http://127.0.0.1:{port}/slow");
+        // The client connects + waits for the slow response. The server runs inline.
+        let client = tokio::spawn(async move { client_request("GET", &url, None).await });
+        run_on(&interp, &src).await.expect("server ran");
+        let (status, body) = client.await.unwrap();
+        assert_eq!(status, "HTTP/1.1 200 OK", "the in-flight request must complete");
+        assert_eq!(body, "drained");
+        let out = interp.output();
+        // onShutdown printed EXACTLY ONCE, before serve returned.
+        assert_eq!(
+            out.matches("onShutdown").count(),
+            1,
+            "onShutdown must run exactly once (out={out:?})"
+        );
+        assert!(
+            out.find("onShutdown").unwrap() < out.find("served-returned").unwrap(),
+            "onShutdown must run before serve resolves (out={out:?})"
+        );
+    }
+
+    /// drainTimeout: a 10s handler with `drainTimeout: 50` → after shutdown the drain
+    /// waits only ~50ms then ABORTS the in-flight handler. serve resolves promptly; the
+    /// client connection is closed without a 200.
+    #[tokio::test]
+    async fn shutdown_drain_timeout_aborts_slow_handler() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as task from "std/task"
+import * as time from "std/time"
+let s = create()
+s.route("GET", "/slow", async (req) => {{
+  await time.sleep(10000)
+  return "never"
+}})
+await s.bind("127.0.0.1", {port})
+task.spawn(async () => {{
+  await time.sleep(120)
+  s.shutdown()
+}})
+await s.serve({{ drainTimeout: 50 }})
+print("served-returned")
+"#
+        );
+        let interp = new_interp();
+        let url = format!("http://127.0.0.1:{port}/slow");
+        let client = tokio::spawn(async move { client_request_raw("GET", &url, None).await });
+        let started = std::time::Instant::now();
+        run_on(&interp, &src).await.expect("server ran");
+        let elapsed = started.elapsed();
+        // serve resolved well before the 10s handler would have completed.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "serve must resolve ~50ms after shutdown, not wait for the 10s handler (took {elapsed:?})"
+        );
+        let (_status, full) = client.await.unwrap();
+        // The aborted handler never wrote "never".
+        assert!(
+            !full.contains("never"),
+            "the timed-out handler must be aborted, not allowed to complete (resp={full:?})"
+        );
+        assert!(
+            interp.output().contains("served-returned"),
+            "serve must resolve so the program continues"
+        );
+    }
+
+    /// shutdown-before-serve: calling `s.shutdown()` before `serve` → serve returns
+    /// immediately (after running onShutdown once), accepting no connections.
+    #[tokio::test]
+    async fn shutdown_before_serve_returns_immediately() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/x", (req) => "y")
+await s.bind("127.0.0.1", {port})
+s.shutdown()
+await s.serve({{ onShutdown: () => print("onShutdown") }})
+print("served-returned")
+"#
+        );
+        let interp = new_interp();
+        let started = std::time::Instant::now();
+        run_on(&interp, &src).await.expect("server ran");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "serve must return immediately when shutdown was already armed (took {elapsed:?})"
+        );
+        let out = interp.output();
+        assert_eq!(
+            out.matches("onShutdown").count(),
+            1,
+            "onShutdown still runs exactly once on an already-armed shutdown (out={out:?})"
+        );
+        assert!(out.contains("served-returned"), "serve must resolve");
+    }
+
+    /// shutdown() is idempotent: calling it twice is a no-op (no panic, serve still
+    /// resolves cleanly and onShutdown runs once).
+    #[tokio::test]
+    async fn shutdown_is_idempotent() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/x", (req) => "y")
+await s.bind("127.0.0.1", {port})
+s.shutdown()
+s.shutdown()
+await s.serve({{ onShutdown: () => print("onShutdown") }})
+print("done")
+"#
+        );
+        let interp = new_interp();
+        run_on(&interp, &src).await.expect("server ran");
+        let out = interp.output();
+        assert_eq!(out.matches("onShutdown").count(), 1, "onShutdown once (out={out:?})");
+        assert!(out.contains("done"));
+    }
+
+    /// Reviewer adversarial probe (CNTR §7): `shutdown()` fired TWICE with the SECOND
+    /// call landing DURING the in-flight drain (the first stopped the accept loop; the
+    /// second arrives while a slow handler is still draining). It must be a no-op:
+    /// onShutdown runs EXACTLY ONCE, no double-callback, no panic, the in-flight
+    /// request still completes, and serve resolves cleanly.
+    #[tokio::test]
+    async fn shutdown_twice_second_during_drain_is_noop() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as task from "std/task"
+import * as time from "std/time"
+let s = create()
+s.route("GET", "/slow", async (req) => {{
+  await time.sleep(300)
+  return "drained"
+}})
+await s.bind("127.0.0.1", {port})
+// First shutdown ~120ms in (request mid-flight → stops accept, begins drain).
+// Second shutdown ~200ms in (still inside the 300ms drain window).
+task.spawn(async () => {{ await time.sleep(120); s.shutdown() }})
+task.spawn(async () => {{ await time.sleep(200); s.shutdown() }})
+await s.serve({{ onShutdown: () => print("onShutdown") }})
+print("served-returned")
+"#
+        );
+        let interp = new_interp();
+        let url = format!("http://127.0.0.1:{port}/slow");
+        let client = tokio::spawn(async move { client_request("GET", &url, None).await });
+        run_on(&interp, &src).await.expect("server ran");
+        let (status, body) = client.await.unwrap();
+        assert_eq!(status, "HTTP/1.1 200 OK", "in-flight request must still complete");
+        assert_eq!(body, "drained");
+        let out = interp.output();
+        assert_eq!(
+            out.matches("onShutdown").count(),
+            1,
+            "a second shutdown DURING drain must not re-run onShutdown (out={out:?})"
+        );
+        assert!(out.contains("served-returned"), "serve must resolve cleanly");
+    }
+
+    /// Reviewer adversarial probe (CNTR §7): `s.shutdown()` called from INSIDE a request
+    /// handler. The handler that armed the shutdown must still complete + write its
+    /// response (it is the in-flight request being drained), and serve resolves.
+    #[tokio::test]
+    async fn shutdown_from_inside_request_handler() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/stop", async (req) => {{
+  s.shutdown()
+  return "stopping"
+}})
+await s.bind("127.0.0.1", {port})
+await s.serve({{ onShutdown: () => print("onShutdown") }})
+print("served-returned")
+"#
+        );
+        let interp = new_interp();
+        let url = format!("http://127.0.0.1:{port}/stop");
+        let client = tokio::spawn(async move { client_request("GET", &url, None).await });
+        run_on(&interp, &src).await.expect("server ran");
+        let (status, body) = client.await.unwrap();
+        assert_eq!(
+            status, "HTTP/1.1 200 OK",
+            "the handler that triggered shutdown must still complete its response"
+        );
+        assert_eq!(body, "stopping");
+        let out = interp.output();
+        assert_eq!(out.matches("onShutdown").count(), 1, "onShutdown once (out={out:?})");
+        assert!(out.contains("served-returned"), "serve must resolve after the handler drains");
+    }
 
     /// Like `client_request` but returns the FULL raw response text (head + body)
     /// so tests can assert on headers.

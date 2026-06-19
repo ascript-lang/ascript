@@ -1017,6 +1017,7 @@ async fn real_main() -> ExitCode {
         Command::Tree => pkg_command_exit(pkg::commands::cmd_tree()),
         #[cfg(feature = "pkg")]
         Command::Verify => pkg_command_exit(pkg::commands::cmd_verify()),
+        Command::Init { template, force, dir } => run_init(&template, force, &dir),
         Command::Cache { action } => match action {
             CacheAction::Clean => {
                 let compiled = ascript::cache::compile_cache::compiled_dir();
@@ -1416,4 +1417,68 @@ fn pkg_command_exit(result: Result<(), String>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The embedded `server` template (CNTR §9.3). Each tuple is
+/// `(scaffolded-filename, file-contents)`. Files are `include_str!`-embedded at
+/// compile time from `templates/server/` — no network, no runtime file reads.
+#[cfg(not(ascript_rt))]
+const SERVER_TEMPLATE: &[(&str, &str)] = &[
+    ("main.as", include_str!("../templates/server/main.as")),
+    ("Dockerfile", include_str!("../templates/server/Dockerfile")),
+    (".dockerignore", include_str!("../templates/server/.dockerignore")),
+    ("ascript.toml", include_str!("../templates/server/ascript.toml")),
+    ("README.md", include_str!("../templates/server/README.md")),
+];
+
+/// CNTR §9.3 — `ascript init [--template server] [--force] [dir]`. Scaffolds a
+/// container-ready project from an embedded template. Refuses to overwrite existing
+/// files (lists the conflicts, exits nonzero) unless `--force`.
+#[cfg(not(ascript_rt))]
+fn run_init(template: &str, force: bool, dir: &str) -> ExitCode {
+    let files = match template {
+        "server" => SERVER_TEMPLATE,
+        other => {
+            eprintln!("error: unknown template '{other}' (available: server)");
+            return ExitCode::from(2);
+        }
+    };
+
+    let target = std::path::Path::new(dir);
+    if let Err(e) = std::fs::create_dir_all(target) {
+        eprintln!("error: could not create {}: {e}", target.display());
+        return ExitCode::from(1);
+    }
+
+    // Conflict detection: collect every existing destination before writing anything.
+    if !force {
+        let conflicts: Vec<&str> = files
+            .iter()
+            .filter(|(name, _)| target.join(name).exists())
+            .map(|(name, _)| *name)
+            .collect();
+        if !conflicts.is_empty() {
+            eprintln!(
+                "error: refusing to overwrite existing file(s) in {}:",
+                target.display()
+            );
+            for name in &conflicts {
+                eprintln!("  {name}");
+            }
+            eprintln!("rerun with --force to overwrite");
+            return ExitCode::from(1);
+        }
+    }
+
+    for (name, contents) in files {
+        let dest = target.join(name);
+        if let Err(e) = std::fs::write(&dest, contents) {
+            eprintln!("error: could not write {}: {e}", dest.display());
+            return ExitCode::from(1);
+        }
+    }
+
+    println!("scaffolded the '{template}' template into {}", target.display());
+    println!("  next: cd {} && ascript run main.as", target.display());
+    ExitCode::SUCCESS
 }

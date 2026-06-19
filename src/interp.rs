@@ -395,12 +395,27 @@ pub(crate) enum ResourceState {
     TcpListener(tokio::net::TcpListener),
     #[cfg(feature = "net")]
     TcpStream(crate::stdlib::net_tcp::TcpStreamState),
+    // CNTR §3.1 std/net/unix: a bound Unix-domain listener (unlinks its socket file on
+    // drop) and a buffered client/accepted stream (BufReader for `readLine`). Mirrors
+    // the TCP variants; unix-only (a `UnixListener`/`UnixStream` is POSIX).
+    #[cfg(all(feature = "net", unix))]
+    UnixListener(crate::stdlib::net_unix::UnixListenerState),
+    #[cfg(all(feature = "net", unix))]
+    UnixStream(crate::stdlib::net_unix::UnixStreamState),
     // M14 std/net/http: a received HTTP response whose body has not yet been read.
     // `reqwest::Response::text()/bytes()/json()` consume `self` by value, so the
     // response is stored here and `take_resource`'d by the first body accessor; a
     // second body accessor on the same handle is a use-after-consume Tier-2 panic.
     #[cfg(feature = "net")]
     HttpResponse(reqwest::Response),
+    // CNTR §3.2 std/net/http: a buffered response from the `{socketPath}` UDS http1
+    // client. reqwest cannot speak HTTP/1.1 over a `UnixStream`, so that path reads the
+    // body up-front (bounded) and stores the raw bytes here; `resp.text()/bytes()/json()/
+    // json(Class)` operate on these bytes to produce the SAME script-visible surface as
+    // a TCP `reqwest::Response`. Consumed by the first body accessor (use-after-consume
+    // is the same Tier-2 panic as `HttpResponse`).
+    #[cfg(all(feature = "net", unix))]
+    HttpBufferedResponse(Vec<u8>),
     // M14 std/net/http: a streaming response body (`opts.stream:true`). Wraps the
     // response's chunked byte stream in a `BufReader` so the §11.4 reader idiom
     // (`read(n?)`/`readLine()`/`readToEnd()`) applies verbatim. Finalized on EOF.
@@ -557,6 +572,20 @@ pub(crate) enum ResourceState {
     /// lifetime). GC-UNTRACED.
     #[cfg(feature = "ffi")]
     ForeignPtr(usize),
+    /// CNTR §4.1: a `std/docker` Engine-API client. Holds only the resolved socket
+    /// path + the negotiated API version — NO live socket (each API call opens a
+    /// fresh `UnixStream`), so there is nothing OS-backed to reclaim on drop beyond
+    /// removing the table entry. Unix-only.
+    #[cfg(all(feature = "docker", unix))]
+    DockerClient(crate::stdlib::docker::DockerClientState),
+    /// CNTR §4.3–4.4: a `std/docker` log/event/pull stream. Owns the dedicated
+    /// `UnixStream` byte source (buffered) + the framing state machine (8-byte
+    /// multiplex demux, raw TTY, or newline JSON-lines). `next()` pulls the next
+    /// item; dropping the variant (on `close()`/last-drop) closes the connection.
+    /// Boxed to keep the `ResourceState` enum compact (the BufReader + framing buffer
+    /// are sizeable). Unix-only.
+    #[cfg(all(feature = "docker", unix))]
+    DockerStream(Box<crate::stdlib::docker::DockerStreamState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -865,6 +894,42 @@ pub struct Interp {
     /// (never held across `.await` since all lookup sites are sync). `None` when
     /// paranoid mode is off (the default) — the check short-circuits immediately.
     pub(crate) paranoid_set: RefCell<Option<ParanoidElisionSet>>,
+    /// CNTR §6: inbound OS-signal handlers registered via `process.on` / removed via
+    /// `process.off`. Keyed by the canonical signal name (`"SIGTERM"`, …). The FIRST
+    /// `on` for a signal spawns ONE `spawn_local` listener task; a later `on` for the
+    /// same signal SWAPS the handler in-place (last-wins, no new task); `off` flips the
+    /// entry to [`SignalState::Restored`] so the listener's next receipt emulates the
+    /// OS-default kill (`exit(128+signo)`). Main-isolate only — a worker isolate calling
+    /// `process.on` is a Tier-2 refusal, so this map is never touched off the main
+    /// isolate. A `RefCell` (the handler `Value` is cloned out and the borrow dropped
+    /// before the handler runs — never held across `.await`). Only WRITTEN by
+    /// `std/process` (`sys`-gated); the field is unconditional so `Interp::new` always
+    /// builds — `#[allow(dead_code)]` off `sys` (mirrors `snapshots_touched`).
+    #[cfg_attr(not(feature = "sys"), allow(dead_code))]
+    pub(crate) signal_handlers: RefCell<std::collections::HashMap<&'static str, SignalReg>>,
+}
+
+/// CNTR §6: one registered inbound-signal handler + its listener-task state.
+#[cfg_attr(not(feature = "sys"), allow(dead_code))]
+pub(crate) struct SignalReg {
+    /// The current handler `Value` (callable). Swapped in place on a repeat `on`.
+    pub(crate) handler: Value,
+    /// Whether the handler is live (`Active`) or has been removed via `off` (`Restored`).
+    pub(crate) state: SignalState,
+    /// Held so dropping the `Interp` aborts the listener task (no zombie thread on a
+    /// fresh interp teardown). The listener loop normally lives for the program's life.
+    pub(crate) _task: crate::stdlib::task_mod::AbortOnDrop,
+}
+
+/// CNTR §6: a registered signal is either live or restored-to-default.
+#[cfg_attr(not(feature = "sys"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SignalState {
+    /// `on` is live: the listener invokes the current handler on each receipt.
+    Active,
+    /// `off` was called: the listener's NEXT receipt emulates the OS default
+    /// (`exit(128+signo)`) instead of calling a handler.
+    Restored,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -1256,6 +1321,8 @@ impl Interp {
             // `set_paranoid_set` / `ASCRIPT_ELIDE_PARANOID=1`. When off, all
             // contract-failure paths are entirely unaffected (zero cost).
             paranoid_set: RefCell::new(None),
+            // CNTR §6: no inbound-signal handlers until the first `process.on`.
+            signal_handlers: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1481,6 +1548,51 @@ impl Interp {
         } else {
             Err(Control::Panic(AsError::at(
                 format!("capability 'net' denied for host '{host}'"),
+                span,
+            )))
+        }
+    }
+
+    /// CNTR §3.1: the carve-out allow-list KEY for a Unix-domain socket path —
+    /// `unix:<canonical>`, where `<canonical>` is the same best-effort
+    /// `canonical_lossy` form the `fs` scope uses (so `./sock/../s` and `./s` agree).
+    /// Public so the net_unix tests can build a matching allow entry.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) fn unix_scope_key(&self, path: &str) -> String {
+        let canon = crate::stdlib::caps::canonical_unix_path(path);
+        format!("unix:{}", canon)
+    }
+
+    /// CNTR §3.1 STAGE 2 (net carve-out, UDS form): enforce a `net` carve-out against a
+    /// resolved Unix-socket `path` at connect/bind time. **Gate-12 fast path:** when no
+    /// `net` carve-out is configured (`net_scope` is `None`) this returns `Ok(())`
+    /// immediately with NO canonicalization — the dispatch-site bitset test was already
+    /// conclusive. When a carve-out exists, the path is admitted iff `unix:<canonical>`
+    /// is on the carve-out's `allow` list (a UDS is a filesystem-named endpoint, so the
+    /// allow entry names the literal socket path, not a host); else a Tier-2 panic.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) fn check_unix_path(&self, path: &str, span: Span) -> Result<(), Control> {
+        // Borrow is await-free and dropped before return.
+        let configured = {
+            let caps = self.caps.borrow();
+            caps.net_scope.is_some()
+        };
+        if !configured {
+            return Ok(()); // Gate-12: no carve-out → no canonicalization.
+        }
+        let key = self.unix_scope_key(path);
+        let allowed = {
+            let caps = self.caps.borrow();
+            match &caps.net_scope {
+                None => return Ok(()),
+                Some(scope) => scope.allow.iter().any(|e| e == &key),
+            }
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Control::Panic(AsError::at(
+                format!("capability 'net' denied for unix socket '{path}'"),
                 span,
             )))
         }
@@ -1836,6 +1948,35 @@ impl Interp {
                 let _ = so.flush();
             }
         }
+    }
+
+    /// CNTR §6: flush buffered stdout before a process-exiting signal default
+    /// (`exit(128+signo)`) or a handler `exit(code)`. `push_output` already flushes
+    /// per line under `Live`, so this is a belt-and-suspenders final flush before the
+    /// hard `std::process::exit` in the signal listener.
+    #[cfg_attr(not(feature = "sys"), allow(dead_code))]
+    pub(crate) fn flush_output(&self) {
+        use std::io::Write;
+        let _ = std::io::stdout().lock().flush();
+    }
+
+    /// CNTR §6 exit-hang fix: abort all registered inbound-signal listener tasks.
+    ///
+    /// A `process.on` handler spawns a never-ending `spawn_local` listener loop kept
+    /// in `signal_handlers` (each held by an `AbortOnDrop`). Those listeners are
+    /// DAEMON tasks — Node semantics: a registered handler must NOT keep the process
+    /// alive on its own. The entry points drain spawned tasks via `local.await` AFTER
+    /// the main future resolves; an unbounded listener loop would block that drain
+    /// forever (the program HANGS instead of exiting). Clearing the map drops every
+    /// `AbortOnDrop`, aborting the listeners so the drain completes cleanly.
+    ///
+    /// Called right after the main future resolves and BEFORE `local.await` at the
+    /// real user-facing run paths (VM + tree-walker `ascript run`, `run_source`, the
+    /// embedded-bundle loader). A no-op when nothing is registered.
+    #[cfg_attr(not(feature = "sys"), allow(dead_code))]
+    pub(crate) fn abort_signal_listeners(&self) {
+        // Dropping each `SignalReg` drops its `AbortOnDrop`, aborting the task.
+        self.signal_handlers.borrow_mut().clear();
     }
 
     /// Emit one std/log record line. Buffers into `log_capture` under `Capture`
@@ -3040,6 +3181,28 @@ impl Interp {
             // Not an HttpResponse (or already gone): nothing to return. If it was a
             // different live resource, put it back is unnecessary — ids are unique
             // per kind by construction, so this branch means "already consumed".
+            _ => None,
+        }
+    }
+
+    /// CNTR §3.2: take the buffered UDS response body bytes behind a handle id,
+    /// removing it from the table. `None` if it was already consumed (a body accessor
+    /// took it) — the caller maps `None` to the same "already consumed" Tier-2 panic.
+    #[cfg(all(feature = "net", unix))]
+    pub(crate) fn take_http_buffered(&self, id: u64) -> Option<Vec<u8>> {
+        // Peek the kind WITHOUT removing: a non-buffered entry (e.g. a live reqwest
+        // `HttpResponse`) must be left intact for `take_http_response`. Removing it
+        // unconditionally would drop the reqwest response and make its body accessor
+        // fail with "already consumed".
+        let is_buffered = matches!(
+            self.resources.borrow().get(&id),
+            Some(ResourceState::HttpBufferedResponse(_))
+        );
+        if !is_buffered {
+            return None;
+        }
+        match self.resources.borrow_mut().remove(&id) {
+            Some(ResourceState::HttpBufferedResponse(b)) => Some(b),
             _ => None,
         }
     }
@@ -5387,7 +5550,11 @@ impl Interp {
         // kind maps to NO cap (a pure in-memory native) stays ungated.
         let cap_bits = self.caps_bits(); // Copy snapshot — no borrow across the awaits below.
         if !cap_bits.all_granted() {
-            if let Some(cap) = m.receiver.kind.governing_cap() {
+            // CNTR §5.3: iterate the handle's CapReq in stable `Cap::ALL` order.
+            // For a single-cap handle (every current arm) the loop runs EXACTLY once
+            // with the same cap/args/error-string as the pre-CNTR `Option<Cap>` path
+            // → byte-identical. A `CapReq::NONE` handle iterates zero times (ungated).
+            for cap in m.receiver.kind.governing_caps().iter() {
                 self.require_cap(cap, m.receiver.kind.type_name(), &m.method, &args, span)?;
             }
         }
@@ -5422,6 +5589,10 @@ impl Interp {
             use crate::value::NativeKind::*;
             if matches!(m.receiver.kind, TcpListener | TcpStream) {
                 return self.call_tcp_method(&m, args, span).await;
+            }
+            #[cfg(unix)]
+            if matches!(m.receiver.kind, UnixListener | UnixStream) {
+                return self.call_unix_method(&m, args, span).await;
             }
             if matches!(m.receiver.kind, HttpResponse) {
                 return self.call_http_response_method(&m, args, span).await;
@@ -5488,6 +5659,15 @@ impl Interp {
                 return self.call_resilience_native_method(&m, args, span).await;
             }
         }
+        #[cfg(all(feature = "docker", unix))]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::DockerClient) {
+                return self.call_docker_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, crate::value::NativeKind::DockerStream) {
+                return self.call_docker_stream_method(&m, args, span).await;
+            }
+        }
         #[cfg(feature = "telemetry")]
         {
             use crate::value::NativeKind::*;
@@ -5509,7 +5689,7 @@ impl Interp {
         {
             use crate::value::NativeKind::*;
             // FFI handle methods. The `ffi` capability already re-checked above via
-            // `governing_cap` (all three FFI kinds → Cap::Ffi), so operating an open
+            // `governing_caps` (all three FFI kinds → Cap::Ffi), so operating an open
             // handle is denied after `caps.drop("ffi")`.
             match m.receiver.kind {
                 ForeignLib if m.method == "symbol" => {
@@ -8572,6 +8752,15 @@ pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'s
     {
         use crate::value::NativeKind::*;
         if matches!(kind, AiStream | AiTextStream) {
+            return Some("next");
+        }
+    }
+    // CNTR §4.3: a docker log/event/pull stream follows the `[item, err]` pull
+    // contract (nil item ends the stream), so `for await` drives it via `.next()`
+    // on BOTH engines.
+    #[cfg(all(feature = "docker", unix))]
+    {
+        if matches!(kind, crate::value::NativeKind::DockerStream) {
             return Some("next");
         }
     }
@@ -15554,5 +15743,49 @@ print("after-drop")
         let msg_false = format!("{:?}", check_call_args_in_place(&params, empty, Span::new(0, 0), "f", None, None, false).err().unwrap());
         let msg_true  = format!("{:?}", arity_err.err().unwrap());
         assert_eq!(msg_false, msg_true, "arity message must be identical regardless of elide_contracts");
+    }
+
+    /// CNTR Phase-0 pin — `native_stream_method` registry baseline.
+    ///
+    /// `std/docker` will add log and event stream handles (`DockerLogStream`,
+    /// `DockerEventStream`) to the `native_stream_method` registry in Phase 1.
+    /// Pinning the CURRENT registry state before that addition proves the Phase-1
+    /// commit is PURELY ADDITIVE (it must not alter the verdicts for existing
+    /// `NativeKind` variants).
+    ///
+    /// Current state (feature = "net"):
+    ///   - `SseStream`     → `Some("next")`  (SSE server-sent events)
+    ///   - `WsConnection`  → `Some("recv")`  (WebSocket)
+    ///
+    /// Gated on `feature = "net"` — the same gate that guards the match arms in
+    /// `native_stream_method` (`#[cfg(feature = "net")]`).  Under
+    /// `--no-default-features` the function returns `None` for all kinds and
+    /// there is nothing to pin beyond the None-fallthrough behaviour.
+    #[cfg(feature = "net")]
+    #[test]
+    fn cntr_native_stream_method_registry_baseline() {
+        use crate::value::NativeKind;
+        // SseStream → "next" (SSE pull-stream protocol).
+        assert_eq!(
+            native_stream_method(NativeKind::SseStream),
+            Some("next"),
+            "native_stream_method(SseStream) must be Some(\"next\") before CNTR \
+             extends the registry; a change here means the pre-CNTR baseline moved"
+        );
+        // WsConnection → "recv" (WebSocket receive loop).
+        assert_eq!(
+            native_stream_method(NativeKind::WsConnection),
+            Some("recv"),
+            "native_stream_method(WsConnection) must be Some(\"recv\") before CNTR \
+             extends the registry; a change here means the pre-CNTR baseline moved"
+        );
+        // A NativeKind that is deliberately NOT a stream must return None
+        // (proves the registry is a positive allowlist, not a catch-all).
+        assert_eq!(
+            native_stream_method(NativeKind::TcpStream),
+            None,
+            "native_stream_method(TcpStream) must be None — TcpStream is a transport \
+             handle, not a stream-protocol handle with a named pull method"
+        );
     }
 }

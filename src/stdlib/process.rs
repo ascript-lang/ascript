@@ -115,7 +115,47 @@ impl ProcReader {
 const DEFAULT_CHUNK: usize = 64 * 1024;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("run", bi("process.run")), ("spawn", bi("process.spawn"))]
+    vec![
+        ("run", bi("process.run")),
+        ("spawn", bi("process.spawn")),
+        // CNTR §6: inbound OS-signal handlers (main-isolate only).
+        ("on", bi("process.on")),
+        ("off", bi("process.off")),
+    ]
+}
+
+/// CNTR §6: map a canonical signal name to a `&'static str` registry key, validating
+/// it. Returns the canonical name + the POSIX signal number. `SIGKILL`/`SIGSTOP`
+/// (uncatchable) and unknown names are Tier-2 panics. Unix-only: the table is the six
+/// catchable signals the spec names. (`signo` powers the §6.3 `exit(128+signo)`.)
+#[cfg(unix)]
+fn signal_lookup(name: &str, span: Span) -> Result<(&'static str, i32), Control> {
+    // Accept both with and without the `SIG` prefix? The spec names them WITH the
+    // prefix ("SIGTERM"); we require the canonical `SIG*` form for a single SoT.
+    Ok(match name {
+        "SIGTERM" => ("SIGTERM", 15),
+        "SIGINT" => ("SIGINT", 2),
+        "SIGHUP" => ("SIGHUP", 1),
+        "SIGQUIT" => ("SIGQUIT", 3),
+        "SIGUSR1" => ("SIGUSR1", 10),
+        "SIGUSR2" => ("SIGUSR2", 12),
+        "SIGKILL" | "SIGSTOP" => {
+            return Err(AsError::at(
+                format!("process.on: '{name}' cannot be caught (it is delivered by the kernel and is uncatchable)"),
+                span,
+            )
+            .into())
+        }
+        other => {
+            return Err(AsError::at(
+                format!(
+                    "process.on: unknown signal '{other}' (expected one of SIGTERM/SIGINT/SIGHUP/SIGQUIT/SIGUSR1/SIGUSR2)"
+                ),
+                span,
+            )
+            .into())
+        }
+    })
 }
 
 fn err_pair(msg: String) -> Value {
@@ -371,8 +411,273 @@ impl Interp {
         match func {
             "run" => self.process_run(args, span).await,
             "spawn" => self.process_spawn(args, span).await,
+            "on" => self.process_on(args, span).await,
+            "off" => self.process_off(args, span).await,
             _ => Err(AsError::at(format!("std/process has no function '{}'", func), span).into()),
         }
+    }
+
+    /// CNTR §6: `process.on(signalName, handler)` — register/replace an inbound-signal
+    /// handler. Main-isolate only; requires the `process` capability (already gated at
+    /// `call_stdlib`). The FIRST `on` for a signal spawns ONE listener task; a repeat
+    /// `on` swaps the handler in place (last-wins, no new task).
+    async fn process_on(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        // Main-isolate only: a worker isolate (pooled `worker fn`, dedicated
+        // `run_in_worker`, actor, streaming) must refuse — a per-isolate OS-signal
+        // handler has no coherent meaning and would race the main program's handlers.
+        if crate::worker::pool::in_isolate() {
+            return Err(AsError::at(
+                "process.on is only available on the main isolate, not inside a worker fn / worker class / worker fn* (register signal handlers at the top level of your program)",
+                span,
+            )
+            .into());
+        }
+        let name = want_string(&arg(args, 0), span, "process.on signal name")?;
+        let handler = arg(args, 1);
+        // The handler must be callable. `Value::Closure` is the VM's compiled-function
+        // value; the others are the tree-walker / native callable kinds.
+        if !matches!(
+            handler.kind(),
+            ValueKind::Function(_)
+                | ValueKind::Closure(_)
+                | ValueKind::Builtin(_)
+                | ValueKind::BoundMethod(_)
+                | ValueKind::NativeMethod(_)
+        ) {
+            return Err(AsError::at(
+                format!(
+                    "process.on: handler must be a function, got {}",
+                    crate::interp::type_name(&handler)
+                ),
+                span,
+            )
+            .into());
+        }
+
+        #[cfg(unix)]
+        {
+            self.signal_on_unix(&name, handler, span)
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: only SIGINT (via ctrl_c) is supported; everything else refuses.
+            self.signal_on_windows(&name, handler, span)
+        }
+    }
+
+    /// CNTR §6: `process.off(signalName)` — remove a handler. The listener's NEXT
+    /// receipt of that signal emulates the OS default (`exit(128+signo)`). Main-isolate
+    /// only; an unknown / off-without-on signal name is still validated (Tier-2 on a
+    /// bad name) but a never-registered signal is a silent no-op (nothing to restore).
+    async fn process_off(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        if crate::worker::pool::in_isolate() {
+            return Err(AsError::at(
+                "process.off is only available on the main isolate, not inside a worker fn / worker class / worker fn*",
+                span,
+            )
+            .into());
+        }
+        let name = want_string(&arg(args, 0), span, "process.off signal name")?;
+        #[cfg(unix)]
+        let (canon, _signo) = signal_lookup(&name, span)?;
+        #[cfg(not(unix))]
+        let canon: &'static str = match name.as_ref() {
+            "SIGINT" => "SIGINT",
+            other => {
+                return Err(AsError::at(
+                    format!("process.off: '{other}' is not supported on this platform (only SIGINT)"),
+                    span,
+                )
+                .into())
+            }
+        };
+        // Flip the entry to Restored. If there is no registered listener for this
+        // signal, there is nothing to restore — a silent no-op (the OS default already
+        // applies). NEVER held across `.await` (a plain sync borrow).
+        if let Some(reg) = self.signal_handlers.borrow_mut().get_mut(canon) {
+            reg.state = crate::interp::SignalState::Restored;
+        }
+        Ok(Value::nil())
+    }
+
+    /// CNTR §6 (unix): install/replace a handler + (first time) spawn the listener task.
+    #[cfg(unix)]
+    fn signal_on_unix(
+        &self,
+        name: &str,
+        handler: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let (canon, signo) = signal_lookup(name, span)?;
+
+        // A repeat `on` for the SAME signal SWAPS the handler in place (last-wins) and
+        // also re-arms a previously-`off`'d entry back to Active — no new listener task.
+        {
+            let mut map = self.signal_handlers.borrow_mut();
+            if let Some(reg) = map.get_mut(canon) {
+                reg.handler = handler;
+                reg.state = crate::interp::SignalState::Active;
+                return Ok(Value::nil());
+            }
+        }
+
+        // FIRST `on` for this signal: build the tokio signal stream now (so a build
+        // failure surfaces synchronously at the registration site, not later in the
+        // task), then spawn ONE listener task.
+        let kind = match signo {
+            15 => SignalKind::terminate(),
+            2 => SignalKind::interrupt(),
+            1 => SignalKind::hangup(),
+            3 => SignalKind::quit(),
+            10 => SignalKind::user_defined1(),
+            12 => SignalKind::user_defined2(),
+            _ => unreachable!("signal_lookup vets signo"),
+        };
+        let mut stream = match signal(kind) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(AsError::at(
+                    format!("process.on: failed to install handler for {canon}: {e}"),
+                    span,
+                )
+                .into())
+            }
+        };
+
+        // The listener task drives the SAME `Interp` (single-threaded, `!Send`): recover
+        // the owning `Rc<Interp>` via the self-`Weak` (the exact `task.spawn` shape) so
+        // the task can `self.call_value(...)` without crossing a `Send` boundary.
+        let interp_rc = self.rc();
+        let handle = tokio::task::spawn_local(async move {
+            loop {
+                if stream.recv().await.is_none() {
+                    // Stream closed (interp/runtime teardown): stop listening.
+                    break;
+                }
+                // Read the CURRENT handler + state, CLONE out, DROP the borrow BEFORE
+                // any await (never hold the registry borrow across `.call_value`).
+                let snapshot = {
+                    let map = interp_rc.signal_handlers.borrow();
+                    map.get(canon)
+                        .map(|reg| (reg.handler.clone(), reg.state))
+                };
+                match snapshot {
+                    Some((_handler, crate::interp::SignalState::Restored)) => {
+                        // §6.3 emulated default: `off` was called — flush output and
+                        // exit with the OS-default code (128 + signo). No handler runs.
+                        interp_rc.flush_output();
+                        std::process::exit(128 + signo);
+                    }
+                    Some((handler, crate::interp::SignalState::Active)) => {
+                        // Invoke the handler with the signal NAME as its single arg.
+                        let r = interp_rc
+                            .call_value(handler, vec![Value::str(canon)], span)
+                            .await;
+                        match r {
+                            // A `Control::Exit` from the handler (e.g. `exit(0)`) mirrors
+                            // the program's exit path: flush, then exit the process.
+                            Err(Control::Exit(code)) => {
+                                interp_rc.flush_output();
+                                std::process::exit(code);
+                            }
+                            // Report a panic like a panicking spawned task; loop CONTINUES.
+                            Err(Control::Panic(e)) => {
+                                eprintln!("error in {canon} signal handler: {}", e.message);
+                            }
+                            // A `?`-propagation or a normal return: nothing to do.
+                            Err(Control::Propagate(_)) | Ok(_) => {}
+                        }
+                    }
+                    None => {
+                        // The entry vanished (cannot happen on the main isolate — we
+                        // never remove entries — but be defensive): stop listening.
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.signal_handlers.borrow_mut().insert(
+            canon,
+            crate::interp::SignalReg {
+                handler,
+                state: crate::interp::SignalState::Active,
+                _task: crate::stdlib::task_mod::AbortOnDrop(handle.abort_handle()),
+            },
+        );
+        Ok(Value::nil())
+    }
+
+    /// CNTR §6 (windows): only SIGINT via `tokio::signal::ctrl_c`. Others refuse.
+    #[cfg(not(unix))]
+    fn signal_on_windows(
+        &self,
+        name: &str,
+        handler: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        if name != "SIGINT" {
+            return Err(AsError::at(
+                format!("process.on: '{name}' is not supported on this platform (only SIGINT via ctrl-c)"),
+                span,
+            )
+            .into());
+        }
+        let canon: &'static str = "SIGINT";
+        let signo = 2;
+        {
+            let mut map = self.signal_handlers.borrow_mut();
+            if let Some(reg) = map.get_mut(canon) {
+                reg.handler = handler;
+                reg.state = crate::interp::SignalState::Active;
+                return Ok(Value::nil());
+            }
+        }
+        let interp_rc = self.rc();
+        let handle = tokio::task::spawn_local(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    break;
+                }
+                let snapshot = {
+                    let map = interp_rc.signal_handlers.borrow();
+                    map.get(canon).map(|reg| (reg.handler.clone(), reg.state))
+                };
+                match snapshot {
+                    Some((_h, crate::interp::SignalState::Restored)) => {
+                        interp_rc.flush_output();
+                        std::process::exit(128 + signo);
+                    }
+                    Some((handler, crate::interp::SignalState::Active)) => {
+                        let r = interp_rc
+                            .call_value(handler, vec![Value::str(canon)], span)
+                            .await;
+                        match r {
+                            Err(Control::Exit(code)) => {
+                                interp_rc.flush_output();
+                                std::process::exit(code);
+                            }
+                            Err(Control::Panic(e)) => {
+                                eprintln!("error in {canon} signal handler: {}", e.message);
+                            }
+                            Err(Control::Propagate(_)) | Ok(_) => {}
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+        self.signal_handlers.borrow_mut().insert(
+            canon,
+            crate::interp::SignalReg {
+                handler,
+                state: crate::interp::SignalState::Active,
+                _task: crate::stdlib::task_mod::AbortOnDrop(handle.abort_handle()),
+            },
+        );
+        Ok(Value::nil())
     }
 
     async fn process_run(&self, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -1092,6 +1397,84 @@ print(after)
 "#)
         .await;
         assert_eq!(out, "true\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn on_unknown_signal_name_is_tier2() {
+        let out = run(r#"
+import { on } from "std/process"
+let r = recover(() => on("SIGFOO", (s) => { print(s) }))
+print(r[1].message)
+"#)
+        .await;
+        assert!(
+            out.contains("SIGFOO") || out.contains("unknown signal"),
+            "unknown signal name must be a Tier-2 panic, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_sigkill_is_tier2_uncatchable() {
+        let out = run(r#"
+import { on } from "std/process"
+let r = recover(() => on("SIGKILL", (s) => { print(s) }))
+print(r[1].message != nil)
+"#)
+        .await;
+        assert_eq!(out, "true\n", "SIGKILL is uncatchable → Tier-2 panic");
+    }
+
+    #[tokio::test]
+    async fn off_never_registered_is_clean_noop() {
+        // Reviewer probe (CNTR §6): `off` for a signal that was never `on`'d is a
+        // silent no-op — it validates the name, finds no entry, and returns nil with
+        // NO panic and NO spawned listener (the OS default already applies).
+        let out = run(r#"
+import { off } from "std/process"
+let r = off("SIGTERM")
+print(r == nil)
+print("done")
+"#)
+        .await;
+        assert_eq!(
+            out, "true\ndone\n",
+            "off() for a never-registered signal must be a clean no-op, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_unknown_signal_name_is_tier2() {
+        // `off` validates the name like `on` — an unknown name is a Tier-2 panic, not
+        // a silent no-op (a typo'd signal must be loud).
+        let out = run(r#"
+import { off } from "std/process"
+let r = recover(() => off("SIGFOO"))
+print(r[1] != nil)
+"#)
+        .await;
+        assert_eq!(out, "true\n", "off() with an unknown name must be Tier-2");
+    }
+
+    #[tokio::test]
+    async fn on_in_worker_isolate_is_refused() {
+        // A `worker fn` calling `process.on` must be a Tier-2 refusal (main-isolate
+        // only). The refusal propagates out of `await w(1)` as a Tier-2 panic; `recover`
+        // catches it and exposes the message.
+        let out = run(r#"
+import { on } from "std/process"
+worker fn w(x) {
+  on("SIGTERM", (s) => { print(s) })
+  return x
+}
+let r = recover(() => await w(1))
+print(r[1] != nil)
+print(r[1].message)
+"#)
+        .await;
+        assert!(
+            out.starts_with("true\n") && out.contains("main isolate"),
+            "process.on in a worker fn must be refused (main-isolate only), got {out:?}"
+        );
     }
 
     #[tokio::test]

@@ -202,6 +202,49 @@ conn.close()
 server.close()
 ```
 
+## std/net/unix
+
+Unix-domain-socket (UDS) client and server handles, built on tokio's `UnixStream`/`UnixListener`. The API is the byte-for-byte structural mirror of `std/net/tcp` over a filesystem socket path instead of a host/port — a stream supports `read`/`readLine`/`readToEnd`/`write`/`close`; a listener supports `accept`/`close`. UDS are a POSIX concept; on a non-Unix platform `connect`/`listen` raise a Tier-2 panic.
+
+```ascript
+import * as unix from "std/net/unix"
+```
+
+### unix.connect
+
+`unix.connect(path) -> future<[stream, err]>` — opens a client stream to the socket at `path`. Tier-1: a missing socket / refused connection comes back as `[nil, err]`.
+
+### unix.listen
+
+`unix.listen(path) -> future<[listener, err]>` — binds a listener at the filesystem `path`. The handle exposes the bound `path` (`listener.path`) and **unlinks the socket file it created** on `close()` / last-drop (a UDS leaves a stale inode otherwise). Binding a path that is already in use is a Tier-1 `[nil, err]`, and a path the listener did not create is never removed.
+
+### UDS stream / listener methods
+
+Identical to the TCP handle methods (see [TCP stream methods](#tcp-stream-methods) and [TCP listener](#tcp-listener)): `read(n?)` / `readLine()` / `readToEnd()` / `write(data)` / `close()` on a stream; `accept()` / `close()` on a listener.
+
+### Capabilities
+
+`std/net/unix` is gated by the `net` capability exactly like the other networking modules: `--deny net` / `--sandbox` (or `caps.drop("net")`) block `connect`/`listen` before any bind/connect. A granular `net` carve-out can allow a specific socket path back with an `allow: ["unix:<path>"]` entry.
+
+```ascript
+import * as unix from "std/net/unix"
+
+let [server, err] = await unix.listen("/tmp/echo.sock")
+print(err) // nil
+print(server.path) // /tmp/echo.sock
+
+let [client, _e] = await unix.connect("/tmp/echo.sock")
+let [conn, _ae] = await server.accept()
+
+await client.write("ping\n")
+let msg = await conn.readLine()
+print(msg) // ping
+
+client.close()
+conn.close()
+server.close() // unlinks /tmp/echo.sock
+```
+
 ## std/net/http
 
 A modern HTTP client built on reqwest. It offers the seven HTTP verbs plus a generic `request`, a cancellation primitive, and a first-class Server-Sent-Events client.
@@ -312,6 +355,7 @@ Every verb (and `request`) accepts an options object. All keys are optional.
 | `cancel` | cancelToken handle | abort the in-flight send — see **Cancellation** below. |
 | `stream` | bool | `true` exposes `resp.body` as a streaming reader instead of buffering. |
 | `bodyMode` | string | for streaming bodies: `"string"` (default) or `"bytes"`. |
+| `socketPath` | string | send this request over a Unix-domain socket instead of TCP. The URL's host is ignored (only the `path` component is used). The response surface is **identical** to TCP (`resp.status`, `resp.headers`, `resp.text()`/`resp.json()`/`resp.body`). Requires the `net` capability. See **socketPath requests** below. |
 
 #### Body shapes
 
@@ -336,6 +380,38 @@ let token = http.cancelToken()
 // ... elsewhere: token.cancel()
 let [resp, err] = await http.get(url, { cancel: token })
 ```
+
+#### socketPath requests
+
+`opts.socketPath` routes the request over a Unix-domain socket instead of TCP. The
+URL's host is ignored; use `opts.url` (or a verb like `http.get`) with any valid URL
+and pair it with `socketPath` to set the path. Alternatively, use
+`http.request({ socketPath, path, method })` with an explicit path when you do not
+have a meaningful URL.
+
+```ascript
+import * as http from "std/net/http"
+
+// HTTP request over /var/run/docker.sock — host in the URL is ignored
+let [resp, err] = await http.get("http://localhost/_ping", {
+  socketPath: "/var/run/docker.sock",
+})
+if (err != nil) { print("docker unavailable: " + err.message) }
+let [text, _] = await resp.text()
+print(text)  // "OK"
+```
+
+Internally `socketPath` requests use a minimal hardened HTTP/1.1 client (the same
+codec `std/docker` uses) — **not reqwest**. This is because reqwest's stable API
+has no Unix-socket connector seam, and the Docker exec/attach protocol requires a
+connection `101 Upgrade` hijack that reqwest cannot hand back. The response surface
+is identical — `resp.status`, `resp.headers`, `resp.text()`/`resp.json(Class)`/
+`resp.body` work exactly the same. The streaming request body option (`body.stream`)
+is **not** supported over a Unix socket (a Tier-2 panic if combined with `socketPath`).
+
+The `socketPath` option is gated by `net`. A granular net carve-out can allow a
+specific socket path with `allow: ["unix:/var/run/docker.sock"]` — see
+[Capabilities & sandboxing](caps).
 
 ### Example: JSON POST with auth and retry
 
@@ -435,8 +511,9 @@ let server = create()
 - `server.route(method, path, handler)` — registers a route. `method` is matched case-insensitively. `path` may contain `:name` segments captured into `req.params`. `handler` is `(req) => response`. Returns the server (chainable). Synchronous.
 - `server.use(middleware)` — registers `(req, next) => response` middleware, run in registration order before the route. A middleware may short-circuit by returning a response without calling `next`, or call `next(req?)` to advance the chain (optionally replacing the request). `next` is single-use. Returns the server. Synchronous.
 - `await server.bind(host, port)` → `[boundPort, err]` — binds a listener **without** looping. Bind port `0` and read the OS-assigned `boundPort`.
-- `await server.serve(opts?)` → `[nil, err]` — runs the accept loop. `opts` may set `maxRequests` (return after serving N requests — useful for tests/shutdown), `maxBodySize` (default 16 MiB), and `requestTimeout` (ms, default 30000). With no `maxRequests`, it loops until the listener errors.
+- `await server.serve(opts?)` → `[nil, err]` — runs the accept loop. `opts` may set `maxRequests` (return after serving N requests — useful for tests/shutdown), `maxBodySize` (default 16 MiB), and `requestTimeout` (ms, default 30000). With no `maxRequests`, it loops until the listener errors **or `server.shutdown()` is called**. Graceful-drain options: `onShutdown` (a `() => …` callback run **once** when shutdown begins, before the drain wait) and `drainTimeout` (ms — bound the post-shutdown wait for in-flight handlers; on timeout the still-running handlers are aborted and the aborted count is `warn`-logged). Without `drainTimeout`, `serve` waits for every in-flight request to finish before resolving.
 - `await server.listen(host, port, opts?)` → `bind` + `serve` for the common case.
+- `server.shutdown()` — synchronous + idempotent. Arms a graceful drain: the accept loop stops accepting new connections, in-flight handlers finish (bounded by `drainTimeout`), then `serve` resolves. Pair with an inbound signal handler for a clean stop, e.g. `process.on("SIGTERM", (sig) => server.shutdown())`. On a multi-isolate `server.serve({ workers: N })` the same `shutdown()` stops **all** isolates.
 - `server.close()` — synchronous; drops the server.
 
 #### Verb shorthand methods

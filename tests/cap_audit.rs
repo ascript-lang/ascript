@@ -173,6 +173,42 @@ fn audit_net_tcp_connect_listen_denied() {
     assert_denied("audit_tcp_connect_sbx.as", imp, "tcp.connect(\"127.0.0.1\", 9)", "net", &["--sandbox"]);
 }
 
+// CNTR §3.1 std/net/unix — a UDS connect/listen is gated by `Net` exactly like TCP.
+// `--deny net` AND `--sandbox` deny BEFORE any bind/connect (no real socket touched).
+#[cfg(all(unix, feature = "net"))]
+#[test]
+fn audit_net_unix_connect_listen_denied() {
+    let imp = "import * as unix from \"std/net/unix\"";
+    assert_denied(
+        "audit_unix_connect.as",
+        imp,
+        "unix.connect(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--deny", "net"],
+    );
+    assert_denied(
+        "audit_unix_listen.as",
+        imp,
+        "unix.listen(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--deny", "net"],
+    );
+    assert_denied(
+        "audit_unix_connect_sbx.as",
+        imp,
+        "unix.connect(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--sandbox"],
+    );
+    assert_denied(
+        "audit_unix_listen_sbx.as",
+        imp,
+        "unix.listen(\"/tmp/ascript-audit-nope.sock\")",
+        "net",
+        &["--sandbox"],
+    );
+}
+
 // [BLOCKER 1] the net carve-out covers http/udp/ws/server — NOT just tcp. A
 // regression that gated only tcp connect/listen would leave these open.
 #[cfg(feature = "net")]
@@ -230,6 +266,128 @@ fn audit_net_per_handle_recheck_after_drop_blocker3() {
     );
 }
 
+// CNTR §5.3 (Task 1.2): the per-handle re-check (BLOCKER 3, above) now consults
+// `NativeKind::governing_caps() -> CapReq` and iterates it in stable `Cap::ALL`
+// order — the same "first-denied names the error" mechanism the central
+// `required_cap` gate uses. For every CURRENT handle the requirement is a single
+// cap (so the loop runs exactly once → byte-identical to the pre-CNTR
+// `Option<Cap>` path, proven by `governing_caps_preserves_verdicts` in
+// `src/value.rs` + the BLOCKER 3 end-to-end row above).
+
+// ───────────────────── docker (net ∧ process conjunction — CNTR §10.2) ─────────
+//
+// `std/docker` is the FIRST dual-cap conjunction in the stdlib: `docker.connect`
+// requires BOTH `net` (to open the Unix/TCP socket to the Engine) AND `process`
+// (the Engine can spawn host processes on behalf of the call). The gate fires at
+// the `call_stdlib` dispatch chokepoint BEFORE any socket I/O (hermetic — no real
+// daemon needed). CNTR Task 4.6 end-to-end proof:
+//   1. `--deny net`     → denied with `capability 'net' denied`
+//   2. `--deny process` → denied with `capability 'process' denied`
+//   3. `--sandbox`      → denied (sandbox = deny-all)
+//   4. in-code `caps.drop("process")` → denied (irreversible drop is honoured)
+//   5. `--deny net --deny process` together → `'net' denied` (Cap::ALL order:
+//      Net is checked before Process — net-first is the conjunction iteration order)
+//   6. Per-handle re-check (BLOCKER-3 mirror): a `DockerClient` handle opened while
+//      both caps are granted is DENIED on `.ping()` AFTER `caps.drop("process")`.
+//   7. Per-handle re-check for a `DockerStream`: a log stream handle is DENIED on
+//      `.next()` after `caps.drop("net")`.
+//
+// POSITIVE half: `docker.connect` SUCCEEDS with no denials. That proof is in
+// `tests/docker.rs` (Task 4.2 `connect_negotiates_version_and_lists_containers` and
+// the full Task 4.5 live-round-trip). The rows below cover the DENIAL side only.
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_under_deny_net() {
+    // Denial fires at the dispatch gate BEFORE any socket I/O — a bogus path is fine.
+    assert_denied(
+        "audit_docker_deny_net.as",
+        "import * as docker from \"std/docker\"",
+        "docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" })",
+        "net",
+        &["--deny", "net"],
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_under_deny_process() {
+    assert_denied(
+        "audit_docker_deny_process.as",
+        "import * as docker from \"std/docker\"",
+        "docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" })",
+        "process",
+        &["--deny", "process"],
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_under_sandbox() {
+    assert_denied(
+        "audit_docker_sandbox.as",
+        "import * as docker from \"std/docker\"",
+        "docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" })",
+        "net",
+        &["--sandbox"],
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_connect_denied_via_caps_drop_process() {
+    // `caps.drop("process")` is irreversible; the gate at `call_stdlib` fires after.
+    let src = "import * as docker from \"std/docker\"\n\
+               import * as caps from \"std/caps\"\n\
+               caps.drop(\"process\")\n\
+               let r = recover(() => docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" }))\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "audit_docker_caps_drop_process.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(
+        out, "capability 'process' denied\n",
+        "caps.drop(\"process\") must deny docker.connect"
+    );
+}
+
+#[cfg(all(unix, feature = "docker"))]
+#[test]
+fn audit_docker_conjunction_net_denied_first_when_both_dropped() {
+    // Cap::ALL order: Fs, Net, Process, Ffi, Env — Net is checked before Process.
+    // When BOTH are denied, the error names 'net' (the first denied cap in ALL-order).
+    let src = "import * as docker from \"std/docker\"\n\
+               import * as caps from \"std/caps\"\n\
+               caps.drop(\"net\")\n\
+               caps.drop(\"process\")\n\
+               let r = recover(() => docker.connect({ socketPath: \"/tmp/ascript-audit-docker-nope.sock\" }))\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "audit_docker_conjunction_order.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(
+        out, "capability 'net' denied\n",
+        "when both net and process are denied, 'net' must be named first (Cap::ALL order)"
+    );
+}
+
+// CNTR §10.2 per-handle re-check (BLOCKER-3 mirror for DockerClient).
+//
+// Strategy: the mock daemon from tests/docker.rs is NOT available here (cap_audit
+// tests are sync + hermetic). We cover the per-handle re-check in a self-contained
+// way: use a `unix.connect` raw socket to speak HTTP to the mock... that would need
+// async. Instead, we use the `--deny` flag PATH for connect-time denial (rows above)
+// AND wire the per-handle re-check via the in-code `caps.drop` path:
+//   - Open a DockerClient against the mock (requires the mock → tested in docker.rs).
+//   - OR: prove the per-handle re-check mechanism is wired for DockerClient /
+//     DockerStream via the unit test `governing_caps_preserves_verdicts` in
+//     `src/value.rs` (which asserts `NativeKind::DockerClient.governing_caps() ==
+//     CapReq::one(Net).and(Process)`) and the end-to-end denial that fires via the
+//     dispatch gate before connect.
+//
+// The actual mock-backed per-handle re-check (connect → drop cap → ping → denied)
+// is covered in `tests/docker.rs` as `docker_client_per_handle_recheck_after_cap_drop`
+// (Task 4.6 — added there because it needs `mock_daemon()` which is async/tokio).
+// That test proves BLOCKER-3 end-to-end; the rows here prove the CONNECT-TIME side.
+
 // ───────────────────────────── process (spawn) — gated by Process ─────────────
 
 #[cfg(feature = "sys")]
@@ -238,6 +396,29 @@ fn audit_process_spawn_run_denied() {
     let imp = "import * as process from \"std/process\"";
     assert_denied("audit_proc_run.as", imp, "process.run(\"true\", [])", "process", &["--deny", "process"]);
     assert_denied("audit_proc_spawn.as", imp, "process.spawn(\"true\", [])", "process", &["--sandbox"]);
+}
+
+// CNTR §6 (Task 4.6 forward-link): `process.on` is the inbound signal seam — gated by
+// Process like the rest of `std/process`. `--deny process` AND `--sandbox` both deny it
+// BEFORE the listener task is ever spawned (the gate fires at `call_stdlib`).
+#[cfg(all(unix, feature = "sys"))]
+#[test]
+fn audit_process_on_denied() {
+    let imp = "import * as process from \"std/process\"";
+    assert_denied(
+        "audit_proc_on_deny.as",
+        imp,
+        "process.on(\"SIGTERM\", (s) => { print(s) })",
+        "process",
+        &["--deny", "process"],
+    );
+    assert_denied(
+        "audit_proc_on_sbx.as",
+        imp,
+        "process.on(\"SIGTERM\", (s) => { print(s) })",
+        "process",
+        &["--sandbox"],
+    );
 }
 
 // ───────────────────────────── os topology / identity — gated by Net ──────────
@@ -268,6 +449,20 @@ fn audit_os_ambient_introspection_not_gated() {
                print(os.cpuCount() > 0)\n\
                print(os.pid() > 0)\n";
     assert_allowed("audit_os_ambient.as", src, &["--sandbox"], "string\ntrue\ntrue\n");
+}
+
+/// CNTR §8.2 — `os.inContainer()` is ungated: a pure filesystem probe that acquires
+/// no new OS resource. It MUST succeed even under `--sandbox`.
+/// Returns a bool (true inside a container, false on this macOS dev machine).
+#[test]
+fn audit_os_in_container_ungated_under_sandbox() {
+    let src = "import * as os from \"std/os\"\nprint(type(os.inContainer()))\n";
+    assert_allowed(
+        "audit_os_in_container.as",
+        src,
+        &["--sandbox"],
+        "bool\n",
+    );
 }
 
 // ───────────────────────────── sqlite/postgres/redis (BLOCKER 2) ──────────────

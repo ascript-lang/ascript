@@ -271,6 +271,9 @@ pub async fn run_file_with_packages(
     let result = local
         .run_until(crate::interp::ambient_root_scope(interp.load_module(path)))
         .await;
+    // CNTR §6 exit-hang fix: abort daemon signal listeners so they don't block the
+    // task drain below (a `process.on` listener loops forever — see the helper doc).
+    interp.abort_signal_listeners();
     local.await; // drain spawned tasks (structured join) — no-op until Phase 2
                  // End-of-program cycle collection (V13-T3): the tree-walker shares
                  // the same `Cc` value model, so a final sweep here reclaims any
@@ -752,16 +755,11 @@ async fn run_tests_parallel(
     Ok(agg)
 }
 
-/// The isolate-count ceiling shared with the worker pool: `$ASCRIPT_WORKERS` if a positive
-/// integer, else `num_cpus` (min 1). `--parallel=N` is clamped to this so it never
-/// oversubscribes beyond the worker budget.
+/// The isolate-count ceiling shared with the worker pool: `$ASCRIPT_WORKERS` override,
+/// else cgroup-aware `min(num_cpus, quota).max(1)` (CNTR §8.1). `--parallel=N` is
+/// clamped to this so it never oversubscribes beyond the worker budget.
 fn worker_isolate_cap() -> usize {
-    std::env::var("ASCRIPT_WORKERS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or_else(num_cpus::get)
-        .max(1)
+    crate::worker::pool::effective_parallelism()
 }
 
 #[cfg(not(ascript_rt))]
@@ -797,6 +795,8 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
             interp.exec_program(&program, &env),
         ))
         .await;
+    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
+    interp.abort_signal_listeners();
     local.await; // drain spawned tasks — no-op until Phase 2
     match result {
         // Any `Ok(Flow)` is normal program completion. `exec_program` converts a
@@ -3849,6 +3849,8 @@ async fn run_entry_proto_to_exit(
     let result = local
         .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
+    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
+    interp.abort_signal_listeners();
     // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks
@@ -4067,6 +4069,9 @@ pub async fn run_file_on_vm_with_packages(
     let result = local
         .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
+    // CNTR §6 exit-hang fix: abort daemon signal listeners so they don't block the
+    // task drain below (a `process.on` listener loops forever — see the helper doc).
+    interp.abort_signal_listeners();
     // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks (structured join)
@@ -4543,6 +4548,8 @@ pub async fn run_file_decode_cfg(
     let result = local
         .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
+    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
+    interp.abort_signal_listeners();
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await;
     crate::gc::collect();
@@ -4668,6 +4675,8 @@ pub async fn run_file_on_vm_profiled(
     let result = local
         .run_until(crate::interp::ambient_root_scope(vm.run(&mut fiber)))
         .await;
+    // CNTR §6 exit-hang fix: abort daemon signal listeners (see helper doc).
+    interp.abort_signal_listeners();
     local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await;
     crate::gc::collect();

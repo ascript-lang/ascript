@@ -15,6 +15,7 @@ const NAV = [
     ['cli', 'The ascript CLI'],
     ['packages', 'Packages & dependencies'],
     ['runtime', 'Compilation & runtime'],
+    ['deploying', 'Deploying & containers'],
   ]},
   { title: 'Language', items: [
     ['language/syntax', 'Syntax & control flow'],
@@ -36,6 +37,7 @@ const NAV = [
     ['stdlib/db', 'Databases (SQLite, Postgres & Redis)'],
     ['stdlib/time', 'Time & locale'],
     ['stdlib/net', 'Networking & HTTP'],
+    ['stdlib/docker', 'Docker (Engine API)'],
     ['stdlib/ffi', 'FFI (C interop)'],
     ['stdlib/caps', 'Capabilities & sandboxing'],
     ['stdlib/async', 'Async & concurrency'],

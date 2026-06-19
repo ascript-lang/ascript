@@ -443,6 +443,220 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::proces
     }
 }
 
+// ── CNTR §7 — graceful drain composition (process.on SIGTERM → srv.shutdown) ──
+
+/// A SINGLE-isolate server (handle method `s.serve()`, no workers) that wires
+/// `process.on("SIGTERM", () => s.shutdown())` so an inbound SIGTERM triggers the
+/// graceful drain. The server runs UNBOUNDED (no maxRequests) — only the SIGTERM stops
+/// it. A 30ms handler keeps an in-flight request mid-drain. `drainTimeout` bounds the
+/// drain so a stuck handler can never hang the drain. `marker_path` is written once the
+/// graceful drain completes (the proof the composition ran), then the program exits.
+fn sigterm_drain_program(marker_path: &str) -> String {
+    format!(
+        r#"
+import * as server from "std/http/server"
+import * as process from "std/process"
+import * as env from "std/env"
+import * as time from "std/time"
+import * as fs from "std/fs"
+
+async fn main() {{
+  let [port, perr] = int(env.get("ASC_SERVE_PORT"))
+  let app = server.create()
+  app.route("GET", "/who", async (req) => {{
+    await time.sleep(30)
+    return "hi:single"
+  }})
+  let [bound, berr] = await app.bind("127.0.0.1", port)
+  process.on("SIGTERM", (sig) => app.shutdown())
+  await app.serve({{
+    drainTimeout: 2000,
+    onShutdown: () => print("draining"),
+  }})
+  // The graceful drain completed → write the marker so the test can confirm the
+  // process.on → shutdown → drain composition ran end-to-end. NOTE: NO explicit
+  // exit() — `main` simply RETURNS and the program ends normally. The registered
+  // SIGTERM listener must NOT keep the process alive (CNTR §6 exit-hang fix): the
+  // listener is a daemon task aborted at program end, so the process exits cleanly.
+  let [w, werr] = fs.write("{marker_path}", "drained-ok")
+}}
+await main()
+"#
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_triggers_graceful_drain() {
+    // The headline composition (CNTR §6 process.on + §7 srv.shutdown): an inbound
+    // SIGTERM runs the registered handler → `s.shutdown()` → the accept loop stops,
+    // onShutdown runs, the in-flight request drains, `serve` resolves, and the program
+    // writes its completion marker. We send a request, SIGTERM mid-flight, and assert
+    // (a) the in-flight request completes (client gets the body), (b) the marker is
+    // written (the drain ran to completion), and (c) the process EXITS CLEANLY on its
+    // own — `main` returns with NO explicit exit(), and the CNTR §6 exit-hang fix
+    // aborts the daemon SIGTERM listener at program end so it does not keep the
+    // runtime alive. The mid-request timing is best-effort (a 30ms handler); the
+    // deterministic core proof is the in-process `shutdown_drains_inflight_request`
+    // lib test.
+    let marker = std::env::temp_dir().join(format!(
+        "ascript_srv_drain_marker_{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let port = reserve_port();
+    let src = sigterm_drain_program(&marker.to_string_lossy());
+    let mut child = spawn_server("sigterm_single", &src, port);
+
+    assert!(
+        wait_until_single_ready(port),
+        "single-isolate server must become ready before SIGTERM"
+    );
+
+    // Fire a request, then SIGTERM the process while it is (very likely) mid-flight in
+    // the 30ms handler.
+    let req = std::thread::spawn(move || http_get(port, "/who"));
+    std::thread::sleep(Duration::from_millis(5));
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+
+    // The in-flight request should still complete (drain). Best-effort on the body.
+    let _ = req.join().unwrap();
+
+    // Wait for the drain-completion marker (the composition ran). Bounded so a genuine
+    // hang fails loudly rather than blocking forever.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut drained = false;
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(&marker).ok().as_deref() == Some("drained-ok") {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // CNTR §6 exit-hang fix: the process must now EXIT CLEANLY on its own (no kill),
+    // since `main` returned normally and the daemon listener is aborted at program end.
+    let mut exit_status = None;
+    let exit_deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < exit_deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            exit_status = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if exit_status.is_none() {
+        let _ = child.kill();
+    }
+    // Always reap (also satisfies clippy::zombie_processes); a child that already
+    // exited via `try_wait` returns its status again harmlessly.
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&marker);
+    let exited = exit_status.map(|s| s.success()).unwrap_or(false);
+    assert!(
+        drained,
+        "the SIGTERM → s.shutdown() → graceful-drain composition must run to completion \
+         (the drain-completion marker was never written)"
+    );
+    assert!(
+        exited,
+        "after the drain, the process must EXIT on its own (the daemon SIGTERM \
+         listener must not keep it alive — CNTR §6 exit-hang fix)"
+    );
+}
+
+/// Probe a `/who` server until it answers "hi:single" (the single-isolate composition
+/// server is up), up to ~6s.
+fn wait_until_single_ready(port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if let Some(b) = http_get_quick(port, "/who") {
+            if b.starts_with("hi:") {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// A MULTI-isolate module-level server (`server.serve({workers:N, setup, maxRequests})`)
+/// with an `onShutdown` callback. When the shared budget is exhausted the fused shutdown
+/// notify fires across all isolates; `onShutdown` must run EXACTLY ONCE on the main side
+/// (not N times, once per isolate), and the process exits 0.
+fn multi_onshutdown_program(workers: usize, k: usize) -> String {
+    format!(
+        r#"
+import * as server from "std/http/server"
+import * as env from "std/env"
+import * as math from "std/math"
+
+worker fn boot(unused) {{
+  let app = server.create()
+  let iid = math.randomInt(1, 1000000000)
+  app.route("GET", "/who", (req) => `hi:${{iid}}`)
+  return app
+}}
+
+async fn main() {{
+  let [port, perr] = int(env.get("ASC_SERVE_PORT"))
+  await server.serve({{
+    port: port,
+    host: "127.0.0.1",
+    workers: {workers},
+    setup: boot,
+    args: [0],
+    maxRequests: {k},
+    onShutdown: () => print("ONSHUTDOWN"),
+  }})
+  print("served-returned")
+}}
+await main()
+"#
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_isolate_onshutdown_runs_once() {
+    // Across N isolates, `onShutdown` must run EXACTLY ONCE on the main side when the
+    // server stops (here via budget exhaustion, which fires the same fused shutdown
+    // notify a `srv.shutdown()` would). We count "ONSHUTDOWN" in the captured stdout.
+    let port = reserve_port();
+    let workers = 3usize;
+    let k = 4usize;
+    let src = multi_onshutdown_program(workers, k);
+    let mut child = spawn_server("multi_onshutdown", &src, port);
+
+    // Serve exactly K requests; the server then stops + runs onShutdown.
+    let mut served = 0usize;
+    for _ in 0..k {
+        if let Some(body) = http_get(port, "/who") {
+            if body.starts_with("hi:") {
+                served += 1;
+            }
+        }
+    }
+    assert_eq!(served, k, "exactly maxRequests={k} requests must be served");
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+    assert!(
+        matches!(status, Some(s) if s.success()),
+        "the multi-isolate server must exit cleanly after stop (status={status:?})"
+    );
+    // Capture stdout to count onShutdown runs.
+    let mut stdout = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut stdout);
+    }
+    assert_eq!(
+        stdout.matches("ONSHUTDOWN").count(),
+        1,
+        "onShutdown must run EXACTLY ONCE across {workers} isolates (stdout={stdout:?})"
+    );
+}
+
 /// SRV §2.2 — Windows fallback: `workers: N > 1` is requested but SO_REUSEPORT is not
 /// available, so the server degrades to a SINGLE isolate (correct, just single-core)
 /// and emits a one-time `warn`. We fire several requests and assert they are all served
