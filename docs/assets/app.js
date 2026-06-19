@@ -15,6 +15,7 @@ const NAV = [
     ['cli', 'The ascript CLI'],
     ['packages', 'Packages & dependencies'],
     ['runtime', 'Compilation & runtime'],
+    ['deploying', 'Deploying & containers'],
   ]},
   { title: 'Language', items: [
     ['language/syntax', 'Syntax & control flow'],

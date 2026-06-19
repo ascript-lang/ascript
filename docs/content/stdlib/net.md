@@ -355,6 +355,7 @@ Every verb (and `request`) accepts an options object. All keys are optional.
 | `cancel` | cancelToken handle | abort the in-flight send — see **Cancellation** below. |
 | `stream` | bool | `true` exposes `resp.body` as a streaming reader instead of buffering. |
 | `bodyMode` | string | for streaming bodies: `"string"` (default) or `"bytes"`. |
+| `socketPath` | string | send this request over a Unix-domain socket instead of TCP. The URL's host is ignored (only the `path` component is used). The response surface is **identical** to TCP (`resp.status`, `resp.headers`, `resp.text()`/`resp.json()`/`resp.body`). Requires the `net` capability. See **socketPath requests** below. |
 
 #### Body shapes
 
@@ -379,6 +380,38 @@ let token = http.cancelToken()
 // ... elsewhere: token.cancel()
 let [resp, err] = await http.get(url, { cancel: token })
 ```
+
+#### socketPath requests
+
+`opts.socketPath` routes the request over a Unix-domain socket instead of TCP. The
+URL's host is ignored; use `opts.url` (or a verb like `http.get`) with any valid URL
+and pair it with `socketPath` to set the path. Alternatively, use
+`http.request({ socketPath, path, method })` with an explicit path when you do not
+have a meaningful URL.
+
+```ascript
+import * as http from "std/net/http"
+
+// HTTP request over /var/run/docker.sock — host in the URL is ignored
+let [resp, err] = await http.get("http://localhost/_ping", {
+  socketPath: "/var/run/docker.sock",
+})
+if (err != nil) { print("docker unavailable: " + err.message) }
+let [text, _] = await resp.text()
+print(text)  // "OK"
+```
+
+Internally `socketPath` requests use a minimal hardened HTTP/1.1 client (the same
+codec `std/docker` uses) — **not reqwest**. This is because reqwest's stable API
+has no Unix-socket connector seam, and the Docker exec/attach protocol requires a
+connection `101 Upgrade` hijack that reqwest cannot hand back. The response surface
+is identical — `resp.status`, `resp.headers`, `resp.text()`/`resp.json(Class)`/
+`resp.body` work exactly the same. The streaming request body option (`body.stream`)
+is **not** supported over a Unix socket (a Tier-2 panic if combined with `socketPath`).
+
+The `socketPath` option is gated by `net`. A granular net carve-out can allow a
+specific socket path with `allow: ["unix:/var/run/docker.sock"]` — see
+[Capabilities & sandboxing](caps).
 
 ### Example: JSON POST with auth and retry
 

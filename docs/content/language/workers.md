@@ -470,11 +470,18 @@ await server.serve({ port: 8080, workers: 0, setup: boot, args: [routes] })
 How it works:
 
 - **`workers` absent or `1`** → today's single-isolate accept loop, unchanged.
-- **`workers: N` (N>1, or `0` = `num_cpus`)** → spawn N shared-nothing isolates. Each runs
-  `setup(...args)` at boot to build its **own** server handle and open its **own** per-isolate
-  resources (a DB pool, prepared statements — these never cross the airlock), then accepts on
-  its own `SO_REUSEPORT` socket. A connection that lands on isolate *k* is accepted, dispatched,
-  and answered entirely on isolate *k*'s core — **no cross-isolate hop per request**.
+- **`workers: N` (N>1, or `0` = cgroup-aware parallelism)** → spawn N shared-nothing
+  isolates. Each runs `setup(...args)` at boot to build its **own** server handle and open
+  its **own** per-isolate resources (a DB pool, prepared statements — these never cross the
+  airlock), then accepts on its own `SO_REUSEPORT` socket. A connection that lands on
+  isolate *k* is accepted, dispatched, and answered entirely on isolate *k*'s core —
+  **no cross-isolate hop per request**.
+- **`workers: 0` is cgroup-aware** — it reads the container's CPU quota from
+  `/sys/fs/cgroup/cpu.max` (cgroup v2) or the v1 equivalents and uses
+  `ceil(quota / period)` instead of the host's raw core count. Outside a container (or
+  when no quota is set), `0` falls back to `num_cpus`. Override the auto-sizing with
+  `$ASCRIPT_WORKERS=N`. This means `workers: 0` is the correct default for any
+  container-deployed server — it never oversubscribes the cgroup allocation.
 - **`setup`** is a `worker fn`; its `args` are sendable (typically the frozen
   [`shared`](../stdlib/shared) state). Handlers are `worker fn`s too.
 - **`maxRequests`** across N isolates bounds the **total** number of connections served (a
@@ -484,7 +491,11 @@ How it works:
   accept loop, drains the in-flight handlers, and resolves `serve`. `serve({ onShutdown,
   drainTimeout })` runs an `onShutdown` callback once when the drain begins and bounds the
   drain wait. The idiom is an inbound-signal handler: `process.on("SIGTERM", (sig) =>
-  app.shutdown())`.
+  app.shutdown())`. Note: `process.on` registers handlers on the **main isolate only** —
+  each worker isolate's `process.on` call would be a Tier-2 refusal (signals are
+  process-global; N racing handlers for one delivery would be wrong). Wire the signal on
+  the main isolate, before `serve`; `srv.shutdown()` is safe to call from there and
+  propagates the stop to all worker isolates via the shared `Arc<Notify>`.
 
 ### The shared config pattern
 
