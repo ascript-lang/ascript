@@ -1615,15 +1615,42 @@ static NET_HTTP_MEMBERS: &[(&str, MemberKind)] = &[
 
 static HTTP_SERVER_CREATE_PARAMS: &[StdParam] = &[];
 static HTTP_SERVER_SERVE_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+// BATT A8 §5.7 — signed cookies + sessions (the `auth` feature).
+static HTTP_SERVER_SIGN_COOKIE_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req_untyped("value"),
+    StdParam::req("secret", "string | bytes"),
+];
+static HTTP_SERVER_VERIFY_COOKIE_PARAMS: &[StdParam] = &[
+    StdParam::req("signedValue", "string"),
+    StdParam::req("secret", "string | bytes"),
+];
+static HTTP_SERVER_SET_COOKIE_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("value", "string"),
+    StdParam::opt("opts", "object"),
+];
+static HTTP_SERVER_SESSION_PARAMS: &[StdParam] = &[
+    StdParam::req("req", "object"),
+    StdParam::req("secret", "string | bytes"),
+];
 
 static HTTP_SERVER_SIGS: &[(&str, StdSig)] = &[
     ("create", StdSig { params: HTTP_SERVER_CREATE_PARAMS, ret: None, doc: "Creates and returns a new HTTP server handle." }),
     ("serve", StdSig { params: HTTP_SERVER_SERVE_PARAMS, ret: Some("[nil, err]"), doc: "Multi-isolate REUSEPORT serve: spreads the accept loop across N shared-nothing isolates. Async." }),
+    ("signCookie", StdSig { params: HTTP_SERVER_SIGN_COOKIE_PARAMS, ret: Some("string"), doc: "Signs a cookie value with HMAC-SHA256 into a tamper-evident string." }),
+    ("verifyCookie", StdSig { params: HTTP_SERVER_VERIFY_COOKIE_PARAMS, ret: Some("[value, err]"), doc: "Verifies a signed cookie value in constant time, returning the original value or a Tier-1 error." }),
+    ("setCookie", StdSig { params: HTTP_SERVER_SET_COOKIE_PARAMS, ret: Some("string"), doc: "Renders a Set-Cookie header value with attributes (httpOnly defaults true, sameSite defaults Lax); CR/LF in name or value is a Tier-2 panic." }),
+    ("session", StdSig { params: HTTP_SERVER_SESSION_PARAMS, ret: Some("[object, err]"), doc: "Reads and verifies the signed session cookie from a request; an absent cookie yields an empty session." }),
 ];
 
 static HTTP_SERVER_MEMBERS: &[(&str, MemberKind)] = &[
     ("create", MemberKind::Fn),
     ("serve", MemberKind::Fn),
+    ("signCookie", MemberKind::Fn),
+    ("verifyCookie", MemberKind::Fn),
+    ("setCookie", MemberKind::Fn),
+    ("session", MemberKind::Fn),
 ];
 
 // ── std/sqlite ────────────────────────────────────────────────────────────────

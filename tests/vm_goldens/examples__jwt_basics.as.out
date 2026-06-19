@@ -1,0 +1,14 @@
+# exit: none
+sign error: nil
+token has three segments: true
+verify error: nil
+subject: alice
+role: admin
+tampered rejected: true
+wrong key rejected: true
+alg none rejected: true
+decode error: nil
+decoded header alg: HS256
+decoded claims sub: alice
+decoded verified flag: false
+jwt_basics ok

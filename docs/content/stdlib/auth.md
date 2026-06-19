@@ -223,3 +223,85 @@ Exchanges a `refreshToken` for a fresh access token (`grant_type=refresh_token`)
 
 Fetches an issuer's OpenID Connect metadata from `<issuer>/.well-known/openid-configuration` and
 returns `[metadata, err]`.
+
+## Signed cookies + sessions
+
+`std/http/server` ships four helpers for **tamper-evident cookies** and **stateless sessions**. A
+cookie value is JSON-serialized and authenticated with **HMAC-SHA256** over the encoded payload,
+then verified in **constant time** (the same `verify_slice` that backs `std/jwt`). The signed value
+looks like:
+
+```
+base64url(json(value)) "." base64url(hmac_sha256(secret, payload_b64))
+```
+
+Verification recomputes the HMAC over the payload segment and compares the tags constant-time — never
+`==` on raw signature bytes. Any tampering, a wrong secret, or a malformed value **fails closed** to a
+Tier-1 `[nil, err]`, because a forged cookie is ordinary control flow, not a crash.
+
+```ascript
+import * as server from "std/http/server"
+
+const SECRET = "a-strong-signing-key"
+
+// On login: sign the session and render a Set-Cookie header.
+app.route("POST", "/login", (req) => {
+  let signed = server.signCookie("session", { user: "ada", role: "admin" }, SECRET)
+  let cookie = server.setCookie("session", signed, { path: "/", maxAge: 3600 })
+  return { status: 200, headers: { "set-cookie": cookie }, body: "logged-in" }
+})
+
+// On every other request: read the verified session (empty if absent).
+app.route("GET", "/me", (req) => {
+  let [sess, err] = server.session(req, SECRET)
+  if err != nil { return { status: 401, body: "invalid session" } }
+  if sess.user == nil { return { status: 401, body: "no session" } }
+  return `hello ${sess.user} (${sess.role})`
+})
+```
+
+::: warning
+**`setCookie` is a header-injection chokepoint.** A CR, LF, or other control character in a cookie
+**name** or **value** is a **Tier-2 panic** — not a Tier-1 result — because rendering it into a
+`Set-Cookie` header would enable HTTP response-splitting. That is always a programmer bug (the sibling
+of the SMTP header-injection guard), so the malformed cookie is never rendered. Authentication
+*failures* (a tampered or absent signature) stay Tier-1 values; *injection attempts* are loud Tier-2
+panics.
+:::
+
+These helpers are **pure crypto / string rendering** (no I/O), so — unlike `server.create`/`serve` —
+they are **not** `net`-gated: they work under `--sandbox` and inside a `run_in_worker({ deny net })`
+isolate (a handler can verify a session without any network capability).
+
+### `server.signCookie(name, value, secret)`
+
+Signs `value` (any JSON-serializable value) into a tamper-evident cookie string under `secret` (a
+`string` or `bytes`). Returns the signed `string`. The `name` is checked for CR/LF/control bytes (it
+travels with the value into the `Set-Cookie` render) but is not part of the signature, so
+`verifyCookie` needs only the signed value and the secret.
+
+### `server.verifyCookie(signedValue, secret)`
+
+Verifies a signed cookie value in constant time and returns `[value, err]`: the decoded original value
+on success, or a Tier-1 `[nil, err]` if the signature, secret, or encoding is wrong. **Fails closed.**
+
+### `server.setCookie(name, value, opts?)`
+
+Renders a `Set-Cookie` header value. `opts` (all optional):
+
+- `httpOnly?: bool` — **defaults `true`** (only an explicit `false` drops the `HttpOnly` attribute).
+- `sameSite?: string` — one of `"Strict"`, `"Lax"`, `"None"`; **defaults `"Lax"`** (any other value is a
+  Tier-2 panic).
+- `secure?: bool` — adds `Secure` when truthy.
+- `path?: string` / `domain?: string` — set `Path` / `Domain`.
+- `maxAge?: int` — sets `Max-Age` in seconds; `0` is meaningful (expire now) and always rendered.
+
+A CR/LF/control character in `name`, `value`, `path`, or `domain` is a **Tier-2 panic** (the
+header-injection guard above).
+
+### `server.session(req, secret)`
+
+Reads the `session` cookie from the request's `Cookie` header and verifies it with `secret`. Returns
+`[object, err]`: an **absent** session cookie yields `[{}, nil]` (an empty session, no error — being
+logged out is not a failure); a **present valid** cookie yields the decoded session object; a
+**tampered** cookie yields a Tier-1 `[nil, err]`.

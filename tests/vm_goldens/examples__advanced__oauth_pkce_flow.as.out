@@ -1,0 +1,10 @@
+# exit: none
+pkce method: S256
+verifier length: 43
+challenge length: 43
+token type: Bearer
+got access token: true
+jwks kids: ["ec-1"]
+verified subject: user-123
+verified issuer: https://idp.example
+oauth_pkce_flow ok

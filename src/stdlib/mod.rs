@@ -374,9 +374,17 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         // All network modules — sockets, HTTP, DNS, UDP, WebSocket, servers, Unix-domain.
         // `"net"` covers `net.lookup`/`lookupOne` (DNS) by construction. `net_unix` is a
         // UDS byte pipe — single-cap `net` (it conveys no process authority; CNTR §5.1).
-        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" | "http_server" => {
-            CapReq::one(Cap::Net)
-        }
+        "net" | "net_tcp" | "net_http" | "net_udp" | "net_ws" => CapReq::one(Cap::Net),
+        // BATT A8 §5.7 — `http_server` is PER-FUNC (the `jwt` precedent): `create`/`serve`
+        // bind + accept sockets → `Net`; the signed-cookie + session helpers
+        // (`signCookie`/`verifyCookie`/`setCookie`/`session`) are PURE crypto / string
+        // rendering (no I/O) → ungated, so they work under `--sandbox` (a handler may
+        // verify a session in a `run_in_worker({deny net})` isolate). `auth`-only funcs.
+        "http_server" => match func {
+            #[cfg(feature = "auth")]
+            "signCookie" | "verifyCookie" | "setCookie" | "session" => CapReq::NONE,
+            _ => CapReq::one(Cap::Net),
+        },
         #[cfg(feature = "net")]
         "net_unix" => CapReq::one(Cap::Net),
         // CNTR §5.2 — the FIRST conjunction: `docker.*` drives the Engine API over the
@@ -1100,6 +1108,17 @@ mod cap_gate_tests {
         // DNS specifically: net.lookup / lookupOne route through "net" → Net.
         assert_eq!(req("net", "lookup"), vec![Cap::Net]);
         assert_eq!(req("net", "lookupOne"), vec![Cap::Net]);
+        // BATT A8 §5.7 — http_server is per-func (the jwt precedent): create/serve bind
+        // + accept sockets → Net; the cookie/session helpers are pure crypto → ungated.
+        assert_eq!(req("http_server", "create"), vec![Cap::Net]);
+        assert_eq!(req("http_server", "serve"), vec![Cap::Net]);
+        #[cfg(feature = "auth")]
+        {
+            assert!(required_cap("http_server", "signCookie").is_empty());
+            assert!(required_cap("http_server", "verifyCookie").is_empty());
+            assert!(required_cap("http_server", "setCookie").is_empty());
+            assert!(required_cap("http_server", "session").is_empty());
+        }
         // CNTR §5.1: net_unix is a single-cap `net` (a UDS pipe conveys no process authority).
         #[cfg(feature = "net")]
         assert_eq!(req("net_unix", "connect"), vec![Cap::Net]);
