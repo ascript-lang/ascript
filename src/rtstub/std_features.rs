@@ -101,6 +101,10 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // tls + data). The net edge is load-bearing for tier selection: an email
     // bundle (B6 SMTP client) must select the net tier.
     ("std/email",       Some("email")),
+    // BATT B8 §9 — std/blob is gated on the `blob` feature (blob = net + crypto +
+    // data + xml). The net edge is load-bearing for tier selection: a blob bundle
+    // (the S3 client) must select the net tier; xml decodes the S3 responses.
+    ("std/blob",        Some("blob")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.
@@ -156,6 +160,14 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     ("email", "data"),
     // tls = ["net", ...]. First reached transitively via `email → tls`.
     ("tls", "net"),
+    // BATT B8 §9 — blob = ["net", "crypto", "data", "xml"]. A std/blob bundle pulls
+    // the net tier (the S3 client), crypto (SigV4 HMAC-SHA256), data (base64/sha2),
+    // and xml (decoding S3 list/error responses). All four bare feature→feature edges
+    // must be tracked so the `closure_drift` reverse check stays green.
+    ("blob", "net"),
+    ("blob", "crypto"),
+    ("blob", "data"),
+    ("blob", "xml"),
 ];
 
 /// Collect all `std/` module specifiers imported anywhere in `archive`.

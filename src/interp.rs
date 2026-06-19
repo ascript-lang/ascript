@@ -615,6 +615,13 @@ pub(crate) enum ResourceState {
     /// `email`.
     #[cfg(feature = "email")]
     SmtpClient(Box<crate::stdlib::email::SmtpClientState>),
+    /// BATT B8 §9.2: a `std/blob` S3-compatible client (`blob.client(config)`). CONFIG
+    /// ONLY (endpoint, region, creds, default bucket, path-style) — no socket; every op
+    /// makes a fresh signed request through the shared pooled reqwest client. Boxed to
+    /// keep the enum compact. Plain data reclaimed by Drop; GC-untraced; non-sendable.
+    /// Feature `blob`.
+    #[cfg(feature = "blob")]
+    BlobClient(Box<crate::stdlib::blob::BlobClientState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5717,6 +5724,12 @@ impl Interp {
         {
             if matches!(m.receiver.kind, crate::value::NativeKind::SmtpClient) {
                 return self.call_smtp_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "blob")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::BlobClient) {
+                return self.call_blob_method(&m, args, span).await;
             }
         }
         #[cfg(feature = "telemetry")]

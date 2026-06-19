@@ -1361,6 +1361,15 @@ pub enum NativeKind {
     // sendable. Feature-gated — compiled out without `archive`.
     #[cfg(feature = "archive")]
     ArchiveWriter,
+    // BATT B8 §9.2: a `std/blob` S3-compatible client handle (`blob.client(config)`).
+    // Backed by `ResourceState::BlobClient` — CONFIG ONLY (endpoint, region, creds,
+    // default bucket, path-style); every op makes a fresh signed request through the
+    // SHARED pooled reqwest client, so there is no socket to reclaim. `governing_caps`
+    // = Net (operating it — incl. `presign`, which mints a capability-bearing URL from
+    // the secret — is gated; a `caps.drop("net")` HOLDS for an already-built client).
+    // GC-untraced (plain data reclaimed by Drop), non-sendable. Feature `blob`.
+    #[cfg(feature = "blob")]
+    BlobClient,
 }
 
 impl NativeKind {
@@ -1429,6 +1438,8 @@ impl NativeKind {
             NativeKind::ArchiveWriter => "archiveWriter",
             #[cfg(feature = "email")]
             NativeKind::SmtpClient => "smtpClient",
+            #[cfg(feature = "blob")]
+            NativeKind::BlobClient => "blobClient",
         }
     }
 
@@ -1533,6 +1544,12 @@ impl NativeKind {
             // opens must HOLD (the per-handle re-check mirrors TcpStream/HttpBody).
             #[cfg(feature = "email")]
             NativeKind::SmtpClient => CapReq::one(Cap::Net),
+            // BATT B8 §9.2: operating a blob client makes a signed S3 request over the
+            // network on each op (and `presign` mints a capability-bearing URL from the
+            // secret key), so a `caps.drop("net")` after the client is built must HOLD
+            // (the per-handle re-check mirrors TcpStream/SmtpClient).
+            #[cfg(feature = "blob")]
+            NativeKind::BlobClient => CapReq::one(Cap::Net),
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a

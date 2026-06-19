@@ -289,6 +289,66 @@ fn audit_email_message_builder_allowed_under_sandbox() {
     assert_eq!(out, "true\ntrue\n", "email.message/validateAddress must work under --sandbox");
 }
 
+// BATT B8 §9.2 — the `std/blob` S3 client is WHOLE-MODULE `Net`, INCLUDING `presign`
+// (the deliberate decision: a presigned URL mints capability-bearing authority from
+// the secret key, so it is gated alongside the network ops). `--deny net`, `--sandbox`,
+// and in-code `caps.drop("net")` all deny EVERY blob op (`blob.client` constructs a
+// handle, but operating it — put/get/head/delete/list/presign/putMultipart — is denied
+// at the per-handle Net re-check, BEFORE any request leaves the host).
+#[cfg(feature = "blob")]
+#[test]
+fn audit_blob_all_ops_denied() {
+    // Whole-module Net: `blob.client(...)` is gated at the dispatch chokepoint AND each
+    // op (incl. presign) is gated at the per-handle re-check. We recover around the
+    // WHOLE chain (construct + op) so the denial surfaces wherever it fires first.
+    let mk = |op: &str| {
+        format!(
+            "import * as blob from \"std/blob\"\n\
+             let r = recover(() => {{\n\
+               let client = blob.client({{endpoint:\"http://127.0.0.1:9\", region:\"us-east-1\", \
+               accessKey:\"AKIDEXAMPLE\", secretKey:\"secret\", bucket:\"b\", pathStyle:true}})\n\
+               return {op}\n\
+             }})\n\
+             print(r[1].message)\n"
+        )
+    };
+    for (name, op) in [
+        ("audit_blob_put.as", "client.put(\"k\", \"v\")"),
+        ("audit_blob_get.as", "client.get(\"k\")"),
+        ("audit_blob_head.as", "client.head(\"k\")"),
+        ("audit_blob_delete.as", "client.delete(\"k\")"),
+        // presign is gated too (the deliberate whole-module decision).
+        ("audit_blob_presign.as", "client.presign(\"GET\", \"k\")"),
+        ("audit_blob_multipart.as", "client.putMultipart(\"k\", [\"a\"])"),
+        // even constructing the client is denied (the module dispatch gate).
+        ("audit_blob_client.as", "client"),
+    ] {
+        for flags in [&["--deny", "net"][..], &["--sandbox"][..]] {
+            let src = mk(op);
+            let (ok, out, err) = run_with_args(&src, name, flags);
+            assert!(ok, "[{name}] {flags:?} denial is recoverable; stderr: {err}");
+            assert_eq!(
+                out.trim(),
+                "capability 'net' denied",
+                "[{name}] {flags:?} expected net denial, got {out:?}"
+            );
+        }
+    }
+    // in-code caps.drop("net") — irreversible; the gate fires after the drop. The
+    // client is built BEFORE the drop (so it exists); presign on it is then denied at
+    // the per-handle re-check.
+    let src = "import * as blob from \"std/blob\"\n\
+        import * as caps from \"std/caps\"\n\
+        let client = blob.client({endpoint:\"http://127.0.0.1:9\", region:\"us-east-1\", \
+        accessKey:\"AKIDEXAMPLE\", secretKey:\"secret\", bucket:\"b\", pathStyle:true})\n\
+        caps.drop(\"net\")\n\
+        let r = recover(() => client.presign(\"GET\", \"k\"))\n\
+        print(r[1].message)\n";
+    let (ok, out, _err) = run_with_args(src, "audit_blob_presign_drop.as", &[]);
+    assert!(ok, "blob presign drop should run (recoverable)");
+    assert_eq!(out.trim(), "capability 'net' denied", "caps.drop(\"net\") must deny blob.presign");
+}
+
 // CNTR §3.1 std/net/unix — a UDS connect/listen is gated by `Net` exactly like TCP.
 // `--deny net` AND `--sandbox` deny BEFORE any bind/connect (no real socket touched).
 #[cfg(all(unix, feature = "net"))]

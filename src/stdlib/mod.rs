@@ -9,10 +9,12 @@ pub mod ai;
 pub mod array;
 pub mod assert_mod;
 pub mod bench;
-// B7: SigV4 core only — NOT yet registered in STD_MODULES / routing / std_sigs / rtstub.
-// The client + operations (B8) wire it in. Private `mod` so it stays off the drift surface.
+// BATT B8 §9.2 — `std/blob` S3-compatible object storage (the SigV4 core in B7 +
+// the client/operations here). Registered in STD_MODULES / routing / required_cap /
+// std_sigs / rtstub / docs. `pub` so `blob::BlobClientState` is reachable from the
+// `ResourceState` enum in `interp.rs`.
 #[cfg(feature = "blob")]
-mod blob;
+pub mod blob;
 pub mod bytes;
 pub mod caps;
 #[cfg(feature = "binary")]
@@ -256,6 +258,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/html" => html::exports(),
         #[cfg(feature = "email")]
         "std/email" => email::exports(),
+        #[cfg(feature = "blob")]
+        "std/blob" => blob::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -336,6 +340,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/xml",
     "std/html",
     "std/email",
+    "std/blob",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -455,6 +460,13 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         // which also carry network egress). `--deny net`/`--sandbox` blocks it.
         #[cfg(feature = "auth")]
         "oauth" => CapReq::one(Cap::Net),
+        // BATT B8 §9.2 — `std/blob` is WHOLE-MODULE `Net` (incl. `presign`): the
+        // S3 ops make signed network requests, and `presign` mints a
+        // capability-bearing URL from the secret key — gating the whole
+        // secret-handling surface is the deliberate decision (a denied `net`
+        // blocks `presign` too). Feature-gated like the dispatch arm.
+        #[cfg(feature = "blob")]
+        "blob" => CapReq::one(Cap::Net),
         // BATT B1 §6 — `std/archive` is PER-FUNC: the in-memory streaming fns
         // (`tarWriter`/`tarEntries`/`tarAppend`) touch no OS resource → ungated; the
         // disk fns (`tarExtractTo`/`zipExtractTo`/`tarCreateFromDir`, added in B2)
@@ -738,6 +750,8 @@ impl Interp {
                 "send" | "connect" => self.call_email_async(func, args, span).await,
                 _ => email::call(func, args, span),
             },
+            #[cfg(feature = "blob")]
+            "blob" => self.call_blob(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1234,6 +1248,13 @@ mod cap_gate_tests {
             assert_eq!(req("email", "send"), vec![Cap::Net]);
             assert_eq!(req("email", "connect"), vec![Cap::Net]);
         }
+        // BATT B8 §9.2 — blob is WHOLE-MODULE Net (incl. presign).
+        #[cfg(feature = "blob")]
+        {
+            assert_eq!(req("blob", "client"), vec![Cap::Net]);
+            assert_eq!(req("blob", "presign"), vec![Cap::Net]);
+            assert_eq!(req("blob", "anything"), vec![Cap::Net]);
+        }
     }
 
     /// Drift guard: every resource-acquiring module string the dispatch match
@@ -1273,6 +1294,9 @@ mod cap_gate_tests {
             ("telemetry", Cap::Net),
             #[cfg(feature = "workflow")]
             ("workflow", Cap::Fs),
+            // BATT B8 §9.2 — blob is whole-module Net (the S3 client + presign).
+            #[cfg(feature = "blob")]
+            ("blob", Cap::Net),
         ];
         for (m, want) in gated {
             assert_eq!(

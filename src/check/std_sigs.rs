@@ -1589,6 +1589,54 @@ static EMAIL_MEMBERS: &[(&str, MemberKind)] = &[
     ("close", MemberKind::HandleMethod),
 ];
 
+// ── std/blob (BATT B8 §9.2) ───────────────────────────────────────────────────
+
+static BLOB_CLIENT_PARAMS: &[StdParam] = &[StdParam::req("config", "object")];
+// BlobClient handle methods.
+static BLOB_PUT_PARAMS: &[StdParam] = &[
+    StdParam::req("key", "string"),
+    StdParam::req("data", "bytes | string"),
+    StdParam::opt("opts", "object"),
+];
+static BLOB_GET_PARAMS: &[StdParam] = &[StdParam::req("key", "string"), StdParam::opt("opts", "object")];
+static BLOB_HEAD_PARAMS: &[StdParam] = &[StdParam::req("key", "string"), StdParam::opt("opts", "object")];
+static BLOB_DELETE_PARAMS: &[StdParam] = &[StdParam::req("key", "string"), StdParam::opt("opts", "object")];
+static BLOB_LIST_PARAMS: &[StdParam] = &[StdParam::opt("opts", "object")];
+static BLOB_PRESIGN_PARAMS: &[StdParam] = &[
+    StdParam::req("method", "string"),
+    StdParam::req("key", "string"),
+    StdParam::opt("opts", "object"),
+];
+static BLOB_PUT_MULTIPART_PARAMS: &[StdParam] = &[
+    StdParam::req("key", "string"),
+    StdParam::req("source", "array | generator"),
+    StdParam::opt("opts", "object"),
+];
+
+static BLOB_SIGS: &[(&str, StdSig)] = &[
+    ("client", StdSig { params: BLOB_CLIENT_PARAMS, ret: Some("blobClient"), doc: "Builds an S3-compatible client over the shared pooled HTTP client with SigV4 signing. config: {endpoint, region, accessKey, secretKey, sessionToken?, bucket?, pathStyle?}. The handle exposes put/get/head/delete/list/presign/putMultipart. Net-gated (whole module, including presign)." }),
+    // BlobClient handle methods.
+    ("put", StdSig { params: BLOB_PUT_PARAMS, ret: Some("[string, err]"), doc: "Uploads an object and returns [etag, err]. opts: {contentType?, metadata?, bucket?}. data is a string or bytes. Async." }),
+    ("get", StdSig { params: BLOB_GET_PARAMS, ret: Some("[bytes, err]"), doc: "Downloads an object and returns [bytes, err]. opts: {bucket?, range?: [start, end]}. Async." }),
+    ("head", StdSig { params: BLOB_HEAD_PARAMS, ret: Some("[object, err]"), doc: "Fetches object metadata and returns [{size, etag, contentType, lastModified, metadata}, err]. opts: {bucket?}. Async." }),
+    ("delete", StdSig { params: BLOB_DELETE_PARAMS, ret: Some("[nil, err]"), doc: "Deletes an object and returns [nil, err]. opts: {bucket?}. Async." }),
+    ("list", StdSig { params: BLOB_LIST_PARAMS, ret: Some("generator"), doc: "Returns a LAZY generator that yields {key, size, etag, lastModified} per object, paginating across continuation tokens (page N+1 fetched only when iteration crosses it). opts: {prefix?, delimiter?, bucket?, pageSize?}." }),
+    ("presign", StdSig { params: BLOB_PRESIGN_PARAMS, ret: Some("[string, err]"), doc: "Mints a presigned URL (no network) and returns [url, err]. opts: {expires?: seconds (default 900), bucket?, contentType?}. Net-gated (the URL carries the signing secret's authority)." }),
+    ("putMultipart", StdSig { params: BLOB_PUT_MULTIPART_PARAMS, ret: Some("[string, err]"), doc: "Uploads a large object in parts (create → UploadPart per chunk → complete; aborts the upload on any part error so no orphan remains) and returns [etag, err]. source is an array of bytes/string chunks. A configured partSize below 5 MiB is a Tier-2 error. Async." }),
+];
+
+static BLOB_MEMBERS: &[(&str, MemberKind)] = &[
+    ("client", MemberKind::Fn),
+    // BlobClient handle methods — not module exports.
+    ("put", MemberKind::HandleMethod),
+    ("get", MemberKind::HandleMethod),
+    ("head", MemberKind::HandleMethod),
+    ("delete", MemberKind::HandleMethod),
+    ("list", MemberKind::HandleMethod),
+    ("presign", MemberKind::HandleMethod),
+    ("putMultipart", MemberKind::HandleMethod),
+];
+
 // ── std/net ───────────────────────────────────────────────────────────────────
 
 static NET_LOOKUP_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
@@ -2983,6 +3031,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/xml", XML_MEMBERS),
     ("std/html", HTML_MEMBERS),
     ("std/email", EMAIL_MEMBERS),
+    ("std/blob", BLOB_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3061,6 +3110,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/xml" => XML_SIGS,
         "std/html" => HTML_SIGS,
         "std/email" => EMAIL_SIGS,
+        "std/blob" => BLOB_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
@@ -3237,6 +3287,7 @@ mod tests {
             ("std/jwt", JWT_SIGS),
             ("std/oauth", OAUTH_SIGS),
             ("std/archive", ARCHIVE_SIGS),
+            ("std/blob", BLOB_SIGS),
         ];
         for (module, sigs) in all_sigs {
             for (name, sig) in sigs.iter() {

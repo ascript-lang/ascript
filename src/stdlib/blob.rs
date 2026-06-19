@@ -1,21 +1,35 @@
 #![cfg(feature = "blob")]
-#![allow(dead_code)]
-// B7: sigv4 core is exercised by the vector battery; the client (B8) is its real consumer.
 
-//! `std/blob` — S3-compatible object storage.
+//! `std/blob` — S3-compatible object storage (BATT B8 §9).
 //!
-//! **B7 scope:** the AWS Signature Version 4 (SigV4) core ONLY, as pure functions.
-//! Operations + the pooled-HTTP client come in B8; this module is intentionally
-//! NOT yet registered in `STD_MODULES` / routing / `std_sigs` / `rtstub`.
+//! A small S3 REST client over the SHARED pooled reqwest client
+//! (`net_http::shared_client()` — there is NO second HTTP stack) with AWS
+//! Signature Version 4 request signing (the [`sigv4`] core, B7). Every operation
+//! is **Tier-1** (`[value, err]`): an S3 error body decodes to `{code, message,
+//! status}`; a network failure or malformed XML is a clean error, never a panic.
+//! Misuse (a non-object client config, a non-array `list` opts, a too-small
+//! configured multipart part size) is a **Tier-2** panic.
+//!
+//! The `blob.client(...)` handle is a `NativeKind::BlobClient` carrying CONFIG ONLY
+//! (endpoint, region, credentials, default bucket, path-style flag) behind a
+//! [`ResourceState::BlobClient`]; operating it requires the `net` capability (whole
+//! module, INCLUDING `presign` — minting a capability-bearing URL from the secret
+//! key is gated alongside the rest of the secret-handling surface).
 //!
 //! SigV4 is security-critical: a wrong canonicalization silently produces an
-//! invalid signature or, worse, signs the wrong request. Every stage is pinned
-//! byte-exactly against published / independently-derived AWS vectors in the
-//! `sigv4_vector_battery` below.
+//! invalid signature or, worse, signs the wrong request. Every stage of the
+//! [`sigv4`] core is pinned byte-exactly against published / independently-derived
+//! AWS vectors in the `sigv4_vector_battery` below.
 
 /// AWS Signature Version 4 core. Pure functions over request components — no I/O,
 /// no clock, no environment. The caller supplies the `amz_datetime`
 /// (`YYYYMMDDTHHMMSSZ`) and a precomputed payload hash.
+///
+/// `allow(dead_code)`: this is the COMPLETE SigV4 surface (the `EMPTY_PAYLOAD_SHA256`
+/// constant + the `SignedRequest`/`PresignedQuery` accessor fields). The B8 client
+/// reaches most of it; the remainder is exercised by the `sigv4_vector_battery` and is
+/// part of the audited, vector-pinned public API — kept whole on purpose.
+#[allow(dead_code)]
 pub(crate) mod sigv4 {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
@@ -372,6 +386,962 @@ pub(crate) mod sigv4 {
             signature: sig,
         }
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The S3 client (BATT B8 §9.2)
+// ═════════════════════════════════════════════════════════════════════════════
+
+use crate::error::AsError;
+use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
+use crate::span::Span;
+use crate::stdlib::{arg, want_object, want_string};
+use crate::value::{NativeKind, NativeMethod, Value, ValueKind};
+use indexmap::IndexMap;
+use std::rc::Rc;
+
+/// The S3 service name (always `s3` for object storage).
+const SERVICE: &str = "s3";
+/// Default presign expiry (seconds).
+const DEFAULT_PRESIGN_EXPIRES: u64 = 900;
+/// S3's hard floor for a non-final multipart part (5 MiB).
+const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// The CONFIG-ONLY state behind a `NativeKind::BlobClient` handle. Holds no socket —
+/// every operation makes a fresh request through the SHARED pooled reqwest client,
+/// so there is nothing to reclaim on drop beyond the plain data. Boxed in the
+/// `ResourceState` enum to keep it compact.
+#[derive(Clone)]
+pub(crate) struct BlobClientState {
+    /// The endpoint base URL (scheme://host[:port]), no trailing slash.
+    endpoint: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    /// Default bucket (overridable per-call via `opts.bucket`).
+    bucket: Option<String>,
+    /// Path-style (`endpoint/bucket/key`) vs virtual-host (`bucket.host/key`).
+    path_style: bool,
+}
+
+pub fn exports() -> Vec<(&'static str, Value)> {
+    vec![("client", crate::stdlib::bi("blob.client"))]
+}
+
+/// Build the `[YYYYMMDDTHHMMSSZ, YYYYMMDD]` pair from epoch-ms (the det clock seam).
+fn amz_dates(epoch_ms: f64) -> (String, String) {
+    // Convert epoch ms → a UTC civil datetime WITHOUT a calendar dep: derive the
+    // date from days-since-epoch and the time from the second-of-day. This matches
+    // the `YYYYMMDDTHHMMSSZ` / `YYYYMMDD` SigV4 forms and is determinism-replayable
+    // by construction (input is the det clock).
+    let total_secs = (epoch_ms / 1000.0).floor() as i64;
+    let days = total_secs.div_euclid(86_400);
+    let secs_of_day = total_secs.rem_euclid(86_400);
+    let (h, mi, s) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (y, mo, d) = civil_from_days(days);
+    let datetime = format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z");
+    let date = format!("{y:04}{mo:02}{d:02}");
+    (datetime, date)
+}
+
+/// Days since 1970-01-01 → (year, month, day). Howard Hinnant's civil_from_days.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Parse + type-check `blob.client(config)`. Misuse → Tier-2 panic.
+fn parse_client_config(config: &Value, span: Span) -> Result<BlobClientState, Control> {
+    let o = want_object(config, span, "blob.client")?;
+    let req_str = |key: &str| -> Result<String, Control> {
+        match o.get(key) {
+            Some(v) => Ok(want_string(&v, span, &format!("blob.client '{key}'"))?.to_string()),
+            None => Err(AsError::at(format!("blob.client: '{key}' is required"), span).into()),
+        }
+    };
+    let opt_str = |key: &str| -> Result<Option<String>, Control> {
+        match o.get(key) {
+            None => Ok(None),
+            Some(v) if matches!(v.kind(), ValueKind::Nil) => Ok(None),
+            Some(v) => Ok(Some(want_string(&v, span, &format!("blob.client '{key}'"))?.to_string())),
+        }
+    };
+    let endpoint = req_str("endpoint")?;
+    let endpoint = endpoint.trim_end_matches('/').to_string();
+    let region = req_str("region")?;
+    let access_key = req_str("accessKey")?;
+    let secret_key = req_str("secretKey")?;
+    let session_token = opt_str("sessionToken")?;
+    let bucket = opt_str("bucket")?;
+    // path_style defaults true (non-AWS endpoints are usually path-style); an AWS
+    // endpoint (`amazonaws.com`) defaults to virtual-host.
+    let path_style = match o.get("pathStyle") {
+        Some(v) if !matches!(v.kind(), ValueKind::Nil) => v.is_truthy(),
+        _ => !endpoint.contains("amazonaws.com"),
+    };
+    if endpoint.is_empty() || !endpoint.contains("://") {
+        return Err(AsError::at(
+            format!("blob.client: 'endpoint' must be an absolute URL (scheme://host), got {endpoint:?}"),
+            span,
+        )
+        .into());
+    }
+    Ok(BlobClientState {
+        endpoint,
+        region,
+        access_key,
+        secret_key,
+        session_token,
+        bucket,
+        path_style,
+    })
+}
+
+/// A built request target: the absolute URL, the host header to sign, and the
+/// canonical URI path (already split so the host carries no path).
+struct Target {
+    url: String,
+    host: String,
+    /// The path component to sign (begins with `/`).
+    path: String,
+}
+
+impl BlobClientState {
+    /// Resolve the effective bucket (per-call override else default). A missing
+    /// bucket is a Tier-2 misuse.
+    fn bucket_for(&self, opts: Option<&Value>, span: Span) -> Result<String, Control> {
+        if let Some(ov) = opts {
+            if let ValueKind::Object(o) = ov.kind() {
+                if let Some(b) = o.get("bucket") {
+                    if !matches!(b.kind(), ValueKind::Nil) {
+                        return Ok(want_string(&b, span, "blob opts.bucket")?.to_string());
+                    }
+                }
+            }
+        }
+        self.bucket.clone().ok_or_else(|| {
+            AsError::at(
+                "blob: no bucket — set a default bucket on the client or pass opts.bucket",
+                span,
+            )
+            .into()
+        })
+    }
+
+    /// Build the URL + host + signing path for a (bucket, key) under the configured
+    /// addressing style. `key` may be empty (bucket-level operations like `list`).
+    fn target(&self, bucket: &str, key: &str) -> Target {
+        // Split the endpoint into scheme + authority (host[:port]).
+        let (scheme, authority) = match self.endpoint.split_once("://") {
+            Some((s, rest)) => (s, rest),
+            None => ("https", self.endpoint.as_str()),
+        };
+        // Encode each key path segment (S3 single-encode, preserving `/`).
+        let key_path = if key.is_empty() {
+            String::new()
+        } else {
+            sigv4::canonical_uri(&format!("/{}", key.trim_start_matches('/')))
+        };
+        if self.path_style {
+            // endpoint/bucket/key — host is the endpoint authority unchanged.
+            let path = if key.is_empty() {
+                format!("/{bucket}")
+            } else {
+                format!("/{bucket}{key_path}")
+            };
+            Target {
+                url: format!("{scheme}://{authority}{path}"),
+                host: authority.to_string(),
+                path,
+            }
+        } else {
+            // virtual-host: bucket.host/key
+            let vhost = format!("{bucket}.{authority}");
+            let path = if key.is_empty() { "/".to_string() } else { key_path };
+            Target {
+                url: format!("{scheme}://{vhost}{path}"),
+                host: vhost,
+                path,
+            }
+        }
+    }
+}
+
+/// Decode an S3 XML error body → `{code, message, status}`. A malformed body still
+/// yields a clean error (carrying the status + the raw text as the message), never a
+/// panic. `status` is always present.
+fn s3_error_value(status: u16, body: &str) -> Value {
+    let mut code = String::new();
+    let mut message = String::new();
+    if let Ok(doc) = crate::stdlib::xml::parse_document(body) {
+        code = xml_child_text(&doc, "Code").unwrap_or_default();
+        message = xml_child_text(&doc, "Message").unwrap_or_default();
+    }
+    let mut o: IndexMap<String, Value> = IndexMap::new();
+    o.insert("code".to_string(), Value::str(if code.is_empty() { format!("HTTP{status}") } else { code }));
+    o.insert(
+        "message".to_string(),
+        Value::str(if message.is_empty() {
+            // Carry a trimmed snippet of the raw body so the user sees SOMETHING.
+            let snippet: String = body.trim().chars().take(200).collect();
+            if snippet.is_empty() {
+                format!("S3 request failed with status {status}")
+            } else {
+                snippet
+            }
+        } else {
+            message
+        }),
+    );
+    o.insert("status".to_string(), Value::int(status as i64));
+    Value::object(o)
+}
+
+/// An S3 XML element value is `{tag, attrs, children}`; `children` is an array of
+/// either text strings or nested elements. Find the FIRST child element with `tag`
+/// and return its concatenated text content.
+fn xml_child_text(elem: &Value, tag: &str) -> Option<String> {
+    let child = xml_find_child(elem, tag)?;
+    Some(xml_text(&child))
+}
+
+/// Find the first direct child element of `elem` whose tag == `tag`.
+fn xml_find_child(elem: &Value, tag: &str) -> Option<Value> {
+    let ValueKind::Object(o) = elem.kind() else { return None };
+    let children = o.get("children")?;
+    let ValueKind::Array(arr) = children.kind() else { return None };
+    for c in arr.borrow().iter() {
+        if let ValueKind::Object(co) = c.kind() {
+            if let Some(t) = co.get("tag") {
+                if matches!(t.kind(), ValueKind::Str(s) if s.as_ref() == tag) {
+                    return Some(c.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// All direct child elements of `elem` whose tag == `tag`.
+fn xml_find_children(elem: &Value, tag: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let ValueKind::Object(o) = elem.kind() else { return out };
+    let Some(children) = o.get("children") else { return out };
+    let ValueKind::Array(arr) = children.kind() else { return out };
+    for c in arr.borrow().iter() {
+        if let ValueKind::Object(co) = c.kind() {
+            if let Some(t) = co.get("tag") {
+                if matches!(t.kind(), ValueKind::Str(s) if s.as_ref() == tag) {
+                    out.push(c.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Concatenated text content of an element (only the direct text children).
+fn xml_text(elem: &Value) -> String {
+    let ValueKind::Object(o) = elem.kind() else { return String::new() };
+    let Some(children) = o.get("children") else { return String::new() };
+    let ValueKind::Array(arr) = children.kind() else { return String::new() };
+    let mut s = String::new();
+    for c in arr.borrow().iter() {
+        if let ValueKind::Str(t) = c.kind() {
+            s.push_str(t);
+        }
+    }
+    s
+}
+
+/// A signed request, ready to send: method, URL, host, the headers to attach
+/// (including the SigV4 `Authorization`), and the body.
+struct SignedHttp {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Interp {
+    /// BATT B8 §9.2 — dispatch the single module function `blob.client(config)`. The
+    /// cap gate already fired at `call_stdlib` (`required_cap("blob", _) == Net`).
+    pub(crate) async fn call_blob(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        match func {
+            "client" => {
+                let cfg = parse_client_config(&arg(args, 0), span)?;
+                let handle = self.register_resource(
+                    NativeKind::BlobClient,
+                    IndexMap::new(),
+                    ResourceState::BlobClient(Box::new(cfg)),
+                );
+                Ok(handle)
+            }
+            _ => Err(AsError::at(format!("std/blob has no function '{func}'"), span).into()),
+        }
+    }
+
+    /// Dispatch a method on a live `BlobClient` handle. The per-handle Net re-check
+    /// fired in `call_native_method` before reaching here (so a `caps.drop("net")`
+    /// holds for an already-built client — INCLUDING `presign`).
+    pub(crate) async fn call_blob_method(
+        &self,
+        m: &Rc<NativeMethod>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let id = m.receiver.id;
+        // Clone the config out (take-out-across-await: never hold the resources borrow
+        // across the network `.await`). The client is config-only, so we clone + return
+        // it immediately (it is never mutated).
+        let cfg = match self.take_resource(id) {
+            Some(ResourceState::BlobClient(s)) => {
+                let cfg = (*s).clone();
+                self.return_resource(id, ResourceState::BlobClient(s));
+                cfg
+            }
+            other => {
+                if let Some(o) = other {
+                    self.return_resource(id, o);
+                }
+                return Err(AsError::at("blob client is closed", span).into());
+            }
+        };
+        match m.method.as_str() {
+            "put" => self.blob_put(&cfg, &args, span).await,
+            "get" => self.blob_get(&cfg, &args, span).await,
+            "head" => self.blob_head(&cfg, &args, span).await,
+            "delete" => self.blob_delete(&cfg, &args, span).await,
+            "list" => self.blob_list(&cfg, &args, span),
+            "presign" => self.blob_presign(&cfg, &args, span),
+            "putMultipart" => self.blob_put_multipart(&cfg, &args, span).await,
+            other => Err(AsError::at(format!("blobClient has no method '{other}'"), span).into()),
+        }
+    }
+
+    /// Sign a request: build the canonical headers (host, x-amz-date,
+    /// x-amz-content-sha256, optional x-amz-security-token), run SigV4, and return
+    /// the ready-to-send request. Time from the determinism seam.
+    fn sign_http(
+        &self,
+        cfg: &BlobClientState,
+        method: &str,
+        target: &Target,
+        query: &str,
+        mut extra_headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> SignedHttp {
+        let (amz_datetime, date) = amz_dates(self.clock_now_ms());
+        let payload_hash = sigv4::sha256_hex(&body);
+
+        let mut headers: Vec<(String, String)> = vec![
+            ("host".to_string(), target.host.clone()),
+            ("x-amz-date".to_string(), amz_datetime.clone()),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        ];
+        if let Some(tok) = &cfg.session_token {
+            headers.push(("x-amz-security-token".to_string(), tok.clone()));
+        }
+        headers.append(&mut extra_headers);
+
+        let signed = sigv4::sign_request(
+            method,
+            &target.path,
+            query,
+            &headers,
+            &payload_hash,
+            &cfg.region,
+            SERVICE,
+            &amz_datetime,
+            &date,
+            &cfg.access_key,
+            &cfg.secret_key,
+        );
+
+        let url = if query.is_empty() {
+            target.url.clone()
+        } else {
+            format!("{}?{}", target.url, query)
+        };
+        // Attach the Authorization header to the wire headers.
+        headers.push(("authorization".to_string(), signed.authorization));
+
+        SignedHttp {
+            method: method.to_string(),
+            url,
+            headers,
+            body,
+        }
+    }
+
+    /// Send a signed request through the shared pooled client. Returns the reqwest
+    /// response or a Tier-1 error pair (network failure).
+    async fn send_signed(&self, req: SignedHttp) -> Result<reqwest::Response, Value> {
+        let client = crate::stdlib::net_http::shared_client();
+        let method = reqwest::Method::from_bytes(req.method.as_bytes())
+            .unwrap_or(reqwest::Method::GET);
+        let mut rb = client.request(method, &req.url);
+        for (k, v) in &req.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        if !req.body.is_empty() {
+            rb = rb.body(req.body.clone());
+        }
+        match rb.send().await {
+            Ok(r) => Ok(r),
+            Err(e) => Err(make_error(Value::str(format!("blob request failed: {e}")))),
+        }
+    }
+
+    // ── put ────────────────────────────────────────────────────────────────────
+
+    async fn blob_put(&self, cfg: &BlobClientState, args: &[Value], span: Span) -> Result<Value, Control> {
+        let key = want_string(&arg(args, 0), span, "blob.put key")?.to_string();
+        let data = body_bytes(&arg(args, 1), span, "blob.put data")?;
+        let opts = arg(args, 2);
+        let opts_ref = (!matches!(opts.kind(), ValueKind::Nil)).then_some(&opts);
+        let bucket = cfg.bucket_for(opts_ref, span)?;
+
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(ov) = opts_ref {
+            if let ValueKind::Object(o) = ov.kind() {
+                if let Some(ct) = o.get("contentType") {
+                    if let ValueKind::Str(s) = ct.kind() {
+                        headers.push(("content-type".to_string(), s.to_string()));
+                    }
+                }
+                if let Some(md) = o.get("metadata") {
+                    if let ValueKind::Object(mo) = md.kind() {
+                        for (k, v) in mo.entries() {
+                            if let ValueKind::Str(s) = v.kind() {
+                                headers.push((format!("x-amz-meta-{}", k.to_ascii_lowercase()), s.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let target = cfg.target(&bucket, &key);
+        let req = self.sign_http(cfg, "PUT", &target, "", headers, data);
+        let resp = match self.send_signed(req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(make_pair(Value::nil(), e)),
+        };
+        let status = resp.status().as_u16();
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string());
+        if !(200..300).contains(&status) {
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(make_pair(Value::nil(), s3_error_value(status, &body)));
+        }
+        Ok(make_pair(Value::str(etag.unwrap_or_default()), Value::nil()))
+    }
+
+    // ── get ────────────────────────────────────────────────────────────────────
+
+    async fn blob_get(&self, cfg: &BlobClientState, args: &[Value], span: Span) -> Result<Value, Control> {
+        let key = want_string(&arg(args, 0), span, "blob.get key")?.to_string();
+        let opts = arg(args, 1);
+        let opts_ref = (!matches!(opts.kind(), ValueKind::Nil)).then_some(&opts);
+        let bucket = cfg.bucket_for(opts_ref, span)?;
+
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(ov) = opts_ref {
+            if let ValueKind::Object(o) = ov.kind() {
+                if let Some(r) = o.get("range") {
+                    if let ValueKind::Array(a) = r.kind() {
+                        let a = a.borrow();
+                        if a.len() == 2 {
+                            if let (ValueKind::Int(s), ValueKind::Int(e)) = (a[0].kind(), a[1].kind()) {
+                                headers.push(("range".to_string(), format!("bytes={s}-{e}")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let target = cfg.target(&bucket, &key);
+        let req = self.sign_http(cfg, "GET", &target, "", headers, Vec::new());
+        let resp = match self.send_signed(req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(make_pair(Value::nil(), e)),
+        };
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(make_pair(Value::nil(), s3_error_value(status, &body)));
+        }
+        match resp.bytes().await {
+            Ok(b) => Ok(make_pair(Value::bytes(b.to_vec()), Value::nil())),
+            Err(e) => Ok(make_pair(Value::nil(), make_error(Value::str(format!("blob.get read failed: {e}"))))),
+        }
+    }
+
+    // ── head ───────────────────────────────────────────────────────────────────
+
+    async fn blob_head(&self, cfg: &BlobClientState, args: &[Value], span: Span) -> Result<Value, Control> {
+        let key = want_string(&arg(args, 0), span, "blob.head key")?.to_string();
+        let opts = arg(args, 1);
+        let opts_ref = (!matches!(opts.kind(), ValueKind::Nil)).then_some(&opts);
+        let bucket = cfg.bucket_for(opts_ref, span)?;
+
+        let target = cfg.target(&bucket, &key);
+        let req = self.sign_http(cfg, "HEAD", &target, "", Vec::new(), Vec::new());
+        let resp = match self.send_signed(req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(make_pair(Value::nil(), e)),
+        };
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            // A HEAD has no body; surface the status.
+            return Ok(make_pair(Value::nil(), s3_error_value(status, "")));
+        }
+        let h = resp.headers();
+        let get = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        let mut out: IndexMap<String, Value> = IndexMap::new();
+        let size = get("content-length").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        out.insert("size".to_string(), Value::int(size));
+        out.insert(
+            "etag".to_string(),
+            Value::str(get("etag").map(|s| s.trim_matches('"').to_string()).unwrap_or_default()),
+        );
+        out.insert("contentType".to_string(), Value::str(get("content-type").unwrap_or_default()));
+        out.insert("lastModified".to_string(), Value::str(get("last-modified").unwrap_or_default()));
+        let mut meta: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in h.iter() {
+            let kn = k.as_str();
+            if let Some(suffix) = kn.strip_prefix("x-amz-meta-") {
+                if let Ok(vs) = v.to_str() {
+                    meta.insert(suffix.to_string(), Value::str(vs.to_string()));
+                }
+            }
+        }
+        out.insert("metadata".to_string(), Value::object(meta));
+        Ok(make_pair(Value::object(out), Value::nil()))
+    }
+
+    // ── delete ──────────────────────────────────────────────────────────────────
+
+    async fn blob_delete(&self, cfg: &BlobClientState, args: &[Value], span: Span) -> Result<Value, Control> {
+        let key = want_string(&arg(args, 0), span, "blob.delete key")?.to_string();
+        let opts = arg(args, 1);
+        let opts_ref = (!matches!(opts.kind(), ValueKind::Nil)).then_some(&opts);
+        let bucket = cfg.bucket_for(opts_ref, span)?;
+
+        let target = cfg.target(&bucket, &key);
+        let req = self.sign_http(cfg, "DELETE", &target, "", Vec::new(), Vec::new());
+        let resp = match self.send_signed(req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(make_pair(Value::nil(), e)),
+        };
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(make_pair(Value::nil(), s3_error_value(status, &body)));
+        }
+        Ok(make_pair(Value::nil(), Value::nil()))
+    }
+
+    // ── list (lazy paginating generator) ─────────────────────────────────────────
+
+    fn blob_list(&self, cfg: &BlobClientState, args: &[Value], span: Span) -> Result<Value, Control> {
+        let opts = arg(args, 0);
+        // A non-object opts (other than nil) is a Tier-2 misuse.
+        if !matches!(opts.kind(), ValueKind::Nil | ValueKind::Object(_)) {
+            return Err(AsError::at(
+                format!("blob.list: opts must be an object, got {}", crate::interp::type_name(&opts)),
+                span,
+            )
+            .into());
+        }
+        let opts_ref = (!matches!(opts.kind(), ValueKind::Nil)).then_some(&opts);
+        let bucket = cfg.bucket_for(opts_ref, span)?;
+        let get_str = |key: &str| -> Option<String> {
+            opts_ref.and_then(|ov| {
+                if let ValueKind::Object(o) = ov.kind() {
+                    o.get(key).and_then(|v| match v.kind() {
+                        ValueKind::Str(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+        };
+        let prefix = get_str("prefix");
+        let delimiter = get_str("delimiter");
+        let page_size: Option<i64> = opts_ref.and_then(|ov| {
+            if let ValueKind::Object(o) = ov.kind() {
+                o.get("pageSize").and_then(|v| match v.kind() {
+                    ValueKind::Int(n) => Some(n),
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        });
+
+        let cfg = cfg.clone();
+        let me = self.rc();
+        // A native cursor generator: it makes its OWN signed HTTP calls per page,
+        // yielding one entry per `next()`. Page N+1 is fetched ONLY when iteration
+        // crosses past page N's entries (driven by NextContinuationToken/IsTruncated).
+        let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
+            Box::pin(async move {
+                let mut continuation: Option<String> = None;
+                loop {
+                    // Build the list-objects-v2 query.
+                    let mut pairs: Vec<(String, String)> = vec![("list-type".into(), "2".into())];
+                    if let Some(p) = &prefix {
+                        if !p.is_empty() {
+                            pairs.push(("prefix".into(), p.clone()));
+                        }
+                    }
+                    if let Some(d) = &delimiter {
+                        if !d.is_empty() {
+                            pairs.push(("delimiter".into(), d.clone()));
+                        }
+                    }
+                    if let Some(ps) = page_size {
+                        pairs.push(("max-keys".into(), ps.to_string()));
+                    }
+                    if let Some(tok) = &continuation {
+                        pairs.push(("continuation-token".into(), tok.clone()));
+                    }
+                    let query = sigv4::canonical_query_pairs(&pairs);
+
+                    let target = cfg.target(&bucket, "");
+                    let req = me.sign_http(&cfg, "GET", &target, &query, Vec::new(), Vec::new());
+                    let resp = match me.send_signed(req).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let g = crate::coro::current_generator().expect("inside a generator");
+                            g.yield_(make_pair(Value::nil(), e)).await;
+                            return Ok(Value::nil());
+                        }
+                    };
+                    let status = resp.status().as_u16();
+                    let text = resp.text().await.unwrap_or_default();
+                    if !(200..300).contains(&status) {
+                        let g = crate::coro::current_generator().expect("inside a generator");
+                        g.yield_(make_pair(Value::nil(), s3_error_value(status, &text))).await;
+                        return Ok(Value::nil());
+                    }
+                    let doc = match crate::stdlib::xml::parse_document(&text) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let g = crate::coro::current_generator().expect("inside a generator");
+                            g.yield_(make_pair(
+                                Value::nil(),
+                                make_error(Value::str(format!("blob.list: malformed XML response: {e}"))),
+                            ))
+                            .await;
+                            return Ok(Value::nil());
+                        }
+                    };
+                    for c in xml_find_children(&doc, "Contents") {
+                        let entry = list_entry_value(&c);
+                        let g = crate::coro::current_generator().expect("inside a generator");
+                        g.yield_(entry).await;
+                    }
+                    let truncated = xml_child_text(&doc, "IsTruncated")
+                        .map(|s| s.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let next = xml_child_text(&doc, "NextContinuationToken").filter(|s| !s.is_empty());
+                    match (truncated, next) {
+                        (true, Some(tok)) => continuation = Some(tok),
+                        _ => break,
+                    }
+                }
+                Ok(Value::nil())
+            });
+        Ok(Value::generator(Rc::new(crate::coro::GeneratorHandle::new(body))))
+    }
+
+    // ── presign (pure; no network) ───────────────────────────────────────────────
+
+    fn blob_presign(&self, cfg: &BlobClientState, args: &[Value], span: Span) -> Result<Value, Control> {
+        let method = want_string(&arg(args, 0), span, "blob.presign method")?.to_string();
+        let key = want_string(&arg(args, 1), span, "blob.presign key")?.to_string();
+        let opts = arg(args, 2);
+        let opts_ref = (!matches!(opts.kind(), ValueKind::Nil)).then_some(&opts);
+        let bucket = cfg.bucket_for(opts_ref, span)?;
+
+        let expires = opts_ref
+            .and_then(|ov| {
+                if let ValueKind::Object(o) = ov.kind() {
+                    o.get("expires").and_then(|v| match v.kind() {
+                        ValueKind::Int(n) if n > 0 => Some(n as u64),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(DEFAULT_PRESIGN_EXPIRES);
+
+        let target = cfg.target(&bucket, &key);
+        let (amz_datetime, date) = amz_dates(self.clock_now_ms());
+        let p = sigv4::presign(
+            &method,
+            &target.path,
+            &target.host,
+            &cfg.region,
+            SERVICE,
+            &amz_datetime,
+            &date,
+            expires,
+            &cfg.access_key,
+            &cfg.secret_key,
+            cfg.session_token.as_deref(),
+            &[],
+        );
+        let url = format!("{}?{}", target.url, p.query);
+        Ok(make_pair(Value::str(url), Value::nil()))
+    }
+
+    // ── putMultipart (create → parts → complete; abort on error) ──────────────────
+
+    async fn blob_put_multipart(
+        &self,
+        cfg: &BlobClientState,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        let key = want_string(&arg(args, 0), span, "blob.putMultipart key")?.to_string();
+        let source = arg(args, 1);
+        let opts = arg(args, 2);
+        let opts_ref = (!matches!(opts.kind(), ValueKind::Nil)).then_some(&opts);
+        let bucket = cfg.bucket_for(opts_ref, span)?;
+
+        // A CONFIGURED partSize below the 5 MiB floor is a Tier-2 misuse.
+        if let Some(ov) = opts_ref {
+            if let ValueKind::Object(o) = ov.kind() {
+                if let Some(ps) = o.get("partSize") {
+                    if let ValueKind::Int(n) = ps.kind() {
+                        if (n as usize) < MIN_PART_SIZE {
+                            return Err(AsError::at(
+                                format!(
+                                    "blob.putMultipart: partSize {n} is below the S3 minimum of {MIN_PART_SIZE} bytes (5 MiB) for non-final parts"
+                                ),
+                                span,
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect chunks from an array source (a generator source is driven the same
+        // way via the iteration protocol; v1 accepts an array of bytes chunks).
+        let chunks = collect_chunks(&source, span)?;
+
+        let content_type = opts_ref.and_then(|ov| {
+            if let ValueKind::Object(o) = ov.kind() {
+                o.get("contentType").and_then(|v| match v.kind() {
+                    ValueKind::Str(s) => Some(s.to_string()),
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        });
+
+        // 1) InitiateMultipartUpload — POST ?uploads
+        let target = cfg.target(&bucket, &key);
+        let mut init_headers: Vec<(String, String)> = Vec::new();
+        if let Some(ct) = &content_type {
+            init_headers.push(("content-type".to_string(), ct.clone()));
+        }
+        let req = self.sign_http(cfg, "POST", &target, "uploads=", init_headers, Vec::new());
+        let resp = match self.send_signed(req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(make_pair(Value::nil(), e)),
+        };
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Ok(make_pair(Value::nil(), s3_error_value(status, &text)));
+        }
+        let upload_id = match crate::stdlib::xml::parse_document(&text)
+            .ok()
+            .and_then(|d| xml_child_text(&d, "UploadId"))
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => id,
+            None => {
+                return Ok(make_pair(
+                    Value::nil(),
+                    make_error(Value::str("blob.putMultipart: no UploadId in InitiateMultipartUpload response")),
+                ))
+            }
+        };
+
+        // 2) UploadPart per chunk — PUT ?partNumber=N&uploadId=...
+        let mut part_etags: Vec<(usize, String)> = Vec::new();
+        let mut failure: Option<Value> = None;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let part_number = i + 1;
+            let query = format!("partNumber={part_number}&uploadId={upload_id}");
+            // canonicalize (sorts partNumber<uploadId) — sigv4 needs canonical query.
+            let canon = sigv4::canonical_query_string(&query);
+            let req = self.sign_http(cfg, "PUT", &target, &canon, Vec::new(), chunk.clone());
+            let resp = match self.send_signed(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
+            let st = resp.status().as_u16();
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            if !(200..300).contains(&st) {
+                let b = resp.text().await.unwrap_or_default();
+                failure = Some(s3_error_value(st, &b));
+                break;
+            }
+            match etag {
+                Some(e) => part_etags.push((part_number, e)),
+                None => {
+                    failure = Some(make_error(Value::str(format!(
+                        "blob.putMultipart: part {part_number} response had no ETag"
+                    ))));
+                    break;
+                }
+            }
+        }
+
+        // On ANY part error → AbortMultipartUpload (no orphaned upload), then return.
+        if let Some(err) = failure {
+            let abort_q = sigv4::canonical_query_string(&format!("uploadId={upload_id}"));
+            let req = self.sign_http(cfg, "DELETE", &target, &abort_q, Vec::new(), Vec::new());
+            let _ = self.send_signed(req).await; // best-effort
+            return Ok(make_pair(Value::nil(), err));
+        }
+
+        // 3) CompleteMultipartUpload — POST ?uploadId=... with the part list XML.
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (n, etag) in &part_etags {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><ETag>{}</ETag></Part>",
+                xml_escape(etag)
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let complete_q = sigv4::canonical_query_string(&format!("uploadId={upload_id}"));
+        let req = self.sign_http(
+            cfg,
+            "POST",
+            &target,
+            &complete_q,
+            vec![("content-type".to_string(), "application/xml".to_string())],
+            xml.into_bytes(),
+        );
+        let resp = match self.send_signed(req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(make_pair(Value::nil(), e)),
+        };
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Ok(make_pair(Value::nil(), s3_error_value(status, &text)));
+        }
+        // S3 can return a 200 with an Error body for CompleteMultipartUpload.
+        if text.contains("<Error") {
+            return Ok(make_pair(Value::nil(), s3_error_value(200, &text)));
+        }
+        let etag = crate::stdlib::xml::parse_document(&text)
+            .ok()
+            .and_then(|d| xml_child_text(&d, "ETag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+        Ok(make_pair(Value::str(etag), Value::nil()))
+    }
+}
+
+/// Build a `{key, size, etag, lastModified}` value from a `<Contents>` element.
+fn list_entry_value(contents: &Value) -> Value {
+    let mut o: IndexMap<String, Value> = IndexMap::new();
+    o.insert("key".to_string(), Value::str(xml_child_text(contents, "Key").unwrap_or_default()));
+    let size = xml_child_text(contents, "Size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    o.insert("size".to_string(), Value::int(size));
+    o.insert(
+        "etag".to_string(),
+        Value::str(xml_child_text(contents, "ETag").map(|s| s.trim_matches('"').to_string()).unwrap_or_default()),
+    );
+    o.insert(
+        "lastModified".to_string(),
+        Value::str(xml_child_text(contents, "LastModified").unwrap_or_default()),
+    );
+    Value::object(o)
+}
+
+/// Coerce a `put`/multipart body argument (string or bytes) into raw bytes.
+fn body_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
+    match v.kind() {
+        ValueKind::Str(s) => Ok(s.as_bytes().to_vec()),
+        ValueKind::Bytes(b) => Ok(b.borrow().to_vec()),
+        _ => Err(AsError::at(
+            format!("{ctx} must be a string or bytes, got {}", crate::interp::type_name(v)),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// Collect multipart chunks from an ARRAY of byte/string chunks. (A generator source
+/// is recorded-unsupported in v1 — pass an array; documented in the spec.)
+fn collect_chunks(source: &Value, span: Span) -> Result<Vec<Vec<u8>>, Control> {
+    match source.kind() {
+        ValueKind::Array(a) => {
+            let mut out = Vec::new();
+            for (i, item) in a.borrow().iter().enumerate() {
+                out.push(body_bytes(item, span, &format!("blob.putMultipart chunk[{i}]"))?);
+            }
+            if out.is_empty() {
+                return Err(AsError::at("blob.putMultipart: source has no chunks", span).into());
+            }
+            Ok(out)
+        }
+        _ => Err(AsError::at(
+            format!(
+                "blob.putMultipart: source must be an array of bytes/string chunks, got {}",
+                crate::interp::type_name(source)
+            ),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// Minimal XML text escaping for the CompleteMultipartUpload part list (ETags are
+/// quoted hex, but escape defensively).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 #[cfg(test)]
