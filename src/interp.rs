@@ -6053,6 +6053,13 @@ impl Interp {
         {
             return true;
         }
+        // BATT B5 §8.1 — email-message `msg.raw()` call-position hook.
+        #[cfg(feature = "email")]
+        if crate::stdlib::email::is_email_value(recv)
+            && crate::stdlib::email::is_email_method(name)
+        {
+            return true;
+        }
         #[cfg(feature = "workflow")]
         if crate::stdlib::workflow::is_ctx_value(recv)
             && crate::stdlib::workflow::is_ctx_method(name)
@@ -6109,6 +6116,17 @@ impl Interp {
             rargs.push(recv);
             rargs.extend(args);
             return self.call_resilience_method(name, &rargs, span).await;
+        }
+        // BATT B5 §8.1 — email-message `msg.raw()` call-position hook. The builder is
+        // pure, so this is a synchronous dispatch (no `Interp` state, no `.await`).
+        #[cfg(feature = "email")]
+        if crate::stdlib::email::is_email_value(&recv)
+            && crate::stdlib::email::is_email_method(name)
+        {
+            let mut eargs = Vec::with_capacity(args.len() + 1);
+            eargs.push(recv);
+            eargs.extend(args);
+            return crate::stdlib::email::call_email_method(name, &eargs, span);
         }
         // Workflow ctx hook.
         #[cfg(feature = "workflow")]

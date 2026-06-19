@@ -24,6 +24,8 @@ pub mod archive;
 pub mod xml;
 #[cfg(feature = "xml")]
 pub mod html;
+#[cfg(feature = "email")]
+pub mod email;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "docker")]
@@ -248,6 +250,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/xml" => xml::exports(),
         #[cfg(feature = "xml")]
         "std/html" => html::exports(),
+        #[cfg(feature = "email")]
+        "std/email" => email::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -327,6 +331,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/archive",
     "std/xml",
     "std/html",
+    "std/email",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -454,6 +459,16 @@ pub fn required_cap(module: &str, func: &str) -> caps::CapReq {
         #[cfg(feature = "archive")]
         "archive" => match func {
             "tarExtractTo" | "zipExtractTo" | "tarCreateFromDir" => CapReq::one(Cap::Fs),
+            _ => CapReq::NONE,
+        },
+        // BATT B5 §8.1/§8.2 — `std/email` is PER-FUNC (the `jwt`/`archive` precedent):
+        // the SMTP client funcs (`send`/`connect`, B6) open a network socket → `Net`;
+        // the pure message builders (`message`/`validateAddress`) touch no OS resource
+        // → ungated (they work under `--sandbox`). Wiring the `Net` arm now so the gate
+        // is correct the moment B6 lands the client.
+        #[cfg(feature = "email")]
+        "email" => match func {
+            "send" | "connect" => CapReq::one(Cap::Net),
             _ => CapReq::NONE,
         },
         // `os` is per-func: topology/identity leak network info → `Net`; the rest
@@ -712,6 +727,8 @@ impl Interp {
             "xml" => xml::call(func, args, span),
             #[cfg(feature = "xml")]
             "html" => html::call(func, args, span),
+            #[cfg(feature = "email")]
+            "email" => email::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1199,6 +1216,15 @@ mod cap_gate_tests {
             assert_eq!(req("archive", "zipExtractTo"), vec![Cap::Fs]);
             assert_eq!(req("archive", "tarCreateFromDir"), vec![Cap::Fs]);
         }
+        // BATT B5 §8 — email is PER-FUNC: the pure builders (message/validateAddress)
+        // are ungated; the SMTP client (send/connect, B6) → Net.
+        #[cfg(feature = "email")]
+        {
+            assert!(required_cap("email", "message").is_empty());
+            assert!(required_cap("email", "validateAddress").is_empty());
+            assert_eq!(req("email", "send"), vec![Cap::Net]);
+            assert_eq!(req("email", "connect"), vec![Cap::Net]);
+        }
     }
 
     /// Drift guard: every resource-acquiring module string the dispatch match
@@ -1294,11 +1320,12 @@ mod cap_gate_tests {
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");
-            if key == "os" || key == "jwt" || key == "archive" {
+            if key == "os" || key == "jwt" || key == "archive" || key == "email" {
                 // Per-func gating (covered above): os (topology→Net, ambient→None);
                 // jwt (BATT §5.4 — jwks→Net, sign/verify/decode/hmacKey→None);
-                // archive (BATT B1 §6 — disk fns→Fs, streaming/in-memory→None). The
-                // whole-module `__probe__` verdict cannot represent a per-func split.
+                // archive (BATT B1 §6 — disk fns→Fs, streaming/in-memory→None);
+                // email (BATT B5 §8 — send/connect→Net, message/validateAddress→None).
+                // The whole-module `__probe__` verdict cannot represent a per-func split.
                 continue;
             }
             let gated = !required_cap(&key, "__probe__").is_empty();

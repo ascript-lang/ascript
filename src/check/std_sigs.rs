@@ -1554,6 +1554,27 @@ static HTML_MEMBERS: &[(&str, MemberKind)] = &[
     ("sanitize", MemberKind::Fn),
 ];
 
+// ── std/email (BATT B5 §8.1) ─────────────────────────────────────────────────
+
+static EMAIL_MESSAGE_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+static EMAIL_VALIDATE_ADDRESS_PARAMS: &[StdParam] = &[StdParam::req("addr", "string")];
+// message-handle method (`msg.raw()`).
+static EMAIL_RAW_PARAMS: &[StdParam] = &[];
+
+static EMAIL_SIGS: &[(&str, StdSig)] = &[
+    ("message", StdSig { params: EMAIL_MESSAGE_PARAMS, ret: Some("[object, err]"), doc: "Builds an email message (the pure builder; the SMTP client is separate). opts: {from, to, cc?, bcc?, subject, text?, html?, attachments?, headers?}. text+html → multipart/alternative; attachments → multipart/mixed (base64, wrapped at 76 cols); non-ASCII headers → RFC 2047 encoded-words; the boundary is content-deterministic. Every address/header is CRLF/NUL-rejected (Tier-2) to kill SMTP header injection; bcc stays in the envelope, never a header." }),
+    ("validateAddress", StdSig { params: EMAIL_VALIDATE_ADDRESS_PARAMS, ret: Some("bool"), doc: "Validates a bare local@domain address against a pragmatic RFC 5321 subset (dotted domain, no spaces/controls, ≤254 chars). Quoted-local forms are a documented-unsupported false." }),
+    // message-handle method.
+    ("raw", StdSig { params: EMAIL_RAW_PARAMS, ret: Some("string"), doc: "Returns the RFC 5322 wire form of a built message (for tests/inspection). The wire form is computed eagerly at build time and is byte-stable." }),
+];
+
+static EMAIL_MEMBERS: &[(&str, MemberKind)] = &[
+    ("message", MemberKind::Fn),
+    ("validateAddress", MemberKind::Fn),
+    // message-handle method — not a module export.
+    ("raw", MemberKind::HandleMethod),
+];
+
 // ── std/net ───────────────────────────────────────────────────────────────────
 
 static NET_LOOKUP_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
@@ -2947,6 +2968,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/archive", ARCHIVE_MEMBERS),
     ("std/xml", XML_MEMBERS),
     ("std/html", HTML_MEMBERS),
+    ("std/email", EMAIL_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3024,6 +3046,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/archive" => ARCHIVE_SIGS,
         "std/xml" => XML_SIGS,
         "std/html" => HTML_SIGS,
+        "std/email" => EMAIL_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)

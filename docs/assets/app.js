@@ -37,6 +37,7 @@ const NAV = [
     ['stdlib/db', 'Databases (SQLite, Postgres & Redis)'],
     ['stdlib/time', 'Time & locale'],
     ['stdlib/net', 'Networking & HTTP'],
+    ['stdlib/email', 'Email (SMTP)'],
     ['stdlib/auth', 'Auth (JWT, OAuth2, sessions)'],
     ['stdlib/docker', 'Docker (Engine API)'],
     ['stdlib/ffi', 'FFI (C interop)'],

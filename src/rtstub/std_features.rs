@@ -97,6 +97,10 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // helpers: escape/unescape/sanitize), so an html-using bundle pulls the
     // data tier.
     ("std/html",        Some("xml")),
+    // BATT Phase B §8 — std/email is gated on the `email` feature (email = net +
+    // tls + data). The net edge is load-bearing for tier selection: an email
+    // bundle (B6 SMTP client) must select the net tier.
+    ("std/email",       Some("email")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.
@@ -141,6 +145,17 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     // BATT Phase B §7.2 — xml = ["data", "dep:quick-xml"]. A std/xml bundle pulls
     // the data tier.
     ("xml", "data"),
+    // BATT Phase B §8 — email = ["net", "tls", "data"]. A std/email bundle pulls
+    // the net + data tiers (the SMTP client fetches over the network; the builder
+    // reuses base64/sha2 from the data tier) PLUS the tls tier (STARTTLS/implicit
+    // TLS in B6). All THREE bare feature→feature edges must be tracked so the
+    // `closure_drift` reverse check stays green; following `email → tls` makes
+    // `tls` closure-relevant, so its own `tls → net` edge is tracked too.
+    ("email", "net"),
+    ("email", "tls"),
+    ("email", "data"),
+    // tls = ["net", ...]. First reached transitively via `email → tls`.
+    ("tls", "net"),
 ];
 
 /// Collect all `std/` module specifiers imported anywhere in `archive`.
