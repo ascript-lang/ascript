@@ -257,8 +257,8 @@ stated, results are measured.
   - Plan: `superpowers/plans/2026-06-12-docs-reconciliation.md`
 
 
-- 🔒 **SIG — stdlib signature table + LSP signature/completion/hover enrichment + audit
-  hardening.** The 2026-06-12 LSP audit established that signature help resolves ONLY a unique
+- ✅ **SIG — stdlib signature table + LSP signature/completion/hover enrichment + audit
+  hardening. MERGED to `main` (`--no-ff`, `11cdb6a`). See EXECUTION LOG.** The 2026-06-12 LSP audit established that signature help resolves ONLY a unique
   same-file `fn` (`src/lsp/providers/signature.rs` — a `MemberExpr` callee like `array.map(`
   returns `None` by construction, so the ENTIRE stdlib, all methods, all builtins, and all
   cross-file imports show no signatures), and that native stdlib functions have NO
@@ -896,6 +896,57 @@ stated, results are measured.
   **Recorded ENABLED follow-ups** (RT+RESIL merged): rt-stub/`--oci` scratch image base for the Dockerfiles; the
   template `/proxy` upgrade to `std/resilience`; a `docker.md` note pointing at `task.timeout` for an unresponsive
   daemon (the docker calls have no built-in per-call read timeout — non-blocking, the daemon is trusted/local).
+
+- **SIG** — ✅ **MERGED to `main` (`--no-ff`, `11cdb6a`)** from `feat/lsp-stdlib-signatures`. Stdlib signature table +
+  LSP signature/completion/hover enrichment + audit hardening. **LSP/checker-static-only — ZERO engine/grammar/fmt/
+  `.aso` surface** (`git diff main -- src/vm src/interp.rs src/compile src/syntax src/value.rs src/gc.rs` EMPTY;
+  `ASO_FORMAT_VERSION` 29 unchanged; `vm_differential` trivially preserved — never touched). **Unit A — the data
+  asset:** `src/check/std_sigs.rs`, a curated `&'static` signature table (params + optionality/variadic + return +
+  one-line doc) for **all ~60 `STD_MODULES` exports + 10 global builtins + handle-method rows** (ffi/docker). Authored
+  with const-fn `StdParam` constructors (`req`/`req_untyped`/`opt`/`with_default`/`variadic`) + a `validate_param_order`
+  ordering guard — NOT a macro (spec granted latitude). The MACHINE source of truth; the docs pages stay the SOCIAL
+  source; **two drift-test families bind them** — the in-module bidirectional completeness pair (every export ⇄ a
+  kind-consistent row, both feature configs) + `tests/std_sigs_docs.rs` (a tolerant Style-1/Style-2 docs parser, 295
+  facts/283 matched, a comparator self-test, a Style-1 full-coverage guard). `std_arity.rs` **subsumed**: `std_fn_arity`
+  is now a thin derivation (`min` = leading non-optional non-variadic param count, `max=None`) over the table — one
+  source of truth, pinned by a 61-entry no-behavior-change test (the campaign's CNTR/PAR/RESIL additions made the plan's
+  published ~36-entry list stale; the full current 61 were pinned). **Unit B — three consumers read the table:**
+  `signatureHelp` gained a resolution ladder over a `MemberExpr`-extended `enclosing_call` (`Callee::{Named|Member}`):
+  same-file `FnDecl` → `builtin_sig` → cross-file `exported_fn_signature_by_import` (param names + annotations from the
+  workspace `ParamList` walk) → namespace-import + `std_sig` → typed-receiver method; active-param advances on `,` +
+  clamps to a variadic `...rest`; UTF-16 `LabelOffsets`; one-line docs. `completion` member items carry real
+  `FUNCTION`/`CONSTANT` kind + signature detail + lazy-resolved docs (from `module_members` — works under a core build
+  where the runtime export is compiled out), auto-import is a cached `OnceLock` list deprioritized via `sort_text="zz…"`,
+  partial-identifier member completion (`math.sq` offers `sqrt`), string/comment suppression. `hover` shows stdlib-member
+  signatures + docs. **One shared `std_sigs::render_param`** across all three surfaces (char-identical optional-`?`/
+  variadic-`...` rendering — holistic-verified). **Unit C — audit hardening C1–C8:** per-model `OnceLock<InferArtifacts>`
+  inference cache (factored `hover_type_at` → `build_artifacts`+`hover_type_in`; `Table` is `!Send` so only the rendered
+  hover spans are cached — `SemanticModel` stays `Send+Sync`) + hover size-class gate; `workspace_diagnostic` yields +
+  reuses open models; folder-removal unindex; fs-canonical index keys (symlink-correct); typeHierarchy decision +
+  index poison-log (`AtomicBool` once); `snippetSupport` gating (capability-less clients get plain bodies — a deliberate
+  behavior change, existing snippet assertions relocated to a snippet-enabled test). **6 phases (0–4 + holistics),
+  subagent-driven** (fresh implementer + independent **opus** reviewer per task; per-phase + whole-effort holistics).
+  **Reviews caught & FIXED real defects failing-test-first:** (1) signature **nested-call selection** — the `+2` slop
+  for unterminated calls let a *completed* inner call win past its own `)` (`pow(abs(x), 2)` showed `abs` over pow's
+  second arg) → bound terminated arg-lists by the `)` position; (2) **three table↔docs reconciliation regressions** — the
+  docs-drift implementer "fixed" docs to match a WRONG table (`bytes` endian made required, `set.from`/`date.parse`/
+  `date.format` optionals) → reverted to true behavior in BOTH (these would have become call-arity false-positives once
+  `std_arity` derived min-arity — the drift test only checks docs==table, NOT table==source-optionality, so a reviewer
+  must audit optionality vs `src/stdlib/<mod>.rs` `call()`); (3) signature-help vs completion **render divergence**
+  (`end: number` vs `end?: number`) → extracted the shared `render_param`; (4) a **narrowest-span coverage gap** (the
+  parity test couldn't catch a `min→max` bug in the shared `hover_type_in`) → a synthetic overlapping-spans guard. **An
+  important campaign-methodology finding recorded:** the self-dev-dep `ascript = {path=".", features=["fuzzgen"]}` lacks
+  `default-features=false`, so `cargo test --no-default-features` / `cargo clippy --no-default-features --all-targets`
+  RE-UNIFY default features (dev-deps load) and do NOT exercise the core-only config — the TRUE core check is
+  `cargo build/clippy --no-default-features --lib` (confirmed: the core-only lib compiles clean). SIG is unaffected
+  (static, 0 `cfg` gates), but the "both configs" gate has had this hole campaign-wide. **Gates:** full suite + clippy
+  clean BOTH feature configs; core-only `--lib` compiles; **Gate-5 zero `examples/**` diagnostics** (the std_arity
+  widening from ~36 to every curated fn introduced no FP — the broad table-optionality tripwire); tree-sitter + frontend
+  conformance green (untouched); the table↔docs drift tripwire **scratch-probe-confirmed live** (a fake export with no
+  row fails CI). Docs: `docs/content/tooling/lsp-capabilities.md` + CLAUDE.md + roadmap (no NAV change). **v1 narrowings
+  (documented, not silent):** cross-file sig help needs the calling file to parse cleanly (the import edge is recorded
+  from a clean parse; in-file/stdlib rungs work on unterminated calls); handle-method/complex-receiver sig help deferred
+  (the curated handle-method rows exist so v2 costs no data work).
 
 ## Execution order
 
