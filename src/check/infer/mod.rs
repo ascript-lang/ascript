@@ -151,4 +151,27 @@ mod infer_cache_tests {
             );
         }
     }
+
+    /// Guards the NARROWEST-span selection of `hover_type_in` directly, with a
+    /// synthetic set of overlapping spans. The parity test above cannot catch a bug
+    /// in the SHARED selection logic (both sides route through `hover_type_in`); this
+    /// one would fail if `min_by_key` ever became `max_by_key` (innermost vs outermost).
+    #[test]
+    fn hover_type_in_prefers_the_narrowest_overlapping_span() {
+        use crate::check::diagnostic::ByteSpan;
+        use crate::check::infer::pass::HoverType;
+        // Three spans all containing offset 12: widths 30, 10, 4 — narrowest is "inner".
+        let artifacts = InferArtifacts {
+            hovers: vec![
+                HoverType { range: ByteSpan { start: 0, end: 30 }, ty: "outer".into() },
+                HoverType { range: ByteSpan { start: 8, end: 18 }, ty: "middle".into() },
+                HoverType { range: ByteSpan { start: 10, end: 14 }, ty: "inner".into() },
+            ],
+        };
+        assert_eq!(hover_type_in(&artifacts, 12).as_deref(), Some("inner"));
+        // At offset 9 only outer+middle contain it → middle (narrower) wins.
+        assert_eq!(hover_type_in(&artifacts, 9).as_deref(), Some("middle"));
+        // Outside every span → None.
+        assert_eq!(hover_type_in(&artifacts, 40), None);
+    }
 }
