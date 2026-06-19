@@ -1085,9 +1085,23 @@ fn exported_fn_sig_from_decl(fn_decl: &crate::syntax::cst::ResolvedNode) -> Expo
     ExportedFnSig { params, ret }
 }
 
-/// Lexically canonicalize a path (resolve `.`/`..` components) WITHOUT touching
-/// the filesystem, so the index is deterministic and `Send + Sync`-friendly.
+/// Canonicalize a path for use as an index key.
+///
+/// Two files that are the same on-disk (e.g. accessed via a symlink) must map
+/// to the SAME index key; otherwise the index accumulates duplicate / stale
+/// entries for what is logically one file.
+///
+/// Strategy:
+/// 1. Try `std::fs::canonicalize` first — it resolves symlinks and produces an
+///    absolute path (the only truly correct approach for on-disk equality).
+/// 2. Fall back to a **lexical** pass (strip `.`/`..` components without FS
+///    access) when the path does not yet exist on disk, e.g. a newly created
+///    file that the editor has notified us about but has not been flushed yet.
 fn canonicalize(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    // Lexical fallback: resolve `.` / `..` without touching the filesystem.
     let mut out = PathBuf::new();
     for comp in path.components() {
         use std::path::Component::*;
@@ -1529,6 +1543,7 @@ fn owning_frame_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     /// Assert (at compile time) that the index is `Send + Sync` — the LSP layer
     /// must never hold a non-`Send` interpreter type.
@@ -1880,5 +1895,31 @@ mod tests {
             defs.iter().any(|d| d.kind == DefKind::Fn),
             "worker fn* must be indexed as Fn; got: {defs:?}"
         );
+    }
+
+    /// C5 — `canonicalize` resolves symlinks when they exist on-disk (using
+    /// `std::fs::canonicalize`), and falls back to lexical normalisation for
+    /// paths that do not exist yet (e.g. newly-created files still being typed).
+    #[test]
+    fn canonicalize_resolves_symlinks_with_lexical_fallback() {
+        let dir = std::env::temp_dir().join(format!("ascript-canon-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let link = dir.join("link");
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(dir.join("real"), &link);
+            std::fs::write(dir.join("real/a.as"), "fn f() {}\n").unwrap();
+            assert_eq!(
+                canonicalize(&link.join("a.as")),
+                canonicalize(&dir.join("real/a.as")),
+                "symlinked and real paths must key identically"
+            );
+        }
+        // Non-existent path: lexical fallback still normalizes `..`.
+        assert_eq!(
+            canonicalize(Path::new("/x/y/../z.as")),
+            PathBuf::from("/x/z.as")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

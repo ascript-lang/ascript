@@ -599,14 +599,17 @@ fn lsp_protocol_end_to_end() {
         comp_labels.contains(&"print") && comp_labels.contains(&"let"),
         "completion should preserve builtins + keywords: {comp_labels:?}"
     );
-    // A snippet item (`match`) carries insertTextFormat == Snippet (2).
+    // A snippet-KIND item (`match`) is always offered; its insertTextFormat depends on
+    // whether the client advertised snippetSupport. This test uses `capabilities: {}`
+    // (no snippetSupport), so the format is PLAIN_TEXT (1) and `${…}` is absent.
+    // C7: clients without snippetSupport receive plain bodies.
     let snippet = comp_items
         .iter()
-        .find(|i| i["label"].as_str() == Some("match") && i["insertTextFormat"].as_i64() == Some(2))
-        .expect("a snippet completion item");
+        .find(|i| i["label"].as_str() == Some("match") && i["kind"].as_i64() == Some(15))
+        .expect("a snippet-kind completion item for 'match'");
     assert!(
-        snippet["insertText"].as_str().is_some_and(|t| t.contains("$")),
-        "snippet has a tab-stop: {snippet}"
+        !snippet["insertText"].as_str().unwrap_or("").contains("${"),
+        "client without snippetSupport must not see ${{…}} syntax: {snippet}"
     );
 
     // 5c. semanticTokens/full on the symbols doc -> a non-empty token stream.
@@ -795,6 +798,11 @@ fn lsp_cross_file_goto_definition_and_rename() {
     let b_path = dir.join("b.as");
     std::fs::write(&a_path, "export fn f(x) { return x }\n").unwrap();
     std::fs::write(&b_path, "import { f } from \"./a\"\nprint(f(1))\n").unwrap();
+    // Canonicalize paths so URI keys match what the server produces after C5
+    // (the server uses std::fs::canonicalize internally, which resolves /var → /private/var on macOS).
+    let a_path = std::fs::canonicalize(&a_path).unwrap_or(a_path);
+    let b_path = std::fs::canonicalize(&b_path).unwrap_or(b_path);
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let a_uri = format!("file://{}", a_path.display());
     let b_uri = format!("file://{}", b_path.display());
     let root_uri = format!("file://{}", dir.display());
@@ -927,6 +935,10 @@ fn lsp_cross_file_rename_respects_shadowing_local() {
     let b_text = "import { x } from \"./a\"\nfn g() {\n  let x = 2\n  return x\n}\nprint(x)\n";
     std::fs::write(&a_path, a_text).unwrap();
     std::fs::write(&b_path, b_text).unwrap();
+    // Canonicalize so URI keys match what the server produces after C5.
+    let a_path = std::fs::canonicalize(&a_path).unwrap_or(a_path);
+    let b_path = std::fs::canonicalize(&b_path).unwrap_or(b_path);
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let a_uri = format!("file://{}", a_path.display());
     let b_uri = format!("file://{}", b_path.display());
     let root_uri = format!("file://{}", dir.display());
@@ -3501,6 +3513,8 @@ fn lsp_workspace_diagnostic_yields() {
         file_texts.push((fname, content));
     }
 
+    // C5: canonicalize so URIs match the server's fs-canonical index keys (e.g. /var → /private/var on macOS).
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let root_uri = format!("file://{}", dir.display());
     // hover-target = first file; it will be in the document store so C2's reuse path is exercised.
     let hover_uri = format!("file://{}/{}", dir.display(), file_texts[0].0);
@@ -3620,6 +3634,11 @@ fn lsp_workspace_folder_removal_unindexes() {
     std::fs::write(&path_a, text_a).unwrap();
     std::fs::write(&path_b, text_b).unwrap();
 
+    // C5: canonicalize so URIs match the server's fs-canonical index keys (e.g. /var → /private/var on macOS).
+    let root_a = std::fs::canonicalize(&root_a).unwrap_or(root_a);
+    let root_b = std::fs::canonicalize(&root_b).unwrap_or(root_b);
+    let path_a = std::fs::canonicalize(&path_a).unwrap_or(path_a);
+    let path_b = std::fs::canonicalize(&path_b).unwrap_or(path_b);
     let uri_a_root = format!("file://{}", root_a.display());
     let uri_b_root = format!("file://{}", root_b.display());
     let uri_a_file = format!("file://{}", path_a.display());
@@ -3725,4 +3744,136 @@ fn lsp_workspace_folder_removal_unindexes() {
     client.close_stdin();
     let _ = client.wait_for_exit(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C7: a client that does NOT advertise `completionItem.snippetSupport` must NOT
+/// receive `${…}` tab-stop syntax in any completion's `insertText`.
+#[test]
+fn lsp_no_snippets_without_snippet_support() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    // Initialize with empty capabilities — no snippetSupport advertised.
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://no_snip.as";
+    let text = "fn f() {\n  \n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+
+    // No item's insertText must contain `${` when snippetSupport is not advertised.
+    let bad: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|i| i["insertText"].as_str().unwrap_or("").contains("${"))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "client without snippetSupport must not receive ${{…}} syntax; offending items: {bad:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// C7: a client that DOES advertise `completionItem.snippetSupport` must receive
+/// the `fn` snippet with `${…}` tab-stops.
+#[test]
+fn lsp_snippets_with_snippet_support() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    // Initialize with explicit snippetSupport = true.
+    client.request(
+        1,
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "completion": {
+                        "completionItem": {
+                            "snippetSupport": true
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://with_snip.as";
+    let text = "fn f() {\n  \n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+
+    // The `fn` snippet must be present and contain `${` tab-stops.
+    let fn_item = items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("fn") && i["kind"].as_u64() == Some(15))
+        .expect("fn snippet-kind item must be offered");
+    assert!(
+        fn_item["insertText"].as_str().unwrap_or("").contains("${"),
+        "fn snippet must contain ${{…}} tab-stops with snippetSupport=true; got: {fn_item}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
 }

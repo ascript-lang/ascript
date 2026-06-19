@@ -65,12 +65,16 @@ fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
 
 /// ADT: a completion item for an enum variant offered after `Enum.`. A unit variant
 /// is a plain `ENUM_MEMBER` insert (`Point`); a payload variant gets a `detail`
-/// showing its signature (`(radius: float)`) and a SNIPPET insert with one tab-stop
-/// per field placeholder (`Circle(${1:radius})`), so the call form is pre-filled.
+/// showing its signature (`(radius: float)`) and (when `snippet_support` is true) a
+/// SNIPPET insert with one tab-stop per field placeholder (`Circle(${1:radius})`),
+/// so the call form is pre-filled. When `snippet_support` is false, a plain text body
+/// (`Circle(radius)`) is emitted instead so clients that do not handle tab-stops do
+/// not display raw `${…}` syntax.
 fn variant_completion_item(
     variant: &str,
     info: &crate::check::infer::table::EnumInfo,
     table: &crate::check::infer::table::Table,
+    snippet_support: bool,
 ) -> CompletionItem {
     let mut ci = item(variant, CompletionItemKind::ENUM_MEMBER);
     let fields = info.fields_of(variant).unwrap_or(&[]);
@@ -87,25 +91,40 @@ fn variant_completion_item(
         })
         .collect();
     ci.detail = Some(format!("({})", sig.join(", ")));
-    // Snippet insert with a placeholder per field. A MULTI-field named variant MUST
-    // be constructed with named args — the engine rejects a positional call
-    // (`interp.rs`: `is_named() && fields.len() > 1` → "requires named fields"), so the
-    // snippet emits the `name: <type>` call form, otherwise tab-completing it would
-    // lead straight into a runtime error. Single-field named (`Circle(radius)`) and
-    // positional variants accept positional args, so they keep the bare placeholder
-    // (field name as label for named, type for positional).
-    let named_call = fields.len() > 1 && fields.iter().all(|f| f.name.is_some());
-    let placeholders: Vec<String> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, f)| match &f.name {
-            Some(n) if named_call => format!("{n}: ${{{}:{}}}", i + 1, f.ty.display(table)),
-            Some(n) => format!("${{{}:{}}}", i + 1, n),
-            None => format!("${{{}:{}}}", i + 1, f.ty.display(table)),
-        })
-        .collect();
-    ci.insert_text = Some(format!("{variant}({})", placeholders.join(", ")));
-    ci.insert_text_format = Some(InsertTextFormat::SNIPPET);
+    if snippet_support {
+        // Snippet insert with a placeholder per field. A MULTI-field named variant MUST
+        // be constructed with named args — the engine rejects a positional call
+        // (`interp.rs`: `is_named() && fields.len() > 1` → "requires named fields"), so the
+        // snippet emits the `name: <type>` call form, otherwise tab-completing it would
+        // lead straight into a runtime error. Single-field named (`Circle(radius)`) and
+        // positional variants accept positional args, so they keep the bare placeholder
+        // (field name as label for named, type for positional).
+        let named_call = fields.len() > 1 && fields.iter().all(|f| f.name.is_some());
+        let placeholders: Vec<String> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| match &f.name {
+                Some(n) if named_call => format!("{n}: ${{{}:{}}}", i + 1, f.ty.display(table)),
+                Some(n) => format!("${{{}:{}}}", i + 1, n),
+                None => format!("${{{}:{}}}", i + 1, f.ty.display(table)),
+            })
+            .collect();
+        ci.insert_text = Some(format!("{variant}({})", placeholders.join(", ")));
+        ci.insert_text_format = Some(InsertTextFormat::SNIPPET);
+    } else {
+        // Plain-text fallback: no tab-stops, just the variant name with field names.
+        let named_call = fields.len() > 1 && fields.iter().all(|f| f.name.is_some());
+        let args: Vec<String> = fields
+            .iter()
+            .map(|f| match &f.name {
+                Some(n) if named_call => format!("{n}: {}", f.ty.display(table)),
+                Some(n) => n.to_string(),
+                None => f.ty.display(table),
+            })
+            .collect();
+        ci.insert_text = Some(format!("{variant}({})", args.join(", ")));
+        ci.insert_text_format = Some(InsertTextFormat::PLAIN_TEXT);
+    }
     ci
 }
 
@@ -164,26 +183,43 @@ fn binding_completions(model: &SemanticModel, char_offset: usize) -> Vec<Complet
     out
 }
 
-/// Curated control-flow snippets. Each is a SNIPPET-format item with `${n:…}`
-/// tab-stops and a `$0` final cursor.
-fn snippet_completions() -> Vec<CompletionItem> {
-    const SNIPPETS: &[(&str, &str)] = &[
-        ("fn", "fn ${1:name}(${2:params}) {\n  $0\n}"),
-        ("if", "if (${1:cond}) {\n  $0\n}"),
-        ("for", "for (${1:item} of ${2:iter}) {\n  $0\n}"),
-        ("while", "while (${1:cond}) {\n  $0\n}"),
-        ("defer", "defer ${1:resource}.close()"),
-        ("match", "match ${1:subject} {\n  ${2:pattern} => $0,\n}"),
-        ("class", "class ${1:Name} {\n  $0\n}"),
+/// Curated control-flow snippets.
+///
+/// When `snippet_support` is `true`, each item is a SNIPPET-format item with
+/// `${n:…}` tab-stops and a `$0` final cursor. When `false`, the tab-stop syntax
+/// is stripped and items are emitted as plain text so clients that do not handle
+/// snippets do not display raw `${…}` text.
+fn snippet_completions(snippet_support: bool) -> Vec<CompletionItem> {
+    // (label, snippet_body, plain_body)
+    const SNIPPETS: &[(&str, &str, &str)] = &[
+        ("fn",    "fn ${1:name}(${2:params}) {\n  $0\n}",     "fn name(params) {\n  \n}"),
+        ("if",    "if (${1:cond}) {\n  $0\n}",                 "if (cond) {\n  \n}"),
+        ("for",   "for (${1:item} of ${2:iter}) {\n  $0\n}",   "for (item of iter) {\n  \n}"),
+        ("while", "while (${1:cond}) {\n  $0\n}",              "while (cond) {\n  \n}"),
+        ("defer", "defer ${1:resource}.close()",               "defer resource.close()"),
+        ("match", "match ${1:subject} {\n  ${2:pattern} => $0,\n}", "match subject {\n  pattern => ,\n}"),
+        ("class", "class ${1:Name} {\n  $0\n}",               "class Name {\n  \n}"),
     ];
     SNIPPETS
         .iter()
-        .map(|(label, body)| CompletionItem {
-            label: label.to_string(),
-            kind: Some(CompletionItemKind::SNIPPET),
-            insert_text: Some(body.to_string()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
-            ..CompletionItem::default()
+        .map(|(label, snip_body, plain_body)| {
+            if snippet_support {
+                CompletionItem {
+                    label: label.to_string(),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    insert_text: Some(snip_body.to_string()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..CompletionItem::default()
+                }
+            } else {
+                CompletionItem {
+                    label: label.to_string(),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    insert_text: Some(plain_body.to_string()),
+                    insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                    ..CompletionItem::default()
+                }
+            }
         })
         .collect()
 }
@@ -283,7 +319,11 @@ pub fn resolve_completion_static(item: &mut CompletionItem) -> bool {
 ///   module → that module's exports (with `filter_text` = the typed prefix so the
 ///   client filters correctly);
 /// - inside a plain string body or comment → NO items (C8 suppression).
-pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> {
+///
+/// `snippet_support` mirrors the client's `completionItem.snippetSupport` capability.
+/// When `false`, snippet bodies are downgraded to plain text so clients that do not
+/// handle snippets do not display raw `${…}` tab-stop syntax.
+pub fn completions(model: &SemanticModel, offset: usize, snippet_support: bool) -> Vec<CompletionItem> {
     let text = &model.text;
     let chars: Vec<char> = text.chars().collect();
     let offset = offset.min(chars.len());
@@ -367,7 +407,7 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                     .variants
                     .iter()
                     .map(|v| {
-                        let mut it = variant_completion_item(v, info, &table);
+                        let mut it = variant_completion_item(v, info, &table, snippet_support);
                         if !prefix.is_empty() {
                             it.filter_text = Some(prefix.clone());
                         }
@@ -409,7 +449,7 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
 
     let mut base = baseline_completions();
     base.extend(binding_completions(model, offset));
-    base.extend(snippet_completions());
+    base.extend(snippet_completions(snippet_support));
     base.extend(auto_import_candidates(model));
     base
 }
@@ -688,10 +728,10 @@ mod tests {
     use super::*;
     use crate::check::LintConfig;
 
-    /// Build a model and complete at the END of `src` (its char count).
+    /// Build a model and complete at the END of `src` (its char count), with snippet support enabled.
     fn items(src: &str) -> Vec<CompletionItem> {
         let model = SemanticModel::build(src.to_string(), None, &LintConfig::default());
-        completions(&model, src.chars().count())
+        completions(&model, src.chars().count(), true)
     }
 
     fn labels(items: &[CompletionItem]) -> Vec<&str> {
@@ -795,7 +835,7 @@ mod tests {
         let _ = items("\"unterminated");
         // An out-of-range offset must not panic.
         let model = SemanticModel::build("let x".to_string(), None, &LintConfig::default());
-        let _ = completions(&model, 9999);
+        let _ = completions(&model, 9999, true);
     }
 
     #[test]
@@ -841,7 +881,7 @@ mod tests {
         // An export unique to a newly-included module is offered as an auto-import
         // with the matching import edit.
         let model = SemanticModel::build("sp\n".to_string(), None, &LintConfig::default());
-        let items = completions(&model, 2);
+        let items = completions(&model, 2, true);
         let spawn = items
             .iter()
             .find(|i| {
@@ -901,7 +941,7 @@ mod tests {
         // `abs` is exported by std/math; nothing imports it yet.
         let src = "ab\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
-        let items = completions(&model, 2);
+        let items = completions(&model, 2, true);
         // `abs` is exported by more than one module (std/decimal AND std/math, both
         // in the canonical list) — each gets its own auto-import item; pick math's.
         let abs = items
@@ -921,19 +961,41 @@ mod tests {
         assert_eq!(edits[0].range.start.line, 0);
     }
 
+    /// C7: when `snippet_support` is `true`, control-flow items carry `${…}` tab-stops.
     #[test]
-    fn baseline_includes_snippets() {
+    fn baseline_includes_snippets_when_snippet_support_true() {
         let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
-        let items = completions(&model, 1);
+        let items = completions(&model, 1, true);
         let fn_snip = items
             .iter()
             .find(|i| i.label == "fn" && i.insert_text_format == Some(InsertTextFormat::SNIPPET))
-            .expect("fn snippet present");
+            .expect("fn snippet present with snippet_support=true");
         assert!(
             fn_snip.insert_text.as_deref().unwrap_or("").contains("$0")
                 || fn_snip.insert_text.as_deref().unwrap_or("").contains("${1"),
             "snippet has a tab-stop: {:?}",
             fn_snip.insert_text
+        );
+    }
+
+    /// C7: when `snippet_support` is `false`, NO completion item's insertText
+    /// should contain raw `${…}` tab-stop syntax.
+    #[test]
+    fn no_snippets_when_snippet_support_false() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let items = completions(&model, 1, false);
+        let with_tabstops: Vec<&CompletionItem> = items
+            .iter()
+            .filter(|i| i.insert_text.as_deref().unwrap_or("").contains("${"))
+            .collect();
+        assert!(
+            with_tabstops.is_empty(),
+            "no item must have ${{…}} syntax when snippet_support=false; got: {with_tabstops:?}"
+        );
+        // Snippet-kind items (fn/if/for/…) must still be offered, just as plain text.
+        assert!(
+            items.iter().any(|i| i.label == "fn" && i.kind == Some(CompletionItemKind::SNIPPET)),
+            "fn snippet-kind item must still be offered even with snippet_support=false"
         );
     }
 
@@ -943,12 +1005,12 @@ mod tests {
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
 
         let color_off = src.find("Color.\n").unwrap() + "Color.".len();
-        let cl = completions(&model, color_off);
+        let cl = completions(&model, color_off, true);
         let cls: Vec<&str> = cl.iter().map(|i| i.label.as_str()).collect();
         assert!(cls.contains(&"Red") && cls.contains(&"Green"), "enum variants: {cls:?}");
 
         let point_off = src.find("Point.\n").unwrap() + "Point.".len();
-        let pl = completions(&model, point_off);
+        let pl = completions(&model, point_off, true);
         let pls: Vec<&str> = pl.iter().map(|i| i.label.as_str()).collect();
         assert!(pls.contains(&"x"), "class field: {pls:?}");
         assert!(pls.contains(&"dist"), "class method: {pls:?}");
@@ -962,7 +1024,7 @@ mod tests {
         let src = "enum Shape {\n  Circle(radius: float),\n  Rect(w: float, h: float),\n  Pair(int, int),\n  Point,\n}\nShape.\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind("Shape.\n").unwrap() + "Shape.".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let find = |label: &str| items.iter().find(|i| i.label == label).cloned();
 
         let circle = find("Circle").expect("Circle offered");
@@ -995,7 +1057,7 @@ mod tests {
         let src = "let total = 1\nfn helper() {}\nt\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind('t').unwrap() + 1; // just after the `t` on the last line
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"total"), "missing local binding: {labels:?}");
         assert!(labels.contains(&"helper"), "missing fn binding: {labels:?}");
@@ -1026,7 +1088,7 @@ mod tests {
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         // Cursor just after the lone `f` on line 3 (inside a's body).
         let off = src.find("  f\n").unwrap() + "  f".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"foo"), "a's own local foo must be offered: {labels:?}");
         assert!(!labels.contains(&"bar"), "sibling b's local bar must NOT be offered: {labels:?}");
@@ -1042,7 +1104,7 @@ mod tests {
         let src = "fn outer() {\n  let captured = 1\n  fn inner() {\n    c\n  }\n}\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.find("    c\n").unwrap() + "    c".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"captured"),
@@ -1057,7 +1119,7 @@ mod tests {
         let src = "fn a() {\n  x\n}\nfn b() {\n  let later = 2\n}\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.find("  x\n").unwrap() + "  x".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             !labels.contains(&"later"),
@@ -1073,7 +1135,7 @@ mod tests {
         let src = "class C {\n  x: number\n  fn m() {}\n}\nlet c = C()\nc.\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind("c.\n").unwrap() + "c.".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"x"), "instance field x must be offered: {labels:?}");
         assert!(labels.contains(&"m"), "instance method m must be offered: {labels:?}");
@@ -1085,7 +1147,7 @@ mod tests {
         let src = "import * as math from \"std/math\"\nmath.\n";
         let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
         let off = src.rfind("math.\n").unwrap() + "math.".len();
-        let items = completions(&model, off);
+        let items = completions(&model, off, true);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"abs"), "module export abs must be offered: {labels:?}");
         assert!(labels.contains(&"sqrt"), "module export sqrt must be offered: {labels:?}");

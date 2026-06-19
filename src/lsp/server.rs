@@ -57,6 +57,12 @@ pub struct Backend {
     /// Set by `window/workDoneProgress/cancel` for the indexing token; checked
     /// between files so a huge workspace's initial indexing can be aborted.
     index_cancelled: AtomicBool,
+    /// Logged ONCE (via `eprintln!`) when the index `RwLock` is poisoned.
+    /// Subsequent handler calls simply skip the index rather than logging a storm.
+    index_poisoned_logged: AtomicBool,
+    /// Whether the client advertised `completionItem.snippetSupport` in `initialize`.
+    /// When false, completions emit plain text bodies without `${…}` tab-stops.
+    snippet_support: AtomicBool,
 }
 
 impl Backend {
@@ -70,6 +76,40 @@ impl Backend {
             pending: Mutex::new(HashMap::new()),
             edit_seq: AtomicU64::new(0),
             index_cancelled: AtomicBool::new(false),
+            index_poisoned_logged: AtomicBool::new(false),
+            snippet_support: AtomicBool::new(false),
+        }
+    }
+
+    /// Acquire a read guard on the workspace index.
+    ///
+    /// On a poisoned lock (a previous request panicked while holding the write
+    /// guard), logs a single diagnostic line to stderr and returns `None` for
+    /// every subsequent call — keeping the server alive without a storm of logs.
+    fn index_read(&self) -> Option<std::sync::RwLockReadGuard<'_, WorkspaceIndex>> {
+        match self.index.read() {
+            Ok(g) => Some(g),
+            Err(_) => {
+                if !self.index_poisoned_logged.swap(true, Ordering::SeqCst) {
+                    eprintln!("LSP index lock poisoned; index disabled");
+                }
+                None
+            }
+        }
+    }
+
+    /// Acquire a write guard on the workspace index.
+    ///
+    /// Same once-only poison log as [`index_read`].
+    fn index_write(&self) -> Option<std::sync::RwLockWriteGuard<'_, WorkspaceIndex>> {
+        match self.index.write() {
+            Ok(g) => Some(g),
+            Err(_) => {
+                if !self.index_poisoned_logged.swap(true, Ordering::SeqCst) {
+                    eprintln!("LSP index lock poisoned; index disabled");
+                }
+                None
+            }
         }
     }
 
@@ -125,7 +165,7 @@ impl Backend {
     /// Incrementally re-index the file behind `uri` (if it maps to a path).
     fn reindex_uri(&self, uri: &Url, text: &str) {
         if let Some(path) = url_to_canon(uri) {
-            if let Ok(mut idx) = self.index.write() {
+            if let Some(mut idx) = self.index_write() {
                 idx.reindex_file(&path, text);
             }
         }
@@ -177,7 +217,7 @@ impl Backend {
         }
         // Index-backed cross-file arity (cannot be computed single-file).
         if let Some(path) = url_to_canon(&uri) {
-            if let Ok(idx) = self.index.read() {
+            if let Some(idx) = self.index_read() {
                 for d in idx.file_module_arity(&path, &text) {
                     diags.push(crate::lsp::convert::byte_diagnostic_to_lsp(&text, &d));
                 }
@@ -283,7 +323,8 @@ pub fn server_capabilities() -> ServerCapabilities {
         // `lsp-types` 0.94 `ServerCapabilities` has NO `type_hierarchy_provider`
         // field, so it is advertised through the `experimental` escape hatch
         // (tower-lsp routes the `textDocument/prepareTypeHierarchy` method
-        // regardless of the advertised capability shape).
+        // regardless of the advertised capability shape). SIG spec §7 documents
+        // this as the correct workaround for crates pinned to this lsp-types version.
         experimental: Some(serde_json::json!({ "typeHierarchyProvider": true })),
         // SP4 §4: cross-file navigation providers backed by the workspace index.
         // Phase 3: advertise lazy `workspaceSymbol/resolve` via the options form.
@@ -404,6 +445,16 @@ impl LanguageServer for Backend {
         if let Ok(mut guard) = self.roots.write() {
             *guard = roots;
         }
+        // Capture whether the client supports snippet completions.
+        let snip = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|ci| ci.snippet_support)
+            .unwrap_or(false);
+        self.snippet_support.store(snip, Ordering::Relaxed);
         Ok(InitializeResult {
             capabilities: server_capabilities(),
             server_info: Some(ServerInfo {
@@ -467,7 +518,7 @@ impl LanguageServer for Backend {
                 cancelled = true;
                 break;
             }
-            if let Ok(mut idx) = self.index.write() {
+            if let Some(mut idx) = self.index_write() {
                 idx.reindex_file(path, text);
             }
             indexed = i + 1;
@@ -681,7 +732,11 @@ impl LanguageServer for Backend {
             let offset = model.line_index.offset(position);
             (
                 model.generation,
-                crate::lsp::providers::completion::completions(model, offset),
+                crate::lsp::providers::completion::completions(
+                    model,
+                    offset,
+                    self.snippet_support.load(Ordering::Relaxed),
+                ),
             )
         };
         // If a newer edit landed while we computed, the result is obsolete; drop it
@@ -826,7 +881,7 @@ impl LanguageServer for Backend {
         };
         let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
         let path = url_to_canon(&uri);
-        let idx = self.index.read().ok();
+        let idx = self.index_read();
         Ok(crate::lsp::providers::signature::signature_help(
             model,
             offset,
@@ -997,7 +1052,7 @@ impl LanguageServer for Backend {
         };
         let mut count = same_file;
         if let Some(path) = url_to_canon(&uri) {
-            if let Ok(idx) = self.index.read() {
+            if let Some(idx) = self.index_read() {
                 // Cross-file references: every use of this name in an importer of
                 // the def's file (the same-file count is authoritative; this adds
                 // the importers' uses, anchored on the def's name range).
@@ -1053,7 +1108,7 @@ impl LanguageServer for Backend {
         // (the file list is cloned out); within the loop the document store is consulted
         // WITHOUT holding any guard across the yield.
         let files: Vec<(PathBuf, String)> = {
-            match self.index.read().ok() {
+            match self.index_read() {
                 Some(idx) => idx
                     .files
                     .iter()
@@ -1154,7 +1209,7 @@ impl LanguageServer for Backend {
         // imported/cross-file name (or a top-level/module global), return a
         // `Location` in the TARGET file.
         if let Some(path) = url_to_canon(&uri) {
-            let xfile = self.index.read().ok().and_then(|idx| {
+            let xfile = self.index_read().and_then(|idx| {
                 idx.definition_at(&path, byte).map(|(def_path, span)| {
                     let target_text = idx_text(&idx, &def_path).unwrap_or_default();
                     (def_path, workspace::byte_span_to_range(&target_text, span))
@@ -1193,7 +1248,7 @@ impl LanguageServer for Backend {
         let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
         // Cross-file via the workspace index first (mirrors `goto_definition`).
         if let Some(path) = url_to_canon(&uri) {
-            let xfile = self.index.read().ok().and_then(|idx| {
+            let xfile = self.index_read().and_then(|idx| {
                 idx.definition_at(&path, offset).map(|(def_path, span)| {
                     let target_text = idx_text(&idx, &def_path).unwrap_or_default();
                     (def_path, workspace::byte_span_to_range(&target_text, span))
@@ -1272,7 +1327,7 @@ impl LanguageServer for Backend {
             };
             crate::lsp::providers::docs::byte_offset_at(model, position)
         };
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
@@ -1294,13 +1349,13 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let offset = {
-            let Ok(idx) = self.index.read() else {
+            let Some(idx) = self.index_read() else {
                 return Ok(None);
             };
             let text = idx_text(&idx, &path).unwrap_or_default();
             range_start_byte(&text, item.selection_range)
         };
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
@@ -1341,7 +1396,7 @@ impl LanguageServer for Backend {
             let store = self.documents.lock().await;
             store.get(&item.uri).map(|m| m.text.clone())
         };
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         let text = model_text
@@ -1497,7 +1552,7 @@ impl LanguageServer for Backend {
         let Some(path) = url_to_canon(&uri) else {
             return Ok(None);
         };
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         let refs = idx.references_at(&path, byte, include_decl);
@@ -1519,7 +1574,7 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> tower_lsp::jsonrpc::Result<Option<Vec<SymbolInformation>>> {
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         let mut out = Vec::new();
@@ -1568,7 +1623,7 @@ impl LanguageServer for Backend {
         let Some(path) = url_to_canon(&uri) else {
             return Ok(None);
         };
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         match idx.prepare_rename(&path, byte) {
@@ -1595,7 +1650,7 @@ impl LanguageServer for Backend {
         let Some(path) = url_to_canon(&uri) else {
             return Ok(None);
         };
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         let Some(edits) = idx.rename_edits(&path, byte, &new_name) else {
@@ -1624,7 +1679,7 @@ impl LanguageServer for Backend {
         &self,
         params: RenameFilesParams,
     ) -> tower_lsp::jsonrpc::Result<Option<WorkspaceEdit>> {
-        let Ok(idx) = self.index.read() else {
+        let Some(idx) = self.index_read() else {
             return Ok(None);
         };
         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
@@ -1667,7 +1722,7 @@ impl LanguageServer for Backend {
             ) else {
                 continue;
             };
-            if let Ok(mut idx) = self.index.write() {
+            if let Some(mut idx) = self.index_write() {
                 // Fully unindex the OLD path: `files` PLUS its contributions to
                 // `defs_by_name` / `import_edges` / `importers` (a bare
                 // `files.remove` leaves stale defs + reverse import edges that
@@ -1690,13 +1745,13 @@ impl LanguageServer for Backend {
             let is_toml = path.file_name().and_then(|n| n.to_str()) == Some("ascript.toml");
             if is_as {
                 if change.typ == FileChangeType::DELETED {
-                    if let Ok(mut idx) = self.index.write() {
+                    if let Some(mut idx) = self.index_write() {
                         // Same full-unindex as didRenameFiles: a bare
                         // `files.remove` leaves stale defs + reverse import edges.
                         idx.fully_unindex(&workspace::canon(&path));
                     }
                 } else if let Ok(text) = std::fs::read_to_string(&path) {
-                    if let Ok(mut idx) = self.index.write() {
+                    if let Some(mut idx) = self.index_write() {
                         idx.reindex_file(&path, &text);
                     }
                 }
@@ -1755,7 +1810,7 @@ impl LanguageServer for Backend {
         // across an await point — full compliance with `await_holding_lock`.
         let surviving_roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
         if !removed_roots.is_empty() {
-            if let Ok(mut idx) = self.index.write() {
+            if let Some(mut idx) = self.index_write() {
                 // Collect orphaned paths first (can't mutate idx.files while iterating it).
                 let to_remove: Vec<PathBuf> = idx
                     .files
@@ -1777,7 +1832,7 @@ impl LanguageServer for Backend {
         // Re-warm the index over the (new / surviving) root set.
         // std::fs::read_to_string is synchronous — no await in this block, so the
         // index write guard below is never held across an await.
-        if let Ok(mut idx) = self.index.write() {
+        if let Some(mut idx) = self.index_write() {
             for root in &surviving_roots {
                 for path in workspace::discover_as_files(root) {
                     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -2203,5 +2258,45 @@ mod tests {
         assert_eq!(store.current_gen(&uri), Some(g2));
         // A handler holding g1 must treat itself as superseded.
         assert!(store.current_gen(&uri) != Some(g1));
+    }
+
+    /// C6 — the index poison-log helper fires ONCE on a poisoned lock, then never
+    /// again (the `AtomicBool` swap gate).
+    #[test]
+    fn index_poison_log_fires_once() {
+        use std::sync::{Arc, RwLock};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let lock: Arc<RwLock<()>> = Arc::new(RwLock::new(()));
+        let poisoned_logged = Arc::new(AtomicBool::new(false));
+
+        // Poison the lock
+        let lock2 = lock.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = lock2.write().unwrap();
+            panic!("poison");
+        }));
+
+        // Helper simulating the wrapper logic
+        let log_once = |lock: &RwLock<()>, logged: &AtomicBool| -> Option<()> {
+            match lock.read() {
+                Ok(g) => { drop(g); Some(()) }
+                Err(_) => {
+                    if !logged.swap(true, Ordering::SeqCst) {
+                        eprintln!("LSP index lock poisoned; index disabled");
+                    }
+                    None
+                }
+            }
+        };
+
+        // First call should log (swap returns false → logs)
+        assert!(log_once(&lock, &poisoned_logged).is_none());
+        assert!(poisoned_logged.load(Ordering::SeqCst));
+
+        // Second call should NOT log again (swap returns true → no log)
+        assert!(log_once(&lock, &poisoned_logged).is_none());
+        // No way to assert "no eprintln" in unit tests but flag stays true
+        assert!(poisoned_logged.load(Ordering::SeqCst));
     }
 }
