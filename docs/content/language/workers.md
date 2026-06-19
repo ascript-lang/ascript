@@ -480,6 +480,11 @@ How it works:
 - **`maxRequests`** across N isolates bounds the **total** number of connections served (a
   shared budget + coordinated stop); the per-isolate split is OS scheduling and is not
   asserted.
+- **Graceful drain** — `server.shutdown()` (on the server handle) stops **every** isolate's
+  accept loop, drains the in-flight handlers, and resolves `serve`. `serve({ onShutdown,
+  drainTimeout })` runs an `onShutdown` callback once when the drain begins and bounds the
+  drain wait. The idiom is an inbound-signal handler: `process.on("SIGTERM", (sig) =>
+  app.shutdown())`.
 
 ### The shared config pattern
 
