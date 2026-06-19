@@ -201,6 +201,78 @@ while (i < 100000) {
 }
 
 #[test]
+fn registered_handler_does_not_keep_process_alive() {
+    // CNTR §6 exit-hang regression: a registered signal handler is a DAEMON listener —
+    // it must NOT keep the process alive on its own. When the main program flow
+    // completes, the process exits cleanly (Node semantics: the listener is aborted at
+    // program end, not awaited forever). Before the fix this hangs on `local.await`.
+    let src = r#"
+import { on } from "std/process"
+on("SIGTERM", (sig) => { print("h") })
+print("done")
+"#;
+    let (child, mut reader) = spawn_script("sig_no_keepalive.as", src);
+    wait_for_line(&mut reader, "done");
+    // No signal sent: the program is over. It must EXIT cleanly within a few seconds.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = child;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let code = status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+            assert_eq!(code, 0, "program ended normally → exit 0, not {code}");
+            return;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("process HANGS after main completes — signal listener kept it alive");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn registered_handler_no_keepalive_tree_walker() {
+    // Same as above but on the legacy tree-walker engine (the other real run path).
+    let src = r#"
+import { on } from "std/process"
+on("SIGTERM", (sig) => { print("h") })
+print("done")
+"#;
+    let file = std::env::temp_dir().join("sig_no_keepalive_tw.as");
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg("--tree-walker")
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ascript");
+    let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
+    wait_for_line(&mut reader, "done");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    use std::os::unix::process::ExitStatusExt;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let code = status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+            assert_eq!(code, 0, "tree-walker: program ended normally → exit 0, not {code}");
+            return;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("tree-walker: process HANGS after main completes");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn last_on_wins_second_handler_runs() {
     // Two `on`s for SIGTERM: the SECOND handler is the live one (registry swap).
     let src = r#"

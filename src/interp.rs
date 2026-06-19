@@ -1960,6 +1960,25 @@ impl Interp {
         let _ = std::io::stdout().lock().flush();
     }
 
+    /// CNTR §6 exit-hang fix: abort all registered inbound-signal listener tasks.
+    ///
+    /// A `process.on` handler spawns a never-ending `spawn_local` listener loop kept
+    /// in `signal_handlers` (each held by an `AbortOnDrop`). Those listeners are
+    /// DAEMON tasks — Node semantics: a registered handler must NOT keep the process
+    /// alive on its own. The entry points drain spawned tasks via `local.await` AFTER
+    /// the main future resolves; an unbounded listener loop would block that drain
+    /// forever (the program HANGS instead of exiting). Clearing the map drops every
+    /// `AbortOnDrop`, aborting the listeners so the drain completes cleanly.
+    ///
+    /// Called right after the main future resolves and BEFORE `local.await` at the
+    /// real user-facing run paths (VM + tree-walker `ascript run`, `run_source`, the
+    /// embedded-bundle loader). A no-op when nothing is registered.
+    #[cfg_attr(not(feature = "sys"), allow(dead_code))]
+    pub(crate) fn abort_signal_listeners(&self) {
+        // Dropping each `SignalReg` drops its `AbortOnDrop`, aborting the task.
+        self.signal_handlers.borrow_mut().clear();
+    }
+
     /// Emit one std/log record line. Buffers into `log_capture` under `Capture`
     /// (tests read it via `log_output`); writes to stderr under `Live`.
     #[cfg(feature = "log")]

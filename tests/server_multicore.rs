@@ -474,9 +474,11 @@ async fn main() {{
     onShutdown: () => print("draining"),
   }})
   // The graceful drain completed → write the marker so the test can confirm the
-  // process.on → shutdown → drain composition ran end-to-end, then exit.
+  // process.on → shutdown → drain composition ran end-to-end. NOTE: NO explicit
+  // exit() — `main` simply RETURNS and the program ends normally. The registered
+  // SIGTERM listener must NOT keep the process alive (CNTR §6 exit-hang fix): the
+  // listener is a daemon task aborted at program end, so the process exits cleanly.
   let [w, werr] = fs.write("{marker_path}", "drained-ok")
-  exit(0)
 }}
 await main()
 "#
@@ -490,13 +492,13 @@ fn sigterm_triggers_graceful_drain() {
     // SIGTERM runs the registered handler → `s.shutdown()` → the accept loop stops,
     // onShutdown runs, the in-flight request drains, `serve` resolves, and the program
     // writes its completion marker. We send a request, SIGTERM mid-flight, and assert
-    // (a) the in-flight request completes (client gets the body), and (b) the marker is
-    // written (the drain ran to completion). HONEST CAVEAT: a registered `process.on`
-    // signal listener keeps the runtime alive (Node-like — the listener task never
-    // ends), so we assert the drain COMPLETED via the marker file rather than a process
-    // exit code (the listener-lifecycle exit is a separate Task-5.1 concern). The
-    // mid-request timing is best-effort (a 30ms handler); the deterministic core proof
-    // is the in-process `shutdown_drains_inflight_request` lib test.
+    // (a) the in-flight request completes (client gets the body), (b) the marker is
+    // written (the drain ran to completion), and (c) the process EXITS CLEANLY on its
+    // own — `main` returns with NO explicit exit(), and the CNTR §6 exit-hang fix
+    // aborts the daemon SIGTERM listener at program end so it does not keep the
+    // runtime alive. The mid-request timing is best-effort (a 30ms handler); the
+    // deterministic core proof is the in-process `shutdown_drains_inflight_request`
+    // lib test.
     let marker = std::env::temp_dir().join(format!(
         "ascript_srv_drain_marker_{}.txt",
         std::process::id()
@@ -533,14 +535,35 @@ fn sigterm_triggers_graceful_drain() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Tear the (listener-kept-alive) process down + reap, then assert.
-    let _ = child.kill();
-    let _ = child.wait();
+    // CNTR §6 exit-hang fix: the process must now EXIT CLEANLY on its own (no kill),
+    // since `main` returned normally and the daemon listener is aborted at program end.
+    let mut exited = false;
+    let exit_deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < exit_deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            assert!(
+                status.success(),
+                "program ended normally → clean exit, got {status:?}"
+            );
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let _ = std::fs::remove_file(&marker);
     assert!(
         drained,
         "the SIGTERM → s.shutdown() → graceful-drain composition must run to completion \
          (the drain-completion marker was never written)"
+    );
+    assert!(
+        exited,
+        "after the drain, the process must EXIT on its own (the daemon SIGTERM \
+         listener must not keep it alive — CNTR §6 exit-hang fix)"
     );
 }
 
