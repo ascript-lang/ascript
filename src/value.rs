@@ -1341,6 +1341,17 @@ pub enum NativeKind {
     // without `auth` (mirrors the docker/resilience pattern).
     #[cfg(feature = "auth")]
     JwksCache,
+    // BATT B6 §8.2: a `std/email` SMTP client handle (`email.connect`, or the
+    // transient handle behind `email.send`). Backed by `ResourceState::SmtpClient`
+    // — a hand-rolled SMTP connection over a `TcpStream` OR a (STARTTLS/implicit)
+    // `tokio_rustls::client::TlsStream`. Methods: `send(msg)` (drives MAIL/RCPT/DATA
+    // and returns `[{accepted, rejected}, err]`) and `close()` (best-effort QUIT +
+    // fd reclaim via Drop). `governing_caps` = Net (each command round-trip is live
+    // network I/O → a `caps.drop("net")` HOLDS for an already-open client). GC-
+    // untraced (a live socket reclaimed by Drop), non-sendable (the worker airlock
+    // rejects it). Feature-gated — compiled out without `email`.
+    #[cfg(feature = "email")]
+    SmtpClient,
     // BATT B1 §6: a `std/archive` streaming tar writer handle (`tarWriter(opts?)`).
     // Backed by `ResourceState::ArchiveWriter` — an in-memory `tar::Builder`
     // (optionally gzip-wrapped, optionally deterministic). Methods: `add(name,
@@ -1416,6 +1427,8 @@ impl NativeKind {
             NativeKind::JwksCache => "jwksCache",
             #[cfg(feature = "archive")]
             NativeKind::ArchiveWriter => "archiveWriter",
+            #[cfg(feature = "email")]
+            NativeKind::SmtpClient => "smtpClient",
         }
     }
 
@@ -1515,6 +1528,11 @@ impl NativeKind {
             // grain (worst case), so it is gated Net.
             #[cfg(feature = "auth")]
             NativeKind::JwksCache => CapReq::one(Cap::Net),
+            // BATT B6 §8.2: an OPEN SMTP client drives MAIL/RCPT/DATA over a live
+            // socket on each `.send()`, so a `caps.drop("net")` after the client
+            // opens must HOLD (the per-handle re-check mirrors TcpStream/HttpBody).
+            #[cfg(feature = "email")]
+            NativeKind::SmtpClient => CapReq::one(Cap::Net),
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a

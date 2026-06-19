@@ -1560,19 +1560,33 @@ static EMAIL_MESSAGE_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
 static EMAIL_VALIDATE_ADDRESS_PARAMS: &[StdParam] = &[StdParam::req("addr", "string")];
 // message-handle method (`msg.raw()`).
 static EMAIL_RAW_PARAMS: &[StdParam] = &[];
+// SMTP client (BATT B6 §8.2).
+static EMAIL_SEND_PARAMS: &[StdParam] = &[StdParam::req("msg", "object"), StdParam::req("opts", "object")];
+static EMAIL_CONNECT_PARAMS: &[StdParam] = &[StdParam::req("opts", "object")];
+// SmtpClient handle methods.
+static EMAIL_CLIENT_SEND_PARAMS: &[StdParam] = &[StdParam::req("msg", "object")];
+static EMAIL_CLIENT_CLOSE_PARAMS: &[StdParam] = &[];
 
 static EMAIL_SIGS: &[(&str, StdSig)] = &[
     ("message", StdSig { params: EMAIL_MESSAGE_PARAMS, ret: Some("[object, err]"), doc: "Builds an email message (the pure builder; the SMTP client is separate). opts: {from, to, cc?, bcc?, subject, text?, html?, attachments?, headers?}. text+html → multipart/alternative; attachments → multipart/mixed (base64, wrapped at 76 cols); non-ASCII headers → RFC 2047 encoded-words; the boundary is content-deterministic. Every address/header is CRLF/NUL-rejected (Tier-2) to kill SMTP header injection; bcc stays in the envelope, never a header." }),
     ("validateAddress", StdSig { params: EMAIL_VALIDATE_ADDRESS_PARAMS, ret: Some("bool"), doc: "Validates a bare local@domain address against a pragmatic RFC 5321 subset (dotted domain, no spaces/controls, ≤254 chars). Quoted-local forms are a documented-unsupported false." }),
+    ("send", StdSig { params: EMAIL_SEND_PARAMS, ret: Some("[object, err]"), doc: "Sends a built message over SMTP and returns [{accepted, rejected}, err]. opts: {host, port?, tls?: \"starttls\"|\"implicit\"|\"none\" (default \"starttls\"; ports 587/465/25), username?, password?, authMethod?: \"plain\"|\"login\", allowInsecureAuth?, caCert?, serverName?, timeout?}. STARTTLS is required when requested — an unavailable/failed upgrade is a Tier-1 error (NEVER a silent plaintext downgrade). AUTH over a non-TLS connection is a Tier-2 error unless allowInsecureAuth:true. Net-gated. Async." }),
+    ("connect", StdSig { params: EMAIL_CONNECT_PARAMS, ret: Some("[smtpClient, err]"), doc: "Opens a reusable SMTP connection (same opts as send) and returns [client, err]. The client exposes send(msg)/close(). Net-gated. Async." }),
     // message-handle method.
     ("raw", StdSig { params: EMAIL_RAW_PARAMS, ret: Some("string"), doc: "Returns the RFC 5322 wire form of a built message (for tests/inspection). The wire form is computed eagerly at build time and is byte-stable." }),
+    // SmtpClient handle methods.
+    ("send", StdSig { params: EMAIL_CLIENT_SEND_PARAMS, ret: Some("[object, err]"), doc: "Sends one message over the open SMTP connection; returns [{accepted, rejected}, err]. The envelope is re-validated for CRLF/NUL injection at the wire layer. The connection stays open for reuse." }),
+    ("close", StdSig { params: EMAIL_CLIENT_CLOSE_PARAMS, ret: Some("nil"), doc: "Sends a best-effort QUIT and closes the SMTP connection (reclaims the socket)." }),
 ];
 
 static EMAIL_MEMBERS: &[(&str, MemberKind)] = &[
     ("message", MemberKind::Fn),
     ("validateAddress", MemberKind::Fn),
-    // message-handle method — not a module export.
+    ("send", MemberKind::Fn),
+    ("connect", MemberKind::Fn),
+    // message-handle + SmtpClient-handle methods — not module exports.
     ("raw", MemberKind::HandleMethod),
+    ("close", MemberKind::HandleMethod),
 ];
 
 // ── std/net ───────────────────────────────────────────────────────────────────

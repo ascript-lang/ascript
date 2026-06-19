@@ -605,6 +605,16 @@ pub(crate) enum ResourceState {
     /// (a plain byte buffer reclaimed by Drop). Feature `archive`.
     #[cfg(feature = "archive")]
     ArchiveWriter(Box<crate::stdlib::archive::ArchiveWriterState>),
+    /// BATT B6 §8.2: a `std/email` SMTP client (`email.connect`, or the transient
+    /// handle inside `email.send`). A hand-rolled SMTP connection over a plaintext
+    /// `TcpStream` or a STARTTLS/implicit `TlsStream`. Boxed to keep the enum compact
+    /// (the buffered reader + the negotiated session flags). Its `Drop` is a plain
+    /// socket close (a best-effort QUIT is sent by `close()`/`send` paths, which own
+    /// the take-out-across-await; the bare Drop just reclaims the fd). GC-untraced
+    /// (a live socket), non-sendable (the worker airlock rejects the handle). Feature
+    /// `email`.
+    #[cfg(feature = "email")]
+    SmtpClient(Box<crate::stdlib::email::SmtpClientState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -5701,6 +5711,12 @@ impl Interp {
         {
             if matches!(m.receiver.kind, crate::value::NativeKind::ArchiveWriter) {
                 return crate::stdlib::archive::call_writer_method(self, &m, &args, span);
+            }
+        }
+        #[cfg(feature = "email")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::SmtpClient) {
+                return self.call_smtp_method(&m, args, span).await;
             }
         }
         #[cfg(feature = "telemetry")]

@@ -243,6 +243,52 @@ fn audit_net_tls_connect_allowed_when_net_granted() {
     );
 }
 
+// BATT B6 §8.2 — the `std/email` SMTP client (`email.send` / `email.connect`) is
+// gated by `Net` at the dispatch chokepoint, BEFORE any socket I/O (port 9 is
+// effectively unreachable on loopback, but the gate fires before `connect()` so no
+// real packet is ever sent). The pure builders (`email.message` /
+// `email.validateAddress`) touch no OS resource → they WORK under `--sandbox`.
+#[cfg(all(feature = "email", feature = "net", feature = "tls"))]
+#[test]
+fn audit_email_send_connect_denied() {
+    let imp = "import * as email from \"std/email\"";
+    // `email.send(msg, opts)` — gated by Net. We build a real message first so the
+    // denial is the SEND gate, not a builder error.
+    let send_expr =
+        "email.send(email.message({from:\"a@b.com\",to:\"c@d.com\",subject:\"x\",text:\"y\"})[0], \
+         {host:\"127.0.0.1\", port:9, tls:\"none\"})";
+    assert_denied("audit_email_send_deny.as", imp, send_expr, "net", &["--deny", "net"]);
+    assert_denied("audit_email_send_sbx.as", imp, send_expr, "net", &["--sandbox"]);
+    // `email.connect(opts)` — gated by Net.
+    let conn_expr = "email.connect({host:\"127.0.0.1\", port:9, tls:\"none\"})";
+    assert_denied("audit_email_connect_deny.as", imp, conn_expr, "net", &["--deny", "net"]);
+    assert_denied("audit_email_connect_sbx.as", imp, conn_expr, "net", &["--sandbox"]);
+
+    // in-code `caps.drop("net")` — irreversible; the gate fires after the drop.
+    let src = "import * as email from \"std/email\"\n\
+               import * as caps from \"std/caps\"\n\
+               caps.drop(\"net\")\n\
+               let r = recover(() => email.connect({host:\"127.0.0.1\", port:9, tls:\"none\"}))\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "audit_email_connect_drop.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(out, "capability 'net' denied\n", "caps.drop(\"net\") must deny email.connect");
+}
+
+// BATT B6 §8.1 positive — the pure email builders WORK under `--sandbox` (no OS
+// resource). `email.message(...)` returns a built message even with all caps dropped.
+#[cfg(feature = "email")]
+#[test]
+fn audit_email_message_builder_allowed_under_sandbox() {
+    let src = "import * as email from \"std/email\"\n\
+               let [msg, e] = email.message({from:\"a@b.com\",to:\"c@d.com\",subject:\"hi\",text:\"body\"})\n\
+               print(e == nil)\n\
+               print(email.validateAddress(\"a@b.com\"))\n";
+    let (ok, out, err) = run_with_args(src, "audit_email_message_sbx.as", &["--sandbox"]);
+    assert!(ok, "[audit_email_message_sbx] stderr: {err}");
+    assert_eq!(out, "true\ntrue\n", "email.message/validateAddress must work under --sandbox");
+}
+
 // CNTR §3.1 std/net/unix — a UDS connect/listen is gated by `Net` exactly like TCP.
 // `--deny net` AND `--sandbox` deny BEFORE any bind/connect (no real socket touched).
 #[cfg(all(unix, feature = "net"))]

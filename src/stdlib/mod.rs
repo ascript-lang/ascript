@@ -728,7 +728,12 @@ impl Interp {
             #[cfg(feature = "xml")]
             "html" => html::call(func, args, span),
             #[cfg(feature = "email")]
-            "email" => email::call(func, args, span),
+            "email" => match func {
+                // The SMTP client funcs need `&self` (resource registration + async
+                // socket I/O); the pure builders stay sync.
+                "send" | "connect" => self.call_email_async(func, args, span).await,
+                _ => email::call(func, args, span),
+            },
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

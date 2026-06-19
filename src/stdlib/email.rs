@@ -55,12 +55,18 @@ use base64::Engine as _;
 use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 
+mod smtp;
+pub(crate) use smtp::SmtpClientState;
+
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
         ("message", bi("email.message")),
         ("validateAddress", bi("email.validateAddress")),
-        // B6 wires `send`/`connect` (Net-gated) — registered now so the gate +
-        // sig surface are stable. They are not yet dispatchable (B6).
+        // B6 §8.2: the SMTP client (Net-gated). `send`/`connect` are dispatched
+        // through `Interp::call_email_async` (they need `&self` for socket I/O +
+        // resource registration); the gate keys on `required_cap("email", _)`.
+        ("send", bi("email.send")),
+        ("connect", bi("email.connect")),
     ]
 }
 

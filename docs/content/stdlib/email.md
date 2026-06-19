@@ -2,10 +2,11 @@
 
 # Email (SMTP)
 
-`std/email` builds RFC 5322 email messages. This page covers the **message builder** —
-a pure, side-effect-free function that assembles the wire form of an email. The SMTP
-**client** (`email.send` / `email.connect`) is a separate, network-gated layer documented
-alongside it once shipped; the builder here needs no capability and runs under `--sandbox`.
+`std/email` builds and sends RFC 5322 email messages. The **message builder**
+(`email.message` / `email.validateAddress`) is pure and side-effect-free — it needs no
+capability and runs under `--sandbox`. The **SMTP client** (`email.send` / `email.connect`)
+is a separate, `net`-gated layer (a hand-rolled SMTP state machine with STARTTLS) covered
+in [SMTP client](#smtp-client) below.
 
 The builder's headline feature is its **header-injection defense**. A `\r`, `\n`, or NUL
 smuggled into an address or header can split the SMTP `DATA` stream and forge extra headers
@@ -86,3 +87,71 @@ import * as schema from "std/schema"
 
 let addr = schema.refine(schema.string(), (v) => email.validateAddress(v), "invalid address")
 ```
+
+## SMTP client
+
+The SMTP client sends a built message over a real connection. It is `net`-gated (denied
+under `--sandbox` / `--deny net`) and built on a small RFC 5321 state machine
+(`EHLO → STARTTLS → AUTH → MAIL/RCPT/DATA → QUIT`) over the shared TLS plumbing — no
+third-party SMTP library.
+
+```ascript
+import * as email from "std/email"
+
+let [msg, _] = email.message({
+  from: "alice@example.com", to: "bob@example.com",
+  subject: "Hi", text: "Sent from AScript.",
+})
+
+let [res, err] = email.send(msg, {
+  host: "smtp.example.com",
+  username: "alice", password: env.get("SMTP_PASS")[0],
+})
+if err != nil {
+  print("send failed:", err.message)
+} else {
+  print("accepted:", len(res.accepted), "rejected:", len(res.rejected))
+}
+```
+
+### `email.send(msg, opts) -> [{accepted, rejected}, err]`
+
+Connects, sends one message, and disconnects. The result's `accepted` is the array of
+recipient addresses the server accepted; `rejected` is an array of `{address, code, message}`
+for any recipient the server refused (a partial rejection populates both). `opts`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `host` | `string` | **required** — the SMTP server hostname. |
+| `port` | `int` | optional — defaults by `tls`: **587** (starttls), **465** (implicit), **25** (none). |
+| `tls` | `string` | `"starttls"` (default), `"implicit"`, or `"none"`. |
+| `username` / `password` | `string` | optional — enables `AUTH`. |
+| `authMethod` | `string` | `"plain"` (default) or `"login"`. |
+| `allowInsecureAuth` | `bool` | opt-in to send credentials over a plaintext (`tls:"none"`) connection — **not recommended**. |
+| `caCert` | `string` | optional extra trusted CA PEM (for a private CA / self-signed server). |
+| `serverName` | `string` | optional TLS SNI / cert-verification name override (defaults to `host`). |
+| `timeout` | `int` | optional per-command + connect budget in milliseconds (default 30000). |
+
+### `email.connect(opts) -> [client, err]`
+
+Opens a **reusable** connection (same `opts` as `send`). The returned `client` exposes:
+
+- `client.send(msg) -> [{accepted, rejected}, err]` — send another message over the open connection.
+- `client.close()` — send a best-effort `QUIT` and close the socket.
+
+### Security model
+
+The client is built around three defenses, all documented as part of its contract:
+
+- **No silent STARTTLS downgrade.** When `tls:"starttls"` is requested, the server **must**
+  advertise `STARTTLS` and complete the upgrade. If it does not advertise it, refuses the
+  command, or the TLS handshake fails, `send`/`connect` returns a **Tier-1 error** and the
+  client **never** sends `MAIL`/`AUTH` over the unencrypted socket. (Use `tls:"none"`
+  explicitly if you really want plaintext.)
+- **No plaintext credentials.** Passing `username`/`password` with `tls:"none"` is a
+  **Tier-2 panic** raised *before* any byte is sent — unless you opt in with
+  `allowInsecureAuth:true`.
+- **Wire-layer injection re-check.** Even a hand-built message object that bypassed the
+  builder's CRLF/NUL guard is **re-validated** (`from` and every recipient) at the wire layer
+  before any `MAIL`/`RCPT` is written — a smuggled `\r\n` is a Tier-2 panic. The `DATA` body
+  is dot-stuffed (a line starting with `.` is escaped) per RFC 5321.
