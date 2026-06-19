@@ -90,6 +90,9 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     // BATT Phase B — std/archive is gated on the `archive` feature (archive =
     // compress), so an archive-using bundle pulls the compression tier.
     ("std/archive",     Some("archive")),
+    // BATT Phase B §7.2 — std/xml is gated on the `xml` feature (xml = data +
+    // quick-xml), so an xml-using bundle pulls the data tier.
+    ("std/xml",         Some("xml")),
 ];
 
 /// Cargo feature-dependency edges relevant for the runtime feature closure.
@@ -131,6 +134,9 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     // BATT Phase B — archive = ["compress"]. A std/archive bundle pulls the
     // compression tier (tar/gzip over the vendored tar/flate2).
     ("archive", "compress"),
+    // BATT Phase B §7.2 — xml = ["data", "dep:quick-xml"]. A std/xml bundle pulls
+    // the data tier.
+    ("xml", "data"),
 ];
 
 /// Collect all `std/` module specifiers imported anywhere in `archive`.

@@ -2,7 +2,7 @@
 
 # Data & serialization
 
-AScript ships a family of data-handling modules for the formats you reach for every day: JSON, CSV, TOML, and YAML serialization; MessagePack and CBOR binary serialization; exact decimal arithmetic; base64/hex/URL/UTF-8 encoding; regular expressions; UUID generation; and URL manipulation. All eleven modules — `std/json`, `std/csv`, `std/toml`, `std/yaml`, `std/msgpack`, `std/cbor`, `std/decimal`, `std/encoding`, `std/regex`, `std/uuid`, and `std/url` — are provided by the `data` Cargo feature, which is enabled by default. If you build AScript with a custom feature set, include `data` to keep these modules available.
+AScript ships a family of data-handling modules for the formats you reach for every day: JSON, CSV, TOML, YAML, and XML serialization; MessagePack and CBOR binary serialization; exact decimal arithmetic; base64/hex/URL/UTF-8 encoding; regular expressions; UUID generation; and URL manipulation. The twelve modules — `std/json`, `std/csv`, `std/toml`, `std/yaml`, `std/xml`, `std/msgpack`, `std/cbor`, `std/decimal`, `std/encoding`, `std/regex`, `std/uuid`, and `std/url` — are provided by the `data` Cargo feature, which is enabled by default (`std/xml` additionally pulls the `xml` feature). If you build AScript with a custom feature set, include `data` to keep these modules available.
 
 > [!TIER1] Fallible functions return a two-element `[value, err]` pair — `err` is `nil` on success. Destructure: `let [v, e] = json.parse(s)`.
 
@@ -668,6 +668,80 @@ Percent-decodes a URL component.
 import * as url from "std/url"
 let [s, err] = url.decode("a%20b%26c")
 // s == "a b&c", err == nil
+```
+
+## std/xml
+
+Strict XML parsing and serialization backed by `quick-xml` (the `xml` Cargo feature, on by default). `std/xml` is deliberately **safe by construction**: the classic XML attacks are structurally impossible.
+
+- **No entity expansion beyond the five predefined entities.** Custom DTD-internal entities (`<!ENTITY a "...">`), external `SYSTEM`/`PUBLIC` entities, and billion-laughs / quadratic-blowup payloads are **never expanded**. A reference to any non-predefined entity yields a `[nil, err]` `undefined entity '<name>'` result — the billion-laughs payload stops at its first custom-entity reference, and an external entity (`file:///…`, `http://…`) is never fetched.
+- **No network or filesystem access.** `std/xml` requires **no capability** and imports nothing that can open a socket or a file. An XXE external-entity fetch is not merely denied — there is no code path that could perform it.
+- **Depth and node budgets.** Nesting deeper than **256** elements or a document exceeding **1,000,000** nodes returns a `[nil, err]` result instead of risking a stack overflow or out-of-memory.
+
+The parse shape is stable: every element is `{ tag, attrs, children }`, where `attrs` is an insertion-ordered object of attribute-name → string value and `children` is an array whose entries are child elements or text strings. CDATA folds into text; comments and processing instructions are dropped. Namespaced names (`ns:tag`, `xmlns:*`) pass through raw.
+
+```ascript
+import * as xml from "std/xml"
+```
+
+> [!TIER1] `xml.parse`, `xml.stringify`, and `xml.unescape` return a `[value, err]` pair. Malformed XML, an undefined entity, or a budget violation lands in the `err` channel.
+
+### xml.parse
+
+Parses XML text into a stable `{tag, attrs, children}` element tree.
+
+- `text` (string) — the XML source text.
+- Returns `[object, err]` — the root element object, or `nil` plus an error on malformed XML, an undefined (custom/external) entity reference, or a depth/node-budget violation.
+
+```ascript
+let [node, err] = xml.parse("<root id=\"1\"><b>hi</b>tail</root>")
+// node == { tag: "root", attrs: { id: "1" }, children: [
+//   { tag: "b", attrs: {}, children: ["hi"] },
+//   "tail",
+// ] }
+// err == nil
+
+// A custom DTD entity is NEVER expanded (XXE / billion-laughs defense):
+let [_, e] = xml.parse("<!DOCTYPE x [<!ENTITY a \"BOOM\">]><x>&a;</x>")
+// e.message == "undefined entity 'a'"
+```
+
+### xml.stringify
+
+Serializes a `{tag, attrs, children}` element tree to XML text.
+
+- `node` (object) — an element object `{ tag, attrs, children }`.
+- `options` (object, optional) — `{ indent }`: a positive integer pretty-prints with that many spaces per level; omit for compact output.
+- Returns `[string, err]` — the XML text, or `nil` plus an error if the node is not a well-formed element tree.
+
+```ascript
+let [text, err] = xml.stringify({ tag: "a", attrs: {}, children: ["hi"] })
+// text == "<a>hi</a>", err == nil
+
+let [pretty, _] = xml.stringify(node, { indent: 2 })
+```
+
+### xml.escape
+
+Escapes the five predefined XML entities (`&`, `<`, `>`, `"`, `'`) in text.
+
+- `text` (string) — the raw text to escape.
+- Returns `string` — the escaped text.
+
+```ascript
+xml.escape("a & b < c") // == "a &amp; b &lt; c"
+```
+
+### xml.unescape
+
+Unescapes the five predefined XML entities plus numeric character references (`&#NN;` / `&#xNN;`).
+
+- `text` (string) — the escaped text.
+- Returns `[string, err]` — the unescaped text, or `nil` plus an error if a named entity is undefined (only the five predefined entities and numeric refs are recognized — there is no entity table).
+
+```ascript
+let [s, err] = xml.unescape("a &amp; b &lt; c") // s == "a & b < c", err == nil
+let [ab, _] = xml.unescape("&#65;&#x42;")        // ab == "AB"
 ```
 
 ## std/decimal

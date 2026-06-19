@@ -20,6 +20,8 @@ pub mod compress;
 pub mod convert;
 #[cfg(feature = "archive")]
 pub mod archive;
+#[cfg(feature = "xml")]
+pub mod xml;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "docker")]
@@ -240,6 +242,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/oauth" => oauth::exports(),
         #[cfg(feature = "archive")]
         "std/archive" => archive::exports(),
+        #[cfg(feature = "xml")]
+        "std/xml" => xml::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -317,6 +321,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/jwt",
     "std/oauth",
     "std/archive",
+    "std/xml",
 ];
 
 /// Is `path` a known canonical `std/*` module specifier? Feature-independent
@@ -698,6 +703,8 @@ impl Interp {
             "oauth" => self.call_oauth(func, args, span).await,
             #[cfg(feature = "archive")]
             "archive" => archive::call(self, func, args, span),
+            #[cfg(feature = "xml")]
+            "xml" => xml::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -1171,6 +1178,9 @@ mod cap_gate_tests {
         assert!(required_cap("caps", "drop").is_empty());
         // resilience is pure / in-memory.
         assert!(required_cap("resilience", "breaker").is_empty());
+        // BATT B3 §7.2 — std/xml is pure parsing (no net/fs) → ungated.
+        assert!(required_cap("xml", "parse").is_empty());
+        assert!(required_cap("xml", "stringify").is_empty());
         // BATT B1 §6 — archive is PER-FUNC: streaming/in-memory fns ungated; the
         // disk fns (B2) → Fs.
         #[cfg(feature = "archive")]
@@ -1268,6 +1278,9 @@ mod cap_gate_tests {
             "msgpack", "cbor", "tui",
             // RESIL §0: pure / in-memory policy kit — no OS resource, no cap.
             "resilience",
+            // BATT B3 §7.2: std/xml is pure parsing/serialization — no net/fs (the
+            // structural XXE / external-entity defense), so it acquires no cap.
+            "xml",
         ];
         for full in STD_MODULES {
             let key = full.strip_prefix("std/").unwrap().replace('/', "_");

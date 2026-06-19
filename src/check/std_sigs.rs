@@ -1509,6 +1509,30 @@ static ARCHIVE_MEMBERS: &[(&str, MemberKind)] = &[
     ("finish", MemberKind::HandleMethod),
 ];
 
+// ── std/xml ───────────────────────────────────────────────────────────────────
+
+static XML_PARSE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static XML_STRINGIFY_PARAMS: &[StdParam] = &[
+    StdParam::req("node", "object"),
+    StdParam::opt("options", "object"),
+];
+static XML_ESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+static XML_UNESCAPE_PARAMS: &[StdParam] = &[StdParam::req("text", "string")];
+
+static XML_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: XML_PARSE_PARAMS, ret: Some("[object, err]"), doc: "Parses XML text into a stable {tag, attrs, children} element tree. Comments and processing instructions are dropped; CDATA folds into text. Custom/external DTD entities are NEVER expanded (a [nil, err] undefined-entity result)." }),
+    ("stringify", StdSig { params: XML_STRINGIFY_PARAMS, ret: Some("[string, err]"), doc: "Serializes a {tag, attrs, children} element tree to XML text. options: {indent?} (a positive integer pretty-prints)." }),
+    ("escape", StdSig { params: XML_ESCAPE_PARAMS, ret: Some("string"), doc: "Escapes the five predefined XML entities (& < > \" ') in text." }),
+    ("unescape", StdSig { params: XML_UNESCAPE_PARAMS, ret: Some("[string, err]"), doc: "Unescapes the five predefined XML entities plus numeric character references (&#NN; / &#xNN;); an undefined named entity yields a [nil, err] result." }),
+];
+
+static XML_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("stringify", MemberKind::Fn),
+    ("escape", MemberKind::Fn),
+    ("unescape", MemberKind::Fn),
+];
+
 // ── std/net ───────────────────────────────────────────────────────────────────
 
 static NET_LOOKUP_PARAMS: &[StdParam] = &[StdParam::req("host", "string")];
@@ -2900,6 +2924,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/jwt", JWT_MEMBERS),
     ("std/oauth", OAUTH_MEMBERS),
     ("std/archive", ARCHIVE_MEMBERS),
+    ("std/xml", XML_MEMBERS),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2975,6 +3000,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/jwt" => JWT_SIGS,
         "std/oauth" => OAUTH_SIGS,
         "std/archive" => ARCHIVE_SIGS,
+        "std/xml" => XML_SIGS,
         _ => return None,
     };
     sigs.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
