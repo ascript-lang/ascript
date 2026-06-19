@@ -124,6 +124,10 @@ webpki-roots = { version = "0.26", optional = true }
 # reuse, not a new stack. HS256/384/512 ride the existing `hmac`+`sha2`.
 rsa = { version = "0.9", optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+# BATT Phase B §6 — `xml` feature: a strict XML parser/serializer (std/xml) + the
+# fail-closed HTML sanitizer (std/html) tokenizer. quick-xml 0.39 is lock-resident
+# (apple-codesign). std/archive reuses the vendored tar/zip/flate2 (zero new deps).
+quick-xml = { version = "0.39", default-features = false, optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "cookies", "gzip", "brotli", "deflate", "zstd", "socks", "http2"], optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
@@ -212,7 +216,7 @@ indexmap = "2"
 ascript = { path = ".", features = ["fuzzgen"] }
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "dap", "doc", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai", "ffi", "shared", "profile", "bundle-zstd", "rt-fetch", "resilience", "docker", "tls", "auth", "archive", "xml", "email", "blob"]
 # RT §5.1/§5.2 — the signed-manifest verification + stub fetch half of the
 # runtime-stub distribution path. Pulls `net` (the pooled reqwest client used to fetch
 # the release manifest + stub blobs) and `ed25519-dalek` (verify the detached manifest
@@ -400,6 +404,15 @@ tls = ["net", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 # signed cookies/sessions. Pulls crypto+data+net + the asymmetric crates (lock-resident).
 # `sha2/oid` is required by `rsa`'s pkcs1v15 SigningKey/VerifyingKey (D: AssociatedOid).
 auth = ["crypto", "data", "net", "dep:rsa", "dep:p256", "sha2/oid"]
+# BATT Phase B — backend data batteries.
+# archive: streaming tar/zip over the vendored tar/zip/flate2 (zero new deps).
+archive = ["compress"]
+# xml: strict XML parse/stringify (std/xml) + the std/html sanitizer tokenizer.
+xml = ["data", "dep:quick-xml"]
+# email: message builder + hand-rolled SMTP client (STARTTLS over the tls plumbing).
+email = ["net", "tls", "data"]
+# blob: S3-compatible object storage (SigV4 signing) over the pooled HTTP client.
+blob = ["net", "crypto", "data", "xml"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"
