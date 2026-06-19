@@ -297,7 +297,7 @@ stated, results are measured.
   (narrow-fallback recorded).
   - Spec: `superpowers/specs/2026-06-12-native-runtime-stubs-design.md` · Plan: `superpowers/plans/2026-06-12-native-runtime-stubs.md`
 
-- 🔒 **CNTR — container-native runtime + `std/docker`.** Unix-domain sockets in `std/net` +
+- ✅ **CNTR — container-native runtime + `std/docker`. MERGED to `main` (`--no-ff`). See EXECUTION LOG.** Unix-domain sockets in `std/net` +
   `std/http` (`{socketPath}`) as the missing foundation; `std/docker` as a typed wrapper over
   the Engine API (containers/images/exec, `logs`/`events` as `for await` streams) gated on
   **net AND process** caps (dual-cap chokepoint extension — the docker socket is
@@ -846,6 +846,56 @@ stated, results are measured.
   M17 spawn-driving; shed is server-tested in `resil_handler_server`). **Recorded follow-up:** redis deadline-mid-op
   abandon may reuse a connection that ideally should be discarded (honestly documented at `src/stdlib/redis.rs`;
   low-risk, narrow window). Parked per spec: hedged requests, AIMD adaptive concurrency, `std/k8s`.
+- **CNTR** — ✅ **MERGED to `main` (`--no-ff`, `6e22800`)** from `feat/containers-docker`. Container-native runtime +
+  `std/docker` (`docker` feature = `["net","data"]`, default-on). **NO `.aso`/opcode/grammar change**
+  (`ASO_FORMAT_VERSION` 29; `vm_differential` **445/0 BOTH feature configs** every step; `src/vm/run.rs` untouched).
+  **The cap chokepoint is now a CONJUNCTION:** `required_cap`/`NativeKind::governing_caps` return a `CapReq` (a
+  `Copy(u8)` bitset newtype with `NONE`/`one`/`and`/`is_empty`/`iter`-in-`Cap::ALL`-order) instead of `Option<Cap>`,
+  so `docker` requires **net ∧ process** (the docker socket is host-root-equivalent); the gate at `call_stdlib` + the
+  per-handle re-check at `call_native_method` iterate `…iter()` behind the **unchanged `!all_granted()`
+  short-circuit** → the all-granted default is byte-identical (single-cap = one iteration; `cap_audit` 100% green =
+  verdict-preservation). **`std/net/unix`** (UDS connect/listen, the `net_tcp.rs` structural mirror, Drop-unlinks the
+  bound path) + a stage-2 `check_unix_path` `unix:<canonical>` carve-out. **`src/stdlib/http1.rs`** — a small HARDENED
+  HTTP/1.1 client codec (generic over the transport; bounds 64KiB/256/16MiB; hostile→clean Tier-1, never
+  panic/hang/OOM; `read_to_end` never pre-`reserve`s an attacker length; `101`→`Upgraded{transport,leftover}`); HTTP
+  over UDS, NOT reqwest. `std/net/http` routes `{socketPath}` through it (`call_http_send_uds`, surface-identical incl.
+  `errorOnStatus`/stream/json). **`std/docker`** (`src/stdlib/docker.rs`): connect (socket resolution
+  opts→`$DOCKER_HOST`→`/var/run/docker.sock`; `tcp://`→Tier-1) + version negotiation (clamp `[1.24,1.43]`) + the
+  unary table + `logs`/`events`/`pull`/exec streams over the **8-byte multiplexed demux** (Multiplexed/Tty
+  auto-detect, oversize-no-alloc + partial-frame reassembly + truncation→Tier-1; `NativeKind::DockerStream` +
+  `native_stream_method=>Some("next")` makes `for await` work on BOTH engines); exec via the `Upgraded` hijack. Return
+  shapes per §4.2 (`ping`→`[true]`, `wait`→`[StatusCode int]`). `DockerClient`/`DockerStream` `governing_caps` =
+  net∧process; all four new handles GC-untraced + non-sendable. Hermetic **recorded-fixture mock Engine daemon**
+  (`tests/docker.rs`) → the whole module is testable with NO Docker; live tests env-gated on `ASCRIPT_DOCKER_LIVE=1`.
+  **Inbound signals + graceful drain** (§6–§7): `process.on`/`off` (`tokio::signal`, MAIN-ISOLATE only; `off` →
+  emulated `exit(128+signo)`; the listeners are daemon tasks ABORTED at program end via `abort_signal_listeners()`
+  before the `local.await` drain — **a review-caught Critical: a registered handler otherwise hung the process at
+  exit**, fixed `0811668`). `srv.shutdown()` + `serve({onShutdown,drainTimeout})` graceful drain: accept_loop
+  predicate generalized `budget==0` → `budget==0 || shutdown.is_armed()` with the **lost-wakeup
+  register→`enable()`→recheck sequence PRESERVED** (the existing server battery byte-identical = the proof);
+  `onShutdown` once (`AtomicBool::swap`); drain awaits in-flight raced vs `drainTimeout`. **cgroup-aware sizing** (§8):
+  `effective_parallelism()` = `$ASCRIPT_WORKERS || min(num_cpus, cgroup_quota)` (cgroup v2 `cpu.max` / v1
+  `cfs_quota`, Linux-only → `None` elsewhere = non-Linux byte-identical to `main`) swapped into the 4 pool/worker
+  sizing sites; `os.inContainer()`. `ascript init --template server`. **8 phases, subagent-driven** (fresh implementer
+  + independent opus reviewer per phase + a final holistic). **Reviews caught & FIXED real bugs:** the exit-hang
+  (above); an `errorOnStatus`-ignored silent divergence on the UDS path; the `rt_select` module→feature drift RED
+  (CNTR added `std/net/unix`+`std/docker` to `STD_MODULES` without the RT stub table). The final holistic tried hard
+  to **skip the net∧process gate** (handle method, stream `next`, `for await`, `net.connect("unix:")`,
+  `http.request({socketPath})`) and **could not** — every UDS-open site is gated. **Two spec-prose corrections** (no
+  recorded-semantics change): the plan's `ASO == 27` is stale (real 29, pinned 29); the docker examples test via the
+  built binary (the in-process VM entry points don't abort signal listeners — a harness property, not an engine
+  divergence). **Perf** (`bench/CNTR_RESULTS.md`, same-session cross-binary vs `5bdb24b`): the cap-gate **mechanism is
+  zero-cost** (bisected: `ff65c5b` = 1.00×); pure-compute flat; whole-program + **real-program A/B flat** (`json_adt`
+  startup-dominated, no measurable delta); RSS flat; in-process `vm_bench` gate PASS (spec/tw ≥2× + DBG armed/none
+  ≤1.05×). **OWNER-VISIBLE finding:** a synthetic 100%-stdlib-call-spam microbench carries a **~5–11% code-layout
+  tax** — bisection-confirmed to be the `net`-essential http1/UDS **code volume** shifting the large `call_stdlib`
+  function's layout (NOT the cap gate; NOT `docker`-feature-gate-avoidable since http1 is `net`-essential), invisible
+  in every real/whole-program workload. Accepted as the **DECODE-precedent class** (DECODE shipped a 2.3×
+  *whole-program* layout tax with an owner note; CNTR's whole-program is flat). Examples
+  `examples/{docker_info,advanced/docker_supervisor}.as`; docs `docs/content/{deploying,stdlib/docker}.md`.
+  **Recorded ENABLED follow-ups** (RT+RESIL merged): rt-stub/`--oci` scratch image base for the Dockerfiles; the
+  template `/proxy` upgrade to `std/resilience`; a `docker.md` note pointing at `task.timeout` for an unresponsive
+  daemon (the docker calls have no built-in per-call read timeout — non-blocking, the daemon is trusted/local).
 
 ## Execution order
 
