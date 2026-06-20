@@ -230,6 +230,19 @@ pub enum TraceOutcome {
     Panic(String),
     /// The call returned `Control::Propagate(v)` (a `?` early return); `v` is airlock-encoded.
     Propagate(Vec<u8>),
+    /// REPLAY §2.5 — the call returned a VIRTUALIZED native handle (today: an
+    /// `HttpResponse`). `kind_tag` is a stable per-`NativeKind` byte (1 = HttpResponse),
+    /// `vid` is the trace-scoped virtual id assigned at birth (in event order), and
+    /// `fields` is the airlock-encoded plain `Object` of the handle's materialized
+    /// `NativeObject.fields` (status/ok/url/headers/…). On replay the chokepoint mints a
+    /// fresh handle carrying the decoded fields + a `ResourceState::ReplayVirtual { vid }`;
+    /// subsequent accessor calls consume `NativeCall { vid, … }` events. Plain `Send`
+    /// data — the `Value` ⇄ bytes happens at the Interp chokepoint, never here.
+    Handle {
+        kind_tag: u8,
+        vid: u32,
+        fields: Vec<u8>,
+    },
 }
 
 /// FFI Task 10 (§7): the marshalled RETURN of a recorded foreign call. A pointer

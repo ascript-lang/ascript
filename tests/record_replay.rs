@@ -526,6 +526,477 @@ fn workflow_run_is_recorded_class() {
 //    install→true, take→false, restore(Some workflow)→false.
 // ===========================================================================
 
+// ===========================================================================
+// Task 4 — HttpResponse handle virtualization (REPLAY §2.5).
+//
+// A tiny raw-TCP HTTP/1.1 server runs on a background thread serving a JSON route
+// (/json) and a text route (/text). The record run drives `http.get` + accessors
+// in-process; the server is then STOPPED and the replay run must succeed OFFLINE
+// (the flagship "record against a real API, replay on a plane" guarantee).
+// ===========================================================================
+
+#[cfg(feature = "net")]
+mod http_virtualization {
+    use super::*;
+    use ascript::value::ValueKind;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A background raw-HTTP/1.1 server. Returns `(base_url, stop)` where `stop` is an
+    /// `Arc<AtomicBool>` the caller sets to shut the accept loop down (so replay runs
+    /// with the server DOWN). Each connection serves ONE request then closes.
+    fn spawn_http_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        serve_one(&mut sock);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{}", addr), stop, handle)
+    }
+
+    /// Read the request line, decide the route, write a response, close.
+    fn serve_one(sock: &mut TcpStream) {
+        sock.set_nonblocking(false).ok();
+        let mut buf = [0u8; 1024];
+        let n = sock.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/");
+        let (ctype, body) = if path.starts_with("/json") {
+            ("application/json", "{\"name\":\"orders\",\"count\":3}".to_string())
+        } else {
+            ("text/plain", "hello replay".to_string())
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            ctype,
+            body.len(),
+            body
+        );
+        let _ = sock.write_all(resp.as_bytes());
+        let _ = sock.flush();
+    }
+
+    /// The `[handle, nil]` pair's element 0 (the native HttpResponse handle).
+    fn pair_handle(pair: &Value) -> Value {
+        match pair.kind() {
+            ValueKind::Array(a) => a.borrow()[0].clone(),
+            other => panic!("expected a [handle, nil] pair, got {other:?}"),
+        }
+    }
+
+    // ---- Test 1: record handle + accessor, replay offline ---- //
+    #[test]
+    fn http_get_records_handle_and_accessors() {
+        let (base, stop, handle) = spawn_http_server();
+        let url = format!("{}/json", base);
+
+        // ---- Record ----
+        let (recorded_status, recorded_body, events) = with_interp(|interp| {
+            let url = url.clone();
+            async move {
+                interp.__install_record_trace(100);
+                let pair = interp
+                    .__call_stdlib("net_http", "get", &[Value::str(url)])
+                    .await
+                    .expect("http.get under record");
+                let resp = pair_handle(&pair);
+                // resp.status — a MATERIALIZED field read (no event consumed).
+                let status = match resp.kind() {
+                    ValueKind::Native(n) => n.fields.get("status").cloned().unwrap(),
+                    _ => panic!("not a native handle"),
+                };
+                // resp.json() — recorded as a NativeCall.
+                let jpair = interp
+                    .__call_native_method(&resp, "json", vec![])
+                    .await
+                    .expect("resp.json() under record");
+                let body = match jpair.kind() {
+                    ValueKind::Array(a) => a.borrow()[0].clone(),
+                    _ => panic!("json pair"),
+                };
+                let events = interp.__take_trace_events().unwrap();
+                interp.__clear_determinism();
+                (status, body, events)
+            }
+        });
+
+        // The trace holds StdlibCall(net_http.get) with a Handle{vid:0} outcome + one
+        // NativeCall{vid:0, method:"json"}.
+        let stdlib: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, DetEvent::StdlibCall { .. }))
+            .collect();
+        assert_eq!(stdlib.len(), 1, "one StdlibCall(net_http.get)");
+        match stdlib[0] {
+            DetEvent::StdlibCall { module, func, outcome, .. } => {
+                assert_eq!(module, "net_http");
+                assert_eq!(func, "get");
+                match outcome {
+                    TraceOutcome::Handle { kind_tag, vid, .. } => {
+                        assert_eq!(*kind_tag, 1, "HttpResponse tag = 1");
+                        assert_eq!(*vid, 0, "first handle gets vid 0");
+                    }
+                    other => panic!("expected a Handle outcome, got {other:?}"),
+                }
+            }
+            _ => unreachable!(),
+        }
+        let native_calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                DetEvent::NativeCall { vid, method, .. } => Some((*vid, method.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(native_calls, vec![(0u32, "json".to_string())], "one NativeCall json@vid0");
+
+        // ---- STOP the server: replay must NOT touch the network ---- //
+        stop.store(true, Ordering::SeqCst);
+        handle.join().ok();
+        // A guaranteed-dead URL would be used by the replay path ONLY if it touched the
+        // network — it must not. We replay against the SAME url (server now down).
+
+        // ---- Replay (offline) ----
+        with_interp(|interp| {
+            let url = url.clone();
+            let events = events.clone();
+            let recorded_status = recorded_status.clone();
+            let recorded_body = recorded_body.clone();
+            async move {
+                interp.__install_replay_trace(100, events);
+                let pair = interp
+                    .__call_stdlib("net_http", "get", &[Value::str(url)])
+                    .await
+                    .expect("http.get replays offline (server is down)");
+                let resp = pair_handle(&pair);
+                // resp.status from the materialized fields (no event).
+                let status = match resp.kind() {
+                    ValueKind::Native(n) => n.fields.get("status").cloned().unwrap(),
+                    _ => panic!("virtual handle is native"),
+                };
+                assert_eq!(status, recorded_status, "replayed status from materialized fields");
+                // resp.json() consumes the recorded NativeCall.
+                let jpair = interp
+                    .__call_native_method(&resp, "json", vec![])
+                    .await
+                    .expect("resp.json() replays from the recorded NativeCall");
+                let body = match jpair.kind() {
+                    ValueKind::Array(a) => a.borrow()[0].clone(),
+                    _ => panic!("json pair"),
+                };
+                assert_eq!(
+                    body.to_string(),
+                    recorded_body.to_string(),
+                    "replayed body matches recording though the server is down"
+                );
+                // Leak check: exactly ONE live resource (the single virtual handle) — no
+                // per-accessor-call accumulation. (A native handle's table entry is
+                // reclaimed on interp drop / explicit close, like every HttpResponse; the
+                // point is the accessor calls add NO further entries.)
+                assert_eq!(
+                    interp.__resource_count(),
+                    1,
+                    "exactly one virtual handle in the table — no per-call leak"
+                );
+                drop(resp);
+                drop(pair);
+                interp.__clear_determinism();
+            }
+        });
+    }
+
+    // ---- Test 2: two responses get distinct vids, per-vid method order ---- //
+    #[test]
+    fn two_responses_get_distinct_vids_and_interleave() {
+        let (base, stop, handle) = spawn_http_server();
+        let ujson = format!("{}/json", base);
+        let utext = format!("{}/text", base);
+
+        let events = with_interp(|interp| {
+            let ujson = ujson.clone();
+            let utext = utext.clone();
+            async move {
+                interp.__install_record_trace(7);
+                let p0 = interp
+                    .__call_stdlib("net_http", "get", &[Value::str(ujson)])
+                    .await
+                    .unwrap();
+                let r0 = pair_handle(&p0);
+                let p1 = interp
+                    .__call_stdlib("net_http", "get", &[Value::str(utext)])
+                    .await
+                    .unwrap();
+                let r1 = pair_handle(&p1);
+                // Interleave: r1.text() then r0.json().
+                let _ = interp.__call_native_method(&r1, "text", vec![]).await.unwrap();
+                let _ = interp.__call_native_method(&r0, "json", vec![]).await.unwrap();
+                let events = interp.__take_trace_events().unwrap();
+                interp.__clear_determinism();
+                events
+            }
+        });
+        stop.store(true, Ordering::SeqCst);
+        handle.join().ok();
+
+        // vids 0 and 1 assigned in handle-birth order.
+        let handles: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                DetEvent::StdlibCall { outcome: TraceOutcome::Handle { vid, .. }, .. } => Some(*vid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handles, vec![0, 1], "two handles get distinct vids in birth order");
+        // The interleaved accessor calls: r1(vid1).text first, then r0(vid0).json.
+        let calls: Vec<(u32, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                DetEvent::NativeCall { vid, method, .. } => Some((*vid, method.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![(1, "text".to_string()), (0, "json".to_string())],
+            "per-vid method order preserved"
+        );
+
+        // Replay verifies the per-vid order: r0.json + r1.text replay against the right vids.
+        with_interp(|interp| {
+            let ujson = ujson.clone();
+            let utext = utext.clone();
+            let events = events.clone();
+            async move {
+                interp.__install_replay_trace(7, events);
+                let r0 = pair_handle(
+                    &interp
+                        .__call_stdlib("net_http", "get", &[Value::str(ujson)])
+                        .await
+                        .unwrap(),
+                );
+                let r1 = pair_handle(
+                    &interp
+                        .__call_stdlib("net_http", "get", &[Value::str(utext)])
+                        .await
+                        .unwrap(),
+                );
+                // Same interleave order as record → matches the recorded NativeCall stream.
+                let t = interp.__call_native_method(&r1, "text", vec![]).await.unwrap();
+                assert_eq!(
+                    match t.kind() { ValueKind::Array(a) => a.borrow()[0].to_string(), _ => unreachable!() },
+                    "hello replay"
+                );
+                let _ = interp.__call_native_method(&r0, "json", vec![]).await.unwrap();
+                interp.__clear_determinism();
+            }
+        });
+    }
+
+    // ---- Test 3: a connection-refused request records [nil, err] as a plain Value ---- //
+    #[test]
+    fn http_error_pair_round_trips() {
+        // A guaranteed-dead address (port 1 on loopback is unbindable/unroutable).
+        let dead = "http://127.0.0.1:1/json".to_string();
+        let events = with_interp(|interp| {
+            let dead = dead.clone();
+            async move {
+                interp.__install_record_trace(5);
+                let pair = interp
+                    .__call_stdlib("net_http", "get", &[Value::str(dead)])
+                    .await
+                    .expect("a connection failure is the Tier-1 [nil, err] pair, not an error");
+                // [nil, err] — element 0 is nil.
+                match pair.kind() {
+                    ValueKind::Array(a) => {
+                        assert!(matches!(a.borrow()[0].kind(), ValueKind::Nil), "[nil, err]");
+                    }
+                    other => panic!("expected [nil, err], got {other:?}"),
+                }
+                let events = interp.__take_trace_events().unwrap();
+                interp.__clear_determinism();
+                events
+            }
+        });
+        // The error pair is recorded as a PLAIN Value outcome (no handle, no vid).
+        let stdlib: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, DetEvent::StdlibCall { .. }))
+            .collect();
+        assert_eq!(stdlib.len(), 1);
+        match stdlib[0] {
+            DetEvent::StdlibCall { outcome, .. } => {
+                assert!(
+                    matches!(outcome, TraceOutcome::Value(_)),
+                    "an error pair records as a plain Value, not a Handle"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, DetEvent::NativeCall { .. })),
+            "no NativeCall for an error pair"
+        );
+
+        // Replay returns the same [nil, err] WITHOUT touching the network.
+        with_interp(|interp| {
+            let dead = dead.clone();
+            let events = events.clone();
+            async move {
+                interp.__install_replay_trace(5, events);
+                let pair = interp
+                    .__call_stdlib("net_http", "get", &[Value::str(dead)])
+                    .await
+                    .expect("error pair replays offline");
+                match pair.kind() {
+                    ValueKind::Array(a) => {
+                        assert!(matches!(a.borrow()[0].kind(), ValueKind::Nil), "replayed [nil, err]");
+                        assert!(!matches!(a.borrow()[1].kind(), ValueKind::Nil), "err is present");
+                    }
+                    other => panic!("expected [nil, err], got {other:?}"),
+                }
+                interp.__clear_determinism();
+            }
+        });
+    }
+
+    // ---- Test 4: streaming + sse are refused under record AND replay ---- //
+    #[test]
+    fn streaming_and_sse_are_refused() {
+        let (base, stop, handle) = spawn_http_server();
+        let url = format!("{}/text", base);
+
+        // {stream:true} → the loud v2 refusal at OPTION PARSE (record).
+        with_interp(|interp| {
+            let url = url.clone();
+            async move {
+                interp.__install_record_trace(1);
+                let opts = Value::object(
+                    [("stream".to_string(), Value::bool_(true))].into_iter().collect(),
+                );
+                let r = interp
+                    .__call_stdlib("net_http", "get", &[Value::str(url), opts])
+                    .await;
+                match r {
+                    Err(Control::Panic(e)) => {
+                        assert!(
+                            e.message.contains("streaming") && e.message.contains("v2"),
+                            "stream refusal names streaming + v2: {}",
+                            e.message
+                        );
+                    }
+                    other => panic!("{{stream:true}} under record must be refused, got {other:?}"),
+                }
+                interp.__clear_determinism();
+            }
+        });
+
+        // http.sse → Refused (the net_http Refused per-func class), record + replay.
+        for empty_replay in [false, true] {
+            with_interp(|interp| {
+                let url = url.clone();
+                async move {
+                    if empty_replay {
+                        interp.__install_replay_trace(1, vec![]);
+                    } else {
+                        interp.__install_record_trace(1);
+                    }
+                    let r = interp.__call_stdlib("net_http", "sse", &[Value::str(url)]).await;
+                    match r {
+                        Err(Control::Panic(e)) => {
+                            assert!(
+                                e.message.contains("net_http") && e.message.contains("sse"),
+                                "sse refusal names net_http.sse: {}",
+                                e.message
+                            );
+                        }
+                        other => panic!("http.sse under a trace context must be refused, got {other:?}"),
+                    }
+                    interp.__clear_determinism();
+                }
+            });
+        }
+        stop.store(true, Ordering::SeqCst);
+        handle.join().ok();
+    }
+
+    // ---- Test 5: json(Class) vs json() — args_hash pins the method args ---- //
+    #[test]
+    fn virtual_handle_method_args_pinned() {
+        let (base, stop, handle) = spawn_http_server();
+        let url = format!("{}/json", base);
+
+        // Record resp.json() (no args).
+        let events = with_interp(|interp| {
+            let url = url.clone();
+            async move {
+                interp.__install_record_trace(2);
+                let resp = pair_handle(
+                    &interp
+                        .__call_stdlib("net_http", "get", &[Value::str(url)])
+                        .await
+                        .unwrap(),
+                );
+                let _ = interp.__call_native_method(&resp, "json", vec![]).await.unwrap();
+                let events = interp.__take_trace_events().unwrap();
+                interp.__clear_determinism();
+                events
+            }
+        });
+        stop.store(true, Ordering::SeqCst);
+        handle.join().ok();
+
+        // Replay resp.json(SomeArg) — a DIFFERENT args signature at the same vid+method
+        // → the args_hash mismatch is a divergence.
+        with_interp(|interp| {
+            let url = url.clone();
+            let events = events.clone();
+            async move {
+                interp.__install_replay_trace(2, events);
+                let resp = pair_handle(
+                    &interp
+                        .__call_stdlib("net_http", "get", &[Value::str(url)])
+                        .await
+                        .unwrap(),
+                );
+                // Pass an extra arg → different args_hash than the recorded no-arg json().
+                let r = interp
+                    .__call_native_method(&resp, "json", vec![Value::str("extra")])
+                    .await;
+                match r {
+                    Err(Control::Panic(e)) => {
+                        assert!(
+                            e.message.contains("divergence"),
+                            "args mismatch is a divergence: {}",
+                            e.message
+                        );
+                    }
+                    other => panic!("json(arg) vs json() must diverge, got {other:?}"),
+                }
+                interp.__clear_determinism();
+            }
+        });
+    }
+}
+
 #[test]
 fn default_path_untouched() {
     with_interp(|interp| async move {

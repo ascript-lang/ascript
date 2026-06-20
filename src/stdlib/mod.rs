@@ -597,11 +597,18 @@ pub fn replay_class(module: &str, func: &str) -> ReplayClass {
             "spawn" => Refused,
             _ => Recorded(Plain),
         },
-        // net_http buffered requests are Recorded — their live HttpResponse handle is
-        // virtualized in Task 4 (`HttpResponse` shape). In Task 3 the live handle is
-        // non-sendable, so a recorded request hits the airlock field-path refusal at
-        // record time (the documented Task-3 behavior; Task 4 adds virtualization).
-        "net_http" => Recorded(HttpResponse),
+        // net_http BUFFERED requests (get/post/put/patch/delete/head/options/request)
+        // are Recorded with the `HttpResponse` shape — their live response handle is
+        // VIRTUALIZED (Task 4): a trace-scoped vid + materialized fields, with accessor
+        // calls recorded as `NativeCall` events. The streaming surfaces are v2 and
+        // Refused (no determinism seam): `sse` mints a live `SseStream`, `cancelToken`
+        // mints a live `CancelHandle` raced against an in-flight request. `{stream:true}`
+        // on an otherwise-Recorded verb is refused at OPTION PARSE inside `call_http_send`
+        // (an EXTRA guard the class table can't express — it's an option, not a func).
+        "net_http" => match func {
+            "sse" | "cancelToken" => Refused,
+            _ => Recorded(HttpResponse),
+        },
         // workflow.run/resume — JSON-plain result by construction (`is_serializable`).
         // Its own internal events go to the WORKFLOW log under the workflow-installed
         // (prev) context; the CLI trace records exactly ONE StdlibCall at the boundary.

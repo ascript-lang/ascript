@@ -697,6 +697,22 @@ pub(crate) enum ResourceState {
     /// Feature `blob`.
     #[cfg(feature = "blob")]
     BlobClient(Box<crate::stdlib::blob::BlobClientState>),
+    /// REPLAY §2.5: a VIRTUALIZED native handle minted during replay (today: an
+    /// `HttpResponse` whose accessor methods are themselves recorded). It holds NO OS
+    /// resource — only the trace-scoped virtual id (`vid`) that the
+    /// `call_native_method` replay hook uses to consume the next `NativeCall` event.
+    /// CORE (NOT feature-gated — the variant + the vid map are core per the plan; the
+    /// http virtualization logic that mints it is net-gated). Inert: no fd, no cleanup
+    /// beyond the Drop that removes the table entry, and NO `Trace` (the native-resource
+    /// rule, §2.6 — `Value::native` already traces as a no-op, so the invariant holds;
+    /// the materialized `fields` live in the `Rc<NativeObject>`, off the Cc graph).
+    ReplayVirtual {
+        // Read by the net-gated `call_native_method` replay hook (`trace_native_method`);
+        // under `--no-default-features` (no virtualizable handle kind) the field is
+        // carried but never consumed — the variant stays CORE per the plan.
+        #[allow(dead_code)]
+        vid: u32,
+    },
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -914,6 +930,19 @@ pub struct Interp {
     /// borrow, so the default path (no context, or a Workflow context) takes ONE
     /// predictably-not-taken branch and is byte-identical.
     trace_active: Cell<bool>,
+    /// REPLAY §2.5 — the trace-side virtual-handle map. On the RECORD side it maps a
+    /// live resource id (the `HttpResponse` handle's `NativeObject.id`) → its assigned
+    /// trace-scoped `vid` (assigned in event order, starting at 0), so a subsequent
+    /// accessor call on that handle records a `NativeCall { vid, … }`. CLEARED whenever
+    /// the determinism context is installed/cleared (mirrors `trace_active` resets in
+    /// `set_determinism`), so each record/replay run gets a fresh vid namespace. CORE
+    /// (a plain `HashMap<u64, u32>` — builds under `--no-default-features`; empty + cold
+    /// on every non-trace run).
+    replay_vid_map: RefCell<HashMap<u64, u32>>,
+    /// REPLAY §2.5 — the vid counter, assigning `vid`s in handle-birth order (0, 1, …)
+    /// during a record run. Reset alongside [`Self::replay_vid_map`] at every
+    /// `set_determinism` install/clear. CORE.
+    replay_vid_counter: Cell<u32>,
     /// SP6 §6: the CLI-injected resolved third-party package set. `None` until
     /// [`Interp::set_package_resolver`] installs it (the REPL / tests / a project
     /// with no deps leave it `None` → every bare specifier is "unknown package").
@@ -1439,6 +1468,8 @@ impl Interp {
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
             trace_active: Cell::new(false),
+            replay_vid_map: RefCell::new(HashMap::new()),
+            replay_vid_counter: Cell::new(0),
             package_resolver: RefCell::new(None),
             // EMBED §6.3: no host modules until the embed builder registers them.
             host_modules: RefCell::new(HashMap::new()),
@@ -1936,6 +1967,12 @@ impl Interp {
             &ctx,
             Some(c) if c.origin == crate::det::Origin::CliTrace
         ));
+        // REPLAY §2.5 — reset the virtual-handle vid namespace at the SAME chokepoint
+        // (a fresh record/replay run starts vids at 0, with no stale id→vid mappings
+        // from a previous context). Zero-cost on the default path (clearing an already-
+        // empty map + resetting a `Cell` to 0).
+        self.replay_vid_map.borrow_mut().clear();
+        self.replay_vid_counter.set(0);
         std::mem::replace(&mut *self.determinism.borrow_mut(), ctx)
     }
 
@@ -2042,7 +2079,7 @@ impl Interp {
         module: &str,
         func: &str,
         args: &[Value],
-        _shape: crate::stdlib::HandleShape,
+        shape: crate::stdlib::HandleShape,
         span: Span,
     ) -> Result<Value, Control> {
         let args_hash = Self::replay_args_hash(module, func, args);
@@ -2075,11 +2112,34 @@ impl Interp {
                     )
                     .into());
                 };
+                // REPLAY §2.5 — a `Handle` outcome (a virtualized `HttpResponse`): mint a
+                // fresh handle carrying the decoded fields + a `ReplayVirtual { vid }`
+                // state, wrapped in the canonical `[handle, nil]` Tier-1 pair. The real
+                // http machinery is NEVER touched (the flagship offline guarantee).
+                if let crate::det::TraceOutcome::Handle { vid, fields, .. } = outcome {
+                    return self.mint_virtual_handle(vid, fields, span);
+                }
                 self.decode_trace_outcome(outcome, span)
             }
             crate::det::Mode::Record => {
                 // Dispatch the REAL call (await OUTSIDE any det borrow).
                 let result = self.dispatch_stdlib(module, func, args, span).await;
+                // REPLAY §2.5 — when the call is shaped `HttpResponse` and the real result
+                // is the canonical `[Native(HttpResponse), nil]` pair, virtualize the
+                // handle: assign a vid, map id→vid, snapshot the `fields` (airlock), and
+                // record a `StdlibCall` with a `Handle` outcome. A `[nil, err]` connection
+                // failure (no handle) falls through to the plain encode below (§2.5
+                // http_error_pair_round_trips).
+                if matches!(shape, crate::stdlib::HandleShape::HttpResponse) {
+                    if let Ok(v) = &result {
+                        if let Some(handle_outcome) = self.record_handle_outcome(v, span)? {
+                            self.with_determinism_mut(|ctx| {
+                                ctx.record_stdlib_call(module, func, args_hash, handle_outcome);
+                            });
+                            return result;
+                        }
+                    }
+                }
                 // Encode the outcome in a sync scope (after the await). `None` = a
                 // process-level `Control::Exit` that is propagated WITHOUT recording.
                 if let Some(outcome) = self.encode_trace_outcome(module, func, &result, span)? {
@@ -2090,6 +2150,134 @@ impl Interp {
                 result
             }
         }
+    }
+
+    /// REPLAY §2.5 — the loud v2 refusal for `{stream:true}` (the `HttpBody` reader)
+    /// under `--record`/`--replay`, fired at OPTION PARSE so a recorded trace never
+    /// contains a stream. Public so the net_http request paths can raise it before
+    /// connecting. A Tier-2 panic (a misuse the user fixes by buffering, not a
+    /// recoverable result).
+    #[cfg(feature = "net")]
+    pub(crate) fn trace_streaming_refused(span: Span) -> Control {
+        AsError::at(
+            "streaming http ({stream:true}) is not supported under --record/--replay — \
+             buffered requests only; streaming is v2",
+            span,
+        )
+        .into()
+    }
+
+    /// REPLAY §2.5 — the stable per-`NativeKind` tag for a virtualized handle. v1
+    /// virtualizes EXACTLY `HttpResponse` (tag 1); the mapping is small and forward-
+    /// stable (the v2 handle-virtualization story — files/sockets/children — extends it).
+    /// `0` is reserved as "not a virtualizable handle kind".
+    fn handle_kind_tag(kind: crate::value::NativeKind) -> u8 {
+        match kind {
+            crate::value::NativeKind::HttpResponse => 1,
+            _ => 0,
+        }
+    }
+
+    /// REPLAY §2.5 (record side) — if `v` is the canonical `[Native(HttpResponse), nil]`
+    /// pair, virtualize it: assign a fresh `vid` (counter++), map the handle's resource id
+    /// → vid (so a later accessor call records a `NativeCall { vid, … }`), airlock-encode
+    /// the handle's plain `fields`, and return `Some(TraceOutcome::Handle{..})`. Returns
+    /// `Ok(None)` when `v` is NOT a recordable handle pair (e.g. a `[nil, err]` connection
+    /// failure) — the caller then records it as a plain `Value` outcome. A `fields` encode
+    /// failure is a clean record-time refusal (the §2.4 discipline). NO `.await` (sync).
+    fn record_handle_outcome(
+        &self,
+        v: &Value,
+        span: Span,
+    ) -> Result<Option<crate::det::TraceOutcome>, Control> {
+        // The canonical success shape is the Tier-1 `[handle, nil]` array pair.
+        let ValueKind::Array(a) = v.kind() else {
+            return Ok(None);
+        };
+        let elems = a.borrow();
+        let (Some(first), Some(second)) = (elems.first(), elems.get(1)) else {
+            return Ok(None);
+        };
+        // element 0 must be a live `Native(HttpResponse)`; element 1 must be `nil` (a
+        // `[nil, err]` failure is NOT a handle — record it as a plain value).
+        let ValueKind::Native(n) = first.kind() else {
+            return Ok(None);
+        };
+        if Self::handle_kind_tag(n.kind) == 0 || !matches!(second.kind(), ValueKind::Nil) {
+            return Ok(None);
+        }
+        let kind_tag = Self::handle_kind_tag(n.kind);
+        let resource_id = n.id;
+        // Assign the next vid in birth order and map the live id → vid.
+        let vid = self.replay_vid_counter.get();
+        self.replay_vid_counter.set(vid + 1);
+        self.replay_vid_map.borrow_mut().insert(resource_id, vid);
+        // Snapshot the handle's plain `fields` as a fresh Object and airlock-encode it.
+        let fields_obj = Value::object(
+            n.fields
+                .iter()
+                .map(|(k, val)| (k.clone(), val.clone()))
+                .collect::<indexmap::IndexMap<String, Value>>(),
+        );
+        let (fields_bytes, shared) =
+            crate::worker::serialize::encode(&fields_obj).map_err(|e| {
+                let ae: AsError = e.into();
+                AsError::at(
+                    format!(
+                        "http response fields are not recordable under --record: {} (a \
+                         live handle / closure cannot be replayed)",
+                        ae.message
+                    ),
+                    span,
+                )
+            })?;
+        if !shared.is_empty() {
+            return Err(AsError::at(
+                "http response fields contain a frozen (shared) value that cannot be \
+                 persisted to a trace",
+                span,
+            )
+            .into());
+        }
+        Ok(Some(crate::det::TraceOutcome::Handle {
+            kind_tag,
+            vid,
+            fields: fields_bytes,
+        }))
+    }
+
+    /// REPLAY §2.5 (replay side) — mint a fresh virtual `HttpResponse` handle from a
+    /// recorded `Handle` outcome: decode the `fields` (airlock; an untrusted-decode
+    /// failure is a clean corrupt-trace error), register a `ReplayVirtual { vid }` state,
+    /// and return the canonical `[Native(HttpResponse), nil]` pair. The real http
+    /// machinery is never touched. Sync (no `.await`).
+    fn mint_virtual_handle(
+        &self,
+        vid: u32,
+        fields: Vec<u8>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let fields_val = crate::worker::serialize::decode(&fields, self)
+            .map_err(|e| AsError::at(format!("corrupt trace: {}", e.message()), span))?;
+        // The decoded fields are an Object (we encoded one); rebuild the `IndexMap` the
+        // NativeObject carries. A non-Object (corrupt trace) is a clean error.
+        let ValueKind::Object(o) = fields_val.kind() else {
+            return Err(AsError::at(
+                "corrupt trace: virtualized handle fields are not an object",
+                span,
+            )
+            .into());
+        };
+        let mut fields_map: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for (k, val) in o.entries() {
+            fields_map.insert(k.to_string(), val);
+        }
+        let handle = self.register_resource(
+            crate::value::NativeKind::HttpResponse,
+            fields_map,
+            ResourceState::ReplayVirtual { vid },
+        );
+        Ok(Value::array(vec![handle, Value::nil()]))
     }
 
     /// REPLAY §2.4 — encode a `Recorded` call's result into a [`crate::det::TraceOutcome`]
@@ -2194,6 +2382,15 @@ impl Interp {
                 })?;
                 Err(Control::Propagate(v))
             }
+            // A `Handle` outcome is consumed by the §2.5 virtual-handle minting paths
+            // (`trace_stdlib_call` / `mint_virtual_handle`), never decoded as a plain
+            // value. Reaching here means a recorded `Handle` was routed to a non-handle
+            // seam (a corrupt/misrouted trace) — a CLEAN error, never a panic.
+            crate::det::TraceOutcome::Handle { .. } => Err(AsError::at(
+                "corrupt trace: a virtualized-handle outcome appeared at a plain-value seam",
+                span,
+            )
+            .into()),
         }
     }
 
@@ -2240,6 +2437,14 @@ impl Interp {
         self.set_determinism(None)
     }
 
+    /// REPLAY (test-only) — the live OS-resource table size. The Task-4 leak check
+    /// asserts a replay run that drops its virtual handles ends with an empty table
+    /// (no `ReplayVirtual` leak).
+    #[doc(hidden)]
+    pub fn __resource_count(&self) -> usize {
+        self.resources.borrow().len()
+    }
+
     /// REPLAY (test-only) — drive a qualified `(module, func)` stdlib call through the
     /// FULL `call_stdlib` path (caps gate → trace hook → dispatch), so a test can record
     /// or replay an effectful call in-process. Mirrors what a compiled program's stdlib
@@ -2252,6 +2457,27 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Control> {
         self.call_stdlib(module, func, args, Span::new(0, 0)).await
+    }
+
+    /// REPLAY (test-only) — drive a method call on a native handle through the FULL
+    /// `call_native_method` path (caps re-check → virtual-handle trace hook → dispatch),
+    /// so a test can record/replay an `HttpResponse` accessor in-process. `recv` is a
+    /// `Value::native` handle (e.g. the `[handle, nil]` pair's element 0).
+    #[doc(hidden)]
+    pub async fn __call_native_method(
+        &self,
+        recv: &Value,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, Control> {
+        let ValueKind::Native(n) = recv.kind() else {
+            return Err(AsError::at("__call_native_method: receiver is not a native handle", Span::new(0, 0)).into());
+        };
+        let m = std::rc::Rc::new(crate::value::NativeMethod {
+            receiver: n.clone(),
+            method: method.to_string(),
+        });
+        self.call_native_method(m, args, Span::new(0, 0)).await
     }
 
     /// The wall clock in ms-epoch: the virtual/recorded clock when deterministic,
@@ -6267,6 +6493,85 @@ impl Interp {
         }
     }
 
+    /// REPLAY §2.5 — the virtual-handle trace hook body. Returns `Some(result)` when the
+    /// call was record-routed or replay-virtualized (the caller returns it directly), or
+    /// `None` when the receiver is NOT a virtualized handle (fall through to the normal
+    /// kind dispatch). Only ever entered when `trace_active()`.
+    ///
+    /// - **Record:** the receiver's resource id is in the vid map → dispatch the REAL
+    ///   accessor (the SAME handler the fall-through reaches), encode the outcome through
+    ///   the airlock, and append a `NativeCall { vid, method, args_hash, outcome }`.
+    /// - **Replay:** the receiver's `ResourceState` is `ReplayVirtual { vid }` → consume
+    ///   the next `NativeCall` event (vid + method + args_hash verified; mismatch /
+    ///   exhaustion → §7 divergence) and decode the outcome WITHOUT dispatching. The real
+    ///   http machinery is never touched — the flagship offline guarantee.
+    ///
+    /// Borrow discipline: the mode + (replay) the `vid` are snapshotted up front; the
+    /// record-side dispatch `.await`s OUTSIDE any det/resources borrow; the encode +
+    /// append happen AFTER the await in a sync scope.
+    #[cfg(feature = "net")]
+    async fn trace_native_method(
+        &self,
+        m: &std::rc::Rc<crate::value::NativeMethod>,
+        args: &[Value],
+        span: Span,
+    ) -> Option<Result<Value, Control>> {
+        let id = m.receiver.id;
+        let method = m.method.as_str();
+        let args_hash = Self::replay_args_hash("__native__", method, args);
+        // Is this receiver a replay-virtual handle? (a short borrow, dropped immediately).
+        let replay_vid = self.with_resource(id, |r| match r {
+            Some(ResourceState::ReplayVirtual { vid }) => Some(*vid),
+            _ => None,
+        });
+
+        if let Some(vid) = replay_vid {
+            // ---- Replay: consume the recorded NativeCall WITHOUT dispatching. ---- //
+            let outcome = self
+                .with_determinism_mut(|ctx| ctx.replay_native_call(vid, method, args_hash))
+                .flatten();
+            // Raise a strict divergence (mismatch / exhaustion) if one was set.
+            if let Err(e) = self.check_divergence(span) {
+                return Some(Err(e));
+            }
+            let Some(outcome) = outcome else {
+                return Some(Err(AsError::at(
+                    format!(
+                        "replay divergence: no recorded outcome for virtual handle method '{}'",
+                        method
+                    ),
+                    span,
+                )
+                .into()));
+            };
+            return Some(self.decode_trace_outcome(outcome, span));
+        }
+
+        // ---- Record: is this receiver a virtualized (id→vid mapped) handle? ---- //
+        let record_vid = self.replay_vid_map.borrow().get(&id).copied();
+        let Some(vid) = record_vid else {
+            // Not a virtualized handle — fall through to the normal kind dispatch.
+            return None;
+        };
+        // Dispatch the REAL accessor (v1 virtualizes EXACTLY HttpResponse). The await is
+        // OUTSIDE any det/resources/vid-map borrow (all dropped above).
+        let result = self
+            .call_http_response_method(m, args.to_vec(), span)
+            .await;
+        // Encode the outcome (after the await) and append the NativeCall event.
+        match self.encode_trace_outcome("__native__", method, &result, span) {
+            Ok(Some(outcome)) => {
+                self.with_determinism_mut(|ctx| {
+                    ctx.record_native_call(vid, method, args_hash, outcome);
+                });
+            }
+            // `Ok(None)` = a process-level Control::Exit (not recorded); pass `result` through.
+            Ok(None) => {}
+            Err(e) => return Some(Err(e)),
+        }
+        Some(result)
+    }
+
     /// Dispatch a `NativeMethod` (e.g. `conn.query`, `child.wait`) to the handler
     /// for its receiver's kind. Async + recursive because handlers (added by
     /// sqlite/process tasks) re-enter the interpreter via `call_value`. For now
@@ -6295,6 +6600,19 @@ impl Interp {
             // → byte-identical. A `CapReq::NONE` handle iterates zero times (ungated).
             for cap in m.receiver.kind.governing_caps().iter() {
                 self.require_cap(cap, m.receiver.kind.type_name(), &m.method, &args, span)?;
+            }
+        }
+        // REPLAY §2.5 — the virtual-handle trace hook. Gate-12: `trace_active()` is the
+        // same `Cell<bool>` the `call_stdlib` hook reads — ONE predictably-not-taken
+        // branch on the default path; no `RefCell` borrow when off. It sits AFTER the
+        // caps re-check (a denied cap under --record/--replay still errors with the CAP
+        // message, never a recorded event), mirroring the FFI B3 re-check site exactly.
+        // v1 virtualizes EXACTLY `HttpResponse` (net-gated); under `--no-default-features`
+        // there is no virtualizable handle kind, so the hook is compiled out entirely.
+        #[cfg(feature = "net")]
+        if self.trace_active() {
+            if let Some(routed) = self.trace_native_method(&m, &args, span).await {
+                return routed;
             }
         }
         #[cfg(feature = "sql")]

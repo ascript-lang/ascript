@@ -397,6 +397,7 @@ const REC_NATIVE_CALL: u8 = 11;
 const OUT_VALUE: u8 = 0;
 const OUT_PANIC: u8 = 1;
 const OUT_PROPAGATE: u8 = 2;
+const OUT_HANDLE: u8 = 3;
 
 // `FfiRet` tags.
 const FFI_INT: u8 = 0;
@@ -417,6 +418,16 @@ fn write_outcome(w: &mut Writer, o: &TraceOutcome) {
             w.u8(OUT_PROPAGATE);
             w.bytes(b);
         }
+        TraceOutcome::Handle {
+            kind_tag,
+            vid,
+            fields,
+        } => {
+            w.u8(OUT_HANDLE);
+            w.u8(*kind_tag);
+            w.u32(*vid);
+            w.bytes(fields);
+        }
     }
 }
 
@@ -425,6 +436,16 @@ fn read_outcome(r: &mut Reader, cur: Cur) -> Result<TraceOutcome, TraceError> {
         OUT_VALUE => Ok(TraceOutcome::Value(r.bytes(cur)?)),
         OUT_PANIC => Ok(TraceOutcome::Panic(r.str(cur)?)),
         OUT_PROPAGATE => Ok(TraceOutcome::Propagate(r.bytes(cur)?)),
+        OUT_HANDLE => {
+            let kind_tag = r.u8(cur)?;
+            let vid = r.u32(cur)?;
+            let fields = r.bytes(cur)?;
+            Ok(TraceOutcome::Handle {
+                kind_tag,
+                vid,
+                fields,
+            })
+        }
         tag => Err(TraceError::BadTag {
             record: cur,
             what: "outcome",
@@ -969,6 +990,27 @@ mod tests {
                 method: "bytes".to_string(),
                 args_hash: 5,
                 outcome: TraceOutcome::Propagate(vec![7]),
+            },
+            // REPLAY §2.5 — a virtualized HttpResponse handle-birth outcome.
+            DetEvent::StdlibCall {
+                module: "net_http".to_string(),
+                func: "get".to_string(),
+                args_hash: 0xDEAD_BEEF,
+                outcome: TraceOutcome::Handle {
+                    kind_tag: 1,
+                    vid: 0,
+                    fields: vec![0x10, 0x20, 0x30, 0x40, 0x50],
+                },
+            },
+            DetEvent::StdlibCall {
+                module: "net_http".to_string(),
+                func: "post".to_string(),
+                args_hash: 0,
+                outcome: TraceOutcome::Handle {
+                    kind_tag: 1,
+                    vid: 4_294_967_295,
+                    fields: vec![],
+                },
             },
         ]
     }
