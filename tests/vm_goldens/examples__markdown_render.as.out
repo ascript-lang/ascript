@@ -1,0 +1,32 @@
+# exit: none
+--- basic ---
+<h1>Title</h1>
+<p>Some <strong>bold</strong> and <em>italic</em> text with <code>code</code>.</p>
+<ul>
+<li>one</li>
+<li>two</li>
+</ul>
+
+--- gfm ---
+<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody>
+<tr><td>1</td><td>2</td></tr>
+</tbody></table>
+<p><del>gone</del></p>
+<ul>
+<li><input disabled="" type="checkbox" checked="" />
+done</li>
+<li><input disabled="" type="checkbox" />
+todo</li>
+</ul>
+
+--- sanitized (default) ---
+<p>Hello <a>click me</a> world.</p>
+
+<p>A safe <a href="https://example.com">link</a>.</p>
+
+--- raw (sanitize:false, trusted input only) ---
+<div class="note">trusted html</div>
+
+--- escape ---
+a \*literal\* \_string\_ with \[brackets\] and \# hash
+markdown_render ok

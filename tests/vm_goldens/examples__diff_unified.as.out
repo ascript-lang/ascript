@@ -1,0 +1,47 @@
+# exit: none
+--- unified (default context) ---
+--- before.txt
++++ after.txt
+@@ -1,5 +1,6 @@
+ alpha
+-beta
++BETA
+ gamma
+ delta
++zeta
+ epsilon
+
+--- unified (context: 1) ---
+--- before.txt
++++ after.txt
+@@ -1,5 +1,6 @@
+ alpha
+-beta
++BETA
+ gamma
+ delta
++zeta
+ epsilon
+
+--- no trailing newline ---
+--- a
++++ b
+@@ -1,2 +1,3 @@
+ one
+-two
+\ No newline at end of file
++two
++three
+
+--- diff.lines hunks ---
+  equal: a[0..1] b[0..1] -> ["alpha"]
+  delete: a[1..2] b[1..1] -> ["beta"]
+  insert: a[2..2] b[1..2] -> ["BETA"]
+  equal: a[2..4] b[2..4] -> ["gamma", "delta"]
+  insert: a[4..4] b[4..5] -> ["zeta"]
+  equal: a[4..5] b[5..6] -> ["epsilon"]
+--- diff.chars hunks ---
+  equal: ["c", "o", "l", "o"]
+  insert: ["u"]
+  equal: ["r"]
+diff_unified ok

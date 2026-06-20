@@ -156,6 +156,11 @@ A malformed range is Tier-1; a malformed candidate version is Tier-2.
 
 Return the lowest version in `versions` that satisfies `range` → `[string|nil, err]`.
 
+**Example:**
+[`examples/semver_ranges.as`](https://github.com/ascript-lang/ascript/blob/main/examples/semver_ranges.as)
+— parsing, precedence, sorting, and the caret/tilde/x-range/hyphen/prerelease
+range forms end to end.
+
 ## std/diff
 
 `std/diff` is a hand-rolled **Myers O(ND)** line/char diff plus a unified-diff
@@ -206,3 +211,13 @@ Identical inputs render the empty string.
 Myers char-level diff of `a` → `b` as an `array` of hunks (the same shape as
 `diff.lines`, with each `lines` entry a single character) — intended for small,
 intra-line comparisons.
+
+**Snapshot tie-in.** When the `diff` feature is enabled (default-on),
+[`assert.snapshot`](assert#assertsnapshotname-value) renders its mismatch text as
+a `diff.unified(stored, new, {fromFile:"stored", toFile:"new"})` hunk, so a drifted
+snapshot reads like a familiar `git diff -u`.
+
+**Example:**
+[`examples/diff_unified.as`](https://github.com/ascript-lang/ascript/blob/main/examples/diff_unified.as)
+— unified hunks, the no-trailing-newline marker, and the `diff.lines`/`diff.chars`
+structured shapes.

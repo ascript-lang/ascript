@@ -250,6 +250,17 @@ files are overwritten and the run passes.
 > (the `sys` and `data` features are both required). Under a stripped build the
 > `snapshot` is simply absent from the module's exports (so calling it is a "value is not callable" Tier-2 panic).
 
+**Failure diff.** On a mismatch the message leads with the path-qualified
+[structural diff](#structural-diff) (best for shape changes) and then shows a
+text diff of the stored vs new payload. When the `diff` feature is enabled
+(default-on), that text section is a **unified `@@` hunk**
+(`diff.unified(stored, new, {fromFile: "stored", toFile: "new"})`, truncated past
+200 lines with a `… N more lines` tail) — the same patch format `git diff` and
+`patch` speak, so a snapshot drift reads like a code review. Without the feature
+the older raw `--- stored --- / --- new ---` dump is used instead; the behavior is
+identical either way, only the message text improves. See
+[`std/diff`](utilities#stddiff).
+
 ---
 
 ## Using std/assert inside test() bodies

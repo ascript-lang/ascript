@@ -1,0 +1,9 @@
+# exit: none
+reproducible: true
+generated pages:
+  about.html (157B)
+  guide.html (299B)
+  index.html (231B)
+about.html sanitized: true
+artifact written: true
+docs_site_gen ok

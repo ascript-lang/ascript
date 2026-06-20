@@ -500,3 +500,12 @@ handle exposes `start()`, `stop()`, `running()`, and `close()`. `opts` may carry
 let [job, err] = cron.schedule("*/5 * * * *", () => print("tick"))
 // later: job.stop()  // graceful;  job.close()  // abort
 ```
+
+### Examples
+
+- [`examples/cron_next.as`](https://github.com/ascript-lang/ascript/blob/main/examples/cron_next.as)
+  — `parse`/`next`/`nextN`/`matches` with a fixed `after` anchor (pure, deterministic),
+  the `tzOffset` shift, and the DOM/DOW OR rule.
+- [`examples/advanced/job_scheduler.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/job_scheduler.as)
+  — the `cron.schedule` handle lifecycle (`running`/`stop`/`close`) and a deterministic
+  upcoming-runs preview.

@@ -851,6 +851,7 @@ markdown.escape("a*b_c # heading")
 ### Examples
 
 - [`examples/markdown_render.as`](https://github.com/ascript-lang/ascript/blob/main/examples/markdown_render.as) — render a small document and demonstrate the sanitize-by-default XSS defense.
+- [`examples/advanced/docs_site_gen.as`](https://github.com/ascript-lang/ascript/blob/main/examples/advanced/docs_site_gen.as) — a mini static-site generator: render a baked page set, then package the HTML into a deterministic `tar.gz` (`std/markdown` + `std/archive` + `std/fs`).
 
 ## std/decimal
 

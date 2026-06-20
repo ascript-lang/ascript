@@ -1,0 +1,12 @@
+# exit: none
+schedule: "*/30 9-17 * * 1-5"
+preview err: nil
+upcoming runs:
+  2023-11-15 09:30 (Wed) UTC
+  2023-11-15 10:00 (Wed) UTC
+  2023-11-15 10:30 (Wed) UTC
+  2023-11-15 11:00 (Wed) UTC
+job running after schedule(): true
+job running after stop(): false
+bad expression errors: true
+job_scheduler ok
