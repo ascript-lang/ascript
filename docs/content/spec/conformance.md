@@ -48,7 +48,8 @@ reference implementation:
 
 > An implementation of AScript **CONFORMS** iff, over the entire conformance suite,
 > it produces **byte-identical observable behaviour** — stdout, exit status, and
-> panic/diagnostic messages (caret columns may differ by the recorded ±1 column) — to
+> panic/diagnostic messages (including caret columns, which are char-canonical across
+> both front-ends) — to
 > the suite's goldens and the reference implementation, in **both** feature
 > configurations (default and `--no-default-features`).
 
