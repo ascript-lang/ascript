@@ -2664,6 +2664,7 @@ fn starts_expression(tok: &Tok) -> bool {
             | Tok::HashBrace
             | Tok::Minus
             | Tok::Bang
+            | Tok::Tilde
             | Tok::Await
             | Tok::Yield
             | Tok::Async
@@ -3769,6 +3770,21 @@ mod tests {
                 o => panic!("expected Stmt::Defer, got {o:?}"),
             },
             o => panic!("expected Stmt::Fn, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn starts_expression_includes_all_prefix_unary_operators() {
+        // `starts_expression` gates speculative operand parsing (e.g. a `yield`
+        // operand). It MUST list every prefix-unary operator, or that operator's
+        // operand is silently dropped on the legacy front-end while the CST/VM
+        // front-end parses it — a four-mode divergence (e.g. `yield ~5` yielded the
+        // bitwise-not on VM but `nil` on the tree-walker until `Tilde` was added).
+        for tok in [Tok::Minus, Tok::Bang, Tok::Tilde] {
+            assert!(
+                starts_expression(&tok),
+                "prefix-unary operator {tok:?} must start an expression"
+            );
         }
     }
 }
