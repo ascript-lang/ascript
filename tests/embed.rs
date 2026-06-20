@@ -200,3 +200,80 @@ fn call_async_under_multi_thread_block_on() {
     });
     assert_eq!(v.as_int(), Some(21));
 }
+
+// ── Task 2.1: AsValue scalars + constructors + accessors + AsKind ────────────
+
+use ascript::embed::AsKind;
+
+#[test]
+fn asvalue_is_not_send() {
+    static_assertions::assert_not_impl_any!(AsValue: Send, Sync);
+}
+
+#[test]
+fn scalar_int_round_trip_through_set_global() {
+    let iso = Isolate::builder().build().unwrap();
+    iso.set_global("x", AsValue::from(7i64)).unwrap();
+    assert_eq!(iso.eval("x * 2").unwrap().as_int(), Some(14));
+}
+
+#[test]
+fn scalar_float_bool_nil_string_round_trip() {
+    let iso = Isolate::builder().build().unwrap();
+    // float
+    iso.set_global("f", AsValue::from(2.5f64)).unwrap();
+    assert_eq!(iso.eval("f + 0.5").unwrap().as_float(), Some(3.0));
+    // bool
+    iso.set_global("b", AsValue::from(true)).unwrap();
+    assert_eq!(iso.eval("b").unwrap().as_bool(), Some(true));
+    // nil
+    iso.set_global("n", AsValue::nil()).unwrap();
+    assert!(iso.eval("n").unwrap().is_nil());
+    // string (construct + borrow back out)
+    iso.set_global("s", AsValue::from("hi")).unwrap();
+    let out = iso.eval("s + \" there\"").unwrap();
+    assert_eq!(out.as_str(), Some("hi there"));
+}
+
+#[test]
+fn string_construct_from_owned_and_borrow() {
+    let v = AsValue::from(String::from("owned"));
+    assert_eq!(v.as_str(), Some("owned"));
+}
+
+#[test]
+fn decimal_is_lossless_via_string() {
+    let iso = Isolate::builder().build().unwrap();
+    // Construct a Decimal host-side from its display string; the engine reads it as a
+    // decimal literal (scale preserved). Add 0.25m in script, read the result string.
+    iso.set_global("d", AsValue::decimal("1.50").unwrap()).unwrap();
+    let r = iso
+        .eval("import * as decimal from \"std/decimal\"\nd + decimal.from(\"0.25\")\n")
+        .unwrap();
+    assert_eq!(r.kind(), AsKind::Decimal);
+    assert_eq!(r.as_decimal_str(), Some("1.75".to_string()));
+}
+
+#[test]
+fn decimal_bad_string_is_typed_error() {
+    assert!(AsValue::decimal("not-a-number").is_err());
+}
+
+#[test]
+fn askind_classifies_scalars() {
+    assert_eq!(AsValue::nil().kind(), AsKind::Nil);
+    assert_eq!(AsValue::from(true).kind(), AsKind::Bool);
+    assert_eq!(AsValue::from(7i64).kind(), AsKind::Int);
+    assert_eq!(AsValue::from(1.5f64).kind(), AsKind::Float);
+    assert_eq!(AsValue::from("s").kind(), AsKind::Str);
+    assert_eq!(AsValue::decimal("1.0").unwrap().kind(), AsKind::Decimal);
+}
+
+#[test]
+fn type_name_delegates_to_engine() {
+    // type_name() is the engine's single source of truth, NOT re-spelled here.
+    assert_eq!(AsValue::from(7i64).type_name(), "int");
+    assert_eq!(AsValue::from(1.5f64).type_name(), "float");
+    assert_eq!(AsValue::from("s").type_name(), "string");
+    assert_eq!(AsValue::nil().type_name(), "nil");
+}

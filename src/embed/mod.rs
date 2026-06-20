@@ -28,7 +28,7 @@ mod error;
 mod value;
 
 pub use error::{EmbedDiagnostic, EmbedError, EmbedPanic};
-pub use value::AsValue;
+pub use value::{AsKind, AsValue};
 
 use std::cell::RefCell;
 use std::rc::Rc;
