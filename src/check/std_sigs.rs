@@ -2451,6 +2451,45 @@ static TIME_SIGS: &[(&str, StdSig)] = &[
     ("throttle", StdSig { params: TIME_THROTTLE_PARAMS, ret: None, doc: "Return a throttled wrapper of f that fires at most once per ms window." }),
 ];
 
+// ── std/cron ────────────────────────────────────────────────────────────────
+
+static CRON_PARSE_PARAMS: &[StdParam] = &[StdParam::req("expr", "string")];
+static CRON_NEXT_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("schedule"),
+    StdParam::opt("opts", "object"),
+];
+static CRON_NEXT_N_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("schedule"),
+    StdParam::req("n", "int"),
+    StdParam::opt("opts", "object"),
+];
+static CRON_MATCHES_PARAMS: &[StdParam] = &[
+    StdParam::req_untyped("schedule"),
+    StdParam::req("epochMs", "int"),
+    StdParam::opt("opts", "object"),
+];
+static CRON_SCHEDULE_PARAMS: &[StdParam] = &[
+    StdParam::req("expr", "string"),
+    StdParam::req("f", "fn()"),
+    StdParam::opt("opts", "object"),
+];
+
+static CRON_SIGS: &[(&str, StdSig)] = &[
+    ("parse", StdSig { params: CRON_PARSE_PARAMS, ret: Some("[schedule, err]"), doc: "Parse a 5-field cron expression into a reusable schedule object." }),
+    ("next", StdSig { params: CRON_NEXT_PARAMS, ret: Some("[epochMs, err]"), doc: "Return the next fire time (epoch ms) at or after opts.after (default: now)." }),
+    ("nextN", StdSig { params: CRON_NEXT_N_PARAMS, ret: Some("[array, err]"), doc: "Return the next n fire times as an array of epoch ms." }),
+    ("matches", StdSig { params: CRON_MATCHES_PARAMS, ret: Some("[bool, err]"), doc: "Return whether the given epoch-ms time matches the schedule." }),
+    ("schedule", StdSig { params: CRON_SCHEDULE_PARAMS, ret: Some("[handle, err]"), doc: "Spawn a job that calls f at each scheduled fire time; returns a handle with start/stop/running/close." }),
+];
+
+static CRON_MEMBERS: &[(&str, MemberKind)] = &[
+    ("parse", MemberKind::Fn),
+    ("next", MemberKind::Fn),
+    ("nextN", MemberKind::Fn),
+    ("matches", MemberKind::Fn),
+    ("schedule", MemberKind::Fn),
+];
+
 static TIME_MEMBERS: &[(&str, MemberKind)] = &[
     ("now", MemberKind::Fn),
     ("monotonic", MemberKind::Fn),
@@ -3071,6 +3110,7 @@ static ALL_MODULES: &[(&str, &[(&str, MemberKind)])] = &[
     ("std/postgres", POSTGRES_MEMBERS),
     ("std/redis", REDIS_MEMBERS),
     ("std/docker", DOCKER_MEMBERS),
+    ("std/cron", CRON_MEMBERS),
     // batch 3 — ai + assert + bench + cli + color + schema + shared + lru + events + template +
     //           caps + task + time + sync + stream + date + intl + log + workflow + telemetry +
     //           tui + ffi + resilience
@@ -3153,6 +3193,7 @@ pub fn std_sig(module: &str, name: &str) -> Option<&'static StdSig> {
         "std/postgres" => POSTGRES_SIGS,
         "std/redis" => REDIS_SIGS,
         "std/docker" => DOCKER_SIGS,
+        "std/cron" => CRON_SIGS,
         // batch 3
         "std/ai" => AI_SIGS,
         "std/assert" => ASSERT_SIGS,
@@ -3334,6 +3375,7 @@ mod tests {
             ("std/postgres", POSTGRES_SIGS),
             ("std/redis", REDIS_SIGS),
             ("std/docker", DOCKER_SIGS),
+            ("std/cron", CRON_SIGS),
             // batch 3
             ("std/ai", AI_SIGS),
             ("std/assert", ASSERT_SIGS),

@@ -184,6 +184,7 @@ const MODULE_PAGES: &[(&str, &str)] = &[
     ("std/stream", "stream.md"),
     ("std/date", "time.md"),
     ("std/intl", "time.md"),
+    ("std/cron", "time.md"),
     ("std/json", "data.md"),
     ("std/log", "log.md"),
     ("std/workflow", "workflow.md"),

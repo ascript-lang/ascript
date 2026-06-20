@@ -83,6 +83,9 @@ pub const STD_MODULE_FEATURES: &[(&str, Option<&str>)] = &[
     ("std/ffi",         Some("ffi")),
     ("std/resilience",  Some("resilience")),
     ("std/docker",      Some("docker")),
+    // BATT T2-1 §11 — std/cron is gated on the `cron` feature (cron = datetime).
+    // A cron bundle therefore pulls the datetime tier (chrono civil-time math).
+    ("std/cron",        Some("cron")),
     // BATT Phase A — std/jwt + std/oauth are gated on the `auth` feature
     // (auth = crypto + data + net + rsa/p256). An auth-using bundle therefore
     // needs the net tier (jwks fetch + oauth token calls) — see FEATURE_DEPS.
@@ -147,6 +150,10 @@ pub const FEATURE_DEPS: &[(&str, &str)] = &[
     // BATT Phase B — archive = ["compress"]. A std/archive bundle pulls the
     // compression tier (tar/gzip over the vendored tar/flate2).
     ("archive", "compress"),
+    // BATT T2-1 §11 — cron = ["datetime"]. A std/cron bundle pulls the datetime
+    // tier (chrono). `datetime`'s only dep is `dep:chrono` (no feature→feature
+    // edge), so this is the single edge cron contributes to the closure.
+    ("cron", "datetime"),
     // BATT Phase B §7.2 — xml = ["data", "dep:quick-xml"]. A std/xml bundle pulls
     // the data tier.
     ("xml", "data"),

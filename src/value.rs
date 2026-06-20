@@ -1370,6 +1370,16 @@ pub enum NativeKind {
     // GC-untraced (plain data reclaimed by Drop), non-sendable. Feature `blob`.
     #[cfg(feature = "blob")]
     BlobClient,
+    // BATT T2-1 §11: a `std/cron` schedule handle (`cron.schedule`). Backed by
+    // `ResourceState::CronJob` — a spawned `spawn_local` loop (`next` → sleep via
+    // the time seam → call the callback) held by an `AbortOnDrop`. Methods:
+    // `start()`/`stop()` (graceful flag), `running()`, `close()` (abort). Carries
+    // NO OS resource of its own (the cron computation + timer are pure; a callback's
+    // OS actions are independently capped) → `governing_caps` = NONE. GC-untraced
+    // (a plain spawned task reclaimed by Drop), non-sendable (the worker airlock
+    // rejects it). Feature-gated — compiled out without `cron`.
+    #[cfg(feature = "cron")]
+    CronJob,
 }
 
 impl NativeKind {
@@ -1440,6 +1450,8 @@ impl NativeKind {
             NativeKind::SmtpClient => "smtpClient",
             #[cfg(feature = "blob")]
             NativeKind::BlobClient => "blobClient",
+            #[cfg(feature = "cron")]
+            NativeKind::CronJob => "cronJob",
         }
     }
 
@@ -1550,6 +1562,12 @@ impl NativeKind {
             // (the per-handle re-check mirrors TcpStream/SmtpClient).
             #[cfg(feature = "blob")]
             NativeKind::BlobClient => CapReq::one(Cap::Net),
+            // BATT T2-1 §11: a cron schedule handle drives pure cron math + a timer
+            // — no OS resource at method time. A `cron.schedule` callback's OS
+            // actions are gated independently when they run → the handle is ungated
+            // (start/stop/running/close work under `--sandbox`).
+            #[cfg(feature = "cron")]
+            NativeKind::CronJob => CapReq::NONE,
             // Telemetry spans/instruments BUFFER in memory; the only network egress is the
             // module-level `telemetry.flush`/`capture`/`init` exporters (gated at the
             // dispatch root → `Cap::Net`); a no-op span does nothing. So operating a

@@ -486,6 +486,13 @@ pub(crate) enum ResourceState {
     // tokio Interval to the next tick. Boxed to keep the enum compact (the
     // tokio Interval future is sizeable).
     Interval(Box<tokio::time::Interval>),
+    // BATT T2-1 §11: a `std/cron` schedule job. Holds the `AbortHandle` of the
+    // spawned `next → sleep → callback` loop (aborted on `close()` / last-drop)
+    // and a graceful-stop flag (`stop()` sets it; the loop exits before the next
+    // fire). `running` reflects the not-stopped state. Cancel-on-drop discipline:
+    // dropping the handle drops this state, whose `AbortOnDrop` aborts the loop.
+    #[cfg(feature = "cron")]
+    CronJob(crate::stdlib::cron::CronJobState),
     // std/time: a debounce wrapper state. Holds the wrapped function, the
     // window in ms, and an optional AbortHandle for the pending delayed call.
     // Explicitly aborting that AbortHandle on each new call (and in the state's
@@ -5791,6 +5798,12 @@ impl Interp {
             }
             if matches!(m.receiver.kind, crate::value::NativeKind::DockerStream) {
                 return self.call_docker_stream_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "cron")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::CronJob) {
+                return self.call_cron_method(&m, args, span).await;
             }
         }
         #[cfg(feature = "auth")]

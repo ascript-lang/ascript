@@ -34,6 +34,8 @@ pub mod html;
 pub mod email;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+#[cfg(feature = "cron")]
+pub mod cron;
 #[cfg(feature = "docker")]
 pub mod docker;
 pub mod events;
@@ -250,6 +252,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/ffi" => ffi::exports(),
         #[cfg(feature = "docker")]
         "std/docker" => docker::exports(),
+        #[cfg(feature = "cron")]
+        "std/cron" => cron::exports(),
         #[cfg(feature = "auth")]
         "std/jwt" => jwt::exports(),
         #[cfg(feature = "auth")]
@@ -339,6 +343,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/ffi",
     "std/resilience",
     "std/docker",
+    "std/cron",
     "std/jwt",
     "std/oauth",
     "std/archive",
@@ -739,6 +744,8 @@ impl Interp {
             "ffi" => self.call_ffi(func, args, span).await,
             #[cfg(feature = "docker")]
             "docker" => self.call_docker(func, args, span).await,
+            #[cfg(feature = "cron")]
+            "cron" => self.call_cron(func, args, span).await,
             #[cfg(feature = "auth")]
             "jwt" => self.call_jwt_async(func, args, span).await,
             #[cfg(feature = "auth")]
@@ -1353,6 +1360,10 @@ mod cap_gate_tests {
             "msgpack", "cbor", "tui",
             // RESIL §0: pure / in-memory policy kit — no OS resource, no cap.
             "resilience",
+            // BATT T2-1 §11: std/cron is pure cron computation + the (already
+            // ungated) timer machinery — the module itself touches no OS; a
+            // `cron.schedule` callback that hits the OS is independently capped.
+            "cron",
             // BATT B3 §7.2: std/xml is pure parsing/serialization — no net/fs (the
             // structural XXE / external-entity defense), so it acquires no cap.
             "xml",
