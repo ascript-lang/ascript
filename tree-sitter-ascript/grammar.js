@@ -915,11 +915,17 @@ module.exports = grammar({
       '`',
       repeat(choice(
         $.template_chars,
+        $.template_escape,
         $.template_substitution,
       )),
       '`',
     ),
     template_chars: _ => token.immediate(prec(1, /[^`$\\]+/)),
+    // A backslash escape (`\n`, `\t`, `\\`, `\``, `\$`, …) inside the template
+    // text. `template_chars` deliberately stops at `\`, so without this rule an
+    // escape adjacent to a `${…}` interpolation produced an ERROR node (the
+    // legacy + CST front-ends already accept these — this closes the grammar gap).
+    template_escape: _ => token.immediate(/\\./),
     template_substitution: $ => seq('${', $._expression, '}'),
 
     boolean: _ => choice('true', 'false'),
