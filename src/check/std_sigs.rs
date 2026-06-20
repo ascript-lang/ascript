@@ -1985,8 +1985,15 @@ static TEST_FILTER_PARAMS: &[StdParam] = &[
     StdParam::opt("opts", "object"),
 ];
 static TEST_NIL_OR_PARAMS: &[StdParam] = &[StdParam::req("gen", "object")];
+static TEST_PROP_PARAMS: &[StdParam] = &[
+    StdParam::req("name", "string"),
+    StdParam::req("generators", "array"),
+    StdParam::req("fn", "function"),
+    StdParam::opt("opts", "object"),
+];
 
 static TEST_SIGS: &[(&str, StdSig)] = &[
+    ("prop", StdSig { params: TEST_PROP_PARAMS, ret: None, doc: "Register a property test: run fn over N seeded draws from the generators, shrinking to a minimal counterexample on failure. opts may set runs, seed, and maxShrinks." }),
     ("int", StdSig { params: TEST_INT_PARAMS, ret: Some("object"), doc: "A generator of integers in [min, max] with edge-case bias toward boundary values." }),
     ("float", StdSig { params: TEST_FLOAT_PARAMS, ret: Some("object"), doc: "A generator of floats in [min, max] with edge-case bias toward boundary values." }),
     ("bool", StdSig { params: TEST_BOOL_PARAMS, ret: Some("object"), doc: "A generator of booleans." }),
@@ -2002,6 +2009,8 @@ static TEST_SIGS: &[(&str, StdSig)] = &[
 ];
 
 static TEST_MEMBERS: &[(&str, MemberKind)] = &[
+    // The `prop` runner entry point (BATT C3).
+    ("prop", MemberKind::Fn),
     // The `gen` namespace export (an Object whose fields are the combinators).
     ("gen", MemberKind::Const("object")),
     ("int", MemberKind::Fn),

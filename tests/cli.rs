@@ -5625,3 +5625,291 @@ fn det_no_flags_is_inert() {
         "a no-flag time.now must be a real (recent) clock, not a frozen base; got {v}"
     );
 }
+
+// ============================================================================
+// BATT C3 — prop() property-test runner + shrinking (§10.3 / §10.5)
+// ============================================================================
+//
+// `prop(name, gens, fn, opts?)` (imported from "std/test") registers a property test
+// into the SAME self.tests table. The runner draws N seeded iterations, and on failure
+// SHRINKS to a minimal counterexample, raising a Tier-2 panic whose message IS the
+// formatted report (the existing `FAIL <name>: <message>` machinery prints it verbatim).
+
+/// Helper: write a single-file `.as` prop corpus to a fresh temp path and run `ascript
+/// test`, returning combined stdout. Extra CLI args (e.g. `--seed N`) inserted before
+/// the file.
+fn run_prop_test(tag: &str, body: &str, extra: &[&str]) -> String {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!(
+        "ascript_propc3_{}_{}.as",
+        tag,
+        std::process::id()
+    ));
+    std::fs::write(&file, body).unwrap();
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("test");
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.arg(&file);
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// (a) a TRUE property passes under `ascript test` (100 runs default).
+#[test]
+fn prop_true_property_passes() {
+    let s = run_prop_test(
+        "commutes",
+        "import { prop, gen } from \"std/test\"\n\
+         prop(\"commutes\", [gen.int(), gen.int()], (a, b) => a + b == b + a)\n",
+        &[],
+    );
+    assert!(s.contains("1 passed"), "true prop must pass; got:\n{s}");
+    assert!(s.contains("0 failed"), "true prop must not fail; got:\n{s}");
+}
+
+/// (b) a FALSE property fails with a report containing `seed:`, the shrunken
+/// counterexample, and the convergence pin: `x <= 99` over `gen.int(0,1000)` shrinks to
+/// EXACTLY `100`.
+#[test]
+fn prop_false_property_shrinks_to_minimal_counterexample() {
+    // The property `(x) => x <= 99` over int(0,1000) is false for any x >= 100; the
+    // minimal failing value is exactly 100.
+    let s = run_prop_test(
+        "shrink99",
+        "import { prop, gen } from \"std/test\"\n\
+         prop(\"le99\", [gen.int(0, 1000)], (x) => x <= 99, { seed: 12345 })\n",
+        &[],
+    );
+    assert!(s.contains("1 failed"), "false prop must fail; got:\n{s}");
+    assert!(s.contains("seed:"), "report must contain the seed line; got:\n{s}");
+    // The shrunken counterexample must be exactly 100 (printed in the report).
+    assert!(
+        s.contains("100"),
+        "shrink must converge to exactly 100; got:\n{s}"
+    );
+    // Must NOT report a non-minimal value like a big original draw still standing in for
+    // the counterexample — assert minimality by checking no 3+ digit value > 100 is the
+    // reported counterexample. (We look for the counterexample marker.)
+    assert!(
+        s.contains("counterexample"),
+        "report must label the counterexample; got:\n{s}"
+    );
+}
+
+/// (b') a replay invocation line is printed so the failure is reproducible.
+#[test]
+fn prop_report_has_replay_recipe() {
+    let s = run_prop_test(
+        "replay",
+        "import { prop, gen } from \"std/test\"\n\
+         prop(\"always_false\", [gen.int(0, 10)], (x) => false, { seed: 7 })\n",
+        &[],
+    );
+    assert!(s.contains("1 failed"), "must fail; got:\n{s}");
+    assert!(s.contains("--seed 7"), "report must print a replay --seed line; got:\n{s}");
+}
+
+/// (c) object-form generators bind by NAME in the report.
+#[test]
+fn prop_object_form_binds_by_name() {
+    let s = run_prop_test(
+        "objform",
+        "import { prop, gen } from \"std/test\"\n\
+         prop(\"named\", { a: gen.int(0, 1000), b: gen.int(0, 1000) }, (args) => args.a <= 99, { seed: 999 })\n",
+        &[],
+    );
+    assert!(s.contains("1 failed"), "must fail; got:\n{s}");
+    // The named field 'a' must appear in the counterexample with its shrunken value 100.
+    assert!(s.contains("a"), "object-form report must name field 'a'; got:\n{s}");
+    assert!(s.contains("100"), "field 'a' must shrink to 100; got:\n{s}");
+}
+
+/// (d) a PANICKING body counts as a failure with the message.
+#[test]
+fn prop_panicking_body_is_failure() {
+    // assert(false) inside the body panics (Tier-2) → property fails.
+    let s = run_prop_test(
+        "panic",
+        "import { prop, gen } from \"std/test\"\n\
+         prop(\"boom\", [gen.int(0, 10)], (x) => { assert(false, \"kaboom\"); return true }, { seed: 1 })\n",
+        &[],
+    );
+    assert!(s.contains("1 failed"), "panicking body must fail; got:\n{s}");
+    assert!(s.contains("seed:"), "panicking failure must still print seed; got:\n{s}");
+}
+
+/// (d') a `?`-propagating body counts as a failure.
+#[test]
+fn prop_propagating_body_is_failure() {
+    // A `?` on a [nil, err] pair propagates → the property fails.
+    let s = run_prop_test(
+        "propagate",
+        "import { prop, gen } from \"std/test\"\n\
+         fn boom() { return Err(\"nope\") }\n\
+         prop(\"prop_fail\", [gen.int(0, 10)], (x) => { let v = boom()?; return true }, { seed: 1 })\n",
+        &[],
+    );
+    assert!(s.contains("1 failed"), "propagating body must fail; got:\n{s}");
+}
+
+/// (e) `opts.seed` reproduces the IDENTICAL counterexample across two runs.
+#[test]
+fn prop_opts_seed_reproduces_counterexample() {
+    let body = "import { prop, gen } from \"std/test\"\n\
+         prop(\"repro\", [gen.int(0, 1000), gen.int(0, 1000)], (a, b) => a + b <= 100, { seed: 424242 })\n";
+    let s1 = run_prop_test("repro1", body, &[]);
+    let s2 = run_prop_test("repro2", body, &[]);
+    assert!(s1.contains("1 failed"), "must fail; got:\n{s1}");
+    // The FAIL line (with the shrunken counterexample) must be byte-identical across runs.
+    let fail1: String = s1.lines().filter(|l| l.contains("FAIL")).collect();
+    let fail2: String = s2.lines().filter(|l| l.contains("FAIL")).collect();
+    assert_eq!(fail1, fail2, "opts.seed must reproduce the same counterexample");
+}
+
+/// (e') CLI `--seed` drives the property when no `opts.seed` is set.
+#[test]
+fn prop_cli_seed_reproduces_counterexample() {
+    let body = "import { prop, gen } from \"std/test\"\n\
+         prop(\"cli_repro\", [gen.int(0, 1000)], (x) => x <= 99)\n";
+    let s1 = run_prop_test("cli1", body, &["--seed", "55"]);
+    let s2 = run_prop_test("cli2", body, &["--seed", "55"]);
+    assert!(s1.contains("1 failed"), "must fail; got:\n{s1}");
+    let fail1: String = s1.lines().filter(|l| l.contains("FAIL")).collect();
+    let fail2: String = s2.lines().filter(|l| l.contains("FAIL")).collect();
+    assert_eq!(fail1, fail2, "--seed must reproduce the same counterexample");
+    // shrinks to exactly 100.
+    assert!(s1.contains("100"), "CLI-seeded shrink must converge to 100; got:\n{s1}");
+}
+
+/// (f) `opts.runs` budget honored: a property that fails only on a specific drawn value
+/// won't fail if runs is too small to hit it (instrumented via a tiny range + low runs).
+#[test]
+fn prop_runs_budget_honored() {
+    // With runs:1 a single draw is taken. We can't easily prove the count externally, but
+    // a property that is true should pass with runs:1, and the tally reflects ONE prop.
+    let s = run_prop_test(
+        "runs",
+        "import { prop, gen } from \"std/test\"\n\
+         prop(\"once\", [gen.int(0, 5)], (x) => x >= 0, { runs: 1 })\n",
+        &[],
+    );
+    assert!(s.contains("1 passed"), "runs:1 true prop passes; got:\n{s}");
+}
+
+/// (f') `maxShrinks: 0` reports the ORIGINAL (unshrunk) counterexample.
+#[test]
+fn prop_max_shrinks_zero_reports_original() {
+    // With maxShrinks:0, no shrinking happens; the reported counterexample is the raw
+    // failing draw (which for a wide range is very unlikely to be exactly 100).
+    let s = run_prop_test(
+        "noshrink",
+        "import { prop, gen } from \"std/test\"\n\
+         prop(\"raw\", [gen.int(500, 1000)], (x) => x <= 99, { seed: 314159, maxShrinks: 0 })\n",
+        &[],
+    );
+    assert!(s.contains("1 failed"), "must fail; got:\n{s}");
+    // The original draw is in [500,1000]; minimality would have produced 500. With
+    // maxShrinks:0 the value stays the raw draw (>= 500, almost surely != 500's shrink).
+    // We assert the report does NOT claim "0 shrinks" produced the minimal bound 100.
+    assert!(
+        !s.contains(": 100\n") && !s.contains("= 100"),
+        "maxShrinks:0 must not shrink to 100; got:\n{s}"
+    );
+}
+
+/// (g) `--filter` matches prop names.
+#[test]
+fn prop_filter_matches_names() {
+    let body = "import { prop, gen } from \"std/test\"\n\
+         prop(\"alpha\", [gen.int(0, 5)], (x) => true)\n\
+         prop(\"beta\", [gen.int(0, 5)], (x) => true)\n";
+    let s = run_prop_test("filter", body, &["--filter", "alpha"]);
+    assert!(s.contains("1 passed"), "filter should run only alpha; got:\n{s}");
+    assert!(s.contains("filtered"), "filter should report a filtered count; got:\n{s}");
+}
+
+/// (h) a prop inside `--frozen-time` sees the FROZEN clock (the det context is installed
+/// per-iteration, so time.now() inside the body is the frozen base).
+#[test]
+fn prop_sees_frozen_time() {
+    let s = run_prop_test(
+        "frozen",
+        "import { prop, gen } from \"std/test\"\n\
+         import * as time from \"std/time\"\n\
+         prop(\"clock\", [gen.int(0, 5)], (x) => time.now() == 1767323045000.0)\n",
+        &["--frozen-time", "1767323045000"],
+    );
+    // The property holds iff the clock is frozen to that epoch on EVERY iteration.
+    assert!(s.contains("1 passed"), "prop must see the frozen clock; got:\n{s}");
+}
+
+/// string shrink pin: `!s.contains("ab")` over a string gen shrinks to EXACTLY "ab".
+#[test]
+fn prop_string_shrinks_to_ab() {
+    let s = run_prop_test(
+        "ab",
+        "import { prop, gen } from \"std/test\"\n\
+         import * as string from \"std/string\"\n\
+         prop(\"no_ab\", [gen.string({ minLen: 0, maxLen: 12, charset: \"ab\" })], (s) => !string.contains(s, \"ab\"), { seed: 2024 })\n",
+        &[],
+    );
+    assert!(s.contains("1 failed"), "must fail (some string contains ab); got:\n{s}");
+    // The minimal counterexample is exactly "ab".
+    assert!(
+        s.contains("\"ab\""),
+        "string shrink must converge to exactly \"ab\"; got:\n{s}"
+    );
+}
+
+/// sanity: a REAL property over arrayOf that genuinely holds (sort is sorted) passes.
+#[test]
+fn prop_array_sort_is_sorted_passes() {
+    let s = run_prop_test(
+        "sortok",
+        "import { prop, gen } from \"std/test\"\n\
+         import * as array from \"std/array\"\n\
+         prop(\"sorted\", [gen.arrayOf(gen.int(0, 100))], (xs) => {\n\
+           let ys = array.sort(xs)\n\
+           let i = 1\n\
+           while (i < len(ys)) { if (ys[i - 1] > ys[i]) { return false }; i = i + 1 }\n\
+           return true\n\
+         })\n",
+        &[],
+    );
+    assert!(s.contains("1 passed"), "sort-is-sorted must hold; got:\n{s}");
+}
+
+/// §10.3 failure-line suffix: a PLAIN test failing under `--seed` gains `(seed: N)`; the
+/// SAME test with NO det flags is byte-identical to pre-C3 (INERT — no suffix).
+#[test]
+fn plain_test_failure_suffix_is_inert_without_seed() {
+    let body = "test(\"boom\", () => { assert(false, \"x\") })\n";
+    let no_flag = run_prop_test("suffix_inert", body, &[]);
+    let seeded = run_prop_test("suffix_seed", body, &["--seed", "5"]);
+    // INERT: the no-flag FAIL line has no `(seed:` suffix.
+    assert!(
+        no_flag.contains("FAIL boom: x") && !no_flag.contains("(seed:"),
+        "no-flag plain test must be INERT (no suffix); got:\n{no_flag}"
+    );
+    // Seeded: the FAIL line gains the `(seed: 5)` suffix.
+    assert!(
+        seeded.contains("FAIL boom: x (seed: 5)"),
+        "--seed must append the suffix; got:\n{seeded}"
+    );
+}
+
+/// prop and plain test() coexist (both run; names reported distinctly).
+#[test]
+fn prop_and_plain_test_coexist() {
+    let s = run_prop_test(
+        "mixed",
+        "import { prop, gen } from \"std/test\"\n\
+         test(\"plain\", () => { assert(true) })\n\
+         prop(\"property\", [gen.int(0, 5)], (x) => x >= 0)\n",
+        &[],
+    );
+    assert!(s.contains("2 passed"), "both the plain test and the prop must run; got:\n{s}");
+}

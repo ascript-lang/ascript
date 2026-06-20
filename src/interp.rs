@@ -1937,6 +1937,32 @@ impl Interp {
         self.determinism.borrow().as_ref().map(|ctx| ctx.mode)
     }
 
+    /// BATT C3 (§10.4): the RNG seed of the active determinism context (the CLI
+    /// `--seed`), or `None` when no det context is installed. Used by the `prop()`
+    /// runner's seed-precedence ladder (`opts.seed > CLI seed > random`). The borrow
+    /// is read-and-drop (never held across an `.await`).
+    /// BATT C3 — register a `(name, func)` into the shared test table. `func` is a
+    /// plain `test()` closure OR a `{__prop}` registration Object (the runner branches
+    /// on `is_prop`). One chokepoint so `test_mod::call_test`'s `prop` arm need not
+    /// touch the private `tests` field.
+    pub(crate) fn register_test(&self, name: String, func: Value) {
+        self.tests.borrow_mut().push((name, func));
+    }
+
+    pub(crate) fn determinism_borrow_seed(&self) -> Option<u64> {
+        self.determinism.borrow().as_ref().map(|ctx| ctx.seed)
+    }
+
+    /// BATT C3 (§10.3): the frozen virtual-clock wall time (ms-epoch) of the active
+    /// determinism context, for the `frozen-time: T` suffix in a `prop()` failure
+    /// report. `None` when no det context is installed.
+    pub(crate) fn determinism_borrow_frozen_ms(&self) -> Option<f64> {
+        self.determinism
+            .borrow()
+            .as_ref()
+            .map(|ctx| ctx.clock.now_ms())
+    }
+
     /// FFI Task 10 (§7A): in Record mode, append an `FfiCall` event (the marshalled
     /// return + post-call `Bytes` out-param snapshots). A no-op when not deterministic.
     #[cfg(feature = "ffi")]
@@ -3367,7 +3393,17 @@ impl Interp {
                     cfg.start_ms,
                 )))
             });
-            let outcome = self.call_value(func, Vec::new(), Span::new(0, 0)).await;
+            // BATT C3 (§10.3): a `prop()` registration is a `{__prop}`-tagged Object,
+            // not a callable — drive the property runner (draw + shrink + report)
+            // instead of the plain `call_value` path. The per-test det context is
+            // already installed above (so a seeded prop reads the CLI seed and a
+            // frozen-time prop sees the frozen clock). The unchanged `call_value` path
+            // handles every plain `test()` closure.
+            let outcome = if crate::stdlib::test_mod::is_prop(&func) {
+                self.run_property(&func, Span::new(0, 0)).await
+            } else {
+                self.call_value(func, Vec::new(), Span::new(0, 0)).await
+            };
             // Clear the per-test context on EVERY exit path (before recording the result
             // or propagating exit) so the runner's own bookkeeping is never deterministic
             // and the next test starts from a clean cell.

@@ -905,6 +905,23 @@ async fn real_main() -> ExitCode {
                 None => None,
             };
             let det = ascript::det::DetTestConfig::from_cli(seed, frozen_ms);
+            // BATT C3 (§10.3): the failure-line suffix `(seed: N[, frozen-time: T])`,
+            // appended to EVERY `FAIL` line when a det context was active (`--seed` and/or
+            // `--frozen-time`). INERT when neither flag was passed (`det == None`) — the
+            // suffix is empty, so a non-seeded plain-test run is byte-identical to pre-C3.
+            // `frozen-time` is shown ONLY when `--frozen-time` was explicitly given (a
+            // bare `--seed` derives a start_ms that is not a user-frozen clock).
+            let det_fail_suffix: String = match det {
+                Some(cfg) => {
+                    let mut suf = format!(" (seed: {}", cfg.seed);
+                    if frozen_ms.is_some() {
+                        suf.push_str(&format!(", frozen-time: {}", cfg.start_ms));
+                    }
+                    suf.push(')');
+                    suf
+                }
+                None => String::new(),
+            };
             // DX D2: `--parallel` (no value) → `num_cpus` isolates; `--parallel=N` → N;
             // absent → `None` (serial). The `default_missing_value = "0"` sentinel maps
             // the bare flag to "auto" (num_cpus); the runner clamps to `$ASCRIPT_WORKERS`.
@@ -986,7 +1003,7 @@ async fn real_main() -> ExitCode {
                 return match cov_result {
                     Ok((summary, report)) => {
                         for (name, message) in &summary.failures {
-                            println!("FAIL {}: {}", name, message);
+                            println!("FAIL {}: {}{}", name, message, det_fail_suffix);
                         }
                         summary.print_tally();
                         // The report goes to stdout (text/lcov) or is written to
@@ -1020,7 +1037,7 @@ async fn real_main() -> ExitCode {
             match test_result {
             Ok(summary) => {
                 for (name, message) in &summary.failures {
-                    println!("FAIL {}: {}", name, message);
+                    println!("FAIL {}: {}{}", name, message, det_fail_suffix);
                 }
                 summary.print_tally();
                 if summary.failed > 0 {

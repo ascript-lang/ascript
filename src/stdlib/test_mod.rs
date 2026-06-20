@@ -61,11 +61,6 @@ use indexmap::IndexMap;
 /// chain deeper than this raises a clean Tier-2 panic rather than risking a stack
 /// overflow. 32 is generous for any realistic generator shape (the fuzzgen budget
 /// precedent) while keeping the bound far below the Rust stack ceiling.
-//
-// `dead_code` allow: the drawer + its primitives are the C2 deliverable consumed by
-// C3's `prop()` runner (not yet landed). Exercised by this module's `#[cfg(test)]`
-// suite; the allow drops away once C3 wires the runner.
-#[allow(dead_code)]
 pub(crate) const MAX_GEN_DEPTH: u32 = 32;
 
 /// Default array/string length bounds (spec §10.4 — `arrayOf` opts default
@@ -124,6 +119,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     let gen_ns = Value::object(ns);
 
     let mut out: Vec<(&'static str, Value)> = vec![("gen", gen_ns)];
+    // `prop` — the property-test runner entry point (BATT C3, §10.4). A top-level
+    // export (NOT under `gen`); `import { prop, gen } from "std/test"`.
+    out.push(("prop", super::bi("test.prop")));
     // Flat re-exports for ergonomics (and so the std_sigs member table — which is
     // flat — covers every constructor by its short name).
     out.push(("int", super::bi("test.int")));
@@ -168,7 +166,6 @@ pub(crate) fn gen_kind(v: &Value) -> Option<String> {
 }
 
 /// Read a field off a generator Object.
-#[allow(dead_code)] // consumed by draw_gen / the C3 runner (see MAX_GEN_DEPTH note).
 fn gen_field(g: &Value, key: &str) -> Option<Value> {
     match g.kind() {
         ValueKind::Object(o) => o.get(key),
@@ -528,6 +525,65 @@ impl Interp {
                 }
                 Ok(make_gen("nilOr", vec![("inner", inner)]))
             }
+            // ── prop(name, gens, fn, opts?) ────────────────────────────────────
+            //
+            // BATT C3 (§10.3/§10.4): register a property test. Like `test()`, this
+            // pushes into the SAME `self.tests` table — but as a `{__prop: true,
+            // gens, fn, opts}` tagged Object (the schema/`__gen` posture; no new
+            // `Value` variant). `run_registered_tests_det` branches on the `__prop`
+            // tag and drives `run_property` instead of `call_value`. The drawing,
+            // re-running, and shrinking all happen there; this is registration only.
+            "prop" => {
+                let name = match arg(args, 0).kind() {
+                    ValueKind::Str(s) => s.to_string(),
+                    _ => arg(args, 0).to_string(),
+                };
+                let gens = arg(args, 1);
+                // Validate the generators argument shape eagerly (Tier-2): either an
+                // array of generators or an object of name→generator. (The per-gen
+                // generator-ness is re-validated at draw time by draw_gen.)
+                match gens.kind() {
+                    ValueKind::Array(_) | ValueKind::Object(_) => {}
+                    _ => {
+                        return Err(cfg_err(
+                            "prop",
+                            format!(
+                                "second argument must be an array or object of generators, got {}",
+                                type_name(&gens)
+                            ),
+                            span,
+                        ))
+                    }
+                }
+                let f = arg(args, 2);
+                if !is_callable(&f) {
+                    return Err(cfg_err(
+                        "prop",
+                        format!("third argument must be a function, got {}", type_name(&f)),
+                        span,
+                    ));
+                }
+                let opts = arg(args, 3);
+                if !matches!(opts.kind(), ValueKind::Nil | ValueKind::Object(_)) {
+                    return Err(cfg_err(
+                        "prop",
+                        format!("opts must be an object, got {}", type_name(&opts)),
+                        span,
+                    ));
+                }
+                // Build the `{__prop, name, gens, fn, opts}` registration Object and push
+                // it into the SAME table plain `test()` uses. The table type stays
+                // `Vec<(String, Value)>`.
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__prop".to_string(), Value::bool_(true));
+                m.insert("name".to_string(), Value::str(name.as_str()));
+                m.insert("gens".to_string(), gens);
+                m.insert("fn".to_string(), f);
+                m.insert("opts".to_string(), opts);
+                let prop_obj = Value::object(m);
+                self.register_test(name, prop_obj);
+                Ok(Value::nil())
+            }
             other => Err(AsError::at(
                 format!("std/test has no function '{other}'"),
                 span,
@@ -543,7 +599,6 @@ impl Interp {
     /// non-generator value is a Tier-2 panic (the runner only ever passes a real
     /// generator, but a hand-rolled `{__gen:"bogus"}` is caught here).
     #[async_recursion::async_recursion(?Send)]
-    #[allow(dead_code)] // C2 deliverable; the C3 prop() runner is its production caller.
     pub(crate) async fn draw_gen(
         &self,
         gen: &Value,
@@ -717,6 +772,573 @@ impl Interp {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BATT C3 — the prop() runner + shrinking (§10.3/§10.5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default iteration count for a property (spec §10.4 — `runs?: 100`).
+const DEFAULT_RUNS: u64 = 100;
+/// Default shrink budget (spec §10.4 — `maxShrinks?: 500`).
+const DEFAULT_MAX_SHRINKS: u64 = 500;
+
+/// Is `v` a `{__prop: true, …}` registration Object (built by `test.prop`)?
+///
+/// The `run_registered_tests_det` loop calls this to decide whether to drive
+/// [`Interp::run_property`] (a property test) or the unchanged `call_value` path (a
+/// plain `test()` closure). A plain test func is a callable, never an Object, so the
+/// two never collide.
+pub(crate) fn is_prop(v: &Value) -> bool {
+    match v.kind() {
+        ValueKind::Object(o) => matches!(o.get("__prop").as_ref().map(|x| x.kind()), Some(ValueKind::Bool(true))),
+        _ => false,
+    }
+}
+
+/// How the generators were supplied (`[g, …]` positional vs `{name: g, …}` named) —
+/// determines how the drawn args are passed to the property fn AND how the
+/// counterexample is rendered in the report.
+enum GenForm {
+    /// Positional: each generator draws one positional argument; `fn(a, b, …)`.
+    Array(Vec<Value>),
+    /// Named: a fixed shape of `name → generator`; `fn({a, b, …})` (one object arg).
+    Object(Vec<(String, Value)>),
+}
+
+impl Interp {
+    /// BATT C3 (§10.3/§10.5) — run a `{__prop}` property registration: draw `runs`
+    /// seeded iterations, and on the FIRST failure SHRINK to a minimal counterexample,
+    /// then raise a Tier-2 panic whose message IS the formatted report. The caller
+    /// (`run_registered_tests_det`) records that message verbatim, so the existing
+    /// `FAIL <name>: <message>` summary machinery prints the full report.
+    ///
+    /// **Seed precedence (§10.4):** `opts.seed` > the CLI seed (carried by the active
+    /// determinism context, i.e. `--seed`) > a fresh random seed. A fresh seed is
+    /// PRINTED in the report so the failure is replayable.
+    ///
+    /// **Per-iteration RNG:** iteration `i` draws from `SeededRng::new(seed_for(base, i))`
+    /// where `seed_for(base, i) = base ^ splitmix64(i)` — a deterministic mix so each
+    /// iteration is an independent, reproducible stream and re-running with the same
+    /// base seed reproduces the identical counterexample.
+    pub(crate) async fn run_property(&self, prop_obj: &Value, span: Span) -> Result<Value, Control> {
+        let name = prop_field_str(prop_obj, "name").unwrap_or_default();
+        let fnv = prop_field(prop_obj, "fn").unwrap_or(Value::nil());
+        let opts = prop_field(prop_obj, "opts").unwrap_or(Value::nil());
+
+        // Resolve the generator form.
+        let gens = prop_field(prop_obj, "gens").unwrap_or(Value::nil());
+        let form = match gens.kind() {
+            ValueKind::Array(a) => GenForm::Array(a.borrow().to_vec()),
+            ValueKind::Object(o) => {
+                let mut v = Vec::new();
+                for (k, g) in o.entries() {
+                    v.push((k.to_string(), g));
+                }
+                GenForm::Object(v)
+            }
+            _ => {
+                return Err(AsError::at(
+                    "test.prop: generators must be an array or object".to_string(),
+                    span,
+                )
+                .into())
+            }
+        };
+
+        // runs / maxShrinks budgets.
+        let runs = opt_u64_field(&opts, "runs").unwrap_or(DEFAULT_RUNS).max(1);
+        let max_shrinks = opt_u64_field(&opts, "maxShrinks").unwrap_or(DEFAULT_MAX_SHRINKS);
+
+        // Seed precedence: opts.seed > CLI seed (from the active det context) > random.
+        let (base_seed, seed_source) = match opt_u64_field(&opts, "seed") {
+            Some(s) => (s, SeedSource::Opts),
+            None => match self.determinism_seed() {
+                Some(s) => (s, SeedSource::Cli),
+                None => (fresh_random_seed(), SeedSource::Random),
+            },
+        };
+
+        // ── the N seeded iterations ────────────────────────────────────────────
+        for i in 0..runs {
+            let mut rng = SeededRng::new(seed_for(base_seed, i));
+            // Draw the argument list for this iteration.
+            let args = self.draw_args(&form, &mut rng, span).await?;
+            // Run the property once; a failure (falsy / panic / propagate) triggers
+            // shrinking from THIS draw.
+            if let Some(orig_msg) = self.run_property_once(&fnv, &form, &args, span).await? {
+                // Shrink, then build + raise the report.
+                let (shrunk, shrinks) = self
+                    .shrink(&fnv, &form, &args, max_shrinks, span)
+                    .await?;
+                let report = format_report(
+                    &name,
+                    &form,
+                    &shrunk,
+                    i,
+                    shrinks,
+                    base_seed,
+                    seed_source,
+                    self.determinism_frozen_ms(),
+                    &orig_msg,
+                );
+                return Err(AsError::at(report, span).into());
+            }
+        }
+        // All iterations held → the property passes.
+        Ok(Value::nil())
+    }
+
+    /// Draw the argument list for ONE iteration from the resolved generator form.
+    async fn draw_args(
+        &self,
+        form: &GenForm,
+        rng: &mut SeededRng,
+        span: Span,
+    ) -> Result<Vec<Value>, Control> {
+        match form {
+            GenForm::Array(gens) => {
+                let mut args = Vec::with_capacity(gens.len());
+                for g in gens {
+                    args.push(self.draw_gen(g, rng, 0, span).await?);
+                }
+                Ok(args)
+            }
+            GenForm::Object(fields) => {
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                for (k, g) in fields {
+                    m.insert(k.clone(), self.draw_gen(g, rng, 0, span).await?);
+                }
+                // Object-form passes a SINGLE object argument to the property fn.
+                Ok(vec![Value::object(m)])
+            }
+        }
+    }
+
+    /// Run the property fn once on `args`. Returns `Ok(None)` if the property HELD
+    /// (truthy return, no panic/propagate); `Ok(Some(msg))` if it FAILED, where `msg`
+    /// describes the failure class (a panic message, a propagated err, or the falsy
+    /// note). Misuse of the runner itself surfaces as `Err` (rare).
+    ///
+    /// For the object form, the args vector already holds the single object argument.
+    async fn run_property_once(
+        &self,
+        fnv: &Value,
+        _form: &GenForm,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Option<String>, Control> {
+        match self.call_value(fnv.clone(), args.to_vec(), span).await {
+            Ok(v) => {
+                // A `?` inside the property body returns the `[nil, err]` Tier-1 pair AS
+                // the closure's value (function-scoped early return — it does NOT escape
+                // the closure as `Control::Propagate`). Per spec §10.4 a propagated error
+                // is a FAILURE, so detect that pair shape here.
+                if let Some(msg) = tier1_err_message(&v) {
+                    Ok(Some(format!("property propagated an error: {msg}")))
+                } else if v.is_truthy() {
+                    Ok(None)
+                } else {
+                    Ok(Some("property returned a falsy value".to_string()))
+                }
+            }
+            // A Tier-2 panic inside the body = failure (matches `assert` semantics).
+            Err(Control::Panic(e)) => Ok(Some(e.message)),
+            // A `?`-propagate that DOES escape (e.g. a body that is not itself a fn
+            // boundary) = failure carrying the err.
+            Err(Control::Propagate(pair)) => {
+                Ok(Some(format!("property propagated an error: {}", propagated_err_msg(&pair))))
+            }
+            // exit() unwinds the runner (not a property failure).
+            Err(Control::Exit(code)) => Err(Control::Exit(code)),
+        }
+    }
+
+    /// Greedily shrink a failing argument list to a minimal counterexample (§10.5).
+    /// Returns the shrunken args plus the number of accepted shrink steps. Each
+    /// candidate is re-run with [`run_property_once`]; a candidate is kept ONLY if it
+    /// STILL fails. The loop stops at a fixpoint (no smaller failing candidate) or when
+    /// `max_shrinks` accepted steps is reached. `max_shrinks == 0` → the original is
+    /// returned unshrunk.
+    async fn shrink(
+        &self,
+        fnv: &Value,
+        form: &GenForm,
+        original: &[Value],
+        max_shrinks: u64,
+        span: Span,
+    ) -> Result<(Vec<Value>, u64), Control> {
+        let mut current = original.to_vec();
+        let mut shrinks = 0u64;
+        if max_shrinks == 0 {
+            return Ok((current, 0));
+        }
+        // Outer fixpoint loop: keep sweeping the argument positions until a full sweep
+        // accepts no shrink.
+        'outer: loop {
+            // Shrink each argument position pointwise (for object form there is one
+            // object argument — its fields are shrunk inside shrink_value).
+            for pos in 0..current.len() {
+                // Generate ordered "smaller" candidates for this position's value.
+                let candidates = shrink_value(&current[pos]);
+                for cand in candidates {
+                    if shrinks >= max_shrinks {
+                        break 'outer;
+                    }
+                    let mut trial = current.clone();
+                    trial[pos] = cand;
+                    if self.run_property_once(fnv, form, &trial, span).await?.is_some() {
+                        // Still fails → accept this smaller value and restart the sweep
+                        // (greedy: always re-shrink from the new, smaller counterexample).
+                        current = trial;
+                        shrinks += 1;
+                        continue 'outer;
+                    }
+                }
+            }
+            // A full sweep accepted nothing → fixpoint.
+            break;
+        }
+        Ok((current, shrinks))
+    }
+
+    /// The base RNG seed carried by the active determinism context (the CLI `--seed`),
+    /// or `None` when no det context is installed.
+    fn determinism_seed(&self) -> Option<u64> {
+        self.determinism_borrow_seed()
+    }
+
+    /// The frozen virtual-clock start (ms-epoch) of the active det context, if any —
+    /// used for the `frozen-time: T` suffix in the report.
+    fn determinism_frozen_ms(&self) -> Option<f64> {
+        self.determinism_borrow_frozen_ms()
+    }
+}
+
+/// Where the base seed came from (drives the report wording + replay recipe).
+#[derive(Clone, Copy, PartialEq)]
+enum SeedSource {
+    Opts,
+    Cli,
+    Random,
+}
+
+/// Deterministic per-iteration seed: mix the base seed with a splitmix64 hash of the
+/// iteration index so each iteration is an independent, reproducible stream.
+fn seed_for(base: u64, i: u64) -> u64 {
+    base ^ splitmix64(i.wrapping_add(0x9E37_79B9_7F4A_7C15))
+}
+
+/// A splitmix64 finalizer — a fast, well-distributed integer hash.
+fn splitmix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A fresh, non-reproducible seed (used when neither `opts.seed` nor `--seed` is set).
+/// PRINTED in the report so the failure is replayable.
+fn fresh_random_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    splitmix64(nanos ^ (std::process::id() as u64).wrapping_shl(32))
+}
+
+/// Read a `{__prop}` field value.
+fn prop_field(v: &Value, key: &str) -> Option<Value> {
+    match v.kind() {
+        ValueKind::Object(o) => o.get(key),
+        _ => None,
+    }
+}
+
+/// Read a `{__prop}` string field.
+fn prop_field_str(v: &Value, key: &str) -> Option<String> {
+    match prop_field(v, key).map(|x| x.into_kind()) {
+        Some(OwnedKind::Str(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// Read an optional non-negative integer field from an opts Object (`runs`/`seed`/
+/// `maxShrinks`). A finite number is truncated; a negative/non-finite/missing → `None`.
+/// `seed` may be any u64 (we read it through `as_f64` and reinterpret a negative as its
+/// two's-complement via `as i64 as u64`, so a literal i64 seed round-trips).
+fn opt_u64_field(opts: &Value, field: &str) -> Option<u64> {
+    let o = match opts.kind() {
+        ValueKind::Object(o) => o,
+        _ => return None,
+    };
+    let v = o.get(field)?;
+    match v.kind() {
+        ValueKind::Int(n) => Some(n as u64),
+        ValueKind::Float(f) if f.is_finite() && f >= 0.0 => Some(f as u64),
+        _ => None,
+    }
+}
+
+/// If `v` is a Tier-1 error pair `[value, err]` whose `err` slot is a NON-nil error
+/// (the shape a `?`-propagation produces as a closure's return value), return the err
+/// message. A success pair `[value, nil]` returns `None` (not a failure), as does any
+/// non-pair value (a plain bool/number property result). This is how the prop runner
+/// observes a `?`-propagation, since `?` returns the pair as the closure value rather
+/// than escaping as `Control::Propagate`.
+fn tier1_err_message(v: &Value) -> Option<String> {
+    let a = match v.kind() {
+        ValueKind::Array(a) => a,
+        _ => return None,
+    };
+    let v = a.borrow();
+    if v.len() != 2 {
+        return None;
+    }
+    // The err slot must be non-nil to be a failure.
+    match v[1].kind() {
+        ValueKind::Nil => None,
+        ValueKind::Object(o) => match o.get("message").map(|m| m.into_kind()) {
+            Some(OwnedKind::Str(s)) => Some(s.to_string()),
+            _ => Some(v[1].to_string()),
+        },
+        _ => Some(v[1].to_string()),
+    }
+}
+
+/// The err message carried by a `?`-propagated `[nil, err]` pair (best-effort).
+fn propagated_err_msg(pair: &Value) -> String {
+    if let ValueKind::Array(a) = pair.kind() {
+        let v = a.borrow();
+        if v.len() == 2 {
+            if let ValueKind::Object(o) = v[1].kind() {
+                if let Some(OwnedKind::Str(s)) = o.get("message").map(|m| m.into_kind()) {
+                    return s.to_string();
+                }
+            }
+            return v[1].to_string();
+        }
+    }
+    pair.to_string()
+}
+
+/// Produce an ordered list of "smaller" candidate values for `v` (§10.5). The greedy
+/// shrink driver tries each in order, keeping the first that STILL fails. The ordering
+/// is most-aggressive-first (closest to the simplest value) so the driver takes big
+/// jumps when they keep failing and converges to the boundary with `-1`/tail steps.
+fn shrink_value(v: &Value) -> Vec<Value> {
+    match v.kind() {
+        ValueKind::Int(n) => shrink_int(n).into_iter().map(Value::int).collect(),
+        ValueKind::Float(f) => shrink_float(f).into_iter().map(Value::float).collect(),
+        ValueKind::Str(s) => shrink_string(s),
+        ValueKind::Bool(true) => vec![Value::bool_(false)],
+        ValueKind::Array(a) => shrink_array(&a.borrow()),
+        ValueKind::Object(o) => shrink_object(&o.entries()),
+        _ => vec![],
+    }
+}
+
+/// Integer shrink: toward 0 by halving the DISTANCE, then `-1` steps to reach the exact
+/// boundary (so `x <= 99` over a wide range converges to exactly 100). Most-aggressive
+/// first: `0`, then `n/2`, then `n - 1`. The greedy driver re-shrinks from each accepted
+/// value, so the halving chain (837 → 418 → … → 101) is followed by a single `-1` to 100.
+fn shrink_int(n: i64) -> Vec<i64> {
+    if n == 0 {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    // Toward 0 (drop the value entirely if it still fails at 0).
+    out.push(0);
+    // Halve the distance to 0 (rounds toward 0).
+    let half = n / 2;
+    if half != 0 && half != n {
+        out.push(half);
+    }
+    // The single-step neighbor toward 0 (the boundary-finder).
+    let neighbor = if n > 0 { n - 1 } else { n + 1 };
+    if neighbor != 0 && neighbor != half {
+        out.push(neighbor);
+    }
+    out.dedup();
+    out
+}
+
+/// Float shrink: toward 0.0 (try 0.0, then halve, then snap to the nearest integer if
+/// that is a strictly-simpler distinct value).
+fn shrink_float(f: f64) -> Vec<f64> {
+    if f == 0.0 || !f.is_finite() {
+        return vec![];
+    }
+    let mut out = vec![0.0];
+    let half = f / 2.0;
+    if half != f {
+        out.push(half);
+    }
+    let truncated = f.trunc();
+    if truncated != f && truncated.abs() < f.abs() {
+        out.push(truncated);
+    }
+    out
+}
+
+/// String shrink: drop the tail by halves (toward ""), then shrink the remaining run by
+/// removing one trailing char. Most-aggressive first ("" then halves) so `!contains("ab")`
+/// converges to exactly `"ab"` (the shortest still-failing substring).
+fn shrink_string(s: &str) -> Vec<Value> {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return vec![];
+    }
+    let mut out: Vec<Value> = Vec::new();
+    // "" — drop everything.
+    out.push(Value::str(""));
+    // Keep the first half (drop the tail half).
+    let half = len / 2;
+    if half > 0 && half < len {
+        out.push(Value::str(chars[..half].iter().collect::<String>()));
+    }
+    // Keep the SECOND half (drop the head half) — lets the failing substring survive when
+    // it lives in the tail.
+    if half > 0 && half < len {
+        out.push(Value::str(chars[half..].iter().collect::<String>()));
+    }
+    // Drop a single trailing char (boundary-finder toward the minimal substring).
+    out.push(Value::str(chars[..len - 1].iter().collect::<String>()));
+    // Drop a single LEADING char.
+    out.push(Value::str(chars[1..].iter().collect::<String>()));
+    out
+}
+
+/// Array shrink: drop the tail by halves (toward []), then drop a single trailing
+/// element, then shrink the first element pointwise.
+fn shrink_array(items: &[Value]) -> Vec<Value> {
+    let len = items.len();
+    if len == 0 {
+        return vec![];
+    }
+    let mut out: Vec<Value> = Vec::new();
+    out.push(Value::array(vec![])); // []
+    let half = len / 2;
+    if half > 0 && half < len {
+        out.push(Value::array(items[..half].to_vec()));
+        out.push(Value::array(items[half..].to_vec()));
+    }
+    if len >= 1 {
+        out.push(Value::array(items[..len - 1].to_vec())); // drop last
+    }
+    // Pointwise: shrink the first element (one candidate each), keeping the rest.
+    for cand in shrink_value(&items[0]) {
+        let mut a = items.to_vec();
+        a[0] = cand;
+        out.push(Value::array(a));
+    }
+    out
+}
+
+/// Object shrink: the shape is fixed (objectWith), so shrink field VALUES pointwise.
+/// `__gen`/`__prop` keys never appear in a drawn object.
+fn shrink_object(entries: &[(std::rc::Rc<str>, Value)]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for (i, (_k, v)) in entries.iter().enumerate() {
+        for cand in shrink_value(v) {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            for (j, (kk, vv)) in entries.iter().enumerate() {
+                if j == i {
+                    m.insert(kk.to_string(), cand.clone());
+                } else {
+                    m.insert(kk.to_string(), vv.clone());
+                }
+            }
+            out.push(Value::object(m));
+        }
+    }
+    out
+}
+
+/// Render a counterexample argument for the report. Strings are QUOTED (so `""` and a
+/// trailing space are visible, and the minimal `"ab"` reads unambiguously); arrays and
+/// objects recurse with quoted string elements; everything else uses the plain
+/// value display.
+fn render_value(v: &Value) -> String {
+    match v.kind() {
+        ValueKind::Str(s) => format!("{s:?}"),
+        ValueKind::Array(a) => {
+            let parts: Vec<String> = a.borrow().iter().map(render_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        ValueKind::Object(o) => {
+            let parts: Vec<String> = o
+                .entries()
+                .iter()
+                .map(|(k, vv)| format!("{k}: {}", render_value(vv)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        _ => v.to_string(),
+    }
+}
+
+/// Build the §10.3 failure report (the panic message that the summary prints verbatim).
+/// Multi-line body, lowercase headline, no trailing period (the DX guide).
+#[allow(clippy::too_many_arguments)]
+fn format_report(
+    name: &str,
+    form: &GenForm,
+    shrunk: &[Value],
+    iteration: u64,
+    shrinks: u64,
+    seed: u64,
+    seed_source: SeedSource,
+    frozen_ms: Option<f64>,
+    orig_msg: &str,
+) -> String {
+    let mut s = String::new();
+    s.push_str("property failed");
+    // Counterexample — positional (a, b, …) or named (a: …, b: …).
+    s.push_str("\n  counterexample: ");
+    match form {
+        GenForm::Array(_) => {
+            let parts: Vec<String> = shrunk.iter().map(render_value).collect();
+            s.push_str(&parts.join(", "));
+        }
+        GenForm::Object(fields) => {
+            // The drawn object is the single arg; render name: value pairs.
+            let obj = shrunk.first().cloned().unwrap_or(Value::nil());
+            let parts: Vec<String> = match obj.kind() {
+                ValueKind::Object(o) => fields
+                    .iter()
+                    .map(|(k, _)| {
+                        let val = o.get(k).map(|v| render_value(&v)).unwrap_or_else(|| "nil".into());
+                        format!("{k}: {val}")
+                    })
+                    .collect(),
+                _ => vec![render_value(&obj)],
+            };
+            s.push_str(&parts.join(", "));
+        }
+    }
+    s.push_str(&format!("\n  failing iteration: {iteration}"));
+    s.push_str(&format!("\n  shrinks: {shrinks}"));
+    s.push_str(&format!("\n  reason: {orig_msg}"));
+    // The seed line (§10.3) — note the source so a random seed reads as such.
+    let seed_note = match seed_source {
+        SeedSource::Opts => " (from opts.seed)",
+        SeedSource::Cli => " (from --seed)",
+        SeedSource::Random => " (random — pass it to reproduce)",
+    };
+    s.push_str(&format!("\n  seed: {seed}{seed_note}"));
+    if let Some(t) = frozen_ms {
+        s.push_str(&format!("\n  frozen-time: {t}"));
+    }
+    // The replay invocation, verbatim (§10.3).
+    let mut replay = format!("ascript test <file> --seed {seed}");
+    if let Some(t) = frozen_ms {
+        replay.push_str(&format!(" --frozen-time {t}"));
+    }
+    replay.push_str(&format!(" --filter \"{name}\""));
+    s.push_str(&format!("\n  replay: {replay}"));
+    s
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // the seeded drawing primitives (edge-biased)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -724,7 +1346,6 @@ impl Interp {
 /// the BOUNDARY POOL (`{min, max, 0, ±1}` clamped into range) instead of a uniform
 /// draw. This is the fuzzgen philosophy surfaced (`src/fuzzgen/`): boundary values
 /// far more often than uniform sampling, because bugs cluster at boundaries.
-#[allow(dead_code)] // drawing primitives consumed by draw_gen / the C3 runner.
 fn draw_int(rng: &mut SeededRng, min: i64, max: i64) -> i64 {
     if min == max {
         return min;
@@ -745,7 +1366,6 @@ fn draw_int(rng: &mut SeededRng, min: i64, max: i64) -> i64 {
 
 /// The boundary pool for an int range: `{min, max, 0, 1, -1}` clamped to lie within
 /// `[min, max]`, de-duplicated. Always non-empty (min and max are always in range).
-#[allow(dead_code)]
 fn int_boundary_pool(min: i64, max: i64) -> Vec<i64> {
     let mut pool = vec![min, max];
     for &cand in &[0i64, 1, -1] {
@@ -767,7 +1387,6 @@ fn is_int_boundary(v: i64, min: i64, max: i64) -> bool {
 
 /// Draw a float in `[min, max]` with the same 1-in-4 boundary bias (`{min, max, 0,
 /// ±1}` clamped into range).
-#[allow(dead_code)]
 fn draw_float(rng: &mut SeededRng, min: f64, max: f64) -> f64 {
     if min == max {
         return min;
@@ -788,7 +1407,6 @@ fn draw_float(rng: &mut SeededRng, min: f64, max: f64) -> f64 {
 /// Draw a collection/string length in `[min, max]` with edge bias toward the
 /// endpoints (empty / single / full) — arrays and strings bias toward
 /// empty/single, matching §10.4.
-#[allow(dead_code)]
 fn draw_count(rng: &mut SeededRng, min: usize, max: usize) -> usize {
     if min >= max {
         return min;
@@ -805,7 +1423,6 @@ fn draw_count(rng: &mut SeededRng, min: usize, max: usize) -> usize {
 
 /// Draw a string of `n` characters from a named charset (or a literal character
 /// set). Every produced char is a valid Unicode scalar value.
-#[allow(dead_code)]
 fn draw_string(rng: &mut SeededRng, n: usize, charset: &str) -> String {
     let mut s = String::with_capacity(n);
     match charset_chars(charset) {
@@ -850,7 +1467,6 @@ fn charset_chars(charset: &str) -> Option<Vec<char>> {
 
 /// Draw a single valid Unicode scalar value with a light boundary bias. Never
 /// produces a surrogate (`U+D800..=U+DFFF`) — every result is a real scalar.
-#[allow(dead_code)]
 fn draw_unicode_scalar(rng: &mut SeededRng) -> char {
     // 1-in-4: a boundary scalar.
     if rng.next_u64().is_multiple_of(4) {
