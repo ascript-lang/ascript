@@ -39,6 +39,7 @@ const NAV = [
     ['spec/patterns', 'Pattern matching'],
     ['spec/errors', 'Errors & recover'],
     ['spec/modules', 'Modules & packages'],
+    ['spec/concurrency', 'Concurrency & workers'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
