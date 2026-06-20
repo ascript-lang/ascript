@@ -35,6 +35,9 @@ const NAV = [
     ['spec/values', 'Values & types'],
     ['spec/expressions', 'Expressions & operators'],
     ['spec/statements', 'Statements & declarations'],
+    ['spec/classes', 'Classes, enums & interfaces'],
+    ['spec/patterns', 'Pattern matching'],
+    ['spec/errors', 'Errors & recover'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
